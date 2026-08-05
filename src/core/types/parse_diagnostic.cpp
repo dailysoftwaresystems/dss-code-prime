@@ -455,6 +455,8 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     // BOTH in the same PR.
     //   0x0xxx → P0xxx     (parse)
     //   0x1xxx → A0xxx     (assembler — plan 13 AS1; allocated 2026-05-29)
+    //   0x2xxx → X0xxx     (optimizer pass engine + pass internals — plan 22
+    //                       PR1; renderer arm landed 2026-08-04, TF-C118)
     //   0x4xxx → R0xxx     (register allocator)
     //   0x5xxx → O0xxx     RESERVED — object format / linker (plan 14;
     //                       holding the slot so plan-14 doesn't accidentally
@@ -470,14 +472,37 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
     //   0x8xxx → K0xxx     (linker — plan 14 LK4)
     //   0xExxx → S0xxx     (semantic analysis)
     //   0xFxxx → H0xxx     (HIR verifier / lowering)
-    // Free for future families: 0x2xxx, 0x3xxx (reserve for JVM IL /
-    // .NET IL / future shader-stage validators post-v1).
+    // Free for future families: 0x3xxx ONLY (the sole unclaimed nibble —
+    // 0x6xxx/0x7xxx are RESERVED-not-free per the rows above, and 0x2xxx
+    // is now the optimizer X_* family). Post-v1 candidates (JVM IL /
+    // .NET IL / future shader-stage validators) draw from 0x3xxx.
+    //
+    // D-DIAG-OPT-FAMILY-NIBBLE-CLAIMED-IN-HEADER-BUT-NOT-IN-RENDERER.
+    // WHY THE 0x2xxx ARM BELOW EXISTS AS A SEPARATE NOTE (TF-C118): plan 00
+    // §0.3's allocation discipline says to claim a new family "here AND in
+    // parse_diagnostic.cpp's switch in the same PR". For the X_* family only
+    // the HEADER half landed — the enumerators went in at 0x2xxx while this
+    // renderer kept no 0x2000u arm, so every optimizer diagnostic rendered
+    // under the PARSER's default letter with the family nibble left in the
+    // number (X_PipelineVersionMismatch printed "P2002", not "X0002"). This
+    // is exactly the half-landed claim that rule exists to prevent; the
+    // band-wide test pin in tests/core/test_parse_diagnostic.cpp
+    // (PrefixOptimizerBandRendersAsXWithNibbleStripped) now covers all
+    // eight codes so a future family cannot half-land the same way.
+    //
+    // ★ THERE IS A THIRD MIRROR, and it had drifted identically: the census
+    // instrument scripts/corpus-census/corpus-census.py hand-copies this
+    // nibble→letter table into `NIBBLE_LETTER` and was also missing 0x2000
+    // (fixed in the same cycle). Claiming a family means updating plan 00
+    // §0.3, THIS function, and that dict.
     // Render as the 4-digit hex grouping the user actually sees.
     const auto v          = static_cast<std::uint16_t>(c);
     const std::uint16_t nibble = v & 0xF000u;
     char letter = 'P';
     if (nibble == 0x1000u) {
         letter = 'A';
+    } else if (nibble == 0x2000u) {
+        letter = 'X';
     } else if (nibble == 0x4000u) {
         letter = 'R';
     } else if (nibble == 0x5000u) {
@@ -498,9 +523,10 @@ std::string diagnosticCodePrefix(DiagnosticCode c) {
         letter = 'H';
     }
     // Strip the high nibble for the numeric portion when it's a phase
-    // marker (A/K/R/C/D/S/H/I/L). The 9xxx range stays 9xxx so
+    // marker (A/X/K/R/C/D/S/H/I/L). The 9xxx range stays 9xxx so
     // P_BuilderInvariant prints as "P9000".
-    const bool hasNibbleMarker = (nibble == 0x1000u || nibble == 0x4000u
+    const bool hasNibbleMarker = (nibble == 0x1000u || nibble == 0x2000u
+                                  || nibble == 0x4000u
                                   || nibble == 0x5000u
                                   || nibble == 0x8000u
                                   || nibble == 0xA000u || nibble == 0xB000u

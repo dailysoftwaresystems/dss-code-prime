@@ -1,4 +1,5 @@
 #include "core/types/grammar_schema.hpp"
+#include "repo_root.hpp"
 
 #include <gtest/gtest.h>
 
@@ -5695,22 +5696,26 @@ TEST(GrammarSchema, ParserMaxExpressionDepthWrongTypeReportsCode) {
 // C11/C23 6.4.5: the shipped c-subset text with `stringLiteralPrefixes`, for
 // mutation-based validation of the `elementCoreByFormat` per-format core map.
 namespace {
+// Located through the ONE test-side resolver (`repo_root.hpp`:
+// $DSS_CONFIG_ROOT → the CMake-baked repo root → the cwd ancestor walk). The
+// private cwd walk this replaces resolved nothing in an OUT-OF-TREE build,
+// whose cwd has no `src/dss-config` in its ancestry, so every mutation test
+// below then ran against an empty string. `configRoot()` throws on an
+// unresolvable root — GoogleTest reports that as a failure of the one running
+// test, never an `abort()` that would cost this binary's other tests their
+// verdicts.
 [[nodiscard]] std::string shippedCSubsetTextForPrefixTest() {
     namespace fs = std::filesystem;
-    fs::path dir = fs::current_path();
-    for (int i = 0; i < 12; ++i) {
-        fs::path const cand =
-            dir / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-        if (fs::exists(cand)) {
-            std::ifstream in{cand, std::ios::binary};
-            std::stringstream ss; ss << in.rdbuf();
-            return ss.str();
-        }
-        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
-        dir = dir.parent_path();
+    fs::path const cand =
+        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+    std::ifstream in{cand, std::ios::binary};
+    if (!in) {
+        ADD_FAILURE() << "cannot open shipped c-subset.lang.json at "
+                      << cand.string();
+        return {};
     }
-    ADD_FAILURE() << "could not locate shipped c-subset.lang.json above cwd";
-    return {};
+    std::stringstream ss; ss << in.rdbuf();
+    return ss.str();
 }
 } // namespace
 

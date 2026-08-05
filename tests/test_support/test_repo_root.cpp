@@ -1,0 +1,201 @@
+// Tests for the ONE test-side repo-root resolver (`repo_root.hpp`).
+//
+// This file carries TWO suites with deliberately different run conditions,
+// separated because they need opposite environments:
+//
+//   * `RepoRoot.*`        — precedence and validation, run by the ordinary
+//                           ctest entry with the usual dss_add_test wiring.
+//   * `BakedRootOnly.*`   — THE REGRESSION GUARD for the out-of-tree defect.
+//                           Run ONLY by the `regression/out_of_tree_baked_root`
+//                           entry, whose cwd has no `src/dss-config` in any
+//                           ancestor and whose `DSS_CONFIG_ROOT` is stripped.
+//                           The two entries select their suite with
+//                           `--gtest_filter` (see tests/CMakeLists.txt).
+//
+// WHY THE GUARD EXISTS. A build directory OUTSIDE the source tree used to fail
+// 29 of 787 ctest entries, because ~19 test-side helpers each walked up from
+// `current_path()` for `src/dss-config` and never read the documented
+// `DSS_CONFIG_ROOT`. Every one of those now routes through `repo_root.hpp`.
+// The failure mode this guard defends against is the SILENT one: if someone
+// deletes the baked `DSS_TEST_REPO_ROOT` compile definition, an ordinary ctest
+// run stays green forever — the environment variable and the cwd walk both
+// still work in-tree — and the out-of-tree build silently rots again. This
+// entry is the only place where NEITHER of those two fallbacks is available,
+// so it is the only place that can observe the baked value doing its job.
+
+#include "golden_file.hpp"   // findCorpusRoot / readFile — the real consumers
+#include "repo_root.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+
+#ifdef _WIN32
+#include <stdlib.h>
+#else
+#include <stdlib.h>
+#endif
+
+namespace fs = std::filesystem;
+
+namespace {
+
+// Portable RAII env override — restores the prior value (or clears) on exit.
+// Mirrors the helper in tests/core/test_config_path_walk.cpp; kept local for
+// the same reason that one is, so a test that mutates the environment cannot
+// leak that mutation into a sibling binary's expectations.
+class ScopedEnv {
+public:
+    ScopedEnv(char const* name, std::string const& value) : name_(name) {
+        if (char const* prev = std::getenv(name)) { had_ = true; prev_ = prev; }
+        set(value);
+    }
+    // Construct-to-CLEAR: used by the tests that must prove a candidate is
+    // absent rather than merely wrong.
+    explicit ScopedEnv(char const* name) : name_(name) {
+        if (char const* prev = std::getenv(name)) { had_ = true; prev_ = prev; }
+        clear();
+    }
+    ~ScopedEnv() { had_ ? set(prev_) : clear(); }
+    ScopedEnv(ScopedEnv const&)            = delete;
+    ScopedEnv& operator=(ScopedEnv const&) = delete;
+
+private:
+    void set(std::string const& v) {
+#ifdef _WIN32
+        _putenv_s(name_.c_str(), v.c_str());
+#else
+        ::setenv(name_.c_str(), v.c_str(), 1);
+#endif
+    }
+    void clear() {
+#ifdef _WIN32
+        _putenv_s(name_.c_str(), "");
+#else
+        ::unsetenv(name_.c_str());
+#endif
+    }
+    std::string name_;
+    bool        had_ = false;
+    std::string prev_;
+};
+
+} // namespace
+
+// ── ordinary conditions ─────────────────────────────────────────────────
+
+TEST(RepoRoot, ResolvesAndPointsAtRealTrees) {
+    const auto root = dss::test::repoRoot();
+    EXPECT_TRUE(fs::is_directory(root)) << root.string();
+    EXPECT_TRUE(fs::is_directory(dss::test::configRoot()))
+        << dss::test::configRoot().string();
+    EXPECT_TRUE(fs::is_directory(dss::test::corpusRoot()))
+        << dss::test::corpusRoot().string();
+}
+
+// The property that makes env-first SAFE. Without per-candidate validation, one
+// stale shell export would redden every test in the suite instead of falling
+// through to the baked value.
+TEST(RepoRoot, StaleEnvOverrideFallsThroughInsteadOfPoisoningTheRun) {
+    const auto expected = dss::test::repoRoot();
+    ScopedEnv  guard("DSS_CONFIG_ROOT",
+                     (fs::temp_directory_path() / "dss-nonexistent-root")
+                         .string());
+    EXPECT_EQ(dss::test::repoRoot(), expected)
+        << "a DSS_CONFIG_ROOT that does not contain src/dss-config must be "
+           "REJECTED by validation and fall through to the next candidate";
+}
+
+// An empty value is not an override. Guards the `env[0] != '\0'` check.
+TEST(RepoRoot, EmptyEnvOverrideIsIgnored) {
+    const auto expected = dss::test::repoRoot();
+    ScopedEnv  guard("DSS_CONFIG_ROOT", "");
+    EXPECT_EQ(dss::test::repoRoot(), expected);
+}
+
+// An explicit, VALID override must win — this is the half of the contract the
+// operator's control run expected and did not get.
+TEST(RepoRoot, ValidEnvOverrideIsHonoured) {
+    const auto real = dss::test::repoRoot();
+    ScopedEnv  guard("DSS_CONFIG_ROOT", real.string());
+    EXPECT_EQ(dss::test::repoRoot(), real);
+}
+
+TEST(RepoRoot, DiagnosticNamesAllThreeSources) {
+    const auto msg = dss::test::repoRootDiagnostic();
+    EXPECT_NE(msg.find("DSS_CONFIG_ROOT"), std::string::npos)      << msg;
+    EXPECT_NE(msg.find("DSS_TEST_REPO_ROOT"), std::string::npos)   << msg;
+    EXPECT_NE(msg.find("ancestor walk"), std::string::npos)        << msg;
+}
+
+// ── THE REGRESSION GUARD ────────────────────────────────────────────────
+// Runs only under `regression/out_of_tree_baked_root`.
+
+// PRECONDITIONS FIRST, AS A TEST. An arm that silently loses its own setup
+// still reports green, and a green guard that proves nothing is worse than no
+// guard — it actively certifies the thing it stopped checking. These two
+// assertions are what stop that: if ctest's ENVIRONMENT_MODIFICATION ever stops
+// unsetting the variable, or the chosen working directory ever gains repo
+// ancestry, THIS reddens and tells you the sibling assertions below went
+// vacuous.
+TEST(BakedRootOnly, PreconditionsHold) {
+    char const* const env = std::getenv("DSS_CONFIG_ROOT");
+    ASSERT_TRUE(env == nullptr || env[0] == '\0')
+        << "DSS_CONFIG_ROOT must be UNSET for this arm (got '" << env
+        << "') — with it set, the arm passes through candidate (1) and proves "
+           "nothing about the baked root";
+
+    std::error_code ec;
+    fs::path        here = fs::current_path(ec);
+    ASSERT_FALSE(here.empty());
+    for (int i = 0; i < 12 && !here.empty(); ++i) {
+        ASSERT_FALSE(fs::is_directory(here / "src" / "dss-config", ec))
+            << "cwd " << fs::current_path(ec).string()
+            << " has repo ancestry at " << here.string()
+            << " — the ancestor walk can satisfy resolution here, so this arm "
+               "would pass via candidate (3) rather than the baked root";
+        const fs::path parent = here.parent_path();
+        if (parent == here) break;
+        here = parent;
+    }
+}
+
+// THE ASSERTION THE WHOLE ARM EXISTS FOR: with no environment and no repo
+// ancestry, resolution still succeeds — which can only be the CMake-baked
+// DSS_TEST_REPO_ROOT. Delete that compile definition and this fails.
+TEST(BakedRootOnly, ResolvesFromBakedDefinitionAlone) {
+    ASSERT_TRUE(dss::test::findRepoRoot().has_value())
+        << dss::test::repoRootDiagnostic();
+
+    const auto root = dss::test::repoRoot();
+    EXPECT_TRUE(fs::is_directory(root / "src" / "dss-config")) << root.string();
+    EXPECT_TRUE(fs::is_directory(dss::test::configRoot()));
+    EXPECT_TRUE(fs::is_directory(dss::test::corpusRoot()));
+}
+
+// Through the REAL helper the twelve aborting suites use, not just the raw
+// resolver. `findCorpusRoot()` is `golden_file.hpp`'s entry point — the one
+// whose 8-hop walk ended in `std::abort()` and produced "Subprocess aborted"
+// out-of-tree. Reading an actual file through it is the difference between
+// "the resolver returns a path" and "a corpus consumer can still work".
+TEST(BakedRootOnly, RealCorpusHelperResolvesAndReadsAFile) {
+    const auto corpus = dss::test_support::findCorpusRoot();
+    ASSERT_TRUE(fs::is_directory(corpus)) << corpus.string();
+
+    const auto sample = corpus / "c-subset" / "mini_calc.c";
+    ASSERT_TRUE(fs::exists(sample))
+        << "corpus resolved to " << corpus.string()
+        << " but the sample file is missing — resolution returned a path that "
+           "is not the real corpus";
+    EXPECT_FALSE(dss::test_support::readFile(sample).empty());
+}
+
+// The configRoot() half, likewise resolved to a real file on disk rather than
+// to a directory that merely exists.
+TEST(BakedRootOnly, ConfigRootResolvesAShippedConfigFile) {
+    const auto shipped =
+        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+    EXPECT_TRUE(fs::exists(shipped)) << shipped.string();
+}

@@ -274,7 +274,19 @@ HEX_CODE_RE = re.compile(r"^[A-Z][0-9A-F]{4}$")
 # `diagnosticCodePrefix` (src/core/types/parse_diagnostic.cpp): the high nibble
 # carries the phase letter. Mirrored here ONLY to normalize the two renderings
 # onto one code; the enum VALUES are read from the header, never duplicated.
-NIBBLE_LETTER = {0x1000: "A", 0x4000: "R", 0x5000: "F", 0x8000: "K",
+#
+# ⚠ THIS DICT IS A HAND-MIRRORED COPY AND IT HAS ALREADY DRIFTED ONCE
+# (D-DIAG-OPT-FAMILY-NIBBLE-CLAIMED-IN-HEADER-BUT-NOT-IN-RENDERER, TF-C118,
+# 2026-08-04). `0x2000: "X"` (the optimizer band) was missing here for the same
+# reason it was missing from the renderer itself: the X_* family was claimed in
+# parse_diagnostic.hpp and nowhere else. The consequence was NOT cosmetic for
+# this instrument — `canonical_code` falls back to letter "P" AND skips the
+# nibble strip for an unlisted nibble, so every optimizer diagnostic would have
+# been censused as `P2001`..`P2008`, i.e. attributed to the PARSER, in the very
+# tool whose job is to attribute failures to a tier. Adding a family means
+# updating THREE places, not two: the header, `diagnosticCodePrefix`, and here.
+NIBBLE_LETTER = {0x1000: "A", 0x2000: "X", 0x4000: "R", 0x5000: "F",
+                 0x8000: "K",
                  0xA000: "I", 0xB000: "L", 0xC000: "C", 0xD000: "D",
                  0xE000: "S", 0xF000: "H"}
 

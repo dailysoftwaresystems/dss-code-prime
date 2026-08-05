@@ -9,6 +9,7 @@
 #include "lsp/schema_cache.hpp"
 #include "lsp/transport.hpp"
 #include "lsp_test_helpers.hpp"
+#include "repo_root.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -21,6 +22,7 @@
 #include <future>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -34,21 +36,34 @@ using json   = nlohmann::json;
 
 namespace {
 
-// Walk parent dirs from this TU until we find tests/lsp/sessions/.
-// Mirrors the cwd-independence trick in GrammarSchema::loadShipped.
+// Locate tests/lsp/sessions/.
+//
+// `__FILE__` stays the PRIMARY. It is an absolute path to this very TU, so it
+// names the tree this test was compiled from — which is strictly more precise
+// than a repo-root lookup for finding a file's own sibling data, and it is
+// immune to build location. (It is also why this test was NOT among the 29 an
+// out-of-tree build failed.)
+//
+// The fallback used to be a private 6-hop cwd walk that, on a total miss,
+// silently returned a path it had just failed to find — so a vanished sessions
+// dir surfaced as "0 sessions replayed" rather than as an error. It now defers
+// to the one test-side resolver (repo_root.hpp: $DSS_CONFIG_ROOT -> the
+// CMake-baked root -> the ancestor walk) and FAILS LOUD if neither locator
+// works, because "the corpus is missing" must never read as "the corpus is
+// clean".
 [[nodiscard]] fs::path findSessionsDir() {
-    fs::path here = fs::path{__FILE__}.parent_path();
-    fs::path candidate = here / "sessions";
-    if (fs::exists(candidate)) return candidate;
-    // Fall back to walking up from the test binary location.
-    auto cur = fs::current_path();
-    for (int i = 0; i < 6; ++i) {
-        auto try1 = cur / "tests" / "lsp" / "sessions";
-        if (fs::exists(try1)) return try1;
-        if (!cur.has_parent_path()) break;
-        cur = cur.parent_path();
+    fs::path const fromThisTu = fs::path{__FILE__}.parent_path() / "sessions";
+    if (fs::exists(fromThisTu)) return fromThisTu;
+
+    if (auto const root = dss::test::findRepoRoot()) {
+        fs::path const fromRepo = *root / "tests" / "lsp" / "sessions";
+        if (fs::exists(fromRepo)) return fromRepo;
     }
-    return candidate;
+
+    throw std::runtime_error(
+        "could not locate tests/lsp/sessions/. Tried this TU's own directory ("
+        + fromThisTu.string() + ") and the repo root.\n"
+        + dss::test::repoRootDiagnostic());
 }
 
 [[nodiscard]] std::vector<std::string> readJsonLines(fs::path const& p) {

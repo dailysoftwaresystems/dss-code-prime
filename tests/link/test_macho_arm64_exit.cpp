@@ -35,6 +35,7 @@
 #include "link/format/macho.hpp"
 #include "link/object_format_schema.hpp"
 #include "macho_test_support.hpp"
+#include "repo_root.hpp"
 
 #include <gtest/gtest.h>
 
@@ -59,23 +60,24 @@ using dss::macho::test::findSection;
 using dss::macho::test::readU32LE;
 using dss::macho::test::readU64LE;
 
-// Ancestor-walk to the shipped arm64-darwin-exec format JSON (mirrors
-// findShippedConfig so the test works whether ctest runs from build/ or
-// the repo root). Returns the parsed schema or nullptr (with an
-// ADD_FAILURE) on miss.
+// The shipped Darwin exec format JSON, located through the ONE test-side
+// resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the CMake-baked repo
+// root → the cwd ancestor walk). The private ancestor-walk that stood
+// here found nothing in an OUT-OF-TREE build — that cwd has no
+// `src/dss-config/` above it — which turned this ALWAYS-ON guard off on
+// exactly the legs that cannot run the corpus binary. Returns the parsed
+// schema or nullptr (with an ADD_FAILURE) on miss.
 [[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
 loadDarwinExecByName(char const* fname) {
-    fs::path here = fs::current_path();
-    fs::path shipped;
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const candidate = here / "src" / "dss-config"
-            / "object-formats" / fname;
-        if (fs::exists(candidate)) { shipped = candidate; break; }
-        here = here.parent_path();
+    auto const root = dss::test::findRepoRoot();
+    if (!root) {
+        ADD_FAILURE() << fname << ": " << dss::test::repoRootDiagnostic();
+        return nullptr;
     }
-    if (shipped.empty()) {
-        ADD_FAILURE() << fname << " not found in any ancestor "
-                         "src/dss-config/object-formats";
+    fs::path const shipped =
+        *root / "src" / "dss-config" / "object-formats" / fname;
+    if (!fs::exists(shipped)) {
+        ADD_FAILURE() << shipped.generic_string() << " does not exist";
         return nullptr;
     }
     auto f = ObjectFormatSchema::loadFromFile(shipped.string());

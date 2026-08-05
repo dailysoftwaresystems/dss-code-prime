@@ -25,6 +25,7 @@
 #include "core/types/header_case_diagnostic.hpp"
 #include "core/types/include_path_resolve.hpp"
 #include "core/types/unsuppressable_codes.hpp"
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -199,19 +200,6 @@ CaseCollisionScan caseCollisionsUnder(fs::path const& root) {
         scan.groups.push_back(group);
     }
     return scan;
-}
-
-// Walk up from cwd for `src/dss-config/` — the same walk `findShippedConfig`
-// performs, repeated here so the guard runs against the REAL shipped tree.
-std::optional<fs::path> findConfigRoot() {
-    std::error_code ec;
-    fs::path dir = fs::current_path(ec);
-    for (int i = 0; i < 12 && !dir.empty(); ++i) {
-        if (fs::is_directory(dir / "src" / "dss-config", ec)) return dir;
-        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
-        dir = dir.parent_path();
-    }
-    return std::nullopt;
 }
 
 } // namespace
@@ -479,9 +467,17 @@ TEST(HeaderNameMatching, FoldCollisionFailsLoudAndNamesEveryCandidate) {
 // nowhere else — and it would be INVISIBLE to a contributor on the host most of
 // them use, because their own git client would have silently collapsed it.
 TEST(HeaderNameMatching, ShippedConfigTreeHasNoCaseCollidingPaths) {
-    auto const root = findConfigRoot();
-    ASSERT_TRUE(root.has_value())
-        << "could not locate src/dss-config by walking up from cwd";
+    // The REAL shipped tree, resolved by the ONE test-side resolver
+    // (`repo_root.hpp`) instead of the private cwd walk this file used to carry
+    // — that walk found nothing in an OUT-OF-TREE build, whose cwd has no
+    // `src/dss-config` in its ancestry. Non-throwing `findRepoRoot()` keeps this
+    // guard's existing contract (a miss is an ASSERT here, never an `abort()`
+    // that would cost every sibling test in this binary its verdict), and the
+    // message now carries all three candidates the resolver actually tried —
+    // "walking up from cwd" was only one of them and would send the reader to
+    // the wrong half of the system.
+    auto const root = dss::test::findRepoRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
     // `src/dss-config/**` first (the descriptors this axis resolves), then the
     // WHOLE checked-out tree — the invariant is about CLONING the repo, not
     // just about headers, so the sweep must cover everything a clone

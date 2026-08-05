@@ -57,6 +57,7 @@
 
 #include "ffi/shipped_lib_descriptor.hpp"
 
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <nlohmann/json.hpp>
@@ -80,16 +81,21 @@ using dss::test_support::ScratchDir;
 
 namespace {
 
+// The real descriptor tree this invariant is measured over, resolved through
+// the ONE test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the
+// CMake-baked repo root → the cwd ancestor walk). The private cwd-walk that
+// stood here found nothing in an OUT-OF-TREE build, whose cwd has no
+// `src/dss-config/` above it — and a co-state group with no tree to read is
+// exactly the "no test saw it" hole sys/stat fell through above. Contract
+// unchanged: empty on a miss, both callers ASSERT on it; the ADD_FAILURE names
+// which of the three lookups came up short.
 [[nodiscard]] fs::path configRoot() {
-    fs::path here = fs::current_path();
-    for (int i = 0; i < 12 && !here.empty(); ++i) {
-        fs::path const cand = here / "src" / "dss-config";
-        if (fs::exists(cand)) return cand;
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    auto const root = dss::test::findRepoRoot();
+    if (!root) {
+        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        return {};
     }
-    return {};
+    return *root / "src" / "dss-config";
 }
 
 // The STATEFUL co-state group: every descriptor whose pe surface mints or

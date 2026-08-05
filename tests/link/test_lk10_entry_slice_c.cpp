@@ -37,6 +37,7 @@
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link/writer.hpp"
+#include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
 
@@ -192,24 +193,25 @@ makeSyscallElfExecFormatArm64() {
 // staleness as the format substrate evolves.
 [[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
 loadPeExecWithEntryPoint(std::string const& entryName) {
-    // Walk up from cwd looking for the shipped JSON file — mirrors
-    // the ancestor-walk in `findShippedConfig` so this test works
-    // whether ctest invokes from build/ or the repo root.
+    // Locate the shipped JSON through the ONE test-side resolver
+    // (`repo_root.hpp`: $DSS_CONFIG_ROOT → the CMake-baked repo root →
+    // the cwd ancestor walk). The private cwd-walk that stood here
+    // found nothing in an OUT-OF-TREE build, whose cwd has no
+    // `src/dss-config/` in its ancestry — and this helper's `nullptr`
+    // is indistinguishable from the two config-drift causes the
+    // caller's message names, so the miss must say so itself.
     namespace fs = std::filesystem;
-    fs::path shipped;
-    fs::path here = fs::current_path();
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const candidate = here / "src" / "dss-config"
-            / "object-formats" / "pe64-x86_64-windows-exec.format.json";
-        if (fs::exists(candidate)) {
-            shipped = candidate;
-            break;
-        }
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    auto const root = dss::test::findRepoRoot();
+    if (!root) {
+        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        return nullptr;
     }
-    if (shipped.empty()) return nullptr;
+    fs::path const shipped = *root / "src" / "dss-config"
+        / "object-formats" / "pe64-x86_64-windows-exec.format.json";
+    if (!fs::exists(shipped)) {
+        ADD_FAILURE() << shipped.generic_string() << " does not exist";
+        return nullptr;
+    }
     std::ifstream f{shipped};
     std::stringstream buf;
     buf << f.rdbuf();

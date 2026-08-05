@@ -4,6 +4,7 @@
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
 #include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
 #include "core/substrate/thread_pool.hpp"       // D-PERF-4-CU-PARALLELISM: per-CU build pool
+#include "core/types/config_path_walk.hpp"      // findShippedConfigDir — shared src/dss-config/<dir> resolver
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/glob_match.hpp"  // D-AP2-SOURCES-GLOB: expand sources[] patterns
 #include "core/types/grammar_schema.hpp"
@@ -139,6 +140,81 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 void drainDiagnosticsToStderr(DiagnosticReporter const& rep) {
     static BufferRegistry const kEmpty;
     drainDiagnosticsToStderr(rep, kEmpty);
+}
+
+// ── THE BUILD'S STATEMENT OF RECORD ABOUT WHAT IT PRODUCED ─────────────────
+// D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118).
+//
+// ★ WHY THIS EXISTS. Until now a SUCCESSFUL build said nothing at all about
+// the file it had written, so every consumer had to RECONSTRUCT the name —
+// and reconstructing it requires the artifact-extension table, which is
+// `TargetSpec::outputExtension` keyed on the closed object-format enum. Two
+// partial copies of that table had already escaped into the sqlite harness,
+// they disagreed with each other, and the disagreement threw away a REAL
+// cross-host success: a Linux host cross-built the Windows `testfixture.exe`
+// for pe64 with zero diagnostics, and the driver — looking for a suffix-less
+// `testfixture` — recorded the leg as a build FAILURE. The fix is not a third
+// copy of the table. It is for the compiler to SAY what it wrote.
+//
+// ★ WHY A PLAIN REPORT LINE AND NOT AN `info[...]` DIAGNOSTIC. A diagnostic is
+// DROPPABLE, through three independent gates in `DiagnosticReporter::report`:
+// `--suppress` naming the code, the per-code cap (50), and the global cap
+// (1000, after which every further report is discarded in silence). Any one of
+// them re-creates precisely the false negative this line exists to end — a
+// build that succeeded, saying nothing, read as a build that produced nothing.
+// Escaping all three would mean joining `kUnsuppressableCodes`, whose first
+// Info-severity member is itself a KNOWN open question
+// (D-FF2-UNSUPP-INFO-WAE-ASYMMETRY). This is a driver REPORT, not an opinion
+// about the program, so it goes out the way `--time`'s report does: same
+// stream, same `dss-code-prime: ` prefix, no policy in the way.
+//
+// ★ THE SHAPE, and each part of it is load-bearing for a machine reader:
+//
+//     dss-code-prime: artifact <targetSpec> <absolute path>
+//
+//   · a FIXED leading marker, so a consumer matches a prefix and never a
+//     regex over prose;
+//   · the TARGET SPEC second, because `TargetSpec::parse` REFUSES whitespace
+//     in either half — the spec is a single token by construction, so a
+//     multi-target build stays unambiguous and a consumer can select the line
+//     belonging to the target it asked for;
+//   · the PATH last, so a path containing spaces is still the unambiguous
+//     REMAINDER of the line, and ABSOLUTE, because `--output` is stored
+//     verbatim (`cli_args.cpp`) and would otherwise leave the reader guessing
+//     which cwd to resolve against.
+//
+// Nothing here is keyed on language, processor or object format: the path was
+// already computed from the closed format enum above, and this only reports
+// it.
+[[nodiscard]] std::string artifactPathForReport(fs::path const& p) {
+    // `generic_string()` throws for a path the current locale cannot encode;
+    // the u8 fallback mirrors `link/writer.cpp`'s `pathForDiag`, which the
+    // write-failure diagnostics for this very artifact already use. Forward
+    // slashes on every host — that is what this codebase prints, and every
+    // consumer of the line (POSIX shell, PowerShell, .NET `Path`) takes them.
+    try {
+        return p.generic_string();
+    } catch (...) {
+        auto const u8 = p.u8string();
+        return std::string(reinterpret_cast<char const*>(u8.data()), u8.size());
+    }
+}
+
+// Called ONCE per artifact, and ONLY after the write path reported success.
+void reportArtifactWritten(std::string const& targetSpec,
+                           fs::path const&    outPath) {
+    // Lexical only. `absolute` needs the cwd; `lexically_normal` folds the
+    // `.`/`..` a relative `--output` may have contributed. Neither touches the
+    // disk — the bytes are already committed, and re-statting here would only
+    // create a way for the report to disagree with the write.
+    std::error_code ec;
+    fs::path abs = fs::absolute(outPath, ec);
+    // Not a silent fallback: `outPath` IS the path the writer committed to, so
+    // the line stays TRUE either way. Only the ABSOLUTE guarantee is lost, and
+    // only when the process has no usable cwd to resolve against.
+    if (ec) abs = outPath;
+    std::cerr << "dss-code-prime: artifact " << targetSpec << ' '
+              << artifactPathForReport(abs.lexically_normal()) << '\n';
 }
 
 // Emit a driver-tier D_* diagnostic. Wraps `dss::report` so all
@@ -443,6 +519,19 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         return false;
     }
 
+    // D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118):
+    // THE ONE report site for the three link/write dispatches below (static
+    // archive / single CU / merged multi-CU). They are three routes to the
+    // SAME `outPath`, so the report is attached at their only common ancestor
+    // rather than copied into each — and it is attached to their RESULT, so
+    // the line cannot be printed for a write that failed. Every `return` of a
+    // link/write result below goes through here; a route added later that does
+    // not is a route whose artifact goes unreported, which is the whole defect.
+    auto const reported = [&](bool wrote) {
+        if (wrote) reportArtifactWritten(targetSpecStr, outPath);
+        return wrote;
+    };
+
     // c165 (D-LK-STATIC-LINK): partition `--resolve-library` into DYNAMIC
     // libraries (`.so`/`.dll`/`.dylib` -- read for their export surface during
     // per-CU FFI synthesis, the c162 path) and STATIC `ar` archives (pulled +
@@ -636,9 +725,9 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                 memberNames.push_back(std::move(extracted->names[i]));
             }
         }
-        return linkAndWriteStaticArchive(members, memberNames,
-                                         **targetR, **formatR, outPath, reporter,
-                                         imageRequest);
+        return reported(linkAndWriteStaticArchive(members, memberNames,
+                                                  **targetR, **formatR, outPath,
+                                                  reporter, imageRequest));
     }
     // N==1 (the CU5 multi-file-single-CU case): lower the sole CU + link it. UNCHANGED
     // from cycle 24 — byte-identical single-CU output. Routing N==1 through the merge
@@ -654,9 +743,9 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         // c165 (D-LK-STATIC-LINK): link against any `ar` static archives named on
         // `--resolve-library` (pull the referenced members + merge them in). With
         // no static archives this is `linkAndWrite({mod})`, unchanged.
-        return linkAndWriteWithStaticArchives(
+        return reported(linkAndWriteWithStaticArchives(
             std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
-            **targetR, **formatR, outPath, reporter, imageRequest);
+            **targetR, **formatR, outPath, reporter, imageRequest));
     }
 
     // N>1 (CU6 multi-CU): WHOLE-PROGRAM MIR MERGE (Cycle 25 Stage C). Fold the N per-CU
@@ -938,9 +1027,9 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // against any `ar` static archives named on `--resolve-library` the same way
     // the single-CU path does (pull referenced members + merge). No archives =>
     // `linkAndWrite({mod})`, unchanged.
-    return linkAndWriteWithStaticArchives(
+    return reported(linkAndWriteWithStaticArchives(
         std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
-        **targetR, **formatR, outPath, reporter, imageRequest);
+        **targetR, **formatR, outPath, reporter, imageRequest));
 }
 
 // c9 (Phase-2): the ObjectFormatKind a target spec compiles to, or nullopt if the
@@ -1733,29 +1822,38 @@ int Program::transpile(
 // FF11: declare the language's SYSTEM include dirs (its
 // `semantics.shippedLibDirs`, the /usr/include analogue) on `builder`
 // so the angle form `#include <h>` resolves against them. Each config
-// string is a subdirectory under `src/dss-config/`; resolve it to an
-// absolute dir by walking up from cwd (mirroring `findShippedConfig`'s
-// 8-level walk, so it works from repo root, build/, or a nested ctest
-// cwd). A dir not found in the ancestry is skipped — a header miss then
-// hard-fails downstream with F_ShippedHeaderNotFound, which is the
-// correct fail-loud surface (vs. silently swallowing here). NO language
-// branch: the dirs come entirely from the schema's per-language config.
+// string is a subdirectory under `src/dss-config/`; `findShippedConfigDir`
+// resolves it with the SHARED precedence — `$DSS_CONFIG_ROOT` first, then
+// the 8-level cwd walk — so it works from repo root, build/, a nested
+// ctest cwd, or anywhere at all when the override is set. A dir that
+// resolves NOWHERE is skipped — a header miss then hard-fails downstream
+// with F_ShippedHeaderNotFound, which is the correct fail-loud surface
+// (vs. silently swallowing here). NO language branch: the dirs come
+// entirely from the schema's per-language config.
+//
+// ⚠ THIS USED TO BE A PRIVATE COPY OF THE WALK THAT NEVER READ THE
+// OVERRIDE, and the comment claimed it mirrored `findShippedConfig` while
+// omitting the one branch that makes discovery cwd-independent. MEASURED:
+// same binary, `DSS_CONFIG_ROOT` set in BOTH arms, `#include <stdio.h>` —
+// cwd inside the repo gave rc 0, cwd `C:\` gave `error[F001A]: got
+// stdio.h`. The shipped CLI could not resolve an angle include from any
+// working directory outside its own source tree. Do not re-open a local
+// walk here.
 void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
     auto const& dirs = grammar.semantics().shippedLibDirs;
     if (dirs.empty()) return;
     std::error_code ec;
     for (std::string const& sub : dirs) {
-        fs::path here = fs::current_path(ec);
-        for (int i = 0; i < 8 && !here.empty(); ++i) {
-            fs::path const candidate = here / "src" / "dss-config" / sub;
-            if (fs::is_directory(candidate, ec)) {
-                builder.addSystemDir(candidate);
-                break;
-            }
-            fs::path const parent = here.parent_path();
-            if (parent == here) break;   // hit filesystem root
-            here = parent;
-        }
+        auto const resolved = findShippedConfigDir(sub);
+        if (!resolved) continue;   // fail loud downstream, not here
+        // ABSOLUTE, because `ResolutionContext::systemDirs` documents its
+        // dirs as absolute: the cwd walk produced that for free, but a
+        // RELATIVE `DSS_CONFIG_ROOT` (permitted — see config_path_walk.hpp)
+        // would not. Same idiom as `applyIncludeDirs` below: on an `absolute`
+        // failure keep the raw path rather than drop the dir.
+        fs::path const abs = fs::absolute(*resolved, ec);
+        builder.addSystemDir(ec ? *resolved : abs);
+        ec.clear();
     }
 }
 

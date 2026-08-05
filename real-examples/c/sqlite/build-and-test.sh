@@ -73,8 +73,10 @@
 #      (absolute `sources`) / the sqlite+tcl+zlib include dirs / the recipe defines
 #      (transformed per the leg's declared `recipeTransform`) / the leg's own
 #      resolveLibraries / its declared `stackReserve`; the build routes the binary
-#      to <out>/<leg>/<formatName>/testfixture. ONE manifest generator
-#      (gen-pe64-manifest.py) serves this driver and the .ps1.
+#      to <out>/<leg>/<formatName>/, and the COMPILER says what it named it there
+#      (`dss-code-prime: artifact <spec> <path>` — see `dss_reported_artifact`; the
+#      suffix is the object format's business, not this driver's). ONE manifest
+#      generator (gen-pe64-manifest.py) serves this driver and the .ps1.
 #   8. stage each leg's run dir — including the `libtestloadext.so` extension the
 #      loadext corpus dlopen()s, compiled by THE LEG'S TARGET compiler — then run
 #      SQLite's `.test` UNIT CORPUS through the dss-built fixture on every
@@ -2277,7 +2279,13 @@ for leg in "${LEG_ORDER[@]}"; do
       declare -a _znames=(); read -r -a _znames <<< "${LEG_LIB_Z_NAMES[$leg]}"
       tcl_lib="$(find_first_in ${_paths[@]+"${_paths[@]}"} -- ${_tnames[@]+"${_tnames[@]}"})"
       z_lib="$(find_first_in ${_paths[@]+"${_paths[@]}"} -- ${_znames[@]+"${_znames[@]}"})"
-      searched="provider 'search-paths'; tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; paths searched: ${_paths[*]:-<none declared or all \${env:...} unset>}"
+      # D-HARNESS-SEARCH-PATHS-SKIP-REASON-IS-MALFORMED: the `}` in the fallback
+      # text MUST be escaped. An unescaped one CLOSES the `${_paths[*]:-…}`
+      # expansion early, so bash reads ` unset>}` as literal trailing text.
+      # ✔MEASURED both ways — non-empty array: `a b unset>}` (garbage appended to
+      # a correct list); empty array: `<none declared or all ${env:... unset>}`
+      # (the fallback itself truncated mid-word). `\}` renders both correctly.
+      searched="provider 'search-paths'; tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; paths searched: ${_paths[*]:-<none declared or all \${env:...\} unset>}"
       ;;
     pinned-archive)
       # DECLARED archives, PINNED digests, materialised by $LEG_RESOLVER — see
@@ -2893,6 +2901,48 @@ leg_resolve_library_argv() {    # leg_resolve_library_argv <leg>  -> one token p
       --import-name "${LEG_LIB_Z_IMPORT_NAME[$leg]}" --dss "$DSS_BIN"
 }
 compile_time_suffix() { local t; t="$(grep -oE 'compile time [^[:space:]]+' "$1" 2>/dev/null | tail -1)" || true; [[ -n "$t" ]] && printf '  (%s)' "$t" || true; }
+# >>> dss:artifact-report >>>
+# ── WHAT DID THE COMPILER ACTUALLY WRITE? ASK IT, DO NOT GUESS. ──────────────
+# ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING
+#
+# This driver used to answer that question itself, with `bin="$outd/$fmt/testfixture"`
+# — a name assembled from the artifact's base and NO suffix. DSS names a PE executable
+# `testfixture.exe`, so on the one host where this driver builds the pe64 leg (a POSIX
+# host cross-building for Windows) the binary was there, the compile log held ZERO
+# `error[`, and the leg was still recorded as a build FAILURE and marked POISONED.
+# ✔MEASURED 2026-08-04 on WSL x86_64: `PE32+ executable (console) x86-64, for MS
+# Windows, 8 sections`, 5,387,264 bytes — thrown away by its own instrument. Note
+# WHERE the defect hid: only a cross-host build can reach it, which is precisely the
+# case this harness exists to measure.
+#
+# The suffix is not this file's business and never was. `TargetSpec::outputExtension`
+# (src/program/target_spec.cpp) derives it from the CLOSED object-format enum; a copy
+# here would be a second table to keep in step, and that is not hypothetical — the
+# .ps1 sibling carried the other copy, matched on a format-NAME prefix, and the two
+# disagreed. So the compiler now REPORTS every artifact it commits, one line each, on
+# stderr:
+#
+#     dss-code-prime: artifact <targetSpec> <absolute path>
+#
+# and this reads it. The target spec is a single token BY CONSTRUCTION (DSS refuses
+# whitespace in either half of a spec), so the path is the whole REMAINDER of the line
+# and an output directory containing a space survives intact.
+#
+# ★ ABSENCE IS A REAL ANSWER HERE, NOT AN ERROR TO PAPER OVER. A build that wrote
+# nothing reports nothing; rc 1 is what makes the caller's "0 error[ but no artefact"
+# branch fire on exactly that case, which is a diagnostic worth keeping.
+dss_reported_artifact() {   # dss_reported_artifact <compile-log> <target-spec>
+  local log="$1" spec="$2" hits line
+  # rc taken DIRECTLY off grep, never after a pipe. `-F` because a target spec is a
+  # LITERAL and carries characters a regex would reinterpret.
+  hits="$(grep -F "dss-code-prime: artifact $spec " "$log" 2>/dev/null)" || return 1
+  [[ -n "$hits" ]] || return 1
+  # The LAST such line. A log appended to by a re-run must not resurrect an earlier
+  # build's artefact.
+  line="${hits##*$'\n'}"
+  printf '%s\n' "${line#dss-code-prime: artifact $spec }"
+}
+# <<< dss:artifact-report <<<
 # >>> dss:fresh-inode >>>
 # ── FRESH-INODE INSTALL (macOS only) ─────────────────────────────────────────
 # ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-MACOS-PROVENANCE-KILLS-OVERWRITTEN-FIXTURE
@@ -3009,7 +3059,16 @@ for leg in "${LEG_ORDER[@]}"; do
   # SUBSHELL, so a failure inside it (or a `die`) exits only that subshell and the
   # harness sails on with the sweep silently not done — MEASURED while verifying
   # this very step. `$(...)` propagates the status, so a broken sweep is loud.
-  preflight_out="$(stop_our_fixtures "$outd/$fmt/testfixture" 'pre-flight')" \
+  # ★ THE SWEEP IS SCOPED TO THIS LEG'S ARTEFACT DIRECTORY, not to a file name —
+  # and it has to be, because at this point the artefact HAS NO NAME YET. The name
+  # is whatever the compiler decides to write (see `dss_reported_artifact`), and
+  # this driver is not entitled to guess it; the sweep used to pass a constructed
+  # `…/testfixture`, which is the same guess that poisoned the pe64 leg. The
+  # matcher is a substring test over each process's argv, so a directory is a
+  # strictly WIDER and strictly more honest needle: "anything still executing out
+  # of the directory I am about to overwrite". We hold the run lock, so anything
+  # matching is a leftover by construction.
+  preflight_out="$(stop_our_fixtures "$outd/$fmt/" 'pre-flight')" \
     || die "[$leg] the pre-flight fixture sweep FAILED — refusing to build over a possibly-running fixture."
   while IFS= read -r k; do
     [[ -z "$k" ]] || { warn "[$leg] LEFTOVER FIXTURE: $k"; PREFLIGHT_KILLS+=("$k"); }
@@ -3053,11 +3112,17 @@ for leg in "${LEG_ORDER[@]}"; do
       The generator also asserts that every TU EXISTS on disk, so a staged-tree miss
       lands here rather than mid-compile."
   fi
-  # A project build routes each target to <output>/<formatName>/<artifactName>.
-  # dss-code-prime returns EXIT 0 even on fatal errors → judge from `error[` + the binary.
+  # A project build routes each target to <output>/<formatName>/, and NAMES the file
+  # there itself. dss-code-prime returns EXIT 0 even on fatal errors → judge from
+  # `error[` plus the artefact the build REPORTED (`dss_reported_artifact`).
   "$DSS_BIN" --project "$manifest" --config="$DSS_CONFIG" --output "$outd" --time >"$log" 2>&1 || true
-  bin="$outd/$fmt/testfixture"
-  if grep -qE 'error\[' "$log" || [[ ! -x "$bin" ]]; then
+  # THE ARTEFACT IS READ OUT OF THE BUILD'S OWN REPORT — see `dss_reported_artifact`
+  # for why this driver no longer spells the file name. `|| bin=''` keeps errexit off
+  # the lookup: "the build reported no artefact" is a VERDICT this branch renders,
+  # not a crash. Selected by THIS leg's spec, so a manifest that ever grows a second
+  # target cannot hand us a sibling's binary.
+  bin="$(dss_reported_artifact "$log" "$spec")" || bin=''
+  if grep -qE 'error\[' "$log" || [[ -z "$bin" || ! -x "$bin" ]]; then
     COMPILE_FAILS=$((COMPILE_FAILS + 1))
     # `poisoned` — the ledger's FAILURE class, and it DISPLACES whatever this leg
     # was carrying: a build that produced no artifact is the strongest thing that
@@ -3067,8 +3132,15 @@ for leg in "${LEG_ORDER[@]}"; do
     if grep -qE 'error\[' "$log"; then
       warn "[$leg] build FAILED$(compile_time_suffix "$log") — first diagnostics ($log):"
       { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
+    elif [[ -z "$bin" ]]; then
+      # ★ THE GENUINE CASE THE OLD MESSAGE WAS TRYING TO DESCRIBE, and it now says
+      # what it really means: the build emitted no diagnostics AND never claimed to
+      # have written anything for this leg's target. That is a compiler that
+      # returned quietly without producing an artefact — a defect worth a loud
+      # verdict, and no longer reachable by merely mis-spelling a file name.
+      warn "[$leg] build FAILED$(compile_time_suffix "$log") — 0 error[ and the build reported NO artefact for $spec (expected a 'dss-code-prime: artifact $spec <path>' line in $log)"
     else
-      warn "[$leg] build FAILED$(compile_time_suffix "$log") — 0 error[ but no executable at $bin"
+      warn "[$leg] build FAILED$(compile_time_suffix "$log") — 0 error[ but the artefact the build REPORTED is not an executable file: $bin"
     fi
   else
     # ── STAGE THE ACQUIRED LIBRARIES BESIDE THE ARTEFACT ──────────────────────

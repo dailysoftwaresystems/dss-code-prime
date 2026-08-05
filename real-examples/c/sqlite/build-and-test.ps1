@@ -63,10 +63,12 @@
 #      runtime identity when its library is an acquired STAND-IN, so the artefact
 #      does not record the packager's own install name) and build it:
 #        dss-code-prime --project <manifest> --config=release --output <out>/<leg>
-#      → <out>/<leg>/<format>/testfixture[.exe]   (the `.exe` suffix is DERIVED
-#      from the leg's object format, never hardcoded). An ACQUIRED library is then
-#      copied BESIDE the artefact, because a `@loader_path/<name>` identity is a
-#      claim about that directory and this is what makes it true.
+#      → <out>/<leg>/<format>/, where the COMPILER names the file and SAYS SO
+#      (`dss-code-prime: artifact <spec> <path>`). The suffix belongs to the
+#      object format, and this driver no longer holds a copy of that table —
+#      see Get-ReportedArtifact. An ACQUIRED library is then copied BESIDE the
+#      artefact, because a `@loader_path/<name>` identity is a claim about that
+#      directory and this is what makes it true.
 #   8. PER LEG THAT THIS HOST CAN EXECUTE (run.mode native | launched), run
 #      SQLite's `.test` UNIT CORPUS through the dss-built fixture
 #      (DSS_TIER: veryquick[default] | quick | full | all), parse
@@ -353,13 +355,25 @@ function ToShellPath($p) {
 # Run ONE command line through THIS HOST's POSIX toolchain — the same channel
 # Step 3+4 derives the recipe through, chosen by the same Step-1 decision.
 # Returns @{ Rc; Out }; the rc is taken DIRECTLY off the native call.
+#
+# ★★ `-e` IS LOAD-BEARING — D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL.
+# `wsl.exe <cmd>` WITHOUT it does NOT run <cmd>: WSL reconstructs a command LINE
+# and hands it to the distro's DEFAULT SHELL, which strips quoting and expands
+# ON THIS MACHINE before bash ever sees `$bashLine`. MEASURED 2026-08-04, one
+# variable changed, same input string:
+#   wsl.exe    bash -lc "printf '[%s]\n' 'echo A=$(uname -m)'" -> [echo A=x86_64]
+#   wsl.exe -e bash -lc "printf '[%s]\n' 'echo A=$(uname -m)'" -> [echo A=$(uname -m)]
+# $bashLine is a CALLER-SUPPLIED command line, so every `$`, backslash, glob and
+# quote in it was being evaluated twice — the second evaluation invisible.
 function Invoke-PosixCommand($bashLine) {
   # stderr merged INSIDE bash, never with PowerShell's `2>&1`: PowerShell wraps a
   # native command's stderr in ErrorRecords, an EMPTY stderr line then stringifies
   # to "System.Management.Automation.RemoteException", and non-ASCII bypasses the
   # console encoding and arrives as `?`. Same reasoning as the derive invocation.
-  if ($script:HostNeedsWsl) { $out = @(& wsl.exe bash -l -c "$bashLine 2>&1") }
-  else                      { $out = @(& bash      -l -c "$bashLine 2>&1") }
+  # (That is a DIFFERENT layer from `-e`: `-e` decides who parses the string,
+  # `2>&1` inside bash decides who merges the streams. Both are needed.)
+  if ($script:HostNeedsWsl) { $out = @(& wsl.exe -e bash -l -c "$bashLine 2>&1") }
+  else                      { $out = @(& bash         -l -c "$bashLine 2>&1") }
   return @{ Rc = $LASTEXITCODE; Out = $out }
 }
 
@@ -690,7 +704,10 @@ $script:HostNeedsWsl = ($HostOs -eq 'windows')
 if ($script:HostNeedsWsl) {
   $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
   if (-not $wsl) { Die "no POSIX toolchain for this host: wsl.exe not found.`n      This is WHERE THIS HOST FINDS ITS POSIX TOOLCHAIN, not a statement about any target — deriving the sqlite recipe needs a POSIX shell + make + tclsh (sqlite's build is autotools + tclsh).`n      On a Windows host that toolchain is WSL: install WSL + a Debian/Ubuntu distro." }
-  $probe = & wsl.exe bash -c 'echo posix-ok' 2>&1
+  # `-e` for the same reason every other wsl.exe call site carries it (see
+  # Invoke-PosixCommand): without it this would be a round-trip through the LOCAL
+  # default shell, which is not the thing being probed.
+  $probe = & wsl.exe -e bash -c 'echo posix-ok' 2>&1
   if ($LASTEXITCODE -ne 0 -or "$probe".Trim() -ne 'posix-ok') { Die "this host's POSIX toolchain (WSL) is present but a bash round-trip failed (got: '$probe')." }
   $PosixToolchain = "WSL ($($wsl.Source))"
 } else {
@@ -1495,8 +1512,14 @@ $tmpSh = Join-Path $Work 'derive.sh'
 # POSIX host the driver already IS inside a shell session, so the script is run
 # directly and only the `2>&1` merge is reproduced (with PowerShell's own redirect,
 # which is safe here because the same merge is happening one process out).
+# ★★ `-e` ADDED, `-l` KEPT — they answer different questions and both are needed.
+# `-l` is the LOGIN shell that puts the recipe toolchain on PATH (above). `-e` says
+# WHO PARSES THE STRING: without it, `wsl.exe` hands the whole line to the distro's
+# default shell first, so the payload is parsed twice and the first pass happens
+# where nobody is looking (D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL;
+# MEASURED evidence at Invoke-PosixCommand).
 if ($script:HostNeedsWsl) {
-  $deriveOut = @(& wsl.exe bash -l -c "bash '$(ToShellPath $tmpSh)' 2>&1")
+  $deriveOut = @(& wsl.exe -e bash -l -c "bash '$(ToShellPath $tmpSh)' 2>&1")
 } else {
   $deriveOut = @(& bash -l "$(ToShellPath $tmpSh)" 2>&1)
 }
@@ -2250,16 +2273,102 @@ function Get-OurFixtureProcesses($fixturePath) {
   }
   return $hits
 }
-# Kill every leftover of OUR fixture and return one report line per kill (never
-# silent — a killed process is a fact the verdict has to carry).
-function Stop-OurFixtures($fixturePath, $why) {
+# ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING
+# The PRE-FLIGHT sibling of the matcher above, and it exists because at pre-flight
+# time the fixture HAS NO NAME. The compiler decides what to call the artefact (and
+# the suffix is the object format's business — see Get-ReportedArtifact); this
+# driver used to guess it from a `$sfx` table of its own, which is exactly the
+# defect this cycle removes. The hazard is unchanged, so the sweep is re-scoped to
+# the thing we DO know: the leg's artefact DIRECTORY, which the build is about to
+# overwrite. Anything executing out of it is a leftover by construction — we hold
+# the run lock. Deliberately wider than the exact-path matcher and deliberately
+# only used here; the post-build sweeps know the real path and keep using it.
+function Get-OurFixtureProcessesUnder($dir) {
+  $hits = New-Object 'System.Collections.Generic.List[object]'
+  if (-not $dir) { return $hits }
+  # Lexical: GetFullPath does not require the directory to exist (on a first run
+  # it does not), and the trailing separator keeps `…\pe64` from matching a
+  # sibling `…\pe64-something`.
+  $want = [System.IO.Path]::GetFullPath("$dir")
+  if (-not $want.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+    $want = $want + [System.IO.Path]::DirectorySeparatorChar
+  }
+  foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
+    $path = $null
+    try { $path = $p.Path } catch { $path = $null }   # access denied on foreign processes
+    if (-not $path) { continue }
+    if ([System.IO.Path]::GetFullPath($path).StartsWith(
+          $want, [System.StringComparison]::OrdinalIgnoreCase)) { $hits.Add($p) }
+  }
+  return $hits
+}
+# Kill every process in $procs and return one report line per kill (never silent —
+# a killed process is a fact the verdict has to carry). Shared by both sweeps so
+# the kill/wait/report behaviour cannot drift between them.
+function Stop-FixtureProcesses($procs, $why) {
   $killed = New-Object 'System.Collections.Generic.List[string]'
-  foreach ($p in (Get-OurFixtureProcesses $fixturePath)) {
+  foreach ($p in $procs) {
     $desc = "pid $($p.Id) (started $($p.StartTime.ToString('s')))"
     try { $p.Kill(); [void]$p.WaitForExit(15000); $killed.Add("$why — killed $desc") }
     catch { $killed.Add("$why — FAILED to kill ${desc}: $($_.Exception.Message)") }
   }
   return $killed
+}
+# Kill every leftover of OUR fixture, addressed by its EXACT path.
+function Stop-OurFixtures($fixturePath, $why) {
+  return (Stop-FixtureProcesses (Get-OurFixtureProcesses $fixturePath) $why)
+}
+# The pre-flight form: everything running out of this leg's artefact directory.
+function Stop-OurFixturesUnder($dir, $why) {
+  return (Stop-FixtureProcesses (Get-OurFixtureProcessesUnder $dir) $why)
+}
+
+# ── WHAT DID THE COMPILER ACTUALLY WRITE? ASK IT, DO NOT GUESS. ──────────────
+# ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING
+#
+# WHAT THIS REPLACED, and why porting it to the .sh would have been the wrong fix:
+#
+#     $sfx = if ($fmt -like 'pe*') { '.exe' } else { '' }
+#
+# Its own comment claimed the suffix was "DERIVED FROM THE OBJECT FORMAT, never
+# hardcoded". That was true of the intent and false of the code: it matched a
+# format-NAME PREFIX rather than the closed format enum, and every non-`pe*` format
+# fell through to '' — wrong for `.dll`, `.so`, `.dylib`, `.a` and `.lib`, and
+# harmless only because today's legs are all `-exec`. Meanwhile the .sh sibling
+# carried NO suffix logic at all and built `…/testfixture`, so the two
+# CAPABILITY-PAIRED drivers disagreed. ✔MEASURED 2026-08-04 on WSL x86_64: the .sh
+# cross-built a real `testfixture.exe` for pe64 with ZERO `error[` and recorded the
+# leg as a build FAILURE — a false negative on this project's headline capability,
+# manufactured by three copies of one table.
+#
+# DSS owns that table (`TargetSpec::outputExtension`, keyed on the closed
+# object-format enum) and now REPORTS the artefact it commits, one line per
+# artefact, on stderr:
+#
+#     dss-code-prime: artifact <targetSpec> <absolute path>
+#
+# A target spec cannot contain whitespace (DSS refuses one that does), so the path
+# is the whole REMAINDER of the line and an output directory with a space in it
+# survives. Selecting by SPEC is what keeps a multi-target manifest unambiguous.
+function Get-ReportedArtifact($compileLog, $spec) {
+  if (-not (Test-Path -LiteralPath $compileLog)) { return $null }
+  $marker = "dss-code-prime: artifact $spec "
+  $hit = $null
+  # LAST match wins: a log appended to by a re-run must not resurrect an earlier
+  # build's artefact.
+  foreach ($l in (Get-Content -LiteralPath $compileLog)) {
+    if ("$l".StartsWith($marker, [System.StringComparison]::Ordinal)) {
+      $hit = "$l".Substring($marker.Length)
+    }
+  }
+  if (-not $hit) { return $null }
+  # The compiler prints forward slashes on every host (this codebase's
+  # path-for-display convention). Canonicalise to the host spelling so the process
+  # sweep's GetFullPath comparison, Split-Path and every log line address the file
+  # the way the rest of this driver does. A path that will not resolve is returned
+  # AS REPORTED — the caller's existence check renders that verdict, and it has to
+  # be able to quote what the compiler claimed.
+  try { return (Resolve-Path -LiteralPath $hit -ErrorAction Stop).Path } catch { return $hit }
 }
 
 # Run ONE fixture segment: stdin at EOF, stdout+stderr to $logPath, killed if it
@@ -2372,16 +2481,20 @@ $BuiltLegs = @()
 foreach ($leg in $BuildableLegs) {
   $lbl  = $leg.label
   $fmt  = $leg.format
-  # The executable suffix is DERIVED FROM THE OBJECT FORMAT, never hardcoded and
-  # never taken from the host: a pe artifact is `.exe` whether it was produced on
-  # Windows, Linux or a Mac; an elf or mach-o one has no suffix on any of them.
-  $sfx  = if ($fmt -like 'pe*') { '.exe' } else { '' }
+  # ★ THE ARTEFACT'S NAME IS NOT KNOWN YET, AND THAT IS CORRECT. It is decided by
+  # the compiler and read back out of its report after the build (see
+  # Get-ReportedArtifact for the `$sfx` table that used to live here and what it
+  # cost). All this step knows in advance is the DIRECTORY the build routes to.
   $legOut   = Join-Path $OutRoot $lbl
-  $fixture  = Join-Path (Join-Path $legOut $fmt) "testfixture$sfx"
+  # The directory the build ROUTES to (`--output <legOut>` + the project driver's
+  # per-format subdir). Used ONLY by the pre-flight sweep below, which has to run
+  # before the compiler exists to be asked. Everything AFTER the build derives its
+  # directory from the reported artefact instead (`Split-Path -Parent $fixture`).
+  $preflightDir = Join-Path $legOut $fmt
+  $fixture  = $null
   $manifest = Join-Path $Work "testfixture.$lbl.dss-project.json"
   $LegLedger[$lbl].Fmt      = $fmt
   $LegLedger[$lbl].OutDir   = $legOut
-  $LegLedger[$lbl].Fixture  = $fixture
 
   # ── can this driver express the leg's manifest at all? ──
   $blockers = Test-LegManifestBlockers $leg $GenCaps
@@ -2398,18 +2511,19 @@ foreach ($leg in $BuildableLegs) {
   # deleted. The out-dir wipe further down cannot remove a testfixture that is
   # still executing, and that is exactly how a leftover fixture from a dead run turns
   # into "Access to the path … is denied" — an error that looks nothing like its
-  # cause. We hold the run lock, so anything still running OUR fixture path is a
-  # leftover by construction.
+  # cause. We hold the run lock, so anything still running out of OUR artefact
+  # directory is a leftover by construction.
   #
-  # PER LEG, against THIS leg's own path: a sibling leg's fixture is a different
-  # file and must never be swept by this one.
+  # PER LEG, against THIS leg's own artefact DIRECTORY — not a file name, because
+  # the file has no name until the compiler gives it one (Get-ReportedArtifact).
+  # A sibling leg writes into a different directory and must never be swept here.
   #
   # NOTE the helper functions this calls are defined ABOVE, in the dss:corpus-engine
   # region hoisted before this step. PowerShell binds function names in EXECUTION
   # order, so a helper defined later in the file simply does not exist here — that is
   # a real, measured failure ("The term 'Stop-OurFixtures' is not recognized"), not a
   # style point. Keep the region above this line.
-  $LegLedger[$lbl].PreflightKills = @(Stop-OurFixtures $fixture 'pre-flight')
+  $LegLedger[$lbl].PreflightKills = @(Stop-OurFixturesUnder $preflightDir 'pre-flight')
   foreach ($k in $LegLedger[$lbl].PreflightKills) { Warn "[$lbl] LEFTOVER FIXTURE: $k" }
 # <<< dss:preflight <<<
   $extraDefineArgs = @()
@@ -2462,18 +2576,33 @@ foreach ($leg in $BuildableLegs) {
   if (Test-Path $legOut) { Remove-Item -Recurse -Force $legOut }
   New-Item -ItemType Directory -Force -Path $legOut | Out-Null
   $clog = Join-Path $legOut 'compile.log'
-  # dss-code-prime returns exit 0 even on FATAL errors → judge from `error[` + the binary.
+  # A project build routes each target to <output>/<formatName>/, and NAMES the file
+  # there itself. dss-code-prime returns exit 0 even on FATAL errors → judge from
+  # `error[` plus the artefact the build REPORTED (Get-ReportedArtifact).
   & $DssBin --project $manifest --config="$Config" --output $legOut --time *>&1 |
     Tee-Object -FilePath $clog | Out-Null
   $errCount = (Select-String -Path $clog -Pattern 'error\[' -AllMatches).Count
   $ctime = (Get-Content $clog | Select-String -Pattern 'compile time (\S+)' | Select-Object -Last 1)
   $ctimeSuffix = if ($ctime) { "  ($($ctime.Matches[0].Value))" } else { '' }
-  if ($errCount -gt 0 -or -not (Test-Path $fixture)) {
+  # THE ARTEFACT, AS THE BUILD ITSELF REPORTED IT — read out of the log rather than
+  # spelled here (Get-ReportedArtifact). Selected by THIS leg's spec, so a manifest
+  # that ever grows a second target cannot hand us a sibling's binary.
+  $fixture = Get-ReportedArtifact $clog $leg.spec
+  # THE THREE FAILURE STATEMENTS ARE KEPT DISTINCT because they have three different
+  # remedies: diagnostics were emitted / the build was silent AND claimed nothing /
+  # the build claimed a file that is not there. The middle one is the genuinely
+  # interesting case — a compiler that returned quietly having written nothing — and
+  # it is no longer reachable by merely mis-spelling a file name.
+  if ($errCount -gt 0 -or (-not $fixture) -or (-not (Test-Path -LiteralPath $fixture))) {
     Get-Content $clog | Select-String -Pattern 'error\[' | Select-Object -First 5 | ForEach-Object { Info "      $($_.Line)" }
-    Set-LegVerdict $lbl 'poisoned' "build FAILED$ctimeSuffix — $errCount error[...] diagnostic(s); no testfixture$sfx. See $clog"
-    Warn "[$lbl] BUILD FAILED$ctimeSuffix — $errCount error[...] diagnostic(s); no testfixture$sfx. See $clog"
+    $why = if ($errCount -gt 0) { "$errCount error[...] diagnostic(s)" }
+           elseif (-not $fixture) { "0 error[...] and the build reported NO artefact for $($leg.spec) (expected a 'dss-code-prime: artifact $($leg.spec) <path>' line)" }
+           else { "0 error[...] but the artefact the build REPORTED is not there: $fixture" }
+    Set-LegVerdict $lbl 'poisoned' "build FAILED$ctimeSuffix — $why. See $clog"
+    Warn "[$lbl] BUILD FAILED$ctimeSuffix — $why. See $clog"
     continue
   }
+  $LegLedger[$lbl].Fixture = $fixture
 
   # ── the acquired libraries go BESIDE the artefact ──────────────────────────
   # ★ `@loader_path/<name>` IS FALSE WITHOUT THIS STEP. A leg whose libraries were
@@ -3027,7 +3156,13 @@ Info "recipe   : $nTus TUs, $nDefs defines"
 if ($RefOracle) {
   Info "oracle   : $RefOracleWin"
   Info "             LINUX/gcc reference testfixture (ELF, built by the deriving host). Run it on"
-  Info "             the same .test to EXONERATE dss:   $(if ($script:HostNeedsWsl) { "wsl.exe -- $RefOracle" } else { $RefOracle }) <staged .test>"
+  # `-e`, not `--`: this line is ADVICE AN OPERATOR PASTES, so it must be the
+  # shape that survives. MEASURED 2026-08-04 — `wsl.exe -- <argv>` still routes
+  # through the distro's default shell (`wsl.exe -- /nope` answers `/bin/bash:
+  # line 1: /nope: No such file`, `wsl.exe -e /nope` answers `execvpe(/nope)
+  # failed`), so a staged path with a glob character or a `$` would be rewritten
+  # under the operator mid-triage.
+  Info "             the same .test to EXONERATE dss:   $(if ($script:HostNeedsWsl) { "wsl.exe -e $RefOracle" } else { $RefOracle }) <staged .test>"
   Info "             It fails too => upstream/test-suite. It passes => INCONCLUSIVE for a leg of a"
   Info "             different platform (pe64 / mach-o); never proof of a dss bug on its own."
 } else {

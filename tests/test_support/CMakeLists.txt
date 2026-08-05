@@ -4,6 +4,15 @@
 # self-tests for the substrate itself.)
 
 dss_add_test(NAME test_support/test_scratch_dir SOURCES test_scratch_dir.cpp)
+# The ONE test-side repo-root resolver. This ordinary entry runs the
+# precedence/validation suite; the `BakedRootOnly.*` suite in the same binary is
+# the out-of-tree regression guard and is EXCLUDED here, because it asserts
+# preconditions (no DSS_CONFIG_ROOT, no repo ancestry above cwd) that are false
+# under normal dss_add_test wiring. Its own entry lives at the bottom of
+# tests/CMakeLists.txt, where the stripped environment is set up.
+dss_add_test(NAME test_support/test_repo_root SOURCES test_repo_root.cpp)
+set_property(TEST test_support/test_repo_root APPEND PROPERTY
+             ENVIRONMENT "GTEST_FILTER=-BakedRootOnly.*")
 dss_add_test(NAME test_support/test_host_native_target
              SOURCES test_host_native_target.cpp)
 # D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-MANIFEST-ARM64-ARM-WITHOUT-

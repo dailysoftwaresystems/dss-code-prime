@@ -164,7 +164,7 @@ Closes v2-gap-catalog row 11. PR3 shipped the `scopeRequire` mechanism; the cata
 The cleaner fix is **shape-based positioning**: declare a dedicated `switchStmt` shape, a `caseLabel` shape, and a `switchBody` that's `repeat( alt[ caseLabel, statement ] )`. The schema's existing alt/sequence/repeat machinery is enough; `case` and `default` are valid only at positions where `caseLabel` is expected by the cursor. The `scopeRequire` mechanism is already exercised by tsql-subset's stress test and the loader-level scopeRequire tests — adding a contrived c-subset adoption would not add coverage.
 
 **Surface.**
-- `src/source-config/languages/c-subset.lang.json`:
+- `src/dss-config/sources/c-subset.lang.json`:
   - Add to `keywords`: `switch`, `case`, `default`, `break`.
   - Add to `tokens`: `":"` as `Colon`.
   - Add shapes: `switchStmt`, `switchBody`, `caseLabel`, `breakStmt`.

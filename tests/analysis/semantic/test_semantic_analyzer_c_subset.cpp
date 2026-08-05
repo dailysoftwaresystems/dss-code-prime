@@ -11,6 +11,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -20,6 +21,7 @@
 #include <format>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 
@@ -12253,20 +12255,28 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Resolve the REAL shipped system-include dir (src/dss-config/shippedLibs) by
-// the same 8-level upward walk program.cpp's applySystemDirs uses, so the pins
-// exercise the descriptor the production driver ships.
+// Resolve the REAL shipped system-include dir (src/dss-config/shippedLibs)
+// through the ONE test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the
+// repo root CMake bakes in → a cwd ancestor walk), so the pins exercise the
+// descriptor the production driver ships.
+//
+// This was a private 8-level upward walk mirroring program.cpp's applySystemDirs
+// — and it read neither of the first two sources, so an out-of-tree build (whose
+// cwd has no `src/dss-config` in its ancestry) missed on every hop, returned
+// `{}`, and each of the four callers below answered with `std::abort()`.
+// `abort()` kills the whole test BINARY, so ONE unresolvable directory cost
+// every other test in this file its verdict — the harness could not even say
+// which unit was unhappy. This THROWS instead, which GoogleTest reports as a
+// failure of the one test that asked; the four `.empty()`/`abort()` guards are
+// gone with it because the path can no longer come back empty.
 [[nodiscard]] fs::path findRealShippedLibsDir() {
+    fs::path const dir = dss::test::configRoot() / "shippedLibs";
     std::error_code ec;
-    fs::path here = fs::current_path(ec);
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const candidate = here / "src" / "dss-config" / "shippedLibs";
-        if (fs::is_directory(candidate, ec)) return candidate;
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    if (!fs::is_directory(dir, ec)) {
+        throw std::runtime_error(
+            "the shipped-lib descriptor directory is missing: " + dir.string());
     }
-    return {};
+    return dir;
 }
 
 // Build + analyze `mainSrc` with the REAL shippedLibs dir on the system path
@@ -12277,11 +12287,7 @@ namespace fs = std::filesystem;
 [[nodiscard]] SemanticModel analyzeRealTgmath(std::string mainSrc,
                                               ObjectFormatKind format,
                                               DataModel dataModel) {
-    fs::path const shipped = findRealShippedLibsDir();
-    if (shipped.empty()) {
-        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
-        std::abort();
-    }
+    fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
     builder.addSystemDir(shipped);
@@ -13735,11 +13741,7 @@ namespace {
 // same descriptors the production driver ships — so a regression in stdint.json
 // itself flips the pin red rather than being mirrored green by a scratch copy.
 [[nodiscard]] SemanticModel analyzeWithRealShippedLibs(std::string mainSrc) {
-    fs::path const shipped = findRealShippedLibsDir();
-    if (shipped.empty()) {
-        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
-        std::abort();
-    }
+    fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
     builder.addSystemDir(shipped);
@@ -14728,11 +14730,7 @@ namespace {
 [[nodiscard]] SemanticModel analyzeRealShippedForTarget(
     std::string mainSrc, ObjectFormatKind format, std::string_view arch,
     DataModel dataModel) {
-    fs::path const shipped = findRealShippedLibsDir();
-    if (shipped.empty()) {
-        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
-        std::abort();
-    }
+    fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
     builder.addSystemDir(shipped);
@@ -15175,11 +15173,7 @@ namespace {
                                              ObjectFormatKind format,
                                              DataModel dataModel,
                                              std::string_view arch) {
-    fs::path const shipped = findRealShippedLibsDir();
-    if (shipped.empty()) {
-        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
-        std::abort();
-    }
+    fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
     builder.addSystemDir(shipped);

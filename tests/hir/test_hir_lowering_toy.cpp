@@ -16,6 +16,7 @@
 #include "hir/hir.hpp"
 #include "hir/hir_text.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "repo_root.hpp"
 
 #include <gtest/gtest.h>
 
@@ -187,17 +188,15 @@ TEST(HirLoweringToy, ExprStmtCall) {
 
 namespace {
 
+// The goldens tree, via the ONE test-side resolver (`repo_root.hpp`:
+// $DSS_CONFIG_ROOT → the CMake-baked repo root → the cwd ancestor walk). The
+// private cwd walk this replaces resolved nothing in an OUT-OF-TREE build —
+// that cwd has no `src/dss-config` in its ancestry — and then called
+// `std::abort()`, which kills the whole test BINARY, costing every sibling test
+// in this executable its verdict. `repoRoot()` throws, and GoogleTest reports a
+// throw as a failure of the one running test.
 [[nodiscard]] fs::path findLoweringGoldens() {
-    fs::path cwd = fs::current_path();
-    for (int hops = 0; hops < 8; ++hops) {
-        auto const cand = cwd / "tests" / "hir" / "lowering_goldens";
-        if (fs::is_directory(cand)) return cand;
-        if (!cwd.has_parent_path() || cwd == cwd.parent_path()) break;
-        cwd = cwd.parent_path();
-    }
-    ADD_FAILURE() << "could not locate tests/hir/lowering_goldens from "
-                  << fs::current_path().string();
-    std::abort();
+    return dss::test::repoRoot() / "tests" / "hir" / "lowering_goldens";
 }
 
 [[nodiscard]] bool goldenRefreshRequested() {

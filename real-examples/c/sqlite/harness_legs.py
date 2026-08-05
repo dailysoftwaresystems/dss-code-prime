@@ -156,14 +156,12 @@ MACHO_CPU_TYPES = {
 #                MUST match it (else it is not a path in the namespace we
 #                translate from), an output must NOT, and no argument handed to
 #                a launcher may still match it at spawn time.
-#   separator    [from, to] applied before the translator runs. [] = untouched.
 #   validHostOs  the only host OS on which this namespace exists, so the lint can
 #                CHECK a declaration instead of trusting it. "" = any.
 PATH_TRANSLATIONS = {
     "none": {
         "translator": [],
         "sourceShape": "",
-        "separator": [],
         "validHostOs": "",
     },
     "windows-to-wsl": {
@@ -172,16 +170,38 @@ PATH_TRANSLATIONS = {
         # `root=`), UNC paths are a different mapping again, and case is not
         # ours to guess. Hand-rolled `C:\` -> `/mnt/c/` string surgery gets all
         # three wrong quietly.
-        "translator": ["wsl.exe", "wslpath", "-a", "-u"],
+        #
+        # ★★ `-e` IS PART OF THE TRANSLATOR, NOT DECORATION —
+        # D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL. `wsl.exe <cmd>`
+        # without it does not run <cmd>: WSL reconstructs a command LINE and
+        # feeds it to the distro's DEFAULT SHELL, which strips quoting and
+        # expands before the named binary is reached.
+        #
+        # ⚠ THIS ENTRY CARRIED A MISATTRIBUTED ROOT CAUSE UNTIL 2026-08-04, and
+        # the correction is written down because a workaround stood on it. The
+        # old comment said `wsl.exe wslpath -a -u 'C:\a\b'` prints
+        # `wslpath: C:ab` because "the backslashes are eaten before wslpath ever
+        # sees them", and normalised `\` -> `/` here to route around it. The
+        # SYMPTOM was real; the CAUSE was not wslpath and not backslashes — it
+        # was the hidden local shell, which eats `\` as its own escape character.
+        # ✔RE-MEASURED 2026-08-04 through the REAL call path (python
+        # subprocess.run, this host), one variable changed:
+        #     with    -e :  'C:\a\b' -> rc=0 /mnt/c/a/b
+        #     without -e :  'C:\a\b' -> rc=1 `wslpath: C:ab`
+        # and the give-away that a naive fix would have missed: WITHOUT `-e`,
+        # `'C:\Program Files\Git\x'` SUCCEEDS, because the space makes python
+        # quote the argument and quoted backslashes survive the shell. So the
+        # old defect fired only on paths with no spaces — which is why a
+        # separator workaround looked like it worked.
+        # ⇒ the separator normalisation is GONE, not demoted to belt-and-braces:
+        # with `-e` the path reaches wslpath exactly as this driver holds it
+        # (backslashes, spaces, trailing separator — all rc=0, MEASURED), and
+        # re-spelling a path before handing it to the tool whose entire job is
+        # to own that path's spelling is the same string surgery the paragraph
+        # above refuses. Do not re-add it: if a translation ever fails again,
+        # the input the tool saw must be the input this driver had.
+        "translator": ["wsl.exe", "-e", "wslpath", "-a", "-u"],
         "sourceShape": "windows-drive",
-        # ✔MEASURED 2026-08-04 on this host: `wsl.exe wslpath -a -u 'C:\a\b'`
-        # exits 1 and prints `wslpath: C:ab` — the backslashes are eaten before
-        # wslpath ever sees them. The forward-slash spelling of the SAME path
-        # exits 0 and yields /mnt/c/a/b. Normalising the separator is not path
-        # surgery: `/` is accepted by every Windows path API and `\` is never a
-        # filename character there, so this is a re-spelling of the same string,
-        # and everything that actually varies is still wslpath's to decide.
-        "separator": ["\\", "/"],
         "validHostOs": "windows",
     },
 }
@@ -1064,11 +1084,11 @@ def translate_path(verb, raw, runner=None):
             "would resolve it against the translator's own working directory "
             "and produce a plausible-looking wrong answer."
             % (verb, raw, spec["sourceShape"]))
-    text = raw
-    sep = spec["separator"]
-    if sep:
-        text = text.replace(sep[0], sep[1])
-    argv = list(spec["translator"]) + [text]
+    # VERBATIM. The path the translator sees is the path this driver holds —
+    # no separator normalisation, no re-spelling of any kind (see the
+    # `windows-to-wsl` comment: that workaround existed only to route around a
+    # hidden local shell, and the shell is gone from the translator argv).
+    argv = list(spec["translator"]) + [raw]
     if runner is None:
         runner = _run_translator
     rc, out, err = runner(argv)
@@ -1948,14 +1968,36 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         seen.append(list(argv))
         return 0, "/mnt/c/a/b\n", ""
 
-    check("windows-to-wsl normalises the separator BEFORE the translator",
+    # VERBATIM, and this replaced a check that asserted the OPPOSITE. Until
+    # 2026-08-04 this verb re-spelled `\` as `/` before calling wslpath, to route
+    # around `wslpath: C:ab` — a symptom misattributed to wslpath when its cause
+    # was the local shell `wsl.exe` runs without `-e`. The pin now holds the
+    # property that made the workaround unnecessary: what the driver holds is
+    # what the tool is asked about.
+    check("windows-to-wsl hands the translator the path VERBATIM",
           translate_path("windows-to-wsl", "C:\\a\\b", runner=_ok_runner)
-          == "/mnt/c/a/b" and seen and seen[0][-1] == "C:/a/b",
+          == "/mnt/c/a/b" and seen and seen[0][-1] == "C:\\a\\b",
           "translator saw %r" % (seen[0] if seen else None))
     check("windows-to-wsl invokes the DECLARED translator argv",
           bool(seen) and seen[0][:-1]
           == PATH_TRANSLATIONS["windows-to-wsl"]["translator"],
           "argv=%r" % (seen[0] if seen else None))
+    # D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL, pinned where the argv is
+    # DECLARED. `wsl.exe <cmd>` and `wsl.exe -- <cmd>` both hand the line to the
+    # distro's default shell first; only `-e`/`--exec` reaches the binary. ✔BOTH
+    # MEASURED 2026-08-04: `wsl.exe -- /nope` answers `/bin/bash: line 1: /nope`
+    # while `wsl.exe -e /nope` answers `execvpe(/nope) failed`, and `wsl.exe --`
+    # expands a matching glob argument into two.
+    for verb, spec in sorted(PATH_TRANSLATIONS.items()):
+        argv = spec["translator"]
+        if not argv or os.path.basename(argv[0]).lower() not in ("wsl", "wsl.exe"):
+            continue
+        check("pathTranslation %r runs wsl.exe with -e, not through a local "
+              "shell" % verb,
+              len(argv) > 1 and argv[1] in ("-e", "--exec"),
+              "translator argv=%r — without -e the path is parsed by WSL's "
+              "default shell before wslpath sees it, and `\\` is that shell's "
+              "escape character" % (argv,))
     check("a translator that exits non-zero is FATAL, not a passthrough",
           _raises(lambda: translate_path("windows-to-wsl", "C:/a",
                                          runner=lambda a: (1, "", "boom"))))

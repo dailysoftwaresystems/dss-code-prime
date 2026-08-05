@@ -197,7 +197,7 @@ Master plan §8 row 6 (`analysis-lexical`) is subsumed. The plan-doc updates in 
 - `Tokenizer::tokenize`: track `LexerModeStack`; on every resolved meaning apply `modeOp` / `modeArg` AFTER token emission; when current mode has a non-empty `defaultToken` and no lexeme matches, consume one char and emit the default token; same for whitespace inside modes (mode authors can `EmptySpace`-flag the default if they want it ignorable).
 - StringStyle handling — see §2.3 step 6 plus body-end detection: scan to the next occurrence of `endsAt`, honoring `escapeKind` (skip the escape pair), `endsAtLongestMatch` (consume the **longest** match of `endsAt`'s pattern), and dynamic-tag `tagPattern` (the body ends at the same captured tag as the opener).
 - New diagnostics: `P_UnterminatedString`, `P_UnterminatedComment`, `P_InvalidEscape` per §2.6.
-- `src/source-config/languages/c-subset.lang.json`: add a `line-comment` mode (`defaultToken: { kind: "CommentChar", flags: ["EmptySpace"] }`; opener `//`; newline pops); a `block-comment` mode (opener `/*`; closer `*/`); existing config rows for `//` and `/*` adjusted accordingly. Authoring should mirror the `tsql-subset.lang.json` mode patterns.
+- `src/dss-config/sources/c-subset.lang.json`: add a `line-comment` mode (`defaultToken: { kind: "CommentChar", flags: ["EmptySpace"] }`; opener `//`; newline pops); a `block-comment` mode (opener `/*`; closer `*/`); existing config rows for `//` and `/*` adjusted accordingly. Authoring should mirror the `tsql-subset.lang.json` mode patterns.
 - `tests/tokenizer/test_tokenizer.cpp` — string-body, comment-body, multi-mode push/pop tests.
 - `tests/core/test_c_subset.cpp` — at least one test with an inline comment proves the new mode works end-to-end.
 

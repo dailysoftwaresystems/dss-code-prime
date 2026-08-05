@@ -37,6 +37,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <nlohmann/json.hpp>
@@ -48,6 +49,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -126,26 +128,34 @@ void expectGenericClean(SemanticModel const& m) {
     return out;
 }
 
+// The shipped c-subset config, located by the ONE test-side resolver
+// (`repo_root.hpp`: $DSS_CONFIG_ROOT → the repo root CMake bakes in → a cwd
+// ancestor walk). It was a private 12-hop cwd walk that read neither of the
+// first two sources, so an out-of-tree build — whose cwd has no `src/dss-config`
+// in its ancestry — missed on every hop. It THROWS rather than returning `{}`:
+// GoogleTest turns a throw into a failure of the ONE running test, and an empty
+// path here used to propagate SILENTLY through `findShippedLibDir()` below.
 [[nodiscard]] std::filesystem::path findShippedSourceConfig() {
-    namespace fs = std::filesystem;
-    fs::path dir = fs::current_path();
-    for (int i = 0; i < 12; ++i) {
-        fs::path const candidate =
-            dir / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-        if (fs::exists(candidate)) return candidate;
-        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
-        dir = dir.parent_path();
+    std::filesystem::path const path =
+        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+    if (!std::filesystem::exists(path)) {
+        throw std::runtime_error("shipped c-subset.lang.json is missing: " +
+                                 path.string());
     }
-    ADD_FAILURE() << "could not locate shipped c-subset.lang.json above cwd";
-    return {};
+    return path;
 }
 
 // The REAL shipped-descriptor directory (`src/dss-config/shippedLibs`), so a
 // test can drive `#include <stdint.h>` against the descriptors that actually
 // ship rather than a scratch stand-in — the point of the size_t/uint64_t pins is
 // that the SHIPPED spelling resolves to the right vocabulary entry.
+//
+// Asked of the resolver directly instead of being derived by walking two levels
+// UP from the lang.json above: on a miss that derivation produced the RELATIVE
+// path `shippedLibs` from an empty base and handed it to `addSystemDir`, so the
+// system-include path silently pointed at nothing.
 [[nodiscard]] std::filesystem::path findShippedLibDir() {
-    return findShippedSourceConfig().parent_path().parent_path() / "shippedLibs";
+    return dss::test::configRoot() / "shippedLibs";
 }
 
 // Analyze through the FULL front end with the shipped descriptors on the system

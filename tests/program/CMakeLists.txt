@@ -1,5 +1,7 @@
 # Driver / program-layer tests (plan 14 LK10 cycle 2).
 
+dss_add_test(NAME program/test_artifact_report
+             SOURCES test_artifact_report.cpp)
 dss_add_test(NAME program/test_target_spec
              SOURCES test_target_spec.cpp)
 dss_add_test(NAME program/test_compile_pipeline
@@ -12,6 +14,8 @@ dss_add_test(NAME program/test_cli_args
              SOURCES test_cli_args.cpp)
 dss_add_test(NAME program/test_include_dirs
              SOURCES test_include_dirs.cpp)
+dss_add_test(NAME program/test_system_dirs_cwd_independent
+             SOURCES test_system_dirs_cwd_independent.cpp)
 dss_add_test(NAME program/test_input_resolver
              SOURCES test_input_resolver.cpp)
 dss_add_test(NAME program/test_cross_validate_target_format

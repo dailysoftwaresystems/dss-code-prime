@@ -19,6 +19,7 @@
 #include "hir/hir_intrinsic_registry.hpp"
 #include "hir/hir_text.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "repo_root.hpp"
 #include "tokenizer/token_stream.hpp"
 #include "tokenizer/tokenizer.hpp"
 
@@ -127,26 +128,28 @@ namespace {
     return {};
 }
 
-// The shipped c-subset JSON text (for shiftResult perturbation), found by
-// walking up from cwd exactly as loadShipped does. Returned as raw text so the
-// perturbation is a surgical textual swap of the closed verb value — no JSON
-// library dependency in this target.
+// The shipped c-subset JSON text (for shiftResult perturbation), located
+// through the ONE test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the
+// CMake-baked repo root → the cwd ancestor walk). It used to carry a private
+// copy of that walk, which resolves nothing in an OUT-OF-TREE build — the cwd
+// there has no `src/dss-config` anywhere in its ancestry — and the empty text it
+// then returned fell into the caller's `std::abort()`, taking down the whole
+// test BINARY and every sibling test's verdict with it. `configRoot()` throws
+// instead, which GoogleTest reports as a failure of the one running test.
+// Returned as raw text so the perturbation is a surgical textual swap of the
+// closed verb value — no JSON library dependency in this target.
 [[nodiscard]] std::string shippedCSubsetText() {
-    fs::path dir = fs::current_path();
-    for (int i = 0; i < 12; ++i) {
-        fs::path const cand =
-            dir / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-        if (fs::exists(cand)) {
-            std::ifstream in{cand, std::ios::binary};
-            std::stringstream ss;
-            ss << in.rdbuf();
-            return ss.str();
-        }
-        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
-        dir = dir.parent_path();
+    fs::path const cand =
+        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+    std::ifstream in{cand, std::ios::binary};
+    if (!in) {
+        ADD_FAILURE() << "cannot open shipped c-subset.lang.json at "
+                      << cand.string();
+        return {};
     }
-    ADD_FAILURE() << "could not locate shipped c-subset.lang.json above cwd";
-    return {};
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
 }
 
 // Lower `void f(int a, long b) { a << b; }` under a schema whose
@@ -5174,17 +5177,15 @@ TEST(HirLoweringCSubset, ConcatAllNarrowUnchanged) {
 
 namespace {
 
+// The goldens tree, via the ONE test-side resolver (`repo_root.hpp`:
+// $DSS_CONFIG_ROOT → the CMake-baked repo root → the cwd ancestor walk). The
+// private walk this replaces resolved nothing in an OUT-OF-TREE build and then
+// called `std::abort()` — which kills the whole test BINARY, so one unresolvable
+// goldens path cost every sibling test in this executable its verdict.
+// `repoRoot()` throws, and GoogleTest reports a throw as a failure of the one
+// running test.
 [[nodiscard]] fs::path findLoweringGoldens() {
-    fs::path cwd = fs::current_path();
-    for (int hops = 0; hops < 8; ++hops) {
-        auto const cand = cwd / "tests" / "hir" / "lowering_goldens";
-        if (fs::is_directory(cand)) return cand;
-        if (!cwd.has_parent_path() || cwd == cwd.parent_path()) break;
-        cwd = cwd.parent_path();
-    }
-    ADD_FAILURE() << "could not locate tests/hir/lowering_goldens from "
-                  << fs::current_path().string();
-    std::abort();
+    return dss::test::repoRoot() / "tests" / "hir" / "lowering_goldens";
 }
 
 [[nodiscard]] bool goldenRefreshRequested() {
@@ -6450,16 +6451,11 @@ TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
     // Read the shipped c-subset config text and flip the enumDecl's
     // `liftToEnclosingScope` from true to false. The rest of the
     // schema (incl. `compositeKind: "enum"`) stays untouched.
-    fs::path here = fs::current_path();
-    fs::path schemaPath;
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const cand = here / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-        if (fs::exists(cand)) { schemaPath = cand; break; }
-        fs::path const par = here.parent_path();
-        if (par == here) break;
-        here = par;
-    }
-    ASSERT_FALSE(schemaPath.empty()) << "cannot locate c-subset.lang.json";
+    // The path comes from the ONE test-side resolver (`repo_root.hpp`), not a
+    // private cwd walk: the walk that stood here found nothing in an
+    // OUT-OF-TREE build, whose cwd has no `src/dss-config` in its ancestry.
+    fs::path const schemaPath =
+        dss::test::configRoot() / "sources" / "c-subset.lang.json";
     std::ifstream in{schemaPath, std::ios::binary};
     ASSERT_TRUE(in.is_open()) << "cannot open " << schemaPath.string();
     std::ostringstream buf; buf << in.rdbuf();
@@ -8386,23 +8382,6 @@ TEST(HirLoweringCSubset, SameNamedInlineFunctionTypedParamsStayFunctionLocal) {
 
 namespace {
 
-// Resolve the REAL shipped system-include dir by the same upward walk
-// program.cpp's `applySystemDirs` uses, so these pins read the descriptors the
-// production driver ships — a regression in stdio.json itself turns them red
-// instead of being mirrored green by a scratch copy.
-[[nodiscard]] fs::path findShippedLibsDirForShimPins() {
-    std::error_code ec;
-    fs::path here = fs::current_path(ec);
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const candidate = here / "src" / "dss-config" / "shippedLibs";
-        if (fs::is_directory(candidate, ec)) return candidate;
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
-    }
-    return {};
-}
-
 // Analyze `src` against the real shippedLibs under a GIVEN object format. The
 // format is threaded to BOTH the UnitBuilder (the macro `variants` splice) and
 // `analyze` (the per-SYMBOL availability gate), exactly as the driver does —
@@ -8411,11 +8390,15 @@ namespace {
 [[nodiscard]] SemanticModel analyzeRealStdioAt(std::string src,
                                                ObjectFormatKind format,
                                                DataModel dataModel) {
-    fs::path const shipped = findShippedLibsDirForShimPins();
-    if (shipped.empty()) {
-        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
-        std::abort();
-    }
+    // The REAL shipped system-include dir — the descriptors the production
+    // driver ships — so a regression in stdio.json itself turns these pins red
+    // instead of being mirrored green by a scratch copy. Resolved through the
+    // ONE test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the
+    // CMake-baked repo root → the cwd ancestor walk); the private walk that
+    // used to stand here found nothing in an OUT-OF-TREE build and the miss
+    // ended in `std::abort()`, which kills the whole test BINARY and costs
+    // every sibling test its verdict. `configRoot()` throws instead.
+    fs::path const shipped = dss::test::configRoot() / "shippedLibs";
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};

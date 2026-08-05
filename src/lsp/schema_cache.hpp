@@ -34,8 +34,8 @@ enum class SchemaResolveErrorKind : std::uint8_t {
     NotFound,           // schema dir / shipped name doesn't exist
     LoadFailed,         // file exists but loader rejected it
     NoExtensionMatch,   // file extension matches no known language
-    // Shipped-mode only: cwd-walk failed to locate the
-    // `src/dss-config/sources/` directory within 8 parent levels.
+    // Shipped-mode only: neither `$DSS_CONFIG_ROOT` nor the 8-level
+    // cwd-walk located the `src/dss-config/sources/` directory.
     // Without it, extension-based resolution has no candidate list. Loud
     // failure prevents a silent "extension matches nothing" misdiagnosis
     // when the real problem is "shipped configs not discoverable from
@@ -72,18 +72,21 @@ struct DSS_EXPORT ShippedDiscoveryResult {
 class DSS_EXPORT SchemaCache {
 public:
     // `schemaDir` empty ⇒ shipped-only mode (the cache auto-discovers
-    // `src/dss-config/sources/` via cwd-walk). `discoveryStartPath`
+    // `src/dss-config/sources/` via `findShippedConfigDir`:
+    // `$DSS_CONFIG_ROOT`, else a cwd-walk). `discoveryStartPath`
     // overrides the walk's starting point and exists for tests that need
     // to pin "no shipped dir found" / "dir found but empty" behaviour
     // without mutating process cwd; production callers leave it default.
     explicit SchemaCache(std::optional<std::filesystem::path> schemaDir = std::nullopt,
                          std::optional<std::filesystem::path> discoveryStartPath = std::nullopt);
 
-    // Walk up from `startPath` (default: `current_path()`) up to 8
-    // parent levels looking for `src/dss-config/sources/`. If
-    // found, enumerate `*.lang.json` and return the sorted base names
-    // alongside the located directory. Public + static so tests can
-    // pin behavior without mutating process cwd.
+    // Locate `src/dss-config/sources/` via the shared resolver
+    // (`findShippedConfigDir`): `$DSS_CONFIG_ROOT` first, else a walk up
+    // to 8 parent levels from cwd. If found, enumerate `*.lang.json` and
+    // return the sorted base names alongside the located directory.
+    // An explicit `startPath` means "discover from exactly here" — it
+    // outranks the env override and roots the walk. Public + static so
+    // tests can pin behavior without mutating process cwd.
     [[nodiscard]] static ShippedDiscoveryResult discoverShippedLanguages(
         std::optional<std::filesystem::path> startPath = std::nullopt);
 

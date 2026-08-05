@@ -12,6 +12,7 @@
 #include "core/types/tree_visitor.hpp"
 
 #include "analysis/compilation_unit/toy_cu_fixture.hpp"
+#include "repo_root.hpp"
 
 #include <gtest/gtest.h>
 
@@ -19,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -39,27 +41,25 @@ using dss::cu_test::loadShippedSchema;
 constexpr char kScratchGroup[] = "cu4-import-resolver";
 using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 
-// Read the shipped `<name>.lang.json` TEXT by walking up from cwd to the repo
-// `src/dss-config/sources/` directory — mirrors GrammarSchema::loadShipped's
-// search so the genericity test reads the exact bytes the loader would.
+// Read the shipped `<name>.lang.json` TEXT so the genericity test reads the
+// exact bytes GrammarSchema::loadShipped would. The directory comes from the ONE
+// test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the repo root CMake
+// bakes in → a cwd ancestor walk); this used to be a PRIVATE 8-hop cwd walk that
+// read none of the first two. Out of tree the cwd has no `src/dss-config` in its
+// ancestry, so that walk always missed — and its miss ended in `std::abort()`,
+// which kills the whole test BINARY, costing every sibling test in this file its
+// verdict. Both failure modes now THROW, so an unresolvable root (or an
+// unreadable config) reddens the ONE test that asked and names why.
 [[nodiscard]] std::string readShippedConfigText(std::string_view name) {
-    namespace fs = std::filesystem;
-    std::string const leaf = std::string{name} + ".lang.json";
-    std::error_code ec;
-    fs::path here = fs::current_path(ec);
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const candidate = here / "src" / "dss-config" / "sources" / leaf;
-        if (fs::exists(candidate, ec)) {
-            std::ifstream in(candidate, std::ios::binary);
-            return std::string(std::istreambuf_iterator<char>(in),
-                               std::istreambuf_iterator<char>());
-        }
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    std::filesystem::path const path =
+        dss::test::configRoot() / "sources" / (std::string{name} + ".lang.json");
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("cannot read shipped config '" +
+                                 std::string{name} + "' at " + path.string());
     }
-    ADD_FAILURE() << "could not locate shipped config '" << name << "'";
-    std::abort();
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
 }
 
 } // namespace

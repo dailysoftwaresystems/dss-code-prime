@@ -50,6 +50,7 @@
 // no-verdict defect the ledger it pins was created to end.
 
 #include "arm_verdict_ledger.hpp"
+#include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
 
@@ -77,21 +78,19 @@ using json = nlohmann::json;
 
 namespace {
 
-// The repo root. `dss_add_test` sets DSS_CONFIG_ROOT to CMAKE_SOURCE_DIR for
-// every registered test, which is the same anchor the shipped-config loader
-// uses — so this resolves identically for in-tree and out-of-tree builds.
-[[nodiscard]] fs::path repoRoot() {
-    char const* const root = std::getenv("DSS_CONFIG_ROOT");
-    if (root != nullptr && *root != '\0') return fs::path{root};
-    // Fall back to walking up for src/dss-config, mirroring findShippedConfig.
-    fs::path cur = fs::current_path();
-    for (int i = 0; i < 12; ++i) {
-        if (fs::exists(cur / "src" / "dss-config")) return cur;
-        if (!cur.has_parent_path() || cur.parent_path() == cur) break;
-        cur = cur.parent_path();
-    }
-    return {};
-}
+// The repo root, through the ONE test-side resolver (`repo_root.hpp`:
+// `$DSS_CONFIG_ROOT` → the root CMake bakes in → a 12-hop cwd walk, every
+// candidate validated as a directory containing `src/dss-config`).
+//
+// This used to be a private copy that diverged in two ways that matter: it
+// took `DSS_CONFIG_ROOT` UNVALIDATED (so a stale export poisoned the whole
+// file rather than falling through), and it had no knowledge of the baked
+// `DSS_TEST_REPO_ROOT`, so running this binary directly — outside ctest, which
+// always exports the variable — resolved nothing out-of-tree and returned an
+// EMPTY path that then composed into `""/real-examples/c/sqlite`. The shared
+// resolver throws instead, which GoogleTest reports as a failure of the one
+// test that asked, naming all three sources it tried.
+using dss::test::repoRoot;
 
 [[nodiscard]] fs::path harnessDir() {
     return repoRoot() / "real-examples" / "c" / "sqlite";
@@ -987,11 +986,15 @@ TEST_F(HarnessLegs, BothDriversStageOneZincPerTransform) {
 // ★ WHAT IS NOT TESTED HERE AND WHY: none of these tests invokes `wslpath`.
 // This file runs on Windows, on WSL and on an arm64 Linux VPS, and a test whose
 // green depended on `wsl.exe` would be a skip-or-red on two of the three. The
-// translator CONTRACT (separator normalisation before the call, rc, empty
-// output, an output still in the source namespace, a source path in the wrong
-// namespace) is exercised by `harness_legs.py --self-test` with an INJECTED
-// translator — which this file runs, as `TheResolverSelfTestPasses`. The live
-// `wslpath` path is measured by the driver run recorded in the cycle report.
+// translator CONTRACT (the path handed over VERBATIM, rc, empty output, an
+// output still in the source namespace, a source path in the wrong namespace)
+// is exercised by `harness_legs.py --self-test` with an INJECTED translator —
+// which this file runs, as `TheResolverSelfTestPasses`. The live `wslpath` path
+// is measured by the driver run recorded in the cycle report.
+// ⚠ "VERBATIM" replaced "separator normalisation before the call" on
+// 2026-08-04: that normalisation was a workaround for `wslpath: C:ab`, a symptom
+// whose cause was misattributed to wslpath eating backslashes when it was
+// actually the local shell `wsl.exe` runs without `-e` (section 9 below).
 
 // The vocabulary is CLOSED and the catalogue may not step outside it. Asserted
 // from both directions: the resolver prints the set, and every verb any launcher
@@ -2060,4 +2063,501 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
             }
         }
     }
+}
+
+// ── 9. NOTHING INVOKES `wsl.exe` WITHOUT `-e` ──────────────────────────────
+//
+// D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL.
+//
+// THE FORBIDDEN SHAPE, in one line: `wsl.exe <anything-but--e> …`.
+//
+// WHY. `wsl.exe <cmd>` does not run <cmd>. WSL reconstructs a command LINE from
+// the remaining argv and feeds it to the distro's DEFAULT SHELL, which strips
+// quoting and performs expansions BEFORE the named binary is ever reached — so
+// the payload is parsed twice and the first pass happens where nobody is
+// looking. ✔MEASURED 2026-08-04 on this host, one variable changed, same input:
+//     wsl.exe    bash -lc "printf '[%s]\n' 'echo A=$(uname -m)'"  ->  [echo A=x86_64]
+//     wsl.exe -e bash -lc "printf '[%s]\n' 'echo A=$(uname -m)'"  ->  [echo A=$(uname -m)]
+//
+// ★ QUOTING IS NOT THE FIX, and that is why this is a test and not a review
+// note. ✔MEASURED at the real call site (Invoke-PosixCommand's payload): with no
+// `-e`, a SINGLE-QUOTED `$HOME` inside the payload still expanded, arriving as
+// `[lit /home/rafael and * and a\b]` instead of `[lit $HOME and * and a\b]`,
+// because the outer shell removed the quotes first. Every escaping fix
+// therefore looks correct and still leaks.
+//
+// ★ `--` IS NOT `-e` EITHER — it is documented as "pass the remaining command
+// line as is", and "as is" means "to the shell". ✔MEASURED the same day:
+// `wsl.exe -- /nope` answers `/bin/bash: line 1: /nope: No such file` while
+// `wsl.exe -e /nope` answers `execvpe(/nope) failed`; and one argument
+// `…/g/*.test` reached the callee as TWO arguments under `--` and as ONE under
+// `-e`. That is why `--` is called out by name below instead of being lumped in
+// with "some other token" — it reads like the safe spelling and is not.
+//
+// WHAT IT COST, so nobody re-litigates the severity: tools/ssh-arm64-vps.ps1 ran
+// `wsl.exe bash -lc "ssh … $Command"`, so `-Command 'hostname; uname -m'`
+// printed the VPS hostname and then the LOCAL WSL architecture — x86_64 for an
+// aarch64 box — while exiting 0. A cross-host verification instrument answering
+// with the wrong host's data, silently. The same defect sat under
+// `wslpath: C:ab`, where it was misattributed to wslpath eating backslashes and
+// papered over with a separator rewrite (section 8's corrected comment).
+//
+// THE RULE, and why it is shaped this way rather than "the file must not
+// contain `wsl.exe` without `-e`":
+//   · over LIVE lines (`liveLines`), because every driver DOCUMENTS the shape it
+//     removed — a raw-text rule would be satisfied by deleting the explanation,
+//     which is the lesson `liveLines` already exists for;
+//   · only in COMMAND POSITION (first token, or after `&` / `;` / `(` / `{` /
+//     backtick), because `Get-Command wsl.exe -ErrorAction …` RESOLVES the
+//     launcher without running it, and a diagnostic string may legitimately name
+//     it in prose. This needs no suppression list: neither shape is command
+//     position, by construction;
+//   · `|` is deliberately NOT a command-position marker. build-and-test.sh
+//     carries `grep -qiE 'microsoft|wsl' /proc/version`, and a rule that read
+//     that as a pipeline would red on a regex. A pipeline INTO wsl.exe is not a
+//     shape this harness uses, and buying it would cost a false positive today;
+//   · a bare `wsl` counts only when followed by WHITESPACE — an invocation is
+//     always followed by its argv. That one condition is what keeps the same
+//     regex, `build-wsl/` and `$wslKey` out of it without naming any of them;
+//   · a PowerShell SPLAT (`& wsl.exe @a`) is the correct fix's own shape — there
+//     is no string left to escape — so it is accepted only when the array it
+//     splats is bound to `-e` nearby. That is how tools/ssh-arm64-vps.ps1 passes.
+//
+// COVERAGE IS BY DIRECTORY, NOT BY LIST: both sqlite drivers plus every
+// `tools/*.ps1` and `tools/*.sh`, so a NEW tools script is governed the day it
+// lands. The catalogue's launcher argv and the resolver's translator argv are
+// held to the same rule from their DATA, in the second test — and those are the
+// two places that actually carried `--`.
+//
+// ⚠ ONE THING THIS RULE DOES NOT COVER, labelled rather than left implicit:
+// `.claude/skills/dss-state/driver.mjs` spawns WSL from a JS argv ARRAY
+// (`spawnSync('wsl', ['-e', …])`), not from a command line, so none of the
+// shapes above apply to it. It was VERIFIED BY READING on 2026-08-04 — lines
+// 171, 244, 248-249 and 250 all put `-e` first — and it is left unscanned
+// because a line-oriented rule would either miss it or invent false positives.
+
+namespace {
+
+struct Script {
+    fs::path path;
+    bool     powershell;
+};
+
+// Every script this rule governs. `tools/` is enumerated rather than listed so
+// a new script there cannot land outside the rule.
+[[nodiscard]] std::vector<Script> shellScriptsUnderTest() {
+    std::vector<Script> out;
+    out.push_back({harnessDir() / "build-and-test.ps1", true});
+    out.push_back({harnessDir() / "build-and-test.sh", false});
+    std::error_code       ec;
+    std::vector<fs::path> tools;
+    for (auto const& e : fs::directory_iterator(repoRoot() / "tools", ec)) {
+        if (!e.is_regular_file()) continue;
+        auto const ext = e.path().extension().string();
+        if (ext == ".ps1" || ext == ".sh") tools.push_back(e.path());
+    }
+    std::sort(tools.begin(), tools.end());   // a stable failure order
+    for (auto const& p : tools) {
+        out.push_back({p, p.extension() == ".ps1"});
+    }
+    return out;
+}
+
+[[nodiscard]] bool isWordChar(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+// The character before `at`, ignoring spaces/tabs; '\0' at the start of a line.
+[[nodiscard]] char precedingSymbol(std::string const& line, std::size_t at) {
+    while (at > 0 && (line[at - 1] == ' ' || line[at - 1] == '\t')) --at;
+    return at == 0 ? '\0' : line[at - 1];
+}
+
+// The whitespace-delimited token FOLLOWING the one that starts at `at`.
+[[nodiscard]] std::string tokenAfter(std::string const& line, std::size_t at) {
+    std::size_t i = at;
+    while (i < line.size() && line[i] != ' ' && line[i] != '\t') ++i;
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+    std::size_t j = i;
+    while (j < line.size() && line[j] != ' ' && line[j] != '\t') ++j;
+    return line.substr(i, j - i);
+}
+
+[[nodiscard]] std::vector<std::string> splitWords(std::string const& s) {
+    std::vector<std::string> out;
+    std::istringstream       in{s};
+    std::string              w;
+    while (in >> w) out.push_back(w);
+    return out;
+}
+
+// The 1-based line number of `content` in the RAW file, or 0.
+//
+// ★ NOT the index into `liveLines`, and this is not a nicety: the first version
+// of this test reported the live index, which pointed at build-and-test.ps1:45
+// for a defect on line 373 — a diagnostic that sends the reader to an unrelated
+// line is worse than one that gives no line at all. `liveLines` hands back its
+// lines verbatim, so the raw number is recoverable by looking the text back up.
+[[nodiscard]] std::size_t rawLineNumberOf(fs::path const&    p,
+                                          std::string const& content) {
+    std::istringstream in{fileText(p)};
+    std::string        line;
+    for (std::size_t n = 1; std::getline(in, line); ++n) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == content) return n;
+    }
+    return 0;
+}
+
+// `@a` -> `a`; "" when `tok` is not a PowerShell splat.
+[[nodiscard]] std::string splattedVariable(std::string const& tok) {
+    if (tok.size() < 2 || tok[0] != '@') return {};
+    std::string name;
+    for (std::size_t i = 1; i < tok.size() && isWordChar(tok[i]); ++i) {
+        name.push_back(tok[i]);
+    }
+    return name;
+}
+
+// Is `$<name>` bound to an argv naming `-e` within the window ABOVE `at`? The
+// window mirrors `boundToTranslator`'s reasoning: wide enough for a construct
+// split over a few lines, far too narrow to pair two unrelated mentions.
+[[nodiscard]] bool splatIsBoundToExec(std::vector<std::string> const& lines,
+                                      std::size_t                     at,
+                                      std::string const&              name) {
+    std::string const needle = "$" + name;
+    std::size_t const first  = at >= 12 ? at - 12 : 0;
+    for (std::size_t i = first; i <= at; ++i) {
+        auto const pos = lines[i].find(needle);
+        if (pos == std::string::npos) continue;
+        auto const after = pos + needle.size();
+        if (after < lines[i].size() && isWordChar(lines[i][after])) continue;
+        if (lines[i].find('=') == std::string::npos) continue;
+        if (lines[i].find("'-e'") != std::string::npos ||
+            lines[i].find("\"-e\"") != std::string::npos ||
+            lines[i].find("'--exec'") != std::string::npos ||
+            lines[i].find("\"--exec\"") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct Mention {
+    std::size_t at;
+    std::string spelling;
+};
+
+// Every offset at which this line names the WSL launcher AS A COMMAND WORD.
+[[nodiscard]] std::vector<Mention> wslMentions(std::string const& line) {
+    std::vector<Mention> out;
+    for (std::size_t at = line.find("wsl"); at != std::string::npos;
+         at = line.find("wsl", at + 1)) {
+        // LEFT boundary: `build-wsl/`, `$wslKey`, `--no-wsl` and
+        // `$script:HostNeedsWsl` are names, not invocations.
+        if (at > 0) {
+            char const p = line[at - 1];
+            if (isWordChar(p) || p == '-' || p == '.' || p == '/' ||
+                p == '\\' || p == '$') {
+                continue;
+            }
+        }
+        std::string spelling = "wsl";
+        if (line.compare(at, 7, "wsl.exe") == 0) spelling = "wsl.exe";
+        // RIGHT boundary, and it must be WHITESPACE: an invocation is always
+        // followed by its argv, while `'microsoft|wsl'` is followed by a quote.
+        auto const after = at + spelling.size();
+        if (after >= line.size()) continue;
+        if (line[after] != ' ' && line[after] != '\t') continue;
+        out.push_back({at, spelling});
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
+    std::size_t invocationsSeen = 0;
+    for (auto const& script : shellScriptsUnderTest()) {
+        ASSERT_TRUE(fs::exists(script.path)) << script.path;
+        auto const name  = script.path.filename().string();
+        auto const lines = liveLines(script.path, script.powershell);
+        ASSERT_FALSE(lines.empty()) << name << " has no live lines";
+
+        for (std::size_t i = 0; i < lines.size(); ++i) {
+            auto const& line = lines[i];
+            auto const  mentions = wslMentions(line);
+            auto const  at = mentions.empty() ? 0 : rawLineNumberOf(script.path, line);
+            for (auto const& m : mentions) {
+                auto const next = tokenAfter(line, m.at);
+
+                // `--` first and UNCONDITIONALLY, command position or not: it is
+                // wrong even as advice an operator pastes, so it is refused
+                // wherever it is written.
+                EXPECT_NE(next, "--")
+                    << name << ':' << at << " spells `" << m.spelling
+                    << " --`:\n  " << line
+                    << "\n`--` is NOT `--exec`. MEASURED: `wsl.exe -- /nope`"
+                       " answers `/bin/bash: line 1: /nope: No such file` where"
+                       " `wsl.exe -e /nope` answers `execvpe(/nope) failed` — so"
+                       " `--` hands the whole argv to the distro's default shell,"
+                       " which re-expands it. Use `-e`.";
+
+                char const prev = precedingSymbol(line, m.at);
+                bool const commandPosition =
+                    prev == '\0' || prev == '&' || prev == ';' || prev == '(' ||
+                    prev == '{' || prev == '`';
+                if (!commandPosition) continue;   // a mention, not an invocation
+                ++invocationsSeen;
+
+                if (next == "-e" || next == "--exec") continue;
+                std::string const var = splattedVariable(next);
+                if (!var.empty()) {
+                    EXPECT_TRUE(splatIsBoundToExec(lines, i, var))
+                        << name << ':' << at << " splats `" << next
+                        << "` into " << m.spelling
+                        << " but nothing within 12 live lines above binds `$"
+                        << var << "` to an argv naming '-e':\n  " << line
+                        << "\nA real argv is the RIGHT fix for this defect — it"
+                           " is what tools/ssh-arm64-vps.ps1 does — but only if"
+                           " `-e` is actually in it.";
+                    continue;
+                }
+
+                ADD_FAILURE()
+                    << name << ':' << at << " invokes `" << m.spelling
+                    << "` without `-e`:\n  " << line
+                    << "\nThe next token is '" << next
+                    << "'. D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL:"
+                       " `wsl.exe <cmd>` does not run <cmd>, it hands the"
+                       " reconstructed command line to the distro's DEFAULT"
+                       " SHELL, which strips quoting and expands ON THIS MACHINE"
+                       " first. MEASURED: the same input string gives"
+                       " [echo A=x86_64] without `-e` and [echo A=$(uname -m)]"
+                       " with it, and a SINGLE-QUOTED $HOME in a payload still"
+                       " expanded. Quoting cannot fix it — pass `-e`, or build a"
+                       " real argv and splat it as tools/ssh-arm64-vps.ps1 does.";
+            }
+        }
+    }
+    // NON-VACUITY. Every invocation above could stop being RECOGNISED — a
+    // renamed helper, a driver that stops shelling out, a boundary rule that
+    // grew too strict — and this test would go green by seeing nothing. The
+    // floor is what the two sqlite drivers and ssh-arm64-vps.ps1 supply today.
+    EXPECT_GE(invocationsSeen, 4u)
+        << "only " << invocationsSeen
+        << " wsl invocation(s) were RECOGNISED across the scanned scripts, so"
+           " this rule has stopped seeing the shape it governs and is vacuous."
+           " Fix the recogniser, do not delete the test.";
+}
+
+// The same rule over the two places the spelling is DATA rather than script
+// text — and they are the places that actually carried `--`: the catalogue's
+// launcher argv, and the resolver's declared translator argv. Neither is a
+// command line, so the line rule above cannot see them; both end up as argv[0]
+// of a real process, so the defect is identical.
+TEST_F(HarnessLegs, NoDeclaredWslArgvOmitsExec) {
+    auto const isWsl = [](std::string const& s) {
+        auto const  slash = s.find_last_of("/\\");
+        std::string tail  = slash == std::string::npos ? s : s.substr(slash + 1);
+        for (auto& c : tail) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return tail == "wsl" || tail == "wsl.exe";
+    };
+
+    std::size_t launchers = 0;
+    auto const  doc       = json::parse(fileText(catalogue_));
+    for (auto const& leg : doc.at("legs")) {
+        auto const label = leg.at("label").get<std::string>();
+        for (auto const& entry : leg.at("launchers")) {
+            auto const cmd = entry.at("command").get<std::vector<std::string>>();
+            if (cmd.empty() || !isWsl(cmd.front())) continue;
+            ++launchers;
+            ASSERT_GE(cmd.size(), 2u)
+                << "leg '" << label << "': launcher for ("
+                << entry.at("hostOs") << ", " << entry.at("hostArch")
+                << ") is a bare `" << cmd.front() << "` with no `-e`.";
+            EXPECT_TRUE(cmd[1] == "-e" || cmd[1] == "--exec")
+                << "leg '" << label << "': launcher for ("
+                << entry.at("hostOs") << ", " << entry.at("hostArch")
+                << ") is declared as `" << cmd.front() << ' ' << cmd[1]
+                << "`. Only `-e`/`--exec` EXECUTES the fixture; anything else"
+                   " (including `--`) hands the whole argv to the distro's"
+                   " default shell, which re-expands it. MEASURED: one argument"
+                   " `…/g/*.test` arrived at the callee as TWO under `--` and as"
+                   " ONE under `-e` — a launcher that cannot be trusted to have"
+                   " run the file the driver named.";
+        }
+    }
+    EXPECT_GE(launchers, 2u)
+        << "no wsl launcher was found in the catalogue, so this pin is vacuous"
+           " (both elf64 legs declare one for a Windows host).";
+
+    // The resolver's own translator vocabulary, read the way a driver reads it.
+    auto const r = run({"--path-translations"});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    ASSERT_EQ(r.exitCode, 0u) << r.output;
+    std::size_t translators = 0;
+    for (auto const& line : splitLines(r.output)) {
+        auto const tab = line.find('\t');
+        ASSERT_NE(tab, std::string::npos) << "malformed line: " << line;
+        auto const verb = line.substr(0, tab);
+        auto const argv = splitWords(line.substr(tab + 1));
+        if (argv.empty() || !isWsl(argv.front())) continue;
+        ++translators;
+        EXPECT_TRUE(argv.size() >= 2 && (argv[1] == "-e" || argv[1] == "--exec"))
+            << "pathTranslation '" << verb << "' declares translator argv `"
+            << line.substr(tab + 1)
+            << "`. Without `-e` the path is parsed by WSL's default shell before"
+               " wslpath sees it, and a backslash is that shell's ESCAPE"
+               " character — which is exactly how `wslpath: C:ab` came to be"
+               " blamed on wslpath. MEASURED through the real call path (python"
+               " subprocess.run): 'C:\\a\\b' is rc=1 `wslpath: C:ab` without"
+               " `-e` and rc=0 /mnt/c/a/b with it.";
+    }
+    EXPECT_GE(translators, 1u)
+        << "no wsl-based translator was found, so this half of the pin is"
+           " vacuous (windows-to-wsl declares one).";
+}
+
+// ── 10. NEITHER DRIVER NAMES THE ARTEFACT — THE COMPILER DOES ──────────────
+//
+// ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING
+//
+// ✔MEASURED 2026-08-04, WSL x86_64, HEAD a3af1320: the .sh driver CROSS-BUILT the
+// Windows testfixture — 189 TUs compiled, the link ran, ZERO `error[` and zero
+// `error:`, and `…/pe64-x86_64-windows-exec/testfixture.exe` landed on disk
+// (`file(1)`: PE32+ executable (console) x86-64, 8 sections, 5,387,264 bytes). The
+// driver reported `build FAILED — 0 error[ but no executable at …/testfixture` and
+// marked the leg POISONED: it was looking for a suffix-less name, because nothing
+// in the build had ever told it what the artefact was CALLED.
+//
+// ★ WHY THIS IS WORSE THAN AN ORDINARY BUG, and why it earns a gate test. It is a
+// false negative on the project's headline capability
+// (ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-CROSS-HOST-ANY-TARGET)
+// manufactured by the instrument that measures it — and it hid ITSELF:
+// only a POSIX host cross-building for Windows can reach it, which is exactly the
+// case this harness exists to observe. On the arm64 VPS the leg never got that far;
+// on Windows the .ps1 sibling had its own, different copy of the suffix table.
+//
+// THE THREE RULES BELOW, and each names a shape that was REMOVED this cycle:
+//
+//   1. NO SUFFIX TABLE IN A DRIVER. `TargetSpec::outputExtension`
+//      (src/program/target_spec.cpp) derives the artefact extension from the
+//      CLOSED object-format enum. The .ps1 carried a second copy —
+//      `$sfx = if ($fmt -like 'pe*') { '.exe' } else { '' }` — matched on a format
+//      NAME PREFIX, wrong for every non-exec format, and its own comment claimed
+//      it was "DERIVED FROM THE OBJECT FORMAT, never hardcoded". The .sh carried a
+//      third copy by having none at all. Three copies of one table is how they
+//      came to disagree.
+//   2. NO DRIVER ASSEMBLES THE ARTEFACT PATH. `bin="$outd/$fmt/testfixture"` and
+//      `Join-Path (Join-Path $legOut $fmt) "testfixture$sfx"` are the two shapes
+//      that did; both put the per-format subdir variable and the artefact's base
+//      name on ONE line, which is the shape this rule forbids. (Scoped to `$fmt`
+//      on purpose: it is only ever the DSS output routing. The gcc REFERENCE
+//      fixture, which make names and this driver legitimately copies, never
+//      mentions it.)
+//   3. BOTH DRIVERS READ THE BUILD'S OWN REPORT — and so does the compiler emit
+//      it. The marker is a WIRE FORMAT across three files in two languages, so it
+//      is asserted in all three at once: change it in one and this reds.
+//
+// RED-ON-DISABLE (measured, see the cycle report for the verbatim messages):
+// restore either removed shape and rule 1 or 2 fails naming the line; delete the
+// marker from a driver or from program.cpp and rule 3 fails naming the file.
+TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
+    // The report line the compiler emits per artefact it commits:
+    //   dss-code-prime: artifact <targetSpec> <absolute path>
+    constexpr char const* kMarker = "dss-code-prime: artifact ";
+
+    // DSS's artifact-extension table, as a driver would be tempted to spell one
+    // entry of it: a bare, quoted extension. `wsl.exe` / `dss-code-prime.exe` are
+    // whole file names and never match; a `$sfx`-style row always does.
+    constexpr std::string_view kSuffixes[] = {".exe", ".dll", ".so", ".dylib",
+                                              ".lib"};
+
+    struct Driver {
+        char const* name;
+        bool        powershell;
+    };
+    constexpr Driver kDrivers[] = {{"build-and-test.sh", false},
+                                   {"build-and-test.ps1", true}};
+
+    std::size_t markersSeen = 0;
+    for (auto const& d : kDrivers) {
+        auto const path  = harnessDir() / d.name;
+        auto const lines = liveLines(path, d.powershell);
+        ASSERT_FALSE(lines.empty()) << d.name << " has no live lines";
+
+        std::size_t markerHere = 0;
+        for (auto const& line : lines) {
+            // RULE 1 — a bare quoted artifact extension is a copy of DSS's table.
+            for (auto const& sfx : kSuffixes) {
+                for (char const q : {'\'', '"'}) {
+                    std::string const needle =
+                        std::string{q} + std::string{sfx} + std::string{q};
+                    EXPECT_EQ(line.find(needle), std::string::npos)
+                        << d.name << " spells an artifact extension as a"
+                           " literal:\n  " << line
+                        << "\nThe suffix belongs to the object format"
+                           " (TargetSpec::outputExtension, keyed on the closed"
+                           " format enum). A copy here is a second table to keep"
+                           " in step — and the last time there were two, they"
+                           " disagreed and threw away a real cross-host build.";
+                }
+            }
+
+            // RULE 2 — the per-format output subdir and the artefact's base name
+            // on one line is a path being ASSEMBLED.
+            bool const assembles = line.find("$fmt") != std::string::npos
+                                && line.find("testfixture") != std::string::npos;
+            EXPECT_FALSE(assembles)
+                << d.name << " assembles the artefact path itself:\n  " << line
+                << "\nThe file name is the compiler's to decide and to REPORT"
+                   " (`" << kMarker << "<spec> <path>`); a driver that rebuilds"
+                   " it needs the extension table it must not have.";
+
+            if (line.find(kMarker) != std::string::npos) ++markerHere;
+        }
+
+        // RULE 3 (driver half) — it actually reads the report.
+        EXPECT_GE(markerHere, 1u)
+            << d.name << " never mentions `" << kMarker
+            << "`, so it is not reading the build's own statement of what it"
+               " wrote. Something else is deciding the artefact's name, which is"
+               " the defect this section exists to prevent.";
+        markersSeen += markerHere;
+    }
+
+    // RULE 3 (producer half) — and the compiler actually emits it. Without this
+    // the two drivers could agree perfectly on a string nothing ever prints.
+    //
+    // ★ OVER LIVE LINES, and this was learned the hard way INSIDE this cycle,
+    // exactly as `liveLines` itself was: the first version searched program.cpp's
+    // raw text, and renaming the emitted marker left the test GREEN — because the
+    // emitter DOCUMENTS the wire format it prints, and the docblock still spelled
+    // it. `liveLines`' comment rules are shell/PowerShell (`#`, `<# #>`), so C++
+    // needs its own one-line strip here.
+    auto const emitter = repoRoot() / "src" / "program" / "program.cpp";
+    ASSERT_TRUE(fs::exists(emitter)) << emitter;
+    std::string emitterCode;
+    for (auto const& line : splitLines(fileText(emitter))) {
+        auto const first = line.find_first_not_of(" \t");
+        if (first != std::string::npos && line.compare(first, 2, "//") == 0) continue;
+        emitterCode += line;
+        emitterCode += '\n';
+    }
+    EXPECT_NE(emitterCode.find(kMarker), std::string::npos)
+        << emitter.generic_string() << " does not emit `" << kMarker
+        << "`. Both drivers parse that exact prefix, so this is a wire format:"
+           " renaming it here without renaming it there leaves every leg"
+           " reporting 'the build produced no artefact' on a build that"
+           " succeeded — the original defect, restored.";
+
+    // NON-VACUITY. Rules 1 and 2 are NEGATIVE and go green by seeing nothing, so
+    // the positive half carries the floor: two drivers, at least one reader each.
+    EXPECT_GE(markersSeen, 2u)
+        << "only " << markersSeen
+        << " artefact-report reader(s) were found across the two drivers. Fix the"
+           " recogniser, do not delete the test.";
 }

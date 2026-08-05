@@ -22,6 +22,7 @@
 #include "core/types/type_lattice/type_registry.hpp"
 #include "diagnostic_count.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -1999,9 +2000,6 @@ TEST(ShippedLibDescriptor, MissingHeaderFailsLoud) {
                   rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
 }
 
-// Ancestor-walk for the shipped dir (mirrors `findShippedConfig`) so tests work
-// whether ctest runs from build/ or the repo root. Returns empty if not found.
-
 // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): the SysV `va_list` named-type binding
 // production threads into every shipped-descriptor read (stdio.json's
 // vfprintf spells `va_list`). Tests reading SHIPPED files bind it the same
@@ -2020,16 +2018,22 @@ sysvVaListBinding(TypeInterner& interner) {
     return {NamedTypeBinding{"va_list", vaListTy}};
 }
 
+// The shipped descriptor dir, resolved through the ONE test-side resolver
+// (`repo_root.hpp`: $DSS_CONFIG_ROOT → the CMake-baked repo root → the cwd
+// ancestor walk). This used to be a private ancestor-walk of its own, which
+// found nothing in an OUT-OF-TREE build — that cwd has no `src/dss-config/`
+// anywhere above it, and the walk never read the `DSS_CONFIG_ROOT` ctest
+// already exports. Contract unchanged: empty on a miss, and every caller
+// ASSERTs on that. The ADD_FAILURE carries the resolver's three-source
+// diagnostic so the log names WHICH of the three lookups came up short, not
+// just the call site that noticed.
 [[nodiscard]] fs::path shippedLibsRoot() {
-    fs::path here = fs::current_path();
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const cand = here / "src" / "dss-config" / "shippedLibs";
-        if (fs::exists(cand)) return cand;
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    auto const root = dss::test::findRepoRoot();
+    if (!root) {
+        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        return {};
     }
-    return {};
+    return *root / "src" / "dss-config" / "shippedLibs";
 }
 
 // ── Item 1: constants + typedefs decode (neutral shipped-header content) ─────

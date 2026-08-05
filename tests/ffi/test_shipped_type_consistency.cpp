@@ -49,6 +49,7 @@
 #include "diagnostic_count.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "ffi/shipped_type_consistency.hpp"
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <nlohmann/json.hpp>
@@ -75,16 +76,21 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// The shipped-config tree this sweep enumerates, resolved through the ONE
+// test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the CMake-baked repo
+// root → the cwd ancestor walk) instead of the private cwd-walk that stood
+// here. That walk resolved nothing in an OUT-OF-TREE build — a build directory
+// has no `src/dss-config/` in its ancestry — so the EXHAUSTIVE sweep this file
+// exists to run silently had no tree to sweep. Contract unchanged: empty on a
+// miss, both callers ASSERT on it; the ADD_FAILURE names which of the three
+// lookups came up short.
 [[nodiscard]] fs::path configRoot() {
-    fs::path here = fs::current_path();
-    for (int i = 0; i < 12 && !here.empty(); ++i) {
-        fs::path const cand = here / "src" / "dss-config";
-        if (fs::exists(cand)) return cand;
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    auto const root = dss::test::findRepoRoot();
+    if (!root) {
+        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        return {};
     }
-    return {};
+    return *root / "src" / "dss-config";
 }
 
 // EVERY descriptor under shippedLibs, recursively — never a hand-written list.

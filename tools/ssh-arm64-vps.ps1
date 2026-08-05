@@ -60,7 +60,30 @@ if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
     Write-Error "no DSS_VPS_KEY set and wsl.exe is unavailable. Set DSS_VPS_KEY to a Windows-side key, or install WSL where the key lives."
     exit 3
 }
-$wslKey = if ($conf['DSS_VPS_KEY_WSL']) { $conf['DSS_VPS_KEY_WSL'] } else { '$HOME/.ssh/oracle-vps-private-key' }
-$remote = if ($Command) { ' ' + ($Command -join ' ') } else { '' }
-& wsl.exe bash -lc "ssh -i $wslKey $($common -join ' ') $VpsUser@$VpsHost$remote"
+# ★★ NO LOCAL SHELL ON THIS PATH — D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL.
+#    This branch used to be `wsl.exe bash -lc "ssh … $Command"`, which put the
+#    remote payload inside a string TWO local shells got to parse, and the
+#    pieces after the first `;` executed on the LOCAL machine while the tool
+#    exited 0 — a cross-host verification instrument answering with the wrong
+#    host's data. MEASURED 2026-08-04: `-Command 'hostname; uname -m'` printed
+#    the VPS hostname `dss` and then `x86_64`, the WSL arch, for an aarch64 box.
+#    ★ Quoting the payload is NOT sufficient and the reason is the load-bearing
+#      part: `wsl.exe <cmd>` WITHOUT `-e` runs the command line through WSL's
+#      OWN default shell before the named binary ever sees it. MEASURED, one
+#      variable changed, same input string:
+#        wsl.exe    bash -lc "printf '[%s]\n' 'echo A=$(uname -m)'" → [echo A=x86_64]
+#        wsl.exe -e bash -lc "printf '[%s]\n' 'echo A=$(uname -m)'" → [echo A=$(uname -m)]
+#      That hidden shell strips the quotes and expands locally, so an escaping
+#      fix looks correct and still leaks.
+#    So this passes a real ARGV with `-e` and no shell at all — structurally the
+#    same thing the .sh sibling gets from `ssh "${args[@]}"`. There is no string
+#    to escape, hence nothing to get wrong later.
+#    `~` is deliberate: ssh expands it for -i itself (MEASURED via `ssh -G`),
+#    whereas `$HOME` needs a shell — the very thing removed here.
+$wslKey = if ($conf['DSS_VPS_KEY_WSL']) { $conf['DSS_VPS_KEY_WSL'] } else { '~/.ssh/oracle-vps-private-key' }
+$wslKey = $wslKey -replace '^\$HOME/', '~/' -replace '^\$\{HOME\}/', '~/'
+
+$a = @('-e', 'ssh', '-i', $wslKey) + $common + @("$VpsUser@$VpsHost")
+if ($Command) { $a += $Command }
+& wsl.exe @a
 exit $LASTEXITCODE

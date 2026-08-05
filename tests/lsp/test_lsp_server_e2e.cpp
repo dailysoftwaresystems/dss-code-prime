@@ -131,7 +131,18 @@ TEST(LspServerE2E, DidOpenPublishesDiagnosticsForToySource) {
     EXPECT_EQ(params.at("version"), 1);
     auto const& diags = params.at("diagnostics");
     ASSERT_TRUE(diags.is_array());
-    EXPECT_GE(diags.size(), 1u);
+    // [[D-TEST-LSP-E2E-SEGFAULTS-RATHER-THAN-FAILING-LOUD]]
+    // ASSERT, not EXPECT. `nlohmann::json::operator[](size_type) const`
+    // forwards straight to `std::vector::operator[]` with NO bounds check, so
+    // the `diags[0]` below on an empty array reads a null reference and takes
+    // the process out. MEASURED at a3af1320 with a build dir outside the source
+    // tree: this test SEGFAULTED (Windows 0xC0000005) instead of failing, and
+    // the nine tests after it in this binary never ran — a fail-loud violation
+    // that also destroyed the evidence for the real bug (shipped-config
+    // discovery ignoring DSS_CONFIG_ROOT, now fixed in lsp/schema_cache.cpp).
+    // A non-fatal check in front of an unchecked index is a crash waiting on
+    // any future empty-array outcome; keep this fatal.
+    ASSERT_GE(diags.size(), 1u);
     // Lexer diagnostics are produced first (they walk the source
     // left-to-right) and the LSP layer concatenates them ahead of
     // the parser's diagnostics.

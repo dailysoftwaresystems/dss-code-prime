@@ -76,9 +76,10 @@ struct DSS_EXPORT ResolutionContext {
     // angle form (`#include <h>` → `imports.systemPathToken`). The
     // analogue of C's /usr/include; DISTINCT from `includeDirs` (the
     // quote form's search). The wiring layer resolves the language's
-    // `semantics.shippedLibDirs` config strings to absolute dirs (the
-    // cwd-walk to find `src/dss-config/` lives there, mirroring
-    // `findShippedConfig`) and passes them here. Empty ⇒ no system
+    // `semantics.shippedLibDirs` config strings to absolute dirs (via
+    // `findShippedConfigDir` — `$DSS_CONFIG_ROOT`, else a cwd-walk — the
+    // directory form of `findShippedConfig`) and passes them here.
+    // Empty ⇒ no system
     // headers ship; an angle include then HARD-FAILS
     // (F_ShippedHeaderNotFound) on use. A missing system header is a
     // fatal C error, unlike the soft D_UnresolvedImport for a missing

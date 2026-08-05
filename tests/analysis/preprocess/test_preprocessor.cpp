@@ -18,6 +18,7 @@
 #include "link/object_format_schema.hpp"  // TF-C97: per-format data-model predefines
 #include "tokenizer/tokenizer.hpp"
 #include "test_support/golden_file.hpp"   // TF-C85: findCorpusRoot / readFile
+#include "test_support/repo_root.hpp"     // the ONE repo/config-root resolver
 #include "test_support/scratch_dir.hpp"   // the per-run scratch root (see ppScratchRoot)
 
 #include <gtest/gtest.h>
@@ -165,28 +166,35 @@ static_assert(std::is_reference_v<decltype(cSubset())>,
     return false;
 }
 
-// Read the shipped c-subset config TEXT (walk up to src/dss-config/sources) so
-// a test can REBIND a single config field and reload, proving the engine reads
-// that field from config rather than hard-coding a lexeme. Returns "" if not
-// found (the caller asserts). Mirrors the inline walk in
-// FunctionLikeOpenTokenIsConfigDrivenNotHardcoded.
+// Read the shipped c-subset config TEXT so a test can REBIND a single config
+// field and reload, proving the engine reads that field from config rather than
+// hard-coding a lexeme. Returns "" if not found — the ~14 callers each already
+// assert non-empty, so that contract is UNCHANGED; what is new is that the
+// REASON is reported here instead of being guessed at fourteen call sites.
+//
+// The directory comes from the ONE test-side resolver (`repo_root.hpp`:
+// $DSS_CONFIG_ROOT → the repo root CMake bakes in → a cwd ancestor walk). It
+// used to be a private 8-hop cwd walk, duplicated verbatim inside
+// FunctionLikeOpenTokenIsConfigDrivenNotHardcoded (which now calls this one):
+// out of tree the cwd has no `src/dss-config` in its ancestry, so BOTH copies
+// missed and every rebind test in this file went red at once, for a reason none
+// of them named.
 [[nodiscard]] std::string loadShippedCSubsetText() {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    fs::path here = fs::current_path(ec);
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const cand =
-            here / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-        if (fs::exists(cand, ec)) {
-            std::ifstream in(cand, std::ios::binary);
-            return std::string(std::istreambuf_iterator<char>(in),
-                               std::istreambuf_iterator<char>());
-        }
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    auto const root = dss::test::findRepoRoot();
+    if (!root) {
+        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        return {};
     }
-    return {};
+    std::filesystem::path const cand =
+        *root / "src" / "dss-config" / "sources" / "c-subset.lang.json";
+    std::ifstream in(cand, std::ios::binary);
+    if (!in) {
+        ADD_FAILURE() << "cannot read the shipped c-subset config: "
+                      << cand.string();
+        return {};
+    }
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
 }
 
 } // namespace
@@ -877,27 +885,14 @@ TEST(Preprocessor, EnabledIsConfigDrivenPerLanguage) {
 TEST(Preprocessor, FunctionLikeOpenTokenIsConfigDrivenNotHardcoded) {
     auto loadedText = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(loadedText.has_value());
-    // Read the shipped c-subset config text (walk up to src/dss-config/sources).
+    // Read the shipped c-subset config text. This WAS a byte-for-byte copy of
+    // the cwd walk `loadShippedCSubsetText()` used to carry; the copy is gone,
+    // because a second implementation is a second place to forget when the
+    // resolution rules change — which is precisely what an out-of-tree build
+    // exposed (neither copy read $DSS_CONFIG_ROOT, so both missed together).
     namespace fs = std::filesystem;
-    std::string text;
-    {
-        std::error_code ec;
-        fs::path here = fs::current_path(ec);
-        for (int i = 0; i < 8 && !here.empty(); ++i) {
-            fs::path const cand =
-                here / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-            if (fs::exists(cand, ec)) {
-                std::ifstream in(cand, std::ios::binary);
-                text.assign(std::istreambuf_iterator<char>(in),
-                            std::istreambuf_iterator<char>());
-                break;
-            }
-            fs::path const parent = here.parent_path();
-            if (parent == here) break;
-            here = parent;
-        }
-        ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
-    }
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
     // Rebind ONLY the function-like opener to `BlockOpen` (a real, declared
     // c-subset token). The token name must resolve (validated at load), so this
     // is a well-formed schema -- just one where `(` is no longer the opener.

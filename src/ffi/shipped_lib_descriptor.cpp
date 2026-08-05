@@ -1,5 +1,6 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 
+#include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver
 #include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/include_path_resolve.hpp"   // resolveSystemDescriptor (the `includes` closure walk)
@@ -15,8 +16,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>       // std::size_t (was <cstdlib> for std::getenv, gone with the local walk)
 #include <cstdint>
-#include <cstdlib>       // std::getenv (DSS_CONFIG_ROOT discovery)
 #include <deque>         // std::deque (Option C: address-stable typedef-name backing)
 #include <fstream>
 #include <functional>    // std::function (forEachDescriptorInClosure callbacks)
@@ -2376,31 +2377,14 @@ bool shippedHeaderAvailableForFormat(std::filesystem::path const& descriptorPath
 std::optional<std::unordered_map<std::string, std::vector<std::string>>>
 collectShippedExternSymbolFormats() {
     namespace fs = std::filesystem;
-    // Locate src/dss-config/shippedLibs -- DSS_CONFIG_ROOT override first, then a
-    // cwd-walk up to 8 ancestors (mirrors findShippedConfig's discipline, but for
-    // the DIRECTORY rather than a single named file). nullopt on no hit.
-    fs::path root;
-    {
-        std::error_code ec;
-        if (char const* env = std::getenv("DSS_CONFIG_ROOT");
-            env != nullptr && env[0] != '\0') {
-            fs::path const cand =
-                fs::path{env} / "src" / "dss-config" / "shippedLibs";
-            if (fs::is_directory(cand, ec)) root = cand;
-        }
-        if (root.empty()) {
-            fs::path here = fs::current_path(ec);
-            for (int i = 0; i < 8 && !here.empty(); ++i) {
-                fs::path const cand =
-                    here / "src" / "dss-config" / "shippedLibs";
-                if (fs::is_directory(cand, ec)) { root = cand; break; }
-                fs::path const parent = here.parent_path();
-                if (parent == here) break;
-                here = parent;
-            }
-        }
-    }
-    if (root.empty()) return std::nullopt;  // discovery failed -> caller falls through
+    // Locate src/dss-config/shippedLibs through the SHARED directory resolver
+    // (DSS_CONFIG_ROOT override first, then a cwd-walk up to 8 ancestors). This
+    // was a hand-rolled copy of that precedence; `findShippedConfigDir` is now
+    // the one implementation, so this site cannot drift from the file form the
+    // way `program.cpp::applySystemDirs` silently had. nullopt on no hit.
+    auto const rootOpt = findShippedConfigDir("shippedLibs");
+    if (!rootOpt) return std::nullopt;  // discovery failed -> caller falls through
+    fs::path const& root = *rootOpt;
 
     // ── D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS ────────────────────
     // name -> the UNION of the object-format names every declaring row makes it
