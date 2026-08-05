@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 137> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 138> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -322,6 +322,22 @@ constexpr std::array<DiagnosticCode, 137> kUnsuppressableCodes{{
     // with no diagnostic trail back to the dropped request.
     DiagnosticCode::K_FormatLacksStackReserveControl,
     DiagnosticCode::K_InvalidStackReserveRequest,
+
+    // The extern-import dedup fold (D-LK11-EXTERN-IMPORT-DEDUP) at BOTH merge
+    // tiers — linker.cpp `mergeModules` and mir_merge.cpp — collapses N CUs'
+    // imports of one dynamic symbol into one row. Four fields cannot be folded
+    // and must be a hard stop: `isData` and `isThreadLocal` SELECT THE BINDING
+    // MODEL, and two differing non-zero `dataSizeBytes`/`dataAlignBytes` size
+    // one copy-relocation `.bss` slot two ways.
+    // Suppressing this restores first-wins EXACTLY — the merge proceeds with
+    // one CU's answer and the other CU's calls bind through the wrong model
+    // (a PLT stub standing in for a data object: D-LK-EXTERN-DATA-IMPORT).
+    // ★ AND SUPPRESSION IS NOT EVEN REQUIRED TO LOSE IT: a code absent from
+    // this table is also droppable by the reporter's dedup window and its
+    // per-code cap, so on a link the size of the 103-TU SQLite CLI the
+    // diagnostic can vanish with NO flag and no trace. That is why membership
+    // here is part of creating the code, not a follow-up.
+    DiagnosticCode::K_ExternImportAttributeConflict,
 
     // L_* LIR verifier / lowering band — structural invariants
     // (cannot reach assembler-tier codegen without violating

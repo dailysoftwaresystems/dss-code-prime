@@ -2478,18 +2478,28 @@ TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
 
     struct Driver {
         char const* name;
+        char const* core;
         bool        powershell;
     };
-    constexpr Driver kDrivers[] = {{"build-and-test.sh", false},
-                                   {"build-and-test.ps1", true}};
+    // ★ TF-C119 — THE PAIR, NOT THE DRIVER ALONE. The artefact reader moved into
+    // the shared `base-harness` core, so scanning only `build-and-test.*` redded
+    // this test the moment the extraction landed. That was the test WORKING: the
+    // contract is "something on this side reads the compiler's own statement of
+    // what it wrote", and only its HOME changed, never the contract. Rules 1 and
+    // 2 are applied to BOTH files precisely because the core is now where a
+    // copied extension table or a hand-assembled path would hide.
+    constexpr Driver kDrivers[] = {
+        {"build-and-test.sh", "base-harness.sh", false},
+        {"build-and-test.ps1", "base-harness.ps1", true}};
 
     std::size_t markersSeen = 0;
     for (auto const& d : kDrivers) {
-        auto const path  = harnessDir() / d.name;
+      std::size_t markerHere = 0;
+      for (char const* which : {d.name, d.core}) {
+        auto const path  = harnessDir() / which;
         auto const lines = liveLines(path, d.powershell);
-        ASSERT_FALSE(lines.empty()) << d.name << " has no live lines";
+        ASSERT_FALSE(lines.empty()) << which << " has no live lines";
 
-        std::size_t markerHere = 0;
         for (auto const& line : lines) {
             // RULE 1 — a bare quoted artifact extension is a copy of DSS's table.
             for (auto const& sfx : kSuffixes) {
@@ -2497,7 +2507,7 @@ TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
                     std::string const needle =
                         std::string{q} + std::string{sfx} + std::string{q};
                     EXPECT_EQ(line.find(needle), std::string::npos)
-                        << d.name << " spells an artifact extension as a"
+                        << which << " spells an artifact extension as a"
                            " literal:\n  " << line
                         << "\nThe suffix belongs to the object format"
                            " (TargetSpec::outputExtension, keyed on the closed"
@@ -2512,20 +2522,24 @@ TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
             bool const assembles = line.find("$fmt") != std::string::npos
                                 && line.find("testfixture") != std::string::npos;
             EXPECT_FALSE(assembles)
-                << d.name << " assembles the artefact path itself:\n  " << line
+                << which << " assembles the artefact path itself:\n  " << line
                 << "\nThe file name is the compiler's to decide and to REPORT"
                    " (`" << kMarker << "<spec> <path>`); a driver that rebuilds"
                    " it needs the extension table it must not have.";
 
             if (line.find(kMarker) != std::string::npos) ++markerHere;
         }
+      }
 
-        // RULE 3 (driver half) — it actually reads the report.
+        // RULE 3 (harness half) — the PAIR actually reads the report. Either
+        // file satisfies it: after TF-C119 the reader legitimately lives in the
+        // core, and demanding it in the driver would forbid the extraction.
         EXPECT_GE(markerHere, 1u)
-            << d.name << " never mentions `" << kMarker
-            << "`, so it is not reading the build's own statement of what it"
-               " wrote. Something else is deciding the artefact's name, which is"
-               " the defect this section exists to prevent.";
+            << d.name << " and its shared core " << d.core << " never mention `"
+            << kMarker
+            << "`, so nothing on that side is reading the build's own statement"
+               " of what it wrote. Something else is deciding the artefact's"
+               " name, which is the defect this section exists to prevent.";
         markersSeen += markerHere;
     }
 

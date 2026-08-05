@@ -273,7 +273,7 @@ across four descriptors do:
 
 | Descriptor | Variadic symbols |
 |------------|------------------|
-| `stdio.json`     | `printf`, `fprintf`, `sprintf`, `sscanf` (each authored twice — an `[elf,macho]` import row and a `[pe]` `synthesize` row) |
+| `stdio.json`     | `printf`, `fprintf`, `sprintf`, `sscanf` (each authored twice — an `[elf,macho]` import row and a `[pe]` `synthesize` row), plus `snprintf` — **`[elf]` import row + `[pe]` `synthesize` row; macho is deliberately NOT shipped yet** (TF-C119): the libSystem export is INFERRED, never measured, and under the eager-import law a wrong guess breaks the LOAD of *every* macho binary that includes `<stdio.h>`, not just this symbol. Same `[elf]`-first staging as `popen`/`pclose`/`fileno`. It pairs with the darwin arm of `examples/c-subset/shipped_snprintf_ucrt`: both land together once a real Mac run witnesses the export. |
 | `fcntl.json`     | `open`, `fcntl` |
 | `io.json`        | `_open` |
 | `sys/ioctl.json` | `ioctl` |
@@ -281,10 +281,26 @@ across four descriptors do:
 What is still absent is **not a grammar limit** — it is the ordinary
 need-driven rule this whole directory follows: a symbol ships when a real
 consumer lands, because DSS eager-imports every declared extern. So
-`snprintf`, `scanf`, `fscanf`, `vsnprintf`, `vsprintf` and the rest of the
+`scanf`, `fscanf`, `vsnprintf`, `vsprintf` and the rest of the
 family are simply not authored yet. (`vfprintf` IS shipped — it is not
-variadic; it takes a `va_list`.) The nearest live consumer is the SQLite CLI,
-which needs `snprintf` on the POSIX legs.
+variadic; it takes a `va_list`.)
+
+**`snprintf` SHIPPED 2026-08-05 (TF-C119)** — its consumer, the SQLite CLI,
+landed. ⚠ Two corrections to what this paragraph used to say, kept because
+both were load-bearing and both were wrong:
+
+- It said the CLI "needs `snprintf` on the POSIX legs". ✔MEASURED: `snprintf`
+  was missing on **all three** of `elf64-x86_64`, `elf64-aarch64` **and**
+  `pe64-x86_64` — shipped nowhere, so the POSIX framing implied a specificity
+  that did not exist.
+- The tracking anchor's remediation hint named `__stdio_common_vsnprintf` as
+  the UCRT backing symbol. ✔MEASURED with `objdump -p` over
+  `C:/Windows/System32/ucrtbase.dll` (2,484 exports): **that symbol does not
+  exist**, and neither does a bare `snprintf`. Adding it would have broken
+  every pe binary's LOAD with `0xC0000139` under
+  `D-FFI-DESCRIPTOR-EAGER-IMPORT`. The real core is `__stdio_common_vsprintf`
+  (ordinal 117), already shipped for `sprintf`, so the pe arm is a
+  `synthesize` shim adding **zero** new imports.
 
 **`D-FFI-DESCRIPTOR-VARIADIC-SIGNATURE`** is the tracking anchor. Its original
 subject — the missing `fn` grammar marker — no longer exists; what remains under

@@ -87,22 +87,37 @@ class DiagnosticReporter;
 // `recipeBySymbol` (ALREADY FILTERED to the stdio family by the caller). EMPTY map ⇒ clean
 // no-op — every elf/macho build and every pe TU that includes no <stdio.h> printf family.
 //
-// ★ THE FAMILY SHIPS FIVE RECIPES: `printf`, `fprintf`, `sprintf`, `vfprintf`, `sscanf` —
-// exactly the set `stdio.json` declares a pe `synthesize` row for, and exactly the set the
-// loader's closed recipe table (`shipped_lib_descriptor.cpp`'s `kRecipes`) tags Stdio. The
-// two lists are one vocabulary and MUST stay in lock-step: an arm with no descriptor row is
-// an un-consumed mechanism, and a descriptor row with no arm fails loud below. Each further
-// recipe (`snprintf`, the `_s` family, the wide twins) lands TOGETHER WITH its own
+// ★ THE FAMILY SHIPS SIX RECIPES: `printf`, `fprintf`, `sprintf`, `snprintf`, `vfprintf`,
+// `sscanf` — exactly the set `stdio.json` declares a pe `synthesize` row for, and exactly
+// the set the loader's closed recipe table (`shipped_lib_descriptor.cpp`'s `kRecipes`) tags
+// Stdio. The two lists are one vocabulary and MUST stay in lock-step: an arm with no
+// descriptor row is an un-consumed mechanism, and a descriptor row with no arm fails loud
+// below. Each further recipe (the `_s` family, the wide twins) lands TOGETHER WITH its own
 // descriptor row, its core's symbol row, and a runtime witness — never ahead of them.
 //
-// The five reach the UCRT through three cores + one accessor, every one of them an
+// The six reach the UCRT through three cores + one accessor, every one of them an
 // ORDINARY `stdio.json` pe symbol row (so the eager-import law has already proven each is
 // a real `ucrtbase.dll` export):
 //   printf   -> __stdio_common_vfprintf(0, __acrt_iob_func(1), fmt, NULL, ap)
 //   fprintf  -> __stdio_common_vfprintf(0, stream, fmt, NULL, ap)
 //   vfprintf -> __stdio_common_vfprintf(0, stream, fmt, NULL, ap)   [ap is a real param]
 //   sprintf  -> __stdio_common_vsprintf(LEGACY_NULLTERM, buf, (size_t)-1, fmt, NULL, ap)
+//   snprintf -> __stdio_common_vsprintf(STANDARD_SNPRINTF, buf, n,          fmt, NULL, ap)
+//               then `r < 0 ? -1 : r`   [the ONE multi-block recipe in this family]
 //   sscanf   -> __stdio_common_vsscanf (0, buf, (size_t)-1, fmt, NULL, ap)
+//
+// ★★ `snprintf` SHARES `sprintf`'s CORE — IT DOES NOT GET ITS OWN, AND THAT IS A MEASURED
+// FACT, NOT A SHORTCUT. There is no `__stdio_common_vsnprintf`: `objdump -p
+// C:/Windows/System32/ucrtbase.dll` (2,484 exports) has `__stdio_common_vsprintf`
+// (ordinal 117) and `__stdio_common_vsnprintf_s` (115) and NOTHING between them. The `_s`
+// twin is a DIFFERENT function (extra `_MaxCount`, secure-CRT validation), not a spelling
+// variant, so it is not a substitute either. Naming a nonexistent core in a descriptor row
+// would break EVERY pe binary's LOAD with 0xC0000139 under the eager-import law — the exact
+// failure the advice to use that name was trying to prevent. The real UCRT does the same
+// thing this pass does: SDK 10.0.26100.0 `ucrt/stdio.h:1919` `snprintf` calls `vsnprintf`
+// (:1429), whose body (:1439-1444) is one `__stdio_common_vsprintf` call differing from
+// `sprintf`'s only in the two arguments that matter — the `_Options` bit and a REAL
+// `_BufferCount`. Which is why this recipe adds no import at all.
 //
 // ★ `vfprintf` IS THE ODD ONE OUT AND THE ONLY ONE WITH NO VA LEAF. It is not variadic —
 // C 7.21.6.8 gives it a declared `va_list ap` PARAMETER, already pointing at the caller's

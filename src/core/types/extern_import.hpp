@@ -108,9 +108,48 @@ struct DSS_EXPORT ExternImport {
     // "an unused extern declaration emits no import" rule, now uniform across
     // library-bound AND no-library rows. Set at HIR→MIR from
     // `FfiMetadata.isEagerImport`; rides the MIR merge's whole-row copy, and the
-    // merge OR-combines it when collapsing duplicate rows of one name (an eager
-    // `#include`d symbol + a hand-written non-eager `extern` of the same name
-    // yields an eager surviving row — order-independent). INVARIANT:
+    // merge OR-COMBINES it when it collapses two rows — an eager `#include`d
+    // symbol plus a hand-written non-eager `extern` yields an EAGER surviving
+    // row, order-independent.
+    //
+    // ★ READ THE PRECONDITION ON THAT OR-COMBINE, because it is NOT "of the same
+    // name" (this comment said so until TF-C119, and it was wrong). Both merge
+    // tiers collapse on the FULL import identity — the (mangledName,
+    // libraryPath, version) triple (`mir_merge.cpp::ffiImportKey`,
+    // `linker.cpp`'s `dedupKey`). Two rows that share a NAME but disagree on the
+    // owning library are two DIFFERENT dynamic symbols by construction, so they
+    // do not fold, and nothing about them is OR-combined. The contract above
+    // therefore holds only where the two PRODUCERS spell the same library:
+    //   * the shipped descriptor's `library` map, e.g. src/dss-config/
+    //     shippedLibs/stdio.json:5 → {"pe":"ucrtbase.dll", "elf":"libc.so.6",
+    //     "macho":"/usr/lib/libSystem.B.dylib"};
+    //   * the source-declared-extern default, src/dss-config/sources/
+    //     c-subset.lang.json:1531 `externLibraryByFormat` →
+    //     {"pe":"msvcrt.dll", "elf":"libc.so.6",
+    //      "macho":"/usr/lib/libSystem.B.dylib"}.
+    // On elf and macho those AGREE, so the fold happens and the contract reads
+    // exactly as written. ⚠ ON pe THEY DIVERGE — `ucrtbase.dll` vs `msvcrt.dll`
+    // — so on pe the two rows are, correctly per the key, two imports: a CU that
+    // `#include <stdio.h>`s (⇒ the descriptor row, ucrtbase.dll) beside a sibling
+    // CU that hand-declares `extern int puts(const char*);` without the header
+    // (⇒ the source-extern default, msvcrt.dll) yields TWO surviving rows, TWO
+    // IMAGE_IMPORT_DESCRIPTORs, and the hand-declaring CU's call bound into
+    // msvcrt's copy — the split CRT the UCRT migration retired. Reachable
+    // CROSS-CU only: same-TU the semantic tier SUPPRESSES the shipped row when the
+    // user declares the name (semantic_analyzer.cpp:13324,13354) and forwards the
+    // descriptor's library with it, so one TU yields one row.
+    // ★ THIS DIVERGENCE IS A PRE-EXISTING UCRT-MIGRATION RESIDUAL, NOT SOMETHING
+    // THE FOLD INTRODUCED: the two config values were already what they are, and
+    // widening the key merely stopped a name-only key from HIDING the mismatch
+    // behind a silent cross-library fold (which is itself the misbind
+    // D-LK11-EXTERN-IMPORT-DEDUP exists to prevent). Reconciling the two pe
+    // defaults belongs to D-FFI-PE-CRT-UCRT-MIGRATION, not to the dedup key.
+    // The CURRENT behaviour is pinned by
+    // `MirMerge.PeUcrtbaseAndMsvcrtRowsOfOneNameStayTwoImports` in
+    // tests/mir/test_mir_merge.cpp so that changing either config value MOVES a
+    // test rather than silently changing what a pe binary imports.
+    //
+    // INVARIANT:
     // isEagerImport ⟹ non-empty `libraryPath` (a descriptor always ships a
     // library); the flag never rides an unbound row. FALSE for every non-
     // descriptor producer (the format-AGNOSTIC default — no arch/format branch).

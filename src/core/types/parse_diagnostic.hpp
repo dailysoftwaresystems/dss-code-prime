@@ -2339,7 +2339,40 @@ enum class DiagnosticCode : std::uint16_t {
     //   Never silently clamped or rounded: a rounded reserve is a knob that
     //   lies about the number it was given.
     K_InvalidStackReserveRequest   = 0x801A,
-    // K-NEXT-SLOT: 0x801B — grep this marker before adding a K_* code.
+    // K_ExternImportAttributeConflict (D-LK11-EXTERN-IMPORT-DEDUP): two
+    //   compilation units declare the SAME dynamic symbol -- identical
+    //   (mangledName, libraryPath, version), the triple that IDENTIFIES an
+    //   import -- with CONTRADICTORY per-row ATTRIBUTES, so the merge that
+    //   folds them into one row has two answers and no basis to choose.
+    //   `isData` selects the BINDING MODEL (the ELF copy-relocation data slot
+    //   vs the function-import path), `isThreadLocal` selects the
+    //   (unimplemented, walker-rejected) initial-exec TLS model, and two
+    //   DIFFERING NON-ZERO `dataSizeBytes`/`dataAlignBytes` size ONE
+    //   copy-relocation `.bss` slot two ways (the loader memcpy's `st_size`
+    //   bytes -- picking either silently truncates or over-copies). A zero
+    //   size/align is an INCOMPLETE type ("unknown in this TU", legal C), not
+    //   a disagreement: the non-zero shape wins and no diagnostic fires.
+    //   DISTINCT FROM `K_SymbolRedefinedAcrossUnits` (0x8011): that code is
+    //   the DEFINITION-tier fault -- one name with multiple strong bodies.
+    //   This is a DECLARATION-tier fault about ONE imported symbol nobody
+    //   defines; the remediation is "make the two `extern` declarations agree",
+    //   not "delete one definition". Fires from BOTH merge tiers, which
+    //   deliberately enforce the SAME rules under the SAME code: the MIR
+    //   whole-program merge (`mir_merge.cpp` — the LIVE route: `--compile a.c
+    //   b.c` and every `--project` build) and the assembled-tier fold
+    //   (`link/linker.cpp:568`, reached via `--resolve-library`).
+    //   ⚠ A DIVERGENCE BETWEEN THE TWO TIERS IS A DEFECT, NOT A DESIGN CHOICE.
+    //   Until TF-C119 the MIR tier keyed on `mangledName` ALONE — folding
+    //   across `libraryPath` AND `version` (the c156 D-LK-ELF-SYMBOL-VERSIONING
+    //   misbind shape) and first-wins on every field but `isEagerImport` — i.e.
+    //   the REACHABLE tier was the weaker one. They were harmonized together.
+    //   ★ MEMBERSHIP IN `kUnsuppressableCodes` IS PART OF THIS CODE, not an
+    //   optional extra: outside that table the reporter's dedup window and
+    //   per-code cap can drop this diagnostic silently, which restores
+    //   first-wins with no flag and no trace. See the rationale block in
+    //   `core/types/unsuppressable_codes.cpp`.
+    K_ExternImportAttributeConflict = 0x801B,
+    // K-NEXT-SLOT: 0x801C — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

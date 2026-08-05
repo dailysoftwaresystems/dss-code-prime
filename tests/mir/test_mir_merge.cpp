@@ -55,7 +55,9 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -423,6 +425,516 @@ TEST(MirMerge, MergeOrCombinesEagerImportBitAcrossCollapse) {
     EXPECT_TRUE(survivingPutsEager(/*eagerInCu0=*/false))
         << "non-eager CU0 + eager CU1 → surviving row EAGER (ORDER-INDEPENDENT; "
            "RED if the merge uses plain first-wins instead of the OR-combine)";
+}
+
+// ── D-LK11-EXTERN-IMPORT-DEDUP at the MIR tier ────────────────────
+//
+// The MIR merge is the LIVE fold route — `--compile a.c b.c` and every
+// `--project` build (both sqlite legs) go through `mergeCuMirs`; the
+// assembled-tier `mergeModules` fold is reached only via `--resolve-library`.
+// Until this cycle the MIR tier was the WEAKER of the two: it keyed the FFI
+// collapse on `mangledName` ALONE (so it folded across `libraryPath` and across
+// `version`) and was first-wins on `isData` / `isThreadLocal` / `dataSizeBytes` /
+// `dataAlignBytes`. The pins below cover both halves.
+namespace {
+
+// One CU: `int <fn>() { return <ext>(); }`, the extern reached via GlobalAddr.
+Mir buildCallsExtern(SymbolId fnSym, SymbolId extSym, TypeInterner& in) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(sig, fnSym);
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirInstId const addr      = mb.addGlobalAddr(extSym, sig);
+    MirInstId const callOps[] = {addr};
+    MirInstId const call      = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    return std::move(mb).finish();
+}
+
+[[nodiscard]] ExternImport libImport(std::string name, std::string lib,
+                                     std::string version = {}) {
+    ExternImport e;
+    e.mangledName = std::move(name);
+    e.libraryPath = std::move(lib);
+    e.version     = std::move(version);
+    return e;
+}
+
+// Merge two one-call CUs — CU0's function `main` importing `a`, CU1's `helper`
+// importing `b`. NEITHER CU defines the imported name, so both rows survive
+// cross-CU resolution and reach the merge's import fold. Each row's SymbolId is
+// stamped here (10 / 20 — different per-CU ids for what may be one on-binary
+// name, exactly as two independent CUs would assign).
+[[nodiscard]] std::optional<MergedMirModule>
+mergeTwoImportCus(ExternImport a, ExternImport b, DiagnosticReporter& rep) {
+    a.symbol = SymbolId{10};
+    b.symbol = SymbolId{20};
+
+    TypeInterner in0{CompilationUnitId{1}};
+    Mir mir0 = buildCallsExtern(SymbolId{100}, SymbolId{10}, in0);
+    std::vector<ExternImport> const ext0 = {a};
+
+    TypeInterner in1{CompilationUnitId{2}};
+    Mir mir1 = buildCallsExtern(SymbolId{50}, SymbolId{20}, in1);
+    std::vector<ExternImport> const ext1 = {b};
+
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{100, "main"}, {10, a.mangledName}}), ext0},
+        MergeCuInput{&mir1, &in1, namerOf({{50, "helper"}, {20, b.mangledName}}), ext1},
+    };
+    std::vector<std::string> const entries = {"main"};
+    // Every piece the merge reads is alive for the whole call; the returned
+    // module owns its own `Mir` + host lattice, so the locals may die here.
+    return mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+}
+
+// The merged symbol that `fnName`'s first Call actually binds to — the thing a
+// wrong fold silently changes.
+[[nodiscard]] std::optional<std::uint32_t>
+calleeSymbolOf(Mir const& mm,
+               std::unordered_map<std::uint32_t, std::string> const& names,
+               std::string const& fnName) {
+    auto const f = findFuncByName(mm, names, fnName);
+    if (!f.has_value()) return std::nullopt;
+    auto const c = firstCall(mm, *f);
+    if (!c.has_value()) return std::nullopt;
+    MirInstId const callee = mm.instOperands(*c)[0];
+    if (mm.instOpcode(callee) != MirOpcode::GlobalAddr) return std::nullopt;
+    return mm.globalAddrSymbol(callee).v;
+}
+
+[[nodiscard]] bool diagContains(DiagnosticReporter const& rep, DiagnosticCode code,
+                                std::string_view needle) {
+    for (auto const& d : rep.all()) {
+        if (d.code == code && d.actual.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// Every reported diagnostic's prose — the streamed context when a match misses
+// (an empty `<<` message on a text assertion tells you nothing).
+[[nodiscard]] std::string allDiagText(DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) { out += '['; out += d.actual; out += ']'; }
+    return out;
+}
+
+} // namespace
+
+// ── CONTROL: the fold key is not the bare NAME — `libraryPath` is in it ──
+// `foo` from `a.dll` and `foo` from `b.dll` are DIFFERENT dynamic symbols
+// (libraryPath is the field the walkers group DT_NEEDED /
+// IMAGE_IMPORT_DESCRIPTOR / LC_LOAD_DYLIB by), so they must NOT collapse.
+// RED-ON-DISABLE: restore the `ffiCanonicalForName.find(name)` mangledName-only
+// key and both CUs get ONE merged id → ONE surviving row (a.dll's) → the b.dll
+// row VANISHES and CU1's call silently binds into a.dll. The row-count assertion
+// and the per-CU callee assertions each catch that independently.
+TEST(MirMerge, ExternImportsSameNameDifferentLibraryDoNotFold) {
+    DiagnosticReporter rep;
+    auto merged = mergeTwoImportCus(libImport("foo", "a.dll"),
+                                    libImport("foo", "b.dll"), rep);
+    ASSERT_TRUE(merged.has_value()) << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "two libraries owning one name is not a CONFLICT, it is two imports: "
+        << allDiagText(rep);
+
+    std::unordered_map<std::string, std::uint32_t> symByLib;
+    for (ExternImport const& e : merged->externImports) {
+        EXPECT_EQ(e.mangledName, "foo");
+        symByLib.emplace(e.libraryPath, e.symbol.v);
+    }
+    ASSERT_EQ(merged->externImports.size(), 2u)
+        << "two DIFFERENT libraries owning one name are two distinct imports "
+           "(pre-fix: 1 row — b.dll's import was silently dropped)";
+    ASSERT_TRUE(symByLib.count("a.dll") == 1 && symByLib.count("b.dll") == 1)
+        << "each owning library must keep its own import row";
+    EXPECT_NE(symByLib["a.dll"], symByLib["b.dll"])
+        << "two dynamic symbols must hold two merged ids";
+
+    // ★ THE MISCOMPILE ITSELF: each CU's call site must bind to ITS OWN
+    // library's row. Pre-fix both resolved to the single a.dll id.
+    auto const mainCallee =
+        calleeSymbolOf(merged->mir, merged->symbolNames, "main");
+    auto const helperCallee =
+        calleeSymbolOf(merged->mir, merged->symbolNames, "helper");
+    ASSERT_TRUE(mainCallee.has_value() && helperCallee.has_value());
+    EXPECT_EQ(*mainCallee, symByLib["a.dll"])
+        << "CU0 imported foo from a.dll — its call must bind THERE";
+    EXPECT_EQ(*helperCallee, symByLib["b.dll"])
+        << "CU1 imported foo from b.dll — folding across libraryPath binds this "
+           "call into the WRONG DLL";
+    EXPECT_NE(*mainCallee, *helperCallee);
+
+    MirVerifier verifier{merged->mir, &merged->host.interner()};
+    EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
+}
+
+// ── CONTROL: nor is `version` foldable ────────────────────────────
+// `puts@GLIBC_2.2.5` and `puts@GLIBC_2.17` are genuinely different dynamic
+// symbols (c156 D-LK-ELF-SYMBOL-VERSIONING — the misbind that bound `realpath`
+// to the NULL-buffer-rejecting compat form). Folding them at the MIR tier
+// reintroduces exactly the fault c156 fixed at the writer.
+// RED-ON-DISABLE: same as above — the mangledName-only key yields ONE row and
+// CU1's call binds to the OTHER version's slot.
+TEST(MirMerge, ExternImportsSameNameDifferentVersionDoNotFold) {
+    DiagnosticReporter rep;
+    auto merged = mergeTwoImportCus(libImport("puts", "libc.so.6", "GLIBC_2.2.5"),
+                                    libImport("puts", "libc.so.6", "GLIBC_2.17"), rep);
+    ASSERT_TRUE(merged.has_value()) << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+
+    std::unordered_map<std::string, std::uint32_t> symByVersion;
+    for (ExternImport const& e : merged->externImports) {
+        EXPECT_EQ(e.mangledName, "puts");
+        EXPECT_EQ(e.libraryPath, "libc.so.6");
+        symByVersion.emplace(e.version, e.symbol.v);
+    }
+    ASSERT_EQ(merged->externImports.size(), 2u)
+        << "two symbol VERSIONS of one name are two dynamic symbols (pre-fix: 1)";
+    ASSERT_TRUE(symByVersion.count("GLIBC_2.2.5") == 1 &&
+                symByVersion.count("GLIBC_2.17") == 1);
+    EXPECT_NE(symByVersion["GLIBC_2.2.5"], symByVersion["GLIBC_2.17"])
+        << "two dynamic symbols must hold two merged ids";
+
+    auto const mainCallee =
+        calleeSymbolOf(merged->mir, merged->symbolNames, "main");
+    auto const helperCallee =
+        calleeSymbolOf(merged->mir, merged->symbolNames, "helper");
+    ASSERT_TRUE(mainCallee.has_value() && helperCallee.has_value());
+    EXPECT_EQ(*mainCallee, symByVersion["GLIBC_2.2.5"]);
+    EXPECT_EQ(*helperCallee, symByVersion["GLIBC_2.17"])
+        << "folding across `version` binds this call to the wrong glibc compat "
+           "form — the c156 misbind, reintroduced one tier up";
+    EXPECT_NE(*mainCallee, *helperCallee);
+
+    MirVerifier verifier{merged->mir, &merged->host.interner()};
+    EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
+}
+
+// ── THE KEY'S INJECTIVITY, WITH THE COLLISION THE PROSE ONLY DESCRIBED ──
+//
+// `mir_merge.cpp::ffiImportKey` (and `linker.cpp`'s `dedupKey`, byte-identical)
+// LENGTH-PREFIXES every field precisely because a `mangledName` and a
+// `libraryPath` are ARBITRARY BYTES out of a descriptor, so any separator-joined
+// encoding is non-injective. Both sites argue that at length in prose — and until
+// TF-C119 the argument was pinned by NOTHING: MEASURED, every fixture in tests/
+// used `foo` / `puts` / `a.dll` / `b.dll` / `GLIBC_2.x`, not one of which contains
+// a `:` or a `|`, so replacing BOTH key builders with the naive
+// `mangledName + ":" + libraryPath + ":" + version` left every one of them green.
+// A comment that no test can falsify is a comment, not an invariant.
+//
+// This is the crafted pre-image pair the prose implies. Under the naive encoding
+// BOTH rows key to the identical string `a:b:c:` and fold into ONE import; under
+// the length-prefixed key they are `3:a:b|1:c|0:` and `1:a|3:b:c|0:` and stay two.
+// The failure the fold would cause is the WORST shape in this file — not two
+// unrelated rows merely losing a row, but CU1's call site silently rebound to a
+// DIFFERENT dynamic symbol in a DIFFERENT library, with no diagnostic anywhere.
+//
+// ★ THE NAMES ARE NOT DECORATIVE, so do not "tidy" them: a `:` in a mangledName is
+// unusual but perfectly legal (a descriptor ships whatever bytes the platform's
+// export table holds), and the whole point of the pin is that the key must not
+// CARE. The names differ between the two rows here — unlike every sibling test
+// above, which varies library or version alone — because that is exactly what a
+// collision means: two DIFFERENT triples reaching one key.
+// RED-ON-DISABLE: swap `ffiImportKey`'s body for the separator-joined form and
+// this reds on the row count (1 vs 2) and on `helper`'s callee.
+TEST(MirMerge, LengthPrefixedKeyKeepsAColludingNameLibraryPairApart) {
+    DiagnosticReporter rep;
+    // "a:b" from "c"  vs  "a" from "b:c" — one naive key, two real imports.
+    auto merged = mergeTwoImportCus(libImport("a:b", "c"),
+                                    libImport("a", "b:c"), rep);
+    ASSERT_TRUE(merged.has_value()) << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "two unrelated imports are not a CONFLICT: " << allDiagText(rep);
+
+    ASSERT_EQ(merged->externImports.size(), 2u)
+        << "★ a separator-joined key maps BOTH triples to `a:b:c:` and folds two "
+           "UNRELATED dynamic symbols into one import row — the exact "
+           "non-injectivity the length prefix exists to prevent";
+
+    std::unordered_map<std::string, std::uint32_t> symByName;
+    for (ExternImport const& e : merged->externImports)
+        symByName.emplace(e.mangledName + "@" + e.libraryPath, e.symbol.v);
+    ASSERT_TRUE(symByName.count("a:b@c") == 1 && symByName.count("a@b:c") == 1)
+        << "both triples must survive VERBATIM — neither name nor library may be "
+           "re-spelled by the keying";
+    EXPECT_NE(symByName["a:b@c"], symByName["a@b:c"])
+        << "two dynamic symbols must hold two merged ids";
+
+    // The miscompile itself: each CU binds to ITS OWN import.
+    auto const mainCallee =
+        calleeSymbolOf(merged->mir, merged->symbolNames, "main");
+    auto const helperCallee =
+        calleeSymbolOf(merged->mir, merged->symbolNames, "helper");
+    ASSERT_TRUE(mainCallee.has_value() && helperCallee.has_value());
+    EXPECT_EQ(*mainCallee, symByName["a:b@c"]);
+    EXPECT_EQ(*helperCallee, symByName["a@b:c"])
+        << "under a colliding key CU1's call binds into library \"c\" and calls "
+           "the symbol \"a:b\" — a different function in a different image";
+    EXPECT_NE(*mainCallee, *helperCallee);
+
+    MirVerifier verifier{merged->mir, &merged->host.interner()};
+    EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
+}
+
+// ── THE pe CRT DIVERGENCE THIS KEY MAKES VISIBLE — PINNED AS-IS, NOT AS-WISHED ──
+//
+// extern_import.hpp's `isEagerImport` contract says an eager `#include`d symbol
+// and a hand-written non-eager `extern` of the same name fold to one EAGER row.
+// That is true only where BOTH PRODUCERS SPELL THE SAME LIBRARY, and on pe they
+// do not — MEASURED, from the two config values themselves:
+//   * src/dss-config/shippedLibs/stdio.json:5  `library.pe`            = ucrtbase.dll
+//   * src/dss-config/sources/c-subset.lang.json:1531
+//                                         `externLibraryByFormat.pe`   = msvcrt.dll
+// (elf and macho each spell ONE library across both, so the contract holds there
+// unchanged — which is why this test is pe-shaped and pe-named.)
+//
+// So on pe, CU A `#include <stdio.h>` + CU B `extern int puts(const char*);`
+// produce TWO rows, TWO IMAGE_IMPORT_DESCRIPTORs, and CU B's call bound into
+// msvcrt's copy of `puts` — the split CRT the UCRT migration retired. NOT
+// reachable same-TU: the semantic tier suppresses the shipped row when the user
+// declares the name (semantic_analyzer.cpp:13324,13354), so one TU yields one row.
+//
+// ★ WHAT THIS TEST IS FOR, stated plainly so nobody "fixes" it by editing the
+// expectation. It does NOT bless the divergence and it does NOT claim the wider
+// key caused it: both config values predate this fold, and a name-only key did not
+// RECONCILE them — it HID them, folding across libraryPath, which is the very
+// misbind D-LK11-EXTERN-IMPORT-DEDUP exists to prevent. Reconciling the two pe
+// defaults is D-FFI-PE-CRT-UCRT-MIGRATION's job. Until then this pins the ACTUAL
+// behaviour so that changing either config value MOVES A TEST instead of silently
+// changing what a pe binary imports. When the reconciliation lands, this test's
+// expectation becomes 1 row and its eagerness becomes OR-combined true — and the
+// person doing it will be told so by this failure.
+TEST(MirMerge, PeUcrtbaseAndMsvcrtRowsOfOneNameStayTwoImports) {
+    ExternImport shipped = libImport("puts", "ucrtbase.dll");  // <stdio.h>
+    shipped.isEagerImport = true;                              // descriptor ⇒ eager
+    ExternImport handDeclared = libImport("puts", "msvcrt.dll");  // source `extern`
+    handDeclared.isEagerImport = false;
+
+    DiagnosticReporter rep;
+    auto merged = mergeTwoImportCus(shipped, handDeclared, rep);
+    ASSERT_TRUE(merged.has_value()) << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "two libraries owning one name is not a conflict — it is two imports: "
+        << allDiagText(rep);
+
+    ASSERT_EQ(merged->externImports.size(), 2u)
+        << "★ pe's shipped-descriptor library (ucrtbase.dll) and its source-extern "
+           "default (msvcrt.dll) DIFFER, so these are two dynamic symbols and the "
+           "eagerness OR-combine never runs. If this now reads 1, the two config "
+           "values were reconciled — update extern_import.hpp's pe paragraph and "
+           "this test together";
+
+    std::unordered_map<std::string, ExternImport const*> byLib;
+    for (ExternImport const& e : merged->externImports) {
+        EXPECT_EQ(e.mangledName, "puts");
+        byLib.emplace(e.libraryPath, &e);
+    }
+    ASSERT_TRUE(byLib.count("ucrtbase.dll") == 1 && byLib.count("msvcrt.dll") == 1)
+        << "both CRT images must keep their own import row";
+    EXPECT_TRUE(byLib["ucrtbase.dll"]->isEagerImport)
+        << "the descriptor row stays EAGER (D-FFI-DESCRIPTOR-EAGER-IMPORT)";
+    EXPECT_FALSE(byLib["msvcrt.dll"]->isEagerImport)
+        << "★ and the hand-declared row stays NON-eager: it did NOT fold, so it "
+           "never received the descriptor row's eagerness. This is the observable "
+           "half of the divergence — the linker's reference gate treats the two "
+           "rows by different rules";
+    EXPECT_NE(byLib["ucrtbase.dll"]->symbol.v, byLib["msvcrt.dll"]->symbol.v);
+
+    // …and CU B's call really does bind the msvcrt row. That is the miscompile-
+    // shaped consequence, and it is what makes this a behaviour pin rather than a
+    // row count.
+    auto const mainCallee =
+        calleeSymbolOf(merged->mir, merged->symbolNames, "main");
+    auto const helperCallee =
+        calleeSymbolOf(merged->mir, merged->symbolNames, "helper");
+    ASSERT_TRUE(mainCallee.has_value() && helperCallee.has_value());
+    EXPECT_EQ(*mainCallee, byLib["ucrtbase.dll"]->symbol.v);
+    EXPECT_EQ(*helperCallee, byLib["msvcrt.dll"]->symbol.v)
+        << "the hand-declaring CU calls MSVCRT's puts — one program, two CRTs";
+
+    MirVerifier verifier{merged->mir, &merged->host.interner()};
+    EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
+}
+
+// ── A cross-CU disagreement about ONE dynamic symbol FAILS LOUD ───
+// Same (mangledName, libraryPath, version) ⇒ the rows DO fold — and then the
+// payload must be FOLDED, never picked. `isData` selects the BINDING MODEL (the
+// ELF copy-relocation data slot vs the function-import path) and `isThreadLocal`
+// the (unimplemented) initial-exec TLS model, so silently keeping either row
+// binds the loser CU's references through the WRONG model — the
+// D-LK-EXTERN-DATA-IMPORT silent-miscompile shape. Two DIFFERING non-zero
+// `dataSizeBytes`/`dataAlignBytes` size ONE copy-relocation `.bss` slot two ways.
+//
+// The code is K_ExternImportAttributeConflict (0x801B), NOT
+// K_SymbolRedefinedAcrossUnits: nobody DEFINES this symbol — two `extern`
+// DECLARATIONS of it contradict each other, and the remediation differs.
+//
+// RED-ON-DISABLE: the pre-fix merge was first-wins on all four fields and
+// reported NOTHING, so every `countCode(...) == 1u` here reads 0.
+TEST(MirMerge, ConflictingExternImportAttributesFailLoudAtTheMirTier) {
+    {   // isData: CU0 imports a function, CU1 the same name as a data object.
+        SCOPED_TRACE("isData");
+        ExternImport fnRow   = libImport("shared", "libc.so.6");
+        ExternImport dataRow = libImport("shared", "libc.so.6");
+        dataRow.isData         = true;
+        dataRow.dataSizeBytes  = 8;
+        dataRow.dataAlignBytes = 8;
+        DiagnosticReporter rep;
+        auto merged = mergeTwoImportCus(fnRow, dataRow, rep);
+        ASSERT_TRUE(merged.has_value());
+        EXPECT_EQ(test_support::countCode(
+                      rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u)
+            << allDiagText(rep);
+        EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
+                                 "conflicting `isData` (data object vs function "
+                                 "import) across compilation units (false vs true)"))
+            << "the diagnostic must name the FIELD and BOTH values; got: "
+            << allDiagText(rep);
+        EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
+                                 "D-LK11-EXTERN-IMPORT-DEDUP"))
+            << allDiagText(rep);
+        EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
+                                 "(library \"libc.so.6\")"))
+            << "and identify WHICH import: " << allDiagText(rep);
+    }
+    {   // isThreadLocal: one CU calls the same data object thread-local.
+        SCOPED_TRACE("isThreadLocal");
+        ExternImport plain = libImport("tlsvar", "libc.so.6");
+        plain.isData         = true;
+        plain.dataSizeBytes  = 4;
+        plain.dataAlignBytes = 4;
+        ExternImport tls = plain;
+        tls.isThreadLocal = true;
+        DiagnosticReporter rep;
+        auto merged = mergeTwoImportCus(plain, tls, rep);
+        ASSERT_TRUE(merged.has_value());
+        EXPECT_EQ(test_support::countCode(
+                      rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u)
+            << allDiagText(rep);
+        EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
+                                 "conflicting `isThreadLocal` (thread storage "
+                                 "duration) across compilation units (false vs true)"))
+            << allDiagText(rep);
+    }
+    {   // Two DIFFERING non-zero sizes for ONE copy-relocation slot.
+        SCOPED_TRACE("dataSizeBytes");
+        ExternImport small = libImport("gvar", "libc.so.6");
+        small.isData         = true;
+        small.dataSizeBytes  = 4;
+        small.dataAlignBytes = 4;
+        ExternImport big = small;
+        big.dataSizeBytes = 8;
+        DiagnosticReporter rep;
+        auto merged = mergeTwoImportCus(small, big, rep);
+        ASSERT_TRUE(merged.has_value());
+        EXPECT_EQ(test_support::countCode(
+                      rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u)
+            << allDiagText(rep);
+        EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
+                                 "conflicting `dataSizeBytes` (copy-relocation slot "
+                                 "size) across compilation units (4 vs 8)"))
+            << allDiagText(rep);
+    }
+    {   // ...and for its ALIGNMENT (a distinct field, distinct prose).
+        SCOPED_TRACE("dataAlignBytes");
+        ExternImport a = libImport("gvar3", "libc.so.6");
+        a.isData         = true;
+        a.dataSizeBytes  = 8;
+        a.dataAlignBytes = 8;
+        ExternImport b = a;
+        b.dataAlignBytes = 16;
+        DiagnosticReporter rep;
+        auto merged = mergeTwoImportCus(a, b, rep);
+        ASSERT_TRUE(merged.has_value());
+        EXPECT_EQ(test_support::countCode(
+                      rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u)
+            << allDiagText(rep);
+        EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
+                                 "conflicting `dataAlignBytes` (copy-relocation slot "
+                                 "alignment) across compilation units (8 vs 16)"))
+            << allDiagText(rep);
+    }
+}
+
+// ── CONTROL + fold: a ZERO size/align is an INCOMPLETE TYPE, not a conflict ──
+// `extern const char v[];` in one TU beside a sized declaration in another is
+// legal C (extern_import.hpp:76-81 — both fields stay 0 for an incomplete type),
+// so the merge takes the NON-ZERO shape and reports nothing. Both orders are
+// checked: the INCOMPLETE-FIRST order is the discriminating one — the pre-fix
+// first-wins merge kept CU0's 0/0 and shipped a copy-relocation `.bss` slot of
+// size ZERO, which the walker then rejects (or, worse, sizes wrong).
+TEST(MirMerge, IncompleteExternDataTypeFoldsToTheSizedShapeNotAConflict) {
+    ExternImport sized = libImport("gvar2", "libc.so.6");
+    sized.isData         = true;
+    sized.dataSizeBytes  = 8;
+    sized.dataAlignBytes = 8;
+    ExternImport incomplete = libImport("gvar2", "libc.so.6");
+    incomplete.isData = true;   // 0 / 0 — size unknown in THIS translation unit
+
+    auto const foldedShape = [](ExternImport const& first, ExternImport const& second,
+                                DiagnosticReporter& rep)
+        -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
+        auto merged = mergeTwoImportCus(first, second, rep);
+        if (!merged.has_value()) return std::nullopt;
+        EXPECT_EQ(merged->externImports.size(), 1u)
+            << "one (name, library, version) is ONE import row";
+        if (merged->externImports.size() != 1) return std::nullopt;
+        ExternImport const& row = merged->externImports.front();
+        EXPECT_TRUE(row.isData) << "the data-object model must survive the fold";
+        return std::pair{row.dataSizeBytes, row.dataAlignBytes};
+    };
+
+    {   // ★ THE DISCRIMINATING ORDER: incomplete first.
+        SCOPED_TRACE("incomplete first");
+        DiagnosticReporter rep;
+        auto const shape = foldedShape(incomplete, sized, rep);
+        ASSERT_TRUE(shape.has_value());
+        EXPECT_EQ(test_support::countCode(
+                      rep, DiagnosticCode::K_ExternImportAttributeConflict), 0u)
+            << "a zero size is an incomplete type, not a disagreement: "
+            << allDiagText(rep);
+        EXPECT_EQ(shape->first, 8u)
+            << "the COMPLETE type sizes the copy-relocation slot (pre-fix "
+               "first-wins kept CU0's 0 and shipped an unsized slot)";
+        EXPECT_EQ(shape->second, 8u);
+    }
+    {   // The other order agrees (the fold is order-independent).
+        SCOPED_TRACE("sized first");
+        DiagnosticReporter rep;
+        auto const shape = foldedShape(sized, incomplete, rep);
+        ASSERT_TRUE(shape.has_value());
+        EXPECT_EQ(test_support::countCode(
+                      rep, DiagnosticCode::K_ExternImportAttributeConflict), 0u)
+            << allDiagText(rep);
+        EXPECT_EQ(shape->first, 8u);
+        EXPECT_EQ(shape->second, 8u);
+    }
+}
+
+// ── plan 00 §0.3: a diagnostic slot is claimed in the header AND the RENDERER ──
+// TF-C118's `D-DIAG-OPT-FAMILY-NIBBLE-CLAIMED-IN-HEADER-BUT-NOT-IN-RENDERER`: the
+// X_* family had a header slot and no renderer arm, so every optimizer diagnostic
+// printed under the PARSER's letter for months. `K_ExternImportAttributeConflict`
+// rides the pre-existing 0x8000 → 'K' arm rather than claiming a new nibble, so
+// this pin is what proves that arm actually covers the new code (rather than
+// assuming it) — in BOTH renderings the user can see: the positioned
+// `error[K001B]:` band letter and the buffer-less `error[<name>]` spelling.
+TEST(MirMerge, ExternImportAttributeConflictRendersInTheLinkerBand) {
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::K_ExternImportAttributeConflict),
+              "K001B")
+        << "the 0x8000 nibble must render as the linker band with the nibble "
+           "stripped — a missing arm would print it as the PARSER's 'P801B'";
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::K_ExternImportAttributeConflict),
+              "K_ExternImportAttributeConflict")
+        << "the buffer-less rendering names the code; an unmirrored enumerator "
+           "prints \"Unknown\"";
+    // ...and it is a DISTINCT code from the definition-tier one it replaced at
+    // the conflict arms (an extern-import ATTRIBUTE clash is not a redefinition).
+    EXPECT_NE(static_cast<int>(DiagnosticCode::K_ExternImportAttributeConflict),
+              static_cast<int>(DiagnosticCode::K_SymbolRedefinedAcrossUnits));
 }
 
 // ── A cross-CU call into a MULTI-BLOCK callee: clone + rewire ──────
@@ -2690,14 +3202,17 @@ TEST(SynthStdioShim, UnimplementedVaListStrategyFailsLoud) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════
-// D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) — THE FIVE-ARM OPERAND CONTRACT
+// D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) — THE STDIO SHIM OPERAND CONTRACT (SIX ARMS)
 // ═══════════════════════════════════════════════════════════════════════════════════
 //
 // WHY THIS SECTION EXISTS, stated as the defect it closes rather than as "more
 // coverage". Everything above pins the shim's SHAPE by reading three things about the
 // synthesized call — `ops[0]` (the callee), `ops.size()`, and `ops.back()`. Every
-// operand BETWEEN those was unasserted, and three of the five shipped recipes
-// (`fprintf`, `vfprintf`, `sscanf`) had no unit at all.
+// operand BETWEEN those was unasserted, and three of the five recipes shipped at the
+// time (`fprintf`, `vfprintf`, `sscanf`) had no unit at all. TF-C119 added a SIXTH
+// recipe, `snprintf`; its SINGLE-ARM operand pins live beside its va-leaf and
+// multi-block story in tests/mir/test_synth_stdio_shim_valist.cpp (ARM 6/6), and the
+// all-six together test at the end of this section covers it here.
 //
 // ★ THAT GAP WAS MEASURED, NOT SUPPOSED (TF-C112). Each mutation below was applied to
 // src/mir/merge/synth_stdio_shim.cpp one at a time and BOTH mir stdio binaries re-run:
@@ -2736,13 +3251,13 @@ TEST(SynthStdioShim, UnimplementedVaListStrategyFailsLoud) {
 //                                           __acrt_iob_func" stays true; only "the
 //                                           `_Stream` slot IS that call" catches it
 //   fprintf `stream`/`fmt` transposed   -> FprintfArmForwardsItsStreamAndFmtByPosition
-//   fprintf vaStart(2) -> vaStart(1)    -> that test + the all-five test's fprintf row
+//   fprintf vaStart(2) -> vaStart(1)    -> that test + the all-six test's fprintf row
 //   vfprintf `sig` -> `vsig`            -> VfprintfArmForwardsItsDeclaredApAndIsNotVariadic
 //   vfprintf Arg 2 -> vaStart(2)        -> that test, on the `ap` slot AND both
 //                                          zero-leaf assertions
 //   sscanf re-pointed at the vsprintf   -> SscanfArmUsesTheScanfCoreWithZeroOptions,
 //     core                                 which MISSES its core rather than matching
-//                                          the wrong one, plus the all-five test
+//                                          the wrong one, plus the all-six test
 //   the sprintf missing-core path emits -> EveryPostCloneFailurePathLeavesTheModuleUntouched
 //     the body and publishes the           (func count 2 vs 1, and the symbol DEFINED)
 //     builder before returning false       while the fail-loud assertions stay green
@@ -2757,6 +3272,9 @@ constexpr std::uint32_t kShimPrintf   = 11;
 constexpr std::uint32_t kShimFprintf  = 12;
 constexpr std::uint32_t kShimVfprintf = 13;
 constexpr std::uint32_t kShimSscanf   = 14;
+// TF-C119. The family's structural outlier: THREE named args, a non-pointer among
+// them, and the only recipe whose body is more than one block.
+constexpr std::uint32_t kShimSnprintf = 15;
 
 // The UCRT cores + the stdin/stdout/stderr accessor, as ORDINARY descriptor imports.
 constexpr std::uint32_t kCoreVsprintf = 20;
@@ -2775,12 +3293,18 @@ constexpr std::int64_t kOptLegacyVsprintfNullTerm = 1;
 // UCRT's UNBOUNDED sentinel, `(size_t)-1`. The pass builds it as `~0ull` narrowed into
 // the pool's signed arm, so the stored literal is -1.
 constexpr std::int64_t kBufferCountUnbounded = -1;
+// TF-C119: `snprintf`'s bit — STANDARD_SNPRINTF_BEHAVIOR (bit 1,
+// corecrt_stdio_config.h:116). WITHOUT it the core is the pre-C99 `_snprintf`,
+// which returns -1 on truncation where C99 requires the would-be length. It is the
+// first shipped recipe to pass a nonzero bit that is NOT sprintf's legacy bit 0,
+// which is precisely why a value hoisted out of the sprintf arm must red here.
+constexpr std::int64_t kOptStandardSnprintfBehavior = 2;
 // `__acrt_iob_func(0/1/2)` == stdin/stdout/stderr. `printf` IS `fprintf` to STDOUT, so
 // this index is the difference between conforming output and output on the wrong
 // stream — with nothing at any tier to notice.
 constexpr std::int64_t kIobStdout = 1;
 
-// All four helpers the five arms reach through, as ORDINARY descriptor imports (what
+// All four helpers the six arms reach through, as ORDINARY descriptor imports (what
 // stdio.json's pe rows produce). Distinct from `ucrtCoreImports()` above, which
 // deliberately carries only the sprintf core.
 std::vector<ExternImport> allStdioHelperImports() {
@@ -2801,22 +3325,31 @@ std::vector<ExternImport> allStdioHelperImports() {
 // Each shim's C declaration, so the caller-side scaffold references it with its REAL
 // arity and variadicity instead of a stub that only happens to verify. `vfprintf` is
 // the odd one: three DECLARED parameters and NOT variadic (C 7.21.6.8).
+// `sizeParamIndex` exists for `snprintf` alone: it is the only recipe with a named
+// parameter that is NOT a pointer (`size_t n` at index 1). The scaffold must spell that
+// honestly — the pass DEFINES the shim with a `u64` in that slot and the MirVerifier
+// every test below runs compares the definition against this reference, so a `ptr` here
+// would red on a SCAFFOLD defect and read as a pass defect.
+constexpr std::uint32_t kNoSizeParam = 0xFFFFFFFFu;
 struct ShimDecl {
     std::uint32_t symbol;
     std::uint32_t fixedArgc;
     bool          variadic;
+    std::uint32_t sizeParamIndex = kNoSizeParam;
 };
 constexpr ShimDecl kDeclPrintf{kShimPrintf, 1, true};      // (fmt, ...)
 constexpr ShimDecl kDeclFprintf{kShimFprintf, 2, true};    // (stream, fmt, ...)
 constexpr ShimDecl kDeclVfprintf{kShimVfprintf, 3, false}; // (stream, fmt, ap)
 constexpr ShimDecl kDeclSprintf{kShimSprintf, 2, true};    // (buf, fmt, ...)
 constexpr ShimDecl kDeclSscanf{kShimSscanf, 2, true};      // (buf, fmt, ...)
+constexpr ShimDecl kDeclSnprintf{kShimSnprintf, 3, true, 1};  // (buf, size_t n, fmt, ...)
 
 // The caller-side scaffold: one `main` that references each shim through a GlobalAddr
 // against a NOT-yet-defined callee — the shape the CST->HIR seam leaves behind for a
 // `synthesize`-tagged descriptor row — and calls it at its declared arity.
 Mir buildStdioCaller(TypeInterner& in, std::vector<ShimDecl> const& decls) {
     TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const u64 = in.primitive(TypeKind::U64);
     TypeId const pCh = in.pointer(in.primitive(TypeKind::Char));
 
     MirBuilder mb;
@@ -2824,11 +3357,17 @@ Mir buildStdioCaller(TypeInterner& in, std::vector<ShimDecl> const& decls) {
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
     MirInstId const buf = mb.addInst(MirOpcode::Alloca, {}, pCh, 64);
+    MirLiteralValue nLit;
+    nLit.value = 16;
+    nLit.core  = TypeKind::U64;
+    MirInstId const nArg = mb.addConst(nLit, u64);
     for (ShimDecl const& d : decls) {
-        std::vector<TypeId> const params(d.fixedArgc, pCh);
+        std::vector<TypeId> params(d.fixedArgc, pCh);
+        if (d.sizeParamIndex != kNoSizeParam) params[d.sizeParamIndex] = u64;
         TypeId const shimSig = in.fnSig(params, i32, CallConv::CcMS64, d.variadic);
         std::vector<MirInstId> call{mb.addGlobalAddr(SymbolId{d.symbol}, in.pointer(shimSig))};
-        for (std::uint32_t i = 0; i < d.fixedArgc; ++i) call.push_back(buf);
+        for (std::uint32_t i = 0; i < d.fixedArgc; ++i)
+            call.push_back(i == d.sizeParamIndex ? nArg : buf);
         mb.addInst(MirOpcode::Call, call, i32);
     }
     mb.addReturn(mb.addConst(i32Lit(0), i32));
@@ -2971,7 +3510,7 @@ VaListLayout const kWin64Layout = [] {
 
 }  // namespace
 
-// ── ARM 1/5 · printf ────────────────────────────────────────────────────────────────
+// ── ARM 1/6 · printf ────────────────────────────────────────────────────────────────
 //   int printf(char const* fmt, ...)
 //     -> __stdio_common_vfprintf(0, __acrt_iob_func(1), fmt, NULL, ap)
 //
@@ -3022,7 +3561,7 @@ TEST(SynthStdioShim, PrintfArmForwardsStdoutFmtAndApByPosition) {
     EXPECT_TRUE(verifier.verify(rep));
 }
 
-// ── ARM 2/5 · fprintf ───────────────────────────────────────────────────────────────
+// ── ARM 2/6 · fprintf ───────────────────────────────────────────────────────────────
 //   int fprintf(FILE* stream, char const* fmt, ...)
 //     -> __stdio_common_vfprintf(0, stream, fmt, NULL, ap)
 //
@@ -3069,7 +3608,7 @@ TEST(SynthStdioShim, FprintfArmForwardsItsStreamAndFmtByPosition) {
     EXPECT_TRUE(verifier.verify(rep));
 }
 
-// ── ARM 3/5 · vfprintf — THE ONE THAT IS NOT VARIADIC ───────────────────────────────
+// ── ARM 3/6 · vfprintf — THE ONE THAT IS NOT VARIADIC ───────────────────────────────
 //   int vfprintf(FILE* stream, char const* fmt, va_list ap)
 //     -> __stdio_common_vfprintf(0, stream, fmt, NULL, ap)
 //
@@ -3130,7 +3669,7 @@ TEST(SynthStdioShim, VfprintfArmForwardsItsDeclaredApAndIsNotVariadic) {
     EXPECT_TRUE(verifier.verify(rep));
 }
 
-// ── ARM 4/5 · sprintf ───────────────────────────────────────────────────────────────
+// ── ARM 4/6 · sprintf ───────────────────────────────────────────────────────────────
 //   int sprintf(char* buf, char const* fmt, ...)
 //     -> __stdio_common_vsprintf(LEGACY_VSPRINTF_NULL_TERMINATION, buf, (size_t)-1,
 //                                fmt, NULL, ap)
@@ -3188,7 +3727,7 @@ TEST(SynthStdioShim, SprintfArmPassesBufCountFmtInThatOrder) {
     EXPECT_TRUE(verifier.verify(rep));
 }
 
-// ── ARM 5/5 · sscanf ────────────────────────────────────────────────────────────────
+// ── ARM 5/6 · sscanf ────────────────────────────────────────────────────────────────
 //   int sscanf(char const* buf, char const* fmt, ...)
 //     -> __stdio_common_vsscanf(0, buf, (size_t)-1, fmt, NULL, ap)
 //
@@ -3246,7 +3785,7 @@ TEST(SynthStdioShim, SscanfArmUsesTheScanfCoreWithZeroOptions) {
     EXPECT_TRUE(verifier.verify(rep));
 }
 
-// ── ALL FIVE IN ONE PASS ────────────────────────────────────────────────────────────
+// ── ALL SIX IN ONE PASS ─────────────────────────────────────────────────────────────
 //
 // The arms above each run alone, which cannot catch a value that is right per-recipe
 // but shared across them. Synthesizing the whole family in ONE invocation is what makes
@@ -3254,10 +3793,25 @@ TEST(SynthStdioShim, SscanfArmUsesTheScanfCoreWithZeroOptions) {
 // not have it, and a core resolved once and reused reds on whichever arm needs the
 // other one. It also pins the emission ORDER contract (sorted by SymbolId — the
 // determinism the pass sorts for), and that `main` survives the rebuild.
-TEST(SynthStdioShim, AllFiveArmsSynthesizeTogetherWithPerRecipeValues) {
+//
+// ★ TF-C119 — `snprintf` MAKES THIS FIXTURE COVER SOMETHING NO SINGLE-RECIPE ONE CAN,
+// and that is why it was extended rather than left at five. `snprintf` is the ONLY arm
+// whose body is more than one block (the `r < 0 ? -1 : r` clamp:
+// synth_stdio_shim.cpp:489-506) and therefore the only one that leaves the builder
+// sitting in a NON-ENTRY block when the emission loop moves on to the next recipe. The
+// pass stamps structural markers module-wide with ONE `rederiveStructCfMarkers` after
+// `finish()` — so the MIXED single-/multi-block module is the shape it must survive,
+// and the shape the real pe64 build produces on every `#include <stdio.h>`. Before this
+// extension that mixed case was exercised by no fixture at all: the five-arm module was
+// uniformly single-block, and the one multi-block module was a one-recipe fixture in
+// tests/mir/test_synth_stdio_shim_valist.cpp. The marker assertions below (and the
+// MirVerifier, which RECOMPUTES the derivation and compares stored == derived per
+// reachable block) are what makes that coverage real rather than incidental.
+TEST(SynthStdioShim, AllSixArmsSynthesizeTogetherWithPerRecipeValues) {
     TypeInterner in{CompilationUnitId{1}};
     Mir mir = buildStdioCaller(
-        in, {kDeclSprintf, kDeclPrintf, kDeclFprintf, kDeclVfprintf, kDeclSscanf});
+        in, {kDeclSprintf, kDeclPrintf, kDeclFprintf, kDeclVfprintf, kDeclSscanf,
+             kDeclSnprintf});
 
     std::vector<ExternImport> const externs = allStdioHelperImports();
     DiagnosticReporter rep;
@@ -3266,33 +3820,38 @@ TEST(SynthStdioShim, AllFiveArmsSynthesizeTogetherWithPerRecipeValues) {
                                                {kShimPrintf, "printf"},
                                                {kShimFprintf, "fprintf"},
                                                {kShimVfprintf, "vfprintf"},
-                                               {kShimSscanf, "sscanf"}}),
+                                               {kShimSscanf, "sscanf"},
+                                               {kShimSnprintf, "snprintf"}}),
                                     kWin64Layout, externs, rep));
     ASSERT_FALSE(rep.hasErrors());
 
-    EXPECT_EQ(mir.moduleFuncCount(), 6u) << "main + five shims";
+    EXPECT_EQ(mir.moduleFuncCount(), 7u) << "main + six shims";
     EXPECT_TRUE(findFuncBySymbol(mir, 100u).has_value()) << "main must survive the rebuild";
 
     // Emission order is SORTED BY SymbolId — the pass sorts precisely because
     // `unordered_map` iteration is not stable and a shifting function order would make
     // the binary non-reproducible. main is the clone, so the shims start at index 1.
-    ASSERT_EQ(mir.moduleFuncCount(), 6u);
-    std::vector<std::uint32_t> const wantOrder{100,           kShimSprintf, kShimPrintf,
-                                               kShimFprintf,  kShimVfprintf, kShimSscanf};
+    ASSERT_EQ(mir.moduleFuncCount(), 7u);
+    std::vector<std::uint32_t> const wantOrder{100,           kShimSprintf,  kShimPrintf,
+                                               kShimFprintf,  kShimVfprintf, kShimSscanf,
+                                               kShimSnprintf};
     for (std::uint32_t i = 0; i < wantOrder.size(); ++i)
         EXPECT_EQ(mir.funcSymbol(mir.funcAt(i)).v, wantOrder[i])
             << "function #" << i << ": shim emission must be sorted by SymbolId so the "
                                    "output is byte-reproducible";
 
     // Per-recipe named-arg counts, all produced by the SAME invocation: printf has one
-    // fixed parameter and the rest have two, so any hoisted constant reds here.
+    // fixed parameter, snprintf has three, and the rest have two — so any hoisted
+    // constant reds here. snprintf's `3` is the one a copy-paste gets wrong: it is the
+    // only value in this column that no sibling shares.
     struct LeafCase { std::uint32_t shim; std::uint32_t core; std::size_t apSlot;
                       std::uint32_t named; };
     for (LeafCase const& c : std::vector<LeafCase>{
              {kShimPrintf, kCoreVfprintf, 5, 1},
              {kShimFprintf, kCoreVfprintf, 5, 2},
              {kShimSprintf, kCoreVsprintf, 6, 2},
-             {kShimSscanf, kCoreVsscanf, 6, 2}}) {
+             {kShimSscanf, kCoreVsscanf, 6, 2},
+             {kShimSnprintf, kCoreVsprintf, 6, 3}}) {
         SCOPED_TRACE(testing::Message() << "shim symbol " << c.shim);
         auto const fn = findFuncBySymbol(mir, c.shim);
         ASSERT_TRUE(fn.has_value());
@@ -3301,6 +3860,33 @@ TEST(SynthStdioShim, AllFiveArmsSynthesizeTogetherWithPerRecipeValues) {
         auto const ops = mir.instOperands(*call);
         ASSERT_EQ(ops.size(), c.apSlot + 1);
         EXPECT_TRUE(isVaLeaf(mir, ops[c.apSlot], MirOpcode::VaHomeArgAreaAddr, c.named));
+    }
+
+    // ★ snprintf and sprintf SHARE `__stdio_common_vsprintf`, so the two arms sit one
+    // constant apart in the same call shape — pinned here in the SAME module so a value
+    // hoisted out of either arm reds. These are the two operands that carry snprintf's
+    // entire meaning, and both faults are silent (see the single-arm test in
+    // tests/mir/test_synth_stdio_shim_valist.cpp for what each one does at runtime).
+    {
+        auto const sn = findFuncBySymbol(mir, kShimSnprintf);
+        auto const sp = findFuncBySymbol(mir, kShimSprintf);
+        ASSERT_TRUE(sn.has_value() && sp.has_value());
+        auto const snCall = coreCallOf(mir, *sn, kCoreVsprintf);
+        auto const spCall = coreCallOf(mir, *sp, kCoreVsprintf);
+        ASSERT_TRUE(snCall.has_value() && spCall.has_value());
+        auto const snOps = mir.instOperands(*snCall);
+        auto const spOps = mir.instOperands(*spCall);
+        ASSERT_EQ(snOps.size(), 7u);
+        ASSERT_EQ(spOps.size(), 7u);
+        EXPECT_TRUE(isIntConst(mir, snOps[1], kOptStandardSnprintfBehavior, TypeKind::U64))
+            << "snprintf's _Options is bit 1 (STANDARD_SNPRINTF_BEHAVIOR)";
+        EXPECT_TRUE(isIntConst(mir, spOps[1], kOptLegacyVsprintfNullTerm, TypeKind::U64))
+            << "…and sprintf's, in the SAME module, is still bit 0 — one _Options "
+               "hoisted across both arms reds on whichever it does not fit";
+        EXPECT_TRUE(isArg(mir, snOps[3], 1))
+            << "snprintf's _BufferCount is the caller's REAL n (`Arg 1`)";
+        EXPECT_TRUE(isIntConst(mir, spOps[3], kBufferCountUnbounded, TypeKind::U64))
+            << "…while sprintf's, in the same module, is the (size_t)-1 sentinel";
     }
 
     // …and vfprintf, in the same module, still emits no leaf and forwards its parameter.
@@ -3314,11 +3900,46 @@ TEST(SynthStdioShim, AllFiveArmsSynthesizeTogetherWithPerRecipeValues) {
     EXPECT_TRUE(isArg(mir, mir.instOperands(*vfCall)[5], 2));
 
     // Exactly ONE body fetches stdout, and it is printf's.
-    for (std::uint32_t sym : {kShimFprintf, kShimVfprintf, kShimSprintf, kShimSscanf})
+    for (std::uint32_t sym : {kShimFprintf, kShimVfprintf, kShimSprintf, kShimSscanf,
+                              kShimSnprintf})
         EXPECT_FALSE(coreCallOf(mir, *findFuncBySymbol(mir, sym), kCoreAcrtIob).has_value())
             << "only printf has a fixed destination stream; symbol " << sym;
     EXPECT_TRUE(
         coreCallOf(mir, *findFuncBySymbol(mir, kShimPrintf), kCoreAcrtIob).has_value());
+
+    // ── THE MIXED-MODULE MARKER REDERIVE ────────────────────────────────────────────
+    // One `rederiveStructCfMarkers` runs over the WHOLE module after `finish()`, and
+    // this module is mixed: five one-block bodies plus `main`, and one three-block body.
+    // Markers are a pure function of the CFG (mir_struct_markers.hpp), so the derivation
+    // must not be perturbed by a neighbouring function's shape — a rederive that leaked
+    // the multi-block arm's state, or that ran per-function against the wrong block
+    // range, shows up HERE and in the verifier below and nowhere else in the suite.
+    for (std::uint32_t sym : {100u, kShimSprintf, kShimPrintf, kShimFprintf,
+                              kShimVfprintf, kShimSscanf}) {
+        SCOPED_TRACE(testing::Message() << "single-block function " << sym);
+        auto const fn = findFuncBySymbol(mir, sym);
+        ASSERT_TRUE(fn.has_value());
+        ASSERT_EQ(mir.funcBlockCount(*fn), 1u)
+            << "every arm but snprintf is a single straight-line block";
+        EXPECT_EQ(mir.blockMarker(mir.funcBlockAt(*fn, 0)), StructCfMarker::EntryBlock);
+    }
+    {
+        auto const sn = findFuncBySymbol(mir, kShimSnprintf);
+        ASSERT_TRUE(sn.has_value());
+        ASSERT_EQ(mir.funcBlockCount(*sn), 3u)
+            << "★ snprintf keeps its `r < 0 ? -1 : r` clamp when synthesized ALONGSIDE "
+               "five single-block siblings — collapsing it to a bare `return r` drops "
+               "the UCRT header's normalization";
+        EXPECT_EQ(mir.blockMarker(mir.funcBlockAt(*sn, 0)), StructCfMarker::EntryBlock);
+        // Both arms RETURN, so the if has no real join: rule 4 marks succs[0] IfThen and
+        // succs[1] IfElse and derives no IfJoin (mir_struct_markers.hpp).
+        EXPECT_EQ(mir.blockMarker(mir.funcBlockAt(*sn, 1)), StructCfMarker::IfThen);
+        EXPECT_EQ(mir.blockMarker(mir.funcBlockAt(*sn, 2)), StructCfMarker::IfElse);
+        EXPECT_EQ(countOpcodeIn(mir, *sn, MirOpcode::CondBr), 1u);
+        EXPECT_EQ(countOpcodeIn(mir, *sn, MirOpcode::ICmpSlt), 1u)
+            << "the clamp's predicate is a SIGNED less-than — an unsigned compare makes "
+               "every negative result look large and positive";
+    }
 
     MirVerifier verifier{mir, &in};
     EXPECT_TRUE(verifier.verify(rep));
@@ -3347,22 +3968,35 @@ TEST(SynthStdioShim, EveryPostCloneFailurePathLeavesTheModuleUntouched) {
         std::uint32_t shim;
         char const*   recipe;
         char const*   dropHelper;   // "" == drop nothing (the unknown-recipe backstop)
+        ShimDecl      decl;         // the caller-side reference, at the arm's real arity
     };
     // One case per `return false` that sits AFTER the clone loop in the pass.
     std::vector<Case> const cases{
-        {"printf without the stdout accessor", kShimPrintf, "printf", "__acrt_iob_func"},
-        {"printf without the stream core", kShimPrintf, "printf", "__stdio_common_vfprintf"},
-        {"fprintf without the stream core", kShimFprintf, "fprintf", "__stdio_common_vfprintf"},
-        {"vfprintf without the stream core", kShimVfprintf, "vfprintf", "__stdio_common_vfprintf"},
-        {"sprintf without the buffered core", kShimSprintf, "sprintf", "__stdio_common_vsprintf"},
-        {"sscanf without the scanf core", kShimSscanf, "sscanf", "__stdio_common_vsscanf"},
-        {"an id the recipe/switch vocabularies disagree on", kShimSprintf, "no_such_recipe", ""},
+        {"printf without the stdout accessor", kShimPrintf, "printf", "__acrt_iob_func",
+         kDeclPrintf},
+        {"printf without the stream core", kShimPrintf, "printf", "__stdio_common_vfprintf",
+         kDeclPrintf},
+        {"fprintf without the stream core", kShimFprintf, "fprintf", "__stdio_common_vfprintf",
+         kDeclFprintf},
+        {"vfprintf without the stream core", kShimVfprintf, "vfprintf", "__stdio_common_vfprintf",
+         kDeclVfprintf},
+        {"sprintf without the buffered core", kShimSprintf, "sprintf", "__stdio_common_vsprintf",
+         kDeclSprintf},
+        {"sscanf without the scanf core", kShimSscanf, "sscanf", "__stdio_common_vsscanf",
+         kDeclSscanf},
+        // ★ the MULTI-BLOCK arm: its refusal is the one with the most module state to
+        // leak (three blocks and an open builder), so it earns its own row rather than
+        // riding sprintf's — both refuse over the SAME missing core.
+        {"snprintf without the buffered core", kShimSnprintf, "snprintf",
+         "__stdio_common_vsprintf", kDeclSnprintf},
+        {"an id the recipe/switch vocabularies disagree on", kShimSprintf, "no_such_recipe", "",
+         kDeclSprintf},
     };
 
     for (Case const& c : cases) {
         SCOPED_TRACE(c.what);
         TypeInterner in{CompilationUnitId{1}};
-        Mir mir = buildStdioCaller(in, {ShimDecl{c.shim, 2, true}});
+        Mir mir = buildStdioCaller(in, {c.decl});
         std::size_t const before = mir.moduleFuncCount();
 
         std::vector<ExternImport> externs;

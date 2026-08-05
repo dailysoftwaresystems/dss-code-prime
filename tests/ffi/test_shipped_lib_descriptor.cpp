@@ -4513,21 +4513,25 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
     // … + the 3 trampolines.
     {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
     {"call_once", ShimFamily::Threads},
-    // <stdio.h> printf/scanf family over the UCRT __stdio_common_v* cores — FIVE recipes
-    // as of D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3), where `sprintf` was previously the only
-    // one. ucrtbase.dll exports NOT ONE of these five names (in a real MSVC build each is
-    // a header inline over a `__stdio_common_v*` core), so once the pe CRT flipped off
-    // msvcrt — which DID export all five — a compiler that binds by export table has
-    // nothing to import and must synthesize the body. Each arrived WITH its descriptor row
-    // and its core's symbol row, which is what the backward pin below re-checks.
+    // <stdio.h> printf/scanf family over the UCRT __stdio_common_v* cores — SIX recipes
+    // as of TF-C119, where `sprintf` was once the only one and P3 grew it to five.
+    // ucrtbase.dll exports NOT ONE of these six names (in a real MSVC build each is a
+    // header inline over a `__stdio_common_v*` core), so once the pe CRT flipped off
+    // msvcrt a compiler that binds by export table has nothing to import and must
+    // synthesize the body. Each arrived WITH its descriptor row and its core's symbol row,
+    // which is what the backward pin below re-checks.
     //
-    // ★ `snprintf` is DELIBERATELY ABSENT and stays in the NEGATIVE list below: no
-    // stdio.json row declares it, so a body sneaking into `kRecipes` ahead of its
-    // descriptor row must red. That negative pin is load-bearing — do not "tidy" it away
-    // just because its four former neighbours graduated.
+    // ★ `snprintf` HAS NOW GRADUATED out of the negative list, and its case is stronger
+    // than its five neighbours' rather than weaker: they were importable until the pe CRT
+    // flipped (msvcrt DID export all five), whereas bare `snprintf` was NEVER an export of
+    // EITHER CRT — MEASURED, `objdump -p` finds it in neither ucrtbase.dll nor msvcrt.dll.
+    // It is also the only member that needed NO new core: there is no
+    // `__stdio_common_vsnprintf` to import (ucrtbase has `__stdio_common_vsprintf` at
+    // ordinal 117 and `__stdio_common_vsnprintf_s` at 115, nothing between), so it reuses
+    // `sprintf`'s core with a different `_Options` bit and a real `_BufferCount`.
     {"printf", ShimFamily::Stdio},          {"fprintf", ShimFamily::Stdio},
-    {"sprintf", ShimFamily::Stdio},         {"vfprintf", ShimFamily::Stdio},
-    {"sscanf", ShimFamily::Stdio},
+    {"sprintf", ShimFamily::Stdio},         {"snprintf", ShimFamily::Stdio},
+    {"vfprintf", ShimFamily::Stdio},        {"sscanf", ShimFamily::Stdio},
 };
 
 // Ids that must NOT be recipes. Three groups, each catching a different regression:
@@ -4540,13 +4544,20 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
 // from this negative list into `kPinnedRecipes` above. That is a STRENGTHENING, not a
 // removal: each went from "must not be known" to "must be known AND classify as Stdio
 // AND be declared by exactly one shipped descriptor row" (the backward pin below), which
-// is a strictly narrower constraint. `snprintf` did NOT graduate — stdio.json still
-// declares no row for it — so it stays here as the live guard against a body landing
-// ahead of its descriptor row. `puts`/`fputs`/`__stdio_common_vsprintf` likewise remain:
-// they are REAL ucrtbase exports imported directly, and a recipe id for any of them would
-// mean the loader had started synthesizing over a symbol it can simply import.
+// is a strictly narrower constraint. TF-C119 moved `snprintf` the same way, for the same
+// reason: stdio.json now declares BOTH halves of it — an [elf] import row and a [pe]
+// `synthesize` row — so "must not be known" would now be asserting the opposite of the
+// shipped truth. ⚠ [elf], NOT [elf,macho] like its four siblings: the libSystem export is
+// INFERRED and was never measured (the Mac was unreachable), and under the eager-import
+// law a wrong guess breaks the LOAD of every macho binary that includes <stdio.h>. macho
+// is staged behind a real Mac run, exactly as popen/pclose/fileno are. `puts`/`fputs`/`__stdio_common_vsprintf` remain here and are NOT
+// candidates for the same graduation: they are REAL ucrtbase exports imported directly,
+// and a recipe id for any of them would mean the loader had started synthesizing over a
+// symbol it can simply import. `vsnprintf` is added as the fresh negative in `snprintf`'s
+// place — it is the next plausible speculative body (the UCRT header reaches the core
+// through it), and it has no descriptor row, so a recipe landing ahead of one still reds.
 constexpr char const* kNonRecipes[] = {
-    "snprintf",                                              // unshipped stdio arm
+    "vsnprintf", "snprintf_s",                               // unshipped stdio arms
     "thrd_sleep", "mtx_timedlock", "cnd_timedwait",          // deferred threads ids
     "puts", "fputs", "__stdio_common_vsprintf",
     "mtx_lokc", "SPRINTF", "Sprintf", "sprintf ", " sprintf", "",
@@ -4577,11 +4588,12 @@ TEST(ShippedLibDescriptor, ShimFamilyOfPartitionsEveryRecipeInTheVocabulary) {
     }
     // The shape of the vocabulary itself, so a silent addition/removal is visible.
     EXPECT_EQ(threads, 21u) << "the <threads.h> family is the 18 non-trampoline + 3 trampolines";
-    EXPECT_EQ(stdio, 5u)
-        << "the <stdio.h> family ships EXACTLY printf/fprintf/sprintf/vfprintf/sscanf "
-           "(D-FFI-PE-CRT-UCRT-MIGRATION P3 grew it from 1) — a SIXTH would mean a body "
-           "landed ahead of its stdio.json row, and a FOURTH that one was retired without "
-           "retiring its descriptor row";
+    EXPECT_EQ(stdio, 6u)
+        << "the <stdio.h> family ships EXACTLY "
+           "printf/fprintf/sprintf/snprintf/vfprintf/sscanf (P3 grew it from 1 to 5; "
+           "TF-C119 added snprintf) — a SEVENTH would mean a body landed ahead of its "
+           "stdio.json row, and a FIFTH that one was retired without retiring its "
+           "descriptor row";
 }
 
 // THE LOCKSTEP INVARIANT, asserted as the biconditional the header documents rather than

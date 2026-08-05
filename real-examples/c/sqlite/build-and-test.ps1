@@ -66,7 +66,7 @@
 #      → <out>/<leg>/<format>/, where the COMPILER names the file and SAYS SO
 #      (`dss-code-prime: artifact <spec> <path>`). The suffix belongs to the
 #      object format, and this driver no longer holds a copy of that table —
-#      see Get-ReportedArtifact. An ACQUIRED library is then copied BESIDE the
+#      see Get-DssReportedArtifact (base-harness.ps1). An ACQUIRED library is then copied BESIDE the
 #      artefact, because a `@loader_path/<name>` identity is a claim about that
 #      directory and this is what makes it true.
 #   8. PER LEG THAT THIS HOST CAN EXECUTE (run.mode native | launched), run
@@ -339,6 +339,37 @@ $Stage        = Join-Path $Work 'stage'          # the staged sqlite tree + head
 # so one leg's wipe can never reach a sibling's just-built artifact.
 $OutRoot      = Join-Path $Work 'out'
 $GenPy        = Join-Path $PSScriptRoot 'gen-pe64-manifest.py'
+$CliSmokePy   = Join-Path $PSScriptRoot 'cli-smoke.py'
+# ── THE SHARED CORE ──────────────────────────────────────────────────────────
+# base-harness.ps1 holds the artifact read-back, the manifest/build wrappers and
+# the per-(leg, artifact) verdict ledger — the decisions this driver and
+# build-and-test.sh BOTH make, which used to be written out once per driver and
+# had already drifted three measured ways (base-harness.sh's header names them).
+#
+# base-harness.SH is the other half, and this driver reaches it too: the recipe
+# derivation has always run in a POSIX shell here, so the $deriveScript below
+# SOURCES it rather than carrying a second copy of the same sed/ar/dedup logic.
+# That is what makes the two drivers capability-paired instead of merely similar.
+$BaseHarnessPs1 = Join-Path $PSScriptRoot 'base-harness.ps1'
+$BaseHarnessSh  = Join-Path $PSScriptRoot 'base-harness.sh'
+foreach ($f in @($BaseHarnessPs1, $BaseHarnessSh)) {
+  if (-not (Test-Path -LiteralPath $f)) {
+    Write-Host " [X] ERROR: the shared harness core is missing: $f" -ForegroundColor Red
+    Write-Host "     It carries the recipe derivation, the artifact read-back and the verdict"
+    Write-Host "     ledger that this driver and build-and-test.sh SHARE. Restore it rather than"
+    Write-Host "     reintroducing a private copy — three hand-kept copies of one decision is what"
+    Write-Host "     it was extracted to end."
+    exit 1
+  }
+}
+. $BaseHarnessPs1
+# The contract version this driver was written against. A stale core would
+# otherwise present itself as a MISSING CAPABILITY — silently skipping the CLI,
+# say — which is the failure class the shared core exists to make impossible.
+if ($script:DssBaseHarnessVersion -lt 1) {
+  Write-Host " [X] ERROR: $BaseHarnessPs1 is version $($script:DssBaseHarnessVersion); this driver needs >= 1." -ForegroundColor Red
+  exit 1
+}
 
 # Convert C:\path → /mnt/c/path for a WSL callee (a backslash Windows path through
 # `wsl wslpath` gets its backslashes stripped — do it manually, as the .sh
@@ -538,8 +569,19 @@ function Assert-StagedSourceCoherence($label) {
   # build dir is only its source. `--checkout` additionally pins the stage to the
   # checkout's own manifest.uuid: ONE coherent state is necessary but not
   # sufficient, and this says WHICH state it must be.
+  #
+  # ★ `--require-cli` IS NOW PASSED, and it was not before. The gate has always
+  # had the flag (check-source-coherence.sh:78, :192-208) and NOTHING called it
+  # with one, so the assertion it implements — that sqlite3.c, shell.c and
+  # sqlite3.h are all present, and that shell.c's QUOTED `#include "sqlite3.h"`
+  # can only resolve beside it — shipped inert. It matters now because this
+  # harness BUILDS the CLI: shell.c's startup guard compares sqlite3_sourceid()
+  # against the SQLITE_SOURCE_ID it was compiled with, and a mismatched pair
+  # yields a binary that COMPILES CLEAN, LINKS CLEAN and then prints "SQLite
+  # header and source version mismatch" and exit(1) — indistinguishable from a
+  # miscompile from the outside.
   $dirs = @("$stageP/sqlite/bld", "$stageP/sqlite/src")
-  $line = "bash '$chkP' --checkout `"$SqliteWslDir`" --label '$label' " + (($dirs | ForEach-Object { "'$_'" }) -join ' ')
+  $line = "bash '$chkP' --checkout `"$SqliteWslDir`" --require-cli --label '$label' " + (($dirs | ForEach-Object { "'$_'" }) -join ' ')
   $r = Invoke-PosixCommand $line
   foreach ($ln in $r.Out) { Info "      $ln" }
   if ($r.Rc -ne 0) {
@@ -1074,6 +1116,32 @@ done
 # ★ Defined HERE, before first use: bash resolves a function at CALL time, and the
 # reference-oracle block below calls this long before the staging section does.
 win() { __WIN_PATH_BODY__; }
+# ── THE SHARED CORE, SOURCED ON THE POSIX SIDE ───────────────────────────────
+# ★ THIS IS WHAT MAKES THE TWO DRIVERS ONE IMPLEMENTATION, not two that agree.
+# The recipe derivation has always run in a POSIX shell here, so this script
+# sources the SAME base-harness.sh build-and-test.sh does instead of carrying a
+# second copy of the sed join, the ar recovery and the basename dedup. Three
+# measured drifts came out of the old arrangement; the one this fixes on THIS
+# side is D-HARNESS-SELFTEST-BSD-SED-PORTABILITY — the line below used to be
+# `sed ':a;N;$!ba;s/\\\n/ /g'`, which BSD/macOS sed reads as one enormous LABEL
+# and dies on, silently emitting only the recipe's FIRST line. This driver runs
+# its derivation on a native POSIX host as well as through WSL, so that was not
+# hypothetical.
+BASE_HARNESS="__BASE_HARNESS_SH__"
+[ -r "$BASE_HARNESS" ] || { echo "the shared harness core is missing: $BASE_HARNESS" >&2; exit 1; }
+. "$BASE_HARNESS"
+# ★ AND ITS VERSION IS ASSERTED, exactly as build-and-test.sh does at its own
+# source site. This half of the driver carries the ENTIRE recipe derivation, so a
+# stale core here does not look like an error — it looks like a smaller TU set, a
+# missing define, a capability that quietly is not there. Checking only that the
+# FILE EXISTS (which is all this did) tests the one failure mode that is already
+# loud. The number must match $script:DssBaseHarnessVersion on the PowerShell
+# side; both are bumped together when a contract changes.
+[ "${DSS_BASE_HARNESS_VERSION:-0}" -ge 2 ] || {
+  echo "the shared harness core $BASE_HARNESS is version ${DSS_BASE_HARNESS_VERSION:-<unset>}; this driver needs >= 2." >&2
+  echo "A stale core does not fail loudly on its own: it silently loses capabilities (the TU drop" >&2
+  echo "ledger, the archive-missing stop) that this derivation depends on." >&2
+  exit 1; }
 DIR="__SQLITE_WSL_DIR__"
 STAGE="__STAGE_WSL__"
 # ── SHARED-CLONE WRITE LOCK ─────────────────────────────────────────────────
@@ -1327,10 +1395,20 @@ if ( cd "$BLD" && make -s testfixture USE_AMALGAMATION=0 -j"$(nproc 2>/dev/null 
   # landed — which would make this announce a MISSING oracle that is sitting right
   # there. The copy is the load-bearing half; DrvFs already presents files as 0777
   # by default, so the chmod only matters when the mount carries real metadata.
+  #
+  # ★ BUT THE TOLERATED chmod IS THEN ASSERTED, and that is the difference
+  # between "best effort" and "silently maybe". `chmod … || true` on its own
+  # means an oracle can be announced as available while carrying no exec bit —
+  # the one property every later use of it depends on. The `-x` test states the
+  # outcome instead of hoping for it, on both mount kinds.
   if cp "$BLD/testfixture" "$REF_KEEP"; then
     chmod +x "$REF_KEEP" 2>/dev/null || true
-    echo "REF-ORACLE=$REF_KEEP"
-    echo "REF-ORACLE-WIN=$(win "$REF_KEEP")"
+    if [ -x "$REF_KEEP" ]; then
+      echo "REF-ORACLE=$REF_KEEP"
+      echo "REF-ORACLE-WIN=$(win "$REF_KEEP")"
+    else
+      echo "REF-ORACLE-MISS=reference testfixture was COPIED to $REF_KEEP but is not executable there (chmod +x did not take on this filesystem), so it cannot be run as an oracle."
+    fi
   else
     echo "REF-ORACLE-MISS=reference testfixture LINKED but could NOT be preserved to $REF_KEEP -- it is about to be deleted to expose the recipe, so no oracle survives this run. Check permissions / free space."
   fi
@@ -1339,37 +1417,120 @@ else
 fi
 rm -f "$BLD/testfixture"
 RECIPE="$STAGE/testfixture-recipe.txt"
-( cd "$BLD" && make -n testfixture USE_AMALGAMATION=0 ) > "$RECIPE" 2>&1 || true
-BLOB="$(sed ':a;N;$!ba;s/\\\n/ /g' "$RECIPE" | tr '\t' ' ')"
-# defines (-DNAME[=VALUE]) — strip make's literal "" and -D
-mapfile -t RECIPE_DEFS < <(printf '%s\n' "$BLOB" | grep -oE '\-D[A-Za-z0-9_]+(=[^ ]*)?' | sed 's/^-D//; s/"//g' | sort -u)
-# sqlite -I dirs (drop the bare `.`; it is $BLD, added explicitly below)
-mapfile -t SQLITE_INCS < <(printf '%s\n' "$BLOB" | grep -oE '\-I ?[^ ]+' | sed 's/^-I *//' | grep -v '^\.$' | sort -u)
-# TU set (1): every .c the recipe names (absolute, or relative → $BLD)
-declare -A TU=()
-while IFS= read -r c; do
-  [ -n "$c" ] || continue
-  if   [ -f "$c" ];      then TU["$c"]=1
-  elif [ -f "$BLD/$c" ]; then TU["$BLD/$c"]=1
-  fi
-done < <(printf '%s\n' "$BLOB" | tr ' ' '\n' | grep -E '\.c$' | sort -u)
-# TU set (2): the core sources inside libsqlite3.a (DSS can't consume the .a)
 AR="$BLD/libsqlite3.a"; [ -f "$BLD/.libs/libsqlite3.a" ] && AR="$BLD/.libs/libsqlite3.a"
-if [ -f "$AR" ]; then
-  while read -r obj; do
-    base="${obj%.o}"
-    hit="$(find "$DIR/src" "$DIR/ext" "$BLD" -name "$base.c" 2>/dev/null | grep -v '/tsrc/' | head -1)"
-    [ -z "$hit" ] && hit="$(find "$DIR/src" "$DIR/ext" "$BLD" -name "$base.c" 2>/dev/null | head -1)"
-    [ -n "$hit" ] && TU["$hit"]=1
-  done < <(ar t "$AR" 2>/dev/null | grep '\.o$')
+# ── THE FIXTURE RECIPE, DERIVED BY THE SHARED CORE ───────────────────────────
+# ★ THE SAME dss_bh_emit_recipe THE CLI DERIVATION BELOW USES, and the same one
+# build-and-test.sh's Step 4 uses. This block used to run `make -n` itself and
+# then re-implement the span/archive TU recovery, the dedup and the floors — a
+# hand-kept copy of the shared function sitting three lines above a call to it.
+# The .sh twin carried the same copy. Two callers on the private path and two on
+# the shared one is how the drift this core was extracted to end gets rebuilt.
+# whole-blob + token-scope `all`: `make -n testfixture` runs with every
+# prerequisite already built, so the recipe IS essentially the one link command
+# and there is no bootstrap whose foreign -D must be kept out.
+if ! dss_bh_emit_recipe \
+      --build-dir "$BLD" --make-target testfixture --recipe-file "$RECIPE" \
+      --make-var USE_AMALGAMATION=0 \
+      --prereq-mode whole-blob --token-scope all \
+      --archive "$AR" --archive-from-span 0 \
+      --search-root "$DIR/src" --search-root "$DIR/ext" --search-root "$BLD" \
+      --min-tus 150 --min-defines 18 \
+      --out-tus "$STAGE/tus.shell.txt" \
+      --out-defines "$STAGE/defines.txt" \
+      --out-includes "$STAGE/recipe-includes.shell.txt"; then
+  echo "the testfixture recipe derivation FAILED -- see $RECIPE" >&2; exit 1
 fi
-# de-alias generated .c that exist under both bld/ and bld/tsrc/ (dedup by basename)
-declare -A SEEN=(); declare -a TUS=()
-for f in $(printf '%s\n' "${!TU[@]}" | sort); do
-  b="$(basename "$f")"; [ -n "${SEEN[$b]:-}" ] && continue; SEEN[$b]="$f"; TUS+=("$f")
-done
-[ ${#TUS[@]} -ge 150 ]        || { echo "recipe yielded only ${#TUS[@]} TUs (<150) — see $RECIPE" >&2; exit 1; }
-[ ${#RECIPE_DEFS[@]} -ge 18 ] || { echo "recipe yielded only ${#RECIPE_DEFS[@]} defines (<18)" >&2; exit 1; }
+mapfile -t TUS         < "$STAGE/tus.shell.txt"
+mapfile -t RECIPE_DEFS < "$STAGE/defines.txt"
+mapfile -t SQLITE_INCS < "$STAGE/recipe-includes.shell.txt"
+
+# ── the sqlite3 CLI: reference oracle + its OWN recipe ───────────────────────
+# The .sh twin's Step 4 does exactly this, in the same order and for the same
+# reasons; read the comments there. In short:
+#   · `make sqlite3.c shell.c tclsqlite3.c` first — asking make for the CLI
+#     regenerates fts5.c/sqlite3.h and leaves the amalgamation ORPHANS behind at
+#     an older vintage, which reds the coherence gate
+#     (D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE). Upstream's own rule, not a patch.
+#   · build + PRESERVE a gcc `sqlite3d` — the CLI ATTRIBUTION ORACLE. The SAME
+#     TUs from the SAME staged tree, built by upstream's own rule. NOT "the same
+#     defines, only the compiler differs": upstream compiles the library with
+#     SQLITE_CORE and shell.c without it (main.mk:2160-2166) and the reference
+#     inherits that split, while DSS builds one program from the UNION. See the
+#     matched-control note in build-and-test.sh's Step 4 and cli-smoke.py's
+#     docstring — all three used to carry the same overclaim.
+#   · then delete it, so `make -n sqlite3d` prints a recipe at all.
+#   · derive in LINK-LINE mode: sqlite3d's prerequisites are .o files, and a
+#     whole-blob scrape absorbs tool/lemon.c + lempar.c + mksourceid.c
+#     (BUILD-HOST tools) whenever the objects are stale.
+if ( cd "$BLD" && make sqlite3.c shell.c tclsqlite3.c ) > "$STAGE/amalgamation-regen.log" 2>&1; then
+  echo "AMALGAMATION-REGEN=ok"
+else
+  echo "AMALGAMATION-REGEN=FAILED (tolerated here -- the coherence gate renders the verdict). Log: $(win "$STAGE/amalgamation-regen.log")"
+fi
+REF_CLI_KEEP="$STAGE/reference-sqlite3"
+REF_CLI_LOG="$STAGE/reference-cli-build.log"
+if ( cd "$BLD" && make -s sqlite3d -j"$(nproc 2>/dev/null || echo 4)" ) > "$REF_CLI_LOG" 2>&1 && [ -x "$BLD/sqlite3d" ]; then
+  # Plain `cp` + a tolerated `chmod`, for the DrvFs reason spelled out at the
+  # reference TESTFIXTURE above — and then ASSERTED, for the reason spelled out
+  # there too: an oracle announced without an exec bit is an oracle that will
+  # fail every one of cli-smoke.py's 14 assertions for a reason that has nothing
+  # to do with either binary, which is precisely the "reference GIVEN BUT
+  # UNUSABLE" case that gate now has to announce.
+  if cp "$BLD/sqlite3d" "$REF_CLI_KEEP"; then
+    chmod +x "$REF_CLI_KEEP" 2>/dev/null || true
+    if [ ! -x "$REF_CLI_KEEP" ]; then
+      echo "REF-CLI-MISS=the reference sqlite3 CLI was COPIED to $REF_CLI_KEEP but is not executable there (chmod +x did not take on this filesystem), so no smoke failure could be EXONERATED against it."
+    else
+    # BOTH spellings: the reference is a LINUX binary, so a Windows-side driver
+    # reaches it through its launcher in the SHELL namespace, while every log
+    # line and existence check wants the driver's own spelling.
+    echo "REF-CLI=$REF_CLI_KEEP"
+    echo "REF-CLI-WIN=$(win "$REF_CLI_KEEP")"
+    fi
+  else
+    echo "REF-CLI-MISS=the reference sqlite3 CLI LINKED but could not be preserved to $REF_CLI_KEEP -- it is about to be deleted to expose its recipe, so no CLI oracle survives this run."
+  fi
+else
+  echo "REF-CLI-MISS=the reference gcc sqlite3 CLI did not build (tolerated -- the CLI legs still build). Log KEPT at $(win "$REF_CLI_LOG") -- READ IT. Without it NO smoke failure can be EXONERATED."
+fi
+rm -f "$BLD/sqlite3d"
+CLI_RECIPE="$STAGE/sqlite3-cli-recipe.txt"
+#   · `--always-make` + `--token-scope recipe`: `make -n` prints only what it
+#     WOULD do, so with the objects current it prints ONE line (the link) whose
+#     -D set omits SQLITE_CORE — and without that, ext/icu/icu.c:31-33 demands
+#     <unicode/*.h> and the CLI dies with four error[F001A]. `-B` prints
+#     everything (still a DRY RUN); `recipe` scope keeps the jimsh/lemon
+#     bootstrap's foreign -D out. The floor below is 18; the regression that
+#     actually matters — losing SQLITE_CORE when the -D tokens are read off the
+#     link line alone — is caught BY NAME a few lines down, because a count
+#     cannot say WHICH define went missing and a count with no headroom reds on
+#     an unrelated upstream edit. (This note used to claim a floor of 19 that the
+#     call below sets to 18: two numbers for one fact, five lines apart.)
+if ! dss_bh_emit_recipe \
+      --build-dir "$BLD" --make-target sqlite3d --recipe-file "$CLI_RECIPE" \
+      --prereq-mode link-line --always-make 1 --token-scope recipe \
+      --archive "$AR" --archive-from-span 1 \
+      --search-root "$DIR/src" --search-root "$DIR/ext" --search-root "$BLD" \
+      --min-tus 100 --min-defines 18 \
+      --out-tus "$STAGE/cli-tus.shell.txt" \
+      --out-defines "$STAGE/cli-defines.txt" \
+      --out-includes "$STAGE/cli-includes.shell.txt"; then
+  echo "the sqlite3 CLI recipe derivation FAILED -- see $CLI_RECIPE" >&2; exit 1
+fi
+mapfile -t CLI_TUS  < "$STAGE/cli-tus.shell.txt"
+mapfile -t CLI_INCS < "$STAGE/cli-includes.shell.txt"
+# The CLI's only entry point. Asserted BY NAME: losing it still clears the TU
+# floor on the 102 library sources, producing a program with no `main` that fails
+# far later at the entry trampoline (sqlite3.c has no main either).
+printf '%s\n' "${CLI_TUS[@]}" | grep -qE '/shell\.c$' \
+  || { echo "the CLI TU set has no shell.c -- derived from $CLI_RECIPE" >&2; exit 1; }
+# ★ SQLITE_CORE, ASSERTED BY NAME — the define whose absence is silent in every
+# count. Without it ext/icu/icu.c:31-33 stops compiling to nothing and demands
+# <unicode/*.h>, failing three minutes later as `error[F001A] got unicode/*.h`.
+# It comes from the library COMPILE lines, so its absence means the -D tokens
+# were read off the link line alone (see --token-scope recipe above).
+grep -qx 'SQLITE_CORE' "$STAGE/cli-defines.txt" \
+  || { echo "the CLI define set has no SQLITE_CORE -- the -D tokens were read from the link line alone; ext/icu/icu.c will demand <unicode/*.h>. Derived from $CLI_RECIPE" >&2; exit 1; }
 
 # ── stage: sqlite sources + generated derived sources + tcl8.6/zlib headers ──
 mkdir -p "$STAGE/sqlite/bld" "$STAGE/tclinc" "$STAGE/zinc-src" "$STAGE/test"
@@ -1443,6 +1604,14 @@ remap() {
 # tus.txt (Windows paths)
 : > "$STAGE/tus.txt"
 for f in "${TUS[@]}"; do s="$(remap "$f")"; [ -f "$s" ] && win "$s" >> "$STAGE/tus.txt"; done
+# ★ THE SAME ROUND-TRIP ASSERTION THE CLI's TU LIST GETS, and for the same
+# reason: a remap() case that is missing for one path does not error, it drops
+# the TU — and a short manifest still compiles, still links, and produces a
+# smaller program. The CLI half has had this check; the FIXTURE half did not,
+# which is a capability in one path and not its twin one level down.
+_n_fx_src=${#TUS[@]}; _n_fx_dst="$(grep -c . "$STAGE/tus.txt" || true)"
+[ "$_n_fx_dst" -eq "$_n_fx_src" ] || {
+  echo "staging lost fixture TUs: derived $_n_fx_src, staged $_n_fx_dst -- a remap() case is missing for one of them" >&2; exit 1; }
 # includes.base.txt: the sqlite -I dirs (remapped) + $BLD + tcl. NOT zlib: that
 # dir is PER TARGET, so the PowerShell side appends each stage's own zinc/ to
 # this base and writes one includes.<stage>.txt per stage. The base is
@@ -1452,8 +1621,36 @@ for f in "${TUS[@]}"; do s="$(remap "$f")"; [ -f "$s" ] && win "$s" >> "$STAGE/t
   [ -n "$d" ] || continue; s="$(remap "$d")"; [ -d "$s" ] && win "$s" >> "$STAGE/includes.base.txt"
 done
 win "$STAGE/tclinc" >> "$STAGE/includes.base.txt"
-# defines.txt
-printf '%s\n' "${RECIPE_DEFS[@]}" > "$STAGE/defines.txt"
+# defines.txt is written DIRECTLY by dss_bh_emit_recipe above (--out-defines) —
+# a define carries no path, so unlike the TU and include lists there is nothing
+# to remap and no second spelling to produce. It is deliberately NOT rewritten
+# here from $RECIPE_DEFS: two writers of one file is how the two of them get to
+# disagree.
+# ── the CLI's own tus / includes, remapped + spelled the way the DRIVER reads ─
+# Same remap+win treatment as the fixture's above: the derivation ran against the
+# LIVE sqlite tree, but the manifest must name the STAGED copies.
+#
+# ★ THE CLI'S INCLUDE LIST IS NOT THE FIXTURE'S, and the difference is real. The
+# fixture's base list ends with $STAGE/tclinc; the CLI must not see it. shell.c
+# has no Tcl in it (✔MEASURED 2026-08-05: zero `tcl.h` / `Tcl_` references in the
+# generated shell.c), so handing it the staged Tcl headers would be an undeclared
+# input that can only ever shadow something. The zlib dir is NOT here for the same
+# reason it is not in the fixture's base: it is PER TARGET, and the PowerShell
+# side appends each stage's own zinc/ (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED).
+: > "$STAGE/cli-tus.txt"
+for f in "${CLI_TUS[@]}"; do s="$(remap "$f")"; [ -f "$s" ] && win "$s" >> "$STAGE/cli-tus.txt"; done
+: > "$STAGE/cli-includes.base.txt"
+{ echo "$BLD"; for d in "${CLI_INCS[@]}"; do echo "$d"; done; } | while read -r d; do
+  [ -n "$d" ] || continue; s="$(remap "$d")"; [ -d "$s" ] && win "$s" >> "$STAGE/cli-includes.base.txt"
+done
+# A remap that silently dropped TUs would produce a short manifest that still
+# compiles a smaller program. Assert the count SURVIVED the staging round-trip.
+_n_cli_src=${#CLI_TUS[@]}; _n_cli_dst="$(grep -c . "$STAGE/cli-tus.txt" || true)"
+[ "$_n_cli_dst" -eq "$_n_cli_src" ] || {
+  echo "staging lost CLI TUs: derived $_n_cli_src, staged $_n_cli_dst -- a remap() case is missing for one of them" >&2; exit 1; }
+echo "CLI-TUS=$_n_cli_dst"
+echo "CLI-DEFS=$(grep -c . "$STAGE/cli-defines.txt" || true)"
+echo "CLI-INCS=$(grep -c . "$STAGE/cli-includes.base.txt" || true)"
 # the staged test dir (Windows path) for the corpus run
 win "$STAGE/test" > "$STAGE/testdir.win.txt"
 
@@ -1496,7 +1693,7 @@ $cloneLockRegion = ($shLines[($lockStart + 1)..($lockEnd - 1)]) -join "`n"
 # the SAME Step-1 decision that chose the shell. `wslpath` is not even NAMED on a
 # host that has no WSL.
 $winPathBody = if ($script:HostNeedsWsl) { 'wslpath -m "$1"' } else { 'printf ''%s\n'' "$1"' }
-$deriveScript = $deriveScript.Replace('__CLONE_LOCK_REGION__', $cloneLockRegion).Replace('__SQLITE_WSL_DIR__', $SqliteWslDir).Replace('__STAGE_WSL__', $StageShell).Replace('__WIN_PATH_BODY__', $winPathBody) -replace "`r`n", "`n"
+$deriveScript = $deriveScript.Replace('__CLONE_LOCK_REGION__', $cloneLockRegion).Replace('__SQLITE_WSL_DIR__', $SqliteWslDir).Replace('__STAGE_WSL__', $StageShell).Replace('__WIN_PATH_BODY__', $winPathBody).Replace('__BASE_HARNESS_SH__', (ToShellPath $BaseHarnessSh)) -replace "`r`n", "`n"
 $tmpSh = Join-Path $Work 'derive.sh'
 # UTF-8 WITHOUT a BOM. `-Encoding ascii` (what this used to be) replaces every
 # non-ASCII character with `?` — which silently mangled the injected shared-clone
@@ -1571,6 +1768,35 @@ if ($RefOracle) {
 }
 if (-not (Test-Path (Join-Path $Stage 'tus.txt'))) { Die "recipe derivation produced no tus.txt:`n$($deriveOut -join "`n")" }
 
+# ── the sqlite3 CLI's derivation, read back ──────────────────────────────────
+# Null-safe, like the oracle block above and NOT via `Marker` (which indexes
+# .Matches[0] unconditionally and throws when its marker is absent).
+$nCliTus = ''; $RefCli = ''; $RefCliWin = ''; $RefCliMiss = ''
+$m = ($deriveOut | Select-String -Pattern '^CLI-TUS=(.+)$'      | Select-Object -Last 1)
+if ($m) { $nCliTus    = $m.Matches[0].Groups[1].Value.Trim() }
+$m = ($deriveOut | Select-String -Pattern '^REF-CLI=(.+)$'      | Select-Object -Last 1)
+if ($m) { $RefCli     = $m.Matches[0].Groups[1].Value.Trim() }
+$m = ($deriveOut | Select-String -Pattern '^REF-CLI-WIN=(.+)$'  | Select-Object -Last 1)
+if ($m) { $RefCliWin  = $m.Matches[0].Groups[1].Value.Trim() }
+$m = ($deriveOut | Select-String -Pattern '^REF-CLI-MISS=(.+)$' | Select-Object -Last 1)
+if ($m) { $RefCliMiss = $m.Matches[0].Groups[1].Value.Trim() }
+$m = ($deriveOut | Select-String -Pattern '^AMALGAMATION-REGEN=(.+)$' | Select-Object -Last 1)
+if ($m -and $m.Matches[0].Groups[1].Value -ne 'ok') { Warn "amalgamation regeneration: $($m.Matches[0].Groups[1].Value)" }
+# ★ A MISSING CLI TU FILE IS FATAL, exactly like tus.txt. The alternative is a
+# run that silently builds no CLI on any leg and still reports success — which is
+# the "a capability that quietly is not there" failure this work exists to end.
+if (-not (Test-Path (Join-Path $Stage 'cli-tus.txt'))) {
+  Die "recipe derivation produced no cli-tus.txt — the sqlite3 CLI could not be derived:`n$($deriveOut -join "`n")"
+}
+Info "cli recipe: $nCliTus TUs (shell.c + the library TUs), from the derivation's own 'make -n sqlite3d'"
+if ($RefCli) {
+  Info "cli oracle: reference gcc sqlite3 preserved -> $RefCliWin"
+} else {
+  if (-not $RefCliMiss) { $RefCliMiss = 'the derivation emitted no CLI oracle marker at all (REF-CLI/REF-CLI-MISS) — the reference-CLI block may have been edited out of the derive script.' }
+  Warn "cli oracle: ABSENT -- $RefCliMiss"
+  Warn "        every smoke failure this run is therefore UNATTRIBUTABLE, and cli-smoke.py charges an unattributable failure to DSS by design."
+}
+
 # ── PER-TARGET zlib headers + PER-LEG include lists ──────────────────────────
 # ★ D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED, closed. The staged zconf.h carries
 # the DERIVING host's ./configure probe results; each leg declares what ITS target's
@@ -1621,9 +1847,21 @@ foreach ($k in $StageDirs.Keys) {
   # reads this file as UTF-8, and a BOM would corrupt its first entry.
   Set-Content -LiteralPath $f -Value (@($IncBase) + @(($StageDirs[$k] -replace '\\','/'))) -Encoding utf8NoBOM
 }
+# THE CLI'S OWN PER-STAGE INCLUDE LISTS. Same per-target zinc/ treatment and the
+# same D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED reason, over a DIFFERENT base:
+# cli-includes.base.txt carries no $Stage/tclinc, because shell.c has no Tcl in it.
+$CliLegIncludes = @{}
+$CliIncBase = Get-Content -LiteralPath (Join-Path $Stage 'cli-includes.base.txt')
+foreach ($k in $StageDirs.Keys) {
+  $f = Join-Path $Stage "cli-includes.$k.txt"
+  Set-Content -LiteralPath $f -Value (@($CliIncBase) + @(($StageDirs[$k] -replace '\\','/'))) -Encoding utf8NoBOM
+}
 foreach ($lg in $AllLegs) {
   $k = "$($lg.build.headerStageKey)"
-  if ($StageDirs.ContainsKey($k)) { $LegIncludes[$lg.label] = (Join-Path $Stage "includes.$k.txt") }
+  if ($StageDirs.ContainsKey($k)) {
+    $LegIncludes[$lg.label]    = (Join-Path $Stage "includes.$k.txt")
+    $CliLegIncludes[$lg.label] = (Join-Path $Stage "cli-includes.$k.txt")
+  }
 }
 # FIRST GATE ON THE SHARED INPUT — the moment the stage exists, before anything is
 # read out of it. See Assert-StagedSourceCoherence for why this is a run-wide Die
@@ -1870,7 +2108,16 @@ function Resolve-LegLibraries($leg) {
                   Detail = "provider 'pinned-archive' — $(@($acq.libraries | Where-Object { $_ }).Count) declared library(ies) materialised for target arch $($acq.targetArch) in $cdir ($(if ($acq.fromCache) { 'from cache, no network' } else { 'freshly downloaded + checksum-verified' }))" }
       }
       $missing = @(); if (-not $tcl) { $missing += "tcl ($($tclNames -join ' | '))" }; if (-not $z) { $missing += "z ($($zNames -join ' | '))" }
-      return @{ Ok = $false; Tcl = $tcl; Z = $z; Detail = "provider 'pinned-archive' acquired $(@($acq.libraries | Where-Object { $_ }).Count) file(s) into $cdir but none of them is a declared $($missing -join ' and none is a declared ') — the leg's acquire members and its tclNames/zNames disagree in legs.json (the 'as' name a member materialises under MUST be one this leg's own name list can resolve)." }
+      # ★ `Acquired` RIDES ON THE FAILURE RETURN TOO, and it has to. Ok=$false
+      # here means "the FIXTURE cannot be built for this leg" — but the CLI needs
+      # only zlib, so Step 7b legitimately proceeds on a result whose .Z is set
+      # and whose .Tcl is not. That build records `@loader_path/<name>` for the
+      # acquired zlib, a claim made true ONLY by the copy Step 7b stages beside
+      # the artefact, and that copy is driven off this very field. Dropping it on
+      # the failure path would produce a binary that links clean here and fails in
+      # the target's loader — the one failure this host cannot observe.
+      return @{ Ok = $false; Tcl = $tcl; Z = $z; Acquired = @($acq.libraries | Where-Object { $_ })
+                Detail = "provider 'pinned-archive' acquired $(@($acq.libraries | Where-Object { $_ }).Count) file(s) into $cdir but none of them is a declared $($missing -join ' and none is a declared ') — the leg's acquire members and its tclNames/zNames disagree in legs.json (the 'as' name a member materialises under MUST be one this leg's own name list can resolve)." }
     }
     default {
       # A provider this driver has NO dispatch arm for. Named out loud rather than
@@ -1938,13 +2185,23 @@ function Resolve-LegLibraries($leg) {
 # the way into `resolveLibraries` with no manifest-schema change of any kind.
 #
 # Returns @{ Ok; Tokens; Detail }. Never dies: a failure belongs to ONE leg.
-function Get-ResolveLibraryArgv($leg, $legLibs) {
+#
+# ★ $Only SELECTS WHICH LIBRARIES, and it exists because the two artifacts this
+# harness builds have genuinely different link lines. The testfixture links BOTH
+# (Tcl is what it IS); the sqlite3 CLI links ZLIB ONLY — shell.c has no Tcl in it
+# (✔MEASURED 2026-08-05: zero `tcl.h` / `Tcl_` references in the generated
+# shell.c), and declaring an unused library would record a runtime dependency
+# (DT_NEEDED / LC_LOAD_DYLIB / PE import) that makes the binary refuse to load on
+# a machine without Tcl, for nothing. Defaults to both, so every existing call
+# site is unchanged.
+function Get-ResolveLibraryArgv($leg, $legLibs, $Only = @('tcl','z')) {
   $libs   = $leg.build.libraries
   $tokens = @()
   $notes  = @()
   foreach ($w in @(
       @{ What = 'tcl'; Path = "$($legLibs.Tcl)"; Import = "$($libs.tclImportName)" },
-      @{ What = 'z';   Path = "$($legLibs.Z)";   Import = "$($libs.zImportName)" })) {
+      @{ What = 'z';   Path = "$($legLibs.Z)";   Import = "$($libs.zImportName)" } |
+        Where-Object { @($Only) -contains $_.What })) {
     $call = @('--resolve-library-argv', "$($w.Path)")
     # --dss is passed exactly when there is an identity to record: that is the
     # only case the resolver probes the compiler for, and a leg needing no
@@ -1963,6 +2220,12 @@ function Get-ResolveLibraryArgv($leg, $legLibs) {
     }
     $tokens += $toks
     if ($w.Import) { $notes += "$($w.What) recorded as '$($w.Import)' (the leg's DECLARED runtime identity, displacing the acquired file's own)" }
+  }
+  # A filter that matched NOTHING must not read as "no libraries needed": that is
+  # the inert-instrument shape, and it would silently produce a manifest with an
+  # empty resolveLibraries that fails much later at link time.
+  if (-not $tokens.Count) {
+    return @{ Ok = $false; Tokens = @(); Detail = "no library matched the requested set '$(@($Only) -join ",")' — this leg would be built with NO resolved libraries at all, which cannot be what was meant." }
   }
   return @{ Ok = $true; Tokens = $tokens; Detail = $(if ($notes.Count) { $notes -join '; ' } else { 'no runtime-identity override declared — each library is recorded under its own embedded identity' }) }
 }
@@ -2046,22 +2309,38 @@ foreach ($lbl in $FilteredOut) {
 
 # Resolve every SELECTED leg's inputs up front, so the operator learns about a
 # missing input in the first minute rather than after the first leg's build.
+#
+# ★ TWO MAPS, BECAUSE THE TWO ARTIFACTS NEED DIFFERENT LIBRARIES. $LegLibs holds
+# only the legs where BOTH tcl and z resolved — that is the FIXTURE's
+# precondition, because the fixture IS a Tcl interpreter. $LegLibsAll holds the
+# resolution RESULT for every selected leg, Ok or not, because the sqlite3 CLI
+# needs ZLIB and does not need Tcl at all: a leg whose Tcl could not be found on
+# this host can still produce a perfectly good sqlite3, and Step 7b must be able
+# to see its `.Z`. Keeping only the both-resolved map is what made the CLI loop
+# TCL-gated while its own comment said it was not.
 $LegLibs = @{}
+$LegLibsAll = @{}
 foreach ($lg in $Legs) {
   $r = Resolve-LegLibraries $lg
+  $LegLibsAll[$lg.label] = $r
   if ($r.Ok) {
     $LegLibs[$lg.label] = $r
     Info "[$($lg.label)] tcl : $($r.Tcl)"
     Info "[$($lg.label)] z   : $($r.Z)"
   } else {
     Set-LegVerdict $lg.label 'skipped-build-input-missing' $r.Detail
-    Warn "[$($lg.label)] BUILD INPUT MISSING — this leg will NOT be built on this machine."
+    Warn "[$($lg.label)] BUILD INPUT MISSING — the TESTFIXTURE will NOT be built for this leg on this machine."
     Warn "      $($r.Detail)"
+    # Said out loud, because it changes what the next steps will do: the CLI is a
+    # separate artefact with a separate precondition and Step 7b still tries it.
+    if ("$($r.Z)") {
+      Warn "      …but its ZLIB DID resolve ($($r.Z)), so the sqlite3 CLI is still built for it in Step 7b."
+    }
   }
 }
 $BuildableLegs = @($Legs | Where-Object { $LegLibs.ContainsKey($_.label) })
 if (-not (Test-Path $TclLibrary)) { Warn "Tcl script library not at $TclLibrary — a leg this host RUNS needs it (set `$env:TCL_LIBRARY)." }
-Pass "build inputs resolved for $($BuildableLegs.Count) of $($Legs.Count) selected leg(s)"
+Pass "TESTFIXTURE build inputs (tcl AND zlib) resolved for $($BuildableLegs.Count) of $($Legs.Count) selected leg(s); the sqlite3 CLI needs only zlib and is attempted for $(@($Legs | Where-Object { "$($LegLibsAll[$_.label].Z)" }).Count)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # THE CORPUS RESUME ENGINE — an abort is a RECOVERABLE, REPORTED outcome
@@ -2276,7 +2555,7 @@ function Get-OurFixtureProcesses($fixturePath) {
 # ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING
 # The PRE-FLIGHT sibling of the matcher above, and it exists because at pre-flight
 # time the fixture HAS NO NAME. The compiler decides what to call the artefact (and
-# the suffix is the object format's business — see Get-ReportedArtifact); this
+# the suffix is the object format's business — see Get-DssReportedArtifact); this
 # driver used to guess it from a `$sfx` table of its own, which is exactly the
 # defect this cycle removes. The hazard is unchanged, so the sweep is re-scoped to
 # the thing we DO know: the leg's artefact DIRECTORY, which the build is about to
@@ -2350,26 +2629,18 @@ function Stop-OurFixturesUnder($dir, $why) {
 # A target spec cannot contain whitespace (DSS refuses one that does), so the path
 # is the whole REMAINDER of the line and an output directory with a space in it
 # survives. Selecting by SPEC is what keeps a multi-target manifest unambiguous.
-function Get-ReportedArtifact($compileLog, $spec) {
-  if (-not (Test-Path -LiteralPath $compileLog)) { return $null }
-  $marker = "dss-code-prime: artifact $spec "
-  $hit = $null
-  # LAST match wins: a log appended to by a re-run must not resurrect an earlier
-  # build's artefact.
-  foreach ($l in (Get-Content -LiteralPath $compileLog)) {
-    if ("$l".StartsWith($marker, [System.StringComparison]::Ordinal)) {
-      $hit = "$l".Substring($marker.Length)
-    }
-  }
-  if (-not $hit) { return $null }
-  # The compiler prints forward slashes on every host (this codebase's
-  # path-for-display convention). Canonicalise to the host spelling so the process
-  # sweep's GetFullPath comparison, Split-Path and every log line address the file
-  # the way the rest of this driver does. A path that will not resolve is returned
-  # AS REPORTED — the caller's existence check renders that verdict, and it has to
-  # be able to quote what the compiler claimed.
-  try { return (Resolve-Path -LiteralPath $hit -ErrorAction Stop).Path } catch { return $hit }
-}
+#
+# ★ AND THE READER ITSELF NOW LIVES IN THE SHARED CORE. A private
+# `Get-ReportedArtifact` used to sit here implementing "LAST match wins", with a
+# `dss_reported_artifact` in build-and-test.sh doing the same — so extracting
+# `Get-DssReportedArtifact` / `dss_bh_reported_artifact` took the copy count from
+# two to FOUR, and the two survivors still carried the rule the shared pair
+# refuses. "Last wins" silently assumes ONE artefact per (log, spec); that
+# stopped being true when this harness grew a second artefact per leg, and the
+# failure mode is being handed a SIBLING's binary with no diagnostic at all.
+# Both private copies are deleted. Everything here goes through Invoke-DssBuild,
+# which runs the compiler, counts `error[`, reads the artefact back through the
+# shared reader (which REFUSES an ambiguous log) and checks the file is there.
 
 # Run ONE fixture segment: stdin at EOF, stdout+stderr to $logPath, killed if it
 # stalls (no log growth for $stall s) or exceeds an absolute cap.
@@ -2483,7 +2754,7 @@ foreach ($leg in $BuildableLegs) {
   $fmt  = $leg.format
   # ★ THE ARTEFACT'S NAME IS NOT KNOWN YET, AND THAT IS CORRECT. It is decided by
   # the compiler and read back out of its report after the build (see
-  # Get-ReportedArtifact for the `$sfx` table that used to live here and what it
+  # Get-DssReportedArtifact for the `$sfx` table that used to live here and what it
   # cost). All this step knows in advance is the DIRECTORY the build routes to.
   $legOut   = Join-Path $OutRoot $lbl
   # The directory the build ROUTES to (`--output <legOut>` + the project driver's
@@ -2515,7 +2786,7 @@ foreach ($leg in $BuildableLegs) {
   # directory is a leftover by construction.
   #
   # PER LEG, against THIS leg's own artefact DIRECTORY — not a file name, because
-  # the file has no name until the compiler gives it one (Get-ReportedArtifact).
+  # the file has no name until the compiler gives it one (Get-DssReportedArtifact).
   # A sibling leg writes into a different directory and must never be swept here.
   #
   # NOTE the helper functions this calls are defined ABOVE, in the dss:corpus-engine
@@ -2578,30 +2849,20 @@ foreach ($leg in $BuildableLegs) {
   $clog = Join-Path $legOut 'compile.log'
   # A project build routes each target to <output>/<formatName>/, and NAMES the file
   # there itself. dss-code-prime returns exit 0 even on FATAL errors → judge from
-  # `error[` plus the artefact the build REPORTED (Get-ReportedArtifact).
-  & $DssBin --project $manifest --config="$Config" --output $legOut --time *>&1 |
-    Tee-Object -FilePath $clog | Out-Null
-  $errCount = (Select-String -Path $clog -Pattern 'error\[' -AllMatches).Count
-  $ctime = (Get-Content $clog | Select-String -Pattern 'compile time (\S+)' | Select-Object -Last 1)
-  $ctimeSuffix = if ($ctime) { "  ($($ctime.Matches[0].Value))" } else { '' }
-  # THE ARTEFACT, AS THE BUILD ITSELF REPORTED IT — read out of the log rather than
-  # spelled here (Get-ReportedArtifact). Selected by THIS leg's spec, so a manifest
-  # that ever grows a second target cannot hand us a sibling's binary.
-  $fixture = Get-ReportedArtifact $clog $leg.spec
-  # THE THREE FAILURE STATEMENTS ARE KEPT DISTINCT because they have three different
-  # remedies: diagnostics were emitted / the build was silent AND claimed nothing /
-  # the build claimed a file that is not there. The middle one is the genuinely
-  # interesting case — a compiler that returned quietly having written nothing — and
-  # it is no longer reachable by merely mis-spelling a file name.
-  if ($errCount -gt 0 -or (-not $fixture) -or (-not (Test-Path -LiteralPath $fixture))) {
+  # `error[` plus the artefact the build REPORTED. Invoke-DssBuild (the shared
+  # core) is the ONE place that decision is made, for this artefact and the CLI
+  # and both of build-and-test.sh's; the three failure statements it keeps
+  # distinct are exactly the ones this block used to spell out inline.
+  $build = Invoke-DssBuild -DssBin $DssBin -Manifest $manifest -Config $Config `
+                           -OutputDir $legOut -Log $clog -Spec $leg.spec
+  $ctimeSuffix = $build.TimeSuffix
+  if (-not $build.Ok) {
     Get-Content $clog | Select-String -Pattern 'error\[' | Select-Object -First 5 | ForEach-Object { Info "      $($_.Line)" }
-    $why = if ($errCount -gt 0) { "$errCount error[...] diagnostic(s)" }
-           elseif (-not $fixture) { "0 error[...] and the build reported NO artefact for $($leg.spec) (expected a 'dss-code-prime: artifact $($leg.spec) <path>' line)" }
-           else { "0 error[...] but the artefact the build REPORTED is not there: $fixture" }
-    Set-LegVerdict $lbl 'poisoned' "build FAILED$ctimeSuffix — $why. See $clog"
-    Warn "[$lbl] BUILD FAILED$ctimeSuffix — $why. See $clog"
+    Set-LegVerdict $lbl 'poisoned' "build FAILED$ctimeSuffix — $($build.Error). See $clog"
+    Warn "[$lbl] BUILD FAILED$ctimeSuffix — $($build.Error). See $clog"
     continue
   }
+  $fixture = $build.Path
   $LegLedger[$lbl].Fixture = $fixture
 
   # ── the acquired libraries go BESIDE the artefact ──────────────────────────
@@ -2650,6 +2911,207 @@ foreach ($leg in $BuildableLegs) {
   Pass "[$lbl] testfixture -> $fixture$ctimeSuffix"
 }
 Info "built $($BuiltLegs.Count) of $($BuildableLegs.Count) buildable leg(s); $($AllLegs.Count) declared"
+
+# ── Step 7b — build the sqlite3 CLI for EVERY SELECTED leg ───────────────────
+# ★ A SEPARATE LOOP, AND THAT IS THE POINT — the .sh twin says the same thing at
+# the same place. The CLI's buildability is not the fixture's: it needs ZLIB and
+# does not need TCL, so a leg that could not resolve Tcl on this host can still
+# produce a perfectly good sqlite3. Nesting this in the fixture loop would have
+# inherited its `continue`s and made the CLI unbuildable for a reason that has
+# nothing to do with it.
+#
+# ★★ AND IT IS `$Legs`, NOT `$BuildableLegs` — THE COMMENT ABOVE USED TO BE A
+# CLAIM THIS LOOP CONTRADICTED. `$BuildableLegs` is filtered on
+# `$LegLibs.ContainsKey(...)`, and `$LegLibs` only takes a leg whose resolution
+# returned Ok — which Resolve-LegLibraries does only `if ($tcl -and $z)`. So the
+# loop that "does not need TCL" was gated on TCL, and a leg with zlib and no Tcl
+# silently produced NO sqlite3, NO verdict, and NO effect on the exit code. The
+# .sh twin iterates its full LEG_ORDER and gates on LEG_Z_LIB alone; this now
+# matches it, which is the only reading under which the two drivers are
+# capability-paired.
+#
+# ★ EVERY SELECTED LEG IS BUILT, ON EVERY HOST. No host test here, and there
+# must never be one — whether this machine can EXECUTE the result is Step 7c's
+# question, answered from the leg's resolved `run.mode`.
+Step "7b/9  Build the sqlite3 CLI (dss-code-prime --project, $Config)"
+$CliBuilt = @{}
+$CliFails = 0
+foreach ($leg in $Legs) {
+  $lbl = $leg.label
+  $fmt = $leg.format
+  # THE ONE DECLARED BUILD INPUT THIS ARTEFACT NEEDS. DSS reads each
+  # --resolve-library binary at COMPILE time, so with no zlib there is nothing to
+  # compile against — an OBSERVED absence with a named verdict, never an
+  # inference from what kind of box this is. It COUNTS as a CLI failure, exactly
+  # as the .sh does: an artefact this run declared and did not produce must not
+  # leave the run green.
+  $legLibRes = $LegLibsAll[$lbl]
+  if (-not "$($legLibRes.Z)") {
+    $CliFails++
+    Set-DssArtifactVerdict $lbl 'sqlite3' 'skipped-build-input-missing' "no zlib could be resolved for this leg on this host, and the CLI links zlib (SQLITE_HAVE_ZLIB=1 reaches a live '#include <zlib.h>' in shell.c). Resolver said: $($legLibRes.Detail)"
+    Warn "[$lbl] CLI build NOT ATTEMPTED [skipped-build-input-missing] — $((Get-DssArtifactVerdict $lbl 'sqlite3').Detail)"
+    continue
+  }
+  # ★ ITS OWN OUTPUT DIRECTORY AND ITS OWN COMPILE LOG. `<legOut>/cli/` so the
+  # project driver's per-format subdir lands at `<legOut>/cli/<fmt>/sqlite3.exe`
+  # and CANNOT collide with `<legOut>/<fmt>/testfixture.exe`. The separate log is
+  # the STRUCTURAL half of the artifact-reader fix: two artifacts for the SAME
+  # target spec in ONE log is exactly the ambiguity that made "take the LAST
+  # match" unsafe. Get-DssReportedArtifact fails loud if it ever arises anyway.
+  $cliOut  = Join-Path (Join-Path $OutRoot $lbl) 'cli'
+  $cliLog  = Join-Path $cliOut 'compile.log'
+  $cliMan  = Join-Path $Work "sqlite3.$lbl.dss-project.json"
+  New-Item -ItemType Directory -Force -Path $cliOut | Out-Null
+  if (-not $CliLegIncludes.ContainsKey($lbl)) {
+    $CliFails++
+    Set-DssArtifactVerdict $lbl 'sqlite3' 'poisoned' "this leg has no CLI include list — its zinc stage was not produced (see the ZINC-STAGE-FAIL line above). Compiling it against another target's zlib header is refused (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED)."
+    Warn "[$lbl] CLI POISONED — $((Get-DssArtifactVerdict $lbl 'sqlite3').Detail)"
+    continue
+  }
+  # ZLIB ONLY — see Get-ResolveLibraryArgv's $Only note for why declaring Tcl on
+  # a program that never calls it is a load-time liability, not harmless noise.
+  # It is fed from $LegLibsAll, not $LegLibs: this leg may be one whose Tcl did
+  # not resolve, and `$Only = @('z')` never reads the .Tcl field.
+  $cliLibRes = Get-ResolveLibraryArgv $leg $legLibRes @('z')
+  if (-not $cliLibRes.Ok) {
+    $CliFails++
+    Set-DssArtifactVerdict $lbl 'sqlite3' 'poisoned' "the zlib argv could not be built: $($cliLibRes.Detail)"
+    Warn "[$lbl] CLI POISONED — refusing to build an artefact whose runtime library identity would be wrong:"
+    foreach ($l in ("$($cliLibRes.Detail)" -split "`n")) { Warn "      $l" }
+    continue
+  }
+  $gen = New-DssManifest -Python $python3.Source -GenPy $GenPy -Output $cliMan `
+           -ArtifactName 'sqlite3' -Spec $leg.spec `
+           -TusFile (Join-Path $Stage 'cli-tus.txt') `
+           -IncludesFile $CliLegIncludes[$lbl] `
+           -DefinesFile (Join-Path $Stage 'cli-defines.txt') `
+           -LibArgv $cliLibRes.Tokens `
+           -RecipeTransform $(if ($GenCaps.RecipeTransform) { "$($leg.build.recipeTransform)" } else { $null }) `
+           -StackReserve    $(if ($GenCaps.StackReserve)    { "$($leg.build.stackReserveBytes)" } else { $null })
+  if (-not $gen.Ok) {
+    $CliFails++
+    Set-DssArtifactVerdict $lbl 'sqlite3' 'poisoned' $gen.Error
+    Warn "[$lbl] CLI POISONED — $($gen.Error)"
+    continue
+  }
+  Info "[$lbl] cli manifest -> $cliMan ($($gen.Output))"
+  $build = Invoke-DssBuild -DssBin $DssBin -Manifest $cliMan -Config $Config `
+                           -OutputDir $cliOut -Log $cliLog -Spec $leg.spec
+  if (-not $build.Ok) {
+    $CliFails++
+    Get-Content $cliLog | Select-String -Pattern 'error\[' | Select-Object -First 5 | ForEach-Object { Info "      $($_.Line)" }
+    Set-DssArtifactVerdict $lbl 'sqlite3' 'poisoned' "CLI build FAILED$($build.TimeSuffix) — $($build.Error). See $cliLog"
+    Warn "[$lbl] CLI BUILD FAILED$($build.TimeSuffix) — $($build.Error). See $cliLog"
+    continue
+  }
+  # The acquired libraries go beside THIS artefact too: `@loader_path/<name>` is a
+  # claim about the directory holding the EXECUTABLE, and the CLI's directory is
+  # not the fixture's, so staging beside the fixture does not make it true here.
+  # $LegLibsAll, for the same reason the argv above uses it: this loop reaches
+  # legs $LegLibs does not hold.
+  $acq = @($legLibRes.Acquired | Where-Object { $_ })
+  if ($acq.Count) {
+    $artDir = Split-Path -Parent $build.Path
+    $bad = ''
+    foreach ($al in $acq) {
+      try { Copy-Item -LiteralPath "$($al.path)" -Destination (Join-Path $artDir "$($al.as)") -Force -ErrorAction Stop }
+      catch { $bad = "could not copy $($al.path) -> $artDir\$($al.as) : $($_.Exception.Message)"; break }
+    }
+    if ($bad) {
+      $CliFails++
+      Set-DssArtifactVerdict $lbl 'sqlite3' 'poisoned' "the CLI built, but its ACQUIRED libraries could not be staged beside it in $artDir — $bad. The artefact records '@loader_path/<name>', so it would fail in the target's loader."
+      Warn "[$lbl] CLI POISONED — $bad"
+      continue
+    }
+  }
+  $CliBuilt[$lbl] = $build.Path
+  Set-DssArtifactVerdict $lbl 'sqlite3' 'built' "sqlite3 -> $($build.Path)"
+  Pass "[$lbl] sqlite3 -> $($build.Path)$($build.TimeSuffix)"
+}
+Info "sqlite3 CLI: built on $($CliBuilt.Count) of $($Legs.Count) selected leg(s); $($AllLegs.Count) declared"
+
+# ── Step 7c — the sqlite3 CLI SMOKE GATE, per leg ────────────────────────────
+# ★ WHY THIS EXISTS AT ALL. Step 8's unit corpus runs through `testfixture` — a
+# Tcl interpreter linking the sqlite LIBRARY — and NEVER executes shell.c. argv
+# handling, the dot-commands, the `.dump` writer and the startup version guard
+# are covered by NOTHING without this [D-SQLITE-CLI-BUILT-ON-NO-LEG].
+#
+# ★ ONE IMPLEMENTATION, BOTH DRIVERS: the fourteen assertions live in
+# cli-smoke.py, not in PowerShell and again in bash. Its exit codes are
+# 0 pass / 1 charged-to-DSS / 3 red-but-not-DSS, and 3 is still RED — attribution
+# says WHO is at fault, never that the gate passed.
+Step "7c/9  sqlite3 CLI smoke gate (14 assertions, attributed against gcc)"
+if (-not (Test-Path $CliSmokePy)) { Die "the CLI smoke gate is missing: $CliSmokePy" }
+# The expectation is read from the STAGED header these binaries were compiled
+# against — never a literal in this driver, which would silently stop testing
+# anything the day upstream bumps the version.
+$StagedHeader = Join-Path (Join-Path (Join-Path $Stage 'sqlite') 'bld') 'sqlite3.h'
+if (-not (Test-Path -LiteralPath $StagedHeader)) { Die "the staged sqlite3.h is not there: $StagedHeader — the smoke gate has nothing to compare --version against, and a gate that asserts nothing must never pass quietly." }
+$hdr = Get-Content -LiteralPath $StagedHeader
+$CliExpectVersion  = ($hdr | Select-String -Pattern '^#define SQLITE_VERSION\s+"(.+)"'   | Select-Object -First 1)
+$CliExpectSourceId = ($hdr | Select-String -Pattern '^#define SQLITE_SOURCE_ID\s+"(.+)"' | Select-Object -First 1)
+if (-not $CliExpectVersion -or -not $CliExpectSourceId) { Die "could not read SQLITE_VERSION / SQLITE_SOURCE_ID out of $StagedHeader." }
+$CliExpectVersion  = $CliExpectVersion.Matches[0].Groups[1].Value
+$CliExpectSourceId = $CliExpectSourceId.Matches[0].Groups[1].Value
+Info "expecting version '$CliExpectVersion' / source id '$CliExpectSourceId' (from $StagedHeader)"
+if (-not $RefCli) { Warn "no gcc reference CLI — every smoke failure this run is UNATTRIBUTABLE and is charged to DSS by design." }
+$CliSmokeVerdict = @{}
+$CliSmokeFails = 0
+# EVERY SELECTED LEG, matching Step 7b — a leg the CLI was built for must reach a
+# smoke verdict even when its FIXTURE could not be built, and $BuildableLegs is the
+# fixture's list.
+foreach ($leg in $Legs) {
+  $lbl = $leg.label
+  if (-not $CliBuilt.ContainsKey($lbl)) {
+    $v = Get-DssArtifactVerdict $lbl 'sqlite3'
+    $CliSmokeVerdict[$lbl] = "not run [$(if ($v) { $v.Verdict } else { '<no verdict>' })] — $(if ($v) { $v.Detail } else { 'the CLI build loop never reached this leg' })"
+    continue
+  }
+  # THE ONE LEGITIMATE HOST QUESTION, and it is `run.mode` off the RESOLVED plan
+  # — never `$IsWindows`. A `skip` leg WAS BUILT, and that is a completely
+  # different fact from "not built"; it is recorded, printed, and never silent.
+  if ($leg.run.mode -eq 'skip') {
+    $CliSmokeVerdict[$lbl] = "built, NOT RUN here [$($leg.run.verdict)] — $($leg.run.detail)"
+    Warn "[$lbl] CLI smoke SKIPPED — built at $($CliBuilt[$lbl]) but this host cannot execute it: $($leg.run.detail)"
+    continue
+  }
+  $smokeDir = Join-Path (Join-Path $OutRoot $lbl) 'cli-smoke'
+  if (Test-Path $smokeDir) { Remove-Item -Recurse -Force $smokeDir }
+  New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
+  # ★ THE BINARY IS SPELLED THE WAY ITS LAUNCHER SEES IT. Under `wsl.exe -e` the
+  # child reads a WSL path, so the same Convert-LaunchPath the corpus runner uses
+  # is applied here. cli-smoke.py passes only RELATIVE names for its databases
+  # and sets the child's cwd, so nothing else needs translating.
+  $legXlate = "$($leg.run.pathTranslation)"
+  $smokeArgs = @($CliSmokePy,
+    '--cli',              (Convert-LaunchPath $legXlate $CliBuilt[$lbl]),
+    '--expect-version',   $CliExpectVersion,
+    '--expect-source-id', $CliExpectSourceId,
+    '--workdir',          $smokeDir,
+    '--label',            $lbl,
+    '--json',             (Join-Path $smokeDir 'result.json'))
+  foreach ($t in @($leg.run.launcher)) { if ($t) { $smokeArgs += @('--launcher', "$t") } }
+  # The reference is a LINUX gcc build living in the shell's namespace. On a
+  # Windows host it is reached the same way anything else over there is — through
+  # the declared WSL entry point — and on a native POSIX host it runs directly.
+  if ($RefCli) {
+    $smokeArgs += @('--reference', $RefCli)
+    if ($script:HostNeedsWsl) { $smokeArgs += @('--reference-launcher', 'wsl.exe', '--reference-launcher', '-e') }
+  }
+  $smokeOut = & $python3.Source @smokeArgs 2>&1
+  $srcc = $LASTEXITCODE
+  Set-Content -LiteralPath (Join-Path $smokeDir 'smoke.log') -Value $smokeOut -Encoding utf8NoBOM
+  foreach ($l in $smokeOut) { Info "      $l" }
+  switch ($srcc) {
+    0 { $CliSmokeVerdict[$lbl] = 'PASS (14/14)'; Pass "[$lbl] CLI smoke: 14/14" }
+    3 { $CliSmokeFails++
+        $CliSmokeVerdict[$lbl] = "FAIL — NOT DSS (the gcc reference fails identically); see $smokeDir\result.json"
+        Warn "[$lbl] CLI smoke RED, but DSS is NOT implicated — the gcc reference fails the same assertions." }
+    default { $CliSmokeFails++
+        $CliSmokeVerdict[$lbl] = "FAIL — CHARGED TO DSS; see $smokeDir\result.json"
+        Warn "[$lbl] CLI smoke FAILED and is CHARGED TO DSS — see $smokeDir\smoke.log" }
+  }
+}
 
 
 # ── Step 8 — PER LEG THIS HOST CAN EXECUTE: run the .test UNIT CORPUS ────────
@@ -3229,8 +3691,70 @@ if ($FilteredOut.Count) {
 # steals and reports. Releasing simply keeps that report quiet when it should be.
 Remove-Item -Recurse -Force $LockDir -ErrorAction SilentlyContinue
 
+# ── THE sqlite3 CLI, PER LEG — a SECOND artifact needs a SECOND ledger line ──
+# ★ ONE LINE PER DECLARED LEG, ALWAYS. The fixture ledger above is keyed on the
+# fixture's outcome and cannot express "the fixture built and the CLI did not"
+# (or the reverse, which is reachable: the CLI needs zlib and NOT Tcl). A reader
+# must see both artifacts' fate for every leg without inferring either from the
+# other, and a leg that produced no line at all is the silent shortfall the whole
+# ledger exists to prevent.
+Write-Host "   --- sqlite3 CLI (full TU: shell.c + the library TUs recovered from libsqlite3.a) ---"
+$SelectedLabels = @($Legs | ForEach-Object { $_.label })
+foreach ($lg in $AllLegs) {
+  $lbl = $lg.label
+  $v = Get-DssArtifactVerdict $lbl 'sqlite3'
+  if ($CliBuilt.ContainsKey($lbl)) {
+    Write-Host "   $($lbl.PadRight(14)) ($($lg.spec)): built   smoke: $(if ($CliSmokeVerdict.ContainsKey($lbl)) { $CliSmokeVerdict[$lbl] } else { '<NO SMOKE VERDICT>' })"
+  } elseif (-not $v) {
+    # ★ THE HARNESS KNOWS WHICH, SO IT SAYS WHICH. This line used to print
+    # "not processed [not-selected-by-runner or not buildable]" — an OR between
+    # two facts the driver can distinguish perfectly well, one of which is a
+    # normal operator choice and the other of which is a harness bug. Printing
+    # the OR is how the second one hides inside the first.
+    if ($SelectedLabels -notcontains $lbl) {
+      Write-Host "   $($lbl.PadRight(14)) ($($lg.spec)): not processed [not-selected-by-runner] — DSS_LEGS='$($env:DSS_LEGS)' did not select this leg" -ForegroundColor Yellow
+    } else {
+      Write-Host "   $($lbl.PadRight(14)) ($($lg.spec)): >> NO CLI VERDICT — this leg WAS selected and the CLI loop still recorded nothing for it. That is a harness bug; the ledger check below fails the run on it." -ForegroundColor Red
+    }
+  } else {
+    Write-Host "   $($lbl.PadRight(14)) ($($lg.spec)): NOT BUILT [$($v.Verdict)] — $($v.Detail)" -ForegroundColor Yellow
+  }
+}
+# ── THE CLI VERDICT-COMPLETENESS GUARD — the INSTRUMENT, actually wired in ───
+# ★ Assert-DssArtifactVerdicts SHIPPED WITH ZERO CALL SITES, in both cores, with
+# a docstring calling itself "the inert-instrument guard: a ledger nobody filled
+# in must never read as clean". It is the check that would have caught both of
+# the defects found beside it — a CLI loop silently gated on Tcl, and a run that
+# printed "BUILT on 0 of 5 declared leg(s)" and exited 0.
+#
+# OVER THE SELECTED LEGS, not the declared ones: a leg DSS_LEGS filtered out was
+# never asked for and correctly has no verdict, while a SELECTED leg with none is
+# a harness bug. base-harness.sh's dss_bh_assert_verdicts is the .sh twin and is
+# wired at the same point in that driver.
+$CliLedgerHoles = @(Assert-DssArtifactVerdicts 'sqlite3' $SelectedLabels)
+
 # ── the exit code ────────────────────────────────────────────────────────────
 $failReasons = @()
+# ★ THE CLI IS PART OF THE RUN'S VERDICT, NOT AN EXTRA. A CLI that failed to
+# build, or whose smoke gate went red, fails the run exactly as a fixture failure
+# does — otherwise "we can run all sqlite3 CLI in any host" would be a claim
+# nothing enforces. The two counters stay apart so the message says WHICH half.
+if ($CliFails -gt 0)      { $failReasons += "$CliFails leg(s) did not produce a sqlite3 CLI — each one's reason is on its CLI ledger line above; where a compile was actually attempted the diagnostics are in $OutRoot\<leg>\cli\compile.log" }
+if ($CliSmokeFails -gt 0) { $failReasons += "$CliSmokeFails leg(s) failed the sqlite3 CLI SMOKE GATE — inspect $OutRoot\<leg>\cli-smoke\smoke.log. Each leg's line above says whether it was CHARGED TO DSS or exonerated against the gcc reference; exonerated is still red." }
+# A SELECTED leg with no CLI verdict at all — the ledger cannot say what happened
+# to an artefact this run declared, which is a HARNESS defect and never a result.
+if ($CliLedgerHoles.Count) {
+  $failReasons += "the sqlite3 CLI ledger does not account for every SELECTED leg — no verdict was ever recorded for: $($CliLedgerHoles -join ' '). Every selected leg must reach a named CLI verdict (built / poisoned / skipped-build-input-missing); silence about one is a harness bug."
+}
+# ★ AND A RUN THAT PRODUCED NO CLI AT ALL IS NEVER GREEN. With the CLI loop
+# previously gated on Tcl, an empty list meant Step 7b never ran, $CliFails and
+# $CliSmokeFails both stayed 0, no fail reason was raised — and the closing line
+# announced "BUILT on 0 of 5 declared leg(s); the smoke gate passed on 0" on the
+# way to exit 0. The loop is fixed above; this is the assertion that says so out
+# loud, so the shape cannot come back by a different route.
+if ($Legs.Count -gt 0 -and $CliBuilt.Count -eq 0) {
+  $failReasons += "NOT ONE sqlite3 CLI was built, on any of the $($Legs.Count) selected leg(s). A zero-artefact run proves nothing and must not exit 0 — each leg's reason is on its CLI ledger line above."
+}
 if ($vPoisoned -gt 0) {
   $failReasons += "$vPoisoned leg(s) POISONED: $(@($LegOrder | Where-Object { $LegLedger[$_].Verdict -eq 'poisoned' }) -join ' ')"
 }
@@ -3276,4 +3800,14 @@ if ($failReasons.Count) {
 }
 Pass "sqlite harness GREEN — $countsLine"
 Pass "$verified leg(s) compiled the full-source testfixture + ran the $Tier unit corpus GREEN"
+# The CLI's own closing claim, bounded the same way: "built" and "ran the 14
+# assertions" are different facts, and a cross leg with no launcher on this host
+# legitimately reaches only the first.
+$cliSmoked = @($CliSmokeVerdict.Keys | Where-Object { "$($CliSmokeVerdict[$_])" -like 'PASS*' }).Count
+# ★ "THE REST" IS COUNTED OFF THE BUILT LEGS, NOT OFF THE DECLARED ONES. It used
+# to be $AllLegs.Count − $cliSmoked described as "built but not executable on
+# this host", which silently absorbed every leg that was never built at all —
+# contradicted by this driver's own CLI ledger a few lines earlier. A leg that
+# did not build is not a leg this host could not run.
+Pass "sqlite3 CLI: BUILT on $($CliBuilt.Count) of $($AllLegs.Count) declared leg(s); the 14-assertion smoke gate passed on $cliSmoked (of the $($CliBuilt.Count) built, $($CliBuilt.Count - $cliSmoked) were NOT executed here — each named above; the $($AllLegs.Count - $CliBuilt.Count) that did not build are named there too)"
 exit 0

@@ -489,6 +489,180 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         strippedExterns.insert(ref.reference);
     }
 
+    // ── D-LK11-EXTERN-IMPORT-DEDUP — coalesce the merged CUs' duplicate extern
+    // imports into ONE row per imported DYNAMIC SYMBOL, and FOLD their payloads.
+    //
+    // Before this pass the extern path CONCATENATED. Two CUs both importing
+    // `puts` from `msvcrt.dll` produced TWO rows: `mergedIdFor` mints a FRESH id
+    // per extern (its name-fold consults `nameToId`, which is populated only from
+    // `image.resolvedGlobalDefs` — DEFINITIONS, never imports), so nothing ever
+    // folded them and the walkers faithfully emitted both. MEASURED at 2 CUs: PE
+    // → 2 IAT/ILT thunk rows + 2 `IMAGE_IMPORT_BY_NAME` in one descriptor; ELF →
+    // 2 `.dynsym` entries carrying the IDENTICAL name, 2 `.rela.dyn` GLOB_DAT
+    // rows, and a 24-byte `.got` where 16 is correct. 4 CUs → 4 of each.
+    //
+    // DEDUP KEY = (mangledName, libraryPath, version) — the triple that IDENTIFIES
+    // a dynamic symbol, and nothing weaker:
+    //   * `libraryPath` is IN the key: `foo` from `a.dll` and `foo` from `b.dll`
+    //     are different imports (it is the very field the walkers group DT_NEEDED
+    //     / IMAGE_IMPORT_DESCRIPTOR / LC_LOAD_DYLIB by).
+    //   * `version` is IN the key: `puts@GLIBC_2.2.5` and `puts@GLIBC_2.17` are
+    //     genuinely different dynamic symbols (c156 D-LK-ELF-SYMBOL-VERSIONING).
+    //     Folding them would bind one of the two call sites to the wrong glibc
+    //     compat form — precisely the misbind c156 exists to prevent, so a
+    //     name-only key would REINTRODUCE it here.
+    // The key is LENGTH-PREFIXED, not separator-joined: a mangledName is arbitrary
+    // bytes from a descriptor, so any separator-joined encoding is non-injective
+    // (two different triples could collide into one key and fold two UNRELATED
+    // imports). AGNOSTIC: the fold is structural equality on declared data — a
+    // `.dynsym` row and an IAT slot dedup by the same rule, no format/arch/
+    // language branch.
+    //
+    // RETARGETING IS FREE — pre-seeding `remap` is the WHOLE retarget. `mergedIdFor`
+    // consults `remap` FIRST, and every consumer of a symbol id routes through it:
+    // the single `retargetRelocs` chokepoint (functions AND data items),
+    // `combined.symbols`, and `userEntrySymbol`. Same mechanism the cross-CU
+    // reference bind above already uses.
+    //
+    // PLACEMENT is forced: AFTER the `resolvedGlobalDefs` pre-assignment and AFTER
+    // the thunk-slot mint (both seed `remap` / consume `nextId`), and BEFORE the
+    // emission loop (module 0's relocations are retargeted in that loop's first
+    // iteration, before module 1's externs would otherwise have been seen).
+    // A cross-CU-resolved extern is SKIPPED: its `remap` entry already points at
+    // the sibling def / thunk slot, and overwriting that would un-bind the call.
+    //
+    // ★ THE PAYLOAD IS FOLDED, NEVER DROPPED. Keeping the first row and discarding
+    // the rest is a SILENT MISCOMPILE, not a size win — see the per-field rules at
+    // each site below.
+    //
+    // ★★ THE TWO TIERS NOW AGREE, AND THAT IS LOAD-BEARING — keep them in step.
+    // The MIR-tier merge (mir_merge.cpp `ffiCanonicalForName` + `survivingExterns`)
+    // performs the same fold on the LIVE route (`--compile a.c b.c`, every
+    // `--project` build, both sqlite legs); this assembled-tier merge is reached
+    // only via `--resolve-library`. Both key on the SAME triple
+    // (mangledName, libraryPath, version) and both FAIL LOUD on the same four
+    // fields. ⚠ HISTORY, so the weaker shape is not re-introduced as a
+    // "simplification": until TF-C119 the MIR tier keyed on mangledName ALONE —
+    // folding across libraryPath AND across `version`, which is the c156
+    // D-LK-ELF-SYMBOL-VERSIONING misbind shape — and was first-wins on every field
+    // but `isEagerImport`. The safer tier had been hardened first and the reachable
+    // one left weaker; they were harmonized in the same cycle. A divergence here is
+    // a defect, not a design choice.
+    {
+        // Length-prefixed ⇒ injective over arbitrary field bytes.
+        auto const dedupKey = [](ExternImport const& e) {
+            return std::format("{}:{}|{}:{}|{}:{}",
+                               e.mangledName.size(), e.mangledName,
+                               e.libraryPath.size(), e.libraryPath,
+                               e.version.size(), e.version);
+        };
+        // A disagreement between two CUs about ONE dynamic symbol is a REAL
+        // conflict, never a pick-one. It gets its OWN code rather than borrowing
+        // `K_SymbolRedefinedAcrossUnits`: an import ATTRIBUTE conflict is not a
+        // redefinition, and a misfiled code sends the reader hunting the wrong
+        // fault — the defect class TF-C118 closed when every optimizer diagnostic
+        // was printing under the parser's letter.
+        auto const conflict = [&](ExternImport const& e, char const* field,
+                                  std::string const& kept,
+                                  std::string const& incoming) {
+            report(reporter, DiagnosticCode::K_ExternImportAttributeConflict,
+                   DiagnosticSeverity::Error,
+                   "extern import \"" + e.mangledName + "\"" +
+                   (e.libraryPath.empty() ? std::string{}
+                                          : " (library \"" + e.libraryPath + "\")") +
+                   (e.version.empty() ? std::string{}
+                                      : " (version \"" + e.version + "\")") +
+                   " is declared with conflicting " + field +
+                   " across CompilationUnits (" + kept + " vs " + incoming +
+                   ") — one dynamic symbol cannot be imported two ways "
+                   "(D-LK11-EXTERN-IMPORT-DEDUP).");
+        };
+        // `dataSizeBytes` / `dataAlignBytes` SIZE the ELF copy-relocation `.bss`
+        // slot (c84 D-LK-EXTERN-DATA-IMPORT). One CU legitimately holds an
+        // INCOMPLETE type (`extern const char v[];` ⇒ 0/0 — extern_import.hpp
+        // :76-81), so a zero is "unknown here", not a disagreement: take the
+        // non-zero. Two DIFFERING non-zero values would reserve the SAME slot two
+        // ways — the loader memcpy's `st_size` bytes, so picking either silently
+        // truncates or over-copies. Fail loud.
+        auto const foldNonZero = [&](std::uint64_t& kept, std::uint64_t incoming,
+                                     char const* field, ExternImport const& e) {
+            if (incoming == 0 || kept == incoming) return;  // incomplete / agrees
+            if (kept == 0) { kept = incoming; return; }     // the complete type wins
+            conflict(e, field, std::to_string(kept), std::to_string(incoming));
+        };
+        auto const boolStr = [](bool b) { return std::string{b ? "true" : "false"}; };
+
+        std::unordered_map<std::string, std::size_t> externIdxForKey;
+        for (std::size_t i = 0; i < modules.size(); ++i) {
+            for (auto const& ext : modules[i].externImports) {
+                LinkedSymbolKey const key{modules[i].cuId, ext.symbol};
+                if (strippedExterns.contains(key)) continue;  // bound to a sibling def
+                auto const [kit, firstOfItsKind] =
+                    externIdxForKey.try_emplace(dedupKey(ext),
+                                                combined.externImports.size());
+                if (firstOfItsKind) {
+                    ExternImport out = ext;
+                    out.symbol = SymbolId{mergedIdFor(i, ext.symbol)};  // the CANONICAL id
+                    combined.externImports.push_back(std::move(out));
+                    continue;
+                }
+                ExternImport& kept = combined.externImports[kit->second];
+                // THE retarget: every relocation / symbol row that named this CU's
+                // copy now resolves to the canonical id through `mergedIdFor`.
+                // A pre-existing DIFFERENT mapping is impossible (`buildCompoundIndex`
+                // guarantees an extern's SymbolId is unique within its CU, so an
+                // extern key can never collide with a pre-assigned definition key) —
+                // if it ever happens the compound-index contract was breached, and a
+                // silent overwrite would mis-bind a call, so say so LOUD.
+                if (auto const [rit, fresh] = remap.emplace(key, kept.symbol.v);
+                    !fresh && rit->second != kept.symbol.v) {
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           "extern import \"" + ext.mangledName + "\" (CU #" +
+                           std::to_string(modules[i].cuId.v) + ", symbol #" +
+                           std::to_string(ext.symbol.v) + ") already maps to merged "
+                           "id " + std::to_string(rit->second) + " but its dedup group "
+                           "is canonicalized to " + std::to_string(kept.symbol.v) +
+                           " — the (cuId, SymbolId) uniqueness contract the compound "
+                           "index enforces was breached (D-LK11-EXTERN-IMPORT-DEDUP).");
+                }
+                // `isEagerImport` — OR-COMBINE, as extern_import.hpp:112-114 mandates
+                // and the MIR-tier merge implements. Keeping a NON-eager row when a
+                // sibling CU declared the same import EAGER would let
+                // `rejectOrDropUnreferencedExterns` DROP a shipped-descriptor symbol
+                // the loader must bind (D-FFI-DESCRIPTOR-EAGER-IMPORT) — that is a
+                // LOAD failure (pe 0xC0000139 / elf exit 127), not a size regression.
+                // Order-INDEPENDENT: whichever CU lands first, the bit is ORed in.
+                kept.isEagerImport = kept.isEagerImport || ext.isEagerImport;
+                // `isData` / `isThreadLocal` — a disagreement is a REAL conflict, and
+                // silently picking either row is the D-LK-EXTERN-DATA-IMPORT
+                // silent-miscompile shape: `isData` decides whether the walker binds
+                // the name through the DATA-slot model (the ELF copy-relocation) or
+                // the function-import path, so the loser's CU would have every
+                // reference bound through the WRONG model — a PLT stub standing in
+                // for a data object, or a copy-reloc `.bss` slot standing in for a
+                // function. `isThreadLocal` likewise selects the (unimplemented,
+                // walker-rejected) initial-exec TLS model — D-CSUBSET-THREAD-LOCAL.
+                if (kept.isData != ext.isData) {
+                    conflict(ext, "`isData` (data object vs function import)",
+                             boolStr(kept.isData), boolStr(ext.isData));
+                }
+                if (kept.isThreadLocal != ext.isThreadLocal) {
+                    conflict(ext, "`isThreadLocal` (thread storage duration)",
+                             boolStr(kept.isThreadLocal), boolStr(ext.isThreadLocal));
+                }
+                foldNonZero(kept.dataSizeBytes,  ext.dataSizeBytes,
+                            "`dataSizeBytes` (copy-relocation slot size)", ext);
+                foldNonZero(kept.dataAlignBytes, ext.dataAlignBytes,
+                            "`dataAlignBytes` (copy-relocation slot alignment)", ext);
+                // Every remaining ExternImport field is accounted for: `symbol` IS the
+                // dedup output (replaced by the canonical merged id above), and
+                // `mangledName` / `libraryPath` / `version` are the KEY, hence equal
+                // by construction. No field is carried over silently.
+            }
+        }
+    }
+
     // A defined symbol (function or data) is SHADOWED when it is an externally-visible
     // (Global/Weak) definition whose name's WINNING definition (image.resolvedGlobalDefs)
     // lives at a DIFFERENT (cuId, SymbolId) — i.e. this body lost the weak-vs-strong /
@@ -529,14 +703,14 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             retargetRelocs(i, out.relocations);  // same chokepoint as the function path
             combined.dataItems.push_back(std::move(out));
         }
-        for (auto const& ext : m.externImports) {
-            // A cross-CU-resolved extern was bound to a sibling def + retargeted above —
-            // strip it so the walker emits no (spurious) library import for it.
-            if (strippedExterns.contains(LinkedSymbolKey{m.cuId, ext.symbol})) continue;
-            ExternImport out = ext;
-            out.symbol = SymbolId{mergedIdFor(i, ext.symbol)};
-            combined.externImports.push_back(std::move(out));
-        }
+        // `combined.externImports` is NOT built here: the extern path is owned
+        // ENTIRELY by the D-LK11-EXTERN-IMPORT-DEDUP pass above (it strips the
+        // cross-CU-resolved rows, canonicalizes each remaining import to one row,
+        // and folds the duplicates' payloads into it). Emitting here too would
+        // re-introduce the duplicates the pass just coalesced. Row ORDER is
+        // unchanged — that pass walks the same module-major traversal, so imports
+        // still appear in first-occurrence order.
+        //
         // Carry each SURVIVING definition's ModuleSymbol row (name / binding /
         // visibility), re-keyed to the merged id — the walkers' real-name surfaces
         // (the c150 ET_DYN `.dynsym` exports, the c139 ET_REL `.symtab` names, the

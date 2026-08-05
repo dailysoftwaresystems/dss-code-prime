@@ -74,7 +74,7 @@
 #      (transformed per the leg's declared `recipeTransform`) / the leg's own
 #      resolveLibraries / its declared `stackReserve`; the build routes the binary
 #      to <out>/<leg>/<formatName>/, and the COMPILER says what it named it there
-#      (`dss-code-prime: artifact <spec> <path>` — see `dss_reported_artifact`; the
+#      (`dss-code-prime: artifact <spec> <path>` — see `dss_bh_reported_artifact`; the
 #      suffix is the object format's business, not this driver's). ONE manifest
 #      generator (gen-pe64-manifest.py) serves this driver and the .ps1.
 #   8. stage each leg's run dir — including the `libtestloadext.so` extension the
@@ -173,6 +173,37 @@ LEG_CATALOGUE="$SCRIPT_DIR/legs.json"
 LEG_RESOLVER="$SCRIPT_DIR/harness_legs.py"
 MANIFEST_GEN="$SCRIPT_DIR/gen-pe64-manifest.py"
 SRC_COHERENCE="$SCRIPT_DIR/check-source-coherence.sh"
+CLI_SMOKE="$SCRIPT_DIR/cli-smoke.py"
+# ── THE SHARED CORE ──────────────────────────────────────────────────────────
+# base-harness.sh holds the recipe derivation, the artifact read-back and the
+# per-(leg, artifact) verdict ledger — the decisions this driver and
+# build-and-test.ps1 BOTH make, which used to be written out once per driver and
+# had already drifted three measured ways (its header names them). The .ps1
+# reaches the same file: its recipe derivation has always run in a POSIX shell,
+# and that shell now sources this.
+#
+# Sourced HERE, at the top, and NOT guarded by an `if`: a driver whose shared
+# core is missing must not limp on with a private copy of half of it. That is
+# how the drift started.
+BASE_HARNESS="$SCRIPT_DIR/base-harness.sh"
+[[ -r "$BASE_HARNESS" ]] || {
+  printf ' ✗ ERROR: the shared harness core is missing: %s\n' "$BASE_HARNESS" >&2
+  printf '      It carries the recipe derivation, the artifact read-back and the verdict\n' >&2
+  printf '      ledger that this driver and build-and-test.ps1 SHARE. Restore it rather\n' >&2
+  printf '      than reintroducing a private copy — three hand-kept copies of one decision\n' >&2
+  printf '      is what it was extracted to end.\n' >&2
+  exit 1
+}
+# shellcheck source=base-harness.sh
+. "$BASE_HARNESS"
+# The contract version this driver was written against. A stale core would
+# otherwise present itself as a MISSING CAPABILITY — silently skipping the CLI,
+# say — which is the failure class the shared core exists to make impossible.
+[[ "${DSS_BASE_HARNESS_VERSION:-0}" -ge 1 ]] || {
+  printf ' ✗ ERROR: %s is version %s; this driver needs >= 1.\n' \
+         "$BASE_HARNESS" "${DSS_BASE_HARNESS_VERSION:-<unset>}" >&2
+  exit 1
+}
 # DSS_TCL_VERSION: OPTIONAL pin for the Tcl the fixture is staged against (e.g.
 # "8.6", "9.0"). UNSET — the default — means VERSION-AGNOSTIC: Step 6 discovers
 # whatever Tcl the host actually has, from that installation's OWN tclConfig.sh.
@@ -1639,6 +1670,48 @@ if [[ -n "$REF_LDFLAGS" ]]; then
     warn "      LDFLAGS.configure / @LDFLAGS@ substitution may have changed shape upstream."
   fi
 fi
+# ── REGENERATE THE AMALGAMATION ORPHANS — A PRECONDITION THE CLI CREATES ─────
+# D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE, and this is a NEW instance of it
+# that arrived with the sqlite3 CLI leg. MEASURED 2026-08-05 on the live tree.
+#
+# The gate at the end of this step enforces TWO id classes. The identity class
+# (SQLITE_SOURCE_ID) was already kept honest, because everything carrying one is
+# a prerequisite of `testfixture`. The FTS5 class was not, and asking make for
+# the CLI is what exposed it:
+#
+#   `make sqlite3d` has fts5.o among its prerequisites, so make regenerates
+#   `fts5.c` (via ext/fts5/tool/mkfts5c.tcl) and `sqlite3.h` at the CURRENT
+#   checkout vintage — while `sqlite3.c`, `tclsqlite3.c` and `tsrc/fts5.c`, which
+#   are prerequisites of NOTHING this harness asks for, keep the fts5 stamp they
+#   were generated with. ✔MEASURED: fts5.c at 2026-08-05 00:41 carrying 6bdfff7d
+#   beside three files at 2026-08-04 18:25 carrying bdc841de — "2 DIFFERENT ids
+#   across 4 file(s)", and the coherence gate correctly went red.
+#
+# ★ THIS IS NOT PATCHING THE STAGED TREE. Nothing here edits an upstream source.
+# It asks upstream's OWN build system to regenerate its OWN derived files from
+# ONE source state — literally the command check-source-coherence.sh prints when
+# it fails. Hand-copying one file WOULD be the workaround: it fixes the symptom
+# you noticed and leaves the ones you did not.
+#
+# ★ IT RUNS BEFORE BOTH REFERENCE BUILDS, and the order is measured, not assumed.
+# Once these are current, `make sqlite3d` and `make testfixture` regenerate
+# nothing further: ✔MEASURED 2026-08-05, the gate stayed green across both
+# subsequent builds. Running it afterwards instead would leave a window in which
+# the reference binaries were built from a tree the gate had not yet certified.
+#
+# TOLERATED, NOT FATAL — deliberately. The run-wide `die` belongs to the GATE at
+# the end of this step, which asserts the OUTCOME. Failing here instead would
+# swap a precise "these files disagree, and here are their ids" for a vague "a
+# make invocation exited non-zero", and this is a repair attempt, not the
+# verdict on whether the repair was needed or worked.
+info "regenerating the amalgamation orphans (sqlite3.c / shell.c / tclsqlite3.c) so the stage is ONE vintage"
+if ( cd "$BLD" && make sqlite3.c shell.c tclsqlite3.c ) > "$OUT_DIR/amalgamation-regen.log" 2>&1; then
+  info "      amalgamation regenerated (log: $OUT_DIR/amalgamation-regen.log)"
+else
+  warn "regenerating the amalgamation orphans FAILED (tolerated here — the coherence gate"
+  warn "      at the end of this step is what renders the verdict). Log: $OUT_DIR/amalgamation-regen.log"
+fi
+
 # Build the reference fixture. It generates every derived .c
 # (parse.c/opcodes.c/ctime.c/tclsqlite-ex.c/fts5.c…) + libsqlite3.a, which the DSS
 # TU set needs — AND, when it links, it is the ORACLE that decides whether a corpus
@@ -1731,8 +1804,73 @@ fi
       It is what stops a REUSED $BLD from mixing upstream vintages behind your back
       (D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE). There is no skip path for it by
       design; restore the file rather than routing around it."
-"$SRC_COHERENCE" --checkout "$SQLITE_DIR" --label "staged sqlite (Step 4)" "$BLD" \
+#
+# ★ `--require-cli` IS NOW PASSED, and it was not before. The gate has always had
+# the flag (check-source-coherence.sh:78, :192-208) and NOTHING called it with
+# one, so the assertion it implements — that sqlite3.c, shell.c and sqlite3.h are
+# all present, and that shell.c's QUOTED `#include "sqlite3.h"` can only resolve
+# beside it — was shipped inert. It matters now for a concrete reason: this
+# harness BUILDS the CLI, and shell.c's startup guard compares
+# `sqlite3_sourceid()` against the SQLITE_SOURCE_ID it was compiled with. A
+# mismatched pair produces a binary that COMPILES CLEAN, LINKS CLEAN and then
+# prints "SQLite header and source version mismatch" and exit(1) — which from the
+# outside is indistinguishable from a miscompile.
+"$SRC_COHERENCE" --checkout "$SQLITE_DIR" --require-cli --label "staged sqlite (Step 4)" "$BLD" \
   || die "staged sqlite tree is INCOHERENT — refusing to build (D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE)"
+
+# ── the SECOND attribution oracle: a gcc-built sqlite3 CLI ───────────────────
+# ★ A MATCHED CONTROL — AND WHAT IT DOES AND DOES NOT HOLD CONSTANT, STATED.
+# This is upstream's OWN `sqlite3d` target (main.mk:2185,
+# `sqlite3d$(T.exe): shell.c $(LIBOBJS0)`): the SAME translation units from the
+# SAME staged tree, built by gcc through upstream's own unmodified make rule.
+# That is what an oracle needs — a second implementation compiling the same
+# sources — and it is why a failure both binaries share is not DSS's.
+#
+# ★ WHAT IS **NOT** IDENTICAL, AND SAYING SO IS THE POINT. It is NOT true that
+# "the only variable is the compiler", and the earlier wording here said exactly
+# that. ✔MEASURED 2026-08-05 (base-harness.sh's dss_bh_recipe_token_span carries
+# the measurement): upstream compiles the library objects with 8 defines
+# INCLUDING `SQLITE_CORE` and compiles shell.c, on the link line, with 18 that do
+# NOT include it (main.mk:2160-2166 explains the split). The gcc reference gets
+# that SPLIT, because it is plain `make -s sqlite3d`. DSS builds ONE program from
+# ONE `defines` array, so it necessarily gets the UNION of the two sets. So the
+# controlled variables are: the sources, the tree, and the include dirs. The
+# uncontrolled ones are: the compiler (the thing under test) and shell.c's view
+# of `SQLITE_CORE` (a consequence of one-program-one-define-set). A difference
+# that lands on that seam is a real result the oracle cannot attribute, and it
+# has to be recognised rather than argued away — which needs it written down.
+#
+# It exists because the unit corpus cannot see shell.c at ALL: the corpus runs
+# through `testfixture`, a Tcl interpreter linking the sqlite LIBRARY, so every
+# CLI-only surface (argv, the dot-commands, the .dump writer, the startup guard)
+# is covered by nothing until the smoke gate runs [D-SQLITE-CLI-BUILT-ON-NO-LEG].
+# Without this reference a smoke failure could not be attributed, and cli-smoke.py
+# charges an unattributable failure to DSS rather than waving it through.
+#
+# SAME COPY-THEN-DELETE PAIR as the fixture above, for the same reason: `make -n`
+# only prints a recipe for a MISSING target, and the CLI recipe is harvested a few
+# lines down. The copy is not a make target, so the delete still exposes it.
+# A link miss is TOLERATED (the CLI legs still build; they just cannot be
+# exonerated) and is stated out loud rather than left to silence.
+REF_CLI_KEEP="$OUT_DIR/reference-sqlite3"
+REF_CLI=""
+rm -f "$REF_CLI_KEEP"
+REF_CLI_LOG="$OUT_DIR/reference-cli-build.log"
+info "building the reference gcc sqlite3 CLI (upstream's own 'sqlite3d' target)"
+if ( cd "$BLD" && make -s sqlite3d -j"$JOBS" ) > "$REF_CLI_LOG" 2>&1 && [[ -x "$BLD/sqlite3d" ]]; then
+  if cp -p "$BLD/sqlite3d" "$REF_CLI_KEEP"; then
+    REF_CLI="$REF_CLI_KEEP"
+    info "reference gcc sqlite3 CLI built + preserved -> $REF_CLI  (the CLI ATTRIBUTION ORACLE)"
+  else
+    warn "the reference sqlite3 CLI LINKED but could NOT be preserved to $REF_CLI_KEEP — it is"
+    warn "      about to be deleted to expose its recipe, so no CLI oracle survives this run."
+  fi
+else
+  warn "the reference gcc sqlite3 CLI did not build (tolerated — the CLI legs still build)."
+  warn "      Log KEPT at $REF_CLI_LOG — READ IT. Without it NO smoke failure on any leg can be"
+  warn "      EXONERATED, and cli-smoke.py charges an unattributable failure to DSS by design."
+fi
+rm -f "$BLD/sqlite3d"
 
 # Emit the recipe: with testfixture removed but its prereqs built, `make -n` prints
 # the single testfixture cc/link command (the source of TUs + defines + -I dirs).
@@ -1744,62 +1882,148 @@ fi
 rm -f "$BLD/testfixture"
 RECIPE="$OUT_DIR/testfixture-recipe.txt"
 mkdir -p "$OUT_DIR"
-( cd "$BLD" && make -n testfixture USE_AMALGAMATION=0 ) > "$RECIPE" 2>&1 || true
-# `make -n testfixture` is essentially ONE cc command (the fixture link); join its
-# backslash-continuations, then extract each token-type from the whole blob.
-# ★ ONE `-e` PER LABEL — never `sed ':a;N;$!ba;…'`
-# (D-HARNESS-SELFTEST-BSD-SED-PORTABILITY). GNU sed lets a `:label` be
-# terminated by `;`, BSD/macOS sed does NOT: it swallows the rest of the script
-# as part of the LABEL NAME and dies `unused label 'a;N;$!ba;…'`, emitting only
-# the first line — so the backslash-continuation join SILENTLY DID NOT HAPPEN
-# and $BLOB was whatever sed managed before erroring. Splitting the script into
-# separate -e arguments makes the label end at the argument boundary, which is
-# the portable form: MEASURED byte-identical output (8093 B on this recipe) from
-# BSD sed and GNU sed, and identical to what the Linux legs were already getting.
-BLOB="$(sed -e ':a' -e 'N;$!ba' -e 's/\\\n/ /g' "$RECIPE" | tr '\t' ' ')"
-# defines: -DNAME[=VALUE]  →  DSS `--define NAME[=VALUE]` (strip make's literal "" so
-# SQLITE_PRIVATE="" becomes an EMPTY value, and drop bare shell quoting).
-mapfile -t RECIPE_DEFS < <(printf '%s\n' "$BLOB" | grep -oE '\-D[A-Za-z0-9_]+(=[^ ]*)?' | sed 's/^-D//; s/"//g' | sort -u)
-# sqlite include dirs off the recipe (ext/**, src, .).
-mapfile -t SQLITE_INCS < <(printf '%s\n' "$BLOB" | grep -oE '\-I ?[^ ]+' | sed 's/^-I *//' | grep -v '^\.$' | sort -u)
-# TU set (1): every .c the recipe names directly (the test/ext harness sources +
-# the generated testfixture entry). Most tokens are ABSOLUTE ($(TOP)/…); the few
-# the recipe names RELATIVELY (ctime.c/fts5.c/parse.c/tclsqlite-ex.c) live in the
-# build dir $BLD (make -n's CWD), so an unrooted token is resolved against $BLD
-# too. Without this the generated `tclsqlite-ex.c` — which DEFINES the Tcl
-# `Sqlite3_Init` the fixture links against and is NOT a libsqlite3.a member (so
-# TU-set-2 can't recover it) — is silently dropped and the link fails on an
-# undefined `Sqlite3_Init`.
-declare -A TU=()
-while IFS= read -r c; do
-  [[ -n "$c" ]] || continue
-  if   [[ -f "$c"      ]]; then TU["$c"]=1
-  elif [[ -f "$BLD/$c" ]]; then TU["$BLD/$c"]=1
-  fi
-done < <(printf '%s\n' "$BLOB" | tr ' ' '\n' | grep -E '\.c$' | sort -u)
-# TU set (2): the CORE sources compiled into libsqlite3.a — DSS can't consume the
-# gcc archive, so recover each member's .c (members live in src/, ext/**, or bld/).
+# The archive the CORE sources have to be recovered from: DSS cannot consume a gcc
+# `.a`, so every member's `.c` is found again by name. Resolved BEFORE the
+# derivation because both derivations (this one and the CLI's below) pass it.
 AR="$BLD/libsqlite3.a"; [[ -f "$BLD/.libs/libsqlite3.a" ]] && AR="$BLD/.libs/libsqlite3.a"
-declare -A TU_BASENAME=()      # basename -> path (dedup generated .c aliased in bld/ & bld/tsrc/)
-if [[ -f "$AR" ]]; then
-  while read -r obj; do
-    base="${obj%.o}"
-    hit="$(find "$SQLITE_DIR/src" "$SQLITE_DIR/ext" "$BLD" -name "$base.c" 2>/dev/null | grep -v '/tsrc/' | head -1)"
-    [[ -z "$hit" ]] && hit="$(find "$SQLITE_DIR/src" "$SQLITE_DIR/ext" "$BLD" -name "$base.c" 2>/dev/null | head -1)"
-    [[ -n "$hit" ]] && TU["$hit"]=1
-  done < <(ar t "$AR" 2>/dev/null | grep '\.o$')
+FIXTURE_TUS_FILE="$OUT_DIR/tus.base.txt"
+FIXTURE_DEFS_FILE="$OUT_DIR/defines.base.txt"
+FIXTURE_INCS_FILE="$OUT_DIR/recipe-includes.base.txt"
+# ── THE FIXTURE RECIPE, DERIVED BY THE SHARED CORE ───────────────────────────
+# ★ THE SAME FUNCTION THE CLI DERIVATION BELOW CALLS, AND THE SAME ONE
+# build-and-test.ps1's derive script calls. This block used to be a hand-written
+# copy of dss_bh_emit_recipe: its own `sed -e ':a' …` join, its own -D/-I greps,
+# its own span/archive TU loops and its own dedup. Extracting the core and then
+# leaving the FIXTURE path on the private copy would have been the worst of both
+# — one decision with a shared implementation that half the callers do not use,
+# which is exactly the arrangement that manufactured the three measured drifts
+# base-harness.sh's header lists. Everything this call passes is what the FIXTURE
+# needs and the CLI does not:
+#   · --make-var USE_AMALGAMATION=0   upstream's own switch for the full-source
+#                                     fixture (the amalgamation is banned here).
+#   · --prereq-mode whole-blob        `make -n testfixture` runs with every
+#                                     prerequisite already built, so the recipe
+#                                     IS essentially the one link command.
+#   · --token-scope all               same reason: there is no bootstrap in this
+#                                     recipe to keep foreign -D out of.
+#   · --archive-from-span 0           take EVERY archive member; the fixture links
+#                                     the whole library, not a named object list.
+# FLOORS 150/18: the fixture is ~192 TUs and ~20 defines. High enough that losing
+# the archive recovery (which leaves ~90) is an immediate named stop, low enough
+# not to red on upstream adding or dropping a source file.
+#
+# ★ D-HARNESS-SH-TU-DEDUP-DEPENDS-ON-BASH-HASH-ORDER is closed HERE as a
+# consequence: the surviving path for two same-basename spellings is
+# dss_bh_dedup_by_basename's answer, over a SORTED set, rather than bash's
+# internal hash order over `"${!TU[@]}"`. ✔MEASURED 2026-08-05 before adopting
+# it: byte-identical on this recipe (192 TUs, zero duplicate basenames), so the
+# latent defect closes without moving today's TU set.
+if _fixture_summary="$(dss_bh_emit_recipe \
+      --build-dir "$BLD" --make-target testfixture --recipe-file "$RECIPE" \
+      --make-var USE_AMALGAMATION=0 \
+      --prereq-mode whole-blob --token-scope all \
+      --archive "$AR" --archive-from-span 0 \
+      --search-root "$SQLITE_DIR/src" --search-root "$SQLITE_DIR/ext" --search-root "$BLD" \
+      --min-tus 150 --min-defines 18 \
+      --out-tus "$FIXTURE_TUS_FILE" --out-defines "$FIXTURE_DEFS_FILE" \
+      --out-includes "$FIXTURE_INCS_FILE")"; then
+  mapfile -t TUS         < "$FIXTURE_TUS_FILE"
+  mapfile -t RECIPE_DEFS < "$FIXTURE_DEFS_FILE"
+  mapfile -t SQLITE_INCS < "$FIXTURE_INCS_FILE"
+  pass "recipe: $_fixture_summary"
+else
+  die "the testfixture recipe derivation FAILED — see $RECIPE and the diagnostic above.
+      A short parse does not error on its own: it yields a smaller TU set that compiles,
+      links, and fails much later looking like a codegen bug. That is what the floors and
+      the drop ledger turn into this stop."
 fi
-# de-alias generated .c that exist under both bld/ and bld/tsrc/ (same file, two paths)
-declare -A TU_FINAL=()
-for f in "${!TU[@]}"; do
-  b="$(basename "$f")"
-  if [[ -n "${TU_BASENAME[$b]:-}" ]]; then continue; fi
-  TU_BASENAME["$b"]="$f"; TU_FINAL["$f"]=1
-done
-mapfile -t TUS < <(printf '%s\n' "${!TU_FINAL[@]}" | sort)
-[[ ${#TUS[@]} -ge 150 ]]       || die "recipe derivation yielded only ${#TUS[@]} TUs (<150) — recipe parse broke; see $RECIPE"
-[[ ${#RECIPE_DEFS[@]} -ge 18 ]] || die "recipe derivation yielded only ${#RECIPE_DEFS[@]} defines (<18) — recipe parse broke; see $RECIPE"
-pass "recipe: ${#TUS[@]} TUs, ${#RECIPE_DEFS[@]} defines, ${#SQLITE_INCS[@]} sqlite -I dirs"
+
+# ── the sqlite3 CLI recipe — ITS OWN ARRAYS, never the fixture's map ─────────
+# ★ SEPARATE ARRAYS, DELIBERATELY. The CLI's TU set is derived into CLI_TUS /
+# CLI_DEFS / CLI_INCS and the fixture's `TU` map is not touched. Merging them
+# would be the concrete trigger for the dedup defect closed just above, and the
+# two sets are genuinely different programs: ✔MEASURED 2026-08-05, the CLI set is
+# a STRICT SUBSET of the fixture's plus exactly one file (shell.c), and the
+# fixture carries 90 TUs — the Tcl test harness — that must never reach the CLI.
+#
+# ★ WHY `sqlite3d` AND NOT `sqlite3`. main.mk:216-219 says `sqlite3$(T.exe)`
+# REQUIRES the amalgamation and IGNORES USE_AMALGAMATION, so `make -n sqlite3
+# USE_AMALGAMATION=0` derives an AMALGAMATION build — against this project's
+# "full upstream source, never the amalgamation" rule
+# [D-SQLITE-CLI-UPSTREAM-TARGET-IS-AMALGAMATION-ONLY]. `sqlite3d` is upstream's
+# own full-source CLI: `sqlite3d$(T.exe): shell.c $(LIBOBJS0)` (main.mk:2185).
+#
+# ★ WHY `link-line` MODE. sqlite3d's prerequisites are `.o` files, so a
+# whole-blob scrape finds only shell.c when the objects are current — and when
+# they are STALE it finds far too much: ✔MEASURED 2026-08-05, a whole-blob derive
+# absorbs `tool/lemon.c`, `tool/lempar.c` and `tool/mksourceid.c`, which are
+# BUILD-HOST tools (`lempar.c` is not even standalone C — it is lemon's parser
+# template). Link-line mode reads upstream's own declared prerequisite list and
+# recovers each `.o` through the archive, giving 103 TUs in both object states.
+#
+# ★ WHY `--always-make` AND `--token-scope recipe`. `make -n` prints only what it
+# WOULD do, so with the 102 objects already current it prints ONE line — the
+# link — and the -D set read off it OMITS `SQLITE_CORE` (upstream compiles the
+# library and shell.c with different define sets; main.mk:2160-2166). ✔MEASURED
+# 2026-08-05, that is not cosmetic: ext/icu/icu.c:31-33 is
+# `#if !defined(SQLITE_CORE) || defined(SQLITE_ENABLE_ICU) …`, so a file that
+# should compile to nothing instead demanded <unicode/*.h> and the CLI died with
+# four `error[F001A]`. The build's success depended on the freshness of a build
+# directory nobody thought of as an input. `-B` makes make print everything (a
+# DRY RUN still — `-n` is in force), and `--token-scope recipe` reads the -D/-I
+# off the compile lines UNION the link line, so the jimsh/lemon bootstrap's
+# foreign `JIM_COMPAT` / `HAVE_REALPATH` / `_FILE_OFFSET_BITS=64` stay out.
+#
+# FLOORS: 100 TUs / 18 defines. Honest for a ~103-TU program — high enough that
+# losing the archive recovery (which would leave 1) or the link line (0) is an
+# immediate named stop, low enough not to red on upstream adding or dropping one
+# source file or one flag. The regression that actually matters is caught by NAME
+# below, not by the count: a count with zero headroom reds on an unrelated
+# upstream edit, and a count alone cannot say WHICH define went missing.
+CLI_RECIPE="$OUT_DIR/sqlite3-cli-recipe.txt"
+CLI_TUS_FILE="$OUT_DIR/cli-tus.txt"
+CLI_DEFS_FILE="$OUT_DIR/cli-defines.txt"
+CLI_INCS_FILE="$OUT_DIR/cli-includes.base.txt"
+if _cli_summary="$(dss_bh_emit_recipe \
+      --build-dir "$BLD" --make-target sqlite3d --recipe-file "$CLI_RECIPE" \
+      --prereq-mode link-line --always-make 1 --token-scope recipe \
+      --archive "$AR" --archive-from-span 1 \
+      --search-root "$SQLITE_DIR/src" --search-root "$SQLITE_DIR/ext" --search-root "$BLD" \
+      --min-tus 100 --min-defines 18 \
+      --out-tus "$CLI_TUS_FILE" --out-defines "$CLI_DEFS_FILE" --out-includes "$CLI_INCS_FILE")"; then
+  mapfile -t CLI_TUS  < "$CLI_TUS_FILE"
+  mapfile -t CLI_DEFS < "$CLI_DEFS_FILE"
+  mapfile -t CLI_INCS < "$CLI_INCS_FILE"
+  pass "cli recipe: $_cli_summary"
+else
+  die "the sqlite3 CLI recipe derivation FAILED — see $CLI_RECIPE and the diagnostic above.
+      This is NOT skippable: a CLI leg that silently does not build is exactly the
+      'a capability in one driver and not the other' failure this work closed."
+fi
+# The CLI needs SHELL.C, and a derivation that lost it would still clear the TU
+# floor on the 102 library sources alone — building a library with no `main` and
+# failing much later at the entry trampoline. Asserted by name rather than by
+# count, because the count cannot see WHICH file went missing.
+printf '%s\n' "${CLI_TUS[@]}" | grep -qE '/shell\.c$' \
+  || die "the CLI TU set has no shell.c — it is the CLI's only entry point (sqlite3.c has no main).
+      Derived from: $CLI_RECIPE"
+# ★ SQLITE_CORE, ASSERTED BY NAME. This is the define whose absence is SILENT in
+# every count: with 18 perfectly plausible defines and no SQLITE_CORE,
+# ext/icu/icu.c:31-33 (`#if !defined(SQLITE_CORE) || defined(SQLITE_ENABLE_ICU) …`)
+# stops being a no-op and pulls in <unicode/utypes.h>, and the run dies three
+# minutes later with four `error[F001A] got unicode/*.h` that look like a missing
+# system dependency rather than a derivation bug. ✔MEASURED 2026-08-05 — that is
+# exactly how this was found. It goes missing whenever the -D tokens are read
+# from the LINK line alone (upstream compiles the library with SQLITE_CORE and
+# shell.c without it), so this assertion is the guard on `--token-scope recipe`
+# still doing its job.
+printf '%s\n' "${CLI_DEFS[@]}" | grep -qx 'SQLITE_CORE' \
+  || die "the CLI define set has no SQLITE_CORE (${#CLI_DEFS[@]} defines derived).
+      Without it ext/icu/icu.c stops compiling to nothing and demands <unicode/*.h>,
+      which fails as 'error[F001A] got unicode/utypes.h' — a derivation bug wearing a
+      missing-dependency costume. It is contributed by the library COMPILE lines, so
+      this means the -D tokens were read from the link line alone: check that
+      --always-make and --token-scope recipe survived. Derived from: $CLI_RECIPE"
 
 # ── Step 5 — build dss-code-prime (CMake-4 Release) ──────────────────────────
 step "5/9  Build dss-code-prime (CMake ${MIN_CMAKE_MAJOR}+ Release)"
@@ -2002,7 +2226,10 @@ done
       zlib.h includes it and every ./configure guard lives in it; without it no leg's
       zlib header can be configured for its target."
 # label -> the include-list file that leg's manifest must use; populated below.
-declare -A LEG_INC_FILE=() LEG_ZINC_DIR=()
+# ONE PER ARTIFACT: the fixture and the CLI are different programs with different
+# declared inputs (the CLI must not see the staged Tcl headers), so a single
+# shared list would hand one of them an input it never asked for.
+declare -A LEG_INC_FILE=() LEG_CLI_INC_FILE=() LEG_ZINC_DIR=()
 declare -A ZINC_STAGE_DIR=()
 # rc DIRECTLY off python3 (never through a pipe) — the output is captured first
 # and parsed after, so a FAIL line is still read on a non-zero rc.
@@ -2821,10 +3048,28 @@ for _k in "${!ZINC_STAGE_DIR[@]}"; do
   printf '%s\n' "${INC_DIRS_HEAD[@]}" "${ZINC_STAGE_DIR[$_k]}" "${INC_DIRS_TAIL[@]}" \
     > "$OUT_DIR/recipe-includes.$_k.txt"
 done
+# THE CLI'S OWN INCLUDE LIST, from the CLI's OWN recipe — one per header stage,
+# exactly like the fixture's above and for the same D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED
+# reason (each leg compiles against the zlib header staged for ITS target).
+#
+# ★ IT IS NOT THE FIXTURE'S LIST, and the difference is real rather than tidy:
+# $INC_DIRS_HEAD carries $THIRD_PARTY_INCS, i.e. the staged TCL headers, which the
+# CLI has no business seeing. shell.c does not use Tcl at all — ✔MEASURED
+# 2026-08-05: zero `tcl.h` / `Tcl_` references in the generated shell.c — so
+# handing it tcl on -I would be an undeclared input that could only ever shadow
+# something. ${CLI_INCS[@]} is what `make -n sqlite3d` itself asked for (the six
+# sqlite src/ext dirs); the leg's zinc/ supplies <zlib.h>, which shell.c DOES
+# include; $INC_DIRS_TAIL supplies $BLD (the generated sqlite3.h) and, on a Mac,
+# the SDK dir that must stay LAST so it cannot shadow the staged zlib header.
+for _k in "${!ZINC_STAGE_DIR[@]}"; do
+  printf '%s\n' "${CLI_INCS[@]}" "${ZINC_STAGE_DIR[$_k]}" "${INC_DIRS_TAIL[@]}" \
+    > "$OUT_DIR/cli-includes.$_k.txt"
+done
 for _l in "${LEG_DECLARED[@]}"; do
   _k="${LEG_HEADER_STAGE_KEY[$_l]:-}"
   [[ -n "$_k" && -n "${ZINC_STAGE_DIR[$_k]:-}" ]] || continue
   LEG_INC_FILE["$_l"]="$OUT_DIR/recipe-includes.$_k.txt"
+  LEG_CLI_INC_FILE["$_l"]="$OUT_DIR/cli-includes.$_k.txt"
   LEG_ZINC_DIR["$_l"]="${ZINC_STAGE_DIR[$_k]}"
 done
 
@@ -2851,16 +3096,31 @@ done
 # rc is taken DIRECTLY off python3 by the caller's `if`, never through a pipe.
 generate_manifest() {           # generate_manifest <leg> <out-manifest> <library-argv>...
   local leg="$1" out="$2"; shift 2
-  python3 "$MANIFEST_GEN" \
-    --tus       "$RECIPE_TUS_FILE" \
-    --includes  "${LEG_INC_FILE[$leg]}" \
-    --defines   "$RECIPE_DEFS_FILE" \
-    --target    "${LEG_SPEC[$leg]}" \
-    "$@" \
-    --artifact-name   testfixture \
-    --recipe-transform "${LEG_RECIPE_TRANSFORM[$leg]}" \
-    --stack-reserve    "${LEG_STACK_RESERVE[$leg]}" \
-    --output    "$out"
+  dss_bh_generate_manifest "$MANIFEST_GEN" "$out" testfixture "${LEG_SPEC[$leg]}" \
+    "$RECIPE_TUS_FILE" "${LEG_INC_FILE[$leg]}" "$RECIPE_DEFS_FILE" \
+    "${LEG_RECIPE_TRANSFORM[$leg]}" "${LEG_STACK_RESERVE[$leg]}" "$@"
+}
+# generate_cli_manifest <leg> <out-manifest> <library-argv>… — the SECOND artifact.
+#
+# ★ A SECOND MANIFEST IS NOT A STYLE CHOICE. The manifest schema allows exactly
+# ONE artifact: `artifactName` is a SCALAR (src/program/project_config.cpp:372-390),
+# so two artifacts need two manifests and two `--project` invocations. There is no
+# multi-artifact form to reach for.
+#
+# Four things differ from the fixture's manifest, and every one of them is a
+# property of the PROGRAM rather than of the leg:
+#   · --tus            the CLI's own 103 (shell.c + the 102 library TUs)
+#   · --includes       the CLI's own list — no staged Tcl headers
+#   · --artifact-name  sqlite3
+#   · the library argv the CALLER passes: ZLIB ONLY, no Tcl.
+# Everything leg-shaped — the target spec, the recipe transform, the stack
+# reserve — is read from the SAME leg declaration the fixture uses, because those
+# are facts about the TARGET and the CLI is built for the same one.
+generate_cli_manifest() {       # generate_cli_manifest <leg> <out-manifest> <library-argv>...
+  local leg="$1" out="$2"; shift 2
+  dss_bh_generate_manifest "$MANIFEST_GEN" "$out" sqlite3 "${LEG_SPEC[$leg]}" \
+    "$CLI_TUS_FILE" "${LEG_CLI_INC_FILE[$leg]}" "$CLI_DEFS_FILE" \
+    "${LEG_RECIPE_TRANSFORM[$leg]}" "${LEG_STACK_RESERVE[$leg]}" "$@"
 }
 # leg_resolve_library_argv <leg> — the argv that hands DSS this leg's two resolved
 # libraries, ONE TOKEN PER LINE, on stdout. Diagnostics to stderr; rc is the
@@ -2896,11 +3156,28 @@ leg_resolve_library_argv() {    # leg_resolve_library_argv <leg>  -> one token p
   python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
       --resolve-library-argv "${LEG_TCL_LIB[$leg]}" \
       --import-name "${LEG_LIB_TCL_IMPORT_NAME[$leg]}" --dss "$DSS_BIN" \
-    && python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+    && leg_resolve_z_library_argv "$leg"
+}
+# leg_resolve_z_library_argv <leg> — the ZLIB HALF ONLY, for the sqlite3 CLI.
+#
+# ★ THE CLI DOES NOT LINK TCL, AND MUST NOT DECLARE THAT IT DOES. shell.c has no
+# Tcl in it (✔MEASURED 2026-08-05: zero `tcl.h` / `Tcl_` references in the
+# generated shell.c), so listing the Tcl library in its manifest would record a
+# runtime dependency the program never uses — a DT_NEEDED / import that makes the
+# binary refuse to load on a machine without Tcl, for no reason at all.
+#
+# ★ IT DOES LINK ZLIB, and that correction is MEASURED rather than assumed. The
+# recipe carries `SQLITE_HAVE_ZLIB=1` (it survives the windows-selfconfig
+# transform by design — that transform drops only a leading HAVE_/Z_HAVE_), and
+# under it shell.c reaches a live `#include <zlib.h>` at two places, so the
+# generated CLI really does call into zlib. `-lz` is on upstream's own sqlite3d
+# link line for exactly this reason.
+leg_resolve_z_library_argv() {  # leg_resolve_z_library_argv <leg> -> one token per line
+  local leg="$1"
+  python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
       --resolve-library-argv "${LEG_Z_LIB[$leg]}" \
       --import-name "${LEG_LIB_Z_IMPORT_NAME[$leg]}" --dss "$DSS_BIN"
 }
-compile_time_suffix() { local t; t="$(grep -oE 'compile time [^[:space:]]+' "$1" 2>/dev/null | tail -1)" || true; [[ -n "$t" ]] && printf '  (%s)' "$t" || true; }
 # >>> dss:artifact-report >>>
 # ── WHAT DID THE COMPILER ACTUALLY WRITE? ASK IT, DO NOT GUESS. ──────────────
 # ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING
@@ -2915,6 +3192,19 @@ compile_time_suffix() { local t; t="$(grep -oE 'compile time [^[:space:]]+' "$1"
 # WHERE the defect hid: only a cross-host build can reach it, which is precisely the
 # case this harness exists to measure.
 #
+# ★ AND THE READER LIVES IN THE SHARED CORE, NOT HERE. This driver used to carry
+# its own `dss_reported_artifact` whose rule was "take the LAST match", and the
+# .ps1 carried a `Get-ReportedArtifact` implementing the same rule — so extracting
+# `dss_bh_reported_artifact` took the copy count from two to FOUR while the two
+# survivors still implemented the rule the shared one refuses. "Last wins"
+# silently assumes ONE artifact per (log, spec), which stopped being true the
+# moment this harness built a second artifact per leg: it would hand back a
+# SIBLING's binary with no diagnostic. Both private copies are gone; the readers
+# here and in build-and-test.ps1 are now the shared pair
+# (`dss_bh_reported_artifact` / `Get-DssReportedArtifact`), which REFUSE an
+# ambiguous log instead of guessing. Likewise the compile-time suffix, which was
+# a third private one-liner and is now `dss_bh_compile_time_suffix`.
+#
 # The suffix is not this file's business and never was. `TargetSpec::outputExtension`
 # (src/program/target_spec.cpp) derives it from the CLOSED object-format enum; a copy
 # here would be a second table to keep in step, and that is not hypothetical — the
@@ -2924,24 +3214,13 @@ compile_time_suffix() { local t; t="$(grep -oE 'compile time [^[:space:]]+' "$1"
 #
 #     dss-code-prime: artifact <targetSpec> <absolute path>
 #
-# and this reads it. The target spec is a single token BY CONSTRUCTION (DSS refuses
-# whitespace in either half of a spec), so the path is the whole REMAINDER of the line
-# and an output directory containing a space survives intact.
+# and the shared core reads it. The target spec is a single token BY CONSTRUCTION (DSS
+# refuses whitespace in either half of a spec), so the path is the whole REMAINDER of
+# the line and an output directory containing a space survives intact.
 #
 # ★ ABSENCE IS A REAL ANSWER HERE, NOT AN ERROR TO PAPER OVER. A build that wrote
 # nothing reports nothing; rc 1 is what makes the caller's "0 error[ but no artefact"
 # branch fire on exactly that case, which is a diagnostic worth keeping.
-dss_reported_artifact() {   # dss_reported_artifact <compile-log> <target-spec>
-  local log="$1" spec="$2" hits line
-  # rc taken DIRECTLY off grep, never after a pipe. `-F` because a target spec is a
-  # LITERAL and carries characters a regex would reinterpret.
-  hits="$(grep -F "dss-code-prime: artifact $spec " "$log" 2>/dev/null)" || return 1
-  [[ -n "$hits" ]] || return 1
-  # The LAST such line. A log appended to by a re-run must not resurrect an earlier
-  # build's artefact.
-  line="${hits##*$'\n'}"
-  printf '%s\n' "${line#dss-code-prime: artifact $spec }"
-}
 # <<< dss:artifact-report <<<
 # >>> dss:fresh-inode >>>
 # ── FRESH-INODE INSTALL (macOS only) ─────────────────────────────────────────
@@ -3061,7 +3340,7 @@ for leg in "${LEG_ORDER[@]}"; do
   # this very step. `$(...)` propagates the status, so a broken sweep is loud.
   # ★ THE SWEEP IS SCOPED TO THIS LEG'S ARTEFACT DIRECTORY, not to a file name —
   # and it has to be, because at this point the artefact HAS NO NAME YET. The name
-  # is whatever the compiler decides to write (see `dss_reported_artifact`), and
+  # is whatever the compiler decides to write (see `dss_bh_reported_artifact`), and
   # this driver is not entitled to guess it; the sweep used to pass a constructed
   # `…/testfixture`, which is the same guess that poisoned the pe64 leg. The
   # matcher is a substring test over each process's argv, so a directory is a
@@ -3112,35 +3391,48 @@ for leg in "${LEG_ORDER[@]}"; do
       The generator also asserts that every TU EXISTS on disk, so a staged-tree miss
       lands here rather than mid-compile."
   fi
-  # A project build routes each target to <output>/<formatName>/, and NAMES the file
-  # there itself. dss-code-prime returns EXIT 0 even on fatal errors → judge from
-  # `error[` plus the artefact the build REPORTED (`dss_reported_artifact`).
-  "$DSS_BIN" --project "$manifest" --config="$DSS_CONFIG" --output "$outd" --time >"$log" 2>&1 || true
-  # THE ARTEFACT IS READ OUT OF THE BUILD'S OWN REPORT — see `dss_reported_artifact`
-  # for why this driver no longer spells the file name. `|| bin=''` keeps errexit off
-  # the lookup: "the build reported no artefact" is a VERDICT this branch renders,
-  # not a crash. Selected by THIS leg's spec, so a manifest that ever grows a second
-  # target cannot hand us a sibling's binary.
-  bin="$(dss_reported_artifact "$log" "$spec")" || bin=''
-  if grep -qE 'error\[' "$log" || [[ -z "$bin" || ! -x "$bin" ]]; then
+  # ── THE BUILD, THROUGH THE SHARED CORE ────────────────────────────────────
+  # ★ THE SAME FUNCTION THE CLI LOOP CALLS. This block used to run the compiler
+  # itself and read the artefact back with a PRIVATE `dss_reported_artifact`
+  # whose rule was "take the LAST match" — the very rule
+  # dss_bh_reported_artifact refuses, because with two artifacts per leg it can
+  # hand a caller its SIBLING's binary with no diagnostic. Extracting the core
+  # and leaving the FIXTURE on the private copy left the count at four copies of
+  # one decision, two of them still implementing the unsafe rule.
+  # rc: 0 built · 1 no artefact reported · 2 AMBIGUOUS · 3 diagnostics · 4 the
+  # build REPORTED an artefact that is not on disk. `|| _rc=$?` is load-bearing
+  # under `set -Eeuo pipefail`: see the identical note in the CLI loop below.
+  _rc=0
+  bin="$(dss_bh_build_artifact "$DSS_BIN" "$manifest" "$DSS_CONFIG" "$outd" "$log" "$spec")" || _rc=$?
+  # THE ONE EXTRA QUESTION THIS LOOP ASKS, and it is asked HERE rather than in the
+  # shared core on purpose: Step 8 EXECS this file, so the POSIX exec bit has to be
+  # set. That is not a target-agnostic property (a staticlib leg's artefact is not
+  # executable) and it is not askable on a Windows host at all, which is why the
+  # core stops at "does it exist" and the caller that intends to exec adds this.
+  if [[ $_rc -eq 0 && ! -x "$bin" ]]; then _rc=5; fi
+  if [[ $_rc -ne 0 ]]; then
     COMPILE_FAILS=$((COMPILE_FAILS + 1))
     # `poisoned` — the ledger's FAILURE class, and it DISPLACES whatever this leg
     # was carrying: a build that produced no artifact is the strongest thing that
     # can be said about it, and a failure must never read as a skip.
     LEG_VERDICT["$leg"]="poisoned"
     LEG_VERDICT_DETAIL["$leg"]="the fixture did not build for ${LEG_SPEC[$leg]} — see $log"
-    if grep -qE 'error\[' "$log"; then
-      warn "[$leg] build FAILED$(compile_time_suffix "$log") — first diagnostics ($log):"
+    if [[ $_rc -eq 3 ]]; then
+      warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — first diagnostics ($log):"
       { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
-    elif [[ -z "$bin" ]]; then
+    elif [[ $_rc -eq 2 ]]; then
+      warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — the build log reports MORE THAN ONE artefact for $spec; see the diagnostic above and $log"
+    elif [[ $_rc -eq 1 ]]; then
       # ★ THE GENUINE CASE THE OLD MESSAGE WAS TRYING TO DESCRIBE, and it now says
       # what it really means: the build emitted no diagnostics AND never claimed to
       # have written anything for this leg's target. That is a compiler that
       # returned quietly without producing an artefact — a defect worth a loud
       # verdict, and no longer reachable by merely mis-spelling a file name.
-      warn "[$leg] build FAILED$(compile_time_suffix "$log") — 0 error[ and the build reported NO artefact for $spec (expected a 'dss-code-prime: artifact $spec <path>' line in $log)"
+      warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — 0 error[ and the build reported NO artefact for $spec (expected a 'dss-code-prime: artifact $spec <path>' line in $log)"
+    elif [[ $_rc -eq 4 ]]; then
+      warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — 0 error[ but the artefact the build REPORTED is not there: $bin"
     else
-      warn "[$leg] build FAILED$(compile_time_suffix "$log") — 0 error[ but the artefact the build REPORTED is not an executable file: $bin"
+      warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — 0 error[ but the artefact the build REPORTED is not an executable file: $bin"
     fi
   else
     # ── STAGE THE ACQUIRED LIBRARIES BESIDE THE ARTEFACT ──────────────────────
@@ -3201,8 +3493,242 @@ for leg in "${LEG_ORDER[@]}"; do
     fi
     # <<< dss:fresh-inode-install <<<
     FIXTURE["$leg"]="$bin"; COMPILE_OK["$leg"]=1
-    pass "[$leg] testfixture -> $bin$(compile_time_suffix "$log")"
+    pass "[$leg] testfixture -> $bin$(dss_bh_compile_time_suffix "$log")"
   fi
+done
+
+# ── Step 7b — build the sqlite3 CLI for EVERY declared leg ───────────────────
+# ★ A SEPARATE LOOP, AND THAT IS THE POINT. The CLI's buildability is not the
+# fixture's: it needs ZLIB and does not need TCL, so a leg whose Tcl could not be
+# resolved on this host — which stops the fixture dead at the loop above — can
+# still produce a perfectly good sqlite3. Nesting this inside the fixture loop
+# would have inherited the fixture's `continue`s and silently made the CLI
+# unbuildable for a reason that has nothing to do with it.
+#
+# ★ THE BUILD IS ATTEMPTED FOR EVERY DECLARED LEG, ON EVERY HOST. There is no
+# host test in this loop and there must never be one — the same rule the fixture
+# loop states, for the same reason: whether this machine can EXECUTE the result
+# is a different question, asked by the smoke gate in Step 7c. A leg this host
+# can never run is still compiled and still linked, because that is the
+# capability under test.
+step "7b/9  Build the sqlite3 CLI (dss-code-prime --project), per leg"
+declare -A CLI_BIN=() CLI_OK=()
+CLI_FAILS=0
+for leg in "${LEG_ORDER[@]}"; do
+  spec="${LEG_SPEC[$leg]}"; fmt="${LEG_FORMAT[$leg]}"
+  # ★ ITS OWN OUTPUT DIRECTORY, AND ITS OWN COMPILE LOG. `<outd>/cli/` rather
+  # than `<outd>/`, so the project driver's per-format subdir lands at
+  # `<outd>/cli/<fmt>/sqlite3` and CANNOT collide with `<outd>/<fmt>/testfixture`.
+  # The separate log is the STRUCTURAL half of the artifact-reader fix: two
+  # artifacts for the SAME target spec in ONE log is exactly the ambiguity that
+  # made "take the LAST match" unsafe, and giving each build its own log means
+  # the ambiguity never arises. dss_bh_reported_artifact fails loud if it ever
+  # does anyway.
+  outd="$OUT_DIR/$leg/cli"; log="$outd/compile.log"
+  manifest="$outd/$leg.sqlite3.dss-project.json"
+  mkdir -p "$outd"
+  # The ONE thing that can stop a leg here is a DECLARED BUILD INPUT this machine
+  # could not find: DSS reads --resolve-library binaries at COMPILE time, so
+  # without zlib there is nothing to compile against. An OBSERVED absence with a
+  # named verdict — not an inference from what kind of box this is.
+  if [[ -z "${LEG_Z_LIB[$leg]:-}" ]]; then
+    CLI_FAILS=$((CLI_FAILS + 1))
+    dss_bh_set_verdict "$leg" sqlite3 'skipped-build-input-missing' \
+      "no zlib could be resolved for this leg on this host, and the CLI links zlib (SQLITE_HAVE_ZLIB=1 reaches a live '#include <zlib.h>' in shell.c) — see Step 6."
+    warn "[$leg] CLI build NOT ATTEMPTED [skipped-build-input-missing] — $(dss_bh_get_detail "$leg" sqlite3)"
+    continue
+  fi
+  if [[ -z "${LEG_CLI_INC_FILE[$leg]:-}" ]]; then
+    CLI_FAILS=$((CLI_FAILS + 1))
+    dss_bh_set_verdict "$leg" sqlite3 'poisoned' \
+      "the zlib header dir for this leg's stage 'zinc/${LEG_HEADER_STAGE_KEY[$leg]:-?}' was NOT produced — see the ZINC-STAGE-FAIL line in Step 6. Compiling it against another target's zlib header is refused (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED)."
+    warn "[$leg] CLI POISONED — $(dss_bh_get_detail "$leg" sqlite3)"
+    continue
+  fi
+  # Sweep this leg's CLI artefact DIRECTORY, not a file name: at this point the
+  # artefact has no name yet (the compiler decides it), and guessing one is the
+  # defect D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING names.
+  preflight_out="$(stop_our_fixtures "$outd/$fmt/" 'cli pre-flight')" \
+    || die "[$leg] the pre-flight sweep for the CLI artefact dir FAILED — refusing to build over a possibly-running binary."
+  while IFS= read -r k; do
+    [[ -z "$k" ]] || { warn "[$leg] LEFTOVER CLI PROCESS: $k"; PREFLIGHT_KILLS+=("$k"); }
+  done <<< "$preflight_out"
+
+  declare -a _cli_lib_argv=()
+  _cli_argv_log="$outd/resolve-library-argv.log"
+  if _argv_raw="$(leg_resolve_z_library_argv "$leg" 2>"$_cli_argv_log")" && [[ -n "$_argv_raw" ]]; then
+    mapfile -t _cli_lib_argv <<< "$_argv_raw"
+  else
+    _argv_msg="$(tr '\n' ' ' < "$_cli_argv_log" 2>/dev/null || true)"
+    [[ -n "${_argv_msg// /}" ]] || _argv_msg="<the resolver refused with no diagnostic on stderr — see $_cli_argv_log>"
+    CLI_FAILS=$((CLI_FAILS + 1))
+    dss_bh_set_verdict "$leg" sqlite3 'poisoned' \
+      "the DSS argv for this leg's resolved zlib could not be built (declared runtime identity: '${LEG_LIB_Z_IMPORT_NAME[$leg]:-<none>}') — $_argv_msg"
+    warn "[$leg] CLI POISONED — $(dss_bh_get_detail "$leg" sqlite3)"
+    continue
+  fi
+  info "[$leg] $spec — ${#CLI_TUS[@]} TUs → sqlite3 (resolve: $(basename "${LEG_Z_LIB[$leg]}"); transform: ${LEG_RECIPE_TRANSFORM[$leg]})"
+  if counts="$(generate_cli_manifest "$leg" "$manifest" "${_cli_lib_argv[@]}")"; then
+    while IFS= read -r _cl; do [[ -z "$_cl" ]] || info "[$leg] cli manifest: $_cl"; done <<< "$counts"
+  else
+    printf '%s\n' "$counts" | sed 's/^/      /' >&2
+    die "[$leg] CLI manifest generation FAILED ($MANIFEST_GEN) — see above."
+  fi
+  # rc: 0 built · 1 no artefact reported · 2 AMBIGUOUS · 3 diagnostics. Judged
+  # from `error[` plus the build's own artefact report, never from the process
+  # exit status — dss-code-prime returns 0 even on fatal errors.
+  # `|| _rc=$?` is LOAD-BEARING, not style. This file runs under `set -Eeuo
+  # pipefail` with an ERR trap, and a plain `bin="$(fn)"; _rc=$?` lets the
+  # assignment's non-zero status trip errexit BEFORE the next line runs — the
+  # harness then dies with "failed at line N (command: return 3)" instead of
+  # rendering this leg's verdict, turning a per-leg build failure into a
+  # whole-run abort. MEASURED here on the first real run. The `|| …` list form
+  # suppresses errexit for the assignment, which is exactly how the fixture
+  # loop's `|| bin=''` above has always handled the same hazard.
+  _rc=0
+  bin="$(dss_bh_build_artifact "$DSS_BIN" "$manifest" "$DSS_CONFIG" "$outd" "$log" "$spec")" || _rc=$?
+  if [[ $_rc -ne 0 ]]; then
+    CLI_FAILS=$((CLI_FAILS + 1))
+    case "$_rc" in
+      3) _why="$(grep -m3 -E 'error\[' "$log" | tr '\n' ' ')" ;;
+      2) _why="the build log reports MORE THAN ONE artefact for $spec — see the diagnostic above and $log" ;;
+      4) _why="0 error[ but the artefact the build REPORTED is not there: $bin" ;;
+      *) _why="0 error[ and the build reported NO artefact for $spec (expected a 'dss-code-prime: artifact $spec <path>' line in $log)" ;;
+    esac
+    dss_bh_set_verdict "$leg" sqlite3 'poisoned' "the sqlite3 CLI did not build for $spec — $_why  See $log"
+    warn "[$leg] CLI build FAILED$(dss_bh_compile_time_suffix "$log") — $_why"
+    continue
+  fi
+  # The acquired libraries go BESIDE this artefact too. A leg that ACQUIRED its
+  # zlib records `@loader_path/<name>` for it, which is a claim about the
+  # directory holding THE EXECUTABLE — and the CLI's directory is not the
+  # fixture's, so staging beside the fixture does not make it true here.
+  _stage_dir="$(dirname "$bin")"; _stage_bad=""
+  while IFS=$'\t' read -r _as _src; do
+    [[ -n "$_as" && -n "$_src" ]] || continue
+    cp -p "$_src" "$_stage_dir/$_as" || _stage_bad="$_stage_bad $_as"
+  done <<< "${LEG_ACQ_LIBS[$leg]:-}"
+  if [[ -n "$_stage_bad" ]]; then
+    CLI_FAILS=$((CLI_FAILS + 1))
+    dss_bh_set_verdict "$leg" sqlite3 'poisoned' \
+      "the CLI built for $spec, but its ACQUIRED librar(y/ies)$_stage_bad could not be staged into $_stage_dir. The artefact records '@loader_path/<name>' for them, so without the copies it fails in the target's loader."
+    warn "[$leg] CLI POISONED — $(dss_bh_get_detail "$leg" sqlite3)"
+    continue
+  fi
+  # Same macOS fresh-inode install the fixture gets, and for the same measured
+  # reason (D-HARNESS-MACOS-PROVENANCE-KILLS-OVERWRITTEN-FIXTURE): the smoke gate
+  # execs this file ~30 times, so an inode carrying a permanent exec DENY would
+  # turn every assertion into a 137 with no output. A HOST fact about the box
+  # that will exec the file, not about the target that produced it.
+  if [[ "$HOST_OS" == "darwin" ]]; then
+    fresh_ino="$(fixture_fresh_inode "$bin")" || die "[$leg] could not install the sqlite3 CLI on a FRESH INODE at $bin (rc=$?) — D-HARNESS-MACOS-PROVENANCE-KILLS-OVERWRITTEN-FIXTURE."
+    info "[$leg] fresh-inode install: $bin now inode $fresh_ino"
+  fi
+  CLI_BIN["$leg"]="$bin"; CLI_OK["$leg"]=1
+  dss_bh_set_verdict "$leg" sqlite3 'built' "sqlite3 -> $bin"
+  pass "[$leg] sqlite3 -> $bin$(dss_bh_compile_time_suffix "$log")"
+done
+info "sqlite3 CLI: built on $(( ${#LEG_ORDER[@]} - CLI_FAILS )) of ${#LEG_ORDER[@]} processed leg(s)"
+
+# ── Step 7c — the sqlite3 CLI SMOKE GATE, per leg ────────────────────────────
+# ★ WHY THIS EXISTS AT ALL. The unit corpus in Step 8 runs through `testfixture`
+# — a Tcl interpreter linking the sqlite LIBRARY — and NEVER executes shell.c. So
+# argv handling, the dot-commands, the `.dump` writer and the startup version
+# guard are covered by NOTHING without this [D-SQLITE-CLI-BUILT-ON-NO-LEG].
+#
+# ★ EVERY LEG GETS A VERDICT, OR A LOUD SKIP WITH A REASON. A leg that built the
+# CLI but cannot execute it here (run.mode `skip` — a cross target with no
+# launcher on this host) is recorded as `built-not-run-here`, which is a
+# completely different fact from "not built" and is printed as such in Step 9.
+# Silence about a leg is a harness bug.
+step "7c/9  sqlite3 CLI smoke gate (14 assertions, attributed against gcc)"
+[[ -f "$CLI_SMOKE" ]] || die "the CLI smoke gate is missing: $CLI_SMOKE"
+# The expectation comes from the STAGED tree's OWN header — the very file these
+# binaries were compiled against — never from a literal in this driver. A
+# hardcoded "3.54.0" silently stops testing anything the day upstream bumps.
+CLI_EXPECT_VERSION="$(sed -n 's/^#define SQLITE_VERSION  *"\(.*\)".*/\1/p' "$BLD/sqlite3.h" | head -1)"
+CLI_EXPECT_SOURCE_ID="$(sed -n 's/^#define SQLITE_SOURCE_ID  *"\(.*\)".*/\1/p' "$BLD/sqlite3.h" | head -1)"
+[[ -n "$CLI_EXPECT_VERSION" && -n "$CLI_EXPECT_SOURCE_ID" ]] \
+  || die "could not read SQLITE_VERSION / SQLITE_SOURCE_ID out of $BLD/sqlite3.h.
+      They are what the smoke gate compares the built CLI's --version against; without
+      them the gate would be asserting nothing, which must never pass quietly."
+info "expecting version '$CLI_EXPECT_VERSION' / source id '$CLI_EXPECT_SOURCE_ID' (from $BLD/sqlite3.h)"
+[[ -n "$REF_CLI" ]] || warn "no gcc reference CLI — every smoke failure this run is UNATTRIBUTABLE and is charged to DSS by design."
+declare -A CLI_SMOKE_VERDICT=()
+CLI_SMOKE_FAILS=0
+for leg in "${LEG_ORDER[@]}"; do
+  if [[ "${CLI_OK[$leg]:-0}" != "1" ]]; then
+    CLI_SMOKE_VERDICT["$leg"]="not run [$(dss_bh_get_verdict "$leg" sqlite3)] — $(dss_bh_get_detail "$leg" sqlite3)"
+    continue                                  # already counted + warned in Step 7b
+  fi
+  # THE ONE LEGITIMATE HOST QUESTION, and it is `run.mode` off the RESOLVED plan
+  # — never `if [[ $HOST_OS ]]`. `native` runs it directly, `launched` runs it
+  # through the leg's DECLARED launcher, `skip` records a named verdict.
+  if [[ "${LEG_RUN_MODE[$leg]}" == "skip" ]]; then
+    CLI_SMOKE_VERDICT["$leg"]="built, NOT RUN here [${LEG_RUN_VERDICT[$leg]}] — ${LEG_RUN_DETAIL[$leg]}"
+    warn "[$leg] CLI smoke SKIPPED — built at ${CLI_BIN[$leg]} but this host cannot execute it: ${LEG_RUN_DETAIL[$leg]}"
+    continue
+  fi
+  _smoke_dir="$OUT_DIR/$leg/cli-smoke"
+  rm -rf "$_smoke_dir"; mkdir -p "$_smoke_dir"
+  declare -a _smoke_argv=("$CLI_SMOKE" --cli "${CLI_BIN[$leg]}"
+                          --expect-version "$CLI_EXPECT_VERSION"
+                          --expect-source-id "$CLI_EXPECT_SOURCE_ID"
+                          --workdir "$_smoke_dir" --label "$leg"
+                          --json "$_smoke_dir/result.json")
+  # THE LAUNCHER IS DECLARED, NOT INFERRED — and it is `eval`'d, not word-split.
+  # LEG_LAUNCH is the catalogue's launcher argv SHLEX-QUOTED and space-joined by
+  # the resolver, so it can be multi-word (`arch -x86_64`) AND a single word can
+  # contain spaces. `for t in ${LEG_LAUNCH[...]}` would shred exactly that case;
+  # `eval` on the resolver's own quoting is the only correct split, which is why
+  # run_leg does the same thing. Empty for a native leg.
+  declare -a _smoke_launch=()
+  eval "_smoke_launch=(${LEG_LAUNCH[$leg]:-})"
+  for _t in "${_smoke_launch[@]}"; do _smoke_argv+=(--launcher "$_t"); done
+  # The reference is a LOCAL gcc build, so it always runs natively — no launcher.
+  [[ -n "$REF_CLI" ]] && _smoke_argv+=(--reference "$REF_CLI")
+  # ★ THE LEG'S RUNTIME ENVIRONMENT, APPLIED IN A SUBSHELL. Two things are
+  # load-bearing here and both are DECLARED by the leg rather than known to this
+  # file:
+  #   · LEG_LAUNCH_ENV — for the arm64 leg this is QEMU_LD_PREFIX. Without it
+  #     qemu cannot find the guest loader and EVERY exec dies at exit 255, which
+  #     would read as 14 DSS failures on a binary that is completely fine.
+  #   · LD_LIBRARY_PATH — a leg whose libraries the harness STAGED (any provider
+  #     but `host-system`) needs its own zlib on the loader path; a `host-system`
+  #     leg's libraries are already where this machine's loader looks.
+  # The subshell is what keeps both out of the parent: leaking QEMU_LD_PREFIX or
+  # a foreign LD_LIBRARY_PATH into the rest of the run would silently change how
+  # every later leg's processes resolve libraries.
+  # ★ `|| _srcc=$?` below is LOAD-BEARING, not style — the same rule this file
+  # already states at :3561. Under `set -Eeuo pipefail` a bare `cmd; rc=$?` exits
+  # the script ON the non-zero, BEFORE the assignment runs. With that form the
+  # whole classification below is DEAD CODE for every failing leg: verdicts 1
+  # (charged to DSS) and 3 (the gcc reference fails identically) can never be
+  # reached, and one leg's failed smoke ABORTS THE ENTIRE RUN — measured TF-C119,
+  # where it killed the run at step 7c and the unit corpus at step 8 never ran.
+  # A leg that cannot smoke must yield a LOUD VERDICT, never silence and never a
+  # dead sibling: the harness survives everything.
+  _srcc=0
+  (
+    declare -a _envs=()
+    eval "_envs=(${LEG_LAUNCH_ENV[$leg]:-})"
+    [[ ${#_envs[@]} -eq 0 ]] || export "${_envs[@]}"
+    if [[ "${LEG_LIB_PROVIDER[$leg]}" != "host-system" ]]; then
+      export LD_LIBRARY_PATH="$(dirname "${LEG_Z_LIB[$leg]}")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+    python3 "${_smoke_argv[@]}"
+  ) > "$_smoke_dir/smoke.log" 2>&1 || _srcc=$?
+  sed 's/^/      /' "$_smoke_dir/smoke.log"
+  case "$_srcc" in
+    0) CLI_SMOKE_VERDICT["$leg"]="PASS (14/14)"
+       pass "[$leg] CLI smoke: 14/14" ;;
+    3) CLI_SMOKE_FAILS=$((CLI_SMOKE_FAILS + 1))
+       CLI_SMOKE_VERDICT["$leg"]="FAIL — NOT DSS (the gcc reference fails identically); see $_smoke_dir/result.json"
+       warn "[$leg] CLI smoke RED, but DSS is NOT implicated — the gcc reference fails the same assertions." ;;
+    *) CLI_SMOKE_FAILS=$((CLI_SMOKE_FAILS + 1))
+       CLI_SMOKE_VERDICT["$leg"]="FAIL — CHARGED TO DSS; see $_smoke_dir/result.json"
+       warn "[$leg] CLI smoke FAILED and is CHARGED TO DSS — see $_smoke_dir/smoke.log" ;;
+  esac
 done
 
 # ── Step 8 — run the .test UNIT CORPUS through each leg's fixture ─────────────
@@ -3798,6 +4324,21 @@ step "9/9  Results"
 printf '   compiler : %s @ %s%s\n' "$DSS_BIN" "$SRC_HEAD" "$SRC_DIVERGE_NOTE"
 printf '   sqlite   : %s @ %s\n' "$SQLITE_DIR" "$(git_head_short "$SQLITE_DIR")"
 printf '   recipe   : %s TUs, %s defines (%s)\n' "${#TUS[@]}" "${#RECIPE_DEFS[@]}" "$RECIPE"
+printf '   cli recipe: %s TUs, %s defines (%s)\n' "${#CLI_TUS[@]}" "${#CLI_DEFS[@]}" "$CLI_RECIPE"
+# The CLI's own ATTRIBUTION ORACLE, and its absence, on the same terms as the
+# fixture's below: without it NO smoke failure can be separated from an upstream
+# or environment fault, and cli-smoke.py charges an unattributable failure to DSS.
+if [[ -n "${REF_CLI:-}" && -f "${REF_CLI:-}" && -x "${REF_CLI:-}" ]]; then
+  # The TU count is the LIVE one, read off the derivation two lines above. It was
+  # a hardcoded `103` printed directly beneath the line that prints
+  # ${#CLI_TUS[@]} — two numbers for one fact, one of which stops being true the
+  # day upstream adds a source file, sitting where a reader compares them.
+  printf '   cli oracle: %s  (gcc `make sqlite3d` — the SAME %s TUs from the SAME staged tree; the compiler and the -D split differ, see the note at Step 4)\n' \
+    "$REF_CLI" "${#CLI_TUS[@]}"
+else
+  printf '   cli oracle: %sABSENT%s — no smoke failure this run could be attributed. Log: %s\n' \
+    "$C_YLW" "$C_RST" "${REF_CLI_LOG:-$OUT_DIR/reference-cli-build.log}"
+fi
 # The ATTRIBUTION ORACLE, surfaced where a human triaging a failure will see it.
 # Its ABSENCE is printed too, and loudly: a missing oracle is the difference
 # between attributing a corpus failure and arguing about it (it is what stalled
@@ -3846,6 +4387,57 @@ for leg in "${LEG_DECLARED[@]}"; do
       "${LEG_VERDICT[$leg]:-<NO VERDICT>}" "${LEG_VERDICT_DETAIL[$leg]:-<no reason recorded>}"
   fi
 done
+
+# ── THE sqlite3 CLI, PER LEG — a SECOND artifact needs a SECOND ledger line ──
+# ★ ONE LINE PER DECLARED LEG, ALWAYS. The fixture block above is keyed on the
+# fixture's outcome and cannot express "the fixture built and the CLI did not"
+# (or the reverse, which is reachable: the CLI needs zlib and NOT Tcl, so a
+# host with no Tcl builds a CLI and no fixture). A reader must be able to see
+# both artifacts' fate for every leg without inferring either from the other.
+printf '   --- sqlite3 CLI (full TU: shell.c + the %s library TUs recovered from %s) ---\n' \
+  "$(( ${#CLI_TUS[@]} - 1 ))" "$(basename "$AR")"
+for leg in "${LEG_DECLARED[@]}"; do
+  _cv="$(dss_bh_get_verdict "$leg" sqlite3)"
+  if [[ "${CLI_OK[$leg]:-0}" == "1" ]]; then
+    printf '   %-14s (%s): %sbuilt%s   smoke: %s\n' "$leg" "${LEG_SPEC[$leg]}" "$C_GRN" "$C_RST" \
+      "${CLI_SMOKE_VERDICT[$leg]:-<NO SMOKE VERDICT>}"
+  elif [[ -z "$_cv" ]]; then
+    # Not selected by DSS_LEGS — the loop never processed it. Named, never blank:
+    # a leg that silently produced no line is the shortfall the ledger exists for.
+    # ★ THIS BRANCH IS ONLY HONEST BECAUSE THE HARNESS KNOWS WHICH: `LEG_ORDER`
+    # is the SELECTED set, so a leg outside it was filtered out and a leg inside
+    # it with no verdict is a HARNESS BUG — which the CLI-ledger guard below
+    # turns into a non-zero exit rather than a plausible-looking line.
+    if printf '%s\n' "${LEG_ORDER[@]}" | grep -qxF "$leg"; then
+      printf '   %-14s (%s): %s★ NO CLI VERDICT%s — this leg WAS selected and the CLI loop still recorded nothing for it. That is a harness bug; see the ledger check below.\n' \
+        "$leg" "${LEG_SPEC[$leg]}" "$C_RED" "$C_RST"
+    else
+      printf '   %-14s (%s): %snot processed%s [not-selected-by-runner] — DSS_LEGS='\''%s'\'' did not select this leg\n' \
+        "$leg" "${LEG_SPEC[$leg]}" "$C_YLW" "$C_RST" "${DSS_LEGS:-}"
+    fi
+  else
+    printf '   %-14s (%s): %sNOT BUILT%s [%s] — %s\n' "$leg" "${LEG_SPEC[$leg]}" "$C_YLW" "$C_RST" \
+      "$_cv" "$(dss_bh_get_detail "$leg" sqlite3)"
+  fi
+done
+# ── THE CLI VERDICT-COMPLETENESS GUARD — the INSTRUMENT, actually wired in ───
+# ★ `dss_bh_assert_verdicts` SHIPPED INERT. It was written with the docstring
+# "the inert-instrument guard: a ledger nobody filled in must never read as
+# clean" and then had ZERO call sites in either driver — the guard against a
+# silent ledger was itself the silent thing. It is the check that would have
+# caught the two defects found beside it: a CLI loop that skipped legs it should
+# have built, and a run reporting "BUILT on 0 of 5" and exiting 0.
+#
+# OVER THE SELECTED LEGS, not the declared ones, and the distinction is the whole
+# reason the ledger line above can say WHICH: a leg DSS_LEGS filtered out was
+# never asked for and has no verdict by design; a leg that WAS selected and
+# reached no verdict is a harness bug. Reported here, made FATAL below beside the
+# fixture ledger's own hole detector, because a run that cannot say what happened
+# to an artifact it declared has not proved what it claims.
+CLI_LEDGER_HOLE=0
+if [[ ${#LEG_ORDER[@]} -gt 0 ]]; then
+  dss_bh_assert_verdicts sqlite3 "${LEG_ORDER[@]}" || CLI_LEDGER_HOLE=1
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # THE VERDICT LEDGER — every DECLARED leg, one named verdict, counts that SUM
@@ -3945,8 +4537,35 @@ if [[ "$LEDGER_HOLE" -eq 1 ]]; then
   printf 'not prove it about every leg it claimed to cover. Refusing to exit 0.\n'
   exit 1
 fi
+# The SECOND artifact's ledger, on exactly the same terms. Two artifacts per leg
+# means two ways to lose a leg silently, and a hole in either one is the same
+# defect: the run cannot say what happened to something it declared.
+if [[ "${CLI_LEDGER_HOLE:-0}" -eq 1 ]]; then
+  printf '\n%sTHE sqlite3 CLI LEDGER DOES NOT ADD UP — a SELECTED leg reached no CLI verdict.%s\n' "$C_RED" "$C_RST"
+  printf 'The leg(s) are named in the base-harness diagnostic above. This is a HARNESS defect:\n'
+  printf 'the CLI build loop must reach a named verdict for every leg the runner selected —\n'
+  printf 'built, poisoned, or skipped-build-input-missing. Refusing to exit 0.\n'
+  exit 1
+fi
 if [[ "$COMPILE_FAILS" -gt 0 ]]; then
   printf '\n%s%d leg(s) failed to compile the testfixture — inspect the compile.log diagnostics.%s\n' "$C_RED" "$COMPILE_FAILS" "$C_RST"
+  exit 1
+fi
+# ★ THE CLI IS PART OF THE RUN'S VERDICT, NOT AN EXTRA. A CLI that failed to
+# build, or whose smoke gate went red, exits non-zero exactly as a fixture
+# failure does — otherwise "we can run all sqlite3 CLI in any host" would be a
+# claim nothing enforces, and a silently-unbuilt CLI is the shortfall this whole
+# step exists to make impossible. The two counters are kept apart so the message
+# says WHICH half broke.
+if [[ "${CLI_FAILS:-0}" -gt 0 ]]; then
+  printf '\n%s%d leg(s) did not produce a sqlite3 CLI — each one'\''s reason is on its CLI ledger line above.%s\n' "$C_RED" "$CLI_FAILS" "$C_RST"
+  printf 'Where a compile was actually attempted, the diagnostics are in %s/<leg>/cli/compile.log.\n' "$OUT_DIR"
+  exit 1
+fi
+if [[ "${CLI_SMOKE_FAILS:-0}" -gt 0 ]]; then
+  printf '\n%s%d leg(s) failed the sqlite3 CLI smoke gate — inspect %s/<leg>/cli-smoke/smoke.log.%s\n' "$C_RED" "$CLI_SMOKE_FAILS" "$OUT_DIR" "$C_RST"
+  printf 'Each leg'\''s line above says whether it was CHARGED TO DSS or exonerated against the\n'
+  printf 'gcc reference. Exonerated is still red: it names WHO is at fault, not that it passed.\n'
   exit 1
 fi
 if [[ "$UNIT_FAILS" -gt 0 ]]; then
@@ -3959,3 +4578,18 @@ if [[ ${#ENV_SKIPS[@]} -gt 0 && "$STRICT_VERDICTS" -eq 1 ]]; then exit 1; fi
 # to produce" — a sentence that got smaller as the host got less capable, without
 # ever saying so. It now names what was verified out of what was DECLARED.
 pass "$LEDGER_VERIFIED of $LEDGER_TOTAL declared leg(s) VERIFIED: compiled the full-source testfixture + ran the $DSS_TIER unit corpus GREEN — SQLite units pass with dss-code-prime.  ($LEDGER_SKIPPED skipped: $LEDGER_STRUCTURAL structural, $LEDGER_ENVIRONMENTAL environmental, $LEDGER_HARNESS harness — each named above; 0 poisoned)"
+# The CLI's own closing claim, BOUNDED the same way — it names how many legs
+# built it and how many actually EXECUTED the gate, because "built" and "ran the
+# 14 assertions" are different facts and a cross leg with no launcher on this
+# host legitimately reaches only the first.
+_cli_built=0; _cli_smoked=0
+for leg in "${LEG_DECLARED[@]}"; do
+  [[ "${CLI_OK[$leg]:-0}" == "1" ]] && _cli_built=$((_cli_built + 1))
+  [[ "${CLI_SMOKE_VERDICT[$leg]:-}" == PASS* ]] && _cli_smoked=$((_cli_smoked + 1))
+done
+# ★ "THE REST" IS COUNTED OFF THE BUILT LEGS, NOT OFF THE DECLARED ONES. It used
+# to read $LEDGER_TOTAL − $_cli_smoked and describe that as "built but not
+# executable on this host", which silently absorbed every leg that was never
+# built at all — contradicted by this driver's own CLI ledger three lines
+# earlier. A leg that did not build is not a leg this host could not run.
+pass "sqlite3 CLI: BUILT on $_cli_built of $LEDGER_TOTAL declared leg(s) from ${#CLI_TUS[@]} full-source TUs; the 14-assertion smoke gate passed on $_cli_smoked (of the $_cli_built built, $(( _cli_built - _cli_smoked )) were NOT executed here — each named above; the $(( LEDGER_TOTAL - _cli_built )) that did not build are named there too)"

@@ -77,6 +77,7 @@
 // are operand-contract faults, and test_mir_merge.cpp reds on each of them.
 
 #include "core/types/aggregate_layout.hpp"      // VaListStrategy
+#include "core/types/arg_payload.hpp"           // Arg payload is PACKED (position<<16)|ordinal
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -114,6 +115,7 @@ constexpr std::uint32_t kPrintfSym   = 11;
 constexpr std::uint32_t kFprintfSym  = 12;
 constexpr std::uint32_t kVfprintfSym = 13;
 constexpr std::uint32_t kSscanfSym   = 14;
+constexpr std::uint32_t kSnprintfSym = 15;
 constexpr std::uint32_t kMainSym     = 100;
 
 constexpr std::uint32_t kCoreVsprintfSym = 20;
@@ -138,12 +140,21 @@ MirLiteralValue i32Lit(std::int64_t v) {
 // variadicity. `vfprintf` is the odd one — three DECLARED parameters and NOT variadic
 // (C 7.21.6.8) — and spelling that here keeps `main`'s reference a plausible call
 // rather than a stub that only happens to verify.
-struct ShimDecl { std::uint32_t fixedArgc; bool variadic; };
+//
+// `sizeParamIndex` exists for `snprintf` alone: it is the only recipe with a parameter
+// that is NOT a pointer (`size_t n` at index 1). The scaffold has to spell that
+// honestly rather than pass a pointer in the slot, because the pass DEFINES the shim
+// with a `u64` there and the MirVerifier every test below runs compares the definition
+// against this reference — a `ptr` here would red on a scaffold defect and read as a
+// pass defect.
+constexpr std::uint32_t kNoSizeParam = 0xFFFFFFFFu;
+struct ShimDecl { std::uint32_t fixedArgc; bool variadic; std::uint32_t sizeParamIndex; };
 ShimDecl declOf(std::uint32_t sym) {
     switch (sym) {
-    case kPrintfSym:   return {1, true};    // printf(fmt, ...)
-    case kVfprintfSym: return {3, false};   // vfprintf(stream, fmt, ap)
-    default:           return {2, true};    // fprintf / sprintf / sscanf
+    case kPrintfSym:   return {1, true,  kNoSizeParam};  // printf(fmt, ...)
+    case kVfprintfSym: return {3, false, kNoSizeParam};  // vfprintf(stream, fmt, ap)
+    case kSnprintfSym: return {3, true,  1};             // snprintf(buf, size_t n, fmt, ...)
+    default:           return {2, true,  kNoSizeParam};  // fprintf / sprintf / sscanf
     }
 }
 
@@ -152,6 +163,7 @@ ShimDecl declOf(std::uint32_t sym) {
 // behind for a `synthesize`-tagged descriptor row.
 Mir buildCaller(TypeInterner& in, std::vector<std::uint32_t> const& shimSyms) {
     TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const u64 = in.primitive(TypeKind::U64);
     TypeId const pCh = in.pointer(in.primitive(TypeKind::Char));
 
     MirBuilder mb;
@@ -159,12 +171,18 @@ Mir buildCaller(TypeInterner& in, std::vector<std::uint32_t> const& shimSyms) {
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
     MirInstId const buf = mb.addInst(MirOpcode::Alloca, {}, pCh, 64);
+    MirLiteralValue nLit;
+    nLit.value = 16;
+    nLit.core  = TypeKind::U64;
+    MirInstId const nArg = mb.addConst(nLit, u64);
     for (std::uint32_t sym : shimSyms) {
         ShimDecl const d = declOf(sym);
-        std::vector<TypeId> const params(d.fixedArgc, pCh);
+        std::vector<TypeId> params(d.fixedArgc, pCh);
+        if (d.sizeParamIndex != kNoSizeParam) params[d.sizeParamIndex] = u64;
         TypeId const shimSig = in.fnSig(params, i32, CallConv::CcMS64, d.variadic);
         std::vector<MirInstId> co{mb.addGlobalAddr(SymbolId{sym}, in.pointer(shimSig))};
-        for (std::uint32_t i = 0; i < d.fixedArgc; ++i) co.push_back(buf);
+        for (std::uint32_t i = 0; i < d.fixedArgc; ++i)
+            co.push_back(i == d.sizeParamIndex ? nArg : buf);
         mb.addInst(MirOpcode::Call, co, i32);
     }
     mb.addReturn(mb.addConst(i32Lit(0), i32));
@@ -242,6 +260,68 @@ std::optional<std::int64_t> constI64(Mir const& mir, MirInstId id) {
     MirLiteralValue const& lit = mir.literalValue(mir.constLiteralIndex(id));
     auto const* v = std::get_if<std::int64_t>(&lit.value);
     return v == nullptr ? std::nullopt : std::optional<std::int64_t>{*v};
+}
+
+// ── POSITIONAL OPERAND PROBES (TF-C119) ──────────────────────────────────────
+//
+// ★ WHY THESE EXIST HERE AT ALL, and why "not a Const" is not good enough. MEASURED
+// (TF-C112, recorded at tests/mir/test_mir_merge.cpp:3216-3223 with the rule at :3226):
+// transposing `buf` and `fmt` in the SPRINTF arm passed every assertion in BOTH stdio
+// test binaries AND the MirVerifier, because both operands are `char*` and the only
+// thing separating them is their POSITION. The rule that measurement produced is
+// "EVERY operand of EVERY arm is pinned BY POSITION" — and the snprintf arm was the
+// first to break it: `_Buffer` (`Arg 0`), `_Format` (`Arg 2`) and `_Locale` were
+// unasserted here, so the identical transposition was invisible in this arm.
+//
+// They check the OPCODE first and only then read the opcode-specific payload:
+// `Mir::instPayload` / `Mir::constLiteralIndex` abort LOUD on a wrong opcode, so a bare
+// `EXPECT_EQ(opcode, …)` followed by a payload read would take the whole binary down on
+// the first mismatch instead of failing one assertion and letting the rest report.
+testing::AssertionResult isArgAt(Mir const& mir, MirInstId op, std::uint32_t ordinal) {
+    if (mir.instOpcode(op) != MirOpcode::Arg)
+        return testing::AssertionFailure()
+               << "slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
+               << ", not the parameter `Arg " << ordinal << "`";
+    // An `Arg` payload is the PACKED (position<<16)|ordinal of arg_payload.hpp, decoded
+    // rather than compared raw: a raw `== ordinal` would pass only by the accident that
+    // ms_x64 makes ordinal == position, and would silently start meaning something else
+    // on a CC where the two diverge.
+    std::uint32_t const got = arg_payload::ordinal(mir.instPayload(op));
+    if (got != ordinal)
+        return testing::AssertionFailure()
+               << "slot holds parameter `Arg " << got << "`, want `Arg " << ordinal
+               << "` — the arm forwarded the WRONG PARAMETER into this slot (a "
+                  "transposition; the candidates here are all pointers, so no type "
+                  "check at any tier can see it)";
+    std::uint32_t const pos = arg_payload::position(mir.instPayload(op));
+    if (pos != ordinal)
+        return testing::AssertionFailure()
+               << "`Arg " << ordinal << "` records flat call-operand position " << pos;
+    return testing::AssertionSuccess();
+}
+
+// `_Locale = NULL` (the ambient locale) — a null POINTER const, NOT an integer zero.
+// The literal CORE is what separates the two, and they are otherwise the same value.
+testing::AssertionResult isNullPointerConst(Mir const& mir, MirInstId op) {
+    if (mir.instOpcode(op) != MirOpcode::Const)
+        return testing::AssertionFailure()
+               << "slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
+               << ", not a Const (want the NULL `_Locale`)";
+    MirLiteralValue const& lit = mir.literalValue(mir.constLiteralIndex(op));
+    auto const* got = std::get_if<std::int64_t>(&lit.value);
+    if (got == nullptr)
+        return testing::AssertionFailure() << "Const does not carry an integer literal";
+    if (*got != 0)
+        return testing::AssertionFailure()
+               << "Const is " << *got << ", want 0 — a NON-null `_Locale` hands the "
+                  "core some other locale object";
+    if (lit.core != TypeKind::Ptr)
+        return testing::AssertionFailure()
+               << "Const core is #" << static_cast<int>(lit.core) << ", want #"
+               << static_cast<int>(TypeKind::Ptr)
+               << " — an integer zero in the `_Locale` slot is a DIFFERENT operand "
+                  "from a null pointer, and only the core tells them apart";
+    return testing::AssertionSuccess();
 }
 
 std::uint32_t countOpcode(Mir const& mir, MirFuncId fn, MirOpcode op) {
@@ -470,6 +550,156 @@ TEST(SynthStdioShimVaListArm, HomePayloadTracksEachRecipesNamedArgCount) {
     ASSERT_EQ(printfOps.size(), 6u);
     EXPECT_EQ(printfOps[2].v, iobCall->v)
         << "the core's `_Stream` argument must BE the accessor call's result";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep));
+}
+
+// ── THE ARM WITH A THIRD NAMED PARAMETER, AND THE ONLY ONE WITH A TAIL ───────
+//
+// `snprintf` (TF-C119) is the family's structural outlier twice over, and both
+// deviations are the silent kind.
+//
+// (1) IT IS THE FIRST RECIPE WITH THREE NAMED ARGS. Every leaf-emitting sibling has
+// one or two, so `vaStart(2)` — the value four of the five arms pass — is a plausible
+// copy-paste that anchors `ap` on the FORMAT POINTER's home slot instead of one past
+// it. The core would then read the format string itself as the first `%d`. That is a
+// wrong-output miscompile with no diagnostic at any tier, and it is why the payload is
+// pinned here beside its siblings rather than trusted to the runtime witness alone.
+//
+// (2) IT IS THE ONLY RECIPE IN THIS FAMILY THAT IS NOT A SINGLE BLOCK. Its body ends
+// with the UCRT header's `_Result < 0 ? -1 : _Result` clamp (`ucrt/stdio.h:1443`),
+// which MIR has no Select opcode for and so spells as a compare + CondBr + two
+// returning blocks — the `thrd_join` shape. ★ THIS TEST IS THE CLAMP'S ONLY WITNESS,
+// and that is stated rather than glossed: on every return value measured to date the
+// clamp is an IDENTITY (the core's only negative is exactly -1), so NO runtime test
+// can distinguish its presence from its absence. It is defensive fidelity to the
+// header, and structural fidelity is therefore the only thing that CAN be asserted
+// about it. Delete the tail and this reds; nothing else in the tree would.
+//
+// The two non-va operands that carry snprintf's whole meaning are pinned here too,
+// because they are what separate it from `sprintf` — same core, same TypeId, same
+// operand count, so nothing else can tell a mixed-up pair apart:
+//   * `_Options` MUST be 2 (STANDARD_SNPRINTF_BEHAVIOR). 1 is sprintf's legacy bit and
+//     yields -1 on truncation instead of the C99 would-be length.
+//   * `_BufferCount` MUST be the shim's own `Arg 1`, NOT a constant. The `(size_t)-1`
+//     sentinel its siblings pass would let the core write past the caller's buffer.
+//
+// ★★ AND EVERY OTHER OPERAND IS PINNED BY POSITION TOO, which it was not until TF-C119.
+// The rule comes from a MEASUREMENT, not from tidiness: transposing `buf` and `fmt` in
+// the SPRINTF arm passed every assertion in both stdio test binaries and the
+// MirVerifier (tests/mir/test_mir_merge.cpp:3216-3226) — both are `char*`, so only the
+// POSITION distinguishes them. This arm had `_Options` and `_BufferCount` pinned but
+// `_Buffer` (`Arg 0`), `_Format` (`Arg 2`) and `_Locale` bare, so the very same
+// transposition was invisible HERE while being caught two files over. snprintf makes it
+// worse than sprintf, not better: with a REAL `_BufferCount` the core writes `n` bytes
+// into whatever the `_Buffer` slot holds, so a transposition writes formatted output
+// over the caller's FORMAT STRING — through a bound the format string never agreed to.
+TEST(SynthStdioShimVaListArm, SnprintfForwardsThreeNamedArgsAndClampsItsResult) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildCaller(in, {kSnprintfSym});
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{
+        {kSnprintfSym, "snprintf"}};
+    std::vector<ExternImport> const externs = stdioCoreImports();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, homogeneousPointer(false),
+                                    externs, rep));
+    ASSERT_FALSE(rep.hasErrors());
+
+    auto const shim = findFuncBySymbol(mir, kSnprintfSym);
+    ASSERT_TRUE(shim.has_value()) << "snprintf must be a synthesized definition";
+
+    // It reuses SPRINTF's core — there is no `__stdio_common_vsnprintf` in ucrtbase to
+    // reach for, so resolving through the vsprintf core is the correct wiring and not a
+    // mis-wire. (A recipe that reached for a nonexistent core would fail loud in the
+    // pass, which is the behaviour `MissingCoreFailsLoud` covers.)
+    std::size_t operandCount = 0;
+    auto const ap = apOperandOfCoreCall(mir, *shim, kCoreVsprintfSym, &operandCount);
+    ASSERT_TRUE(ap.has_value())
+        << "snprintf must forward through __stdio_common_vsprintf";
+    EXPECT_EQ(operandCount, 7u)
+        << "callee + the buffered core's six parameters "
+           "(_Options, _Buffer, _BufferCount, _Format, _Locale, _ArgList)";
+
+    ASSERT_EQ(mir.instOpcode(*ap), MirOpcode::VaHomeArgAreaAddr);
+    EXPECT_EQ(mir.instPayload(*ap), 3u)
+        << "★ snprintf(buf, n, fmt, ...) has THREE named args. A payload of 2 — the "
+           "value four of the five sibling arms pass — anchors `ap` on the FORMAT "
+           "pointer's home slot, and the core formats the format string as its first "
+           "conversion. Compiles, links, loads, runs, prints garbage";
+
+    auto const call = coreCallOf(mir, *shim, kCoreVsprintfSym);
+    ASSERT_TRUE(call.has_value());
+    auto const ops = mir.instOperands(*call);
+    ASSERT_EQ(ops.size(), 7u);
+
+    // ── EVERY OPERAND, BY POSITION ──
+    // __stdio_common_vsprintf(_Options, _Buffer, _BufferCount, _Format, _Locale, _ArgList)
+    EXPECT_EQ(constI64(mir, ops[1]), std::optional<std::int64_t>{2})
+        << "_Options must be STANDARD_SNPRINTF_BEHAVIOR (1<<1). 1 is sprintf's "
+           "LEGACY_VSPRINTF_NULL_TERMINATION, under which truncation returns -1 "
+           "instead of C99's would-be length — measured, and silent";
+
+    EXPECT_TRUE(isArgAt(mir, ops[2], 0))
+        << "★ _Buffer is snprintf's `Arg 0`. If this reads `Arg 2`, the arm transposed "
+           "buf and fmt: the shim formats the destination as a control string and "
+           "writes `n` bytes of the result over the caller's FORMAT STRING. Both are "
+           "char*, so no type check at any tier sees it — MEASURED on the sprintf arm, "
+           "which passed both stdio test binaries and the MirVerifier under exactly "
+           "this swap";
+
+    // `_BufferCount` is the shim's OWN second parameter, not a literal. Asserted as an
+    // Arg with index 1 rather than merely "not a Const": a shim that forwarded `Arg 0`
+    // (the buffer pointer) as the count would also fail a not-a-Const check while being
+    // a completely different bug.
+    EXPECT_TRUE(isArgAt(mir, ops[3], 1))
+        << "★ _BufferCount must be the caller's REAL n (`Arg 1`), not 0 (the buffer) "
+           "and not 2 (the format). Its siblings pass the (size_t)-1 unbounded "
+           "sentinel, which here would let the core write past the caller's buffer — "
+           "memory corruption, not wrong text";
+    EXPECT_FALSE(constI64(mir, ops[3]).has_value())
+        << "a constant in the _BufferCount slot IS the unbounded-sentinel regression";
+
+    EXPECT_TRUE(isArgAt(mir, ops[4], 2))
+        << "★ _Format is snprintf's `Arg 2` — the other half of the transposition pair, "
+           "and the operand that makes `vaStart(3)` mean what it says";
+    EXPECT_TRUE(isNullPointerConst(mir, ops[5]))
+        << "_Locale must be a NULL pointer (the ambient locale), the same value every "
+           "sibling arm passes — an integer zero here is a different operand with the "
+           "same digits";
+    EXPECT_EQ(ops[6].v, ap->v)
+        << "_ArgList is the LAST operand, which is what makes `apOperandOfCoreCall`'s "
+           "ops.back() probe above mean `ap` at all";
+
+    // ── THE CLAMP TAIL, the part with no runtime witness ──
+    EXPECT_EQ(mir.funcBlockCount(*shim), 3u)
+        << "★ entry + the two arms of `r < 0 ? -1 : r`. Every OTHER stdio recipe is a "
+           "single block; collapsing this one to a bare `return r` drops the header's "
+           "normalization and reds ONLY here";
+    EXPECT_EQ(countOpcode(mir, *shim, MirOpcode::ICmpSlt), 1u)
+        << "the clamp's predicate is a SIGNED less-than against 0 — an unsigned "
+           "compare would make every negative result look large and positive";
+    EXPECT_EQ(countOpcode(mir, *shim, MirOpcode::CondBr), 1u);
+
+    // The negative arm must return the literal -1, not the raw result: that is the
+    // whole content of the normalization, and a CondBr into two identical `return r`
+    // blocks would satisfy every structural count above.
+    bool sawMinusOne = false;
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(*shim); ++bi) {
+        MirBlockId const b = mir.funcBlockAt(*shim, bi);
+        for (std::uint32_t i = 0; i < mir.blockInstCount(b); ++i) {
+            MirInstId const id = mir.blockInstAt(b, i);
+            if (mir.instOpcode(id) != MirOpcode::Return) continue;
+            auto const rops = mir.instOperands(id);
+            if (rops.size() == 1 && constI64(mir, rops[0])
+                == std::optional<std::int64_t>{-1})
+                sawMinusOne = true;
+        }
+    }
+    EXPECT_TRUE(sawMinusOne)
+        << "one arm must `return -1`; two arms both returning the core's result would "
+           "pass the block/CondBr counts while normalizing nothing";
 
     MirVerifier verifier{mir, &in};
     EXPECT_TRUE(verifier.verify(rep));

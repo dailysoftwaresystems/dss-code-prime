@@ -50,9 +50,31 @@ void emitErr(DiagnosticReporter& rep, std::string msg) {
 // value), never loudly — which is why the exact value was measured with a hand-written
 // probe before this pass existed, not read off documentation. `sprintf()` passes
 // LEGACY_VSPRINTF_NULL_TERMINATION (bit 0) paired with `_BufferCount = (size_t)-1`.
-// (Bit 1 is STANDARD_SNPRINTF_BEHAVIOR — the `snprintf` option, named in the return-value
-// note below but not declared here: no shipped recipe passes it.)
 constexpr std::uint64_t kOptLegacyVsprintfNullTermination = 1ull << 0;
+
+// Bit 1, `_CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR` (corecrt_stdio_config.h:116) —
+// what `snprintf` ALONE passes, and the first shipped recipe to pass a nonzero `_Options`
+// other than sprintf's legacy bit 0.
+//
+// ★ THIS BIT IS THE WHOLE C99 CONTRACT OF `snprintf`, not a tuning knob, and the two
+// behaviours it selects between are BOTH silent — neither errors, neither fails to link,
+// so the only way to tell them apart is to observe a TRUNCATING call at runtime. That is
+// what `examples/c-subset/shipped_snprintf_ucrt` exists to do, and it is also why the older
+// `sprintf`-only witness could not pin `_Options` at all: with `_BufferCount = (size_t)-1`
+// no truncation is reachable, so bits 0/1/2 are observationally identical there.
+//
+// WHAT THE DIVERGENCE ACTUALLY IS, SEPARATED INTO MEASURED AND DOCUMENTED because the two
+// are not the same size and conflating them would make this comment lie:
+//   * MEASURED (clear the bit, rebuild, run on pe64): the RETURN VALUE flips. C99 7.19.6.5
+//     requires the length the output WOULD have had; with the bit clear the core returns
+//     -1. Verbatim, `snprintf(buf, 4, "%d", 12345)` went `ret=5` → `ret=-1`, and the corpus
+//     example went exit 42 → exit 50.
+//   * DOCUMENTED, NOT REPRODUCED HERE: the legacy `_snprintf` is also described as leaving
+//     the buffer unterminated on truncation. On the ucrtbase build measured, it did NOT —
+//     the NUL was still written at `buf[3]` with the bit clear. So NUL-placement is NOT the
+//     discriminator; do not cite it as one. (The buffer's NUL and its extent ARE pinned by
+//     the example, but against the `_BufferCount` argument, not this bit — see below.)
+constexpr std::uint64_t kOptStandardSnprintfBehavior = 1ull << 1;
 
 // ZERO options — what `printf`/`fprintf`/`vfprintf`/`sscanf` pass, and a DECISION rather
 // than a placeholder, so it is named instead of spelled `0` five times. On the printf side
@@ -67,8 +89,9 @@ constexpr std::uint64_t kOptLegacyVsprintfNullTermination = 1ull << 0;
 constexpr std::uint64_t kOptNone = 0ull;
 
 // UCRT's UNBOUNDED-buffer sentinel for the `_BufferCount` parameter — `(size_t)-1`, what
-// the real header inlines pass for the length-less `sprintf`/`sscanf` (contrast
-// `snprintf`, whose real count is the whole point of the call).
+// the real header inlines pass for the length-less `sprintf`/`sscanf`. `snprintf` is the
+// contrast and the reason this is a named constant rather than a literal: it forwards the
+// caller's REAL `n`, because the bounded buffer is the entire point of the call.
 constexpr std::uint64_t kBufferCountUnbounded = ~0ull;
 
 // `__acrt_iob_func` indices — UCRT's `stdin`/`stdout`/`stderr` are `__acrt_iob_func(0/1/2)`
@@ -191,18 +214,32 @@ bool synthesizeStdioShim(
     // same house convention the threads shim uses for `mtx_t*`.
     TypeId const iobFuncSig = sig({u32Ty}, pVoid);
 
-    // DELIBERATE: every arm below RETURNS THE CORE'S VALUE DIRECTLY. For the STREAM and
-    // SCANF cores that is also literally what the UCRT header inlines do (`_vfprintf_l` /
-    // `_vsscanf_l` are a bare `return __stdio_common_v*(...)`), so those need no argument.
-    // The `sprintf` arm is the one that differs: the UCRT's own `vsprintf` inline instead
-    // ends with `return _Result < 0 ? -1 : _Result;`, so the omission there looks at first
-    // glance like a missing normalization. It is not — the clamp
+    // DELIBERATE: every arm below EXCEPT `snprintf` RETURNS THE CORE'S VALUE DIRECTLY. For
+    // the STREAM and SCANF cores that is also literally what the UCRT header inlines do
+    // (`_vfprintf_l` / `_vsscanf_l` are a bare `return __stdio_common_v*(...)`), so those
+    // need no argument. The `sprintf` arm is the one that differs: the UCRT's own `vsprintf`
+    // inline instead ends with `return _Result < 0 ? -1 : _Result;`, so the omission there
+    // looks at first glance like a missing normalization. It is not — the clamp
     // is an IDENTITY on every value this core can actually produce: the only negative it
     // EVER returns is exactly -1, and the one non-(-1) case is a POSITIVE would-be length
     // under STANDARD_SNPRINTF_BEHAVIOR, which the clamp leaves alone (and which is C99's
     // required snprintf truncation result). C also asks only for "a negative value" on
     // output error (7.21.6.6), never for -1 specifically. So an ICmp+Select would buy no
     // observable behavior.
+    //
+    // ★ SO WHY DOES THE `snprintf` ARM EMIT THE CLAMP ANYWAY? Because the argument above is
+    // evidence about ONE ucrtbase build's five probed error paths, not a proof over the
+    // core's whole domain — and `ucrtbase.dll` is a serviced OS component that this project
+    // neither ships nor pins. For `sprintf` that gap is academic (the clamp is unreachable
+    // either way, and C accepts any negative). For `snprintf` it is not: the return value is
+    // LOAD-BEARING — callers size buffers with it, and `n == 0` exists purely to be asked
+    // "how long would this be?" — so its contract should be a property of DSS's own emitted
+    // code, not of an unaudited binary's internals. Emitting the clamp costs one ICmp and a
+    // two-block tail and makes this shim byte-for-byte the header inline it stands in for.
+    // STATED WITHOUT OVERCLAIM so nobody mistakes it for a bug fix: on every return value
+    // measured to date the clamp is an IDENTITY, so no test can distinguish its presence
+    // from its absence. It is DEFENSIVE FIDELITY to `ucrt/stdio.h:1443`, not an observed
+    // repair, and it is the one part of this recipe with no red-on-disable witness.
     //
     // ★ REPRODUCING THE MEASUREMENT (it is an empirical claim, so it must be re-runnable —
     // a claim nobody can re-check is a claim that silently rots). In a scratch C program:
@@ -271,9 +308,14 @@ bool synthesizeStdioShim(
     auto u32c  = [&](std::uint32_t v) {
         return konst(static_cast<std::int64_t>(v), TypeKind::U32, u32Ty);
     };
+    auto i32c  = [&](std::int32_t v) {
+        return konst(static_cast<std::int64_t>(v), TypeKind::I32, i32Ty);
+    };
     auto nullP = [&]() { return konst(0, TypeKind::Ptr, pVoid); };
 
-    // Open a shim function + its entry block. Every printf-family recipe is single-block.
+    // Open a shim function + its ENTRY block. Every printf-family recipe is single-block
+    // except `snprintf`, whose return clamp adds a two-block tail (created in-arm, exactly
+    // as `synthesizeThreadsShim`'s `thrd_join` does).
     auto begin = [&](SymbolId sym, TypeId fnSig) {
         (void)builder.addFunction(fnSig, sym, SymbolBinding::Global,
                                   SymbolVisibility::Default);
@@ -412,6 +454,58 @@ bool synthesizeStdioShim(
             continue;
         }
 
+        if (recipe == "snprintf") {
+            // int snprintf(char* buf, size_t n, char const* fmt, ...)
+            //   r = __stdio_common_vsprintf(STANDARD_SNPRINTF, buf, n, fmt, NULL, ap)
+            //   return r < 0 ? -1 : r
+            // ★ THE SAME CORE AS `sprintf`, differing in exactly the two arguments that
+            // carry snprintf's semantics — and that is forced, not chosen: ucrtbase exports
+            // no `__stdio_common_vsnprintf` at all (see the header). This mirrors
+            // `ucrt/stdio.h:1439-1444`, which is literally how a real MSVC build spells
+            // `snprintf`.
+            //   * `_Options` = STANDARD_SNPRINTF_BEHAVIOR — WITHOUT this bit the core is
+            //     the pre-C99 `_snprintf`, which returns -1 on truncation where C99 wants
+            //     the would-be length. MEASURED both ways; see the constant's own note for
+            //     what did and did NOT reproduce.
+            //   * `_BufferCount` = the caller's REAL `n`, not `kBufferCountUnbounded`. The
+            //     sentinel would make the core write past the caller's buffer on any output
+            //     longer than `n` — a silent heap/stack overrun, the worst failure mode in
+            //     this file, since it corrupts memory rather than producing wrong text.
+            auto const core = coreSym("__stdio_common_vsprintf");
+            if (!core.has_value()) return false;   // reported; nothing emitted yet.
+            begin(sym, vsig({pChar, u64Ty, pChar}, i32Ty));
+            MirInstId const buf = builder.addArg(0, pChar);
+            MirInstId const n   = builder.addArg(1, u64Ty);
+            MirInstId const fmt = builder.addArg(2, pChar);
+            MirInstId const ap  = vaStart(3);      // THREE named args, not two.
+            std::array<MirInstId, 7> ops{
+                builder.addGlobalAddr(*core, interner.pointer(coreBufferedSig)),
+                u64c(kOptStandardSnprintfBehavior),
+                buf,
+                n,
+                fmt,
+                nullP(),              // _Locale = NULL (the ambient locale)
+                ap};
+            MirInstId const r =
+                builder.addInst(MirOpcode::Call, ops, i32Ty, /*payload=*/0);
+            // The `_Result < 0 ? -1 : _Result` tail. Two blocks with their own returns
+            // rather than a select — MIR has no Select opcode, and the `thrd_join`
+            // precedent is exactly this shape. Markers are left default and canonicalized
+            // by the module-wide `rederiveStructCfMarkers` after `finish()`; never
+            // hand-stamp IfThen/IfJoin.
+            std::array<MirInstId, 2> lt{r, i32c(0)};
+            MirInstId const isNeg = builder.addInst(MirOpcode::ICmpSlt, lt,
+                                                    interner.primitive(TypeKind::Bool));
+            MirBlockId const negBB = builder.createBlock();
+            MirBlockId const okBB  = builder.createBlock();
+            builder.addCondBr(isNeg, negBB, okBB);
+            builder.beginBlock(negBB);
+            builder.addReturn(i32c(-1));
+            builder.beginBlock(okBB);
+            builder.addReturn(r);
+            continue;
+        }
+
         if (recipe == "sscanf") {
             // int sscanf(char const* buf, char const* fmt, ...)
             //   -> __stdio_common_vsscanf(0, buf, (size_t)-1, fmt, NULL, ap)
@@ -438,7 +532,7 @@ bool synthesizeStdioShim(
             continue;
         }
 
-        // The anti-silent-gap backstop. Those five ARE the whole shipped stdio vocabulary
+        // The anti-silent-gap backstop. Those six ARE the whole shipped stdio vocabulary
         // (see the header): the loader's closed `kRecipes` table admits no other stdio id,
         // so reaching here means that table and this switch have drifted apart.
         emitErr(reporter,
@@ -449,9 +543,12 @@ bool synthesizeStdioShim(
 
     opt::passes::cloneGlobalsVerbatim(mir, builder);
     mir = std::move(builder).finish();
-    // Canonicalize StructCfMarkers module-wide from the CFG (idempotent here — every
-    // recipe is single-block — but it keeps the merge-path MirVerifier's stored==derived
-    // check satisfied for the clones, matching synth_threads_shim).
+    // Canonicalize StructCfMarkers module-wide from the CFG. NO LONGER MERELY DEFENSIVE:
+    // the `snprintf` arm's clamp creates two blocks with DEFAULT markers, so this call is
+    // what makes them canonical (IfThen/IfJoin) and the merge-path MirVerifier's
+    // stored==derived check pass — the same role it plays for `thrd_join` in
+    // synth_threads_shim. Idempotent for every other function (single-block recipes +
+    // clones re-derive to their existing markers).
     rederiveStructCfMarkers(mir);
     return true;
 }
