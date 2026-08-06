@@ -5898,11 +5898,23 @@ def self_test(path=CATALOGUE, out=sys.stdout):
               (_zip in _sets[l["label"]]) == posix,
               "target OS %r, declared=%r" % (spec_target_os(l["spec"]),
                                              _zip in _sets[l["label"]]))
-    # The pe64 leg's EMPTY list is a measured claim, not an omission; asserting it
-    # here means re-populating it by reflex fails the self-test first.
-    check("the pe64 leg declares NOTHING earned (0 errors / 979,736 measured)",
-          _sets["pe64-x86_64"] == set(),
-          "got %r" % _sets["pe64-x86_64"])
+    # ★ THE INTENT, unchanged since TF-C123: pe64 must never re-inherit a SIBLING's
+    # confounds. All six patterns it once carried were earned on LINUX, and its own
+    # native tier measured 0 errors / 979,736 — so a bare pattern here is a copy.
+    # ⚠ THE ORIGINAL FORM OF THIS PIN ASSERTED THE SET WAS EMPTY, which was a true
+    # measurement in TF-C123 and became WRONG in TF-C124: `win32longpath-1.3` was then
+    # genuinely EARNED on pe64 UNDER WINE, with a matched control (the same dss-built
+    # testfixture.exe runs `win32longpath-1.3... Ok` on REAL Windows — compiler held
+    # constant, only the runtime varied). Pinning the empty SET would have made an
+    # honestly-earned entry fail the self-test, i.e. it would have punished the very
+    # discipline it exists to enforce. So pin the RULE, not the count:
+    #   every pe64 confound must be `emulated:`-scoped.
+    # That is what keeps a native-Windows failure unexcusable, which is the platform
+    # that actually proves this leg.
+    _pe = _sets["pe64-x86_64"]
+    check("every pe64 confound is emulated-scoped (native Windows stays unexcusable)",
+          all(p.startswith("emulated:") for p in _pe),
+          "got %r" % _pe)
     # A scoped pattern must reach the drivers WITH its scope, or the qemu-only
     # writecrash excusal silently becomes a bare one and suppresses a future
     # genuine regression on a native run.
