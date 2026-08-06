@@ -20,7 +20,7 @@
   ],
 
 
-  "$longDoubleFormatComment": "x86_64 macOS `long double` is the 80-bit x87 extended type (16-byte aligned) -- the same value the macho64-x86_64-darwin-exec sibling declares. (arm64 macOS uses IEEE-754 binary128 and its dylib omits this field.)",
+  "$longDoubleFormatComment": "x86_64 macOS `long double` is the 80-bit x87 extended type (16-byte aligned) -- the same value the macho64-x86_64-darwin-exec sibling declares. ⚠ CORRECTED 2026-08-06: this comment used to end '(arm64 macOS uses IEEE-754 binary128 and its dylib omits this field.)', which was wrong TWICE and is worth recording rather than quietly deleting. Apple arm64 `long double` is `f64` (long double IS double), NOT binary128 -- binary128 is LINUX arm64, a different platform on the same CPU; and the arm64 dylib's omission was a GAP, not a design: it was the only arm64 Darwin format missing the axis, so `long double` compiled on the arm64 `.o` and `.exec` and was REJECTED on the `.dylib` (S0056) from the same source. The sibling now declares `f64` and the sentence that rationalised its absence is gone.",
   "longDoubleFormat": "x87-80",
 
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: Darwin x86_64 uses the generic LSB-first bit-field allocation -- same gnu_packed as the x86_64 macho siblings.",

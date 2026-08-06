@@ -162,3 +162,19 @@ dss_add_test(NAME link/test_macho_object_reader SOURCES test_macho_object_reader
 # nativeId, out-of-range SymbolTableIndex, out-of-range SectionNumber), non-PE
 # schema fail-loud, and the DTYPE_FUNCTION extern isData inference.
 dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)
+
+# D-FORMAT-MACHO-X86_64-STATICLIB-DECLARES-NO-EXTERN-CALL-DISPATCH — the CLASS,
+# not the instance. Groups the 24 shipped `.format.json` files into families by
+# stripping the ARCH token, then diffs each arm's declared ROOT-KEY SET against
+# its siblings: an asymmetry must be justified at the site by a
+# `$absentKeyRationale` entry, AND every such entry must still correspond to a
+# real absence (both directions fail loud, so the table can neither be skipped
+# nor rot). Three gaps of this exact shape shipped in three cycles because
+# nothing ever compared a format against its own siblings; applying the method
+# by hand found a fourth. Reads the JSON directly — the whole subject is which
+# keys are DECLARED, which the loaded schema object can no longer tell you —
+# hence the json link (the `test_c_symbol_decoration` precedent).
+dss_add_test(NAME link/test_object_format_family_symmetry
+             SOURCES test_object_format_family_symmetry.cpp)
+target_link_libraries(dss_link_test_object_format_family_symmetry
+                      PRIVATE nlohmann_json::nlohmann_json)

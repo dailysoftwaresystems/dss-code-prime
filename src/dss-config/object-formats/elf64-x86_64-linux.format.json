@@ -2,6 +2,10 @@
   "$comment": "ELF64 relocatable + dynamic for x86_64 (Linux / SysV). First shipped object-format JSON (plan 14 LK1, 2026-05-29). Consumed by `src/link/format/elf.cpp` via the format-blind linker engine. Section names + flags + ELF identity fields are the SAME values readelf prints; relocation `nativeId` values are the ELF type numbers stored in `r_info` low 32 bits.",
 
   "dssObjectFormatVersion": 1,
+  "$absentKeyRationaleComment": "Machine-read by tests/link/test_object_format_family_symmetry.cpp: every root key a SIBLING of this format declares and this file does not must appear below with a non-empty reason, and every entry below must correspond to a real absence. Both directions fail loud, so this table can neither be skipped nor rot after a gap is closed.",
+  "$absentKeyRationale": {
+    "externAddrBinding": "DELIBERATE, and the aarch64 sibling that DOES declare it says so itself: 'DSS-NEUTRAL to x86_64 (its `&extern` value is a PC-relative rel32, already PIE-safe) ... so ONLY the relocatable + static-archive formats declare it' (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT, TF-C52). Taking the ADDRESS of a preemptible extern as a live value needs a foreign-linker GOT slot on arm64 because an absolute `adrp`+`add` page-pair against a symbol that may bind externally is REJECTED by a default-PIE link; x86_64's rel32 form is already position-independent, so declaring `got` here would force a GOT indirection gcc/clang do not emit for the same source. An ARCH-SPECIFIC ABI fact, not an unfinished copy."
+  },
 
   "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: ELF has NO image field for a stack SIZE on ANY flavor -- PT_GNU_STACK encodes stack EXECUTABILITY, not size. The kernel sizes the initial thread's stack from the process limit (`ulimit -s` / setrlimit RLIMIT_STACK) and further threads from pthread_attr_setstacksize, so nothing the linker writes can change it. A `stackReserve` / `--stack-reserve` request is therefore REFUSED with that remedy rather than silently dropped -- which is also why the sqlite full tier passes on Linux (8 MiB by default) and overflowed on Windows at 1 MiB.",
 
