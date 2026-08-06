@@ -99,6 +99,48 @@ done
 _offenders_head="$(git grep -I -l -P '\r$' HEAD 2>/dev/null | sed 's|^HEAD:||')"
 _offenders_index="$(git grep --cached -I -l -P '\r$' 2>/dev/null)"
 
+# ── STALE-CHECKOUT DETECTION — the git history here may not describe this tree ──
+#
+# ★ MEASURED 2026-08-06 (TF-C123), and it cost a false red on a green gate: the
+#   WSL leg of the 3-leg gate rsyncs the Windows tree with `--exclude '.git/'`
+#   (D-GATE-WSL-SYNC-LEAVES-GIT-HEAD-STALE). The CONTENT is current; the `.git`
+#   directory is whatever that checkout last fetched. So checks A and C — which
+#   read HEAD and the index — answer about a DIFFERENT COMMIT than the files on
+#   disk, and reported the ten pre-normalisation CRLF blobs as live violations
+#   while every one of them was LF on disk.
+#
+# ⇒ A guard that cannot tell whose history it is reading must SAY SO, not
+#   convict. The detection is exact rather than heuristic: if a file that HEAD
+#   or the index calls CRLF carries NO CR on disk, then the recorded history is
+#   not the history of this working tree. A genuine violation has CR in BOTH.
+#
+# ⚠ Check D (worktree rewritten under a pin) is UNAFFECTED — it reads the disk —
+#   so it keeps running. Only the history-scoped checks are suspended, and the
+#   run is still a FAILURE if check D finds anything.
+_stale_evidence=""
+_all_history_offenders="$(printf '%s\n%s\n' "${_offenders_head}" "${_offenders_index}" | sort -u)"
+while IFS= read -r _f; do
+    [[ -z "${_f}" ]] && continue
+    [[ -f "${_f}" ]] || continue
+    if [[ "$(tr -dc '\r' < "${_f}" | wc -c | tr -d ' ')" -eq 0 ]]; then
+        _stale_evidence="${_f}"
+        break
+    fi
+done <<< "${_all_history_offenders}"
+
+if [[ -n "${_stale_evidence}" ]]; then
+    echo "line-endings: HISTORY SCAN SKIPPED — this work tree's .git does not describe its files." >&2
+    echo "    evidence: '${_stale_evidence}' is recorded as CRLF in HEAD/index but carries ZERO CR on disk." >&2
+    echo "    HEAD here is $(git rev-parse --short HEAD 2>/dev/null || echo '<unresolved>')." >&2
+    echo "    This is the expected shape of a tree synced WITHOUT .git (see the WSL leg of the" >&2
+    echo "    3-leg gate, D-GATE-WSL-SYNC-LEAVES-GIT-HEAD-STALE). Convicting on that history would" >&2
+    echo "    report violations belonging to another commit — so checks A and C are suspended here." >&2
+    echo "    Run this guard on the AUTHORITATIVE checkout for history hygiene." >&2
+    _offenders_head=""
+    _offenders_index=""
+    _skip_binary_check=1
+fi
+
 _report=""
 _check_set() {
     local _what="$1"; shift
@@ -115,6 +157,10 @@ _check_set "staged (index)"   "${_offenders_index}"
 # ── Check C: the pin's own glob set must contain no binary-detected blob ──
 # Without this, a source file git mis-detects as binary is skipped by `-I` above
 # and this guard would report a clean tree over a file it never opened.
+# ⚠ Suspended alongside checks A/C when the history does not describe this tree:
+# `i/-text` is an INDEX fact, so a stale index answers about a different commit.
+_binary_in_pinned=""
+[[ -n "${_skip_binary_check:-}" ]] || \
 _binary_in_pinned="$(git ls-files --eol -- '*.c' '*.h' '*.cpp' '*.hpp' '*.cmake' 'CMakeLists.txt' '*/CMakeLists.txt' '*.md' 'VERSION' 2>/dev/null \
     | awk '$1 == "i/-text" { sub(/^[^\t]*\t/, ""); print }')"
 if [[ -n "${_binary_in_pinned}" ]]; then
@@ -164,7 +210,14 @@ if [[ -n "${_worktree_rewritten}" ]]; then
 fi
 
 if [[ -z "${_report}" ]]; then
-    echo "line-endings: OK (${_control_head} committed + ${_control_index} staged text blobs, none carries CR)"
+    if [[ -n "${_skip_binary_check:-}" ]]; then
+        # Say plainly what was NOT checked. A guard reporting "OK" while having
+        # silently skipped half its checks is the self-blind-instrument shape
+        # this repo keeps finding — the message must not outrun the evidence.
+        echo "line-endings: OK (WORKTREE ONLY — the history scan was SKIPPED, see above; the ${_control_head} HEAD / ${_control_index} index blobs were NOT judged)"
+    else
+        echo "line-endings: OK (${_control_head} committed + ${_control_index} staged text blobs, none carries CR)"
+    fi
     exit 0
 fi
 

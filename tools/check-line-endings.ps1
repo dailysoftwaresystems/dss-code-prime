@@ -92,6 +92,34 @@ $OffendersHead  = Get-GitLines @('grep','-I','-l','-P','\r$','HEAD') |
                   ForEach-Object { $_ -replace '^HEAD:', '' }
 $OffendersIndex = Get-GitLines @('grep','--cached','-I','-l','-P','\r$')
 
+# ── STALE-CHECKOUT DETECTION — kept identical in intent to the .sh sibling ──
+#
+# ★ MEASURED 2026-08-06 (TF-C123): the WSL leg of the 3-leg gate rsyncs the tree
+#   with `--exclude '.git/'` (D-GATE-WSL-SYNC-LEAVES-GIT-HEAD-STALE), so HEAD and
+#   the index answer about a DIFFERENT COMMIT than the files on disk, and this
+#   guard convicted ten pre-normalisation blobs that were all LF on disk.
+#   The detection is EXACT, not heuristic: a file the history calls CRLF while
+#   carrying ZERO CR on disk proves the recorded history is not this tree's.
+#   A genuine violation has CR in BOTH.
+# ⚠ Present here even though this driver runs on the AUTHORITATIVE checkout in
+#   practice: a capability in one sibling and not the other is the exact defect
+#   class this repo keeps re-finding, and "it cannot happen on my host" is how
+#   the last four instances survived.
+$SkipHistoryScan = $false
+foreach ($f in (@($OffendersHead) + @($OffendersIndex) | Sort-Object -Unique)) {
+    if ([string]::IsNullOrEmpty($f) -or -not (Test-Path -LiteralPath $f)) { continue }
+    $bytes = [IO.File]::ReadAllBytes($f)
+    if (($bytes | Where-Object { $_ -eq 13 } | Select-Object -First 1) -eq $null) {
+        Write-Host "line-endings: HISTORY SCAN SKIPPED — this work tree's .git does not describe its files."
+        Write-Host "    evidence: '$f' is recorded as CRLF in HEAD/index but carries ZERO CR on disk."
+        Write-Host "    Convicting on that history would report violations belonging to another commit,"
+        Write-Host "    so checks A and C are suspended. Run this guard on the AUTHORITATIVE checkout."
+        $SkipHistoryScan = $true
+        break
+    }
+}
+if ($SkipHistoryScan) { $OffendersHead = @(); $OffendersIndex = @() }
+
 $report = New-Object System.Collections.Generic.List[string]
 function Add-Offenders([string]$What, $Files) {
     foreach ($f in @($Files)) {
@@ -103,8 +131,11 @@ Add-Offenders 'committed (HEAD)' $OffendersHead
 Add-Offenders 'staged (index)'   $OffendersIndex
 
 # ── Check C: the pin's own glob set must contain no binary-detected blob ──
-$eolRows = Get-GitLines @('ls-files','--eol','--','*.c','*.h','*.cpp','*.hpp',
-                          '*.cmake','CMakeLists.txt','*/CMakeLists.txt','*.md','VERSION')
+# Suspended with checks A/C on a stale checkout: `i/-text` is an INDEX fact.
+$eolRows = if ($SkipHistoryScan) { @() } else {
+    Get-GitLines @('ls-files','--eol','--','*.c','*.h','*.cpp','*.hpp',
+                   '*.cmake','CMakeLists.txt','*/CMakeLists.txt','*.md','VERSION')
+}
 foreach ($row in $eolRows) {
     if ($row -match '^i/-text') {
         $path = ($row -split "`t", 2)[-1]
@@ -134,7 +165,12 @@ foreach ($row in (Get-GitLines @('ls-files','--eol'))) {
 }
 
 if ($report.Count -eq 0) {
-    Write-Host "line-endings: OK ($ControlHead committed + $ControlIndex staged text blobs, none carries CR)"
+    if ($SkipHistoryScan) {
+        # Never let the summary outrun the evidence: say what was NOT judged.
+        Write-Host "line-endings: OK (WORKTREE ONLY - the history scan was SKIPPED, see above; the $ControlHead HEAD / $ControlIndex index blobs were NOT judged)"
+    } else {
+        Write-Host "line-endings: OK ($ControlHead committed + $ControlIndex staged text blobs, none carries CR)"
+    }
     exit 0
 }
 
