@@ -41,6 +41,11 @@ constexpr std::uint64_t kDtSoname   = 14;  // DT_SONAME (d_val = .dynstr offset)
 [[nodiscard]] constexpr std::uint8_t stType(std::uint8_t info) noexcept { return info & 0xFu; }
 [[nodiscard]] constexpr std::uint8_t stVisibility(std::uint8_t other) noexcept { return other & 0x3u; }
 
+// SHN_* special section indices (gABI 4.6). SHN_UNDEF is the one this
+// reader must filter on: an `st_shndx` of 0 means the entry is a
+// REFERENCE the library makes, not a definition it offers.
+constexpr std::uint16_t kShnUndef   = 0;
+
 // STB_*
 constexpr std::uint8_t kStbLocal    = 0;
 constexpr std::uint8_t kStbGlobal   = 1;
@@ -273,13 +278,57 @@ readElf64(std::span<std::uint8_t const> bytes,
         std::uint32_t const st_name  = readU32(bytes, symOff +  0);
         std::uint8_t  const st_info  = bytes[symOff +  4];
         std::uint8_t  const st_other = bytes[symOff +  5];
-        // st_shndx, st_value, st_size — unused for import-surface
-        // reporting (we only care about NAME + KIND + VISIBILITY +
-        // LINKAGE for the FF1 surface; the symbol's runtime VA is
-        // dyld's concern, not ours).
+        std::uint16_t const st_shndx = readU16(bytes, symOff +  6);
+        // st_value, st_size — unused for import-surface reporting (we
+        // only care about NAME + KIND + VISIBILITY + LINKAGE for the
+        // FF1 surface; the symbol's runtime VA is dyld's concern, not
+        // ours). `st_shndx` IS read: it is the definedness bit (below).
 
         if (st_name == 0u) continue;  // unnamed entries (section syms, etc.) — by-design
         if (stBind(st_info) == kStbLocal) continue;  // locals don't export — by-design
+        // D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED.
+        // `.dynsym` is NOT an export table: unlike PE's `.edata` and
+        // Mach-O's export trie, it holds BOTH the definitions a library
+        // offers AND the references it makes (its own imports), told
+        // apart only by `st_shndx` (SHN_UNDEF == a reference). Reading
+        // every row as an export made this reader claim a library
+        // EXPORTS symbols it merely IMPORTS — the ONE sibling of the
+        // three FF1 readers that disagreed with `ImportSurface`'s
+        // documented contract ("a single symbol the dynamic library
+        // exports"; `import_surface.hpp`). PE reads the export
+        // directory and Mach-O filters `(N_EXT && N_TYPE == N_SECT)` /
+        // walks the export trie, so neither could ever surface a
+        // reference.
+        //
+        // MEASURED consequence, and it is not confined to DT_NEEDED:
+        // `ingest()` binds a governed extern to the FIRST source whose
+        // surface carries the name (first-source-wins,
+        // `ffi/ingest.cpp`). libtcl8.6.so's `.dynsym` carries 14 zlib
+        // names as SHN_UNDEF rows, so `--resolve-library libtcl8.6.so
+        // --resolve-library libz.so.1` bound `deflateBound` to
+        // libtcl8.6.so — the WRONG owning library — and libz.so.1 then
+        // appeared in no `ExternImport.libraryPath` at all, so the ELF
+        // writer emitted one DT_NEEDED because it was handed one
+        // library. Swapping the two `--resolve-library` arguments
+        // produced BOTH DT_NEEDEDs: the emitted dependency set was a
+        // function of command-line ORDER. The image loaded anyway only
+        // because ld.so's flat global scope reaches libz through
+        // libtcl's own DT_NEEDED; on a host where it is not otherwise
+        // reachable the artifact fails at load with nothing in the
+        // build to explain why.
+        //
+        // A SHN_UNDEF row is skipped SILENTLY and that is deliberate:
+        // it is a structural filter, exactly like the two skips above,
+        // not an anomaly. The loudness lives downstream and is
+        // IMPROVED by this filter — an extern that matches no real
+        // export now reaches the shipped-descriptor oracle and the link
+        // tier, which reject a genuinely undefined symbol with
+        // K_SymbolUndefined instead of silently binding it to a library
+        // that does not define it.
+        //
+        // Only SHN_UNDEF is filtered. SHN_ABS / SHN_COMMON / SHN_XINDEX
+        // and every real section index are DEFINITIONS and stay.
+        if (st_shndx == kShnUndef) continue;
 
         ImportSurface row;
         row.mangledName = readNulTerminated(bytes,

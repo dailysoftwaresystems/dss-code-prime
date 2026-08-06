@@ -356,6 +356,98 @@ TEST(BinaryReaderElf, SkipsLocalBindSymbols) {
     EXPECT_EQ((*r)[0].mangledName, "exported_fn");
 }
 
+namespace {
+// The surfaced names, comma-joined, so an assertion can compare CONTENT in
+// one shot and a failure prints exactly which names came back. Comparing the
+// joined string (rather than a size) is deliberate: an equal-size surface
+// holding the WRONG name must fail.
+[[nodiscard]] std::string surfacedNames(std::vector<ImportSurface> const& rows) {
+    std::string joined;
+    for (auto const& row : rows) {
+        if (!joined.empty()) joined += ",";
+        joined += row.mangledName;
+    }
+    return joined;
+}
+}  // namespace
+
+// ── SHN_UNDEF rows are the library's IMPORTS, never its exports ──
+//
+// D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED — the
+// root-cause pin. `.dynsym` is not an export table: it holds the
+// definitions the library offers AND the references it makes, told apart
+// only by `st_shndx` (SHN_UNDEF == a reference). This reader surfaced
+// both, so DSS believed libtcl8.6.so EXPORTED the 14 zlib names it merely
+// IMPORTS; `ingest()`'s first-source-wins then bound `deflateBound` to
+// libtcl8.6.so and libz.so.1 vanished from the emitted DT_NEEDED set.
+//
+// The assertion is on CONTENT, not on the count: a size-only check passes
+// for a surface holding the WRONG one of the two names.
+TEST(BinaryReaderElf, SkipsUndefinedSymbolsWhichAreImportsNotExports) {
+    std::vector<std::string> names = {"tcl_defines_this", "zlib_defines_this"};
+    std::vector<Sym> syms;
+    // A real definition: st_shndx = 1 (a real section index).
+    syms.push_back({0, info(1 /*STB_GLOBAL*/, 2 /*STT_FUNC*/), 0, 1, 0x1000, 16});
+    // A reference this library MAKES: st_shndx = 0 (SHN_UNDEF), which is
+    // exactly the shape libtcl8.6.so carries for every zlib name.
+    syms.push_back({0, info(1 /*STB_GLOBAL*/, 2 /*STT_FUNC*/), 0, 0, 0, 0});
+
+    auto const bytes = buildMinimalElf64(syms, names);
+    DiagnosticReporter rep;
+    auto const r = readImportsFromBytes(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+        "libtcl-like.so", rep);
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+
+    EXPECT_EQ(surfacedNames(*r), "tcl_defines_this")
+        << "the SHN_UNDEF row is a reference this library MAKES, not a symbol "
+           "it exports; surfacing it makes `ingest()` bind a caller's extern "
+           "to a library that does not define it (the DT_NEEDED defect)";
+}
+
+// A WEAK undefined reference is still a reference. glibc-style weak imports
+// (`__pthread_key_create` and friends) are SHN_UNDEF with STB_WEAK, so a
+// filter written on the bind class instead of `st_shndx` would let them
+// through. Content-anchored: the defined weak export MUST survive, so this
+// cannot pass by filtering weakness itself.
+TEST(BinaryReaderElf, WeakUndefinedIsSkippedButWeakDefinedSurvives) {
+    std::vector<std::string> names = {"weak_defined_here", "weak_referenced_only"};
+    std::vector<Sym> syms;
+    syms.push_back({0, info(2 /*STB_WEAK*/, 2), 0, 1, 0x1000, 16});
+    syms.push_back({0, info(2 /*STB_WEAK*/, 2), 0, 0, 0, 0});
+
+    auto const bytes = buildMinimalElf64(syms, names);
+    DiagnosticReporter rep;
+    auto const r = readImportsFromBytes(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+        "libweak.so", rep);
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+
+    ASSERT_EQ(surfacedNames(*r), "weak_defined_here");
+    EXPECT_EQ((*r)[0].linkage, SymbolLinkage::Weak)
+        << "definedness is the filter; the weak BIND must still be reported";
+}
+
+// SHN_ABS (0xFFF1) is a DEFINITION with no section — a version-script
+// absolute, a linker-provided address constant. Only SHN_UNDEF means
+// "not defined here", so the filter must not overreach to every special
+// index. This is the control that keeps the fix from becoming
+// `st_shndx < SHN_LORESERVE`.
+TEST(BinaryReaderElf, AbsoluteSectionIndexIsADefinitionAndSurvives) {
+    std::vector<std::string> names = {"abs_constant"};
+    std::vector<Sym> syms;
+    syms.push_back({0, info(1, 1 /*STT_OBJECT*/), 0, 0xFFF1 /*SHN_ABS*/, 0x40, 8});
+
+    auto const bytes = buildMinimalElf64(syms, names);
+    DiagnosticReporter rep;
+    auto const r = readImportsFromBytes(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+        "libabs.so", rep);
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+
+    EXPECT_EQ(surfacedNames(*r), "abs_constant");
+}
+
 // ── Failure modes ────────────────────────────────────────────────
 
 TEST(BinaryReader, EmptyFileFailsLoud) {

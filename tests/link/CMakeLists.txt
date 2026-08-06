@@ -163,6 +163,15 @@ dss_add_test(NAME link/test_macho_object_reader SOURCES test_macho_object_reader
 # schema fail-loud, and the DTYPE_FUNCTION extern isData inference.
 dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)
 
+# D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED: the
+# cross-format dependency-table pin. ONE two-library import set through the
+# ELF, PE, and Mach-O writers; each format's real dependency table (DT_NEEDED
+# / IMAGE_IMPORT_DESCRIPTOR.Name / LC_LOAD_DYLIB) is parsed back out of the
+# emitted bytes and must name EVERY resolved library. The defect it guards
+# survived because nothing compared the three writers on shared input.
+dss_add_test(NAME link/test_image_library_deps
+             SOURCES test_image_library_deps.cpp)
+
 # D-FORMAT-MACHO-X86_64-STATICLIB-DECLARES-NO-EXTERN-CALL-DISPATCH — the CLASS,
 # not the instance. Groups the 24 shipped `.format.json` files into families by
 # stripping the ARCH token, then diffs each arm's declared ROOT-KEY SET against
