@@ -62,3 +62,50 @@ real-examples/**/*.sh   text eol=lf
 real-examples/**/*.ps1  text eol=lf
 real-examples/**/*.py   text eol=lf
 real-examples/**/*.json text eol=lf
+
+# ── D-REPO-GITATTRIBUTES-PINS-EOL-FOR-CONFIGS-BUT-NOT-FOR-SOURCES ──────────
+# THE SOURCE TREE ITSELF. Every rule above pins a CONFIG, a GOLDEN or a
+# DRIVER — i.e. a file some test reads byte-exactly — and not one of them
+# covers a `.cpp`. MEASURED 2026-08-06 before this block existed:
+# `git check-attr text eol -- src/link/linker.cpp tests/link/test_pe_writer.cpp`
+# reported `unspecified` for both, so NO C/C++/CMake source anywhere in this
+# tree had a pinned line ending.
+#
+# That is not a hypothetical: the defect had ALREADY LANDED SIX TIMES.
+# `git grep -I -l -P '\r$' HEAD -- src tests real-examples tools` returned
+# src/CMakeLists.txt, src/core/compiler.{cpp,hpp}, src/core/export.hpp,
+# src/main.cpp and tests/ffi/test_shipped_lib_descriptor.cpp — the last
+# WHOLLY CRLF (6206 CRs). They are normalised in their own dedicated commit;
+# a pin does not retroactively rewrite committed content.
+#
+# HOW IT GETS IN: a tool's platform default, never a decision. The measured
+# instance was a delegated agent editing fixtures through Python
+# `pathlib.write_text`, whose `newline` default applies platform translation
+# and so silently rewrites LF -> CRLF on Windows. This pin takes that choice
+# away from the tool: the clean filter normalises on `git add` regardless of
+# `core.autocrlf`, so the bytes this repo STORES can no longer depend on
+# which OS an author (or an agent) happened to run on.
+#
+# ⚠ These globs are LAST, and last-match wins — so each one is checked
+# against the `examples/**/*.bin binary` rule above: none of `*.c`, `*.h`,
+# `*.cpp`, `*.hpp`, `*.cmake`, `CMakeLists.txt`, `*.md`, `/VERSION` can match
+# a `.bin`, so the `#embed` resource bytes that rule exists to protect stay
+# binary. VERIFIED, not assumed: `git ls-files --eol` over exactly this glob
+# set reports 1346 `i/lf` + 9 `i/crlf` + 1 `i/none` and ZERO `-text`, i.e.
+# git detects no binary content anywhere in the captured set.
+*.c            text eol=lf
+*.h            text eol=lf
+*.cpp          text eol=lf
+*.hpp          text eol=lf
+CMakeLists.txt text eol=lf
+*.cmake        text eol=lf
+
+# `*.md` and `/VERSION` ride the same block because the SAME normalisation
+# commit rewrites them: the repo-wide sweep (`git grep -I -l -P '\r$' HEAD`,
+# no pathspec) found four MORE CRLF blobs outside src/tests — the three
+# `.plans/*.md` files and `VERSION`. Normalising a file whose extension is
+# NOT pinned would be the same defect scheduled to recur, so they are pinned
+# in the same breath they are fixed. `VERSION` is anchored to the repo root
+# (`/VERSION`) because it is a single specific file, not an extension class.
+*.md           text eol=lf
+/VERSION       text eol=lf
