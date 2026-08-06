@@ -460,7 +460,10 @@ echo "=== THE LOADEXT HELPER: DSS builds it, the reference cc is a CONTROL, and 
 # ★ WHAT IS TESTED HERE vs IN harness_legs.py --self-test. The BUILD itself — the
 # argv, the object format, whether the artefact is a loadable shared library,
 # which arm is the control — lives in the shared resolver and is covered by its
-# own 1,187-assertion self-test, which both drivers run as a refuse-to-start.
+# own self-test, which both drivers run as a refuse-to-start. (This line used to
+# quote that battery's assertion COUNT; it was 1,187 when written and 1,606 when
+# noticed. A number that only one of the two files knows how to update is a
+# number that rots, so it is stated as a reference instead of a figure.)
 # What is tested HERE is the DRIVER's half: that it calls the resolver with the
 # paths only it knows, and that it turns one report into one verdict without
 # dying. So the resolver is STUBBED below — that is the seam, deliberately, and
@@ -546,6 +549,63 @@ stage_run() {   # stage_run <leg> <rundir> <resolver> ; env: STUB_RC/STUB_CLASS/
 # the SCRIPT — no shebang, no chmod, and portable to a host whose python3 is
 # somewhere unusual.
 
+# ── THE PATH NAMESPACE THE RESOLVER ACTUALLY RECEIVES ────────────────────────
+# D-TEST-CONFOUND-SCOPE-SH-CANNOT-RUN-UNDER-GIT-BASH. The driver hands the
+# resolver POSIX paths; what python3 RECEIVES is whatever the exec boundary
+# delivers. Under Git Bash / MSYS on Windows that boundary REWRITES every
+# path-shaped argument on its way into a NATIVE python.exe, so the argv this
+# battery reads back says C:/Users/…/Temp/confload_X/sqlite/src where the shell
+# said /tmp/confload_X/sqlite/src — and the three path assertions below failed on
+# a perfectly correct driver, which is why this file had never once been runnable
+# on the Windows workstation.
+#
+# ✔MEASURED 2026-08-06. The rewriter is the MSYS runtime at the MSYS-process →
+# native-.exe boundary: `type -a python3` resolves to a Windows app-exec alias and
+# sys.executable is …\pythoncore-3.14-64\python.exe. It is NOT a property of the
+# nesting — the outer shell's own `python3 …` and the inner `"$BASH" "$TMPRUN"`
+# run produce byte-identical argv — nor of the argv position (bare or after an
+# option), nor of whether the path exists.
+#
+# ⚠ MSYS_NO_PATHCONV=1 IS NOT THE FIX, in either shell. It is the SAME rewrite
+# that makes the stub's own path openable, so with it set python.exe never starts:
+# "can't open file 'C:\tmp\confload_X\stub_resolver.py'". MEASURED at both layers.
+#
+# So the namespace is MEASURED, not assumed: the EXPECTATION is sent through the
+# same transport the driver's argument takes, and compared where the driver
+# actually spoke. The assertion is not weakened — the needle still originates in
+# this fixture's own knowledge of which directory it created, so a driver that
+# passed the build root for the source root (or omitted the option) still reds.
+# On Linux/macOS/WSL the transport is the identity and every needle is unchanged.
+NS_PROBE="$LOADTMP/ns_probe.py"
+cat > "$NS_PROBE" <<'NSPY'
+import sys
+sys.stdout.write(sys.argv[1])
+NSPY
+ns_path() {   # <a path THIS fixture owns> → that same path AS THE RESOLVER SEES IT
+  local _seen
+  _seen="$(python3 "$NS_PROBE" "$1" 2>/dev/null)"
+  # ⚠ NEVER return empty, and never `exit` from here: every call site is a `$( )`,
+  # so an exit would end only the substitution and hand `check` an EMPTY needle —
+  # which every string contains, i.e. a silent PASS over an unmeasured assertion.
+  # A probe that could not answer POISONS its assertion instead, unmistakably.
+  if [ -z "$_seen" ]; then
+    echo "      NS-PROBE FAILED for [$1] — poisoning the assertion rather than passing it" >&2
+    printf '%s' "<<NS-PROBE-FAILED:$1>>"
+    return
+  fi
+  printf '%s' "$_seen"
+}
+# Probe self-check, on a sentinel path this battery never asserts on (so the
+# mapping can neither be derived from nor launder any real expectation): a
+# transport that dropped the tail would quietly shorten every needle below into a
+# weaker one that still matched. Checked ONCE, and fatal — the stubs are python
+# too, so a python3 that cannot echo its own argv makes this whole section inert.
+_NS_SENTINEL="$(ns_path "$LOADTMP/ns-sentinel")"
+case "$_NS_SENTINEL" in
+  *ns-sentinel) : ;;
+  *) echo "FATAL: the path-namespace probe mangled its sentinel ([$_NS_SENTINEL]); the loadext path assertions would be measuring the wrong string"; exit 1 ;;
+esac
+
 echo "--- the driver calls the resolver with the paths only IT knows ---"
 A=$(STUB_RC=0 STUB_STAGED="$LOAD_OUT/x/testdir/testloadext.dll" \
     stage_run pe-shaped "$LOAD_OUT/pe/run" "$STUB")
@@ -554,9 +614,9 @@ ARGV=$(cat "$STUB_ARGV_LOG")
 check "it asks for THIS leg by label"          "--build-loadext-helper"  "$ARGV"
 check "...passing the resolved builder"        "--helper-builder"        "$ARGV"
 check "...the DSS binary"                      "--dss"                   "$ARGV"
-check "...the sqlite src root (for sqlite3ext.h)" "$LOAD_SQ/src"         "$ARGV"
-check "...the BUILD root (for the generated sqlite3.h)" "$LOAD_BLD"      "$ARGV"
-check "...the run's testdir as the destination" "$LOAD_OUT/pe/run/testdir" "$ARGV"
+check "...the sqlite src root (for sqlite3ext.h)" "$(ns_path "$LOAD_SQ/src")" "$ARGV"
+check "...the BUILD root (for the generated sqlite3.h)" "$(ns_path "$LOAD_BLD")" "$ARGV"
+check "...the run's testdir as the destination" "$(ns_path "$LOAD_OUT/pe/run/testdir")" "$ARGV"
 check "...and the driver's own build config"   "release"                 "$ARGV"
 # ★ THE CONTROL ARM IS PASSED, NOT ASSUMED — and it may be EMPTY.
 check "the VERIFIED control compiler is passed through" "mingw-gcc"      "$ARGV"

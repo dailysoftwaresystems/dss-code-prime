@@ -273,7 +273,17 @@ function Pin-ReadSegment($driver) {
   Ck "healthy log: NO diagnostic is invented" '' $r.Diagnostic
   Ck "healthy log: files counted"             2  $r.Completed.Count
   Ck "healthy log: last file"        'misc7.test' $r.Completed[$r.Completed.Count - 1]
-  Ck "healthy log: summary intact"   '0 errors out of 192 tests' $r.Summary
+  # ★ THE WHOLE LINE, HOST SUFFIX AND ALL — CORRECTED TF-C124, and this pin used
+  # to encode the defect. Read-CorpusSegment recorded only the MATCHED SUBSTRING
+  # ('0 errors out of 192 tests'), so this driver dropped the trailing
+  # ' on host Darwin 64-bit' that build-and-test.sh's parse_segment keeps
+  # (`summary=$0`) and that $summaryText's own comment claims is carried "byte
+  # for byte". Found by the new mirror verifier's DIFFERENTIAL battery
+  # (harness_legs.py --check-regions) on its first complete run — not by review,
+  # and not by this file, which was asserting the wrong side of the divergence.
+  # D-HARNESS-CORPUS-ENGINE-MIRROR-CLAIMS-A-VERIFIER-THAT-DOES-NOT-EXIST.
+  Ck "healthy log: summary is the WHOLE line, not just the counts" `
+     '0 errors out of 192 tests on host Darwin 64-bit' $r.Summary
   Ck "healthy log: ' Ok' tally"      3  $r.OkLines
 
   # (3) a GENUINE mid-corpus crash: files completed AND a diagnostic exists, so

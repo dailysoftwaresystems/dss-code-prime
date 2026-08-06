@@ -618,6 +618,53 @@ pin_run_dir_argv() { # pin_run_dir_argv <driver>
   ck_has "...and the exit code" "$RUN_DIR_WHY" "exited 3"
 }
 
+# ── K — WHAT A FORWARDED VARIABLE'S VALUE MEANS ON THE OTHER SIDE ───────────
+# D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY.
+#
+# The driver marshals its forward set into THREE declared groups — namespace-
+# neutral, driver-path, catalogue-declared — and the counted-group argv that
+# carries them is new code with no other coverage. What the RESOLVER then does
+# with each group (translate a driver path, refuse an undeclared name) is pinned
+# by harness_legs.py's own battery, which both drivers already run at Step 0.
+#
+# ★ `none` IS THE VERB HERE ON PURPOSE, not to dodge the hard case: it is the
+# only verb whose translator exists on every host, so this pin runs identically
+# on Linux, macOS and Windows. The TRANSLATION is asserted in the resolver's
+# battery against an INJECTED translator, for the same reason.
+pin_env_forward() { # pin_env_forward <driver>
+  local drv="$1" out
+  load_fns "$drv" launch_env_carrier || return 0
+  LEG_RESOLVER="$LEGS_PY"; LEG_CATALOGUE="$CATALOGUE"
+  export QUICKTEST_OMIT="a,b"
+  # ★ A RELATIVE VALUE, AND THAT IS A PORTABILITY FIX, NOT A WEAKENING.
+  # ✔MEASURED 2026-08-06: an ABSOLUTE `/opt/tcl/lib/tcl8.6` came back from the
+  # resolver as `C:/Program Files/Git/opt/tcl/lib/tcl8.6` — MSYS rewrites a
+  # lone POSIX absolute path on its way into native python.exe, so the pin was
+  # asserting against Git Bash's path translation rather than against the
+  # driver. Same artefact as D-TEST-CONFOUND-SCOPE-SH-CANNOT-RUN-UNDER-GIT-BASH.
+  # A relative path is untouched by every host's translator and is still a path;
+  # what this pin asserts — the three groups, the filter, the `--forward-path=`
+  # spelling and the assignment ORDER — is unchanged by it.
+  export TCL_LIBRARY="opt/tcl/lib/tcl8.6"
+  export QEMU_LD_PREFIX="usr/aarch64-linux-gnu"
+  unset SQLITE_TEST_PATTERN_LIST            # THE FILTER's subject: it is UNSET
+  out="$(launch_env_carrier wslenv none "" \
+           2 SQLITE_TEST_PATTERN_LIST QUICKTEST_OMIT 1 TCL_LIBRARY)"
+  ck "a DRIVER-PATH variable is ASSIGNED, and before the carrier names it" \
+     "TCL_LIBRARY=opt/tcl/lib/tcl8.6
+WSLENV=QUICKTEST_OMIT:TCL_LIBRARY" "$out"
+  case "$out" in
+    *SQLITE_TEST_PATTERN_LIST*) ck "an UNSET variable is never carried" "absent" "present" ;;
+    *) ck "an UNSET variable is never carried" "absent" "absent" ;;
+  esac
+  out="$(launch_env_carrier wslenv none "" \
+           2 SQLITE_TEST_PATTERN_LIST QUICKTEST_OMIT 1 TCL_LIBRARY QEMU_LD_PREFIX)"
+  ck_has "a CATALOGUE-declared launcher variable crosses too" "$out" "QEMU_LD_PREFIX"
+  out="$(launch_env_carrier inherit none "" \
+           2 SQLITE_TEST_PATTERN_LIST QUICKTEST_OMIT 1 TCL_LIBRARY)"
+  ck "a launcher that INHERITS is left byte-for-byte alone" "" "$out"
+}
+
 green "A+B  the not-run recorder + the shared run decision" pin_verdicts
 green "C    the Step-8 gate sequence, executed"             pin_step8_gates
 green "D    parse_segment keeps the first diagnostic"       pin_parse_segment
@@ -626,6 +673,7 @@ green "F    acq_field over a REAL acquisition record"       pin_acq_field
 green "G    the loader variable is TARGET-keyed"            pin_loader_var
 green "I    the confound supply is PER LEG"                 pin_confound_supply
 green "J    a failed run-dir operation is a VERDICT"        pin_run_dir_argv
+green "K    a forwarded PATH crosses through its declared group" pin_env_forward
 
 # ═══════════════════════════════════════════════════════════════════════════
 # H — RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.
@@ -690,6 +738,18 @@ if mutate "H7 make a failed run-dir operation look fine" "$WORK/m7.sh" 'RUN_DIR_
     skip && /^  return 1$/ { skip = 0; next }
     { print }'; then
   red "H7 a failed run-dir operation is REPORTED, never swallowed" pin_run_dir_argv "$WORK/m7.sh"
+fi
+
+# H8 — forward the DRIVER-PATH group by NAME instead of with its value, which is
+# the quieter half of D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-
+# BOUNDARY: the variable crosses, nothing is translated, and Tcl blames the
+# acquisition. The resolver refuses that spelling, so the mutant's helper `die`s
+# and the assignment the pin asserts never appears.
+if mutate "H8 forward a DRIVER PATH by name, untranslated" "$WORK/m8.sh" 'call+=("--forward-path=$n=${!n}"); carried=1' '
+    /^    call\+=\("--forward-path=\$n=\$\{!n\}"\); carried=1$/ {
+      print "    call+=(--forward \"$n\"); carried=1"; next }
+    { print }'; then
+  red "H8 a DRIVER PATH may not be forwarded raw" pin_env_forward "$WORK/m8.sh"
 fi
 
 printf '\n'

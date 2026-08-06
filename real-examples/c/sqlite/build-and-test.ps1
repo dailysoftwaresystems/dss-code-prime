@@ -243,6 +243,11 @@ $LegsPy       = Join-Path $PSScriptRoot 'harness_legs.py'
 # The catalogue itself, named explicitly rather than left to the resolver's
 # default: stage-zinc.py takes it too, and both must be reading the SAME file.
 $LegsJson     = Join-Path $PSScriptRoot 'legs.json'
+# The deferred-anchor registry, consulted AT the point a leg fails
+# (D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE).
+# Not required to exist: a checkout without .plans still runs, it just gets one
+# line saying the lookup found nothing to read.
+$AnchorRegistry = Join-Path $RepoRoot '.plans/_deferred-anchor-registry.md'
 # DSS_TIER: which unit-corpus tier — veryquick (default) | quick | full | all.
 $Tier         = if ($env:DSS_TIER) { $env:DSS_TIER } else { 'veryquick' }
 # DSS_CONFIG: RELEASE by default (load-bearing — the corpus must exercise the
@@ -674,19 +679,76 @@ function Get-LaunchEnvCarrierName($verb) {
   if (-not $carrier) { Die "envTransfer '$verb' declares no carrier variable, yet it is not 'inherit'. The resolver and this driver disagree about the vocabulary." }
   return $carrier
 }
-function Resolve-LaunchEnvCarrier($verb, $names, $current) {
+#
+# ★★ AND THE THIRD QUESTION, WHICH THE FIRST TWO DO NOT ASK: does the VALUE
+# still mean the same thing once it has crossed? For a variable holding a path
+# it does not, and TCL_LIBRARY is exactly that variable
+# [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY]. It is
+# therefore NOT forwarded by name: it goes through `--forward-path`, whose value
+# the resolver puts through this launcher's DECLARED `pathTranslation` — the
+# same door the argv already uses — and the resolver REFUSES any forwarded name
+# it has no declared kind for, so the next path-valued variable someone adds
+# here cannot be forwarded raw by accident.
+function Resolve-LaunchEnvCarrier($verb, $pathVerb, $plain, $pathVars, $declared, $current) {
   if (-not $verb -or $verb -eq 'inherit') { return @() }
+  $call = @('--env-transfer', "$verb", '--path-translation', "$pathVerb",
+            '--carrier-current', "$current")
   # THE FILTER, and it is the load-bearing line of this function.
-  $wanted = @($names | Where-Object { $_ } |
-              Where-Object { [Environment]::GetEnvironmentVariable($_) })
+  $wanted = @()
+  foreach ($n in @($plain | Where-Object { $_ })) {
+    if ([Environment]::GetEnvironmentVariable($n)) { $call += @('--forward', "$n"); $wanted += $n }
+  }
+  foreach ($n in @($pathVars | Where-Object { $_ })) {
+    # `--forward-path=NAME=VALUE` in ONE token, deliberately: a Windows path can
+    # contain spaces and the resolver splits on the FIRST `=` only.
+    $v = [Environment]::GetEnvironmentVariable($n)
+    if ($v) { $call += "--forward-path=$n=$v"; $wanted += $n }
+  }
+  foreach ($n in @($declared | Where-Object { $_ })) {
+    if ([Environment]::GetEnvironmentVariable($n)) { $call += @('--forward-declared', "$n"); $wanted += $n }
+  }
   if (-not $wanted.Count) { return @() }
-  $call = @('--env-transfer', "$verb", '--carrier-current', "$current")
-  foreach ($n in $wanted) { $call += @('--forward', "$n") }
   try { $out = @(& $python3.Source $LegsPy @call 2>&1); $rc = $LASTEXITCODE }
   catch { $rc = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }; $out = @("$($_.Exception.Message)") }
   if ($rc -ne 0) { Die "could not resolve the launcher's environment transfer (envTransfer '$verb', rc=$rc):`n$(($out | ForEach-Object { "      $_" }) -join "`n")`n      Without it the launched fixture runs with an EMPTY run environment, which does not fail — it silently changes what the corpus does." }
   return @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
                   ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+}
+#
+# ── THE REGISTRY, AT THE POINT OF FAILURE ────────────────────────────────────
+# D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE.
+#
+# ✔MEASURED (TF-C123): a 2x2 attribution was commissioned from scratch for 57
+# unit failures whose identical experiment and identical verdict were already in
+# the registry from seven cycles earlier, and the un-cited row let three false
+# statements reach a commit. The row was findable; looking is the part you have
+# to remember. So the harness looks, HERE, and prints what it found beside the
+# failure it just reported.
+#
+# ⚠ FAIL-SOFT BY CONSTRUCTION. This runs on a failure path and must never become
+# one: every error is one line and a return. It is a POINTER, never a verdict —
+# a matched row means someone has looked at something with this name before, not
+# that this failure is explained, and the banner says so.
+function Show-RegistryControls($legLabel, $failingTests) {
+  try {
+    $call = @('--registry-controls', $AnchorRegistry)
+    if ($legLabel) { $call += @('--for-leg', "$legLabel") }
+    # Bounded on purpose: a leg can fail with hundreds of names and this is a
+    # pointer, not a search engine. The resolver reports how many rows it held
+    # back, so a truncated lookup never reads as an exhaustive one.
+    foreach ($t in @($failingTests | Where-Object { $_ } | Select-Object -First 12)) {
+      $call += @('--for-test', "$t")
+    }
+    $out = @(& $python3.Source $LegsPy @call 2>&1)
+  } catch {
+    Info "      (registry lookup unavailable: $($_.Exception.Message))"
+    return
+  }
+  $lines = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+                    ForEach-Object { "$_" } | Where-Object { $_ })
+  if (-not $lines.Count) { return }
+  Info "      ── registry rows naming this leg / these tests (a POINTER, not a verdict — read before commissioning an experiment):"
+  foreach ($l in $lines) { Info "      $l" }
 }
 function Assert-LaunchArgsTranslated($verb, $argv) {
   if (-not $verb -or $verb -eq 'none') { return }
@@ -803,8 +865,19 @@ if (-not $python3) { Die "python3 not found on PATH — needed to resolve the le
 #                              diagnostic, the target-keyed loader variable and the
 #                              acquisition contract field, each with its
 #                              red-on-disable mutation asserted to have LANDED.
+#   test-mirror-regions.ps1    the `dss:` REGIONS — every region declared with who
+#                              verifies it (a claimed verifier that does not read
+#                              the region is a LOUD failure), and for a region
+#                              declared MIRRORED the symbol pairing plus
+#                              DIFFERENTIAL EXECUTION of both drivers' copies on
+#                              byte-identical input. It found a live divergence on
+#                              its first complete run: THIS driver recorded only
+#                              the MATCHED SUBSTRING of sqlite's summary line
+#                              where the .sh records the whole line.
+#                              D-HARNESS-CORPUS-ENGINE-MIRROR-CLAIMS-A-VERIFIER-THAT-DOES-NOT-EXIST
 foreach ($selfTest in @((Join-Path $PSScriptRoot 'test-confound-scope.ps1'),
-                        (Join-Path $PSScriptRoot 'test-driver-contracts.ps1'))) {
+                        (Join-Path $PSScriptRoot 'test-driver-contracts.ps1'),
+                        (Join-Path $PSScriptRoot 'test-mirror-regions.ps1'))) {
 $stName = Split-Path -Leaf $selfTest
 if ($env:DSS_SKIP_SELFTEST -eq '1') {
   Warn "driver self-test $stName SKIPPED (DSS_SKIP_SELFTEST=1) — a late-stage defect will not surface until the end of the run."
@@ -2985,7 +3058,19 @@ function Read-CorpusSegment($logPath) {
     }
     if ($c -eq '*' -and $line.StartsWith('*** Giving up')) { $r.GaveUp = $true; continue }
     $m = $reSummary.Match($line)
-    if ($m.Success) { $r.Summary = $m.Value; $r.Errors = [int]$m.Groups[1].Value; $r.Tests = [int]$m.Groups[2].Value; continue }
+    # ★ THE WHOLE LINE, not $m.Value — FOUND BY THE MIRROR VERIFIER ON ITS FIRST
+    # COMPLETE RUN (TF-C124), and it had been wrong here since this function was
+    # written. The .sh sibling's parse_segment records `summary=$0` and its
+    # header says why: "S is the WHOLE line ('0 errors out of 9 tests on <host>
+    # …'), which is what this harness has always printed". This copy recorded
+    # only the MATCHED SUBSTRING, so the .ps1 dropped the host and OS suffix
+    # while $summaryText's own comment three thousand lines below claimed the
+    # text was "the fixture's own, byte for byte". Two drivers, one corpus, two
+    # different verdict strings — the exact silent divergence
+    # D-HARNESS-CORPUS-ENGINE-MIRROR-CLAIMS-A-VERIFIER-THAT-DOES-NOT-EXIST said
+    # the unenforced mirror permitted. `$r.Errors`/`$r.Tests` still come from
+    # the capture groups, so the counts are unchanged.
+    if ($m.Success) { $r.Summary = $line; $r.Errors = [int]$m.Groups[1].Value; $r.Tests = [int]$m.Groups[2].Value; continue }
     $m = $rePerm.Match($line.TrimStart()); if ($m.Success) { $r.Permutation = $m.Groups[1].Value; continue }
     $m = $reTest.Match($line); if ($m.Success) { $r.LastTest = $m.Groups[1].Value }
   }
@@ -4041,13 +4126,21 @@ $oldLegEnv = @{}
 foreach ($en in $legEnvNames) { $oldLegEnv[$en] = [Environment]::GetEnvironmentVariable($en) }
 # ── the launcher's ENVIRONMENT namespace ─────────────────────────────────────
 # WHICH VARIABLES MAY CROSS IS THIS DRIVER'S KNOWLEDGE — it is the one that sets
-# them — and the rule is NAMESPACE-NEUTRAL VALUES ONLY. `$env:PATH` and
-# `$env:TCL_LIBRARY` are deliberately ABSENT: both hold HOST paths, and a foreign
-# fixture handed this host's PATH would be worse off than with its own. What must
-# cross are the two sqlite hooks the corpus engine steers with, plus whatever the
-# leg's launcher declared. HOW they cross belongs to the verb, not here.
-$legEnvVerb     = "$($leg.run.envTransfer)"
-$legForward     = @('SQLITE_TEST_PATTERN_LIST', 'QUICKTEST_OMIT') + $legEnvNames
+# them. `$env:PATH` stays ABSENT on purpose: a foreign fixture handed this host's
+# PATH would be worse off than with its own, and there is no translation that
+# makes a Windows PATH mean anything to a Linux process.
+# ★ TCL_LIBRARY IS PRESENT AND IS NOT IN THE PLAIN LIST
+# [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY]. Its value is
+# a HOST path, so it crosses through $legForwardPaths, which the resolver puts
+# through this launcher's DECLARED pathTranslation. Leaving it out entirely was
+# the defect; adding it to the plain list would have been a QUIETER one — Tcl
+# would fail to find init.tcl again and the driver would blame the acquisition.
+# WHICH kind each name is, and the refusal of any name with no declared kind, is
+# the resolver's (LAUNCH_FORWARD_KINDS); HOW they cross belongs to the verb.
+$legEnvVerb      = "$($leg.run.envTransfer)"
+$legForwardPlain = @('SQLITE_TEST_PATTERN_LIST', 'QUICKTEST_OMIT')
+$legForwardPaths = @('TCL_LIBRARY')
+$legForward      = $legForwardPlain + $legForwardPaths + $legEnvNames
 $legCarrierName = Get-LaunchEnvCarrierName $legEnvVerb
 $legCarrierOld  = if ($legCarrierName) { [Environment]::GetEnvironmentVariable($legCarrierName) } else { $null }
 if ($legCarrierName) {
@@ -4077,7 +4170,8 @@ while ($si -lt $segments.Count) {
     # environment TRANSFER, resolved PER SEGMENT from what is actually SET right
     # now. For `inherit` this is empty and the block below is byte-for-byte the
     # run it always was.
-    foreach ($a in (Resolve-LaunchEnvCarrier $legEnvVerb $legForward $legCarrierOld)) {
+    foreach ($a in (Resolve-LaunchEnvCarrier $legEnvVerb $legXlate $legForwardPlain `
+                                             $legForwardPaths $legEnvNames $legCarrierOld)) {
       $kv = $a.Split('=', 2); [Environment]::SetEnvironmentVariable($kv[0], $kv[1])
     }
     $run = Invoke-Fixture $fixture @($seg.Args) $rundir $log "$log.stderr" $SegStall $SegCap $legLauncher $legXlate $legLaunchFixture
@@ -4408,6 +4502,12 @@ if ($preconditionFail) {
   Warn "[$LegTag] corpus FAIL — $summaryText; $($real.Count) GENUINE DSS failure(s): $($real -join ' ')"
   if ($confound.Count) { Info "      (+$($confound.Count) known confound(s) ignored: $($confound -join ' '))" }
 }
+# ★ ONE call for EVERY failing branch above, deliberately placed after the chain
+# rather than inside the branch that happened to motivate it: an ABORT and a
+# ZERO-FILES run need the prior control every bit as much as a genuine failure,
+# and a lookup wired into one branch is a lookup that silently does not run for
+# the other four. It costs nothing on the green path.
+if ($unitFail) { Show-RegistryControls $LegTag $real }
 # A killed zombie / stolen stale lock is a fact about THIS run, not a footnote — it
 # rides on the verdict even when the corpus itself came back clean.
 if ($hygiene.Count) {

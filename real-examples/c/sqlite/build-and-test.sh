@@ -179,6 +179,11 @@ LEG_RESOLVER="$SCRIPT_DIR/harness_legs.py"
 MANIFEST_GEN="$SCRIPT_DIR/gen-pe64-manifest.py"
 SRC_COHERENCE="$SCRIPT_DIR/check-source-coherence.sh"
 CLI_SMOKE="$SCRIPT_DIR/cli-smoke.py"
+# The deferred-anchor registry, consulted AT the point a leg fails
+# (D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE).
+# NOT required to exist: a checkout without .plans still runs, it just gets one
+# line saying the lookup found nothing to read.
+ANCHOR_REGISTRY="$SCRIPT_DIR/../../../.plans/_deferred-anchor-registry.md"
 # ── THE SHARED CORE ──────────────────────────────────────────────────────────
 # base-harness.sh holds the recipe derivation, the artifact read-back and the
 # per-(leg, artifact) verdict ledger — the decisions this driver and
@@ -762,7 +767,18 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
 #                             the precondition discriminator, acq_field and the
 #                             target-keyed loader variable, each with its
 #                             red-on-disable mutation asserted to have LANDED.
-declare -a _SELFTESTS=("$SCRIPT_DIR/test-confound-scope.sh" "$SCRIPT_DIR/test-driver-contracts.sh")
+#   test-mirror-regions.sh    the `dss:` REGIONS — every region declared with who
+#                             verifies it (a claimed verifier that does not read
+#                             the region is a LOUD failure), and for a region
+#                             declared MIRRORED the symbol pairing plus
+#                             DIFFERENTIAL EXECUTION of both drivers' copies on
+#                             byte-identical input. It found a live divergence on
+#                             its first complete run: the .ps1 recorded only the
+#                             MATCHED SUBSTRING of sqlite's summary line where
+#                             this driver records the whole line.
+#                             D-HARNESS-CORPUS-ENGINE-MIRROR-CLAIMS-A-VERIFIER-THAT-DOES-NOT-EXIST
+declare -a _SELFTESTS=("$SCRIPT_DIR/test-confound-scope.sh" "$SCRIPT_DIR/test-driver-contracts.sh"
+                       "$SCRIPT_DIR/test-mirror-regions.sh")
 for _selftest in "${_SELFTESTS[@]}"; do
 if [[ "${DSS_SKIP_SELFTEST:-0}" == "1" ]]; then
   warn "driver self-test ${_selftest##*/} SKIPPED (DSS_SKIP_SELFTEST=1) — a late-stage defect will not surface until the end of the run."
@@ -969,18 +985,42 @@ launch_env_carrier_name() {    # launch_env_carrier_name <verb>  -> stdout
       The resolver and this driver disagree about the vocabulary."
   printf '%s\n' "$carrier"
 }
-launch_env_carrier() {         # launch_env_carrier <verb> <current> <name...>
-  local verb="$1" current="$2"; shift 2
+# ★★ AND THE THIRD QUESTION, WHICH THE FIRST TWO DO NOT ASK: does the VALUE still
+# mean the same thing once it has crossed? For a variable holding a path it does
+# not [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY]. So the
+# names arrive here in THREE declared groups, and the resolver REFUSES any name
+# it has no declared kind for — a path-valued variable added to the plain group
+# by a later edit is a LOUD refusal, not a raw forward.
+#   $3 = the count of NAMESPACE-NEUTRAL names, then that many names
+#   then the count of DRIVER-PATH names, then that many names
+#   then the remaining args: names the CATALOGUE declared for this launcher
+launch_env_carrier() {         # launch_env_carrier <envverb> <pathverb> <current> <nplain> <plain...> <npath> <path...> <declared...>
+  local verb="$1" pathverb="$2" current="$3"; shift 3
   [[ -n "$verb" && "$verb" != "inherit" ]] || return 0
-  local -a call=(--env-transfer "$verb" --carrier-current "$current") n
+  local -a call=(--env-transfer "$verb" --path-translation "${pathverb:-none}"
+                 --carrier-current "$current")
+  local n i nplain npath carried=0
+  nplain="$1"; shift
+  for ((i = 0; i < nplain; i++)); do
+    n="$1"; shift
+    [[ -n "$n" && -n "${!n:-}" ]] || continue   # THE FILTER — see the note above
+    call+=(--forward "$n"); carried=1
+  done
+  npath="$1"; shift
+  for ((i = 0; i < npath; i++)); do
+    n="$1"; shift
+    [[ -n "$n" && -n "${!n:-}" ]] || continue   # THE FILTER — same rule
+    # ONE token with the `=` form: a path may contain spaces, and the resolver
+    # splits on the FIRST `=` only.
+    call+=("--forward-path=$n=${!n}"); carried=1
+  done
   for n in "$@"; do
-    [[ -n "$n" ]] || continue
-    [[ -n "${!n:-}" ]] || continue     # THE FILTER — see the note above
-    call+=(--forward "$n")
+    [[ -n "$n" && -n "${!n:-}" ]] || continue   # THE FILTER — same rule
+    call+=(--forward-declared "$n"); carried=1
   done
   # Nothing SET means nothing to carry, and carrying nothing is the correct
   # answer — not an empty carrier that manufactures empty variables.
-  [[ " ${call[*]} " == *" --forward "* ]] || return 0
+  [[ "$carried" == 1 ]] || return 0
   local out rc
   if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" "${call[@]}" 2>&1)"; then rc=0; else rc=$?; fi
   [[ $rc -eq 0 ]] || die "could not resolve the launcher's environment transfer (envTransfer '$verb', rc=$rc):
@@ -988,6 +1028,41 @@ launch_env_carrier() {         # launch_env_carrier <verb> <current> <name...>
       Without it the launched fixture runs with an EMPTY run environment, which does not
       fail — it silently changes what the corpus does."
   printf '%s\n' "$out"
+}
+# ── THE REGISTRY, AT THE POINT OF FAILURE ────────────────────────────────────
+# D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE.
+#
+# ✔MEASURED (TF-C123): a 2x2 attribution was commissioned from scratch for 57
+# unit failures whose IDENTICAL experiment and IDENTICAL verdict were already in
+# the registry from seven cycles earlier, and the un-cited row let three false
+# statements reach a commit. The row was findable; LOOKING is the part you have
+# to remember. So the harness looks, here, and prints what it found beside the
+# failure it just reported.
+#
+# ⚠ FAIL-SOFT BY CONSTRUCTION, because this runs on a failure path and must never
+# become one: the resolver mode always exits 0, and this function swallows even
+# that. A run that already failed must not also lose its report.
+# ⚠ A POINTER, NEVER A VERDICT — a matched row means someone has looked at
+# something with this name before, not that this failure is explained.
+registry_controls_for() {      # registry_controls_for <leg> <failing test name...>
+  local leg="$1"; shift
+  local -a call=(--registry-controls "$ANCHOR_REGISTRY" --for-leg "$leg") t
+  local n=0
+  for t in "$@"; do
+    [[ -n "$t" ]] || continue
+    # Bounded: a leg can fail with hundreds of names and this is a pointer, not
+    # a search engine. The resolver says how many rows it held back, so a
+    # truncated lookup never reads as an exhaustive one.
+    [[ $n -lt 12 ]] || break
+    call+=(--for-test "$t"); n=$((n + 1))
+  done
+  local out
+  # `|| true` deliberately: python3 absent, unreadable registry, anything —
+  # none of it may add a failure to a leg that has already failed.
+  out="$(python3 "$LEG_RESOLVER" "${call[@]}" 2>&1 || true)"
+  [[ -n "$out" ]] || return 0
+  info "      ── registry rows naming this leg / these tests (a POINTER, not a verdict — read before commissioning an experiment):"
+  printf '%s\n' "$out" | sed 's/^/      /'
 }
 assert_launch_args_translated() {   # assert_launch_args_translated <verb> <arg...>
   local verb="$1"; shift
@@ -4899,10 +4974,16 @@ for leg in "${LEG_ORDER[@]}"; do
   fi
   # ── the launcher's ENVIRONMENT namespace ───────────────────────────────────
   # WHICH variables may cross is THIS DRIVER's knowledge — it is the one that
-  # sets them — and the rule is NAMESPACE-NEUTRAL VALUES ONLY: PATH and
-  # TCL_LIBRARY are deliberately absent because both hold HOST paths. HOW they
-  # cross belongs to the verb. Empty on every POSIX host, where the child simply
-  # inherits, so this leaves the .sh's long-standing behaviour untouched.
+  # sets them. PATH stays absent on purpose: no translation makes one host's
+  # PATH mean anything to a foreign process. HOW they cross belongs to the verb.
+  # Empty on every POSIX host, where the child simply inherits, so this leaves
+  # the .sh's long-standing behaviour untouched.
+  # ★ TCL_LIBRARY IS PRESENT AND IS IN THE SECOND GROUP, NOT THE FIRST
+  # [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY]. Its value
+  # is a path in THIS driver's namespace, so it crosses through --forward-path,
+  # which the resolver puts through the launcher's DECLARED pathTranslation.
+  # Omitting it was the defect the .ps1 was found with; putting it in the plain
+  # group would be the quieter one, and the resolver refuses that spelling.
   # Only the carrier's NAME and its prior value are per-LEG; WHICH variables are
   # actually carried is decided per SEGMENT, in the loop below, from what is set
   # at that moment (see launch_env_carrier for why that distinction is the
@@ -4910,7 +4991,9 @@ for leg in "${LEG_ORDER[@]}"; do
   leg_env_verb="${LEG_ENV_TRANSFER[$leg]:-inherit}"
   declare -a LEG_ENV_NAMES=()
   mapfile -t LEG_ENV_NAMES < <(printf '%s\n' ${LEG_LAUNCH_ENV[$leg]} | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')
-  declare -a LEG_ENV_FORWARD=(SQLITE_TEST_PATTERN_LIST QUICKTEST_OMIT
+  declare -a LEG_ENV_FORWARD_PLAIN=(SQLITE_TEST_PATTERN_LIST QUICKTEST_OMIT)
+  declare -a LEG_ENV_FORWARD_PATHS=(TCL_LIBRARY)
+  declare -a LEG_ENV_FORWARD=("${LEG_ENV_FORWARD_PLAIN[@]}" "${LEG_ENV_FORWARD_PATHS[@]}"
                               ${LEG_ENV_NAMES[@]+"${LEG_ENV_NAMES[@]}"})
   leg_carrier_name="$(launch_env_carrier_name "$leg_env_verb")"
   leg_carrier_old=""
@@ -5071,8 +5154,10 @@ for leg in "${LEG_ORDER[@]}"; do
     # very silence this mechanism exists to end. Same trap, same remedy, as the
     # translated segment paths above.
     declare -a LEG_ENV_CARRIER=()
-    leg_env_carrier_out="$(launch_env_carrier "$leg_env_verb" "$leg_carrier_old" \
-                             ${LEG_ENV_FORWARD[@]+"${LEG_ENV_FORWARD[@]}"})"
+    leg_env_carrier_out="$(launch_env_carrier "$leg_env_verb" "$leg_xlate" "$leg_carrier_old" \
+                             "${#LEG_ENV_FORWARD_PLAIN[@]}" "${LEG_ENV_FORWARD_PLAIN[@]}" \
+                             "${#LEG_ENV_FORWARD_PATHS[@]}" "${LEG_ENV_FORWARD_PATHS[@]}" \
+                             ${LEG_ENV_NAMES[@]+"${LEG_ENV_NAMES[@]}"})"
     if [[ -n "$leg_env_carrier_out" ]]; then
       mapfile -t LEG_ENV_CARRIER <<< "$leg_env_carrier_out"
       export "${LEG_ENV_CARRIER[@]}"
@@ -5461,6 +5546,14 @@ for leg in "${LEG_ORDER[@]}"; do
     UNIT_FAILS=$((UNIT_FAILS + 1))
     warn "[$leg] corpus FAIL — $summary; ${#real[@]} GENUINE DSS failure(s): ${real[*]}"
     [[ ${#confound[@]} -gt 0 ]] && info "      (+${#confound[@]} known confound(s) ignored: ${confound[*]})"
+  fi
+  # ★ ONE call for EVERY failing branch above, deliberately placed after the
+  # chain rather than inside the branch that motivated it: an ABORT and a
+  # ZERO-FILES run need the prior control every bit as much as a genuine failure,
+  # and a lookup wired into one branch silently does not run for the other four.
+  # Keyed on the recorded VERDICT, which is the same fact the .ps1's $unitFail is.
+  if [[ "${UNIT_VERDICT[$leg]:-}" == FAIL:* ]]; then
+    registry_controls_for "$leg" ${real[@]+"${real[@]}"}
   fi
   # A killed zombie / stolen stale lock is a fact about THIS run, not a footnote —
   # it rides on the verdict even when the corpus itself came back clean.

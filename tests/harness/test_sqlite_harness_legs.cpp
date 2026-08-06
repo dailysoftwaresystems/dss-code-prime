@@ -1654,7 +1654,8 @@ TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
         char const* fixtureSite;    // the line that must call it
         char const* segmentHelper;  // translates a segment's script argument
         char const* segmentNeedle;  // marks a segment-queue RECORD
-        char const* forwardListSite; // names the variables that must cross
+        char const* forwardListSite; // names the NAMESPACE-NEUTRAL variables
+        char const* forwardPathSite; // names the DRIVER-PATH variables
     };
     // Each driver reaches the translator through ONE named intermediary, and it
     // is the intermediary the segment records must name:
@@ -1673,11 +1674,21 @@ TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
     // naming both variables anywhere and was satisfied by the RESTORE line
     // (`$env:QUICKTEST_OMIT = $oldOmit; $env:SQLITE_TEST_PATTERN_LIST = …`), so
     // emptying the real list stayed GREEN. Measured, and fixed here.
+    //
+    // ★ TWO CONSTRUCTS SINCE TF-C124, AND THE SPLIT IS THE POINT
+    // [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY]. This
+    // pin used to assert that TCL_LIBRARY appeared in NO forward construct,
+    // which was right about the danger and wrong about the remedy: the variable
+    // has to cross (a leg whose Tcl was acquired cannot find init.tcl without
+    // it) and it holds a HOST path, so it must cross TRANSLATED. `forwardListSite`
+    // is now the NAMESPACE-NEUTRAL group and TCL_LIBRARY is still banned from it;
+    // `forwardPathSite` is the DRIVER-PATH group and TCL_LIBRARY must be there.
+    // Deleting the path group to satisfy the ban now reds the second assertion.
     constexpr Driver kDrivers[] = {
         {"build-and-test.sh", false, "launch_path", "launch_bin=", "LAUNCH_",
-         "${US}", "LEG_ENV_FORWARD"},
+         "${US}", "LEG_ENV_FORWARD_PLAIN=", "LEG_ENV_FORWARD_PATHS="},
         {"build-and-test.ps1", true, "Convert-LaunchPath", "$legLaunchFixture =",
-         "Get-SegmentArgs", "Kind = '", "$legForward"}};
+         "Get-SegmentArgs", "Kind = '", "$legForwardPlain =", "$legForwardPaths ="}};
 
     for (auto const& d : kDrivers) {
         auto const path = harnessDir() / d.name;
@@ -1800,12 +1811,13 @@ TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
                 line.find("QUICKTEST_OMIT") != std::string::npos) {
                 forwardsThePatternList = true;
             }
-            // NAMESPACE-NEUTRAL VALUES ONLY. Forwarding a HOST path into a
-            // foreign namespace is worse than not forwarding it: the child gets
-            // a path it cannot resolve and uses it anyway.
+            // NAMESPACE-NEUTRAL VALUES ONLY *IN THIS GROUP*. A HOST path named
+            // here would cross verbatim: the child gets a path it cannot resolve
+            // and uses it anyway. TCL_LIBRARY belongs in the path group below.
             EXPECT_EQ(line.find("TCL_LIBRARY"), std::string::npos)
-                << d.name << " forwards a HOST PATH into the launcher's"
-                             " environment:\n  "
+                << d.name << " names a HOST PATH in its NAMESPACE-NEUTRAL"
+                             " forward group, where it would cross untranslated:"
+                             "\n  "
                 << line;
             EXPECT_EQ(line.find("PATH'"), std::string::npos)
                 << d.name << " forwards this host's PATH into the launcher's"
@@ -1819,6 +1831,31 @@ TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
                " files: MEASURED 2026-08-04, a launched fixture that could not"
                " see it re-ran the corpus from the beginning after an abort and"
                " reported it as progress.";
+
+        // THE PATH GROUP, AND THE FLAG THAT MAKES IT MEAN ANYTHING. A driver
+        // could satisfy the ban above by simply dropping TCL_LIBRARY again —
+        // which is the defect the anchor names, not a fix — so the variable must
+        // be PRESENT in the driver-path group, and the driver must ask the
+        // resolver to translate it (`--forward-path`, the only spelling that
+        // routes a value through the launcher's declared pathTranslation).
+        bool forwardsTclLibraryAsAPath = false, asksForPathForward = false;
+        for (auto const& line : lines) {
+            if (line.find("--forward-path") != std::string::npos) asksForPathForward = true;
+            if (line.find(d.forwardPathSite) == std::string::npos) continue;
+            if (line.find("TCL_LIBRARY") != std::string::npos) forwardsTclLibraryAsAPath = true;
+        }
+        EXPECT_TRUE(forwardsTclLibraryAsAPath)
+            << d.name << ": its DRIVER-PATH forward group ("
+            << d.forwardPathSite
+            << ") does not name TCL_LIBRARY. A leg whose Tcl came from"
+               " acquisition cannot find init.tcl without it, and the failure is"
+               " reported against the acquisition rather than the boundary"
+               " [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY].";
+        EXPECT_TRUE(asksForPathForward)
+            << d.name << " never spells --forward-path, so whatever it names in"
+                         " its driver-path group crosses UNTRANSLATED — a"
+                         " Windows path handed to a Linux process, which does"
+                         " not fail as a path error.";
     }
 }
 

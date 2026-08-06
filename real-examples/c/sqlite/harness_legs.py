@@ -364,6 +364,133 @@ def env_carrier_assignments(verb, names, current=""):
     return ["%s=%s" % (carrier, sep.join(merged))]
 
 
+# ── WHAT A FORWARDED VARIABLE'S VALUE MEANS ON THE OTHER SIDE ───────────────
+#
+# THE HALF `envTransfer` DOES NOT COVER, AND IT IS A DIFFERENT QUESTION.
+# `envTransfer` answers WHETHER a variable crosses the launcher's environment
+# boundary. It says NOTHING about whether the VALUE still means the same thing
+# once it has crossed — and for a variable holding a path, it does not.
+# [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY.]
+#
+# ✔MEASURED (TF-C123): `build-and-test.ps1` sets `TCL_LIBRARY` for a leg whose
+# Tcl came from acquisition, and TCL_LIBRARY was NOT in the forward set — so a
+# `wsl.exe`-launched leg did not carry it and Tcl could not find `init.tcl`.
+# ⚠ AND THE OBVIOUS FIX IS A SECOND, QUIETER DEFECT: the value is a HOST path
+# (`C:\…`), so merely NAMING it in the carrier hands a Windows path to a Linux
+# process. Tcl then fails to find `init.tcl` again and the driver blames the
+# acquisition instead of the boundary — the same symptom, a wrong diagnosis, and
+# no signal that anything was translated or not.
+#
+# So a forwarded variable is not just a NAME: it is a name plus a claim about
+# the NAMESPACE its value lives in. The claim is DECLARED, per variable, in one
+# place, and there is no default — an undeclared name is REFUSED, because
+# "nobody classified this yet" and "this value is namespace-neutral" are the two
+# answers that must never look alike. That is the whole point: the next
+# path-valued variable someone adds to a driver's forward list cannot be
+# forwarded raw by accident, because it cannot be forwarded at all until its
+# kind is written down here.
+#
+#   opaque       the value means the same thing in every namespace — a Tcl glob
+#                list, a comma-separated file list, a flag. Crosses verbatim.
+#   driver-path  the value is a path IN THIS DRIVER'S namespace. It MUST be put
+#                through the launcher's declared `pathTranslation` before it
+#                crosses; for a launcher declaring `none` that is the identity,
+#                which is correct and still goes through the same door.
+#
+# A variable whose value the CATALOGUE declared for a specific launcher
+# (`launchers[].env`, e.g. QEMU_LD_PREFIX) is a third case and is NOT in this
+# table: it was written FOR that launcher, so it is already in the launcher's
+# namespace by construction. Those cross through `declared` below, which is a
+# separate argument precisely so that "the catalogue authored this value" is a
+# statement a reader can see, not an omission they have to infer.
+LAUNCH_FORWARD_KINDS = {
+    "SQLITE_TEST_PATTERN_LIST": "opaque",
+    "QUICKTEST_OMIT": "opaque",
+    "TCL_LIBRARY": "driver-path",
+}
+
+
+def forward_kind(name):
+    """The declared kind of a forwarded variable, or a LegError. Never a
+    permissive default — see the note above: an unclassified variable that
+    silently meant `opaque` is exactly the raw-path forward this exists to
+    stop."""
+    kind = LAUNCH_FORWARD_KINDS.get(name)
+    if kind is None:
+        raise LegError(
+            "%r is not a DECLARED forwardable variable (declared: %s). A "
+            "variable crossing a launcher's environment boundary must state "
+            "the namespace its VALUE lives in: 'opaque' (means the same thing "
+            "on both sides) or 'driver-path' (a path in THIS driver's "
+            "namespace, which must go through the launcher's declared "
+            "pathTranslation first). There is no default, because forwarding a "
+            "HOST path verbatim does not fail as a path error — the callee "
+            "opens a relative file of that name, misses, and the run reads as a "
+            "broken binary. Add it to LAUNCH_FORWARD_KINDS with its kind, or "
+            "pass it as a catalogue-declared launcher variable if legs.json "
+            "authored its value for this launcher."
+            % (name, ", ".join("%s=%s" % (k, v)
+                               for k, v in sorted(LAUNCH_FORWARD_KINDS.items()))))
+    return kind
+
+
+def launch_forward_assignments(env_verb, path_verb, forwards, declared=(),
+                               current="", runner=None):
+    """Every `NAME=VALUE` a driver must apply so that the process its launcher
+    spawns sees the run environment MEANING what this driver meant.
+
+    `forwards` is [(name, value)] — the driver-set variables that are actually
+    SET right now (the caller filters; see env_carrier_assignments' note on why
+    an unset name in the carrier is a false green). `declared` is the names the
+    CATALOGUE declared for this launcher, already in its namespace.
+
+    Returns the value re-assignments FIRST (so a driver applying them in order
+    has the translated value in place before the carrier names it), then the
+    carrier. Empty for a verb whose child inherits — a native run stays
+    byte-for-byte itself.
+
+    `runner` is passed through to translate_path so the self-test can exercise
+    the contract on a host with no translator installed."""
+    # THE VERB FIRST, before any name is looked at: an unknown envTransfer is
+    # fatal on its own terms, and diagnosing it as "undeclared variable" would
+    # name the wrong thing.
+    spec = env_transfer(env_verb)
+    names = [n for n, _ in forwards if n] + [n for n in declared if n]
+    if not spec["nameCarrier"] or not names:
+        return []
+    out = []
+    for name, value in forwards:
+        if not name:
+            continue
+        if forward_kind(name) != "driver-path":
+            continue
+        # A path-valued variable with no value would cross as EMPTY-BUT-EXISTING,
+        # which is the failure mode that made the carrier filter load-bearing.
+        if not value:
+            raise LegError(
+                "%r is declared 'driver-path' but was forwarded with no value. "
+                "Only a variable that is actually SET may be carried: naming an "
+                "unset one materialises it on the other side as EMPTY-BUT-"
+                "EXISTING, which reads as a real setting rather than as absence."
+                % name)
+        # THE GUARD THE ANCHOR ASKS FOR, and it is here rather than at the call
+        # site so that neither driver can be the one that forgets: a path-valued
+        # variable may not cross a boundary whose translation nobody declared.
+        if not path_verb:
+            raise LegError(
+                "%r is declared 'driver-path', so its value (%r) is in THIS "
+                "driver's namespace — but no pathTranslation was declared for "
+                "the launcher it is crossing to. A path forwarded without a "
+                "declared translation is not a path error on the other side: "
+                "the callee opens a relative file of that name and the run "
+                "reads as a broken binary. Declare the launcher's "
+                "pathTranslation (legs.json) and pass it here."
+                % (name, value))
+        out.append("%s=%s" % (name, translate_path(path_verb, value,
+                                                   runner=runner)))
+    return out + env_carrier_assignments(env_verb, names, current)
+
+
 # ── Launcher run FILESYSTEM ─────────────────────────────────────────────────
 #
 # THE THIRD NAMESPACE, AND IT WAS FOUND THE SAME WAY THE FIRST TWO WERE — BY
@@ -4363,6 +4490,808 @@ def lint(path=CATALOGUE):
     return findings
 
 
+# ── THE `dss:` REGIONS, AND WHO ACTUALLY CHECKS EACH ONE ────────────────────
+#
+# D-HARNESS-CORPUS-ENGINE-MIRROR-CLAIMS-A-VERIFIER-THAT-DOES-NOT-EXIST.
+#
+# ✔MEASURED (TF-C123): the `dss:corpus-engine` header said "the verifier extracts
+# it from this file by these sentinels". `grep -rl 'dss:corpus-engine'` returned
+# exactly the two driver files themselves. NOTHING read the sentinel. The
+# mirrored region was entirely unenforced, the two copies could diverge silently,
+# and the region carried a note saying they could not — a comment crediting an
+# instrument that was never built, which is strictly worse than no comment
+# because it retires the reader's suspicion.
+#
+# ★ THE GENERALISATION, WHICH IS THE PART THAT STOPS THIS RECURRING UNDER A
+# DIFFERENT SENTINEL NAME. It is not enough to build one verifier for one
+# region: the defect was that a region's verification status was INVISIBLE. So
+# every `dss:` region is DECLARED here, with who checks it, and the declaration
+# is checked in BOTH directions:
+#
+#   · a region marked in a driver with no row here            -> LOUD
+#   · a row here naming a region no driver marks              -> LOUD
+#   · a row claiming a verifier FILE that does not mention    -> LOUD
+#     the region  (the exact defect: a claim with no reader)
+#   · a row claiming NO verifier without stating WHY          -> LOUD
+#
+# The last one is the load-bearing line. "Unverified" stays possible — several
+# regions are read markers for a human and nothing more — but it becomes a
+# STATED DECISION with a reason, never an omission a reader has to detect.
+#
+#   drivers    the driver files that must mark this region, exactly.
+#   verifiers  files that read the region BY ITS SENTINEL. Checked to exist and
+#              to actually contain the sentinel name.
+#   mirror     True  => the region is claimed to be MIRRORED between the two
+#              drivers, and check_dss_regions runs the differential battery on
+#              it (below): the two copies are executed on identical input and
+#              their answers must be identical.
+#   why        required when `verifiers` is empty.
+DSS_REGIONS = {
+    "corpus-engine": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["harness_legs.py"], "mirror": True},
+    "clone-lock": {
+        "drivers": ["build-and-test.sh"],
+        "verifiers": ["build-and-test.ps1"],
+        "$comment": "the .ps1 EXTRACTS this block out of the .sh and injects it "
+                    "into the staging step, so the .ps1 is a real consumer of "
+                    "the sentinel — not a second copy."},
+    "src-provenance": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["test-confound-scope.sh", "test-confound-scope.ps1"]},
+    "src-clone": {"drivers": ["build-and-test.sh"],
+                  "verifiers": ["test-confound-scope.sh"]},
+    "src-gate": {"drivers": ["build-and-test.sh"],
+                 "verifiers": ["test-confound-scope.sh"]},
+    "confound-supply": {"drivers": ["build-and-test.sh"],
+                        "verifiers": ["test-confound-scope.sh"]},
+    "loadext-stage": {"drivers": ["build-and-test.sh"],
+                      "verifiers": ["test-confound-scope.sh",
+                                    "test-confound-scope.ps1"]},
+    "loadext-stage-ps1": {"drivers": ["build-and-test.ps1"],
+                          "verifiers": ["test-confound-scope.ps1"]},
+    "loadext-verdict": {"drivers": ["build-and-test.sh"],
+                        "verifiers": ["test-confound-scope.sh"]},
+    "verdict-vocabulary": {"drivers": ["build-and-test.sh"],
+                           "verifiers": ["test-driver-contracts.sh"]},
+    # ── the regions that are READER MARKERS and nothing more ────────────────
+    # Each states WHY, because "nobody checks this" must be a decision on the
+    # record rather than a gap someone has to notice.
+    "selftest": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": [],
+        "why": "the region IS the refuse-to-start gate; it is exercised every "
+               "time either driver starts, and its contents are pinned by "
+               "tests/harness/test_sqlite_harness_legs.cpp rather than by "
+               "sentinel extraction."},
+    "run-lock": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": [],
+        "why": "a navigation marker over per-driver lock code that is not "
+               "mirrored — the two hosts' locking primitives differ (flock vs a "
+               "lock FILE), so there is no shared answer to compare."},
+    "preflight": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": [],
+        "why": "a navigation marker; the preflight CALLS the corpus-engine "
+               "helpers, which is where the shared logic lives and where the "
+               "differential battery already reaches it."},
+    "corpus-loop": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": [],
+        "why": "the per-leg driving loop: it is control flow over the "
+               "corpus-engine helpers, and its OUTCOMES are pinned by "
+               "tests/harness/test_sqlite_harness_legs.cpp (the segment-queue "
+               "and verdict-ladder contracts) rather than by text comparison."},
+    "artifact-report": {
+        "drivers": ["build-and-test.sh"], "verifiers": [],
+        "why": "a navigation marker over reporting code with no .ps1 twin."},
+    "fresh-inode": {
+        "drivers": ["build-and-test.sh"], "verifiers": [],
+        "why": "a navigation marker over the POSIX inode-freshness install "
+               "dance; there is no Windows twin (D-HARNESS-INODE64-MISBINDING "
+               "is a Darwin/Linux concern)."},
+    "fresh-inode-install": {
+        "drivers": ["build-and-test.sh"], "verifiers": [],
+        "why": "the second half of dss:fresh-inode; same reason."},
+    "run-dir": {
+        "drivers": ["build-and-test.sh"], "verifiers": [],
+        "why": "a navigation marker; the run-directory PLAN it applies is "
+               "resolved by harness_legs.py --run-dir-plan and pinned there."},
+}
+
+
+# ── THE MIRROR CONTRACT for a region declared `mirror: True` ────────────────
+#
+# The two copies are NOT text-identical and never could be: one is bash driving
+# awk, the other is PowerShell driving .NET regex objects. A textual diff after
+# "normalising incidental syntax" would be theatre in one direction (normalise
+# hard enough and every real difference washes out) or noise in the other.
+#
+# So the contract is stated as CAPABILITIES, and checked two ways:
+#
+#   1. PAIRING. Every symbol defined in either copy is accounted for here —
+#      paired with its twin, or declared single-driver WITH A REASON. A helper
+#      added to one driver and not the other is a LOUD failure at the moment it
+#      is added, which is the capability-pair defect class this project keeps
+#      paying for ([[D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-
+#      DRIVER]] and its siblings).
+#
+#   2. DIFFERENTIAL EXECUTION, for the pairs that are pure functions of their
+#      input. Both copies are EXTRACTED FROM THE SHIPPED DRIVERS by their
+#      sentinels, executed on byte-identical input, and their answers compared.
+#      This is the half that catches a changed REGEX, which pairing alone never
+#      would — and it is why this verifier is not theatre.
+#
+# `sh`/`ps1` name the defining symbol in each copy. `differential` names the
+# battery case that drives the pair, or "" for a pair checked by presence only
+# (a process-hygiene helper is not a pure function of its input and driving it
+# would mean spawning processes to kill).
+MIRROR_PAIRS = [
+    {"sh": "corpus_files", "ps1": "Get-CorpusFiles", "differential": "corpus-files"},
+    {"sh": "tier_prefixes", "ps1": "Get-TierPrefixes", "differential": "tier-prefixes"},
+    {"sh": "tier_permutations", "ps1": "Get-TierPermutations",
+     "differential": "tier-permutations"},
+    {"sh": "parse_segment", "ps1": "Read-CorpusSegment", "differential": "parse-segment"},
+    {"sh": "resolve_abort_file", "ps1": "Resolve-AbortFile",
+     "differential": "resolve-abort-file"},
+    {"sh": "files_after", "ps1": "Get-FilesAfter", "differential": "files-after"},
+    {"sh": "our_fixture_pids", "ps1": "Get-OurFixtureProcesses", "differential": "",
+     "why": "enumerates live processes; driving it differentially would mean "
+            "spawning processes for the two shells to find and kill."},
+    {"sh": "stop_our_fixtures", "ps1": "Stop-OurFixtures", "differential": "",
+     "why": "kills processes; see our_fixture_pids."},
+    {"sh": "run_fixture_segment", "ps1": "Invoke-Fixture", "differential": "",
+     "why": "spawns the fixture with timeouts and output capture — the one "
+            "helper here that is deliberately NOT a pure function."},
+    {"sh": "fact", "ps1": None, "differential": "",
+     "why": "the .sh persists parse_segment's answer as a TAB-separated FACT "
+            "FILE (a subshell cannot return a structure); the .ps1 keeps the "
+            "hashtable Read-CorpusSegment returns, so it needs no reader."},
+    {"sh": "facts", "ps1": None, "differential": "", "why": "see fact."},
+    {"sh": "group_digits", "ps1": None, "differential": "",
+     "why": "thousands separators: PowerShell has ToString('N0') natively, bash "
+            "has nothing locale-free."},
+    {"sh": "str_gt", "ps1": None, "differential": "",
+     "why": "byte-wise string comparison: PowerShell has "
+            "[StringComparer]::Ordinal natively."},
+    {"sh": "ps_enum_available", "ps1": None, "differential": "",
+     "why": "probes whether `ps -eo pid=,args=` can enumerate at all; the .ps1 "
+            "uses Get-CimInstance, which has no equivalent failure mode to "
+            "probe for."},
+    {"sh": "leg_loader_path_var", "ps1": None, "differential": "",
+     "why": "the .ps1 resolves the loader variable ONCE per leg into "
+            "$LegLoaderVar at Step 8, outside this region; the .sh needs it as "
+            "a function because run_leg re-execs the shell."},
+    {"sh": "run_leg", "ps1": None, "differential": "",
+     "why": "the .sh REPLACES its own process with the launcher; the .ps1 "
+            "spawns via Start-Process inside Invoke-Fixture, so there is no "
+            "separate exec step."},
+    {"sh": None, "ps1": "Get-OurFixtureProcessesUnder", "differential": "",
+     "why": "matches a fixture by the DIRECTORY it runs under, which the .ps1 "
+            "needs because a Windows image path can be spelled several ways; "
+            "the .sh matches the full argv directly."},
+    {"sh": None, "ps1": "Stop-OurFixturesUnder", "differential": "",
+     "why": "see Get-OurFixtureProcessesUnder."},
+    {"sh": None, "ps1": "Stop-FixtureProcesses", "differential": "",
+     "why": "the shared tail of Stop-OurFixtures / Stop-OurFixturesUnder; the "
+            ".sh has one caller and needs no split."},
+]
+
+# The symbol-definition grammar of each driver language, used to enumerate what
+# a region DEFINES. Deliberately anchored at column 0: a nested definition is
+# not a capability of the region, it is an implementation detail of one.
+MIRROR_SYMBOL_RE = {
+    "sh": re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{"),
+    "ps1": re.compile(r"^function\s+([A-Za-z][A-Za-z0-9-]*)\s*(\(|\{)"),
+}
+
+
+def dss_region_spans(text, name):
+    """[(start, end)] line indices (0-based, inclusive) of every `dss:<name>`
+    region in `text`. A region whose sentinels are unbalanced or crossed yields
+    a LegError — an unreadable marker is not a region, and silently returning
+    nothing would read exactly like "this region is not here"."""
+    opens, closes = [], []
+    for i, line in enumerate(text.split("\n")):
+        if re.search(r">>>\s*dss:%s\s*>>>" % re.escape(name), line):
+            opens.append(i)
+        if re.search(r"<<<\s*dss:%s\s*<<<" % re.escape(name), line):
+            closes.append(i)
+    if len(opens) != len(closes):
+        raise LegError("dss:%s has %d opening and %d closing sentinel(s) — an "
+                       "unbalanced region cannot be extracted, and a verifier "
+                       "that silently extracted the wrong lines would be worse "
+                       "than none" % (name, len(opens), len(closes)))
+    spans = []
+    for o, c in zip(opens, closes):
+        if c <= o:
+            raise LegError("dss:%s closes at line %d before it opens at line %d"
+                           % (name, c + 1, o + 1))
+        spans.append((o, c))
+    return spans
+
+
+def dss_region_text(text, name):
+    """The region's body, sentinel lines EXCLUDED. Multiple spans concatenate in
+    file order — the .sh's dss:corpus-engine is one span today, but a region
+    that grew a second one must not silently lose it."""
+    lines = text.split("\n")
+    out = []
+    for start, end in dss_region_spans(text, name):
+        out.extend(lines[start + 1:end])
+    return "\n".join(out)
+
+
+def dss_region_symbols(text, lang):
+    """The symbols a region body DEFINES, in file order."""
+    rx = MIRROR_SYMBOL_RE[lang]
+    out = []
+    for line in text.split("\n"):
+        m = rx.match(line)
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+# ── THE DIFFERENTIAL BATTERY ────────────────────────────────────────────────
+#
+# THE HALF THAT MAKES THIS A VERIFIER RATHER THAN A HEADCOUNT. Both copies are
+# EXTRACTED FROM THE SHIPPED DRIVERS by their sentinels — never re-typed here —
+# executed on byte-identical input, and their answers compared line for line.
+#
+# ★ EXACTLY WHAT IS NORMALISED, AND WHY EACH IS INCIDENTAL RATHER THAN SEMANTIC.
+# This list is the whole defence against a vacuous pass, so it is short and it is
+# stated rather than buried:
+#
+#   1. LINE ENDINGS. PowerShell writes CRLF on Windows; CRLF -> LF on both sides.
+#      Nothing in this answer vocabulary can contain a line terminator, so no
+#      semantic difference can hide inside this.
+#   2. TRAILING WHITESPACE on each emitted line, and trailing blank lines at the
+#      end of the capture. `printf` and the PowerShell pipeline pad differently.
+#      Leading whitespace is NOT stripped: it is inside the value.
+#   3. THE FAILING-TEST-NAME SET is emitted SORTED by both sides. The .sh streams
+#      names as it meets them and the .ps1 accumulates them in a hashtable; both
+#      drivers CONSUME the answer as a set (the classifier iterates it). This is
+#      the ONLY answer compared as a set. Every other answer — the completed-file
+#      list, the permutation, the last test, all counts — is compared as an
+#      ORDERED list, where order and multiplicity are semantic and a difference
+#      reds.
+#
+# NOTHING ELSE. No case folding, no whitespace collapsing inside a value, no
+# numeric coercion, no truncation, no "ignore if empty".
+#
+# The projection into a common answer vocabulary for parse_segment is the .sh
+# region's OWN documented fact alphabet (F/X/S/E/C/P/T/G/N/D/K/Q/A) — not a new
+# one invented here — and the .sh side reads it back through the region's own
+# `fact`/`facts` helpers, so those are exercised rather than bypassed.
+MIRROR_PRELUDE_SH = """set -Eeuo pipefail
+warn() { :; }
+info() { :; }
+die()  { echo "DIE: $*" >&2; exit 9; }
+"""
+
+MIRROR_PRELUDE_PS1 = """$ErrorActionPreference = 'Stop'
+function Warn($m) { }
+function Info($m) { }
+function Die($m)  { Write-Error $m; exit 9 }
+"""
+
+MIRROR_CASES = {
+    "corpus-files": {
+        "sh": 'corpus_files "$CORPUSDIR"',
+        "ps1": "foreach ($f in (Get-CorpusFiles $CORPUSDIR)) { $f }",
+    },
+    "tier-permutations": {
+        "sh": 'tier_permutations "$TIERFILE"',
+        "ps1": "foreach ($p in (Get-TierPermutations $TIERFILE)) { $p }",
+    },
+    "tier-prefixes": {
+        "sh": 'tier_prefixes "$PERMSFILE"',
+        "ps1": "foreach ($p in (Get-TierPrefixes $PERMSFILE)) { $p }",
+    },
+    "resolve-abort-file": {
+        "sh": ('while IFS= read -r nm; do\n'
+               '  printf "%s\\t%s\\n" "$nm" "$(resolve_abort_file "$nm" "$LISTFILE")"\n'
+               'done < "$NAMESFILE"'),
+        "ps1": ("$corpus = @(Get-Content -LiteralPath $LISTFILE)\n"
+                "foreach ($nm in (Get-Content -LiteralPath $NAMESFILE)) {\n"
+                "  \"$nm`t$(Resolve-AbortFile $nm $corpus)\" }"),
+    },
+    "files-after": {
+        "sh": 'files_after "$BOUNDARY" "$LISTFILE"',
+        "ps1": ("$corpus = @(Get-Content -LiteralPath $LISTFILE)\n"
+                "foreach ($f in (Get-FilesAfter $corpus $BOUNDARY)) { $f }"),
+    },
+    # THE ONE THAT CARRIES THE PARSING SEMANTICS. Both sides project into the
+    # .sh region's own fact alphabet; see the normalisation note above.
+    "parse-segment": {
+        "sh": ('parse_segment "$LOGFILE" "$FACTFILE"\n'
+               'facts F "$FACTFILE"\n'
+               'facts X "$FACTFILE" | LC_ALL=C sort -u | sed "s/^/X /"\n'
+               'for k in S E C P T G N D K Q A; do\n'
+               '  printf "%s %s\\n" "$k" "$(fact "$k" "$FACTFILE")"\n'
+               'done'),
+        "ps1": ("$r = Read-CorpusSegment $LOGFILE\n"
+                "foreach ($f in $r.Completed) { $f }\n"
+                "foreach ($n in ($r.FailNames.Keys | Sort-Object)) { \"X $n\" }\n"
+                "\"S $($r.Summary)\"\n"
+                "\"E $(if ($r.Summary) { $r.Errors } else { '' })\"\n"
+                "\"C $(if ($r.Summary) { $r.Tests } else { '' })\"\n"
+                "\"P $($r.Permutation)\"\n"
+                "\"T $($r.LastTest)\"\n"
+                "\"G $(if ($r.GaveUp) { '1' } else { '' })\"\n"
+                "\"N $($r.Completed.Count)\"\n"
+                "\"D $(if ($r.Completed.Count) { $r.Completed[$r.Completed.Count - 1] } else { '' })\"\n"
+                "\"K $($r.OkLines)\"\n"
+                "\"Q $($r.FailMarkers)\"\n"
+                "\"A $($r.Diagnostic)\""),
+    },
+}
+
+
+def _ps1_single_quote(value):
+    """A PowerShell single-quoted literal: only `'` needs doubling inside one."""
+    return "'%s'" % str(value).replace("'", "''")
+
+
+def _mirror_normalise(raw):
+    """See the normalisation note above: line endings, then trailing whitespace,
+    then trailing blank lines. Nothing else."""
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines = [ln.rstrip() for ln in lines]
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _mirror_write_fixtures(work):
+    """The byte-identical inputs both copies are driven with. Written ONCE and
+    handed to both, so the two answers are answers to the same question.
+
+    Every value here is chosen because some line of the region reads it: the
+    exclusion block sqlite's permutations.test really writes, a `-prefix ""`
+    suite and a `-prefix "mm-"` one, a CRLF log line, a summary with trailing
+    text after the counts, a `!Failures on these tests:` line with its leading
+    bang, and a traceback frame whose closing quote abuts the name."""
+    corpus = os.path.join(work, "corpus")
+    os.makedirs(corpus)
+    for name in ["alter.test", "wal2.test", "swarmvtab.test",
+                 "swarmvtabfault.test", "zipfile.test", "walsetlk.test",
+                 "all.test", "permutations.test", "veryquick.test"]:
+        with open(os.path.join(corpus, name), "w", encoding="utf-8") as fh:
+            fh.write("# %s\n" % name)
+    perms = os.path.join(corpus, "permutations.test")
+    with open(perms, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(
+            "set alltests [test_set $alltests -exclude {\n"
+            "  all.test permutations.test\n"
+            "  veryquick.test\n"
+            "}]\n"
+            'test_suite "veryquick" -prefix "" -description {\n'
+            "}\n"
+            'test_suite "mmap" -prefix "mm-" -description {\n'
+            "}\n"
+            'test_suite "inmemory_journal" -description {\n'
+            "}\n")
+    tier = os.path.join(work, "tier.test")
+    with open(tier, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("run_test_suite veryquick\n"
+                 "  run_test_suite inmemory_journal\n"
+                 "# run_test_suite mmap\n")
+    listfile = os.path.join(work, "corpus.lst")
+    with open(listfile, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("alter.test\nswarmvtab.test\nswarmvtabfault.test\n"
+                 "wal2.test\nwalsetlk.test\nzipfile.test\n")
+    namesfile = os.path.join(work, "names.lst")
+    with open(namesfile, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("inmemory_journal.swarmvtabfault-1.1-oom-persistent.143\n"
+                 "mm-wal2-3.3\n"
+                 "walsetlk-2.1.3\n"
+                 "nothing-matches-here.1\n")
+    log = os.path.join(work, "segment.log")
+    # BINARY, so the CRLF line below really is CRLF on every host. The .sh
+    # region strips a trailing CR in its first awk rule and says why; if either
+    # copy stops doing that, this fixture is what notices.
+    with open(log, "wb") as fh:
+        fh.write(b"Can't find a usable init.tcl in the following directories:\n"
+                 b"alter-1.1... Ok\n"
+                 b"Time: alter.test 12 ms\n"
+                 b"wal2-2.1... Ok\r\n"
+                 b"Time: wal2.test 34 ms\n"
+                 b'"run_test_suite inmemory_journal"\n'
+                 b"! walsetlk-2.1.3 expected: [1]\n"
+                 b"! walsetlk-2.1.3 got: [0]\n"
+                 b"!Failures on these tests: walsetlk-2.1.3 zipfile-25.0\n"
+                 b"*** Giving up...\n"
+                 b"2 errors out of 41 tests on somehost Linux 64-bit\n")
+    # ★ RELATIVE, and both arms run with `work` as their CWD. MEASURED while
+    # writing this: handing Git Bash an absolute `C:\Users\…` path ate every
+    # backslash (`C:UsersrafaeAppData…`), and an absolute path is a namespace
+    # claim this battery has no business making — the two arms only have to
+    # agree with EACH OTHER, and a bare relative name means the same thing to
+    # both interpreters on every host.
+    return {"CORPUSDIR": "corpus", "PERMSFILE": "corpus/permutations.test",
+            "TIERFILE": "tier.test", "LISTFILE": "corpus.lst",
+            "NAMESFILE": "names.lst", "LOGFILE": "segment.log",
+            "FACTFILE": "facts.tsv", "BOUNDARY": "swarmvtab.test"}
+
+
+def _mirror_run(lang, region, case, work, env):
+    """(ok, lines, detail) — one copy's answer, or why it could not be had."""
+    import subprocess  # local, matching the rest of this module's spawn sites
+    body = MIRROR_CASES[case][lang]
+    # The script is named RELATIVELY and the child's cwd is `work`, for the same
+    # reason the fixtures are: an absolute Windows path handed to Git Bash loses
+    # its backslashes.
+    # ★ THE FIXTURE PATHS ARE WRITTEN INTO THE SCRIPT, NOT PASSED THROUGH THE
+    # ENVIRONMENT. ✔MEASURED while writing this: Git Bash's `bash`, spawned from
+    # Python with an explicit `env=`, did NOT see the added variables at all
+    # (`CORPUSDIR: unbound variable`). A battery whose inputs can silently fail
+    # to arrive is the same class of defect as the one it exists to find, so the
+    # inputs are literals in the generated script and cannot go missing.
+    if lang == "sh":
+        rel = "arm_%s.sh" % case
+        head = "".join("%s=%s\n" % (k, shlex.quote(v)) for k, v in sorted(env.items()))
+        text = MIRROR_PRELUDE_SH + head + region + "\n" + body + "\n"
+        argv = [os.environ.get("BASH", "bash"), rel]
+    else:
+        rel = "arm_%s.ps1" % case
+        head = "".join("$%s = %s\n" % (k, _ps1_single_quote(v))
+                       for k, v in sorted(env.items()))
+        text = MIRROR_PRELUDE_PS1 + head + region + "\n" + body + "\n"
+        argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", rel]
+    script = os.path.join(work, rel)
+    with open(script, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, cwd=work)
+        out, err = proc.communicate()
+        rc = proc.returncode
+    except OSError as exc:
+        return False, [], "could not run %s: %s" % (argv[0], exc)
+    out = out.decode("utf-8", "replace")
+    err = err.decode("utf-8", "replace")
+    if rc != 0:
+        return False, [], ("%s arm exited %s: %s"
+                           % (lang, rc, (err.strip() or out.strip())[:400]))
+    return True, _mirror_normalise(out), ""
+
+
+def check_dss_regions(harness_dir, out=None):
+    """The verifier the `dss:corpus-engine` header promised. Prints one line per
+    assertion and a final `passed=N failed=N skipped=N`; returns that triple.
+
+    ★ A SKIP IS NOT A PASS AND IS NOT SILENT. The differential battery needs BOTH
+    interpreters; a host with only one gets a SKIP with the interpreter named,
+    and both drivers turn a nonzero skip count into a WARN saying what went
+    unproven. That is the same rule the other self-tests already run under."""
+    import shutil as _sh
+    import tempfile as _tf
+    out = out or sys.stdout
+    counts = {"passed": 0, "failed": 0, "skipped": 0}
+
+    def check(label, ok, detail=""):
+        if ok:
+            counts["passed"] += 1
+            out.write("  ok   %s\n" % label)
+        else:
+            counts["failed"] += 1
+            out.write("  FAIL %s%s\n" % (label, ("\n       " + detail) if detail else ""))
+
+    def skip(label, why):
+        counts["skipped"] += 1
+        out.write("  SKIP %s — %s\n" % (label, why))
+
+    texts = {}
+    for fn in ("build-and-test.sh", "build-and-test.ps1"):
+        path = os.path.join(harness_dir, fn)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                texts[fn] = fh.read()
+        except OSError as exc:
+            check("driver readable: %s" % fn, False, str(exc))
+            texts[fn] = ""
+    out.write("--- every dss: region is DECLARED, and its verifier claim is CHECKED ---\n")
+
+    # 1. Every region MARKED in a driver has a declaration, and vice versa.
+    # ★ A COMMENT LINE, not "the string appears somewhere". MEASURED while
+    # writing this: build-and-test.ps1 carries `-match '>>> dss:clone-lock >>>'`
+    # — it REFERENCES the .sh's marker to extract that region, and a looser scan
+    # read that as the .ps1 declaring a region of its own.
+    marked = {}
+    for fn, text in texts.items():
+        for name in sorted(set(re.findall(r"(?m)^\s*#\s*>>>\s*dss:([a-z0-9-]+)\s*>>>",
+                                          text))):
+            marked.setdefault(name, set()).add(fn)
+    for name in sorted(marked):
+        check("dss:%s is declared in DSS_REGIONS (%s)"
+              % (name, ", ".join(sorted(marked[name]))), name in DSS_REGIONS,
+              "it is marked in %s and nothing states who checks it — that is the "
+              "exact silence D-HARNESS-CORPUS-ENGINE-MIRROR-CLAIMS-A-VERIFIER-"
+              "THAT-DOES-NOT-EXIST is about" % ", ".join(sorted(marked[name])))
+    for name in sorted(DSS_REGIONS):
+        check("dss:%s is still marked in a driver" % name, name in marked,
+              "DSS_REGIONS declares it but no driver marks it — a stale "
+              "declaration is a claim about code that is gone")
+        if name not in marked:
+            continue
+        want = set(DSS_REGIONS[name].get("drivers", []))
+        check("dss:%s is marked in exactly the declared driver(s)" % name,
+              marked[name] == want,
+              "declared %s, marked in %s"
+              % (sorted(want) or "<none>", sorted(marked[name])))
+
+    # 2. Sentinels well-formed. dss_region_spans raises on unbalanced/crossed.
+    for name in sorted(marked):
+        for fn in sorted(marked[name]):
+            try:
+                spans = dss_region_spans(texts[fn], name)
+                ok, detail = bool(spans), ""
+            except LegError as exc:
+                ok, detail = False, str(exc)
+            check("dss:%s in %s has balanced sentinels" % (name, fn), ok, detail)
+
+    # 3. THE CLAIM ITSELF. A verifier file that does not name the region is the
+    #    defect this whole checker exists for, so it is an assertion and not a
+    #    docstring.
+    for name in sorted(DSS_REGIONS):
+        spec = DSS_REGIONS[name]
+        verifiers = spec.get("verifiers", [])
+        if not verifiers:
+            check("dss:%s states WHY nothing verifies it" % name,
+                  bool(spec.get("why")),
+                  "a region with no verifier must say so on the record; an "
+                  "empty list with no reason is indistinguishable from an "
+                  "oversight")
+            continue
+        for vf in verifiers:
+            path = os.path.join(harness_dir, vf)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    body = fh.read()
+                present = ("dss:%s" % name) in body
+                detail = ""
+            except OSError as exc:
+                present, detail = False, str(exc)
+            check("dss:%s — its claimed verifier %s really reads it"
+                  % (name, vf), present,
+                  detail or ("%s does not contain the sentinel `dss:%s`. A "
+                             "comment crediting an instrument that does not "
+                             "read it is worse than no comment: it retires the "
+                             "reader's suspicion." % (vf, name)))
+
+    # 4. THE MIRROR CONTRACT — pairing, then differential execution.
+    for name in sorted(n for n in DSS_REGIONS if DSS_REGIONS[n].get("mirror")):
+        out.write("--- dss:%s — the MIRROR contract ---\n" % name)
+        sh_text = dss_region_text(texts.get("build-and-test.sh", ""), name)
+        ps_text = dss_region_text(texts.get("build-and-test.ps1", ""), name)
+        check("dss:%s has a body in BOTH drivers" % name,
+              bool(sh_text.strip()) and bool(ps_text.strip()),
+              "sh=%d chars ps1=%d chars" % (len(sh_text), len(ps_text)))
+        sh_syms = dss_region_symbols(sh_text, "sh")
+        ps_syms = dss_region_symbols(ps_text, "ps1")
+        declared_sh = [p["sh"] for p in MIRROR_PAIRS if p.get("sh")]
+        declared_ps = [p["ps1"] for p in MIRROR_PAIRS if p.get("ps1")]
+        # ★ THE ANTI-DRIFT PROPERTY: you cannot add a helper to one driver
+        #   without declaring whether it needs a twin.
+        for s in sh_syms:
+            check("sh `%s` is accounted for in MIRROR_PAIRS" % s,
+                  s in declared_sh,
+                  "a helper added to build-and-test.sh with no row saying "
+                  "whether the .ps1 needs it is exactly how a capability comes "
+                  "to exist in one driver only")
+        for s in ps_syms:
+            check("ps1 `%s` is accounted for in MIRROR_PAIRS" % s,
+                  s in declared_ps,
+                  "a helper added to build-and-test.ps1 with no row saying "
+                  "whether the .sh needs it")
+        for pair in MIRROR_PAIRS:
+            if pair.get("sh") and pair.get("ps1"):
+                check("pair %s <-> %s: both still defined"
+                      % (pair["sh"], pair["ps1"]),
+                      pair["sh"] in sh_syms and pair["ps1"] in ps_syms,
+                      "sh=%s ps1=%s" % (pair["sh"] in sh_syms,
+                                        pair["ps1"] in ps_syms))
+            else:
+                only = "sh" if pair.get("sh") else "ps1"
+                check("single-driver %s `%s` states WHY"
+                      % (only, pair.get("sh") or pair.get("ps1")),
+                      bool(pair.get("why")),
+                      "a capability present in one driver only must say why, or "
+                      "it is indistinguishable from one that was forgotten")
+
+        # ── DIFFERENTIAL EXECUTION ──────────────────────────────────────────
+        cases = [p["differential"] for p in MIRROR_PAIRS if p.get("differential")]
+        have_pwsh = _sh.which("pwsh")
+        have_bash = _sh.which(os.environ.get("BASH", "bash")) or _sh.which("bash")
+        if not (have_pwsh and have_bash):
+            missing = " and ".join(
+                [w for w, h in (("pwsh", have_pwsh), ("bash", have_bash)) if not h])
+            for case in cases:
+                skip("differential %s" % case,
+                     "%s is not on PATH, so the two copies cannot be executed "
+                     "on the same input from this host" % missing)
+        else:
+            work = _tf.mkdtemp(prefix="dss-mirror-")
+            try:
+                env = _mirror_write_fixtures(work)
+                for case in cases:
+                    ok_sh, sh_out, d_sh = _mirror_run("sh", sh_text, case, work, env)
+                    ok_ps, ps_out, d_ps = _mirror_run("ps1", ps_text, case, work, env)
+                    if not (ok_sh and ok_ps):
+                        check("differential %s: both copies RAN" % case, False,
+                              "; ".join(x for x in (d_sh, d_ps) if x))
+                        continue
+                    same = sh_out == ps_out
+                    detail = ""
+                    if not same:
+                        detail = ("the two drivers answer DIFFERENTLY on "
+                                  "identical input:\n         .sh : %s\n"
+                                  "         .ps1: %s"
+                                  % (" | ".join(sh_out) or "<empty>",
+                                     " | ".join(ps_out) or "<empty>"))
+                    check("differential %s: identical answers (%d line(s))"
+                          % (case, len(sh_out)), same, detail)
+            finally:
+                _sh.rmtree(work, ignore_errors=True)
+
+    out.write("passed=%d failed=%d skipped=%d\n"
+              % (counts["passed"], counts["failed"], counts["skipped"]))
+    return counts
+
+
+# ── THE REGISTRY AS AN INSTRUMENT ───────────────────────────────────────────
+#
+# D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE.
+#
+# ✔THE MOTIVATING CASE, MEASURED (TF-C123): a 2×2 attribution (compiler × rundir
+# filesystem) was commissioned from scratch for 57 unit failures whose IDENTICAL
+# experiment and IDENTICAL verdict were already in the registry from seven cycles
+# earlier. The un-cited row let three false statements reach a commit message,
+# each of which that row would have pre-empted. The row was findable — the leg
+# name, the driver and the word `rundir` all appear in it — and nobody looked,
+# because looking is a thing you have to REMEMBER to do. At 868 rows, "remember
+# to grep" is not a durable answer.
+#
+# So the harness looks instead, AT the point it reports a failure, and prints
+# what it found beside the failure. That turns the registry from a document into
+# an instrument: the prior control arrives WITH the failure rather than waiting
+# to be recalled.
+#
+# ⚠ THIS RUNS ON A FAILURE PATH AND MUST NEVER BECOME ONE ITSELF. Everything
+# here is fail-soft by construction: an unreadable, absent, malformed or
+# gigantic registry produces ONE line saying so and rc 0. A run that already
+# failed must not also lose its report because the lookup tripped.
+#
+# ⚠ AND IT IS A POINTER, NOT A VERDICT. A matched row means "someone has looked
+# at something with this name before", never "this failure is explained". The
+# output says so, because a harness that appears to excuse a failure it merely
+# pattern-matched would be far worse than one that says nothing.
+REGISTRY_CONTROL_MAX_ROWS = 8
+REGISTRY_CONTROL_MIN_TOKEN = 4
+REGISTRY_CONTROL_MAX_BYTES = 8 * 1024 * 1024
+REGISTRY_CONTROL_EXCERPT = 220
+
+
+def registry_control_tokens(name, kind):
+    """The searchable tokens in a name, most specific FIRST.
+
+    ★ THE KIND IS THE CALLER'S KNOWLEDGE AND IT IS NOT GUESSABLE, which is why
+    it is an argument rather than a shape test:
+
+      `leg`   a leg LABEL (`elf64-x86_64`) searches WHOLE and only whole.
+              ✔MEASURED while writing this: decomposing it into `elf64` and
+              `x86_64` matched 310 of the 868 rows — an instrument that answers
+              with a third of the document answers nothing.
+      `test`  a failing test NAME (`inmemory_journal.walsetlk-2.1.3`) searches
+              whole AND by component, because that is how a row actually spells
+              a test FAMILY: rows say `walsetlk`, never `walsetlk-2.1.3`.
+              Numeric and short components are dropped — a 3-character token
+              matches half the corpus."""
+    out = []
+    name = (name or "").strip()
+    if not name:
+        return out
+    out.append(name)
+    if kind != "test":
+        return out
+    for tok in re.split(r"[.\-/\\ ,;:()\[\]]+", name):
+        if (len(tok) >= REGISTRY_CONTROL_MIN_TOKEN
+                and re.match(r"^[A-Za-z][A-Za-z0-9_]*$", tok)
+                and tok not in out):
+            out.append(tok)
+    return out
+
+
+def _registry_row_matches(row_lower, token):
+    """Is `token` present in `row_lower` on WORD BOUNDARIES? A bare substring
+    test would have `wal2` hit `wal2xyz`, and the whole value of this lookup is
+    that the row it names is the row a reader would have grepped for."""
+    return re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])"
+                     % re.escape(token), row_lower) is not None
+
+
+def registry_controls(registry_path, legs, tests,
+                      max_rows=REGISTRY_CONTROL_MAX_ROWS):
+    """(lines, note) — the registry rows whose text names this failure.
+
+    `lines` is ready to print, one row per entry. `note` is a single line
+    explaining why there is nothing to print, or "" when the lookup ran
+    normally. NEITHER path raises: see the section header.
+
+    ★ A FAILING TEST FAMILY OUTRANKS THE LEG, and when there is one the leg
+    alone is not enough to print a row. The leg names every row that ever
+    mentioned that target; the FAMILY is what makes a row the matched control
+    for THIS failure. A row naming both is the one to read first, so it sorts
+    to the top rather than being the only thing kept."""
+    try:
+        leg_toks, test_toks = [], []
+        for name in legs or []:
+            for tok in registry_control_tokens(name, "leg"):
+                if tok not in leg_toks:
+                    leg_toks.append(tok)
+        for name in tests or []:
+            for tok in registry_control_tokens(name, "test"):
+                if tok not in test_toks:
+                    test_toks.append(tok)
+        if not leg_toks and not test_toks:
+            return [], "no leg or test-family name to look up"
+        if not os.path.isfile(registry_path):
+            return [], ("registry not readable here (%s) — check it by hand for "
+                        "a matched control" % registry_path)
+        size = os.path.getsize(registry_path)
+        if size > REGISTRY_CONTROL_MAX_BYTES:
+            return [], ("registry is %d bytes, past this lookup's %d-byte cap — "
+                        "not read" % (size, REGISTRY_CONTROL_MAX_BYTES))
+        hits = []
+        with open(registry_path, "r", encoding="utf-8", errors="replace") as fh:
+            for lineno, row in enumerate(fh, 1):
+                if not row.startswith("|"):
+                    continue
+                cells = row.split("|")
+                if len(cells) < 3:
+                    continue
+                anchor = re.search(r"`(D-[A-Z0-9-]+)`", cells[1] or "")
+                if not anchor:
+                    continue
+                low = row.lower()
+                hit_tests = [t for t in test_toks
+                             if _registry_row_matches(low, t.lower())]
+                hit_legs = [t for t in leg_toks
+                            if _registry_row_matches(low, t.lower())]
+                if test_toks and not hit_tests:
+                    continue          # the leg alone is not a matched control
+                if not hit_tests and not hit_legs:
+                    continue
+                matched = hit_tests + hit_legs
+                hits.append((len(hit_tests) * 3 + len(hit_legs),
+                             max(len(t) for t in matched),
+                             lineno, anchor.group(1), matched, cells[2]))
+        if not hits:
+            named = ", ".join((test_toks + leg_toks)[:6])
+            return [], ("no registry row names %s — nothing matched, which is "
+                        "itself worth recording" % named)
+        hits.sort(key=lambda h: (-h[0], -h[1], h[2]))
+        lines = []
+        for _, _, lineno, anchor, matched, cell in hits[:max_rows]:
+            excerpt = re.sub(r"\s+", " ", re.sub(r"[*`]", "", cell)).strip()
+            if len(excerpt) > REGISTRY_CONTROL_EXCERPT:
+                excerpt = excerpt[:REGISTRY_CONTROL_EXCERPT] + " …"
+            lines.append("%s  [line %d, matched %s]\n      %s"
+                         % (anchor, lineno, " ".join(matched[:4]), excerpt))
+        if len(hits) > max_rows:
+            lines.append("… and %d more row(s) — grep the registry for %s"
+                         % (len(hits) - max_rows,
+                            " ".join((test_toks + leg_toks)[:4])))
+        return lines, ""
+    except Exception as exc:                       # noqa: BLE001 — see the header
+        return [], ("registry lookup did not run (%s: %s) — this is a POINTER "
+                    "only and never fails a run"
+                    % (type(exc).__name__, exc))
+
+
 # ── Self-test ───────────────────────────────────────────────────────────────
 #
 # Runs at the START of both drivers (their Step 0), for the same reason the
@@ -4469,6 +5398,17 @@ def _raises(thunk):
     except LegError:
         return True
     return False
+
+
+def _raise_text(thunk):
+    """The LegError text `thunk` refused with, or "" if it did not refuse. A
+    refusal that does not NAME its subject is a refusal an operator cannot act
+    on, so the diagnostic is asserted as well as the raise."""
+    try:
+        thunk()
+    except LegError as exc:
+        return str(exc)
+    return ""
 
 
 def _forbidden_runner(argv):
@@ -4720,6 +5660,135 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           any(leg["run"].get("envTransfer") not in (None, "inherit")
               for h in SELF_TEST_HOSTS
               for leg in plan(h[0], h[1], every, path)["legs"]))
+
+    # ── WHAT A FORWARDED VARIABLE'S VALUE MEANS ON THE OTHER SIDE ───────────
+    # D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY. The
+    # translator is INJECTED, exactly as translate_path's own battery does it, so
+    # the contract is exercised on a host with no `wslpath` — the assertion is
+    # about which door the value goes through, not about what wslpath answers.
+    _xlated = lambda argv: (0, "/mnt/c/tcl/tcl8.6", "")  # noqa: E731
+    check("an UNDECLARED forwarded variable is REFUSED, never assumed opaque",
+          _raises(lambda: forward_kind("SOME_NEW_VAR")))
+    check("...and the refusal names the variable",
+          "SOME_NEW_VAR" in _raise_text(lambda: forward_kind("SOME_NEW_VAR")))
+    check("the two corpus hooks are declared namespace-NEUTRAL",
+          forward_kind("SQLITE_TEST_PATTERN_LIST") == "opaque"
+          and forward_kind("QUICKTEST_OMIT") == "opaque")
+    check("TCL_LIBRARY is declared a DRIVER PATH, not opaque",
+          forward_kind("TCL_LIBRARY") == "driver-path")
+    check("'inherit' still needs no assignments, path-valued or not",
+          launch_forward_assignments(
+              "inherit", "windows-to-wsl", [("TCL_LIBRARY", r"C:\tcl\tcl8.6")],
+              runner=_xlated) == [])
+    check("an opaque variable crosses by NAME only",
+          launch_forward_assignments(
+              "wslenv", "none", [("QUICKTEST_OMIT", "a,b")])
+          == ["WSLENV=QUICKTEST_OMIT"])
+    # ★ THE ASSERTION THE ANCHOR EXISTS FOR: the value that crosses is the
+    # TRANSLATED one, and it is assigned BEFORE the carrier names it.
+    check("a DRIVER-PATH variable crosses TRANSLATED, and first",
+          launch_forward_assignments(
+              "wslenv", "windows-to-wsl", [("TCL_LIBRARY", r"C:\tcl\tcl8.6")],
+              runner=_xlated)
+          == ["TCL_LIBRARY=/mnt/c/tcl/tcl8.6", "WSLENV=TCL_LIBRARY"])
+    check("...and a launcher sharing this namespace gets it VERBATIM",
+          launch_forward_assignments(
+              "wslenv", "none", [("TCL_LIBRARY", "/opt/tcl8.6")])
+          == ["TCL_LIBRARY=/opt/tcl8.6", "WSLENV=TCL_LIBRARY"])
+    check("a DRIVER-PATH variable with NO DECLARED TRANSLATION is REFUSED",
+          _raises(lambda: launch_forward_assignments(
+              "wslenv", "", [("TCL_LIBRARY", r"C:\tcl\tcl8.6")])))
+    check("...and the refusal names the variable and its value",
+          "TCL_LIBRARY" in _raise_text(lambda: launch_forward_assignments(
+              "wslenv", "", [("TCL_LIBRARY", r"C:\tcl\tcl8.6")])))
+    check("an UNDECLARED variable is refused on the assignment path too",
+          _raises(lambda: launch_forward_assignments(
+              "wslenv", "none", [("SOME_NEW_VAR", "x")])))
+    check("a catalogue-DECLARED launcher variable needs no kind and no value",
+          launch_forward_assignments(
+              "wslenv", "windows-to-wsl", [], ["QEMU_LD_PREFIX"])
+          == ["WSLENV=QEMU_LD_PREFIX"])
+    check("a path-valued variable named with NO VALUE is REFUSED",
+          _raises(lambda: launch_forward_assignments(
+              "wslenv", "windows-to-wsl", [("TCL_LIBRARY", "")],
+              runner=_xlated)))
+    check("the unknown-VERB diagnosis wins over the unknown-variable one",
+          "envTransfer" in _raise_text(lambda: launch_forward_assignments(
+              "copy-the-block", "none", [("SOME_NEW_VAR", "x")])))
+
+    # ── THE REGISTRY AS AN INSTRUMENT ───────────────────────────────────────
+    # D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE.
+    # ★ DRIVEN THROUGH THE REAL INPUT PATH: a file on disk, in the registry's own
+    # row format, parsed by the shipped parser. Nothing here is re-typed data
+    # handed straight to an assertion.
+    # ⚠ THE FIXTURE ANCHOR NAMES ARE DELIBERATELY INERT, AND THAT IS NOT STYLE.
+    # ✔MEASURED (TF-C124): `real-examples/` is a SCANNED ROOT of the anchor guard
+    # (tools/check-anchor-registry.sh, over *.sh *.ps1 *.py — added by
+    # [[D-HARNESS-ANCHOR-GUARD-SKIPS-HARNESS-DRIVERS]]), so ANY anchor-shaped
+    # literal in THIS file — test data, sample output, docstring — is a CITATION
+    # as far as the guard is concerned, and a first draft of this fixture failed
+    # the gate by citing a row that does not exist. A fixture must therefore
+    # never wear a name a real row could ever have: naming a REAL anchor here
+    # would be worse still, because deleting that row would then point the guard
+    # at test data instead of at code. Runtime output is not scanned — only
+    # literals in this source are — so printing a real row's text is fine.
+    import tempfile as _rtf
+    # The two fixture names, ASSEMBLED rather than written: with either spelled
+    # as one literal the guard extracts it and fails the gate. `_FX` is what
+    # makes them inert AND unmistakable in the fixture's own output.
+    _FX = "D" + "-FIXTURE-NOT-A-REAL-ANCHOR-"
+    _FX_A, _FX_B = _FX + "RUNDIR", _FX + "OTHER-LEG"
+    _rdir = _rtf.mkdtemp(prefix="dss-regctl-")
+    try:
+        _reg = os.path.join(_rdir, "_deferred-anchor-registry.md")
+        with open(_reg, "w", encoding="utf-8") as _fh:
+            _fh.write(
+                "| Anchor | Status | Resolution | Files |\n"
+                "| --- | --- | --- | --- |\n"
+                "| `%s` | the elf64-x86_64 leg runs its " % _FX_A +
+                "databases over DrvFs; wal2 and walsetlk fail identically under "
+                "gcc | run it on ext4 | build-and-test.ps1 |\n"
+                "| `%s` | about the pe64-x86_64 leg and " % _FX_B +
+                "nothing else | n/a | x |\n"
+                "| not a row at all, no anchor here |\n")
+        _lines, _note = registry_controls(_reg, ["elf64-x86_64"], ["walsetlk-2.1.3"])
+        check("a row naming BOTH the leg and the failing family is found",
+              _note == "" and len(_lines) == 1
+              and _FX_A in _lines[0],
+              "note=%r lines=%r" % (_note, _lines))
+        check("...and it reports WHICH tokens matched, so the hit is auditable",
+              "walsetlk" in _lines[0] and "elf64-x86_64" in _lines[0])
+        check("a row naming only the OTHER leg is not offered",
+              all(_FX_B not in ln for ln in _lines))
+        # ★ THE ANTI-NOISE RULE, and it is the one that decides whether this is an
+        # instrument or a wall of text: with a failing family in hand, a row that
+        # matches only the LEG is not a matched control.
+        _lines2, _ = registry_controls(_reg, ["pe64-x86_64"], ["walsetlk-2.1.3"])
+        check("the LEG alone does not qualify a row once a family is known",
+              all(_FX_B not in ln for ln in _lines2))
+        _lines3, _ = registry_controls(_reg, ["pe64-x86_64"], [])
+        check("...but with NO failing family the leg is all there is, and is used",
+              any(_FX_B in ln for ln in _lines3))
+        check("a 3-character fragment is not a family (it matches everything)",
+              registry_control_tokens("wal-1.2", "test") == ["wal-1.2"])
+        check("a leg label is searched WHOLE, never decomposed",
+              registry_control_tokens("elf64-x86_64", "leg") == ["elf64-x86_64"])
+        check("a family token matches on WORD BOUNDARIES, not as a substring",
+              registry_controls(_reg, [], ["wal2-1.0"])[0]
+              and not registry_controls(_reg, [], ["wal2x-1.0"])[0])
+        # FAIL-SOFT, asserted rather than assumed: this runs on a failure path.
+        _miss, _mnote = registry_controls(os.path.join(_rdir, "nope.md"),
+                                          ["elf64-x86_64"], [])
+        check("an ABSENT registry yields no rows and ONE explanatory line",
+              _miss == [] and "not readable" in _mnote)
+        check("nothing MATCHING yields no rows and says so, never silence",
+              registry_controls(_reg, [], ["zzzznosuchfamily-1.0"])[0] == []
+              and "nothing matched"
+              in registry_controls(_reg, [], ["zzzznosuchfamily-1.0"])[1])
+        check("a registry that is a DIRECTORY is fail-soft, not an exception",
+              registry_controls(_rdir, ["elf64-x86_64"], [])[0] == [])
+    finally:
+        shutil.rmtree(_rdir, ignore_errors=True)
 
     # ── the launcher's run FILESYSTEM ────────────────────────────────────────
     # D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS. The third namespace, asserted
@@ -5979,9 +7048,20 @@ def main(argv=None):
     # is a tool nobody reads the help of, so this is fixed rather than worked
     # around by de-punctuating the prose. `errors="replace"` keeps the old
     # degrade-don't-die behaviour for anything a terminal still cannot render.
+    #
+    # ★ AND `newline="\n"`, ADDED TF-C124 FOR THE SECOND HALF OF THE SAME FACT.
+    # ✔MEASURED: on Windows this module's stdout is TEXT MODE, so every `\n` it
+    # writes leaves as `\r\n` — `--env-transfers` really emits
+    # `inherit\t\r\nwslenv\tWSLENV\r\n`. This module's output is a MACHINE
+    # INTERFACE read by both drivers, and a stray CR is invisible in every log
+    # while changing what the consumer got: build-and-test.sh's own note records
+    # a classified skip token being rejected as a HARNESS DEFECT for exactly
+    # this reason, and it cost a whole assertion here before it was found again.
+    # Fixed at the SOURCE — one line, every mode, both drivers — rather than by
+    # teaching each consumer to strip a CR it should never have received.
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace", newline="\n")
         except (AttributeError, ValueError, OSError):
             pass   # a redirected/wrapped stream that cannot be reconfigured
     p = argparse.ArgumentParser(prog="harness_legs.py", description=__doc__,
@@ -6035,10 +7115,67 @@ def main(argv=None):
                         "assignments the driver must make. Prints NOTHING for a "
                         "verb whose child simply inherits.")
     p.add_argument("--forward", action="append", default=None, metavar="NAME",
-                   help="an environment variable the launched process must see. "
-                        "Repeatable. ⚠ NAMESPACE-NEUTRAL VALUES ONLY: forwarding "
-                        "a variable whose value is a HOST path (PATH, "
-                        "TCL_LIBRARY) hands the child a path it cannot resolve.")
+                   help="an environment variable the launched process must see, "
+                        "whose value is NAMESPACE-NEUTRAL. Repeatable. Its kind "
+                        "must be DECLARED `opaque` in LAUNCH_FORWARD_KINDS; a "
+                        "path-valued or unclassified name is REFUSED here and "
+                        "names --forward-path in the diagnostic, so a HOST path "
+                        "cannot reach a foreign launcher by this door.")
+    p.add_argument("--forward-path", action="append", default=None,
+                   metavar="NAME=VALUE",
+                   help="a forwarded variable whose value is a path IN THIS "
+                        "DRIVER'S namespace (TCL_LIBRARY). Repeatable. Its "
+                        "value is put through --path-translation and printed "
+                        "back as the assignment the driver must make BEFORE the "
+                        "carrier names it. ★ USE THE `=` FORM: a Windows path "
+                        "may begin with a drive letter but a future value may "
+                        "not, and the space form would have argparse read one "
+                        "starting with `-` as an option.")
+    p.add_argument("--forward-declared", action="append", default=None,
+                   metavar="NAME",
+                   help="a forwarded variable whose value the CATALOGUE wrote "
+                        "for THIS launcher (legs.json `launchers[].env`, e.g. "
+                        "QEMU_LD_PREFIX). Repeatable. It is already in the "
+                        "launcher's namespace by construction, so it crosses "
+                        "verbatim and needs no declared kind — stated as its "
+                        "own flag so that fact is visible rather than inferred.")
+    p.add_argument("--check-regions", action="store_true",
+                   help="THE VERIFIER THE `dss:corpus-engine` HEADER PROMISED "
+                        "[D-HARNESS-CORPUS-ENGINE-MIRROR-CLAIMS-A-VERIFIER-"
+                        "THAT-DOES-NOT-EXIST]. Checks every `dss:` region "
+                        "against its declaration in DSS_REGIONS (a region with "
+                        "no declaration, a declaration with no region, a "
+                        "claimed verifier that does not read the region, and an "
+                        "unverified region with no stated reason are each a "
+                        "LOUD failure), then verifies the MIRROR contract of "
+                        "every region declared mirrored: the symbol pairing, "
+                        "and DIFFERENTIAL EXECUTION of both copies — extracted "
+                        "from the shipped drivers — on byte-identical input. "
+                        "Prints `passed=N failed=N skipped=N`.")
+    p.add_argument("--registry-controls", default=None, metavar="REGISTRY",
+                   help="print any _deferred-anchor-registry.md row whose text "
+                        "names one of the --for NAMEs (a leg label, a failing "
+                        "test name or family). Called by both drivers AT the "
+                        "point they report a failure, so a prior matched "
+                        "control arrives WITH the failure instead of waiting to "
+                        "be remembered "
+                        "[D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-"
+                        "BEFORE-COMMISSIONING-ONE]. ⚠ ALWAYS exits 0: it runs "
+                        "on a failure path and must never become one. A row is "
+                        "a POINTER, never a verdict.")
+    p.add_argument("--for-leg", action="append", default=None, dest="for_legs",
+                   metavar="LABEL",
+                   help="a LEG LABEL to look up under --registry-controls. "
+                        "Repeatable. Searched WHOLE: decomposing `elf64-x86_64` "
+                        "matched a third of the registry.")
+    p.add_argument("--for-test", action="append", default=None, dest="for_tests",
+                   metavar="NAME",
+                   help="a FAILING TEST NAME to look up under "
+                        "--registry-controls. Repeatable. Searched whole AND by "
+                        "family component, because that is how a row spells a "
+                        "test family. When any is given, a row matching only "
+                        "the leg is NOT printed — the leg alone is not a "
+                        "matched control.")
     p.add_argument("--carrier-current", default="", metavar="VALUE",
                    help="the carrier variable's existing value, so an operator's "
                         "own setting is merged rather than clobbered")
@@ -6180,11 +7317,13 @@ def main(argv=None):
             or args.acquire or args.acquire_plan or args.resolve_library_argv
             or args.resolve_target_cc or args.build_loadext_helper
             or args.loadext_builder or args.tcl_coherence
-            or args.run_filesystems or args.run_dir_plan):
+            or args.run_filesystems or args.run_dir_plan
+            or args.registry_controls or args.check_regions):
         p.error("one of --verdict-vocabulary / --plan / --header-stages / "
                 "--config-stages / --lint "
                 "/ --self-test / --path-translations / --translate-path / "
                 "--assert-translated / --env-transfers / --env-transfer / "
+                "--registry-controls / --check-regions / "
                 "--acquire / --acquire-plan / --resolve-library-argv / "
                 "--resolve-target-cc / --build-loadext-helper / "
                 "--loadext-builder / --tcl-coherence / --run-filesystems / "
@@ -6216,15 +7355,56 @@ def main(argv=None):
         if args.assert_translated:
             assert_translated(args.path_translation, args.assert_translated)
             return 0
+        if args.check_regions:
+            counts = check_dss_regions(HERE)
+            return 0 if counts["failed"] == 0 else 1
+        if args.registry_controls:
+            # OUTSIDE the LegError contract on purpose — this mode has no
+            # failure mode by design, so it is answered before anything that
+            # could raise and it returns 0 on every path.
+            lines, note = registry_controls(args.registry_controls,
+                                            args.for_legs or [],
+                                            args.for_tests or [])
+            for line in lines:
+                sys.stdout.write("%s\n" % line)
+            if note:
+                sys.stdout.write("(%s)\n" % note)
+            return 0
         if args.env_transfers:
             for verb in sorted(ENV_TRANSFERS):
                 sys.stdout.write("%s\t%s\n"
                                  % (verb, ENV_TRANSFERS[verb]["nameCarrier"]))
             return 0
         if args.env_transfer:
-            for line in env_carrier_assignments(args.env_transfer,
-                                                args.forward or [],
-                                                args.carrier_current):
+            # `--forward` is the NAMESPACE-NEUTRAL door and it stays that way:
+            # a name whose declared kind is not `opaque` (or which has no
+            # declared kind at all) is refused HERE, naming --forward-path, so
+            # the raw-path forward cannot be spelled at the CLI either.
+            plain = []
+            for n in (args.forward or []):
+                kind = forward_kind(n)
+                if kind != "opaque":
+                    raise LegError(
+                        "--forward %s: that variable is declared %r, not "
+                        "'opaque'. Its value is a path in THIS driver's "
+                        "namespace, so it must cross as "
+                        "`--forward-path %s=<value>` (with "
+                        "--path-translation), which translates it. Forwarding "
+                        "it by name alone would hand the launched process a "
+                        "path from the wrong namespace."
+                        % (n, kind, n))
+                plain.append((n, ""))
+            for spec in (args.forward_path or []):
+                if "=" not in spec:
+                    raise LegError(
+                        "--forward-path expects NAME=VALUE, got %r. The VALUE "
+                        "is required: it is the path being translated."
+                        % spec)
+                nm, _, val = spec.partition("=")
+                plain.append((nm, val))
+            for line in launch_forward_assignments(
+                    args.env_transfer, args.path_translation, plain,
+                    args.forward_declared or [], args.carrier_current):
                 sys.stdout.write("%s\n" % line)
             return 0
         if args.resolve_library_argv:
