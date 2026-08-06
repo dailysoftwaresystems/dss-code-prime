@@ -130,17 +130,27 @@ natively and says so — it is still a row, never an omission.
 | Linux/WSL  | pe64-x86_64    | Windows              |  ✅  |  ⬜   | banner+CRUD+integrity |
 | Linux/WSL  | macho64-arm64  | macOS                |  ⬜  |  ⬜   |                       |
 | Linux/WSL  | macho64-x86_64 | macOS                |  ⬜  |  ⬜   |                       |
-| arm64 VPS  | elf64-arm64    | VPS (native)         |  ⬜  |  ⬜   |                       |
+| arm64 VPS  | elf64-arm64    | VPS (native)         |  ✅  |  ✅   | 14/14 · 1/331,333     |
 | arm64 VPS  | elf64-x86_64   | Linux x86_64         |  ⬜  |  ⬜   |                       |
-| arm64 VPS  | pe64-x86_64    | Windows              |  ✅  |  ⬜   | CRUD 13/13            |
-| arm64 VPS  | macho64-arm64  | macOS                |  ⬜  |  ⬜   |                       |
-| arm64 VPS  | macho64-x86_64 | macOS                |  ⬜  |  ⬜   |                       |
+| arm64 VPS  | pe64-x86_64    | Windows (native)     |  ✅  |  ✅   | CRUD+integrity · 0/192|
+| arm64 VPS  | macho64-arm64  | macOS (native)       |  ✅  |  ✅   | CRUD+integrity · 0/192|
+| arm64 VPS  | macho64-x86_64 | macOS (Rosetta)      |  ✅  |  ✅   | CRUD+integrity · 0/192|
 ```
 
 ★ **Note what this table makes visible that Table 1 hides**: Table 1 can be entirely green —
 every host builds every leg — while most of Table 2 is empty. Those are *different claims*.
 "It compiled for that target" and "it works on that target" are separated by exactly the
 class of defect this project has already shipped once (see below).
+
+★★ **THE TRANSPORT MUST CARRY WHAT THE HARNESS STAGES — otherwise the round trip tests
+something you would never ship.** ✔MEASURED 2026-08-06: a VPS-built `testfixture.exe` was
+hand-carried to Windows with its DLLs but WITHOUT Tcl's script library. All **192 tests
+passed** and the process still exited **rc=1**, on `unknown encoding "cp1252"` raised from
+`finish_test` — i.e. a non-zero exit that looked like a failure, arriving AFTER every
+assertion had already succeeded. Staging the library and setting `TCL_LIBRARY` flipped it
+to rc=0. Same family as the macOS `init.tcl` wall: **a library's code is not all a library
+needs.** When transporting an artifact by hand, carry its `scriptLibraryDir` (or the target
+host's own staged copy) and set the loader/data variables the driver would have set.
 
 ⚠ **The UNITS round trip is heavier than the CLI's and must not be quietly skipped for that
 reason.** Running a cross-built testfixture on the target needs the test corpus and Tcl's
