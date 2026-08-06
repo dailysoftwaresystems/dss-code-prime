@@ -350,6 +350,79 @@ $KillSettle   = if ($env:DSS_KILL_SETTLE) { [int]$env:DSS_KILL_SETTLE } else { 2
 # $env:TCL_LIBRARY on any other host.
 $TclLibrary   = if ($env:TCL_LIBRARY) { $env:TCL_LIBRARY } else { 'C:\Program Files\Git\mingw64\lib\tcl8.6' }
 
+# ── THE RUNTIME DATA an ACQUIRED library needs, which its CODE does not carry ──
+# [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
+#
+# ✔MEASURED on the operator's Mac at 11e97e0e (in the .sh sibling, but the defect
+# is the mechanism's, not that driver's): the macho64-arm64 fixture BUILT and ran
+# `select1.test` correctly - "0 errors out of 192 tests" - and the TIER died
+# instantly with `Can't find a usable init.tcl in the following directories:
+# /opt/local/lib/tcl8.6`, because permutations.test runs every unit in a FRESH
+# SLAVE interpreter and `interp create` re-enters `tclInit`, which needs Tcl's
+# SCRIPT LIBRARY. The acquired MacPorts dylib bakes in MacPorts' own prefix, and
+# only the dylib was ever downloaded.
+#
+# $TclLibrary above is the HOST's copy and stays exactly what it always was: the
+# right answer for a `host-system`-provider leg and for nothing else. A leg whose
+# Tcl was ACQUIRED gets the STAGED directory instead - target-keyed, leg-scoped.
+#
+# THE CONTRACT FIELD, NAMED ONCE - ✔READ FROM harness_legs.py, NOT GUESSED.
+# `acquisition_record()` returns a TOP-LEVEL `scriptLibraryDir`, derived by
+# `_script_library_dir()` from the ONE `dataDirs` entry whose `role` is
+# `tclScriptLibrary` (`DATA_DIR_ROLES`, singled out there precisely because "a
+# driver has to point TCL_LIBRARY at it"). It is on the SUCCESS and FAILURE
+# returns alike - one record type, so "a field cannot be forgotten on the branch
+# nobody exercises". This driver reads the resolved field and never re-derives it
+# from `dataDirs`, so a rename is a one-line change here and in the .sh.
+$AcqScriptLibraryKey = 'scriptLibraryDir'
+# ⚠ THE KEY IS A PARAMETER, NOT AN AMBIENT `$script:` READ. Two reasons, the second
+# measured: (a) it mirrors the .sh, which passes `optional:$ACQ_SCRIPT_LIBRARY_KEY`
+# at the call site, so the two drivers read the contract the same way; and (b) an
+# ambient variable that is not in scope makes `PSObject.Properties[$null]` throw
+# "Index operation failed; the array index evaluated to null" - the exact trap this
+# file already records for `$oldLegEnv[$null]` at Step 8.
+function Get-AcquiredScriptLibrary($acq, $key) {
+  if (-not $key) { Die "Get-AcquiredScriptLibrary was called with no contract field name. The acquisition report field is `$AcqScriptLibraryKey; a lookup with an empty key cannot distinguish 'no script library' from 'this driver forgot which field to read'." }
+  # ABSENT or EMPTY is not an error HERE - a leg whose acquired library needs no
+  # runtime data legitimately has none - so this returns '' and the CALLER decides.
+  $p = $acq.PSObject.Properties[$key]
+  if (-not $p) { return '' }
+  return "$($p.Value)"
+}
+# ── THE RUNTIME LOADER'S SEARCH VARIABLE, PER TARGET ────────────────────────
+# [D-HARNESS-RUN-ENV-LD-LIBRARY-PATH-INERT-ON-DARWIN + item (c) of
+#  D-HARNESS-ACQUIRE-ERGONOMIC-GAPS, which asked for the choice to be made in ONE
+#  place, target-keyed.]
+#
+# There is no such thing as "the" loader search variable: ld.so reads
+# LD_LIBRARY_PATH, dyld reads DYLD_LIBRARY_PATH and IGNORES the ELF one, and the
+# Windows loader reads neither - it searches the EXECUTABLE'S OWN DIRECTORY, which
+# is where Step 7 already stages this leg's acquired DLLs, and PATH is the
+# next-best approximation this driver has always used for it.
+#
+# THE OS COMES FROM THE RESOLVED PLAN. `build.configStageKey` is
+# `spec_target_os(spec)` - harness_legs.py's `configure_stage_key`: "the staged-
+# configure-header directory name for this leg: its TARGET OS", and it RAISES
+# rather than defaulting. The format token is CROSS-CHECKED against it rather than
+# used as the source: the same declare-then-cross-check discipline zconfGuards
+# uses. The .sh twin holds the identical table; the RIGHT long-term home is a
+# declared loader-variable name emitted by the shared resolver, so neither driver
+# holds it at all.
+function Get-LegLoaderPathVar($leg) {
+  $os = "$($leg.build.configStageKey)"
+  # `<container><bits>-<arch>-<os>-<kind>`: the OS is the second-to-last token.
+  $parts = @("$($leg.format)".Split('-'))
+  $fmtOs = if ($parts.Count -ge 3) { $parts[$parts.Count - 2] } else { '' }
+  if (-not $os) { Die "[$($leg.label)] the resolved plan carries no target OS (build.configStageKey is empty). The runtime loader's search variable is a property of the TARGET; choosing one without knowing the target is how LD_LIBRARY_PATH came to be exported for a Darwin leg that cannot read it." }
+  if ($os -ne $fmtOs) { Die "[$($leg.label)] the resolved plan disagrees with itself about this leg's target OS: configStageKey says '$os', the object format '$($leg.format)' says '$fmtOs'. One of them decides which loader variable this leg's libraries are exported under." }
+  switch ($os) {
+    'windows' { return 'PATH' }
+    'linux'   { return 'LD_LIBRARY_PATH' }
+    'darwin'  { return 'DYLD_LIBRARY_PATH' }
+    default   { Die "[$($leg.label)] target OS '$os' has no declared runtime-loader search variable in this driver. Known: windows (PATH) | linux (LD_LIBRARY_PATH) | darwin (DYLD_LIBRARY_PATH). A new target OS must DECLARE its answer; defaulting to one spelling is the defect this function exists to end." }
+  }
+}
+
 $Stage        = Join-Path $Work 'stage'          # the staged sqlite tree + headers
 # PER-LEG output root: <Work>/out/<label>/… . Nothing is written to `out/` itself,
 # so one leg's wipe can never reach a sibling's just-built artifact.
@@ -637,16 +710,29 @@ if (-not $python3) { Die "python3 not found on PATH — needed to resolve the le
 # So the driver REFUSES TO START if its own end-of-run logic is broken. This reuses
 # test-confound-scope.ps1, which EXTRACTS the shipped classifier and runs it — no
 # duplicated logic to drift. Set DSS_SKIP_SELFTEST=1 to bypass (not recommended).
-$selfTest = Join-Path $PSScriptRoot 'test-confound-scope.ps1'
+# ★ A LIST, NOT A SINGLE FILE. Each entry EXTRACTS shipped logic and executes it,
+# and each emits the same `passed=N failed=N skipped=N` summary parsed below — so
+# adding a fourth costs one array entry instead of a second copy of this careful
+# rc/skip/refuse block. A self-test that exists but is never RUN is documentation,
+# which is how a guarded behaviour comes to look guarded without being tested.
+#   test-confound-scope.ps1    the end-of-run confound classifier
+#   test-driver-contracts.ps1  the LEG CONTRACTS — the verdict recorders, the
+#                              shared run decision, Read-CorpusSegment's first
+#                              diagnostic, the target-keyed loader variable and the
+#                              acquisition contract field, each with its
+#                              red-on-disable mutation asserted to have LANDED.
+foreach ($selfTest in @((Join-Path $PSScriptRoot 'test-confound-scope.ps1'),
+                        (Join-Path $PSScriptRoot 'test-driver-contracts.ps1'))) {
+$stName = Split-Path -Leaf $selfTest
 if ($env:DSS_SKIP_SELFTEST -eq '1') {
-  Warn 'driver self-test SKIPPED (DSS_SKIP_SELFTEST=1) — a late-stage defect will not surface until the end of the run.'
+  Warn "driver self-test $stName SKIPPED (DSS_SKIP_SELFTEST=1) — a late-stage defect will not surface until the end of the run."
 } elseif (-not (Test-Path $selfTest)) {
   Die "driver self-test missing: $selfTest`n      This guard is what stops a defect in the END-OF-RUN classifier from costing you the entire run."
 } else {
   $stOut = & pwsh -NoProfile -File $selfTest 2>&1
   if ($LASTEXITCODE -ne 0) {
     $stOut | ForEach-Object { "      $_" } | Write-Host
-    Die "DRIVER SELF-TEST FAILED — refusing to start.`n      The end-of-run classifier is broken, so this run would execute the whole corpus (hours) and then abort while classifying."
+    Die "DRIVER SELF-TEST FAILED ($stName) — refusing to start.`n      Late-stage driver logic is broken, so this run would execute the whole corpus (hours) and then abort while classifying — or would classify a leg's outcome wrongly and report it."
   }
   # ★ PARITY with build-and-test.sh: the SKIP COUNT is part of the result, not a
   # footnote, and an UNPARSEABLE summary is a failure rather than a blank. The old
@@ -667,10 +753,11 @@ driver self-test exited 0 but printed no readable summary line.
   $n = $sm.Matches[0].Groups[1].Value
   $nSkip = $sm.Matches[0].Groups[3].Value
   if ($nSkip -eq '0') {
-    Info "driver self-test: OK ($n assertions, 0 skipped)"
+    Info "driver self-test ${stName}: OK ($n assertions, 0 skipped)"
   } else {
-    Warn "driver self-test: OK ($n assertions) — but $nSkip assertion(s) SKIPPED on this host (unmet prerequisite, normally 'no git on PATH'). That part of the late-stage logic is UNPROVEN for this run: $selfTest"
+    Warn "driver self-test ${stName}: OK ($n assertions) — but $nSkip assertion(s) SKIPPED on this host (unmet prerequisite, normally 'no git on PATH'). That part of the late-stage logic is UNPROVEN for this run: $selfTest"
   }
+}
 }
 # ── the LEG RESOLVER's own self-test, same refuse-to-start discipline ────────
 # The resolver decides WHICH TARGETS THIS RUN BUILDS. A defect there does not
@@ -2219,9 +2306,30 @@ function Resolve-LegLibraries($leg) {
       # one" is answered identically everywhere.
       $tcl = Find-DeclaredLib $tclNames @($cdir)
       $z   = Find-DeclaredLib $zNames   @($cdir)
+      # ── THE SCRIPT LIBRARY THE ACQUIRED Tcl CANNOT RUN WITHOUT ──────────────
+      # [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY] - see the
+      # $AcqScriptLibraryKey note at the top of this file for the measurement.
+      # ⚠ ABSENT IS REPORTED, NEVER ASSUMED BENIGN. It does not fail the build and
+      # does not fail a directly-named .test file - the MAIN interpreter is already
+      # initialised by then, so `tclInit` is never re-entered. It kills the TIER,
+      # and only the tier. That asymmetry is why this was invisible until a tier
+      # ran, and why the absence is said out loud HERE rather than discovered as an
+      # unnamed abort 11 resumes later.
+      $tclScriptDir = Get-AcquiredScriptLibrary $acq $AcqScriptLibraryKey
+      if ($tclScriptDir) {
+        Info "[$($leg.label)] Tcl script library (acquired): $tclScriptDir - TCL_LIBRARY is pointed here for THIS leg only"
+      } else {
+        Warn "[$($leg.label)] the acquisition report stages NO Tcl script library (report field '$AcqScriptLibraryKey' is empty)."
+        Warn "      An acquired libtcl bakes in ITS PACKAGER'S script-library path, which does not exist on this"
+        Warn "      machine. Individual .test files will still run; the TIER will abort at the first ``interp create``"
+        Warn "      with `"Can't find a usable init.tcl`" and NO unit will get a verdict."
+        Warn "      D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY - the fix belongs in the leg's"
+        Warn "      ``pinned-archive`` declaration + harness_legs.py, not here."
+      }
       if ($tcl -and $z) {
         return @{ Ok = $true; Tcl = $tcl; Z = $z; Acquired = @($acq.libraries | Where-Object { $_ })
-                  Detail = "provider 'pinned-archive' — $(@($acq.libraries | Where-Object { $_ }).Count) declared library(ies) materialised for target arch $($acq.targetArch) in $cdir ($(if ($acq.fromCache) { 'from cache, no network' } else { 'freshly downloaded + checksum-verified' }))" }
+                  TclScriptDir = $tclScriptDir
+                  Detail = "provider 'pinned-archive' — $(@($acq.libraries | Where-Object { $_ }).Count) declared library(ies) materialised for target arch $($acq.targetArch) in $cdir ($(if ($acq.fromCache) { 'from cache, no network' } else { 'freshly downloaded + checksum-verified' }))$(if ($tclScriptDir) { "; Tcl script library staged at $tclScriptDir" })" }
       }
       $missing = @(); if (-not $tcl) { $missing += "tcl ($($tclNames -join ' | '))" }; if (-not $z) { $missing += "z ($($zNames -join ' | '))" }
       # ★ `Acquired` RIDES ON THE FAILURE RETURN TOO, and it has to. Ok=$false
@@ -2233,6 +2341,7 @@ function Resolve-LegLibraries($leg) {
       # the failure path would produce a binary that links clean here and fails in
       # the target's loader — the one failure this host cannot observe.
       return @{ Ok = $false; Tcl = $tcl; Z = $z; Acquired = @($acq.libraries | Where-Object { $_ })
+                TclScriptDir = $tclScriptDir
                 Detail = "provider 'pinned-archive' acquired $(@($acq.libraries | Where-Object { $_ }).Count) file(s) into $cdir but none of them is a declared $($missing -join ' and none is a declared ') — the leg's acquire members and its tclNames/zNames disagree in legs.json (the 'as' name a member materialises under MUST be one this leg's own name list can resolve)." }
     }
     default {
@@ -2408,10 +2517,101 @@ Info "manifest generator: $([System.IO.Path]::GetFileName($GenPy))  --recipe-tra
 # later step keeps the verdict written here, so no leg can end the run unnamed.
 $LegLedger = @{}
 $LegOrder  = @()
+
+# ── THE CLOSED VERDICT VOCABULARY, READ FROM THE SHARED RESOLVER ─────────────
+# ★ NOT SPELLED HERE. A driver-local copy of a closed vocabulary is how the two
+# drivers drift, which is this file family's standing defect class
+# (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER). The .sh reads
+# the same list from the same call.
+$VerdictVocabulary = @()
+$vocabOut = & $python3.Source $LegsPy '--verdict-vocabulary' 2>&1
+$vocabRc  = $LASTEXITCODE
+if ($vocabRc -eq 0) {
+  # ⚠ `2>&1` merges STDERR into the pipeline, which is what makes the refusal below
+  # able to QUOTE the diagnostic - but on SUCCESS a stderr line would otherwise be
+  # accepted as a verdict token. ErrorRecords are dropped for that reason and that
+  # reason only: the vocabulary is what the resolver printed on STDOUT.
+  $VerdictVocabulary = @(@($vocabOut) |
+      Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+      ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+}
+if ($VerdictVocabulary.Count -eq 0) {
+  Die "the leg resolver could not state the CLOSED verdict vocabulary (rc=$vocabRc): [$vocabOut]. Without it this driver cannot tell a classified skip from an unclassified one, and an unclassified skip is precisely how a leg's entire corpus vanishes from the ledger while the summary still reads as full coverage. Refusing to run rather than guess the list."
+}
+# Legs whose non-verification could not be CLASSIFIED. Counted, named, and folded
+# into the exit code at Step 9 — a harness defect that only warns is one that ships.
+$UnclassifiedVerdicts = New-Object 'System.Collections.Generic.List[string]'
+
+# ★ AN EMPTY OR UNKNOWN VERDICT TOKEN IS NOW IMPOSSIBLE BY CONSTRUCTION, NOT BY
+# REVIEW (D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-AVAILABLE).
+# ✔MEASURED on the operator's Mac at 11e97e0e, in this driver's .sh sibling:
+# `macho64-x86_64 …: compiled   units: not run []` — a whole leg's corpus skipped
+# with NO class, in the same sentence that said its declared launcher was present.
+# A not-run carrying no class cannot be counted as structural / environmental /
+# harness, so a leg can vanish from the accounting while the summary still LOOKS
+# complete. Every verdict this driver writes goes through this ONE function, so
+# there is no second place a fifth unguarded assignment can be added.
 function Set-LegVerdict($label, $verdict, $detail) {
   if (-not $script:LegLedger.ContainsKey($label)) { $script:LegLedger[$label] = @{ Label = $label; Spec = ''; Verdict = ''; Detail = ''; Built = $false; UnitVerdict = ''; UnitFail = $false } }
+  $tok = "$verdict".Trim()
+  if (-not $tok -or ($script:VerdictVocabulary -notcontains $tok)) {
+    $why = if (-not $tok) { "this driver recorded a verdict with an EMPTY token" }
+           else { "this driver recorded the verdict token '$tok', which is OUTSIDE the closed vocabulary ($($script:VerdictVocabulary -join ' '))" }
+    [void]$script:UnclassifiedVerdicts.Add($label)
+    Warn "[$label] HARNESS DEFECT — $why."
+    Warn "      what it did say: $(if ($detail) { $detail } else { '<no reason recorded>' })"
+    # `poisoned` — the vocabulary's name for "no artifact was exercised and the
+    # reason is OURS". It keeps the leg INSIDE the Step-9 accounting (so it can
+    # never also become a ledger hole) and keeps the run from exiting 0, while
+    # the run itself CONTINUES to every other leg: the harness must survive its
+    # own defects, not hide them.
+    $verdict = 'poisoned'
+    $detail  = "HARNESS DEFECT: $why. $(if ($detail) { $detail } else { '<no reason recorded>' })"
+  }
   $script:LegLedger[$label].Verdict = $verdict
   $script:LegLedger[$label].Detail  = $detail
+}
+# The UNIT-level twin: the `units: …` string a reader sees per leg. Same guard,
+# because the leg verdict and the unit verdict are two different sentences and the
+# measured defect was in the SECOND one.
+function Set-UnitNotRun($label, $token, $detail) {
+  if (-not $script:LegLedger.ContainsKey($label)) { $script:LegLedger[$label] = @{ Label = $label; Spec = ''; Verdict = ''; Detail = ''; Built = $false; UnitVerdict = ''; UnitFail = $false } }
+  $tok = "$token".Trim()
+  $txt = if ($detail) { "$detail" } else { '<no reason recorded>' }
+  if (-not $tok -or ($script:VerdictVocabulary -notcontains $tok)) {
+    [void]$script:UnclassifiedVerdicts.Add($label)
+    Warn "[$label] HARNESS DEFECT — this leg's ENTIRE unit corpus did not run and the token recorded for it ('$tok') is not one this run can classify."
+    Warn "      what it did say: $txt"
+    $script:LegLedger[$label].UnitVerdict = "not run [poisoned] — HARNESS DEFECT: unclassified skip token '$tok'. $txt"
+    return
+  }
+  $script:LegLedger[$label].UnitVerdict = "not run [$tok] — $txt"
+}
+# ── THE SINGLE RUN-DECISION, SHARED BY BOTH ARTIFACTS ────────────────────────
+# The sqlite3 CLI smoke gate and the unit corpus ask the SAME question — "may this
+# host EXECUTE this leg?" — and the answer is `run.mode` off the RESOLVED plan,
+# never `$IsWindows`. A FUNCTION, so the two call sites cannot drift into two
+# different answers.
+# ⚠ NOTE, because the obvious reading of that anchor is WRONG: the two call sites
+# had ALREADY agreed here, in BOTH drivers. What differed was a SECOND, unrelated
+# gate in the .sh's units path (an absent CONTROL compiler) that this driver never
+# had — see the note at the same place in build-and-test.sh.
+function Test-LegRunSkipped($leg) {
+  switch ("$($leg.run.mode)") {
+    'skip'   { return $true }
+    'native' { return $false }
+    'launched' {
+      # A `launched` leg with no launcher argv is the same contradiction wearing
+      # its other face: the plan says "runnable" and hands the driver nothing to
+      # run it with. The resolver already refuses an EMPTY declared command; this
+      # asserts the invariant survived transport through the JSON plan.
+      if (-not @($leg.run.launcher).Count) {
+        Die "[$($leg.label)] the resolved plan says run mode 'launched' but carries an EMPTY launcher argv. A leg cannot be both runnable and unrunnable — that is a transport defect between harness_legs.py and this driver, not a property of this machine."
+      }
+      return $false
+    }
+    default { Die "[$($leg.label)] has an unknown run mode '$($leg.run.mode)' — the resolver and this driver disagree about the vocabulary." }
+  }
 }
 foreach ($lg in $AllLegs) {
   $LegOrder += $lg.label
@@ -2510,7 +2710,15 @@ if ($tclCohLegs -gt 0) {
   Info "tcl coherence: the staged headers match the libtcl of all $tclCohLegs resolved leg(s) — measured from each library's OWN bytes, not its file name"
 }
 
-if (-not (Test-Path $TclLibrary)) { Warn "Tcl script library not at $TclLibrary — a leg this host RUNS needs it (set `$env:TCL_LIBRARY)." }
+# ★ SCOPED TO THE LEGS THAT ACTUALLY NEED IT. This warned unconditionally, which
+# is now misleading: a leg whose Tcl was ACQUIRED gets the STAGED script library
+# instead ($LegTclLibrary at Step 8), so the host's copy is irrelevant to it. It is
+# still required by a `host-system`-provider leg, whose libtcl IS this machine's.
+# [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
+$hostTclLegs = @($Legs | Where-Object { "$($_.build.libraries.provider)" -eq 'host-system' } | ForEach-Object { $_.label })
+if ($hostTclLegs.Count -and -not (Test-Path -LiteralPath $TclLibrary)) {
+  Warn "Tcl script library not at $TclLibrary — needed by the leg(s) whose Tcl is this MACHINE's ($($hostTclLegs -join ' ')); set `$env:TCL_LIBRARY. A leg whose Tcl was ACQUIRED is unaffected: it gets the staged script library."
+}
 Pass "TESTFIXTURE build inputs (tcl AND zlib) resolved for $($BuildableLegs.Count) of $($Legs.Count) selected leg(s); the sqlite3 CLI needs only zlib and is attempted for $(@($Legs | Where-Object { "$($LegLibsAll[$_.label].Z)" }).Count)"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2633,6 +2841,17 @@ function Read-CorpusSegment($logPath) {
   $r = @{
     Summary = ''; Tests = 0; Errors = 0; FailNames = @{}; Completed = New-Object 'System.Collections.Generic.List[string]'
     LastTest = ''; Permutation = ''; GaveUp = $false; OkLines = 0; FailMarkers = 0
+    # ── THE FIRST DIAGNOSTIC LINE ────────────────────────────────────────────
+    # [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY, the harness half.]
+    # MEASURED in the .sh sibling: the resume engine reported "the UNNAMED file
+    # that aborted ... the log named no resolvable corpus file (last test: none)"
+    # ELEVEN TIMES while the captured log's FIRST LINE said exactly what was wrong
+    # ("Can't find a usable init.tcl in the following directories: ..."). It had
+    # the diagnosis in hand and did not surface it. This is the first non-blank
+    # line that is NOT the fixture doing its job - not a per-test line, not a
+    # `Time:` line, not an ` Ok`, not a summary. CONSULTED ONLY on the
+    # zero-progress abort path, so it can never mislabel a healthy segment.
+    Diagnostic = ''
   }
   $reSummary = [regex]'(\d+) errors? out of (\d+) tests'
   $reTime    = [regex]'^Time: (\S+) \d+ ms$'
@@ -2644,6 +2863,15 @@ function Read-CorpusSegment($logPath) {
   $rePerm    = [regex]'^"?(?:run_test_suite|run_tests)\s+([A-Za-z_][A-Za-z0-9_]*)'
   foreach ($line in [System.IO.File]::ReadLines($logPath)) {
     if ($line.Length -eq 0) { continue }
+    # FIRST, before any `continue` below: a rule placed lower would never see a
+    # line an earlier rule consumed. Only the FIRST qualifying line is kept.
+    if (-not $r.Diagnostic -and $line.Trim() -and
+        -not $line.StartsWith('Time: ', [System.StringComparison]::Ordinal) -and
+        -not $line.EndsWith(' Ok', [System.StringComparison]::Ordinal) -and
+        -not $reTest.IsMatch($line) -and -not $reSummary.IsMatch($line)) {
+      $d = $line.Replace("`t", ' ')
+      $r.Diagnostic = if ($d.Length -gt 400) { $d.Substring(0, 400) + ' ...[truncated]' } else { $d }
+    }
     # Per-test tally. An ABORTED segment never prints a summary, so these counts are
     # the ONLY record of the work it did — see the derivation note at the union.
     if ($line.EndsWith(' Ok', [System.StringComparison]::Ordinal)) { $r.OkLines++ }
@@ -3242,7 +3470,8 @@ foreach ($leg in $Legs) {
   # THE ONE LEGITIMATE HOST QUESTION, and it is `run.mode` off the RESOLVED plan
   # — never `$IsWindows`. A `skip` leg WAS BUILT, and that is a completely
   # different fact from "not built"; it is recorded, printed, and never silent.
-  if ($leg.run.mode -eq 'skip') {
+  # Asked through the SHARED predicate, which is the same call Step 8 makes.
+  if (Test-LegRunSkipped $leg) {
     $CliSmokeVerdict[$lbl] = "built, NOT RUN here [$($leg.run.verdict)] — $($leg.run.detail)"
     Warn "[$lbl] CLI smoke SKIPPED — built at $($CliBuilt[$lbl]) but this host cannot execute it: $($leg.run.detail)"
     continue
@@ -3337,11 +3566,14 @@ $TierPrefixes = Get-TierPrefixes (Join-Path $StagedTestDir 'permutations.test')
 # and the fact that it was BUILT is recorded with it. This is the whole point of
 # the cycle: the build happened on a host that can never run the artifact.
 foreach ($leg in $BuiltLegs) {
-  if ($leg.run.mode -ne 'skip') { continue }
+  if (-not (Test-LegRunSkipped $leg)) { continue }
   Set-LegVerdict $leg.label "$($leg.run.verdict)" "BUILT OK ($($LegLedger[$leg.label].Fixture)) but NOT RUN on this host — $($leg.run.detail)"
+  # …and the UNIT-level sentence too, guarded by the same closed vocabulary. Two
+  # artifacts per leg means two ways to lose one silently.
+  Set-UnitNotRun $leg.label "$($leg.run.verdict)" "$($leg.run.detail)  (the fixture DID build: $($LegLedger[$leg.label].Fixture))"
   Info "[$($leg.label)] built, NOT run here [$($leg.run.verdict)]: $($leg.run.detail)"
 }
-$RunnableLegs = @($BuiltLegs | Where-Object { $_.run.mode -eq 'native' -or $_.run.mode -eq 'launched' })
+$RunnableLegs = @($BuiltLegs | Where-Object { -not (Test-LegRunSkipped $_) })
 if ($RunnableLegs.Count -eq 0) { Info "no built leg can be EXECUTED on this host — every one of them has a named skip verdict above." }
 
 # ── THE LOADEXT HELPER: THIS DRIVER NOW STAGES ONE, LIKE ITS SIBLING ─────────
@@ -3526,9 +3758,37 @@ if ($Confounds.Count) {
 } else {
   Info "[$LegTag] NO confound patterns: nothing has ever been measured as a non-DSS confound on this leg, and a confound must be EARNED per platform, never copied from a sibling leg. Every failure here counts."
 }
-# The leg's OWN library directories go on PATH so its fixture can load them at
-# run time; TCL_LIBRARY points the Tcl runtime at its script library.
-$runEnvPath = (Split-Path $LegLibs[$LegTag].Tcl) + [System.IO.Path]::PathSeparator + (Split-Path $LegLibs[$LegTag].Z) + [System.IO.Path]::PathSeparator + $env:PATH
+# The leg's OWN library directories go on its TARGET's loader search variable so
+# its fixture can load them at run time; TCL_LIBRARY points the Tcl runtime at its
+# script library.
+#
+# ★ THE VARIABLE NAME IS A PROPERTY OF THE TARGET, NOT A CONSTANT
+# [D-HARNESS-RUN-ENV-LD-LIBRARY-PATH-INERT-ON-DARWIN]. For a `windows` target it
+# resolves to PATH, which is byte-for-byte what this driver has always done and is
+# the only case it can run natively; for an elf/macho leg it resolves to the
+# variable that target's loader actually reads, instead of a name chosen once and
+# then wrong for four of the five legs.
+$LegLoaderVar = Get-LegLoaderPathVar $leg
+$legLibDirs = @((Split-Path $LegLibs[$LegTag].Tcl), (Split-Path $LegLibs[$LegTag].Z)) | Select-Object -Unique
+$runEnvPath = ($legLibDirs -join [System.IO.Path]::PathSeparator) + [System.IO.Path]::PathSeparator + [Environment]::GetEnvironmentVariable($LegLoaderVar)
+# ★ THE ACQUIRED Tcl's SCRIPT LIBRARY WINS OVER THE HOST'S, and only for a leg
+# that HAS one [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]. $TclLibrary
+# is this machine's own copy: correct for a `host-system` leg (whose libtcl is
+# this machine's) and WRONG for an acquired one, whose libtcl bakes in its
+# packager's prefix. Leg-scoped, never a global export, and never keyed on the
+# host - a leg whose Tcl was acquired needs the staged copy on EVERY host that
+# runs it.
+# ⚠ THE FALLBACK IS A BRIDGE, NOT AN ENDORSEMENT, AND IT IS NOW LOAD-BEARING FOR
+# EVERY LEG. As of this working tree ALL FIVE legs declare `pinned-archive`, so
+# there is no `host-system` leg left for which $TclLibrary is the right answer -
+# yet until legs.json declares a `dataDirs` entry with role `tclScriptLibrary`,
+# `scriptLibraryDir` is empty and every leg lands here, on the HOST's script
+# library. That is exactly the pairing D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-
+# LIBRARY warns about (a packager's library against a host's scripts, matched on
+# nothing but a version-number coincidence). It is kept because removing it would
+# red a currently-working tier before the declaration lands, and the per-leg WARN
+# at acquisition time says so out loud every run rather than letting it pass.
+$LegTclLibrary = if ($LegLibs[$LegTag].TclScriptDir) { "$($LegLibs[$LegTag].TclScriptDir)" } else { $TclLibrary }
 $rundir = Join-Path $legOut 'run'; if (Test-Path $rundir) { Remove-Item -Recurse -Force $rundir }
 New-Item -ItemType Directory -Force -Path $rundir | Out-Null
 $runlog = Join-Path $legOut 'corpus.log'
@@ -3561,6 +3821,7 @@ if (-not $helper.Ok) {
     # arm - the default builder needs nothing from this machine. It must NOT red
     # a run in which nothing is broken.
     Set-LegVerdict $LegTag 'skipped-build-input-missing' "the fixture BUILT ($fixture), but DSS_LOADEXT_HELPER=$LoadextBuilder was requested and this host cannot provide that arm, so this leg's corpus was NOT run. $($helper.Detail)"
+    Set-UnitNotRun $LegTag 'skipped-build-input-missing' "$($helper.Detail)"
     Warn "[$LegTag] corpus NOT run - the requested loadext helper arm is unavailable here; the rest of the run CONTINUES:"
     Warn "      $($helper.Detail)"
   } else {
@@ -3571,6 +3832,7 @@ if (-not $helper.Ok) {
     # D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO is named after.
     $LoadextStageFails++
     Set-LegVerdict $LegTag 'poisoned' "the fixture BUILT ($fixture), but this leg's loadext helper extension could not be staged, so its corpus was NOT run and this run covers NONE of its units. $($helper.Detail)"
+    Set-UnitNotRun $LegTag 'poisoned' "loadext helper staging FAILED: $($helper.Detail)"
     Warn "[$LegTag] POISONED - loadext helper staging FAILED; this leg's corpus is NOT run, the rest of the run CONTINUES:"
     Warn "      $($helper.Detail)"
   }
@@ -3599,7 +3861,14 @@ if ($legLauncher.Count) {
 }
 $resumes    = 0
 $lastBoundary = ''
-$oldPath = $env:PATH; $oldTclLib = $env:TCL_LIBRARY
+# The previous segment's first diagnostic, but ONLY when that segment completed
+# zero files. Empty means "the last segment made progress", which is what keeps a
+# genuine mid-corpus crash on the ordinary resume path. $preconditionFail is the
+# diagnostic itself once detected — the classifier below reads it, so the verdict
+# is decided in one place. [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
+$prevZeroDiag = ''
+$preconditionFail = ''
+$oldLoaderPath = [Environment]::GetEnvironmentVariable($LegLoaderVar); $oldTclLib = $env:TCL_LIBRARY
 $oldOmit = $env:QUICKTEST_OMIT; $oldPatterns = $env:SQLITE_TEST_PATTERN_LIST
 # The leg's DECLARED launcher environment (legs.json `launchers[].env`, e.g.
 # QEMU_LD_PREFIX). Snapshotted so it is restored exactly, including "was unset".
@@ -3639,7 +3908,8 @@ while ($si -lt $segments.Count) {
     Info "[$LegTag] segment $($si + 1): $($seg.Label)$(if ($seg.Patterns.Count) { "  (SQLITE_TEST_PATTERN_LIST: $($seg.Patterns.Count) candidate file(s))" })"
   }
   try {
-    $env:PATH = $runEnvPath; if (Test-Path $TclLibrary) { $env:TCL_LIBRARY = $TclLibrary }
+    [Environment]::SetEnvironmentVariable($LegLoaderVar, $runEnvPath)
+    if (Test-Path -LiteralPath $LegTclLibrary) { $env:TCL_LIBRARY = $LegTclLibrary }
     if ($TierExcludes.Count) { $env:QUICKTEST_OMIT = ($TierExcludes -join ',') }
     # The leg's DECLARED launcher environment (QEMU_LD_PREFIX and friends). Set
     # for the CHILD by setting it here and restoring in the finally — Start-Process
@@ -3659,7 +3929,7 @@ while ($si -lt $segments.Count) {
     $run = Invoke-Fixture $fixture @($seg.Args) $rundir $log "$log.stderr" $SegStall $SegCap $legLauncher $legXlate $legLaunchFixture
     $segRc = $run.Rc
   } finally {
-    $env:PATH = $oldPath; $env:TCL_LIBRARY = $oldTclLib
+    [Environment]::SetEnvironmentVariable($LegLoaderVar, $oldLoaderPath); $env:TCL_LIBRARY = $oldTclLib
     $env:QUICKTEST_OMIT = $oldOmit; $env:SQLITE_TEST_PATTERN_LIST = $oldPatterns
     foreach ($en in $legEnvNames) { [Environment]::SetEnvironmentVariable($en, $oldLegEnv[$en]) }
     if ($legCarrierName) { [Environment]::SetEnvironmentVariable($legCarrierName, $legCarrierOld) }
@@ -3689,6 +3959,44 @@ while ($si -lt $segments.Count) {
   }
 
   # ── ABORT ──────────────────────────────────────────────────────────────────
+  # ★★ FIRST: IS THIS AN ABORT AT ALL, OR A PRECONDITION FAILURE?
+  # [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY, the harness half.]
+  #
+  # MEASURED on the operator's Mac (in the .sh sibling; the defect is the
+  # mechanism's): the fixture could not initialise a SLAVE interpreter, so EVERY
+  # segment died before running a single file. The engine reported "the UNNAMED
+  # file that aborted ... the log named no resolvable corpus file" ELEVEN TIMES and
+  # then "resume budget (10) exhausted" - burning its whole budget on a failure
+  # that could never make progress, and never naming a cause, while the captured
+  # log's FIRST LINE said exactly what was wrong.
+  #
+  # ★★ THIS DOES NOT WEAKEN THE RESILIENCE RULE, AND THE SEPARATION IS EXACT.
+  # A fixture abort/crash stays a RECOVERABLE outcome: named, resumed past,
+  # reported in the union - one bad unit must never cost us the other thousand.
+  # What is added is a DISTINCT case with two conjuncts a genuine mid-corpus crash
+  # cannot satisfy together: (1) the segment completed ZERO files, and (2) its
+  # first diagnostic is IDENTICAL to the previous segment's, which also completed
+  # zero files. A real crash on the corpus's next file also completes zero files -
+  # but the resume boundary STRICTLY ADVANCES every time, so it dies in a different
+  # file with a different diagnostic and (2) fails. The FIRST such abort is still
+  # resumed exactly as today: one attempt is what distinguishes "could not start"
+  # from "crashed at the start".
+  if ($res.Completed.Count -eq 0 -and $res.Diagnostic -and $res.Diagnostic -eq $prevZeroDiag) {
+    $preconditionFail = $res.Diagnostic
+    Warn "[$LegTag] PRECONDITION FAILURE — the fixture completed ZERO test files in TWO consecutive segments with the IDENTICAL first diagnostic."
+    Warn "      This is NOT a resumable fixture crash: nothing the resume engine can do changes it,"
+    Warn "      so the remaining $($MaxResumes - $resumes) resume(s) are NOT spent on it."
+    Warn "      the diagnostic, verbatim, from $log :"
+    Warn "        $($res.Diagnostic)"
+    Info "      first lines of that log:"
+    Get-Content $log -TotalCount 6 | ForEach-Object { Info "        $_" }
+    $notReached += "EVERY unit of the '$(if ($seg.Perm) { $seg.Perm } else { $Tier })' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $($res.Diagnostic)"
+    break
+  }
+  # Carried to the NEXT segment so the comparison above has something to compare
+  # against. Cleared by any segment that made progress, which is what keeps a
+  # genuine crash on the resilience path.
+  $prevZeroDiag = if ($res.Completed.Count -eq 0) { $res.Diagnostic } else { '' }
   $lastDone = if ($res.Completed.Count) { $res.Completed[$res.Completed.Count - 1] } else { '' }
   $perm     = $res.Permutation
   if (-not $perm -and $seg.Perm) { $perm = $seg.Perm }
@@ -3889,7 +4197,20 @@ if ($TierExcludes.Count) { $led.Add(""); $led.Add("== EXCLUDED by operator (DSS_
 Set-Content -LiteralPath $Ledger -Value $led
 
 $unitVerdict = ''; $unitFail = $false
-if ($aborts.Count) {
+if ($preconditionFail) {
+  # ★ FIRST ARM, AND IT CARRIES THE DIAGNOSIS. The old engine would have landed in
+  # the ABORT arm below and produced "N fixture ABORT(s) [veryquick/?]" — identical
+  # rows naming an unnamed file — while sitting on the actual error. A harness that
+  # says "the log named no resolvable corpus file" while holding "Can't find a
+  # usable init.tcl" is withholding the diagnosis, and THAT, not the retrying, was
+  # the expensive half. [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
+  $unitVerdict = "FAIL: PRECONDITION FAILURE — the fixture completed ZERO test files in $($results.Count) consecutive segment(s), each dying with the same first diagnostic: $preconditionFail  (this is not a resumable crash; the remaining resume budget was NOT spent on it — see $runlog)"
+  $unitFail = $true
+  Warn "[$LegTag] corpus FAIL — PRECONDITION FAILURE, no unit of this leg's corpus ever ran."
+  Warn "      $preconditionFail"
+  Info "      $($results.Count) segment(s), $filesDone test file(s) completed, $resumes of $MaxResumes resume(s) used."
+  Info "      per-unit ledger: $Ledger"
+} elseif ($aborts.Count) {
   # An abort is itself a FAILURE. Resuming recovers the units behind it; it never
   # makes the abort disappear, and a run with aborts is NEVER green.
   $where = @(); foreach ($a in $aborts) { $where += "$(if ($a.Perm) { $a.Perm } else { '?' })/$(if ($a.File) { $a.File } else { '?' })" }
@@ -4158,6 +4479,15 @@ if ($LoadextStageFails -gt 0) {
 $unitFailLegs = @($LegOrder | Where-Object { $LegLedger[$_].UnitFail })
 if ($unitFailLegs.Count) { $failReasons += "$($unitFailLegs.Count) leg(s) with genuine unit failures: $($unitFailLegs -join ' ')" }
 if ($accounted -ne $AllLegs.Count) { $failReasons += "the leg ledger does not account for every declared leg ($accounted of $($AllLegs.Count))" }
+# ★ AN UNCLASSIFIED NON-VERIFICATION IS ITS OWN FAIL REASON, and it is NOT the
+# accounting-hole line above. That line (correctly) also fires, but it names the
+# wrong thing: "the ledger does not account for a leg" sends a reader to the leg
+# plan, when what happened is that a leg was recorded not-run under a token this
+# run could not classify. Reporting it separately is the difference between a
+# diagnosis and a symptom (D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-AVAILABLE).
+if ($UnclassifiedVerdicts.Count) {
+  $failReasons += "$($UnclassifiedVerdicts.Count) non-verification(s) carried a verdict token this driver could not classify: $(@($UnclassifiedVerdicts | Select-Object -Unique) -join ' '). Each is warned above with what the driver DID say. This is a HARNESS defect, not a compiler result: a not-run that names no class cannot be counted as structural, environmental or harness, so the leg would vanish from the accounting while the summary still read as coverage. The closed vocabulary is: $($VerdictVocabulary -join ' ')"
+}
 # STRUCTURAL skips are reported, NEVER fatal — nothing about this machine could
 # change them. ENVIRONMENTAL skips warn by default and are FATAL under
 # DSS_STRICT_ARM_VERDICTS=1, exactly as arm_verdict_ledger.hpp specifies: a

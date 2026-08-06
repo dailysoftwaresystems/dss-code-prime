@@ -456,6 +456,37 @@ declare -A LEG_TCL_LIB_ANY=()
 # BESIDE the binary at Step 7 or the artefact fails at load time on the target
 # machine. Empty for every other provider.
 declare -A LEG_ACQ_DIR=() LEG_ACQ_LIBS=()
+# ── THE RUNTIME DATA an acquired library needs, which its CODE does not carry ──
+# [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
+#
+# ✔MEASURED on the operator's Mac at 11e97e0e: the macho64-arm64 fixture BUILT
+# (189 TUs, zero diagnostics) and ran `select1.test` correctly — "0 errors out of
+# 192 tests", no leaks — and then the TIER driver died instantly with
+#     Can't find a usable init.tcl in the following directories: /opt/local/lib/tcl8.6 …
+#     (procedure "tclInit" line 61)  invoked from within "interp create tinterp"
+# because `permutations.test` runs every unit in a FRESH SLAVE INTERPRETER, and
+# `interp create` re-enters `tclInit`, which needs Tcl's SCRIPT LIBRARY. The
+# acquired MacPorts `libtcl8.6.dylib` bakes in `/opt/local/lib/tcl8.6` — MacPorts'
+# own prefix — and only the dylib was ever downloaded.
+#
+# ★ THE GENERAL LESSON: acquisition obtains a library's CODE but not the RUNTIME
+# DATA that library requires. Nothing at build time can see it — the link
+# succeeds, the binary runs, and it dies only on the code path that touches the
+# data. ICU and tzdata are the next two.
+#
+# This driver's half is to CONSUME what acquisition staged and point the leg's run
+# environment at it. WHICH directory that is, and staging it, belong to the shared
+# resolver — see $ACQ_SCRIPT_LIBRARY_KEY below for the exact contract read.
+declare -A LEG_TCL_SCRIPT_DIR=()
+# THE CONTRACT FIELD, NAMED ONCE — ✔READ FROM harness_legs.py, NOT GUESSED.
+# `acquisition_record()` returns a TOP-LEVEL `scriptLibraryDir`, derived by
+# `_script_library_dir()` from the ONE `dataDirs` entry whose `role` is
+# `tclScriptLibrary` (`DATA_DIR_ROLES`, singled out there precisely because "a
+# driver has to point TCL_LIBRARY at it"). It is on the SUCCESS and FAILURE
+# returns alike — one record type, so "a field cannot be forgotten on the branch
+# nobody exercises". This driver reads the resolved field and never re-derives it
+# from `dataDirs`, so a rename is a one-line change HERE and in the .ps1.
+ACQ_SCRIPT_LIBRARY_KEY="scriptLibraryDir"
 # LEG_DECLARED = every leg the catalogue declares (the ledger's denominator).
 # LEG_ORDER    = the subset this invocation actually processes (DSS_LEGS filter).
 declare -a LEG_ORDER=() LEG_DECLARED=()
@@ -774,9 +805,21 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
 # is the one you least want to lose. A portability defect in the late-stage code
 # surfaces here, in seconds, instead of after a multi-hour corpus.
 # Set DSS_SKIP_SELFTEST=1 to bypass (not recommended; say why in the log).
-_selftest="$SCRIPT_DIR/test-confound-scope.sh"
+# ★ A LIST, NOT A SINGLE FILE. Each entry EXTRACTS shipped logic and executes it,
+# and each emits the same `passed=N failed=N skipped=N` summary parsed below — so
+# adding a fourth costs one array entry instead of a second copy of this careful
+# rc/skip/refuse block. A self-test that exists but is never RUN is documentation,
+# which is how a guarded behaviour comes to look guarded without being tested.
+#   test-confound-scope.sh    the end-of-run confound classifier + the Step-2 gate
+#   test-driver-contracts.sh  the LEG CONTRACTS — the not-run recorder, the shared
+#                             run decision, the Step-8 gate sequence, parse_segment,
+#                             the precondition discriminator, acq_field and the
+#                             target-keyed loader variable, each with its
+#                             red-on-disable mutation asserted to have LANDED.
+declare -a _SELFTESTS=("$SCRIPT_DIR/test-confound-scope.sh" "$SCRIPT_DIR/test-driver-contracts.sh")
+for _selftest in "${_SELFTESTS[@]}"; do
 if [[ "${DSS_SKIP_SELFTEST:-0}" == "1" ]]; then
-  warn "driver self-test SKIPPED (DSS_SKIP_SELFTEST=1) — a late-stage defect will not surface until the end of the run."
+  warn "driver self-test ${_selftest##*/} SKIPPED (DSS_SKIP_SELFTEST=1) — a late-stage defect will not surface until the end of the run."
 elif [[ ! -f "$_selftest" ]]; then
   die "driver self-test missing: $_selftest
       This guard is what stops a defect in the END-OF-RUN classifier from costing
@@ -813,21 +856,23 @@ else
       died before printing it."
     fi
     if [[ "$_st_skip" == "0" ]]; then
-      info "driver self-test: OK ($_st_pass assertions, 0 skipped)"
+      info "driver self-test ${_selftest##*/}: OK ($_st_pass assertions, 0 skipped)"
     else
-      warn "driver self-test: OK ($_st_pass assertions) — but $_st_skip assertion(s) SKIPPED on this host
+      warn "driver self-test ${_selftest##*/}: OK ($_st_pass assertions) — but $_st_skip assertion(s) SKIPPED on this host
       (an unmet prerequisite, normally 'no git on PATH' at Step 0, before Step 1 installs it).
       That part of the late-stage logic is UNPROVEN for this run — re-run the self-test by hand
       once git is present if you want the full battery: $_selftest"
     fi
   else
     printf '%s\n' "$_st_out" | sed 's/^/      /' >&2
-    die "DRIVER SELF-TEST FAILED — refusing to start.
-      The end-of-run classifier is broken, so this run would execute the whole corpus
-      (hours) and then abort while classifying. Fix the driver first; the output above
-      names the failing assertion."
+    die "DRIVER SELF-TEST FAILED ($_selftest) — refusing to start.
+      Late-stage driver logic is broken, so this run would execute the whole corpus
+      (hours) and then abort while classifying — or would classify a leg's outcome
+      wrongly and report it. Fix the driver first; the output above names the
+      failing assertion."
   fi
 fi
+done
 
 # ── Step 0b — SELF-TEST the LEG PLAN (same refuse-to-start discipline) ───────
 # The leg plan decides WHICH TARGETS this run is about. A defect there does not
@@ -1053,6 +1098,45 @@ for _l in "${LEG_DECLARED[@]}"; do
     *)        die  "leg '$_l' has an unknown run mode '${LEG_RUN_MODE[$_l]}' — the resolver and this driver disagree about the vocabulary." ;;
   esac
 done
+
+# ── THE SINGLE RUN-DECISION, SHARED BY BOTH ARTIFACTS ────────────────────────
+# The sqlite3 CLI smoke gate (Step 7c) and the unit corpus (Step 8) ask the SAME
+# question — "may this host EXECUTE this leg?" — and the answer is `run.mode` off
+# the RESOLVED plan, never `if [[ $HOST_OS ]]`. It is a FUNCTION, and defined HERE
+# beside the plan it reads, so the two call sites cannot drift into two different
+# answers: that drift is what D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-
+# AVAILABLE is about, and the fix its registry row asked for is one resolver, both
+# call sites.
+#
+# ⚠ NOTE FOR THE NEXT READER, because the obvious reading of that row is WRONG and
+# cost this cycle its first hour: the two call sites had ALREADY agreed on this
+# question — both tested `run.mode == skip` and nothing else. What actually
+# differed is that Step 8 carried a SECOND, unrelated gate (an absent CONTROL
+# compiler) which Step 7c never had. See the note where that gate used to be.
+leg_run_is_skipped() {         # leg_run_is_skipped <leg>  -> 0 when NOT runnable here
+  # ⚠ TWO `local` STATEMENTS, NOT ONE. ✔MEASURED (bash 5.x): `local a="$1"
+  # b="${M[$a]:-}"` expands EVERY right-hand side BEFORE performing ANY of the
+  # assignments, so the second one reads an unset `a` and dies `a: unbound
+  # variable` under `set -u`. The same trap `corpus_files` above documents — and
+  # it was caught here by an executable pin, not by reading.
+  local _leg="$1"
+  local _mode="${LEG_RUN_MODE[$_leg]:-}"
+  case "$_mode" in
+    skip)   return 0 ;;
+    native) return 1 ;;
+    launched)
+      # A `launched` leg with no launcher argv is the contradiction this anchor is
+      # named after wearing its other face: the plan says "runnable" and hands the
+      # driver nothing to run it with. The resolver already refuses an EMPTY
+      # declared command, so this asserts the invariant SURVIVED transport through
+      # `--format sh` + `eval` rather than trusting that it did.
+      [[ -n "${LEG_LAUNCH[$_leg]:-}" ]] || die "[$_leg] the resolved plan says run mode 'launched' but carries an EMPTY launcher argv.
+      A leg cannot be both runnable and unrunnable. That is a transport defect between
+      $(basename "$LEG_RESOLVER") and this driver, not a property of this machine."
+      return 1 ;;
+    *) die "[$_leg] has an unknown run mode '${_mode:-<empty>}' — the resolver and this driver disagree about the vocabulary." ;;
+  esac
+}
 
 # DSS_LEGS: comma-separated filter (e.g. DSS_LEGS=elf64-x86_64) for fast iteration.
 # It never adds a leg and never changes a verdict class — a filtered-out leg is
@@ -2548,14 +2632,31 @@ acquire_leg_libs() {            # acquire_leg_libs <leg>  -> acquisition JSON
 # ConvertFrom-Json); what neither driver is allowed to do is re-derive a value.
 # ⚠ TAB-separated and read with `IFS=$'\t'`, because a cache path may contain
 # spaces — the same reason `LEG_LIB_PATHS` is newline-separated.
-acq_field() {                   # acq_field <json> <cacheDir|libraries>
+#              <json> scriptLibraryDir -> the staged Tcl script library, or ""
+# ★ `optional:<key>` IS A SEPARATE MODE FROM THE PLAIN READ, DELIBERATELY. A plain
+# `report[key]` must KeyError on a field the contract guarantees — a driver that
+# shrugs at a missing `cacheDir` would resolve libraries out of nowhere. But
+# `scriptLibraryDir` is legitimately "" for a leg whose acquired library needs no
+# runtime data, so it is read with a default and the CALLER decides what "" means.
+# [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
+acq_field() {                   # acq_field <json> <cacheDir|libraries|optional:<key>>
   python3 -c 'import json, sys
+# ★ NO NEWLINE TRANSLATION. ✔MEASURED 2026-08-06 on Windows: Python opens stdout
+# in TEXT MODE and writes \r\n for every \n, so a path read back through `$( )`
+# keeps a trailing CR — `$(dirname "/cache/libtcl.dylib\r")` and every later
+# comparison then work on a name no file has. Harmless on the POSIX hosts this
+# driver usually runs on, which is exactly why it would surface first on the ONE
+# host nobody had tried.
+sys.stdout.reconfigure(newline="")
 report = json.load(sys.stdin)
-if sys.argv[1] == "libraries":
+what = sys.argv[1]
+if what == "libraries":
     for lib in report["libraries"]:
         sys.stdout.write("%s\t%s\n" % (lib["as"], lib["path"]))
+elif what.startswith("optional:"):
+    sys.stdout.write("%s\n" % (report.get(what.split(":", 1)[1], "") or ""))
 else:
-    sys.stdout.write("%s\n" % report[sys.argv[1]])' "$2" <<< "$1"
+    sys.stdout.write("%s\n" % report[what])' "$2" <<< "$1"
 }
 
 # ── resolve EVERY declared leg's build inputs ────────────────────────────────
@@ -2642,6 +2743,31 @@ for leg in "${LEG_ORDER[@]}"; do
            && _acq_libs="$(acq_field "$_acq_json" libraries)" \
            && [[ -n "$_acq_dir" && -n "$_acq_libs" ]]; then
           LEG_ACQ_DIR["$leg"]="$_acq_dir"; LEG_ACQ_LIBS["$leg"]="$_acq_libs"
+          # ── THE SCRIPT LIBRARY THE ACQUIRED Tcl CANNOT RUN WITHOUT ──────────
+          # [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY] — see the
+          # LEG_TCL_SCRIPT_DIR note at the top of this file for the measurement.
+          # Selected by ROLE out of the acquisition report; `run_leg` points
+          # TCL_LIBRARY at it, leg-scoped, for THIS leg's child only.
+          # ⚠ ABSENT IS REPORTED, NEVER ASSUMED BENIGN. A missing script library
+          # does not fail the build and does not fail a directly-named .test file
+          # — the MAIN interpreter is already initialised by the time one is
+          # sourced, so `tclInit` is never re-entered. It kills the TIER, and only
+          # the tier, because permutations.test runs every unit in a fresh SLAVE
+          # interpreter. That asymmetry is exactly why this was invisible until a
+          # tier ran, and why the absence is said OUT LOUD here rather than
+          # discovered as an unnamed abort 11 resumes later.
+          _acq_tcldir="$(acq_field "$_acq_json" "optional:$ACQ_SCRIPT_LIBRARY_KEY")" || _acq_tcldir=""
+          if [[ -n "$_acq_tcldir" ]]; then
+            LEG_TCL_SCRIPT_DIR["$leg"]="$_acq_tcldir"
+            info "[$leg] Tcl script library (acquired): $_acq_tcldir  — TCL_LIBRARY is pointed here for THIS leg's children only"
+          else
+            warn "[$leg] the acquisition report stages NO Tcl script library (report field '$ACQ_SCRIPT_LIBRARY_KEY' is empty)."
+            warn "      An acquired libtcl bakes in ITS PACKAGER'S script-library path, which does not exist on this"
+            warn "      machine. Individual .test files will still run; the TIER will abort at the first"
+            warn "      \`interp create\` with \"Can't find a usable init.tcl\" and NO unit will get a verdict."
+            warn "      D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY — the fix belongs in the leg's"
+            warn "      \`pinned-archive\` declaration + $(basename "$LEG_RESOLVER"), not here."
+          fi
           # The (tcl, z) pair is picked out of the acquired cache with the leg's
           # OWN declared names, by the same helper the other providers use — the
           # driver never decides which acquired file is the Tcl one from its shape.
@@ -2810,12 +2936,16 @@ resolve_leg_target_cc() {       # resolve_leg_target_cc <leg>  -> 0 + LEG_CC set
   # verdict). Low trigger probability — but the shape, not the odds, is what
   # that anchor is about, and the new self-test does not cover this arm.
   # It reuses this function's OWN refusal mechanism, the same one both failure
-  # exits below use — set LEG_CC_WHY, leave LEG_CC[$leg] unset, return
-  # non-zero — so the caller's existing `[[ -z "${LEG_CC[$leg]:-}" ]]` branch
-  # records `skipped-build-input-missing` for THIS leg and CONTINUES. NOT a
-  # silent skip: `leg_marks_missing` warns loudly, the leg reaches a NAMED
-  # verdict the Step-9 ledger counts (so it can never become a ledger hole),
-  # and the reason below is what the caller prints as "The resolver's ladder".
+  # exits below use — set LEG_CC_WHY, leave LEG_CC[$leg] unset, return non-zero —
+  # so the caller reports "no CONTROL compiler here" and CARRIES ON.
+  # ⚠ CORRECTED 2026-08-06 (D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-
+  # AVAILABLE): this note used to say the caller "records
+  # `skipped-build-input-missing` for THIS leg and CONTINUES" via
+  # `leg_marks_missing`. That STOPPED BEING TRUE when the control became optional
+  # — the caller's branch now records NO verdict in either direction, by design —
+  # and a comment asserting a verdict that is not set is how the empty `not run
+  # []` token survived review. An absent control costs the leg NOTHING now: the
+  # loadext helper comes from DSS, and Step 8 runs the corpus regardless.
   # rc 5 only to sit apart from the resolver's own rc and from the `return 4`
   # below; every caller tests truthiness, never the value.
   # The `if` (never `_err="$(mktemp)"; rc=$?`) keeps errexit out of it — the
@@ -3046,6 +3176,31 @@ parse_segment() {              # parse_segment <log> <out-facts>
     # both silently match NOTHING and every count would come back zero. MSYS awk
     # strips it and hides the problem, which is precisely how this stayed invisible.
     { sub(/\r$/, "") }
+    # ── THE FIRST DIAGNOSTIC LINE ────────────────────────────────────────────
+    # [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY, second half.]
+    # (NB no apostrophes in this block either: it lives inside a single-quoted awk
+    # program, and one apostrophe ENDS that program mid-rule. Measured the hard way
+    # while writing this very rule.)
+    # MEASURED: the harness reported "the UNNAMED file that aborted ... the log
+    # named no resolvable corpus file (last test: none)" ELEVEN TIMES while the
+    # FIRST LINE of the captured log read "Can not find a usable init.tcl in the
+    # following directories: /opt/local/lib/tcl8.6 ..." (verbatim, with the
+    # contraction restored, in the PRECONDITION FAILURE branch below). It had the
+    # diagnosis in hand and did not surface it.
+    # `A` is the first non-blank line that is NOT the fixture doing its job — not a
+    # per-test line, not a `Time:` line, not an ` Ok`, not a summary. It is
+    # CONSULTED ONLY on the zero-progress abort path below, so it can never
+    # mislabel a healthy segment; captured here because this is the ONE streaming
+    # pass over a log that can reach 150 MB / 3.6M lines.
+    # FIRST, before every `next` in this program — a rule placed lower would never
+    # see a line an earlier rule consumed.
+    { if (diag == "" && $0 ~ /[^ \t]/ \
+          && $0 !~ /^Time: / && $0 !~ / Ok$/ && $0 !~ /^[^ \t]+\.\.\./ \
+          && $0 !~ /[0-9]+ errors? out of [0-9]+ tests/) {
+        diag = $0
+        gsub(/\t/, " ", diag)                 # the fact file is TAB-separated
+        if (length(diag) > 400) diag = substr(diag, 1, 400) " …[truncated]"
+      } }
     /^Time: / { if (NF==4 && $4=="ms") { print "F\t" $2; nf++; lastdone=$2; next } }
     /^\*\*\* Giving up/ { gaveup=1; next }
     /^!?Failures on these tests:/ {
@@ -3071,6 +3226,7 @@ parse_segment() {              # parse_segment <log> <out-facts>
           if (perm!="")    print "P\t" perm
           if (lasttest!="")print "T\t" lasttest
           if (gaveup)      print "G\t1"
+          if (diag!="")    print "A\t" diag
           print "N\t" nf+0; print "D\t" lastdone
           print "K\t" ok+0; print "Q\t" fx+0 }
   ' "$1" > "$2"
@@ -3189,6 +3345,64 @@ stop_our_fixtures() {          # stop_our_fixtures <fixture-abs-path> <why>
 # `pathTranslation`), translated ONCE per leg by the caller rather than once per
 # segment, and so does every path-valued argument. run_fixture_segment ASSERTS
 # that before it forks — see the comment there for why not here.
+# ── THE RUNTIME LOADER'S SEARCH VARIABLE, PER TARGET ────────────────────────
+# [D-HARNESS-RUN-ENV-LD-LIBRARY-PATH-INERT-ON-DARWIN, and the second site the
+#  D-HARNESS-ACQUIRE-ERGONOMIC-GAPS row (c) names — one place, target-keyed, as
+#  that row asked.]
+#
+# There is no such thing as "the" loader search variable. It is a property of the
+# TARGET's loader, and the leg declares its target: ld.so reads LD_LIBRARY_PATH,
+# dyld reads DYLD_LIBRARY_PATH and IGNORES the ELF one, and the Windows loader
+# reads neither.
+#
+# THE OS COMES FROM THE RESOLVED PLAN, NOT FROM A SPLIT DONE HERE.
+# `LEG_CONFIG_STAGE_KEY` is `spec_target_os(spec)` — harness_legs.py's
+# `configure_stage_key` docstring: "the staged-configure-header directory name for
+# this leg: its TARGET OS", and it RAISES rather than defaulting, so `--plan`
+# cannot deliver an unknown one. The format token is CROSS-CHECKED against it
+# rather than used as the source: same declare-then-cross-check discipline as
+# zconfGuards. ⚠ The name is about configure staging, so this reuse is worth
+# stating: the value is the target OS, but the RIGHT long-term home is a declared
+# `LEG_TARGET_OS` (better: a declared loader-variable name) emitted by the shared
+# resolver, so neither driver holds this table.
+leg_loader_path_var() {        # leg_loader_path_var <leg> -> the env var NAME, or ""
+  local _leg="$1"
+  local _os="${LEG_CONFIG_STAGE_KEY[$_leg]:-}"
+  local _fmt="${LEG_FORMAT[$_leg]:-}"
+  # `<container><bits>-<arch>-<os>-<kind>`: the OS is the second-to-last token.
+  local _fmt_os=""
+  case "$_fmt" in
+    *-*-*) _fmt_os="${_fmt%-*}"; _fmt_os="${_fmt_os##*-}" ;;
+  esac
+  [[ -n "$_os" ]] || die "[$_leg] the resolved plan carries no target OS (LEG_CONFIG_STAGE_KEY is empty).
+      The runtime loader's search variable is a property of the TARGET; choosing one without
+      knowing the target is how LD_LIBRARY_PATH came to be exported for a Darwin leg that
+      cannot read it (D-HARNESS-RUN-ENV-LD-LIBRARY-PATH-INERT-ON-DARWIN)."
+  [[ "$_os" == "$_fmt_os" ]] || die "[$_leg] the resolved plan disagrees with itself about this leg's target OS:
+      configStageKey says '$_os', the object format '$_fmt' says '$_fmt_os'.
+      One of them decides which loader variable this leg's libraries are exported under, and a
+      run that guesses which would silently export a variable the target's loader ignores."
+  case "$_os" in
+    linux)   printf '%s' 'LD_LIBRARY_PATH' ;;
+    darwin)  printf '%s' 'DYLD_LIBRARY_PATH' ;;
+    windows)
+      # A DECLARED EMPTY, NOT A FALL-THROUGH. The Windows loader has no
+      # environment search variable of this kind — it searches the EXECUTABLE'S
+      # OWN DIRECTORY first, which is exactly where Step 7 stages this leg's
+      # acquired DLLs, so nothing is missing. ⚠ And PATH is specifically the wrong
+      # answer here: this function's caller runs inside the subshell that is about
+      # to `exec` the LAUNCHER (`wine`), and a PATH mutated with staged library
+      # directories — or with the `;` a Windows PATH needs — would break the
+      # launcher's OWN lookup before the fixture ever started. The .ps1 twin, which
+      # runs a pe64 leg NATIVELY and resolves its launcher differently, does use
+      # PATH; that difference is a property of the two run paths, not a drift.
+      printf '%s' '' ;;
+    *) die "[$_leg] target OS '$_os' has no declared runtime-loader search variable in this driver.
+      Known: linux (LD_LIBRARY_PATH) | darwin (DYLD_LIBRARY_PATH) | windows (none — the loader
+      searches the executable's directory). A new target OS must DECLARE its answer; defaulting
+      to the ELF spelling is the defect this function exists to end." ;;
+  esac
+}
 run_leg() {                    # run_leg <leg> <bin> <args...>  — REPLACES this shell
   local leg="$1" bin="$2"; shift 2
   # THE LAUNCHER IS DECLARED, NOT INFERRED. `LEG_LAUNCH` is the catalogue's
@@ -3203,16 +3417,42 @@ run_leg() {                    # run_leg <leg> <bin> <args...>  — REPLACES thi
   eval "envs=(${LEG_LAUNCH_ENV[$leg]})"
   [[ ${#envs[@]} -eq 0 ]] || export "${envs[@]}"
   # The leg's OWN library directories, for the runtime loader. Only for a leg whose
-  # libraries the harness STAGED (`ubuntu-ports-arm64`, `search-paths`): a
-  # `host-system` leg's libraries are, by definition, already where this machine's
-  # loader looks, and prepending a system dir would be a change with no purpose.
-  # Keyed on the leg's DECLARED provider, so a future staged-library leg inherits it.
+  # libraries the harness STAGED (`ubuntu-ports-arm64`, `search-paths`,
+  # `pinned-archive`): a `host-system` leg's libraries are, by definition, already
+  # where this machine's loader looks, and prepending a system dir would be a
+  # change with no purpose. Keyed on the leg's DECLARED provider, so a future
+  # staged-library leg inherits it.
   if [[ "${LEG_LIB_PROVIDER[$leg]}" != "host-system" ]]; then
-    local d1 d2 libpath
+    local d1 d2 libpath lvar
     d1="$(dirname "${LEG_TCL_LIB[$leg]}")"; d2="$(dirname "${LEG_Z_LIB[$leg]}")"
     libpath="$d1"; [[ "$d2" == "$d1" ]] || libpath="$d1:$d2"
-    export LD_LIBRARY_PATH="$libpath${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    # ★★ THE VARIABLE NAME IS A PROPERTY OF THE TARGET, NOT A CONSTANT.
+    # [D-HARNESS-RUN-ENV-LD-LIBRARY-PATH-INERT-ON-DARWIN] — its trigger has FIRED.
+    # This line was `export LD_LIBRARY_PATH=…` for every leg. **dyld IGNORES
+    # LD_LIBRARY_PATH**; on Darwin the variable is DYLD_LIBRARY_PATH. The row
+    # recorded it as inert only because both macho legs were `provider:
+    # host-system` and never reached this code — they are `pinned-archive` now, so
+    # it is LIVE, and it is the same target-keyed principle as the rest of the
+    # catalogue. ✔VERIFIED here rather than taken on trust: legs.json declares
+    # `"provider": "pinned-archive"` for BOTH macho legs at this commit, which is
+    # precisely the trigger condition the row named.
+    lvar="$(leg_loader_path_var "$leg")"
+    if [[ -n "$lvar" ]]; then
+      local cur="${!lvar:-}"
+      [[ -z "$cur" ]] || libpath="$libpath:$cur"
+      export "$lvar=$libpath"
+    fi
   fi
+  # ── THE ACQUIRED Tcl's SCRIPT LIBRARY, LEG-SCOPED ──────────────────────────
+  # [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]. Exported HERE and
+  # nowhere else: this function is the last thing a segment's BACKGROUND SUBSHELL
+  # does before `exec`, so the assignment reaches this leg's child and CANNOT leak
+  # into the driver, into the reference fixture, or into another leg — which is
+  # the same isolation the launcher env and the loader path above rely on. Never a
+  # global export, and never keyed on the host: a leg whose Tcl was acquired needs
+  # this on every host that runs it, and a leg whose Tcl is the host's own must
+  # NOT have it (the host's tclsh already resolves its own).
+  [[ -z "${LEG_TCL_SCRIPT_DIR[$leg]:-}" ]] || export TCL_LIBRARY="${LEG_TCL_SCRIPT_DIR[$leg]}"
   if [[ ${#launch[@]} -eq 0 ]]; then
     exec "$bin" "$@" 2>&1
   else
@@ -3234,6 +3474,14 @@ run_fixture_segment() {        # run_fixture_segment <leg> <bin> <launch_bin> <l
   # as the harness refusing to start. In the foreground it stops the run.
   [[ "${LEG_RUN_MODE[$leg]}" != "launched" ]] \
     || assert_launch_args_translated "${LEG_PATH_TRANSLATION[$leg]:-none}" "$launch_bin" "$@"
+  # SAME CHOKE POINT, SAME REASON, for the loader search variable: `run_leg` asks
+  # `leg_loader_path_var` for it, and that function DIES on a target OS it has no
+  # declared answer for — but by then it is inside the background subshell above,
+  # where a `die` exits only that subshell, lands in the segment log, and reads as
+  # a failing test instead of as the harness refusing to start. Asking here, in the
+  # foreground, makes the refusal a refusal. The answer is discarded; only its
+  # ability to EXIST is being asserted.
+  [[ "${LEG_LIB_PROVIDER[$leg]}" == "host-system" ]] || leg_loader_path_var "$leg" >/dev/null
   # `trap - ERR; set +e` inside the subshell is load-bearing. The old form was a
   # `|| segrc=$?` list, which suppresses errexit and the ERR trap; a BACKGROUND job
   # does not, so this subshell would inherit them (set -E) and the harness-level
@@ -4009,8 +4257,9 @@ for leg in "${LEG_ORDER[@]}"; do
   fi
   # THE ONE LEGITIMATE HOST QUESTION, and it is `run.mode` off the RESOLVED plan
   # — never `if [[ $HOST_OS ]]`. `native` runs it directly, `launched` runs it
-  # through the leg's DECLARED launcher, `skip` records a named verdict.
-  if [[ "${LEG_RUN_MODE[$leg]}" == "skip" ]]; then
+  # through the leg's DECLARED launcher, `skip` records a named verdict. Asked
+  # through the SHARED predicate, which is the same call Step 8 makes.
+  if leg_run_is_skipped "$leg"; then
     CLI_SMOKE_VERDICT["$leg"]="built, NOT RUN here [${LEG_RUN_VERDICT[$leg]}] — ${LEG_RUN_DETAIL[$leg]}"
     warn "[$leg] CLI smoke SKIPPED — built at ${CLI_BIN[$leg]} but this host cannot execute it: ${LEG_RUN_DETAIL[$leg]}"
     continue
@@ -4053,11 +4302,16 @@ for leg in "${LEG_ORDER[@]}"; do
   #   · LEG_LAUNCH_ENV — for the arm64 leg this is QEMU_LD_PREFIX. Without it
   #     qemu cannot find the guest loader and EVERY exec dies at exit 255, which
   #     would read as 14 DSS failures on a binary that is completely fine.
-  #   · LD_LIBRARY_PATH — a leg whose libraries the harness STAGED (any provider
-  #     but `host-system`) needs its own zlib on the loader path; a `host-system`
-  #     leg's libraries are already where this machine's loader looks.
+  #   · the TARGET's loader search variable — a leg whose libraries the harness
+  #     STAGED (any provider but `host-system`) needs its own zlib on the loader
+  #     path; a `host-system` leg's libraries are already where this machine's
+  #     loader looks. ★ THE NAME IS `leg_loader_path_var`'s ANSWER, not a
+  #     constant: this was a hardcoded LD_LIBRARY_PATH, which dyld IGNORES — the
+  #     SECOND site of D-HARNESS-RUN-ENV-LD-LIBRARY-PATH-INERT-ON-DARWIN, recorded
+  #     as item (c) of D-HARNESS-ACQUIRE-ERGONOMIC-GAPS with the instruction to
+  #     fix both together so the choice is made in ONE place, target-keyed.
   # The subshell is what keeps both out of the parent: leaking QEMU_LD_PREFIX or
-  # a foreign LD_LIBRARY_PATH into the rest of the run would silently change how
+  # a foreign loader path into the rest of the run would silently change how
   # every later leg's processes resolve libraries.
   # ★ `|| _srcc=$?` below is LOAD-BEARING, not style — the same rule this file
   # already states at :3561. Under `set -Eeuo pipefail` a bare `cmd; rc=$?` exits
@@ -4069,13 +4323,30 @@ for leg in "${LEG_ORDER[@]}"; do
   # A leg that cannot smoke must yield a LOUD VERDICT, never silence and never a
   # dead sibling: the harness survives everything.
   _srcc=0
+  # Resolved HERE, in the foreground, for the reason the subshell body restates.
+  _smoke_lvar=""
+  [[ "${LEG_LIB_PROVIDER[$leg]}" == "host-system" ]] || _smoke_lvar="$(leg_loader_path_var "$leg")"
   (
     declare -a _envs=()
     eval "_envs=(${LEG_LAUNCH_ENV[$leg]:-})"
     [[ ${#_envs[@]} -eq 0 ]] || export "${_envs[@]}"
     if [[ "${LEG_LIB_PROVIDER[$leg]}" != "host-system" ]]; then
-      export LD_LIBRARY_PATH="$(dirname "${LEG_Z_LIB[$leg]}")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      # $_smoke_lvar was resolved in the FOREGROUND, above: `leg_loader_path_var`
+      # dies on an undeclared target OS, and a `die` in THIS subshell would be
+      # captured as smoke output and classified as a CLI failure charged to DSS —
+      # the harness accusing the compiler of a bug in the harness.
+      _lvar="$_smoke_lvar"
+      if [[ -n "$_lvar" ]]; then
+        _lpath="$(dirname "${LEG_Z_LIB[$leg]}")"
+        _lcur="${!_lvar:-}"; [[ -z "$_lcur" ]] || _lpath="$_lpath:$_lcur"
+        export "$_lvar=$_lpath"
+      fi
     fi
+    # The acquired Tcl's script library, same leg-scope, same subshell. The CLI
+    # does not embed Tcl — but cli-smoke.py is the arm that would report a
+    # Tcl-shaped failure as a DSS defect, so the leg's declared run environment is
+    # applied here in full rather than in part.
+    [[ -z "${LEG_TCL_SCRIPT_DIR[$leg]:-}" ]] || export TCL_LIBRARY="${LEG_TCL_SCRIPT_DIR[$leg]}"
     python3 "${_smoke_argv[@]}"
   ) > "$_smoke_dir/smoke.log" 2>&1 || _srcc=$?
   sed 's/^/      /' "$_smoke_dir/smoke.log"
@@ -4121,6 +4392,108 @@ declare -A UNIT_VERDICT=()     # leg -> PASS / FAIL:<reasons> / skipped
 # per-leg resume-engine bookkeeping, surfaced in Step 9
 declare -A LEG_SEGMENTS=() LEG_RESUMES=() LEG_FILESDONE=() LEG_LEDGER=() LEG_ABORTS=() LEG_NOTREACHED=() LEG_HYGIENE=()
 UNIT_FAILS=0
+
+# ── THE ONE PLACE A LEG'S UNIT CORPUS IS RECORDED AS "NOT RUN" ───────────────
+# ★ AN EMPTY SKIP TOKEN IS NOW IMPOSSIBLE BY CONSTRUCTION, NOT BY REVIEW
+# (D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-AVAILABLE).
+#
+# ✔MEASURED on the operator's Mac at 11e97e0e:
+#     macho64-x86_64 (x86_64:macho64-x86_64-darwin-exec): compiled   units: not run []
+#       — host darwin/arm64 cannot run x86_64:macho64-x86_64-darwin-exec natively;
+#         declared launcher 'arch -x86_64' is available
+# A whole leg's corpus was skipped with NO classified reason, in the same sentence
+# that said the thing it needed was present. A not-run carrying no class cannot be
+# counted as structural / environmental / harness, so the unit ledger can lose an
+# entire leg while still LOOKING complete — and "every unit gets a verdict; silence
+# about a unit is a harness bug" is the rule that forbids exactly that.
+#
+# Every `not run` this driver writes goes through THIS function, and it REFUSES to
+# write one without a token from the CLOSED vocabulary. That is the by-construction
+# half: there is no second place to add a fifth unguarded assignment.
+#
+# THE VOCABULARY IS READ FROM THE SHARED RESOLVER, never spelled here. A
+# driver-local copy of a closed vocabulary is how the two drivers drift, which is
+# the standing defect class this file family keeps re-learning
+# (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER).
+# rc DIRECTLY off the `if`, never `x="$(...)"; rc=$?` — under `set -Eeuo pipefail`
+# the assignment form exits before the rc can be read.
+# stderr is NOT swallowed: if this refuses, the resolver's own diagnostic is the
+# thing worth reading, and a `2>/dev/null` here would leave the die below asserting
+# a failure it could not describe.
+# >>> dss:verdict-vocabulary >>>
+# (EXTRACTED AND EXECUTED by test-driver-contracts.sh, so the pin exercises THIS
+#  read — CR handling included — instead of a clean literal list of its own. A pin
+#  that stubs the vocabulary cannot see the defect the stub papers over; that is
+#  exactly how the CRLF bug below survived its first pin.)
+if _vocab_out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --verdict-vocabulary)"; then
+  _vocab_rc=0
+else
+  _vocab_rc=$?
+fi
+declare -a UNIT_SKIP_VOCAB=()
+if [[ "$_vocab_rc" -eq 0 ]]; then
+  # A herestring, NOT a pipe and NOT a process substitution: `printf | grep -q`
+  # can return 141 (SIGPIPE on the writer) under `pipefail` even on a MATCH, and
+  # `mapfile < <(cmd)` swallows the command's rc entirely. Both are ways to make a
+  # membership test lie, which is the last thing a guard against silence may do.
+  #
+  # ★★ THE TRAILING CR IS STRIPPED, AND IT IS NOT DEFENSIVE NOISE.
+  # ✔MEASURED 2026-08-06 on Windows/Git Bash: `python3 … --verdict-vocabulary | od -c`
+  # emits `r a n \r \n` — Python opens stdout in TEXT MODE and translates \n to
+  # \r\n on Windows. `read -r` strips the \n and KEEPS the \r, so every token would
+  # be stored as `ran\r`, `poisoned\r`, … and `unit_verdict_token_known` would then
+  # reject EVERY LEGITIMATE TOKEN — turning each correctly-classified not-run into a
+  # bogus "HARNESS DEFECT", marking those legs `poisoned`, and failing the run. The
+  # guard against silence would have become a guard that screams at nothing.
+  # Same hazard `parse_segment` documents for a CRLF segment log, same remedy. The
+  # .ps1 twin is safe by construction: it reads the tokens through `.Trim()`.
+  while IFS= read -r _v; do
+    _v="${_v%$'\r'}"
+    [[ -z "${_v//[[:space:]]/}" ]] || UNIT_SKIP_VOCAB+=("$_v")
+  done <<< "$_vocab_out"
+fi
+[[ ${#UNIT_SKIP_VOCAB[@]} -gt 0 ]] || die "the leg resolver could not state the CLOSED verdict vocabulary (rc=$_vocab_rc).
+      command: python3 $LEG_RESOLVER --verdict-vocabulary
+      Without it this driver cannot tell a classified skip from an unclassified one, and an
+      unclassified skip is precisely how a leg's entire corpus vanishes from the ledger while
+      the summary still reads as full coverage. Refusing to run rather than guess the list."
+# <<< dss:verdict-vocabulary <<<
+unit_verdict_token_known() {   # unit_verdict_token_known <token>
+  local _t
+  for _t in "${UNIT_SKIP_VOCAB[@]}"; do [[ "$_t" == "$1" ]] && return 0; done
+  return 1
+}
+# Legs whose not-run could not be classified. Counted and named so the run says so
+# out loud AND cannot exit 0 — a harness defect that only warns is a harness defect
+# that ships.
+UNIT_UNCLASSIFIED=0
+declare -a UNIT_UNCLASSIFIED_LEGS=()
+unit_not_run() {               # unit_not_run <leg> <token> <detail>
+  local leg="$1" token="$2" detail="$3" why=""
+  [[ -n "$detail" ]] || detail="<no reason recorded>"
+  if [[ -z "$token" ]]; then
+    why="this driver recorded a NOT-RUN with an EMPTY verdict token"
+  elif ! unit_verdict_token_known "$token"; then
+    why="this driver recorded a NOT-RUN with the token '$token', which is OUTSIDE the closed vocabulary (${UNIT_SKIP_VOCAB[*]})"
+  fi
+  if [[ -n "$why" ]]; then
+    UNIT_UNCLASSIFIED=$((UNIT_UNCLASSIFIED + 1)); UNIT_UNCLASSIFIED_LEGS+=("$leg")
+    warn "[$leg] HARNESS DEFECT — $why."
+    warn "      This leg's ENTIRE unit corpus did not run and the run cannot say under which class."
+    warn "      what it did say  : $detail"
+    warn "      resolved run plan: mode='${LEG_RUN_MODE[$leg]:-<unset>}'${LEG_LAUNCH[$leg]:+, declared launcher '${LEG_LAUNCH[$leg]}'}"
+    # `poisoned` — the closed vocabulary's name for "no artifact was exercised and
+    # the reason is OURS". Recording it keeps the leg inside the Step-9 ledger (so
+    # it can never ALSO become an accounting hole) and keeps the run from exiting
+    # 0. The run still CONTINUES to every other leg: the harness must survive its
+    # own defects, not hide them.
+    LEG_VERDICT["$leg"]="poisoned"
+    LEG_VERDICT_DETAIL["$leg"]="HARNESS DEFECT: $why. $detail"
+    UNIT_VERDICT["$leg"]="not run [poisoned] — HARNESS DEFECT: $why. $detail"
+    return 0
+  fi
+  UNIT_VERDICT["$leg"]="not run [$token] — $detail"
+}
 # Legs whose corpus could not be run because their loadext helper could not be
 # STAGED. Its own counter, deliberately: it is neither a fixture compile failure
 # (COMPILE_FAILS — the fixture built fine) nor a unit failure (UNIT_FAILS — no
@@ -4317,24 +4690,47 @@ for leg in "${LEG_ORDER[@]}"; do
   # Step 7. The verdict is left exactly as those steps set it — this loop never
   # invents one, and never silently drops a leg.
   if [[ -z "${LEG_TCL_LIB[$leg]:-}" ]]; then
-    UNIT_VERDICT["$leg"]="not run [${LEG_VERDICT[$leg]}] — ${LEG_VERDICT_DETAIL[$leg]}"
+    unit_not_run "$leg" "${LEG_VERDICT[$leg]}" "${LEG_VERDICT_DETAIL[$leg]}"
     continue                                   # already warned at Step 6/7
   fi
   if [[ "${COMPILE_OK[$leg]:-0}" != "1" ]]; then
-    UNIT_VERDICT["$leg"]="not run [${LEG_VERDICT[$leg]}] — step 7 did not produce a fixture"
+    unit_not_run "$leg" "${LEG_VERDICT[$leg]}" "step 7 did not produce a fixture"
     warn "[$leg] corpus skipped — step 7 did not compile the fixture"; continue
   fi
-  if [[ "${LEG_RUN_MODE[$leg]}" == "skip" ]]; then
+  if leg_run_is_skipped "$leg"; then
     # ★ BUILT, and the build result is REPORTED — this is the whole point of the
     # split. The artifact for this target exists and is on disk; this machine
     # simply cannot execute it, which the resolver said up front and by name.
-    UNIT_VERDICT["$leg"]="not run [${LEG_VERDICT[$leg]}] — ${LEG_VERDICT_DETAIL[$leg]}  (the fixture DID build: ${FIXTURE[$leg]})"
+    unit_not_run "$leg" "${LEG_VERDICT[$leg]}" "${LEG_VERDICT_DETAIL[$leg]}  (the fixture DID build: ${FIXTURE[$leg]})"
     info "[$leg] fixture built but NOT RUN here [${LEG_RUN_VERDICT[$leg]}]: ${LEG_RUN_DETAIL[$leg]}"
     continue
   fi
+  # ★★ THE GATE THAT USED TO BE HERE COST A WHOLE LEG ITS CORPUS, AND IT IS GONE.
+  # [D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-AVAILABLE]
+  #
+  # It read `if [[ -z "${LEG_CC[$leg]:-}" ]]; then <not run>; continue; fi` — i.e.
+  # "run this leg's ~330,000 units only if THIS MACHINE owns a compiler that
+  # targets that leg". It is a leftover from before the loadext helper was built
+  # by DSS: Step 6 stopped recording any verdict for an absent control compiler
+  # ("★★ NO VERDICT IS RECORDED HERE ANY MORE, IN EITHER DIRECTION"), but this
+  # gate was not removed with it, so a leg with no control was skipped carrying
+  # the EMPTY verdict Step 6 had deliberately stopped setting.
+  #
+  # ✔MEASURED, and this is the whole diagnosis: on the operator's arm64 Mac,
+  # `clang -dumpmachine` reports `arm64-apple-darwin24.6.0`, which the resolver
+  # correctly REFUSES for macho64-x86_64 ("targets arch 'arm64' …; this leg needs
+  # 'x86_64'"). So macho64-arm64 got a control and ran its corpus, macho64-x86_64
+  # got none and ran nothing — on the same machine, from the same build, with its
+  # declared `arch -x86_64` launcher present and its CLI smoke passing 14/14
+  # THROUGH THAT LAUNCHER in the very same run.
+  #
+  # ⚠ THE CONTROL IS OPTIONAL BY CONSTRUCTION and nothing below needs it: the one
+  # consumer is `stage_loadext_extension`, whose `--reference-cc "${LEG_CC[$leg]:-}"`
+  # is DECLARED to accept empty ("IS ALLOWED TO BE EMPTY, and that is the whole
+  # de-host-locking"). Requiring it here re-locked the corpus to the host that a
+  # cross leg exists to escape [D-HARNESS-CROSS-HOST-ANY-TARGET].
   if [[ -z "${LEG_CC[$leg]:-}" ]]; then
-    UNIT_VERDICT["$leg"]="not run [${LEG_VERDICT[$leg]}] — ${LEG_VERDICT_DETAIL[$leg]}  (the fixture DID build: ${FIXTURE[$leg]})"
-    continue                                   # already warned at Step 6
+    info "[$leg] no CONTROL compiler on this host — the corpus RUNS anyway (the loadext helper comes from DSS); only the helper's cross-check against a second toolchain is lost."
   fi
   bin="${FIXTURE[$leg]}"; rundir="$OUT_DIR/$leg/run"; rm -rf "$rundir"; mkdir -p "$rundir"
   # The launcher's DECLARED path namespace, and this leg's fixture spelled in it.
@@ -4389,14 +4785,14 @@ for leg in "${LEG_ORDER[@]}"; do
     # preserves the displaced run verdict in the detail.
     leg_marks_missing "$leg" "its corpus is NOT run (the fixture DID build: ${FIXTURE[$leg]})" \
       "DSS_LOADEXT_HELPER=$LOADEXT_BUILDER was requested and this host cannot provide that arm. $STAGE_WHY"
-    UNIT_VERDICT["$leg"]="not run [skipped-build-input-missing] — $STAGE_WHY"
+    unit_not_run "$leg" "skipped-build-input-missing" "$STAGE_WHY"
     continue
   fi
   if [[ "$_stage_rc" -ne 0 ]]; then
     STAGE_FAILS=$((STAGE_FAILS + 1))
     LEG_VERDICT["$leg"]="poisoned"
     LEG_VERDICT_DETAIL["$leg"]="the fixture BUILT (${FIXTURE[$leg]}), but this leg's loadext helper extension ('${LEG_LOADEXT_NAME[$leg]:-<undeclared>}') could not be staged, so its corpus was NOT run and this run covers NONE of its units. $STAGE_WHY"
-    UNIT_VERDICT["$leg"]="not run [poisoned] — loadext helper staging FAILED: $STAGE_WHY"
+    unit_not_run "$leg" "poisoned" "loadext helper staging FAILED: $STAGE_WHY"
     warn "[$leg] POISONED — loadext helper staging FAILED; this leg's corpus is NOT run, the rest of the run CONTINUES:"
     warn "      $STAGE_WHY"
     continue
@@ -4453,6 +4849,13 @@ for leg in "${LEG_ORDER[@]}"; do
   ps_enum_available || HYGIENE+=("leftover-fixture detection UNAVAILABLE on this host (ps(1) cannot enumerate) — a stray fixture would go unnoticed")
   seg_i=0; resumes=0; last_boundary=""; total_tests=0; total_errors=0; files_done=0
   seg_summary=""; all_fails=""
+  # The previous segment's first diagnostic, but ONLY when that segment completed
+  # zero files. Empty means "the last segment made progress", which is what keeps a
+  # genuine mid-corpus crash on the ordinary resume path. See the PRECONDITION
+  # FAILURE branch for why one repetition, and not the first occurrence, is the
+  # discriminator. PRECONDITION_FAIL is the diagnostic itself once detected — the
+  # classifier below reads it, so the verdict is decided in one place.
+  prev_zero_diag=""; PRECONDITION_FAIL=""
   while [[ $seg_i -lt ${#SEGQ[@]} ]]; do
     IFS="$US" read -r s_kind s_perm s_label s_patfile s_arg1 s_arg2 <<< "${SEGQ[$seg_i]}"
     if [[ $seg_i -eq 0 ]]; then
@@ -4513,6 +4916,7 @@ for leg in "${LEG_ORDER[@]}"; do
     s_last="$(fact T "$facts_f")"; s_done="$(fact D "$facts_f")"
     s_nf="$(fact N "$facts_f")";   s_gaveup="$(fact G "$facts_f")"
     s_ok="$(fact K "$facts_f")";   s_fx="$(fact Q "$facts_f")"
+    s_diag="$(fact A "$facts_f")"
     files_done=$((files_done + s_nf))
     # failing NAMES always flow into the classifier, summary or not (VERIFIED on the
     # real `all` run: mm-backup4-3.3 came from an ABORTED segment and was still
@@ -4543,6 +4947,48 @@ for leg in "${LEG_ORDER[@]}"; do
     fi
 
     # ── ABORT ────────────────────────────────────────────────────────────────
+    # ★★ FIRST: IS THIS AN ABORT AT ALL, OR A PRECONDITION FAILURE?
+    # [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY, the harness half.]
+    #
+    # ✔MEASURED on the operator's Mac: the fixture could not initialise a SLAVE
+    # interpreter (no Tcl script library), so EVERY segment died before running a
+    # single file. The engine reported "the UNNAMED file that aborted under
+    # permutation 'veryquick' … the log named no resolvable corpus file (last test:
+    # none); the resume boundary was FORCED" ELEVEN TIMES and then "resume budget
+    # (10) exhausted". It burned its whole budget on a failure that could never
+    # make progress, and never named a cause — while the captured log's FIRST LINE
+    # said exactly what was wrong.
+    #
+    # ★★ THIS DOES NOT WEAKEN THE RESILIENCE RULE, AND THE SEPARATION IS EXACT.
+    # A fixture abort/crash remains a RECOVERABLE outcome: named, resumed past,
+    # reported in the union — one bad unit must never cost us the other thousand.
+    # What is added is a DISTINCT case with two conjuncts that a genuine mid-corpus
+    # crash cannot satisfy together:
+    #   (1) the segment completed ZERO files, and
+    #   (2) its first diagnostic is IDENTICAL to the previous segment's, which also
+    #       completed zero files.
+    # A real crash on the corpus's next file also completes zero files — but the
+    # resume boundary STRICTLY ADVANCES every time, so it dies in a different file
+    # with a different diagnostic, and (2) fails. Two identical zero-progress
+    # segments in a row mean the fixture never started, which is not something
+    # resuming can fix. The FIRST such abort is still resumed exactly as today: one
+    # attempt is what distinguishes "could not start" from "crashed at the start".
+    if [[ "$s_nf" -eq 0 && -n "$s_diag" && "$s_diag" == "${prev_zero_diag:-}" ]]; then
+      PRECONDITION_FAIL="$s_diag"
+      warn "[$leg] PRECONDITION FAILURE — the fixture completed ZERO test files in TWO consecutive segments with the IDENTICAL first diagnostic."
+      warn "      This is NOT a resumable fixture crash: nothing the resume engine can do changes it,"
+      warn "      so the remaining $((DSS_MAX_RESUMES - resumes)) resume(s) are NOT spent on it."
+      warn "      the diagnostic, verbatim, from $seglog:"
+      warn "        $s_diag"
+      info "      first lines of that log:"
+      head -6 "$seglog" 2>/dev/null | sed 's/^/        /'
+      NOT_REACHED+=("EVERY unit of the '${s_perm:-$DSS_TIER}' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $s_diag")
+      break
+    fi
+    # Carried to the NEXT segment so the comparison above has something to compare
+    # against. Cleared by any segment that made progress, which is what keeps a
+    # genuine crash on the resilience path.
+    if [[ "$s_nf" -eq 0 ]]; then prev_zero_diag="$s_diag"; else prev_zero_diag=""; fi
     # An aborted segment is NOT an empty segment. It printed no summary, so its work
     # is counted from its per-test lines (see the derivation note at the union) —
     # otherwise the totals silently omit everything it did, and a regression inside
@@ -4763,7 +5209,21 @@ for leg in "${LEG_ORDER[@]}"; do
     [[ ${#EXCLUDE_PATTERNS[@]} -eq 0 ]] || { printf '\n== EXCLUDED by operator (DSS_TIER_EXCLUDES -> QUICKTEST_OMIT) ==\n   %s\n' "${EXCLUDE_PATTERNS[*]}"; }
   } > "$ledger"
 
-  if [[ ${#ABORTS[@]} -gt 0 ]]; then
+  if [[ -n "$PRECONDITION_FAIL" ]]; then
+    # ★ FIRST ARM, AND IT CARRIES THE DIAGNOSIS. The old engine would have landed
+    # in the ABORT arm below and produced "N fixture ABORT(s) [veryquick/?]" —
+    # eleven identical rows naming an unnamed file — while sitting on the actual
+    # error. A harness that says "the log named no resolvable corpus file" while
+    # holding "Can't find a usable init.tcl" is withholding the diagnosis, and
+    # THAT, not the retrying, was the expensive half.
+    # [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
+    UNIT_VERDICT["$leg"]="FAIL:PRECONDITION FAILURE — the fixture completed ZERO test files in $nseg consecutive segment(s), each dying with the same first diagnostic: $PRECONDITION_FAIL  (this is not a resumable crash; the remaining resume budget was NOT spent on it — see $runlog)"
+    UNIT_FAILS=$((UNIT_FAILS + 1))
+    warn "[$leg] corpus FAIL — PRECONDITION FAILURE, no unit of this leg's corpus ever ran."
+    warn "      $PRECONDITION_FAIL"
+    info "      $nseg segment(s), $files_done test file(s) completed, $resumes of $DSS_MAX_RESUMES resume(s) used."
+    info "      per-unit ledger: $ledger"
+  elif [[ ${#ABORTS[@]} -gt 0 ]]; then
     # An abort is itself a FAILURE. Resuming recovers the units behind it; it never
     # makes the abort disappear, and a run with aborts is NEVER green.
     v="FAIL:${#ABORTS[@]} fixture ABORT(s) [${ABORTS[*]}]; recovered by $resumes resume(s); union: $union_summary"
@@ -5066,6 +5526,23 @@ fi
 # liveness-based, so a run that dies here just leaves one the next invocation steals
 # and reports. Releasing simply keeps that report quiet when it should be.
 rm -rf "$LOCK_DIR"
+# ★ AN UNCLASSIFIED NOT-RUN IS ITS OWN EXIT, AND IT COMES FIRST. The ledger hole
+# below is the LEG-level backstop and would (correctly) have caught this too — but
+# it names the wrong thing: "a leg reached no verdict" sends a reader to the leg
+# plan, when what actually happened is that a leg's ENTIRE UNIT CORPUS was skipped
+# for a reason the driver could not classify. Reporting it separately is the
+# difference between a diagnosis and a symptom
+# (D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-AVAILABLE).
+if [[ "${UNIT_UNCLASSIFIED:-0}" -gt 0 ]]; then
+  printf '\n%s%d leg(s) had their UNIT CORPUS skipped with a verdict token this driver could not classify: %s%s\n' \
+    "$C_RED" "$UNIT_UNCLASSIFIED" "${UNIT_UNCLASSIFIED_LEGS[*]}" "$C_RST"
+  printf 'Each one is warned above with what the driver DID say and the run mode the resolver\n'
+  printf 'planned for it. This is a HARNESS defect, not a compiler result: a not-run that names\n'
+  printf 'no class cannot be counted as structural, environmental or harness, so the leg would\n'
+  printf 'otherwise vanish from the accounting while the summary still read as coverage.\n'
+  printf 'The closed vocabulary is: %s\n' "${UNIT_SKIP_VOCAB[*]}"
+  exit 1
+fi
 if [[ "$LEDGER_HOLE" -eq 1 ]]; then
   printf '\n%sTHE LEDGER DOES NOT ADD UP — a declared leg reached no named verdict.%s\n' "$C_RED" "$C_RST"
   printf 'That is a HARNESS defect, not a compiler result: whatever this run proved, it did\n'
