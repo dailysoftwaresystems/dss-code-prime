@@ -112,6 +112,27 @@ foreach ($row in $eolRows) {
     }
 }
 
+# ── Check D: a PINNED file's WORKING TREE must not have been rewritten ────
+# ★ THE PIN'S OWN BLIND SPOT. `.gitattributes` normalises on `git add`, so once
+# a file is pinned `eol=lf`, a tool that rewrites it CRLF ON DISK changes every
+# byte while changing nothing git will show as a change (measured instance:
+# Python `pathlib.write_text` over 159 fixtures). MEASURED exactly: `git status`
+# DOES report ` M <path>`, but `git diff`, `git diff --stat` and (after
+# `git add`) `git diff --cached` are ALL empty — so the file reads as modified
+# with no reviewable content, and the rewrite can never even be committed.
+# Checks A-C cannot see it BY CONSTRUCTION: the blob is fine; the tree is not.
+# Closed set (`w/crlf`, `w/mixed`) on purpose — an unmeasured `w/` state must
+# not be guessed at. Kept identical to the .sh sibling.
+foreach ($row in (Get-GitLines @('ls-files','--eol'))) {
+    $parts = $row -split "`t", 2
+    if ($parts.Count -lt 2) { continue }
+    $attrs = $parts[0]
+    if ($attrs -notmatch 'eol=lf') { continue }
+    if ($attrs -match '(^|\s)w/(crlf|mixed)(\s|$)') {
+        $report.Add("  worktree rewritten to CRLF under an eol=lf pin (git diff shows NOTHING to review): $($parts[1])")
+    }
+}
+
 if ($report.Count -eq 0) {
     Write-Host "line-endings: OK ($ControlHead committed + $ControlIndex staged text blobs, none carries CR)"
     exit 0

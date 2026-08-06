@@ -124,6 +124,45 @@ if [[ -n "${_binary_in_pinned}" ]]; then
     done <<< "${_binary_in_pinned}"
 fi
 
+# ── Check D: a PINNED file's WORKING TREE must not have been rewritten ────
+# ★ THE PIN'S OWN BLIND SPOT, and the sharpest lesson in the anchor this guard
+# closes. `.gitattributes` normalises on `git add`, so once a file is pinned
+# `eol=lf`, a tool that rewrites it CRLF ON DISK changes every byte of the file
+# while changing NOTHING git will ever show you as a change. That is not
+# hypothetical: it is what happened to the `src/dss-config/**` files when an
+# agent edited 159 fixtures through Python `pathlib.write_text`.
+# ⚠ MEASURED EXACTLY, because the imprecise version of this claim is easy to
+# repeat and wrong: rewrite a pinned `.cpp` to CRLF on disk and
+#   · `git status` DOES report ` M <path>` (twice running — it does not settle);
+#   · `git diff` and `git diff --stat` are EMPTY;
+#   · `git add` + `git diff --cached` are EMPTY too, so the rewrite can never
+#     be committed and simply LIVES in the working tree indefinitely.
+# So the file is flagged as changed and then no view will tell you WHAT changed
+# — an author who checks `git diff` on that `M` concludes it is noise. Checks
+# A–C cannot see it BY CONSTRUCTION: the blob is fine; the working tree is not.
+#
+# `git ls-files --eol` reports BOTH sides — `i/` (index) and `w/` (worktree). A
+# file DECLARED `eol=lf` whose worktree form is `crlf` or `mixed` was rewritten
+# by something AFTER checkout, on any host and regardless of `core.autocrlf`,
+# because with `eol=lf` declared a checkout always produces LF.
+#
+# ⚠ Deliberately a CLOSED set (`w/crlf`, `w/mixed`) rather than "anything that
+# is not `w/lf`": an unmeasured `w/` state — a sparse or partial checkout, a
+# file not materialised — must not be guessed at and turned into a red.
+# MEASURED when this landed: 2166 tracked files declare `eol=lf`, and ZERO have
+# a non-LF worktree form.
+_worktree_rewritten="$(git ls-files --eol 2>/dev/null | awk -F'\t' '
+    NF >= 2 && index($1, "eol=lf") > 0 {
+        split($1, f, /[ \t]+/)
+        if (f[2] == "w/crlf" || f[2] == "w/mixed") print $2
+    }')"
+if [[ -n "${_worktree_rewritten}" ]]; then
+    while IFS= read -r _f; do
+        [[ -z "${_f}" ]] && continue
+        _report+="  worktree rewritten to CRLF under an eol=lf pin (git diff shows NOTHING to review): ${_f}"$'\n'
+    done <<< "${_worktree_rewritten}"
+fi
+
 if [[ -z "${_report}" ]]; then
     echo "line-endings: OK (${_control_head} committed + ${_control_index} staged text blobs, none carries CR)"
     exit 0
