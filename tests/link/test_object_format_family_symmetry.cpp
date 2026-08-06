@@ -57,6 +57,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -364,5 +365,132 @@ TEST(ObjectFormatFamilySymmetry, EveryDarwinFormatDeclaresItsLongDoubleAxis) {
             << row.name << ": a Darwin format that omits the axis REJECTS "
                            "`long double` with S0056 while its siblings compile "
                            "it — same translation unit, different answer.";
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The FIFTH instance, and the one the class test was written in time to
+// catch rather than trail: `supportedDataSections` + its `sections[]` rows
+// on `macho64-x86_64-darwin` and `-staticlib`
+// (D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-ABSENT). Until they
+// landed, ANY translation unit with a string literal or a global was
+// refused on those two tiers — `K_NoMatchingObjectFormat ... does not
+// advertise that section` — while the arm64 siblings emitted the same
+// source at rc=0.
+//
+// ★ WHY THIS IS A SEPARATE, NAMED TEST RATHER THAN LEFT TO T1's SWEEP.
+// T1 sees only ROOT keys, so it would have caught the missing
+// `supportedDataSections` and been BLIND to the four missing `sections[]`
+// rows — and it is exactly that pair coming apart that produces the WORST
+// diagnostic in this area: MEASURED 2026-08-05 on the `-exec` sibling,
+// opting into `rodata` with no row leaves `encodeExecDynamic`'s
+// `hasConst && secConst == nullptr` guard a bare `return {}`, so the caller
+// reports a generic `K_ImageEmpty` that never names the cause. The opt-in
+// (which the LINKER's pre-walker gate reads) and the row (which the WALKER
+// reads) are one contract and this test asserts them as one.
+//
+// ⚠ AND IT IS DELIBERATELY NOT A SYMMETRY ASSERTION. `relro` is the case
+// that proves it: the RELOCATABLE tiers give it its own `__DATA,__const`
+// row — the `.o` precursor ld64 gathers into __DATA_CONST — while the
+// IMAGE tiers declare `relro` in the opt-in set and NO row, because their
+// walker FOLDS a const-with-load-time-relocations item into `__DATA,__data`
+// and dyld rebases the slot. Both arms are asserted, so a stray relro row
+// on an exec format (dead config the image walker never reads) reds just as
+// loudly as a missing one on a `.o`.
+// ─────────────────────────────────────────────────────────────────────────
+TEST(ObjectFormatFamilySymmetry, EveryMachoFormatDeclaresItsDataSectionsWithTheirRows) {
+    struct Tier { char const* name; bool relroHasItsOwnRow; };
+    for (Tier const tier : {
+             Tier{"macho64-x86_64-darwin",           true},
+             Tier{"macho64-x86_64-darwin-staticlib", true},
+             Tier{"macho64-x86_64-darwin-exec",      false},
+             Tier{"macho64-x86_64-darwin-dylib",     false},
+             Tier{"macho64-arm64-darwin",            true},
+             Tier{"macho64-arm64-darwin-staticlib",  true},
+             Tier{"macho64-arm64-darwin-exec",       false},
+             Tier{"macho64-arm64-darwin-dylib",      false}}) {
+        auto r = ObjectFormatSchema::loadShipped(tier.name);
+        ASSERT_TRUE(r.has_value()) << tier.name;
+        auto const& fmt = **r;
+
+        // (a) THE LINKER'S PRE-WALKER GATE. An absent key is an EMPTY set,
+        // so `rodata` is refused too — string literals, not merely writable
+        // statics. This is the half that was missing on the two `.o` tiers.
+        struct Opt { DataSectionKind kind; char const* label; };
+        for (Opt const opt : {Opt{DataSectionKind::Rodata, "rodata"},
+                              Opt{DataSectionKind::Data,   "data"},
+                              Opt{DataSectionKind::Bss,    "bss"},
+                              Opt{DataSectionKind::RelRoConst, "relro"}}) {
+            EXPECT_TRUE(fmt.acceptsDataSection(opt.kind))
+                << tier.name << ": `supportedDataSections` does not list '"
+                << opt.label
+                << "', so the linker's acceptsDataSection gate refuses every "
+                   "item of that kind with K_NoMatchingObjectFormat before "
+                   "any walker runs — on a `rodata` regression that is every "
+                   "TU carrying a string literal "
+                   "(D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-"
+                   "ABSENT).";
+        }
+
+        // (b) THE WALKER'S ROWS. Mach-O segment/section names carry no arch
+        // axis, so these are the SAME on both CPUs — the values that legitim-
+        // ately differ per arch are `macho.cputype` and `relocations[]`, not
+        // these. `type` is the section_64.flags field: S_REGULAR (0) for the
+        // file-backed rows, S_ZEROFILL (1) for __bss.
+        struct Want {
+            SectionKind   kind;
+            char const*   segment;
+            char const*   name;
+            std::uint32_t type;
+        };
+        for (Want const w : {Want{SectionKind::Rodata, "__TEXT", "__const", 0u},
+                             Want{SectionKind::Data,   "__DATA", "__data",  0u},
+                             Want{SectionKind::Bss,    "__DATA", "__bss",   1u}}) {
+            auto const* s = fmt.sectionByKind(w.kind);
+            ASSERT_NE(s, nullptr)
+                << tier.name << ": declares the data-section opt-in but no "
+                   "`sections[]` row for " << w.segment << "," << w.name
+                << " — the gate then ADMITS an item the walker cannot PLACE, "
+                   "which on the image arm is a bare `return {}` reported as "
+                   "a generic K_ImageEmpty that never names this file.";
+            EXPECT_EQ(s->segment, w.segment) << tier.name;
+            EXPECT_EQ(s->name, w.name) << tier.name;
+            EXPECT_EQ(s->type, w.type)
+                << tier.name << ": " << w.segment << "," << w.name
+                << " section_64.flags — S_ZEROFILL (1) on __bss means "
+                   "\"occupies VM, stores no file bytes\"; S_REGULAR (0) "
+                   "elsewhere. Swapping them writes a file-backed section "
+                   "with offset 0 or a zero-fill section with real bytes.";
+            EXPECT_EQ(s->addrAlign, 8u)
+                << tier.name << ": " << w.segment << "," << w.name
+                << " addrAlign. On a DATA row this field is a RAW-BYTE floor "
+                   "handed to buildExecDataSection (the walker H1-raises it "
+                   "and writes section_64.align as its log2) — UNLIKE the "
+                   "`__text` row in the same array, whose addrAlign IS the "
+                   "literal log2. Two conventions in one array: a `4` typed "
+                   "here meaning \"16 bytes\" silently becomes a 4-byte "
+                   "floor.";
+        }
+
+        // (c) relro — see the header comment: its own row on the relocatable
+        // tiers, deliberately NO row on the image tiers.
+        auto const* relro = fmt.sectionByKind(SectionKind::RelRoConst);
+        if (tier.relroHasItsOwnRow) {
+            ASSERT_NE(relro, nullptr)
+                << tier.name << ": a relocatable Mach-O keeps relro in its "
+                   "OWN `__DATA,__const` section (the input shape ld64 "
+                   "gathers into __DATA_CONST); the MH_OBJECT walker calls "
+                   "requireSection for it and fails loud without this row "
+                   "(D-LK-RELRO-CONST-DATA-RELOCATABLE).";
+            EXPECT_EQ(relro->segment, "__DATA") << tier.name;
+            EXPECT_EQ(relro->name, "__const") << tier.name;
+            EXPECT_NE(fmt.sectionByKind(SectionKind::Rodata), relro);
+        } else {
+            EXPECT_EQ(relro, nullptr)
+                << tier.name << ": the IMAGE walker folds a relro item into "
+                   "`__DATA,__data` and lets dyld rebase the slot, so a relro "
+                   "row here is dead config nothing reads — and a reader who "
+                   "found one would reasonably assume the section is emitted.";
+        }
     }
 }

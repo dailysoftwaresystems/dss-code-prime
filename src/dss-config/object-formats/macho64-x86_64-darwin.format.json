@@ -2,10 +2,6 @@
   "$comment": "Mach-O relocatable object (.o, MH_OBJECT) for x86_64 macOS / Darwin. Third shipped object-format JSON (plan 14 LK3, 2026-05-30). Consumed by `src/link/format/macho.cpp` via the format-blind linker engine. mach_header_64 + section_64 + nlist_64 + relocation_info field values follow Apple's OS X ABI Mach-O File Format Reference + `<mach-o/loader.h>` / `<mach-o/nlist.h>` / `<mach-o/x86_64/reloc.h>`.",
 
   "dssObjectFormatVersion": 1,
-  "$absentKeyRationaleComment": "Machine-read by tests/link/test_object_format_family_symmetry.cpp: every root key a SIBLING of this format declares and this file does not must appear below with a non-empty reason, and every entry below must correspond to a real absence. Both directions fail loud, so this table can neither be skipped nor rot after a gap is closed.",
-  "$absentKeyRationale": {
-    "supportedDataSections": "NOT deliberate -- a KNOWN OPEN DEFECT, declared here so it is visible at the site and not only in the registry: D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-ABSENT. This file and its `-staticlib` sibling declare only the `text` section, while every arm64 macho format and the x86_64 `-exec`/`-dylib` siblings declare `supportedDataSections` plus their section rows. MEASURED 2026-08-06, immediately after `externCallDispatch` was added here: a TU whose only extern is `puts` now gets PAST MIR->LIR and then hits `error[K_NoMatchingObjectFormat] ... module carries an AssembledData item with section=rodata but format 'macho64-x86_64-darwin' (kind=macho) does not advertise that section` -- so any translation unit with a string literal or a global still cannot use this tier. The closing work is BOTH `supportedDataSections` AND its `sections[]` rows in ONE change: the x86_64 `-exec` file's own `$supportedDataSectionsComment` MEASURED that opting into `rodata` WITHOUT its row does not fail loud (macho.cpp's `hasConst && secConst == nullptr` guard is a bare `return {}`), so a half-fix reports a generic `K_ImageEmpty` and never names the cause. Left OPEN rather than half-closed: this cycle's scope was the `externCallDispatch` key, and the registry row already carries the arm64 runtime precedent that makes this a config gap and not a capability question."
-  },
 
   "$stackReserveUnsupportedReasonComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: this artifact form has NO image header field for a stack size (a relocatable object / static archive is an INPUT to a later link, not a loadable program), so a `stackReserve` / `--stack-reserve` request against it is REFUSED with an actionable remedy -- request the reserve on the build that produces the final EXECUTABLE image -- rather than silently dropped.",
 
@@ -38,6 +34,9 @@
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: macOS x86_64 `long double` = x87 80-bit, 16/16 (SysV). See macho64-x86_64-darwin-exec.",
   "longDoubleFormat": "x87-80",
 
+  "$supportedDataSectionsComment": "D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-ABSENT (closed 2026-08-06) — the last two cells of that anchor are this file and its `-staticlib` sibling, which until now declared `text` and nothing else while every arm64 macho format and the x86_64 `-exec`/`-dylib` siblings declared a set. ★ TWO KEYS, ONE CHANGE, AND SPLITTING THEM IS THE HAZARD THE ANCHOR NAMES: the linker's PRE-WALKER gate reads THIS set (`acceptsDataSection` — a generic set-membership with zero format-name branches, the same field ELF and PE declare), and the `sections[]` rows below tell the WALKER where each kind lands. Declaring one without the other is not a half-fix but a WORSE diagnostic — MEASURED on the `-exec` sibling 2026-08-05, opting into `rodata` with no row leaves `encodeExecDynamic`'s `hasConst && secConst == nullptr` guard a bare `return {}` and the caller reports a generic `K_ImageEmpty` that never names the cause. ⓘ THE MH_OBJECT ARM IS NOT THAT ARM, and that was MEASURED here rather than inherited: this walker routes every PRESENT kind through `requireSection`, so a declared-but-rowless kind fails loud naming the section (MEASURED 2026-08-06 by deleting the rodata row from this file with the opt-in left in place, quoted VERBATIM: `error[K_NoMatchingObjectFormat] [target=x86_64:macho64-x86_64-darwin] Mach-O writer (MH_OBJECT) requires section kind 'rodata' but object format 'macho64-x86_64-darwin' does not declare one`). The pair still ships together — because the gate must not ADMIT what the walker cannot PLACE — but the reason is that invariant, not a fear that this arm would go quiet. ★ EVIDENCE, EACH AT ITS OWN GRADE. MEASURED on this host, end to end through the real CLI: one TU carrying a string literal (rodata), `int counter = 7;` (data), a tentative `int zero_global;` (bss) and two const-with-load-time-relocation globals (relro) compiled rc=1 with `error[K_NoMatchingObjectFormat] ... section=rodata ... does not advertise that section in its 'supportedDataSections' set` BEFORE this key, and rc=0 with the `.o` emitted AFTER — while `macho64-arm64-darwin` compiled the identical source at rc=0 throughout as the matched control. ⛔ NOT MEASURED, stated rather than buried: NOTHING RAN. A Mach-O `.o` is an INPUT to a later ld64 link, and no Mac was reachable from this host, so what is claimed is 'the walker places the bytes and the emitted object parses', never 'ld64 accepted it' and never 'it executed'. ★ NOT A BULK COPY OF THE arm64 SIBLING, and the difference is checkable rather than asserted: the SET is a property of what the MH_OBJECT walker can PLACE — shared format-blind code whose only per-cputype dispatch is the EXEC-only `__stubs` substrate a relocatable never emits — and Mach-O segment/section NAMES carry no arch axis, which this family's own x86_64 `-exec` file already states and ships. WHAT IS DELIBERATELY NOT BROUGHT OVER: the arm64 `relocations[]` rows (this file keeps X86_64_RELOC_UNSIGNED_8/_4, and it is that abs64 row the relro/data pointer fixups resolve through), and `tdata`/`tbss` — the MH_OBJECT walker emits no TLV machinery on ANY arch and rejects a thread-local item loud (`K_FormatLacksThreadLocalSupport`), so declaring them would advertise a capability that does not exist. RED-ON-DISABLE, MEASURED 2026-08-06 by a fail-closed mutator (witness unique before / absent after, sha256 DIFFERS, mutant still parses, file restored and its sha256 re-verified): delete this key and the probe above returns to `error[K_NoMatchingObjectFormat] ... section=rodata`, and BOTH pins red naming this file — `ObjectFormatFamilySymmetry.EveryMachoFormatDeclaresItsDataSectionsWithTheirRows` (tests/link, the declaration) and `Program_CompileFiles.MachORelocatableTiersPlaceEveryDeclaredDataSection` (tests/program, the emission: source through the real pipeline, then the emitted section_64 table parsed by a reader that shares no code with DSS, on all four relocatable Darwin arms). Delete the rodata `sections[]` row INSTEAD and both red again with the walker's own message — which is the point of pinning the pair rather than the key.",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
+
   "macho": {
     "$comment": "mach_header_64 identity. cputype = CPU_TYPE_X86_64 (0x01000007 — CPU_ARCH_ABI64 bit OR'd with x86 ABI type 7). cpusubtype = CPU_SUBTYPE_X86_64_ALL (3). filetype = MH_OBJECT (1). flags = 0 — MH_SUBSECTIONS_VIA_SYMBOLS (0x2000) is intentionally NOT set: the cycle-1 walker emits one flat `__text` blob with no N_ALT_ENTRY subsection markers, so advertising the flag would lie to ld64 about function-granular dead-strip safety (silent-failure-hunter HIGH-1 convergence). The flag will return when the substrate emits per-function subsections — anchored at plan 14 §3.1 D-LK3-2.",
     "cputype": 16777223,
@@ -55,6 +54,46 @@
       "type": 2147484672,
       "flags": 0,
       "addrAlign": 4,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-ABSENT: read-only initialized data — string literals and const globals carrying NO relocations — in section `__const` inside the R+X `__TEXT` segment, which is where clang places it in an x86_64 `.o`. section_64.flags (the substrate's `type` field) = S_REGULAR (0): no write attribute and no exec attribute, so folding it into __TEXT preserves W^X. ★ addrAlign 8 is a RAW-BYTE FLOOR handed to the shared `buildExecDataSection` substrate — NOT the literal log2 the `__text` row above carries; the walker H1-raises it to the strictest member's alignment and writes section_64.align as that value's log2. The two conventions live in one array on purpose and this comment is the only thing that says so. No `virtualAddress` key: MH_OBJECT section addrs are walker-computed in the flat `.o` address space and validate() rejects a non-zero VA on an object row.",
+      "kind": "rodata",
+      "name": "__const",
+      "segment": "__TEXT",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Writable initialized globals (`int counter = 7;`) — clang's `__DATA,__data`, a segment distinct from the r-x `__TEXT` because a store into __TEXT faults. section_64.flags (`type`) = S_REGULAR (0). A reloc-bearing MUTABLE pointer global lands here too, and the walker emits this section's OWN relocation_info table for it — resolving the fixup through this file's `X86_64_RELOC_UNSIGNED_8` row (kind 2 = x86_64.target.json's `abs64`), which is precisely the axis that IS per-CPU: the arm64 sibling reaches the same place through ARM64_RELOC_UNSIGNED. addrAlign 8 = raw-byte floor (H1-raised, written as log2 — see the rodata row).",
+      "kind": "data",
+      "name": "__data",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-RELRO-CONST-DATA-RELOCATABLE (Mach-O x86_64 `.o` arm): a CONST global carrying LOAD-TIME relocations — `int *const p = &x;`, a const function-pointer table (sqlite's VFS method tables / `aSyscall[]`) — which clang emits as `__DATA,__const`, the `.o` PRECURSOR of the image's `__DATA_CONST,__const` (ld64 gathers these input sections into __DATA_CONST, read-only after rebase; the Mach-O analog of gcc's `.data.rel.ro`). ★ A DISTINCT ROW, NOT A FOLD — and that DIVERGES from this same family's `-exec`/`-dylib` files deliberately: those list `relro` in `supportedDataSections` with NO row of its own because the IMAGE walker merges a relro item into `__DATA,__data` and dyld rebases the slot, whereas the relocatable arm keeps the two apart so ld64 receives the input shape clang would have produced. The (segment, section) PAIR is the Mach-O identity, which is what makes (`__DATA`,`__const`) a different section from the (`__TEXT`,`__const`) rodata row above rather than a duplicate name. relocation_info has no addend column, so the addend is written INTO the 8-byte slot (Mach-O's in-place-addend convention) and the final linker computes S + A.",
+      "kind": "relro",
+      "name": "__const",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Zero-initialized globals (tentative `int g;`) — clang's `__DATA,__bss`. section_64.flags (`type`) = S_ZEROFILL (1): the section has a size and a flat-space addr but NO file bytes (section_64.offset = 0), so the addr cursor advances while the file does not, and the walker emits it LAST per the Mach-O zerofill-last convention. addrAlign 8 = raw-byte floor (H1-raised, written as log2 — see the rodata row).",
+      "kind": "bss",
+      "name": "__bss",
+      "segment": "__DATA",
+      "type": 1,
+      "flags": 0,
+      "addrAlign": 8,
       "entrySize": 0
     }
   ],
