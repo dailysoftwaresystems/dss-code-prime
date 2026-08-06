@@ -1319,12 +1319,17 @@ TEST(MachOWriter, NonMachOFormatKindEmitsK_NoMatchingObjectFormat) {
 TEST(MachOFormatJson, ZeroCputypeRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-macho","kind":"macho"},
       "macho": { "cputype": 0, "filetype": 1 }
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: no sections/image block to trip any
+    // other rule, so cputype==0 is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/macho/cputype"), 1u) << rejectSummary(r);
 }
 
 // ── Mach-O section row missing `segment` rejected ──────────────
@@ -1332,6 +1337,7 @@ TEST(MachOFormatJson, ZeroCputypeRejectedByValidate) {
 TEST(MachOFormatJson, EmptySegmentRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-macho-seg","kind":"macho"},
@@ -1339,6 +1345,10 @@ TEST(MachOFormatJson, EmptySegmentRejectedByValidate) {
       "sections":[{"kind":"text","name":"__text","type":0,"flags":0,"addrAlign":4,"entrySize":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: cputype is valid and virtualAddress
+    // defaults to 0, so the empty 'segment' is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/segment"), 1u) << rejectSummary(r);
 }
 
 // ── ELF/PE section row with `segment` set rejected ─────────────
@@ -1346,6 +1356,7 @@ TEST(MachOFormatJson, EmptySegmentRejectedByValidate) {
 TEST(ElfFormatJson, SegmentFieldRejectedOnElfSection) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-elf","kind":"elf"},
@@ -1353,6 +1364,11 @@ TEST(ElfFormatJson, SegmentFieldRejectedOnElfSection) {
       "sections":[{"kind":"text","name":".text","segment":"__TEXT","type":1,"flags":6,"addrAlign":16,"entrySize":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: class/data/machine are all valid and
+    // virtualAddress defaults to 0 (ET_REL default), so the non-empty
+    // 'segment' is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/segment"), 1u) << rejectSummary(r);
 }
 
 // ── Mach-O MH_OBJECT section with non-zero virtualAddress rejected ──
@@ -1365,6 +1381,7 @@ TEST(MachOFormatJson, NonZeroVirtualAddressRejectedOnMhObject) {
     // a future MachO-row edit can't silently no-op.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-macho-va","kind":"macho"},
@@ -1372,6 +1389,12 @@ TEST(MachOFormatJson, NonZeroVirtualAddressRejectedOnMhObject) {
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":4,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: cputype is valid and 'segment' is
+    // non-empty, so the non-zero virtualAddress on this MH_OBJECT row
+    // is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/virtualAddress"), 1u)
+        << rejectSummary(r);
 }
 
 // ── D-LK10-ENTRY-MACHO-SECTIONVA-COMPUTED: schema __text VA inconsistent
@@ -1396,6 +1419,7 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
     // cputype; nothing here builds a trampoline, so they emit nothing.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
       "format": { "name": "macho-va-inconsistent-test", "version": "1.0", "kind": "macho" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
@@ -1965,6 +1989,7 @@ TEST(MachOExecWriter, ExternTargetFailsLoudAsUndefined) {
 TEST(MachOExecFormatJsonValidate, ObjWithImageBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"obj-with-image","kind":"macho"},
@@ -1973,6 +1998,13 @@ TEST(MachOExecFormatJsonValidate, ObjWithImageBlockRejected) {
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: the single `fail("/image", ...)` call
+    // site fires once regardless of which image field triggered its
+    // `anySet` check (here pageZeroSize/dylinkerPath/loadDylibs); cputype
+    // is valid and the section row is otherwise clean, so it is the only
+    // diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image"), 1u) << rejectSummary(r);
 }
 
 TEST(MachOExecFormatJsonValidate, ObjWithBindNowFalseRejected) {
@@ -1983,6 +2015,7 @@ TEST(MachOExecFormatJsonValidate, ObjWithBindNowFalseRejected) {
     // LK6 cycle 2c post-fold review.)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"obj-with-bindnow-false","kind":"macho"},
@@ -1991,6 +2024,11 @@ TEST(MachOExecFormatJsonValidate, ObjWithBindNowFalseRejected) {
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: same `fail("/image", ...)` call site as
+    // ObjWithImageBlockRejected, this time tripped by `bindNow: false`
+    // alone; cputype is valid and the section row is otherwise clean.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image"), 1u) << rejectSummary(r);
 }
 
 TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
@@ -2006,6 +2044,7 @@ TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
     // trampoline is built and no cc name is resolved.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-dylibs","kind":"macho"},
@@ -2041,6 +2080,7 @@ TEST(MachOExecFormatJsonValidate, DylibWithoutDylibImageShapeRejected) {
     // is pinned in test_macho_dylib_writer.cpp.)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"a-dylib","kind":"macho"},
@@ -2048,14 +2088,20 @@ TEST(MachOExecFormatJsonValidate, DylibWithoutDylibImageShapeRejected) {
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
-    bool sawInstallName = false;
-    for (auto const& d : r.error()) {
-        if (d.message.find("installName") != std::string::npos) {
-            sawInstallName = true;
-        }
-    }
-    EXPECT_TRUE(sawInstallName)
-        << "expected the dylib installName requirement to fire";
+    // MEASURED: this bare-minimum dylib fixture is missing THREE
+    // independent parts of the dylib shape at once -- loadDylibs and
+    // installName default to empty, and __text's virtualAddress
+    // defaults to 0 while segmentPageSize defaults to 0x1000, so the
+    // "must equal segmentPageSize" rule fires too. Each is its own
+    // `fail()` call in validate(); the path pin below targets
+    // installName (this test's namesake), and errorCount documents
+    // that the other two legitimately co-fire so a future edit can't
+    // silently drop one without this test noticing.
+    EXPECT_EQ(errorCount(r), 3u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/installName"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/loadDylibs"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/<text>/virtualAddress"), 1u)
+        << rejectSummary(r);
 }
 
 TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
@@ -2072,6 +2118,7 @@ TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
     // built — the load IS the test).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"underflow","kind":"macho"},
@@ -2110,6 +2157,7 @@ TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
     // matching this fixture's x86_64 cputype; inert (no trampoline).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-dyld","kind":"macho"},
@@ -2587,6 +2635,7 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-lazy-pending","kind":"macho"},
@@ -2648,6 +2697,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
     // (D-LK10-ENTRY 2.13) — shipped macho64-x86_64-darwin-exec values.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-default","kind":"macho"},
@@ -2676,6 +2726,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
     // (D-LK10-ENTRY 2.13) — shipped macho64-x86_64-darwin-exec values.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-on","kind":"macho"},
@@ -2709,6 +2760,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
     // matching this fixture's x86_64 cputype; inert (no trampoline).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-bad","kind":"macho"},
@@ -2767,6 +2819,7 @@ namespace {
 loadChainedFixupsExecFormat() {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-integration","kind":"macho"},
@@ -3149,6 +3202,7 @@ TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
     // isolates exactly the LC_DYLD_INFO_ONLY/LC_DYSYMTAB swap.
     auto fmtLegacy = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-legacy-for-delta","kind":"macho"},
@@ -3379,6 +3433,7 @@ TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
     // (D-LK10-ENTRY 2.13) — shipped macho64-x86_64-darwin-exec values.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bindnow-default","kind":"macho"},
@@ -3416,6 +3471,7 @@ TEST(MachOExecFormatJson, PageZeroSizeMustBePowerOfTwo) {
     // matching this fixture's x86_64 cputype; inert (no trampoline).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bad-pagezero","kind":"macho"},
@@ -3563,6 +3619,7 @@ TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
     // matching this fixture's x86_64 cputype; inert (no trampoline).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bindnow-wrong","kind":"macho"},
@@ -3603,6 +3660,7 @@ TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-two-libs","kind":"macho"},

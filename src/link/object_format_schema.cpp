@@ -94,6 +94,51 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "elf target on a case-insensitive one");
     }
 
+    // ── D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN: the C-symbol decoration
+    //    rule is REQUIRED on EVERY format ──────────────────────────────
+    //
+    // The loader rejects a missing or unknown `cSymbolDecoration` upstream;
+    // THIS arm is the only thing standing between a HAND-BUILT
+    // `ObjectFormatData` and a schema whose decoration rule was never
+    // declared. That path is real and is exactly the one the linker and the
+    // walkers are handed: `ObjectFormatSchema{ObjectFormatData}` is a public
+    // constructor that runs NO validation, so every in-memory producer
+    // reaches the engine without passing the JSON tier at all.
+    //
+    // ★★ THE TEETH — READ THIS BEFORE ADDING ANY CONDITION TO THE LINE
+    // BELOW. The predicate guarding this rule is the constant `true`: there
+    // is no `if (isExecFlavor())`, no `if (kind == …)`, nothing. That is
+    // deliberate and it is what makes the rule enforce anything at all, for
+    // three independent reasons:
+    //   * a relocatable Mach-O `.o` carries `_main` exactly as its MH_EXECUTE
+    //     sibling does — the decoration is not an executable-only property;
+    //   * `unapplyCMangling` runs on LIBRARY INGEST, which happens under
+    //     whatever flavor is being produced, including a staticlib;
+    //   * decisively, A UNIVERSAL PREDICATE CANNOT BE TAUTOLOGICAL. Contrast
+    //     the `processExit ⇒ isExecFlavor()` rule in this same function: its
+    //     ET_DYN arm enforces NOTHING, because `elfDynPieShape` counts
+    //     `processExit.has_value()` as one of its own cluster members, so the
+    //     antecedent already contains the consequent. The tree says so in its
+    //     own words at `ObjectFormatSchema::isExecFlavor()` — "a TAUTOLOGY
+    //     [that] enforces nothing". A rule whose guard is `true` has no
+    //     antecedent to be contaminated.
+    //
+    // ★ VERIFIED at the time of writing (grep of this header + this file):
+    // NO sibling predicate reads `cSymbolDecoration` — not `isExecFlavor()`,
+    // not `isImageFlavor()`, not `allowsUndefinedImports()`, not
+    // `isStaticArchive()`. IF A FUTURE PREDICATE STARTS READING THIS FIELD,
+    // AND THIS RULE IS EVER GATED ON THAT PREDICATE, THE RULE LOSES ITS TEETH
+    // ON THAT ARM — which is the processExit story repeating. Keep the guard
+    // constant, or the reason it is safe disappears with it.
+    if (cSymbolDecorationSchemeName(cSymbolDecoration.scheme).empty()) {
+        fail("/cSymbolDecoration",
+             "missing required 'cSymbolDecoration' — every object format must "
+             "declare how a canonical C identifier is decorated to obtain its "
+             "linker-visible name ('none' or 'leading-underscore'); a silent "
+             "default would re-hide the rule in the engine's C++ table, which "
+             "is the two-owner defect this key exists to remove");
+    }
+
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): container rules ──
     //
     // `container: archive` is a STATIC-LIBRARY format: its driver output is

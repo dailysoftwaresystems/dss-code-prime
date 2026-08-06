@@ -339,10 +339,21 @@ struct DSS_EXPORT CuMirModule {
     // `libraryShimRecipes` is empty there anyway); a non-empty THREADS partition with a
     // nullopt vehicle is a fail-loud in the synth pass (never a silently-assumed vehicle).
     std::optional<LibrarySynthesis> librarySynthesis;
-    // D-CSUBSET-C11-THREADS-MACHO: the active object format's kind, captured here so the
-    // LOWER half's `synthesizeThreadsShim` can C-mangle its native helper-import names for
-    // the format (macho prepends `_`) — the SAME applyCMangling the FFI ingest uses.
-    ObjectFormatKind objectFormat = ObjectFormatKind::Unknown;
+    // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN (step C4): the active format's DECLARED
+    // C-symbol decoration scheme, captured here so the LOWER half can C-mangle names for
+    // the format — `synthesizeThreadsShim`'s native helper imports and `nameOf`'s
+    // definition merge-keys — via the SAME `applyCMangling`/`linkNameFor` the FFI ingest
+    // uses.
+    //
+    // ★ THIS FIELD USED TO BE `ObjectFormatKind objectFormat`, i.e. the format's
+    // IDENTITY, and the change is the point rather than a rename. The mangling rule now
+    // arrives as a declared VERB read out of `.format.json`, so the LOWER half is handed
+    // the ANSWER and never the question — it cannot ask "which format is this?" because
+    // the struct no longer carries it. The `Unspecified` zero stays an INVALID sentinel
+    // exactly as the old `Unknown` did (same discipline as `librarySynthesis` keeping
+    // "absent" representable): every loaded schema carries a real scheme, because
+    // `ObjectFormatData::validate()` requires one on every format, unconditionally.
+    CSymbolDecorationScheme cSymbolDecoration = CSymbolDecorationScheme::Unspecified;
     // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the RESOLVED calling convention's WHOLE
     // `vaListLayout` block, captured here for the SAME reason as `librarySynthesis`/
     // `objectFormat` — the LOWER half sees only this struct, and `synthesizeStdioShim`'s

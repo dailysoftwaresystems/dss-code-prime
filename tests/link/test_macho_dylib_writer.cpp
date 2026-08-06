@@ -45,6 +45,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
+#include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "link/format/macho.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
@@ -68,6 +69,10 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::countWithMessage;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -1071,6 +1076,7 @@ namespace {
                                         std::string_view textVa = "16384") {
     std::string s = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dylib","kind":"macho"},
@@ -1149,6 +1155,7 @@ TEST(MachoDylibFormatJsonValidate, InstallNameOnExecRejected) {
     // executable schema.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-exec-badid","kind":"macho"},
@@ -1157,6 +1164,14 @@ TEST(MachoDylibFormatJsonValidate, InstallNameOnExecRejected) {
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294983680}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED: this fixture is exec-flavored (filetype "execute") but
+    // declares neither `processExit` nor `entryCallingConvention`, so
+    // D-LK10-ENTRY 2.13's entry-cluster requirement fires ALONGSIDE the
+    // installName-on-exec rule this test pins -- two independent
+    // defects, not a knock-on of one.
+    EXPECT_EQ(errorCount(r), 2u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/installName"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 1u) << rejectSummary(r);
 }
 
 TEST(MachoDylibFormatJsonValidate, MissingInstallNameRejected) {
@@ -1164,6 +1179,7 @@ TEST(MachoDylibFormatJsonValidate, MissingInstallNameRejected) {
     // from the output file name, so an unset installName fails HERE.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dylib-noid","kind":"macho"},
@@ -1172,6 +1188,12 @@ TEST(MachoDylibFormatJsonValidate, MissingInstallNameRejected) {
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":16384}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: pageZeroSize/dylinkerPath default to the
+    // values a dylib requires, loadDylibs is non-empty, and __text's
+    // virtualAddress (16384) already equals segmentPageSize, so the
+    // empty installName is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/installName"), 1u) << rejectSummary(r);
 }
 
 // -- (8) c171: the x86_64 .dylib variant-parity sibling -----------

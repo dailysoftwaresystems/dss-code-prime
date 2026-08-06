@@ -444,6 +444,11 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
 # tests/test_support/arm_verdict_ledger.hpp, with a reason. Empty verdict = "still
 # in flight"; Step 9 refuses to let any declared leg end that way.
 declare -A LEG_CC=() LEG_CC_MACHINE=() LEG_TCL_LIB=() LEG_Z_LIB=() LEG_VERDICT=() LEG_VERDICT_DETAIL=()
+# EVERY leg that resolved a libtcl, INCLUDING one whose zlib did not — the Tcl
+# header/library coherence check (Step 6) is about a version skew, and a leg that
+# found its Tcl can witness one whether or not it is buildable. LEG_TCL_LIB above
+# is deliberately narrower: it is the FIXTURE's precondition and needs both.
+declare -A LEG_TCL_LIB_ANY=()
 # For a leg whose libraries were ACQUIRED (`pinned-archive`): where they landed,
 # and the "<as>\t<path>" lines the resolver reported. Kept because the artefact is
 # not finished when the link is — an acquired library is a STAND-IN whose declared
@@ -2075,10 +2080,21 @@ pass "dss-code-prime built: $DSS_BIN"
 
 # ── Step 6 — stage third-party headers + obtain per-leg libs ─────────────────
 step "6/9  Third-party headers (parsed agnostically) + per-leg tcl/zlib libraries"
-# Headers are leg-INDEPENDENT: DSS parses the host tcl/zlib headers agnostically
-# (ABI is irrelevant at parse). The tcl headers sit in a per-version private subdir
-# (safe on -I); zlib.h sits directly in a system include dir (would shadow the OS
-# descriptors) → stage a private copy of just zlib.h + zconf.h.
+# Headers are leg-INDEPENDENT as far as ABI goes: DSS parses the host tcl/zlib
+# headers agnostically (ABI is irrelevant at parse). The tcl headers sit in a
+# per-version private subdir (safe on -I); zlib.h sits directly in a system
+# include dir (would shadow the OS descriptors) → stage a private copy of just
+# zlib.h + zconf.h.
+# ⚠ THAT SENTENCE USED TO STOP AT "leg-INDEPENDENT", AND IT IS ONLY HALF TRUE —
+# which is why the defect below survived for months
+# [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED].
+# True of ABI. FALSE of API SURFACE: the header VERSION selects WHICH SYMBOLS the
+# fixture REFERENCES (sqlite's tclsqlite.c gates live code on
+# TCL_MAJOR_VERSION>8), and that is a LINK-time, PER-LEG fact. The Tcl chosen
+# here is the ONE Tcl input this harness still takes from the HOST while every
+# leg's library is pinned by its own TARGET-keyed provider — so after the
+# per-leg libraries are resolved below, the two are compared leg by leg and a
+# skew REFUSES the run.
 THIRD_PARTY_INCS=()
 # find_in / the *_ROOTS lists / tcl_configs / tcl_cfg_for all live in the SHARED
 # THIRD-PARTY DISCOVERY block above Step 4 — Step 4's `ensure_tclsh` needs the very
@@ -2651,6 +2667,7 @@ for leg in "${LEG_ORDER[@]}"; do
       resolve to an empty library pair and read as a missing input — so it fails loud here."
       ;;
   esac
+  [[ -z "$tcl_lib" ]] || LEG_TCL_LIB_ANY["$leg"]="$tcl_lib"
   if [[ -z "$tcl_lib" || -z "$z_lib" ]]; then
     _lost="libtcl and libz"
     [[ -n "$tcl_lib" ]] && _lost="libz"
@@ -2662,6 +2679,62 @@ for leg in "${LEG_ORDER[@]}"; do
   LEG_TCL_LIB["$leg"]="$tcl_lib"; LEG_Z_LIB["$leg"]="$z_lib"
   info "[$leg] libs ($provider): $tcl_lib  +  $z_lib"
 done
+
+# ── THE FOURTH Tcl COHERENCE CHECK — AND THE ONLY PER-LEG ONE ────────────────
+# [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED]
+#
+# The three checks above — `PINNED Tcl skew after Step 4` (interpreter-vs-
+# staging), `Tcl staging is INCOHERENT` (header-vs-tclConfig) and `RECIPE/STAGING
+# Tcl MISMATCH` (recipe-vs-staging), named by their diagnostics rather than by
+# line numbers that go stale — are ALL HOST-SCOPED: they hold this machine's Tcl
+# installation to account against itself. Not one of them compares the staged
+# header against the library a LEG WILL ACTUALLY LINK — and that is the
+# comparison that matters, because the header above is the ONE Tcl input this
+# harness still takes from the HOST while every leg's library is pinned by its
+# TARGET-keyed provider.
+#
+# ✔MEASURED 2026-08-06, first native macOS run: a 9.0 header (that host's default
+# Homebrew tcl-tk) over the pinned 8.6 libraries produced four K_SymbolUndefined
+# — Tcl_GetBool, Tcl_GetBoolFromObj, Tcl_GetBytesFromObj, Tcl_GetChild — because
+# sqlite's tclsqlite.c gates live code on TCL_MAJOR_VERSION>8. On Linux the host
+# tclsh is 8.6, so header and library had agreed BY ACCIDENT OF THE HOST.
+#
+# ★ FATAL, NEVER A WARN. A warn here builds a binary that links clean and then
+# misbehaves, which is the exact class this harness exists to prevent. A leg
+# whose library version cannot be MEASURED is the one soft outcome, and it is a
+# loud warning naming that leg — never a silent pass.
+#
+# ★ THE COMPARISON LIVES IN $LEG_RESOLVER, NOT HERE — the same argument
+# --translate-path and --resolve-library-argv already make. build-and-test.ps1
+# calls the identical verb, so this capability cannot exist in one driver and
+# not the other [D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER].
+# It reads the library's BYTES (export table + self-declared identity), never the
+# file name: `libtcl8.6.so` is what somebody CALLED the file, and a name being
+# trusted is what this whole anchor is about.
+declare -a _tclcoh=(); _tclcoh_n=0
+for leg in "${LEG_ORDER[@]}"; do
+  # LEG_TCL_LIB_ANY, not LEG_TCL_LIB: a leg whose zlib is missing is not BUILT,
+  # but its libtcl is still evidence about the run's one host-chosen input, and
+  # a skew it witnesses is a skew every other leg has too.
+  [[ -n "${LEG_TCL_LIB_ANY[$leg]:-}" ]] || continue
+  _tclcoh+=(--leg-tcl-library "$leg=${LEG_TCL_LIB_ANY[$leg]}"); _tclcoh_n=$((_tclcoh_n + 1))
+done
+if [[ "$_tclcoh_n" -gt 0 ]]; then
+  # rc DIRECTLY off the command substitution, never after a pipe. stderr is
+  # merged because the refusal IS the diagnostic and losing it would leave the
+  # operator with a bare exit code.
+  if _tclcoh_out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+                      --tcl-coherence --staged-tcl-header "$TCL_INC/tcl.h" \
+                      "${_tclcoh[@]}" 2>&1)"; then _tclcoh_rc=0; else _tclcoh_rc=$?; fi
+  if [[ "$_tclcoh_rc" -ne 0 ]]; then
+    die "Tcl HEADER/LIBRARY COHERENCE FAILED (rc=$_tclcoh_rc) — refusing to build.
+$(printf '%s\n' "$_tclcoh_out" | sed 's/^/      /')
+      The staged headers come from THIS HOST ($TCL_INC); every leg's library comes from its own
+      declared provider. This driver will not compile a fixture against one Tcl and link another."
+  fi
+  printf '%s\n' "$_tclcoh_out" | sed 's/^/      /'
+  info "tcl coherence: the staged $TCL_VER headers match the libtcl of all $_tclcoh_n resolved leg(s) — measured from each library's OWN bytes, not its file name"
+fi
 
 # ── each leg's TARGET C compiler — THE CONTROL ARM, NOT A REQUIREMENT ────────
 #

@@ -127,6 +127,7 @@ makeSyscallElfExecFormat() {
     // x86_64 Linux exit_group=231 via SYSCALL (0x0F 0x05) in rax.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-elf-syscall-x64", "version": "0.1", "kind": "elf" },
@@ -158,6 +159,7 @@ makeSyscallElfExecFormatArm64() {
     // AArch64 Linux exit_group=94 via SVC #0 (0xD4000001) in x8.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-elf-syscall-arm64", "version": "0.1", "kind": "elf" },
@@ -1104,6 +1106,12 @@ makeElfExecFormatData(bool withProcessExit) {
     // hand-built ObjectFormatData must set it or validate() reports it,
     // which would pollute the "exactly one problem" assertions below.
     data.headerNameMatching = HeaderNameMatching::CaseSensitive;
+    // Likewise REQUIRED with a zero INVALID sentinel
+    // (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN). Set here for the same reason:
+    // this fixture's whole job is to differ from its sibling in EXACTLY ONE
+    // capability, and an unset required axis would add a second problem to
+    // both halves of the pair.
+    data.cSymbolDecoration.scheme = CSymbolDecorationScheme::None;
     data.entryPoint         = "";   // every shipped exec leaves this empty
     data.externCallDispatch = ExternCallDispatch::DirectPlt;
 
@@ -1222,6 +1230,7 @@ TEST(EntryGateFold, ExecFlavorWithoutProcessExitIsRejectedAtConfigLoad) {
     // T1 below MUST bypass the loader — the vacuity trap.)
     auto const loaded = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-elf-exec-noexit", "version": "0.1", "kind": "elf" },

@@ -504,6 +504,7 @@ TEST(PeFormatJson, NonZeroVirtualAddressRejected) {
     // no-op. Added in LK1 cycle 2 alongside the new field.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe-va","kind":"pe"},
@@ -511,6 +512,13 @@ TEST(PeFormatJson, NonZeroVirtualAddressRejected) {
       "sections":[{"kind":"text","name":".text","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: pe.machine is valid, no optionalHeader
+    // is declared (so its own "must not declare" rule can't co-fire),
+    // and 'segment' is empty, so the non-zero virtualAddress on this
+    // (default) PE .obj row is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/virtualAddress"), 1u)
+        << rejectSummary(r);
 }
 
 // ── PE section with `segment` field rejected (cross-format check) ──
@@ -523,6 +531,7 @@ TEST(PeFormatJson, SegmentFieldRejectedOnPeSection) {
     // silently drop the PE arm (test-analyzer convergence).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe-seg","kind":"pe"},
@@ -530,6 +539,11 @@ TEST(PeFormatJson, SegmentFieldRejectedOnPeSection) {
       "sections":[{"kind":"text","name":".text","segment":"__TEXT","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: pe.machine is valid and virtualAddress
+    // defaults to 0 (satisfying the default PE .obj rule), so the
+    // non-empty 'segment' is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/segment"), 1u) << rejectSummary(r);
 }
 
 // ── pe.machine = 0 validate rejection ──────────────────────────
@@ -539,12 +553,17 @@ TEST(PeFormatJson, ZeroMachineRejectedByValidate) {
     // rejection so a regression that drops the rule ships loud.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe","kind":"pe"},
       "pe": { "machine": 0 }
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: no optionalHeader/sections declared, so
+    // pe.machine==0 is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/pe/machine"), 1u) << rejectSummary(r);
 }
 
 // ── PE relocation addend=non-zero fails loud ───────────────────
@@ -1699,6 +1718,7 @@ TEST(PeExecWriter, DataExternUnderForeignDataImportBindingFailsLoud) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-exec-foreign-data-binding","kind":"pe"},
@@ -2640,6 +2660,7 @@ TEST(PeExecWriter, ExternTargetFailsLoudAsUndefined) {
 TEST(PeExecFormatJsonValidate, MissingImageBaseRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe-exec","kind":"pe"},
@@ -2664,6 +2685,7 @@ TEST(PeExecFormatJsonValidate, MissingImageBaseRejected) {
 TEST(PeExecFormatJsonValidate, ObjWithOptionalHeaderRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"obj-with-opt-hdr","kind":"pe"},
@@ -2671,11 +2693,17 @@ TEST(PeExecFormatJsonValidate, ObjWithOptionalHeaderRejected) {
       "optionalHeader": { "magic": 523 }
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: pe.machine is valid and no sections are
+    // declared, so the optionalHeader-on-.obj rule is the only
+    // diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/optionalHeader"), 1u) << rejectSummary(r);
 }
 
 TEST(PeExecFormatJsonValidate, NonPow2SectionAlignmentRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"odd-align","kind":"pe"},
@@ -2713,6 +2741,7 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentBelowPageSizeRejected) {
     // rejects sub-page alignment with STATUS_INVALID_IMAGE_FORMAT.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"sub-page","kind":"pe"},
@@ -2742,6 +2771,7 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentBelowPageSizeRejected) {
 TEST(PeExecFormatJsonValidate, MissingSubsystemRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-subsystem","kind":"pe"},
@@ -2766,6 +2796,7 @@ TEST(PeExecFormatJsonValidate, MissingSubsystemRejected) {
 TEST(PeExecFormatJsonValidate, MissingStackHeapSizesRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-stack","kind":"pe"},
@@ -2795,6 +2826,7 @@ TEST(PeExecFormatJsonValidate, MissingStackHeapSizesRejected) {
 TEST(PeExecFormatJsonValidate, SectionAlignmentLessThanFileAlignmentRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"sect-lt-file","kind":"pe"},
@@ -2825,6 +2857,7 @@ TEST(PeExecFormatJsonValidate, VirtualAddressNotMultipleOfSectionAlignmentReject
     // of sectionAlignment per PE/COFF §3.4.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"misaligned-va","kind":"pe"},
@@ -2861,6 +2894,7 @@ TEST(PeExecWriter, DllArmEncodesEntrylessImage) {
     // non-empty image with AddressOfEntryPoint == 0.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"a-dll","kind":"pe"},
@@ -3429,6 +3463,7 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"elf-lazy-gate","kind":"elf"},
@@ -3828,6 +3863,7 @@ TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
     char const* const kJson = R"({
       "$comment": "Synthetic PE-Exec schema for D-LK2-RODATA require-section test — declares rodata capability but omits the section row.",
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name": "pe-exec-rodata-no-row", "version": "1.0", "kind": "pe"},
@@ -3915,6 +3951,7 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
     char const* const kJson = R"({
       "$comment": "Synthetic PE-Exec schema for D-LK2-RODATA cert-table-shift test — declares non-zero attributeCertReserveSize so the walker computes cert table offset past rdata+idata.",
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name": "pe-exec-cert-shift", "version": "1.0", "kind": "pe"},

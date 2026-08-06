@@ -393,6 +393,7 @@ TEST(MachOArm64Exit, IndirectSlotDispatchOnMachOFailsLoud) {
     // built, and the guard under test fires before entry resolution.
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-indirect-bad","kind":"macho"},
@@ -662,6 +663,7 @@ TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
     // name is resolved against a target.
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-badpage","kind":"macho"},
@@ -731,6 +733,7 @@ TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
     // NOT the x86_64 sibling's `sysv_amd64`); inert (no trampoline).
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-badva","kind":"macho"},

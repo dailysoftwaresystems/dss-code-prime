@@ -59,6 +59,7 @@ namespace {
 // `test_elf_writer.cpp`).
 constexpr std::string_view kFormatMatchingX86_64 = R"({
   "dssObjectFormatVersion": 1,
+  "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
   "format": {"name": "test-elf", "kind": "elf"},
@@ -83,6 +84,7 @@ constexpr std::string_view kFormatMatchingX86_64 = R"({
 // declared so the ELF walker doesn't pollute the diagnostic count.
 constexpr std::string_view kFormatMissingReloc = R"({
   "dssObjectFormatVersion": 1,
+  "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
   "format": {"name": "test-elf-bare", "kind": "elf"},
@@ -255,6 +257,7 @@ TEST(Linker, ImageWithNoDataBindingStillRejectsReferencedDataExtern) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-exec-no-data-binding","kind":"pe"},

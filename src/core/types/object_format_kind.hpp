@@ -122,6 +122,111 @@ static_assert([] {
 }(), "ObjectFormatKind ordinals must stay dense from 0 — a per-kind array "
      "sized by the name-table row count would otherwise index out of range");
 
+// ── C-symbol decoration scheme (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN) ──
+//
+// HOW this object format decorates a canonical C identifier to obtain the
+// name the LINKER sees — Apple's leading `_` versus nothing at all. A
+// property of the OBJECT FORMAT's C ABI, exactly like `ExternCallDispatch`
+// / `DataImportBinding` above, and keyed by the format for the same reason:
+// the SAME CPU target decorates under macho64-x86_64-darwin and does not
+// under elf64-x86_64-linux, so the rule cannot live on the target schema.
+//
+// ★ WHY THIS VOCABULARY EXISTS AT ALL — the defect it removes. Before this
+// axis, ONE per-format fact had TWO OWNERS: the closed C++ table
+// `kCManglingRules` (src/ffi/mangling/c_mangle.cpp, keyed on
+// `ObjectFormatKind` and pinned by a `static_assert`), AND a duplicate
+// LITERAL encoding inside the format descriptors themselves — the
+// `macho64-*-exec` files ship `processExit.importMangledName: "_exit"`
+// while their elf/pe siblings ship `"exit"`. A per-format fact encoded
+// twice, in two languages, with nothing forcing the two to agree. That is
+// the agnosticism bar's own shape inverted: per-format vocabulary belongs
+// in `.format.json`, never in a C++ table keyed on a format enum.
+//
+// ★ THE DECORATION IS NOT COSMETIC, and the reason is MEASURED rather than
+// stylistic: on the undecorated formats the underscored spelling ALREADY
+// NAMES A DIFFERENT FUNCTION. `nm -D /lib/x86_64-linux-gnu/libc.so.6`
+// (MEASURED 2026-08-06, WSL Ubuntu) shows `exit@@GLIBC_2.2.5` AND
+// `_exit@@GLIBC_2.2.5` as two distinct exported symbols — C `exit(3)` (which
+// flushes stdio) and POSIX `_exit(2)` (which does not); `objdump -p
+// C:\Windows\System32\ucrtbase.dll` (MEASURED 2026-08-06) likewise exports
+// `exit`, `_exit` AND `_Exit` as three distinct entries. So a format that
+// wrongly claimed `leading-underscore` would not merely produce an ugly
+// name — it would bind a working program to the WRONG FUNCTION, silently.
+//
+// ── Why a CLOSED ENUM and not a prefix STRING ────────────────────────
+// The first design carried the decoration as a literal prefix
+// (`cSymbolDecoration: "_"` / `""`). That was refuted and the refutation
+// adopted: a free string makes every unintended value REPRESENTABLE (`"__"`,
+// `" "`, a trailing-`@N` stdcall suffix that the prefix shape cannot even
+// express), so the config could ask for decorations no engine arm
+// implements and nothing would refuse it at load. A closed verb set can
+// only name schemes that HAVE an implementation, and a typo fails loud at
+// the `…FromName` lookup. Adding 32-bit PE's `_func@N` stdcall rule later
+// is a new enumerator plus its engine arm — never a new string spelling
+// that silently starts working.
+enum class CSymbolDecorationScheme : std::uint8_t {
+    // Zero is the INVALID sentinel: a hand-built `ObjectFormatData` that
+    // never set the field is rejected by `ObjectFormatData::validate()`,
+    // exactly as a zero `DataModel` / `HeaderNameMatching` is. The loader
+    // path always sets it or fails.
+    Unspecified       = 0,
+    // This format does not decorate C symbols: the linker-visible name IS
+    // the canonical C identifier. ELF (System V), PE/COFF x64, WASM (which
+    // reaches imports through its import namespace) and SPIR-V (no C ABI
+    // surface at all).
+    None              = 1,
+    // Apple's convention: exactly ONE leading underscore on every C symbol,
+    // on both 32- and 64-bit Mach-O (the rule has no bitness axis).
+    LeadingUnderscore = 2,
+};
+
+// ★ HAND-ROLLED rather than an `EnumNameTable<E,N>`, and the deviation is the
+// whole point — read `objectFormatKindName`'s "★ THE SENTINEL SPELLS
+// CORRECTLY" note directly above before changing this. `EnumNameTable::name`
+// FALLS BACK TO `rows[0].second` for an unlisted value, so a table that omits
+// the sentinel would report the sentinel under the FIRST REAL SCHEME'S name
+// ("none") — the worst possible answer, since `none` is a legitimate scheme
+// and `validate()` would then see a populated field where none was declared.
+// Listing the sentinel with an empty name instead makes `fromName("")`
+// RESOLVE TO IT, re-opening the same hole from the other side. Neither shape
+// can express "this value has no spelling", so the switch is written out —
+// the `dataModelName` / `headerNameMatchingName` precedent, both of which are
+// hand-rolled for exactly this reason and are both consumed by `validate()`
+// through the `…Name(x).empty()` idiom this enables.
+[[nodiscard]] constexpr std::string_view
+cSymbolDecorationSchemeName(CSymbolDecorationScheme s) noexcept {
+    switch (s) {
+        case CSymbolDecorationScheme::Unspecified:       return {};
+        case CSymbolDecorationScheme::None:              return "none";
+        case CSymbolDecorationScheme::LeadingUnderscore: return "leading-underscore";
+    }
+    return {};
+}
+
+// `Unspecified` deliberately has NO JSON spelling — a spellable "unspecified"
+// would let a typo look deliberate, and would let a format DECLARE the
+// invalid sentinel and pass the required-declaration rule while meaning
+// nothing. The empty string is rejected for the same reason: it is what a
+// `"scheme": ""` typo produces.
+[[nodiscard]] constexpr std::optional<CSymbolDecorationScheme>
+cSymbolDecorationSchemeFromName(std::string_view s) noexcept {
+    if (s == "none")               return CSymbolDecorationScheme::None;
+    if (s == "leading-underscore") return CSymbolDecorationScheme::LeadingUnderscore;
+    return std::nullopt;
+}
+
+// The format's C-symbol decoration block (`"cSymbolDecoration"` in
+// `.format.json`). A BLOCK carrying one `scheme` verb rather than a bare
+// scalar, mirroring `processExit`'s `mechanism` dispatch: a future scheme
+// that needs per-arm PARAMETERS (32-bit PE stdcall's `@N` byte count, say)
+// gains a sibling key INSIDE this block instead of a second root key that
+// only some formats may legally declare. REQUIRED on every format — see
+// `ObjectFormatData::validate()` for why the rule is unconditional rather
+// than exec-flavor-gated.
+struct DSS_EXPORT CSymbolDecoration {
+    CSymbolDecorationScheme scheme = CSymbolDecorationScheme::Unspecified;
+};
+
 // ── Extern-call dispatch model (D-FFI-EXTERN-CALL-DISPATCH) ────────
 //
 // How an extern (shipped-library / cross-image) CALL is reached AT THE

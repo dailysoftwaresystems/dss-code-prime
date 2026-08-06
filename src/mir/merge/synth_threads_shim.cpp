@@ -70,7 +70,7 @@ bool synthesizeThreadsShim(
     TypeInterner&                                         interner,
     std::unordered_map<std::uint32_t, std::string> const& recipeBySymbol,
     std::optional<LibrarySynthesis> const&                librarySynthesis,
-    ObjectFormatKind                                      format,
+    CSymbolDecorationScheme                               scheme,
     std::vector<ExternImport>&                            externImports,
     DiagnosticReporter&                                   reporter) {
     // Presence gate: no tagged shim symbol ⇒ clean no-op (every elf + every non-threads
@@ -225,13 +225,13 @@ bool synthesizeThreadsShim(
     for (auto const& e : externImports)
         if (!e.isData) helperSyms.emplace(e.mangledName, e.symbol);
     auto importOf = [&](std::string const& name, TypeId helperSig) -> MirInstId {
-        // C-mangle the helper's canonical C name for the active format (macho prepends `_`;
-        // elf/pe are identity) — the SAME `applyCMangling(name, format)` the FFI ingest
+        // C-mangle the helper's canonical C name for the active format (leading-underscore
+        // prepends `_`; none is identity) — the SAME `applyCMangling` the FFI ingest
         // applies, so the on-disk undefined-symbol name matches the library's export
         // (libSystem exports `_pthread_mutex_init`, kernel32 `InitializeCriticalSection`).
         // Dedup by the MANGLED name so a TU that ALSO imports the helper via <pthread.h>/
         // <windows.h> (whose ExternImport.mangledName is already mangled) reuses that symbol.
-        std::string const mangled = dss::ffi::applyCMangling(name, format);
+        std::string const mangled = dss::ffi::applyCMangling(name, scheme);
         SymbolId hs;
         if (auto it = helperSyms.find(mangled); it != helperSyms.end()) {
             hs = it->second;

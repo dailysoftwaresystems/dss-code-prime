@@ -794,6 +794,28 @@ struct DSS_EXPORT ObjectFormatData {
     // validate() (the loader path always sets it or fails).
     HeaderNameMatching   headerNameMatching{};
 
+    // ── D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN: the C-symbol decoration rule ──
+    //
+    // REQUIRED top-level `"cSymbolDecoration"` BLOCK (`{"scheme": "none"}` /
+    // `{"scheme": "leading-underscore"}`; closed enum, loader fails loud on
+    // missing OR unknown). How this format decorates a canonical C identifier
+    // to obtain the LINKER-visible name. Like `dataModel` and
+    // `headerNameMatching` it is a per-(OS × format) fact one CPU target
+    // cannot answer — the same x86_64 target decorates under
+    // macho64-x86_64-darwin and does not under elf64-x86_64-linux — and like
+    // them it is REQUIRED rather than optional-with-default, because the whole
+    // defect being closed is a per-format fact with TWO OWNERS that nothing
+    // forced to agree. A silent default would simply make the C++ table's
+    // answer the winner again, invisibly, for any file that forgot the key.
+    //
+    // See `CSymbolDecoration` (core/types/object_format_kind.hpp) for the
+    // full rationale, the closed-enum-vs-prefix-string decision, and the
+    // MEASURED evidence that `_exit` already names a DIFFERENT function on
+    // both undecorated formats. The zero-scheme default is the INVALID
+    // sentinel: a hand-built ObjectFormatData that never set it is rejected
+    // by validate() (the loader path always sets it or fails).
+    CSymbolDecoration    cSymbolDecoration{};
+
     // ── D-CSUBSET-BITFIELD-ABI-EXACT: the per-ABI bit-field PACKING strategy ──
     //
     // C bit-field allocation is genuinely ABI-defined and is determined by the
@@ -1229,6 +1251,15 @@ public:
     // `__has_include` answer the TARGET's convention on any build host.
     [[nodiscard]] HeaderNameMatching   headerNameMatching() const noexcept {
         return d_.headerNameMatching;
+    }
+    // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN: how THIS format decorates a
+    // canonical C identifier to obtain the linker-visible name (`none` /
+    // `leading-underscore`). Always a REAL scheme for a loader-produced
+    // schema — the field is REQUIRED + closed-enum at load, and
+    // `validate()` rejects the `Unspecified` sentinel on the in-memory
+    // path too, so no caller has to defend against it.
+    [[nodiscard]] CSymbolDecoration const& cSymbolDecoration() const noexcept {
+        return d_.cSymbolDecoration;
     }
     // D-CSUBSET-BITFIELD-ABI-EXACT: the format's declared bit-field strategy, or
     // `None` if it declared none (the caller falls back to the target's value via

@@ -209,6 +209,7 @@ TEST(ElfExecFormatJson, ShippedFileLoadsCleanlyWithExecFields) {
 TEST(ElfExecFormatJson, InterpreterTypeCheckRejectsNonString) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-interp","kind":"elf"},
@@ -237,6 +238,7 @@ TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
     // empty); explicit empty is not.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"empty-interp","kind":"elf"},
@@ -266,12 +268,18 @@ TEST(ElfRelFormatJson, InterpreterOnRelFormatRejectedAtLoad) {
     // ET_REL/virtualAddress!=0 reject.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"rel-with-interp","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel", "interpreter": "/lib64/ld-linux-x86-64.so.2" }
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: class/data/machine are valid and no
+    // sections are declared, so the ET_REL interpreter is the only
+    // diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/elf/interpreter"), 1u) << rejectSummary(r);
 }
 
 TEST(ElfRelFormatJson, BindNowFalseOnRelFormatRejectedAtLoad) {
@@ -283,12 +291,18 @@ TEST(ElfRelFormatJson, BindNowFalseOnRelFormatRejectedAtLoad) {
     // review.)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"rel-with-bindnow-false","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel", "bindNow": false }
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: class/data/machine are valid and no
+    // sections are declared, so ET_REL's rejected bindNow=false is the
+    // only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/elf/bindNow"), 1u) << rejectSummary(r);
 }
 
 TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
@@ -305,6 +319,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
     // validate() ties the interpreter to the cluster on ET_DYN only.)
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-interp","kind":"elf"},
@@ -525,6 +540,7 @@ TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingFutureWork) {
     // machine guard rejects before any trampoline work reads it.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"riscv-exec","kind":"elf"},
@@ -1084,6 +1100,7 @@ TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
     // "sym_42" IS the behavior under test.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-entry-named","kind":"elf"},
@@ -1124,6 +1141,7 @@ TEST(ElfExecWriter, UnknownEntryPointOnDynamicPathFailsLoud) {
     // resolver and erase the K_SymbolUndefined this test pins.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-bad-entry","kind":"elf"},
@@ -1195,6 +1213,7 @@ TEST(ElfExecWriter, ExternImportsProduceDynamicImage) {
 TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bindnow-wrong-type","kind":"elf"},
@@ -1221,6 +1240,7 @@ TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
     // reaches the bindNow default it is here to pin.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bindnow-default","kind":"elf"},
@@ -1243,6 +1263,7 @@ TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
     // resolver runs.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"elf-lazy-pending","kind":"elf"},
@@ -1797,6 +1818,7 @@ TEST(ElfExecWriter, ZeroFunctionModuleFailLoud) {
 TEST(ElfExecFormatJson, ExecWithZeroVirtualAddressRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-exec","kind":"elf"},
@@ -1832,6 +1854,7 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
     // 4096, so the value cannot be hardcoded in the walker.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-page-align","kind":"elf"},
@@ -1855,6 +1878,7 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
 TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"odd-page-align","kind":"elf"},
@@ -1884,6 +1908,7 @@ TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
 TEST(ElfRelFormatJson, RelWithNonZeroVirtualAddressRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-rel","kind":"elf"},
@@ -1891,17 +1916,30 @@ TEST(ElfRelFormatJson, RelWithNonZeroVirtualAddressRejected) {
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: class/data/machine are valid and
+    // 'segment' is empty (an ELF row), so the non-zero virtualAddress
+    // on this ET_REL row is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/virtualAddress"), 1u)
+        << rejectSummary(r);
 }
 
 TEST(ElfFormatJson, UnknownTypeStringRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-type","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"executable" }
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: the loader emits this diagnostic and
+    // leaves `elf.type` at its Rel default (no return); class/data/
+    // machine are valid and no sections are declared, so validate()
+    // adds nothing further.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/elf/type"), 1u) << rejectSummary(r);
 }
 
 // PE NonZeroVirtualAddressRejected test relocated to
@@ -1929,6 +1967,7 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
     // returns before `entryPoint` is read.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"forge-exec","kind":"elf"},
@@ -1975,6 +2014,7 @@ TEST(ElfExecWriter, UnknownEntryPointFailsLoud) {
     // and erase the K_SymbolUndefined this test pins.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-entry","kind":"elf"},
@@ -2085,6 +2125,7 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
     // the empty-PT_INTERP reject is what this test pins.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-interp","kind":"elf"},

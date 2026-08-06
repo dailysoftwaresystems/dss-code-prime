@@ -101,13 +101,13 @@ readSource(IngestionSource const& src, DiagnosticReporter& reporter,
 //                                     F_MangleMissingExpectedPrefix
 //                                     already in the reporter
 [[nodiscard]] std::optional<std::string>
-toCanonicalName(ImportSurface const& row, ObjectFormatKind format,
+toCanonicalName(ImportSurface const& row, CSymbolDecorationScheme scheme,
                 bool fromBinary, DiagnosticReporter& reporter) {
     if (!fromBinary) {
         // FF2 header-parser rows are already canonical by design.
         return row.mangledName;
     }
-    auto canonical = unapplyCManglingStrict(row.mangledName, format, reporter);
+    auto canonical = unapplyCManglingStrict(row.mangledName, scheme, reporter);
     if (!canonical) {
         // Underlying diagnostic already emitted by strict unapply.
         return std::nullopt;
@@ -284,7 +284,8 @@ ingest(std::span<IngestionSource const> sources,
     bySymbol.reserve(aggregated.size());
     for (auto const& tagged : aggregated) {
         auto canonical = toCanonicalName(
-            tagged.row, format.kind(), tagged.fromBinary, reporter);
+            tagged.row, format.cSymbolDecoration().scheme, tagged.fromBinary,
+            reporter);
         if (!canonical) continue;  // strict-unapply already reported
         // post-fold #6 silent-failure C1: empty canonical name would
         // emplace `bySymbol[""]` and silently shadow every subsequent
@@ -366,9 +367,10 @@ ingest(std::span<IngestionSource const> sources,
         // libSystem's x86_64 slice exports `_fstat$INODE64`, so that (un-
         // decorated: `fstat$INODE64`) is the only key that can match its row.
         std::string const linkerName =
-            linkNameFor(ext.canonicalName, ext.asmName, format.kind(),
-                        ext.linkName);
-        auto it = bySymbol.find(unapplyCMangling(linkerName, format.kind()));
+            linkNameFor(ext.canonicalName, ext.asmName,
+                        format.cSymbolDecoration().scheme, ext.linkName);
+        auto it = bySymbol.find(
+            unapplyCMangling(linkerName, format.cSymbolDecoration().scheme));
         if (it == bySymbol.end()) continue;  // unmatched -> caller applies policy
         TaggedRow const& matched = *it->second;
 
@@ -536,7 +538,8 @@ synthesizeFfiFromSourceDecls(
         // definition rail's `nameOf`, which passes the SymbolRecord's copy of the
         // identical string, produces the identical bytes).
         meta.mangledName   = linkNameFor(ext.canonicalName, ext.asmName,
-                                         format.kind(), ext.linkName);
+                                         format.cSymbolDecoration().scheme,
+                                         ext.linkName);
         meta.linkage       = FfiLinkage::Strong;
         meta.visibility    = FfiVisibility::Default;
         // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3): a

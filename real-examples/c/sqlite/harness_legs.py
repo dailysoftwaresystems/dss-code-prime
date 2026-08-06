@@ -982,6 +982,496 @@ def verify_shared_lib(path, want_container):
     return (True, "%d bytes, %s" % (len(blob), detail))
 
 
+# ── Tcl HEADER-vs-LIBRARY coherence, PER LEG ────────────────────────────────
+# [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED]
+#
+# THE DEFECT THIS EXISTS FOR (✔MEASURED 2026-08-06, first native macOS run):
+# the drivers pick the Tcl HEADER from the HOST (tclsh on PATH -> its
+# tclConfig.sh -> TCL_INCLUDE_SPEC) while EVERY leg's Tcl LIBRARY is pinned by
+# its provider. On a Mac whose default Homebrew tcl-tk is 9.0.3 the fixture
+# compiled against a 9.0 header and linked an 8.6 library, and sqlite's
+# tclsqlite.c gates live code on TCL_MAJOR_VERSION>8 — so the build died with
+# four K_SymbolUndefined (Tcl_GetBool, Tcl_GetBoolFromObj, Tcl_GetBytesFromObj,
+# Tcl_GetChild) that a human had to reverse-engineer back to a version skew.
+# On Linux the host tclsh is 8.6, so header and library agreed BY ACCIDENT OF
+# THE HOST — which is why hundreds of green runs never saw it.
+#
+# The drivers already had THREE Tcl coherence checks (interpreter-vs-staging,
+# header-vs-tclConfig, recipe-vs-staging) and ALL THREE ARE HOST-SCOPED. This is
+# the missing FOURTH one, and the only PER-LEG one: it compares the staged
+# header against the library each leg will actually LINK.
+#
+# ★ WHY IT IS HERE AND NOT IN THE DRIVERS. Both drivers hard-require this module
+# already, and library ACQUISITION was centralised here for exactly this reason
+# (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER: a capability
+# in one driver and not the other is a recurring defect class in this harness).
+# ONE implementation, two callers.
+#
+# ★★ A FILE NAME IS NOT A MEASUREMENT. `libtcl8.6.so` is what somebody called
+# the file; the whole defect above is a name being trusted. Nothing here reads
+# the path it was handed except to report it. Two INDEPENDENT instruments are
+# taken out of the BYTES, and either one may veto:
+#
+#   A. STRUCTURAL — the library's own export table, read from the container's
+#      own tables (ELF .dynsym, Mach-O LC_SYMTAB, PE export directory). Tcl 9.0
+#      exports four names 8.6 does not, and they are precisely the four the
+#      fixture referenced when this defect fired. Presence of ALL of them says
+#      "major 9"; absence of ALL says "major 8"; a MIX says NOTHING (a Tcl 8.7
+#      is exactly that mix) and is reported as undetermined rather than guessed.
+#   B. SELF-DECLARED — the identity the binary stamps on ITSELF and the loader
+#      actually uses: ELF DT_SONAME, Mach-O LC_ID_DYLIB, the PE export
+#      directory's Name. Still a name, but the BINARY'S name for itself, not the
+#      filesystem's, and it carries the MINOR that (A) cannot.
+#
+# Each instrument is compared against the staged header independently. A
+# disagreement from EITHER is fatal; "cannot determine" only happens when BOTH
+# are silent, and that is a WARN-and-skip, never a silent pass.
+#
+# ✔MEASURED 2026-08-06 — the readers below, on FIVE real Tcl libraries covering
+# all three containers and two architectures, every one reporting 887/894/883
+# exported names, `Tcl_CreateInterp` present, ZERO of the 9.0 markers:
+#   /usr/lib/x86_64-linux-gnu/libtcl8.6.so            ELF64 x86_64  DT_SONAME    libtcl8.6.so
+#   ~/.cache/dss-code-prime/arm64libs/libtcl8.6.so    ELF64 aarch64 DT_SONAME    libtcl8.6.so
+#   harness-libs/macho64-arm64/libtcl8.6.dylib        Mach-O arm64  LC_ID_DYLIB  /opt/local/lib/libtcl8.6.dylib
+#   harness-libs/macho64-x86_64/libtcl8.6.dylib       Mach-O x86_64 LC_ID_DYLIB  /opt/local/lib/libtcl8.6.dylib
+#   C:/Program Files/Git/mingw64/bin/tcl86.dll        PE64          export Name  tcl86.dll
+# No Tcl 9 library was available on this machine, so the "major 9" arm is
+# exercised by the self-test against SYNTHESISED images of all three containers
+# rather than a measured one. That the four names exist in 9.0 and not in 8.6 is
+# DOCUMENTED (Tcl 9 API) and INFERRED from upstream sqlite calling them under
+# `TCL_MAJOR_VERSION>8`; that they are absent from 8.6 is MEASURED, five times.
+
+# The names Tcl 9.0 exports and Tcl 8.6 does not. Deliberately the SAME four the
+# fixture failed on: if this set ever stops discriminating, it stops
+# discriminating on the exact symbols the defect was made of.
+TCL9_ONLY_EXPORTS = ("Tcl_GetBool", "Tcl_GetBoolFromObj",
+                     "Tcl_GetBytesFromObj", "Tcl_GetChild")
+# Present in EVERY Tcl since 7.x. Its absence does not mean "an old Tcl", it
+# means "this is not a Tcl library" — a resolved path that is something else
+# entirely, which is a different and worse fact than a version skew.
+TCL_SENTINEL_EXPORT = "Tcl_CreateInterp"
+
+SHT_STRTAB = 3
+SHT_DYNAMIC = 6
+SHT_DYNSYM = 11
+DT_NULL = 0
+DT_SONAME = 14
+STB_GLOBAL = 1
+STB_WEAK = 2
+SHN_UNDEF = 0
+LC_SYMTAB = 0x2
+LC_ID_DYLIB = 0xD
+N_STAB = 0xE0
+N_EXT = 0x01
+N_TYPE = 0x0E
+N_SECT = 0x0E
+
+
+def _elf_exports(blob):
+    """(exported names, DT_SONAME) for an ELF64 shared object, or (None, why).
+
+    Read through the SECTION headers rather than PT_DYNAMIC's hash tables: a
+    library on disk has them, and .dynsym's sh_size/sh_entsize gives the symbol
+    count directly, where DT_GNU_HASH would have to be walked to recover it.
+    Endianness comes from EI_DATA, never from the host — this file is read on a
+    machine that may not share the target's byte order."""
+    import struct
+    if blob[:4] != b"\x7fELF" or len(blob) < 64:
+        return None, "not an ELF image"
+    if blob[4] != 2:
+        return None, "ELF but not 64-bit (EI_CLASS=%d)" % blob[4]
+    end = "<" if blob[5] == 1 else ">"
+    e_shoff, = struct.unpack(end + "Q", blob[0x28:0x30])
+    e_shentsize, e_shnum = struct.unpack(end + "HH", blob[0x3A:0x3E])
+    if not e_shoff or e_shentsize < 64 or not e_shnum:
+        return None, "no section header table (stripped?)"
+    secs = []
+    for i in range(e_shnum):
+        o = e_shoff + i * e_shentsize
+        if o + 64 > len(blob):
+            return None, "the section header table runs past the end of the file"
+        _nm, stype, _fl, _ad, off, size, link, _in, _al, entsz = struct.unpack(
+            end + "IIQQQQIIQQ", blob[o:o + 64])
+        secs.append((stype, off, size, link, entsz))
+
+    def _strtab(link):
+        if link >= len(secs) or secs[link][0] != SHT_STRTAB:
+            return None
+        _t, off, size, _l, _e = secs[link]
+        return blob[off:off + size]
+
+    def _at(tab, idx):
+        stop = tab.find(b"\0", idx)
+        return tab[idx:stop if stop >= 0 else len(tab)]
+
+    names, soname, saw_dynsym = set(), "", False
+    for stype, off, size, link, entsz in secs:
+        if stype == SHT_DYNSYM and entsz >= 24:
+            tab = _strtab(link)
+            if tab is None:
+                continue
+            saw_dynsym = True
+            for k in range(size // entsz):
+                so = off + k * entsz
+                if so + 24 > len(blob):
+                    break
+                st_name, st_info, _oth, st_shndx = struct.unpack(
+                    end + "IBBH", blob[so:so + 8])
+                if st_shndx == SHN_UNDEF:
+                    continue          # imported, not exported
+                if (st_info >> 4) not in (STB_GLOBAL, STB_WEAK):
+                    continue          # local
+                nm = _at(tab, st_name)
+                if nm:
+                    names.add(nm.decode("ascii", "replace"))
+        elif stype == SHT_DYNAMIC:
+            tab = _strtab(link)
+            if tab is None:
+                continue
+            p = off
+            while p + 16 <= off + size and p + 16 <= len(blob):
+                tag, val = struct.unpack(end + "qQ", blob[p:p + 16])
+                if tag == DT_NULL:
+                    break
+                if tag == DT_SONAME:
+                    soname = _at(tab, val).decode("ascii", "replace")
+                p += 16
+    if not saw_dynsym:
+        return None, "ELF64 with no .dynsym — it exports nothing readable"
+    return names, soname
+
+
+def _macho_exports(blob):
+    """(exported names, LC_ID_DYLIB install name) for a THIN 64-bit little-endian
+    Mach-O, or (None, why). Names are de-underscored: Mach-O's asm-level `_Tcl_x`
+    is the C symbol `Tcl_x`, and every caller here speaks C."""
+    import struct
+    if len(blob) < 32:
+        return None, "too small to be a Mach-O image"
+    magic, = struct.unpack("<I", blob[:4])
+    if magic != MH_MAGIC_64:
+        if _fat_slices(blob):
+            return None, ("a Mach-O FAT/universal archive — the leg's own slice "
+                          "must be selected before this can be read "
+                          "[D-FF1-MACHO-FAT]")
+        return None, "not a thin 64-bit little-endian Mach-O"
+    ncmds, = struct.unpack("<I", blob[16:20])
+    names, ident, saw_symtab = set(), "", False
+    p = 32
+    for _ in range(ncmds):
+        if p + 8 > len(blob):
+            break
+        cmd, cmdsize = struct.unpack("<II", blob[p:p + 8])
+        if cmdsize < 8:
+            break
+        if cmd == LC_SYMTAB and p + 24 <= len(blob):
+            symoff, nsyms, stroff, strsize = struct.unpack(
+                "<IIII", blob[p + 8:p + 24])
+            tab = blob[stroff:stroff + strsize]
+            saw_symtab = True
+            for k in range(nsyms):
+                so = symoff + k * 16
+                if so + 16 > len(blob):
+                    break
+                n_strx, n_type, _sect, _desc = struct.unpack(
+                    "<IBBH", blob[so:so + 8])
+                if n_type & N_STAB:
+                    continue          # a debug entry, not a symbol
+                if not n_type & N_EXT:
+                    continue          # not external
+                if (n_type & N_TYPE) != N_SECT:
+                    continue          # undefined/absolute/indirect, not defined here
+                stop = tab.find(b"\0", n_strx)
+                nm = tab[n_strx:stop if stop >= 0 else len(tab)]
+                if nm:
+                    s = nm.decode("ascii", "replace")
+                    names.add(s[1:] if s.startswith("_") else s)
+        elif cmd == LC_ID_DYLIB and p + 12 <= len(blob):
+            nameoff, = struct.unpack("<I", blob[p + 8:p + 12])
+            ident = blob[p + nameoff:p + cmdsize].split(b"\0")[0].decode(
+                "utf-8", "replace")
+        p += cmdsize
+    if not saw_symtab:
+        return None, "Mach-O with no LC_SYMTAB — it exports nothing readable"
+    return names, ident
+
+
+def _pe_exports(blob):
+    """(exported names, the export directory's own Name) for a PE32+ image, or
+    (None, why). The Name field is the DLL's self-declared identity — the name
+    an importer records — and it is NOT required to equal the file name."""
+    import struct
+    if blob[:2] != b"MZ" or len(blob) < 0x40:
+        return None, "not an MZ/PE image"
+    e_lfanew, = struct.unpack("<I", blob[0x3C:0x40])
+    if e_lfanew + 24 > len(blob) or blob[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+        return None, "an MZ image whose e_lfanew does not point at a PE signature"
+    nsec, = struct.unpack("<H", blob[e_lfanew + 6:e_lfanew + 8])
+    opt_size, = struct.unpack("<H", blob[e_lfanew + 20:e_lfanew + 22])
+    opt = e_lfanew + 24
+    if opt + 2 > len(blob):
+        return None, "truncated optional header"
+    magic, = struct.unpack("<H", blob[opt:opt + 2])
+    if magic != 0x20B:
+        return None, "PE but not PE32+ (optional header magic 0x%04X)" % magic
+    ddir = opt + 112                  # PE32+ data directories start here
+    if ddir + 8 > len(blob):
+        return None, "truncated data directories"
+    exp_rva, _exp_size = struct.unpack("<II", blob[ddir:ddir + 8])
+    if not exp_rva:
+        return None, "PE32+ with an empty export data directory — it exports nothing"
+    secs = []
+    for i in range(nsec):
+        o = opt + opt_size + i * 40
+        if o + 40 > len(blob):
+            return None, "the section table runs past the end of the file"
+        vsize, vaddr, rawsize, rawptr = struct.unpack("<IIII", blob[o + 8:o + 24])
+        secs.append((vaddr, max(vsize, rawsize), rawptr))
+
+    def _off(rva):
+        for vaddr, vspan, rawptr in secs:
+            if vaddr <= rva < vaddr + vspan:
+                return rawptr + (rva - vaddr)
+        return None
+
+    def _cstr(rva):
+        o = _off(rva)
+        if o is None or o >= len(blob):
+            return ""
+        stop = blob.find(b"\0", o)
+        return blob[o:stop if stop >= 0 else len(blob)].decode("ascii", "replace")
+
+    eo = _off(exp_rva)
+    if eo is None or eo + 40 > len(blob):
+        return None, "the export directory's RVA maps into no section"
+    name_rva, _base, _nfun, nnames, _afun, anames, _aord = struct.unpack(
+        "<IIIIIII", blob[eo + 12:eo + 40])
+    ident = _cstr(name_rva) if name_rva else ""
+    names = set()
+    ao = _off(anames) if anames else None
+    if ao is not None:
+        for k in range(nnames):
+            o = ao + 4 * k
+            if o + 4 > len(blob):
+                break
+            rva, = struct.unpack("<I", blob[o:o + 4])
+            s = _cstr(rva)
+            if s:
+                names.add(s)
+    return names, ident
+
+
+def library_exports(blob):
+    """(exported names, self-declared identity, why-not) for a shared library, in
+    whichever of the three containers it is. `names` is None when nothing could
+    be read, and `why_not` then says what stopped it — the caller must treat that
+    as "cannot determine", never as "exports nothing"."""
+    for reader in (_elf_exports, _macho_exports, _pe_exports):
+        names, extra = reader(blob)
+        if names is not None:
+            return names, extra, ""
+    # Report through the container the bytes actually claim to be, so the reason
+    # names the format the reader gave up on rather than the last one tried.
+    container, _shared, detail = binary_shared_lib_shape(blob)
+    if container == "elf64":
+        return None, "", _elf_exports(blob)[1]
+    if container == "macho64":
+        return None, "", _macho_exports(blob)[1]
+    if container == "pe64":
+        return None, "", _pe_exports(blob)[1]
+    return None, "", detail
+
+
+# The version shapes a Tcl library stamps on ITSELF. A CLOSED vocabulary, keyed
+# on the identity the binary declares (DT_SONAME / LC_ID_DYLIB / PE export Name)
+# — never on the path it was found at. Anything outside it yields no version at
+# all, which is the honest answer and lets instrument (A) stand alone.
+_TCL_IDENT_SHAPES = (
+    # libtcl8.6.so · libtcl8.6.so.0 · libtcl9.0.dylib
+    re.compile(r"^libtcl(\d+)\.(\d+)\.(?:so|dylib)(?:\.\d+)*$"),
+    # tcl86.dll · tcl90.dll — Windows spells the version with no separator
+    re.compile(r"^tcl(\d)(\d)\.dll$", re.IGNORECASE),
+)
+
+
+def tcl_identity_version(ident):
+    """"X.Y" parsed out of a library's SELF-DECLARED identity, or "".
+
+    Only the basename is considered: LC_ID_DYLIB is an absolute install path
+    (`/opt/local/lib/libtcl8.6.dylib`) while DT_SONAME and the PE export Name are
+    bare."""
+    base = (ident or "").replace("\\", "/").rsplit("/", 1)[-1]
+    for shape in _TCL_IDENT_SHAPES:
+        m = shape.match(base)
+        if m:
+            return "%s.%s" % (m.group(1), m.group(2))
+    return ""
+
+
+def tcl_library_facts(blob):
+    """Everything measurable about a Tcl library's version, from its BYTES.
+
+    Returns a dict:
+      symbolMajor   "8" | "9" | ""   — instrument (A), the export table
+      identity      the binary's self-declared name (reported even when it
+                    carries no version, because it is the loader's view)
+      identityVersion "X.Y" | ""     — instrument (B)
+      version       the best single answer for a message ("" when neither
+                    instrument spoke)
+      method        prose naming WHICH instruments spoke
+      undetermined  why nothing could be measured ("" when something could)
+    """
+    names, ident, why = library_exports(blob)
+    facts = {"symbolMajor": "", "identity": ident, "identityVersion": "",
+             "version": "", "method": "", "undetermined": ""}
+    if names is None:
+        facts["undetermined"] = ("its export table could not be read: %s"
+                                 % (why or "unrecognised container"))
+        return facts
+    if TCL_SENTINEL_EXPORT not in names:
+        facts["undetermined"] = (
+            "it exports %d name(s) but not %s, so it is not a Tcl library at all "
+            "— the leg resolved something else under a Tcl file name"
+            % (len(names), TCL_SENTINEL_EXPORT))
+        return facts
+    facts["identityVersion"] = tcl_identity_version(ident)
+    present = [n for n in TCL9_ONLY_EXPORTS if n in names]
+    if len(present) == len(TCL9_ONLY_EXPORTS):
+        facts["symbolMajor"] = "9"
+    elif not present:
+        facts["symbolMajor"] = "8"
+    # else: a MIX. Tcl 8.7 is exactly that. Say nothing rather than guess.
+    spoke = []
+    if facts["symbolMajor"]:
+        spoke.append("exported-symbol markers -> major %s" % facts["symbolMajor"])
+    if facts["identityVersion"]:
+        spoke.append("self-declared identity %r -> %s"
+                     % (ident, facts["identityVersion"]))
+    facts["method"] = "; ".join(spoke)
+    facts["version"] = facts["identityVersion"] or facts["symbolMajor"]
+    if not spoke:
+        facts["undetermined"] = (
+            "it is a Tcl library (%d exports) but neither instrument could pin "
+            "its version: %d of the %d Tcl-9-only markers are present (%s), "
+            "which no single release explains, and its self-declared identity "
+            "%r carries no version"
+            % (len(names), len(present), len(TCL9_ONLY_EXPORTS),
+               ", ".join(present) or "none", ident))
+    return facts
+
+
+def tcl_library_facts_at(path):
+    """`tcl_library_facts` for a file. An unreadable file is UNDETERMINED, not a
+    pass: the driver has already decided this path is the leg's library."""
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except OSError as exc:
+        return {"symbolMajor": "", "identity": "", "identityVersion": "",
+                "version": "", "method": "",
+                "undetermined": "it could not be read: %s" % exc}
+    return tcl_library_facts(blob)
+
+
+_TCL_H_VERSION_RE = re.compile(
+    r"^[ \t]*#[ \t]*define[ \t]+TCL_VERSION[ \t]+\"([0-9][0-9.]*)\"", re.MULTILINE)
+
+
+def tcl_header_version(path):
+    """The "X.Y" a staged tcl.h DECLARES, or "".
+
+    Tolerates Tcl 9's indented `#   define` as well as 8.6's `#define`, and is
+    the SAME fact build-and-test.sh's `tcl_h_version` reads with sed — spelled
+    once here so both drivers ask the same question of the same bytes."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return ""
+    m = _TCL_H_VERSION_RE.search(text)
+    return m.group(1) if m else ""
+
+
+def tcl_coherence(header_version, entries):
+    """THE FOURTH, PER-LEG Tcl CHECK. Pure — takes the staged header's version
+    and [(label, path, facts)], returns (ok, report lines, warnings, fatal).
+
+    Two ways to be incoherent, and the CROSS-LEG one is judged first because it
+    has the better diagnostic:
+      1. Two legs resolve DIFFERENT Tcl versions. The headers are staged ONCE for
+         every leg, so no single header can serve both — the run is structurally
+         incoherent whatever the header says.
+      2. A leg's library disagrees with the staged header. EITHER instrument may
+         veto: the marker set vetoes on the MAJOR (an API generation the library
+         does not have), the self-declared identity vetoes on the full X.Y.
+    Never a warning. A warn here ships a binary that links clean and misbehaves,
+    which is the exact class this harness exists to prevent."""
+    lines, warnings = [], []
+    for label, path, facts in entries:
+        lines.append("%s\t%s\t%s\t%s"
+                     % (label, facts["version"] or "?",
+                        facts["method"] or facts["undetermined"], _fwd(path)))
+        if facts["undetermined"]:
+            warnings.append(
+                "[%s] the Tcl version of %s could NOT be determined — %s. This "
+                "leg is NOT checked against the staged header; if it fails to "
+                "link on Tcl symbols, a header/library version skew is the first "
+                "thing to rule out."
+                % (label, _fwd(path), facts["undetermined"]))
+    known = [(label, path, facts) for label, path, facts in entries
+             if facts["version"]]
+    versions = sorted({facts["version"] for _l, _p, facts in known})
+    if len(versions) > 1:
+        return (False, lines, warnings,
+                "the selected legs resolve %d DIFFERENT Tcl versions (%s), and "
+                "the Tcl headers are staged ONCE for every leg — so no header "
+                "can be correct for all of them. This run is structurally "
+                "incoherent and would compile at least one leg against a Tcl it "
+                "does not link.\n%s\n      Fix the legs' libraries so they agree, "
+                "or select only the legs that do."
+                % (len(versions), ", ".join(versions),
+                   "\n".join("        %-16s %s   (%s)"
+                             % (label, facts["version"], _fwd(path))
+                             for label, path, facts in known)))
+    header_major = (header_version or "").split(".")[0]
+    for label, path, facts in known:
+        why = ""
+        if (facts["symbolMajor"] and header_major
+                and facts["symbolMajor"] != header_major):
+            why = ("its export table has the Tcl %s API generation (%s) while "
+                   "the staged header declares TCL_VERSION \"%s\""
+                   % (facts["symbolMajor"],
+                      "all %d of %s are exported"
+                      % (len(TCL9_ONLY_EXPORTS), ", ".join(TCL9_ONLY_EXPORTS))
+                      if facts["symbolMajor"] == "9" else
+                      "none of %s is exported" % ", ".join(TCL9_ONLY_EXPORTS),
+                      header_version))
+        elif (facts["identityVersion"] and header_version
+                and facts["identityVersion"] != header_version):
+            why = ("it declares itself %r (Tcl %s) while the staged header "
+                   "declares TCL_VERSION \"%s\""
+                   % (facts["identity"], facts["identityVersion"],
+                      header_version))
+        if why:
+            return (False, lines, warnings,
+                    "Tcl HEADER/LIBRARY SKEW on leg '%s' — %s.\n"
+                    "        leg library : %s\n"
+                    "        staged header: TCL_VERSION \"%s\"\n"
+                    "      The header decides WHICH Tcl symbols the fixture "
+                    "REFERENCES (sqlite's tclsqlite.c gates live code on "
+                    "TCL_MAJOR_VERSION>8); the library decides which it can "
+                    "RESOLVE. Building anyway produces undefined-symbol errors "
+                    "that read like a compiler defect.\n"
+                    "      Fix: DSS_TCL_VERSION=%s (stage the header this leg's "
+                    "PINNED library matches), then re-run. Pinning the header to "
+                    "the library is correct; pinning the library to this host is "
+                    "not — every leg's library is target-keyed and this host is "
+                    "not a target."
+                    % (label, why, _fwd(path), header_version,
+                       facts["version"]))
+    return (True, lines, warnings, "")
+
+
 def _fwd(path):
     """A path spelled with forward slashes, on every host.
 
@@ -3756,6 +4246,223 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           all(binary_shared_lib_shape(b)[2]
               for b in (b"", _elf(ET_DYN), _pe(0x22), _macho(2), b"junk")))
 
+    # ── the FOURTH, PER-LEG Tcl coherence check ──────────────────────────────
+    # [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED]
+    #
+    # WHY THE IMAGES ARE SYNTHESISED. The three READERS were ✔MEASURED against
+    # five REAL Tcl 8.6 libraries (see the banner above `library_exports`) — but
+    # no Tcl 9 library exists on the machines this project builds on, and the
+    # whole point of the check is the 8-vs-9 discrimination. A synthetic image
+    # per container is the only way to exercise the "major 9" arm on ANY host,
+    # which is also the rule the rest of this self-test follows: assert every arm
+    # on every machine rather than only the arms this machine happens to have.
+    # These builders emit the smallest images the readers accept — the tables the
+    # readers actually walk, and nothing else.
+    def _elf_lib(exports, soname, endian="<"):
+        import struct
+        strtab = bytearray(b"\0")
+        offs = {}
+        for nm in list(exports) + [soname]:
+            if nm and nm not in offs:
+                offs[nm] = len(strtab)
+                strtab += nm.encode() + b"\0"
+        syms = bytearray(24)                       # index 0 is the null symbol
+        for nm in exports:
+            syms += struct.pack(endian + "IBBHQQ", offs[nm],
+                                (STB_GLOBAL << 4) | 2, 0, 1, 0, 0)
+        dyn = struct.pack(endian + "qQ", DT_SONAME, offs.get(soname, 0)) \
+            + struct.pack(endian + "qQ", DT_NULL, 0)
+        o_str = 64
+        o_sym = o_str + len(strtab)
+        o_dyn = o_sym + len(syms)
+        o_sh = o_dyn + len(dyn)
+        shdrs = b"".join(
+            struct.pack(endian + "IIQQQQIIQQ", 0, st, 0, 0, off, size, link, 0, 0, esz)
+            for st, off, size, link, esz in (
+                (0, 0, 0, 0, 0),                                   # SHT_NULL
+                (SHT_STRTAB, o_str, len(strtab), 0, 0),            # 1 .dynstr
+                (SHT_DYNSYM, o_sym, len(syms), 1, 24),             # 2 .dynsym
+                (SHT_DYNAMIC, o_dyn, len(dyn), 1, 16)))            # 3 .dynamic
+        ehdr = bytearray(64)
+        ehdr[0:6] = b"\x7fELF" + bytes([2, 1 if endian == "<" else 2])
+        ehdr[16:18] = struct.pack(endian + "H", ET_DYN)
+        ehdr[0x28:0x30] = struct.pack(endian + "Q", o_sh)
+        ehdr[0x3A:0x3E] = struct.pack(endian + "HH", 64, 4)
+        return bytes(ehdr) + bytes(strtab) + bytes(syms) + dyn + shdrs
+
+    def _macho_lib(exports, install_name):
+        import struct
+        strtab = bytearray(b"\0")
+        offs = {}
+        for nm in exports:
+            offs[nm] = len(strtab)
+            strtab += b"_" + nm.encode() + b"\0"
+        idname = install_name.encode() + b"\0"
+        idname += b"\0" * (-(24 + len(idname)) % 8)
+        lc_id = struct.pack("<IIIIII", LC_ID_DYLIB, 24 + len(idname), 24,
+                            0, 0, 0) + idname
+        o_sym = 32 + len(lc_id) + 24
+        syms = b"".join(struct.pack("<IBBHQ", offs[nm], N_EXT | N_SECT, 1, 0, 0)
+                        for nm in exports)
+        lc_symtab = struct.pack("<IIIIII", LC_SYMTAB, 24, o_sym, len(exports),
+                                o_sym + len(syms), len(strtab))
+        head = struct.pack("<IIIIIII", MH_MAGIC_64, 0x0100000C, 0, MH_DYLIB,
+                           2, len(lc_id) + 24, 0) + b"\0" * 4
+        return head + lc_id + lc_symtab + syms + bytes(strtab)
+
+    def _pe_lib(exports, dll_name):
+        import struct
+        RVA = 0x1000
+        RAW = 0x200
+        body = bytearray(40 + 4 * len(exports))
+        def _put(text):
+            at = len(body)
+            body.extend(text.encode() + b"\0")
+            return RVA + at
+        name_rva = _put(dll_name)
+        for i, nm in enumerate(exports):
+            struct.pack_into("<I", body, 40 + 4 * i, _put(nm))
+        struct.pack_into("<IIIIIII", body, 12, name_rva, 1, len(exports),
+                         len(exports), 0, RVA + 40, 0)
+        opt = bytearray(240)
+        struct.pack_into("<H", opt, 0, 0x20B)
+        struct.pack_into("<II", opt, 112, RVA, len(body))
+        coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 240,
+                           IMAGE_FILE_DLL | 0x22)
+        sec = (b".rdata\0\0" + struct.pack("<IIII", len(body), RVA, len(body), RAW)
+               + b"\0" * 16)
+        head = bytearray(0x40)
+        head[0:2] = b"MZ"
+        struct.pack_into("<I", head, 0x3C, 0x40)
+        img = bytearray(head + b"PE\0\0" + coff + bytes(opt) + sec)
+        img += b"\0" * (RAW - len(img))
+        return bytes(img + body)
+
+    _T9 = list(TCL9_ONLY_EXPORTS) + [TCL_SENTINEL_EXPORT]
+    _T8 = ["Tcl_GetBoolean", "Tcl_GetBooleanFromObj", TCL_SENTINEL_EXPORT]
+    _libs = {
+        "elf 9.0":    _elf_lib(_T9, "libtcl9.0.so"),
+        "elf 8.6":    _elf_lib(_T8, "libtcl8.6.so"),
+        "elf 8.6 BE": _elf_lib(_T8, "libtcl8.6.so", endian=">"),
+        "macho 9.0":  _macho_lib(_T9, "/opt/homebrew/opt/tcl-tk/lib/libtcl9.0.dylib"),
+        "macho 8.6":  _macho_lib(_T8, "/opt/local/lib/libtcl8.6.dylib"),
+        "pe 9.0":     _pe_lib(_T9, "tcl90.dll"),
+        "pe 8.6":     _pe_lib(_T8, "tcl86.dll"),
+    }
+    for _name, _blob in sorted(_libs.items()):
+        _want = _name.split()[1]
+        _f = tcl_library_facts(_blob)
+        check("a synthetic %s libtcl measures as Tcl %s" % (_name, _want),
+              _f["version"] == _want and not _f["undetermined"],
+              "got %r (%s%s)" % (_f["version"], _f["method"], _f["undetermined"]))
+        check("%s: BOTH instruments spoke, and they agree" % _name,
+              _f["symbolMajor"] == _want.split(".")[0]
+              and _f["identityVersion"] == _want,
+              "symbolMajor=%r identityVersion=%r"
+              % (_f["symbolMajor"], _f["identityVersion"]))
+    # A BIG-ENDIAN ELF is read correctly: the reader takes byte order from
+    # EI_DATA, never from the host. A host-keyed struct format would report this
+    # one as "cannot determine" on every machine this project owns.
+    check("the ELF reader is not host-endian",
+          tcl_library_facts(_libs["elf 8.6 BE"])["version"] == "8.6")
+
+    # UNDETERMINED — the failure mode that must never become a silent pass.
+    for _what, _blob, _needle in (
+            ("a MIX of the Tcl-9 markers (an 8.7-shaped library)",
+             _elf_lib([TCL9_ONLY_EXPORTS[0], TCL_SENTINEL_EXPORT], "libtcl.so"),
+             "no single release explains"),
+            ("a library that is not Tcl at all",
+             _elf_lib(["sqlite3_open"], "libsqlite3.so.0"),
+             TCL_SENTINEL_EXPORT),
+            ("bytes in no container this reader knows", b"junk", "could not be read"),
+            ("a Mach-O universal archive", (0xCAFEBABE).to_bytes(4, "big")
+             + (0).to_bytes(4, "big"), "could not be read")):
+        _f = tcl_library_facts(_blob)
+        check("UNDETERMINED, with a reason: %s" % _what,
+              not _f["version"] and _needle in _f["undetermined"],
+              "version=%r undetermined=%r" % (_f["version"], _f["undetermined"]))
+
+    check("a versionless self-declared identity still leaves the MAJOR measured",
+          tcl_library_facts(_elf_lib(_T8, "libtcl.so"))["symbolMajor"] == "8")
+    for _ident, _want in (("libtcl8.6.so", "8.6"), ("libtcl8.6.so.0", "8.6"),
+                          ("/opt/local/lib/libtcl8.6.dylib", "8.6"),
+                          ("libtcl9.0.dylib", "9.0"), ("tcl86.dll", "8.6"),
+                          ("tcl90.dll", "9.0"), ("libtcl.so", ""),
+                          ("tcl.dll", ""), ("libtcl8.6.a", ""), ("", "")):
+        check("self-declared identity %r -> %r" % (_ident, _want),
+              tcl_identity_version(_ident) == _want,
+              "got %r" % tcl_identity_version(_ident))
+
+    def _entry(label, key):
+        return (label, "/lib/" + key.replace(" ", "-"),
+                tcl_library_facts(_libs[key]))
+
+    _ok, _lines, _warn, _fatal = tcl_coherence(
+        "8.6", [_entry("elf64-arm64", "elf 8.6"),
+                _entry("macho64-arm64", "macho 8.6"),
+                _entry("pe64-x86_64", "pe 8.6")])
+    check("three legs pinned at 8.6 under an 8.6 header are COHERENT",
+          _ok and not _warn and len(_lines) == 3, _fatal)
+
+    # ★ THE DEFECT, REPRODUCED. A 9.0 header (this Mac's Homebrew default) over
+    # the 8.6 library every leg's provider pins. Before this check the run got
+    # four K_SymbolUndefined hours later; now it refuses in the first seconds.
+    _ok, _lines, _warn, _fatal = tcl_coherence(
+        "9.0", [_entry("elf64-arm64", "elf 8.6"), _entry("macho64-arm64", "macho 8.6")])
+    check("a 9.0 header over a PINNED 8.6 library is FATAL", not _ok)
+    check("the refusal names the leg, both versions and the remedy",
+          all(t in _fatal for t in ("elf64-arm64", "9.0", "8.6",
+                                    "DSS_TCL_VERSION=8.6")),
+          _fatal)
+    check("the refusal names the SYMBOLS the skew is made of",
+          all(n in _fatal for n in TCL9_ONLY_EXPORTS), _fatal)
+    # …and the mirror image, which is what a Tcl-9 host with a Tcl-9 library
+    # would hit the day the pinned archives move.
+    check("an 8.6 header over a 9.0 library is FATAL too",
+          not tcl_coherence("8.6", [_entry("macho64-arm64", "macho 9.0")])[0])
+    # The MINOR is only visible to the self-declared identity — the marker set
+    # cannot see 8.5-vs-8.6. Either instrument may veto on its own.
+    check("a MINOR-only skew is caught by the self-declared identity alone",
+          not tcl_coherence("8.6", [("elf64-x86_64", "/lib/x", tcl_library_facts(
+              _elf_lib(_T8, "libtcl8.5.so")))])[0])
+
+    _ok, _lines, _warn, _fatal = tcl_coherence(
+        "8.6", [_entry("elf64-arm64", "elf 8.6"), _entry("macho64-arm64", "macho 9.0")])
+    check("legs that disagree WITH EACH OTHER are structurally incoherent",
+          not _ok and "structurally incoherent" in _fatal
+          and "elf64-arm64" in _fatal and "macho64-arm64" in _fatal, _fatal)
+
+    _ok, _lines, _warn, _fatal = tcl_coherence(
+        "8.6", [_entry("elf64-arm64", "elf 8.6"),
+                ("pe64-x86_64", "/lib/junk", tcl_library_facts(b"junk"))])
+    check("a leg whose version cannot be measured WARNS and is skipped, never "
+          "silently passed",
+          _ok and len(_warn) == 1 and "pe64-x86_64" in _warn[0], "%r" % _warn)
+    check("every leg is reported, measured or not", len(_lines) == 2)
+    check("no legs resolved a libtcl is not, by itself, an incoherence",
+          tcl_coherence("8.6", [])[0])
+
+    # The staged header's version comes out of the FILE. Tcl 9 indents its
+    # `#   define`; 8.6 does not. Both spellings, and a file that declares
+    # nothing (which the CLI turns into a refusal, not a pass).
+    import tempfile as _tf
+    _hd = _tf.mkdtemp(prefix="dss-tclh-")
+    try:
+        for _text, _want in (('#define TCL_VERSION "8.6"\n', "8.6"),
+                             ('#   define TCL_VERSION\t"9.0"\n', "9.0"),
+                             ('/* #define TCL_VERSION "7.6" */\n', ""),
+                             ('#define TCL_PATCH_LEVEL "8.6.14"\n', "")):
+            _p = os.path.join(_hd, "tcl.h")
+            with open(_p, "w", encoding="utf-8") as _f:
+                _f.write("#ifndef _TCL\n" + _text + "#endif\n")
+            check("a staged tcl.h containing %r reports %r" % (_text.strip(), _want),
+                  tcl_header_version(_p) == _want,
+                  "got %r" % tcl_header_version(_p))
+        check("a tcl.h that is not there reports nothing, and never a version",
+              tcl_header_version(os.path.join(_hd, "absent.h")) == "")
+    finally:
+        shutil.rmtree(_hd, ignore_errors=True)
+
     # ── the artefact line, matched the way BOTH base harnesses match it ───────
     _log = ("dss-code-prime: artifact x86_64:pe64-x86_64-windows-dll /out/a.dll\n"
             "info[R_Something] noise\n"
@@ -4154,6 +4861,27 @@ def main(argv=None):
                         "Given with a non-empty --import-name, its --help is "
                         "PROBED for override support and a compiler without it is "
                         "a LOUD refusal, never a silently dropped override.")
+    # ── the FOURTH, PER-LEG Tcl coherence check ────────────────────────────
+    # [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED]
+    # The other three Tcl checks live in the drivers and are all HOST-scoped.
+    # This one is per-LEG, so it lives here, where both drivers can call it and
+    # neither can drift from the other.
+    p.add_argument("--tcl-coherence", action="store_true",
+                   help="verify the STAGED Tcl header against the Tcl library "
+                        "EACH LEG WILL LINK. Prints '<label>\\t<version|?>\\t"
+                        "<how it was measured>\\t<path>' per leg on stdout; "
+                        "warnings and the refusal go to stderr. rc 0 coherent, "
+                        "5 INCOHERENT, 2 the header could not be read. A leg "
+                        "whose version cannot be measured is a WARNING and is "
+                        "skipped — never a silent pass.")
+    p.add_argument("--staged-tcl-header", default="", metavar="PATH",
+                   help="the tcl.h the run actually stages (its TCL_VERSION is "
+                        "read from the FILE, not from the directory's name)")
+    p.add_argument("--leg-tcl-library", action="append", default=None,
+                   metavar="LABEL=PATH",
+                   help="a leg and the libtcl it resolved. Repeatable — pass "
+                        "every leg that resolved one, so a run whose legs "
+                        "disagree WITH EACH OTHER is caught as well.")
     p.add_argument("--lint", action="store_true")
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--host-os", default=None)
@@ -4172,14 +4900,14 @@ def main(argv=None):
             or args.env_transfers or args.env_transfer
             or args.acquire or args.acquire_plan or args.resolve_library_argv
             or args.resolve_target_cc or args.build_loadext_helper
-            or args.loadext_builder):
+            or args.loadext_builder or args.tcl_coherence):
         p.error("one of --verdict-vocabulary / --plan / --header-stages / "
                 "--config-stages / --lint "
                 "/ --self-test / --path-translations / --translate-path / "
                 "--assert-translated / --env-transfers / --env-transfer / "
                 "--acquire / --acquire-plan / --resolve-library-argv / "
                 "--resolve-target-cc / --build-loadext-helper / "
-                "--loadext-builder is required")
+                "--loadext-builder / --tcl-coherence is required")
     if (args.translate_path or args.assert_translated) and not args.path_translation:
         p.error("--translate-path / --assert-translated require "
                 "--path-translation <verb> — the namespace is the launcher's "
@@ -4295,6 +5023,40 @@ def main(argv=None):
             for key, answers in configure_stages(load_catalogue(args.catalogue)).items():
                 sys.stdout.write("%s\t%s\n" % (key, " ".join(
                     "%s=%d" % (n, 1 if v else 0) for n, v in sorted(answers.items()))))
+            return 0
+        if args.tcl_coherence:
+            if not args.staged_tcl_header:
+                p.error("--tcl-coherence requires --staged-tcl-header <path to "
+                        "the tcl.h this run stages>")
+            header_version = tcl_header_version(args.staged_tcl_header)
+            if not header_version:
+                # NOT a pass. Every leg's library is pinned; if the one thing
+                # chosen from the HOST cannot even state its version, the
+                # comparison this check exists for cannot be made at all.
+                raise LegError(
+                    "the staged Tcl header %s declares no `#define TCL_VERSION "
+                    "\"x.y\"` (or could not be read). That is the ONE Tcl input "
+                    "this harness takes from the host rather than from a leg's "
+                    "own declaration, so it cannot be checked against the "
+                    "libraries the legs will link "
+                    "[D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-"
+                    "LIBRARY-IS-PINNED]." % _fwd(args.staged_tcl_header))
+            entries = []
+            for raw in (args.leg_tcl_library or []):
+                label, sep, path = raw.partition("=")
+                if not sep or not label or not path:
+                    p.error("--leg-tcl-library takes LABEL=PATH, got %r" % raw)
+                entries.append((label, path, tcl_library_facts_at(path)))
+            ok, lines, warnings, fatal = tcl_coherence(header_version, entries)
+            sys.stdout.write("staged-header\t%s\t%s\n"
+                             % (header_version, _fwd(args.staged_tcl_header)))
+            for line in lines:
+                sys.stdout.write("%s\n" % line)
+            for w in warnings:
+                sys.stderr.write("WARN: %s\n" % w)
+            if not ok:
+                sys.stderr.write("harness_legs.py: Tcl INCOHERENCE: %s\n" % fatal)
+                return 5
             return 0
         if args.lint:
             findings = lint(args.catalogue)

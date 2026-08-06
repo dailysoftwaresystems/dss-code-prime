@@ -96,6 +96,7 @@ namespace {
                                              unsigned pageSize = 4096) {
     return std::string(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-adhoc","kind":"macho"},
@@ -342,6 +343,7 @@ namespace {
 [[nodiscard]] std::string codeSignSchemaRaw(char const* csBody) {
     return std::string(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-bad","kind":"macho"},
@@ -490,6 +492,7 @@ TEST(MachOAdHocCodeSign, ObjectFiletypeWithCodeSignatureFailsLoud) {
     // biconditional fires.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-obj-with-cs","kind":"macho"},

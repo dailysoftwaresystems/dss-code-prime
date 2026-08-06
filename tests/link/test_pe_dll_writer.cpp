@@ -662,6 +662,7 @@ namespace {
                                           = "8226") {
     std::string s = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dll","kind":"pe"},
@@ -713,6 +714,7 @@ TEST(PeDllFormatJsonValidate, ExecWithImageFileDllBitRejected) {
     // The symmetric copy-paste guard: 0x2022 on an EXEC schema.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-exe","kind":"pe"},

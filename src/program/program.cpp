@@ -760,6 +760,13 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // match the externs' already-mangled `mangledName` on macho (identity on elf/pe). Both
     // the def↔extern resolution and the `main` entry match key on this same convention.
     ObjectFormatKind const fmtKind = (*formatR)->kind();
+    // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN (step C4): the C-symbol decoration
+    // rule is now READ FROM THE SCHEMA rather than looked up in a C++ table keyed
+    // on `fmtKind`. Both merge rails below (`nameOf` for definitions, the entry-name
+    // set) take THIS one value, so they cannot diverge — and `validate()` guarantees
+    // it is a real scheme, never the `Unspecified` sentinel.
+    CSymbolDecorationScheme const cSymDecor =
+        (*formatR)->cSymbolDecoration().scheme;
     std::vector<MergeCuInput> mergeInputs;
     mergeInputs.reserve(cuMirs.size());
     for (auto& cuMir : cuMirs) {
@@ -773,9 +780,11 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         // name run through the FORMAT'S C MANGLING (`applyCMangling`), so it matches the
         // extern's already-mangled `mangledName` — on Mach-O a shell.c reference to
         // `_sqlite3_libversion` now matches sqlite3.c's definition `sqlite3_libversion`
-        // (mangled to `_sqlite3_libversion`). applyCMangling is config-driven
-        // (`kCManglingRules`): IDENTITY on elf/pe (their cross-CU match is unchanged),
-        // one leading `_` on macho. Safe by construction — every format writer names its
+        // (mangled to `_sqlite3_libversion`). applyCMangling is config-driven in the
+        // literal sense since TF-C122 (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN C4): it
+        // is handed the format's DECLARED `cSymbolDecoration.scheme`, not a C++ table
+        // keyed on the format identity. `none` is IDENTITY (elf/pe -- their cross-CU
+        // match is unchanged); `leading-underscore` adds one `_` (macho). Safe by construction — every format writer names its
         // on-binary defined symbols synthetically (`_sym_<id>` / `sym_<id>`), so this key
         // is a MATCH key only, never the emitted symbol name (no double-mangle). Capturing
         // `&cuMir` is safe — `cuMirs` is done growing.
@@ -789,13 +798,13 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         // arm only would leave `definedNames.count(e.mangledName)` missing, the
         // sibling-defined extern unstripped, and an intra-image call silently
         // emitted as a dynamic import. Byte-identical for every unlabelled symbol.
-        in.nameOf = [cuMirP = &cuMir, fmtKind](SymbolId s) -> std::string {
+        in.nameOf = [cuMirP = &cuMir, cSymDecor](SymbolId s) -> std::string {
             // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the fourth
             // input is passed here too — a required parameter precisely so a rail
             // cannot quietly omit it and reintroduce the divergence described
             // above with a different override channel.
             if (SymbolRecord const* r = cuMirP->model.recordFor(s)) {
-                return dss::ffi::linkNameFor(r->name, r->asmName, fmtKind,
+                return dss::ffi::linkNameFor(r->name, r->asmName, cSymDecor,
                                              r->linkName);
             }
             for (auto const& e : cuMirP->externImports) {
@@ -837,7 +846,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
             // convention as the merge's DEFINITION keys (nameOf mangles too), so the merged
             // `userEntrySymbol` scan — `entrySet.count(nameOf(func))` in mergeCuMirs — still
             // finds `main` on macho (both keyed `_main`). Identity on elf/pe.
-            entryNames.push_back(dss::ffi::applyCMangling(n, fmtKind));
+            entryNames.push_back(dss::ffi::applyCMangling(n, cSymDecor));
         }
     }
 
@@ -910,7 +919,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         // object-format config for what is a recipe-table defect).
         std::unordered_map<std::uint32_t, std::string> mergedThreadsRecipes, mergedStdioRecipes;
         for (auto const& [symV, name] : merged->symbolNames) {
-            std::string const bare = dss::ffi::unapplyCMangling(name, fmtKind);
+            std::string const bare = dss::ffi::unapplyCMangling(name, cSymDecor);
             if (!dss::ffi::isKnownSynthesizeRecipe(bare)
                 || definedOrImported.find(symV) != definedOrImported.end()) {
                 continue;
@@ -935,7 +944,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         }
         if (!synthesizeThreadsShim(merged->mir, merged->host.interner(),
                                    mergedThreadsRecipes, (*formatR)->librarySynthesis(),
-                                   fmtKind, merged->externImports, reporter)) {
+                                   cSymDecor, merged->externImports, reporter)) {
             return false;  // internal invariant breach (vocab/switch drift) — reported.
         }
         // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —

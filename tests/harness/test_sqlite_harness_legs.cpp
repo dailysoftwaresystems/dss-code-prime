@@ -60,6 +60,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -2574,4 +2575,341 @@ TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
         << "only " << markersSeen
         << " artefact-report reader(s) were found across the two drivers. Fix the"
            " recogniser, do not delete the test.";
+}
+
+// ── 8. THE FOURTH, PER-LEG Tcl COHERENCE CHECK ─────────────────────────────
+// [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED]
+//
+// THE DEFECT, ✔MEASURED 2026-08-06 by the first native macOS run of
+// build-and-test.sh. The harness picks the Tcl HEADER from the HOST (tclsh on
+// PATH -> its tclConfig.sh -> TCL_INCLUDE_SPEC) while EVERY leg's Tcl LIBRARY is
+// pinned by its own target-keyed provider. On a Mac whose default Homebrew
+// tcl-tk is 9.0.3 the fixture compiled against a 9.0 header and linked an 8.6
+// library, and sqlite's tclsqlite.c gates live code on TCL_MAJOR_VERSION>8 — so
+// the leg died on four K_SymbolUndefined (Tcl_GetBool, Tcl_GetBoolFromObj,
+// Tcl_GetBytesFromObj, Tcl_GetChild) that a human had to reverse-engineer back
+// to a version skew. On Linux the host tclsh is 8.6, so header and library had
+// agreed BY ACCIDENT OF THE HOST — which is why hundreds of green runs on the
+// same compiler never saw it.
+//
+// The harness already had THREE Tcl coherence checks and ALL THREE ARE HOST-
+// SCOPED: interpreter-vs-staging, header-vs-tclConfig, recipe-vs-staging. Not
+// one compared the staged header against the library a LEG WILL LINK. This
+// section pins the missing FOURTH one, and the four properties that make it
+// worth having:
+//
+//   1. IT IS PER-LEG AND IT LIVES IN THE SHARED RESOLVER, so it cannot exist in
+//      one driver and not the other (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-
+//      ONE-LEG-IN-ONE-DRIVER). Both drivers must actually CALL it.
+//   2. IT REFUSES, IT DOES NOT WARN. A warn ships a binary that links clean and
+//      then misbehaves — the exact class this harness exists to prevent.
+//   3. IT MEASURES THE LIBRARY'S BYTES, NOT ITS FILE NAME. `libtcl8.6.so` is
+//      what somebody CALLED the file; a name being trusted is the whole anchor.
+//   4. "CANNOT DETERMINE" IS A LOUD WARNING, NEVER A SILENT PASS.
+//
+// THE FIXTURE IS A SYNTHETIC ELF64, BUILT HERE, IN C++. The resolver's own
+// self-test builds its own synthetic images in Python; this one is deliberately
+// an INDEPENDENT implementation of the same container, so a reader defect that
+// happened to match one builder's quirks cannot pass both. It carries only what
+// the reader walks: .dynsym + .dynstr + .dynamic(DT_SONAME).
+
+namespace {
+
+void putLE(std::string& b, std::uint64_t v, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        b.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+    }
+}
+
+// A minimal ELF64 ET_DYN exporting `exports` and declaring DT_SONAME `soname`.
+[[nodiscard]] std::string synthElfLibrary(std::vector<std::string> const& exports,
+                                          std::string const&              soname) {
+    std::string                          strtab(1, '\0');
+    std::map<std::string, std::uint64_t> at;
+    auto intern = [&](std::string const& s) -> std::uint64_t {
+        if (s.empty()) return 0;
+        auto it = at.find(s);
+        if (it != at.end()) return it->second;
+        auto const off = static_cast<std::uint64_t>(strtab.size());
+        at.emplace(s, off);
+        strtab += s;
+        strtab.push_back('\0');
+        return off;
+    };
+    for (auto const& e : exports) intern(e);
+    auto const sonameOff = intern(soname);
+
+    std::string syms(24, '\0');   // index 0 is the null symbol
+    for (auto const& e : exports) {
+        putLE(syms, at[e], 4);
+        syms.push_back(static_cast<char>(0x12));   // STB_GLOBAL | STT_FUNC
+        syms.push_back('\0');                      // st_other
+        putLE(syms, 1, 2);                         // st_shndx: defined
+        putLE(syms, 0, 8);                         // st_value
+        putLE(syms, 0, 8);                         // st_size
+    }
+    std::string dyn;
+    putLE(dyn, 14, 8);            // DT_SONAME
+    putLE(dyn, sonameOff, 8);
+    putLE(dyn, 0, 8);             // DT_NULL
+    putLE(dyn, 0, 8);
+
+    std::uint64_t const oStr = 64;
+    std::uint64_t const oSym = oStr + strtab.size();
+    std::uint64_t const oDyn = oSym + syms.size();
+    std::uint64_t const oSh  = oDyn + dyn.size();
+
+    std::string sh;
+    auto section = [&](std::uint32_t type, std::uint64_t off, std::uint64_t size,
+                       std::uint32_t link, std::uint64_t entsize) {
+        putLE(sh, 0, 4);          // sh_name — the reader never reads section names
+        putLE(sh, type, 4);
+        putLE(sh, 0, 8);          // sh_flags
+        putLE(sh, 0, 8);          // sh_addr
+        putLE(sh, off, 8);
+        putLE(sh, size, 8);
+        putLE(sh, link, 4);
+        putLE(sh, 0, 4);          // sh_info
+        putLE(sh, 0, 8);          // sh_addralign
+        putLE(sh, entsize, 8);
+    };
+    section(0, 0, 0, 0, 0);                            // SHT_NULL
+    section(3, oStr, strtab.size(), 0, 0);             // 1 .dynstr
+    section(11, oSym, syms.size(), 1, 24);             // 2 .dynsym
+    section(6, oDyn, dyn.size(), 1, 16);               // 3 .dynamic
+
+    std::string eh(64, '\0');
+    eh[0] = 0x7F; eh[1] = 'E'; eh[2] = 'L'; eh[3] = 'F';
+    eh[4] = 2;    // ELFCLASS64
+    eh[5] = 1;    // ELFDATA2LSB
+    eh[16] = 3;   // e_type = ET_DYN
+    std::string tmp;
+    putLE(tmp, oSh, 8);
+    eh.replace(0x28, 8, tmp);
+    tmp.clear();
+    putLE(tmp, 64, 2);   // e_shentsize
+    putLE(tmp, 4, 2);    // e_shnum
+    eh.replace(0x3A, 4, tmp);
+    return eh + strtab + syms + dyn + sh;
+}
+
+// The exact four names the fixture failed on. Spelled here rather than read out
+// of the resolver so the two sides cannot agree on a set that discriminates
+// nothing.
+std::vector<std::string> const kTcl9Only = {"Tcl_GetBool", "Tcl_GetBoolFromObj",
+                                            "Tcl_GetBytesFromObj",
+                                            "Tcl_GetChild"};
+
+[[nodiscard]] std::string tcl86Library() {
+    return synthElfLibrary({"Tcl_CreateInterp", "Tcl_GetBoolean",
+                            "Tcl_GetBooleanFromObj"},
+                           "libtcl8.6.so");
+}
+
+[[nodiscard]] std::string tcl90Library() {
+    std::vector<std::string> ex = kTcl9Only;
+    ex.push_back("Tcl_CreateInterp");
+    return synthElfLibrary(ex, "libtcl9.0.so");
+}
+
+void writeBytes(fs::path const& p, std::string const& bytes) {
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+// A staged tcl.h that declares exactly one version. Tcl 9 indents its
+// `#   define`; 8.6 does not — both spellings appear below on purpose.
+[[nodiscard]] fs::path writeTclHeader(fs::path const& dir, std::string const& body) {
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    auto const p = dir / "tcl.h";
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    out << "#ifndef _TCL\n#define _TCL\n" << body << "#endif\n";
+    return p;
+}
+
+}   // namespace
+
+// 1. BOTH DRIVERS CALL IT. This is the anti-regression pin that matters most:
+//    the harness already HAD three Tcl checks, and the defect was that none of
+//    them was per-leg. A fourth check nobody invokes would be the same failure
+//    wearing a newer hat, and a fourth check only ONE driver invokes is this
+//    project's canonical silent harness bug.
+TEST_F(HarnessLegs, BothDriversRunThePerLegTclCoherenceCheck) {
+    struct Driver {
+        char const* name;
+        bool        powershell;
+    };
+    constexpr Driver kDrivers[] = {{"build-and-test.sh", false},
+                                   {"build-and-test.ps1", true}};
+    for (auto const& d : kDrivers) {
+        auto const lines = liveLines(harnessDir() / d.name, d.powershell);
+        ASSERT_FALSE(lines.empty()) << d.name;
+        // Over LIVE lines: both drivers DOCUMENT this check at length, and a
+        // raw-text rule would be satisfied by the prose alone.
+        for (char const* flag : {"--tcl-coherence", "--staged-tcl-header",
+                                 "--leg-tcl-library"}) {
+            bool found = false;
+            for (auto const& line : lines) {
+                if (line.find(flag) != std::string::npos) {
+                    found = true;
+                    break;
+                }
+            }
+            EXPECT_TRUE(found)
+                << d.name << " has no LIVE line passing `" << flag
+                << "` to harness_legs.py. The staged Tcl header is the ONE Tcl"
+                   " input this harness still takes from the HOST while every"
+                   " leg's library is pinned by its target-keyed provider; a"
+                   " driver that does not compare them builds a fixture against"
+                   " one Tcl and links another"
+                   " [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-"
+                   "LIBRARY-IS-PINNED].";
+        }
+    }
+}
+
+// 2. THE DEFECT ITSELF, END TO END THROUGH THE CLI — with its MATCHED CONTROL.
+//    The control is the point: the same two library files under an 8.6 header
+//    must pass, or this test would go green on a check that refuses everything.
+TEST_F(HarnessLegs, AStagedTclHeaderThatDisagreesWithALegsLibraryIsRefused) {
+    auto const      dir = scratch_->path() / "tcl-skew";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    auto const lib86 = dir / "libtcl8.6.so";
+    writeBytes(lib86, tcl86Library());
+    ASSERT_TRUE(fs::exists(lib86)) << lib86;
+    auto const h86 = writeTclHeader(dir / "inc86", "#define TCL_VERSION \"8.6\"\n");
+    auto const h90 = writeTclHeader(dir / "inc90", "#   define TCL_VERSION\t\"9.0\"\n");
+
+    // THE CONTROL — 8.6 header, 8.6 library, two legs. Must be silent.
+    auto const ok = run({"--tcl-coherence", "--staged-tcl-header", h86.string(),
+                         "--leg-tcl-library", "elf64-arm64=" + lib86.string(),
+                         "--leg-tcl-library", "macho64-arm64=" + lib86.string()});
+    ASSERT_TRUE(ok.spawned) << ok.diagnostic;
+    EXPECT_EQ(ok.exitCode, 0u)
+        << "a run whose staged header and every leg's library are the SAME Tcl"
+           " must build. If this reds, the check refuses everything and the"
+           " refusal below proves nothing.\n"
+        << ok.output;
+    EXPECT_NE(ok.output.find("elf64-arm64\t8.6"), std::string::npos) << ok.output;
+
+    // THE DEFECT — the Mac's 9.0 header over the pinned 8.6 library.
+    auto const bad = run({"--tcl-coherence", "--staged-tcl-header", h90.string(),
+                          "--leg-tcl-library", "elf64-arm64=" + lib86.string()});
+    ASSERT_TRUE(bad.spawned) << bad.diagnostic;
+    EXPECT_EQ(bad.exitCode, 5u)
+        << "a 9.0 staged header over a leg's PINNED 8.6 library must REFUSE."
+           " Building anyway is what produced four K_SymbolUndefined on the"
+           " first native macOS run.\n"
+        << bad.output;
+    // The diagnostic has to be actionable without reading the driver: the leg,
+    // both versions, and the remedy the operator actually used.
+    for (char const* needle : {"elf64-arm64", "9.0", "8.6", "DSS_TCL_VERSION=8.6",
+                               "Tcl_GetBytesFromObj"}) {
+        EXPECT_NE(bad.output.find(needle), std::string::npos)
+            << "the refusal never says `" << needle
+            << "`, so it sends its reader nowhere.\n"
+            << bad.output;
+    }
+
+    // AND THE MIRROR IMAGE — an 8.6 header over a 9.0 library. Same skew, other
+    // direction; a check that only knew one direction would be half a check.
+    auto const lib90 = dir / "libtcl9.0.so";
+    writeBytes(lib90, tcl90Library());
+    ASSERT_TRUE(fs::exists(lib90)) << lib90;
+    auto const rev = run({"--tcl-coherence", "--staged-tcl-header", h86.string(),
+                          "--leg-tcl-library", "pe64-x86_64=" + lib90.string()});
+    ASSERT_TRUE(rev.spawned) << rev.diagnostic;
+    EXPECT_EQ(rev.exitCode, 5u) << rev.output;
+}
+
+// 3. THE HEADERS ARE STAGED ONCE FOR EVERY LEG, so legs that resolve DIFFERENT
+//    Tcls are structurally incoherent whatever the header says. That is a
+//    property of the RUN, and it must be named as such rather than reported as
+//    "one leg is wrong".
+TEST_F(HarnessLegs, LegsThatResolveDifferentTclVersionsAreStructurallyIncoherent) {
+    auto const      dir = scratch_->path() / "tcl-split";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    auto const lib86 = dir / "libtcl8.6.so";
+    auto const lib90 = dir / "libtcl9.0.so";
+    writeBytes(lib86, tcl86Library());
+    writeBytes(lib90, tcl90Library());
+    ASSERT_TRUE(fs::exists(lib86) && fs::exists(lib90)) << dir;
+    auto const h86 = writeTclHeader(dir / "inc", "#define TCL_VERSION \"8.6\"\n");
+
+    auto const r = run({"--tcl-coherence", "--staged-tcl-header", h86.string(),
+                        "--leg-tcl-library", "elf64-arm64=" + lib86.string(),
+                        "--leg-tcl-library", "macho64-arm64=" + lib90.string()});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_EQ(r.exitCode, 5u) << r.output;
+    EXPECT_NE(r.output.find("structurally incoherent"), std::string::npos)
+        << "two legs resolved two Tcls and the refusal blamed a single leg."
+           " One set of headers is staged for all of them, so no header can be"
+           " correct for both — say that, or the operator pins the wrong one.\n"
+        << r.output;
+    for (char const* needle : {"elf64-arm64", "macho64-arm64"}) {
+        EXPECT_NE(r.output.find(needle), std::string::npos) << r.output;
+    }
+}
+
+// 4. THE SOFT OUTCOMES, WHICH ARE WHERE A CHECK LIKE THIS GOES QUIETLY VACUOUS.
+//    "cannot determine" must be LOUD and must name the leg; and the version must
+//    come from the library's BYTES, never from what the file is called.
+TEST_F(HarnessLegs, AnUnmeasurableTclLibraryWarnsAndTheNameNeverDecidesTheVersion) {
+    auto const      dir = scratch_->path() / "tcl-soft";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    auto const h86 = writeTclHeader(dir / "inc", "#define TCL_VERSION \"8.6\"\n");
+
+    // (a) A file that is not an object file at all. Not a pass, not a refusal:
+    //     a warning that names the leg.
+    auto const junk = dir / "libtcl8.6.so";
+    writeBytes(junk, "this is not an object file");
+    ASSERT_TRUE(fs::exists(junk)) << junk;
+    auto const soft = run({"--tcl-coherence", "--staged-tcl-header", h86.string(),
+                           "--leg-tcl-library", "pe64-x86_64=" + junk.string()});
+    ASSERT_TRUE(soft.spawned) << soft.diagnostic;
+    EXPECT_EQ(soft.exitCode, 0u)
+        << "a library whose version cannot be MEASURED is not a skew — refusing"
+           " here would make an unreadable third-party binary kill a run that is"
+           " otherwise fine.\n"
+        << soft.output;
+    EXPECT_NE(soft.output.find("WARN"), std::string::npos) << soft.output;
+    EXPECT_NE(soft.output.find("pe64-x86_64"), std::string::npos) << soft.output;
+
+    // (b) ★ THE ANCHOR'S OWN LESSON, AS A TEST. The file is CALLED libtcl9.0.so
+    //     and its contents are an 8.6 library. If the check read the name it
+    //     would pass; it reads the export table and the binary's own DT_SONAME,
+    //     so it refuses under a 9.0 header and passes under an 8.6 one.
+    auto const lying = dir / "libtcl9.0.so";
+    writeBytes(lying, tcl86Library());
+    ASSERT_TRUE(fs::exists(lying)) << lying;
+    auto const h90 = writeTclHeader(dir / "inc90", "#define TCL_VERSION \"9.0\"\n");
+    auto const byName = run({"--tcl-coherence", "--staged-tcl-header", h90.string(),
+                             "--leg-tcl-library", "elf64-x86_64=" + lying.string()});
+    ASSERT_TRUE(byName.spawned) << byName.diagnostic;
+    EXPECT_EQ(byName.exitCode, 5u)
+        << "a file NAMED libtcl9.0.so whose bytes are Tcl 8.6 was accepted under"
+           " a 9.0 header. The check is reading the file name — which is the"
+           " defect this anchor is about, one level down.\n"
+        << byName.output;
+    auto const byBytes = run({"--tcl-coherence", "--staged-tcl-header", h86.string(),
+                              "--leg-tcl-library", "elf64-x86_64=" + lying.string()});
+    ASSERT_TRUE(byBytes.spawned) << byBytes.diagnostic;
+    EXPECT_EQ(byBytes.exitCode, 0u)
+        << "the same file, whose BYTES are Tcl 8.6, must satisfy an 8.6 header"
+           " however it happens to be named.\n"
+        << byBytes.output;
+
+    // (c) A staged header that states no version is a REFUSAL, not a pass: it is
+    //     the one Tcl input taken from the host, and an unmeasurable one cannot
+    //     be checked against anything.
+    auto const mute = writeTclHeader(dir / "incmute",
+                                     "#define TCL_PATCH_LEVEL \"8.6.14\"\n");
+    auto const r = run({"--tcl-coherence", "--staged-tcl-header", mute.string(),
+                        "--leg-tcl-library", "elf64-arm64=" + lying.string()});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_EQ(r.exitCode, 2u) << r.output;
 }

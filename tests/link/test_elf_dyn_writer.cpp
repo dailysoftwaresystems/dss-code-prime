@@ -32,6 +32,7 @@
 #include "link/format/elf.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
+#include "format_reject_support.hpp"   // countAtPath / rejectSummary
 
 #include <gtest/gtest.h>
 
@@ -42,6 +43,9 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -401,6 +405,7 @@ TEST(ElfDynFormatJson, ShippedDynFileLoadsWithDynShape) {
 TEST(ElfDynFormatJson, InterpreterOnDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-interp","kind":"elf"},
@@ -408,11 +413,18 @@ TEST(ElfDynFormatJson, InterpreterOnDynRejectedAtLoad) {
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    // `interpreter` alone is a 1-of-4 PARTIAL entry cluster (elf.interpreter
+    // / processExit / entryCallingConvention / processArgs) -- the
+    // all-or-none rule fires at '/elf', not '/elf/interpreter'
+    // (object_format_schema.cpp).
+    EXPECT_EQ(countAtPath(r, "/elf"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(ElfDynFormatJson, EntryPointOnDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-entry","kind":"elf"},
@@ -421,6 +433,8 @@ TEST(ElfDynFormatJson, EntryPointOnDynRejectedAtLoad) {
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/entryPoint"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(ElfDynFormatJson, TextVaNotEqualPageAlignRejectedAtLoad) {
@@ -428,6 +442,7 @@ TEST(ElfDynFormatJson, TextVaNotEqualPageAlignRejectedAtLoad) {
     // (the exec-style 0x401000 here must reject).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-exec-va","kind":"elf"},
@@ -435,11 +450,15 @@ TEST(ElfDynFormatJson, TextVaNotEqualPageAlignRejectedAtLoad) {
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/sections/<text>/virtualAddress"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(ElfDynFormatJson, CopyRelocationBindingOnDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-copy-reloc","kind":"elf"},
@@ -448,18 +467,27 @@ TEST(ElfDynFormatJson, CopyRelocationBindingOnDynRejectedAtLoad) {
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/dataImportBinding"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(ElfDynFormatJson, SonameOnNonDynRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-with-soname","kind":"elf"},
+      "$entryClusterComment": "D-LK10-ENTRY 2.13: ET_EXEC is unconditionally exec-flavored, and validate() REJECTS an exec-flavored format that declares no processExit -- so without this pair the fixture would be rejected for a reason unrelated to the soname defect it pins. Values verbatim from the shipped elf64-x86_64-linux-exec.format.json.",
+      "processExit": { "mechanism": "by-name-import", "importMangledName": "exit", "importLibraryPath": "libc.so.6" },
+      "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "soname": "libx.so.1" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/elf/soname"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 // ── Writer: header + phdr pins ──────────────────────────────────
@@ -504,6 +532,7 @@ TEST(ElfDynWriter, SonameEmittedWhenConfigured) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-with-soname","kind":"elf"},
@@ -1012,6 +1041,7 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
     // pre-c151 reject, now owned by the all-or-none cluster rule).
     auto a = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-half-interp","kind":"elf"},
@@ -1022,10 +1052,15 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
         << "interpreter without the rest of the entry cluster must "
            "reject (no trampoline -> e_entry = 0 executes header "
            "bytes)";
+    // 1-of-4 cluster (interpreter only) -> the all-or-none rule fires at
+    // '/elf'; no other field is declared, so nothing else can fire.
+    EXPECT_EQ(countAtPath(a, "/elf"), 1u) << rejectSummary(a);
+    EXPECT_EQ(errorCount(a), 1u) << rejectSummary(a);
     // (b) the trampoline trio WITHOUT the interpreter — a PIE with
     // no loader to resolve its libc exit import.
     auto b = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-half-exit","kind":"elf"},
@@ -1039,11 +1074,25 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
     ASSERT_FALSE(b.has_value())
         << "processExit/cc/processArgs without elf.interpreter must "
            "reject (half-configured PIE)";
+    // 3-of-4 cluster (no interpreter) -> the all-or-none rule fires at
+    // '/elf'. AND, because `isExecFlavor()`'s ET_DYN arm requires ALL
+    // FOUR members (elfDynPieShape), this schema reads as NOT
+    // exec-flavored -- so processExit/entryCallingConvention/processArgs
+    // each independently trip the generic "only legal on exec-flavored
+    // formats" gate (D-LK10-ENTRY 2.13 / D-RUNTIME-MAIN-ARGC-ARGV). MEASURED
+    // knock-on, not assumed: 1 (/elf) + 3 (one per stray field) = 4.
+    EXPECT_EQ(countAtPath(b, "/elf"), 1u) << rejectSummary(b);
+    EXPECT_EQ(countAtPath(b, "/processExit"), 1u) << rejectSummary(b);
+    EXPECT_EQ(countAtPath(b, "/entryCallingConvention"), 1u)
+        << rejectSummary(b);
+    EXPECT_EQ(countAtPath(b, "/processArgs"), 1u) << rejectSummary(b);
+    EXPECT_EQ(errorCount(b), 4u) << rejectSummary(b);
     // (c) interpreter + processExit + cc but NO processArgs — the
     // sneakiest half-state: the image would load and run, but
     // main(argc, argv) would read process-entry register garbage.
     auto c = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"dyn-half-args","kind":"elf"},
@@ -1056,6 +1105,18 @@ TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
     ASSERT_FALSE(c.has_value())
         << "a PIE cluster missing processArgs must reject (main's "
            "argc/argv would be register garbage)";
+    // 3-of-4 cluster (no processArgs) -> the all-or-none rule fires at
+    // '/elf'. Same knock-on shape as fixture (b): isExecFlavor() is false
+    // (elfDynPieShape needs processArgs too), so the declared processExit
+    // + entryCallingConvention each independently trip the "only legal on
+    // exec-flavored formats" gate. processArgs itself is absent, so it
+    // cannot trip its own gate. MEASURED: 1 (/elf) + 2 = 3.
+    EXPECT_EQ(countAtPath(c, "/elf"), 1u) << rejectSummary(c);
+    EXPECT_EQ(countAtPath(c, "/processExit"), 1u) << rejectSummary(c);
+    EXPECT_EQ(countAtPath(c, "/entryCallingConvention"), 1u)
+        << rejectSummary(c);
+    EXPECT_EQ(countAtPath(c, "/processArgs"), 0u) << rejectSummary(c);
+    EXPECT_EQ(errorCount(c), 3u) << rejectSummary(c);
 }
 
 TEST(ElfPieFormatJson, SonameWithEntryClusterRejectedAtLoad) {
@@ -1064,6 +1125,7 @@ TEST(ElfPieFormatJson, SonameWithEntryClusterRejectedAtLoad) {
     // PIE) — rejecting keeps configs honest.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"pie-with-soname","kind":"elf"},
@@ -1077,6 +1139,11 @@ TEST(ElfPieFormatJson, SonameWithEntryClusterRejectedAtLoad) {
     ASSERT_FALSE(r.has_value())
         << "soname + entry cluster must reject (a PIE is not a "
            "library)";
+    // Full 4-of-4 cluster present -> isPieShape true -> the PIE-specific
+    // soname rule fires at '/elf/soname' (NOT the all-or-none '/elf'
+    // partial-cluster rule, which requires an INCOMPLETE cluster).
+    EXPECT_EQ(countAtPath(r, "/elf/soname"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 // ── PIE writer: header/phdr/dynamic pins ────────────────────────

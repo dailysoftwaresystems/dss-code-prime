@@ -137,6 +137,7 @@ encodePeUntrampolined(AssembledModule           mod,  // by value: stamped copy
 TEST(MachOCodeSignPlaceholder, NonMultipleOfEightRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bad-cs","kind":"macho"},
@@ -173,6 +174,7 @@ TEST(MachOCodeSignPlaceholder, NonMultipleOfEightRejectedAtLoad) {
 TEST(MachOCodeSignPlaceholder, ZeroAcceptedAsDisabled) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-no-cs","kind":"macho"},
@@ -198,6 +200,7 @@ TEST(MachOCodeSignPlaceholder, ObjectFiletypeRejectsCodeSigField) {
     // placeholder is meaningful only on executable images.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-obj-with-cs","kind":"macho"},
@@ -206,6 +209,12 @@ TEST(MachOCodeSignPlaceholder, ObjectFiletypeRejectsCodeSigField) {
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MH_OBJECT rejects the WHOLE 'image' block (not a per-field path) --
+    // codeSignatureSize is one of nine fields the same `anySet` guard
+    // covers (object_format_schema.cpp), so the diagnostic is stamped at
+    // '/image' itself.
+    EXPECT_EQ(countAtPath(r, "/image"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 // ── Mach-O: walker emits LC_CODE_SIGNATURE + zero reservation ────────
@@ -220,6 +229,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsNonZeroCodeSigSize) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-static","kind":"macho"},
@@ -265,6 +275,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathRejectsTakesPrecedenceOverBindNow) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs+lazy-no-externs","kind":"macho"},
@@ -316,6 +327,7 @@ TEST(MachOCodeSignPlaceholder, DynamicPathEmitsLcCodeSignatureWithZeroReservatio
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cs-dyn","kind":"macho"},
@@ -428,6 +440,7 @@ TEST(MachOCodeSignPlaceholder, ZeroSizeOmitsLcCodeSignature) {
     // pair differing ONLY in the reservation request.
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-no-cs-walk","kind":"macho"},
@@ -686,6 +699,7 @@ TEST(MachOCodeSignPlaceholder, StaticPathDropsAdHocCodeSignatureRequest) {
 TEST(PeCertPlaceholder, NonMultipleOfEightRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-bad-cert","kind":"pe"},
@@ -731,14 +745,22 @@ TEST(PeCertPlaceholder, ObjFormatRejectsCertField) {
     // PE .obj must not declare attributeCertReserveSize.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-obj-with-cert","kind":"pe"},
       "pe": { "machine": 34404, "type": "obj" },
       "optionalHeader": { "attributeCertReserveSize": 1024 },
-      "sections":[{"kind":"text","name":".text","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
+      "$sectionRowComment": "addrAlign MUST be 0 for a PE row (PE folds alignment into Characteristics via the substrate 'type' field, object_format_schema.cpp) -- the sibling 'pe-with-cert' fixture below documents the same trap ('it previously carried ... addrAlign 16 ... a further reason to reject that had nothing to do with the rule under test'). MEASURED, not assumed.",
+      "sections":[{"kind":"text","name":".text","type":0,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // PE .obj rejects the WHOLE 'optionalHeader' block (not a per-field
+    // path) -- attributeCertReserveSize is one of eleven fields the same
+    // `anySet` guard covers, so the diagnostic is stamped at
+    // '/optionalHeader' itself, not '/optionalHeader/attributeCertReserveSize'.
+    EXPECT_EQ(countAtPath(r, "/optionalHeader"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 // ── PE: walker emits security directory entry + zero reservation ─────
@@ -748,6 +770,7 @@ TEST(PeCertPlaceholder, WalkerEmitsSecurityDirAndZeroReservation) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-with-cert","kind":"pe"},
@@ -813,6 +836,7 @@ TEST(PeExecFormatJsonValidate,
     // silently produce a non-executable binary.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-no-exec-bit","kind":"pe"},
@@ -856,6 +880,7 @@ TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-imports-with-cert","kind":"pe"},

@@ -814,7 +814,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // import library) the SAME post-construction way as libraryShimRecipes, so the LOWER
     // half's `synthesizeThreadsShim` picks the right primitive family. nullopt on elf.
     cuMir.librarySynthesis = format.librarySynthesis();
-    cuMir.objectFormat     = format.kind();   // for the synth pass's per-format helper mangling
+    // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN (C4): the DECLARED rule, not the identity.
+    cuMir.cSymbolDecoration = format.cSymbolDecoration().scheme;
     // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): capture the RESOLVED CC's WHOLE `vaListLayout`
     // so the LOWER half's `synthesizeStdioShim` knows the target's variadic-forwarding
     // model — strategy AND `variadicUsesOverflowBase`, which is what picks the va leaf.
@@ -1498,7 +1499,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // the CU model's; the vehicle comes from `cuMir.librarySynthesis`.
     if (!synthesizeThreadsShim(cuMir.mir, model.lattice().interner(),
                                threadsRecipes, cuMir.librarySynthesis,
-                               cuMir.objectFormat, cuMir.externImports, reporter)) {
+                               cuMir.cSymbolDecoration, cuMir.externImports,
+                               reporter)) {
         return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
     }
 
@@ -1550,8 +1552,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // ShippedExternSymbol that becomes the import row.
     auto nameOf = [&](SymbolId s) -> std::string {
         SymbolRecord const* r = model.recordFor(s);
-        return r ? dss::ffi::linkNameFor(r->name, r->asmName, fmtKind,
-                                         r->linkName)
+        return r ? dss::ffi::linkNameFor(r->name, r->asmName,
+                                         cuMir.cSymbolDecoration, r->linkName)
                  : std::string{};
     };
 

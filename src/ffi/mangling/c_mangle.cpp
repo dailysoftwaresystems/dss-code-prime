@@ -10,68 +10,44 @@ namespace dss::ffi {
 
 namespace {
 
-// Closed-table: per-ObjectFormatKind decoration rule for C names.
-// Each row maps a format kind to whether it prefixes C identifiers
-// with a leading underscore. The shape is one row per
-// `ObjectFormatKind` variant so the static_assert below catches a
-// new variant addition that forgot to declare its rule.
-struct CManglingRule {
-    ObjectFormatKind format;
-    bool             addLeadingUnderscore;
-};
-
-constexpr std::array<CManglingRule, kObjectFormatKindTable.rows.size()> kCManglingRules{{
-    { ObjectFormatKind::Unknown, false },  // defensive default
-    { ObjectFormatKind::Elf,     false },  // System V / Linux convention
-    { ObjectFormatKind::Pe,      false },  // PE64 cdecl (32-bit cdecl `_func` lands at D-FF4-1)
-    { ObjectFormatKind::MachO,   true  },  // Apple convention: leading `_` on every C symbol
-    { ObjectFormatKind::Wasm,    false },  // uses import-namespace, no name mangling
-    { ObjectFormatKind::Spirv,   false },  // no C ABI surface
-}};
-
-// One row per format-kind variant: a future format added to
-// `ObjectFormatKind` without a matching rule here would silently
-// inherit the linear-scan default (false / no decoration), masking
-// the design decision. The static_assert + the
-// `kCManglingRulesAlignedWithEnum` consteval pin force a fold-now.
-// Anchored against `kObjectFormatKindTable` (the canonical
-// variant-count source in `link/object_format_schema.hpp`) rather
-// than `Spirv+1u` — the latter would silently accept any future
-// variant appended after Spirv as long as the row count happened
-// to match. (silent-failure H1 + code-reviewer post-fold #2.)
-static_assert(kCManglingRules.size() == kObjectFormatKindTable.rows.size(),
-              "kCManglingRules row count must equal the ObjectFormatKind "
-              "variant count (anchored against kObjectFormatKindTable). "
-              "Adding a kind requires adding a rule.");
-
-consteval bool kCManglingRulesAlignedWithEnum() {
-    for (std::size_t i = 0; i < kCManglingRules.size(); ++i) {
-        if (static_cast<std::size_t>(kCManglingRules[i].format) != i) return false;
-    }
-    return true;
-}
-static_assert(kCManglingRulesAlignedWithEnum(),
-              "kCManglingRules row order must match the ObjectFormatKind "
-              "underlying values — a paste-error row in the wrong slot "
-              "would silently apply the wrong rule to the wrong format.");
-
+// D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN (step C4): the closed C++ table
+// `kCManglingRules` STOOD HERE and is GONE. It mapped each `ObjectFormatKind`
+// to a bool, keyed on the format IDENTITY, and it was one of TWO owners of a
+// single per-format fact — the other being a literal encoding in the format
+// descriptors themselves (`macho64-*-exec` spelling `processExit.
+// importMangledName` as `_exit` while elf/pe spell it `exit`). Two owners, two
+// languages, nothing forcing them to agree.
+//
+// The rule now arrives as a DECLARED VERB read out of `.format.json`
+// (`cSymbolDecoration.scheme`), and this file no longer speaks
+// `ObjectFormatKind` at all. That last part is the load-bearing half: with the
+// identity absent from every signature below, an identity branch is not
+// something a reviewer has to look for — it is unrepresentable here.
+//
+// WHAT REPLACED THE static_asserts. The old table carried two of them, whose
+// job was to notice a NEW `ObjectFormatKind` variant that forgot to declare its
+// rule (it would otherwise inherit the linear-scan `false`). That job did not
+// disappear, it MOVED and got stronger: a new format now cannot be added
+// without a `.format.json`, and `ObjectFormatData::validate()` REQUIRES
+// `cSymbolDecoration` on every format unconditionally — so the omission is
+// caught at config LOAD for every format that will ever exist, rather than by a
+// compile-time assert over the enum's current membership.
 [[nodiscard]] constexpr bool
-addsLeadingUnderscoreFor(ObjectFormatKind format) noexcept {
-    auto const idx = static_cast<std::size_t>(format);
-    if (idx >= kCManglingRules.size()) return false;
-    return kCManglingRules[idx].addLeadingUnderscore;
+addsLeadingUnderscoreFor(CSymbolDecorationScheme scheme) noexcept {
+    return scheme == CSymbolDecorationScheme::LeadingUnderscore;
 }
 
 } // namespace
 
-bool cFormatAddsLeadingUnderscore(ObjectFormatKind format) noexcept {
-    return addsLeadingUnderscoreFor(format);
+bool cFormatAddsLeadingUnderscore(CSymbolDecorationScheme scheme) noexcept {
+    return addsLeadingUnderscoreFor(scheme);
 }
 
 std::string
-applyCMangling(std::string_view canonicalName, ObjectFormatKind format) {
+applyCMangling(std::string_view       canonicalName,
+               CSymbolDecorationScheme scheme) {
     if (canonicalName.empty()) return {};
-    if (addsLeadingUnderscoreFor(format)) {
+    if (addsLeadingUnderscoreFor(scheme)) {
         std::string out;
         out.reserve(canonicalName.size() + 1u);
         out.push_back('_');
@@ -83,7 +59,7 @@ applyCMangling(std::string_view canonicalName, ObjectFormatKind format) {
 
 std::string
 linkNameFor(std::string_view canonicalName, std::string_view asmLabel,
-            ObjectFormatKind format, std::string_view linkBaseName) {
+            CSymbolDecorationScheme scheme, std::string_view linkBaseName) {
     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): an explicit assembler name
     // REPLACES the format's C mangling. It is
     // returned byte-for-byte — no prefix added, none stripped, no validation of
@@ -98,16 +74,17 @@ linkNameFor(std::string_view canonicalName, std::string_view asmLabel,
     // line below. That single call is the property the tests pin: with
     // `linkName:"fstat$INODE64"` a macho build emits `_fstat$INODE64` and an elf
     // build emits the bare `fstat$INODE64`, because the `_` is the FORMAT's fact
-    // (`kCManglingRules`), never the symbol's. Empty ⇒ the canonical identifier,
+    // (the declared `cSymbolDecoration.scheme`), never the symbol's. Empty ⇒ the canonical identifier,
     // byte-identical to every pre-TF-C121 image.
     return applyCMangling(linkBaseName.empty() ? canonicalName : linkBaseName,
-                          format);
+                          scheme);
 }
 
 std::string
-unapplyCMangling(std::string_view decoratedName, ObjectFormatKind format) {
+unapplyCMangling(std::string_view       decoratedName,
+                 CSymbolDecorationScheme scheme) {
     if (decoratedName.empty()) return {};
-    if (addsLeadingUnderscoreFor(format)
+    if (addsLeadingUnderscoreFor(scheme)
         && !decoratedName.empty()
         && decoratedName.front() == '_') {
         return std::string{decoratedName.substr(1)};
@@ -160,11 +137,11 @@ mangleErrorKindName(MangleErrorKind k) noexcept {
 }
 
 std::expected<std::string, MangleError>
-unapplyCManglingStrict(std::string_view    decoratedName,
-                       ObjectFormatKind    format,
-                       DiagnosticReporter& reporter) {
+unapplyCManglingStrict(std::string_view        decoratedName,
+                       CSymbolDecorationScheme scheme,
+                       DiagnosticReporter&     reporter) {
     if (decoratedName.empty()) return std::string{};
-    if (cFormatAddsLeadingUnderscore(format)) {
+    if (cFormatAddsLeadingUnderscore(scheme)) {
         // Guarded by the empty-input early-return above; decoratedName.front() is safe.
         if (decoratedName.front() != '_') {
             std::string detail = std::string{"format expects leading '_' "

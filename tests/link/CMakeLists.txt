@@ -1,6 +1,20 @@
 # Linker unit tests (plan 14 LK4 substrate).
 
 dss_add_test(NAME link/test_object_format_schema SOURCES test_object_format_schema.cpp)
+
+# D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN — the per-format C-symbol decoration
+# axis (`cSymbolDecoration`), given its own file the way the sibling
+# `headerNameMatching` axis has `tests/core/test_header_name_matching.cpp`:
+# the closed vocabulary + its non-nameable sentinel, the loader's REQUIRED
+# rule, the loader-BYPASSING `validate()` rule (which no JSON-fed test can
+# cover), the unconditional-across-every-flavor proof, and the
+# enumerated-from-disk sweep over all 24 shipped formats.
+dss_add_test(NAME link/test_c_symbol_decoration  SOURCES test_c_symbol_decoration.cpp)
+# Parses a shipped `.format.json` directly so its "shipped file MINUS exactly one
+# key" fixture is copied VERBATIM and cannot drift from the real file — hence the
+# json link (the `ffi/test_shipped_type_consistency` precedent).
+target_link_libraries(dss_link_test_c_symbol_decoration
+                      PRIVATE nlohmann_json::nlohmann_json)
 dss_add_test(NAME link/test_linker               SOURCES test_linker.cpp)
 # Cycle 24 — the pure cross-CU DEFINITION resolver tripwire (shared by the linker
 # today + a future whole-program MIR merge). Direct value-in/value-out policy pins.

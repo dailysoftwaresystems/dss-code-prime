@@ -212,9 +212,15 @@ struct DSS_EXPORT ShippedSymbol {
     //
     // ★ IT DECLARES THE UNDECORATED BASE NAME — the leading `_` is composed by
     // the ENGINE (`ffi::linkNameFor` -> `applyCMangling`), NEVER written here.
-    // That `_` is a per-FORMAT fact with two owners already (`kCManglingRules`
-    // and the format descriptors' `importMangledName`); a per-symbol third copy
-    // would grow with the descriptor corpus and drift. The ELF `version` field
+    // That `_` is a per-FORMAT fact. When this field landed (TF-C121) the fact
+    // had TWO owners -- a closed C++ table `kCManglingRules` and the format
+    // descriptors' `importMangledName` literals -- and a per-symbol third copy
+    // would have grown with the descriptor corpus and drifted. That two-owner
+    // problem is now CLOSED (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN step C4,
+    // TF-C122): the C++ table is gone and the rule is the format's declared
+    // `cSymbolDecoration.scheme`. The argument against writing `_` here is
+    // UNCHANGED and is now simply the ordinary one -- a per-format fact belongs
+    // on the format, not repeated on every symbol that happens to use it. The ELF `version` field
     // above is the exact precedent and it COMPOSES the same way: config says
     // `realpath` + `version:"GLIBC_2.3"`, never `realpath@GLIBC_2.3`.
     //

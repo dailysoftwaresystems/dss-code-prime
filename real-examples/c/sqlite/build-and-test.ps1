@@ -2456,6 +2456,60 @@ foreach ($lg in $Legs) {
   }
 }
 $BuildableLegs = @($Legs | Where-Object { $LegLibs.ContainsKey($_.label) })
+
+# ── THE FOURTH Tcl COHERENCE CHECK — AND THE ONLY PER-LEG ONE ────────────────
+# [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED]
+#
+# The Tcl HEADERS this run compiles every leg against were staged back in Step
+# 3+4, by the POSIX derivation, from whatever tclConfig.sh that machine happened
+# to have. Every leg's LIBRARY, resolved just above, comes from its OWN declared
+# provider and is pinned. Nothing had ever compared the two.
+#
+# ✔MEASURED 2026-08-06, first native macOS run of the .sh: a 9.0 header over the
+# pinned 8.6 libraries produced four K_SymbolUndefined (Tcl_GetBool,
+# Tcl_GetBoolFromObj, Tcl_GetBytesFromObj, Tcl_GetChild) because sqlite's
+# tclsqlite.c gates live code on TCL_MAJOR_VERSION>8. The same skew is reachable
+# from here the day the WSL distro's default Tcl moves to 9.x — which the Step
+# 3+4 staging comment already records as a KNOWN LATENT hazard.
+#
+# ★ FATAL, NEVER A WARN, AND NEVER A PER-LEG SKIP. The headers are staged ONCE
+# for every leg, so a skew is a property of the RUN, not of one leg; and a warn
+# would ship a binary that links clean and then misbehaves. A leg whose library
+# version cannot be MEASURED is the one soft outcome and is named out loud.
+#
+# ★ THE COMPARISON LIVES IN harness_legs.py, called by BOTH drivers with the
+# same verb — this capability cannot exist in one driver and not the other
+# [D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER]. It reads each
+# library's BYTES (export table + self-declared identity), never its file name.
+#
+# ★ THE HEADER IS MEASURED WHERE IT WAS STAGED, not where it came from: $Stage\
+# tclinc\tcl.h is the copy every leg's include list actually points at, and it is
+# on THIS filesystem even when the derivation that produced it ran inside WSL.
+$StagedTclH = Join-Path (Join-Path $Stage 'tclinc') 'tcl.h'
+$tclCohArgs = @('--tcl-coherence', '--staged-tcl-header', "$StagedTclH")
+$tclCohLegs = 0
+foreach ($lg in $Legs) {
+  $t = "$($LegLibsAll[$lg.label].Tcl)"
+  if ($t) { $tclCohArgs += @('--leg-tcl-library', "$($lg.label)=$t"); $tclCohLegs++ }
+}
+if ($tclCohLegs -gt 0) {
+  # Invoke-LegResolver takes the rc DIRECTLY off the call and keeps stderr —
+  # here the refusal IS the diagnostic.
+  $tclCoh = Invoke-LegResolver $tclCohArgs
+  if ($tclCoh.Rc -ne 0) {
+    # ⚠ THE REMEDY THE RESOLVER NAMES IS NOT ACTIONABLE FROM THIS DRIVER, and
+    # saying so is cheaper than letting an operator try it and get nowhere:
+    # `DSS_TCL_VERSION` is implemented by build-and-test.sh ONLY (✔MEASURED
+    # 2026-08-06: zero occurrences in this file). This driver's Step-3+4
+    # derivation picks its tclConfig.sh with `find /usr/lib | head -1` and has no
+    # pin at all — D-HARNESS-PS1-TCL-CONFIG-DISCOVERY-8X-ONLY, whose trigger this
+    # refusal IS. So the remedy here is to make the POSIX side's Tcl match.
+    Die "Tcl HEADER/LIBRARY COHERENCE FAILED (rc=$($tclCoh.Rc)) — refusing to build.`n$(($tclCoh.Text -split "`n" | ForEach-Object { "      $_" }) -join "`n")`n      The staged headers came from the POSIX derivation in Step 3+4 ($StagedTclH); every leg's library comes from its own declared provider. This driver will not compile a fixture against one Tcl and link another.`n      ⚠ `$env:DSS_TCL_VERSION is NOT implemented by this driver (build-and-test.sh only): Step 3+4 takes the first tclConfig.sh it finds, with no pin [D-HARNESS-PS1-TCL-CONFIG-DISCOVERY-8X-ONLY]. Until that is closed, the fix from here is to make the POSIX toolchain's default Tcl the one the legs' libraries are pinned at, then delete $Stage and re-run so the derivation re-stages."
+  }
+  foreach ($ln in ($tclCoh.Text -split "`n")) { if ($ln.Trim()) { Info "      $ln" } }
+  Info "tcl coherence: the staged headers match the libtcl of all $tclCohLegs resolved leg(s) — measured from each library's OWN bytes, not its file name"
+}
+
 if (-not (Test-Path $TclLibrary)) { Warn "Tcl script library not at $TclLibrary — a leg this host RUNS needs it (set `$env:TCL_LIBRARY)." }
 Pass "TESTFIXTURE build inputs (tcl AND zlib) resolved for $($BuildableLegs.Count) of $($Legs.Count) selected leg(s); the sqlite3 CLI needs only zlib and is attempted for $(@($Legs | Where-Object { "$($LegLibsAll[$_.label].Z)" }).Count)"
 

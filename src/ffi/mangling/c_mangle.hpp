@@ -14,23 +14,30 @@
 // identifier to/from its per-platform linker-visible decorated
 // form.
 //
-// Convention (v1):
-//   ObjectFormatKind::Elf     → no decoration (canonical C identifier)
-//   ObjectFormatKind::Pe      → no decoration (PE64 only ships today;
-//                                32-bit cdecl `_func` / stdcall
-//                                `_func@N` deferred until first 32-bit
-//                                PE target)
-//   ObjectFormatKind::MachO   → leading underscore (`_printf`) — Apple
-//                                convention. The decoration rule
-//                                reads `ObjectFormatKind` only,
-//                                which is bitness-agnostic by design:
-//                                Apple uses the same convention on
-//                                32-bit and 64-bit Mach-O so no
-//                                bitness axis is needed.
-//   ObjectFormatKind::Wasm    → no decoration (uses import-namespace
-//                                instead of name mangling)
-//   ObjectFormatKind::Spirv   → no decoration (SPIR-V has no C ABI)
-//   ObjectFormatKind::Unknown → no decoration (defensive default)
+// ★ THE RULE IS CONFIG, NOT CODE (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN,
+// step C4). Every function here takes a `CSymbolDecorationScheme` — the verb
+// the ACTIVE OBJECT FORMAT declares in its `.format.json` under
+// `cSymbolDecoration.scheme` — and NOT an `ObjectFormatKind`. A closed C++
+// table keyed on the format identity (`kCManglingRules`) used to live in the
+// .cpp; it was one of two owners of a single per-format fact, the other being
+// the descriptors' own `importMangledName` literals, with nothing forcing the
+// two to agree.
+//
+// Passing the declared verb rather than the identity is deliberate and is the
+// stronger half of the fix: this header cannot branch on "which format is
+// this?" because it is never told. Callers obtain the scheme from the loaded
+// schema (`format.cSymbolDecoration().scheme`), which `validate()` guarantees
+// is a real scheme and never the `Unspecified` sentinel.
+//
+// The two schemes that ship today:
+//   * `none`               → the linker-visible name IS the C identifier
+//                            (ELF/System V, PE/COFF x64, WASM's import
+//                            namespace, SPIR-V's decoration-based linkage).
+//   * `leading-underscore` → `_printf` — Apple's convention, which has no
+//                            bitness axis (32- and 64-bit Mach-O agree), which
+//                            is exactly why it is a per-FORMAT declaration.
+// 32-bit PE cdecl `_func` / stdcall `_func@N` arrive as their own scheme
+// enumerators WITH their engine arms, never as a re-spelling of these.
 //
 // Source-language agnostic: this is C-name mangling (FF4's plan
 // row). C++/Rust mangling is post-v1 (FF7/FF8) and lives in its
@@ -51,16 +58,16 @@ namespace dss::ffi {
 // Empty input → empty output (callers gate empties upstream;
 // FF4 does not synthesize a name).
 [[nodiscard]] DSS_EXPORT std::string
-applyCMangling(std::string_view canonicalName, ObjectFormatKind format);
+applyCMangling(std::string_view canonicalName, CSymbolDecorationScheme scheme);
 
 // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL, GCC 6.47.5) +
 // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME) —
 // THE one rule that turns a declared
 // symbol into its ON-BINARY name, with BOTH override channels folded in:
 //
-//     linkNameFor(canonical, asmLabel, fmt, linkBaseName)
+//     linkNameFor(canonical, asmLabel, scheme, linkBaseName)
 //         = asmLabel.empty()
-//               ? applyCMangling(linkBaseName.empty() ? canonical : linkBaseName, fmt)
+//               ? applyCMangling(linkBaseName.empty() ? canonical : linkBaseName, scheme)
 //               : asmLabel
 //
 // ★ THE TWO OVERRIDES ARE DIFFERENT KINDS OF FACT, AND THAT IS WHY THEY COMPOSE
@@ -87,9 +94,11 @@ applyCMangling(std::string_view canonicalName, ObjectFormatKind format);
 //     through the SAME SINGLE `applyCMangling` call below — there is one
 //     decoration rule and this function is where it is consulted. Writing the
 //     `_` per-symbol in config instead would make a THIRD in-tree copy of a
-//     PER-FORMAT fact that already has two owners (`kCManglingRules` here, and
-//     the format descriptors' `importMangledName`), and it would grow with the
-//     descriptor corpus. A per-format fact must not be encoded per-symbol.
+//     PER-FORMAT fact. Before step C4 that fact had TWO owners (a C++ table
+//     here and the descriptors' `importMangledName` literals); it now has ONE,
+//     the declared `cSymbolDecoration.scheme`, and a per-symbol `_` would
+//     immediately re-create the problem AND grow with the descriptor corpus.
+//     A per-format fact must not be encoded per-symbol.
 //
 // PRECEDENCE, stated once: asmLabel > linkBaseName > canonical. A user's explicit
 // source-level `__asm` outranks DSS's config-level answer for the same name (the
@@ -111,7 +120,7 @@ applyCMangling(std::string_view canonicalName, ObjectFormatKind format);
 // signal, unchanged).
 [[nodiscard]] DSS_EXPORT std::string
 linkNameFor(std::string_view canonicalName, std::string_view asmLabel,
-            ObjectFormatKind format, std::string_view linkBaseName);
+            CSymbolDecorationScheme scheme, std::string_view linkBaseName);
 
 // Inverse of `applyCMangling`: strip the per-platform decoration
 // to recover the canonical C identifier. Used by FF1 binary
@@ -130,14 +139,16 @@ linkNameFor(std::string_view canonicalName, std::string_view asmLabel,
 //
 // Empty input → empty output (mirrors `applyCMangling`).
 [[nodiscard]] DSS_EXPORT std::string
-unapplyCMangling(std::string_view decoratedName, ObjectFormatKind format);
+unapplyCMangling(std::string_view decoratedName, CSymbolDecorationScheme scheme);
 
-// Test-exposed: does this format add a leading underscore for C
-// symbols? Returns false for ELF / Wasm / SPIR-V / Unknown.
-// True for MachO. PE is currently false in v1 (PE64 only); the
-// 32-bit PE branch lands when D-FF4-1 fires.
+// Does the DECLARED scheme add a leading underscore for C symbols? True for
+// `leading-underscore`, false for `none`, and false for the `Unspecified`
+// sentinel — which no loaded schema can carry (`validate()` rejects it on
+// every format, unconditionally), so the sentinel arm is a defensive floor
+// rather than a reachable policy. Single-sourced: the three manglers below all
+// consult this, so the rule exists once.
 [[nodiscard]] DSS_EXPORT bool
-cFormatAddsLeadingUnderscore(ObjectFormatKind format) noexcept;
+cFormatAddsLeadingUnderscore(CSymbolDecorationScheme scheme) noexcept;
 
 // Closed-set failure modes for `unapplyCManglingStrict`.
 enum class MangleErrorKind : std::uint8_t {
@@ -160,18 +171,17 @@ struct DSS_EXPORT MangleError {
 // a structural anomaly worth surfacing rather than the conservative
 // pass-through that `unapplyCMangling` does.
 //
-// For formats with no decoration (ELF/Pe/Wasm/Spirv/Unknown), strict
-// mode is structurally a no-op: input passes through unchanged and
-// success is returned. The strict check only fires for decorated
-// formats (MachO today; PE32 cdecl post-D-FF4-1).
+// Under the `none` scheme, strict mode is structurally a no-op: input passes
+// through unchanged and success is returned. The strict check only fires under
+// a decorating scheme (`leading-underscore` today; PE32 cdecl post-D-FF4-1).
 //
 // Empty input → empty output success (mirrors `applyCMangling`
 // empty-input contract; an empty name is never "decorated" so there's
 // nothing to enforce). `reporter` receives an `F_*` diagnostic on
 // the error path.
 [[nodiscard]] DSS_EXPORT std::expected<std::string, MangleError>
-unapplyCManglingStrict(std::string_view    decoratedName,
-                       ObjectFormatKind    format,
-                       DiagnosticReporter& reporter);
+unapplyCManglingStrict(std::string_view        decoratedName,
+                       CSymbolDecorationScheme scheme,
+                       DiagnosticReporter&     reporter);
 
 } // namespace dss::ffi

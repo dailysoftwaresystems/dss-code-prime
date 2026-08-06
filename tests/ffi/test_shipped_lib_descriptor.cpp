@@ -5978,6 +5978,145 @@ TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {
            "surface (guards vacuous ABSENT passes)";
 }
 
+// D-FFI-DARWIN-SYSCTL-CONSTANTS-EMPTY — the DECLARED numbers of the Darwin
+// sysctl MIB constants, and the COMPLETENESS of the two domains they form.
+//
+// sqlite src/test1.c:9100-9104 addresses hw.availcpu / hw.ncpu by MIB ARRAY
+// (`nm[0] = CTL_HW; nm[1] = HW_AVAILCPU;`), which is why CTL_HW / HW_NCPU /
+// HW_AVAILCPU had to ship at all; the other 36 rows are here because a PARTIAL
+// constant domain is the trap sys/file.json's LOCK_* comment names — a name
+// that exists in the real header, is absent here, and therefore compiles to a
+// fail-loud miss on an include this descriptor shadows totally.
+//
+// EVERY value below was MEASURED on a real Mac (macOS 26.5.2 build 25F84,
+// Apple clang 21.0.0) by COMPILING rather than by reading a header, with four
+// agreeing instruments: `cc -E -dM`, the `.long` emitted by `cc -S` for
+// `const int x = <NAME>;`, `#pragma message` stringification, and a native
+// arm64 run plus an x86_64 (Rosetta) run.
+//
+// WHY BOTH ARCHES ARE READ even though every row is FLAT: the flatness is a
+// MEASURED RESULT, not a default. The `-dM` dumps for `-arch arm64` and
+// `-arch x86_64` were diffed over the entire CTL_*/HW_* surface (48 lines
+// each) and are byte-identical, which is exactly the check `_SC_PAGESIZE` in
+// unistd.json FAILS (elf 30 / macho 29, hence its `variants`). Reading both
+// arches here is what would catch someone later adding an arch variant that
+// contradicts the measurement.
+//
+// ★ WHAT THIS TEST CANNOT DO, so it is not mistaken for the whole guard: a
+// number that is internally consistent but points at the WRONG kernel node is
+// invisible here — asserting CTL_HW == 6 beside a row that says 6 proves only
+// that both were typed the same way. That check requires the kernel and lives
+// in examples/c-subset/shipped_sysctl_mib_hw_macho, which cross-checks each MIB
+// against the sysctlbyname NAME form of the same node on a real Mac.
+// MEASURED by demonstration: perturbing HW_MEMSIZE 24 -> 3 still BUILDS
+// (rc 0) and the example then exits 15 instead of 42.
+//
+// RED-ON-DISABLE: delete any row, or perturb any value, and the matching
+// EXPECT_EQ below fails for both arches; drop a row from either domain and the
+// contiguity check also names the gap.
+TEST(ShippedLibDescriptor, RealSysSysctlJsonMibConstantDomains) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "sysctl.json";
+
+    struct Row { char const* name; std::int64_t value; };
+    // The CTL_ top level: contiguous 0..8, plus its two bounds.
+    Row const ctl[] = {
+        {"CTL_UNSPEC", 0}, {"CTL_KERN", 1}, {"CTL_VM", 2}, {"CTL_VFS", 3},
+        {"CTL_NET", 4}, {"CTL_DEBUG", 5}, {"CTL_HW", 6}, {"CTL_MACHDEP", 7},
+        {"CTL_USER", 8}, {"CTL_MAXID", 9}, {"CTL_MAXNAME", 12},
+    };
+    // The HW_ second level: contiguous 1..27, plus HW_MAXID 28.
+    Row const hw[] = {
+        {"HW_MACHINE", 1}, {"HW_MODEL", 2}, {"HW_NCPU", 3}, {"HW_BYTEORDER", 4},
+        {"HW_PHYSMEM", 5}, {"HW_USERMEM", 6}, {"HW_PAGESIZE", 7},
+        {"HW_DISKNAMES", 8}, {"HW_DISKSTATS", 9}, {"HW_EPOCH", 10},
+        {"HW_FLOATINGPT", 11}, {"HW_MACHINE_ARCH", 12}, {"HW_VECTORUNIT", 13},
+        {"HW_BUS_FREQ", 14}, {"HW_CPU_FREQ", 15}, {"HW_CACHELINE", 16},
+        {"HW_L1ICACHESIZE", 17}, {"HW_L1DCACHESIZE", 18}, {"HW_L2SETTINGS", 19},
+        {"HW_L2CACHESIZE", 20}, {"HW_L3SETTINGS", 21}, {"HW_L3CACHESIZE", 22},
+        {"HW_TB_FREQ", 23}, {"HW_MEMSIZE", 24}, {"HW_AVAILCPU", 25},
+        {"HW_TARGET", 26}, {"HW_PRODUCT", 27}, {"HW_MAXID", 28},
+    };
+
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        DarwinBsdClusterRead m;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
+                                                     ObjectFormatKind::MachO, m));
+        auto find = [&](std::string_view n) -> ShippedConstant const* {
+            for (auto const& c : m.desc->constants)
+                if (c.name == n) return &c;
+            return nullptr;
+        };
+        // The three sqlite src/test1.c actually reaches, named separately so a
+        // failure says WHY the row exists rather than only that a number moved.
+        for (auto const* n : {"CTL_HW", "HW_NCPU", "HW_AVAILCPU"})
+            ASSERT_NE(find(n), nullptr)
+                << n << " is referenced by sqlite src/test1.c:9100-9104 — "
+                        "without it the macho testfixture does not compile "
+                        "(error[S0001], MEASURED)";
+
+        for (auto const* tbl : {&ctl[0], &hw[0]}) {
+            std::size_t const n = (tbl == &ctl[0]) ? std::size(ctl) : std::size(hw);
+            for (std::size_t i = 0; i < n; ++i) {
+                auto const* c = find(tbl[i].name);
+                ASSERT_NE(c, nullptr) << tbl[i].name << " missing (arch="
+                                      << arch << ")";
+                EXPECT_EQ(c->value, tbl[i].value)
+                    << tbl[i].name << " (arch=" << arch << ") — MEASURED on "
+                       "macOS 26.5.2; a wrong MIB number does NOT fail to "
+                       "compile, it queries the wrong kernel node";
+                EXPECT_EQ(m.interner.kind(c->type), TypeKind::I32)
+                    << tbl[i].name << " is an int MIB id (sysctl takes int*)";
+            }
+        }
+
+        // DOMAIN COMPLETENESS, not merely per-row correctness: the ids must be
+        // contiguous with no hole, which is what makes "ship the whole closed
+        // domain" checkable instead of aspirational. A dropped row is caught
+        // here even if every surviving row is right.
+        for (std::int64_t want = 0; want <= 8; ++want) {
+            bool seen = false;
+            for (auto const& r : ctl)
+                if (r.value == want && std::string_view{r.name} != "CTL_MAXID")
+                    seen = true;
+            EXPECT_TRUE(seen) << "CTL_ top level has a hole at id " << want;
+        }
+        for (std::int64_t want = 1; want <= 27; ++want) {
+            bool seen = false;
+            for (auto const& r : hw) if (r.value == want) seen = true;
+            EXPECT_TRUE(seen) << "HW_ level has a hole at id " << want;
+        }
+        EXPECT_EQ(m.desc->constants.size(), std::size(ctl) + std::size(hw))
+            << "the descriptor must ship EXACTLY the two closed domains "
+               "(arch=" << arch << ") — a row added without updating this test "
+               "is either an unmeasured value or a partial third domain";
+
+        // The deliberate OMISSIONS. Each of KERN_/VM_/USER_/CTLTYPE_ is its own
+        // closed domain with ZERO in-tree consumer, and a domain nobody calls is
+        // where a transcription error would sit unchecked. Pinned so that a
+        // future PARTIAL add is caught: shipping one KERN_* row means shipping
+        // the KERN_* domain whole and extending this test.
+        for (auto const& c : m.desc->constants) {
+            std::string_view const n{c.name};
+            EXPECT_FALSE(n.rfind("KERN_", 0) == 0 || n.rfind("VM_", 0) == 0
+                         || n.rfind("USER_", 0) == 0
+                         || n.rfind("CTLTYPE_", 0) == 0)
+                << n << " belongs to a domain this descriptor deliberately does "
+                        "not ship — ship it WHOLE (the sys/file.json LOCK_* "
+                        "discipline) and extend this test, or not at all";
+        }
+
+        // Positive control on the SAME read: the two functions must still be
+        // there, so a descriptor that failed to decode cannot satisfy the
+        // ABSENT assertions above vacuously.
+        EXPECT_NE(findDarwinBsdSymbol(m, "sysctl"), nullptr)
+            << "positive control: sysctl must decode on macho";
+        EXPECT_NE(findDarwinBsdSymbol(m, "sysctlbyname"), nullptr)
+            << "positive control: sysctlbyname must decode on macho";
+    }
+}
+
 
 // ── TF-C97 (D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY): two DESCRIPTORS, one
 // ── `timespec` — the PREMISE this cycle had to measure before it could design

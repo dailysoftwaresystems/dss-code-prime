@@ -2241,7 +2241,7 @@ TEST(SynthThreadsShim, SynthesizesDefinitionAndHelperImportNotTheShimName) {
     std::vector<ExternImport> externs;   // a threads.h-only TU imports no cond-var/CS yet
     DiagnosticReporter rep;
     LibrarySynthesis const win32{LibrarySynthVehicle::Win32, "kernel32.dll"};
-    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, win32, ObjectFormatKind::Pe,
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, win32, CSymbolDecorationScheme::None,
                                       externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
@@ -2289,7 +2289,7 @@ TEST(SynthThreadsShim, EmptyRecipeMapIsNoOp) {
     DiagnosticReporter rep;
     // nullopt vehicle: the empty-map gate MUST short-circuit BEFORE the vehicle check, so
     // an empty map is a clean no-op even with no declared vehicle (elf's steady state).
-    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, std::nullopt, ObjectFormatKind::Elf,
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, std::nullopt, CSymbolDecorationScheme::None,
                                       externs, rep));
     EXPECT_FALSE(rep.hasErrors());
     EXPECT_EQ(mir.moduleFuncCount(), 1u) << "no shim appended for an empty map";
@@ -2325,7 +2325,7 @@ TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
                                       LibrarySynthesis{LibrarySynthVehicle::Win32, "kernel32.dll"},
-                                      ObjectFormatKind::Pe, externs, rep));
+                                      CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     // DIRECT-PASS adds ONLY thrd_create (main + thrd_create) — no trampoline function.
@@ -2415,7 +2415,7 @@ TEST(SynthThreadsShim, CallOnceSynthesizesAddressTakenTrampolineWithIndirectCall
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
                                       LibrarySynthesis{LibrarySynthVehicle::Win32, "kernel32.dll"},
-                                      ObjectFormatKind::Pe, externs, rep));
+                                      CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     // 3 functions: main + call_once + the synthesized __dss_once_tramp.
@@ -2530,7 +2530,7 @@ TEST(SynthThreadsShim, ThrdJoinIsMultiBlockAndVerifies) {
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
                                       LibrarySynthesis{LibrarySynthVehicle::Win32, "kernel32.dll"},
-                                      ObjectFormatKind::Pe, externs, rep));
+                                      CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     MirFuncId joinFn{};
@@ -2628,7 +2628,7 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
     std::vector<ExternImport> externs = merged->externImports;
     LibrarySynthesis const win32{LibrarySynthVehicle::Win32, "kernel32.dll"};
     ASSERT_TRUE(synthesizeThreadsShim(merged->mir, merged->host.interner(),
-                                      mergedRecipes, win32, ObjectFormatKind::Pe, externs, rep));
+                                      mergedRecipes, win32, CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     bool defined = false;
@@ -2669,7 +2669,7 @@ TEST(SynthThreadsShim, PthreadVehicleSynthesizesDefinitionAndPthreadHelperImport
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
     LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, "/usr/lib/libSystem.B.dylib"};
-    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthread, ObjectFormatKind::MachO,
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthread, CSymbolDecorationScheme::LeadingUnderscore,
                                       externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
@@ -2716,7 +2716,7 @@ TEST(SynthThreadsShim, MissingLibrarySynthesisWithNonEmptyRecipesFailsLoud) {
     std::unordered_map<std::uint32_t, std::string> recipes{{10u, "mtx_lock"}};
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
-    EXPECT_FALSE(synthesizeThreadsShim(mir, in, recipes, std::nullopt, ObjectFormatKind::MachO,
+    EXPECT_FALSE(synthesizeThreadsShim(mir, in, recipes, std::nullopt, CSymbolDecorationScheme::LeadingUnderscore,
                                        externs, rep))
         << "recipes present + no vehicle MUST fail loud, never assume a primitive family";
     EXPECT_TRUE(rep.hasErrors());
@@ -2756,7 +2756,7 @@ TEST(SynthThreadsShim, PthreadAllTwentyOneRecipesEmitAndVerify) {
         std::vector<ExternImport> externs;
         DiagnosticReporter rep;
         LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, "/usr/lib/libSystem.B.dylib"};
-        ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthread, ObjectFormatKind::MachO,
+        ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthread, CSymbolDecorationScheme::LeadingUnderscore,
                                           externs, rep))
             << "recipe '" << c.recipe << "' must synthesize";
         EXPECT_FALSE(rep.hasErrors()) << c.recipe;
@@ -2843,7 +2843,7 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
     std::vector<ExternImport> externs = merged->externImports;
     LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, "/usr/lib/libSystem.B.dylib"};
     ASSERT_TRUE(synthesizeThreadsShim(merged->mir, merged->host.interner(),
-                                      mergedRecipes, pthread, ObjectFormatKind::MachO,
+                                      mergedRecipes, pthread, CSymbolDecorationScheme::LeadingUnderscore,
                                       externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 

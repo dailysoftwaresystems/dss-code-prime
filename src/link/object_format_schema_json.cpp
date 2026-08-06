@@ -91,7 +91,17 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // `headerNameMatching`: 27 keys appear in a direct `doc.contains(…)`/
     // `doc.at(…)`, plus `relocations` through the shared substrate, = 28; all
     // 24 shipped files declare the new key, so the two sets stay identical.
-    static constexpr std::array<std::string_view, 28> kFormatDocumentKeys{
+    // RE-DERIVED a third time after D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN
+    // added the REQUIRED `cSymbolDecoration`: 28 keys appear in a direct
+    // `doc.contains(…)`/`doc.at(…)`, plus `relocations` through the shared
+    // substrate, = 29; all 24 shipped files declare the new key, so the two
+    // sets stay identical. ★ REGISTERING THE KEY HERE IS NOT BOOKKEEPING — it
+    // is what makes declaring it possible at all: the loop below rejects any
+    // unregistered non-`$` root key, so a descriptor that declared
+    // `cSymbolDecoration` before this row existed would be refused at LOAD.
+    // That ordering is why the vocabulary lands before the descriptors, never
+    // after.
+    static constexpr std::array<std::string_view, 29> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -99,6 +109,10 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // the per-OS `#include` header-NAME case rule — a silent WRONG-ACCEPT
         // in one direction and a wrong REJECT in the other if it typos
         "headerNameMatching",
+        // the per-format C-symbol decoration rule — a wrong value BINDS TO A
+        // DIFFERENT FUNCTION (`_exit` is a real, distinct export on both
+        // undecorated formats), so a typo here is a silent-miscompile risk
+        "cSymbolDecoration",
         // the C-visible face of those axes (TF-C97 — `__LP64__`/`_LP64`)
         "predefinedMacros",
         // output packaging + artifact vocabulary
@@ -418,6 +432,71 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                   s));
         } else {
             data.headerNameMatching = *hm;
+        }
+    }
+
+    // ── D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN: `cSymbolDecoration` ──────
+    //
+    // HOW this format decorates a canonical C identifier to obtain the
+    // LINKER-visible name (`none` / `leading-underscore`). A BLOCK rather
+    // than a bare scalar — `{"scheme": "..."}` — mirroring `processExit`'s
+    // `mechanism` dispatch below, so a future scheme that needs per-arm
+    // parameters (32-bit PE stdcall's `@N` byte count) gains a sibling key
+    // INSIDE the block instead of a second root key. See `CSymbolDecoration`
+    // (core/types/object_format_kind.hpp) for the full rationale.
+    //
+    // The scheme is a CLOSED verb, never a literal prefix string: a free
+    // string makes `"__"` / `" "` representable, i.e. it lets config request
+    // decorations no engine arm implements, and nothing could refuse them at
+    // load. An unknown spelling is a HARD error — the `dataModel` discipline
+    // — because a typo that fell back to `none` on a Mach-O format would bind
+    // every C call to an undecorated name that libSystem does not export.
+    //
+    // ★ REQUIRED ON EVERY FORMAT, UNCONDITIONALLY — not gated on exec flavor,
+    // not gated on kind. A relocatable Mach-O `.o` carries `_main` just as its
+    // executable sibling does; `unapplyCMangling` runs on LIBRARY INGEST
+    // regardless of the artifact flavor being produced; and decisively, a
+    // universal predicate CANNOT BE TAUTOLOGICAL. Gate the rule on any
+    // property and it stops enforcing on whatever that property excludes,
+    // silently — which is precisely how the `processExit ⇒ isExecFlavor`
+    // rule lost its teeth on the ET_DYN arm (see the footgun note on
+    // `ObjectFormatSchema::isExecFlavor`). REQUIRED rather than
+    // optional-with-default for the reason the anchor exists: the defect
+    // being closed is a per-format fact with TWO OWNERS, and a default would
+    // just make the C++ table the silent winner again for any file that
+    // forgot the key.
+    if (!doc.contains("cSymbolDecoration")) {
+        coll.emit(DiagnosticCode::C_MissingField, "/cSymbolDecoration",
+                  "missing required 'cSymbolDecoration' — every object format "
+                  "must declare how a canonical C identifier is decorated to "
+                  "obtain its linker-visible name (a block "
+                  "{\"scheme\": \"none\"} or "
+                  "{\"scheme\": \"leading-underscore\"}); a silent default "
+                  "would re-hide the rule in the engine's C++ table, which is "
+                  "the two-owner defect this key exists to remove");
+    } else if (!doc.at("cSymbolDecoration").is_object()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, "/cSymbolDecoration",
+                  "'cSymbolDecoration' must be an object with a 'scheme' "
+                  "string ('none' or 'leading-underscore')");
+    } else {
+        auto const& csd = doc.at("cSymbolDecoration");
+        if (!csd.contains("scheme") || !csd.at("scheme").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/cSymbolDecoration/scheme",
+                      "'cSymbolDecoration' requires a 'scheme' string "
+                      "('none' or 'leading-underscore')");
+        } else {
+            auto const s = csd.at("scheme").get<std::string>();
+            auto const sc = cSymbolDecorationSchemeFromName(s);
+            if (!sc) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/cSymbolDecoration/scheme",
+                          std::format("unknown cSymbolDecoration.scheme "
+                                      "'{}' — expected one of 'none', "
+                                      "'leading-underscore'", s));
+            } else {
+                data.cSymbolDecoration.scheme = *sc;
+            }
         }
     }
 

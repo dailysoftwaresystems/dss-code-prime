@@ -64,7 +64,7 @@ synthesizeThreadsShim(Mir&                                                  mir,
                       TypeInterner&                                         interner,
                       std::unordered_map<std::uint32_t, std::string> const& recipeBySymbol,
                       std::optional<LibrarySynthesis> const&                librarySynthesis,
-                      ObjectFormatKind                                      format,
+                      CSymbolDecorationScheme                               scheme,
                       std::vector<ExternImport>&                            externImports,
                       DiagnosticReporter&                                   reporter);
 

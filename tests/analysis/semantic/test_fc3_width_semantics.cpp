@@ -837,6 +837,7 @@ namespace {
 [[nodiscard]] std::string minimalElfFormatJson(char const* dataModelLine) {
     return std::string{R"({
   "dssObjectFormatVersion": 1,
+  "cSymbolDecoration": { "scheme": "none" },
   )"} + dataModelLine + R"(
   "headerNameMatching": "case-sensitive",
   "format": { "name": "fc3-stub", "version": "1.0", "kind": "elf" },
