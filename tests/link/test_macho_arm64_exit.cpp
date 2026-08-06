@@ -589,12 +589,61 @@ TEST(MachOArm64Exit, Arm64ExecEmitsBuildVersionMacOs) {
 // 4096, so the x86 layout is byte-identical to before this cycle. Pin the
 // default explicitly (a knob-that-lies guard: prove the absence path
 // yields 4096, not 0 or 16384).
+//
+// ★ RE-VALIDATED 2026-08-05, the cycle that filled in that format's
+// runnable-CLI key set (artifactProfiles / dataImportBinding /
+// supportedDataSections + rows / image.codeSignature). NEITHER key this
+// test asserts was touched, deliberately, and each for its own reason —
+// the assertions below are UNCHANGED and still mean exactly what they
+// meant. The comments are what needed correcting.
+//
+//  * segmentPageSize: 4096 is already what the absent-key path yields
+//    and it is the correct x86_64 macOS VM page, so declaring it
+//    explicitly would change no emitted byte — while quietly gutting
+//    THIS test, whose whole subject is the ABSENCE path. It would stay
+//    green and stop proving anything. Left absent on purpose.
+//
+//  * buildVersion: ★ the old one-liner here said "Intel/Rosetta is
+//    lenient". Do not read that as established. It is DOCUMENTED at
+//    best and nothing in this project has measured it: LC_BUILD_VERSION
+//    is how dyld4 identifies a main executable's PLATFORM, which is an
+//    OS-version property rather than a CPU one, so the leniency claim
+//    may not survive contact with a current macOS. It stays absent here
+//    for a CONCRETE reason instead: `macho::encodeExec` (the static
+//    exec arm) REJECTS a schema carrying image.buildVersion LOUD
+//    (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION), and several walker
+//    tests drive this format with zero-extern modules straight down
+//    that arm — so declaring it today turns tests red for a reason that
+//    has nothing to do with macOS. IF the first Rosetta run of a
+//    DSS-built x86_64 Mach-O fails at load with a platform /
+//    EBADMACHO-class error, this EXPECT_FALSE is the line to flip (to
+//    a buildVersion assertion mirroring Arm64ExecEmitsBuildVersionMacOs
+//    above), and that static-arm gap is what must land with it.
 TEST(MachOArm64Exit, X86DarwinExecDefaultsTo4KSegmentPageSize) {
     auto fmt = loadDarwinExecByName("macho64-x86_64-darwin-exec.format.json");
     ASSERT_TRUE(fmt);
     EXPECT_EQ(fmt->machoImage().segmentPageSize, 4096u);
-    // x86 declares no buildVersion (Intel/Rosetta is lenient).
+    // x86 declares no buildVersion — see the block comment above; this
+    // is a live open question, not a settled platform fact.
     EXPECT_FALSE(fmt->machoImage().buildVersion.has_value());
+    // ★ The load-bearing half of "4096 is right here", added with the
+    // runnable-CLI key set: validate()'s Mach-O mmap-congruence rule
+    // reads BOTH this page size and the __text row's virtualAddress,
+    // and 0x100001000 is congruent under 4 KiB and NOT under 16 KiB.
+    // Pin the pair together, so a future edit that clones the arm64
+    // sibling's 16384 into this schema is caught HERE — by the
+    // arithmetic that explains why it is wrong — rather than as an
+    // opaque config-load rejection somewhere downstream.
+    auto const* text = fmt->sectionByKind(SectionKind::Text);
+    ASSERT_NE(text, nullptr);
+    EXPECT_EQ((text->virtualAddress - fmt->machoImage().pageZeroSize)
+                  % fmt->machoImage().segmentPageSize,
+              0u)
+        << "__text VA 0x" << std::hex << text->virtualAddress
+        << " is not congruent to pageZeroSize 0x"
+        << fmt->machoImage().pageZeroSize << " under segmentPageSize 0x"
+        << fmt->machoImage().segmentPageSize
+        << " — the kernel rejects such an image at exec (EBADMACHO)";
 }
 
 // ── validate() fail-loud: a non-power-of-two segmentPageSize ──────────

@@ -129,7 +129,10 @@ def main(argv=None):
     # must survive) and let the target configure itself; then add SQLITE_OS_WIN=1
     # as an explicit bridge for test helpers that probe it before sqliteInt.h.
     #   _HAVE_SQLITE_CONFIG_H is dropped for the same reason: it makes sqliteInt.h
-    # `#include "config.h"` — the POSIX `configure`-generated header carrying the
+    # `#include "sqlite_cfg.h"` (sqlite/src/sqliteInt.h:214 — the name is
+    # `sqlite_cfg.h`, NOT `config.h`; this comment said `config.h` for a while and
+    # contradicted the correct name 25 lines below) — the POSIX
+    # `configure`-generated header carrying the
     # build host's HAVE_LOCALTIME_R etc. Inheriting it on a Windows TARGET is the
     # same cross-compile category error (date.c then picks localtime_r over plain
     # localtime). Dropping it makes sqlite self-configure its Windows build from
@@ -140,9 +143,51 @@ def main(argv=None):
     # — which stopped being true the moment the .sh started calling it for five
     # legs. The decision now lives in the catalogue (legs.json declares
     # `recipeTransform: "windows-selfconfig"` on the pe64 leg and `"none"` on the
-    # four POSIX-target legs, where the deriving host's probes ARE the target's)
-    # and arrives here as an argument. An elf/mach-o leg must keep its HAVE_*
-    # defines: dropping them there would discard real, correct configuration.
+    # four POSIX-target legs) and arrives here as an argument.
+    #
+    # ⛔ AND THE SENTENCE THAT USED TO FOLLOW WAS THE BUG. It read: "An elf/mach-o
+    # leg must keep its HAVE_* defines: dropping them there would discard real,
+    # correct configuration" — TRUE for elf, FALSE for mach-o, and stated as one
+    # rule over both. It is the sentence that licensed `recipeTransform: "none"`
+    # on the two Darwin legs, whose CLI then failed on `off64_t`/`pread64`/
+    # `pwrite64`: the deriving host's probes are the target's only when the target
+    # IS that host's platform family, which for a Darwin leg on a Linux deriving
+    # box it is not.
+    #
+    # ★ THE REMEDY IS NOT IN THIS FILE, and that is the point of correcting the
+    # prose rather than adding a transform. The Darwin leak does not travel on the
+    # command line at all: `_HAVE_SQLITE_CONFIG_H` (which DOES survive here,
+    # deliberately) makes sqliteInt.h `#include "sqlite_cfg.h"`, and the answers
+    # arrive INSIDE that header. A recipe transform cannot reach inside a header;
+    # the only one that could would drop `_HAVE_SQLITE_CONFIG_H` wholesale and
+    # throw ~49 correct answers away with the 3 wrong ones (HAVE_GMTIME_R,
+    # HAVE_FDATASYNC, HAVE_USLEEP among them). So each leg instead DECLARES
+    # `build.configureAnswers` and stage-zinc.py writes it a target-specific
+    # sqlite_cfg.h, placed ahead of the deriving host's on the include list. See
+    # legs.json's $configureAnswersComment.
+    #
+    # ✔MEASURED 2026-08-05, macho64-arm64 CLI, 103 TUs, `--config=release`, from a
+    # WINDOWS host: recipe verbatim -> 4 errors (off64_t x2, pread64, pwrite64);
+    # with the staged Darwin header and this transform still `none` -> ZERO.
+    #
+    # ⚠ AND WHAT IS *NOT* THE REASON `none` IS RIGHT FOR THE FOUR POSIX LEGS —
+    # ✔MEASURED 2026-08-05 (TF-C121), against the recipe this harness actually
+    # derives: `stage/defines.txt` and `stage/cli-defines.txt` contain NO bare
+    # `HAVE_*` and NO `Z_HAVE_*` AT ALL. The only two that even look like one are
+    # `SQLITE_HAVE_ZLIB=1` (a project feature flag, which `^(HAVE_|Z_HAVE_)`
+    # deliberately does not match) and `_HAVE_SQLITE_CONFIG_H`. So the `^(HAVE_|
+    # Z_HAVE_)` arm below is a NO-OP on today's recipe, and the single define this
+    # transform actually removes is `_HAVE_SQLITE_CONFIG_H`.
+    # The regex arm STAYS as a standing guard — upstream's recipe is re-derived from
+    # `make -n` every run and may grow such a define without warning — but it must
+    # not be described as load-bearing, and "dropping those would discard real
+    # configuration" is not why `none` is correct for elf/mach-o. `none` is correct
+    # for them because `_HAVE_SQLITE_CONFIG_H` must SURVIVE (it is the whole
+    # delivery mechanism for the ~49 answers that ARE the target's), and the three
+    # answers that differ are corrected inside the staged header instead.
+    # harness_legs.py and legs.json's `$configureAnswersComment` state the same
+    # fact — "_HAVE_SQLITE_CONFIG_H is the ONE host-probe define left on the
+    # command line" — and this paragraph used to contradict both.
     if args.recipe_transform == "windows-selfconfig":
         _host_probe = re.compile(r"^(HAVE_|Z_HAVE_)")
         _config_h = "_HAVE_SQLITE_CONFIG_H"

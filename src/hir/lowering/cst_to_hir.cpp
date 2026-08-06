@@ -8770,7 +8770,19 @@ struct Lowerer {
                         // silent bug the descriptor path fixes).
                         shipped != nullptr ? shipped->version : std::string{},
                         /*isEagerImport=*/false,
-                        pr->asmName});   // TF-C88 (asm label)
+                        pr->asmName,   // TF-C88 (asm label)
+                        // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME):
+                        // and the SUPPRESSED descriptor row's per-target link
+                        // base name, by the same argument the `version` two
+                        // lines up carries — the user's prototype restates the C
+                        // signature, never which name libSystem exports for it
+                        // on this arch. Without this a bare `int fstat(int,
+                        // struct stat*);` over `#include <sys/stat.h>` re-binds
+                        // Darwin-x86_64's legacy 32-bit-inode `_fstat`. The
+                        // user's OWN `__asm` label (`pr->asmName`, previous
+                        // field) still outranks it inside `linkNameFor`.
+                        shipped != nullptr ? shipped->linkName
+                                           : std::string{}});
                     if (asGlobal) {
                         pushOut(ef, d);
                     } else if (moduleDecls_ != nullptr) {
@@ -9280,7 +9292,12 @@ struct Lowerer {
             /*noLibraryBinding=*/shipped == nullptr,
             shipped != nullptr ? shipped->version : std::string{},
             /*isEagerImport=*/false,
-            rec->asmName});   // TF-C88 (asm label)
+            rec->asmName,   // TF-C88 (asm label)
+            // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the
+            // suppressed row's per-target link base name — the SECOND
+            // suppression site, kept in lockstep with the bare-prototype arm
+            // above (these two have drifted before; see the TF-C112 note).
+            shipped != nullptr ? shipped->linkName : std::string{}});
         outNode = ef;
         return true;
     }
@@ -9826,6 +9843,14 @@ struct Lowerer {
             // which declarator owns which label. Empty for every extern declared
             // without one, which makes the import rail byte-identical there.
             if (rec != nullptr) row.asmName = rec->asmName;
+            // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): carry the
+            // record's per-target link base name too, for the SAME reason and by
+            // the same one-line copy. A source-declared `extern` normally has
+            // none (the field is EMPTY on every user-written declaration, so this
+            // producer's rows are byte-identical to pre-TF-C121); reading it off
+            // the SymbolRecord — rather than deciding here that it cannot exist —
+            // is what keeps this producer honest if a future path stamps one.
+            if (rec != nullptr) row.linkName = rec->linkName;
             externDecls.push_back(std::move(row));
         };
         for (NodeId d : declarators) {
@@ -10252,7 +10277,14 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         externDecls.push_back(HirExternRecord{
             node, ext.name, ext.library, /*noLibraryBinding=*/false,
             ext.version,          // D-LK-ELF-SYMBOL-VERSIONING (c156)
-            /*isEagerImport=*/true});
+            /*isEagerImport=*/true,
+            // A descriptor row has no DECLARATOR, so there is no user `__asm`
+            // label to read — the empty string here is the correct value, not a
+            // gap. The per-target LINK BASE NAME is the descriptor's channel and
+            // it is the NEXT field: `linkNameFor` decorates it with the format's
+            // rule, exactly as it decorates `canonicalName` when it is empty.
+            /*asmName=*/std::string{},
+            ext.linkName});       // D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME
     }
 
     HirNodeId const root = builder.makeModule(decls);

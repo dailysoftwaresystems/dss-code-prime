@@ -125,8 +125,10 @@ fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
 # a pass over work it did not do.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN,
 # by design. One line to update, against an instrument that would otherwise lie.
-TOTAL_ASSERTIONS=64      # 20 classifier + 14 provenance helpers + 12 Step-2 gate
-                         # + 18 loadext staging (6 of them compiler-gated)
+TOTAL_ASSERTIONS=96      # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+                         # + 28 loadext staging + 6 staged sqlite_cfg.h (this driver)
+                         # + 4 launcher argv form (this driver, 2 of them behavioural)
+                         # + 12 driver-pairing (.ps1-gated)
 pass=0; fail=0; skip=0
 check() { # <label> <expected-substring> <actual>
   if [[ "$3" == *"$2"* ]]; then echo "  ok   $1"; pass=$((pass+1))
@@ -435,17 +437,33 @@ else
 fi
 
 echo
-echo "=== THE LOADEXT HELPER: a target-keyed NAME, and a failure that does NOT kill the run ==="
-# D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN.
+echo "=== THE LOADEXT HELPER: DSS builds it, the reference cc is a CONTROL, and no failure kills the run ==="
+# TWO anchors, and this battery guards both halves.
 #
-# ✔MEASURED 2026-08-05 on a WSL/Ubuntu x86_64 host: two legs had already reported
-# GREEN (331,351 and 331,355 units) when `stage_loadext_extension` failed to link
-# the pe64 helper and `die`d. The run ENDED there — no Step 9, no ledger, no
-# verdict for the two legs that had passed and none for the two never reached. The
-# shipped function must now RETURN on every failure path so the caller can record
-# `poisoned` and CONTINUE, and it must stage the helper under the name THIS LEG'S
-# TARGET looks for (`testloadext.dll` on a Windows Tcl, `libtestloadext.so`
-# elsewhere — MEASURED at sqlite test/loadext.test:26-29), not one POSIX constant.
+# D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN. ✔MEASURED
+# 2026-08-05 on a WSL/Ubuntu x86_64 host: two legs had already reported GREEN
+# (331,351 and 331,355 units) when `stage_loadext_extension` failed to link the
+# pe64 helper and `die`d. The run ENDED there — no Step 9, no ledger, no verdict
+# for the two legs that had passed and none for the two never reached. The
+# shipped function must RETURN on every failure path so the caller can record a
+# NAMED verdict and CONTINUE.
+#
+# D-HARNESS-CROSS-HOST-ANY-TARGET. The helper is now emitted by DSS for the leg's
+# declared `sharedLibFormat`, so no host needs a cross-compiler for any leg; the
+# verified target compiler is an OPTIONAL CONTROL. The rc contract is what this
+# driver translates, and it has TWO failure classes that must not be folded into
+# one: 1 = poisoned (a REAL failure; must red the run) and 2 =
+# skipped-build-input-missing (ENVIRONMENTAL; must NOT).
+#
+# ★ WHAT IS TESTED HERE vs IN harness_legs.py --self-test. The BUILD itself — the
+# argv, the object format, whether the artefact is a loadable shared library,
+# which arm is the control — lives in the shared resolver and is covered by its
+# own 1,187-assertion self-test, which both drivers run as a refuse-to-start.
+# What is tested HERE is the DRIVER's half: that it calls the resolver with the
+# paths only it knows, and that it turns one report into one verdict without
+# dying. So the resolver is STUBBED below — that is the seam, deliberately, and
+# it is why this file still runs on a machine with no compiler and no sqlite
+# clone at all.
 #
 # Extracted and run the same way as the classifier above: at TOP LEVEL, under the
 # driver's exact `set -Eeuo pipefail`, with `die` defined so that reintroducing one
@@ -456,23 +474,47 @@ if [ -z "$STAGEBLK" ]; then echo "FATAL: could not extract the loadext-stage blo
 if [ -z "$VERDBLK" ]; then echo "FATAL: could not extract the loadext-verdict block"; exit 1; fi
 echo "extracted $(printf '%s\n' "$STAGEBLK" | wc -l) staging + $(printf '%s\n' "$VERDBLK" | wc -l) verdict lines from the shipped script"
 
-# A stand-in sqlite tree. NOTHING here reads the real staged clone: this file is a
-# refuse-to-start gate for the driver and must run on a machine that has never
-# cloned sqlite.
+# A stand-in tree. NOTHING here reads the real staged clone or the real resolver:
+# this file is a refuse-to-start gate for the driver and must run on a machine
+# that has never cloned sqlite and has no compiler.
 LOAD_SQ="$LOADTMP/sqlite"; LOAD_BLD="$LOADTMP/bld"; LOAD_OUT="$LOADTMP/out"
-mkdir -p "$LOAD_SQ/src" "$LOAD_BLD" "$LOAD_OUT/pe-shaped" "$LOAD_OUT/posix-shaped" "$LOAD_OUT/nameless"
+mkdir -p "$LOAD_SQ/src" "$LOAD_BLD" "$LOAD_OUT"
 printf 'int dss_selftest_helper(void) { return 42; }\n' > "$LOAD_SQ/src/test_loadext.c"
 
-# Two legs whose ONLY difference is the declared helper name — that is the property
-# under test. The labels are shaped like the catalogue's, not copied from it: this
-# battery must not red when a leg is added or renamed in legs.json.
-declare -A LEG_CC=(          [pe-shaped]="__none__"  [posix-shaped]="__none__"  [nameless]="__none__" )
-declare -A LEG_CC_MACHINE=(  [pe-shaped]="x86_64-w64-mingw32" [posix-shaped]="x86_64-linux-gnu" [nameless]="x86_64-linux-gnu" )
-declare -A LEG_LOADEXT_NAME=([pe-shaped]="testloadext.dll" [posix-shaped]="libtestloadext.so" [nameless]="" )
-declare -A LEG_SHARED_FLAGS=([pe-shaped]="-shared" [posix-shaped]="-shared -fPIC" [nameless]="-shared" )
-declare -A LEG_SPEC=(        [pe-shaped]="x86_64:pe64-x86_64-windows-exec" [posix-shaped]="x86_64:elf64-x86_64-linux-exec" [nameless]="x86_64:elf64-x86_64-linux-exec" )
+# THE STUB RESOLVER. It records the argv it was handed (so the battery can assert
+# WHAT the driver asked for), then emits a canned report and the rc the caller
+# chose. python3 is already a hard requirement of the driver this stands in for.
+STUB="$LOADTMP/stub_resolver.py"
+cat > "$STUB" <<'STUBPY'
+import json, os, sys
+open(os.environ["STUB_ARGV_LOG"], "w").write("\n".join(sys.argv[1:]))
+rc = int(os.environ.get("STUB_RC", "0"))
+sys.stdout.write(json.dumps({
+    "verdictClass": os.environ.get("STUB_CLASS", ""),
+    "detail": os.environ.get("STUB_DETAIL", "a detail line"),
+    "crossCheck": os.environ.get("STUB_CROSS", ""),
+    "staged": os.environ.get("STUB_STAGED", "/staged/libtestloadext.so"),
+}) + "\n")
+sys.exit(rc)
+STUBPY
+# A stub that emits something that is NOT JSON at all — the resolver's own FATAL
+# line takes this shape, and a driver that reads it as an empty field would print
+# a confident blank instead of the refusal.
+STUB_FATAL="$LOADTMP/stub_fatal.py"
+cat > "$STUB_FATAL" <<'STUBPY'
+import os, sys
+open(os.environ["STUB_ARGV_LOG"], "w").write("\n".join(sys.argv[1:]))
+sys.stderr.write("harness_legs.py: FATAL: no leg labelled 'nope'\n")
+sys.exit(2)
+STUBPY
 
-stage_run() {   # stage_run <leg> <rundir> [<sqlite-dir override>]
+declare -A LEG_CC=(          [pe-shaped]="mingw-gcc"          [posix-shaped]=""                  )
+declare -A LEG_CC_MACHINE=(  [pe-shaped]="x86_64-w64-mingw32" [posix-shaped]=""                  )
+declare -A LEG_LOADEXT_NAME=([pe-shaped]="testloadext.dll"    [posix-shaped]="libtestloadext.so" )
+declare -A LEG_SPEC=(        [pe-shaped]="x86_64:pe64-x86_64-windows-exec" [posix-shaped]="x86_64:elf64-x86_64-linux-exec" )
+
+STUB_ARGV_LOG="$LOADTMP/argv.txt"
+stage_run() {   # stage_run <leg> <rundir> <resolver> ; env: STUB_RC/STUB_CLASS/…
   {
     echo 'set -Eeuo pipefail'          # the driver's own options (build-and-test.sh:64)
     echo 'info() { echo "      INFO: $*"; }'
@@ -481,39 +523,83 @@ stage_run() {   # stage_run <leg> <rundir> [<sqlite-dir override>]
     # outcome — instead of the block failing for the unrelated reason that `die`
     # is not defined out here.
     echo 'die()  { echo "DIE: $*"; exit 9; }'
-    declare -p LEG_CC LEG_CC_MACHINE LEG_LOADEXT_NAME LEG_SHARED_FLAGS LEG_SPEC
-    printf 'SQLITE_DIR=%q\n' "${3:-$LOAD_SQ}"
-    printf 'BLD=%q\n' "$LOAD_BLD"
-    printf 'OUT_DIR=%q\n' "$LOAD_OUT"
+    declare -p LEG_CC LEG_CC_MACHINE LEG_LOADEXT_NAME LEG_SPEC
+    printf 'LEG_RESOLVER=%q\n'  "$3"
+    printf 'LEG_CATALOGUE=%q\n' "$LOADTMP/legs.json"
+    printf 'LOADEXT_BUILDER=%q\n' "${STUB_BUILDER:-dss}"
+    printf 'DSS_BIN=%q\n'       "/nonexistent/dss-code-prime"
+    printf 'DSS_CONFIG=%q\n'    "release"
+    printf 'SQLITE_DIR=%q\n'    "$LOAD_SQ"
+    printf 'BLD=%q\n'           "$LOAD_BLD"
+    printf 'OUT_DIR=%q\n'       "$LOAD_OUT"
     echo 'SQLITE_TESTDIR_SUBDIR="testdir"'
-    echo 'leg_shared_flags() { printf "%s" "${LEG_SHARED_FLAGS[$1]}"; }'
     printf '%s\n' "$STAGEBLK"
     printf 'if stage_loadext_extension %q %q; then echo "RC=0"; else echo "RC=$?"; fi\n' "$1" "$2"
     echo 'echo "WHY=[$STAGE_WHY]"'
+    echo 'echo "CROSS=[$STAGE_CROSSCHECK]"'
   } > "$TMPRUN"
-  "$BASH" "$TMPRUN" 2>&1
+  STUB_ARGV_LOG="$STUB_ARGV_LOG" "$BASH" "$TMPRUN" 2>&1
 }
+# The driver invokes `python3 "$LEG_RESOLVER" …`, so the stub is handed to it as
+# the SCRIPT — no shebang, no chmod, and portable to a host whose python3 is
+# somewhere unusual.
 
-echo "--- a leg that declares NO helper name: refused, and it says which key ---"
-N=$(stage_run nameless "$LOAD_OUT/nameless/run"); echo "$N" | sed 's/^/      /'
-check "an undeclared helper name RETURNS 1"        "RC=1"                "$N"
-check "...naming the key to add"                   "loadExtHelperName"   "$N"
+echo "--- the driver calls the resolver with the paths only IT knows ---"
+A=$(STUB_RC=0 STUB_STAGED="$LOAD_OUT/x/testdir/testloadext.dll" \
+    stage_run pe-shaped "$LOAD_OUT/pe/run" "$STUB")
+echo "$A" | sed 's/^/      /'
+ARGV=$(cat "$STUB_ARGV_LOG")
+check "it asks for THIS leg by label"          "--build-loadext-helper"  "$ARGV"
+check "...passing the resolved builder"        "--helper-builder"        "$ARGV"
+check "...the DSS binary"                      "--dss"                   "$ARGV"
+check "...the sqlite src root (for sqlite3ext.h)" "$LOAD_SQ/src"         "$ARGV"
+check "...the BUILD root (for the generated sqlite3.h)" "$LOAD_BLD"      "$ARGV"
+check "...the run's testdir as the destination" "$LOAD_OUT/pe/run/testdir" "$ARGV"
+check "...and the driver's own build config"   "release"                 "$ARGV"
+# ★ THE CONTROL ARM IS PASSED, NOT ASSUMED — and it may be EMPTY.
+check "the VERIFIED control compiler is passed through" "mingw-gcc"      "$ARGV"
+check "...with the triple it reported"         "x86_64-w64-mingw32"      "$ARGV"
+check "a staged helper RETURNS 0"              "RC=0"                    "$A"
 
-echo "--- the sqlite source is missing: refused, and it names the file ---"
-M=$(stage_run posix-shaped "$LOAD_OUT/posix-shaped/run" "$LOADTMP/no-such-tree")
-echo "$M" | sed 's/^/      /'
-check "a missing extension source RETURNS 1"       "RC=1"                "$M"
-check "...naming the path it looked for"           "no-such-tree"        "$M"
+echo "--- a leg with NO control compiler: the field is EMPTY, and the run proceeds ---"
+B=$(STUB_RC=0 STUB_CROSS="NO CONTROL ON THIS HOST: nothing here targets it" \
+    stage_run posix-shaped "$LOAD_OUT/posix/run" "$STUB")
+echo "$B" | sed 's/^/      /'
+check "an absent control does NOT stop the leg"      "RC=0"                    "$B"
+check "...and the cross-check line says so out loud" "NO CONTROL ON THIS HOST" "$B"
+# ★ RED-ON-DISABLE for the de-host-locking itself: `--reference-cc` must still be
+# PASSED (empty), never omitted, or the resolver would fall back to its default.
+check_eq "an empty control compiler is passed as an EMPTY ARGUMENT, not omitted" "1" \
+  "$(grep -c -- '--reference-cc' "$STUB_ARGV_LOG")"
 
-echo "--- the resolved compiler vanished from PATH: refused, and it cites the anchor ---"
-G=$(stage_run posix-shaped "$LOAD_OUT/posix-shaped/run"); echo "$G" | sed 's/^/      /'
-check "a compiler no longer on PATH RETURNS 1"     "RC=1"                "$G"
-check "...and REFUSES to fall back to the host cc" "D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO" "$G"
+echo "--- a REAL failure (rc 3): poisoned, reported, and NOT fatal ---"
+C=$(STUB_RC=3 STUB_CLASS=poisoned \
+    STUB_DETAIL="the dss build FAILED: error[P0016] got quote include not found" \
+    stage_run pe-shaped "$LOAD_OUT/pe/run2" "$STUB")
+echo "$C" | sed 's/^/      /'
+check "a failed helper build RETURNS 1 (it does NOT die)" "RC=1"      "$C"
+check "...and carries the compiler's own diagnostic"      "P0016"     "$C"
+
+echo "--- the operator asked for an arm this host lacks (rc 4): ENVIRONMENTAL ---"
+D=$(STUB_RC=4 STUB_CLASS=skipped-build-input-missing STUB_BUILDER=reference \
+    STUB_DETAIL="DSS_LOADEXT_HELPER=reference was requested, and no candidate" \
+    stage_run posix-shaped "$LOAD_OUT/posix/run2" "$STUB")
+echo "$D" | sed 's/^/      /'
+# ★ THE VERDICT-CLASS CONTRACT. Folding this into rc 1 would red a run in which
+# nothing is broken — the default builder would have staged the helper here.
+check "a control arm this host cannot provide RETURNS 2, NOT 1" "RC=2" "$D"
+check "...and says the DEFAULT would have worked"  "DSS_LOADEXT_HELPER=reference" "$D"
+
+echo "--- output that is not a report at all: refused, and QUOTED ---"
+E=$(STUB_RC=2 stage_run pe-shaped "$LOAD_OUT/pe/run3" "$STUB_FATAL")
+echo "$E" | sed 's/^/      /'
+check "an unreadable outcome is a FAILURE, never a quiet success" "RC=1" "$E"
+check "...and the refusal quotes what it could not read"          "FATAL" "$E"
 
 # ── STRUCTURAL: the shipped text itself, because "it returns" is only half ────
 # The other half is that the CALLER turns that return into a named verdict and
 # keeps going. Asserted against the shipped lines rather than by re-running a
-# 4,600-line driver.
+# 4,800-line driver.
 check_eq "the staging block contains NO die"  "" \
   "$(printf '%s\n' "$STAGEBLK" | grep -n '^\s*die \|[^_a-zA-Z]die "' | head -1)"
 check_eq "the verdict block contains NO die"  "" \
@@ -521,47 +607,151 @@ check_eq "the verdict block contains NO die"  "" \
 check "the caller records the ledger's FAILURE class" 'LEG_VERDICT["$leg"]="poisoned"' "$VERDBLK"
 check "the caller CONTINUES to the next leg"          "continue"                       "$VERDBLK"
 check "the caller counts the degraded leg"            "STAGE_FAILS=\$((STAGE_FAILS + 1))" "$VERDBLK"
+# ★ THE TWO CLASSES ARE KEPT APART BY THE CALLER TOO, and the environmental one
+# must NOT feed the counter that reds the run.
+check "the caller maps rc 2 to the ENVIRONMENTAL verdict" 'leg_marks_missing' "$VERDBLK"
+check_eq "...and does NOT count it as a stage failure" "1" \
+  "$(printf '%s\n' "$VERDBLK" | grep -c 'STAGE_FAILS=\$((STAGE_FAILS + 1))')"
+# ★ THE errexit TRAP. `stage_loadext_extension …; rc=$?` would EXIT on rc 1/2
+# before the class could be read — the shape that once shipped a whole classifier
+# as dead code. The caller must use the `if`/`else rc=$?` form.
+check "the caller captures the rc in a form errexit cannot swallow" \
+  'if stage_loadext_extension "$leg" "$rundir"; then _stage_rc=0; else _stage_rc=$?; fi' "$VERDBLK"
 check "Step 9 REDS the run on a degraded leg" \
   'if [[ "${STAGE_FAILS:-0}" -gt 0 ]]; then' "$(cat "$SH")"
 
-# ── compiler-gated: the SUCCESS path and a real compile failure ──────────────
-# These need a working C compiler for the HOST (any target — the property under
-# test is the file NAME and the return code, not the object format).
-LOAD_CC=""
-for c in cc gcc clang; do command -v "$c" >/dev/null 2>&1 && { LOAD_CC="$c"; break; } done
-if [ -z "$LOAD_CC" ]; then
-  echo "  SKIP no host C compiler (tried cc gcc clang) — 6 assertions not run"
-  echo "       (the staging function's success path and its compile-failure path)"
-  skip=$((skip+6))
-else
-  echo "--- the success path, with $LOAD_CC ---"
-  LEG_CC[pe-shaped]="$LOAD_CC"; LEG_CC[posix-shaped]="$LOAD_CC"
-  P=$(stage_run pe-shaped "$LOAD_OUT/pe-shaped/run"); echo "$P" | sed 's/^/      /'
-  check "a staged helper RETURNS 0" "RC=0" "$P"
-  if [ -f "$LOAD_OUT/pe-shaped/run/testdir/testloadext.dll" ]; then
-    echo "  ok   the helper lands under the leg's DECLARED name"; pass=$((pass+1))
-  else
-    echo "  FAIL the helper is not at run/testdir/testloadext.dll"; fail=$((fail+1))
-  fi
-  # RED-ON-DISABLE for the target-keying: the pre-fix driver wrote ONE POSIX name
-  # for every leg, so a pe64 fixture looked for a file that was never there.
-  if [ -f "$LOAD_OUT/pe-shaped/run/testdir/libtestloadext.so" ]; then
-    echo "  FAIL the old hardcoded POSIX name is still being written for a Windows leg"; fail=$((fail+1))
-  else
-    echo "  ok   the old hardcoded POSIX name is NOT written for a Windows leg"; pass=$((pass+1))
-  fi
-  Q=$(stage_run posix-shaped "$LOAD_OUT/posix-shaped/run2"); echo "$Q" | sed 's/^/      /'
-  if [ -f "$LOAD_OUT/posix-shaped/run2/testdir/libtestloadext.so" ]; then
-    echo "  ok   a sibling leg gets ITS OWN declared name from the same code"; pass=$((pass+1))
-  else
-    echo "  FAIL the sibling leg's declared name was not honoured"; fail=$((fail+1))
-  fi
+# ── BOTH DRIVERS, OR THE CAPABILITY IS A SILENT HARNESS BUG ──────────────────
+# D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED existed because
+# build-and-test.sh staged a helper and build-and-test.ps1 staged none. The
+# capability now lives in harness_legs.py precisely so it cannot be in one driver
+# and not the other, and THIS is the assertion that keeps it that way.
 
-  echo "--- a REAL compile failure: reported, never fatal ---"
-  LEG_SHARED_FLAGS[posix-shaped]="-shared -fdss-no-such-option"
-  F=$(stage_run posix-shaped "$LOAD_OUT/posix-shaped/run3"); echo "$F" | sed 's/^/      /'
-  check "a failed helper compile RETURNS 1 (it does NOT die)" "RC=1" "$F"
-  check "...and points at the full diagnostics"               "loadext-helper.log" "$F"
+# ── THE STAGED sqlite_cfg.h, IN THIS DRIVER ─────────────────────────────────
+# D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES. The
+# recipe's `_HAVE_SQLITE_CONFIG_H` makes sqliteInt.h include a `sqlite_cfg.h`, and
+# the DERIVING host's build dir is on every include list — so unless this driver
+# ASKS for a per-target one and puts it FIRST, every leg silently inherits this
+# machine's ./configure answers. Both halves are asserted, because either one
+# alone is inert: asking for the header and then listing it after $BLD stages a
+# file nothing reads.
+SHTXT="$(cat "$SH")"
+# ★★ A CODE-SHAPE ASSERTION MUST NOT BE SATISFIABLE BY A COMMENT, and one of the
+# ones below was. ✔MEASURED 2026-08-05 (TF-C121): the first cut of the `rm -f
+# "$BLD/sqlite_cfg.h"` assertion matched against the WHOLE file text, and the
+# explanatory comment written beside the fix QUOTES that exact line — so deleting
+# the real `rm -f` and re-running still reported `ok`, 96/0. A guard whose own
+# prose satisfies it proves nothing, which is the defect class this entire file
+# exists to refuse, committed by this file.
+# So: every assertion about the SHAPE OF THE CODE runs against a comment-stripped
+# view. Assertions about DIAGNOSTIC TEXT keep using $SHTXT — a die message is code,
+# and asserting it survives comment-stripping anyway.
+SHCODE="$(grep -v '^[[:space:]]*#' "$SH")"
+check "the .sh asks stage-zinc.py for a per-target sqlite_cfg.h" \
+      "--sqlite-cfg-h" "$SHCODE"
+check "...writing it into its own cfg/ root" "--cfg-dest" "$SHCODE"
+check "...and REFUSES a run in which none was produced" \
+      "produced NO per-target sqlite_cfg.h" "$SHTXT"
+check "...with that dir FIRST on the fixture include list" \
+      '"${CFG_STAGE_DIR[$_c]}" "${INC_DIRS_HEAD[@]}"' "$SHCODE"
+check "...and FIRST on the CLI include list" \
+      '"${CFG_STAGE_DIR[$_c]}" "${CLI_INCS[@]}"' "$SHCODE"
+# ★ AND THE DERIVING HOST'S OWN COPY IS REMOVED, which is the OTHER half.
+# A quote include searches the INCLUDING FILE'S OWN DIRECTORY before this list is
+# consulted at all, so `$BLD/ctime.c` — TU #1 of BOTH artefacts — read the deriving
+# host's `sqlite_cfg.h` out of its own directory no matter what the include list
+# said, and then `#define SQLITECONFIG_H 1` shadowed sqliteInt.h's include for the
+# rest of that TU. The list position alone therefore did NOT close the anchor.
+# RED-ON-DISABLE: delete the `rm -f` line and this goes red — VERIFIED by doing
+# exactly that. Matched against $SHCODE, never $SHTXT: the comment beside the fix
+# quotes this line verbatim, and against the full text the assertion passed on a
+# driver from which the real line had been deleted.
+check "...and the DERIVING host's copy is REMOVED from the staged bld dir" \
+      'rm -f "$BLD/sqlite_cfg.h"' "$SHCODE"
+
+# ── THE LAUNCHER ARGV FORM: `--launcher=<tok>`, NEVER `--launcher <tok>` ─────
+# D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION.
+#
+# A launcher TOKEN may itself begin with a dash, and argparse then refuses the
+# SPACE form with "expected one argument" instead of taking the next word as the
+# value. ✔MEASURED 2026-08-05 (TF-C121): that killed the pe64 CLI smoke gate before
+# a single assertion ran, and the caller classified the harness's own argv defect
+# as `smoke: FAIL — CHARGED TO DSS` — the harness accusing the compiler.
+#
+# ★ PINNED WITH A DASH-LEADING TOKEN ON PURPOSE. Every launcher token the harness
+# has ever actually run starts with a LETTER (`wine`, `qemu-aarch64`, `qemu-x86_64`,
+# `wsl.exe`), and against those the two forms behave identically — so a test written
+# with one of them would pass on the broken code and prove nothing. `arch -x86_64`
+# is what legs.json DECLARES for macho64-x86_64 on a darwin/arm64 host, i.e. the
+# real token that would fire this the first time that leg runs on the operator's
+# Mac. Using the declared string means this test cannot rot into a letter-initial
+# token that passes either way.
+check "the .sh emits the \`=\` form to cli-smoke.py" '--launcher=$_t' "$SHCODE"
+# $SHCODE, not $SHTXT: the comment beside the fix spells the broken form out
+# (`NOT --launcher <tok>`) as the thing being warned against, so against the full
+# text this assertion would red on a CORRECT driver.
+check_eq "...and never the space form" "" \
+  "$(printf '%s\n' "$SHCODE" | grep -n -- '--launcher "\|--launcher \$\|--launcher [a-z]\|--reference-launcher "\|--reference-launcher \$\|--reference-launcher [a-z-]' | head -1)"
+# ★ BEHAVIOURAL RED-ON-DISABLE, against the REAL shipped cli-smoke.py parser — not
+# a restatement of the source text above. Both invocations carry the SAME two
+# tokens (`arch`, `-x86_64`); only the argv FORM differs. Nothing is built, no
+# binary is run: argparse rejects or accepts the tokens long before any work.
+_LAUNCH_SPACE="$(python3 "$(dirname "$SH")/cli-smoke.py" --launcher arch --launcher -x86_64 2>&1 || true)"
+_LAUNCH_EQ="$(python3 "$(dirname "$SH")/cli-smoke.py" --launcher=arch --launcher=-x86_64 2>&1 || true)"
+check "RED-ON-DISABLE: the SPACE form with \`arch -x86_64\` is REFUSED by argparse" \
+      "argument --launcher: expected one argument" "$_LAUNCH_SPACE"
+# The `=` form must get PAST token consumption — asserted POSITIVELY, by the error
+# it reaches instead (the missing required arguments), not merely by the absence of
+# the other one. "It did not say X" is satisfied by a tool that says nothing at all.
+check "...while the \`=\` form consumes BOTH tokens and reaches the required-arg check" \
+      "the following arguments are required: --cli" "$_LAUNCH_EQ"
+
+# ── BOTH DRIVERS, OR THE CAPABILITY IS A SILENT HARNESS BUG ──────────────────
+# D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED existed because
+# build-and-test.sh staged a helper and build-and-test.ps1 staged none. The
+# capability now lives in harness_legs.py precisely so it cannot be in one driver
+# and not the other, and THIS is the assertion that keeps it that way.
+PS1="$(dirname "$SH")/build-and-test.ps1"
+if [ ! -f "$PS1" ]; then
+  echo "  SKIP build-and-test.ps1 not found beside the .sh — 12 pairing assertions not run"
+  skip=$((skip+12))
+else
+  PS1TXT="$(cat "$PS1")"
+  # Same comment-stripped view as $SHCODE above, and for the same measured reason.
+  PS1CODE="$(grep -v '^[[:space:]]*#' "$PS1")"
+  check "the .ps1 stages a helper too"                "--build-loadext-helper" "$PS1TXT"
+  check "...through the SAME shared resolver"         "Resolve-LoadextHelper"  "$PS1TXT"
+  check "...and honours the same operator switch"     "--loadext-builder"      "$PS1TXT"
+  check "...mapping the ENVIRONMENTAL class apart from the failure one" \
+        "skipped-build-input-missing" "$PS1TXT"
+  # The same four-way pairing for the staged sqlite_cfg.h. A capability in one
+  # driver and not the other is the silent harness bug this block is named for,
+  # and this one would be INVISIBLE on the .ps1 side: the leg would build, and
+  # build wrong.
+  check "the .ps1 asks for the per-target sqlite_cfg.h too" "--sqlite-cfg-h" "$PS1TXT"
+  check "...writing it into its own cfg/ root"              "--cfg-dest"     "$PS1TXT"
+  check "...and REFUSES a run in which none was produced" \
+        "produced NO per-target sqlite_cfg.h" "$PS1TXT"
+  check "...with that dir FIRST on its include lists" \
+        "@((\$CfgStageDirs[\$c] -replace '\\\\','/')) + @(\$IncBase)" "$PS1CODE"
+  check "...and REMOVES the deriving host's copy, exactly as the .sh does" \
+        'Remove-Item -LiteralPath $DerivedCfgH -Force' "$PS1CODE"
+  # ── AND THE LAUNCHER ARGV FORM, IN BOTH DRIVERS ────────────────────────────
+  # This is the pairing that was NOT there: the fix for
+  # D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION landed in both
+  # drivers with prose only and no guard at all, so either one could silently
+  # regress to the space form. The .ps1 is where it was MEASURED to bite (its
+  # `--reference-launcher -e` killed the pe64 CLI smoke gate), which is why the
+  # sibling option is asserted here by name and not folded into the one above.
+  check "the .ps1 emits the \`=\` form too"                 '--launcher=$t'            "$PS1CODE"
+  check "...including the sibling that actually broke"      '--reference-launcher=-e'  "$PS1CODE"
+  # ★ THE .ps1's SPLIT SHAPE IS NOT A SPACE. ✔MEASURED while demonstrating this
+  # guard: reverting the .ps1 to `@("--launcher", "$t")` produces NO literal
+  # `--launcher ` anywhere, because PowerShell passes the option and its value as
+  # two ARRAY ELEMENTS. A space-only pattern therefore stayed green on a driver
+  # that had been reverted. The regression shape to forbid here is the option
+  # string CLOSED and followed by a comma.
+  check_eq "...and never the space form (nor the .ps1's array-split shape)" "" \
+    "$(printf '%s\n' "$PS1CODE" | grep -n -E -- "--(reference-)?launcher( ['\"\$a-z]|['\"][[:space:]]*,)" | head -1)"
 fi
 
 echo

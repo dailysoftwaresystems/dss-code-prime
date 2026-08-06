@@ -432,11 +432,17 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // name so FF5/FF1 name the import with it VERBATIM instead of the
             // C-mangled identifier. Empty for every extern without a label ⇒ the
             // downstream naming is byte-identical there.
+            // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): carry the
+            // descriptor's per-target link BASE name so FF5/FF1 decorate IT with
+            // the format's rule instead of the canonical identifier. Already
+            // resolved per (arch, format) at descriptor-read time — a plain
+            // string like `version`, not a per-format map needing the fold above.
             refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
                             r.noLibraryBinding,
                             r.version,   // D-LK-ELF-SYMBOL-VERSIONING (c156)
                             r.isEagerImport,
-                            r.asmName});
+                            r.asmName,
+                            r.linkName});
         }
 
         auto const ffiEntry = reporter.errorCount();
@@ -1537,9 +1543,15 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // DEFINITION rail; `program.cpp`'s merge-key lambda is its cross-CU twin and
     // MUST route through the same function (see linkNameFor's own comment for what
     // a divergence between the two silently produces).
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): `linkName` is passed
+    // EXPLICITLY (the parameter is required, not defaulted) so this rail and the
+    // import rail hand `linkNameFor` the same four inputs. The semantic injector
+    // writes the identical string onto BOTH the SymbolRecord read here and the
+    // ShippedExternSymbol that becomes the import row.
     auto nameOf = [&](SymbolId s) -> std::string {
         SymbolRecord const* r = model.recordFor(s);
-        return r ? dss::ffi::linkNameFor(r->name, r->asmName, fmtKind)
+        return r ? dss::ffi::linkNameFor(r->name, r->asmName, fmtKind,
+                                         r->linkName)
                  : std::string{};
     };
 

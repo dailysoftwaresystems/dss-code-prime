@@ -193,6 +193,24 @@ struct DSS_EXPORT ExternDeclRef {
     // positional aggregate initializers (fixtures included) keep compiling and
     // default it to "".
     std::string_view asmName{};
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the per-target LINK
+    // BASE NAME a shipped-library descriptor declared for this extern, already
+    // resolved for the active (arch, format) by the descriptor reader and
+    // UNDECORATED — threaded verbatim from `HirExternRecord.linkName`. EMPTY =
+    // none ⇒ every downstream name is computed exactly as before this cycle.
+    //
+    // When set it replaces the BASE that `ffi::linkNameFor` decorates (NOT the
+    // decoration itself, which `asmName` above does): `linkName:"fstat$INODE64"`
+    // yields `_fstat$INODE64` on Mach-O and `fstat$INODE64` on ELF, because the
+    // leading underscore belongs to the FORMAT. It also becomes the un-decorated
+    // key the binary-match lookup uses, for the same reason `asmName` does — the
+    // library really exports the aliased name, so keying on the plain C
+    // identifier would silently miss the row.
+    //
+    // LAST field, mirroring `HirExternRecord`, so existing positional aggregate
+    // initializers (the ~30 fixtures in tests/ffi) keep compiling and default it
+    // to "".
+    std::string_view linkName{};
 };
 
 // ── HirIngestResult ─────────────────────────────────────────────

@@ -28,7 +28,9 @@ function Warn($m) { "      WARN: $m" }
 # host's "OK (N assertions)". This file now has a skippable block of its own, so it
 # inherits the same hazard and the same cure.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN.
-$TotalAssertions = 29     # 11 classifier + 18 checkout-provenance
+$TotalAssertions = 57     # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
+                          # + 5 structural + 8 staged sqlite_cfg.h (5 this driver, 3 .sh pairing)
+                          # + 6 launcher argv form (4 structural + 2 behavioural, python-gated)
 $pass = 0; $fail = 0; $skip = 0
 function Check($label, $cond) {
   if ($cond) { "  ok   $label"; $script:pass++ } else { "  FAIL $label"; $script:fail++ }
@@ -236,6 +238,215 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     # under .git and Windows can hold a handle a moment longer than we do.
     Remove-Item -Recurse -Force -LiteralPath $tmpRoot -ErrorAction SilentlyContinue
   }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE LOADEXT HELPER (dss:loadext-stage-ps1) — the half this driver never had
+# ─────────────────────────────────────────────────────────────────────────────
+# D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED is the gap this
+# driver's new staging closes: build-and-test.sh pre-staged the shared object
+# sqlite's test/loadext.test dlopen()s and this driver staged NONE, so ~16
+# loadext-* units per leg were left to sqlite's own hardcoded `gcc`. It could not
+# simply be copied over, because the helper has to be built FOR THE LEG'S TARGET
+# and this host's `gcc` reports x86_64-w64-mingw32 - correct for pe64, correctly
+# refused for the elf legs, whose 330,436 units would then have been skipped.
+# DSS now emits the helper for the leg's declared sharedLibFormat, so the premise
+# is gone [D-HARNESS-CROSS-HOST-ANY-TARGET].
+#
+# WHAT IS TESTED HERE. The BUILD lives in harness_legs.py and is covered by its
+# own self-test, which this driver runs as a refuse-to-start. What is tested here
+# is this driver's half: that Resolve-LoadextHelper translates the resolver's rc
+# contract into the RIGHT verdict class, and that the staging block records a
+# named verdict and CONTINUES rather than dying. Same discipline as every other
+# section: EXTRACT the shipped code and RUN it - a re-implementation would stay
+# green while the driver's copy rotted.
+$fnStart = ($lines | Select-String -Pattern '^function Resolve-LoadextHelper \{' | Select-Object -First 1).LineNumber
+if (-not $fnStart) { throw "could not locate `function Resolve-LoadextHelper` in build-and-test.ps1 - it is a CONTRACT with this file." }
+$fnEnd = $null
+for ($i = $fnStart; $i -lt $lines.Count; $i++) {
+  if ($lines[$i] -eq '}') { $fnEnd = $i + 1; break }   # first closing brace at column 0
+}
+if (-not $fnEnd) { throw "could not find the end of Resolve-LoadextHelper (no closing brace at column 0)" }
+Invoke-Expression (($lines[($fnStart-1)..($fnEnd-1)]) -join "`n")
+"extracted $($fnEnd - $fnStart + 1) loadext-helper lines from the shipped script"
+
+$stageStart = ($lines | Select-String -Pattern '^# >>> dss:loadext-stage-ps1 >>>$' | Select-Object -First 1).LineNumber
+$stageEnd   = ($lines | Select-String -Pattern '^# <<< dss:loadext-stage-ps1 <<<$' | Select-Object -First 1).LineNumber
+if (-not $stageStart -or -not $stageEnd -or $stageEnd -le $stageStart) {
+  throw "could not locate the shipped dss:loadext-stage-ps1 region (start=$stageStart end=$stageEnd) - those sentinels are a CONTRACT with this file."
+}
+$stageBlk = ($lines[$stageStart..($stageEnd - 2)]) -join "`n"
+
+"--- the rc contract: 0 staged / 3 poisoned / 4 environmental / anything else refused ---"
+$py = Get-Command python3 -ErrorAction SilentlyContinue
+if (-not $py) { $py = Get-Command python -ErrorAction SilentlyContinue }
+if (-not $py) {
+  # The stub resolver is a python script for the same reason the real one is: both
+  # drivers already hard-require python3. Skip LOUDLY and COUNT it (9 = the
+  # assertions in the else-arm), so the summary can never read as "all proven".
+  "  SKIP no python3 on PATH - the loadext rc contract was NOT exercised (9 assertions skipped)"
+  $skip += 9
+} else {
+  $lxTmp = Join-Path ([IO.Path]::GetTempPath()) ("confload_" + [guid]::NewGuid().ToString('N').Substring(0,12))
+  New-Item -ItemType Directory -Force -Path $lxTmp | Out-Null
+  try {
+    # A stub that records the argv it was handed, then emits a canned report and
+    # the rc the caller chose. NOTHING here touches DSS or a sqlite clone: this
+    # file is a refuse-to-start gate and must run on a bare machine.
+    $stub = Join-Path $lxTmp 'stub_resolver.py'
+    @'
+import json, os, sys
+open(os.environ["STUB_ARGV_LOG"], "w").write("\n".join(sys.argv[1:]))
+sys.stdout.write(json.dumps({
+    "verdictClass": os.environ.get("STUB_CLASS", ""),
+    "detail": os.environ.get("STUB_DETAIL", "a detail line"),
+    "crossCheck": os.environ.get("STUB_CROSS", ""),
+    "staged": os.environ.get("STUB_STAGED", "/staged/testloadext.dll"),
+}) + "\n")
+sys.exit(int(os.environ.get("STUB_RC", "0")))
+'@ | Set-Content -LiteralPath $stub -Encoding UTF8
+    $env:STUB_ARGV_LOG = Join-Path $lxTmp 'argv.txt'
+    function Invoke-Stub($rc, $klass, $detail) {
+      $env:STUB_RC = "$rc"; $env:STUB_CLASS = "$klass"; $env:STUB_DETAIL = "$detail"
+      Resolve-LoadextHelper -Python $py.Source -LegsPy $stub -Label 'pe64-x86_64' `
+        -Builder 'dss' -DssBin 'C:\nope\dss.exe' `
+        -SqliteSrc (Join-Path $lxTmp 'sq\src') -SqliteBld (Join-Path $lxTmp 'sq\bld') `
+        -DestDir (Join-Path $lxTmp 'run\testdir') -WorkDir (Join-Path $lxTmp 'work') `
+        -Config 'release' -ReferenceCc 'gcc' -ReferenceMachine 'x86_64-w64-mingw32'
+    }
+    $r0 = Invoke-Stub 0 '' 'testloadext.dll, built for x86_64:pe64-x86_64-windows-dll by dss'
+    Check "rc 0 is a staged helper"                    ($r0.Ok -and $r0.Class -eq '')
+    Check "...and it carries the staged path"          ("$($r0.Staged)" -eq '/staged/testloadext.dll')
+    $argv = (Get-Content -Raw $env:STUB_ARGV_LOG)
+    # ★ THE ARGUMENT THAT MUST NOT BE OMITTED. An absent --reference-cc would let
+    # the resolver take its own default; passing it EMPTY is what says "this host
+    # has no control compiler" without changing which arm is primary.
+    Check "the control compiler is PASSED, not assumed"  ($argv -match '--reference-cc')
+    Check "...and so is the destination testdir"         ($argv -match 'testdir')
+    $r3 = Invoke-Stub 3 'poisoned' 'the dss build FAILED: error[P0016] got quote include not found'
+    Check "rc 3 is POISONED - a real failure"           ((-not $r3.Ok) -and $r3.Class -eq 'poisoned')
+    Check "...carrying the compiler's own diagnostic"   ("$($r3.Detail)" -match 'P0016')
+    # ★ THE VERDICT-CLASS CONTRACT. Folding this into 'poisoned' would red a run
+    # in which nothing is broken - the DEFAULT builder needs nothing from this box.
+    $r4 = Invoke-Stub 4 'skipped-build-input-missing' 'DSS_LOADEXT_HELPER=reference was requested'
+    Check "rc 4 is ENVIRONMENTAL, NOT a failure"        ((-not $r4.Ok) -and $r4.Class -eq 'skipped-build-input-missing')
+    $r9 = Invoke-Stub 9 'something-new' 'an unknown class'
+    Check "an unrecognised rc is refused, never a quiet success" ((-not $r9.Ok) -and $r9.Class -eq 'poisoned')
+    # Output that is not a report at all (the resolver's own FATAL line).
+    $badStub = Join-Path $lxTmp 'stub_fatal.py'
+    @'
+import os, sys
+open(os.environ["STUB_ARGV_LOG"], "w").write("\n".join(sys.argv[1:]))
+sys.stderr.write("harness_legs.py: FATAL: no leg labelled 'nope'\n")
+sys.exit(2)
+'@ | Set-Content -LiteralPath $badStub -Encoding UTF8
+    $rf = Resolve-LoadextHelper -Python $py.Source -LegsPy $badStub -Label 'nope' `
+            -Builder 'dss' -DssBin 'C:\nope\dss.exe' -SqliteSrc $lxTmp -SqliteBld $lxTmp `
+            -DestDir $lxTmp -WorkDir $lxTmp -Config 'release'
+    Check "unreadable output is POISONED and QUOTED" ((-not $rf.Ok) -and "$($rf.Detail)" -match 'FATAL')
+  } finally {
+    Remove-Item Env:STUB_RC, Env:STUB_CLASS, Env:STUB_DETAIL, Env:STUB_ARGV_LOG -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force -LiteralPath $lxTmp -ErrorAction SilentlyContinue
+  }
+}
+
+"--- STRUCTURAL: a staging failure is a per-leg verdict, never the end of the run ---"
+# The .sh learnt this the expensive way: a `die` in its staging function ended a
+# run in which two legs had already reported green over 331,351 and 331,355 units.
+Check "the staging block records a NAMED verdict"        ($stageBlk -match "Set-LegVerdict")
+Check "...keeps the ENVIRONMENTAL class apart from the failure one" ($stageBlk -match 'skipped-build-input-missing')
+Check "...CONTINUES to the next leg"                     ($stageBlk -match '(?m)^\s*continue\s*$')
+Check "...counts only the REAL failure toward the run's red" ($stageBlk -match '\$LoadextStageFails\+\+')
+# RED-ON-DISABLE for the whole point: a `Die` here would take the run with it.
+Check "the staging block contains NO Die"                (-not ($stageBlk -match '(?m)^\s*Die '))
+
+"--- STRUCTURAL: the staged sqlite_cfg.h is asked for, and it is asked for FIRST ---"
+# D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES. The
+# recipe's _HAVE_SQLITE_CONFIG_H makes sqliteInt.h include a sqlite_cfg.h, and the
+# staged bld dir - which holds the DERIVING host's copy - is the FIRST entry on
+# this driver's base include list. So the per-target header has to be both
+# REQUESTED and placed AHEAD of it; either half alone is inert, and the failure is
+# silent (the leg builds, and builds wrong). The .sh twin of these assertions lives
+# in test-confound-scope.sh, which also cross-checks THIS file.
+$ps1Txt = Get-Content -LiteralPath $sh -Raw
+# ★★ A CODE-SHAPE ASSERTION MUST NOT BE SATISFIABLE BY A COMMENT, and one below
+# was. MEASURED 2026-08-05 (TF-C121): the first cut of the staged-cfg removal
+# assertion matched the WHOLE file text, and the explanatory comment written beside
+# the fix quotes the removed line verbatim - so deleting the real code and
+# re-running still reported ok. A guard its own prose satisfies proves nothing.
+# So every SHAPE-OF-CODE assertion runs against a comment-stripped view; assertions
+# about DIAGNOSTIC TEXT keep the raw text (a Die message is code either way).
+$ps1Code = (($ps1Txt -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+Check "the .ps1 asks stage-zinc.py for a per-target sqlite_cfg.h" ($ps1Code -match '--sqlite-cfg-h')
+Check "...writing it into its own cfg/ root"                      ($ps1Code -match '--cfg-dest')
+Check "...and REFUSES a run in which none was produced"           ($ps1Txt  -match 'produced NO per-target sqlite_cfg\.h')
+Check "...with that dir FIRST on its include lists"               ($ps1Code -match '\@\(\(\$CfgStageDirs\[\$c\] -replace ''\\\\'',''/''\)\) \+ \@\(\$IncBase\)')
+# ★ AND THE OTHER HALF: the DERIVING host's own copy is REMOVED from the staged
+# bld dir. Position alone was NOT enough. A quote include searches the INCLUDING
+# FILE'S OWN DIRECTORY before this list is consulted at all, so bld/ctime.c - TU #1
+# of BOTH the fixture and the CLI, which does `#include "sqlite_cfg.h"` and then
+# `#define SQLITECONFIG_H 1` - read the deriving host's answers out of its own
+# directory whatever the include list said, and then shadowed sqliteInt.h's include
+# for the rest of that TU. RED-ON-DISABLE: put the file back and this goes red.
+Check "...and REMOVES the deriving host's copy from the staged bld dir" ($ps1Code -match 'Remove-Item -LiteralPath \$DerivedCfgH -Force')
+# And the .sh must carry the same capability, or it is a capability in one driver
+# and not the other - the exact shape this file exists to refuse.
+$shTxt  = Get-Content -LiteralPath ($sh -replace '\.ps1$', '.sh') -Raw
+$shCode = (($shTxt -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+Check "the .sh asks for it too"                                   ($shCode -match '--sqlite-cfg-h')
+Check "...and refuses a run without it"                           ($shTxt  -match 'produced NO per-target sqlite_cfg\.h')
+Check "...and removes the deriving host's copy too"               ($shCode -match 'rm -f "\$BLD/sqlite_cfg\.h"')
+
+"--- STRUCTURAL: the launcher argv form is ``--launcher=<tok>``, never a space ---"
+# D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION.
+#
+# A launcher TOKEN may itself begin with a dash, and argparse then refuses the
+# SPACE form with "expected one argument" instead of taking the next word as the
+# value. MEASURED 2026-08-05 (TF-C121) in THIS driver: `--reference-launcher -e`
+# killed the pe64 CLI smoke gate before a single assertion ran, and the caller then
+# classified that argv defect as `smoke: FAIL - CHARGED TO DSS`, i.e. the harness
+# accusing the compiler of a bug in the harness's own command line.
+#
+# The fix landed in both drivers with PROSE ONLY and no guard, which is what this
+# block repairs. Both options are named separately because the sibling is the one
+# that actually bit.
+# $ps1Code / $shCode, never the raw text: the comments beside these fixes spell the
+# BROKEN form out as the thing being warned against, so a full-text "never the
+# space form" would red on a CORRECT driver, and a full-text "emits the = form"
+# would stay green on a broken one.
+Check "the .ps1 emits the ``=`` form for --launcher"          ($ps1Code -match '--launcher=\$t')
+Check "...and for the sibling that actually broke the gate"   ($ps1Code -match '--reference-launcher=-e')
+# ★ THE SPLIT SHAPE IS NOT A SPACE. MEASURED while demonstrating this guard:
+# reverting to `@("--launcher", "$t")` produces NO literal `--launcher ` anywhere,
+# because PowerShell passes the option and its value as two ARRAY ELEMENTS - so a
+# space-only pattern stayed green on a reverted driver. The shape to forbid here is
+# the option string CLOSED and followed by a comma.
+Check "...and never the space form (nor the array-split shape)" (-not ($ps1Code -match "--(reference-)?launcher( ['`"`$a-z]|['`"]\s*,)"))
+Check "the .sh emits the ``=`` form too"                      ($shCode -match '--launcher=\$_t')
+
+# ★ BEHAVIOURAL RED-ON-DISABLE, against the REAL shipped cli-smoke.py parser -
+# not a restatement of the source text above. Both invocations carry the SAME two
+# tokens; only the argv FORM differs.
+# ★ PINNED WITH A DASH-LEADING TOKEN ON PURPOSE. Every launcher token this harness
+# has ever actually run starts with a LETTER (wine, qemu-aarch64, qemu-x86_64,
+# wsl.exe) and against those the two forms behave identically - so a test written
+# with one of them would pass on the broken code and prove nothing. `arch -x86_64`
+# is what legs.json DECLARES for macho64-x86_64 on a darwin/arm64 host, i.e. the
+# real token that fires this the first time that leg runs on the operator's Mac.
+if (-not $py) {
+  "  SKIP no python3 on PATH - the launcher argv form was NOT exercised against cli-smoke.py (2 assertions skipped)"
+  $skip += 2
+} else {
+  $smokePy = Join-Path $PSScriptRoot 'cli-smoke.py'
+  # Nothing is built and no binary runs: argparse decides long before any work.
+  $spaceOut = (& $py.Source $smokePy '--launcher' 'arch' '--launcher' '-x86_64' 2>&1) -join "`n"
+  $eqOut    = (& $py.Source $smokePy '--launcher=arch' '--launcher=-x86_64'      2>&1) -join "`n"
+  Check "RED-ON-DISABLE: the SPACE form with ``arch -x86_64`` is REFUSED by argparse" `
+        ($spaceOut -match 'argument --launcher: expected one argument')
+  # Asserted POSITIVELY, by the error the `=` form reaches INSTEAD (missing
+  # required args) - "it did not say X" is satisfied by a tool that says nothing.
+  Check "...while the ``=`` form consumes BOTH tokens and reaches the required-arg check" `
+        ($eqOut -match 'the following arguments are required: --cli')
 }
 
 ""

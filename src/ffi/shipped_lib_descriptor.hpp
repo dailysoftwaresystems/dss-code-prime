@@ -191,6 +191,52 @@ struct DSS_EXPORT ShippedSymbol {
     // case). A flat string is also accepted (arch-invariant). ELF-only
     // semantics; carried but unused on PE/Mach-O.
     std::string version;
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): optional per-target
+    // LINK BASE NAME — the UNDECORATED name the shipped library actually exports
+    // for this C identifier ON THIS TARGET, when it is not the identifier itself.
+    // EMPTY (default, every symbol until opted in) ⇒ the `name` above, which is
+    // byte-identical to the pre-TF-C121 image.
+    //
+    // ★ WHY IT EXISTS — MEASURED, a SILENT MISBINDING, not a theoretical gap.
+    // Darwin reaches its modern 64-bit-inode ABI through `$INODE64` asm-label
+    // ALIASES on x86_64 (`sys/cdefs.h`: `__DARWIN_SUF_64_BIT_INO_T` is
+    // `"$INODE64"` on x86_64 and EMPTY otherwise), while on arm64 that ABI is the
+    // only one and the plain names are correct. Declaring the plain name on
+    // x86_64 binds the LEGACY 32-bit-inode implementation while DSS compiles the
+    // MODERN 144-byte `struct stat`: the callee writes only 120 bytes, `st_size`
+    // is read at offset 96 but written at 72, `fstat` hands back `st_size == 0`,
+    // and sqlite concludes every database file is empty ("database disk image is
+    // malformed"). Four-arm differential: `cc -arch x86_64` imports
+    // `_fstat$INODE64` and sees st_size 4096; DSS imported `_fstat` and saw 0,
+    // with bytes 120-143 still holding the pre-call 0xA5 poison.
+    //
+    // ★ IT DECLARES THE UNDECORATED BASE NAME — the leading `_` is composed by
+    // the ENGINE (`ffi::linkNameFor` -> `applyCMangling`), NEVER written here.
+    // That `_` is a per-FORMAT fact with two owners already (`kCManglingRules`
+    // and the format descriptors' `importMangledName`); a per-symbol third copy
+    // would grow with the descriptor corpus and drift. The ELF `version` field
+    // above is the exact precedent and it COMPOSES the same way: config says
+    // `realpath` + `version:"GLIBC_2.3"`, never `realpath@GLIBC_2.3`.
+    //
+    // ★ NOT `asmName`. `asmName` answers "the user's C source wrote `__asm("x")`"
+    // — verbatim, C semantics, and it BYPASSES the mangling. This answers "which
+    // base name does the shipped library export on this target" — DSS vocabulary,
+    // and it is the INPUT to the mangling. A user `__asm` still outranks it.
+    //
+    // PER-TARGET by the SAME `variants` (when:{arch?,format?,dataModel?})
+    // mechanism `version`/structs/constants/typedefs use — `{"variants":[{"when":
+    // {"format":"macho","arch":"x86_64"},"value":"fstat$INODE64"}]}` — resolved
+    // by the reader to THIS single string for the ACTIVE target (0 matches ⇒
+    // empty ⇒ the canonical name; the arm64-Darwin and Linux arms). A flat string
+    // is also accepted (target-invariant).
+    //
+    // ★ AUTHORING CHECK — the old "verify the symbol is exported" rule does NOT
+    // catch this class: BOTH `_fstat` and `_fstat$INODE64` exist in libSystem's
+    // x86_64 slice, so an export check passes on the wrong one. The check that
+    // works is "does a REAL compiler for THIS target emit THIS name for THIS C
+    // identifier" — compile a one-line TU with the platform toolchain and read
+    // the undefined symbol it emits.
+    std::string linkName;
     // Optional per-SYMBOL `library` OVERRIDE — the per-object-format runtime
     // image for THIS symbol alone, SAME shape as the descriptor-level `library`
     // map ("pe"/"elf"/"macho" -> image name). EMPTY (default, almost every

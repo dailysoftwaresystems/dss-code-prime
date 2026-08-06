@@ -1,4 +1,20 @@
 #!/usr/bin/env pwsh
+#Requires -Version 7.0
+# ★ THE #Requires ABOVE IS FAIL-LOUD, NOT DECORATION — added TF-C121 after a
+# MEASURED first-run failure. The shebang says `pwsh`, but on Windows the shell a
+# reader reaches for is `powershell` (Windows PowerShell 5.1, which ships with the
+# OS and is what `powershell -File …` resolves to). This script does not PARSE
+# under 5.1: `powershell -NoProfile -File build-and-test.ps1` dies with
+# `ParserError … MissingEndCurlyBrace` pointing at a line INSIDE a here-string,
+# i.e. an error message that names neither the real cause nor the remedy. ✔MEASURED
+# 2026-08-05: the identical file returns ERROR_COUNT=0 from
+# `[System.Management.Automation.Language.Parser]::ParseFile` under pwsh 7.5.2.
+# ⚠ THE INVERTED-INSTRUMENT LESSON: a .NET-parser check run from pwsh reports the
+# file CLEAN and is therefore NOT evidence that `powershell -File` can run it — the
+# checker inherits the checking shell's grammar. Verify with the shell a user would
+# actually type, or declare the requirement so the wrong one refuses loudly. This
+# line makes 5.1 print "requires Windows PowerShell 7.0" instead of a parse error
+# 800 lines in. (D-HARNESS-PS1-UNPARSEABLE-UNDER-WINDOWS-POWERSHELL-5-1)
 # real-examples/c/sqlite/build-and-test.ps1
 # ─────────────────────────────────────────────────────────────────────────────
 # SQLite UNIT-CORPUS harness for DSS Code Prime — full-source (no amalgamation),
@@ -687,6 +703,33 @@ leg-resolver self-test exited 0 but printed no readable summary line.
 "@
   }
   Info "leg-resolver self-test: OK ($($lm.Matches[0].Groups[1].Value) assertions)"
+}
+
+# ── WHICH ARM BUILDS THE loadext HELPER — resolved HERE, as a refuse-to-start ──
+# The helper is the shared object sqlite's test/loadext.test dlopen()s. Since
+# 2026-08-05 DSS emits it for the leg's declared sharedLibFormat, so this driver
+# no longer needs a compiler for any leg's target; the leg's VERIFIED target
+# compiler is an optional CONTROL, and DSS_LOADEXT_HELPER=reference stages that
+# one instead so the corpus itself becomes the differential.
+#
+# RESOLVED BEFORE ANYTHING IS BUILT, on purpose: a typo'd DSS_LOADEXT_HELPER must
+# stop the run in its first seconds, not after five fixture builds. The
+# vocabulary lives in harness_legs.py so both drivers refuse the same values with
+# the same words. ASCII ONLY in what is printed here (a non-ASCII character in
+# gate output has already killed a run on a cp1252 console).
+$LoadextBuilder = (& $python3.Source $LegsPy '--loadext-builder' 2>&1)
+if ($LASTEXITCODE -ne 0) {
+  Die "DSS_LOADEXT_HELPER='$($env:DSS_LOADEXT_HELPER)' is not a builder this harness implements:`n      $($LoadextBuilder -join "`n      ")"
+}
+$LoadextBuilder = "$LoadextBuilder".Trim()
+if ($LoadextBuilder -eq 'reference') {
+  Warn "DSS_LOADEXT_HELPER=reference - the loadext helper will be STAGED from each leg's VERIFIED"
+  Info "      target C compiler instead of from DSS. That is the CONTROL arm: it makes the corpus"
+  Info "      itself the differential for 'is a loadext-* red the fixture or the helper?', and it"
+  Info "      re-introduces a host dependency ON PURPOSE - a leg with no such compiler on this box"
+  Info "      records skipped-build-input-missing (environmental; the default would have run it)."
+} else {
+  Info "loadext helper builder: $LoadextBuilder (DSS emits it per leg; no host cross-compiler needed)"
 }
 # <<< dss:selftest <<<
 
@@ -1814,18 +1857,35 @@ $ZincRoot = Join-Path $Stage 'zinc'
 foreach ($h in @('zlib.h', 'zconf.h')) {
   if (-not (Test-Path (Join-Path $ZincSrc $h))) { Die "the derivation did not stage $h into $ZincSrc — every leg parses this one header, so there is no leg to build on any host. See the derive output above." }
 }
+#
+# ★★ AND THE SECOND STAGED HEADER, SQLITE'S OWN ./configure OUTPUT
+# (D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES). The
+# recipe carries `_HAVE_SQLITE_CONFIG_H`, which makes sqliteInt.h
+# `#include "sqlite_cfg.h"`, and the staged bld dir on every include list holds the
+# DERIVING host's copy — so every leg inherited a Linux box's probe answers.
+# MEASURED: that is how the macho legs came to fail on `off64_t`/`pread64`/
+# `pwrite64`. Each leg declares its own answers (legs.json `build.configureAnswers`)
+# and the SAME stage-zinc.py writes one cfg/<targetOs>/sqlite_cfg.h per stage. The
+# two families are keyed DIFFERENTLY on purpose (recipeTransform vs target OS), so
+# the include lists below are written per (zinc stage, config stage) PAIR.
+$CfgRoot = Join-Path $Stage 'cfg'
+$DerivedCfgH = Join-Path $Stage 'sqlite/bld/sqlite_cfg.h'
+if (-not (Test-Path $DerivedCfgH)) { Die "the derivation did not stage sqlite_cfg.h into $Stage/sqlite/bld -- sqlite's ./configure writes it and the recipe's _HAVE_SQLITE_CONFIG_H makes every TU include it, so each leg's own copy is rewritten from it. Without it there is no leg to build on any host." }
 $StageZincPy = Join-Path $PSScriptRoot 'stage-zinc.py'
-if (-not (Test-Path $StageZincPy)) { Die "stage-zinc.py not found next to this script ($StageZincPy) — it is the single implementation of per-target zlib header staging, shared with build-and-test.sh." }
+if (-not (Test-Path $StageZincPy)) { Die "stage-zinc.py not found next to this script ($StageZincPy) — it is the single implementation of per-target staged-header production, shared with build-and-test.sh." }
 $zincOut = & $python3.Source $StageZincPy `
              '--zlib-h'  (Join-Path $ZincSrc 'zlib.h') `
              '--zconf-h' (Join-Path $ZincSrc 'zconf.h') `
              '--dest'    $ZincRoot `
+             '--sqlite-cfg-h' $DerivedCfgH `
+             '--cfg-dest' $CfgRoot `
              '--catalogue' $LegsJson 2>&1
 $zincRc = $LASTEXITCODE
 # label -> the include-list file that leg's manifest must use. A leg absent from
-# this map lost its header stage and is poisoned in Step 7.
-$LegIncludes = @{}
-$StageDirs   = @{}
+# this map lost one of its two header stages and is poisoned in Step 7.
+$LegIncludes  = @{}
+$StageDirs    = @{}
+$CfgStageDirs = @{}
 foreach ($ln in $zincOut) {
   if ($ln -match '^ZINC-STAGE-OK=([^|]*)\|([^|]*)\|([^|]*)\|(.*)$') {
     $k = $Matches[1]; $StageDirs[$k] = $Matches[2]
@@ -1835,32 +1895,88 @@ foreach ($ln in $zincOut) {
     Warn "zinc stage '$($Matches[1])' COULD NOT BE PRODUCED — $($Matches[2])"
   } elseif ($ln -match '^ZINC-STAGES=(.*)$') {
     Info "zinc stages: $($Matches[1]) produced"
+  } elseif ($ln -match '^CFG-STAGE-OK=([^|]*)\|([^|]*)\|([^|]*)\|(.*)$') {
+    $c = $Matches[1]; $CfgStageDirs[$c] = $Matches[2]
+    Info "sqlite config stage '$c' -> $($Matches[2])   [$($Matches[3])]"
+    if ($Matches[4]) { Info "      note: $($Matches[4])" }
+  } elseif ($ln -match '^CFG-STAGE-FAIL=([^|]*)\|(.*)$') {
+    Warn "sqlite config stage '$($Matches[1])' COULD NOT BE PRODUCED — $($Matches[2])"
+  } elseif ($ln -match '^CFG-STAGES=(.*)$') {
+    Info "sqlite config stages: $($Matches[1]) produced"
   } else { Info "      $ln" }
 }
 if ($StageDirs.Count -eq 0) { Die "stage-zinc.py produced NO per-target zlib header dir (rc=$zincRc):`n$($zincOut -join "`n")" }
+if ($CfgStageDirs.Count -eq 0) { Die "stage-zinc.py produced NO per-target sqlite_cfg.h (rc=$zincRc). Every leg would fall back to the DERIVING host's copy in the staged bld dir, which is exactly D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES:`n$($zincOut -join "`n")" }
+# ── ★★ AND NOW REMOVE THE DERIVING HOST'S COPY, because "the staged dir is FIRST
+# on the include list" DOES NOT COVER EVERY TU.
+#
+# THE EXCEPTION, MEASURED 2026-08-05 (TF-C121). A quote include searches the
+# INCLUDING FILE'S OWN DIRECTORY *BEFORE* THE INCLUDE LIST IS CONSULTED AT ALL
+# (src/core/types/include_path_resolve.hpp: `resolveIncludePath` -- "try the
+# including file's own directory FIRST, then each of `includeDirs`", C 6.10.2p3).
+# The position argument is therefore sound only for an includer with no
+# `sqlite_cfg.h` beside it. `sqliteInt.h` lives in sqlite/src/ and has none -- but
+# `$Stage/sqlite/bld/ctime.c` DOES, and it is TU #1 in BOTH tus.txt and
+# cli-tus.txt, i.e. the fixture and the CLI, on every leg. It opens with
+# `#if defined(_HAVE_SQLITE_CONFIG_H) && !defined(SQLITECONFIG_H)` /
+# `#include "sqlite_cfg.h"` / `#define SQLITECONFIG_H 1`, so it took the DERIVING
+# host's header out of its own directory (HAVE_MALLOC_H, HAVE_PREAD64,
+# HAVE_PWRITE64 -- all three answers the staging exists to correct) and then
+# SHADOWED sqliteInt.h's guarded include for the rest of that TU. Latent only
+# because ctime.c consumes HAVE_ISNAN alone, a row every target agrees on.
+#
+# ★ THIS IS NOT "PATCHING THE STAGED TREE" -- worth stating because that is a HARD
+# rule here (the corpus must be unmodified upstream sqlite). `sqlite_cfg.h` is not
+# upstream source: it is a GENERATED ARTEFACT OF THE HARNESS'S OWN `./configure`
+# run, produced by the derivation above into a build dir this harness created, and
+# its content is not discarded -- stage-zinc.py has just read it and rewritten it
+# into one per-target copy per stage. On THIS side the point is even plainer: the
+# whole $Stage tree is `rm -rf`'d and re-copied at the start of every run, so this
+# removal cannot outlive the run that made it.
+Remove-Item -LiteralPath $DerivedCfgH -Force
+Info "removed the deriving host's copy at $DerivedCfgH - $($CfgStageDirs.Count) per-target copy/copies replace it; a quote include searches the includer's OWN dir first, so leaving it there let bld/ctime.c (TU #1) read the deriving machine's answers ahead of the whole include list"
+# The (zinc stage, config stage) pairs the DECLARED legs actually need — built from
+# the legs, never as a cross product of the two families.
+$StagePairs = @{}
+foreach ($lg in $AllLegs) {
+  $k = "$($lg.build.headerStageKey)"; $c = "$($lg.build.configStageKey)"
+  if ($StageDirs.ContainsKey($k) -and $CfgStageDirs.ContainsKey($c)) { $StagePairs["$k|$c"] = $true }
+}
 $IncBase = Get-Content -LiteralPath (Join-Path $Stage 'includes.base.txt')
-foreach ($k in $StageDirs.Keys) {
-  $f = Join-Path $Stage "includes.$k.txt"
+# THE CLI'S OWN PER-STAGE INCLUDE LISTS. Same treatment over a DIFFERENT base:
+# cli-includes.base.txt carries no $Stage/tclinc, because shell.c has no Tcl in it.
+$CliLegIncludes = @{}
+$CliIncBase = Get-Content -LiteralPath (Join-Path $Stage 'cli-includes.base.txt')
+foreach ($pair in $StagePairs.Keys) {
+  $k = $pair.Split('|')[0]; $c = $pair.Split('|')[1]
+  # ★ THE cfg/ DIR GOES FIRST -- but position is only HALF the mechanism, and on
+  # its own it was NOT ENOUGH. A quote include searches the including file's OWN
+  # DIRECTORY *BEFORE* this list is consulted at all (C 6.10.2p3), so no list
+  # position can outrank a `sqlite_cfg.h` sitting beside the includer -- which is
+  # exactly the case for bld/ctime.c, TU #1 of both artefacts. The OTHER half is
+  # the `Remove-Item $DerivedCfgH` above, which deletes the deriving host's copy so
+  # that self-directory lookup misses everywhere; the measurement is in the comment
+  # there. First is still the only placement that stays correct however the rest is
+  # ordered, and it shadows nothing: the staged dir holds that one file.
   # utf8NoBOM, NOT ascii: these lines are PATHS, and `-Encoding ascii` replaces
   # every non-ASCII character with `?` — a user profile with an accent in it
   # would silently become an include dir that does not exist. gen-pe64-manifest.py
   # reads this file as UTF-8, and a BOM would corrupt its first entry.
-  Set-Content -LiteralPath $f -Value (@($IncBase) + @(($StageDirs[$k] -replace '\\','/'))) -Encoding utf8NoBOM
-}
-# THE CLI'S OWN PER-STAGE INCLUDE LISTS. Same per-target zinc/ treatment and the
-# same D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED reason, over a DIFFERENT base:
-# cli-includes.base.txt carries no $Stage/tclinc, because shell.c has no Tcl in it.
-$CliLegIncludes = @{}
-$CliIncBase = Get-Content -LiteralPath (Join-Path $Stage 'cli-includes.base.txt')
-foreach ($k in $StageDirs.Keys) {
-  $f = Join-Path $Stage "cli-includes.$k.txt"
-  Set-Content -LiteralPath $f -Value (@($CliIncBase) + @(($StageDirs[$k] -replace '\\','/'))) -Encoding utf8NoBOM
+  Set-Content -LiteralPath (Join-Path $Stage "includes.$k.$c.txt") `
+    -Value (@(($CfgStageDirs[$c] -replace '\\','/')) + @($IncBase) + @(($StageDirs[$k] -replace '\\','/'))) `
+    -Encoding utf8NoBOM
+  Set-Content -LiteralPath (Join-Path $Stage "cli-includes.$k.$c.txt") `
+    -Value (@(($CfgStageDirs[$c] -replace '\\','/')) + @($CliIncBase) + @(($StageDirs[$k] -replace '\\','/'))) `
+    -Encoding utf8NoBOM
 }
 foreach ($lg in $AllLegs) {
-  $k = "$($lg.build.headerStageKey)"
-  if ($StageDirs.ContainsKey($k)) {
-    $LegIncludes[$lg.label]    = (Join-Path $Stage "includes.$k.txt")
-    $CliLegIncludes[$lg.label] = (Join-Path $Stage "cli-includes.$k.txt")
+  $k = "$($lg.build.headerStageKey)"; $c = "$($lg.build.configStageKey)"
+  # BOTH staged headers or NEITHER. A leg with one of the two would be compiled
+  # against somebody else's answers for the other, so it stays out of the map and
+  # Step 7 poisons it by name.
+  if ($StageDirs.ContainsKey($k) -and $CfgStageDirs.ContainsKey($c)) {
+    $LegIncludes[$lg.label]    = (Join-Path $Stage "includes.$k.$c.txt")
+    $CliLegIncludes[$lg.label] = (Join-Path $Stage "cli-includes.$k.$c.txt")
   }
 }
 # FIRST GATE ON THE SHARED INPUT — the moment the stage exists, before anything is
@@ -2274,11 +2390,12 @@ function Test-LegManifestBlockers($leg, $gen) {
       $blockers += "this leg declares recipeTransform='$t' + stackReserveBytes=$($leg.build.stackReserveBytes), but $([System.IO.Path]::GetFileName($GenPy)) applies 'windows-selfconfig' + an 8 MiB reserve UNCONDITIONALLY and exposes $(if ($have.Count) { "only $($have -join ' ')" } else { 'neither --recipe-transform nor --stack-reserve' }). Generating this leg's manifest with the generator as it stands would silently apply the WINDOWS transform to a non-Windows target — a cross-compile category error, so it is refused"
     }
   }
-  # The leg's OWN staged zlib header. Absent = its zinc/<recipeTransform>/ could
-  # not be produced (stage-zinc.py said so, loudly, in Step 3+4). There is NO
-  # fallback to a sibling stage's copy: that fallback is the defect.
+  # The leg's OWN staged headers, BOTH of them: zinc/<recipeTransform>/ (zlib) and
+  # cfg/<targetOs>/ (sqlite's ./configure output). Absent = stage-zinc.py said so,
+  # loudly, in Step 3+4. There is NO fallback to a sibling stage's copy or to the
+  # deriving host's own: those fallbacks ARE the defect.
   if (-not $LegIncludes.ContainsKey($leg.label)) {
-    $blockers += "this leg's staged zlib header dir (zinc/$($leg.build.headerStageKey)/, from its declared zconfGuards) was NOT produced, so there is no include list this leg could correctly be compiled with. See the ZINC-STAGE-FAIL line in Step 3+4. Compiling it against another stage's zinc/ is exactly D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED and is refused"
+    $blockers += "this leg has no include list: its staged zlib header dir (zinc/$($leg.build.headerStageKey)/, from its declared zconfGuards) and/or its staged sqlite config dir (cfg/$($leg.build.configStageKey)/, from its declared configureAnswers) was NOT produced. See the ZINC-STAGE-FAIL / CFG-STAGE-FAIL line in Step 3+4. Compiling it against another stage's zinc/, or against the DERIVING host's sqlite_cfg.h, is exactly D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED / D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES and is refused"
   }
   return $blockers
 }
@@ -2802,9 +2919,10 @@ foreach ($leg in $BuildableLegs) {
   # its own recipe transform + stack reserve. When it cannot (Test-LegManifestBlockers
   # has already refused any leg that would need them to differ), the call is
   # BYTE-FOR-BYTE the pe64 invocation this driver has always made.
-  # ★ THIS LEG'S OWN INCLUDE LIST — the base recipe dirs plus the zinc/ staged for
-  # ITS recipeTransform. Not one shared includes.txt: that is what made every leg
-  # compile against the pe leg's zlib header.
+  # ★ THIS LEG'S OWN INCLUDE LIST — the base recipe dirs, the zinc/ staged for ITS
+  # recipeTransform, and (FIRST on the list) the cfg/ staged for ITS target OS. Not
+  # one shared includes.txt: that is what made every leg compile against the pe
+  # leg's zlib header AND against the deriving host's sqlite_cfg.h.
   # ★ THE TWO LIBRARY ARGUMENTS COME FROM THE RESOLVER — see Get-ResolveLibraryArgv
   # for why this driver must not spell the flag, and why a leg whose declared
   # runtime identity cannot be recorded is POISONED rather than built. With no
@@ -2964,7 +3082,7 @@ foreach ($leg in $Legs) {
   New-Item -ItemType Directory -Force -Path $cliOut | Out-Null
   if (-not $CliLegIncludes.ContainsKey($lbl)) {
     $CliFails++
-    Set-DssArtifactVerdict $lbl 'sqlite3' 'poisoned' "this leg has no CLI include list — its zinc stage was not produced (see the ZINC-STAGE-FAIL line above). Compiling it against another target's zlib header is refused (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED)."
+    Set-DssArtifactVerdict $lbl 'sqlite3' 'poisoned' "this leg has no CLI include list — its zinc stage and/or its sqlite config stage was not produced (see the ZINC-STAGE-FAIL / CFG-STAGE-FAIL line above). Compiling it against another target's zlib header, or against the DERIVING host's sqlite_cfg.h, is refused (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED / D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES)."
     Warn "[$lbl] CLI POISONED — $((Get-DssArtifactVerdict $lbl 'sqlite3').Detail)"
     continue
   }
@@ -3090,13 +3208,35 @@ foreach ($leg in $Legs) {
     '--workdir',          $smokeDir,
     '--label',            $lbl,
     '--json',             (Join-Path $smokeDir 'result.json'))
-  foreach ($t in @($leg.run.launcher)) { if ($t) { $smokeArgs += @('--launcher', "$t") } }
+  # ★ `--opt=value`, NOT `--opt value` — a launcher TOKEN may itself begin with a
+  # dash and argparse then refuses it as "expected one argument" rather than taking
+  # it as the value. ✔MEASURED 2026-08-05 (TF-C121): the sibling `--reference-launcher`
+  # line below passed `-e` positionally and killed the pe64 CLI smoke gate outright;
+  # the harness then reported that argv bug as `smoke: FAIL — CHARGED TO DSS`, i.e. it
+  # accused the compiler of a defect in its own command line. THIS line had the same
+  # shape and had simply never been reached by a dash-leading token — `wine`,
+  # `qemu-aarch64` and `wsl.exe` all start with a letter. It is NOT hypothetical:
+  # legs.json declares `arch -x86_64` for the macho64-x86_64 leg on a darwin/arm64
+  # host, whose second token is `-x86_64`. Fixed here BEFORE that host ever runs it.
+  # (D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION)
+  foreach ($t in @($leg.run.launcher)) { if ($t) { $smokeArgs += @("--launcher=$t") } }
   # The reference is a LINUX gcc build living in the shell's namespace. On a
   # Windows host it is reached the same way anything else over there is — through
   # the declared WSL entry point — and on a native POSIX host it runs directly.
   if ($RefCli) {
     $smokeArgs += @('--reference', $RefCli)
-    if ($script:HostNeedsWsl) { $smokeArgs += @('--reference-launcher', 'wsl.exe', '--reference-launcher', '-e') }
+    # ★ THE BUG THIS CYCLE MEASURED, and the `=` form is the fix: `-e` passed as a
+    # positional value made argparse report `argument --reference-launcher: expected
+    # one argument` and exit 2, so the smoke gate never ran a single assertion — yet
+    # the caller classified the non-zero rc as `FAIL — CHARGED TO DSS`. A harness
+    # argv defect was attributed to the compiler. That is the FALSE-ACCUSATION twin
+    # of D-HARNESS-ATTRIBUTION-ORACLE-EXONERATES-VIA-A-REFERENCE-THAT-NEVER-RAN, and
+    # it is the more dangerous direction: a false acquittal hides a real bug, a false
+    # accusation sends someone hunting one that does not exist.
+    # ⚠ `wsl.exe -e` is REQUIRED, not stylistic: without `-e` WSL routes the command
+    # line through the distro's default shell, which expands `$( )` on the WINDOWS
+    # side before bash ever sees it.
+    if ($script:HostNeedsWsl) { $smokeArgs += @('--reference-launcher=wsl.exe', '--reference-launcher=-e') }
   }
   $smokeOut = & $python3.Source @smokeArgs 2>&1
   $srcc = $LASTEXITCODE
@@ -3150,63 +3290,155 @@ foreach ($leg in $BuiltLegs) {
 $RunnableLegs = @($BuiltLegs | Where-Object { $_.run.mode -eq 'native' -or $_.run.mode -eq 'launched' })
 if ($RunnableLegs.Count -eq 0) { Info "no built leg can be EXECUTED on this host — every one of them has a named skip verdict above." }
 
-# ── THE LOADEXT HELPER: THIS DRIVER STAGES NONE, AND SAYS SO ONCE, OUT LOUD ──
-# D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED — this gap's OWN
-# anchor, registered 2026-08-05 (TF-C120). It is a DIFFERENT defect from its .sh
-# sibling D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN (✅ CLOSED
-# the same cycle): that one staged a WRONG-TARGET helper and died on it; this one
-# stages NO helper at all. Filing them under one name is what let this half hide.
+# ── THE LOADEXT HELPER: THIS DRIVER NOW STAGES ONE, LIKE ITS SIBLING ─────────
+# D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED (registered
+# 2026-08-05, TF-C120) is the gap this closes. It was a DIFFERENT defect from its
+# .sh sibling D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN: that
+# one staged a WRONG-TARGET helper and died on it; this one staged NO helper at
+# all, so ~16 loadext-* units per leg were left to sqlite's own hardcoded-`gcc`
+# self-build (or, on a box with no gcc, to a "Skipping loadext tests" line and no
+# verdict at all).
 #
-# build-and-test.sh pre-stages the shared object sqlite's test/loadext.test
-# dlopen()s, built by the leg's own VERIFIED target compiler (harness_legs.py
-# --resolve-target-cc). THIS DRIVER DOES NOT, and never has — ✔MEASURED
-# 2026-08-05: neither a staging call nor a target-cc resolution exists anywhere
-# in this file. That is a real difference in what the two drivers prove, so it is
-# STATED rather than left for a reader to notice; silence about a coverage
-# difference is the harness bug, not the difference itself.
+# ★ WHY IT COULD NOT SIMPLY BE COPIED OVER BEFORE, AND WHAT CHANGED. The blocker
+# was real and it was written down here: the helper has to be built FOR THE LEG'S
+# TARGET by a compiler on THIS host, and on Windows `gcc -dumpmachine` prints
+# `x86_64-w64-mingw32` (MEASURED) — correct for pe64 and correctly REFUSED for
+# elf64-x86_64. Staging would therefore have marked this driver's LARGEST leg
+# (elf64-x86_64, 330,436 units under wsl.exe) `skipped-build-input-missing` for
+# want of a Linux-targeting compiler on a Windows PATH. Closing one gap by
+# opening a bigger one is not closing it.
 #
-# ★ WHY IT IS NOT SIMPLY COPIED OVER — the obvious move, and it is WRONG HERE.
-# The helper must be built FOR THE LEG'S TARGET by a compiler on the DRIVER'S
-# host. ✔MEASURED 2026-08-05 on this box: `gcc -dumpmachine` prints
-# `x86_64-w64-mingw32`, so the verified resolver accepts it for pe64 and
-# correctly REFUSES it for elf64-x86_64. Adding staging here would therefore mark
-# this driver's LARGEST leg — elf64-x86_64, the one it runs under `wsl.exe`,
-# 330,436 units — `skipped-build-input-missing` for want of a Linux-targeting
-# compiler on a Windows PATH. It would cost real coverage to close a gap that on
-# THIS driver is not currently biting, because:
+# ⇒ THAT PREMISE IS GONE. DSS emits the helper for the leg's declared
+# `sharedLibFormat`, so this Windows host builds the elf64 leg's
+# `libtestloadext.so` itself. ✔MEASURED 2026-08-05 on this box: the shared
+# resolver produced a 13,912-byte ELF64 ET_DYN for x86_64:elf64-x86_64-linux-dyn
+# with no Linux compiler present at all, and the same call produced an
+# 8,192-byte PE with IMAGE_FILE_DLL set for pe64 — which sqlite's own
+# sqlite3_load_extension() loaded, answering `SELECT half(9.0)` = 4.500.
+# [D-HARNESS-CROSS-HOST-ANY-TARGET]
 #
-#   every leg this driver can execute runs its fixture in an environment whose
-#   own native compiler IS that leg's target — pe64 natively on Windows (mingw
-#   gcc), the elf legs inside WSL (Linux gcc) — so loadext.test's own `exec gcc`
-#   self-build is target-correct here. The .sh needs pre-staging because IT
-#   launches a cross-ARCH leg under qemu, where the guest's `exec gcc` is passed
-#   through to the HOST kernel and yields a HOST x86-64 object
-#   (D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO).
+# ★★ AND IT IS THE SAME CODE, NOT A SECOND IMPLEMENTATION. Everything that
+# decides — object format, argv, whether the artefact is a loadable shared
+# library, whether a control was possible, which verdict class a failure is —
+# lives in harness_legs.py, which both drivers already hard-require. That is what
+# keeps this from becoming the next capability that exists in one driver and not
+# the other.
 #
-# WHAT IS STILL LOST, said plainly because it is the honest part: on a host with
-# no gcc at all, loadext.test does not fail — it prints "Skipping loadext tests:
-# Test extension not built..." and returns (✔MEASURED at test/loadext.test:83-95),
-# so ~16 units leave the run with only that line to show for it. Closing it
-# properly means resolving the helper compiler IN THE LAUNCHER'S NAMESPACE (a
-# WSL-side cc for a wsl.exe-launched leg), which neither driver can do today.
-#
-# ✔ THIS GAP NOW HAS ITS OWN REGISTRY ROW — D-HARNESS-PS1-STAGES-NO-LOADEXT-
-# HELPER-COVERAGE-IS-UNDECLARED, registered 2026-08-05 (TF-C120), 🔴 OPEN.
-# ★ ORDERING LESSON, kept because it cost a gate failure to learn: a new `D-*`
-# token cannot be minted in this file first. tools/check-anchor-registry.sh scans
-# real-examples/ and FAILS the gate on any anchor with no plan-side row (✔MEASURED
-# 2026-08-05 — it failed on exactly that). The registry row is written BEFORE the
-# citation, never after.
+# ⚠ WHAT IS STILL DIFFERENT FROM THE .sh, STATED RATHER THAN LEFT TO BE NOTICED:
+# a leg this driver launches through `wsl.exe` runs its fixture in ANOTHER
+# filesystem namespace. The helper is staged into the run's testdir, which the
+# fixture reaches through the same translated path as everything else, so it is
+# found — but the CONTROL arm, when one exists, is a compiler on THIS host, not
+# inside the launcher's namespace. Resolving a WSL-side cc for a wsl.exe-launched
+# leg is still something neither driver can do; it costs nothing today because
+# the primary arm needs no compiler at all.
 #
 # ⚠ ASCII ONLY in the emitted strings below: a non-ASCII character in gate output
 # has already killed a run on a cp1252 console at its LAST line.
-if ($RunnableLegs.Count) {
-  Warn "this driver pre-stages NO loadext helper extension (build-and-test.sh does)"
-  Info "      sqlite's test/loadext.test builds its own with a hardcoded 'gcc', inside the fixture's OWN environment."
-  Info "      That is target-correct for every leg THIS driver can launch (pe64 native on Windows; the elf legs inside WSL),"
-  Info "      but on a host with no gcc at all loadext.test SKIPS itself and ~16 loadext-* units leave no verdict behind."
-  Info "      [D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED]"
+
+# Resolve-LoadextHelper -> @{ Ok; Class; Detail; CrossCheck; Staged }
+#
+# A THIN CALL, deliberately: it hands the shared resolver the paths only this
+# driver knows and turns ONE report into ONE verdict. `$ReferenceCc` may be
+# EMPTY, and that is the whole de-host-locking — empty means "no verified target
+# compiler here", which costs the leg its CONTROL and nothing else.
+#
+# THE rc CONTRACT (harness_legs.py --build-loadext-helper): 0 staged, 3 poisoned
+# (a REAL failure - the run must not exit 0), 4 skipped-build-input-missing
+# (ENVIRONMENTAL - only reachable when the operator selected the control arm and
+# this box cannot provide it). Anything else is treated as a failure, never as a
+# quiet success: an unreadable outcome is not evidence the helper is there.
+function Resolve-LoadextHelper {
+  param(
+    [Parameter(Mandatory)] $Python,
+    [Parameter(Mandatory)] $LegsPy,
+    [Parameter(Mandatory)] $Label,
+    [Parameter(Mandatory)] $Builder,
+    [Parameter(Mandatory)] $DssBin,
+    [Parameter(Mandatory)] $SqliteSrc,
+    [Parameter(Mandatory)] $SqliteBld,
+    [Parameter(Mandatory)] $DestDir,
+    [Parameter(Mandatory)] $WorkDir,
+    [Parameter(Mandatory)] $Config,
+    $ReferenceCc = '',
+    $ReferenceMachine = ''
+  )
+  $call = @($LegsPy, '--build-loadext-helper', $Label,
+            '--helper-builder', "$Builder",
+            '--dss', "$DssBin",
+            '--sqlite-src', "$SqliteSrc", '--sqlite-bld', "$SqliteBld",
+            '--dest-dir', "$DestDir", '--work-dir', "$WorkDir",
+            '--dss-config', "$Config",
+            '--reference-cc', "$ReferenceCc",
+            '--reference-machine', "$ReferenceMachine")
+  $out = & $Python @call 2>&1
+  $rc = $LASTEXITCODE
+  $text = ($out | ForEach-Object { "$_" }) -join "`n"
+  # The report is on stdout on EVERY outcome - a driver needs the detail most
+  # when it failed - so it is parsed the same way either way. Output that is not
+  # JSON at all is the resolver's own FATAL line; it is quoted rather than
+  # swallowed.
+  $rep = $null
+  try { $rep = $text | ConvertFrom-Json } catch { $rep = $null }
+  if ($null -eq $rep) {
+    return @{ Ok = $false; Class = 'poisoned'; Staged = ''; CrossCheck = ''
+              Detail = "the helper build exited $rc and printed something this driver could not read as a report: $($text -replace "`n", ' ')" }
+  }
+  switch ($rc) {
+    0 { return @{ Ok = $true;  Class = '';         Staged = "$($rep.staged)"; Detail = "$($rep.detail)"; CrossCheck = "$($rep.crossCheck)" } }
+    4 { return @{ Ok = $false; Class = 'skipped-build-input-missing'; Staged = ''; Detail = "$($rep.detail)"; CrossCheck = "$($rep.crossCheck)" } }
+    3 { return @{ Ok = $false; Class = 'poisoned'; Staged = ''; Detail = "$($rep.detail)"; CrossCheck = "$($rep.crossCheck)" } }
+    default {
+      return @{ Ok = $false; Class = 'poisoned'; Staged = ''; CrossCheck = ''
+                Detail = "the helper build exited $rc, which this driver does not recognise as a verdict class ('$($rep.verdictClass)'). Treating it as a failure rather than assuming the helper was staged. $($rep.detail)" }
+    }
+  }
 }
+
+# The leg's OPTIONAL control compiler. Empty when this host has none, which is
+# the normal case for a cross leg and costs the leg NOTHING - the primary arm is
+# DSS. Never a guess: it is whatever --resolve-target-cc accepted, or nothing.
+# ★ ONLY ASKED FOR A LEG THIS DRIVER WILL ACTUALLY RUN, and only up front, so the
+# per-leg staging call below never spawns a probe mid-corpus.
+$LegControlCc = @{}
+foreach ($leg in $RunnableLegs) {
+  $lbl = $leg.label
+  $LegControlCc[$lbl] = @{ Cc = ''; Machine = '' }
+  $ccOut = & $python3.Source $LegsPy '--resolve-target-cc' $lbl 2>&1
+  if ($LASTEXITCODE -eq 0) {
+    $parts = ("$ccOut" -split "`t")
+    if ($parts.Count -ge 2) {
+      $LegControlCc[$lbl] = @{ Cc = $parts[0].Trim(); Machine = $parts[1].Trim() }
+      Info "[$lbl] control cc: $($parts[0].Trim()) - it reports '$($parts[1].Trim())', which is $($leg.spec)'s arch+OS (asked, not assumed)"
+    } else {
+      # ★ THE THIRD OUTCOME, WHICH USED TO FIRE NEITHER BRANCH AND SAY NOTHING.
+      # rc=0 is the resolver's "I FOUND one" answer, and its contract is a single
+      # TAB-separated `<cc>\t<machine>` line. An rc=0 that does not parse is a
+      # BROKEN CONTRACT, not an absent compiler - and the two must not look alike,
+      # because the silent version left $LegControlCc[$lbl] empty and the run then
+      # proceeded exactly as if the host had no cross-compiler, i.e. a resolver
+      # defect wearing the disguise of a normal, expected, costless condition.
+      # NOT a Die: the control arm is optional by construction (a leg with no
+      # control still builds its helper with DSS), so refusing the whole run over
+      # it would be the reverse defect. It is a NAMED, LOUD verdict with the bytes
+      # quoted, consistent with the `default {}` arm of Resolve-LoadextHelper
+      # above, which likewise refuses an unrecognised shape instead of assuming.
+      Warn "[$lbl] --resolve-target-cc exited 0 but did not answer in the declared <cc><TAB><machine> shape - got $($parts.Count) field(s): [$ccOut]. Treating this leg as having NO control compiler, and saying so: an rc=0 that will not parse is a RESOLVER defect, not the ordinary 'this host has no cross-compiler' case reported below. The loadext helper is still built by DSS; only the cross-check is lost."
+    }
+  } else {
+    Info "[$lbl] no CONTROL compiler on this host - the loadext helper will be built by DSS for $($leg.build.sharedLibFormat), which needs nothing from this machine."
+  }
+}
+$SqliteStageSrc = Join-Path (Join-Path $Stage 'sqlite') 'src'
+$SqliteStageBld = Join-Path (Join-Path $Stage 'sqlite') 'bld'
+# Legs whose fixture BUILT but whose loadext helper could not be STAGED. Its own
+# counter, deliberately: it is neither a fixture compile failure (the fixture
+# built fine) nor a unit failure (no unit ran), and folding it into either would
+# print a Step-9 line that names the wrong thing. The leg is ALSO recorded
+# `poisoned`, so the exit code is already covered by $vPoisoned; this counter
+# exists so the summary can say WHAT poisoned it. Same split as the .sh's
+# $STAGE_FAILS.
+$LoadextStageFails = 0
 
 foreach ($leg in $RunnableLegs) {
 # ★★ THE BODY OF THIS LOOP IS DELIBERATELY NOT INDENTED. Two reasons, both
@@ -3247,6 +3479,52 @@ $rundir = Join-Path $legOut 'run'; if (Test-Path $rundir) { Remove-Item -Recurse
 New-Item -ItemType Directory -Force -Path $rundir | Out-Null
 $runlog = Join-Path $legOut 'corpus.log'
 $Ledger = Join-Path $legOut 'corpus-units.txt'
+
+# >>> dss:loadext-stage-ps1 >>>
+# THE LOADEXT HELPER, STAGED FOR THIS LEG'S TARGET. See the block above Step 8's
+# leg loop for why this driver can do it at all now.
+#
+# tester.tcl's cmdlinearg(testdir) default: the fixture `file mkdir`s this subdir
+# of its CWD and cd's into it before any .test body runs, so a test's relative
+# './libtestloadext.so' ('./testloadext.dll' on a Windows Tcl) resolves THERE.
+# This driver passes no --testdir override, so the destination is $rundir/testdir.
+#
+# ★ A FAILURE HERE IS A PER-LEG VERDICT, NEVER THE END OF THE RUN. The .sh learnt
+# this the expensive way on 2026-08-05: a `die` in its staging function ended a
+# run in which two legs had already reported green over 331,351 and 331,355
+# units. Every branch below records a NAMED verdict from the closed vocabulary in
+# tests/test_support/arm_verdict_ledger.hpp and CONTINUES to the next leg.
+$helper = Resolve-LoadextHelper -Python $python3.Source -LegsPy $LegsPy `
+            -Label $LegTag -Builder $LoadextBuilder -DssBin $DssBin `
+            -SqliteSrc $SqliteStageSrc -SqliteBld $SqliteStageBld `
+            -DestDir (Join-Path $rundir 'testdir') `
+            -WorkDir (Join-Path $legOut 'loadext-helper') -Config $Config `
+            -ReferenceCc $LegControlCc[$LegTag].Cc `
+            -ReferenceMachine $LegControlCc[$LegTag].Machine
+if (-not $helper.Ok) {
+  if ($helper.Class -eq 'skipped-build-input-missing') {
+    # ENVIRONMENTAL, and only reachable when the operator selected the CONTROL
+    # arm - the default builder needs nothing from this machine. It must NOT red
+    # a run in which nothing is broken.
+    Set-LegVerdict $LegTag 'skipped-build-input-missing' "the fixture BUILT ($fixture), but DSS_LOADEXT_HELPER=$LoadextBuilder was requested and this host cannot provide that arm, so this leg's corpus was NOT run. $($helper.Detail)"
+    Warn "[$LegTag] corpus NOT run - the requested loadext helper arm is unavailable here; the rest of the run CONTINUES:"
+    Warn "      $($helper.Detail)"
+  } else {
+    # A REAL failure: the compiler under test did not produce a loadable shared
+    # library. `poisoned` because this leg's loadext-* units cannot be trusted
+    # and the alternative - run the corpus anyway - hands the fixture back to
+    # loadext.test's own hardcoded `gcc`, which is the wrong-target helper
+    # D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO is named after.
+    $LoadextStageFails++
+    Set-LegVerdict $LegTag 'poisoned' "the fixture BUILT ($fixture), but this leg's loadext helper extension could not be staged, so its corpus was NOT run and this run covers NONE of its units. $($helper.Detail)"
+    Warn "[$LegTag] POISONED - loadext helper staging FAILED; this leg's corpus is NOT run, the rest of the run CONTINUES:"
+    Warn "      $($helper.Detail)"
+  }
+  continue
+}
+Info "[$LegTag] loadext helper -> $($helper.Staged) - $($helper.Detail)"
+if ($helper.CrossCheck) { Info "      $($helper.CrossCheck)" }
+# <<< dss:loadext-stage-ps1 <<<
 
 # >>> dss:corpus-loop >>>
 # Segment queue. Segment 0 is EXACTLY today's invocation (`fixture <tier>.test`)
@@ -3815,6 +4093,13 @@ if ($Legs.Count -gt 0 -and $CliBuilt.Count -eq 0) {
 }
 if ($vPoisoned -gt 0) {
   $failReasons += "$vPoisoned leg(s) POISONED: $(@($LegOrder | Where-Object { $LegLedger[$_].Verdict -eq 'poisoned' }) -join ' ')"
+}
+# NAMED SEPARATELY from the poisoned count above, which it is a subset of: a leg
+# that built its fixture and then could not stage the shared object the corpus
+# dlopen()s ran NONE of its units, and the summary has to say that rather than
+# leaving a reader to infer it from a bare "POISONED".
+if ($LoadextStageFails -gt 0) {
+  $failReasons += "$LoadextStageFails leg(s) BUILT their testfixture but could not stage the loadext helper the corpus dlopen()s - their units did NOT run. Each one is named above with the exact reason and its $OutRoot\<leg>\loadext-helper\ logs."
 }
 $unitFailLegs = @($LegOrder | Where-Object { $LegLedger[$_].UnitFail })
 if ($unitFailLegs.Count) { $failReasons += "$($unitFailLegs.Count) leg(s) with genuine unit failures: $($unitFailLegs -join ' ')" }

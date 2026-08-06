@@ -499,6 +499,251 @@ TEST(ShippedLibDescriptor, SymbolVersionMalformedShapesFailLoud) {
             ] } }] })JSON"));
 }
 
+// ── TF-C121: per-symbol `linkName` (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME) ─
+//
+// The per-target LINK BASE NAME — the undecorated name the shipped library
+// exports for a C identifier ON THIS TARGET. Reader-side pins; the COMPOSITION
+// with the format decoration is pinned in tests/ffi/test_c_mangle.cpp
+// (`FfiCMangleLinkName.*`) and end-to-end on emitted object bytes in
+// tests/program/test_compile_pipeline.cpp.
+
+// A flat `"linkName": "..."` (target-invariant) decodes onto the symbol.
+TEST(ShippedLibDescriptor, SymbolLinkNameFlatStringDecodes) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ln_flat.json", R"JSON({
+        "header": "x.h",
+        "library": { "macho": "/usr/lib/libSystem.B.dylib" },
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "linkName": "f$EVERYWHERE" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->symbols.size(), 1u);
+    EXPECT_EQ(desc->symbols[0].linkName, "f$EVERYWHERE");
+}
+
+// ★ THE PER-ARCH SPLIT IS THE WHOLE POINT — so BOTH arms are pinned, not just
+// the one that motivated the field. The `$INODE64` shape: Darwin's modern
+// 64-bit-inode ABI is an asm-label ALIAS on x86_64 and the ONLY ABI on arm64,
+// so the x86_64 arm resolves to the alias while arm64 matches NO variant and
+// keeps the canonical identifier (an empty `linkName`, which downstream means
+// "use `name`"). A flat string here would be exact on x86_64 and WRONG on
+// arm64 — merely moving the defect — which is why a one-arm pin would be
+// worthless. RED-ON-DISABLE (MEASURED): drop the `linkName` decode from
+// shipped_lib_descriptor.cpp and the x86_64 arm reads "" instead of
+// "fstat$INODE64".
+TEST(ShippedLibDescriptor, SymbolLinkNameVariantSelectsPerArchBothArms) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ln_variant.json", R"JSON({
+        "header": "sys/stat.h",
+        "library": { "macho": "/usr/lib/libSystem.B.dylib" },
+        "symbols": [
+            { "name": "fstat", "signature": "fn(i32, ptr<void>) -> i32",
+              "linkName": { "variants": [
+                  { "when": { "format": "macho", "arch": "x86_64" }, "value": "fstat$INODE64" }
+              ] } }
+        ]
+    })JSON");
+    auto linkNameFor = [&](std::string_view arch, ObjectFormatKind fmt) -> std::string {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, arch, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        for (auto const& s : desc->symbols)
+            if (s.name == "fstat") return s.linkName;
+        ADD_FAILURE() << "fstat symbol missing";
+        return "<none>";
+    };
+    std::string const x86Macho = linkNameFor("x86_64", ObjectFormatKind::MachO);
+    EXPECT_EQ(x86Macho, "fstat$INODE64")
+        << "x86_64-Darwin reaches the modern 64-bit-inode ABI through the "
+           "$INODE64 alias; binding the plain name reaches the LEGACY "
+           "32-bit-inode callee, which writes 120 of 144 bytes and reports "
+           "st_size 0";
+    EXPECT_EQ(linkNameFor("arm64", ObjectFormatKind::MachO), "")
+        << "arm64-Darwin has ONE inode ABI, so the plain name is already "
+           "correct — 0 variants match, and empty means 'use `name`'";
+    EXPECT_EQ(linkNameFor("x86_64", ObjectFormatKind::Elf), "")
+        << "the variant is format-gated too: no Linux symbol carries this alias";
+    // ★ The UNDECORATED spelling is load-bearing: the leading `_` Mach-O puts on
+    // every C symbol is composed by the ENGINE (applyCMangling), never written
+    // in config, so a descriptor value that already carried one would be
+    // double-decorated into `__fstat$INODE64`.
+    //
+    // ★★ `starts_with`, NOT `.front()`, AND THE REASON IS THIS TEST'S OWN
+    // RED-ON-DISABLE. Dropping the `linkName` decode makes the x86_64 arm read
+    // "" — exactly what the EXPECT_EQ above exists to catch — but `EXPECT_*` is
+    // NON-FATAL, so execution then reached `.front()` on that EMPTY string.
+    // `std::string::front()` REQUIRES `!empty()` ([string.access]), so that was
+    // UB on the one path this test documents as its own failure mode.
+    //   ⚠ AND THE MEASURED SYMPTOM WAS THE QUIET ONE, WHICH IS WHY THIS IS
+    //   WRITTEN DOWN RATHER THAN JUST FIXED. Run 2026-08-05 on the Windows gate
+    //   leg (MinGW g++ / libstdc++, `-g`, no `_GLIBCXX_ASSERTIONS`) with the
+    //   decode disabled: the old shape did NOT abort — `front()` returned the
+    //   NUL terminator and `EXPECT_NE(..., '_')` PASSED VACUOUSLY. So the defect
+    //   was not "the red-on-disable crashes" but "this assertion silently stops
+    //   asserting on the exact input it was written for", with a hardened
+    //   standard library (or the clang ASan/UBSan leg) free to turn it into a
+    //   crash instead. `starts_with` is TOTAL on the empty string: no UB, and
+    //   the check keeps its meaning for every input.
+    EXPECT_FALSE(x86Macho.starts_with('_'))
+        << "config declares the UNDECORATED base name — the leading Mach-O `_` "
+           "is the FORMAT's fact, composed downstream by applyCMangling; a "
+           "pre-decorated value would emit `__fstat$INODE64`";
+}
+
+// Malformed `linkName` shapes all fail loud — the SAME closed-schema battery
+// `version` gets, run against the SAME shared decoder
+// (`decodePerTargetSymbolString`), which is why the two can never drift.
+TEST(ShippedLibDescriptor, SymbolLinkNameMalformedShapesFailLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    int caseNo = 0;
+    auto readsClean = [&](std::string const& body) -> bool {
+        auto const path =
+            writeTemp(dir, "lnbad" + std::to_string(caseNo++) + ".json", body);
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, "x86_64",
+                                             ObjectFormatKind::MachO);
+        return desc.has_value() && !rep.hasErrors();
+    };
+    // linkName is a number (neither string nor object).
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32","linkName": 3 }] })JSON"));
+    // empty flat string (omit the key instead — an empty value is ambiguous
+    // with "no override" and would hide a truncated edit).
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32","linkName": "" }] })JSON"));
+    // OBJECT with no `variants` array.
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32","linkName": {} }] })JSON"));
+    // a variant missing its `value`.
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "linkName": { "variants": [ { "when": { "format": "macho" } } ] } }] })JSON"));
+    // an unknown key inside `when` (closed vocabulary — a typo'd "ach" would
+    // otherwise widen the match silently).
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "linkName": { "variants": [
+                { "when": { "ach": "x86_64" }, "value": "f$X" } ] } }] })JSON"));
+    // TWO variants both matching the active target → ambiguous, not last-wins.
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "linkName": { "variants": [
+                { "when": { "format": "macho" }, "value": "f$A" },
+                { "when": { "arch": "x86_64" }, "value": "f$B" }
+            ] } }] })JSON"));
+    // sanity: a well-formed variant DOES read clean (the negatives above are
+    // not failing for an unrelated reason).
+    EXPECT_TRUE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "linkName": { "variants": [
+                { "when": { "arch": "x86_64", "format": "macho" }, "value": "f$INODE64" }
+            ] } }] })JSON"));
+}
+
+// ★ THE REAL DESCRIPTORS, every renamed symbol at once — the pin that would have
+// caught the shipped bug. MEASURED ground truth (macOS 26.5.2, Apple clang
+// 21.0.0), and the control is EXHAUSTIVE rather than a sample: ONE generated TU
+// per arch taking `&sym` of ALL 232 macho-visible descriptor FUNCTIONS, only
+// `-arch` differing, `cc -c` then `nm -u`, 232 undefined symbols on each side.
+//   x86_64 → _stat$INODE64 _fstat$INODE64 _lstat$INODE64 _statfs$INODE64
+//            _fstatfs$INODE64 _opendir$INODE64 _readdir$INODE64
+//            _realpath$DARWIN_EXTSN
+//   arm64  → _stat _fstat _lstat _statfs _fstatfs _opendir _readdir
+//            _realpath$DARWIN_EXTSN
+// No OTHER name among the 232 is renamed on either arch, so this table is
+// COMPLETE and a row added here later needs new measurement, not a guess.
+//
+// ★★ THE TABLE CARRIES THE EXPECTED NAME PER ARCH, NOT A `diverges` BOOL — AND
+// THAT SHAPE IS THE WHOLE LESSON OF THIS TEST. The bool asked "does the emitted
+// name differ BETWEEN THE TWO ARCHES". `realpath` answers NO — it is
+// `_realpath$DARWIN_EXTSN` on both — so the bool filed it under "needs no
+// linkName", and a comment here asserted that as MEASURED and told future
+// readers not to change it. THE QUESTION THAT DECIDES A LINK NAME IS A DIFFERENT
+// ONE: "does the emitted name differ from THE ONE WE DECLARE." By that question
+// realpath diverged on BOTH arches while DSS shipped plain `_realpath`. Its
+// variant is `format`-keyed where the seven $INODE64 rows are (format, arch)-
+// keyed, so its two cells below spell the SAME string on purpose — a shape a
+// cross-arch DIFF is structurally blind to.
+//   ⚠ AND IT WAS NOT BENIGN. MEASURED on that host: `realpath` and
+//   `realpath$DARWIN_EXTSN` are different functions at different addresses
+//   (dlsym, arm64 0x185e82d4c vs 0x185e2a8a0; x86_64 likewise, `same=0`), plain
+//   `_realpath` LINKS CLEAN so nothing ever failed loud, and the shipped DSS
+//   `sqlite3` Mach-O carries 2 call sites to the plain name. `$DARWIN_EXTSN` is
+//   the conforming POSIX-2008 form — the NULL-`resolved` malloc'ing behaviour
+//   shell.c actually calls — so the plain name reached the legacy callee.
+// `closedir` and `mkdir` stay as the per-SYMBOL controls: plain on BOTH arches,
+// so they prove the rename is a property of individual symbols and not of a
+// header — a blanket "suffix everything in dirent.json" goes red on `closedir`.
+TEST(ShippedLibDescriptor, RealDescriptorsCarryTheirDarwinLinkNames) {
+    struct Row { char const* descriptor; char const* symbol;
+                 char const* expectX86;  char const* expectArm; };
+    constexpr std::array<Row, 10> kRows{{
+        {"sys/stat.json", "stat",     "stat$INODE64",          ""},
+        {"sys/stat.json", "fstat",    "fstat$INODE64",         ""},
+        {"sys/stat.json", "lstat",    "lstat$INODE64",         ""},
+        {"unistd.json",   "statfs",   "statfs$INODE64",        ""},
+        {"unistd.json",   "fstatfs",  "fstatfs$INODE64",       ""},
+        {"dirent.json",   "opendir",  "opendir$INODE64",       ""},
+        {"dirent.json",   "readdir",  "readdir$INODE64",       ""},
+        {"dirent.json",   "closedir", "",                      ""},  // control
+        {"sys/stat.json", "mkdir",    "",                      ""},  // control
+        // ★ the same string BOTH sides — format-keyed, not arch-keyed.
+        {"stdlib.json",   "realpath", "realpath$DARWIN_EXTSN",
+                                      "realpath$DARWIN_EXTSN"},
+    }};
+    auto const shippedRoot = dss::test::findRepoRoot();
+    ASSERT_TRUE(shippedRoot.has_value()) << dss::test::repoRootDiagnostic();
+    // Reads the REAL descriptor for one (arch, macho) and returns `symbol`'s
+    // resolved `linkName` — "<missing>" if the row is gone, so deleting a row
+    // REDS here instead of silently satisfying an empty expectation.
+    auto linkNameOf = [&](char const* descriptor, char const* symbol,
+                          std::string_view arch) -> std::string {
+        fs::path const p =
+            *shippedRoot / "src" / "dss-config" / "shippedLibs" / descriptor;
+        TypeInterner       interner{CompilationUnitId{1}};
+        TypeRegistry       typeReg;
+        DiagnosticReporter rep;
+        auto const desc = readShippedLibDescriptor(p, interner, typeReg, rep,
+                                                   DataModel::Lp64, arch,
+                                                   ObjectFormatKind::MachO);
+        if (!desc.has_value()) {
+            ADD_FAILURE() << descriptor << " failed to read for arch " << arch;
+            return "<unreadable>";
+        }
+        for (auto const& s : desc->symbols)
+            if (s.name == symbol) return s.linkName;
+        ADD_FAILURE() << descriptor << " declares no symbol " << symbol;
+        return "<missing>";
+    };
+    for (auto const& r : kRows) {
+        EXPECT_EQ(linkNameOf(r.descriptor, r.symbol, "x86_64"), r.expectX86)
+            << r.symbol << " on x86_64-Darwin: the descriptor must declare the "
+               "EXACT base name `cc -arch x86_64` emits for this identifier. An "
+               "EMPTY expectation means the plain name is already what the "
+               "platform binds; a NON-EMPTY one means binding the plain name "
+               "reaches a DIFFERENT callee and misbinds SILENTLY (it links "
+               "clean either way, which is why only this table can catch it)";
+        EXPECT_EQ(linkNameOf(r.descriptor, r.symbol, "arm64"), r.expectArm)
+            << r.symbol << " on arm64-Darwin: the same rule, measured "
+               "separately. The seven $INODE64 names are PLAIN here while "
+               "`realpath` is NOT — which is precisely why the expectation is "
+               "per-arch DATA and never a `diverges` bool";
+    }
+}
+
 // ── macros surface (preprocessor-macro; D-PP-DESCRIPTOR-MACRO-INJECT) ─────────
 
 // Function-like (assert), object-like (no params), and variadic forms all parse;
@@ -4545,12 +4790,18 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
 // removal: each went from "must not be known" to "must be known AND classify as Stdio
 // AND be declared by exactly one shipped descriptor row" (the backward pin below), which
 // is a strictly narrower constraint. TF-C119 moved `snprintf` the same way, for the same
-// reason: stdio.json now declares BOTH halves of it — an [elf] import row and a [pe]
+// reason: stdio.json now declares BOTH halves of it — an [elf,macho] import row and a [pe]
 // `synthesize` row — so "must not be known" would now be asserting the opposite of the
-// shipped truth. ⚠ [elf], NOT [elf,macho] like its four siblings: the libSystem export is
-// INFERRED and was never measured (the Mac was unreachable), and under the eager-import
-// law a wrong guess breaks the LOAD of every macho binary that includes <stdio.h>. macho
-// is staged behind a real Mac run, exactly as popen/pclose/fileno are. `puts`/`fputs`/`__stdio_common_vsprintf` remain here and are NOT
+// shipped truth. ⚠ CLAIM ROT CORRECTED 2026-08-05: this note used to read "[elf], NOT
+// [elf,macho] like its four siblings ... macho is staged behind a real Mac run, exactly as
+// popen/pclose/fileno are", and BOTH halves of that are now false — `snprintf` reads
+// [elf,macho], and so do `fileno` and (as of this cycle) `popen`/`pclose`. The staging it
+// described was real and its REASON still governs any FUTURE row (the libSystem export was
+// INFERRED, never measured, and under the eager-import law a wrong guess breaks the LOAD of
+// every macho binary that includes <stdio.h>) — it simply ENDED, on a measurement taken on
+// the operator's real Mac. Nothing here ASSERTS an availability set, so the rot was
+// invisible to the suite; that is exactly why it is corrected rather than left.
+// `puts`/`fputs`/`__stdio_common_vsprintf` remain here and are NOT
 // candidates for the same graduation: they are REAL ucrtbase exports imported directly,
 // and a recipe id for any of them would mean the loader had started synthesizing over a
 // symbol it can simply import. `vsnprintf` is added as the fresh negative in `snprintf`'s

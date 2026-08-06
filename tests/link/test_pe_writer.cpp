@@ -3689,9 +3689,27 @@ TEST(LinkerEndToEnd, ElfAcceptsRodataDataItemsAfterD_LK1_ELF_EXEC_DATA_SECTIONS)
            "D-LK1-ELF-EXEC-DATA-SECTIONS has closed";
 }
 
-TEST(LinkerEndToEnd, MachORejectsDataItemsUntilD_LK3_RODATA) {
-    // Parallel to the ELF test — Mach-O declares no
-    // `supportedDataSections`; D-LK3-RODATA still anchored.
+// FLIPPED 2026-08-05 — was `MachORejectsDataItemsUntilD_LK3_RODATA`,
+// the negative twin of the ELF test above, whose whole content was
+// "Mach-O declares no `supportedDataSections`; D-LK3-RODATA still
+// anchored". D-LK3-RODATA IS NOW CLOSED FOR BOTH DARWIN EXEC FORMATS:
+// `macho64-arm64-darwin-exec` closed it (runtime-witnessed on Apple
+// Silicon) and `macho64-x86_64-darwin-exec` joined it on 2026-08-05
+// with the rest of its runnable-CLI key set. The walker arm is the
+// SAME shared `exec_data_section.hpp` substrate the ELF arm uses.
+//
+// So this becomes the POSITIVE pin its ELF twin already is, asserted
+// just as strictly and in the same shape — not deleted, not softened:
+// every assertion below is the exact mirror of
+// `ElfAcceptsRodataDataItemsAfterD_LK1_ELF_EXEC_DATA_SECTIONS`, and
+// each one goes red if the format JSON's `supportedDataSections` row
+// or its `__TEXT,__const` `sections[]` row is removed without
+// re-anchoring the walker arm. The sweep in
+// `AsmSubstrate.ShippedExecFormatsRodataSectionPerWalkerArm` covers
+// the CONFIG half across every shipped exec format; this covers the
+// END-TO-END half for Mach-O — that a rodata item survives the
+// linker's gate and reaches a walker that links it cleanly.
+TEST(LinkerEndToEnd, MachOAcceptsRodataDataItemsAfterD_LK3_RODATA) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped(
@@ -3700,15 +3718,20 @@ TEST(LinkerEndToEnd, MachORejectsDataItemsUntilD_LK3_RODATA) {
     DiagnosticReporter rep;
     LinkedImage img =
         runLinkerWithRodataItem(**target, **fmt, rep);
-    EXPECT_FALSE(img.ok());
-    EXPECT_EQ(::dss::test_support::countCode(rep,
-                  DiagnosticCode::K_NoMatchingObjectFormat),
-              1u);
-    EXPECT_EQ(img.resolvedFuncCount, 0u);
-    EXPECT_FALSE((**fmt).acceptsDataSection(
+    EXPECT_TRUE(img.ok())
+        << "Mach-O exec must now accept a Rodata dataItem end-to-end "
+           "(D-LK3-RODATA)";
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // resolvedFuncCount == 2: the user `ret` function PLUS the
+    // synthetic `_start` trampoline the linker prepends for exec
+    // images (D-LK10-ENTRY Slice C) — the same count the ELF twin
+    // pins, and the marker of a clean link vs the pre-close
+    // rejection at 0.
+    EXPECT_EQ(img.resolvedFuncCount, 2u);
+    EXPECT_TRUE((**fmt).acceptsDataSection(
         DataSectionKind::Rodata))
-        << "Mach-O exec format JSON must not advertise rodata "
-           "until D-LK3-RODATA closes";
+        << "Mach-O exec format JSON must advertise rodata now that "
+           "D-LK3-RODATA has closed";
 }
 
 // D-LK4-DATA-PRODUCER writer pin (was RejectsDataKindDataItem… — flipped when

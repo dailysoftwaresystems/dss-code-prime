@@ -790,8 +790,13 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         // sibling-defined extern unstripped, and an intra-image call silently
         // emitted as a dynamic import. Byte-identical for every unlabelled symbol.
         in.nameOf = [cuMirP = &cuMir, fmtKind](SymbolId s) -> std::string {
+            // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the fourth
+            // input is passed here too — a required parameter precisely so a rail
+            // cannot quietly omit it and reintroduce the divergence described
+            // above with a different override channel.
             if (SymbolRecord const* r = cuMirP->model.recordFor(s)) {
-                return dss::ffi::linkNameFor(r->name, r->asmName, fmtKind);
+                return dss::ffi::linkNameFor(r->name, r->asmName, fmtKind,
+                                             r->linkName);
             }
             for (auto const& e : cuMirP->externImports) {
                 if (e.symbol.v == s.v) return e.mangledName;

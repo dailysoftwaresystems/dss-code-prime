@@ -15260,3 +15260,72 @@ TEST(SemanticAnalyzerCSubset, TFC112SuppressedElfStdioRowCarriesNoRecipe) {
     ASSERT_TRUE(sup->library.contains("elf"));
     EXPECT_EQ(sup->library.at("elf"), "libc.so.6");
 }
+
+// ── TF-C121: the suppressed row also carries its per-target LINK BASE NAME ────
+//
+// `SuppressedShippedSymbol::linkName` is the THIRD property a suppressed
+// descriptor row must forward, joining `version` (c156) and `recipeId`
+// (TF-C112). It shipped with NO test coverage anywhere under tests/analysis/,
+// on a field whose sibling properties each got a pin ONLY AFTER the same two
+// suppression sites had already dropped one of them — which is what the two
+// TFC112 tests above are. Same field family, same failure mode, so the same
+// guard.
+//
+// THE SCENARIO IS THE ONE THE FIELD'S OWN COMMENT NAMES: a user restating
+// `fstat`'s C signature over `#include <sys/stat.h>`. That is legal C and
+// exactly what portable code writes. The prototype restates the SIGNATURE and
+// says NOTHING about which name libSystem exports for it on this arch, so a
+// suppressed row that forgets the link name silently re-binds Darwin-x86_64's
+// LEGACY 32-bit-inode `_fstat` — which reads st_size from offset 96 of a
+// structure that writes it at 72, reporting 0. It LINKS CLEAN either way, so
+// nothing fails loud and only a pin like this one can see it.
+//
+// BOTH ARMS, for the reason the reader-side sibling
+// (`ShippedLibDescriptor.SymbolLinkNameVariantSelectsPerArchBothArms`) gives:
+// x86_64 must carry the alias and arm64 must carry NOTHING, because arm64 has
+// one inode ABI and its plain name is already correct. A flat string would
+// satisfy one arm while corrupting the other.
+//
+// ⚠ SCOPE, so a green run is not over-read: this pins the SEMANTIC rail — that
+// the suppressed row RECORDS the resolved name. The two CST→HIR threading sites
+// that carry it onward into `HirExternRecord` (the bare-prototype arm and
+// `claimSuppressedShimSymbol`) are a separate rail and are NOT pinned here; the
+// shipped `shipped_linkname_inode64` corpus example exercises the ordinary
+// INJECTION path, not this suppression path, so that rail's pin belongs in
+// tests/hir/test_hir_lowering_c_subset.cpp and does not exist yet.
+namespace {
+// `fn(i32, ptr<void>) -> i32` IS sys/stat.json's declared shape for `fstat`, so
+// this prototype interns to the same TypeId and goal-2 suppression fires.
+constexpr char const* kFstatRedeclSrc =
+    "#include <sys/stat.h>\n"
+    "int fstat(int fd, void *buf);\n"
+    "int main(void) { return fstat(0, (void *)0); }\n";
+} // namespace
+
+TEST(SemanticAnalyzerCSubset, TFC121SuppressedDarwinRowCarriesItsPerTargetLinkName) {
+    auto const linkNameOn = [](std::string_view arch) -> std::string {
+        auto model = analyzeRealShippedForTarget(kFstatRedeclSrc,
+                                                 ObjectFormatKind::MachO, arch,
+                                                 DataModel::Lp64);
+        EXPECT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty()
+                    ? "" : model.diagnostics().all()[0].actual);
+        auto const* sup = model.suppressedShippedSymbolFor("fstat");
+        if (sup == nullptr) {
+            ADD_FAILURE()
+                << "goal-2 must have suppressed the descriptor's fstat for arch "
+                << arch << " — with no recorded row there is nothing to forward";
+            return "<missing>";
+        }
+        return sup->linkName;
+    };
+    EXPECT_EQ(linkNameOn("x86_64"), "fstat$INODE64")
+        << "the suppressed row must carry Darwin-x86_64's $INODE64 alias. "
+           "Dropping it hands the user's prototype the LEGACY 32-bit-inode "
+           "callee — a SILENT misbind: it links, it runs, and st_size reads 0";
+    EXPECT_EQ(linkNameOn("arm64"), "")
+        << "arm64-Darwin has ONE inode ABI, so no variant matches and the "
+           "resolved name is EMPTY, meaning 'use `name`'. A flat (non-variant) "
+           "link name would put `_fstat$INODE64` here and break the arch that "
+           "was already correct";
+}

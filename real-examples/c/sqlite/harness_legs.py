@@ -49,6 +49,7 @@ USAGE
   harness_legs.py --plan [--host-os OS] [--host-arch ARCH] [--format json|sh]
                          [--launchers-available a,b,... | --launchers-none]
   harness_legs.py --header-stages
+  harness_legs.py --config-stages
   harness_legs.py --path-translations
   harness_legs.py --path-translation VERB --translate-path PATH [--translate-path …]
   harness_legs.py --path-translation VERB --assert-translated ARG [--assert-translated …]
@@ -318,6 +319,91 @@ ZCONF_GUARDS = ("Z_HAVE_UNISTD_H", "Z_HAVE_STDARG_H")
 POSIX_ONLY_ZCONF_GUARDS = ("Z_HAVE_UNISTD_H",)
 TARGET_OS_NAMES = ("linux", "windows", "darwin")
 
+# ── THE DERIVING HOST'S `configure` ANSWERS ARE NOT THIS TARGET'S ───────────
+#
+# D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES.
+#
+# EXACTLY THE ZCONF_GUARDS DEFECT, ONE LAYER UP, and it is worth stating in the
+# same shape because the remedy is the same shape. The recipe is derived by
+# running `make -n` on the DERIVING host, and it carries `_HAVE_SQLITE_CONFIG_H`
+# — the ONLY host-probe define left on the command line — plus an include path to
+# that host's own build dir. So `sqliteInt.h`'s `#include "sqlite_cfg.h"` pulls in
+# the DERIVING host's `./configure` answers WHOLESALE and applies them to whatever
+# target the leg names.
+#
+# ✔MEASURED, THE WHOLE CHAIN: the deriving Linux `sqlite_cfg.h` sets
+# `HAVE_PREAD64`/`HAVE_PWRITE64`; `os_unix.c` reads
+# `#if defined(HAVE_PREAD64) && defined(HAVE_PWRITE64)` -> `USE_PREAD64` -> the
+# `osPread64`/`osPwrite64` macros, whose casts are typed with `off64_t` — a type
+# Darwin does not have. `off64_t` + `pread64` + `pwrite64` are ONE defect, not
+# three. ⛔ There is NO `HAVE_OFF64_T` macro anywhere in sqlite; an earlier
+# `$recipeTransformComment` in legs.json named one, and it never existed.
+#
+# ★ THE CLASS IS CLOSED, AND IT WAS CLOSED BY MACHINE DIFF rather than by reading
+# the header and reasoning about it: the deriving Linux `sqlite_cfg.h` against the
+# Mac's OWN configure-generated one, EXACTLY THREE LINES DIFFER —
+# `HAVE_PREAD64`, `HAVE_PWRITE64`, `HAVE_MALLOC_H`. All ~49 other answers
+# (`HAVE_FDATASYNC`, `HAVE_GMTIME_R`, `HAVE_LOCALTIME_R`, `HAVE_USLEEP`,
+# `HAVE_UTIME`, `HAVE_ISNAN`, `HAVE_NANOSLEEP`, `HAVE_REALPATH`, `HAVE_DLOPEN`,
+# `HAVE_ZLIB`, the `HAVE_INT*_T` family, `SIZEOF_OFF_T 8`, …) are BYTE-IDENTICAL.
+# That is why this vocabulary is three names and not fifty: a leg declares only
+# what `configure` actually VARIES across the targets this harness builds, and
+# the deriving host answers the rest — correctly, because the answers agree.
+#
+# ★ AND IT IS NOT A `-D` PROBLEM. A define can be dropped from a command line; a
+# `#define` inside an included header cannot. `windows-selfconfig` drops
+# `_HAVE_SQLITE_CONFIG_H` entirely and lets sqlite self-configure from
+# `SQLITE_OS_WIN` — see the REJECTED-ALTERNATIVES note on `configure_stages()` for
+# why the same blunt move is the WRONG answer on Darwin.
+#
+# Each entry names the target OSes on which the answer is TRUE, so a declaration
+# can be CROSS-CHECKED against the leg's own spec instead of trusted. The `why`
+# is the evidence, not a rationalisation: it is what a reader needs to judge
+# whether the derivation is still right when a sixth leg arrives.
+CONFIGURE_ANSWERS = {
+    "HAVE_PREAD64": {
+        "trueOnTargetOs": ("linux",),
+        "why": "pread64() is the glibc LFS64 spelling. ✔MEASURED on the "
+               "operator's Mac (macOS 26.5.2, arm64) by sqlite's OWN configure "
+               "methodology — compile AND link a TU calling it against "
+               "/usr/bin/cc: LINK-FAIL (plain `pread` LINK-OK). Windows has no "
+               "such libc name either.",
+    },
+    "HAVE_PWRITE64": {
+        "trueOnTargetOs": ("linux",),
+        "why": "The write half of the same glibc LFS64 pair, and it must be "
+               "declared separately because os_unix.c requires BOTH before it "
+               "defines USE_PREAD64. ✔MEASURED on that same Mac: LINK-FAIL "
+               "(plain `pwrite` LINK-OK).",
+    },
+    "HAVE_MALLOC_H": {
+        "trueOnTargetOs": ("linux", "windows"),
+        "why": "<malloc.h> is a glibc header and a Microsoft CRT header; Darwin "
+               "ships <malloc/malloc.h> and no <malloc.h>. ✔MEASURED on the "
+               "operator's Mac: HDR-MISS (every other probed header, including "
+               "<sys/sysctl.h> and <zlib.h>, resolved). ✔MEASURED on this "
+               "project's Windows box: the UCRT ships malloc.h under the Windows "
+               "SDK's ucrt/ include dir. ⚠ LATENT, NOT LIVE: mem1.c reads "
+               "`#if HAVE_MALLOC_H && HAVE_MALLOC_USABLE_SIZE`, and "
+               "HAVE_MALLOC_USABLE_SIZE is absent on BOTH the deriving host and "
+               "the Mac — so this row has never fired. It is declared anyway "
+               "because it is the same leak, and 'it happens not to fire today' "
+               "is not a reason to ship a wrong answer.",
+    },
+}
+CONFIGURE_ANSWER_NAMES = tuple(sorted(CONFIGURE_ANSWERS))
+
+
+def configure_answer_for_target_os(name, target_os):
+    """The value `configure` WOULD produce for `name` on `target_os` — the
+    derivation the lint checks a declaration against. Raises on an unknown
+    symbol, because a name nothing derives cannot be cross-checked at all."""
+    entry = CONFIGURE_ANSWERS.get(name)
+    if entry is None:
+        raise LegError("unknown configure answer %r (known: %s)"
+                       % (name, ", ".join(CONFIGURE_ANSWER_NAMES)))
+    return target_os in entry["trueOnTargetOs"]
+
 # Host identity, in the SAME spellings the corpus manifests use for `runOn` and
 # the same arch spellings the shipped *.target.json files use as their `name`.
 # (`currentHostOs()` / `currentHostArch()` in arm_verdict_ledger.hpp are the C++
@@ -567,6 +653,658 @@ def loadext_helper_name(leg):
     return str(leg.get("build", {}).get("loadExtHelperName", ""))
 
 
+# ── WHO BUILDS THE HELPER: DSS ITSELF, ON ANY HOST ──────────────────────────
+#
+# D-HARNESS-CROSS-HOST-ANY-TARGET. Operator, 2026-08-05: "why do we need mingw?
+# since dss code prime should not have dependencies?" and "I installed mingw in
+# wsl, but we should NOT depend on a tool".
+#
+# ★ THE DEFECT THE PREVIOUS CYCLE LEFT BEHIND, and it is a DIFFERENT one from the
+# bug it fixed. `resolve_target_cc` above is correct as far as it goes — a
+# compiler's NAME is not a declaration of its target, and asking `-dumpmachine`
+# is the right way to find out. But the shape it fixed the bug INTO made every
+# leg's RUN conditional on this host owning a THIRD-PARTY CROSS-COMPILER for that
+# leg's target: a mingw `gcc` for pe64, `aarch64-linux-gnu-gcc` for the arm64
+# leg, an Apple `clang` for the two macho legs. A leg with no such compiler
+# recorded `skipped-build-input-missing` and its ~330,000 units did not run. That
+# is host-dependence in its plainest form, and it contradicts the project's hard
+# requirement that ANY target build inside ANY host.
+#
+# ⇒ THE COMPILER THIS REPOSITORY SHIPS BUILDS IT. ✔MEASURED 2026-08-05 on this
+# project's WINDOWS box — ONE host, all five legs, `--compile
+# <sqlite>/src/test_loadext.c` at the leg's own declared `sharedLibFormat`, rc=0
+# and zero `error[`/`error:` on every one:
+#
+#     pe64-x86_64-windows-dll      ->  test_loadext.dll      8,704 bytes
+#     elf64-x86_64-linux-dyn       ->  test_loadext.so      13,912 bytes
+#     elf64-aarch64-linux-dyn      ->  test_loadext.so      13,912 bytes
+#     macho64-arm64-darwin-dylib   ->  test_loadext.dylib   67,426 bytes
+#     macho64-x86_64-darwin-dylib  ->  test_loadext.dylib   17,890 bytes
+#
+# and — the part that makes this a result rather than a claim — the three a
+# machine here can LOAD were loaded THROUGH SQLITE'S OWN LOADER, which is what
+# test/loadext.test does: `sqlite3_enable_load_extension` +
+# `sqlite3_load_extension(db, <artefact>, "testloadext_init", &err)` +
+# `SELECT half(9.0)` returned 4.500 for the pe64 DLL natively on Windows, for the
+# elf64-x86_64 .so inside WSL, and for the elf64-aarch64 .so under
+# `qemu-aarch64`. The host program in each case was built by the REFERENCE
+# compiler against upstream's own `sqlite3.c`, so the ONLY thing under test was
+# the DSS artefact. The two macho legs emit cleanly and cannot be loaded off a
+# Mac — the same structural fact their `launchers` already declare, not a new gap.
+#
+# ⚠ WHY test_loadext.c IS BUILDABLE AT ALL WITHOUT LINKING sqlite: it includes
+# `sqlite3ext.h` and uses SQLITE_EXTENSION_INIT1, so every `sqlite3_*` call is a
+# MACRO through the `sqlite3_api` function-pointer table the loader passes in.
+# ✔MEASURED from the emitted ELF's `.dynsym`: the only undefined symbols are
+# `<string.h>` names against DT_NEEDED `libc.so.6`, and the exports are exactly
+# `testloadext_init`, `testbrokenext_init`, `sqlite3_api`. There is no sqlite
+# library to resolve against and therefore no per-leg library input to find.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# ★★ THE DESIGN QUESTION, ANSWERED RATHER THAN ASSUMED: DSS IS NOW TESTING DSS.
+#
+# The fixture is DSS-built and now the extension it dlopen()s is DSS-built too.
+# Two distinct hazards, and they are NOT the same size:
+#
+#   (a) FALSE RED — DSS's shared-library emission is broken, so the ~16 loadext-*
+#       units fail for a reason that is not what the corpus is testing. This is
+#       real but benign in kind: it is still a GENUINE DSS defect, merely
+#       mis-attributed. The cure is attribution, and the report below names the
+#       builder of the staged artefact so a reader never has to guess.
+#   (b) FALSE GREEN — a defect SHARED by the fixture and the helper cancels out.
+#       Both compile the same `sqlite3ext.h`, so a wrong `sqlite3_api_routines`
+#       layout would agree with itself and `half()` would work. This is the
+#       dangerous one, and no amount of inspecting the artefact catches it.
+#
+# The reference-compiler build was, implicitly, the control against (b). But it
+# was never a MATCHED control: it was the only arm that ever ran, and an arm that
+# is never compared proves nothing. Making it MANDATORY is what produced the host
+# dependence; deleting it would drop the only instrument that can answer "was
+# that red the fixture or the helper?".
+#
+# ⇒ WHAT IS IMPLEMENTED. DSS is the PRIMARY and the DEFAULT — always available,
+# on every host, so no leg's coverage depends on what a machine happens to carry.
+# The reference compiler stays as an OPTIONAL CONTROL with two jobs:
+#
+#   1. PASSIVE, whenever a VERIFIED target compiler is present (the
+#      `-dumpmachine` check above still decides that, unchanged): the same source
+#      is ALSO built with it, into a sibling directory, and both artefacts are
+#      reported side by side. It never gates and it never stages. Cost is one
+#      sub-second compile; what it buys is that the control artefact is ON DISK
+#      beside the primary when a loadext-* red has to be triaged.
+#   2. ACTIVE, when the operator asks for it (`DSS_LOADEXT_HELPER=reference`):
+#      the control artefact is the one STAGED, so the corpus itself becomes the
+#      differential and hazard (b) is answerable by RUNNING it, not by argument.
+#      That is the only form of a matched control that can actually detect a
+#      cancelling pair, and it is one environment variable away at all times.
+#
+# ⇒ WHAT IS DELIBERATELY NOT IMPLEMENTED: an AUTOMATIC fallback to the reference
+# compiler when the DSS build fails. A DSS emission failure is a compiler defect
+# and this harness exists to surface compiler defects; quietly building the
+# artefact another way would hide exactly the finding. A failed primary build is
+# `poisoned`, with the compiler's own diagnostics quoted. The operator switch is
+# the explicit, visible way to take the other path.
+#
+# ⇒ AND WHAT REPLACES THE INSPECTION THE CONTROL CANNOT DO. "It compiled" is not
+# "it is a loadable shared library": an empty file, or an `-exec` image emitted
+# under a `.dll` name, would satisfy a returncode and fail every loadext-* unit
+# hours later. So the staged artefact's OWN HEADER is read (see
+# `binary_shared_lib_shape`) and must say both (i) the container this leg's
+# declared sharedLibFormat names and (ii) SHARED LIBRARY — ET_DYN / MH_DYLIB /
+# IMAGE_FILE_DLL. Host-free, no external tool, and it is the one check that would
+# have caught the failure mode the reference build was silently standing in for.
+
+# The `--language` the helper is compiled as. The SAME name the fixture's own
+# manifest generator writes (gen-pe64-manifest.py, `"language": "c-subset"`), so
+# the helper and the fixture cannot come to be parsed by two different front ends.
+LOADEXT_HELPER_LANGUAGE = "c-subset"
+
+# The file `--compile` is pointed at, relative to the staged sqlite tree's `src/`.
+# Named here rather than in two drivers for the same reason the helper's OUTPUT
+# name is declared per leg: one spelling, one place to change it.
+LOADEXT_HELPER_SOURCE = "test_loadext.c"
+
+# WHO may build it. Closed, because an unrecognised value must not silently mean
+# "the default" — the whole point of the switch is to make the differential
+# runnable, and a typo that quietly staged the primary would report a control
+# that never happened.
+LOADEXT_HELPER_BUILDERS = ("dss", "reference")
+LOADEXT_HELPER_BUILDER_ENV = "DSS_LOADEXT_HELPER"
+
+# The SHARED-LIBRARY kind each object-format CONTAINER spells, so a leg's declared
+# `sharedLibFormat` can be CHECKED rather than trusted — the same declare-then-
+# cross-check discipline as POSIX_ONLY_ZCONF_GUARDS and
+# LOADEXT_HELPER_NAME_BY_TARGET_OS above.
+# ✔MEASURED 2026-08-05 from the shipped `src/dss-config/object-formats/`: each
+# container ships exactly one shared-library kind and it is spelled differently
+# in each — `elf64-{x86_64,aarch64}-linux-dyn`, `pe64-x86_64-windows-dll`,
+# `macho64-{x86_64,arm64}-darwin-dylib`. Keyed on the CONTAINER, never on the
+# host and never on the arch: `elf64-aarch64-linux-dyn` and
+# `elf64-x86_64-linux-dyn` differ only in the arch token the spec already carries.
+SHARED_LIB_KIND_BY_CONTAINER = {
+    "elf64": "dyn",
+    "pe64": "dll",
+    "macho64": "dylib",
+}
+
+
+def spec_format_container(spec):
+    """'x86_64:pe64-x86_64-windows-exec' -> 'pe64'. The container is the FIRST
+    token of the format name, the same decomposition `spec_target_os` uses from
+    the other end."""
+    parts = spec_format(spec).split("-")
+    return parts[0] if parts and parts[0] else ""
+
+
+def derived_shared_lib_format(spec):
+    """The shared-library format name DERIVABLE from a leg's exec spec, or "".
+
+    Format names are `<container><bits>-<arch>-<os>-<kind>`, so the shared-library
+    sibling of a leg's own format is that name with its KIND token replaced by the
+    container's shared-library kind. Pure, and used ONLY by the lint — the value a
+    driver passes to `--target` is the leg's DECLARATION, never this."""
+    fmt = spec_format(spec)
+    parts = fmt.split("-")
+    if len(parts) < 4:
+        return ""
+    kind = SHARED_LIB_KIND_BY_CONTAINER.get(spec_format_container(spec))
+    if not kind:
+        return ""
+    return "-".join(parts[:-1] + [kind])
+
+
+def shared_lib_format(leg):
+    """The declared object format the loadext helper is emitted in, verbatim.
+
+    No default and no derivation, for the reason the whole catalogue is written
+    this way: the exact string handed to `--target` is the thing that has cost
+    this project failed invocations, so a reader of legs.json must be able to SEE
+    it. The lint cross-checks it against `derived_shared_lib_format`."""
+    return str(leg.get("build", {}).get("sharedLibFormat", ""))
+
+
+def shared_lib_spec(leg):
+    """The combined `<arch>:<format>` argument. ★ ONE ARG, NOT TWO — there is no
+    separate `--object-format` flag — and the arch and the format spell arm64
+    DIFFERENTLY (`arm64:elf64-aarch64-linux-dyn`). Spelled HERE so neither driver
+    ever assembles it, which is where that trap has bitten before."""
+    return "%s:%s" % (spec_target_arch(leg.get("spec", "")), shared_lib_format(leg))
+
+
+def loadext_helper_builder(raw, env=None):
+    """Which builder STAGES the helper: the operator's choice, or 'dss'.
+
+    An unrecognised value RAISES. Defaulting a typo'd `DSS_LOADEXT_HELPER` back to
+    'dss' would report a control run that never happened, which is worse than no
+    control at all."""
+    value = (raw if raw is not None
+             else (env if env is not None else os.environ).get(
+                 LOADEXT_HELPER_BUILDER_ENV, ""))
+    value = (value or "").strip().lower()
+    if not value:
+        return LOADEXT_HELPER_BUILDERS[0]
+    if value not in LOADEXT_HELPER_BUILDERS:
+        raise LegError(
+            "unknown loadext helper builder %r (known: %s). This selects WHICH "
+            "artefact is staged for sqlite's test/loadext.test to dlopen(): "
+            "'dss' (the default — the compiler this repository ships, available "
+            "on every host) or 'reference' (the leg's VERIFIED target C "
+            "compiler, the control arm, which exists only where such a compiler "
+            "is installed). A value nothing implements must not be read as the "
+            "default: it would report a control that never ran."
+            % (value, ", ".join(LOADEXT_HELPER_BUILDERS)))
+    return value
+
+
+def loadext_helper_dss_argv(leg, dss, source, include_dirs, outdir, config):
+    """The EXACT argv that makes DSS emit this leg's helper. Pure.
+
+    ★ `--output` IS A DIRECTORY, not a file — DSS writes `<outdir>/<stem><ext>`
+    and NAMES it itself (✔MEASURED 2026-08-05: `test_loadext.dll` / `.so` /
+    `.dylib`, i.e. the SOURCE stem, never the leg's declared helper name). The
+    caller reads the path the build REPORTED and copies it to the declared name;
+    it never predicts either. Pointing `--output` at a file path is how a
+    one-byte 'artefact' turns out to be a directory being stat-ed.
+    ★ `--include-dir`, not `-I`. ★ `--config=<v>`, joined, matching the shape
+    base-harness.sh's `dss_bh_build_artifact` already uses."""
+    argv = [dss, "--compile", source,
+            "--language", LOADEXT_HELPER_LANGUAGE,
+            "--target", shared_lib_spec(leg)]
+    for d in include_dirs:
+        argv += ["--include-dir", d]
+    argv += ["--output", outdir, "--config=%s" % config]
+    return argv
+
+
+def loadext_helper_reference_argv(leg, cc, source, include_dirs, out_path):
+    """The control arm's argv — the leg's own declared `sharedLibFlags` plus the
+    same two include roots. Pure. Byte-for-byte the invocation build-and-test.sh's
+    `stage_loadext_extension` has always made, kept identical on purpose: a
+    control whose command changed at the same time as the thing it controls is
+    not a control."""
+    argv = [cc] + list(leg.get("build", {}).get("sharedLibFlags", []))
+    for d in include_dirs:
+        argv.append("-I%s" % d)
+    argv += ["-o", out_path, source]
+    return argv
+
+
+# ── "it compiled" is NOT "it is a loadable shared library" ───────────────────
+#
+# The failure mode this rules out, named by the operator: an empty or wrong-KIND
+# artefact that nevertheless "succeeds". A zero-byte file, or an executable image
+# emitted under a `.dll` name, satisfies a returncode and then fails every
+# loadext-* unit hours later with `no such function: half` — which reads exactly
+# like a DSS miscompile in the FIXTURE. So the artefact's own header is read.
+#
+# The three checks are the three containers' own answers to the same question,
+# taken from each format's specification (DOCUMENTED: ELF gABI `e_type`;
+# PE/COFF `IMAGE_FILE_HEADER.Characteristics`; Mach-O `mach_header_64.filetype`),
+# and each was ✔MEASURED against the artefacts listed at the top of this section.
+# No external tool is consulted — `file`/`objdump`/`otool` would be exactly the
+# third-party host dependence this whole change removes.
+MH_MAGIC_64 = 0xFEEDFACF
+MH_DYLIB = 0x6
+ET_DYN = 3
+IMAGE_FILE_DLL = 0x2000
+
+
+def binary_shared_lib_shape(blob):
+    """(container, isSharedLib, detail) read from a binary's OWN header.
+
+    `container` is this catalogue's container vocabulary (`elf64`/`pe64`/
+    `macho64`) or "" when the bytes are none of them. Pure — it takes the bytes,
+    not a path — so the self-test can assert every arm without producing five
+    real binaries on whatever machine it happens to run on."""
+    import struct
+    if not blob:
+        return ("", False, "the file is EMPTY (0 bytes)")
+    if blob[:4] == b"\x7fELF":
+        if len(blob) < 20:
+            return ("", False, "truncated ELF header (%d bytes)" % len(blob))
+        if blob[4] != 2:
+            return ("", False, "ELF but not 64-bit (EI_CLASS=%d)" % blob[4])
+        etype, = struct.unpack("<H", blob[16:18])
+        return ("elf64", etype == ET_DYN,
+                "ELF64 e_type=%d (%s)"
+                % (etype, "ET_DYN — a shared object" if etype == ET_DYN
+                   else "NOT ET_DYN — not a shared object"))
+    if blob[:2] == b"MZ":
+        if len(blob) < 0x40:
+            return ("", False, "truncated DOS header (%d bytes)" % len(blob))
+        e_lfanew, = struct.unpack("<I", blob[0x3C:0x40])
+        if e_lfanew + 24 > len(blob) or blob[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+            return ("", False, "an MZ image whose e_lfanew (0x%X) does not point "
+                               "at a PE signature" % e_lfanew)
+        chars, = struct.unpack("<H", blob[e_lfanew + 22:e_lfanew + 24])
+        return ("pe64", bool(chars & IMAGE_FILE_DLL),
+                "PE Characteristics=0x%04X (%s)"
+                % (chars, "IMAGE_FILE_DLL set" if chars & IMAGE_FILE_DLL
+                   else "IMAGE_FILE_DLL NOT set — this is not a DLL"))
+    if len(blob) >= 16:
+        magic, = struct.unpack("<I", blob[:4])
+        if magic == MH_MAGIC_64:
+            filetype, = struct.unpack("<I", blob[12:16])
+            return ("macho64", filetype == MH_DYLIB,
+                    "Mach-O 64 filetype=%d (%s)"
+                    % (filetype, "MH_DYLIB" if filetype == MH_DYLIB
+                       else "NOT MH_DYLIB"))
+    if _fat_slices(blob):
+        return ("", False, "a Mach-O FAT/universal archive, not a single-arch "
+                           "shared library [D-FF1-MACHO-FAT]")
+    return ("", False, "unrecognised: first 4 bytes %r" % (blob[:4],))
+
+
+def verify_shared_lib(path, want_container):
+    """(ok, detail) for an artefact that claims to be `want_container`'s shared
+    library. Reads the file; everything it decides comes from
+    `binary_shared_lib_shape`."""
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except OSError as exc:
+        return (False, "could not be read back: %s" % exc)
+    container, is_shared, detail = binary_shared_lib_shape(blob)
+    if not container:
+        return (False, "%d bytes, and it is not a recognised object file — %s"
+                       % (len(blob), detail))
+    if container != want_container:
+        return (False, "%d bytes, but it is a %s image and this leg's declared "
+                       "sharedLibFormat is a %s one — %s"
+                       % (len(blob), container, want_container, detail))
+    if not is_shared:
+        return (False, "%d bytes of %s, but NOT a shared library — %s. sqlite's "
+                       "test/loadext.test dlopen()s this file; an image that is "
+                       "not loadable fails every loadext-* unit with `no such "
+                       "function: half`, which reads exactly like a DSS "
+                       "miscompile in the FIXTURE."
+                       % (len(blob), container, detail))
+    return (True, "%d bytes, %s" % (len(blob), detail))
+
+
+def _fwd(path):
+    """A path spelled with forward slashes, on every host.
+
+    NOT cosmetic. Two drivers consume these paths: build-and-test.ps1 on Windows
+    and build-and-test.sh on POSIX. `os.path.join` on Windows produces a MIXED
+    spelling (`C:/a/b\\c`) when its first component came from a caller that used
+    forward slashes, and this project has already been bitten by a path whose
+    spelling differed between the tool that produced it and the tool that
+    consumed it. Windows accepts `/` in every API and in PowerShell; POSIX is
+    unaffected because there is nothing to replace. It is also the spelling
+    dss-code-prime itself prints (base-harness.ps1: "the compiler prints forward
+    slashes on every host"), so the report and the compiler's own log agree."""
+    return (path or "").replace("\\", "/")
+
+
+def _run_capture(argv, cwd=None):
+    """(rc, combined output). rc is taken DIRECTLY off the process, never after a
+    pipe. Kept next to its callers for the same reason `_run_machine_probe` is."""
+    import subprocess
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, cwd=cwd)
+    except OSError as exc:
+        return 127, "%s: %s" % (type(exc).__name__, exc)
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+# The line dss-code-prime prints for each artefact it emitted. ✔MEASURED
+# 2026-08-05: `dss-code-prime: artifact x86_64:pe64-x86_64-windows-dll <path>`.
+# Matched here the SAME way base-harness.sh's `dss_bh_reported_artifacts` and
+# base-harness.ps1's `Get-DssReportedArtifacts` match it — by the literal
+# `dss-code-prime: artifact <spec> ` prefix, taking DISTINCT paths, and REFUSING
+# to guess when there is more than one. Duplicated here rather than reached for
+# because those two live in base-harness.{sh,ps1}, which this cycle does not own;
+# the shapes must not diverge, and the self-test pins this one against the exact
+# prefix both of them grep for.
+DSS_ARTIFACT_LINE_PREFIX = "dss-code-prime: artifact "
+
+
+def dss_reported_artifacts(log_text, spec):
+    """Every DISTINCT artefact path the log reports for `spec`, in order."""
+    needle = "%s%s " % (DSS_ARTIFACT_LINE_PREFIX, spec)
+    out = []
+    for line in (log_text or "").splitlines():
+        line = line.strip()
+        if line.startswith(needle):
+            path = line[len(needle):].strip()
+            if path and path not in out:
+                out.append(path)
+    return out
+
+
+def dss_log_errors(log_text, limit=8):
+    """The diagnostic lines a caller should quote. BOTH spellings: dss-code-prime
+    prints `error[CODE]` for its own diagnostics, and a front-end message can
+    read `error:` — grepping only one of them has cost this project a diagnosis
+    before."""
+    hits = []
+    for line in (log_text or "").splitlines():
+        if "error[" in line or "error:" in line:
+            hits.append(line.strip())
+            if len(hits) >= limit:
+                break
+    return hits
+
+
+def build_loadext_helper(leg, dss, sqlite_src, sqlite_bld, dest_dir, work_dir,
+                         dss_config="release", builder=None, reference_cc="",
+                         reference_machine="", runner=None):
+    """Build + STAGE this leg's loadext helper, and report BOTH arms.
+
+    Returns a report dict (see `verdictClass`). Raises LegError only for a
+    catalogue/usage defect — every BUILD outcome is a reported verdict, because
+    this is called from inside a per-leg loop and one leg's failure must never
+    cost the other legs theirs [the harness must SURVIVE everything].
+
+    `verdictClass` is from the drivers' closed vocabulary and there are exactly
+    three outcomes:
+      ""                            staged; the run proceeds.
+      "poisoned"                    a REAL failure — the primary build produced
+                                    no loadable library. Not environmental: the
+                                    compiler under test did not do its job, and
+                                    the run must not exit 0 on it.
+      "skipped-build-input-missing" ENVIRONMENTAL — the operator asked for the
+                                    REFERENCE arm and this machine has no
+                                    verified target compiler for the leg. Nothing
+                                    is wrong with DSS or with the corpus; a
+                                    different machine, same catalogue, runs it.
+                                    It may exit 0, and it says loudly that the
+                                    default (`dss`) would have worked here.
+    """
+    runner = runner or _run_capture
+    builder = loadext_helper_builder(builder)
+    label = leg.get("label", "?")
+    name = loadext_helper_name(leg)
+    source = _fwd(os.path.join(sqlite_src, LOADEXT_HELPER_SOURCE))
+    includes = [_fwd(sqlite_src), _fwd(sqlite_bld)]
+    container = spec_format_container(leg.get("spec", ""))
+    report = {
+        "leg": label,
+        "builder": builder,
+        "helperName": name,
+        "source": source,
+        "sharedLibSpec": shared_lib_spec(leg),
+        "staged": "",
+        "primary": None,
+        "control": None,
+        "crossCheck": "",
+        "verdictClass": "poisoned",
+        "detail": "",
+    }
+
+    if not name:
+        report["detail"] = (
+            "this leg declares no build.loadExtHelperName, so the harness does "
+            "not know what file sqlite's test/loadext.test will look for on %s. "
+            "Staging it under a guessed name is invisible to the corpus, which "
+            "then builds its own with a hardcoded compiler. Declare it in "
+            "legs.json (harness_legs.py --lint checks it against the target OS)."
+            % leg.get("spec", "?"))
+        return report
+    if not shared_lib_format(leg):
+        report["detail"] = (
+            "this leg declares no build.sharedLibFormat, so there is no object "
+            "format to emit the helper in. It is the `--target <arch>:<format>` "
+            "argument DSS is given; declare it in legs.json (harness_legs.py "
+            "--lint checks it against the leg's own spec).")
+        return report
+    if not os.path.isfile(source):
+        report["detail"] = ("sqlite extension source not found: %s — the staged "
+                            "tree is incomplete, so no leg's helper can be built "
+                            "from it." % source)
+        return report
+
+    os.makedirs(work_dir, exist_ok=True)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # ── the DSS arm — always attempted, on every host ────────────────────────
+    def _dss_arm():
+        outdir = _fwd(os.path.join(work_dir, "dss"))
+        log_path = _fwd(os.path.join(work_dir, "loadext-helper-dss.log"))
+        os.makedirs(outdir, exist_ok=True)
+        argv = loadext_helper_dss_argv(leg, dss, source, includes, outdir,
+                                       dss_config)
+        rc, out = runner(argv)
+        try:
+            with open(log_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(" ".join(argv) + "\n\n" + (out or ""))
+        except OSError:
+            pass
+        arm = {"builder": "dss", "available": True, "ok": False, "rc": rc,
+               "argv": argv, "log": log_path, "artifact": "", "bytes": 0,
+               "errors": dss_log_errors(out), "why": ""}
+        # ★ dss-code-prime EXITS 0 EVEN ON FATAL ERRORS — the verdict comes from
+        # `error[`/`error:` in the output PLUS the artefact the build itself
+        # REPORTED, never from the process exit status. Same rule, same order, as
+        # base-harness.{sh,ps1}.
+        if arm["errors"]:
+            arm["why"] = ("the build emitted %d diagnostic(s); first: %s"
+                          % (len(arm["errors"]), arm["errors"][0]))
+            return arm
+        hits = dss_reported_artifacts(out, shared_lib_spec(leg))
+        if len(hits) > 1:
+            arm["why"] = ("the build reported %d DIFFERENT artefacts for %s (%s) "
+                          "— refusing to guess which was meant"
+                          % (len(hits), shared_lib_spec(leg), ", ".join(hits)))
+            return arm
+        if not hits:
+            arm["why"] = ("0 diagnostics and the build reported NO artefact for "
+                          "%s (expected a '%s%s <path>' line)"
+                          % (shared_lib_spec(leg), DSS_ARTIFACT_LINE_PREFIX,
+                             shared_lib_spec(leg)))
+            return arm
+        arm["artifact"] = _fwd(hits[0])
+        if not os.path.isfile(hits[0]):
+            arm["why"] = ("0 diagnostics but the artefact the build REPORTED is "
+                          "not on disk: %s" % hits[0])
+            return arm
+        arm["bytes"] = os.path.getsize(hits[0])
+        arm["ok"] = True
+        return arm
+
+    # ── the reference arm — the CONTROL, only where it exists ────────────────
+    def _reference_arm():
+        arm = {"builder": "reference", "available": bool(reference_cc),
+               "ok": False, "rc": None, "argv": [], "log": "", "artifact": "",
+               "bytes": 0, "errors": [], "cc": reference_cc,
+               "machine": reference_machine, "why": ""}
+        if not reference_cc:
+            arm["why"] = (
+                "no declared targetCc candidate on this machine both EXISTS and "
+                "proves (via `%s`) that it targets %s. That is the ENTIRE reason "
+                "this arm is a control and not the default: requiring it here is "
+                "what made a leg's coverage depend on the host owning a "
+                "third-party cross-compiler."
+                % (CC_TARGET_MACHINE_FLAG, leg.get("spec", "?")))
+            return arm
+        outdir = _fwd(os.path.join(work_dir, "reference"))
+        os.makedirs(outdir, exist_ok=True)
+        dst = _fwd(os.path.join(outdir, name))
+        log_path = _fwd(os.path.join(work_dir, "loadext-helper-reference.log"))
+        argv = loadext_helper_reference_argv(leg, reference_cc, source, includes,
+                                             dst)
+        arm["argv"] = argv
+        rc, out = runner(argv)
+        arm["rc"] = rc
+        arm["log"] = log_path
+        try:
+            with open(log_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(" ".join(argv) + "\n\n" + (out or ""))
+        except OSError:
+            pass
+        if rc != 0:
+            arm["errors"] = [l for l in (out or "").splitlines() if l.strip()][:8]
+            arm["why"] = ("`%s` exited %d; first line: %s"
+                          % (reference_cc, rc,
+                             arm["errors"][0] if arm["errors"] else "<empty log>"))
+            return arm
+        if not os.path.isfile(dst):
+            arm["why"] = "the compiler exited 0 but wrote no %s" % dst
+            return arm
+        arm["artifact"] = dst
+        arm["bytes"] = os.path.getsize(dst)
+        arm["ok"] = True
+        return arm
+
+    if builder == "dss":
+        primary = _dss_arm()
+        control = _reference_arm()
+    else:
+        primary = _reference_arm()
+        # The control is DSS, and it is built even when the operator has asked
+        # for the reference arm: this direction is the one that ANSWERS the
+        # cancelling-defect question, so both artefacts must exist to compare.
+        control = _dss_arm()
+    report["primary"] = primary
+    report["control"] = control
+
+    if not primary["ok"]:
+        if builder == "reference" and not primary["available"]:
+            report["verdictClass"] = "skipped-build-input-missing"
+            report["detail"] = (
+                "%s=reference was requested, and %s. The DEFAULT builder ('dss') "
+                "needs nothing from this machine and would have staged this "
+                "leg's helper here — so this is an operator-selected control arm "
+                "that this host cannot provide, not a defect."
+                % (LOADEXT_HELPER_BUILDER_ENV, primary["why"]))
+            return report
+        report["verdictClass"] = "poisoned"
+        report["detail"] = (
+            "the %s build of this leg's loadext helper (%s) FAILED: %s  "
+            "[command: %s]  [full diagnostics: %s]  NOT falling back to the "
+            "other builder: %s"
+            % (primary["builder"], name, primary["why"],
+               " ".join(primary["argv"]) or "<none>", primary["log"] or "<none>",
+               "a DSS emission failure is a compiler defect and this harness "
+               "exists to surface them — building the artefact another way would "
+               "hide the finding" if primary["builder"] == "dss" else
+               "the operator explicitly selected this arm; silently substituting "
+               "the other one would report a control that never ran"))
+        return report
+
+    # ── stage it under the name THIS LEG'S TARGET looks for ──────────────────
+    staged = _fwd(os.path.join(dest_dir, name))
+    try:
+        shutil.copyfile(primary["artifact"], staged)
+    except OSError as exc:
+        report["verdictClass"] = "poisoned"
+        report["detail"] = ("the %s build produced %s but it could not be staged "
+                            "as %s: %s" % (primary["builder"],
+                                           primary["artifact"], staged, exc))
+        return report
+    report["staged"] = staged
+
+    ok, why = verify_shared_lib(staged, container)
+    if not ok:
+        report["verdictClass"] = "poisoned"
+        report["detail"] = (
+            "the %s build of %s reported success, but the artefact it produced "
+            "is not a loadable %s shared library: %s  [command: %s]"
+            % (primary["builder"], name, container, why,
+               " ".join(primary["argv"])))
+        return report
+
+    report["verdictClass"] = ""
+    # The one-line ledger detail. It names the BUILDER and the TARGET SPEC, which
+    # together are the whole provenance question a loadext-* red raises; the full
+    # argv is in the report and in the log, so this does not paste a 12-token
+    # command line into a per-leg summary.
+    report["detail"] = ("%s, built for %s by %s%s — verified: %s"
+                        % (name, shared_lib_spec(leg), primary["builder"],
+                           (" (%s, which reports '%s')"
+                            % (reference_cc, reference_machine or "<unrecorded>"))
+                           if primary["builder"] == "reference" else "",
+                           why))
+    # THE CROSS-CHECK LINE. Reported on every outcome so a build log always
+    # states what the control did — including "there was none here", which is a
+    # fact about the machine and not a silence.
+    if control["ok"]:
+        delta = control["bytes"] - primary["bytes"]
+        report["crossCheck"] = (
+            "CONTROL PRESENT: the same source also built by %s (%s) -> %s, %d "
+            "bytes (%+d vs the staged %s artefact's %d). The staged file is the "
+            "%s one; the control sits beside it so a loadext-* red can be "
+            "re-run against it (%s=%s)."
+            % (control["builder"], control.get("cc") or "dss",
+               control["artifact"], control["bytes"], delta, primary["builder"],
+               primary["bytes"], primary["builder"], LOADEXT_HELPER_BUILDER_ENV,
+               "reference" if primary["builder"] == "dss" else "dss"))
+    elif not control["available"]:
+        report["crossCheck"] = (
+            "NO CONTROL ON THIS HOST: %s The staged helper is the %s one and it "
+            "was verified structurally (%s); nothing about this leg's coverage "
+            "depends on the missing compiler."
+            % (control["why"], primary["builder"], why))
+    else:
+        report["crossCheck"] = (
+            "CONTROL ATTEMPTED AND FAILED (this does NOT gate the run): %s  "
+            "[%s]  A control that cannot build the same source is itself worth "
+            "seeing — but the staged helper is the %s one and it verified: %s"
+            % (control["why"], control["log"], primary["builder"], why))
+    return report
+
+
 def leg_by_label(legs, label, where=""):
     """ONE leg, by label, or a LegError naming every label there is. One copy,
     because two subcommands looking a leg up two ways is how their diagnostics
@@ -617,6 +1355,93 @@ def header_stages(legs):
                 "different recipeTransforms or reconcile the guards."
                 % (owner[key], leg.get("label"), key, stages[key], guards))
         stages.setdefault(key, guards)
+        owner.setdefault(key, leg.get("label"))
+    return stages
+
+
+# ── The sqlite CONFIGURE header, per TARGET ─────────────────────────────────
+#
+# D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES. The
+# staged `sqlite_cfg.h` twin of `header_stages()` above: a leg declares what ITS
+# target's answers are (`build.configureAnswers`) and the drivers stage one
+# configured header per distinct TARGET OS.
+#
+# ★ THE KEY IS THE TARGET OS, NOT THE recipeTransform, and the difference is the
+# whole reason this is a second stage family rather than another file in the zinc
+# one. Four legs share `recipeTransform: "none"` — two Linux and two Darwin — and
+# their configure answers DIFFER. Keying this on the transform would hand the
+# Darwin legs the Linux header again, which is the defect.
+#
+# ⛔ REJECTED ALTERNATIVES, recorded because both are the obvious thing to try:
+#
+#   (a) DERIVE THE RECIPE PER TARGET, on a machine of that target (run sqlite's
+#       ./configure on a Mac for the Darwin legs). This is what upstream's build
+#       system expects and it is the reason a native build never has this bug.
+#       It is REFUSED here because it breaks the harness's hard requirement —
+#       "build ANY target inside ANY host" [D-HARNESS-CROSS-HOST-ANY-TARGET]:
+#       it makes the Darwin legs unbuildable on the four hosts out of five that
+#       are not a Mac, which is exactly the host-lock this catalogue exists to
+#       end.
+#
+#   (b) A BLUNT `darwin-selfconfig` RECIPE TRANSFORM that simply drops
+#       `_HAVE_SQLITE_CONFIG_H`, mirroring `windows-selfconfig`. ✔MEASURED: it
+#       WORKS — the macho64-arm64 CLI's `off64_t`/`pread64`/`pwrite64` errors all
+#       disappear. It is still the wrong answer: it discards ~49 CORRECT answers
+#       to fix 3 wrong ones, and ~10 of the 49 have real consequences.
+#       `HAVE_GMTIME_R`/`HAVE_LOCALTIME_R` falling away makes date.c use the
+#       NON-REENTRANT `gmtime`/`localtime` in a SQLITE_THREADSAFE=1 build;
+#       `HAVE_FDATASYNC` falling away makes os_unix.c `#define fdatasync fsync`;
+#       `HAVE_USLEEP` falling away drops sqlite3_sleep to 1-SECOND granularity,
+#       which the timing-sensitive corpus WILL notice. The same blunt drop is
+#       acceptable on WINDOWS only because `SQLITE_OS_WIN` re-configures the whole
+#       os_win.c path and none of those Unix answers is consulted there.
+#
+# What is staged instead is a header that answers all ~49 identical rows with the
+# deriving host's answers and the ones that VARY with the leg's own declaration.
+
+def configure_stage_key(leg):
+    """The staged-configure-header directory name for this leg: its TARGET OS.
+
+    Raises rather than defaulting. A leg whose spec does not name an OS this
+    resolver knows has no derivable configure answers either, so a silent key
+    (`""`, `"unknown"`) would put its header wherever the driver's path join
+    happened to land and compile it against somebody else's answers."""
+    spec = leg.get("spec", "")
+    target_os = spec_target_os(spec)
+    if target_os not in TARGET_OS_NAMES:
+        raise LegError(
+            "leg '%s': cannot derive a target OS from spec %r (format names are "
+            "<container><bits>-<arch>-<os>-<kind>; got %r, known: %s) — so there "
+            "is no target this leg's sqlite configure answers could be staged "
+            "for, and compiling it against the DERIVING host's answers is the "
+            "defect this key closes"
+            % (leg.get("label", "?"), spec, target_os, ", ".join(TARGET_OS_NAMES)))
+    return target_os
+
+
+def configure_answers(leg):
+    return dict(leg.get("build", {}).get("configureAnswers", {}))
+
+
+def configure_stages(legs):
+    """key -> answers, in first-declared order.
+
+    RAISES on a conflict, exactly as `header_stages` does: two legs targeting one
+    OS share ONE staged `sqlite_cfg.h`, and silently picking either declaration
+    would put a leg back where this anchor started — compiled against a
+    configuration measured on somebody else's machine."""
+    stages, owner = {}, {}
+    for leg in legs:
+        key = configure_stage_key(leg)
+        answers = configure_answers(leg)
+        if key in stages and stages[key] != answers:
+            raise LegError(
+                "legs '%s' and '%s' both target OS '%s' — so they share ONE "
+                "staged sqlite_cfg.h — but declare DIFFERENT configureAnswers "
+                "(%r vs %r). One stage cannot be two headers; reconcile them, "
+                "because at most one of the two can be a fact about that target."
+                % (owner[key], leg.get("label"), key, stages[key], answers))
+        stages.setdefault(key, answers)
         owner.setdefault(key, leg.get("label"))
     return stages
 
@@ -1461,7 +2286,12 @@ def plan_leg(leg, host_os, host_arch, available):
         # `headerStageKey` is DERIVED here so a driver never has to spell the
         # recipeTransform -> zinc/ mapping itself; it reads the key and joins it
         # onto the stage root. Host-free, like everything else in this dict.
-        "build": dict(build, attempt=True, headerStageKey=header_stage_key(leg)),
+        # `configStageKey` is its twin for the staged `sqlite_cfg.h` (the leg's
+        # TARGET OS — see configure_stages() for why that key and not the
+        # transform), so the drivers join a key onto a root there too and neither
+        # of them decides which target's configure answers a leg compiles against.
+        "build": dict(build, attempt=True, headerStageKey=header_stage_key(leg),
+                      configStageKey=configure_stage_key(leg)),
         "run": run,
     }
 
@@ -1524,8 +2354,25 @@ def emit_sh(resolved):
         put("LEG_ZCONF_GUARDS",
             " ".join("%s=%d" % (k, 1 if v else 0)
                      for k, v in sorted(b.get("zconfGuards", {}).items())))
+        # The leg's OWN staged sqlite_cfg.h directory name + the answers that made
+        # it. Same division of labour as the zinc pair directly above: the driver
+        # joins the key onto its cfg/ root and never decides the mapping, and the
+        # answer string is emitted so a build log states, per leg, WHICH configure
+        # answers that leg was compiled against.
+        put("LEG_CONFIG_STAGE_KEY", b.get("configStageKey", ""))
+        put("LEG_CONFIGURE_ANSWERS",
+            " ".join("%s=%d" % (k, 1 if v else 0)
+                     for k, v in sorted(b.get("configureAnswers", {}).items())))
         put("LEG_STACK_RESERVE", str(b.get("stackReserveBytes", 0)))
         put("LEG_SHARED_FLAGS", " ".join(b.get("sharedLibFlags", [])))
+        # The object format DSS emits this leg's loadext helper in, and the
+        # combined `--target` argument built from it. Both emitted so a build log
+        # can STATE them per leg; neither driver assembles the combined form
+        # itself, which is the trap `shared_lib_spec` exists to close (the arch
+        # and the format spell arm64 differently).
+        put("LEG_SHARED_LIB_FORMAT", b.get("sharedLibFormat", ""))
+        put("LEG_SHARED_LIB_SPEC",
+            "%s:%s" % (leg["targetArch"], b.get("sharedLibFormat", "")))
         put("LEG_CC_CANDIDATES", " ".join(b.get("targetCc", {}).get("candidates", [])))
         put("LEG_CC_PKG", b.get("targetCc", {}).get("package", ""))
         # The FILE NAME sqlite's own test/loadext.test looks for on THIS leg's
@@ -1871,6 +2718,59 @@ def lint(path=CATALOGUE):
                         "would stage a header configured for a different machine, "
                         "which is the whole defect this key closes."
                         % (label, target_os, name, guards.get(name), want))
+        # ── the sqlite configure answers this leg's staged header carries ─────
+        # The same four checks the zconf guards get — REQUIRED, CLOSED, BOOLEAN,
+        # CROSS-CHECKED — because it is the same defect one layer up: the recipe's
+        # `_HAVE_SQLITE_CONFIG_H` makes sqliteInt.h include the DERIVING host's
+        # generated sqlite_cfg.h, so without a per-target answer the Darwin legs
+        # compile against a Linux machine's ./configure run.
+        answers = build.get("configureAnswers")
+        if not isinstance(answers, dict):
+            findings.append("leg '%s': missing build.configureAnswers — every leg "
+                            "must declare, for ITS OWN target, each sqlite "
+                            "./configure answer that VARIES across the targets "
+                            "this harness builds (%s). Omitting it is how the "
+                            "Darwin legs came to compile against the deriving "
+                            "Linux host's HAVE_PREAD64/HAVE_PWRITE64 and fail on "
+                            "`off64_t`, a type Darwin does not have."
+                            % (label, ", ".join(CONFIGURE_ANSWER_NAMES)))
+        else:
+            for name in sorted(set(answers) - set(CONFIGURE_ANSWER_NAMES)):
+                findings.append("leg '%s': unknown configure answer %r (known: %s) "
+                                "— an answer nothing stages is a declaration that "
+                                "reads as configuration and is not. ⛔ In "
+                                "particular there is NO `HAVE_OFF64_T` anywhere "
+                                "in sqlite: off64_t arrives through "
+                                "HAVE_PREAD64+HAVE_PWRITE64 -> USE_PREAD64."
+                                % (label, name, ", ".join(CONFIGURE_ANSWER_NAMES)))
+            for name in CONFIGURE_ANSWER_NAMES:
+                if name not in answers:
+                    findings.append("leg '%s': build.configureAnswers omits %r — "
+                                    "every answer is declared for every leg, so a "
+                                    "reader never has to know a default"
+                                    % (label, name))
+                elif not isinstance(answers[name], bool):
+                    findings.append("leg '%s': build.configureAnswers[%r] is %r, "
+                                    "not a JSON boolean — a string is truthy in "
+                                    "bash, PowerShell and python alike, and this "
+                                    "value decides whether a #define lands in a "
+                                    "header every TU parses"
+                                    % (label, name, answers[name]))
+                elif target_os in TARGET_OS_NAMES:
+                    # DERIVABLE from the target, so it is CHECKED rather than
+                    # trusted — the POSIX_ONLY_ZCONF_GUARDS discipline. Each
+                    # entry's `why` is quoted so the finding carries the evidence
+                    # that settled it, not just the verdict.
+                    want = configure_answer_for_target_os(name, target_os)
+                    if answers[name] is not want:
+                        findings.append(
+                            "leg '%s': targets OS '%s' but declares %s=%r; that "
+                            "answer is DERIVABLE from the target and should be "
+                            "%r. %s A declaration that disagrees with the target "
+                            "would stage a sqlite_cfg.h measured on a different "
+                            "machine, which is the whole defect this key closes."
+                            % (label, target_os, name, answers[name], want,
+                               CONFIGURE_ANSWERS[name]["why"]))
         libs = build.get("libraries", {})
         provider = libs.get("provider")
         if provider not in LIBRARY_PROVIDERS:
@@ -1887,11 +2787,59 @@ def lint(path=CATALOGUE):
             findings.append("leg '%s': libraries declare no tclNames/zNames" % label)
         findings.extend(_lint_acquire(label, spec, libs))
         if not build.get("targetCc", {}).get("candidates"):
-            findings.append("leg '%s': no targetCc candidates — the corpus's "
-                            "dlopen()ed helper extension could not be built for it"
-                            % label)
+            # ⚠ NOT "the helper could not be built" — it can, and by DEFAULT it is.
+            # DSS is the PRIMARY builder of the loadext helper and needs nothing
+            # from this machine (`build_loadext_helper`, builder 'dss'); targetCc
+            # only ever names the CONTROL arm's third-party cross-compiler, which
+            # is optional by construction ("that is the ENTIRE reason this arm is a
+            # control and not the default"). This message claimed the opposite,
+            # which would send a reader hunting for a cross-toolchain to fix a
+            # missing control.
+            findings.append("leg '%s': no targetCc candidates — DSS still builds "
+                            "the corpus's dlopen()ed helper extension for it, but "
+                            "the leg declares no CONTROL compiler, so a loadext-* "
+                            "red on it can never be cross-checked against a "
+                            "reference build" % label)
         if not build.get("sharedLibFlags"):
             findings.append("leg '%s': no sharedLibFlags" % label)
+        # ── the object format the helper is EMITTED in ────────────────────────
+        # DECLARED (so a reader of legs.json sees the exact `--target` argument —
+        # the string that has cost this project failed invocations), then
+        # cross-checked against the leg's OWN spec, which already names the
+        # container, the arch and the OS. Same discipline as loadExtHelperName
+        # below and POSIX_ONLY_ZCONF_GUARDS above.
+        declared_fmt = build.get("sharedLibFormat")
+        want_fmt = derived_shared_lib_format(spec)
+        if not declared_fmt:
+            findings.append(
+                "leg '%s': no build.sharedLibFormat — every leg declares the "
+                "object format DSS emits its loadext helper in, because that "
+                "string IS the `--target <arch>:<format>` argument and there is "
+                "no separate --object-format flag. For this leg's spec %r it is "
+                "%r. Without it the helper cannot be built by the compiler this "
+                "repository ships, and the leg falls back to needing a "
+                "third-party cross-compiler on the host "
+                "[D-HARNESS-CROSS-HOST-ANY-TARGET]."
+                % (label, spec, want_fmt or "<underivable from this spec>"))
+        elif not want_fmt:
+            findings.append(
+                "leg '%s': declares sharedLibFormat %r, but no shared-library "
+                "format can be DERIVED from its spec %r to check it against "
+                "(format names are <container><bits>-<arch>-<os>-<kind> and the "
+                "known containers are %s) — so the declaration cannot be "
+                "cross-checked and would be trusted blind"
+                % (label, declared_fmt, spec,
+                   ", ".join(sorted(SHARED_LIB_KIND_BY_CONTAINER))))
+        elif declared_fmt != want_fmt:
+            findings.append(
+                "leg '%s': declares sharedLibFormat %r, but its spec %r names "
+                "container/arch/OS whose shared-library format is %r. A format "
+                "that is not this leg's own emits the helper for a DIFFERENT "
+                "target — the exact wrong-target helper "
+                "D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO is named after, one "
+                "layer down: every loadext-* unit would then false-red as a "
+                "genuine DSS failure."
+                % (label, declared_fmt, spec, want_fmt))
         # ── the helper extension's FILE NAME, per target ─────────────────────
         # DECLARED, then cross-checked against the target OS the spec already
         # names — the same discipline as POSIX_ONLY_ZCONF_GUARDS above, and for
@@ -1924,6 +2872,13 @@ def lint(path=CATALOGUE):
     # others instead of dying on the first one.
     try:
         header_stages(legs)
+    except LegError as exc:
+        findings.append("%s" % exc)
+    # And the same for the staged sqlite configure header, whose stage key is the
+    # TARGET OS: two legs targeting one OS share one header, so two different
+    # declarations for one OS is a catalogue defect and not a preference.
+    try:
+        configure_stages(legs)
     except LegError as exc:
         findings.append("%s" % exc)
     for key, spellings in sorted(vocab.items()):
@@ -2328,6 +3283,79 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         check("stage '%s' serves exactly one recipeTransform" % key,
               len(transforms) == 1, "serves %r" % sorted(transforms))
 
+    # ── the staged sqlite CONFIGURE header plan ──────────────────────────────
+    # The twin of the block above, and HOST-INVARIANT for the same reason: which
+    # ./configure answers a leg compiles against is a fact about its TARGET. The
+    # defect this replaces was precisely a host fact reaching a target: the
+    # deriving Linux box's `sqlite_cfg.h`, applied to Darwin.
+    cfg_stages = configure_stages(legs)
+    check("one staged configure header per distinct TARGET OS",
+          sorted(cfg_stages) == sorted({spec_target_os(leg["spec"]) for leg in legs}),
+          "stages=%r targetOS=%r" % (sorted(cfg_stages),
+                                     sorted({spec_target_os(leg["spec"]) for leg in legs})))
+    check("more than one configure stage is declared", len(cfg_stages) > 1,
+          "only %r — with a single stage this whole mechanism is untested by the "
+          "catalogue it ships with" % sorted(cfg_stages))
+    # ★ THE STAGE THAT MADE THE CASE. The four `recipeTransform: "none"` legs are
+    # TWO different configurations, and a key that could not tell them apart is
+    # what shipped Linux answers to Darwin. Asserted rather than assumed, because
+    # the moment it stops being true this whole family is decorative.
+    check("the transform key CANNOT stand in for the configure key",
+          len({configure_stage_key(l) for l in legs
+               if header_stage_key(l) == "none"}) > 1,
+          "every 'none'-transform leg resolves to one configure stage — if that "
+          "is really so, this second stage family has no reason to exist")
+    for host in SELF_TEST_HOSTS:
+        resolved = plan(host[0], host[1], set(), path)
+        for leg in resolved["legs"]:
+            key = leg["build"]["configStageKey"]
+            check("configure stage key is host-invariant on %s/%s for %s"
+                  % (host[0], host[1], leg["label"]),
+                  key == spec_target_os(leg["spec"]),
+                  "key=%r targetOS=%r" % (key, spec_target_os(leg["spec"])))
+            check("the leg's configure stage exists in the stage plan (%s/%s %s)"
+                  % (host[0], host[1], leg["label"]), key in cfg_stages)
+            check("the leg's declared answers ARE its stage's answers (%s/%s %s)"
+                  % (host[0], host[1], leg["label"]),
+                  cfg_stages.get(key) == leg["build"].get("configureAnswers"),
+                  "stage=%r leg=%r" % (cfg_stages.get(key),
+                                       leg["build"].get("configureAnswers")))
+    # Every declared answer is in the closed vocabulary, is a real JSON boolean,
+    # and AGREES with what the target derivation says — the same three properties
+    # the lint checks, asserted here so a catalogue edit cannot ship without them
+    # even if someone runs the drivers without `--lint`.
+    for leg in legs:
+        answers = configure_answers(leg)
+        target_os = spec_target_os(leg["spec"])
+        check("leg '%s' declares every configure answer, and only known ones"
+              % leg["label"],
+              sorted(answers) == sorted(CONFIGURE_ANSWER_NAMES),
+              "declared %r, vocabulary %r" % (sorted(answers),
+                                              sorted(CONFIGURE_ANSWER_NAMES)))
+        for name, value in sorted(answers.items()):
+            check("leg '%s': %s is a JSON boolean" % (leg["label"], name),
+                  isinstance(value, bool), "got %r" % (value,))
+            check("leg '%s': %s agrees with target OS '%s'"
+                  % (leg["label"], name, target_os),
+                  value is configure_answer_for_target_os(name, target_os),
+                  "declared %r, derivation says %r"
+                  % (value, configure_answer_for_target_os(name, target_os)))
+    # A conflict must RAISE rather than pick a winner: two legs on one target OS
+    # share one staged header, and "either one" is how a leg ends up compiled
+    # against a configuration nobody declared for it.
+    _clash = json.loads(json.dumps(legs))
+    for _l in _clash:
+        if spec_target_os(_l["spec"]) == "darwin":
+            _l["build"]["configureAnswers"] = dict(
+                _l["build"]["configureAnswers"], HAVE_MALLOC_H=True)
+            break
+    check("two legs on one target OS with different answers RAISE",
+          _raises(lambda: configure_stages(_clash)))
+    # And a spec whose OS cannot be derived is refused outright — never keyed to
+    # "" or "unknown", which a driver would join onto its cfg/ root as a path.
+    check("a leg whose spec names no known OS is refused a configure stage key",
+          _raises(lambda: configure_stage_key({"label": "x", "spec": "x86_64:weird"})))
+
     # The sh emitter must round-trip every leg, and must emit assignments ONLY —
     # build-and-test.sh `eval`s this text, so a line that is not an assignment is
     # a command it would execute.
@@ -2335,8 +3363,13 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 25,
+          len(statements) == 1 + len(labels) * 29,
           "got %d statements for %d legs" % (len(statements), len(labels)))
+    check("the sh emitter carries the leg's staged configure header",
+          "LEG_CONFIG_STAGE_KEY[" in sh and "LEG_CONFIGURE_ANSWERS[" in sh,
+          "without it build-and-test.sh has no way to give a leg the sqlite_cfg.h "
+          "staged for its own target, which is "
+          "D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES")
     check("the sh emitter carries the helper extension's target-keyed name",
           "LEG_LOADEXT_NAME[" in sh,
           "without it build-and-test.sh spells one POSIX file name for five "
@@ -2614,29 +3647,338 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           sorted(set(LOADEXT_HELPER_NAME_BY_TARGET_OS.values()))
           == ["libtestloadext.so", "testloadext.dll"])
 
+    # ── WHO BUILDS IT: DSS, on any host; the reference compiler as a CONTROL ──
+    # D-HARNESS-CROSS-HOST-ANY-TARGET. Every assertion below is on the PURE parts
+    # (the argv, the format derivation, the header reader, the builder verb), so
+    # the whole rule is provable on a machine with no compiler of any kind. The
+    # end-to-end evidence — five formats emitted from ONE Windows host, three of
+    # them LOADED through sqlite's own sqlite3_load_extension() — is recorded in
+    # the section header above; a self-test that shelled out to DSS would be
+    # asserting the compiler's availability, not this module's rules.
+    check("the shared-library kind is keyed on the CONTAINER, one per container",
+          sorted(SHARED_LIB_KIND_BY_CONTAINER.items())
+          == [("elf64", "dyn"), ("macho64", "dylib"), ("pe64", "dll")])
+    for _spec, _want in [
+        ("x86_64:elf64-x86_64-linux-exec", "elf64-x86_64-linux-dyn"),
+        ("arm64:elf64-aarch64-linux-exec", "elf64-aarch64-linux-dyn"),
+        ("x86_64:pe64-x86_64-windows-exec", "pe64-x86_64-windows-dll"),
+        ("arm64:macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib"),
+        ("x86_64:macho64-x86_64-darwin-exec", "macho64-x86_64-darwin-dylib"),
+        # A container nothing here knows yields "" rather than a guess, so the
+        # lint reports "cannot be cross-checked" instead of trusting blind.
+        ("wasm32:wasm32-v1", ""),
+    ]:
+        check("the shared-library format of %s derives to %r" % (_spec, _want),
+              derived_shared_lib_format(_spec) == _want,
+              "got %r" % derived_shared_lib_format(_spec))
+    for leg in legs:
+        check("leg '%s' declares the shared-library format its own spec implies"
+              % leg["label"],
+              shared_lib_format(leg) == derived_shared_lib_format(leg["spec"]),
+              "declared %r, derived %r"
+              % (shared_lib_format(leg), derived_shared_lib_format(leg["spec"])))
+    # ★ THE ARGUMENT THAT HAS COST FAILED INVOCATIONS: ONE combined `--target`,
+    # and the arch and the format spell arm64 DIFFERENTLY.
+    check("the arm64 leg's --target argument spells arm64 BOTH ways, in one arg",
+          shared_lib_spec(leg_by_label(legs, "elf64-arm64", path))
+          == "arm64:elf64-aarch64-linux-dyn",
+          "got %r" % shared_lib_spec(leg_by_label(legs, "elf64-arm64", path)))
+    _pe_argv = loadext_helper_dss_argv(
+        leg_by_label(legs, "pe64-x86_64", path), "/dss", "/sq/src/test_loadext.c",
+        ["/sq/src", "/bld"], "/work/dss", "release")
+    check("the DSS argv passes ONE --target and no --object-format",
+          _pe_argv.count("--target") == 1
+          and "--object-format" not in _pe_argv
+          and _pe_argv[_pe_argv.index("--target") + 1] == "x86_64:pe64-x86_64-windows-dll",
+          "%r" % (_pe_argv,))
+    check("...uses --include-dir, never -I",
+          _pe_argv.count("--include-dir") == 2
+          and not any(a.startswith("-I") for a in _pe_argv), "%r" % (_pe_argv,))
+    check("...points --output at a DIRECTORY, never at the artefact",
+          _pe_argv[_pe_argv.index("--output") + 1] == "/work/dss",
+          "DSS writes <outdir>/<stem><ext> and NAMES it itself; a file path here "
+          "is how a 1-byte 'artefact' turns out to be a directory being stat-ed")
+    check("...and asks for the driver's own build config",
+          "--config=release" in _pe_argv, "%r" % (_pe_argv,))
+    _ref_argv = loadext_helper_reference_argv(
+        leg_by_label(legs, "elf64-x86_64", path), "cc", "/sq/src/test_loadext.c",
+        ["/sq/src", "/bld"], "/work/reference/libtestloadext.so")
+    check("the CONTROL argv is the leg's own declared sharedLibFlags, unchanged",
+          _ref_argv[:3] == ["cc", "-shared", "-fPIC"], "%r" % (_ref_argv,))
+    # The builder verb: default, explicit, and the typo that must NOT be silently
+    # read as the default.
+    check("the default builder is dss", loadext_helper_builder(None, env={}) == "dss")
+    check("the operator's env var selects the control arm",
+          loadext_helper_builder(None, env={LOADEXT_HELPER_BUILDER_ENV: "reference"})
+          == "reference")
+    check("an explicit argument beats the environment",
+          loadext_helper_builder("dss", env={LOADEXT_HELPER_BUILDER_ENV: "reference"})
+          == "dss")
+    check("a builder nothing implements RAISES, it is not read as the default",
+          _raises(lambda: loadext_helper_builder("mingw", env={})),
+          "silently defaulting a typo would report a control that never ran")
+
+    # ── "it compiled" is NOT "it is a loadable shared library" ────────────────
+    # The header reader, over bytes rather than files, so every arm is asserted
+    # on any machine. The three POSITIVE cells are the exact headers ✔MEASURED
+    # from the artefacts DSS emitted on 2026-08-05 (readelf/objdump/file agreeing
+    # with this reader on all three).
+    def _elf(etype, cls=2):
+        return (b"\x7fELF" + bytes([cls]) + b"\0" * 11
+                + etype.to_bytes(2, "little") + b"\0" * 8)
+
+    def _pe(chars):
+        head = bytearray(b"MZ" + b"\0" * 0x3E)
+        head[0x3C:0x40] = (0x40).to_bytes(4, "little")
+        pe = bytearray(b"PE\0\0" + b"\0" * 20)
+        pe[22:24] = chars.to_bytes(2, "little")
+        return bytes(head) + bytes(pe)
+
+    def _macho(filetype):
+        return (MH_MAGIC_64.to_bytes(4, "little") + b"\0" * 8
+                + filetype.to_bytes(4, "little") + b"\0" * 16)
+
+    for _blob, _want in [
+        (_elf(ET_DYN), ("elf64", True)),
+        (_elf(2), ("elf64", False)),              # ET_EXEC — compiled, not loadable
+        (_elf(ET_DYN, cls=1), ("", False)),       # 32-bit
+        (_pe(IMAGE_FILE_DLL | 0x22), ("pe64", True)),
+        (_pe(0x22), ("pe64", False)),             # an EXE emitted under a .dll name
+        (_macho(MH_DYLIB), ("macho64", True)),
+        (_macho(2), ("macho64", False)),          # MH_EXECUTE
+        (b"", ("", False)),                       # the empty "artefact"
+        (b"!<arch>\n", ("", False)),              # a static archive
+    ]:
+        _c, _s, _d = binary_shared_lib_shape(_blob)
+        check("a %d-byte artefact reads as %r" % (len(_blob), _want),
+              (_c, _s) == _want, "got (%r, %r) — %s" % (_c, _s, _d))
+    check("every shape carries a reason, on both outcomes",
+          all(binary_shared_lib_shape(b)[2]
+              for b in (b"", _elf(ET_DYN), _pe(0x22), _macho(2), b"junk")))
+
+    # ── the artefact line, matched the way BOTH base harnesses match it ───────
+    _log = ("dss-code-prime: artifact x86_64:pe64-x86_64-windows-dll /out/a.dll\n"
+            "info[R_Something] noise\n"
+            "dss-code-prime: artifact x86_64:pe64-x86_64-windows-dll /out/a.dll\n"
+            "dss-code-prime: artifact x86_64:elf64-x86_64-linux-dyn /out/a.so\n")
+    check("the reported artefact is selected by SPEC and de-duplicated",
+          dss_reported_artifacts(_log, "x86_64:pe64-x86_64-windows-dll")
+          == ["/out/a.dll"],
+          "%r" % dss_reported_artifacts(_log, "x86_64:pe64-x86_64-windows-dll"))
+    check("a sibling spec's artefact is never returned",
+          dss_reported_artifacts(_log, "x86_64:elf64-x86_64-linux-dyn")
+          == ["/out/a.so"])
+    check("TWO DIFFERENT paths for one spec are BOTH returned, so the caller can "
+          "refuse to guess",
+          len(dss_reported_artifacts(
+              _log + "dss-code-prime: artifact x86_64:pe64-x86_64-windows-dll "
+                     "/out/b.dll\n", "x86_64:pe64-x86_64-windows-dll")) == 2)
+    check("the prefix is the one base-harness.{sh,ps1} grep for",
+          DSS_ARTIFACT_LINE_PREFIX == "dss-code-prime: artifact ")
+    # BOTH spellings. Grepping only `error[` has cost this project a diagnosis.
+    check("diagnostics are found as `error[` AND as `error:`",
+          dss_log_errors("error[P0016]: got quote include not found: sqlite3.h")
+          and dss_log_errors("test_loadext.c:14: error: no such thing"))
+
+    # ── build_loadext_helper: every verdict class, with the compiler injected ─
+    # A stub runner, so these cells are reproducible on a machine with no
+    # compiler at all — the same discipline as the resolve_target_cc cells above.
+    import tempfile as _tf
+    _bl_dir = _tf.mkdtemp(prefix="dss-legs-loadext-")
+    try:
+        _sq = os.path.join(_bl_dir, "sq", "src")
+        _bld = os.path.join(_bl_dir, "bld")
+        os.makedirs(_sq)
+        os.makedirs(_bld)
+        with open(os.path.join(_sq, LOADEXT_HELPER_SOURCE), "w") as _f:
+            _f.write("int x;\n")
+        _pe_leg = leg_by_label(legs, "pe64-x86_64", path)
+
+        def _fake_dss(blob, spec_override=None):
+            """A runner that writes `blob` where DSS would and reports it."""
+            def run(argv):
+                if argv[0] != "/dss":                    # the reference arm
+                    out_i = argv.index("-o")
+                    with open(argv[out_i + 1], "wb") as f:
+                        f.write(blob)
+                    return 0, ""
+                outdir = argv[argv.index("--output") + 1]
+                spec = spec_override or argv[argv.index("--target") + 1]
+                art = _fwd(os.path.join(outdir, "test_loadext.dll"))
+                os.makedirs(outdir, exist_ok=True)
+                with open(art, "wb") as f:
+                    f.write(blob)
+                return 0, "%s%s %s\n" % (DSS_ARTIFACT_LINE_PREFIX, spec, art)
+            return run
+
+        def _call(**kw):
+            n = len(os.listdir(_bl_dir))
+            kw.setdefault("dss", "/dss")
+            return build_loadext_helper(
+                _pe_leg, kw.pop("dss"), _sq, _bld,
+                os.path.join(_bl_dir, "dest%d" % n),
+                os.path.join(_bl_dir, "work%d" % n), **kw)
+
+        _r = _call(runner=_fake_dss(_pe(IMAGE_FILE_DLL | 0x22)))
+        check("a DSS-built DLL stages under the leg's DECLARED name",
+              _r["verdictClass"] == "" and _r["staged"].endswith("/testloadext.dll")
+              and os.path.isfile(_r["staged"]),
+              "%r / %r" % (_r["verdictClass"], _r["staged"]))
+        check("...and the report names DSS as the builder, with no control here",
+              _r["builder"] == "dss" and _r["primary"]["builder"] == "dss"
+              and not _r["control"]["available"]
+              and "NO CONTROL ON THIS HOST" in _r["crossCheck"], _r["crossCheck"])
+        # ★ RED ON DISABLE, and it is THE one that matters: an artefact that
+        # "succeeded" but is not loadable must NOT be staged as if it were. Same
+        # runner, same rc=0, ONE byte-level difference — IMAGE_FILE_DLL cleared.
+        _r = _call(runner=_fake_dss(_pe(0x22)))
+        check("★ an EXE emitted under a .dll name is POISONED, not staged as OK",
+              _r["verdictClass"] == "poisoned"
+              and "not a loadable pe64 shared library" in _r["detail"],
+              "%r / %s" % (_r["verdictClass"], _r["detail"]))
+        _r = _call(runner=_fake_dss(b""))
+        check("...and so is a ZERO-BYTE artefact the build called a success",
+              _r["verdictClass"] == "poisoned" and "EMPTY" in _r["detail"],
+              _r["detail"])
+        # An ELF where a PE was asked for: the leg's declared format is the only
+        # thing that decides, and it catches a wrong --target as readily as a
+        # broken emitter.
+        _r = _call(runner=_fake_dss(_elf(ET_DYN)))
+        check("an artefact for the WRONG container is refused by the leg's own "
+              "declared format",
+              _r["verdictClass"] == "poisoned" and "elf64 image" in _r["detail"],
+              _r["detail"])
+        # A build that says nothing and claims nothing.
+        _r = _call(runner=lambda argv: (0, "") if argv[0] == "/dss" else (0, ""))
+        check("a silent build that reports NO artefact is poisoned",
+              _r["verdictClass"] == "poisoned"
+              and "reported NO artefact" in _r["detail"], _r["detail"])
+        # dss-code-prime EXITS 0 ON FATAL ERRORS — the diagnostics decide.
+        _r = _call(runner=lambda argv: (0, "error[P0016]: got quote include not "
+                                           "found: sqlite3.h\n"))
+        check("rc=0 with `error[` diagnostics is a FAILURE, never a success",
+              _r["verdictClass"] == "poisoned" and "P0016" in _r["detail"],
+              _r["detail"])
+        check("...and the refusal says it will NOT fall back to the other builder",
+              "NOT falling back" in _r["detail"], _r["detail"])
+        # THE CONTROL ARM, present.
+        _r = _call(runner=_fake_dss(_pe(IMAGE_FILE_DLL | 0x22)),
+                   reference_cc="gcc", reference_machine="x86_64-w64-mingw32")
+        check("a verified target compiler is built as a CONTROL beside the primary",
+              _r["verdictClass"] == "" and _r["builder"] == "dss"
+              and _r["control"]["ok"] and _r["control"]["builder"] == "reference"
+              and "CONTROL PRESENT" in _r["crossCheck"], _r["crossCheck"])
+        check("...the control is NOT what gets staged",
+              _r["staged"] != _r["control"]["artifact"], _r["staged"])
+        check("...and a failing control does NOT gate the run",
+              _call(runner=lambda argv: _fake_dss(_pe(IMAGE_FILE_DLL))(argv)
+                    if argv[0] == "/dss" else (1, "cc: fatal"),
+                    reference_cc="gcc")["verdictClass"] == "")
+        # THE DIFFERENTIAL SWITCH: the control becomes the staged artefact.
+        _r = _call(runner=_fake_dss(_pe(IMAGE_FILE_DLL | 0x22)),
+                   builder="reference", reference_cc="gcc")
+        check("DSS_LOADEXT_HELPER=reference STAGES the control arm",
+              _r["verdictClass"] == "" and _r["builder"] == "reference"
+              and _r["primary"]["builder"] == "reference"
+              and _r["control"]["builder"] == "dss", "%r" % _r["detail"])
+        # ★ THE VERDICT-CLASS CONTRACT: the operator asked for an arm this host
+        # cannot provide. ENVIRONMENTAL (the default would have worked), so
+        # `skipped-build-input-missing` — NOT `poisoned`, which would red a run
+        # in which nothing is wrong.
+        _r = _call(runner=_fake_dss(_pe(IMAGE_FILE_DLL)), builder="reference")
+        check("...and with no verified compiler it is ENVIRONMENTAL, not a failure",
+              _r["verdictClass"] == "skipped-build-input-missing"
+              and "would have staged this leg's helper here" in _r["detail"],
+              "%r / %s" % (_r["verdictClass"], _r["detail"]))
+        # The two catalogue-shaped refusals, which the lint also catches.
+        _noname = json.loads(json.dumps(_pe_leg))
+        _noname["build"].pop("loadExtHelperName")
+        check("a leg with no declared helper name is refused, naming the key",
+              build_loadext_helper(_noname, "/dss", _sq, _bld,
+                                   os.path.join(_bl_dir, "dn"),
+                                   os.path.join(_bl_dir, "wn"),
+                                   runner=_fake_dss(b"x"))["detail"]
+              .find("loadExtHelperName") >= 0)
+        _nofmt = json.loads(json.dumps(_pe_leg))
+        _nofmt["build"].pop("sharedLibFormat")
+        check("a leg with no declared sharedLibFormat is refused, naming the key",
+              build_loadext_helper(_nofmt, "/dss", _sq, _bld,
+                                   os.path.join(_bl_dir, "df"),
+                                   os.path.join(_bl_dir, "wf"),
+                                   runner=_fake_dss(b"x"))["detail"]
+              .find("sharedLibFormat") >= 0)
+        check("a missing extension source is refused, naming the path",
+              LOADEXT_HELPER_SOURCE in build_loadext_helper(
+                  _pe_leg, "/dss", os.path.join(_bl_dir, "no-such-tree"), _bld,
+                  os.path.join(_bl_dir, "ds"), os.path.join(_bl_dir, "ws"),
+                  runner=_fake_dss(b"x"))["detail"])
+    finally:
+        shutil.rmtree(_bl_dir, ignore_errors=True)
+
     # RED ON DISABLE: the lint must actually catch a wrong declaration, so it is
     # fed one. A mutated COPY on disk — never the shipped catalogue.
-    import tempfile as _tf
     _mut_dir = _tf.mkdtemp(prefix="dss-legs-lint-")
     try:
         with open(path, "r", encoding="utf-8") as _f:
             _doc = json.load(_f)
-        for _variant, _mutate in (
-            ("a POSIX helper name on the Windows leg",
+        # (target OS the mutation is applied to, key it breaks, what it does,
+        # how). The KEY is carried explicitly rather than sniffed out of the
+        # label: a finding about the OTHER key would let a mutation pass for the
+        # wrong reason, which is how a red-on-disable becomes decorative. The
+        # target OS is carried too because a wrong declaration is only wrong on
+        # the target it disagrees with — `HAVE_PREAD64: true` is CORRECT on the
+        # Linux legs and is the shipped defect on the Darwin ones.
+        for _os, _key, _variant, _mutate in (
+            ("windows", "loadExtHelperName", "a POSIX helper name on the Windows leg",
              lambda l: l["build"].update(loadExtHelperName="libtestloadext.so")),
-            ("no helper name at all",
+            ("windows", "loadExtHelperName", "no helper name at all",
              lambda l: l["build"].pop("loadExtHelperName", None)),
+            # ★ RED ON DISABLE for the NEW declaration. The wrong-format case is
+            # the dangerous one: `elf64-x86_64-linux-dyn` on the pe64 leg emits a
+            # LINUX shared object for a WINDOWS fixture — byte-for-byte the
+            # wrong-target helper D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO is
+            # named after, arriving through a different door.
+            ("windows", "sharedLibFormat", "a Linux shared-library format on the Windows leg",
+             lambda l: l["build"].update(sharedLibFormat="elf64-x86_64-linux-dyn")),
+            ("windows", "sharedLibFormat", "the leg's own EXEC format where the shared one belongs",
+             lambda l: l["build"].update(sharedLibFormat="pe64-x86_64-windows-exec")),
+            ("windows", "sharedLibFormat", "no sharedLibFormat at all",
+             lambda l: l["build"].pop("sharedLibFormat", None)),
+            # ★ RED ON DISABLE FOR configureAnswers, and the first mutation is
+            # THE SHIPPED DEFECT ITSELF: `HAVE_PREAD64: true` on a Darwin leg is
+            # exactly what the deriving Linux host's sqlite_cfg.h asserted, and
+            # what made the macho64-arm64 CLI fail on `off64_t`/`pread64`/
+            # `pwrite64`. If the lint cannot catch it, the declaration is
+            # decorative and the header staged from it would be wrong again.
+            ("darwin", "HAVE_PREAD64", "the deriving Linux host's HAVE_PREAD64 on a Darwin leg",
+             lambda l: l["build"]["configureAnswers"].update(HAVE_PREAD64=True)),
+            ("darwin", "HAVE_MALLOC_H", "glibc's HAVE_MALLOC_H on a Darwin leg",
+             lambda l: l["build"]["configureAnswers"].update(HAVE_MALLOC_H=True)),
+            ("linux", "HAVE_PWRITE64", "HAVE_PWRITE64 denied on a Linux leg",
+             lambda l: l["build"]["configureAnswers"].update(HAVE_PWRITE64=False)),
+            ("darwin", "configureAnswers", "a string where a JSON boolean belongs",
+             lambda l: l["build"]["configureAnswers"].update(HAVE_PREAD64="false")),
+            ("darwin", "configureAnswers", "no configureAnswers at all",
+             lambda l: l["build"].pop("configureAnswers", None)),
+            ("darwin", "HAVE_PWRITE64", "one answer of the three omitted",
+             lambda l: l["build"]["configureAnswers"].pop("HAVE_PWRITE64", None)),
+            # ⛔ THE MACRO THAT DOES NOT EXIST. legs.json used to name
+            # `HAVE_OFF64_T` in prose; sqlite has no such symbol, and a
+            # declaration of one would read as configuration while staging
+            # nothing.
+            ("darwin", "HAVE_OFF64_T", "an invented configure answer",
+             lambda l: l["build"]["configureAnswers"].update(HAVE_OFF64_T=False)),
         ):
             _copy = json.loads(json.dumps(_doc))
             for _l in _copy["legs"]:
-                if spec_target_os(_l["spec"]) == "windows":
+                if spec_target_os(_l["spec"]) == _os:
                     _mutate(_l)
             _p = os.path.join(_mut_dir, "legs.json")
             with open(_p, "w", encoding="utf-8") as _f:
                 json.dump(_copy, _f)
-            _found = [f for f in lint(_p) if "loadExtHelperName" in f]
+            _found = [f for f in lint(_p) if _key in f]
             check("the lint REDS on %s" % _variant, bool(_found),
-                  "lint said nothing about it — the check is dead config")
+                  "lint said nothing about %s — the check is dead config" % _key)
     finally:
         shutil.rmtree(_mut_dir, ignore_errors=True)
 
@@ -2680,6 +4022,14 @@ def main(argv=None):
                         "must materialise: '<key>\\t<GUARD>=<0|1> ...', one per "
                         "line. HOST-FREE — a leg's header configuration is a fact "
                         "about its TARGET.")
+    p.add_argument("--config-stages", action="store_true",
+                   help="print the distinct staged sqlite_cfg.h directories the "
+                        "drivers must materialise: '<targetOs>\\t<HAVE_*>=<0|1> "
+                        "...', one per line. HOST-FREE — which ./configure "
+                        "answers a leg compiles against is a fact about its "
+                        "TARGET, and inheriting the DERIVING host's is "
+                        "D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-"
+                        "CONFIGURE-PROBES.")
     p.add_argument("--path-translations", action="store_true",
                    help="print the closed path-translation vocabulary: "
                         "'<verb>\\t<translator argv>', one per line")
@@ -2729,6 +4079,48 @@ def main(argv=None):
                         "target is REFUSED, never assumed, because the compiler "
                         "builds this leg's dlopen()ed loadext helper and a "
                         "wrong-target one false-reds every loadext-* unit.")
+    # ── the loadext helper the corpus dlopen()s ─────────────────────────────
+    # ONE implementation, called by BOTH drivers — the same argument this
+    # module's header makes for putting the leg decision here, and the reason
+    # the .ps1 can finally stage a helper at all (it never could, because it had
+    # no way to build one for a target its host has no compiler for).
+    p.add_argument("--build-loadext-helper", default=None, metavar="LABEL",
+                   help="build this leg's loadext helper extension and stage it "
+                        "under the leg's declared loadExtHelperName. DSS is the "
+                        "primary/default builder; the leg's verified target C "
+                        "compiler is an optional CONTROL. Prints a JSON report; "
+                        "rc 0 staged, 3 poisoned, 4 skipped-build-input-missing.")
+    # A REFUSE-TO-START QUERY, deliberately separate from --build-loadext-helper.
+    # Both drivers resolve the operator's choice ONCE, at Step 6, before any leg
+    # has been compiled: a typo'd DSS_LOADEXT_HELPER must stop the run in the
+    # first seconds, not after ~50 s..8 min of fixture build per leg. It prints
+    # the resolved name and exits non-zero (rc 2, the LegError code) on a value
+    # nothing implements.
+    p.add_argument("--loadext-builder", action="store_true",
+                   help="print the resolved loadext helper builder ($%s, else "
+                        "'dss') and refuse an unimplemented value"
+                        % LOADEXT_HELPER_BUILDER_ENV)
+    p.add_argument("--helper-builder", default=None, metavar="dss|reference",
+                   help="which arm STAGES the helper (default: $%s, else 'dss'). "
+                        "'reference' makes the corpus itself the differential."
+                        % LOADEXT_HELPER_BUILDER_ENV)
+    p.add_argument("--sqlite-src", default="", metavar="DIR",
+                   help="the staged sqlite tree's src/ (holds %s + sqlite3ext.h)"
+                        % LOADEXT_HELPER_SOURCE)
+    p.add_argument("--sqlite-bld", default="", metavar="DIR",
+                   help="the build dir holding the GENERATED sqlite3.h")
+    p.add_argument("--dest-dir", default="", metavar="DIR",
+                   help="where the staged helper must land (the run's testdir)")
+    p.add_argument("--work-dir", default="", metavar="DIR",
+                   help="scratch for the build outputs and their logs")
+    p.add_argument("--dss-config", default="release", metavar="debug|release",
+                   help="the --config= DSS is given for the helper")
+    p.add_argument("--reference-cc", default="", metavar="CC",
+                   help="the VERIFIED target compiler for the control arm, or "
+                        "empty when this host has none (never a guess: it is "
+                        "whatever --resolve-target-cc accepted)")
+    p.add_argument("--reference-machine", default="", metavar="TRIPLE",
+                   help="the triple that compiler reported, for the log")
     p.add_argument("--acquire", default=None, metavar="LABEL",
                    help="materialise LABEL's declared `pinned-archive` libraries "
                         "(download -> verify pinned sha256 -> extract -> slice to "
@@ -2775,16 +4167,19 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if not (args.verdict_vocabulary or args.plan or args.lint or args.self_test
-            or args.header_stages or args.path_translations
+            or args.header_stages or args.config_stages or args.path_translations
             or args.translate_path or args.assert_translated
             or args.env_transfers or args.env_transfer
             or args.acquire or args.acquire_plan or args.resolve_library_argv
-            or args.resolve_target_cc):
-        p.error("one of --verdict-vocabulary / --plan / --header-stages / --lint "
+            or args.resolve_target_cc or args.build_loadext_helper
+            or args.loadext_builder):
+        p.error("one of --verdict-vocabulary / --plan / --header-stages / "
+                "--config-stages / --lint "
                 "/ --self-test / --path-translations / --translate-path / "
                 "--assert-translated / --env-transfers / --env-transfer / "
                 "--acquire / --acquire-plan / --resolve-library-argv / "
-                "--resolve-target-cc is required")
+                "--resolve-target-cc / --build-loadext-helper / "
+                "--loadext-builder is required")
     if (args.translate_path or args.assert_translated) and not args.path_translation:
         p.error("--translate-path / --assert-translated require "
                 "--path-translation <verb> — the namespace is the launcher's "
@@ -2850,6 +4245,38 @@ def main(argv=None):
                 return 3
             sys.stdout.write("%s\t%s\n" % (cc, machine))
             return 0
+        if args.loadext_builder:
+            sys.stdout.write("%s\n"
+                             % loadext_helper_builder(args.helper_builder))
+            return 0
+        if args.build_loadext_helper:
+            leg = leg_by_label(load_catalogue(args.catalogue),
+                               args.build_loadext_helper, args.catalogue)
+            # REQUIRED, and refused by name rather than defaulted: every one of
+            # these is a path only the calling driver knows, and a helper built
+            # against a guessed include root silently resolves a SYSTEM
+            # sqlite3.h of an unrelated version — the very fall-through
+            # build-and-test.sh's staging comment warns about.
+            for flag, value in (("--dss", args.dss),
+                                ("--sqlite-src", args.sqlite_src),
+                                ("--sqlite-bld", args.sqlite_bld),
+                                ("--dest-dir", args.dest_dir),
+                                ("--work-dir", args.work_dir)):
+                if not value:
+                    p.error("--build-loadext-helper requires %s" % flag)
+            report = build_loadext_helper(
+                leg, args.dss, args.sqlite_src, args.sqlite_bld, args.dest_dir,
+                args.work_dir, dss_config=args.dss_config,
+                builder=args.helper_builder,
+                reference_cc=args.reference_cc,
+                reference_machine=args.reference_machine)
+            sys.stdout.write(json.dumps(report, indent=1, sort_keys=True) + "\n")
+            # The REPORT is on stdout on every outcome — a driver needs the
+            # detail most when it failed — and the rc names the verdict CLASS so
+            # a caller never has to classify prose. 3 and 4 sit apart from the
+            # LegError rc 2 above and from --resolve-target-cc's 3.
+            return {"": 0, "poisoned": 3,
+                    "skipped-build-input-missing": 4}[report["verdictClass"]]
         if args.acquire or args.acquire_plan:
             label = args.acquire or args.acquire_plan
             legs = load_catalogue(args.catalogue)
@@ -2863,6 +4290,11 @@ def main(argv=None):
             for key, guards in header_stages(load_catalogue(args.catalogue)).items():
                 sys.stdout.write("%s\t%s\n" % (key, " ".join(
                     "%s=%d" % (n, 1 if v else 0) for n, v in sorted(guards.items()))))
+            return 0
+        if args.config_stages:
+            for key, answers in configure_stages(load_catalogue(args.catalogue)).items():
+                sys.stdout.write("%s\t%s\n" % (key, " ".join(
+                    "%s=%d" % (n, 1 if v else 0) for n, v in sorted(answers.items()))))
             return 0
         if args.lint:
             findings = lint(args.catalogue)

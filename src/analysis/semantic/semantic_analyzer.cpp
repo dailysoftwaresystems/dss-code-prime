@@ -13355,7 +13355,17 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                             SuppressedShippedSymbol{std::move(effectiveLibrary),
                                                     sym.version,
                                                     sym.synthesize,
-                                                    sym.signature});
+                                                    sym.signature,
+                                                    // TF-C121 (D-FFI-SHIPPED-
+                                                    // SYMBOL-PER-TARGET-LINK-
+                                                    // NAME): and so does the
+                                                    // per-target LINK BASE NAME
+                                                    // — a user prototype of
+                                                    // `fstat` that lost it would
+                                                    // re-import Darwin-x86_64's
+                                                    // LEGACY 32-bit-inode
+                                                    // `_fstat`, silently.
+                                                    sym.linkName});
                     }
                     continue;
                 }
@@ -13403,6 +13413,31 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 // `int*`-pointee rejects strict).
                 rec.isShippedDescriptorFn =
                     sym.kind == ffi::ShippedSymbolKind::Function;
+                // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the
+                // descriptor's per-target LINK BASE NAME, already resolved for
+                // the active (arch, format) by the reader, UNDECORATED.
+                //
+                // ★ WHY `linkName` AND NOT `asmName`, stated where the choice is
+                // made. `rec.asmName` is returned VERBATIM by `ffi::linkNameFor`
+                // — that is what a user's C `__asm("x")` means — so assigning
+                // "fstat$INODE64" there would emit `fstat$INODE64` with NO
+                // leading underscore on Mach-O and the import would not resolve
+                // at all. The name we need is `_fstat$INODE64`, i.e. the base
+                // name run THROUGH the format's decoration. So it rides its own
+                // field, which `linkNameFor` feeds to the SAME single
+                // `applyCMangling` call the un-overridden path uses: one
+                // decoration rule, two possible bases. Pre-composing the `_`
+                // here instead would put a per-FORMAT fact in a per-symbol place
+                // and make the elf/pe arms wrong.
+                //
+                // ★ BOTH RAILS, ONE STRING. This SymbolRecord is the DEFINITION/
+                // merge-key rail (`compile_pipeline`/`program.cpp` nameOf); the
+                // `ShippedExternSymbol` pushed immediately below is the IMPORT
+                // rail. They are set from the same `sym.linkName` in the same
+                // breath so the two can never disagree — the invariant
+                // `linkNameFor`'s header calls out as the difference between a
+                // stripped intra-image call and a silent dynamic import.
+                rec.linkName = sym.linkName;
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, sym.name, id);
 
@@ -13410,7 +13445,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     id, sym.name, sym.signature, std::move(effectiveLibrary),
                     sym.kind == ffi::ShippedSymbolKind::Function,
                     sym.synthesize,   // D-CSUBSET-C11-THREADS-HEADER (pe shim tag)
-                    sym.version});    // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                    sym.version,      // D-LK-ELF-SYMBOL-VERSIONING (c156)
+                    sym.linkName});   // D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME
             }
 
             // Item 1: inject the descriptor's CONSTANTS (the neutral form of a

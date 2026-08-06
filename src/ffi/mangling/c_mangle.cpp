@@ -83,7 +83,7 @@ applyCMangling(std::string_view canonicalName, ObjectFormatKind format) {
 
 std::string
 linkNameFor(std::string_view canonicalName, std::string_view asmLabel,
-            ObjectFormatKind format) {
+            ObjectFormatKind format, std::string_view linkBaseName) {
     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): an explicit assembler name
     // REPLACES the format's C mangling. It is
     // returned byte-for-byte — no prefix added, none stripped, no validation of
@@ -92,7 +92,16 @@ linkNameFor(std::string_view canonicalName, std::string_view asmLabel,
     // is already gated non-empty at its source (S_AsmLabelInvalid), so an empty
     // one here can only mean "no label".
     if (!asmLabel.empty()) return std::string{asmLabel};
-    return applyCMangling(canonicalName, format);
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): a descriptor-declared
+    // per-target link BASE name swaps WHAT gets decorated and nothing else — so
+    // the override and the default fall into the SAME `applyCMangling` call one
+    // line below. That single call is the property the tests pin: with
+    // `linkName:"fstat$INODE64"` a macho build emits `_fstat$INODE64` and an elf
+    // build emits the bare `fstat$INODE64`, because the `_` is the FORMAT's fact
+    // (`kCManglingRules`), never the symbol's. Empty ⇒ the canonical identifier,
+    // byte-identical to every pre-TF-C121 image.
+    return applyCMangling(linkBaseName.empty() ? canonicalName : linkBaseName,
+                          format);
 }
 
 std::string

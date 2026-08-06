@@ -17,7 +17,9 @@
 
 #include <gtest/gtest.h>
 
+#include <concepts>
 #include <string>
+#include <string_view>
 
 using namespace dss;
 using namespace dss::ffi;
@@ -224,3 +226,89 @@ TEST(FfiCMangle, AllFormatKindsHaveExplicitRulePin) {
             << " (" << row.second << ")";
     }
 }
+
+// ── TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): `linkNameFor`'s ──────
+// ── per-target LINK BASE NAME, and its composition with the format rule ──────
+//
+// The field answers "which UNDECORATED base name does the shipped library
+// export for this C identifier ON THIS TARGET" (Darwin's `fstat$INODE64` on
+// x86_64, the plain name on arm64). It is the INPUT to the decoration, unlike
+// `asmLabel` — a user's C `__asm("x")` — which REPLACES it.
+
+// ★ THE PROPERTY THE WHOLE DESIGN RESTS ON: the OVERRIDE path and the DEFAULT
+// path go through ONE decoration rule. Same format, same call, only the base
+// differs — so the `_` appears on both macho arms and on neither elf arm. An
+// implementation that pre-composed the underscore in config (or in the semantic
+// injector) would satisfy the first EXPECT and fail the elf ones, which is
+// exactly the "it works on the arch I tested" shape this cycle is closing.
+TEST(FfiCMangleLinkName, OverrideAndDefaultShareOneDecorationRule) {
+    // OVERRIDE path — macho decorates the declared base name.
+    EXPECT_EQ(linkNameFor("fstat", /*asmLabel=*/"", ObjectFormatKind::MachO,
+                          /*linkBaseName=*/"fstat$INODE64"),
+              "_fstat$INODE64");
+    // DEFAULT path — SAME format, SAME function, no override.
+    EXPECT_EQ(linkNameFor("fstat", "", ObjectFormatKind::MachO, ""), "_fstat");
+    // The elf arms of both, proving the `_` is the FORMAT's fact and not the
+    // symbol's: an override on a format whose decoration is EMPTY composes to
+    // the bare base name, with no underscore leaking across formats.
+    EXPECT_EQ(linkNameFor("fstat", "", ObjectFormatKind::Elf, "fstat$INODE64"),
+              "fstat$INODE64");
+    EXPECT_EQ(linkNameFor("fstat", "", ObjectFormatKind::Elf, ""), "fstat");
+    // …and pe, the third shipped decoration policy (also empty in v1).
+    EXPECT_EQ(linkNameFor("f", "", ObjectFormatKind::Pe, "f2"), "f2");
+}
+
+// PRECEDENCE, pinned rather than left to reading order: a user's explicit source
+// `__asm("x")` outranks the descriptor's per-target answer for the same name,
+// and it is still VERBATIM (never decorated on top). The plausible wrong
+// implementation — decorating the asm label once a linkBaseName exists — would
+// emit `_dss_user_label` here.
+TEST(FfiCMangleLinkName, AsmLabelOutranksLinkBaseNameAndStaysVerbatim) {
+    EXPECT_EQ(linkNameFor("fstat", "dss_user_label", ObjectFormatKind::MachO,
+                          "fstat$INODE64"),
+              "dss_user_label");
+    EXPECT_EQ(linkNameFor("fstat", "dss_user_label", ObjectFormatKind::Elf,
+                          "fstat$INODE64"),
+              "dss_user_label");
+}
+
+// Empty canonical + empty label + empty base ⇒ empty: the `nameOf`
+// "module-private" signal, unchanged by this cycle. A base name supplied over an
+// EMPTY canonical still composes (an odd but well-defined input; the rule has no
+// special case for it).
+TEST(FfiCMangleLinkName, EmptyInputsPreserveThePreExistingContract) {
+    EXPECT_EQ(linkNameFor("", "", ObjectFormatKind::MachO, ""), "");
+    EXPECT_EQ(linkNameFor("", "", ObjectFormatKind::Elf, ""), "");
+    EXPECT_EQ(linkNameFor("", "", ObjectFormatKind::MachO, "base"), "_base");
+}
+
+// ★ THE FOUR-CALLER AGREEMENT, ENFORCED STRUCTURALLY RATHER THAN ASSERTED.
+//
+// `c_mangle.hpp` documents that `linkNameFor` exists precisely so its four
+// callers — `program.cpp`'s cross-CU merge key, `compile_pipeline`'s definition
+// rail, and the two `ffi::ingest` import sites — produce BYTE-IDENTICAL names.
+// If one honors an override and another does not, `mir_merge`'s
+// `definedNames.count(e.mangledName)` misses, the sibling-defined extern is not
+// stripped, and an intra-image call is silently emitted as a dynamic import:
+// green build, wrong binding, no diagnostic.
+//
+// The way a NEW override input breaks that is not by a caller passing the wrong
+// value — it is by a caller not passing it AT ALL and inheriting a default. So
+// the pin is that a three-argument call MUST NOT COMPILE. Adding `= {}` to the
+// `linkBaseName` parameter turns this static_assert red, which is the
+// red-on-disable for the whole invariant (MEASURED: with the default added, the
+// build fails here naming this assertion).
+template <typename... A>
+concept CallableLinkNameFor = requires(A... a) { dss::ffi::linkNameFor(a...); };
+
+static_assert(CallableLinkNameFor<std::string_view, std::string_view,
+                                  ObjectFormatKind, std::string_view>,
+              "linkNameFor must accept (canonical, asmLabel, format, "
+              "linkBaseName)");
+static_assert(!CallableLinkNameFor<std::string_view, std::string_view,
+                                   ObjectFormatKind>,
+              "linkNameFor's linkBaseName must be a REQUIRED parameter, never a "
+              "defaulted one: a default lets a caller silently drop one rail's "
+              "override, and the four callers' byte-for-byte agreement is what "
+              "keeps mir_merge from emitting an intra-image call as a dynamic "
+              "import (green build, wrong binding, no diagnostic)");

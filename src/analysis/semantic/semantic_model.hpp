@@ -106,6 +106,37 @@ struct DSS_EXPORT SymbolRecord {
     // deffn(int x){…}` emits `mydeffn`), so `mergeOrCollideRedeclaration` carries
     // a non-empty label from the absorbed declaration onto the survivor.
     std::string asmName;
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the per-target LINK
+    // BASE NAME a SHIPPED-LIBRARY DESCRIPTOR declared for this symbol, already
+    // resolved for the active (arch, format) and UNDECORATED. EMPTY for every
+    // user-written declaration and for every descriptor row that does not opt in.
+    //
+    // ★ IT IS NOT `asmName` ABOVE, AND THE DIFFERENCE IS THE MANGLING. `asmName`
+    // is the user's C `__asm("x")`: C says that string IS the symbol, so it
+    // BYPASSES `applyCMangling`. This is DSS's answer to "which base name does
+    // the shipped library export on this target", so it is the INPUT to
+    // `applyCMangling` — `linkName:"fstat$INODE64"` must reach Mach-O as
+    // `_fstat$INODE64`, with the `_` supplied by the FORMAT rule and not by
+    // config. Both are folded into the ONE naming function `ffi::linkNameFor`,
+    // which is where their precedence (asmName > linkName > name) is stated.
+    //
+    // ★ IT LIVES HERE FOR THE SAME FORCED REASON `asmName` DOES: `compile_
+    // pipeline`'s `nameOf` and `program.cpp`'s cross-CU merge key read
+    // `SemanticModel`, never HIR. The import rail carries the identical string
+    // (ShippedExternSymbol → HirExternRecord → ExternDeclRef), and BOTH rails
+    // must hand `linkNameFor` the same inputs or `mir_merge`'s
+    // `definedNames.count(e.mangledName)` misses and an intra-image call is
+    // silently emitted as a dynamic import.
+    //
+    // ★ IT NEEDS NO REDECLARATION-MERGE CARRY, unlike `asmName` above, and the
+    // reason is structural rather than an oversight: descriptor injection is
+    // gated on `userDeclaredNames`, which is a WHOLE-TU, POSITION-BLIND name set
+    // — so a symbol carrying a `linkName` was, by construction, never declared by
+    // the user anywhere in the TU and can never reach
+    // `mergeOrCollideRedeclaration`. The case that DOES arise — a user
+    // prototype SUPPRESSING a descriptor row — is served by
+    // `SuppressedShippedSymbol::linkName`, not by a merge.
+    std::string linkName;
     ScopeId     scope{};
     NodeId      declNode{};         // the declaration's name node (or the rule node if no name child)
     NodeId      declRuleNode{};     // the declaration rule node itself (for diagnostic spans)
@@ -586,6 +617,16 @@ struct DSS_EXPORT ShippedExternSymbol {
     // Carried verbatim to HirExternRecord.version → the ELF writer's
     // .gnu.version_r; ELF-only (unused on PE/Mach-O).
     std::string version;
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the descriptor's
+    // per-target LINK BASE NAME, already resolved for the active (arch, format)
+    // — UNDECORATED (`fstat$INODE64`, never `_fstat$INODE64`). EMPTY ⇒ the
+    // canonical `name`. Carried verbatim to HirExternRecord.linkName →
+    // ExternDeclRef.linkName → `ffi::linkNameFor`, which applies the FORMAT's
+    // decoration to it exactly as it would to `name`. The SAME string is also
+    // stamped on this symbol's `SymbolRecord.linkName` at injection so the
+    // definition rail and the import rail feed `linkNameFor` identical inputs
+    // (the byte-for-byte agreement its header documents).
+    std::string linkName;
 };
 
 // c86 + c156: the link identity of a goal-2 SUPPRESSED shipped descriptor
@@ -641,6 +682,16 @@ struct DSS_EXPORT SuppressedShippedSymbol {
     // recipe-less row's copy is simply unread today) so the field's meaning is
     // "what the descriptor declared", never "what one consumer needed".
     TypeId signature;
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the suppressed row's
+    // per-target LINK BASE NAME (`ShippedSymbol::linkName`, already resolved for
+    // the active target), or EMPTY. Rides here for the SAME reason `version`
+    // does, one field family up: a user bare prototype of `fstat` over
+    // `#include <sys/stat.h>` — the feature-test pattern real code writes — must
+    // still import Darwin-x86_64's `_fstat$INODE64`, or the suppression silently
+    // reinstates the exact 32-bit-inode misbinding this field exists to kill.
+    // The descriptor is the authority on which name the LIBRARY exports; a user
+    // prototype restates the C signature, never the platform's link identity.
+    std::string linkName;
 };
 
 class DSS_EXPORT SemanticModel {

@@ -53,20 +53,47 @@ namespace dss::ffi {
 [[nodiscard]] DSS_EXPORT std::string
 applyCMangling(std::string_view canonicalName, ObjectFormatKind format);
 
-// TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL, GCC 6.47.5) —
+// TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL, GCC 6.47.5) +
+// TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME) —
 // THE one rule that turns a declared
-// symbol into its ON-BINARY name, with the explicit-assembler-name case folded in:
+// symbol into its ON-BINARY name, with BOTH override channels folded in:
 //
-//     linkName(canonical, asmLabel, fmt)
-//         = asmLabel.empty() ? applyCMangling(canonical, fmt) : asmLabel
+//     linkNameFor(canonical, asmLabel, fmt, linkBaseName)
+//         = asmLabel.empty()
+//               ? applyCMangling(linkBaseName.empty() ? canonical : linkBaseName, fmt)
+//               : asmLabel
 //
-// An asm label REPLACES the mangling; it is never mangled on top of. MEASURED
-// against /usr/bin/clang on arm64-darwin: `int gv __asm("myglobal");` emits
-// `myglobal` (no leading `_`) while an undecorated `caller` emits `_caller`, and
-// the macOS SDK's `__DARWIN_ALIAS` family writes its own underscore
-// (`__asm("_" __STRING(sym) …)`) precisely because the string is used verbatim.
-// The in-tree precedent for a pre-decorated, never-re-mangled name is a format
-// descriptor's `importMangledName` (macho64-arm64-darwin-exec ships `"_exit"`).
+// ★ THE TWO OVERRIDES ARE DIFFERENT KINDS OF FACT, AND THAT IS WHY THEY COMPOSE
+// DIFFERENTLY — the whole reason this is one function with two override inputs
+// rather than two functions:
+//
+//   * `asmLabel` answers "the USER'S C SOURCE wrote `__asm("x")`". C semantics
+//     say that string IS the symbol, so it REPLACES the mangling; it is never
+//     mangled on top of. MEASURED against /usr/bin/clang on arm64-darwin: `int
+//     gv __asm("myglobal");` emits `myglobal` (no leading `_`) while an
+//     undecorated `caller` emits `_caller` — which is exactly why the macOS
+//     SDK's `__DARWIN_ALIAS` family writes its own underscore
+//     (`__asm("_" __STRING(sym) …)`). The in-tree precedent for a pre-decorated,
+//     never-re-mangled name is a format descriptor's `importMangledName`
+//     (macho64-arm64-darwin-exec ships `"_exit"`).
+//
+//   * `linkBaseName` answers "which UNDECORATED BASE NAME does the shipped
+//     library export for this C identifier ON THIS TARGET" — DSS vocabulary,
+//     resolved per-(arch,format) by the descriptor reader (`ShippedSymbol::
+//     linkName`). It replaces the BASE that gets decorated, NOT the decoration:
+//     Darwin's 64-bit-inode ABI is reached through `fstat$INODE64` on x86_64 and
+//     through the plain name on arm64, and BOTH are Mach-O C symbols that carry
+//     the format's leading `_`. So the override path and the default path go
+//     through the SAME SINGLE `applyCMangling` call below — there is one
+//     decoration rule and this function is where it is consulted. Writing the
+//     `_` per-symbol in config instead would make a THIRD in-tree copy of a
+//     PER-FORMAT fact that already has two owners (`kCManglingRules` here, and
+//     the format descriptors' `importMangledName`), and it would grow with the
+//     descriptor corpus. A per-format fact must not be encoded per-symbol.
+//
+// PRECEDENCE, stated once: asmLabel > linkBaseName > canonical. A user's explicit
+// source-level `__asm` outranks DSS's config-level answer for the same name (the
+// user is overriding DSS deliberately); both outrank the plain identifier.
 //
 // ★ IT EXISTS AS A FUNCTION, NOT AS FOUR `if`s, BECAUSE THE FOUR CALLERS MUST
 // AGREE BYTE-FOR-BYTE. Two of them build the cross-CU merge KEY (the definition
@@ -75,12 +102,16 @@ applyCMangling(std::string_view canonicalName, ObjectFormatKind format);
 // `definedNames.count(e.mangledName)` misses, the sibling-defined extern is NOT
 // stripped, and an intra-image call is silently emitted as a dynamic import
 // against the format-default library — green build, wrong binding, no diagnostic.
+// `linkBaseName` is therefore a REQUIRED parameter, not a defaulted one: a
+// caller that has no such name must say `{}` out loud rather than inherit a
+// default that silently drops one rail's override.
 //
-// Empty label ⇒ the pre-TF-C88 behavior, byte-identical. Empty canonical name with
-// an empty label ⇒ empty (the `nameOf` "module-private" signal, unchanged).
+// Empty label + empty linkBaseName ⇒ the pre-TF-C88 behavior, byte-identical.
+// Empty canonical name with both empty ⇒ empty (the `nameOf` "module-private"
+// signal, unchanged).
 [[nodiscard]] DSS_EXPORT std::string
 linkNameFor(std::string_view canonicalName, std::string_view asmLabel,
-            ObjectFormatKind format);
+            ObjectFormatKind format, std::string_view linkBaseName);
 
 // Inverse of `applyCMangling`: strip the per-platform decoration
 // to recover the canonical C identifier. Used by FF1 binary

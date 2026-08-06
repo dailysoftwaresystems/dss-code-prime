@@ -13,14 +13,40 @@
  *     _BufferCount = the caller's REAL n, not the (size_t)-1 unbounded sentinel
  * followed by the header's `r < 0 ? -1 : r` clamp.
  *
- * WHY THERE IS NO DARWIN ARM IN expected.json. stdio.json gates the `snprintf` import
- * row to `["elf"]`: that libSystem exports it is INFERRED, not MEASURED (no Mac and no
- * macOS SDK were reachable when this landed), and under the eager-import law a wrong
- * guess breaks EVERY macho binary's LOAD -- not just the ones calling snprintf. So it
- * follows the same staging stdio.json applies to `popen`/`pclose`/`fileno`: macho fails
- * loud S0001 until a real run witnesses the export. The macho descriptor row and the
- * darwin arm here land TOGETHER, in one edit, after the operator's Mac run. See the
- * `$comment` in expected.json and stdio.json's TF-C119 clause.
+ * WHY THE TWO DARWIN ARMS ARRIVED LATE, AND IN THAT ORDER. This example first
+ * shipped with NO darwin arm at all: stdio.json gated the `snprintf`
+ * import row to `["elf"]` while libSystem's export of it was INFERRED, not MEASURED (no
+ * Mac and no macOS SDK were reachable when it landed), and under the eager-import law a
+ * wrong guess breaks EVERY macho binary's LOAD -- not just the ones calling snprintf.
+ * MEASURED 2026-08-05 on the operator's real Mac (macOS 26.5.2, arm64), reading the
+ * SDK's libSystem `.tbd` export stub: `_snprintf` is PRESENT. So the descriptor row
+ * gained `"macho"` and the `arm64:macho64-arm64-darwin-exec` arm landed here in the SAME
+ * edit -- neither half is valid alone.
+ *   THE INSTRUMENT IS RECORDED BECAUSE THE ONE THIS FILE USED TO NAME IS BROKEN:
+ *   `nm -gU /usr/lib/libSystem.B.dylib` reads a path that DOES NOT EXIST on modern macOS
+ *   (libSystem lives only in the dyld shared cache), so it answers a FALSE ABSENT for
+ *   EVERY symbol -- the dangerous direction of wrong here. Use the SDK `.tbd` stub.
+ *   AND THE x86_64 DARWIN ARM IS HERE TOO, added in the commit that made it
+ *   possible. It was previously omitted on the stated grounds that
+ *   `macho64-x86_64-darwin-exec.format.json` "declares no `dataImportBinding` (a
+ *   documented, test-pinned omission)", so ANY <stdio.h> TU walled there at
+ *   K_FormatLacksImportSupport on `___stdinp`. THAT WALL NO LONGER EXISTS, and the
+ *   note asserting it as MEASURED "both BEFORE and AFTER this change" was already
+ *   false when written: the SAME diff added `"dataImportBinding": "got-indirect"`
+ *   to that format, and "test-pinned" was never true either -- that format's own
+ *   earlier comment said no test pinned these.
+ *   ✔MEASURED 2026-08-05 at the working-tree tip, THIS source through the real
+ *   CLI: `--target x86_64:macho64-x86_64-darwin-exec` compiles AND links rc=0 with
+ *   no `error[`, emitting a 23,805-byte Mach-O whose only printf-family import is
+ *   `_snprintf (from libSystem)`. ✔RUN on the operator's Mac through the
+ *   `darwin/arm64 -> arch -x86_64` Rosetta path: stdout byte-exact and exit 42,
+ *   identical to the arm64 arm -- and for BOTH the baseline AND the `release`
+ *   arm, which matters because the runner compiles a release arm only when its
+ *   baseline RAN, so on a Windows gate the darwin release arms are never built
+ *   and a release-only fault there is structurally invisible.
+ *   Omitting the arm withheld the tree's ONLY runtime witness for `snprintf` on
+ *   the target this cycle had just opened.
+ * See the `$comment` in expected.json and stdio.json's TF-C119 clause.
  *
  * WHY THE OLDER sprintf WITNESS COULD NOT DO THIS JOB. shipped_sprintf_ucrt says so
  * itself: with `_BufferCount = (size_t)-1` no truncation is reachable, so _Options

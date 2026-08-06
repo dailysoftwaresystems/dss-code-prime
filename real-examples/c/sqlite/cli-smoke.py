@@ -350,11 +350,25 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="cli-smoke.py")
     p.add_argument("--cli", required=True,
                    help="the DSS-built sqlite3 CLI, spelled as its LAUNCHER sees it")
+    # ★ THE `=` FORM IS THE ONLY ONE THAT WORKS, AND THIS HELP TEXT USED TO SAY
+    # OTHERWISE. It read `e.g. --launcher wsl.exe --launcher -e` — byte-for-byte the
+    # invocation ✔MEASURED to fail on 2026-08-05 (TF-C121): a launcher TOKEN may
+    # itself begin with a dash, and argparse then refuses the SPACE form with
+    # "expected one argument" instead of taking the next word as the value. That
+    # killed the pe64 CLI smoke gate before a single assertion ran, and the caller
+    # classified the argv defect as `smoke: FAIL — CHARGED TO DSS` — the harness
+    # accusing the compiler of its own command-line bug. Advertising the broken
+    # form in this tool's own --help is how that gets reintroduced.
+    # (D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION)
     p.add_argument("--launcher", action="append", default=[], metavar="TOKEN",
-                   help="one launcher argv token (repeatable), e.g. --launcher wsl.exe --launcher -e")
+                   help="one launcher argv token (repeatable). ALWAYS the `=` form, "
+                        "e.g. --launcher=arch --launcher=-x86_64 : a token may start "
+                        "with a dash and the space form then fails")
     p.add_argument("--reference", default="",
                    help="a gcc-built reference sqlite3 (upstream `make sqlite3d`), spelled as ITS launcher sees it")
-    p.add_argument("--reference-launcher", action="append", default=[], metavar="TOKEN")
+    p.add_argument("--reference-launcher", action="append", default=[], metavar="TOKEN",
+                   help="one reference-launcher argv token (repeatable); same `=` "
+                        "form rule as --launcher above")
     p.add_argument("--expect-version", required=True,
                    help="SQLITE_VERSION read from the STAGED sqlite3.h this binary was compiled against")
     p.add_argument("--expect-source-id", required=True,

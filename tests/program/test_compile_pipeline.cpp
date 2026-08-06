@@ -444,6 +444,147 @@ TEST(Program_CompileFiles, SingleCuAsmLabelReplacesTheMachOMangling) {
         << "the C identifier must NOT reach the object once a label renames it";
 }
 
+// ── TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the per-target ──────
+// ── link BASE name, end-to-end on the EMITTED BYTES, both arches ─────────────
+//
+// ★ THIS IS THE TEST WHOSE ABSENCE LET A SILENT MISBINDING SHIP. Darwin reaches
+// its modern 64-bit-inode ABI through `$INODE64` asm-label ALIASES on x86_64 and
+// through the PLAIN names on arm64 (`sys/cdefs.h`: `__DARWIN_ONLY_64_BIT_INO_T`
+// is 0 on x86_64, 1 on arm64). DSS declared the plain names, so an x86_64
+// Darwin build bound the LEGACY 32-bit-inode implementations while compiling the
+// MODERN 144-byte `struct stat` — the callee writes 120 bytes, `st_size` is read
+// at 96 and written at 72, `fstat` reports 0, and sqlite calls every database
+// "malformed". It never failed loud: a descriptor SHADOWS the SDK header
+// entirely, so the platform's own asm label never participates, and libSystem
+// exports BOTH spellings so the plain import resolves.
+//
+// GROUND TRUTH, MEASURED on real Darwin (macOS 26.5.2) with a MATCHED TWO-ARCH
+// CONTROL — one TU, only `-arch` differs, `cc -c` then `nm -u`:
+//   x86_64 → _stat$INODE64 _fstat$INODE64 _lstat$INODE64 _opendir$INODE64
+//            _readdir$INODE64   (and _closedir PLAIN)
+//   arm64  → _stat _fstat _lstat _opendir _readdir            (and _closedir)
+// These assertions reproduce exactly that, through DSS's own pipeline.
+//
+// BOTH ARMS ARE PINNED because the per-arch SPLIT is the property. A flat alias
+// would satisfy the x86_64 arm and be WRONG on arm64 — merely relocating the
+// defect — so an x86_64-only pin would be worse than none.
+//
+// ★ `_closedir` IS ASSERTED PLAIN ON BOTH ARMS, and that is not decoration: it
+// is the per-SYMBOL control proving the divergence belongs to individual
+// symbols, not to `<dirent.h>`. A "suffix everything in this header" fix goes
+// red here.
+//
+// RED-ON-DISABLE (MEASURED, by reverting and re-running): remove `linkName`
+// from `sys/stat.json`'s `fstat` row and the x86_64 object carries `_fstat`
+// instead of `_fstat$INODE64`, failing the first EXPECT_NE below. Drop
+// `ext.linkName` from the shipped-descriptor `HirExternRecord` producer in
+// `cst_to_hir.cpp` and BOTH `$INODE64` names vanish while arm64 stays green —
+// which is precisely the "it passed on the arch I tested" shape.
+namespace {
+
+// Compile `source` for `spec`, read the emitted artifact's bytes.
+[[nodiscard]] std::string
+compileAndReadArtifact(char const* scratchTag, char const* fileName,
+                       std::string const& source, char const* spec,
+                       char const* artifact) {
+    ScratchDir scratch{Location::InsideRepo, scratchTag};
+    auto const src = writeCSubsetSource(scratch.path(), fileName, source);
+    scratch.useAsCwd();
+    auto const outDir = scratch.path() / "out";
+    Program prog;
+    prog.setOutputDir(outDir);
+    int const rc =
+        prog.compileFiles({src.generic_string()}, "c-subset", {spec});
+    EXPECT_EQ(rc, 0) << "compile failed for " << spec;
+    auto const obj = outDir / artifact;
+    EXPECT_TRUE(fs::exists(obj)) << "no artifact at " << obj.generic_string();
+    if (!fs::exists(obj)) return {};
+    std::ifstream in(obj, std::ios::binary | std::ios::ate);
+    EXPECT_TRUE(in.good());
+    auto const size = static_cast<std::streamoff>(in.tellg());
+    std::string data(static_cast<std::size_t>(size), '\0');
+    in.seekg(0);
+    in.read(data.data(), size);
+    return data;
+}
+
+// The one TU both arms compile — references the five diverging symbols plus the
+// non-diverging `closedir` control. Deliberately a REAL `#include` of the
+// shipped descriptors, not a hand-written extern: the whole defect lives in the
+// descriptor rows, so a test that declared the externs itself would pin nothing.
+constexpr char const* kInode64Probe =
+    "#include <sys/stat.h>\n"
+    "#include <dirent.h>\n"
+    "int main(void) {\n"
+    "    struct stat st;\n"
+    "    DIR *d;\n"
+    "    if (fstat(0, &st) != 0) return 1;\n"
+    "    if (stat(\"/\", &st) != 0) return 2;\n"
+    "    if (lstat(\"/\", &st) != 0) return 3;\n"
+    "    d = opendir(\"/\");\n"
+    "    if (d == 0) return 4;\n"
+    "    if (readdir(d) == 0) return 5;\n"
+    "    return closedir(d);\n"
+    "}\n";
+
+}  // namespace
+
+TEST(Program_CompileFiles, MachOX86_64ShippedLinkNameEmitsInode64Aliases) {
+    std::string const data = compileAndReadArtifact(
+        "program", "inode64.c", kInode64Probe,
+        "x86_64:macho64-x86_64-darwin-exec", "inode64");
+    ASSERT_FALSE(data.empty());
+    for (char const* sym : {"fstat", "stat", "lstat", "opendir", "readdir"}) {
+        std::string const aliased = std::string("_") + sym + "$INODE64";
+        EXPECT_NE(data.find(aliased), std::string::npos)
+            << "x86_64-Darwin must import " << aliased
+            << " — the plain name binds the LEGACY 32-bit-inode callee, which "
+               "writes 120 of 144 bytes and reports st_size 0 (MEASURED)";
+    }
+    EXPECT_NE(data.find(std::string("_closedir")), std::string::npos)
+        << "closedir does NOT diverge per arch (MEASURED: `cc -arch x86_64` "
+           "emits the plain name) — the per-SYMBOL control";
+    EXPECT_EQ(data.find(std::string("__fstat$INODE64")), std::string::npos)
+        << "the descriptor declares the UNDECORATED base name and the ENGINE "
+           "composes the format's `_`; a config-side underscore would "
+           "double-decorate";
+}
+
+TEST(Program_CompileFiles, MachOArm64ShippedLinkNameKeepsThePlainNames) {
+    std::string const data = compileAndReadArtifact(
+        "program", "inode64.c", kInode64Probe,
+        "arm64:macho64-arm64-darwin-exec", "inode64");
+    ASSERT_FALSE(data.empty());
+    EXPECT_EQ(data.find(std::string("$INODE64")), std::string::npos)
+        << "arm64-Darwin has ONE inode ABI — no variant may match, and an alias "
+           "here would import a symbol libSystem's arm64 slice does not export";
+    for (char const* sym : {"_fstat", "_stat", "_lstat", "_opendir", "_readdir",
+                            "_closedir"}) {
+        EXPECT_NE(data.find(std::string(sym)), std::string::npos)
+            << "arm64-Darwin must import the plain " << sym
+            << " (the MATCHED CONTROL that must stay green)";
+    }
+}
+
+// The DEFAULT path on a format whose decoration is EMPTY: the same descriptor
+// rows, no variant matching, no underscore. This is the second half of "the
+// override path and the default path go through ONE decoration rule" — if the
+// `_` had been baked into config or composed in the semantic injector, elf
+// would carry it too.
+TEST(Program_CompileFiles, ElfShippedLinkNameDefaultsToTheBareIdentifier) {
+    std::string const data = compileAndReadArtifact(
+        "program", "inode64.c", kInode64Probe,
+        "x86_64:elf64-x86_64-linux-exec", "inode64");
+    ASSERT_FALSE(data.empty());
+    EXPECT_EQ(data.find(std::string("$INODE64")), std::string::npos)
+        << "no Linux symbol carries a Darwin inode alias";
+    EXPECT_EQ(data.find(std::string("_fstat")), std::string::npos)
+        << "ELF adds NO leading underscore — a `_fstat` here would mean the "
+           "decoration leaked out of the Mach-O rule";
+    EXPECT_NE(data.find(std::string("fstat")), std::string::npos)
+        << "the bare C identifier is the ELF import name";
+}
+
 // ── D-LK3-MACHO-ARM64-OBJECT: the arm64 sibling emits a real .o ──
 //
 // End-to-end pipeline proof for the arm64 Mach-O relocatable object

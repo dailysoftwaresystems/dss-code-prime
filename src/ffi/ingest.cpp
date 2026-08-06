@@ -361,8 +361,13 @@ ingest(std::span<IngestionSource const> sources,
         // `__DARWIN_ALIAS_C(open)` is `_open…` on disk — so keying on the C
         // identifier would silently miss the row and drop the extern through to the
         // format-default library with no diagnostic.
+        // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the descriptor's
+        // per-target link BASE name rides the same call for the same reason —
+        // libSystem's x86_64 slice exports `_fstat$INODE64`, so that (un-
+        // decorated: `fstat$INODE64`) is the only key that can match its row.
         std::string const linkerName =
-            linkNameFor(ext.canonicalName, ext.asmName, format.kind());
+            linkNameFor(ext.canonicalName, ext.asmName, format.kind(),
+                        ext.linkName);
         auto it = bySymbol.find(unapplyCMangling(linkerName, format.kind()));
         if (it == bySymbol.end()) continue;  // unmatched -> caller applies policy
         TaggedRow const& matched = *it->second;
@@ -525,8 +530,13 @@ synthesizeFfiFromSourceDecls(
         // rail (`program.cpp`'s merge-key lambda), which routes through the same
         // function, or a labelled definition and a labelled reference to it stop
         // collapsing at merge time and the call is emitted as a dynamic import.
+        // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): `linkName` is the
+        // fourth input to the SAME single naming point — the descriptor-declared
+        // base name for this target, decorated by the format's rule (so the
+        // definition rail's `nameOf`, which passes the SymbolRecord's copy of the
+        // identical string, produces the identical bytes).
         meta.mangledName   = linkNameFor(ext.canonicalName, ext.asmName,
-                                         format.kind());
+                                         format.kind(), ext.linkName);
         meta.linkage       = FfiLinkage::Strong;
         meta.visibility    = FfiVisibility::Default;
         // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3): a

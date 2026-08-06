@@ -79,8 +79,11 @@
 #      generator (gen-pe64-manifest.py) serves this driver and the .ps1.
 #   8. stage each leg's run dir — including the loadext extension the corpus
 #      dlopen()s (`libtestloadext.so`, or `testloadext.dll` on a Windows target:
-#      the name is DECLARED per leg), compiled by THE LEG'S TARGET compiler,
-#      which is accepted only after it states that target — then run
+#      the name is DECLARED per leg), EMITTED BY DSS ITSELF for the leg's declared
+#      `sharedLibFormat`, so no host needs a cross-compiler for any leg; where a
+#      VERIFIED target compiler happens to exist it also builds a CONTROL copy
+#      beside it, and DSS_LOADEXT_HELPER=reference stages that one instead —
+#      then run
 #      SQLite's `.test` UNIT CORPUS through the dss-built fixture on every
 #      runnable leg (DSS_TIER: veryquick[default] | quick | full | all), parse
 #      "N errors out of M tests", and classify each failing test against the
@@ -430,7 +433,9 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
            LEG_LAUNCH=() LEG_LAUNCH_ENV=() \
            LEG_PATH_TRANSLATION=() LEG_PATH_TRANSLATOR=() LEG_ENV_TRANSFER=() \
            LEG_RECIPE_TRANSFORM=() LEG_HEADER_STAGE_KEY=() LEG_ZCONF_GUARDS=() \
+           LEG_CONFIG_STAGE_KEY=() LEG_CONFIGURE_ANSWERS=() \
            LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() LEG_LOADEXT_NAME=() \
+           LEG_SHARED_LIB_FORMAT=() LEG_SHARED_LIB_SPEC=() \
            LEG_CC_CANDIDATES=() LEG_CC_PKG=() \
            LEG_LIB_PROVIDER=() LEG_LIB_TCL_NAMES=() LEG_LIB_Z_NAMES=() LEG_LIB_PATHS=() \
            LEG_LIB_TCL_IMPORT_NAME=() LEG_LIB_Z_IMPORT_NAME=()
@@ -1095,8 +1100,13 @@ curl -fsS --max-time 20 -o /dev/null https://github.com || die "offline — cann
 pass "$HOST_OS/$HOST_ARCH host is online"
 ensure_cmd git git
 # HOST toolchain, for the harness's OWN work (deriving the recipe, building the
-# reference oracle) — NOT the per-leg target compilers, which come from each leg's
-# declared `targetCc` candidates in Step 6.
+# reference oracle) — NOT the per-leg target compilers, which are the OPTIONAL
+# CONTROL arm resolved from each leg's declared `targetCc` candidates in Step 6.
+# ⚠ This block is the harness's own remaining host dependence and it is a
+# different question from the one D-HARNESS-CROSS-HOST-ANY-TARGET asks: `make` +
+# a host `cc` derive the RECIPE from upstream's build system and build the gcc
+# reference oracle the confound classifier compares against. Neither produces an
+# artefact for any leg's target.
 if [[ "$HOST_OS" == "darwin" ]]; then
   command -v cc >/dev/null 2>&1 || die "no C compiler (cc) — run 'xcode-select --install'."
   command -v make >/dev/null 2>&1 || die "no 'make' — run 'xcode-select --install'."
@@ -2231,12 +2241,36 @@ done
 # ONE PER ARTIFACT: the fixture and the CLI are different programs with different
 # declared inputs (the CLI must not see the staged Tcl headers), so a single
 # shared list would hand one of them an input it never asked for.
-declare -A LEG_INC_FILE=() LEG_CLI_INC_FILE=() LEG_ZINC_DIR=()
-declare -A ZINC_STAGE_DIR=()
+declare -A LEG_INC_FILE=() LEG_CLI_INC_FILE=() LEG_ZINC_DIR=() LEG_CFG_DIR=()
+declare -A ZINC_STAGE_DIR=() CFG_STAGE_DIR=()
+# ★★ AND THE SAME STORY FOR SQLITE'S OWN ./configure HEADER
+# (D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES).
+# `configure` ran HERE, on the deriving host, and wrote $BLD/sqlite_cfg.h with THIS
+# machine's probe answers. The recipe carries `_HAVE_SQLITE_CONFIG_H` — the one
+# host-probe define left on the command line — which makes sqliteInt.h
+# `#include "sqlite_cfg.h"`, and $BLD is on every leg's include list. So every leg
+# inherited this box's answers: MEASURED, that is how the macho64-arm64 CLI came to
+# fail on `off64_t`/`pread64`/`pwrite64` (HAVE_PREAD64+HAVE_PWRITE64 -> os_unix.c's
+# USE_PREAD64 -> macro casts typed with a type Darwin does not have).
+# Each leg DECLARES its target's answers (legs.json `build.configureAnswers`) and
+# the same stage-zinc.py writes one cfg/<targetOs>/sqlite_cfg.h per declared stage —
+# the deriving host's answers for the ~49 rows that do not vary, the leg's own for
+# the three that do. Step 7 puts that dir AHEAD of $BLD on the leg's include list,
+# so the leg's own header wins the quote-include search and $BLD still supplies the
+# generated sqlite3.h/parse.h/opcodes.h it is there for.
+CFG_ROOT="$BLD/cfg"; mkdir -p "$CFG_ROOT"
+# The DERIVING host's generated header. Fatal for the whole run if absent, exactly
+# like zlib.h above and for the same reason: it is the SOURCE every stage is
+# rewritten from, so without it no leg on any host has a configure header at all.
+[[ -f "$BLD/sqlite_cfg.h" ]] || die "the generated sqlite_cfg.h is not in $BLD.
+      sqlite's ./configure writes it there and the recipe's _HAVE_SQLITE_CONFIG_H makes every TU
+      include it; each leg is staged its OWN copy from it (build.configureAnswers), so its absence
+      is fatal for the ENTIRE run rather than for one leg."
 # rc DIRECTLY off python3 (never through a pipe) — the output is captured first
 # and parsed after, so a FAIL line is still read on a non-zero rc.
 ZINC_OUT="$(python3 "$SCRIPT_DIR/stage-zinc.py" --zlib-h "$ZINC_SRC/zlib.h" \
               --zconf-h "$ZINC_SRC/$(basename "$ZCH")" --dest "$ZINC_ROOT" \
+              --sqlite-cfg-h "$BLD/sqlite_cfg.h" --cfg-dest "$CFG_ROOT" \
               --catalogue "$LEG_CATALOGUE" 2>&1)" || true
 while IFS= read -r _zl; do
   case "$_zl" in
@@ -2250,11 +2284,66 @@ while IFS= read -r _zl; do
       _rest="${_zl#ZINC-STAGE-FAIL=}"
       warn "zinc stage '${_rest%%|*}' COULD NOT BE PRODUCED — ${_rest#*|}" ;;
     ZINC-STAGES=*) info "zinc stages: ${_zl#ZINC-STAGES=} produced" ;;
+    CFG-STAGE-OK=*)
+      _rest="${_zl#CFG-STAGE-OK=}"; _k="${_rest%%|*}"; _rest="${_rest#*|}"
+      _dir="${_rest%%|*}"; _rest="${_rest#*|}"; _ans="${_rest%%|*}"; _note="${_rest#*|}"
+      CFG_STAGE_DIR["$_k"]="$_dir"
+      info "sqlite config stage '$_k' -> $_dir   [$_ans]"
+      [[ -z "$_note" ]] || info "      note: $_note" ;;
+    CFG-STAGE-FAIL=*)
+      _rest="${_zl#CFG-STAGE-FAIL=}"
+      warn "sqlite config stage '${_rest%%|*}' COULD NOT BE PRODUCED — ${_rest#*|}" ;;
+    CFG-STAGES=*) info "sqlite config stages: ${_zl#CFG-STAGES=} produced" ;;
     *) [[ -z "$_zl" ]] || info "      $_zl" ;;
   esac
 done <<< "$ZINC_OUT"
 [[ ${#ZINC_STAGE_DIR[@]} -gt 0 ]] || die "stage-zinc.py produced NO per-target zlib header dir:
 $ZINC_OUT"
+[[ ${#CFG_STAGE_DIR[@]} -gt 0 ]] || die "stage-zinc.py produced NO per-target sqlite_cfg.h.
+      Every leg would then fall back to the DERIVING host's copy on the \$BLD include dir, which is
+      exactly D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES:
+$ZINC_OUT"
+# ── ★★ AND NOW REMOVE THE DERIVING HOST'S COPY, because "the staged dir is FIRST
+# on the include list" DOES NOT COVER EVERY TU.
+#
+# ⛔ THE EXCEPTION, ✔MEASURED 2026-08-05 (TF-C121). A quote include searches the
+# INCLUDING FILE'S OWN DIRECTORY *BEFORE* THE INCLUDE LIST IS CONSULTED AT ALL
+# (src/core/types/include_path_resolve.hpp: `resolveIncludePath` — "try the
+# including file's own directory FIRST, then each of `includeDirs`", C 6.10.2p3).
+# The position argument is therefore sound only for an includer that has no
+# `sqlite_cfg.h` beside it. `sqliteInt.h` lives in sqlite/src/ and does not — but
+# `$BLD/ctime.c` DOES, and it is TU #1 in BOTH tus.txt and cli-tus.txt, i.e. the
+# fixture and the CLI, on every leg. It opens with:
+#     #if defined(_HAVE_SQLITE_CONFIG_H) && !defined(SQLITECONFIG_H)
+#     #include "sqlite_cfg.h"
+#     #define SQLITECONFIG_H 1
+# so it took the DERIVING host's header out of its own directory (HAVE_MALLOC_H,
+# HAVE_PREAD64, HAVE_PWRITE64 — all three of the answers the staging exists to
+# correct) and then SHADOWED sqliteInt.h's guarded include for the rest of that
+# TU. Latent only because ctime.c consumes HAVE_ISNAN alone, a row on which every
+# target agrees; os_unix.c (which is where the off64_t/pread64/pwrite64 damage
+# actually lands) has no sibling header and got the staged one correctly, which is
+# why the "6 errors -> 0" result held and the exception stayed invisible.
+#
+# ★ THIS IS NOT "PATCHING THE STAGED TREE" — and the distinction is worth stating
+# because that is a HARD rule here (the corpus must be unmodified upstream sqlite).
+# `sqlite_cfg.h` is not upstream source: it is a GENERATED ARTEFACT OF THE
+# HARNESS'S OWN `./configure` RUN thirty lines up, in a build dir this harness
+# created. Removing it removes THIS HARNESS'S OWN OUTPUT, and its content is not
+# discarded — stage-zinc.py has just read it (above) and rewritten it into one
+# per-target copy per stage.
+# ★ AND IT COSTS NOTHING TO REGENERATE, ✔MEASURED: upstream's own Makefile carries
+# `sqlite_cfg.h: $(AS_AUTO_DEF)` -> `$(AS_AUTORECONFIG)`, so a human re-running
+# `make testfixture` by hand in $BLD (the workflow the LDFLAGS note at Step 4
+# contemplates) regenerates it automatically and BYTE-IDENTICALLY — measured md5
+# 24c26a7425fea820274d20945244915f before and after, `Makefile is unchanged`. This
+# driver re-runs `./configure` unconditionally at the top of every run in any case.
+# With it gone the self-directory lookup MISSES on every TU on every leg, the
+# include list wins uniformly, and the SQLITECONFIG_H shadowing becomes harmless
+# (ctime.c now defines it having read the RIGHT header). test-confound-scope.sh
+# asserts the removal is still here.
+rm -f "$BLD/sqlite_cfg.h"
+info "removed the deriving host's $BLD/sqlite_cfg.h — ${#CFG_STAGE_DIR[@]} per-target copy/copies replace it; a quote include searches the includer's OWN dir first, so leaving it there let \$BLD/ctime.c (TU #1) read this machine's answers ahead of the whole include list"
 THIRD_PARTY_INCS=("$TCL_INC")
 info "tcl $TCL_VER headers: $TCL_INC   zlib source headers: $ZINC_SRC (from $ZH) -> ${#ZINC_STAGE_DIR[@]} per-target stage(s) under $ZINC_ROOT"
 
@@ -2574,20 +2663,40 @@ for leg in "${LEG_ORDER[@]}"; do
   info "[$leg] libs ($provider): $tcl_lib  +  $z_lib"
 done
 
-# ── each leg's TARGET C compiler (the loadext helper extension) ──────────────
-# WHY IT IS RESOLVED HERE AND NOT AT STEP 8, and why a missing one does NOT stop
-# the build: the compiler builds this leg's declared `loadExtHelperName`, the
-# extension the loadext corpus dlopen()s — a RUN input, not a build input for the
-# fixture itself. So:
-#   · a leg that WILL run needs it. Absent (and un-installable) ⇒
-#     `skipped-build-input-missing`, decided NOW, at Step 6, rather than after a
-#     ~50 s..8 min compile and a staging step — the leg is still BUILT (that is
-#     unconditional), it just will not be run.
-#   · a leg that will NOT run here does not need it at all, and failing it for a
-#     cross-compiler it would never invoke would manufacture an environmental skip
-#     out of nothing — on a Linux box that is both macho legs, every run.
-# The candidates are the leg's own declared `targetCc.candidates`, first present
-# wins. ⚠ The old `${CC:-cc}` override is deliberately NOT carried over: with five
+# ── each leg's TARGET C compiler — THE CONTROL ARM, NOT A REQUIREMENT ────────
+#
+# ★★★ READ THIS BEFORE THE PARAGRAPHS BELOW IT, WHICH DESCRIBE A RULE THAT IS
+# STILL TRUE AND A ROLE THAT HAS CHANGED. Since 2026-08-05 the loadext helper
+# extension is built by DSS ITSELF, for the leg's declared `sharedLibFormat`, on
+# whatever host this driver is running on — so NO leg's run depends on this
+# machine owning a third-party cross-compiler any more.
+# Operator: "why do we need mingw? since dss code prime should not have
+# dependencies?" / "I installed mingw in wsl, but we should NOT depend on a tool".
+# [D-HARNESS-CROSS-HOST-ANY-TARGET]
+#
+# WHAT THIS BLOCK STILL DOES, AND WHY IT IS WORTH KEEPING. A verified target
+# compiler is now the CONTROL arm: where one exists, the same source is ALSO
+# built with it beside the DSS artefact, and `DSS_LOADEXT_HELPER=reference`
+# STAGES it instead so the corpus becomes a differential. That control matters
+# precisely because DSS is now testing DSS — the fixture and the helper both
+# compile sqlite3ext.h, so a shared defect could cancel and read as green.
+#
+# ⇒ THE THREE THINGS THAT CHANGED HERE, each of them a de-host-locking:
+#   1. A leg with NO verified compiler is no longer `skipped-build-input-missing`.
+#      It records nothing at all — its helper comes from DSS and its corpus runs.
+#      That single change is what un-skips pe64 on a Linux/WSL box without mingw,
+#      the arm64 leg without gcc-aarch64-linux-gnu, and both macho legs anywhere.
+#   2. `pkg_install` is no longer attempted UNASKED. Installing a cross-compiler
+#      to satisfy a CONTROL would mutate the machine for an arm that is optional
+#      by construction; it is attempted only when the operator has explicitly
+#      selected `DSS_LOADEXT_HELPER=reference`.
+#   3. The resolution is best-effort. Its failure is INFORMATION (printed, and
+#      carried into the leg's cross-check line), never a verdict.
+#
+# The RULE the resolver applies is unchanged and still load-bearing: a candidate
+# is accepted only if `<cc> -dumpmachine` names this leg's own target arch AND
+# OS. A control built by the wrong-target compiler would be a worthless control.
+# ⚠ The old `${CC:-cc}` override is deliberately NOT carried over: with five
 # legs, one `$CC` cannot say WHICH leg's target compiler it means, and applying it
 # to a cross leg is exactly the wrong-arch helper this anchor
 # (D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO) exists to prevent. `$CC` still governs
@@ -2674,14 +2783,36 @@ resolve_leg_target_cc() {       # resolve_leg_target_cc <leg>  -> 0 + LEG_CC set
   }
   return 0
 }
+# WHICH ARM STAGES THE HELPER. Resolved ONCE, here, by the shared resolver so
+# both drivers read the operator's choice the same way and an unrecognised value
+# is refused by name rather than silently read as the default (which would report
+# a control that never ran). `--helper-builder ''` means "take $DSS_LOADEXT_HELPER
+# or the default"; the resolver owns both the vocabulary and the precedence.
+# `|| die`, never `X="$(...)"; rc=$?` — under `set -Eeuo pipefail` the assignment
+# form EXITS before the rc can be read, which is the trap that once shipped a
+# whole verdict classifier as dead code. The resolver's own refusal (rc 2, with
+# the full vocabulary and the reason) has already gone to stderr.
+LOADEXT_BUILDER="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --loadext-builder)" \
+  || die "DSS_LOADEXT_HELPER='${DSS_LOADEXT_HELPER:-}' is not a builder this harness implements — see the refusal above."
+if [[ "$LOADEXT_BUILDER" == "reference" ]]; then
+  warn "DSS_LOADEXT_HELPER=reference — the loadext helper will be STAGED from each leg's"
+  warn "      VERIFIED target C compiler instead of from DSS. This is the CONTROL arm: it makes"
+  warn "      the corpus itself the differential for 'is a loadext-* red the fixture or the helper?',"
+  warn "      and it re-introduces a host dependency ON PURPOSE — a leg with no such compiler here"
+  warn "      records skipped-build-input-missing (environmental; the default would have run it)."
+fi
 for leg in "${LEG_ORDER[@]}"; do
-  # A leg this host cannot RUN needs no helper extension — do not manufacture an
-  # environmental skip out of a cross-compiler it would never invoke.
+  # A leg this host cannot RUN needs no helper extension — not even a control.
   [[ "${LEG_RUN_MODE[$leg]}" != "skip" ]] || continue
   # A leg with no libraries is not built, so there is no run to stage for it.
   [[ -n "${LEG_TCL_LIB[$leg]:-}" ]] || continue
-  if ! resolve_leg_target_cc "$leg" && [[ -n "${LEG_CC_PKG[$leg]}" ]]; then
-    warn "[$leg] no candidate compiler on PATH targets ${LEG_SPEC[$leg]} — trying to install ${LEG_CC_PKG[$leg]}"
+  # ★ THE INSTALL IS ONLY ATTEMPTED FOR AN ARM THE OPERATOR ASKED FOR. Installing
+  # a cross-compiler to satisfy the optional control would mutate this machine for
+  # something that is optional by construction — and it is exactly the "we should
+  # NOT depend on a tool" the primary path now removes.
+  if ! resolve_leg_target_cc "$leg" \
+     && [[ "$LOADEXT_BUILDER" == "reference" && -n "${LEG_CC_PKG[$leg]}" ]]; then
+    warn "[$leg] DSS_LOADEXT_HELPER=reference and no candidate compiler on PATH targets ${LEG_SPEC[$leg]} — trying to install ${LEG_CC_PKG[$leg]}"
     info "      ${LEG_CC_WHY}"
     # Subshell: a package manager that cannot supply it costs this leg its RUN,
     # never the whole harness.
@@ -2690,12 +2821,23 @@ for leg in "${LEG_ORDER[@]}"; do
                # reads $PATH itself, so this is for the rest of THIS driver.
     resolve_leg_target_cc "$leg" || true
   fi
+  # ★★ NO VERDICT IS RECORDED HERE ANY MORE, IN EITHER DIRECTION. This branch used
+  # to call `leg_marks_missing` — the single line that made a leg's ~330,000 units
+  # depend on this host owning a cross-compiler for that leg's target. The helper
+  # now comes from DSS (Step 8), so an absent control costs the leg NOTHING; it is
+  # reported as the fact it is. The verdict for the operator-selected `reference`
+  # arm is decided at Step 8, by the shared resolver, from the report it returns —
+  # in ONE place, with the reason attached [D-HARNESS-CROSS-HOST-ANY-TARGET].
   if [[ -z "${LEG_CC[$leg]:-}" ]]; then
-    leg_marks_missing "$leg" "it is still BUILT, but this host cannot RUN its corpus" \
-      "no declared targetCc candidate both EXISTS here and TARGETS ${LEG_SPEC[$leg]} — tried ${LEG_CC_CANDIDATES[$leg]:-<none declared>}${LEG_CC_PKG[$leg]:+ (apt: ${LEG_CC_PKG[$leg]})}. It builds this leg's ${LEG_LOADEXT_NAME[$leg]:-loadext helper}, the extension the loadext corpus dlopen()s; NOT falling back to a compiler that targets something else, because an extension the $leg fixture cannot load would false-red every loadext-* test as a genuine DSS failure [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO]. The resolver's ladder: ${LEG_CC_WHY:-<no diagnostic>}"
+    # `:-` on a key the resolver ALWAYS emits: under `set -u` an absent key aborts
+    # the driver, and this branch is already reporting a degraded state — it must
+    # not be the thing that ends the run. (The lint at Step 0 requires
+    # `sharedLibFormat` on every leg, so the fallback text should be unreachable.)
+    info "[$leg] no CONTROL compiler here (tried ${LEG_CC_CANDIDATES[$leg]:-<none declared>}) — the loadext helper will be built by DSS for ${LEG_SHARED_LIB_SPEC[$leg]:-<no sharedLibFormat declared>}, which needs nothing from this machine."
+    [[ -z "${LEG_CC_WHY// /}" ]] || info "      the resolver's ladder: ${LEG_CC_WHY}"
     continue
   fi
-  info "[$leg] target cc: ${LEG_CC[$leg]} — it reports '${LEG_CC_MACHINE[$leg]}', which is ${LEG_SPEC[$leg]}'s arch+OS (asked, not assumed)"
+  info "[$leg] control cc: ${LEG_CC[$leg]} — it reports '${LEG_CC_MACHINE[$leg]}', which is ${LEG_SPEC[$leg]}'s arch+OS (asked, not assumed)"
   [[ -z "${LEG_CC_WHY// /}" ]] || info "      candidates passed over: ${LEG_CC_WHY}"
 done
 
@@ -3124,9 +3266,47 @@ RECIPE_TUS_FILE="$OUT_DIR/recipe-tus.txt"
 RECIPE_DEFS_FILE="$OUT_DIR/recipe-defines.txt"
 printf '%s\n' "${TUS[@]}"         > "$RECIPE_TUS_FILE"
 printf '%s\n' "${RECIPE_DEFS[@]}" > "$RECIPE_DEFS_FILE"
-for _k in "${!ZINC_STAGE_DIR[@]}"; do
-  printf '%s\n' "${INC_DIRS_HEAD[@]}" "${ZINC_STAGE_DIR[$_k]}" "${INC_DIRS_TAIL[@]}" \
-    > "$OUT_DIR/recipe-includes.$_k.txt"
+#
+# The distinct (zinc stage, config stage) PAIRS the declared legs actually need —
+# built from the legs, not as a cross product of the two families: 2 zinc stages x
+# 3 config stages would write 6 include lists for the 3 combinations that exist,
+# and a list nothing uses is a file a reader has to rule out.
+declare -A LEG_STAGE_PAIRS=()
+for _l in "${LEG_DECLARED[@]}"; do
+  _k="${LEG_HEADER_STAGE_KEY[$_l]:-}"; _c="${LEG_CONFIG_STAGE_KEY[$_l]:-}"
+  [[ -n "$_k" && -n "${ZINC_STAGE_DIR[$_k]:-}" ]] || continue
+  [[ -n "$_c" && -n "${CFG_STAGE_DIR[$_c]:-}" ]] || continue
+  LEG_STAGE_PAIRS["$_k|$_c"]=1
+done
+#
+# ★★ THE STAGED sqlite_cfg.h DIR IS THE SECOND THING ON THIS LIST THAT IS NOT LEG-
+# INDEPENDENT, ON A DIFFERENT KEY — which is why the lists below are written per
+# PAIR (zinc stage, config stage) rather than per zinc stage.
+# The two families are keyed differently ON PURPOSE: the zlib header follows the
+# `recipeTransform` and the sqlite configure header follows the TARGET OS, and four
+# legs share `recipeTransform: "none"` while being TWO different configure targets
+# (two Linux, two Darwin). One key could not tell them apart, and a leg handed the
+# other family's header is the whole defect
+# (D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES).
+# ★ THE cfg/ DIR GOES FIRST — but position is only HALF the mechanism, and on its
+# own it was NOT ENOUGH. Quote includes search the INCLUDING FILE'S OWN DIRECTORY
+# *BEFORE* THIS LIST IS CONSULTED AT ALL (src/core/types/include_path_resolve.hpp,
+# C 6.10.2p3), so no list position can outrank a `sqlite_cfg.h` sitting beside the
+# includer — which is exactly the case for `$BLD/ctime.c`, TU #1 of both artefacts.
+# The OTHER half is the `rm -f "$BLD/sqlite_cfg.h"` at Step 6, which deletes the
+# deriving host's copy so that self-directory lookup misses everywhere; the full
+# measurement is in the comment there. With it gone, `sqliteInt.h` (in src/, no
+# sibling header) and `ctime.c` (in $BLD, sibling now removed) resolve through the
+# SAME list, and the first entry that has the header wins.
+# First is still the only placement that is correct no matter how the rest of the
+# list is later reordered, and it can shadow nothing: the staged dir holds exactly
+# one file, `sqlite_cfg.h`. (The .ps1 puts its staged bld dir at the FRONT of its
+# base list, so "just before $BLD" would have been two different rules in two
+# drivers — which is how they drift.)
+for _pair in "${!LEG_STAGE_PAIRS[@]}"; do
+  _k="${_pair%%|*}"; _c="${_pair#*|}"
+  printf '%s\n' "${CFG_STAGE_DIR[$_c]}" "${INC_DIRS_HEAD[@]}" "${ZINC_STAGE_DIR[$_k]}" \
+    "${INC_DIRS_TAIL[@]}" > "$OUT_DIR/recipe-includes.$_k.$_c.txt"
 done
 # THE CLI'S OWN INCLUDE LIST, from the CLI's OWN recipe — one per header stage,
 # exactly like the fixture's above and for the same D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED
@@ -3141,16 +3321,23 @@ done
 # sqlite src/ext dirs); the leg's zinc/ supplies <zlib.h>, which shell.c DOES
 # include; $INC_DIRS_TAIL supplies $BLD (the generated sqlite3.h) and, on a Mac,
 # the SDK dir that must stay LAST so it cannot shadow the staged zlib header.
-for _k in "${!ZINC_STAGE_DIR[@]}"; do
-  printf '%s\n' "${CLI_INCS[@]}" "${ZINC_STAGE_DIR[$_k]}" "${INC_DIRS_TAIL[@]}" \
-    > "$OUT_DIR/cli-includes.$_k.txt"
+for _pair in "${!LEG_STAGE_PAIRS[@]}"; do
+  _k="${_pair%%|*}"; _c="${_pair#*|}"
+  printf '%s\n' "${CFG_STAGE_DIR[$_c]}" "${CLI_INCS[@]}" "${ZINC_STAGE_DIR[$_k]}" \
+    "${INC_DIRS_TAIL[@]}" > "$OUT_DIR/cli-includes.$_k.$_c.txt"
 done
 for _l in "${LEG_DECLARED[@]}"; do
-  _k="${LEG_HEADER_STAGE_KEY[$_l]:-}"
+  _k="${LEG_HEADER_STAGE_KEY[$_l]:-}"; _c="${LEG_CONFIG_STAGE_KEY[$_l]:-}"
+  # BOTH staged headers or NEITHER: a leg with one of the two is a leg compiled
+  # against somebody else's answers for the other, and the Step-7/7b blockers
+  # below poison it by name rather than letting it build. `continue` here leaves
+  # LEG_INC_FILE unset, which is what those blockers test.
   [[ -n "$_k" && -n "${ZINC_STAGE_DIR[$_k]:-}" ]] || continue
-  LEG_INC_FILE["$_l"]="$OUT_DIR/recipe-includes.$_k.txt"
-  LEG_CLI_INC_FILE["$_l"]="$OUT_DIR/cli-includes.$_k.txt"
+  [[ -n "$_c" && -n "${CFG_STAGE_DIR[$_c]:-}" ]] || continue
+  LEG_INC_FILE["$_l"]="$OUT_DIR/recipe-includes.$_k.$_c.txt"
+  LEG_CLI_INC_FILE["$_l"]="$OUT_DIR/cli-includes.$_k.$_c.txt"
   LEG_ZINC_DIR["$_l"]="${ZINC_STAGE_DIR[$_k]}"
+  LEG_CFG_DIR["$_l"]="${CFG_STAGE_DIR[$_c]}"
 done
 
 # generate_manifest <leg> <out-manifest> — write this leg's project manifest.
@@ -3394,12 +3581,14 @@ for leg in "${LEG_ORDER[@]}"; do
     continue
   fi
   # THE OTHER thing that can stop a leg here, and it is a DEFECT rather than an
-  # environment: its own staged zlib header dir could not be produced (a
-  # ZINC-STAGE-FAIL in Step 6). `poisoned`, named, and NO fallback to a sibling
-  # stage's zinc/ — that fallback is D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED.
+  # environment: one of its two staged header dirs could not be produced (a
+  # ZINC-STAGE-FAIL or a CFG-STAGE-FAIL in Step 6). `poisoned`, named, and NO
+  # fallback to a sibling stage's copy — that fallback IS
+  # D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED / D-HARNESS-MACHO-LEG-INHERITS-THE-
+  # DERIVING-LINUX-HOSTS-CONFIGURE-PROBES.
   if [[ -z "${LEG_INC_FILE[$leg]:-}" ]]; then
     LEG_VERDICT["$leg"]='poisoned'
-    LEG_VERDICT_DETAIL["$leg"]="the zlib header dir for this leg's stage 'zinc/${LEG_HEADER_STAGE_KEY[$leg]:-?}' (its declared zconfGuards: ${LEG_ZCONF_GUARDS[$leg]:-none}) was NOT produced — see the ZINC-STAGE-FAIL line in Step 6. Compiling it against another target's zlib header is refused."
+    LEG_VERDICT_DETAIL["$leg"]="this leg has no include list: its staged zlib header dir 'zinc/${LEG_HEADER_STAGE_KEY[$leg]:-?}' (declared zconfGuards: ${LEG_ZCONF_GUARDS[$leg]:-none}) and/or its staged sqlite config dir 'cfg/${LEG_CONFIG_STAGE_KEY[$leg]:-?}' (declared configureAnswers: ${LEG_CONFIGURE_ANSWERS[$leg]:-none}) was NOT produced — see the ZINC-STAGE-FAIL / CFG-STAGE-FAIL line in Step 6. Compiling it against another target's zlib header, or against the DERIVING host's sqlite_cfg.h, is refused."
     COMPILE_FAILS=$((COMPILE_FAILS + 1))
     warn "[$leg] POISONED — ${LEG_VERDICT_DETAIL[$leg]}"
     continue
@@ -3435,6 +3624,10 @@ for leg in "${LEG_ORDER[@]}"; do
   # <<< dss:preflight <<<
   info "[$leg] $spec — ${#TUS[@]} TUs → testfixture (resolve: $(basename "${LEG_TCL_LIB[$leg]}"), $(basename "${LEG_Z_LIB[$leg]}"); transform: ${LEG_RECIPE_TRANSFORM[$leg]}; stackReserve: ${LEG_STACK_RESERVE[$leg]})"
   info "[$leg] zlib headers: ${LEG_ZINC_DIR[$leg]}  [${LEG_ZCONF_GUARDS[$leg]}]"
+  # STATED PER LEG, beside the zlib line and for the same reason: a build log must
+  # be able to answer "which machine's ./configure answers was this compiled
+  # against?" without anyone re-deriving it from a key.
+  info "[$leg] sqlite config header: ${LEG_CFG_DIR[$leg]}  [${LEG_CONFIGURE_ANSWERS[$leg]}]"
   # THE LIBRARY ARGV, BUILT BY THE RESOLVER (see `leg_resolve_library_argv`).
   # `mapfile` because the tokens are NEWLINE-separated and a token may contain
   # spaces (a cache path) or `=` (the identity override) — word-splitting them
@@ -3621,7 +3814,7 @@ for leg in "${LEG_ORDER[@]}"; do
   if [[ -z "${LEG_CLI_INC_FILE[$leg]:-}" ]]; then
     CLI_FAILS=$((CLI_FAILS + 1))
     dss_bh_set_verdict "$leg" sqlite3 'poisoned' \
-      "the zlib header dir for this leg's stage 'zinc/${LEG_HEADER_STAGE_KEY[$leg]:-?}' was NOT produced — see the ZINC-STAGE-FAIL line in Step 6. Compiling it against another target's zlib header is refused (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED)."
+      "this leg has no CLI include list: its staged zlib header dir 'zinc/${LEG_HEADER_STAGE_KEY[$leg]:-?}' and/or its staged sqlite config dir 'cfg/${LEG_CONFIG_STAGE_KEY[$leg]:-?}' (declared configureAnswers: ${LEG_CONFIGURE_ANSWERS[$leg]:-none}) was NOT produced — see the ZINC-STAGE-FAIL / CFG-STAGE-FAIL line in Step 6. Compiling it against another target's zlib header, or against the DERIVING host's sqlite_cfg.h, is refused (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED / D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES)."
     warn "[$leg] CLI POISONED — $(dss_bh_get_detail "$leg" sqlite3)"
     continue
   fi
@@ -3764,7 +3957,21 @@ for leg in "${LEG_ORDER[@]}"; do
   # run_leg does the same thing. Empty for a native leg.
   declare -a _smoke_launch=()
   eval "_smoke_launch=(${LEG_LAUNCH[$leg]:-})"
-  for _t in "${_smoke_launch[@]}"; do _smoke_argv+=(--launcher "$_t"); done
+  # ★ `--launcher=<tok>`, NOT `--launcher <tok>` — a launcher TOKEN may itself begin
+  # with a dash, and argparse then refuses it ("expected one argument") instead of
+  # taking it as the value. ✔MEASURED 2026-08-05 (TF-C121) in the .ps1 twin, whose
+  # `--reference-launcher -e` killed the pe64 CLI smoke gate before a single
+  # assertion ran — and the caller then classified that argv defect as
+  # `smoke: FAIL — CHARGED TO DSS`, accusing the compiler of a bug in the harness's
+  # own command line. THIS line has the identical shape and is latent only because
+  # every token it has ever seen starts with a letter (`wine`, `qemu-aarch64`,
+  # `qemu-x86_64`, `wsl.exe`). It is not hypothetical: legs.json declares
+  # `arch -x86_64` for macho64-x86_64 on a darwin/arm64 host, second token `-x86_64`
+  # — i.e. it would fire the first time anyone runs that leg on the operator's Mac.
+  # Fixed in BOTH drivers in one change; a fix in one and not the other is this
+  # project's canonical silent harness bug.
+  # (D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION)
+  for _t in "${_smoke_launch[@]}"; do _smoke_argv+=("--launcher=$_t"); done
   # The reference is a LOCAL gcc build, so it always runs natively — no launcher.
   [[ -n "$REF_CLI" ]] && _smoke_argv+=(--reference "$REF_CLI")
   # ★ THE LEG'S RUNTIME ENVIRONMENT, APPLIED IN A SUBSHELL. Two things are
@@ -3853,12 +4060,13 @@ STAGE_FAILS=0
 # `./libtestloadext.so` (`./testloadext.dll` on a Windows Tcl) resolves HERE. The
 # harness passes no --testdir override.
 SQLITE_TESTDIR_SUBDIR="testdir"
-# How a shared object is produced — DECLARED by the leg (`build.sharedLibFlags` in
-# legs.json), not pattern-matched off its format name here. This used to be a
-# `case "${LEG_SPEC[$1]##*:}" in macho64-*)` in this file, i.e. a second, private
-# opinion about object formats sitting a long way from the catalogue that already
-# has one; a new format would have had to be taught to both.
-leg_shared_flags() { printf '%s' "${LEG_SHARED_FLAGS[$1]}"; }
+# ⓘ `leg_shared_flags()` USED TO LIVE HERE and is deliberately GONE, not moved to
+# a second place. `build.sharedLibFlags` is still declared per leg and still used
+# — but only by the CONTROL arm, whose argv harness_legs.py now assembles
+# (`loadext_helper_reference_argv`). The primary arm is DSS, which takes an object
+# format and not a flag list. A wrapper here with no caller is dead config that
+# reads as configuration, and this project has paid for that shape before; the
+# declaration's one consumer is now the one file both drivers share.
 # [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO] Stage the helper shared object the
 # loadext corpus dlopen()s, built for THE LEG'S TARGET.
 #
@@ -3913,12 +4121,18 @@ leg_shared_flags() { printf '%s' "${LEG_SHARED_FLAGS[$1]}"; }
 # curating the corpus to get green is forbidden. The cost is stated plainly in the
 # verdict detail so a reader knows what this run did not cover.
 #
-# The compiler was RESOLVED at Step 6, from the leg's own declared
-# `targetCc.candidates` AND verified against this leg's target, and a leg that
-# could not resolve one never reaches this function (it carries
-# `skipped-build-input-missing` and its corpus is not run). What must never happen
-# is a fallback to the host compiler: that is precisely the defect above, and it
-# is invisible in the results.
+# ★★★ WHO BUILDS IT, SINCE 2026-08-05: DSS ITSELF, FOR THE LEG'S DECLARED
+# `sharedLibFormat` — so this function no longer needs ANY third-party compiler and
+# no leg's corpus depends on one being installed here [D-HARNESS-CROSS-HOST-ANY-
+# TARGET]. The leg's verified target compiler is now the optional CONTROL arm
+# (Step 6), built beside the primary where it exists and STAGED only when the
+# operator asks (DSS_LOADEXT_HELPER=reference). A leg with neither used to record
+# `skipped-build-input-missing` and skip ~330,000 units; it now simply runs.
+# What must STILL never happen is a fallback to a compiler that targets something
+# else — that is the defect above, and it is invisible in the results. The
+# resolver refuses it in both directions: a candidate must PROVE its target with
+# `-dumpmachine`, and a failed DSS build is `poisoned` rather than quietly rebuilt
+# by the other arm.
 # >>> dss:loadext-stage >>>
 # EXTRACTED AND EXECUTED by test-confound-scope.sh, at top level, under this
 # driver's exact shell options — the same treatment the confound classifier and
@@ -3926,40 +4140,102 @@ leg_shared_flags() { printf '%s' "${LEG_SHARED_FLAGS[$1]}"; }
 # test would stay green while the shipped function broke. The battery there
 # asserts the target-keyed NAME, every RETURN path, and — the red-on-disable that
 # matters most — that this block contains no `die`.
+#
+# ★★★ THE BUILD ITSELF LIVES IN harness_legs.py, NOT HERE, AND THAT IS THE POINT.
+# This function is now a THIN CALL: it hands the resolver the paths only this
+# driver knows and turns ONE report into ONE verdict. Everything that decides —
+# which compiler, which object format, whether the artefact is actually a
+# loadable shared library, whether a control was possible — is in the file both
+# drivers already hard-require, so build-and-test.ps1 gets the identical
+# capability from the identical code. That is what stops the pair-gap this
+# project keeps paying for (a capability in one driver and not the other is a
+# silent harness bug), and it is why the .ps1 can finally stage a helper at all:
+# it never could, because it had no way to build one for a target its own host
+# has no compiler for [D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-
+# UNDECLARED].
+#
+# TWO FAILURE CLASSES, NOT ONE — this is why the return codes are 1 and 2:
+#   1  poisoned                    a REAL failure. The primary build produced no
+#                                  loadable library. The run must not exit 0.
+#   2  skipped-build-input-missing ENVIRONMENTAL. The operator asked for the
+#                                  CONTROL arm (DSS_LOADEXT_HELPER=reference) and
+#                                  this machine has no verified target compiler.
+#                                  Nothing is wrong; the default would have run.
+# Folding these into one code is what would let an operator-selected control arm
+# red a run in which nothing is broken — the resolver names the class, and this
+# function only translates it.
+
+# loadext_field <json> <key> -> the one string, flattened to a single line.
+# Same shape and the same reason as acq_field above: the report is JSON, python3
+# is already a hard requirement of this driver, and a bash-side regex over JSON
+# is how a driver comes to read a truncated reason and print it as the whole one.
+# ★ INSIDE the extracted block ON PURPOSE. test-confound-scope.sh runs the shipped
+# staging function verbatim; a reader function defined outside would have to be
+# RE-IMPLEMENTED in the test, and a re-implementation is exactly what lets the
+# test stay green while the shipped code breaks.
+# A key that is absent (or output that is not JSON at all — the resolver's own
+# FATAL line) returns non-zero rather than an empty string, so the caller's `||`
+# branch can say so instead of printing a confident blank.
+loadext_field() {              # loadext_field <json> <key>
+  python3 -c 'import json, sys
+try:
+    report = json.load(sys.stdin)
+except ValueError:
+    sys.exit(3)
+value = report.get(sys.argv[1])
+if value is None:
+    sys.exit(4)
+sys.stdout.write(" ".join(str(value).split()))' "$2" <<< "$1"
+}
 STAGE_WHY=""
-stage_loadext_extension() {    # stage_loadext_extension <leg> <rundir>  -> 0 | 1
-  local leg="$1" rundir="$2"
-  local cc="${LEG_CC[$leg]}"
+STAGE_CROSSCHECK=""
+stage_loadext_extension() {    # stage_loadext_extension <leg> <rundir> -> 0 | 1 | 2
+  local leg="$1" rundir="$2" _json _rc=0 _klass
   local name="${LEG_LOADEXT_NAME[$leg]:-}"
-  local src="$SQLITE_DIR/src/test_loadext.c"
-  STAGE_WHY=""
-  if [[ -z "$name" ]]; then
-    STAGE_WHY="this leg declares no build.loadExtHelperName, so the harness does not know what file sqlite's test/loadext.test will look for on ${LEG_SPEC[$leg]}. Staging it under a guessed name is invisible to the corpus, which then builds its own with a hardcoded compiler. Declare it in legs.json (harness_legs.py --lint checks it against the target OS)."
-    return 1
-  fi
-  local dst="$rundir/$SQLITE_TESTDIR_SUBDIR/$name"
-  local log="$OUT_DIR/$leg/loadext-helper.log"
-  if [[ ! -f "$src" ]]; then
-    STAGE_WHY="sqlite extension source not found: $src — the staged tree is incomplete, so no leg's helper can be built from it."
-    return 1
-  fi
-  if ! command -v "$cc" >/dev/null 2>&1; then
-    STAGE_WHY="the target C compiler '$cc' resolved at Step 6 (it reported '${LEG_CC_MACHINE[$leg]:-<unrecorded>}') is NO LONGER on PATH. NOT falling back to the host compiler: sqlite's loadext.test would then build a wrong-target extension the $leg fixture cannot load, and every loadext-* test would false-red as a genuine DSS failure [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO]."
-    return 1
-  fi
-  mkdir -p "$(dirname "$dst")" "$(dirname "$log")" || {
-    STAGE_WHY="could not create the run's testdir ($(dirname "$dst")) — check free space and permissions."
+  local dstdir="$rundir/$SQLITE_TESTDIR_SUBDIR"
+  local work="$OUT_DIR/$leg/loadext-helper"
+  STAGE_WHY=""; STAGE_CROSSCHECK=""
+  mkdir -p "$dstdir" "$work" || {
+    STAGE_WHY="could not create the run's testdir ($dstdir) or the helper's work dir ($work) — check free space and permissions."
     return 1
   }
-  # leg_shared_flags is a deliberate word-split flag list. The compiler's own
-  # diagnostics go to a per-leg log so the ledger line stays one line and the
-  # evidence survives; rc is taken DIRECTLY off the compiler, never after a pipe.
-  if ! "$cc" $(leg_shared_flags "$leg") -I"$SQLITE_DIR/src" -I"$BLD" -o "$dst" "$src" >"$log" 2>&1; then
-    STAGE_WHY="the loadext helper did not build: $cc $(leg_shared_flags "$leg") -I$SQLITE_DIR/src -I$BLD -o $dst $src  [full diagnostics: $log]  first line: $(head -1 "$log" 2>/dev/null || printf '<empty log>')"
-    return 1
-  fi
-  info "[$leg] loadext helper -> $dst (built by $cc, which reports '${LEG_CC_MACHINE[$leg]:-<unrecorded>}')"
-  return 0
+  # rc DIRECTLY off python3, never after a pipe, and the `if` keeps errexit out of
+  # it — `_json="$(…)"; _rc=$?` would EXIT on rc 3/4 before the class could be
+  # read, which is the trap that once shipped an entire verdict classifier as
+  # DEAD CODE. stderr joins stdout: the resolver puts its FATAL line there and
+  # this function must be able to quote it.
+  #
+  # ★ `--reference-cc "${LEG_CC[$leg]:-}"` IS ALLOWED TO BE EMPTY, and that is the
+  # whole de-host-locking. Empty = "no verified target compiler on this machine",
+  # which costs the leg its CONTROL and nothing else. It is never a guess: it is
+  # exactly what `--resolve-target-cc` accepted at Step 6, or nothing.
+  if _json="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+                --build-loadext-helper "$leg" \
+                --helper-builder "$LOADEXT_BUILDER" \
+                --dss "$DSS_BIN" \
+                --sqlite-src "$SQLITE_DIR/src" --sqlite-bld "$BLD" \
+                --dest-dir "$dstdir" --work-dir "$work" \
+                --dss-config "$DSS_CONFIG" \
+                --reference-cc "${LEG_CC[$leg]:-}" \
+                --reference-machine "${LEG_CC_MACHINE[$leg]:-}" 2>&1)"; then _rc=0; else _rc=$?; fi
+  # The report is on stdout on EVERY outcome — a driver needs the detail most when
+  # it failed — so the fields are read the same way either way. Flattened to one
+  # line each: they become ledger DETAILs, which Step 9 prints per leg.
+  _klass="$(loadext_field "$_json" verdictClass)" || _klass="?"
+  STAGE_WHY="$(loadext_field "$_json" detail)" || STAGE_WHY="the helper build reported nothing this driver could read; raw output: $(printf '%s' "$_json" | tr '\n' ' ')"
+  STAGE_CROSSCHECK="$(loadext_field "$_json" crossCheck)" || STAGE_CROSSCHECK=""
+  case "$_rc" in
+    0) info "[$leg] loadext helper -> $(loadext_field "$_json" staged) — $STAGE_WHY"
+       [[ -z "$STAGE_CROSSCHECK" ]] || info "      $STAGE_CROSSCHECK"
+       return 0 ;;
+    4) return 2 ;;                        # skipped-build-input-missing
+    3) return 1 ;;                        # poisoned
+    *) # rc 2 = the resolver's own FATAL (a catalogue/usage defect), or anything
+       # else. A class this driver does not recognise is POISONED, never assumed
+       # benign: an unreadable outcome is not evidence that the helper is there.
+       STAGE_WHY="the helper build exited $_rc, which this driver does not recognise as a verdict class (${_klass}). Treating it as a failure rather than assuming the helper was staged. Raw: $(printf '%s' "$_json" | tr '\n' ' ' | cut -c1-600)"
+       return 1 ;;
+  esac
 }
 # <<< dss:loadext-stage <<<
 for leg in "${LEG_ORDER[@]}"; do
@@ -4025,7 +4301,25 @@ for leg in "${LEG_ORDER[@]}"; do
   # `die`d, so one leg's link error ended a run in which two legs had already
   # gone green (D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN).
   # >>> dss:loadext-verdict >>>
-  if ! stage_loadext_extension "$leg" "$rundir"; then
+  # ★ TWO CLASSES, AND THE `if`/`else _stage_rc=$?` SHAPE IS LOAD-BEARING: a plain
+  # `stage_loadext_extension …; rc=$?` under `set -Eeuo pipefail` + the ERR trap
+  # EXITS on the non-zero BEFORE the assignment, which is how a classifier ships
+  # as dead code. Both branches record a NAMED verdict from the closed vocabulary
+  # in tests/test_support/arm_verdict_ledger.hpp and CONTINUE to the next leg.
+  _stage_rc=0
+  if stage_loadext_extension "$leg" "$rundir"; then _stage_rc=0; else _stage_rc=$?; fi
+  if [[ "$_stage_rc" -eq 2 ]]; then
+    # ENVIRONMENTAL, and it can ONLY happen when the operator asked for the
+    # control arm — the default builder needs nothing from this machine. It does
+    # NOT feed $STAGE_FAILS: nothing failed, so this must not red a run.
+    # `leg_marks_missing` is the established path for exactly this class and it
+    # preserves the displaced run verdict in the detail.
+    leg_marks_missing "$leg" "its corpus is NOT run (the fixture DID build: ${FIXTURE[$leg]})" \
+      "DSS_LOADEXT_HELPER=$LOADEXT_BUILDER was requested and this host cannot provide that arm. $STAGE_WHY"
+    UNIT_VERDICT["$leg"]="not run [skipped-build-input-missing] — $STAGE_WHY"
+    continue
+  fi
+  if [[ "$_stage_rc" -ne 0 ]]; then
     STAGE_FAILS=$((STAGE_FAILS + 1))
     LEG_VERDICT["$leg"]="poisoned"
     LEG_VERDICT_DETAIL["$leg"]="the fixture BUILT (${FIXTURE[$leg]}), but this leg's loadext helper extension ('${LEG_LOADEXT_NAME[$leg]:-<undeclared>}') could not be staged, so its corpus was NOT run and this run covers NONE of its units. $STAGE_WHY"

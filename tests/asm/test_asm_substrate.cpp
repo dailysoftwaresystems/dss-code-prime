@@ -151,41 +151,76 @@ TEST(AsmSubstrate, AssembledModuleCarriesDataItemsField) {
 // D-LK2-RODATA CLOSED 2026-06-02: PE walker emits `.rdata`.
 // D-LK1-ELF-EXEC-DATA-SECTIONS CLOSED: the ELF ET_EXEC walker emits
 // `.rodata` (both x86_64 and aarch64 exec formats declare the row +
-// `supportedDataSections: ["rodata"]`). The FLIP-MARKER for PE and
-// BOTH ELF exec formats is now NE(nullptr). Mach-O (D-LK3-RODATA)
-// remains anchored; its assertion stays EQ(nullptr) until that
-// walker arm closes.
+// `supportedDataSections: ["rodata"]`).
+// D-LK3-RODATA (Mach-O) CLOSED: the MH_EXECUTE walker emits a loadable
+// `__TEXT,__const` from `AssembledModule.dataItems` — the SAME
+// `exec_data_section.hpp` substrate (`buildExecDataSection` /
+// `addDataSymbolVas`) the ELF arm uses, read through `sectionByKind`
+// with zero format-name branches. The arm landed with
+// `macho64-arm64-darwin-exec` (runtime-witnessed on Apple Silicon);
+// `macho64-x86_64-darwin-exec` joined it on 2026-08-05 — MEASURED, its
+// emitted image carries `__TEXT,__const addr=0x1000010e0 size=0x2` for
+// a `const char msg[]="x"` TU. So the flip this test's old EQ(nullptr)
+// branch instructed ("flip this EQ to NE when that closes") is now
+// done, and the macho execs join the sweep rather than sitting in a
+// hand-written negative branch: ONE list, every shipped exec format,
+// every walker arm closed.
 TEST(AsmSubstrate, ShippedExecFormatsRodataSectionPerWalkerArm) {
-    // PE + ELF (x86_64 + aarch64): walker arms CLOSED — must declare
-    // the row. ELF arm closure = D-LK1-ELF-EXEC-DATA-SECTIONS; both
-    // arches share the SAME elf.cpp code path (arch differs only via
-    // config), so both must declare the rodata section row.
+    // Every shipped EXEC format: its rodata walker arm is CLOSED, so
+    // each must declare the row the walker reads at emit time. Per-arch
+    // pairs are listed BOTH times on purpose — each pair shares one
+    // writer code path (arch differs only via config), so a missing row
+    // on one of a pair is a config regression the other would hide.
     for (auto const* formatName : {
              "pe64-x86_64-windows-exec",
              "elf64-x86_64-linux-exec",
-             "elf64-aarch64-linux-exec"}) {
+             "elf64-aarch64-linux-exec",
+             "macho64-x86_64-darwin-exec",
+             "macho64-arm64-darwin-exec"}) {
         auto fmt = ObjectFormatSchema::loadShipped(formatName);
         ASSERT_TRUE(fmt.has_value()) << formatName;
         EXPECT_NE((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
             << formatName
             << ": its rodata walker arm is CLOSED (D-LK2-RODATA for "
-               "PE / D-LK1-ELF-EXEC-DATA-SECTIONS for ELF) — the format "
-               "JSON must declare a rodata (`.rdata` / `.rodata`) "
+               "PE / D-LK1-ELF-EXEC-DATA-SECTIONS for ELF / "
+               "D-LK3-RODATA for Mach-O) — the format JSON must declare "
+               "a rodata (`.rdata` / `.rodata` / `__TEXT,__const`) "
                "section row that the walker reads at emit time. If this "
                "fails, the JSON row was removed without re-anchoring "
                "the walker arm.";
     }
-    // Mach-O: walker arm still anchored (D-LK3-RODATA) — must NOT yet
-    // declare the row. When the walker arm closes, flip this EQ to NE.
-    {
-        auto fmt = ObjectFormatSchema::loadShipped(
-            "macho64-x86_64-darwin-exec");
-        ASSERT_TRUE(fmt.has_value());
-        EXPECT_EQ((*fmt)->sectionByKind(SectionKind::Rodata), nullptr)
-            << "macho64-x86_64-darwin-exec declares a rodata section "
-               "row — the matching walker arm (D-LK3-RODATA for Mach-O) "
-               "must land in the SAME slice; flip this assertion from "
-               "EQ(nullptr) to NE(nullptr) when that closes.";
+    // ★ The row alone is not the contract — a format may declare a
+    // `sections[]` row and still not ADMIT the items (the linker's
+    // pre-walker gate reads `supportedDataSections`, a SEPARATE key).
+    // Pin both halves together: a format carrying the row but not the
+    // opt-in accepts nothing, and one carrying the opt-in but not the
+    // row is worse still — MEASURED 2026-08-05 on
+    // macho64-x86_64-darwin-exec, that combination returns from
+    // `encodeExecDynamic` with NO diagnostic and the caller reports
+    // the generic `K_ImageEmpty` ("the walker returned success with no
+    // output"), because the `hasConst && secConst == nullptr` guard at
+    // src/link/format/macho.cpp:2753 is a bare `return {}` while its
+    // `hasData`/`hasBss` siblings ten lines below each emit a
+    // `K_NoMatchingObjectFormat` naming the missing row. This
+    // assertion cannot fix that walker asymmetry (it is a src/link
+    // defect, anchored separately) but it does stop THIS pair of keys
+    // from drifting apart in the shipped configs, which is the only
+    // way the shipped pipeline reaches it.
+    for (auto const* formatName : {
+             "pe64-x86_64-windows-exec",
+             "elf64-x86_64-linux-exec",
+             "elf64-aarch64-linux-exec",
+             "macho64-x86_64-darwin-exec",
+             "macho64-arm64-darwin-exec"}) {
+        auto fmt = ObjectFormatSchema::loadShipped(formatName);
+        ASSERT_TRUE(fmt.has_value()) << formatName;
+        EXPECT_TRUE((*fmt)->acceptsDataSection(DataSectionKind::Rodata))
+            << formatName
+            << ": it declares a rodata `sections[]` row but does NOT "
+               "list `rodata` in `supportedDataSections`, so the "
+               "linker's pre-walker gate rejects every rodata item and "
+               "the row is dead config. The two keys must move "
+               "together.";
     }
 }
 
