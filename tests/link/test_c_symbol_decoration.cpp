@@ -38,6 +38,7 @@
 //       reds instead of passing silently.
 
 #include "core/types/object_format_kind.hpp"
+#include "link/object_format_backend.hpp"
 #include "link/object_format_schema.hpp"
 #include "format_reject_support.hpp"   // countAtPath / errorCount / rejectSummary
 #include "repo_root.hpp"
@@ -338,7 +339,12 @@ TEST(CSymbolDecorationValidate, HandBuiltSchemaLeftAtTheSentinelIsRejected) {
     // hand-built precedent).
     dss::detail::ObjectFormatData data;
     data.name               = "synth-csd";
-    data.kind               = ObjectFormatKind::Elf;
+    // TF-C125: a hand-built `ObjectFormatData` now names its format by
+    // resolving the BACKEND, exactly as the loader does. `data.kind` is
+    // gone — the field defaulted to `ObjectFormatKind::Elf`, so a
+    // default-constructed struct silently claimed an ELF identity with
+    // `elf.machine == 0`; the pointer's default is null and fails closed.
+    data.backend            = dss::link::objectFormatBackendByConfigName("elf");
     data.dataModel          = DataModel::Lp64;
     data.headerNameMatching = HeaderNameMatching::CaseSensitive;
     data.elf.fileClass      = 2;   // ELFCLASS64
@@ -383,42 +389,50 @@ TEST(CSymbolDecorationValidate, HandBuiltSchemaLeftAtTheSentinelIsRejected) {
 // rejection from all of them. Gate the rule on any of those and this reds.
 TEST(CSymbolDecorationValidate, RuleIsUNCONDITIONALAcrossEveryFlavorAxis) {
     struct Flavor {
-        char const*      label;
-        ObjectFormatKind kind;
+        char const* label;
+        // TF-C125: the format is named by its CONFIG SPELLING and resolved
+        // through the registry, the same path `loadFromText` takes — so this
+        // table can no longer name a format the engine does not implement.
+        char const* configName;
         // applied after the common fields
         void (*shape)(dss::detail::ObjectFormatData&);
     };
 
     Flavor const flavors[] = {
-        {"elf-rel", ObjectFormatKind::Elf,
+        {"elf-rel", "elf",
          [](dss::detail::ObjectFormatData& d) {
              d.elf.fileClass = 2; d.elf.dataEncoding = 1; d.elf.machine = 62;
              d.elf.objectType = ElfObjectType::Rel;
          }},
-        {"elf-rel-archive", ObjectFormatKind::Elf,
+        {"elf-rel-archive", "elf",
          [](dss::detail::ObjectFormatData& d) {
              d.elf.fileClass = 2; d.elf.dataEncoding = 1; d.elf.machine = 62;
              d.elf.objectType = ElfObjectType::Rel;
              d.container = ObjectFormatContainer::Archive;
          }},
-        {"pe-obj", ObjectFormatKind::Pe,
+        {"pe-obj", "pe",
          [](dss::detail::ObjectFormatData& d) {
              d.pe.machine = 0x8664; d.pe.objectType = PeObjectType::Obj;
          }},
-        {"macho-object", ObjectFormatKind::MachO,
+        {"macho-object", "macho",
          [](dss::detail::ObjectFormatData& d) {
              d.macho.cputype = 0x0100000C;
              d.macho.filetype = MachOObjectType::Object;
          }},
-        {"wasm", ObjectFormatKind::Wasm, [](dss::detail::ObjectFormatData&) {}},
-        {"spirv", ObjectFormatKind::Spirv, [](dss::detail::ObjectFormatData&) {}},
+        {"wasm", "wasm", [](dss::detail::ObjectFormatData&) {}},
+        {"spirv", "spirv", [](dss::detail::ObjectFormatData&) {}},
     };
 
     for (auto const& f : flavors) {
         SCOPED_TRACE(f.label);
         dss::detail::ObjectFormatData data;
         data.name               = f.label;
-        data.kind               = f.kind;
+        data.backend            =
+            dss::link::objectFormatBackendByConfigName(f.configName);
+        ASSERT_NE(data.backend, nullptr)
+            << "no backend claims config spelling '" << f.configName
+            << "' — the registry FAILS CLOSED, so an unresolved spelling here\n"
+               "would silently produce a format with no identity rules at all";
         data.dataModel          = DataModel::Lp64;
         data.headerNameMatching = HeaderNameMatching::CaseSensitive;
         f.shape(data);

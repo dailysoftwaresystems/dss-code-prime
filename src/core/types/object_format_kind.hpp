@@ -19,12 +19,28 @@
 // rather than `src/link/` so non-linker layers can speak the kind
 // without pulling in `link/object_format_schema.hpp`'s full
 // 800-LOC substrate. Concrete callers:
-//   * `src/ffi/`     — FF4 C-mangling dispatches on
-//                      `ObjectFormatKind` (per-format
-//                      leading-underscore rule);
-//                      `synthesizeFfiFromSourceDecls` reports the
+//   * `src/ffi/`     — `synthesizeFfiFromSourceDecls` reports the
 //                      kind in `F_FfiNoImportLibraryForFormat`
-//                      diagnostics.
+//                      diagnostics; `abi_catalog.cpp`'s `kAbiCatalog`
+//                      still SELECTS THE CALLING CONVENTION from a
+//                      table keyed on (target name, this enum) — an
+//                      OPEN identity branch, anchored at [[D-FFI-ABI-
+//                      CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-
+//                      IDENTITY]], NOT a sanctioned use.
+//                      ⚠ THIS BULLET USED TO READ "FF4 C-mangling
+//                      dispatches on `ObjectFormatKind` (per-format
+//                      leading-underscore rule)", which `c_mangle.cpp`
+//                      has CONTRADICTED since TF-C122 deleted
+//                      `kCManglingRules` and made decoration a DECLARED
+//                      per-format verb. Corrected TF-C125.
+//   * `src/program/` — `compile_pipeline.cpp`'s archive-member reader
+//                      switch, `program.cpp`'s `.obj`/`.o` member-
+//                      extension pick, and `cross_validate_target_
+//                      format.cpp`'s machine-code switch — also OPEN
+//                      identity branches of the same species, MEASURED
+//                      in TF-C125 and anchored. Listed so the next
+//                      reader does not mistake "it is in this list"
+//                      for "it is sanctioned".
 //   * `src/core/types/grammar_schema_json.cpp` — semantic config
 //                      loader validates the per-language
 //                      `externLibraryByFormat` map keys against
@@ -32,6 +48,12 @@
 //                      (catches a typo like `"pee"` instead of
 //                      `"pe"` at config load rather than at compile
 //                      time).
+//   ★ `src/link/` IS NO LONGER A CALLER, and that is the TF-C125 result.
+//     The object-format schema tier resolves an `ObjectFormatBackend`
+//     instead, and its two loader TUs carry a COMPILE-ERROR PIN that makes
+//     this enum's name AMBIGUOUS inside them: `ObjectFormatKind::Elf` is
+//     unspellable there, not merely absent
+//     (D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES).
 // Same extraction precedent as `section_kind.hpp` (which left
 // `link/object_format_schema.hpp` as the umbrella header so every
 // existing consumer continues to work without changing its
@@ -91,6 +113,27 @@ objectFormatKindFromName(std::string_view s) noexcept {
 isSelectableObjectFormatKind(ObjectFormatKind k) noexcept {
     return k != ObjectFormatKind::Unknown;
 }
+
+// The reserved SPELLING of the invalid sentinel, as it appears in a config
+// file. Derived from the shared name table rather than written out, so it
+// cannot drift from the enum.
+//
+// ★ WHY A NAME-LEVEL FORM EXISTS AT ALL (TF-C125). The format loader must
+// still distinguish "you wrote the reserved word `unknown`" from "you wrote a
+// spelling nobody claims" — two different author mistakes that earn two
+// different diagnostics — but after the identity-branch removal that TU cannot
+// spell `ObjectFormatKind::Unknown`, and must not: it resolves a declared
+// spelling to a BACKEND, and no backend claims the sentinel. Comparing a
+// declared spelling against the reserved spelling is config-vocabulary against
+// config-vocabulary, which is the one shape the ruling does permit.
+inline constexpr std::string_view kObjectFormatKindSentinelName =
+    kObjectFormatKindTable.name(ObjectFormatKind::Unknown);
+
+[[nodiscard]] constexpr bool
+isObjectFormatKindSentinelName(std::string_view s) noexcept {
+    return s == kObjectFormatKindSentinelName;
+}
+
 
 inline constexpr std::string_view kObjectFormatKindSentinelRejection =
     "'unknown' is the invalid sentinel, not a selectable object format — it "
@@ -586,10 +629,22 @@ struct DSS_EXPORT LibrarySynthesis {
 //     nothing, so a request on an ELF target fails LOUD.
 //
 // WHICH header field / load command a declared reserve lands in. A vehicle
-// names a structure of ONE image format, so the loader cross-checks it
-// against `format.kind` (a config-coherence rule, not an engine branch):
-// declaring `pe-optional-header` on an ELF schema is dead config whose
-// request the ELF walker would silently drop.
+// names a structure of ONE image format, so the loader cross-checks it against
+// the backend that IMPLEMENTS the vehicle: declaring `pe-optional-header` on an
+// ELF schema is dead config whose request the ELF walker would silently drop.
+//
+// ★ THE SENTENCE THAT USED TO SIT HERE — *"the loader cross-checks it against
+// `format.kind` (a config-coherence rule, not an engine branch)"* — WAS STRUCK
+// IN TF-C125, together with its twin in `object_format_schema_json.cpp` which
+// defended the same `kVehicleKinds` table as *"a TABLE … not an if-chain"*.
+// Both were wrong in the same way: a table keyed on format identity carries the
+// identity dependency it claims to avoid, because every consumer must know an
+// identity to index it. The operator's ruling ("we must never have identity
+// branches") admits no loader exception, and the precedent is `kCManglingRules`
+// — DELETED in TF-C122, not relocated. The cross-check now asks
+// `ObjectFormatBackend::stackReserveVehicles()` which backend implements the
+// vehicle. Recorded rather than silently deleted, because the two comments are
+// exactly what would re-authorize the pattern for the next reader.
 //
 // Exactly ONE vehicle ships today because exactly one walker arm
 // implements one (`src/link/format/pe.cpp`). `macho-lc-main` is the

@@ -15,6 +15,7 @@
 //     return nullptr on miss.
 
 #include "core/types/parse_diagnostic.hpp"
+#include "link/object_format_backend.hpp"
 #include "link/object_format_schema.hpp"
 #include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 
@@ -1573,7 +1574,12 @@ TEST(StaticLibraryFormats, ArchiveContainerRejectedOnImageFlavor) {
     // reason that has nothing to do with containers.
     data.cSymbolDecoration.scheme = CSymbolDecorationScheme::None;
     data.name             = "synth-staticlib";
-    data.kind             = ObjectFormatKind::Elf;
+    // TF-C125: a hand-built `ObjectFormatData` now names its format by
+    // resolving the BACKEND, exactly as the loader does. `data.kind` is
+    // gone — the field defaulted to `ObjectFormatKind::Elf`, so a
+    // default-constructed struct silently claimed an ELF identity with
+    // `elf.machine == 0`; the pointer's default is null and fails closed.
+    data.backend          = dss::link::objectFormatBackendByConfigName("elf");
     data.dataModel        = DataModel::Lp64;
     data.elf.fileClass    = 2;   // ELFCLASS64
     data.elf.dataEncoding = 1;   // ELFDATA2LSB

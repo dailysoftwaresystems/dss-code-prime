@@ -187,3 +187,15 @@ dss_add_test(NAME link/test_object_format_family_symmetry
              SOURCES test_object_format_family_symmetry.cpp)
 target_link_libraries(dss_link_test_object_format_family_symmetry
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES (TF-C125) — the
+# backend seam. Fail-closed resolution FIRST (a null backend that meant "skip
+# the rules" would let all 24 formats validate clean while validating nothing),
+# then a whole-family MUTATION PROBE: break each required identity field of each
+# shipped format and demand a reject at that exact JSON pointer. Reads the
+# shipped `.format.json` files and mutates them in memory, so the fixtures
+# cannot drift from what we ship — hence the json link.
+dss_add_test(NAME link/test_object_format_backend_registry
+             SOURCES test_object_format_backend_registry.cpp)
+target_link_libraries(dss_link_test_object_format_backend_registry
+                      PRIVATE nlohmann_json::nlohmann_json)

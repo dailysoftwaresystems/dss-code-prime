@@ -12,6 +12,7 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/symbol_attrs.hpp"        // SymbolBinding / SymbolVisibility (lifted to core/types for MIR-tier producers)
 #include "core/types/target_schema.hpp"       // EnumNameTable<E,N>
+#include "link/object_format_backend.hpp"     // D-LINK-…-KIND-IDENTITY-BRANCHES: the format-identity SEAM
 
 #include <array>
 #include <cstdint>
@@ -745,7 +746,24 @@ struct DSS_EXPORT ObjectFormatData {
     ObjectFormatSchemaId id{};
     std::string          name;         // "elf64-x86_64-linux" etc.
     std::string          version;
-    ObjectFormatKind     kind = ObjectFormatKind::Elf;
+
+    // ── D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES ──
+    //
+    // WAS: `ObjectFormatKind kind = ObjectFormatKind::Elf;` — a field that
+    // both (a) let 26 sites in this tier ask "which format is this?" and
+    // (b) DEFAULTED TO ELF, so a default-constructed `ObjectFormatData`
+    // silently claimed an ELF identity with `elf.machine == 0` (EM_NONE).
+    //
+    // NOW: the resolved backend, or `nullptr`. Null is the invalid sentinel
+    // and it FAILS CLOSED at every reader — `validate()` refuses the
+    // document, `isImageFlavor()`/`isExecFlavor()` answer false,
+    // `allowsUndefinedImports()` answers false (the STRICT direction), and
+    // the linker refuses to walk. There is no default-format path left to
+    // fall into. `ObjectFormatSchema{ObjectFormatData}` remains a public,
+    // validation-free constructor, so this pointer is the one thing standing
+    // between a hand-built struct and the engine; every accessor that reads
+    // it is written to survive it being null.
+    link::ObjectFormatBackend const* backend = nullptr;
 
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): output container ──
     //
@@ -1186,27 +1204,20 @@ struct DSS_EXPORT ObjectFormatData {
     // created exactly the two-copy divergence this arc is closing.)
     // See the public forwarder for the full semantics + the ET_DYN
     // caveat.
+    // ★ THE DERIVATION MOVED TO THE BACKENDS; IT DID NOT COLLAPSE INTO A
+    // DECLARED FLAG. The ELF backend still re-derives the ET_DYN PIE shape
+    // from ALL FOUR cluster members (interpreter + processExit +
+    // entryCallingConvention + processArgs) rather than trusting one of
+    // them, for the reason this function has always carried: a hand-built,
+    // validate-bypassing `ObjectFormatData` must not be able to fake a PIE
+    // by setting a single field, and `ObjectFormatSchema{ObjectFormatData}`
+    // is a public constructor that runs no validation. Had this become a
+    // declared `"execFlavor": true` key, the single-field fake would be
+    // handed straight back. See `elf_backend.cpp`.
+    //
+    // Null backend ⇒ false: an unresolved format is not an executable.
     [[nodiscard]] bool isExecFlavor() const noexcept {
-        // ELF ET_DYN PIE shape: the c151 D-LK1-4 entry cluster, all
-        // four members. `validate()` pins the cluster ALL-OR-NONE
-        // (object_format_schema.cpp `clusterCount`), so any one member
-        // is a faithful witness of the other three on a LOADED schema;
-        // all four are re-derived here anyway so a hand-built
-        // (validate-bypassing) ObjectFormatData cannot fake a PIE with
-        // a single field.
-        bool const elfDynPieShape =
-            kind == ObjectFormatKind::Elf
-         && elf.objectType == ElfObjectType::Dyn
-         && !elf.interpreter.empty()
-         && processExit.has_value()
-         && !entryCallingConvention.empty()
-         && processArgs.has_value();
-        return (kind == ObjectFormatKind::Elf
-                && (elf.objectType == ElfObjectType::Exec || elfDynPieShape))
-            || (kind == ObjectFormatKind::Pe
-                && pe.objectType == PeObjectType::Exec)
-            || (kind == ObjectFormatKind::MachO
-                && macho.filetype == MachOObjectType::Execute);
+        return backend != nullptr && backend->isExecFlavor(*this);
     }
 };
 
@@ -1225,7 +1236,34 @@ public:
     [[nodiscard]] ObjectFormatSchemaId id()      const noexcept { return d_.id; }
     [[nodiscard]] std::string_view     name()    const noexcept { return d_.name; }
     [[nodiscard]] std::string_view     version() const noexcept { return d_.version; }
-    [[nodiscard]] ObjectFormatKind     kind()    const noexcept { return d_.kind; }
+    // ★ THE BRIDGE ACCESSOR — kept for the identity branches that still live
+    // OUTSIDE this cycle's authorized file set (`src/program/compile_pipeline
+    // .cpp`, `src/program/program.cpp`, `src/program/cross_validate_target_
+    // format.cpp`, `src/ffi/abi/abi_catalog.cpp` — all anchored, all the same
+    // species). The schema tier cannot even spell `ObjectFormatKind::Elf` any
+    // more — see the compile-error pin at the top of `object_format_schema.cpp`
+    // / `_json.cpp`. When those callers close, this accessor goes with them.
+    //
+    // ⚠ ONE `src/link/` CALLER REMAINS. An earlier draft said "NOTHING in
+    // `src/link/` calls it any more"; an independent audit measured otherwise.
+    // `linker.cpp` sets `LinkedImage::format = schema.kind()` — a value carried
+    // out for consumers and asserted by three tests, never branched on
+    // (`writer.cpp` states that as its own rule, and it holds: no `==`, switch
+    // or table anywhere in `src/` is keyed on `image.format`).
+    // Null backend ⇒ `Unknown`, the project's universal invalid sentinel —
+    // never a spurious ELF identity, which is exactly what the old
+    // `ObjectFormatKind kind = ObjectFormatKind::Elf` default produced.
+    [[nodiscard]] ObjectFormatKind kind() const noexcept {
+        return d_.backend != nullptr ? d_.backend->kind()
+                                     : ObjectFormatKind::Unknown;
+    }
+    // The resolved backend, or nullptr when the document declared no
+    // resolvable format. `src/link/format/`'s walkers compare THIS against
+    // their own singleton to police their public entry points — a pointer
+    // identity on an opaque handle, not an enumerator comparison.
+    [[nodiscard]] link::ObjectFormatBackend const* backend() const noexcept {
+        return d_.backend;
+    }
     // D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): the output container —
     // `Archive` iff this format's driver output is an `ar` static
     // library (`.a`/`.lib`) bundling relocatable members. The driver
@@ -1357,17 +1395,10 @@ public:
     // entry/processExit machinery a `.so` / `.dylib` must not
     // declare) — the two predicates diverged at c150 and no longer
     // mirror each other.
+    // The 3-arm `switch (d_.kind)` this used to be is now the backends'
+    // own `isImageFlavor()`. Null backend ⇒ false (fail-closed).
     [[nodiscard]] bool isImageFlavor() const noexcept {
-        switch (d_.kind) {
-            case ObjectFormatKind::Elf:
-                return d_.elf.objectType != ElfObjectType::Rel;
-            case ObjectFormatKind::Pe:
-                return d_.pe.objectType != PeObjectType::Obj;
-            case ObjectFormatKind::MachO:
-                return d_.macho.filetype != MachOObjectType::Object;
-            default:
-                return false;
-        }
+        return d_.backend != nullptr && d_.backend->isImageFlavor(d_);
     }
 
     // Cross-format EXEC-flavor predicate. True iff the schema
@@ -1477,11 +1508,19 @@ public:
     // hand-built validate-bypassing one (dyn + processExit but no
     // interpreter), where the cluster-member spelling is the one
     // that stays honest about what it read.
+    //
+    // ★ NULL-BACKEND DIRECTION, STATED BECAUSE IT IS THE ONE PLACE WHERE
+    // "fail closed" IS NOT THE SAME AS "return false EVERYWHERE". Every other
+    // predicate here answers `false` on a null backend and that IS the strict
+    // answer. Here `true` is the PERMISSIVE answer (it lets an unresolved
+    // extern through to a later binder), and `!isImageFlavor()` is `true` on a
+    // null backend — so the plain relocatable short-circuit would have made an
+    // unresolvable schema the most permissive one in the tree. The explicit
+    // null test below comes FIRST for exactly that reason.
     [[nodiscard]] bool allowsUndefinedImports() const noexcept {
+        if (d_.backend == nullptr) return false;  // unresolved ⇒ strictest
         if (!isImageFlavor()) return true;   // relocatable: later linker resolves
-        return d_.kind == ObjectFormatKind::Elf
-            && d_.elf.objectType == ElfObjectType::Dyn
-            && !d_.processExit.has_value();  // .so only — a PIE is an executable
+        return d_.backend->allowsUndefinedImports(d_);
     }
 
     // Image-side entry-point symbol name. Empty for relocatable

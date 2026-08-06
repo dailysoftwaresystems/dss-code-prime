@@ -37,6 +37,7 @@
 #include "link/entry_trampoline.hpp"
 #include "link/format/elf.hpp"   // entry-gate fold: drive the walker DIRECTLY (gate 6)
 #include "link/linker.hpp"
+#include "link/object_format_backend.hpp"
 #include "link/object_format_schema.hpp"
 #include "link/writer.hpp"
 #include "repo_root.hpp"
@@ -1100,7 +1101,12 @@ makeElfExecFormatData(bool withProcessExit) {
     data.name               = withProcessExit ? "synth-elf-exec-with-exit"
                                               : "synth-elf-exec-no-exit";
     data.version            = "0.1";
-    data.kind               = ObjectFormatKind::Elf;
+    // TF-C125: a hand-built `ObjectFormatData` now names its format by
+    // resolving the BACKEND, exactly as the loader does. `data.kind` is
+    // gone — the field defaulted to `ObjectFormatKind::Elf`, so a
+    // default-constructed struct silently claimed an ELF identity with
+    // `elf.machine == 0`; the pointer's default is null and fails closed.
+    data.backend            = dss::link::objectFormatBackendByConfigName("elf");
     data.dataModel          = DataModel::Lp64;
     // REQUIRED field whose zero value is the INVALID sentinel — a
     // hand-built ObjectFormatData must set it or validate() reports it,

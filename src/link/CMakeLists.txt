@@ -3,8 +3,22 @@ add_library(link OBJECT
     entry_trampoline.cpp
     image_request.cpp
     linker.cpp
+    object_format_backend.cpp
     object_format_schema.cpp
     object_format_schema_json.cpp
+    # D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES (TF-C125).
+    # `object_format_backends.cpp` holds THE table — the one place in the tree
+    # that names every format. The substrate calls into it, which makes each
+    # `*_backend.cpp` below a LINK-TIME dependency: delete one and the build
+    # fails naming the missing symbol. Static self-registration was rejected
+    # precisely because MSVC discards an object file none of whose symbols are
+    # referenced, so a format would vanish with no link error at all.
+    format/object_format_backends.cpp
+    format/elf_backend.cpp
+    format/pe_backend.cpp
+    format/macho_backend.cpp
+    format/wasm_backend.cpp
+    format/spirv_backend.cpp
     format/ar.cpp
     format/elf.cpp
     format/elf_object_reader.cpp

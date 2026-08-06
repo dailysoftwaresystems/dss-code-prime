@@ -1340,61 +1340,57 @@ LinkedImage link(std::span<AssembledModule const> modules,
                        "section (e.g. relocatable .obj).",
                        dataSectionKindName(d.section),
                        objectFormatSchema.name(),
-                       objectFormatKindName(
-                           objectFormatSchema.kind())));
+                       // TF-C125: byte-identical to the old
+                       // `objectFormatKindName(schema.kind())` on every input,
+                       // without the linker naming the enum at all.
+                       link::objectFormatBackendName(
+                           objectFormatSchema.backend())));
             image.resolvedFuncCount = 0;
             return image;
         }
     }
 
-    // Format-keyed dispatch — closed-enum switch, fail-loud on
-    // any format whose walker hasn't landed yet so the substrate
-    // discipline reports the missing walker instead of silently
-    // returning empty bytes.
-    switch (objectFormatSchema.kind()) {
-    case ObjectFormatKind::Unknown:
+    // ── Walker dispatch ─────────────────────────────────────────────────
+    //
+    // WAS a 6-arm `switch (objectFormatSchema.kind())` — one arm per format
+    // plus the `Unknown` sentinel — i.e. the linker enumerating every object
+    // format that exists. That is the hard veto the bar names, and the
+    // TF-C125 ruling admits no exception for it
+    // (D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES).
+    //
+    // The schema arrives carrying the backend the loader resolved it to, so
+    // the linker asks the schema to encode ITSELF. The `Unknown` arm becomes
+    // the null check: a schema with no backend never reached a walker before
+    // either — it just took a longer route to the same refusal.
+    //
+    // ★ AND THIS IS WHAT MAKES THE WALKERS' OWN SELF-GUARDS UNREACHABLE FROM
+    // HERE. `elf::encode` cannot be handed a PE schema through this path: the
+    // only thing that can produce `backend` is the resolver, and the resolver
+    // returns the backend whose `configName()` the document declared. The
+    // guards stay — they defend the PUBLIC free functions, which ~40 direct
+    // callers in `tests/` still use and which two tests explicitly assert
+    // reject a foreign schema — but nothing routed through the linker can
+    // trip them. See the note in `src/link/format/elf.cpp`.
+    if (auto const* backend = objectFormatSchema.backend();
+        backend != nullptr) {
+        // `request` goes to EVERY backend now. That is safe for exactly the
+        // reason the old switch gave for passing it to PE alone: the
+        // pre-walker gate above refuses any request whose vehicle the schema
+        // does not declare, and the LOADER refuses any schema declaring a
+        // vehicle its own backend does not implement
+        // (`ObjectFormatBackend::stackReserveVehicles()`). A walker with no
+        // vehicle can only ever be handed an empty request — "declared but
+        // silently dropped" stays unreachable, now by a capability chain
+        // instead of by a hand-maintained argument list that had to be
+        // remembered.
+        image.bytes = backend->encode(module, targetSchema,
+                                      objectFormatSchema, reporter, request);
+    } else {
         report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                DiagnosticSeverity::Error,
                "linker: format kind 'unknown' is the invalid sentinel; "
                "the object format schema was constructed without a valid "
                "format declaration");
-        break;
-    case ObjectFormatKind::Elf:
-        image.bytes = elf::encode(module, targetSchema,
-                                  objectFormatSchema, reporter);
-        break;
-    case ObjectFormatKind::Pe:
-        // `request` is threaded ONLY to the walkers that implement a
-        // declared vehicle for one of its fields (today: PE, for
-        // `stackReserveControl.vehicle = pe-optional-header`). The other
-        // walkers take no request BY CONSTRUCTION: their formats declare no
-        // capability, so the gate above has already refused any request that
-        // would reach them. A new vehicle lands WITH its walker's parameter,
-        // never before — so "declared but silently dropped" is unreachable.
-        image.bytes = pe::encode(module, targetSchema,
-                                 objectFormatSchema, reporter, request);
-        break;
-    case ObjectFormatKind::MachO:
-        image.bytes = macho::encode(module, targetSchema,
-                                     objectFormatSchema, reporter);
-        break;
-    case ObjectFormatKind::Wasm:
-        // LK8 skeleton: emits the 8-byte module preamble (magic +
-        // version). Plan 18 fills the section emitters; this
-        // walker is the substrate plumb-through that proves the
-        // format-blind dispatch routes WASM correctly.
-        image.bytes = wasm::encode(module, targetSchema,
-                                   objectFormatSchema, reporter);
-        break;
-    case ObjectFormatKind::Spirv:
-        // LK9 skeleton: emits the 5-word SPIR-V module header
-        // (magic + version + generator + bound + reserved) per
-        // SPIR-V Spec §2.3. Plan 17 fills the instruction stream;
-        // this walker is the substrate plumb-through that proves
-        // the format-blind dispatch routes SPIR-V correctly.
-        image.bytes = spirv::encode(module, targetSchema,
-                                    objectFormatSchema, reporter);
-        break;
     }
 
     // Post-walker error gate (architect O1 fold from LK6 cycle 2a):

@@ -1,5 +1,7 @@
 #include "link/object_format_schema.hpp"
 
+#include "link/object_format_identity_doc.hpp"
+
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table.hpp"
@@ -20,6 +22,36 @@
 #include <string>
 #include <string_view>
 #include <utility>
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// ★★★ COMPILE-ERROR PIN — D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-
+// BRANCHES (TF-C125). DO NOT DELETE TO "FIX A BUILD ERROR".
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Twin of the pin in `object_format_schema.cpp` — READ THE FULL NOTE THERE,
+// including the list of what this pin does NOT catch. Short version: after all
+// #includes the type's NAME is redefined to an identifier that does not exist,
+// so any later spelling of it fails to compile, in EVERY form — unqualified,
+// `dss::`-qualified and `::dss::`-qualified (✔MEASURED on gcc and MSVC; the
+// anonymous-namespace ALIAS this replaced let the qualified spellings through,
+// which an independent audit caught).
+//
+// ★ THIS TU IS WHERE THE RULING BITES HARDEST, which is why it is pinned
+// rather than merely cleaned. It held 7 enumerator comparisons AND BOTH
+// kind-keyed tables — `kCrossKindRules` and `kVehicleKinds` — and the tree had
+// written a DEFENCE of them into the source: *"Expressed as a TABLE … not an
+// if-chain: config vocabulary checked against config vocabulary, evaluated
+// generically."* That sentence is gone, deliberately, along with its twin in
+// `core/types/object_format_kind.hpp`. A rationalization left in the tree
+// re-authorizes the pattern it excuses, and the next reader would have cited
+// it. The rule those tables enforced still runs — it now asks each backend
+// what IT owns, instead of consulting a table that named owners by identity.
+//
+// A loader is not an exception to the identity-branch veto. It was argued to
+// be one, in this file, and the operator rejected the argument.
+#define ObjectFormatKind \
+    DSS_FORMAT_IDENTITY_IS_NOT_SPELLABLE_IN_THIS_TRANSLATION_UNIT
 
 namespace dss {
 
@@ -101,7 +133,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // `cSymbolDecoration` before this row existed would be refused at LOAD.
     // That ordering is why the vocabulary lands before the descriptors, never
     // after.
-    static constexpr std::array<std::string_view, 29> kFormatDocumentKeys{
+    // RE-DERIVED a fourth time in TF-C125: the five per-kind identity blocks
+    // (`elf` / `pe` / `optionalHeader` / `macho` / `image`) LEFT this array —
+    // they are now contributed by the backends that own them, so 29 - 5 = 24.
+    // See the note under the array.
+    static constexpr std::array<std::string_view, 24> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -125,14 +161,35 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // stack-reserve capability + its remedy axis
         "stackReserveControl", "stackReserveUnsupportedReason",
         // section / relocation description
-        "sections", "relocations", "supportedDataSections",
-        // per-kind identity blocks (cross-kind-guarded above)
-        "elf", "pe", "optionalHeader", "macho", "image"};
+        "sections", "relocations", "supportedDataSections"};
     DSS_CHECK_KEY_VOCABULARY(kFormatDocumentKeys);
+
+    // ★ THE PER-KIND IDENTITY BLOCKS ARE **NOT** LISTED ABOVE ANY MORE, and
+    // that is the TF-C125 fix for a real gap an independent audit found. The
+    // array used to end `"elf", "pe", "optionalHeader", "macho", "image"` —
+    // the SAME five names the backends now own via `identityBlockNames()` —
+    // which made this a second, hand-maintained owner of the block vocabulary
+    // sitting in shared substrate. The cross-block ownership loop below claims
+    // "add a sixth format and this loop covers it untouched"; that was true of
+    // the LOOP and false of the LOAD, because a sixth backend's block would
+    // have been rejected here as an unknown root key until somebody hand-edited
+    // this array AND its size. Two owners that nothing forced to agree is the
+    // exact defect this cycle exists to remove — the vocabulary now comes from
+    // the backends themselves.
+    auto isDeclaredIdentityBlock = [](std::string_view key) {
+        for (auto const* b : link::objectFormatBackendTable()) {
+            for (char const* blk : b->identityBlockNames()) {
+                if (key == std::string_view{blk}) return true;
+            }
+        }
+        return false;
+    };
+
     for (auto it = doc.begin(); it != doc.end(); ++it) {
         if (detail::isDocumentationKey(it.key())) continue;
-        bool known = false;
+        bool known = isDeclaredIdentityBlock(it.key());
         for (auto const& k : kFormatDocumentKeys) {
+            if (known) break;
             if (it.key() == k) { known = true; break; }
         }
         if (!known) {
@@ -206,159 +263,117 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                   "'macho' / 'wasm' / 'spirv')");
         return std::unexpected(std::move(coll).release());
     }
-    auto const kindOpt = objectFormatKindFromName(
-        format.at("kind").get<std::string>());
-    if (!kindOpt.has_value()) {
-        coll.emit(DiagnosticCode::C_MalformedJson, "/format/kind",
-                  "expected 'elf' / 'pe' / 'macho' / 'wasm' / 'spirv'");
-        return std::unexpected(std::move(coll).release());
-    }
-    // ★ The `unknown` SENTINEL passes the name lookup above (it is a row in
-    // `kObjectFormatKindTable`), so it must be rejected on its own. `kind` is
-    // THE load-bearing dispatcher of this whole file — the cross-kind
-    // identity-block guard below, the elf/pe/macho/image block readers, FFI
-    // C-mangling, the linker's walker selection and `TargetSchema::
-    // charIsUnsigned(ObjectFormatKind)` all switch on it — so a sentinel kind
-    // matches nothing everywhere at once.
+    // ── Resolve the declared format to its BACKEND ──────────────────────
     //
-    // `ObjectFormatData::validate()` ALSO rejects `Unknown`, and that arm
-    // stays: it is the guard for a HAND-BUILT `ObjectFormatData` that never
-    // set the field (the zero default IS the sentinel), which no JSON path can
-    // reach. This check is the JSON-path one, and it EARLY-RETURNS on purpose.
-    // Continuing the parse under a sentinel kind would run the cross-kind guard
-    // against it and emit one spurious "identity block 'elf' is only meaningful
-    // when format.kind == 'elf'" per declared block — diagnostics that point at
-    // the BLOCKS and advise renaming them, when the single actual defect is the
-    // kind. Stopping here leaves exactly one diagnostic, naming the sentinel.
-    if (!isSelectableObjectFormatKind(*kindOpt)) {
+    // WAS: `objectFormatKindFromName` → `isSelectableObjectFormatKind` →
+    // `data.kind = *kindOpt`, after which seven sites in this file compared
+    // that enum. The declared spelling now resolves straight to the
+    // implementation that owns it, and the enum never enters this TU.
+    auto const kindText = format.at("kind").get<std::string>();
+
+    // ★ The `unknown` SENTINEL is rejected on its own, BEFORE the registry
+    // lookup, purely to keep its diagnostic. Both paths end in "no backend",
+    // but the sentinel earns a message that names it — a config author who
+    // wrote `"kind": "unknown"` made a different mistake from one who wrote
+    // `"kind": "elff"`, and the old code distinguished them. Comparing a
+    // declared spelling against the RESERVED spelling (derived from the shared
+    // name table, not written out here) is config-vs-config, not an engine
+    // identity test.
+    //
+    // It EARLY-RETURNS on purpose. Continuing under an unresolved format would
+    // run the cross-block guard below and emit one spurious "identity block
+    // 'elf' is only meaningful when …" per declared block — diagnostics that
+    // point at the BLOCKS and advise renaming them, when the single actual
+    // defect is the kind. Stopping here leaves exactly one diagnostic.
+    if (isObjectFormatKindSentinelName(kindText)) {
         coll.emit(DiagnosticCode::C_MalformedJson, "/format/kind",
                   std::string{kObjectFormatKindSentinelRejection}
                       + " — declare one of 'elf' / 'pe' / 'macho' / 'wasm' / "
                         "'spirv'");
         return std::unexpected(std::move(coll).release());
     }
-    data.kind = *kindOpt;
 
-    // Cross-format identity-block validation (test-analyzer Gap 6
-    // fold, LK8 review): a schema's `kind` is the load-bearing
-    // dispatcher — every per-format identity block (`elf`, `pe`,
-    // `optionalHeader`, `macho`, `image`) is only consumed when
-    // its matching kind is set. A schema declaring `kind: wasm`
-    // with a stray `elf` / `pe` / `macho` block would silently
-    // drop the block. Reject loudly so a copy-paste-then-rename
-    // mistake surfaces at schema load.
-    struct CrossKindGuard {
-        ObjectFormatKind expectedKind;
-        char const*      blockName;
-    };
-    constexpr CrossKindGuard kCrossKindRules[] = {
-        { ObjectFormatKind::Elf,    "elf"            },
-        { ObjectFormatKind::Pe,     "pe"             },
-        { ObjectFormatKind::Pe,     "optionalHeader" },
-        { ObjectFormatKind::MachO,  "macho"          },
-        { ObjectFormatKind::MachO,  "image"          },
-    };
-    for (auto const& rule : kCrossKindRules) {
-        if (data.kind != rule.expectedKind
-         && doc.contains(rule.blockName)) {
+    // ★★★ THE FAIL-CLOSED GATE. `objectFormatBackendByConfigName` returns
+    // nullptr for every spelling no backend claims, and this REFUSES rather
+    // than continuing with a null backend. A design in which null meant "skip
+    // the identity rules" would let all 24 shipped formats validate clean
+    // while validating nothing — see the note on the resolver itself.
+    auto const* const backend = link::objectFormatBackendByConfigName(kindText);
+    if (backend == nullptr) {
+        coll.emit(DiagnosticCode::C_MalformedJson, "/format/kind",
+                  "expected 'elf' / 'pe' / 'macho' / 'wasm' / 'spirv'");
+        return std::unexpected(std::move(coll).release());
+    }
+    data.backend = backend;
+
+    // Cross-format identity-block validation (test-analyzer Gap 6 fold, LK8
+    // review): every per-format identity block (`elf`, `pe`, `optionalHeader`,
+    // `macho`, `image`) is read ONLY by the backend that owns it. A schema
+    // declaring `kind: wasm` with a stray `elf` block would silently drop the
+    // block. Reject loudly so a copy-paste-then-rename mistake surfaces here.
+    //
+    // ★★ WAS `kCrossKindRules[]` — five rows pairing a block name with the
+    // `ObjectFormatKind` allowed to declare it. THAT TABLE IS THE EXACT SHAPE
+    // THIS CYCLE EXISTS TO DELETE, and the comment above it argued it was fine
+    // because it was "a TABLE … not an if-chain". It is not fine: a table keyed
+    // on format identity is the same dependency as an `if` on format identity,
+    // which is why TF-C122 DELETED `kCManglingRules` rather than relocating it.
+    //
+    // The rule survives with identical semantics and identical wording. What
+    // changed is where the pairing comes from: each backend DECLARES the blocks
+    // it owns, this loop unions them, and a block owned by somebody other than
+    // the resolved backend is rejected. Nothing here knows which name belongs
+    // to whom — add a sixth format and this loop covers it untouched.
+    for (auto const* other : link::objectFormatBackendTable()) {
+        if (other == backend) continue;
+        for (char const* blockName : other->identityBlockNames()) {
+            if (!doc.contains(blockName)) continue;
+            // A block name owned by MORE than one backend is not a conflict;
+            // only a block the RESOLVED backend does not own is.
+            bool ownedHere = false;
+            for (char const* mine : backend->identityBlockNames()) {
+                if (std::string_view{mine} == std::string_view{blockName}) {
+                    ownedHere = true;
+                    break;
+                }
+            }
+            if (ownedHere) continue;
             coll.emit(DiagnosticCode::C_MalformedJson,
-                      std::string{"/"} + rule.blockName,
-                      std::string{"identity block '"} + rule.blockName
+                      std::string{"/"} + blockName,
+                      std::string{"identity block '"} + blockName
                           + "' is only meaningful when format.kind == '"
-                          + std::string{
-                                objectFormatKindName(rule.expectedKind)}
+                          + std::string{other->configName()}
                           + "' (got kind '"
-                          + std::string{objectFormatKindName(data.kind)}
+                          + std::string{backend->configName()}
                           + "'). A stray block of the wrong kind would "
                             "be silently dropped — fix the block name or "
                             "the format.kind.");
         }
     }
-    // Universal-field positive assertion for Wasm + Spirv (type-
-    // design Q3 fold, LK8 post-fold review). WASM has no native
-    // relocations, no per-section file-layout knobs, and its
-    // entry-point lives inside the Start section's function index
-    // (not a top-level symbol name). Spirv's `OpEntryPoint` is
-    // similarly emitted inline as a typed module instruction, not
-    // declared as a substrate-tier symbol name. Skeleton schemas
-    // (`wasm32-v1.format.json`) ship with these fields ABSENT; a
-    // future plan-18 schema that declares them would be silently
-    // ignored by the walker. Reject loudly so a stray
-    // `sections` / `relocations` / `entryPoint` surfaces at load
-    // and gets re-anchored against plan 18 / plan 17 vocabulary.
-    if (data.kind == ObjectFormatKind::Wasm
-     || data.kind == ObjectFormatKind::Spirv) {
-        char const* const universalFields[] = {
-            "sections", "relocations", "entryPoint",
-            // dim-2 HIGH #3 (7425905 audit fold): D-LK10-ENTRY
-            // Slice B fields are meaningless on Wasm/SPIR-V
-            // (no trampoline emitter; their exit semantics are
-            // format-native). Defense-in-depth: reject loudly
-            // rather than silently accept dead data.
-            "processExit", "entryCallingConvention",
-            // D-RUNTIME-MAIN-ARGC-ARGV: the program-entry argument
-            // mechanism rides the same trampoline emitter — dead
-            // data on Wasm/SPIR-V for the same reason.
-            "processArgs",
-            // D-LK2-RODATA closure: the producer-data-section
-            // capability is meaningless on Wasm/SPIR-V (their
-            // walkers emit rodata via format-native section
-            // vocabulary, not via the cross-format dataItems
-            // pipeline).
-            "supportedDataSections",
-            // D-FFI-EXTERN-CALL-DISPATCH: the PLT-stub vs IAT-slot
-            // extern-call shape is an ELF/PE/Mach-O dynamic-import
-            // notion; WASM/SPIR-V reach imports through their own
-            // format-native mechanisms (WASM import section / SPIR-V
-            // linkage decorations), so a top-level declaration here
-            // would be dead data.
-            "externCallDispatch",
-            // D-LK-EXTERN-DATA-IMPORT: the extern-DATA import binding
-            // model (copy relocations) is likewise an ELF/PE/Mach-O
-            // dynamic-import notion — dead data on WASM/SPIR-V.
-            "dataImportBinding",
-            // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the extern-
-            // ADDRESS materialization binding (GOT-slot page-pair) is
-            // likewise an ELF/PE/Mach-O native-image notion — dead data
-            // on WASM/SPIR-V (they reach imports format-natively).
-            "externAddrBinding",
-            // D-CSUBSET-THREAD-LOCAL (TLS C1): the thread-local access
-            // model (segment-register / TEB / TLV descriptor) is an
-            // ELF/PE/Mach-O native-image notion — dead data on
-            // WASM/SPIR-V (their thread-local story is format-native
-            // vocabulary when it lands).
-            "tlsAccess",
-            // D-CSUBSET-C11-THREADS-MACHO: the shipped-library synth
-            // vehicle (kernel32 / pthread primitive family for a
-            // compiler-synthesized shim) is an ELF/PE/Mach-O native-
-            // runtime notion — dead data on WASM/SPIR-V.
-            "librarySynthesis",
-            // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the per-program stack-
-            // reserve capability names an ELF/PE/Mach-O image header field.
-            // WASM/SPIR-V have no such field (a WASM module's stack is the
-            // embedder's; SPIR-V has no call stack of this shape), so a
-            // top-level declaration would be dead data whose request the
-            // walker would silently drop.
-            "stackReserveControl",
-            // ... and its remedy axis: WASM/SPIR-V do not participate in the
-            // stack-reserve conversation at all, so neither key belongs.
-            "stackReserveUnsupportedReason",
-        };
-        for (auto const* field : universalFields) {
-            if (doc.contains(field)) {
-                coll.emit(DiagnosticCode::C_MalformedJson,
-                          std::string{"/"} + field,
-                          std::string{"format kind '"}
-                              + std::string{objectFormatKindName(data.kind)}
-                              + "' must not declare a top-level '"
-                              + field
-                              + "' field — WASM / SPIR-V emit this "
-                                "information through their own format-"
-                                "native section vocabulary (plan 18 / "
-                                "plan 17). A top-level declaration "
-                                "would be silently ignored by the "
-                                "walker.");
-            }
+    // Root keys this format cannot express. WASM has no native relocations, no
+    // per-section file-layout knobs, and its entry point lives inside the Start
+    // section's function index; SPIR-V's `OpEntryPoint` is emitted inline as a
+    // typed module instruction. A top-level declaration of either would be
+    // SILENTLY IGNORED by the walker, so reject it loudly and re-anchor the key
+    // against plan 18 / plan 17 vocabulary.
+    //
+    // WAS `if (data.kind == ObjectFormatKind::Wasm || … ::Spirv)` wrapping a
+    // hardcoded list. The list moved to the two backends that own it (verbatim,
+    // per-key rationale comments included) and is now DECLARED capability, not
+    // an enumeration this loader maintains. A format that rejects nothing
+    // returns an empty span and this loop does nothing.
+    for (char const* field : backend->rejectedRootFields()) {
+        if (doc.contains(field)) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::string{"/"} + field,
+                      std::string{"format kind '"}
+                          + std::string{backend->configName()}
+                          + "' must not declare a top-level '"
+                          + field
+                          + "' field — "
+                          + std::string{backend->rejectedRootFieldsReason()}
+                          + " A top-level declaration would be silently "
+                            "ignored by the walker.");
         }
     }
 
@@ -1075,40 +1090,74 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                       info.granularityBytes));
                 ok = false;
             }
-            // Vehicle ↔ format.kind coherence. A vehicle NAMES a structure of
-            // one image format, so declaring `pe-optional-header` on an ELF
-            // schema is dead config whose request the ELF walker would
-            // silently drop — the exact silent-drop this capability exists to
-            // prevent. Expressed as a TABLE (the `kCrossKindRules` idiom
-            // above), not an if-chain: config vocabulary checked against
-            // config vocabulary, evaluated generically.
-            struct VehicleKindRule {
-                StackReserveVehicle vehicle;
-                ObjectFormatKind    kind;
-            };
-            constexpr VehicleKindRule kVehicleKinds[] = {
-                { StackReserveVehicle::PeOptionalHeader, ObjectFormatKind::Pe },
-            };
+            // Vehicle ↔ implementing-walker coherence. A vehicle NAMES a
+            // structure of one image format, so declaring `pe-optional-header`
+            // on an ELF schema is dead config whose request the ELF walker
+            // would silently drop — the exact silent-drop this capability
+            // exists to prevent.
+            //
+            // ★★ WAS `kVehicleKinds[]`, a table pairing each vehicle with the
+            // `ObjectFormatKind` allowed to declare it, DEFENDED IN THIS FILE
+            // as *"Expressed as a TABLE … not an if-chain: config vocabulary
+            // checked against config vocabulary, evaluated generically."* That
+            // defence was struck in TF-C125 along with its twin in
+            // `core/types/object_format_kind.hpp`, because it is wrong: a table
+            // keyed on format identity is the same dependency as an `if` on
+            // format identity — the consumer still has to know an identity to
+            // get an answer — and it is why `kCManglingRules` was DELETED in
+            // TF-C122 rather than moved. Left standing, the sentence would have
+            // re-authorized the pattern for the next reader; that is what a
+            // rationalization in the tree does.
+            //
+            // The rule is unchanged in what it rejects and in what it says. The
+            // pairing now comes from the backend that IMPLEMENTS the vehicle
+            // (`stackReserveVehicles()`), so the loader asks "does anyone
+            // implement this, and is it you?" instead of consulting a table
+            // that named the owner. A second vehicle lands with its walker arm
+            // and this loop covers it untouched.
             if (ok) {
-                for (auto const& rule : kVehicleKinds) {
-                    if (rule.vehicle == info.vehicle && rule.kind != data.kind) {
-                        coll.emit(
-                            DiagnosticCode::C_MalformedJson,
-                            "/stackReserveControl/vehicle",
-                            std::format(
-                                "stackReserveControl vehicle '{}' names a "
-                                "structure of the '{}' image format, but this "
-                                "schema declares kind '{}'. The '{}' walker "
-                                "would silently DROP a stack-reserve request "
-                                "routed to it. Fix the vehicle or the "
-                                "format.kind. D-SQLITE-PE64-FULL-TIER-STACK-"
-                                "DEPTH.",
-                                stackReserveVehicleName(info.vehicle),
-                                objectFormatKindName(rule.kind),
-                                objectFormatKindName(data.kind),
-                                objectFormatKindName(data.kind)));
-                        ok = false;
+                link::ObjectFormatBackend const* implementer = nullptr;
+                for (auto const* candidate : link::objectFormatBackendTable()) {
+                    for (StackReserveVehicle v :
+                             candidate->stackReserveVehicles()) {
+                        if (v == info.vehicle) { implementer = candidate; break; }
                     }
+                    if (implementer != nullptr) break;
+                }
+                if (implementer != backend) {
+                    // ⚠ `implementer == nullptr` — no walker implements the
+                    // vehicle at all — is a NEW refusal, not the old one. An
+                    // earlier draft of this comment called it "the same
+                    // refusal"; an independent audit measured otherwise and it
+                    // was wrong. The old `kVehicleKinds` loop emitted only when
+                    // a ROW MATCHED, so a vehicle with no row was silently
+                    // ACCEPTED ON EVERY FORMAT. Rejecting it is strictly better
+                    // — such a request would be dropped by every walker, which
+                    // is the silent-drop this capability exists to prevent —
+                    // but it is a behaviour change and is recorded as one.
+                    // Latent today: `StackReserveVehicle` has one enumerator
+                    // and one implementer, so no reachable input differs.
+                    // (`stackReserveVehicleFromName` already rejected an
+                    // unknown spelling upstream, so reaching here means a
+                    // vehicle whose enum row shipped ahead of its walker arm.)
+                    coll.emit(
+                        DiagnosticCode::C_MalformedJson,
+                        "/stackReserveControl/vehicle",
+                        std::format(
+                            "stackReserveControl vehicle '{}' names a "
+                            "structure of the '{}' image format, but this "
+                            "schema declares kind '{}'. The '{}' walker "
+                            "would silently DROP a stack-reserve request "
+                            "routed to it. Fix the vehicle or the "
+                            "format.kind. D-SQLITE-PE64-FULL-TIER-STACK-"
+                            "DEPTH.",
+                            stackReserveVehicleName(info.vehicle),
+                            implementer != nullptr
+                                ? std::string{implementer->configName()}
+                                : std::string{"<no walker implements it>"},
+                            backend->configName(),
+                            backend->configName()));
+                    ok = false;
                 }
             }
             if (ok) data.stackReserveControl = info;
@@ -1658,824 +1707,24 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
-    // Per-format identity sub-block readers — each runs only when
-    // `format.kind` matches its arm. Mach-O (LK3) will add a third
-    // arm on the same pattern.
-
-    // ELF identity block — read only when format kind is Elf.
-    if (data.kind == ObjectFormatKind::Elf && doc.contains("elf")) {
-        auto const& e = doc.at("elf");
-        if (!e.is_object()) {
-            coll.emit(DiagnosticCode::C_MalformedJson, "/elf",
-                      "'elf' must be an object when format.kind == 'elf'");
-        } else {
-            auto readU16 = [&](char const* field, std::uint16_t& out,
-                               std::int64_t max) {
-                if (!e.contains(field) || !e.at(field).is_number_integer())
-                    return;
-                std::int64_t const v = e.at(field).get<std::int64_t>();
-                if (v < 0 || v > max) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/elf/{}", field),
-                              std::format("'{}' ({}) out of range [0, {}]",
-                                          field, v, max));
-                    return;
-                }
-                out = static_cast<std::uint16_t>(v);
-            };
-            // class: "elf32" | "elf64" (ELFCLASS values from psABI).
-            if (e.contains("class") && e.at("class").is_string()) {
-                auto const c = e.at("class").get<std::string>();
-                if      (c == "elf32") data.elf.fileClass = 1;
-                else if (c == "elf64") data.elf.fileClass = 2;
-                else coll.emit(DiagnosticCode::C_MalformedJson, "/elf/class",
-                               "'class' must be 'elf32' or 'elf64'");
-            }
-            // data: "lsb" | "msb".
-            if (e.contains("data") && e.at("data").is_string()) {
-                auto const d = e.at("data").get<std::string>();
-                if      (d == "lsb") data.elf.dataEncoding = 1;
-                else if (d == "msb") data.elf.dataEncoding = 2;
-                else coll.emit(DiagnosticCode::C_MalformedJson, "/elf/data",
-                               "'data' must be 'lsb' or 'msb'");
-            }
-            // osabi: string name → numeric (ELFOSABI_*). Default 0 = SysV.
-            if (e.contains("osabi") && e.at("osabi").is_string()) {
-                auto const o = e.at("osabi").get<std::string>();
-                if      (o == "sysv"     || o == "none") data.elf.osabi = 0;
-                else if (o == "hpux"   ) data.elf.osabi = 1;
-                else if (o == "netbsd" ) data.elf.osabi = 2;
-                else if (o == "gnu"    || o == "linux") data.elf.osabi = 3;
-                else if (o == "freebsd") data.elf.osabi = 9;
-                else coll.emit(DiagnosticCode::C_MalformedJson, "/elf/osabi",
-                               "'osabi' must be one of 'sysv' / 'gnu' / "
-                               "'freebsd' / 'netbsd' / 'hpux' / 'none'");
-            }
-            std::uint16_t abiVerRaw = 0;
-            readU16("abiVersion", abiVerRaw, 255);
-            data.elf.abiVersion = static_cast<std::uint8_t>(abiVerRaw);
-            readU16("machine", data.elf.machine, 0xFFFF);
-            // `type`: closed-enum `ElfObjectType` (rel/exec/dyn)
-            // round-tripped through `EnumNameTable`. Default Rel
-            // keeps LK1 cycle 1 schemas working unchanged.
-            if (e.contains("type") && e.at("type").is_string()) {
-                auto const tName = e.at("type").get<std::string>();
-                auto const tEnum = elfObjectTypeFromName(tName);
-                if (tEnum.has_value()) {
-                    data.elf.objectType = *tEnum;
-                } else {
-                    coll.emit(DiagnosticCode::C_MalformedJson, "/elf/type",
-                              "'type' must be 'rel' / 'exec' / 'dyn'");
-                }
-            }
-            // `interpreter`: PT_INTERP path (dynamic linker name).
-            // Optional in JSON. An empty-string literal (`""`) is
-            // rejected at load: the Linux kernel rejects ELFs with a
-            // zero-length PT_INTERP path, so `""` is unambiguously a
-            // config error (3-agent convergence: code-reviewer +
-            // silent-failure + comment-analyzer on LK6 cycle 2b.1
-            // review). Absent field = field stays at its default
-            // `""` and the walker treats it as "self-contained
-            // executable" (no PT_INTERP emission).
-            if (e.contains("interpreter")) {
-                if (!e.at("interpreter").is_string()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/elf/interpreter",
-                              "'interpreter' must be a string (e.g. "
-                              "'/lib64/ld-linux-x86-64.so.2')");
-                } else {
-                    auto const value =
-                        e.at("interpreter").get<std::string>();
-                    if (value.empty()) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/elf/interpreter",
-                                  "'interpreter' must not be empty — "
-                                  "the Linux kernel rejects ELFs with "
-                                  "a zero-length PT_INTERP path. Omit "
-                                  "the field entirely for self-"
-                                  "contained executables.");
-                    } else {
-                        data.elf.interpreter = value;
-                    }
-                }
-            }
-            // `soname`: DT_SONAME for an ET_DYN shared library
-            // (c150, D-LK1-4). Optional; absent = no DT_SONAME
-            // emitted (the `gcc -shared` no-`-soname` shape). An
-            // empty-string literal is rejected like `interpreter`:
-            // a zero-length DT_SONAME is unambiguously a config
-            // error (omit the field instead). validate() rejects
-            // the field on non-dyn schemas.
-            if (e.contains("soname")) {
-                if (!e.at("soname").is_string()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/elf/soname",
-                              "'soname' must be a string (e.g. "
-                              "'libfoo.so.1')");
-                } else {
-                    auto const value = e.at("soname").get<std::string>();
-                    if (value.empty()) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/elf/soname",
-                                  "'soname' must not be empty -- omit "
-                                  "the field entirely to emit no "
-                                  "DT_SONAME.");
-                    } else {
-                        data.elf.soname = value;
-                    }
-                }
-            }
-            // `pageAlign`: PT_LOAD p_align for Exec images. Required
-            // for ET_EXEC at validate() — the kernel rejects ELF
-            // exec'd images whose p_align is smaller than the
-            // runtime page size. Each (arch × OS) schema declares
-            // its own value (D-LK6-3).
-            if (e.contains("pageAlign")) {
-                if (!e.at("pageAlign").is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/elf/pageAlign",
-                              "'pageAlign' must be an integer (PT_LOAD "
-                              "p_align, e.g. 4096 for x86_64 Linux or "
-                              "65536 for ARM64-64K)");
-                } else {
-                    std::int64_t const pa =
-                        e.at("pageAlign").get<std::int64_t>();
-                    if (pa <= 0
-                     || (static_cast<std::uint64_t>(pa) &
-                         (static_cast<std::uint64_t>(pa) - 1u)) != 0u) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/elf/pageAlign",
-                                  "'pageAlign' must be a positive "
-                                  "power of two (kernel constraint: "
-                                  "p_vaddr % p_align == p_offset % "
-                                  "p_align)");
-                    } else {
-                        data.elf.pageAlign =
-                            static_cast<std::uint64_t>(pa);
-                    }
-                }
-            }
-            // `bindNow`: eager vs lazy dynamic-binding choice.
-            // Optional; defaults to `true` (v1 stance, plan 14 §5
-            // risk row). `false` is the lazy-binding upgrade path
-            // anchored at D-LK6-11 — v1 walker fails loud on
-            // `bindNow == false` until D-LK6-11 lands.
-            if (e.contains("bindNow")) {
-                if (!e.at("bindNow").is_boolean()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/elf/bindNow",
-                              "'bindNow' must be a boolean (true = "
-                              "eager / DF_1_NOW, false = lazy / "
-                              ".rela.plt + JUMP_SLOT — anchored at "
-                              "D-LK6-11, not yet implemented)");
-                } else {
-                    data.elf.bindNow =
-                        e.at("bindNow").get<bool>();
-                }
-            }
-        }
-    }
-
-    // PE/COFF identity block — read only when format kind is Pe.
-    if (data.kind == ObjectFormatKind::Pe && doc.contains("pe")) {
-        auto const& p = doc.at("pe");
-        if (!p.is_object()) {
-            coll.emit(DiagnosticCode::C_MalformedJson, "/pe",
-                      "'pe' must be an object when format.kind == 'pe'");
-        } else {
-            auto readU16 = [&](char const* field, std::uint16_t& out,
-                               std::int64_t max) {
-                if (!p.contains(field) || !p.at(field).is_number_integer())
-                    return;
-                std::int64_t const v = p.at(field).get<std::int64_t>();
-                if (v < 0 || v > max) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/pe/{}", field),
-                              std::format("'{}' ({}) out of range [0, {}]",
-                                          field, v, max));
-                    return;
-                }
-                out = static_cast<std::uint16_t>(v);
-            };
-            readU16("machine", data.pe.machine, 0xFFFF);
-            readU16("characteristics", data.pe.characteristics, 0xFFFF);
-            // `type`: closed-enum PeObjectType (obj/exec/dll).
-            // Default Obj keeps LK2 cycle 1 schemas unchanged.
-            if (p.contains("type") && p.at("type").is_string()) {
-                auto const tName = p.at("type").get<std::string>();
-                auto const tEnum = peObjectTypeFromName(tName);
-                if (tEnum.has_value()) {
-                    data.pe.objectType = *tEnum;
-                } else {
-                    coll.emit(DiagnosticCode::C_MalformedJson, "/pe/type",
-                              "'type' must be 'obj' / 'exec' / 'dll'");
-                }
-            }
-        }
-    }
-
-    // PE32+ Optional Header — read only when PE objectType != Obj.
-    // The walker emits the optional header for Exec/Dll; Obj schemas
-    // never carry it, and validate() rejects an `optionalHeader` key
-    // on an Obj schema as a load-time config error (symmetric with
-    // ELF ET_REL's virtualAddress=0 rejection).
-    if (data.kind == ObjectFormatKind::Pe && doc.contains("optionalHeader")) {
-        auto const& oh = doc.at("optionalHeader");
-        if (!oh.is_object()) {
-            coll.emit(DiagnosticCode::C_MalformedJson, "/optionalHeader",
-                      "'optionalHeader' must be an object");
-        } else {
-            auto readU16 = [&](char const* field, std::uint16_t& out) {
-                if (!oh.contains(field)) return;
-                if (!oh.at(field).is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/optionalHeader/{}", field),
-                              std::format("'{}' must be an integer", field));
-                    return;
-                }
-                std::int64_t const v = oh.at(field).get<std::int64_t>();
-                if (v < 0 || v > 0xFFFF) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/optionalHeader/{}", field),
-                              std::format("'{}' ({}) out of u16 range",
-                                          field, v));
-                    return;
-                }
-                out = static_cast<std::uint16_t>(v);
-            };
-            auto readU32 = [&](char const* field, std::uint32_t& out) {
-                if (!oh.contains(field)) return;
-                if (!oh.at(field).is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/optionalHeader/{}", field),
-                              std::format("'{}' must be an integer", field));
-                    return;
-                }
-                std::int64_t const v = oh.at(field).get<std::int64_t>();
-                if (v < 0 || v > 0xFFFFFFFFLL) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/optionalHeader/{}", field),
-                              std::format("'{}' ({}) out of u32 range",
-                                          field, v));
-                    return;
-                }
-                out = static_cast<std::uint32_t>(v);
-            };
-            auto readU64 = [&](char const* field, std::uint64_t& out) {
-                if (!oh.contains(field)) return;
-                if (!oh.at(field).is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/optionalHeader/{}", field),
-                              std::format("'{}' must be an integer", field));
-                    return;
-                }
-                std::int64_t const v = oh.at(field).get<std::int64_t>();
-                if (v < 0) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/optionalHeader/{}", field),
-                              std::format("'{}' ({}) must be non-negative",
-                                          field, v));
-                    return;
-                }
-                out = static_cast<std::uint64_t>(v);
-            };
-            readU16("magic", data.peOptionalHeader.magic);
-            readU64("imageBase", data.peOptionalHeader.imageBase);
-            readU32("sectionAlignment",
-                    data.peOptionalHeader.sectionAlignment);
-            readU32("fileAlignment", data.peOptionalHeader.fileAlignment);
-            readU16("majorOperatingSystemVersion",
-                    data.peOptionalHeader.majorOperatingSystemVersion);
-            readU16("minorOperatingSystemVersion",
-                    data.peOptionalHeader.minorOperatingSystemVersion);
-            readU16("majorSubsystemVersion",
-                    data.peOptionalHeader.majorSubsystemVersion);
-            readU16("minorSubsystemVersion",
-                    data.peOptionalHeader.minorSubsystemVersion);
-            readU16("subsystem", data.peOptionalHeader.subsystem);
-            readU16("dllCharacteristics",
-                    data.peOptionalHeader.dllCharacteristics);
-            readU64("sizeOfStackReserve",
-                    data.peOptionalHeader.sizeOfStackReserve);
-            readU64("sizeOfStackCommit",
-                    data.peOptionalHeader.sizeOfStackCommit);
-            readU64("sizeOfHeapReserve",
-                    data.peOptionalHeader.sizeOfHeapReserve);
-            readU64("sizeOfHeapCommit",
-                    data.peOptionalHeader.sizeOfHeapCommit);
-            // Plan 14 LK7 — Authenticode codesign placeholder
-            // reservation. Optional; defaults to 0 (no reservation,
-            // no security directory entry). Multiple-of-8 enforced
-            // at validate() (PE COFF §5.9.1 alignment).
-            readU32("attributeCertReserveSize",
-                    data.peOptionalHeader.attributeCertReserveSize);
-        }
-    }
-
-    // Mach-O identity block — read only when format kind is MachO.
-    if (data.kind == ObjectFormatKind::MachO && doc.contains("macho")) {
-        auto const& m = doc.at("macho");
-        if (!m.is_object()) {
-            coll.emit(DiagnosticCode::C_MalformedJson, "/macho",
-                      "'macho' must be an object when format.kind == 'macho'");
-        } else {
-            auto readU32 = [&](char const* field, std::uint32_t& out) {
-                if (!m.contains(field) || !m.at(field).is_number_integer())
-                    return;
-                std::int64_t const v = m.at(field).get<std::int64_t>();
-                if (v < 0
-                 || v > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/macho/{}", field),
-                              std::format("'{}' ({}) out of range [0, 2^32)",
-                                          field, v));
-                    return;
-                }
-                out = static_cast<std::uint32_t>(v);
-            };
-            readU32("cputype",    data.macho.cputype);
-            readU32("cpusubtype", data.macho.cpusubtype);
-            readU32("flags",      data.macho.flags);
-            // `filetype`: closed enum MachOObjectType. Accepts the
-            // string form ("object"/"execute"/"dylib") OR the
-            // integer wire value (1/2/6) for back-compat with
-            // pre-enum shipped JSONs. Unknown values fail loud.
-            if (m.contains("filetype")) {
-                auto const& ft = m.at("filetype");
-                if (ft.is_string()) {
-                    auto const tEnum = machoObjectTypeFromName(
-                        ft.get<std::string>());
-                    if (tEnum.has_value()) {
-                        data.macho.filetype = *tEnum;
-                    } else {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/macho/filetype",
-                                  "'filetype' must be 'object' / "
-                                  "'execute' / 'dylib'");
-                    }
-                } else if (ft.is_number_integer()) {
-                    std::int64_t const v = ft.get<std::int64_t>();
-                    if (v == 1) data.macho.filetype = MachOObjectType::Object;
-                    else if (v == 2) data.macho.filetype = MachOObjectType::Execute;
-                    else if (v == 6) data.macho.filetype = MachOObjectType::Dylib;
-                    else {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/macho/filetype",
-                                  std::format("'filetype' integer {} "
-                                              "not in {{1,2,6}}", v));
-                    }
-                } else {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/macho/filetype",
-                              "'filetype' must be a string or integer");
-                }
-            }
-        }
-    }
-
-    // Mach-O image block — read only when format kind is MachO and
-    // an `image` key is present. Validate() will reject the key on
-    // a MH_OBJECT schema, and require its full population for
-    // MH_EXECUTE (symmetric with PE's optionalHeader gate).
-    if (data.kind == ObjectFormatKind::MachO && doc.contains("image")) {
-        auto const& im = doc.at("image");
-        if (!im.is_object()) {
-            coll.emit(DiagnosticCode::C_MalformedJson, "/image",
-                      "'image' must be an object");
-        } else {
-            if (im.contains("pageZeroSize")) {
-                if (!im.at("pageZeroSize").is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/image/pageZeroSize",
-                              "'pageZeroSize' must be an integer");
-                } else {
-                    std::int64_t const v =
-                        im.at("pageZeroSize").get<std::int64_t>();
-                    if (v < 0) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/image/pageZeroSize",
-                                  "'pageZeroSize' must be non-negative");
-                    } else {
-                        data.machoImage.pageZeroSize =
-                            static_cast<std::uint64_t>(v);
-                    }
-                }
-            }
-            // VM segment page size (LC_SEGMENT_64 vmaddr/vmsize/fileoff
-            // alignment). Optional; default 4 KiB. Power-of-two enforced
-            // at validate(). Apple Silicon arm64-darwin sets 16384.
-            if (im.contains("segmentPageSize")) {
-                if (!im.at("segmentPageSize").is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/image/segmentPageSize",
-                              "'segmentPageSize' must be an integer");
-                } else {
-                    std::int64_t const v =
-                        im.at("segmentPageSize").get<std::int64_t>();
-                    if (v <= 0) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/image/segmentPageSize",
-                                  "'segmentPageSize' must be positive "
-                                  "(a power-of-two VM page size; 4096 for "
-                                  "x86_64-darwin, 16384 for arm64-darwin)");
-                    } else {
-                        data.machoImage.segmentPageSize =
-                            static_cast<std::uint64_t>(v);
-                    }
-                }
-            }
-            if (im.contains("dylinkerPath")) {
-                if (!im.at("dylinkerPath").is_string()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/image/dylinkerPath",
-                              "'dylinkerPath' must be a string");
-                } else {
-                    data.machoImage.dylinkerPath =
-                        im.at("dylinkerPath").get<std::string>();
-                }
-            }
-            // D-LK3-3 (c153) — the MH_DYLIB LC_ID_DYLIB install name.
-            // Optional at parse; validate() requires it non-empty on a
-            // Dylib schema and rejects it on every other filetype.
-            if (im.contains("installName")) {
-                if (!im.at("installName").is_string()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/image/installName",
-                              "'installName' must be a string (the "
-                              "LC_ID_DYLIB name a client links "
-                              "against, e.g. '@rpath/libdss.dylib' -- "
-                              "MH_DYLIB only)");
-                } else {
-                    data.machoImage.installName =
-                        im.at("installName").get<std::string>();
-                }
-            }
-            if (im.contains("loadDylibs")) {
-                if (!im.at("loadDylibs").is_array()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/image/loadDylibs",
-                              "'loadDylibs' must be an array — each "
-                              "entry is either a bare string (path "
-                              "sugar) or an object {path: ...}");
-                } else {
-                    auto const& arr = im.at("loadDylibs");
-                    for (std::size_t i = 0; i < arr.size(); ++i) {
-                        if (arr[i].is_string()) {
-                            data.machoImage.loadDylibs.push_back(
-                                MachODylibRef{arr[i].get<std::string>()});
-                        } else if (arr[i].is_object()
-                                && arr[i].contains("path")
-                                && arr[i].at("path").is_string()) {
-                            data.machoImage.loadDylibs.push_back(
-                                MachODylibRef{arr[i].at("path")
-                                                  .get<std::string>()});
-                        } else {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      std::format("/image/loadDylibs/{}", i),
-                                      "each loadDylibs entry must be a "
-                                      "string or an object with 'path'");
-                        }
-                    }
-                }
-            }
-            // `bindNow`: eager vs lazy dynamic-binding choice on
-            // Mach-O — parallel to `elf.bindNow`. Optional; defaults
-            // to `true` (v1 stance, plan 14 §5 risk row). `false`
-            // is the lazy-binding upgrade path anchored at D-LK6-13.
-            if (im.contains("bindNow")) {
-                if (!im.at("bindNow").is_boolean()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/image/bindNow",
-                              "'bindNow' must be a boolean (true = "
-                              "eager / bind_off opcode stream, false "
-                              "= lazy / lazy_bind_off — anchored at "
-                              "D-LK6-13, not yet implemented)");
-                } else {
-                    data.machoImage.bindNow =
-                        im.at("bindNow").get<bool>();
-                }
-            }
-            // Plan 14 LK7 — Apple codesign placeholder reservation.
-            // Optional; defaults to 0 (no LC_CODE_SIGNATURE emitted).
-            // Multiple-of-8 enforced at validate() (Apple SuperBlob
-            // alignment).
-            if (im.contains("codeSignatureSize")) {
-                if (!im.at("codeSignatureSize").is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/image/codeSignatureSize",
-                              "'codeSignatureSize' must be a "
-                              "non-negative integer (Apple SuperBlob "
-                              "reservation size in bytes; plan 16 "
-                              "fills the bytes post-link).");
-                } else {
-                    std::int64_t const v =
-                        im.at("codeSignatureSize").get<std::int64_t>();
-                    if (v < 0
-                     || v > static_cast<std::int64_t>(
-                                std::numeric_limits<std::uint32_t>::max())) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/image/codeSignatureSize",
-                                  std::format("'codeSignatureSize' "
-                                              "({}) out of u32 range",
-                                              v));
-                    } else {
-                        data.machoImage.codeSignatureSize =
-                            static_cast<std::uint32_t>(v);
-                    }
-                }
-            }
-            // D-LK6-14 chained-fixups: optional bool. Default false
-            // (legacy LC_DYLD_INFO_ONLY path). When true, the walker
-            // emits LC_DYLD_CHAINED_FIXUPS + DYLD_CHAINED_PTR_64
-            // chained pointers in __got. Requires bindNow==true.
-            if (im.contains("useChainedFixups")) {
-                if (!im.at("useChainedFixups").is_boolean()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/image/useChainedFixups",
-                              "'useChainedFixups' must be a boolean "
-                              "(true = LC_DYLD_CHAINED_FIXUPS chained-"
-                              "pointer table, false = legacy "
-                              "LC_DYLD_INFO_ONLY opcode stream — "
-                              "D-LK6-14).");
-                } else {
-                    data.machoImage.useChainedFixups =
-                        im.at("useChainedFixups").get<bool>();
-                }
-            }
-            // D-LK7-ADHOC-CODESIGN-MACHO (increment 2/2) — ad-hoc
-            // code-signature FILL request. Optional nested object;
-            // absent = the legacy `codeSignatureSize`-only placeholder
-            // path. When present the walker DERIVES the reservation
-            // size and writes a real CodeDirectory + SuperBlob. The two
-            // enums are CLOSED — a typo fails loud here (mirrors the
-            // `externCallDispatchFromName` + unknown-value-rejects-loud
-            // discipline) rather than defaulting silently to a signing
-            // scheme. `pageSize` power-of-two and non-empty `identifier`
-            // are likewise fail-loud here (a malformed value must not
-            // reach the size derivation / blob builder).
-            if (im.contains("codeSignature")) {
-                auto const& cs = im.at("codeSignature");
-                if (!cs.is_object()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/image/codeSignature",
-                              "'codeSignature' must be an object "
-                              "{kind, hashAlgorithm, pageSize, "
-                              "identifier}");
-                } else {
-                    MachOCodeSignature sig;
-                    bool ok = true;
-                    // kind (closed enum; default "adhoc").
-                    if (cs.contains("kind")) {
-                        if (!cs.at("kind").is_string()) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/image/codeSignature/kind",
-                                      "'kind' must be a string "
-                                      "(\"adhoc\")");
-                            ok = false;
-                        } else {
-                            auto const s =
-                                cs.at("kind").get<std::string>();
-                            auto const k =
-                                machoCodeSignatureKindFromName(s);
-                            if (!k.has_value()) {
-                                coll.emit(
-                                    DiagnosticCode::C_MalformedJson,
-                                    "/image/codeSignature/kind",
-                                    std::format("unknown codeSignature "
-                                                "kind '{}' — accepted: "
-                                                "\"adhoc\" (CS_ADHOC "
-                                                "CodeDirectory, no CMS).",
-                                                s));
-                                ok = false;
-                            } else {
-                                sig.kind = *k;
-                            }
-                        }
-                    }
-                    // hashAlgorithm (closed enum; default "sha256").
-                    if (cs.contains("hashAlgorithm")) {
-                        if (!cs.at("hashAlgorithm").is_string()) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/image/codeSignature/hashAlgorithm",
-                                      "'hashAlgorithm' must be a string "
-                                      "(\"sha256\")");
-                            ok = false;
-                        } else {
-                            auto const s = cs.at("hashAlgorithm")
-                                               .get<std::string>();
-                            auto const h =
-                                machoCodeSignatureHashAlgoFromName(s);
-                            if (!h.has_value()) {
-                                coll.emit(
-                                    DiagnosticCode::C_MalformedJson,
-                                    "/image/codeSignature/hashAlgorithm",
-                                    std::format("unknown codeSignature "
-                                                "hashAlgorithm '{}' — "
-                                                "accepted: \"sha256\" "
-                                                "(CS_HASHTYPE_SHA256).",
-                                                s));
-                                ok = false;
-                            } else {
-                                sig.hashAlgorithm = *h;
-                            }
-                        }
-                    }
-                    // pageSize (power of two; default 4096).
-                    if (cs.contains("pageSize")) {
-                        if (!cs.at("pageSize").is_number_integer()) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/image/codeSignature/pageSize",
-                                      "'pageSize' must be an integer "
-                                      "power of two (code-slot page "
-                                      "size; typical 4096).");
-                            ok = false;
-                        } else {
-                            std::int64_t const v =
-                                cs.at("pageSize").get<std::int64_t>();
-                            // Power of two in [4096, 65536]: the
-                            // conventional code-signing hash-page size is
-                            // 4096; the bounded range keeps log2(pageSize)
-                            // in [12,16] (one byte) AND keeps the
-                            // nCodeSlots*hashSize layout math safely within
-                            // u32 for any in-range codeLimit (a sub-page
-                            // pageSize like 1 would overflow the slot table
-                            // on a multi-GiB binary — D-LK7-CODESIGN-
-                            // PAGESIZE-OVERFLOW-HARDENING for the residual
-                            // ~4 GiB-codeLimit case).
-                            if (v < 4096
-                             || v > 65536
-                             || (static_cast<std::uint64_t>(v)
-                                 & (static_cast<std::uint64_t>(v) - 1u))
-                                    != 0u) {
-                                coll.emit(
-                                    DiagnosticCode::C_MalformedJson,
-                                    "/image/codeSignature/pageSize",
-                                    std::format("'pageSize' ({}) must be "
-                                                "a power of two in "
-                                                "[4096, 65536] (the "
-                                                "CodeDirectory stores "
-                                                "log2(pageSize) in one "
-                                                "byte; 4096 is the "
-                                                "conventional value).",
-                                                v));
-                                ok = false;
-                            } else {
-                                sig.pageSize =
-                                    static_cast<std::uint32_t>(v);
-                            }
-                        }
-                    }
-                    // identifier (non-empty; required).
-                    if (!cs.contains("identifier")) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/image/codeSignature/identifier",
-                                  "'identifier' is required and must be "
-                                  "a non-empty string (the CodeDirectory "
-                                  "identOffset payload; the kernel keys "
-                                  "the signature on it).");
-                        ok = false;
-                    } else if (!cs.at("identifier").is_string()
-                            || cs.at("identifier").get<std::string>()
-                                   .empty()) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/image/codeSignature/identifier",
-                                  "'identifier' must be a non-empty "
-                                  "string.");
-                        ok = false;
-                    } else {
-                        sig.identifier =
-                            cs.at("identifier").get<std::string>();
-                    }
-                    if (ok) {
-                        data.machoImage.codeSignature = std::move(sig);
-                    }
-                }
-            }
-            // LC_BUILD_VERSION platform / min-OS / SDK (D-LK10-ENTRY-
-            // MACHO-EXIT). Optional nested object; absent → no
-            // LC_BUILD_VERSION emitted. `platform` is a CLOSED enum (a
-            // typo fails loud, mirroring codeSignature). `minOs`/`sdk`
-            // are dotted "X.Y[.Z]" version strings encoded to the on-wire
-            // (major<<16)|(minor<<8)|patch nibble form; a malformed
-            // version fails loud rather than silently shipping 0.0.0.
-            if (im.contains("buildVersion")) {
-                auto const& bv = im.at("buildVersion");
-                if (!bv.is_object()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/image/buildVersion",
-                              "'buildVersion' must be an object "
-                              "{platform, minOs, sdk}");
-                } else {
-                    // "X.Y" / "X.Y.Z" → (major<<16)|(minor<<8)|patch.
-                    // major 16-bit, minor/patch 8-bit each (the
-                    // build_version_command field layout).
-                    auto parseVer = [](std::string_view s)
-                                      -> std::optional<std::uint32_t> {
-                        std::uint32_t parts[3] = {0u, 0u, 0u};
-                        std::size_t idx = 0;
-                        std::uint32_t cur = 0;
-                        bool any = false;
-                        for (char c : s) {
-                            if (c == '.') {
-                                if (idx >= 2) return std::nullopt;
-                                if (!any) return std::nullopt;
-                                parts[idx++] = cur;
-                                cur = 0;
-                                any = false;
-                            } else if (c >= '0' && c <= '9') {
-                                cur = cur * 10u
-                                    + static_cast<std::uint32_t>(c - '0');
-                                if (cur > 0xFFFFu) return std::nullopt;
-                                any = true;
-                            } else {
-                                return std::nullopt;
-                            }
-                        }
-                        if (!any) return std::nullopt;  // empty / trailing '.'
-                        parts[idx] = cur;
-                        if (parts[1] > 0xFFu || parts[2] > 0xFFu)
-                            return std::nullopt;
-                        return (parts[0] << 16) | (parts[1] << 8) | parts[2];
-                    };
-                    MachOBuildVersion ver;
-                    bool ok = true;
-                    // platform (closed enum; required).
-                    if (!bv.contains("platform")
-                     || !bv.at("platform").is_string()) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/image/buildVersion/platform",
-                                  "'platform' is required and must be a "
-                                  "string (\"macos\").");
-                        ok = false;
-                    } else {
-                        auto const s =
-                            bv.at("platform").get<std::string>();
-                        auto const p =
-                            machoBuildVersionPlatformFromName(s);
-                        if (!p.has_value()) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/image/buildVersion/platform",
-                                      std::format("unknown buildVersion "
-                                                  "platform '{}' — "
-                                                  "accepted: \"macos\" "
-                                                  "(PLATFORM_MACOS).", s));
-                            ok = false;
-                        } else {
-                            ver.platform = *p;
-                        }
-                    }
-                    // minOs (version string; required).
-                    if (!bv.contains("minOs")
-                     || !bv.at("minOs").is_string()) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/image/buildVersion/minOs",
-                                  "'minOs' is required and must be a "
-                                  "version string (\"11.0\" / \"11.0.0\").");
-                        ok = false;
-                    } else {
-                        auto const v =
-                            parseVer(bv.at("minOs").get<std::string>());
-                        if (!v.has_value()) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/image/buildVersion/minOs",
-                                      "'minOs' must be a dotted version "
-                                      "\"X.Y[.Z]\" (major<65536, "
-                                      "minor/patch<256).");
-                            ok = false;
-                        } else {
-                            ver.minOs = *v;
-                        }
-                    }
-                    // sdk (version string; optional — defaults to minOs).
-                    if (bv.contains("sdk")) {
-                        if (!bv.at("sdk").is_string()) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/image/buildVersion/sdk",
-                                      "'sdk' must be a version string.");
-                            ok = false;
-                        } else {
-                            auto const v =
-                                parseVer(bv.at("sdk").get<std::string>());
-                            if (!v.has_value()) {
-                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                          "/image/buildVersion/sdk",
-                                          "'sdk' must be a dotted version "
-                                          "\"X.Y[.Z]\".");
-                                ok = false;
-                            } else {
-                                ver.sdk = *v;
-                            }
-                        }
-                    } else {
-                        ver.sdk = ver.minOs;
-                    }
-                    if (ok) {
-                        data.machoImage.buildVersion = ver;
-                    }
-                }
-            }
-        }
-    }
+    // ── Per-format identity sub-block readers ───────────────────────────
+    //
+    // WAS: five `if (data.kind == ObjectFormatKind::<X> && doc.contains(...))`
+    // readers totalling ~800 lines. They moved VERBATIM to the backend that
+    // owns each block (`src/link/format/<x>_backend.cpp`) — same parsing, same
+    // diagnostics, same JSON pointers.
+    //
+    // ★ THE `data.kind ==` HALF OF EACH CONDITION WAS ALREADY DEAD, in all
+    // five. `kCrossKindRules` (above, now the generic block-ownership loop) had
+    // ALREADY emitted an Error for exactly those (kind, block) pairs, so
+    // `loadFromText` had already failed and the `data.kind ==` half could only
+    // suppress a write into a struct about to be discarded. That was MEASURED
+    // in TF-C122 but only INFERRED from the collector's severity default —
+    // never executed, and safe only while that guard stayed at Error, a
+    // coupling nothing tested. Routing through the resolved backend removes the
+    // question entirely rather than leaving it to be re-derived.
+    backend->readIdentity(link::ObjectFormatIdentityDoc{doc}, data,
+                          coll);
 
     for (auto&& problem : data.validate()) {
         coll.emitRaw(std::move(problem));

@@ -1,4 +1,5 @@
 #include "link/format/wasm.hpp"
+#include "link/format/object_format_backends.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
@@ -45,13 +46,42 @@ encode(AssembledModule const&    module,
        DiagnosticReporter&       reporter) {
     (void)targetSchema;  // LK8 skeleton: no target-specific bytes.
 
-    if (objectFormatSchema.kind() != ObjectFormatKind::Wasm) {
+    // ── SELF-GUARD (D-LINK-…-KIND-IDENTITY-BRANCHES, TF-C125) ──────────
+    //
+    // ★★ THIS GUARD SURVIVED THE IDENTITY-BRANCH REMOVAL, AND THE REASON IS
+    // MEASURED FOR THIS SITE. The TF-C125 brief expected it to become
+    // redundant: with walkers reached only through a backend the loader
+    // resolved, a walker "can never be handed a schema of another kind", so
+    // the guard would be unreachable by construction and safely deletable.
+    //
+    // That premise is FALSE here. `wasm::encode` is a PUBLIC free function with
+    // 5 direct call sites in `tests/`, none of which route through the
+    // linker — and `WasmWriter.NonWasmFormatFailsLoud`
+    // (tests/link/test_wasm_writer.cpp) hands it a FOREIGN schema on purpose and asserts this
+    // exact refusal. Deleting the guard would not remove dead code; it would
+    // delete tested behaviour and leave a public entry point that mis-encodes
+    // silently. Refused, with evidence.
+    //
+    // ⚠ THE CITATION ABOVE IS PER-SITE ON PURPOSE. The first version of this
+    // comment was one block pasted into all eight guards, every copy naming
+    // the ELF writer's test as its proof — so seven of the eight cited a
+    // measurement that was not about them. An independent audit caught it.
+    // A comment stamped MEASURED that names the wrong measurement is worse
+    // than no comment, under this project's own rule.
+    //
+    // What it stops being is an IDENTITY branch. It no longer compares an
+    // enumerator; it compares the schema's resolved backend against the
+    // singleton THIS TU implements — a pointer identity on an opaque handle,
+    // in the sanctioned realization tier, which is exactly the tier permitted
+    // to know which format it is. Unreachable from the linker (the resolver
+    // cannot produce a mismatched pair), live for every direct caller.
+    if (objectFormatSchema.backend() != &link::format::wasmBackend()) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              std::string{"wasm::encode called with non-Wasm format '"}
                  + std::string{objectFormatSchema.name()}
                  + "' (kind="
                  + std::string{
-                       objectFormatKindName(objectFormatSchema.kind())}
+                       link::objectFormatBackendName(objectFormatSchema.backend())}
                  + ")");
         return {};
     }
