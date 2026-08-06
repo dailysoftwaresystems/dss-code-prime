@@ -2,7 +2,8 @@
 # check-anchor-registry.ps1 — Windows variant of the deferred-anchor
 # registry CI guard. Mirrors the bash variant; same contract.
 #
-# Contract: every `D-*` identifier cited in `src/` MUST resolve to a row
+# Contract: every `D-*` identifier cited in a SCANNED ROOT (`src/`, `examples/`,
+# `real-examples/` - see the roots table below) MUST resolve to a row
 # in `.plans/_deferred-anchor-registry.md` OR a citation in any
 # `.plans/*.md` file.
 
@@ -147,7 +148,8 @@ if ($missing.Count -eq 0) {
     exit 0
 }
 
-Write-Host "anchor-registry: FAIL - the following anchors are cited in src/ but"
+Write-Host "anchor-registry: FAIL - the following anchors are cited in a SCANNED ROOT"
+Write-Host "(src/, examples/, real-examples/ - NOT src/ alone) but"
 Write-Host "have no matching row/citation in any .plans/*.md file:"
 Write-Host ""
 foreach ($a in $missing) {

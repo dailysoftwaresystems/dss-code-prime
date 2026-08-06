@@ -3,7 +3,8 @@
 # discipline. Per memory + the cross-plan staleness sweep, this leak
 # recurred TWICE before being system-enforced.
 #
-# Contract: every `D-*` identifier cited in `src/` MUST resolve to a row in
+# Contract: every `D-*` identifier cited in a SCANNED ROOT (`src/`, `examples/`,
+# `real-examples/` — see the roots table below) MUST resolve to a row in
 # `.plans/_deferred-anchor-registry.md` OR a citation in any `.plans/*.md`
 # file. The script greps source/, extracts each unique `D-*` anchor name,
 # and fails-loud listing every anchor that has no plan-side counterpart.
@@ -144,7 +145,8 @@ if [[ ${#MISSING[@]} -eq 0 ]]; then
     exit 0
 fi
 
-echo "anchor-registry: FAIL — the following anchors are cited in src/ but"
+echo "anchor-registry: FAIL — the following anchors are cited in a SCANNED ROOT"
+echo "(src/, examples/, real-examples/ — NOT src/ alone) but"
 echo "have no matching row/citation in any .plans/*.md file:"
 echo ""
 for anchor in "${MISSING[@]}"; do

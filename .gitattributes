@@ -109,3 +109,15 @@ CMakeLists.txt text eol=lf
 # (`/VERSION`) because it is a single specific file, not an extension class.
 *.md           text eol=lf
 /VERSION       text eol=lf
+
+# Binary TEST FIXTURES (`tests/**/data/`). Committed object files, shared libraries and
+# other byte-exact inputs a test parses. Declared `binary` for the same reason as the
+# `examples/**/*.bin` rule above, and the reason is worth restating: WITHOUT a declaration
+# these ride on git's binary AUTO-DETECTION, which happened to classify them correctly —
+# i.e. they worked by inference rather than by declaration. MEASURED 2026-08-06 (TF-C124):
+# `tests/ffi/data/libdssver.so.1`, a real GNU ld 2.42 output whose versym/verdef bytes a
+# reader test decodes, was covered by nothing in this file. The EOL pin added the same day
+# named SOURCE extensions and forgot that test DATA is the category most likely to need the
+# OPPOSITE treatment — a pin's blast radius is exactly what it names, and what it omits is
+# invisible (D-REPO-GITATTRIBUTES-DOES-NOT-COVER-BINARY-TEST-FIXTURES).
+tests/**/data/** binary

@@ -75,6 +75,16 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      the witness is ABSENT from the mutant, and the mutant still parses. Never infer that a mutator
      ran from its exit code alone. **Never anchor a mutation to absolute line numbers** — it can
      delete the wrong lines and produce a false red, which is untrustworthy in the other direction.
+     ★★ **AND THE MUTANT MUST NOT CONTAIN THE WITNESS STRING — not even in a comment.**
+     ✔MEASURED 2026-08-06, hours after the rule above was written and by the agent following it:
+     a mutant was spelled `$legForwardPaths = @()  # MUTANT: TCL_LIBRARY dropped again` — and the
+     pin, which searches for `TCL_LIBRARY`, **stayed green over a guard that had been removed**,
+     because the comment announcing the mutation carried the very token being searched for. (The
+     helper stripped whole-line comments, not trailing ones.) ⇒ every fail-closed check passed —
+     the witness *was* unique, the mutant *did* differ, it *did* parse — and the demonstration was
+     still worthless. **Add a fourth check: assert the witness is absent from the mutant BY THE
+     SAME MATCHER THE PIN USES**, not by eye and not by a different reader. Describe a mutation in
+     the harness's output, never inside the mutated file.
    - **★★ A PIN MUST DRIVE ITS SUBJECT THROUGH THE SUBJECT'S REAL INPUT PATH — never re-type its
      data.** ✔MEASURED 2026-08-06: a pin stubbed a driver's vocabulary list with eight hand-typed
      tokens — clean by construction, in a shape the driver NEVER RECEIVES — and so could not see
