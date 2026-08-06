@@ -274,6 +274,20 @@ if(DSS_BUILD_TESTS)
     # Dispatches to the platform-appropriate script. The bash
     # variant runs on Linux/macOS CI; the PowerShell variant runs
     # on Windows CI. Both share the same contract + registry file.
+    # Tracked-blob line-ending guard (2026-08-06 —
+    # D-REPO-GITATTRIBUTES-PINS-EOL-FOR-CONFIGS-BUT-NOT-FOR-SOURCES).
+    # No tracked TEXT blob may carry a line-terminating CR unless it
+    # DECLARES `eol=crlf`. Wired here, beside the anchor guard,
+    # deliberately: `.gitattributes` now pins `eol=lf` for the source
+    # tree, but a pin is only as good as its GLOB COVERAGE — the pin
+    # that existed before covered configs/goldens/drivers and still
+    # let six CRLF blobs land in src/ and tests/ because no `.cpp` was
+    # ever named. The pin is the mechanism; THIS is the invariant, and
+    # an invariant nothing executes is a convention.
+    #
+    # Same WIN32 dispatch, same contract, same exit codes as the
+    # anchor guard above; both scripts drive identical `git`
+    # subcommands so the two shells only marshal arguments.
     if(WIN32)
         find_program(POWERSHELL_EXE NAMES pwsh powershell REQUIRED)
         add_test(
@@ -282,10 +296,20 @@ if(DSS_BUILD_TESTS)
                     -NoProfile -ExecutionPolicy Bypass
                     -File "${CMAKE_SOURCE_DIR}/tools/check-anchor-registry.ps1"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        add_test(
+            NAME line_endings_guard
+            COMMAND ${POWERSHELL_EXE}
+                    -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_SOURCE_DIR}/tools/check-line-endings.ps1"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     else()
         add_test(
             NAME anchor_registry_guard
             COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-anchor-registry.sh"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        add_test(
+            NAME line_endings_guard
+            COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-line-endings.sh"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     endif()
 endif()
