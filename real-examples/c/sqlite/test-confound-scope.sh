@@ -125,10 +125,12 @@ fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
 # a pass over work it did not do.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN,
 # by design. One line to update, against an instrument that would otherwise lie.
-TOTAL_ASSERTIONS=96      # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+TOTAL_ASSERTIONS=104     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
                          # + 28 loadext staging + 6 staged sqlite_cfg.h (this driver)
                          # + 4 launcher argv form (this driver, 2 of them behavioural)
                          # + 12 driver-pairing (.ps1-gated)
+                         # + 8 THE SUPPLY (leg_confound_patterns) — the half that
+                         #   was never tested, and where the defect actually was
 pass=0; fail=0; skip=0
 check() { # <label> <expected-substring> <actual>
   if [[ "$3" == *"$2"* ]]; then echo "  ok   $1"; pass=$((pass+1))
@@ -752,6 +754,88 @@ else
   # string CLOSED and followed by a comma.
   check_eq "...and never the space form (nor the .ps1's array-split shape)" "" \
     "$(printf '%s\n' "$PS1CODE" | grep -n -E -- "--(reference-)?launcher( ['\"\$a-z]|['\"][[:space:]]*,)" | head -1)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# THE SUPPLY — WHERE THAT PATTERN ARRAY CAME FROM
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★★ THIS SECTION EXISTS BECAUSE EVERYTHING ABOVE IT IS ABOUT THE MATCHER, AND
+# THE DEFECT WAS IN THE SUPPLY.
+#
+# Every assertion above sets `CONFOUND_PATTERNS=(...)` BY HAND and then exercises
+# the shipped classifier over it. That pinned the matching in real detail — scope
+# prefixes, permutation prefixes, the `$` anchor, family resemblance — while the
+# question "where does that array COME FROM" was asked by NOTHING, in EITHER
+# driver. So for months the .sh applied one global list to every leg and the .ps1
+# returned a Linux-earned list for pe64 and NOTHING for the legs that had earned
+# it, and the whole battery stayed green over both.
+# ⇒ D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG. The same shape as
+# "the shipped vocabulary read" in test-driver-contracts.sh: a pin that supplies
+# its subject's input by hand is testing the stub.
+#
+# EXTRACTED AND RUN, never re-implemented — same discipline as the classifier.
+echo "--- THE SUPPLY: leg_confound_patterns, extracted from the shipped driver ---"
+SUPPLY=$(sed -n -e '/^# >>> dss:confound-supply >>>$/,/^# <<< dss:confound-supply <<<$/p' "$SH")
+if [ -z "$SUPPLY" ]; then
+  echo "  FAIL could not extract the dss:confound-supply region — those sentinels are a CONTRACT with this file"
+  fail=$((fail+1))
+  # The 8 assertions below cannot run; count them so the accounting invariant
+  # cannot be satisfied by silently losing them.
+  skip=$((skip+8))
+else
+  declare -A LEG_CONFOUNDS=(
+    [elf64-x86_64]="'^walsetlk-' '^busy2-' '^zipfile-25\\.0\$'"
+    [pe64-x86_64]=""
+    [elf64-arm64]="'^busy2-' 'emulated:^writecrash-'"
+  )
+  DSS_CONFOUNDS=""
+  # `die` stubbed so the shipped refusal is a CATCHABLE outcome: the last two
+  # assertions are about the driver REFUSING, and a refusal that killed this
+  # runner could not be asserted about. ⚠ `exit`, NOT `return` — mirroring
+  # test-driver-contracts.sh's stub, and it is load-bearing: with `return` the
+  # shipped function CONTINUES past its refusal to the `printf` below it, so what
+  # the assertion measured was the NEXT statement's status (an unbound-key error
+  # under `set -u`, rc 1) rather than the refusal. Every call below is inside a
+  # `$( )` subshell, so the exit ends that subshell and nothing else. 97 is
+  # arbitrary and only ever compared against itself.
+  die() { printf 'DIE: %s\n' "$*"; exit 97; }
+  eval "$SUPPLY"
+  declare -a SUP=()
+  eval "SUP=($(leg_confound_patterns elf64-x86_64))"
+  check_eq "a leg gets ITS OWN declared patterns"     "^walsetlk- ^busy2- ^zipfile-25\\.0\$" "${SUP[*]}"
+  eval "SUP=($(leg_confound_patterns elf64-arm64))"
+  check_eq "...a DIFFERENT leg gets a DIFFERENT set"  "^busy2- emulated:^writecrash-"        "${SUP[*]}"
+  # ★ THE HEADLINE ASSERTION. A leg whose catalogue entry declares `[]` must come
+  # back EMPTY — never inheriting a sibling's list. This is exactly the direction
+  # the old global `DSS_CONFOUNDS` got wrong.
+  eval "SUP=($(leg_confound_patterns pe64-x86_64))"
+  check_eq "a leg declaring [] inherits NOTHING"      ""                                     "${SUP[*]}"
+  # The scope prefix must survive the supply: if it were stripped here, the
+  # qemu-only writecrash excusal would silently become a bare one and suppress a
+  # future genuine regression on a native run — which every assertion in the
+  # classifier section above would still call correct.
+  eval "SUP=($(leg_confound_patterns elf64-arm64))"
+  # ⚠ NO BACKTICKS IN THIS LABEL: it is a DOUBLE-quoted bash string, so `emulated:`
+  # would be command substitution, and bash duly reported `emulated:: command not
+  # found` and ran the assertion against a mangled label. Measured while writing.
+  check "the 'emulated:' scope survives the supply"   "emulated:^writecrash-"                "${SUP[*]}"
+  # THE OPERATOR OVERRIDE still applies to EVERY leg — stating intent, not
+  # inheriting one — including to a leg that declares nothing.
+  DSS_CONFOUNDS='^operator-1 ^operator-2'
+  eval "SUP=($(leg_confound_patterns pe64-x86_64))"
+  check_eq "the operator override reaches EVERY leg"  "^operator-1 ^operator-2"              "${SUP[*]}"
+  eval "SUP=($(leg_confound_patterns elf64-x86_64))"
+  check_eq "...and REPLACES the earned set, never merges" "^operator-1 ^operator-2"          "${SUP[*]}"
+  DSS_CONFOUNDS=""
+  # ⚠ AN UNDECLARED LEG IS A TRANSPORT DEFECT, NOT AN EMPTY LIST. harness_legs.py
+  # refuses to plan a leg with no `confounds`, so an absent entry here means the
+  # plan this driver eval'd is not the plan that file produces — and answering
+  # `[]` would report every failure on that leg as a DSS defect on the strength
+  # of a bug.
+  SUPOUT="$(leg_confound_patterns macho64-arm64 2>&1)"; SUPRC=$?
+  check_eq "an UNDECLARED leg REFUSES rather than answering []" "97" "$SUPRC"
+  check "...naming the reason"  "transport" "$SUPOUT"
+  unset -f die
 fi
 
 echo

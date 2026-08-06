@@ -555,12 +555,77 @@ case "$VOCAB_SOURCE" in
   *)            assert_vocab_clean ;;
 esac
 
+# ═══════════════════════════════════════════════════════════════════════════
+# I — THE CONFOUND SUPPLY IS PER LEG, FROM THE LEG'S OWN DECLARATION
+# ═══════════════════════════════════════════════════════════════════════════
+# D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG. This driver used to build
+# ONE `CONFOUND_PATTERNS` array before the leg loop, from one global
+# `DSS_CONFOUNDS`, and apply it to every leg — including legs where nothing had
+# ever been measured. H6 below restores exactly that and this pin must go red.
+# ★ The MATCHER has been pinned in detail by test-confound-scope.sh for months;
+# the SUPPLY was pinned by nothing, in either driver, which is why the defect
+# outlived so many green runs.
+pin_confound_supply() { # pin_confound_supply <driver>
+  local drv="$1" out rc
+  DSS_CONFOUNDS=""
+  LEG_CONFOUNDS=()
+  LEG_CONFOUNDS[elf64-x86_64]="'^walsetlk-' '^busy2-'"
+  LEG_CONFOUNDS[pe64-x86_64]=""
+  LEG_CONFOUNDS[elf64-arm64]="'^busy2-' 'emulated:^writecrash-'"
+  load_fns "$drv" leg_confound_patterns || return 0
+  local -a got=()
+  eval "got=($(leg_confound_patterns elf64-x86_64))"
+  ck "a leg gets ITS OWN declared patterns" "^walsetlk- ^busy2-" "${got[*]}"
+  eval "got=($(leg_confound_patterns elf64-arm64))"
+  ck "...a DIFFERENT leg gets a DIFFERENT set" "^busy2- emulated:^writecrash-" "${got[*]}"
+  # THE HEADLINE: a leg declaring nothing must inherit nothing. Under the old
+  # global list this came back with every pattern in the shipped default.
+  eval "got=($(leg_confound_patterns pe64-x86_64))"
+  ck "a leg declaring [] inherits NOTHING" "" "${got[*]}"
+  # The scope prefix must survive the supply, or the qemu-only writecrash
+  # excusal silently becomes a bare one on a native run.
+  eval "got=($(leg_confound_patterns elf64-arm64))"
+  ck_has "the 'emulated:' scope survives the supply" "${got[*]}" "emulated:^writecrash-"
+  # The operator override still applies to EVERY leg — intent, not inheritance.
+  DSS_CONFOUNDS='^op-1 ^op-2'
+  eval "got=($(leg_confound_patterns pe64-x86_64))"
+  ck "the operator override reaches EVERY leg" "^op-1 ^op-2" "${got[*]}"
+  DSS_CONFOUNDS=""
+  # An UNDECLARED leg is a transport defect, never an empty list.
+  out="$(leg_confound_patterns nodecl 2>&1)"; rc=$?
+  ck "an UNDECLARED leg REFUSES rather than answering []" "97" "$rc"
+  ck_has "...naming the reason" "$out" "transport"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# J — A FAILED RUN-DIRECTORY OPERATION IS A VERDICT, NOT A SILENT FALLBACK
+# ═══════════════════════════════════════════════════════════════════════════
+# D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS. Two properties, both load-bearing:
+# an EMPTY argv prefix is a real answer (`runFilesystem: driver` — this driver
+# does it natively), and a FAILING prefix must be REPORTED rather than fallen
+# back from, because the fallback is the DrvFs directory the declaration exists
+# to keep the corpus off.
+pin_run_dir_argv() { # pin_run_dir_argv <driver>
+  local drv="$1" rc
+  load_fns "$drv" run_dir_argv || return 0
+  RUN_DIR_WHY="stale"
+  run_dir_argv leg "do nothing" "" /x; rc=$?
+  ck "an EMPTY prefix is a real answer (driver filesystem)" "0" "$rc"
+  ck "...and clears any previous reason" "" "$RUN_DIR_WHY"
+  run_dir_argv leg "prepare the run directory" "sh -c" 'exit 3'; rc=$?
+  ck "a FAILING prefix is reported, never swallowed" "1" "$rc"
+  ck_has "...naming what could not be done" "$RUN_DIR_WHY" "prepare the run directory"
+  ck_has "...and the exit code" "$RUN_DIR_WHY" "exited 3"
+}
+
 green "A+B  the not-run recorder + the shared run decision" pin_verdicts
 green "C    the Step-8 gate sequence, executed"             pin_step8_gates
 green "D    parse_segment keeps the first diagnostic"       pin_parse_segment
 green "E    the precondition discriminator"                 pin_precondition
 green "F    acq_field over a REAL acquisition record"       pin_acq_field
 green "G    the loader variable is TARGET-keyed"            pin_loader_var
+green "I    the confound supply is PER LEG"                 pin_confound_supply
+green "J    a failed run-dir operation is a VERDICT"        pin_run_dir_argv
 
 # ═══════════════════════════════════════════════════════════════════════════
 # H — RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.
@@ -606,6 +671,25 @@ if mutate "H5 hardcode the ELF loader variable" "$WORK/m5.sh" "darwin)  printf '
       print "    darwin)  printf '\''%s'\'' '\''LD_LIBRARY_PATH'\'' ;;"; next }
     { print }'; then
   red "H5 the loader variable follows the TARGET" pin_loader_var "$WORK/m5.sh"
+fi
+
+# H6 — THE DEFECT ITSELF, RESTORED: one global list for every leg. The pin must
+# go red on "a leg declaring [] inherits NOTHING" and on the per-leg answers.
+if mutate "H6 restore the ONE-GLOBAL-LIST confound supply" "$WORK/m6.sh" 'printf '"'"'%s'"'"' "${LEG_CONFOUNDS[$leg]}"' '
+    /^  printf .%s. "\$\{LEG_CONFOUNDS\[\$leg\]\}"$/ {
+      print "  printf '\''%s'\'' \"'\''^walsetlk-'\'' '\''^busy2-'\'' '\''^zipfile-25.0$'\''\""; next }
+    { print }'; then
+  red "H6 the confound supply is PER LEG, not one global list" pin_confound_supply "$WORK/m6.sh"
+fi
+
+# H7 — make a failed run-directory operation report success, which is the silent
+# fallback onto DrvFs that the whole declaration exists to prevent.
+if mutate "H7 make a failed run-dir operation look fine" "$WORK/m7.sh" 'RUN_DIR_WHY="could not $what in the launcher'"'"'s own filesystem' '
+    /^  RUN_DIR_WHY="could not \$what in the launcher.s own filesystem/ {
+      print "  RUN_DIR_WHY=\"\""; print "  return 0"; skip = 1; next }
+    skip && /^  return 1$/ { skip = 0; next }
+    { print }'; then
+  red "H7 a failed run-dir operation is REPORTED, never swallowed" pin_run_dir_argv "$WORK/m7.sh"
 fi
 
 printf '\n'

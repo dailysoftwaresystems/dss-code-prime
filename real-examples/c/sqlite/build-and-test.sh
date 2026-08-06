@@ -232,104 +232,49 @@ DSS_TIER="${DSS_TIER:-veryquick}"
 # isolate whether a corpus failure is optimizer-induced.
 DSS_CONFIG="${DSS_CONFIG:-release}"
 # DSS_CONFOUNDS: ERE patterns (space/newline-separated) for KNOWN non-DSS unit
-# failures — a failing test matching any is not counted against green. Defaults
-# to the documented set (WAL set-lock wall-clock timing on a fast/uncontended box;
-# a zipfile UPSTREAM TEST-ISOLATION LEAK; the recover-fault OOM-oracle class).
-# (zipfile-25.0 — MECHANISM PROVEN 2026-07-26, superseding the earlier and WRONG
-# "error-message-text env diff" description. symlink.test:163 does `file mkdir x`
-# and never removes it; symlink sorts BEFORE zipfile, so by the time zipfile.test
-# runs in the SHARED testdir a DIRECTORY named `x` exists. zipfile-25.0 asserts
-# `zipfile('x')` fails with "cannot open file: x" — but on Linux fopen() on a
-# directory SUCCEEDS, so it fails later in fread() instead. A 4-case probe in ONE
-# process, varying only the filesystem, gives: x absent -> "cannot open file: x"
-# (expected); x = empty file -> success; x = DIRECTORY -> "error in fread()", the
-# corpus string byte-for-byte. One binary, three outcomes => cannot be codegen.
-# See D-SQLITE-ZIPFILE25-SYMLINK-TESTDIR-LEAK.)
-# (date-2.4c is gcc-EXONERATED — a GCC-built testfixture fails it identically
-# [expected NULL, got a date], so it is a sqlite date-format/version/env diff, not
-# a DSS miscompile. NOTE: fpconv1-2.0 is DELIBERATELY NOT a confound — a debug DSS
-# fixture + a GCC fixture both pass it while a release DSS fixture fails all 500k
-# values, so it is a GENUINE release-optimizer fp miscompile [D-OPT-SQLITE-FPCONV1-
-# RELEASE-FP-MISCOMPILE] the harness MUST flag red until fixed.)
-# A pattern may be SCOPED by execution mode: `emulated:<re>` / `native:<re>`; bare
-# means every leg. `emulated:^writecrash-` is excused ONLY on a leg that needs a
-# runner (qemu), because the emulator injects "qemu: uncaught target signal 6" into
-# the output sqlite's crash harness compares — PROVEN by a gcc-built aarch64
-# abort() emitting that exact string, no DSS involved. The native host leg passes
-# all 988 writecrash assertions, so this must NEVER be excused there.
-# ^walsetlk_recover- is a SEPARATE pattern on purpose: `^walsetlk-` must NOT sweep
-# it in by family resemblance (different test FILE), so it is excused only by its
-# own row, earned by its own control. EVIDENCE: the GCC-built full-source reference
-# testfixture fails it IDENTICALLY — 6 runs each, same machine, same sqlite tree,
-# both linking the same libtcl8.6.so: gcc 4 pass / 2 fail (tm -35334590, -35331430),
-# dss 3 pass / 3 fail (tm -35335818, +36338628, -35333129). Same intermittency, same
-# ~35.3 s magnitude, both signs. See D-SQLITE-WALSETLK-RECOVER-NEGATIVE-ELAPSED.
-# (loadext-2.1 / loadext-2.2 — ADDED 2026-07-31 (TF-C103), the first confounds this
-# harness EARNED using its own reference oracle, and the reason the oracle was
-# repaired the cycle before. They are the only two non-confound failures in the whole
-# `full` tier: 2 out of 1,061,550 tests. MECHANISM, MEASURED and not inferred:
-# loadext.test:64-65 hardcodes the macOS dyld error string as
-# `{dlopen.%s, 10.: .*image.*found.*}`, and macOS 26.5.2 (build 25F84) changed that
-# string in TWO independent ways — the dlopen flags now print in HEX (`0x000A`) where
-# the regex wants DECIMAL (`10`), and the phrase is now `(no such file)` inside a
-# `tried: <path>, <path>, …` enumeration where the regex wants `image not found`.
-# EVIDENCE — this is exoneration, not resemblance: the reference cc-built full-source
-# testfixture, which contains no DSS-compiled code at all, fails the SAME TWO tests on
-# the SAME machine and sqlite tree — `2 errors out of 52 tests`, `!Failures on these
-# tests: loadext-2.1 loadext-2.2` — and emits the identical new-format string. A
-# compiler cannot change what dyld prints. ⚠ SCOPED DELIBERATELY NARROW: anchored to
-# these two test NAMES, NOT to `^loadext-`, so a real DSS defect anywhere else in
-# loadext.test still fails loud — the extension-loading path is exactly where a
-# codegen or linkage defect would plausibly show up. Revisit when sqlite updates the
-# regex upstream or the macOS string changes again. See
-# D-SQLITE-LOADEXT-MACOS26-DLERROR-FORMAT.)
-# (^busy2- and ^recoverfault — CONTROL RECORDED 2026-08-01 (TF-C108). Until this
-# date these were the only two patterns here carrying a DESCRIPTION but no MEASURED
-# matched control, i.e. they were asserted rather than earned. They are now earned,
-# by one experiment: the DSS-built and the gcc-built REFERENCE testfixture ran
-# `full.test` CONCURRENTLY on the same box and the same sqlite tree (23 min; DSS 12
-# errors / 1,061,995, reference 8 errors / 1,062,222). ^recoverfault gets the
-# strongest possible control — the SAME FOUR NAMES failed in BOTH fixtures
-# (recoverfault-{1,2}-oom-{persistent,transient}.{459,460}), and a compiler cannot
-# change which allocation an OOM oracle stops at. ^busy2- is earned as a CLASS: both
-# fixtures failed a busy2 wall-clock assertion, DIFFERENT members each (DSS
-# busy2-2.2.5, reference busy2-1.2.3) — which is the signature of an intermittent
-# environment effect, not of codegen. A SECOND, INDEPENDENT datum points the same
-# way: in the 2026-07-31 `full` run the SAME name, busy2-2.1.3, failed on the host
-# x86_64 leg AND on the arm64-under-qemu leg — two different code generators and two
-# different instruction sets producing the identical timing failure in one run. The same run also re-validated ^walsetlk- (DSS
-# 2.1.3/2.1.12/2.1.14/2.2.6/2.2.8, reference 2.1.8), ^walsetlk_recover- (BOTH negative
-# and near-identical: DSS -33,932,622 us, reference -33,923,905 us) and ^zipfile-25.0
-# (both). ⓘ WHY THE WHOLE FAMILY MOVES TOGETHER: every one of these assertions takes
-# its number from Tcl's `time`, which lives entirely outside DSS-compiled code —
-# VERIFIED, not assumed: ldd resolves libtcl8.6.so to the SAME
-# /lib/x86_64-linux-gnu/libtcl8.6.so for both fixtures, and `nm -D --defined-only`
-# finds Tcl_GetTime defined in NEITHER fixture while that .so exports it; and
-# sqlite's own unixSleep
-# (src/os_unix.c) calls nanosleep(&sp, NULL) with no EINTR retry while
-# sqliteDefaultBusyCallback credits the NOMINAL delay from its totals[] table, so a
-# caught signal shortens the real wait with the handler none the wiser.
-# ★★ ROOT CAUSE, MEASURED THE SAME DAY — THE CLOCK ON THIS BOX IS BROKEN, AND IT IS
-# NOT A COMPILER PROBLEM. CLOCK_REALTIME oscillates between two fixed values ~34.47 s
-# apart, flipping every ~5 s. Two independent instruments: a shell sampler (791
-# intervals) saw 49 steps, max +34.4495 / min -34.4496 s; a single-process probe
-# calling clock_gettime(CLOCK_REALTIME) and clock_gettime(CLOCK_MONOTONIC) back to
-# back at 20 Hz (2,382 samples) saw 48 steps, with (realtime - monotonic) — a
-# CONSTANT unless realtime is stepped — taking exactly two values, SPREAD 35.164 s.
-# The magnitude is the smoking gun: EVERY walsetlk_recover-1.3 negative elapsed ever
-# recorded (-33,932,622 / -33,923,905 / -33,969,790 / -35,334,590 / -35,331,430 /
-# -35,335,818 us) falls inside that spread. A test that reads the clock either side
-# of a wait and straddles a flip mismeasures it by +/-34.5 s. This is why the whole
-# family moves together and why the gcc reference suffers it identically. Tracked by
-# D-ENV-WSL2-CLOCK-REALTIME-STEPS-34S; when the clock is fixed, several of the
-# patterns below may simply evaporate — re-evaluate then and NARROW this list.
-# ⚠ SCOPE NOTE:
-# ^busy2- stays a whole-FILE pattern, which is broader than the per-NAME standard set
-# by loadext-2.1/2.2; narrowing it needs per-name controls that do not exist yet. And
-# misc7-7.0, which fails by the SAME mechanism, is deliberately NOT added here —
-# family resemblance is not a control. See D-SQLITE-MISC7-BUSYTIMEOUT-DELAY-WINDOW-
-# GENUINE and D-SQLITE-WALSETLK-RECOVER-NEGATIVE-ELAPSED.)
-DSS_CONFOUNDS="${DSS_CONFOUNDS:-^walsetlk- ^walsetlk\. ^walsetlk_recover- ^busy2- ^zipfile-25\.0$ ^recoverfault ^date-2\.4c$ ^loadext-2\.1$ ^loadext-2\.2$ emulated:^writecrash-}"
+# failures — a failing test matching any is not counted against green.
+#
+# ★★★ THE DEFAULT SET IS NOT IN THIS FILE ANY MORE, AND THAT IS THE WHOLE FIX.
+# [D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG,
+#  D-HARNESS-SQLITE-CONFOUNDS-NOT-DECLARED-PER-LEG,
+#  D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY.]
+#
+# What stood here was ONE global default list applied to EVERY leg this driver
+# runs — the two elf legs, the two macho legs on a Mac, pe64 under Wine — while
+# build-and-test.ps1 returned a six-pattern list for `pe64-x86_64` and an EMPTY
+# one for everything else. Two drivers, two ledgers, neither keyed on the thing
+# that actually decides the answer. ✔MEASURED consequence: the SAME elf64-x86_64
+# artefact's `zipfile-25.0` was a "known non-DSS confound" under this driver and
+# a "genuine failure" under the .ps1, in the same project on the same day. The
+# genuine-failure count is what every verdict here rests on, so no two legs' were
+# comparable.
+#
+# ⇒ THE EARNED SET IS DECLARED PER LEG, in legs.json `confounds`, and each
+# pattern carries the leg + host + date + mechanism that earned it plus the
+# anchor holding the long form. The prose that used to live in this comment block
+# — the walsetlk/busy2/recoverfault matched controls, the zipfile symlink leak,
+# the macOS dyld string, the qemu abort artefact — moved there WITH its pattern,
+# which is the point: evidence beside the claim it supports, in the one file both
+# drivers read. harness_legs.py's lint REFUSES a pattern with no provenance, a
+# duplicate, one that does not compile as a regex, and a leg that omits the key
+# entirely — `[]` ("nothing has ever been earned here; every failure counts") is
+# a claim a catalogue has to make out loud.
+#
+# ⓘ WHAT THIS VARIABLE STILL DOES, unchanged: an operator OVERRIDE, which
+# deliberately applies to EVERY leg — naming a pattern on the command line is
+# stating intent for this run, not inheriting one — and which is announced as
+# such, per leg, so a reader of the log can never mistake it for the earned set.
+# Its grammar is unchanged too: bare `<re>` = however the leg runs, and the
+# `native:<re>` / `emulated:<re>` scope prefixes, which the catalogue spells as a
+# `scope` FIELD and harness_legs.py renders back into this same wire form.
+#
+# ⛔ THE 55 DrvFs FAILURES ARE NOT CANDIDATES FOR THIS LIST. A launched leg whose
+# run directory lands on a filesystem that only approximates POSIX semantics
+# fails ~60 units under a GCC reference too — but the mechanism is OURS and it is
+# fixed, by declaration, in legs.json `launchers[].runFilesystem`. A confound row
+# would have laundered a harness misconfiguration into "expected", using the very
+# mechanism this list exists to keep honest. D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS.
+DSS_CONFOUNDS="${DSS_CONFOUNDS:-}"
 # DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
 # tier. Delivered through SQLite's OWN upstream hook — the QUICKTEST_OMIT env var
 # read by test/permutations.test (~line 152): a COMMA-separated list of Tcl regexes
@@ -432,6 +377,7 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
            LEG_RUN_MODE=() LEG_RUN_VERDICT=() LEG_RUN_DETAIL=() \
            LEG_LAUNCH=() LEG_LAUNCH_ENV=() \
            LEG_PATH_TRANSLATION=() LEG_PATH_TRANSLATOR=() LEG_ENV_TRANSFER=() \
+           LEG_RUN_FILESYSTEM=() LEG_CONFOUNDS=() LEG_RUN_LAUNCH=() \
            LEG_RECIPE_TRANSFORM=() LEG_HEADER_STAGE_KEY=() LEG_ZCONF_GUARDS=() \
            LEG_CONFIG_STAGE_KEY=() LEG_CONFIGURE_ANSWERS=() \
            LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() LEG_LOADEXT_NAME=() \
@@ -1052,6 +998,88 @@ assert_launch_args_translated() {   # assert_launch_args_translated <verb> <arg.
   if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" "${call[@]}" 2>&1)"; then rc=0; else rc=$?; fi
   [[ $rc -eq 0 ]] || die "REFUSING to spawn the leg's launcher — an argument is still in THIS driver's path namespace, not the launcher's:
       ${out:-<no diagnostic>}"
+}
+
+# ── THE LAUNCHER'S FILESYSTEM ────────────────────────────────────────────────
+# D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS. Twin of Get-LegRunDirPlan /
+# Invoke-RunDirArgv in build-and-test.ps1, capability-paired for the same reason
+# the path-namespace pair above is.
+#
+# THE THIRD NAMESPACE. The two above make a launched leg's argv and environment
+# correct; neither says a word about the FILESYSTEM the launched fixture writes
+# its databases onto — and this corpus is a database engine's, so that is the
+# property it tests hardest. ✔MEASURED on the .ps1 twin's Windows host: /mnt/c is
+# mounted 9p/drvfs with NO `metadata` option, so `chmod 644` reads back as 777 and
+# `chmod 400` as 555 — the entire POSIX mode synthesised from ONE Windows
+# attribute; /tmp (ext4) answers 644 and 400. A 2x2 matched control ({DSS, gcc
+# reference} x {DrvFs, ext4}) reproduced all 60 failures under GCC on DrvFs and
+# made every one VANISH on ext4. ⛔ They are NOT confounds: the mechanism is ours
+# and it is fixed here, by declaration, not excused.
+#
+# ★ THIS DRIVER SPELLS NO MECHANISM — no `--cd`, no `/tmp`, no `mkdir`, no `cp`.
+# It reads the leg's DECLARED verb and asks the resolver, exactly as launch_path
+# asks it about `wslpath`.
+leg_run_dir_plan() {           # leg_run_dir_plan <leg> <driver-rundir>  -> JSON
+  local leg="$1" driver_run_dir="$2" out rc
+  # rc DIRECTLY off python3, never after a pipe.
+  if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+              --run-dir-plan "$leg" --host-os "$HOST_OS" --host-arch "$HOST_ARCH" \
+              --driver-run-dir "$driver_run_dir" --format json 2>&1)"; then rc=0; else rc=$?; fi
+  [[ $rc -eq 0 && -n "${out//[[:space:]]/}" ]] || die "[$leg] could not resolve this leg's RUN DIRECTORY (harness_legs.py --run-dir-plan, rc=$rc):
+      ${out:-<no diagnostic>}
+      Which filesystem a launched leg runs on is DECLARED (legs.json \`launchers[].runFilesystem\`),
+      never assumed — and the assumption is what put a Linux sqlite corpus onto DrvFs."
+  printf '%s\n' "$out"
+}
+# One field out of that JSON. A LIST field (the argv prefixes, the launcher argv)
+# comes back shlex-quoted and space-joined so the caller `eval`s it into an array
+# — the same transport `emit_sh` uses for LEG_LAUNCH, and for the same reason: a
+# word with a space in it must survive.
+run_dir_field() {              # run_dir_field <json> <key>  -> stdout
+  local json="$1" key="$2" out rc
+  if out="$(printf '%s' "$json" | python3 -c '
+import json, shlex, sys
+blob = json.load(sys.stdin)
+key = sys.argv[1]
+if key not in blob:
+    sys.stderr.write("no such run-dir-plan field: %s (have: %s)\n"
+                     % (key, ", ".join(sorted(blob))))
+    raise SystemExit(3)
+v = blob[key]
+sys.stdout.write(" ".join(shlex.quote(x) for x in v) if isinstance(v, list) else str(v))
+' "$key" 2>&1)"; then rc=0; else rc=$?; fi
+  [[ $rc -eq 0 ]] || die "the run-dir plan does not carry the field this driver reads ('$key', rc=$rc):
+      ${out:-<no diagnostic>}
+      That is a contract break between harness_legs.py and this driver, not a property of this host."
+  printf '%s' "$out"
+}
+# Run one of the resolver's argv PREFIXES. An EMPTY prefix means the launcher
+# shares this driver's filesystem and the caller does it natively — that is what
+# `runFilesystem: driver` MEANS, so empty is a real answer and not a missing one,
+# and this returns 0 for it.
+#
+# ★ IT RETURNS A VERDICT, IT DOES NOT `die` — deliberately, not defensively. This
+# driver attempts five legs; a run directory that could not be prepared costs THAT
+# leg its corpus and must not delete four other legs' worth of evidence. It is
+# the same rule stage_loadext_extension learnt the expensive way on 2026-08-05,
+# when a `die` in a staging function ended a run in which two legs had already
+# reported green over 331,351 and 331,355 units.
+# ⛔ AND THERE IS NO FALLBACK TO THIS DRIVER'S OWN DIRECTORY. Falling back would
+# put the corpus straight back onto the filesystem the declaration exists to keep
+# it off, silently, which is worse than not running the leg.
+RUN_DIR_WHY=""
+run_dir_argv() {               # run_dir_argv <leg> <what> <quoted-prefix> <arg...>  -> 0 | 1
+  local leg="$1" what="$2" prefix="$3"; shift 3
+  RUN_DIR_WHY=""
+  [[ -n "${prefix//[[:space:]]/}" ]] || return 0
+  local -a argv=()
+  eval "argv=($prefix)"
+  argv+=("$@")
+  local out rc
+  if out="$("${argv[@]}" 2>&1)"; then rc=0; else rc=$?; fi
+  [[ $rc -eq 0 ]] && return 0
+  RUN_DIR_WHY="could not $what in the launcher's own filesystem — \`${argv[*]}\` exited $rc: ${out:-<no diagnostic>}"
+  return 1
 }
 
 # ── THE LEG PLAN ─────────────────────────────────────────────────────────────
@@ -3095,8 +3123,20 @@ pass "headers staged + build inputs resolved for $_ready of ${#LEG_ORDER[@]} sel
 # after the one that died — is NOT run, and is reported as such per abort. sqlite
 # exposes no finer restart point than (permutation, file).
 #
-# >>> dss:corpus-engine >>>  (region mirrored in build-and-test.ps1; the verifier
-# extracts it from this file by these sentinels, so keep them on their own lines)
+# >>> dss:corpus-engine >>>  (region mirrored in build-and-test.ps1)
+# ⚠ CORRECTED 2026-08-06: this header used to say "the verifier extracts it from
+# this file by these sentinels". THERE IS NO SUCH VERIFIER. ✔MEASURED — the only
+# consumers of any `dss:` sentinel in this repository are test-confound-scope.sh
+# (`src-provenance`, `src-clone`, `src-gate`, `loadext-stage`, `loadext-verdict`,
+# `confound-supply`), test-confound-scope.ps1 (`src-provenance`,
+# `loadext-stage-ps1`) and test-driver-contracts.sh (`verdict-vocabulary`);
+# `corpus-engine` is read by NOTHING. The sentinels are still worth keeping — they
+# mark the paired region for a reader and for the verifier that should exist — but
+# a comment asserting a guard that is not there is the exact defect this project
+# keeps paying for: an instrument credited with an observation it never made.
+# ⇒ nothing about this region is enforced today; the two copies can diverge
+# silently, and the confound classifier's SUPPLY (which lives outside it) did
+# exactly that for months. Keep the sentinels on their own lines.
 
 # sqlite's own $alltests: every `.test` basename in the corpus dir MINUS the driver
 # scripts it excludes by name (all.test / permutations.test / …), byte-sorted — the
@@ -3412,8 +3452,14 @@ run_leg() {                    # run_leg <leg> <bin> <args...>  — REPLACES thi
   # `LEG_LAUNCH_ENV` is the same for `NAME='value'` pairs — it is what carries
   # QEMU_LD_PREFIX for the arm64 leg, which used to be a hardcoded $QEMU_SYSROOT
   # here and is now a property of the leg that needs it.
+  # ★ AND `LEG_RUN_LAUNCH` WINS WHEN IT IS SET: it is the SAME declared argv with
+  # the run filesystem's working-directory option already spliced in by the
+  # resolver (`--run-dir-plan`), which is how a launched leg is told to start in
+  # ITS OWN filesystem instead of over a compatibility mount. Empty on every leg
+  # whose launcher shares this driver's filesystem, so those spawn exactly as
+  # before. [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
   local -a launch=() envs=()
-  eval "launch=(${LEG_LAUNCH[$leg]})"
+  eval "launch=(${LEG_RUN_LAUNCH[$leg]:-${LEG_LAUNCH[$leg]}})"
   eval "envs=(${LEG_LAUNCH_ENV[$leg]})"
   [[ ${#envs[@]} -eq 0 ]] || export "${envs[@]}"
   # The leg's OWN library directories, for the runtime loader. Only for a leg whose
@@ -3488,7 +3534,12 @@ run_fixture_segment() {        # run_fixture_segment <leg> <bin> <launch_bin> <l
   # `die` would fire on the fixture's own non-zero exit — writing a bogus
   # " [X] ERROR: failed at line …" INTO the segment log (stderr is redirected there)
   # and masking the real exit status. A failing test is data here, not an error.
-  ( trap - ERR; set +e; cd "$rundir" && run_leg "$leg" "$launch_bin" "$@" ) > "$log" 2>&1 < /dev/null &
+  # `$leg_run_cd` is $rundir whenever the launcher shares this driver's filesystem
+  # — i.e. on every POSIX host, where this line is byte-for-byte what it always
+  # was. When it does not, the child's real working directory comes from the
+  # launcher's own spliced option and this `cd` only keeps the SUBSHELL somewhere
+  # that exists. [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
+  ( trap - ERR; set +e; cd "${leg_run_cd:-$rundir}" && run_leg "$leg" "$launch_bin" "$@" ) > "$log" 2>&1 < /dev/null &
   local child=$!
   local last_len=-1 last_grow t0
   t0="$(date +%s)"; local last_grow_t="$t0"
@@ -4374,7 +4425,47 @@ TEST_FILE="${DSS_TEST_FILE:-$SQLITE_DIR/test/$DSS_TIER.test}"
 # The corpus directory the tier script lives in — where permutations.test and the
 # ~1.3k .test units are. READ-ONLY to this harness: nothing is ever written here.
 TESTDIR_SRC="$(cd "$(dirname "$TEST_FILE")" && pwd)"
-read -r -a CONFOUND_PATTERNS <<< "$DSS_CONFOUNDS"
+# >>> dss:confound-supply >>>
+# THE CONFOUND SUPPLY, PER LEG, FROM THE LEG'S OWN DECLARATION.
+# [D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG.]
+#
+# What stood here was `read -r -a CONFOUND_PATTERNS <<< "$DSS_CONFOUNDS"` — ONE
+# array, built ONCE, before the leg loop, applied to EVERY leg. It is now a
+# function called INSIDE the loop, because the answer is a property of the leg.
+#
+# ★ THE MATCHER WAS ALWAYS TESTED AND THE SUPPLY NEVER WAS, WHICH IS WHY THE
+# DEFECT LIVED SO LONG: test-confound-scope.{sh,ps1} assign the pattern array
+# directly and then exercise the classifier, so both drivers' matching was pinned
+# in detail while the question "where did that array COME FROM" was asked by
+# nothing at all. Both self-tests now extract and run THIS function too.
+#
+# ⚠ `eval` INTO AN ARRAY, exactly like LEG_LAUNCH: the resolver emits
+# shlex-quoted words so that a pattern containing a space, a `$` or a backslash
+# survives. `for p in ${LEG_CONFOUNDS[...]}` would shred it.
+# ⚠ AND AN UNSET ENTRY IS FATAL, NOT EMPTY: harness_legs.py REFUSES to plan a leg
+# that does not declare `confounds`, so the array being absent here means the
+# plan this driver eval'd is not the plan that file produces. Substituting an
+# empty list would report every failure on the leg as a DSS defect on the
+# strength of a transport bug.
+leg_confound_patterns() {   # leg_confound_patterns <leg>  -> shlex-quoted words
+  local leg="$1"
+  if [[ -n "$DSS_CONFOUNDS" ]]; then
+    # THE OPERATOR OVERRIDE, and it deliberately applies to EVERY leg: naming a
+    # pattern on the command line is stating intent for this run, not inheriting
+    # one. Re-quoted through the same transport so both paths produce one shape.
+    local _p; local -a _out=()
+    for _p in $DSS_CONFOUNDS; do _out+=("$(printf '%q' "$_p")"); done
+    printf '%s' "${_out[*]}"
+    return 0
+  fi
+  [[ -n "${LEG_CONFOUNDS[$leg]+set}" ]] || die "[$leg] the resolved leg plan carries NO LEG_CONFOUNDS entry.
+      harness_legs.py refuses to plan a leg that does not declare \`confounds\`, so this is a transport
+      defect between the resolver and this driver — NOT a leg with nothing earned. Treating it as an
+      empty list would silently report every failure on this leg as a DSS defect.
+      [D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG]"
+  printf '%s' "${LEG_CONFOUNDS[$leg]}"
+}
+# <<< dss:confound-supply <<<
 # Tier exclusions (see DSS_TIER_EXCLUDES above) — announced BEFORE the run so the
 # reduction is on the record even if a leg never reaches a summary line, and
 # carried into every leg's Step-9 verdict via $EXCL_NOTE.
@@ -4635,12 +4726,13 @@ sys.stdout.write(" ".join(str(value).split()))' "$2" <<< "$1"
 }
 STAGE_WHY=""
 STAGE_CROSSCHECK=""
+STAGE_STAGED=""
 stage_loadext_extension() {    # stage_loadext_extension <leg> <rundir> -> 0 | 1 | 2
   local leg="$1" rundir="$2" _json _rc=0 _klass
   local name="${LEG_LOADEXT_NAME[$leg]:-}"
   local dstdir="$rundir/$SQLITE_TESTDIR_SUBDIR"
   local work="$OUT_DIR/$leg/loadext-helper"
-  STAGE_WHY=""; STAGE_CROSSCHECK=""
+  STAGE_WHY=""; STAGE_CROSSCHECK=""; STAGE_STAGED=""
   mkdir -p "$dstdir" "$work" || {
     STAGE_WHY="could not create the run's testdir ($dstdir) or the helper's work dir ($work) — check free space and permissions."
     return 1
@@ -4670,8 +4762,12 @@ stage_loadext_extension() {    # stage_loadext_extension <leg> <rundir> -> 0 | 1
   _klass="$(loadext_field "$_json" verdictClass)" || _klass="?"
   STAGE_WHY="$(loadext_field "$_json" detail)" || STAGE_WHY="the helper build reported nothing this driver could read; raw output: $(printf '%s' "$_json" | tr '\n' ' ')"
   STAGE_CROSSCHECK="$(loadext_field "$_json" crossCheck)" || STAGE_CROSSCHECK=""
+  # The FILE the resolver actually wrote, recorded so the caller can carry it into
+  # a launcher's own filesystem when the corpus does not run in this one.
+  # [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
+  STAGE_STAGED="$(loadext_field "$_json" staged)" || STAGE_STAGED=""
   case "$_rc" in
-    0) info "[$leg] loadext helper -> $(loadext_field "$_json" staged) — $STAGE_WHY"
+    0) info "[$leg] loadext helper -> $STAGE_STAGED — $STAGE_WHY"
        [[ -z "$STAGE_CROSSCHECK" ]] || info "      $STAGE_CROSSCHECK"
        return 0 ;;
     4) return 2 ;;                        # skipped-build-input-missing
@@ -4732,7 +4828,66 @@ for leg in "${LEG_ORDER[@]}"; do
   if [[ -z "${LEG_CC[$leg]:-}" ]]; then
     info "[$leg] no CONTROL compiler on this host — the corpus RUNS anyway (the loadext helper comes from DSS); only the helper's cross-check against a second toolchain is lost."
   fi
+  # THE DRIVER-SIDE run directory. It exists on EVERY leg regardless of where the
+  # corpus actually runs, because this driver has to be able to WRITE into it:
+  # the loadext helper is produced by a process on THIS machine and can only land
+  # where this machine can put a file. For a `driver` filesystem it is also where
+  # the fixture runs; for a foreign one it is the staging area the resolver's
+  # copy argv reads FROM. [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
   bin="${FIXTURE[$leg]}"; rundir="$OUT_DIR/$leg/run"; rm -rf "$rundir"; mkdir -p "$rundir"
+  # >>> dss:run-dir >>>
+  # WHERE THE CORPUS RUNS, DECLARED — never "wherever this driver happens to put
+  # its build tree". A launcher that crosses into another kernel does not write
+  # onto this filesystem; it reaches this one through a compatibility mount whose
+  # POSIX semantics are approximate, and a database engine's corpus is the single
+  # worst thing to run over an approximation of POSIX semantics.
+  # ✔MEASURED 2026-08-06 (the .ps1 twin's host): /mnt/c is 9p/drvfs with NO
+  # `metadata` option, so `chmod 644` reads back as 777 and `chmod 400` as 555 —
+  # every mode bit synthesised from ONE Windows attribute. A 2x2 matched control
+  # ({DSS, gcc reference} x {DrvFs, ext4}) reproduced all 60 failures under GCC on
+  # DrvFs and made every one of them VANISH on ext4.
+  # ★ THIS DRIVER SPELLS NO MECHANISM. The verb is the LAUNCHER's declaration and
+  # harness_legs.py answers with the directory, the launcher argv (working-
+  # directory option already spliced into the right position) and the argv
+  # prefixes that create/clear/populate it. On every POSIX host every declared
+  # launcher is `driver`, so `$leg_launch_run` is empty, `$leg_run_cd` is
+  # `$rundir` and this leg's spawn is byte-for-byte the one it has always been.
+  leg_run_plan="$(leg_run_dir_plan "$leg" "$rundir")"
+  leg_run_fs="$(run_dir_field "$leg_run_plan" runFilesystem)"
+  leg_launch_run="$(run_dir_field "$leg_run_plan" launcherPath)"
+  leg_run_cd="${leg_launch_run:-$rundir}"
+  # The launcher argv the fixture is spawned through: the DECLARED command with
+  # the working-directory option already spliced in by the resolver, so run_leg
+  # never learns where in an argv an option has to go. Identical to LEG_LAUNCH
+  # whenever the verb needs no option, which is every launcher on a POSIX host.
+  LEG_RUN_LAUNCH["$leg"]="$(run_dir_field "$leg_run_plan" launcher)"
+  if [[ -n "$leg_launch_run" ]]; then
+    info "[$leg] the launcher writes onto ITS OWN filesystem (runFilesystem '$leg_run_fs') — the corpus runs in $leg_launch_run"
+    info "      NOT in $rundir, which that launcher reaches only through a compatibility mount whose POSIX file modes are synthesised from one host attribute. [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]"
+    # PER-LEG, NEVER THE RUN — and never a silent fallback to $rundir, which is
+    # the very filesystem this declaration exists to keep the corpus off.
+    # `if …; then :; else` because a plain call under `set -Eeuo pipefail` + the
+    # ERR trap would EXIT on the non-zero before the classifier could run.
+    _rd_ok=1
+    if run_dir_argv "$leg" "clear the run directory $leg_launch_run" \
+                    "$(run_dir_field "$leg_run_plan" rmTreeArgv)" "$leg_launch_run"; then :; else _rd_ok=0; fi
+    if [[ "$_rd_ok" -eq 1 ]]; then
+      if run_dir_argv "$leg" "create the run directory $leg_launch_run" \
+                      "$(run_dir_field "$leg_run_plan" mkdirArgv)" "$leg_launch_run/$SQLITE_TESTDIR_SUBDIR"; then :; else _rd_ok=0; fi
+    fi
+    if [[ "$_rd_ok" -eq 0 ]]; then
+      STAGE_FAILS=$((STAGE_FAILS + 1))
+      LEG_VERDICT["$leg"]="poisoned"
+      LEG_VERDICT_DETAIL["$leg"]="the fixture BUILT (${FIXTURE[$leg]}), but this leg's DECLARED run directory could not be prepared, so its corpus was NOT run and this run covers NONE of its units. $RUN_DIR_WHY"
+      unit_not_run "$leg" "poisoned" "run directory preparation FAILED: $RUN_DIR_WHY"
+      warn "[$leg] POISONED — could not prepare the declared run directory; this leg's corpus is NOT run, the rest of the run CONTINUES:"
+      warn "      $RUN_DIR_WHY"
+      continue
+    fi
+  else
+    info "[$leg] the corpus runs in this driver's own filesystem (runFilesystem '$leg_run_fs') — $rundir"
+  fi
+  # <<< dss:run-dir <<<
   # The launcher's DECLARED path namespace, and this leg's fixture spelled in it.
   # Translated ONCE per leg; the only other translation site is a segment's FIRST
   # argument (the .test script), below. `$bin` itself keeps this driver's spelling
@@ -4798,6 +4953,42 @@ for leg in "${LEG_ORDER[@]}"; do
     continue
   fi
   # <<< dss:loadext-verdict <<<
+  # ★ AND INTO THE FILESYSTEM THE FIXTURE WILL ACTUALLY LOOK IN. The helper is
+  # BUILT by a process on THIS machine, so it can only be written where this
+  # machine can write; when the corpus runs in the launcher's own filesystem the
+  # staged file has to be carried across, through the resolver's DECLARED copy
+  # argv. Without this, moving to a native run directory would have FIXED the
+  # file-permission families and BROKEN loadext.test — trading one manufactured
+  # failure class for another. Inert on every leg that runs where this driver
+  # does. [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
+  if [[ -n "$leg_launch_run" && -n "$STAGE_STAGED" ]]; then
+    _cp_ok=1
+    if run_dir_argv "$leg" "copy the loadext helper into $leg_launch_run/$SQLITE_TESTDIR_SUBDIR" \
+                    "$(run_dir_field "$leg_run_plan" copyArgv)" \
+                    "$(launch_path "${LEG_PATH_TRANSLATION[$leg]:-none}" "$STAGE_STAGED")" \
+                    "$leg_launch_run/$SQLITE_TESTDIR_SUBDIR/$(basename "$STAGE_STAGED")"; then :; else _cp_ok=0; fi
+    if [[ "$_cp_ok" -eq 0 ]]; then
+      STAGE_FAILS=$((STAGE_FAILS + 1))
+      LEG_VERDICT["$leg"]="poisoned"
+      LEG_VERDICT_DETAIL["$leg"]="the fixture BUILT (${FIXTURE[$leg]}) and its loadext helper was produced, but the helper could not be carried into this leg's DECLARED run directory, so its corpus was NOT run. $RUN_DIR_WHY"
+      unit_not_run "$leg" "poisoned" "loadext helper transfer FAILED: $RUN_DIR_WHY"
+      warn "[$leg] POISONED — the loadext helper could not reach the run directory; this leg's corpus is NOT run, the rest of the run CONTINUES:"
+      warn "      $RUN_DIR_WHY"
+      continue
+    fi
+    info "[$leg] loadext helper carried into the launcher's filesystem -> $leg_launch_run/$SQLITE_TESTDIR_SUBDIR/$(basename "$STAGE_STAGED")"
+  fi
+  # THE CONFOUNDS FOR THIS LEG — read from the leg's OWN declaration (legs.json
+  # `confounds`, resolved by harness_legs.py), which is the same declaration
+  # build-and-test.ps1 reads. ONE ledger, both drivers.
+  # [D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG]
+  declare -a CONFOUND_PATTERNS=()
+  eval "CONFOUND_PATTERNS=($(leg_confound_patterns "$leg"))"
+  if [[ ${#CONFOUND_PATTERNS[@]} -gt 0 ]]; then
+    info "[$leg] confound patterns in force (${#CONFOUND_PATTERNS[@]}): ${CONFOUND_PATTERNS[*]}$( [[ -n "$DSS_CONFOUNDS" ]] && printf '   [operator DSS_CONFOUNDS — applied to EVERY leg]' || printf '   [EARNED on this leg — legs.json `confounds`, provenance per pattern]' )"
+  else
+    info "[$leg] NO confound patterns: this leg's catalogue entry declares \`confounds: []\`, i.e. nothing has ever been measured as a non-DSS confound HERE, and a confound must be EARNED per platform, never copied from a sibling leg. Every failure here counts."
+  fi
   runlog="$OUT_DIR/$leg/corpus.log"
   ledger="$OUT_DIR/$leg/corpus-units.txt"
   # scratch lives in the leg's OUT dir — NEVER in the sqlite clone (the .sh runs the

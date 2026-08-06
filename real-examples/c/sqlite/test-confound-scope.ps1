@@ -28,9 +28,11 @@ function Warn($m) { "      WARN: $m" }
 # host's "OK (N assertions)". This file now has a skippable block of its own, so it
 # inherits the same hazard and the same cure.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN.
-$TotalAssertions = 57     # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
+$TotalAssertions = 63     # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
                           # + 5 structural + 8 staged sqlite_cfg.h (5 this driver, 3 .sh pairing)
                           # + 6 launcher argv form (4 structural + 2 behavioural, python-gated)
+                          # + 6 THE SUPPLY (Get-LegConfounds) — the half that was
+                          #   never tested, and where the defect actually was
 $pass = 0; $fail = 0; $skip = 0
 function Check($label, $cond) {
   if ($cond) { "  ok   $label"; $script:pass++ } else { "  FAIL $label"; $script:fail++ }
@@ -447,6 +449,77 @@ if (-not $py) {
   # required args) - "it did not say X" is satisfied by a tool that says nothing.
   Check "...while the ``=`` form consumes BOTH tokens and reaches the required-arg check" `
         ($eqOut -match 'the following arguments are required: --cli')
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# THE SUPPLY - WHERE THAT PATTERN ARRAY CAME FROM
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★★ THIS SECTION EXISTS BECAUSE EVERYTHING ABOVE IT IS ABOUT THE MATCHER, AND
+# THE DEFECT WAS IN THE SUPPLY.
+#
+# Every classifier assertion at the top of this file sets `$Confounds = @(...)`
+# BY HAND and then runs the shipped block over it. That pinned the matching in
+# real detail while the question "where does that array COME FROM" was asked by
+# NOTHING - so `Get-LegConfounds`, whose entire body was
+# `if ($legLabel -eq 'pe64-x86_64') { return $PeEarnedConfounds }`, was never
+# executed by a test. It handed a LINUX-earned list to the one leg that could not
+# use it (zipfile-25.0 turns on POSIX fopen() succeeding on a directory) and an
+# EMPTY list to the legs that had earned it, and this file stayed green.
+# ⇒ D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG. Same lesson as the .sh
+# twin's: a pin that supplies its subject's input by hand is testing the stub.
+#
+# EXTRACTED AND RUN, never re-implemented - same discipline as the classifier.
+"--- THE SUPPLY: Get-LegConfounds, extracted from the shipped driver ---"
+$supStart = ($lines | Select-String -Pattern '^function Get-LegConfounds\(' | Select-Object -First 1).LineNumber
+$supEnd = $null
+if ($supStart) {
+  for ($i = $supStart; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -eq '}') { $supEnd = $i + 1; break }   # first closing brace at column 0
+  }
+}
+if (-not $supStart -or -not $supEnd) {
+  "  FAIL could not locate Get-LegConfounds in the shipped driver - this pin would assert over nothing"
+  $fail++
+  # The 6 assertions below cannot run; count them so the accounting invariant
+  # cannot be satisfied by silently losing them.
+  $skip += 6
+} else {
+  Invoke-Expression (($lines[($supStart-1)..($supEnd-1)]) -join "`n")
+  "extracted $($supEnd - $supStart + 1) supply lines from the shipped script"
+  # The resolved-leg shape harness_legs.py --plan produces, as ConvertFrom-Json
+  # hands it to the driver: a PSCustomObject with a `confounds` array.
+  function New-PinLeg($label, $confounds) {
+    return [pscustomobject]@{ label = $label; confounds = $confounds }
+  }
+  $ConfoundsOverride = $null
+  $earned = @(Get-LegConfounds (New-PinLeg 'elf64-x86_64' @('^walsetlk-','^busy2-','^zipfile-25\.0$')))
+  CheckEq "a leg gets ITS OWN declared patterns" '^walsetlk- ^busy2- ^zipfile-25\.0$' ($earned -join ' ')
+  # ★ THE HEADLINE ASSERTION, AND THE ONE THAT WOULD HAVE CAUGHT THE DEFECT: the
+  # answer follows the leg's DECLARATION and nothing else - not its label.
+  $empty = @(Get-LegConfounds (New-PinLeg 'pe64-x86_64' @()))
+  CheckEq "a leg declaring [] inherits NOTHING" '' ($empty -join ' ')
+  $other = @(Get-LegConfounds (New-PinLeg 'elf64-arm64' @('^busy2-','emulated:^writecrash-')))
+  CheckEq "...a DIFFERENT leg gets a DIFFERENT set" '^busy2- emulated:^writecrash-' ($other -join ' ')
+  # The scope prefix must survive the supply: stripped here, the qemu-only
+  # writecrash excusal silently becomes a bare one and suppresses a future genuine
+  # regression on a native run - which every classifier assertion above would
+  # still call correct.
+  Check "the 'emulated:' scope survives the supply" ($other -contains 'emulated:^writecrash-')
+  # THE OPERATOR OVERRIDE still applies to EVERY leg - stating intent, not
+  # inheriting one - including to a leg that declares nothing.
+  $ConfoundsOverride = @('^operator-1','^operator-2')
+  $ov = @(Get-LegConfounds (New-PinLeg 'pe64-x86_64' @()))
+  CheckEq "the operator override reaches EVERY leg" '^operator-1 ^operator-2' ($ov -join ' ')
+  $ConfoundsOverride = $null
+  # ⚠ AN UNDECLARED LEG IS A TRANSPORT DEFECT, NOT AN EMPTY LIST. harness_legs.py
+  # refuses to plan a leg with no `confounds`, so an absent field means the plan
+  # this driver read is not the plan that file produces - and answering @() would
+  # report every failure on that leg as a DSS defect on the strength of a bug.
+  # `Die` is the stub installed for the provenance section above, which THROWS.
+  $refused = ''
+  try { [void](Get-LegConfounds ([pscustomobject]@{ label = 'macho64-arm64' })) }
+  catch { $refused = "$($_.Exception.Message)" }
+  Check "an UNDECLARED leg REFUSES rather than answering @()" ($refused -match 'transport defect')
 }
 
 ""

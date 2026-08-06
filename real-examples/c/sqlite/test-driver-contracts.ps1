@@ -388,9 +388,63 @@ if ($VocabSource -eq 'unavailable') {
   else { Ok "the vocabulary read produces $($script:VerdictVocabulary.Count) CLEAN token(s)" }
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# G - THE CONFOUND SUPPLY IS KEYED ON THE LEG'S DECLARATION, NEVER ON ITS LABEL
+# ═══════════════════════════════════════════════════════════════════════════
+# D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG. The shipped function used
+# to BE `if ($legLabel -eq 'pe64-x86_64') { return $PeEarnedConfounds }`, and no
+# test in this repository ever called it. F4 below restores exactly that body and
+# this pin must go red - which is the demonstration that the pin is about the
+# supply and not about the matcher its sibling file already covers.
+function Pin-ConfoundSupply($driver) {
+  $script:ConfoundsOverride = $null
+  Invoke-Expression (Get-Fn $driver 'Get-LegConfounds')
+  $mk = { param($label, $c) [pscustomobject]@{ label = $label; confounds = $c } }
+  Ck 'a leg gets ITS OWN declared patterns' '^walsetlk- ^busy2-' `
+     ((@(Get-LegConfounds (& $mk 'elf64-x86_64' @('^walsetlk-','^busy2-')))) -join ' ')
+  # THE ONE THAT WOULD HAVE CAUGHT IT: same declaration, DIFFERENT label. A
+  # label-keyed supply cannot give the same answer to both.
+  Ck '...and the LABEL does not change the answer' '^walsetlk- ^busy2-' `
+     ((@(Get-LegConfounds (& $mk 'pe64-x86_64' @('^walsetlk-','^busy2-')))) -join ' ')
+  Ck 'a leg declaring [] inherits NOTHING' '' `
+     ((@(Get-LegConfounds (& $mk 'pe64-x86_64' @()))) -join ' ')
+  $script:ConfoundsOverride = @('^op-1')
+  Ck 'the operator override reaches EVERY leg' '^op-1' `
+     ((@(Get-LegConfounds (& $mk 'elf64-x86_64' @('^walsetlk-')))) -join ' ')
+  $script:ConfoundsOverride = $null
+  $refused = ''
+  try { [void](Get-LegConfounds ([pscustomobject]@{ label = 'nodecl' })) }
+  catch { $refused = "$($_.Exception.Message)" }
+  Ck 'an UNDECLARED leg REFUSES, never answers @()' $true ($refused -match 'transport defect')
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# H - A FAILED RUN-DIRECTORY OPERATION IS A VERDICT, NOT A SILENT FALLBACK
+# ═══════════════════════════════════════════════════════════════════════════
+# D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS. Two properties, and BOTH matter:
+# an EMPTY argv prefix is a real answer (`runFilesystem: driver` - the driver does
+# it natively), and a FAILING prefix must be reported rather than fallen back
+# from. Falling back would put the corpus straight onto the filesystem the whole
+# declaration exists to keep it off, silently.
+function Pin-RunDirArgv($driver) {
+  Invoke-Expression (Get-Fn $driver 'Invoke-RunDirArgv')
+  $ok = Invoke-RunDirArgv 'leg' 'do nothing' @() @('/x')
+  Ck 'an EMPTY prefix is a real answer (driver filesystem)' $true $ok.Ok
+  Ck '...and carries no complaint' '' "$($ok.Detail)"
+  # A prefix that FAILS. `cmd /c exit 3` is on every Windows box this driver
+  # runs on and needs no WSL - the point under test is the rc handling, not the
+  # tool.
+  $bad = Invoke-RunDirArgv 'leg' 'prepare the run directory' @('cmd','/c') @('exit 3')
+  Ck 'a FAILING prefix is reported, never swallowed' $false $bad.Ok
+  CkHas '...naming what could not be done' "$($bad.Detail)" 'prepare the run directory'
+  CkHas '...and the exit code' "$($bad.Detail)" '3'
+}
+
 Green 'A+B  the verdict recorders + the shared run decision' 'Pin-Verdicts'
 Green 'C    Read-CorpusSegment keeps the first diagnostic'   'Pin-ReadSegment'
 Green 'D+E  the loader variable + the acquisition field'     'Pin-LoaderVar'
+Green 'G    the confound supply follows the DECLARATION'     'Pin-ConfoundSupply'
+Green 'H    a failed run-dir operation is a VERDICT'         'Pin-RunDirArgv'
 
 # ═══════════════════════════════════════════════════════════════════════════
 # F - RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.
@@ -443,6 +497,36 @@ if (Invoke-Mutation 'F3 hardcode the ELF loader variable' $m3 "'darwin'  { retur
       })
     }) {
   Red 'F3 the loader variable follows the TARGET' 'Pin-LoaderVar' $m3
+}
+
+# F4 - THE DEFECT ITSELF, RESTORED: key the confound supply on the LEG LABEL
+# again, exactly as the shipped `Get-LegConfounds` did until this cycle. The pin
+# must go red on "the LABEL does not change the answer".
+$m4 = Join-Path $Work 'm4.ps1'
+if (Invoke-Mutation 'F4 restore the label-keyed confound supply' $m4 '  return @($leg.confounds | Where-Object { $_ })' {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_ -eq '  return @($leg.confounds | Where-Object { $_ })') {
+          "  if (`$leg.label -eq 'pe64-x86_64') { return @('^walsetlk-','^busy2-') }"
+          '  return @()'
+        } else { $_ }
+      })
+    }) {
+  Red 'F4 the confound supply follows the DECLARATION, not the label' 'Pin-ConfoundSupply' $m4
+}
+
+# F5 - make a failed run-directory operation report success, which is the silent
+# fallback the declaration exists to prevent.
+$m5 = Join-Path $Work 'm5.ps1'
+if (Invoke-Mutation 'F5 make a failed run-dir operation look fine' $m5 "return @{ Ok = `$false; Detail = `"could not `$what in the launcher's own filesystem" {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_.Contains("return @{ Ok = `$false; Detail = `"could not `$what in the launcher's own filesystem")) {
+          '    return @{ Ok = $true; Detail = '''' }'
+        } else { $_ }
+      })
+    }) {
+  Red 'F5 a failed run-dir operation is REPORTED, never swallowed' 'Pin-RunDirArgv' $m5
 }
 
 Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue

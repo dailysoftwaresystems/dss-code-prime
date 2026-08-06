@@ -60,6 +60,7 @@ USAGE
 """
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -361,6 +362,220 @@ def env_carrier_assignments(verb, names, current=""):
         if not any(h == n or h.startswith(n + "/") for h in merged):
             merged.append(n)
     return ["%s=%s" % (carrier, sep.join(merged))]
+
+
+# ── Launcher run FILESYSTEM ─────────────────────────────────────────────────
+#
+# THE THIRD NAMESPACE, AND IT WAS FOUND THE SAME WAY THE FIRST TWO WERE — BY
+# MEASURING. [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS.]
+#
+# `pathTranslation` says how a launcher SPELLS a path and `envTransfer` says
+# whether it sees this driver's environment. Neither says anything about the
+# FILESYSTEM the launched process actually writes its databases onto — and a
+# corpus whose subject is a database engine is, more than anything else, a test
+# of a filesystem's semantics.
+#
+# ✔MEASURED 2026-08-06 on this host, ONE process, TWO directories:
+#     /mnt/c/…  fs=v9fs      chmod 644 -> 777   chmod 400 -> 555
+#     /tmp      fs=ext2/ext3 chmod 644 -> 644   chmod 400 -> 400
+# `/mnt/c` is mounted `9p … aname=drvfs;…` with NO `metadata` option, so DrvFs
+# derives the whole POSIX mode from the Windows read-only ATTRIBUTE alone. Every
+# sqlite unit that asserts anything about file permissions therefore fails, and
+# ✔MEASURED BY A 2x2 MATCHED CONTROL ({DSS fixture, gcc reference} x {DrvFs, ext4})
+# all 60 of them fail IDENTICALLY with the gcc reference on DrvFs and VANISH on
+# ext4 — wal2 20, zipfile 12, e_walauto 10, journal3 8, attach 2, tkt3457 1, and
+# a pager4 ABORT. Zero of them are DSS-attributable.
+#
+# ⛔ AND THEY MUST NOT BECOME CONFOUNDS. The mechanism is known, it is OURS, and
+# it is fixable: a confound row for them would permanently launder a harness
+# misconfiguration into "expected", using the very mechanism `confounds` below
+# exists to keep honest.
+#
+# So a launcher entry declares WHICH FILESYSTEM its leg's run directory lives in,
+# in the same shape and for the same reason as its two siblings: closed
+# vocabulary, required on every entry, no default, unknown verb is a LOUD refusal.
+#   root            where run directories go in the LAUNCHER's own filesystem.
+#                   "" = the launcher shares this driver's filesystem and the
+#                   driver's own run directory IS the run directory.
+#   workingDirArgv  how the launcher is told to start its child in a directory,
+#                   as a template over `{dir}`. SPLICED IMMEDIATELY AFTER THE
+#                   LAUNCHER'S PROGRAM NAME (argv[0]) — where a program's own
+#                   options go, and before any option that introduces the child
+#                   command (`-e`). `run_dir_plan` performs the splice so that
+#                   neither driver knows the rule and the resolved argv can be
+#                   asserted whole.  ✔MEASURED: `wsl.exe --cd /tmp -e pwd` -> /tmp.
+#   mkdirArgv       argv PREFIX that creates a directory (+ parents) there.
+#   rmTreeArgv      argv PREFIX that removes a tree there.
+#   copyArgv        argv PREFIX that copies <src> <dst> INTO that filesystem. The
+#                   source is spelled in the launcher's own path namespace, i.e.
+#                   it has already been through `pathTranslation`.
+#                   ⚠ EVERY ONE OF THESE IS A REAL argv, NEVER A SHELL STRING —
+#                   `wsl.exe -e` exists precisely so no local shell re-parses it
+#                   (D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL), and a
+#                   `sh -c` form here would hand that property straight back.
+#   validHostOs     the only host OS the mechanism exists on, so the lint CHECKS.
+RUN_FILESYSTEMS = {
+    "driver": {
+        "root": "",
+        "workingDirArgv": [],
+        "mkdirArgv": [],
+        "rmTreeArgv": [],
+        "copyArgv": [],
+        "validHostOs": "",
+    },
+    "wsl-linux": {
+        # /tmp, not $HOME: ✔MEASURED ext4 with 749 G free, and it is the one
+        # directory a distro guarantees is writable without knowing whose distro
+        # it is. NOT a tmpfs here (`stat -f -c %T /tmp` -> ext2/ext3), which
+        # matters because the corpus writes multi-gigabyte databases.
+        "root": "/tmp/dss-sqlite-harness",
+        "workingDirArgv": ["--cd", "{dir}"],
+        "mkdirArgv": ["wsl.exe", "-e", "mkdir", "-p"],
+        "rmTreeArgv": ["wsl.exe", "-e", "rm", "-rf"],
+        "copyArgv": ["wsl.exe", "-e", "cp", "-f"],
+        "validHostOs": "windows",
+    },
+}
+
+
+def run_filesystem(verb):
+    """The declared verb's spec, or a LegError — never a permissive default.
+
+    Defaulting to `driver` for an unknown verb is exactly the defect this
+    vocabulary exists to prevent: `driver` is itself a CLAIM — that the launched
+    process writes onto the same filesystem this driver does — and it was the
+    unstated, unexamined assumption that put a Linux sqlite corpus onto DrvFs."""
+    spec = RUN_FILESYSTEMS.get(verb)
+    if spec is None:
+        raise LegError(
+            "unknown runFilesystem %r (known: %s). A launcher declares which "
+            "FILESYSTEM its leg's run directory lives in; an unrecognised verb "
+            "cannot be silently treated as 'driver', because 'driver' asserts "
+            "that the launched process writes onto this driver's own filesystem "
+            "— and a filesystem that only APPROXIMATES POSIX semantics (DrvFs "
+            "derives every mode bit from one Windows attribute) fails a database "
+            "engine's corpus without failing anything this harness can see."
+            % (verb, ", ".join(sorted(RUN_FILESYSTEMS))))
+    return spec
+
+
+def splice_working_dir(command, verb, directory):
+    """The launcher argv that starts its child in `directory`.
+
+    The splice point is stated once, here: immediately after the launcher's
+    PROGRAM NAME. `wsl.exe -e` is program + the option that introduces the child
+    command, and `--cd` must precede it. Returns `command` unchanged for a verb
+    with no working-directory option (every `driver` launcher — there the OS
+    process's own working directory is the run directory)."""
+    tmpl = run_filesystem(verb)["workingDirArgv"]
+    if not tmpl:
+        return list(command)
+    if not command:
+        raise LegError(
+            "runFilesystem %r needs to splice a working-directory option into an "
+            "EMPTY launcher argv. A launcher whose child must start elsewhere is "
+            "by definition a launcher." % verb)
+    opts = [x.replace("{dir}", directory) for x in tmpl]
+    return [command[0]] + opts + list(command[1:])
+
+
+def launcher_run_dir(verb, label, driver_run_dir):
+    """The run directory as the LAUNCHER addresses it, or "" for `driver`.
+
+    The leg label is in the name so a log line and an `ls` are readable; the
+    digest of the DRIVER's own run directory is in it so two checkouts, or two
+    output roots, cannot collide inside one shared /tmp. Deterministic, so a
+    re-run reuses (and re-wipes) the same directory rather than littering."""
+    root = run_filesystem(verb)["root"]
+    if not root:
+        return ""
+    if not driver_run_dir:
+        raise LegError(
+            "runFilesystem %r needs this driver's own run directory to derive a "
+            "collision-free name in %s, and none was supplied" % (verb, root))
+    digest = hashlib.sha256(driver_run_dir.encode("utf-8")).hexdigest()[:12]
+    return "%s/%s-%s" % (root, label, digest)
+
+
+# ── EARNED CONFOUNDS ARE A PROPERTY OF THE LEG, NOT OF THE DRIVER ───────────
+#
+# [D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG,
+#  D-HARNESS-SQLITE-CONFOUNDS-NOT-DECLARED-PER-LEG,
+#  D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY.]
+#
+# A "confound" is a unit failure this harness has PROVEN is not the compiler's —
+# by a matched control, on a named leg, on a named date. Which failures are
+# excused therefore decides every verdict this harness renders, and until this
+# key existed the answer depended on WHICH DRIVER YOU RAN:
+#   · build-and-test.sh read ONE global `DSS_CONFOUNDS` and applied it to EVERY
+#     leg, including legs where nothing had ever been measured;
+#   · build-and-test.ps1 returned an earned list for `pe64-x86_64` and `@()` for
+#     everything else — and ALL SIX of its patterns had been earned on LINUX
+#     x86_64, so the Windows driver handed a Linux-earned list to the one leg
+#     that could not use it and withheld it from the legs that earned it.
+# ✔MEASURED consequence: the SAME elf64-x86_64 artefact's `zipfile-25.0` was a
+# "known non-DSS confound" under one driver and a "genuine failure" under the
+# other, in the same project on the same day. No two legs' genuine-failure counts
+# were comparable, and the genuine-failure count is what every verdict rests on.
+#
+# ★ SO THE DECLARATION MOVED HERE AND CARRIES ITS EVIDENCE. Every pattern names
+# the leg and host its control was run on, the date, and the mechanism. A pattern
+# with no provenance cannot be added — the lint refuses it — because "we have
+# always excused this one" is precisely how a real defect becomes furniture.
+# ★★ ABSENCE IS A CLAIM TOO: a leg declaring `"confounds": []` is stating that
+# nothing has ever been earned there and that every failure counts. The key is
+# REQUIRED on every leg so that silence cannot mean "nobody filled this in".
+#
+# `scope` reproduces the `native:`/`emulated:` prefix vocabulary the drivers have
+# always used, as a FIELD rather than a string prefix an operator has to spell:
+#   any        excused however this leg runs.
+#   native     excused only when THIS HOST executes the artefact directly.
+#   emulated   excused only when it goes through a declared launcher. The name is
+#              the operator-facing DSS_CONFOUNDS vocabulary and is deliberately
+#              NOT renamed to `launched`: renaming it would silently un-excuse
+#              every `emulated:` pattern an operator has ever typed.
+CONFOUND_SCOPES = ("any", "native", "emulated")
+
+# Required on EVERY declared pattern, all non-empty. These are the four questions
+# a reader must be able to answer without leaving the file: what does it match,
+# where was it proven, when, and by what mechanism + which anchor holds the long
+# form. A confound is an ASSERTION THAT THE COMPILER IS INNOCENT; it has to show
+# its work.
+CONFOUND_PROVENANCE_KEYS = ("earnedOn", "earnedAt", "mechanism", "anchor")
+
+
+def confound_scope_prefix(scope):
+    """The `native:`/`emulated:` prefix a scope becomes on the wire, so the two
+    drivers' long-standing pattern grammar is produced in ONE place instead of
+    being re-spelled in each of them."""
+    if scope not in CONFOUND_SCOPES:
+        raise LegError(
+            "unknown confound scope %r (known: %s). A scope decides whether a "
+            "pattern excuses a failure at all; an unrecognised one cannot be "
+            "treated as 'any', because 'any' is the widest possible excusal."
+            % (scope, ", ".join(CONFOUND_SCOPES)))
+    return "" if scope == "any" else scope + ":"
+
+
+def leg_confounds(leg):
+    """This leg's DECLARED confound patterns, in wire form (`emulated:^re`).
+
+    A leg with no `confounds` key RAISES rather than returning []: an empty list
+    is a claim a catalogue must make out loud, and a missing key would make
+    "nothing was ever earned here" indistinguishable from "this leg predates the
+    declaration" — which is the ambiguity the old per-driver lists lived in."""
+    label = leg.get("label", "<unlabelled>")
+    if "confounds" not in leg:
+        raise LegError(
+            "leg '%s' declares no `confounds`. Every leg states which unit "
+            "failures have been PROVEN non-DSS on it — `[]` when none ever have, "
+            "which is the common and correct answer. It is required because a "
+            "missing key cannot be told from an empty one, and the difference "
+            "decides whether a failure is reported as a compiler defect." % label)
+    out = []
+    for row in leg["confounds"]:
+        out.append(confound_scope_prefix(row.get("scope", "any")) + row["pattern"])
+    return out
 
 # The zconf.h guards `./configure` may have baked into the DERIVING host's zlib
 # header, and which each leg therefore has to declare for ITS OWN target. Closed,
@@ -3128,9 +3343,13 @@ def plan_leg(leg, host_os, host_arch, available):
     # `pathTranslation` is ALWAYS present and ALWAYS a declared verb — "none" for
     # a native run, because "this driver's paths are the ones the callee sees" is
     # a claim worth stating rather than an absence a driver has to interpret.
+    # `runFilesystem` seeds to "driver" for the same reason `pathTranslation`
+    # seeds to "none": on a NATIVE run the process is this machine's own and it
+    # writes onto this driver's own filesystem — a claim, and a true one, rather
+    # than an absence. Only a LAUNCHER can make it false, and only by declaring so.
     run = {"mode": None, "launcher": [], "env": {}, "verdict": None, "detail": "",
            "pathTranslation": "none", "pathTranslator": [],
-           "envTransfer": "inherit"}
+           "envTransfer": "inherit", "runFilesystem": "driver"}
 
     if os_ok and arch_ok:
         run["mode"] = "native"
@@ -3158,6 +3377,12 @@ def plan_leg(leg, host_os, host_arch, available):
             # namespace. Same refusal on an unknown verb, same reason.
             env_verb = entry.get("envTransfer", "inherit")
             env_transfer(env_verb)
+            # The launcher's FILESYSTEM, declared beside the other two. Same
+            # refusal on an unknown verb, same reason: `driver` claims that the
+            # launched process writes where this driver writes, and a launcher
+            # that crosses into another OS's kernel usually does not.
+            fs_verb = entry.get("runFilesystem", "driver")
+            run_filesystem(fs_verb)
             # A launcher is USABLE only if its translator is too. They are one
             # capability: `wsl.exe` present with no distro behind it resolves
             # neither, and the honest verdict for that machine is the
@@ -3171,6 +3396,7 @@ def plan_leg(leg, host_os, host_arch, available):
                 run["pathTranslation"] = verb
                 run["pathTranslator"] = translator
                 run["envTransfer"] = env_verb
+                run["runFilesystem"] = fs_verb
                 run["detail"] = ("host %s/%s cannot run %s natively; declared "
                                  "launcher '%s' is available%s"
                                  % (host_os, host_arch, spec, " ".join(command),
@@ -3237,6 +3463,13 @@ def plan_leg(leg, host_os, host_arch, available):
         # of them decides which target's configure answers a leg compiles against.
         "build": dict(build, attempt=True, headerStageKey=header_stage_key(leg),
                       configStageKey=configure_stage_key(leg)),
+        # THE PATTERNS, resolved to the wire grammar both drivers already speak,
+        # and the ROWS behind them so a driver can print WHY it excused something
+        # instead of only that it did. Host-free: a confound is a property of the
+        # LEG (its target, its libraries, its upstream), which is exactly the
+        # claim the old per-driver lists could not make.
+        "confounds": leg_confounds(leg),
+        "confoundRows": [dict(r) for r in leg.get("confounds", [])],
         "run": run,
     }
 
@@ -3246,6 +3479,57 @@ def plan(host_os, host_arch, available, path=CATALOGUE):
     return {
         "host": {"os": host_os, "arch": host_arch},
         "legs": [plan_leg(leg, host_os, host_arch, available) for leg in legs],
+    }
+
+
+def run_dir_plan(leg, host_os, host_arch, available, driver_run_dir):
+    """WHERE this leg's corpus runs, and HOW the driver builds that directory.
+
+    ONE answer, computed once, consumed by both drivers — the same division of
+    labour as `--translate-path` and `--env-transfer`. A driver reads the fields;
+    it never decides which filesystem a launcher lives in, never spells the
+    working-directory option, and never learns where in the launcher argv that
+    option has to be spliced.
+
+    `driverPath` is always this driver's own run directory: it exists on every
+    leg because the driver stages into it (the loadext helper is BUILT by a
+    process on this machine and can only be written where this machine can
+    write). `launcherPath` is "" exactly when the two filesystems are the same,
+    which is how a driver tells "run here" from "install into there and run
+    THERE" without knowing any verb name."""
+    resolved = plan_leg(leg, host_os, host_arch, available)
+    run = resolved["run"]
+    verb = run["runFilesystem"]
+    spec = run_filesystem(verb)
+    label = resolved["label"]
+    launcher_path = launcher_run_dir(verb, label, driver_run_dir)
+    return {
+        "leg": label,
+        "runMode": run["mode"],
+        "runFilesystem": verb,
+        "driverPath": driver_run_dir,
+        # "" => this driver's own directory IS the run directory.
+        "launcherPath": launcher_path,
+        # The launcher argv the fixture must actually be spawned through: the
+        # DECLARED command with the working-directory option spliced in. Equal to
+        # the declared command whenever the verb needs no option.
+        "launcher": splice_working_dir(run["launcher"], verb,
+                                       launcher_path or driver_run_dir),
+        # argv PREFIXES. Empty => the driver performs the operation natively on
+        # its own filesystem, which is what `driver` means.
+        "mkdirArgv": list(spec["mkdirArgv"]),
+        "rmTreeArgv": list(spec["rmTreeArgv"]),
+        "copyArgv": list(spec["copyArgv"]),
+        "detail": (
+            "run mode '%s', runFilesystem '%s' — %s"
+            % (run["mode"], verb,
+               "this driver's own filesystem; the run directory is %s"
+               % driver_run_dir if not launcher_path else
+               "the launcher writes onto ITS OWN filesystem, so the corpus runs "
+               "in %s and NOT in %s, which it would reach only through a "
+               "compatibility mount whose POSIX semantics are approximate "
+               "(D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS)"
+               % (launcher_path, driver_run_dir))),
     }
 
 
@@ -3289,6 +3573,20 @@ def emit_sh(resolved):
         # story as the path namespace: the driver reads the VERB and asks this
         # resolver to turn it into assignments (`--env-transfer`).
         put("LEG_ENV_TRANSFER", run["envTransfer"])
+        # WHICH FILESYSTEM the launched corpus writes onto. Same story again: the
+        # driver reads the VERB and asks this resolver for the directory, the
+        # launcher argv and the argv prefixes (`--run-dir-plan`), because the run
+        # directory's filesystem is a property of the LAUNCHER and not of the
+        # machine that happens to be driving. D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-
+        # IS-DRVFS.
+        put("LEG_RUN_FILESYSTEM", run["runFilesystem"])
+        # THE EARNED CONFOUNDS, PER LEG, IN THE DRIVERS' OWN WIRE GRAMMAR. This
+        # is the whole of D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG:
+        # both drivers now read the SAME declaration, so a failure cannot be a
+        # confound under one and a compiler defect under the other. The
+        # provenance behind each pattern stays in legs.json, where the lint can
+        # require it — a driver needs the pattern, a reader needs the evidence.
+        put("LEG_CONFOUNDS", " ".join(q(x) for x in leg["confounds"]))
         put("LEG_RECIPE_TRANSFORM", b.get("recipeTransform", "none"))
         # The leg's OWN staged-header directory name + the guards that made it.
         # The driver joins the key onto its zinc/ root; it never decides the
@@ -3713,6 +4011,57 @@ def lint(path=CATALOGUE):
                             "'%s' host"
                             % (label, entry["hostOs"], entry["hostArch"], everb,
                                want_os))
+            # ── the launcher's FILESYSTEM ──────────────────────────────────
+            # Declared on EVERY entry, third of three, and the one whose absence
+            # cost 55 unit failures across 6 families plus a fixture ABORT — none
+            # of them DSS's, all of them reported as if they were.
+            if "runFilesystem" not in entry:
+                findings.append(
+                    "leg '%s': launcher for (%s, %s) declares no runFilesystem. "
+                    "Every launcher states which FILESYSTEM its leg's run "
+                    "directory lives in — 'driver' when the launched process "
+                    "writes where this driver writes (Wine, qemu, arch), a named "
+                    "verb when it crosses into another kernel's own filesystem "
+                    "(known: %s). Omitting it is how a database engine's corpus "
+                    "came to run over a mount that derives every POSIX mode bit "
+                    "from one Windows attribute."
+                    % (label, entry["hostOs"], entry["hostArch"],
+                       ", ".join(sorted(RUN_FILESYSTEMS))))
+            else:
+                fverb = entry["runFilesystem"]
+                if fverb not in RUN_FILESYSTEMS:
+                    findings.append(
+                        "leg '%s': launcher for (%s, %s) declares unknown "
+                        "runFilesystem %r (known: %s)"
+                        % (label, entry["hostOs"], entry["hostArch"], fverb,
+                           ", ".join(sorted(RUN_FILESYSTEMS))))
+                else:
+                    want_os = RUN_FILESYSTEMS[fverb]["validHostOs"]
+                    if want_os and entry["hostOs"] != want_os:
+                        findings.append(
+                            "leg '%s': launcher for (%s, %s) declares "
+                            "runFilesystem '%s', whose mechanism only exists on "
+                            "a '%s' host"
+                            % (label, entry["hostOs"], entry["hostArch"], fverb,
+                               want_os))
+                    # DERIVABLE, so CHECKED rather than trusted, and it is the
+                    # pair that actually bites: a launcher in a foreign PATH
+                    # namespace is in a foreign FILESYSTEM almost by definition —
+                    # translating a path into `/mnt/c/...` is the compatibility
+                    # mount. Declaring `driver` there is the exact defect.
+                    if (fverb == "driver"
+                            and entry.get("pathTranslation", "none") != "none"):
+                        findings.append(
+                            "leg '%s': launcher for (%s, %s) declares "
+                            "pathTranslation '%s' but runFilesystem 'driver'. A "
+                            "launcher whose paths must be RE-SPELLED to reach it "
+                            "is reaching this driver's files through a "
+                            "compatibility mount, and 'driver' claims the "
+                            "opposite — that it writes onto this filesystem with "
+                            "this filesystem's semantics. That claim is what put "
+                            "a Linux sqlite corpus onto DrvFs."
+                            % (label, entry["hostOs"], entry["hostArch"],
+                               entry.get("pathTranslation")))
             if entry["hostOs"] in leg.get("runOn", []) and entry["hostArch"] == arch:
                 findings.append("leg '%s': launcher declared for (%s, %s), which "
                                 "is this leg's NATIVE host — dead config: the "
@@ -3720,6 +4069,77 @@ def lint(path=CATALOGUE):
                                                                 entry["hostArch"]))
             key = (arch, entry["hostOs"], entry["hostArch"])
             vocab.setdefault(key, set()).add(" ".join(cmd))
+        # ── THE EARNED CONFOUNDS, AND THE EVIDENCE FOR EACH ────────────────
+        # The lint is the only thing standing between "a failure we proved is not
+        # ours" and "a failure we got used to". It therefore refuses a pattern
+        # that does not show its work, and it refuses SILENCE: a leg with nothing
+        # earned must SAY it has nothing earned.
+        if "confounds" not in leg:
+            findings.append(
+                "leg '%s': declares no `confounds`. Every leg states which unit "
+                "failures have been PROVEN non-DSS on it, `[]` when none have. "
+                "Required, because a missing key cannot be told from an empty "
+                "one and the difference decides whether a failing test is "
+                "reported as a compiler defect." % label)
+        elif not isinstance(leg["confounds"], list):
+            findings.append("leg '%s': `confounds` must be a list, got %r"
+                            % (label, type(leg["confounds"]).__name__))
+        else:
+            seen_patterns = set()
+            for row in leg["confounds"]:
+                if not isinstance(row, dict):
+                    findings.append("leg '%s': confound entry %r is not an object "
+                                    "— every pattern carries its provenance"
+                                    % (label, row))
+                    continue
+                pat = row.get("pattern", "")
+                if not pat or not isinstance(pat, str):
+                    findings.append("leg '%s': a confound entry declares no "
+                                    "`pattern`" % label)
+                    continue
+                if pat in seen_patterns:
+                    findings.append(
+                        "leg '%s': confound pattern %r is declared twice. Two "
+                        "rows for one pattern means two provenances, and a "
+                        "reader cannot tell which one is load-bearing."
+                        % (label, pat))
+                seen_patterns.add(pat)
+                try:
+                    re.compile(pat)
+                except re.error as exc:
+                    findings.append(
+                        "leg '%s': confound pattern %r does not compile as a "
+                        "regex (%s) — it would silently match NOTHING and every "
+                        "failure it names would be reported as a DSS defect"
+                        % (label, pat, exc))
+                scope = row.get("scope", "")
+                if scope not in CONFOUND_SCOPES:
+                    findings.append(
+                        "leg '%s': confound %r declares scope %r (known: %s). "
+                        "The scope is REQUIRED and never defaulted: 'any' is the "
+                        "widest possible excusal and must be chosen, not fallen "
+                        "into." % (label, pat, scope, ", ".join(CONFOUND_SCOPES)))
+                for k in CONFOUND_PROVENANCE_KEYS:
+                    v = row.get(k, "")
+                    if not isinstance(v, str) or not v.strip():
+                        findings.append(
+                            "leg '%s': confound %r declares no '%s'. A confound "
+                            "asserts the COMPILER IS INNOCENT of a failing test; "
+                            "it has to show its work — what was measured (%s), "
+                            "on which leg and host, when, and which anchor holds "
+                            "the long form. An unearned confound is how a real "
+                            "defect becomes furniture."
+                            % (label, pat, k, ", ".join(CONFOUND_PROVENANCE_KEYS)))
+                # A scope that no host could ever satisfy is dead config, and it
+                # reads as coverage. `native` on a leg no declared host runs
+                # natively can never fire; `emulated` on a leg with no launcher
+                # likewise. Both are derivable from this very file.
+                if scope == "emulated" and not leg.get("launchers"):
+                    findings.append(
+                        "leg '%s': confound %r is scoped 'emulated' but this leg "
+                        "declares NO launcher, so the scope can never be "
+                        "satisfied and the pattern excuses nothing — dead config "
+                        "that reads as a documented confound" % (label, pat))
         build = leg.get("build", {})
         transform = build.get("recipeTransform")
         if transform not in RECIPE_TRANSFORMS:
@@ -4301,6 +4721,123 @@ def self_test(path=CATALOGUE, out=sys.stdout):
               for h in SELF_TEST_HOSTS
               for leg in plan(h[0], h[1], every, path)["legs"]))
 
+    # ── the launcher's run FILESYSTEM ────────────────────────────────────────
+    # D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS. The third namespace, asserted
+    # in the same shape as the two above: every planned run carries a DECLARED
+    # verb, an unknown verb RAISES rather than degrading to `driver`, and at least
+    # one cell in this catalogue actually needs a non-`driver` answer — otherwise
+    # every assertion here is about a mechanism nothing reaches.
+    for h in SELF_TEST_HOSTS:
+        for leg in plan(h[0], h[1], every, path)["legs"]:
+            verb = leg["run"].get("runFilesystem")
+            check("run plan carries a DECLARED runFilesystem (%s/%s %s)"
+                  % (h[0], h[1], leg["label"]),
+                  verb in RUN_FILESYSTEMS, "got %r" % verb)
+    check("an unknown runFilesystem verb raises rather than meaning 'driver'",
+          _raises(lambda: run_filesystem("nope")))
+    check("an unknown runFilesystem verb raises from the splice path too",
+          _raises(lambda: splice_working_dir(["x"], "nope", "/d")))
+    check("some declared launcher needs a non-driver runFilesystem",
+          any(leg["run"].get("runFilesystem") not in (None, "driver")
+              for h in SELF_TEST_HOSTS
+              for leg in plan(h[0], h[1], every, path)["legs"]))
+    # THE SPLICE, ASSERTED WHOLE. The working-directory option goes immediately
+    # after the launcher's PROGRAM NAME, before the option that introduces the
+    # child command — `wsl.exe --cd <dir> -e <prog>`, never `wsl.exe -e --cd …`,
+    # which would hand `--cd` to the fixture. ✔MEASURED on a Windows host:
+    # `wsl.exe --cd /tmp -e pwd` -> /tmp.
+    check("the working-directory option is spliced after the program name",
+          splice_working_dir(["wsl.exe", "-e"], "wsl-linux", "/tmp/x")
+          == ["wsl.exe", "--cd", "/tmp/x", "-e"],
+          "got %r" % (splice_working_dir(["wsl.exe", "-e"], "wsl-linux", "/tmp/x"),))
+    check("a driver-filesystem launcher's argv is returned UNCHANGED",
+          splice_working_dir(["qemu-x86_64"], "driver", "/anything")
+          == ["qemu-x86_64"])
+    # A `driver` leg's run directory is THIS driver's own — the empty
+    # `launcherPath` is how both drivers tell the two cases apart, so it is the
+    # one field whose emptiness is load-bearing.
+    _elf = leg_by_label(legs, "elf64-x86_64", "self-test")
+    _win = run_dir_plan(_elf, "windows", "x86_64", every, r"C:\o\run")
+    check("a launched wsl leg gets a run directory in the LAUNCHER's filesystem",
+          _win["launcherPath"].startswith("/tmp/") and "elf64-x86_64" in _win["launcherPath"],
+          "got %r" % _win["launcherPath"])
+    check("...whose launcher argv carries the working-directory option",
+          _win["launcher"] == ["wsl.exe", "--cd", _win["launcherPath"], "-e"],
+          "got %r" % (_win["launcher"],))
+    check("...and argv PREFIXES that never route through a local shell",
+          all(a[:2] == ["wsl.exe", "-e"]
+              for a in (_win["mkdirArgv"], _win["rmTreeArgv"], _win["copyArgv"])),
+          "a `sh -c` form would hand the argv back to the local shell "
+          "D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL exists to keep it "
+          "away from; got %r" % ([_win["mkdirArgv"], _win["rmTreeArgv"],
+                                  _win["copyArgv"]],))
+    _lin = run_dir_plan(_elf, "linux", "x86_64", every, "/o/run")
+    check("a NATIVE leg's run directory stays this driver's own",
+          _lin["launcherPath"] == "" and _lin["driverPath"] == "/o/run",
+          "got %r" % _lin)
+    check("...and no argv prefix is offered for it",
+          not any((_lin["mkdirArgv"], _lin["rmTreeArgv"], _lin["copyArgv"])))
+    # TWO OUTPUT ROOTS MUST NOT COLLIDE IN ONE SHARED /tmp — the digest is what
+    # makes a second checkout, or a second DSS_OUT, safe to run concurrently.
+    check("the launcher run directory is derived from the DRIVER's own",
+          run_dir_plan(_elf, "windows", "x86_64", every, r"C:\a\run")["launcherPath"]
+          != _win["launcherPath"])
+    check("...and is STABLE for one driver directory (a re-run re-wipes, never litters)",
+          run_dir_plan(_elf, "windows", "x86_64", every, r"C:\o\run")["launcherPath"]
+          == _win["launcherPath"])
+
+    # ── the EARNED CONFOUNDS, per leg ────────────────────────────────────────
+    # D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG. The catalogue is the
+    # ledger and the lint is what keeps it honest; these assert the RESOLUTION,
+    # i.e. that both drivers are handed the same rows in the grammar they speak.
+    check("every leg's confounds resolve (a missing key is FATAL, never empty)",
+          all(isinstance(leg_confounds(l), list) for l in legs))
+    check("a leg with no `confounds` key RAISES rather than defaulting to []",
+          _raises(lambda: leg_confounds({"label": "x"})))
+    check("an unknown confound scope raises rather than meaning 'any'",
+          _raises(lambda: confound_scope_prefix("sometimes")))
+    check("scope 'any' carries NO prefix (the drivers' bare-pattern grammar)",
+          confound_scope_prefix("any") == "")
+    check("scope 'emulated' becomes the drivers' `emulated:` prefix",
+          confound_scope_prefix("emulated") == "emulated:")
+    # ★ THE ASYMMETRY IS THE POINT, AND IT IS ASSERTED RATHER THAN DESCRIBED.
+    # A catalogue in which every leg carried the same list would be the global
+    # list again, wearing a per-leg shape — so the self-test refuses that.
+    _sets = {l["label"]: set(leg_confounds(l)) for l in legs}
+    check("the legs do NOT all carry the same confound set",
+          len({frozenset(v) for v in _sets.values()}) > 1,
+          "identical sets on every leg would be the old global list in a per-leg "
+          "costume; got %r" % _sets)
+    # zipfile-25.0 turns on POSIX fopen() SUCCEEDING on a directory. It is
+    # declared on every POSIX leg and MUST NOT be on the Windows one, where the
+    # test passes — the single sharpest OS split in the ledger, and the one the
+    # old .ps1 had backwards.
+    _zip = "^zipfile-25\\.0$"
+    for l in legs:
+        posix = spec_target_os(l["spec"]) in ("linux", "darwin")
+        check("zipfile-25.0 is declared exactly on the POSIX legs (%s)" % l["label"],
+              (_zip in _sets[l["label"]]) == posix,
+              "target OS %r, declared=%r" % (spec_target_os(l["spec"]),
+                                             _zip in _sets[l["label"]]))
+    # The pe64 leg's EMPTY list is a measured claim, not an omission; asserting it
+    # here means re-populating it by reflex fails the self-test first.
+    check("the pe64 leg declares NOTHING earned (0 errors / 979,736 measured)",
+          _sets["pe64-x86_64"] == set(),
+          "got %r" % _sets["pe64-x86_64"])
+    # A scoped pattern must reach the drivers WITH its scope, or the qemu-only
+    # writecrash excusal silently becomes a bare one and suppresses a future
+    # genuine regression on a native run.
+    check("the qemu writecrash excusal keeps its `emulated:` scope",
+          "emulated:^writecrash-" in _sets["elf64-arm64"],
+          "got %r" % _sets["elf64-arm64"])
+    check("...and is declared on NO other leg",
+          not any("writecrash" in p
+                  for lbl, s in _sets.items() if lbl != "elf64-arm64"
+                  for p in s),
+          "macho64-x86_64 runs through `arch -x86_64`, so its run mode is "
+          "`launched` and an `emulated:` pattern WOULD match there — the per-leg "
+          "ledger is what stops the scope name carrying it across; got %r" % _sets)
+
     # ── the staged-header plan ───────────────────────────────────────────────
     # HOST-INVARIANT for exactly the reason the build set is: which zlib header a
     # leg compiles against is a fact about that leg's TARGET. If this ever starts
@@ -4417,8 +4954,17 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 29,
+          len(statements) == 1 + len(labels) * 31,
           "got %d statements for %d legs" % (len(statements), len(labels)))
+    check("the sh emitter carries the launcher's run FILESYSTEM",
+          "LEG_RUN_FILESYSTEM[" in sh,
+          "without it build-and-test.sh cannot tell a launcher that shares this "
+          "filesystem from one that reaches it through a compatibility mount, "
+          "which is D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS")
+    check("the sh emitter carries THIS LEG'S earned confounds",
+          "LEG_CONFOUNDS[" in sh,
+          "without it build-and-test.sh falls back to a global list applied to "
+          "every leg, which is D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG")
     check("the sh emitter carries the leg's staged configure header",
           "LEG_CONFIG_STAGE_KEY[" in sh and "LEG_CONFIGURE_ANSWERS[" in sh,
           "without it build-and-test.sh has no way to give a leg the sqlite_cfg.h "
@@ -5612,6 +6158,19 @@ def main(argv=None):
                         "(tests pin this so a plan is reproducible)")
     p.add_argument("--launchers-none", action="store_true",
                    help="treat every declared launcher as absent")
+    p.add_argument("--run-filesystems", action="store_true",
+                   help="print the closed runFilesystem vocabulary, one verb "
+                        "per line (the drivers echo it; the pins assert it)")
+    p.add_argument("--run-dir-plan", default=None, metavar="LABEL",
+                   help="resolve WHERE this leg's corpus runs: the directory in "
+                        "the LAUNCHER's own filesystem, the launcher argv with "
+                        "its working-directory option spliced in, and the argv "
+                        "prefixes that create/clear/populate it. Needs "
+                        "--driver-run-dir. JSON on stdout. "
+                        "D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS")
+    p.add_argument("--driver-run-dir", default="", metavar="DIR",
+                   help="this driver's OWN run directory for the leg, as this "
+                        "driver spells it (--run-dir-plan)")
     args = p.parse_args(argv)
 
     if not (args.verdict_vocabulary or args.plan or args.lint or args.self_test
@@ -5620,14 +6179,21 @@ def main(argv=None):
             or args.env_transfers or args.env_transfer
             or args.acquire or args.acquire_plan or args.resolve_library_argv
             or args.resolve_target_cc or args.build_loadext_helper
-            or args.loadext_builder or args.tcl_coherence):
+            or args.loadext_builder or args.tcl_coherence
+            or args.run_filesystems or args.run_dir_plan):
         p.error("one of --verdict-vocabulary / --plan / --header-stages / "
                 "--config-stages / --lint "
                 "/ --self-test / --path-translations / --translate-path / "
                 "--assert-translated / --env-transfers / --env-transfer / "
                 "--acquire / --acquire-plan / --resolve-library-argv / "
                 "--resolve-target-cc / --build-loadext-helper / "
-                "--loadext-builder / --tcl-coherence is required")
+                "--loadext-builder / --tcl-coherence / --run-filesystems / "
+                "--run-dir-plan is required")
+    if args.run_dir_plan and not args.driver_run_dir:
+        p.error("--run-dir-plan requires --driver-run-dir <dir> — the launcher's "
+                "run directory is DERIVED from this driver's own so that two "
+                "checkouts cannot collide in one shared /tmp, and inventing one "
+                "here would make the answer depend on who asked")
     if (args.translate_path or args.assert_translated) and not args.path_translation:
         p.error("--translate-path / --assert-translated require "
                 "--path-translation <verb> — the namespace is the launcher's "
@@ -5810,6 +6376,9 @@ def main(argv=None):
             return 1 if findings else 0
         if args.self_test:
             return self_test(args.catalogue)
+        if args.run_filesystems:
+            sys.stdout.write("\n".join(sorted(RUN_FILESYSTEMS)) + "\n")
+            return 0
 
         if args.launchers_none and args.launchers_available is not None:
             p.error("--launchers-none and --launchers-available are exclusive")
@@ -5820,6 +6389,13 @@ def main(argv=None):
             available = {x for x in args.launchers_available.split(",") if x}
         host_os = canon_os(args.host_os) if args.host_os else detect_host_os()
         host_arch = canon_arch(args.host_arch) if args.host_arch else detect_host_arch()
+        if args.run_dir_plan:
+            legs = load_catalogue(args.catalogue)
+            leg = leg_by_label(legs, args.run_dir_plan, "--run-dir-plan")
+            json.dump(run_dir_plan(leg, host_os, host_arch, available,
+                                   args.driver_run_dir), sys.stdout, indent=2)
+            sys.stdout.write("\n")
+            return 0
         resolved = plan(host_os, host_arch, available, args.catalogue)
         if args.format == "sh":
             sys.stdout.write(emit_sh(resolved))

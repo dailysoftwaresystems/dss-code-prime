@@ -250,46 +250,51 @@ $Tier         = if ($env:DSS_TIER) { $env:DSS_TIER } else { 'veryquick' }
 # green while masking a release bug, and far slower).
 $Config       = if ($env:DSS_CONFIG) { $env:DSS_CONFIG } else { 'release' }
 # DSS_CONFOUNDS: space-separated .NET-regex patterns for KNOWN non-DSS unit
-# failures (a failing test matching any is not counted against green). Same set
-# as the .sh: WAL set-lock wall-clock timing, an UPSTREAM zipfile test-isolation
-# leak, the recover-fault OOM-oracle class.
-# zipfile-25.0 — MECHANISM PROVEN 2026-07-26 (the old "error-text env diff" note
-# was WRONG): symlink.test:163 `file mkdir x` is never cleaned up and symlink
-# sorts before zipfile, so a DIRECTORY named `x` is present in the shared testdir
-# when zipfile-25.0 asserts that `zipfile('x')` fails with "cannot open file: x".
-# fopen() on a directory SUCCEEDS, so it fails in fread() instead. Proven by a
-# 4-case probe in ONE process varying only the filesystem. Compiler-independent.
-# See D-SQLITE-ZIPFILE25-SYMLINK-TESTDIR-LEAK.
-# ★ ASYMMETRY, DELIBERATELY NOT "FIXED": the .sh also carries `^date-2\.4c$` and
-# this list does not. Adding it here would suppress a failure that has never been
-# observed on pe64 — a confound must be EARNED per platform, not copied across.
-# Tracked by D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY.
-# ⚠ PER-DRIVER SCOPE, recorded 2026-08-01 (TF-C108): build-and-test.sh now carries a
-# MEASURED matched control for '^busy2-' and '^recoverfault' (DSS and a gcc-built
-# reference testfixture ran full.test concurrently; recoverfault failed on the SAME
-# FOUR NAMES in both, busy2 on different members of the family in each). That control
-# was earned on LINUX and does NOT transfer here — it says nothing about pe64, whose
-# own 'full' tier has so far reported 0 errors out of 979,736, i.e. these patterns
-# currently suppress NOTHING on this driver. Should a busy2/recoverfault failure ever
-# appear on pe64, it must be re-earned with a pe64 control (the reference testfixture
-# this driver already builds), not inherited from the Linux row.
+# failures (a failing test matching any is not counted against green).
 #
-# ★★ THE LIST IS PER LEG, AND EVERY ENTRY IN IT WAS EARNED ON pe64. That is the
-# whole reason `Get-LegConfounds` exists instead of one global `$Confounds`: the
-# rule "a confound must be EARNED per platform, not copied across" is exactly as
-# true between two LEGS of this driver as it is between the two drivers. This
-# driver now attempts five legs; handing the pe64 list to a macho or elf leg would
-# silently excuse, on a platform where nothing has ever been measured, failures
-# that would be the first evidence of a real bug there. So a leg that is not
-# pe64-x86_64 starts with an EMPTY list and says so out loud when it runs.
-# DSS_CONFOUNDS overrides deliberately apply to EVERY leg — an operator naming a
-# pattern is stating intent, not inheriting one — and that too is announced.
-$PeEarnedConfounds = @('^walsetlk-', '^walsetlk\.', '^walsetlk_recover-', '^busy2-', '^zipfile-25\.0$', '^recoverfault')
+# ★★★ THE LIST IS NOT IN THIS FILE ANY MORE, AND THAT IS THE WHOLE FIX.
+# [D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG,
+#  D-HARNESS-SQLITE-CONFOUNDS-NOT-DECLARED-PER-LEG,
+#  D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY.]
+#
+# What stood here was `$PeEarnedConfounds` plus a `Get-LegConfounds` whose whole
+# body was `if ($legLabel -eq 'pe64-x86_64')`, and it was wrong in BOTH directions
+# at once. Its six patterns were earned on LINUX x86_64 — the comment it carried
+# conceded as much for two of them, and `zipfile-25.0`'s mechanism is a glibc
+# `fopen()` on a DIRECTORY succeeding, which cannot happen on Windows at all — so
+# this driver handed a Linux-earned list to the one leg that could not use it and
+# withheld it from the legs that had earned it. Meanwhile build-and-test.sh
+# applied ONE global list to every leg. ✔MEASURED consequence: the SAME
+# elf64-x86_64 artefact's `zipfile-25.0` was a "known non-DSS confound" under one
+# driver and a "genuine failure" under the other, in the same project on the same
+# day — so no two legs' genuine-failure counts were comparable, and that count is
+# what every verdict this harness renders rests on.
+#
+# ⇒ the earned set is DECLARED PER LEG in legs.json, each pattern carrying the
+# leg + host + date + mechanism that earned it and the anchor holding the long
+# form; harness_legs.py's lint REFUSES a pattern with no provenance, and both
+# drivers read that one declaration. `[]` is a real answer, made out loud.
+#
+# ⓘ WHAT THIS VARIABLE STILL DOES: an operator OVERRIDE, which deliberately
+# applies to EVERY leg — naming a pattern on the command line is stating intent
+# for this run, not inheriting one — and which is announced as such per leg so a
+# reader of the log can never mistake it for the earned set.
 $ConfoundsOverride = if ($env:DSS_CONFOUNDS) { @($env:DSS_CONFOUNDS -split '\s+' | Where-Object { $_ }) } else { $null }
-function Get-LegConfounds($legLabel) {
+# THE SUPPLY, IN ONE PLACE, KEYED ON THE LEG'S OWN DECLARATION AND ON NOTHING
+# ELSE — no label, no host, no format. `$leg` is the RESOLVED leg from
+# harness_legs.py --plan, whose `confounds` field is the catalogue's rows already
+# rendered into the `native:`/`emulated:` wire grammar both drivers speak.
+# ⚠ A leg WITHOUT the field is a resolver/driver transport defect, never an empty
+# list: the resolver refuses to plan a leg that does not declare `confounds`, so
+# the field being absent HERE means the plan this driver read is not the plan that
+# file produces. Failing loud is the only honest answer — silently substituting
+# `@()` would report "every failure on this leg counts" on the strength of a bug.
+function Get-LegConfounds($leg) {
   if ($null -ne $ConfoundsOverride) { return $ConfoundsOverride }
-  if ($legLabel -eq 'pe64-x86_64')  { return $PeEarnedConfounds }
-  return @()
+  if ($null -eq $leg.PSObject.Properties['confounds']) {
+    Die "[$($leg.label)] the resolved leg plan carries NO ``confounds`` field. harness_legs.py refuses to plan a leg that does not declare one, so this is a transport defect between the resolver and this driver — not a leg with nothing earned. Treating it as an empty list would silently report every failure on this leg as a DSS defect. [D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG]"
+  }
+  return @($leg.confounds | Where-Object { $_ })
 }
 # DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
 # tier. Delivered through SQLite's OWN upstream hook — the QUICKTEST_OMIT env var
@@ -556,6 +561,83 @@ function Convert-LaunchPath($verb, $p) {
 # that breaks it, rather than that segment silently reading a relative filename.
 function Get-SegmentArgs($verb, $scriptPath, $rest) {
   return @((Convert-LaunchPath $verb $scriptPath)) + @($rest | Where-Object { $null -ne $_ })
+}
+#
+# ── THE LAUNCHER'S FILESYSTEM ────────────────────────────────────────────────
+# D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS.
+#
+# THE THIRD NAMESPACE, AND THE ONE THIS DRIVER GOT WRONG FOR LONGEST. The two
+# above make a launched leg's argv and environment correct; neither says a word
+# about the FILESYSTEM the launched fixture writes its databases onto, and this
+# corpus is a database engine's.
+#
+# ✔MEASURED 2026-08-06 on this host, ONE process, TWO directories:
+#     /mnt/c/…   fs=v9fs        chmod 644 -> 777    chmod 400 -> 555
+#     /tmp       fs=ext2/ext3   chmod 644 -> 644    chmod 400 -> 400
+# `/mnt/c` is mounted `9p … aname=drvfs;…` with NO `metadata` option, so DrvFs
+# synthesises the whole POSIX mode from the single Windows read-only ATTRIBUTE.
+# Every sqlite unit that asserts anything about file permissions therefore fails
+# — and ✔MEASURED BY A 2x2 MATCHED CONTROL ({DSS fixture, gcc reference} x
+# {DrvFs, ext4}) all 60 of them fail IDENTICALLY under GCC on DrvFs and VANISH on
+# ext4. Zero were DSS's; all 60 were reported as if they might be.
+#
+# ⛔ AND THEY ARE NOT CONFOUNDS. The mechanism is ours and it is fixable; a
+# confound row would launder a harness misconfiguration into "expected".
+#
+# ★ THIS FUNCTION KNOWS NOTHING ABOUT WSL, `--cd`, `/tmp` OR `cp`, exactly as
+# Convert-LaunchPath knows nothing about `wslpath`. The verb comes off the leg's
+# LAUNCHER declaration and harness_legs.py answers with the directory, the
+# launcher argv (its working-directory option already spliced into the right
+# position) and the argv PREFIXES that create, clear and populate it. A driver
+# that spelled any of those would be the second copy of a mechanism, which is
+# this project's canonical silent harness bug.
+# tester.tcl's cmdlinearg(testdir) default: the fixture `file mkdir`s this subdir
+# of its CWD and cd's into it before any .test body runs, so a test's relative
+# `./libtestloadext.so` (`./testloadext.dll` on a Windows Tcl) resolves THERE.
+# This driver passes no --testdir override. Named once here rather than spelled
+# at each of its three sites — the .sh twin's SQLITE_TESTDIR_SUBDIR, same value,
+# same reason.
+$SqliteTestdirSubdir = 'testdir'
+function Get-LegRunDirPlan($label, $driverRunDir) {
+  try {
+    $out = @(& $python3.Source $LegsPy '--catalogue' $LegsJson '--run-dir-plan' "$label" `
+                '--host-os' $HostOs '--host-arch' $HostArch `
+                '--driver-run-dir' "$driverRunDir" '--format' 'json' 2>&1)
+    $rc  = $LASTEXITCODE
+  } catch {
+    $rc = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+    $out = @("$($_.Exception.Message)")
+  }
+  $stdout = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+  if ($rc -ne 0) {
+    Die "[$label] could not resolve this leg's RUN DIRECTORY (harness_legs.py --run-dir-plan, rc=$rc):`n$(($out | ForEach-Object { "      $_" }) -join "`n")`n      Which filesystem a launched leg runs on is DECLARED (legs.json ``launchers[].runFilesystem``), never assumed — and the assumption is what put a Linux corpus onto DrvFs."
+  }
+  try { return ($stdout -join "`n") | ConvertFrom-Json } catch {
+    Die "[$label] harness_legs.py --run-dir-plan exited 0 but did not print the JSON this driver reads ($($_.Exception.Message)). Output was:`n$(($stdout | Select-Object -First 20 | ForEach-Object { "      $_" }) -join "`n")"
+  }
+}
+# Run one of the resolver's argv PREFIXES. An EMPTY prefix means the launcher
+# shares this driver's filesystem and the caller does the operation natively —
+# that is what `runFilesystem: driver` MEANS, so empty is a real answer and not a
+# missing one, and `Ok` is $true for it.
+#
+# ★ IT RETURNS A VERDICT, IT DOES NOT `Die` — and that is deliberate, not
+# defensive. This driver attempts five legs; a run directory that could not be
+# created costs THAT leg its corpus and must not delete four other legs' worth of
+# evidence. It is the same rule the loadext staging block above learnt the
+# expensive way on 2026-08-05, and test-confound-scope.ps1 pins "the staging block
+# contains NO Die" precisely so it cannot be un-learnt.
+# ⛔ AND THERE IS NO FALLBACK TO THIS DRIVER'S OWN DIRECTORY. Falling back would
+# put the corpus straight back onto the filesystem the declaration exists to keep
+# it off, and it would do so silently, which is worse than not running the leg.
+function Invoke-RunDirArgv($label, $what, $prefix, $rest) {
+  $argv = @($prefix | Where-Object { $_ }) + @($rest | Where-Object { $_ })
+  if ($argv.Count -lt 2) { return @{ Ok = $true; Detail = '' } }
+  $out = & $argv[0] @($argv | Select-Object -Skip 1) 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    return @{ Ok = $false; Detail = "could not $what in the launcher's own filesystem — ``$($argv -join ' ')`` exited ${LASTEXITCODE}: $(($out | ForEach-Object { "$_" }) -join ' | ')" }
+  }
+  return @{ Ok = $true; Detail = '' }
 }
 #
 # ── THE LAUNCHER'S ENVIRONMENT NAMESPACE ─────────────────────────────────────
@@ -2770,8 +2852,20 @@ Pass "TESTFIXTURE build inputs (tcl AND zlib) resolved for $($BuildableLegs.Coun
 # exposes no finer restart point than (permutation, file), so a finer resume would
 # mean hand-rolling a runner.
 #
-# >>> dss:corpus-engine >>>  (region mirrored in build-and-test.sh; the verifier
-# extracts it from this file by these sentinels, so keep them on their own lines)
+# >>> dss:corpus-engine >>>  (region mirrored in build-and-test.sh)
+# ⚠ CORRECTED 2026-08-06: this header used to say "the verifier extracts it from
+# this file by these sentinels". THERE IS NO SUCH VERIFIER. ✔MEASURED — the only
+# consumers of any `dss:` sentinel in this repository are test-confound-scope.sh
+# (`src-provenance`, `src-clone`, `src-gate`, `loadext-stage`, `loadext-verdict`,
+# `confound-supply`), test-confound-scope.ps1 (`src-provenance`,
+# `loadext-stage-ps1`) and test-driver-contracts.sh (`verdict-vocabulary`);
+# `corpus-engine` is read by NOTHING. The sentinels are still worth keeping — they
+# mark the paired region for a reader and for the verifier that should exist — but
+# a comment asserting a guard that is not there is the exact defect this project
+# keeps paying for: an instrument credited with an observation it never made.
+# ⇒ nothing about this region is enforced today; the two copies can diverge
+# silently, and the confound classifier's SUPPLY (which lives outside it) did
+# exactly that for months. Keep the sentinels on their own lines.
 
 # sqlite's own $alltests: every `.test` basename in the corpus dir MINUS the driver
 # scripts it excludes by name (all.test / permutations.test / …), ORDINAL-sorted —
@@ -3745,18 +3839,18 @@ $legLauncher = @($leg.run.launcher)
 # Translated ONCE, here, so a per-segment path is the only other site.
 $legXlate    = "$($leg.run.pathTranslation)"
 $legLaunchFixture = Convert-LaunchPath $legXlate $fixture
-# CONFOUNDS ARE PER LEG AND EVERY ONE OF THEM WAS EARNED SOMEWHERE. See
-# Get-LegConfounds: a non-pe64 leg starts EMPTY rather than inheriting a list
-# measured on a platform it is not.
-$Confounds   = @(Get-LegConfounds $LegTag)
+# CONFOUNDS ARE PER LEG AND EVERY ONE OF THEM WAS EARNED SOMEWHERE — read from
+# THIS LEG'S OWN DECLARATION (legs.json `confounds`, resolved by harness_legs.py),
+# which is the same declaration build-and-test.sh reads. One ledger, both drivers.
+$Confounds   = @(Get-LegConfounds $leg)
 Step "8/9  [$LegTag] $($leg.spec) — $Tier.test ($LegRunMode$(if ($legLauncher.Count) { ": $($legLauncher -join ' ')" })$(if ($legXlate -and $legXlate -ne 'none') { "; paths -> '$legXlate' via '$($leg.run.pathTranslator -join ' ')'" }))"
 if ($legXlate -and $legXlate -ne 'none') {
   Info "[$LegTag] the launcher addresses files in ANOTHER namespace — fixture $fixture -> $legLaunchFixture"
 }
 if ($Confounds.Count) {
-  Info "[$LegTag] confound patterns in force ($($Confounds.Count)): $($Confounds -join ' ')$(if ($null -ne $ConfoundsOverride) { '   [operator DSS_CONFOUNDS — applied to EVERY leg]' } else { '   [EARNED on this leg]' })"
+  Info "[$LegTag] confound patterns in force ($($Confounds.Count)): $($Confounds -join ' ')$(if ($null -ne $ConfoundsOverride) { '   [operator DSS_CONFOUNDS — applied to EVERY leg]' } else { '   [EARNED on this leg — legs.json `confounds`, provenance per pattern]' })"
 } else {
-  Info "[$LegTag] NO confound patterns: nothing has ever been measured as a non-DSS confound on this leg, and a confound must be EARNED per platform, never copied from a sibling leg. Every failure here counts."
+  Info "[$LegTag] NO confound patterns: this leg's catalogue entry declares ``confounds: []``, i.e. nothing has ever been measured as a non-DSS confound HERE, and a confound must be EARNED per platform, never copied from a sibling leg. Every failure here counts."
 }
 # The leg's OWN library directories go on its TARGET's loader search variable so
 # its fixture can load them at run time; TCL_LIBRARY points the Tcl runtime at its
@@ -3789,8 +3883,47 @@ $runEnvPath = ($legLibDirs -join [System.IO.Path]::PathSeparator) + [System.IO.P
 # red a currently-working tier before the declaration lands, and the per-leg WARN
 # at acquisition time says so out loud every run rather than letting it pass.
 $LegTclLibrary = if ($LegLibs[$LegTag].TclScriptDir) { "$($LegLibs[$LegTag].TclScriptDir)" } else { $TclLibrary }
+# THE DRIVER-SIDE run directory. It exists on EVERY leg regardless of where the
+# corpus actually runs, because this driver has to be able to WRITE into it: the
+# loadext helper is produced by a process on this machine and can only land where
+# this machine can put a file. For a `driver` filesystem it is also where the
+# fixture runs; for a foreign one it is the staging area the resolver's copy argv
+# reads FROM. [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
 $rundir = Join-Path $legOut 'run'; if (Test-Path $rundir) { Remove-Item -Recurse -Force $rundir }
 New-Item -ItemType Directory -Force -Path $rundir | Out-Null
+# WHERE THE CORPUS RUNS, DECLARED — never "wherever this driver happens to put
+# its build tree". `$legRunDir` is the launcher's own path when the two
+# filesystems differ, and $rundir when they do not; `$legLaunchRun` is empty in
+# the second case, which is how every site below tells the two apart without
+# knowing a single verb name.
+$runDirPlan   = Get-LegRunDirPlan $LegTag $rundir
+$legRunFs     = "$($runDirPlan.runFilesystem)"
+$legLaunchRun = "$($runDirPlan.launcherPath)"
+$legRunDir    = if ($legLaunchRun) { $legLaunchRun } else { $rundir }
+# The launcher argv the fixture is spawned through — the DECLARED command with
+# the working-directory option already spliced in by the resolver. Equal to the
+# declared command whenever the verb needs none, so a `driver` leg's spawn is
+# byte-for-byte the one it has always been.
+$legLauncher  = @($runDirPlan.launcher | Where-Object { $_ })
+if ($legLaunchRun) {
+  Info "[$LegTag] the launcher writes onto ITS OWN filesystem (runFilesystem '$legRunFs') — the corpus runs in $legLaunchRun"
+  Info "      NOT in $rundir, which that launcher reaches only through a compatibility mount whose POSIX file modes are synthesised from one Windows attribute (chmod 644 reads back as 777). [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]"
+  $mk = Invoke-RunDirArgv $LegTag "clear the run directory $legLaunchRun" $runDirPlan.rmTreeArgv @($legLaunchRun)
+  if ($mk.Ok) { $mk = Invoke-RunDirArgv $LegTag "create the run directory $legLaunchRun" $runDirPlan.mkdirArgv @("$legLaunchRun/$SqliteTestdirSubdir") }
+  if (-not $mk.Ok) {
+    # PER-LEG, NEVER THE RUN. Same rule as the loadext staging block below.
+    # ⛔ NOT a fallback to $rundir: that is the DrvFs directory this declaration
+    # exists to keep the corpus off, and taking it silently would manufacture ~60
+    # failures that look like compiler defects.
+    Set-LegVerdict $LegTag 'poisoned' "the fixture BUILT ($fixture), but this leg's DECLARED run directory could not be prepared, so its corpus was NOT run. $($mk.Detail)"
+    Set-UnitNotRun $LegTag 'poisoned' "run directory preparation FAILED: $($mk.Detail)"
+    Warn "[$LegTag] POISONED - could not prepare the declared run directory; this leg's corpus is NOT run, the rest of the run CONTINUES:"
+    Warn "      $($mk.Detail)"
+    continue
+  }
+} else {
+  Info "[$LegTag] the corpus runs in this driver's own filesystem (runFilesystem '$legRunFs') — $rundir"
+}
 $runlog = Join-Path $legOut 'corpus.log'
 $Ledger = Join-Path $legOut 'corpus-units.txt'
 
@@ -3811,7 +3944,7 @@ $Ledger = Join-Path $legOut 'corpus-units.txt'
 $helper = Resolve-LoadextHelper -Python $python3.Source -LegsPy $LegsPy `
             -Label $LegTag -Builder $LoadextBuilder -DssBin $DssBin `
             -SqliteSrc $SqliteStageSrc -SqliteBld $SqliteStageBld `
-            -DestDir (Join-Path $rundir 'testdir') `
+            -DestDir (Join-Path $rundir $SqliteTestdirSubdir) `
             -WorkDir (Join-Path $legOut 'loadext-helper') -Config $Config `
             -ReferenceCc $LegControlCc[$LegTag].Cc `
             -ReferenceMachine $LegControlCc[$LegTag].Machine
@@ -3840,6 +3973,27 @@ if (-not $helper.Ok) {
 }
 Info "[$LegTag] loadext helper -> $($helper.Staged) - $($helper.Detail)"
 if ($helper.CrossCheck) { Info "      $($helper.CrossCheck)" }
+# ★ AND INTO THE FILESYSTEM THE FIXTURE WILL ACTUALLY LOOK IN. The helper is
+# BUILT by a process on this machine, so it can only be written where this
+# machine can write; when the corpus runs in the launcher's own filesystem the
+# staged file has to be carried across, through the resolver's DECLARED copy
+# argv. Without this the move to an ext4 run directory would have FIXED the
+# permission families and BROKEN loadext.test — trading one manufactured failure
+# class for another. [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
+if ($legLaunchRun) {
+  $helperSrc = Convert-LaunchPath $legXlate "$($helper.Staged)"
+  $helperDst = "$legLaunchRun/$SqliteTestdirSubdir/$([System.IO.Path]::GetFileName("$($helper.Staged)"))"
+  $cp = Invoke-RunDirArgv $LegTag "copy the loadext helper to $helperDst" $runDirPlan.copyArgv @($helperSrc, $helperDst)
+  if (-not $cp.Ok) {
+    $LoadextStageFails++
+    Set-LegVerdict $LegTag 'poisoned' "the fixture BUILT ($fixture) and its loadext helper was produced, but the helper could not be carried into this leg's DECLARED run directory, so its corpus was NOT run. $($cp.Detail)"
+    Set-UnitNotRun $LegTag 'poisoned' "loadext helper transfer FAILED: $($cp.Detail)"
+    Warn "[$LegTag] POISONED - the loadext helper could not reach the run directory; this leg's corpus is NOT run, the rest of the run CONTINUES:"
+    Warn "      $($cp.Detail)"
+    continue
+  }
+  Info "[$LegTag] loadext helper carried into the launcher's filesystem -> $helperDst"
+}
 # <<< dss:loadext-stage-ps1 <<<
 
 # >>> dss:corpus-loop >>>

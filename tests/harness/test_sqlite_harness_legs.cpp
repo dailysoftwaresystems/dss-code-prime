@@ -292,6 +292,16 @@ public:
         ADD_FAILURE() << "no leg labelled '" << label << '\'';
         return doc_;  // unreachable in a passing run
     }
+    // The leg itself, for the declarations that live beside `launchers` rather
+    // than inside one — `confounds` is per LEG, which is the whole point of
+    // D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG.
+    [[nodiscard]] json& legOf(std::string const& label) {
+        for (auto& leg : doc_.at("legs")) {
+            if (leg.at("label").get<std::string>() == label) return leg;
+        }
+        ADD_FAILURE() << "no leg labelled '" << label << '\'';
+        return doc_;  // unreachable in a passing run
+    }
 
 private:
     dss::test_support::ScratchDir dir_;
@@ -1184,6 +1194,185 @@ TEST_F(HarnessLegs, AMalformedPathTranslationDeclarationFailsLint) {
         EXPECT_NE(r.exitCode, 0u)
             << "envTransfer 'wslenv' declared on a LINUX host launcher linted"
                " clean:\n"
+            << r.output;
+    }
+    // ── and the same, for the launcher's FILESYSTEM ────────────────────────
+    // D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS. The third namespace, and the
+    // one whose absence cost 55 unit failures across 6 families plus a fixture
+    // ABORT — every one of them non-DSS, all of them reported as if they were.
+    {
+        MutatedCatalogue m{catalogue_, "legs-unknown-fsverb"};
+        m.firstLauncherOf("pe64-x86_64")["runFilesystem"] = "somewhere-else";
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "an unknown runFilesystem verb LINTED CLEAN:\n" << r.output;
+        EXPECT_NE(r.output.find("somewhere-else"), std::string::npos) << r.output;
+    }
+    {
+        MutatedCatalogue m{catalogue_, "legs-missing-fsverb"};
+        m.firstLauncherOf("pe64-x86_64").erase("runFilesystem");
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "a launcher with NO runFilesystem linted clean:\n"
+            << r.output
+            << "\n`driver` is a CLAIM — that the launched process writes onto"
+               " this driver's filesystem with this filesystem's semantics — and"
+               " it was the unexamined one.";
+        EXPECT_NE(r.output.find("runFilesystem"), std::string::npos) << r.output;
+    }
+    {
+        // The pairing that actually bites: a launcher whose paths must be
+        // RE-SPELLED to reach it is reaching this driver's files through a
+        // compatibility mount, so `driver` is exactly the wrong answer there.
+        // This is the shipped defect, restored.
+        MutatedCatalogue m{catalogue_, "legs-drvfs-restored"};
+        auto& wsl = m.firstLauncherOf("elf64-x86_64");
+        // entry 0 is the qemu one; find the translating launcher by its verb.
+        json* target = nullptr;
+        for (auto& leg : m.doc().at("legs")) {
+            if (leg.at("label").get<std::string>() != "elf64-x86_64") continue;
+            for (auto& e : leg.at("launchers")) {
+                if (e.at("pathTranslation").get<std::string>() != "none") {
+                    target = &e;
+                }
+            }
+        }
+        ASSERT_NE(target, nullptr)
+            << "no translating launcher to mutate — this test would assert"
+               " nothing";
+        (void)wsl;
+        (*target)["runFilesystem"] = "driver";
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "a TRANSLATING launcher declaring runFilesystem 'driver' linted"
+               " clean — that is the exact declaration that put a Linux sqlite"
+               " corpus onto DrvFs:\n"
+            << r.output;
+        EXPECT_NE(r.output.find("runFilesystem"), std::string::npos) << r.output;
+    }
+}
+
+// ── THE EARNED-CONFOUND LEDGER LIVES IN THE CATALOGUE ───────────────────────
+//
+// D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG /
+// D-HARNESS-SQLITE-CONFOUNDS-NOT-DECLARED-PER-LEG /
+// D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY.
+//
+// A confound asserts THE COMPILER IS INNOCENT of a failing test, and the count
+// of genuine failures is what every verdict this harness renders rests on. So
+// the declaration has to show its work, and the lint is what makes that
+// non-optional. ✔MEASURED consequence of the old per-driver lists: the same
+// elf64-x86_64 artefact's `zipfile-25.0` was a "known non-DSS confound" under
+// one driver and a "genuine failure" under the other, on the same day.
+//
+// RED-ON-DISABLE: delete the matching rule from harness_legs.py's lint and the
+// case below goes green with `findings=0`.
+TEST_F(HarnessLegs, EveryLegDeclaresItsEarnedConfoundsWithProvenance) {
+    auto const doc = json::parse(fileText(catalogue_));
+    std::size_t rows = 0;
+    std::set<std::string> distinct;
+    for (auto const& leg : doc.at("legs")) {
+        auto const label = leg.at("label").get<std::string>();
+        ASSERT_TRUE(leg.contains("confounds"))
+            << label
+            << " declares no `confounds`. The key is REQUIRED even when the"
+               " answer is `[]`: a missing key cannot be told from an empty one,"
+               " and the difference decides whether a failing test is reported"
+               " as a compiler defect.";
+        std::string set;
+        for (auto const& row : leg.at("confounds")) {
+            ++rows;
+            for (char const* k :
+                 {"pattern", "scope", "earnedOn", "earnedAt", "mechanism",
+                  "anchor"}) {
+                ASSERT_TRUE(row.contains(k))
+                    << label << ": a confound row omits '" << k << '\'';
+                EXPECT_FALSE(row.at(k).get<std::string>().empty())
+                    << label << ": a confound row's '" << k << "' is EMPTY."
+                    << " An unearned confound is how a real defect becomes"
+                       " furniture.";
+            }
+            auto const scope = row.at("scope").get<std::string>();
+            EXPECT_TRUE(scope == "any" || scope == "native" ||
+                        scope == "emulated")
+                << label << ": unknown confound scope '" << scope << '\'';
+            set += row.at("pattern").get<std::string>() + '|';
+        }
+        distinct.insert(set);
+    }
+    EXPECT_GT(rows, 0u) << "no leg declares any confound — this test would"
+                           " assert nothing";
+    // ★ THE ASYMMETRY IS THE POINT. If every leg carried the same rows this
+    // would be the old GLOBAL list wearing a per-leg costume, and the defect
+    // would be back with the paperwork done.
+    EXPECT_GT(distinct.size(), 1u)
+        << "every leg declares the SAME confound set, which is the global list"
+           " again — a confound must be EARNED per platform, never copied from"
+           " a sibling leg.";
+}
+
+TEST_F(HarnessLegs, AConfoundWithoutProvenanceFailsLint) {
+    {
+        MutatedCatalogue m{catalogue_, "legs-confound-no-provenance"};
+        auto& leg = m.legOf("pe64-x86_64");
+        leg["confounds"] = json::array(
+            {json{{"pattern", "^made-up-"}, {"scope", "any"}}});
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "a confound with NO provenance LINTED CLEAN:\n"
+            << r.output
+            << "\nA confound asserts the compiler is innocent of a failing"
+               " test; it has to show its work.";
+        EXPECT_NE(r.output.find("^made-up-"), std::string::npos) << r.output;
+    }
+    {
+        // The key omitted entirely — "nobody filled this in" must not be
+        // readable as "nothing was ever earned here".
+        MutatedCatalogue m{catalogue_, "legs-confounds-missing"};
+        m.legOf("elf64-x86_64").erase("confounds");
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "a leg with NO `confounds` key linted clean:\n" << r.output;
+        EXPECT_NE(r.output.find("confounds"), std::string::npos) << r.output;
+    }
+    {
+        // A pattern that does not compile matches NOTHING, so every failure it
+        // names is reported as a DSS defect — the loud half of the same lie.
+        MutatedCatalogue m{catalogue_, "legs-confound-bad-regex"};
+        auto& leg = m.legOf("pe64-x86_64");
+        leg["confounds"] = json::array({json{{"pattern", "^broken["},
+                                             {"scope", "any"},
+                                             {"earnedOn", "nowhere"},
+                                             {"earnedAt", "never"},
+                                             {"mechanism", "none"},
+                                             {"anchor", "D-NONE"}}});
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "a confound pattern that does not COMPILE linted clean:\n"
+            << r.output;
+    }
+    {
+        // A scope no host can satisfy is dead config that reads as coverage.
+        MutatedCatalogue m{catalogue_, "legs-confound-dead-scope"};
+        auto& leg = m.legOf("macho64-arm64");  // declares NO launcher at all
+        leg["confounds"] = json::array({json{{"pattern", "^never-fires-"},
+                                             {"scope", "emulated"},
+                                             {"earnedOn", "nowhere"},
+                                             {"earnedAt", "never"},
+                                             {"mechanism", "none"},
+                                             {"anchor", "D-NONE"}}});
+        auto const r = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "an `emulated`-scoped confound on a leg with NO launcher linted"
+               " clean — it can never fire, and it reads as a documented"
+               " confound:\n"
             << r.output;
     }
 }
