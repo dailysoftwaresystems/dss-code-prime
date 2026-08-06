@@ -112,20 +112,79 @@ VERDICTS = [
 # driver calls `--acquire <leg>` and reads the resulting JSON; neither driver
 # knows what HTTP is. That is what makes the capability-pair gap unrepeatable
 # rather than merely repaired.
-LIBRARY_PROVIDERS = {"host-system", "ubuntu-ports-arm64", "search-paths",
-                     "pinned-archive"}
+LIBRARY_PROVIDERS = {"host-system", "search-paths", "pinned-archive"}
 RECIPE_TRANSFORMS = {"none", "windows-selfconfig"}
 
 # The archive kinds `--acquire` can open, and the `tarfile` mode that opens each.
-# CLOSED on purpose: a `.deb` (an `ar` archive) and a `.pkg.tar.zst` (needs zstd,
-# which is not in the stdlib before 3.14) are NOT here, so a catalogue that
-# declares one fails the lint LOUDLY instead of failing at download time on some
-# other machine, months later.
+# CLOSED on purpose: a `.pkg.tar.zst` (needs zstd, which is not in the stdlib
+# before 3.14) is NOT here, so a catalogue that declares one fails the lint
+# LOUDLY instead of failing at download time on some other machine, months later.
+#
+# ★ `deb` IS AN `ar` ARCHIVE WHOSE PAYLOAD IS A TAR, and it is opened by this
+# module rather than by `dpkg-deb` — the tool the old `ubuntu-ports-arm64`
+# provider shelled out to and which no Windows or macOS host has. The `ar` header
+# is 60 fixed bytes; the payload member is `data.tar.<ext>`, and the <ext> decides
+# which of the tar modes above opens it. ⚠ THE ZSTD WALL IS REAL AND MEASURED
+# (2026-08-06): EVERY Ubuntu .deb — amd64 and arm64, jammy through current —
+# ships `data.tar.zst`, so the "Ubuntu amd64 archive, literal sibling of the
+# arm64 provider" is NOT convertible with the stdlib. Debian bookworm's are
+# `data.tar.xz` and are. A `data.tar.zst` therefore gets a refusal that NAMES the
+# wall instead of a stack trace from tarfile.
 ARCHIVE_FORMATS = {
     "tar.bz2": "r:bz2",
     "tar.gz":  "r:gz",
     "tar.xz":  "r:xz",
+    "deb":     "ar+data.tar",
 }
+
+# The inner-tar suffixes a `.deb` payload may carry, and the mode that opens each
+# — the SAME modes as above, which is the point: `deb` adds a container, not a
+# compressor.
+DEB_PAYLOAD_MODES = {
+    "data.tar.bz2": "r:bz2",
+    "data.tar.gz":  "r:gz",
+    "data.tar.xz":  "r:xz",
+}
+
+# ── WHICH COPY OF AN ACQUIRED LIBRARY ACTUALLY RUNS ─────────────────────────
+#
+# D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY. Acquisition obtains a
+# library's CODE. It does not obtain the RUNTIME DATA that library needs, and
+# NOTHING AT BUILD TIME CAN SEE THE DIFFERENCE: the link succeeds, the binary
+# runs, and it dies only on the code path that touches the data. Tcl (its script
+# library), ICU (its data bundle) and tzdata all carry a baked-in directory path
+# that acquisition silently leaves dangling.
+#
+# Whether that matters for a given member is decided by ONE question — WHICH COPY
+# OF THE LIBRARY DOES THE ARTEFACT ACTUALLY LOAD? — so it is DECLARED per member
+# rather than guessed:
+#
+#   staged-beside-artefact  the file we acquired IS the file that runs (the
+#                           driver stages it next to the binary; Mach-O
+#                           `@loader_path`, ELF LD_LIBRARY_PATH, the Windows
+#                           app-directory search). ⇒ every runtime data
+#                           directory it bakes in MUST be staged too, or the
+#                           artefact dies at the first code path that reads it.
+#   target-supplies-its-own the target machine loads ITS OWN copy by name, and
+#                           our copy is a BUILD-TIME STAND-IN read for its export
+#                           table. ⇒ its baked-in directories belong to that
+#                           machine and staging ours would be the wrong data.
+RUNTIME_COPIES = {"staged-beside-artefact", "target-supplies-its-own"}
+
+# An `importName` that resolves NEXT TO THE LOADING BINARY rather than by name or
+# at an absolute path. Declared as a closed set so `runtimeCopy` can be
+# CROSS-CHECKED against it instead of taken on trust.
+IMPORT_NAME_BESIDE_PREFIXES = ("@loader_path/", "@executable_path/", "$ORIGIN/")
+
+# What an absolute path baked into an acquired library IS. Both are claims a
+# reader can check, and `inert` costs a `$why` — "nothing reads this" is exactly
+# the sentence that was wrong about `/opt/local/lib/tcl8.6`.
+EMBEDDED_PATH_KINDS = {"runtime-data", "inert"}
+
+# What a staged data directory is FOR. `tclScriptLibrary` is singled out because
+# a driver has to point `TCL_LIBRARY` at it; everything else is `generic` and is
+# staged without any driver having to know what it is.
+DATA_DIR_ROLES = {"tclScriptLibrary", "generic"}
 
 # Mach-O `cpu_type_t` per TARGET ARCH — the key that picks a slice out of a
 # universal archive. Keyed on the leg's own target arch, never on the host: a
@@ -1289,8 +1348,15 @@ def library_exports(blob):
 _TCL_IDENT_SHAPES = (
     # libtcl8.6.so · libtcl8.6.so.0 · libtcl9.0.dylib
     re.compile(r"^libtcl(\d+)\.(\d+)\.(?:so|dylib)(?:\.\d+)*$"),
-    # tcl86.dll · tcl90.dll — Windows spells the version with no separator
-    re.compile(r"^tcl(\d)(\d)\.dll$", re.IGNORECASE),
+    # tcl86.dll · tcl90.dll · tcl86t.dll — Windows spells the version with no
+    # separator, and a trailing `t` marks a THREADED build (the convention
+    # msys2, conda-forge and ActiveState all use; sqlite's testfixture wants
+    # exactly that build). ⚠ THE SUFFIX WAS MISSING AND IT COST A MEASUREMENT:
+    # the pe64 leg's acquired `tcl86t.dll` matched nothing, so instrument B went
+    # SILENT and the per-leg coherence check degraded from "8.6" to a bare major
+    # "8" without saying it had — the quiet half-failure this pair of
+    # instruments exists to avoid. ✔MEASURED 2026-08-06 on the acquired DLL.
+    re.compile(r"^tcl(\d)(\d)t?\.dll$", re.IGNORECASE),
 )
 
 
@@ -2121,6 +2187,75 @@ def _macho_install_name(buf):
     return ""
 
 
+# ── THE PATHS A LIBRARY BAKES IN ────────────────────────────────────────────
+#
+# An ABSOLUTE PATH WITH AT LEAST TWO COMPONENTS, POSIX or Windows-drive spelled,
+# not preceded by another path character (so `abc/def/ghi` inside a longer word
+# does not produce a phantom `/def/ghi`). ✔MEASURED 2026-08-06 across the six
+# libraries this catalogue stages: 14 tokens in each MacPorts libtcl slice, 2 in
+# each libz, 14 in Debian's libtcl8.6.so, and ZERO in conda-forge's tcl86t.dll
+# and zlib.dll — i.e. the grammar is tight enough that the declaration is a
+# readable list rather than a wall of noise, and loose enough to have caught the
+# one path that mattered (`/opt/local/lib/tcl8.6`).
+#
+# ⚠ THIS IS A STRING SCAN, DELIBERATELY, AND NOT A SECTION WALK. A data path can
+# be built at run time from pieces, and it can live in __TEXT, __DATA or a
+# packager's config blob; a scan that only understood one container's string
+# section would be a check that passes for the wrong reason on the next format.
+# Its cost is the false positives above, and every one of them is DECLARED once
+# against a PINNED digest, so the list can never drift under the declaration.
+_ABS_PATH_TOKEN_RE = re.compile(
+    rb"(?<![A-Za-z0-9_+.\-\\/])(?:[A-Za-z]:[\\/]|/)"
+    rb"[A-Za-z0-9_+.-]+(?:[\\/][A-Za-z0-9_+.-]+)+")
+
+
+def embedded_absolute_paths(blob):
+    """Every absolute path token a library carries, sorted. Bytes in, strings
+    out — the caller compares them against the DECLARATION."""
+    return sorted({m.group().decode("utf-8", "replace")
+                   for m in _ABS_PATH_TOKEN_RE.finditer(blob)})
+
+
+def loader_dependency_paths(blob):
+    """The paths a library declares as LIBRARIES FOR THE LOADER, as opposed to
+    data it reads itself.
+
+    These are subtracted from the audit above because they are not a data
+    directory by any reading — they are the loader's business, and a build that
+    demanded they be declared as data would be demanding nonsense.
+
+    Mach-O is the only container that spells them as PATHS: LC_ID_DYLIB,
+    LC_LOAD*_DYLIB and LC_RPATH. An ELF's DT_NEEDED is a bare soname and a PE's
+    import table a bare DLL name, so neither can produce an absolute-path token
+    at all — and an ELF DT_RPATH/DT_RUNPATH, which CAN, is deliberately NOT
+    excused here: it is a path the packager chose, exactly the kind of thing this
+    audit exists to put in front of a reader."""
+    import struct
+    out = []
+    if len(blob) < 32:
+        return out
+    magic, = struct.unpack("<I", blob[:4])
+    if magic != 0xFEEDFACF:
+        return out
+    ncmds, = struct.unpack("<I", blob[16:20])
+    p = 32
+    #     LC_ID_DYLIB  LC_LOAD_DYLIB  LC_LOAD_WEAK  LC_REEXPORT  LC_LAZY  LC_UPWARD
+    dylib = (0xD, 0xC, 0x80000018, 0x8000001F, 0x20, 0x80000023)
+    for _ in range(ncmds):
+        if p + 8 > len(blob):
+            break
+        cmd, cmdsize = struct.unpack("<II", blob[p:p + 8])
+        if cmdsize < 8 or p + cmdsize > len(blob):
+            break
+        if cmd in dylib or cmd in (0x1C, 0x8000001C):      # + LC_RPATH
+            nameoff, = struct.unpack("<I", blob[p + 8:p + 12])
+            if 8 <= nameoff < cmdsize:
+                out.append(blob[p + nameoff:p + cmdsize]
+                           .split(b"\0")[0].decode("utf-8", "replace"))
+        p += cmdsize
+    return out
+
+
 def _thin_for_arch(blob, target_arch, where):
     """The slice of `blob` this leg's TARGET needs.
 
@@ -2196,8 +2331,10 @@ def _download(url, dest, timeout=120):
 
 def acquire_plan(leg, root):
     """What `--acquire` WOULD do, as data: the declared archives, the cache paths
-    they land in, and the (as-name -> importName) map. Pure — no filesystem, no
-    network — so the self-test can assert the plan on any machine."""
+    they land in, the (as-name -> importName) map and the staged data
+    directories. Pure — no filesystem, no network — so the self-test can assert
+    the plan on any machine, and so the FAILURE path can answer with the same
+    fields the success path does."""
     libs = leg.get("build", {}).get("libraries", {})
     acq = libs.get("acquire", {})
     target_arch = spec_target_arch(leg.get("spec", ""))
@@ -2217,6 +2354,16 @@ def acquire_plan(leg, root):
                 "as": m.get("as", ""),
                 "universal": bool(m.get("universal", False)),
                 "importName": m.get("importName", ""),
+                "runtimeCopy": m.get("runtimeCopy", ""),
+                "embeddedPaths": [{"path": e.get("path", ""),
+                                   "kind": e.get("kind", ""),
+                                   "role": e.get("role", "")}
+                                  for e in m.get("embeddedPaths", [])],
+                "dataDirs": [{"member": d.get("member", ""),
+                              "as": d.get("as", ""),
+                              "role": d.get("role", ""),
+                              "path": os.path.join(cdir, d.get("as", ""))}
+                             for d in m.get("dataDirs", [])],
                 "path": os.path.join(cdir, m.get("as", "")),
             } for m in a.get("members", [])],
         })
@@ -2226,7 +2373,37 @@ def acquire_plan(leg, root):
         "cacheDir": cdir,
         "downloadDir": ddir,
         "archives": archives,
+        # ── THE CONTRACT FIELD ──────────────────────────────────────────────
+        # Where Tcl's SCRIPT LIBRARY (init.tcl and friends) was staged for this
+        # leg, or "" when the leg stages none. A driver reads THIS and sets
+        # `TCL_LIBRARY`; it never joins a path itself, for the same reason it
+        # never spells `--resolve-library` itself.
+        #
+        # ★ IT IS COMPUTED HERE, IN THE PURE PLAN, AND THE RESULT COPIES IT —
+        # so the success return and the failure return CANNOT carry different
+        # field sets (D-HARNESS-PINNED-ARCHIVE-FAILURE-RETURN-OMITS-ACQUIRED:
+        # "a function whose SUCCESS return and FAILURE return carry different
+        # field sets is a silent-omission generator"). There is one record
+        # shape, `acquisition_record`, and one place the value comes from.
+        "scriptLibraryDir": _script_library_dir(archives),
     }
+
+
+def _script_library_dir(archives):
+    """The staged Tcl script library among a plan's data directories, or "".
+
+    Refuses on TWO of them rather than picking: `TCL_LIBRARY` is one directory,
+    so a leg that staged two script libraries has no answer and the driver must
+    not be handed whichever came first."""
+    found = [d["path"] for a in archives for m in a["members"]
+             for d in m["dataDirs"] if d["role"] == "tclScriptLibrary"]
+    if len(found) > 1:
+        raise LegError(
+            "this leg stages %d Tcl script libraries (%s), but TCL_LIBRARY names "
+            "exactly one directory. Declare `role: tclScriptLibrary` on the one "
+            "the fixture must use and `generic` on the rest."
+            % (len(found), ", ".join(found)))
+    return found[0] if found else ""
 
 
 # Bumped when the MATERIALISATION changes shape (a new slicing rule, a new
@@ -2239,7 +2416,41 @@ def acquire_plan(leg, root):
 #           libtcl8.6.dylib had been swapped would be handed to the compiler
 #           without a murmur. The digest pin has to survive extraction or it only
 #           protects the download.
-ACQUIRE_STAMP_VERSION = 2
+#   2 -> 3: staged DATA DIRECTORIES (Tcl's script library) and the per-member
+#           `runtimeCopy` / `embeddedPaths` declarations join the stamp. A cache
+#           written before them holds the libraries but not the scripts, and a
+#           stamp that did not mention them would call it fresh.
+ACQUIRE_STAMP_VERSION = 3
+
+
+def acquisition_record(plan_, libraries=(), from_cache=False, remediated=(),
+                       loader_dependencies=(), error=""):
+    """THE acquisition result — ONE record shape, built in ONE place.
+
+    D-HARNESS-PINNED-ARCHIVE-FAILURE-RETURN-OMITS-ACQUIRED closed a bug where a
+    failure return omitted a field its success twin carried, and its own closing
+    note names the durable fix: "make the acquisition result ONE record type
+    populated on both paths, so a field cannot be forgotten on the branch nobody
+    exercises". This is that type. `--acquire` prints it on success AND on
+    failure (with `error` set and the rc still naming the failure), so a driver
+    that needs `scriptLibraryDir` most — because acquisition just failed and it
+    is about to report why — is not handed a different shape."""
+    return {
+        "leg": plan_["leg"],
+        "targetArch": plan_["targetArch"],
+        "cacheDir": plan_["cacheDir"],
+        "scriptLibraryDir": plan_["scriptLibraryDir"],
+        "libraries": list(libraries),
+        "fromCache": bool(from_cache),
+        "remediated": list(remediated),
+        # The library paths each staged library hands to the LOADER, reported
+        # rather than audited (see loader_dependency_paths). ⚠ It is worth
+        # READING: MacPorts' libtcl8.6.dylib carries LC_LOAD_DYLIB
+        # `/opt/local/lib/libz.1.dylib`, a prefix no target Mac has, and it loads
+        # only because dyld falls back to /usr/lib.
+        "loaderDependencies": list(loader_dependencies),
+        "error": error,
+    }
 
 
 def acquire(leg, root, offline=False, downloader=_download):
@@ -2266,7 +2477,13 @@ def acquire(leg, root, offline=False, downloader=_download):
         "archives": [{"sha256": a["sha256"], "url": a["url"],
                       "members": [{"member": m["member"], "as": m["as"],
                                    "universal": m["universal"],
-                                   "importName": m["importName"]}
+                                   "importName": m["importName"],
+                                   "runtimeCopy": m["runtimeCopy"],
+                                   "embeddedPaths": m["embeddedPaths"],
+                                   "dataDirs": [{"member": d["member"],
+                                                 "as": d["as"],
+                                                 "role": d["role"]}
+                                                for d in m["dataDirs"]]}
                                   for m in a["members"]]}
                      for a in plan_["archives"]],
     }
@@ -2301,6 +2518,21 @@ def acquire(leg, root, offline=False, downloader=_download):
                     remediated.append("%s: content does not match the digest "
                                       "recorded when it was extracted" % m["as"])
                     fresh = False
+                for d in m["dataDirs"]:
+                    # A STAGED DIRECTORY IS PINNED THE SAME WAY A FILE IS — by
+                    # ONE digest over the whole tree (every relative path and
+                    # every file's own sha256). Anything added, removed or
+                    # edited under it changes that digest, so the script library
+                    # cannot rot into something the pinned library was never
+                    # shipped with.
+                    if not os.path.isdir(d["path"]):
+                        remediated.append("%s/: absent" % d["as"])
+                        fresh = False
+                    elif _sha256_tree(d["path"]) != have.get(d["as"] + "/"):
+                        remediated.append(
+                            "%s/: contents do not match the digest recorded "
+                            "when they were extracted" % d["as"])
+                        fresh = False
 
     if not fresh:
         # EVERY declaration is validated, and OFFLINE refuses, BEFORE anything is
@@ -2338,7 +2570,6 @@ def acquire(leg, root, offline=False, downloader=_download):
                 "design; point DSS_HARNESS_CACHE_ROOT (or --cache-root) at a "
                 "writable directory." % (plan_["leg"], root, exc))
         for a in plan_["archives"]:
-            mode = ARCHIVE_FORMATS[a["archiveFormat"]]
             dl = a["download"]
             if os.path.isfile(dl):
                 got = _sha256_file(dl)
@@ -2366,7 +2597,7 @@ def acquire(leg, root, offline=False, downloader=_download):
                         "or substituted third-party binary stops the build "
                         "instead of entering it."
                         % (a["url"], a["sha256"], got))
-            with tarfile.open(dl, mode) as tf:
+            with _open_archive(dl, a["archiveFormat"], a["url"]) as tf:
                 for m in a["members"]:
                     blob = _extract_member(tf, m["member"], a["url"])
                     where = "%s :: %s" % (os.path.basename(a["url"]), m["member"])
@@ -2392,37 +2623,261 @@ def acquire(leg, root, offline=False, downloader=_download):
                         os.remove(dest)
                     with open(dest, "wb") as f:
                         f.write(blob)
+                    for d in m["dataDirs"]:
+                        _extract_tree(tf, d["member"], d["path"], a["url"])
         with open(stamp_path, "w", encoding="utf-8") as f:
             _json.dump({"declaration": want_stamp,
-                        "materialised": {m["as"]: _sha256_file(m["path"])
-                                         for a in plan_["archives"]
-                                         for m in a["members"]}},
+                        "materialised": dict(
+                            [(m["as"], _sha256_file(m["path"]))
+                             for a in plan_["archives"] for m in a["members"]]
+                            + [(d["as"] + "/", _sha256_tree(d["path"]))
+                               for a in plan_["archives"] for m in a["members"]
+                               for d in m["dataDirs"]])},
                        f, indent=1, sort_keys=True)
 
     libraries = []
+    loader_deps = []
     for a in plan_["archives"]:
         for m in a["members"]:
             with open(m["path"], "rb") as f:
-                head = f.read(1 << 16)
+                blob = f.read()
+            _audit_embedded_paths(plan_["leg"], m, blob)
+            for dep in loader_dependency_paths(blob):
+                loader_deps.append("%s -> %s" % (m["as"], dep))
             libraries.append({
                 "as": m["as"],
                 "path": m["path"],
                 "importName": m["importName"],
+                "runtimeCopy": m["runtimeCopy"],
                 # The identity being DISPLACED, so a build log states the
                 # substitution instead of hiding it.
-                "embeddedIdentity": _macho_install_name(head),
+                "embeddedIdentity": _macho_install_name(blob[:1 << 16]),
                 "sourceUrl": a["url"],
                 "archiveSha256": a["sha256"],
                 "fileSha256": _sha256_file(m["path"]),
+                # The runtime data this library needs, and where it was put.
+                # Reported per library because "which staged directory belongs
+                # to which library?" has to have an answer in the build log.
+                "dataDirs": [{"as": d["as"], "role": d["role"],
+                              "path": d["path"],
+                              "treeSha256": _sha256_tree(d["path"])}
+                             for d in m["dataDirs"]],
             })
-    return {
-        "leg": plan_["leg"],
-        "targetArch": plan_["targetArch"],
-        "cacheDir": cdir,
-        "fromCache": fresh,
-        "remediated": remediated,
-        "libraries": libraries,
-    }
+    return acquisition_record(plan_, libraries=libraries, from_cache=fresh,
+                              remediated=remediated,
+                              loader_dependencies=loader_deps)
+
+
+def _audit_embedded_paths(label, member, blob):
+    """★ THE GUARD THIS ANCHOR EXISTS FOR — D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-
+    SCRIPT-LIBRARY.
+
+    A `.dylib`/`.so`/`.dll` is not always self-contained. Tcl bakes in its script
+    library, ICU its data bundle, tzdata its zone directory — and acquisition
+    obtains the CODE and silently leaves the path dangling. Nothing at build time
+    sees it: the link succeeds, the binary runs, and it dies only on the code
+    path that touches the data. It cost this project its first Mach-O unit
+    corpus, and the failure named no file.
+
+    So every absolute path a staged library carries is put in front of a reader
+    ONCE, against a PINNED digest, and after that the check is mechanical:
+
+      · a path in the bytes that the declaration does not mention  -> REFUSE
+      · a path the declaration mentions that is not in the bytes   -> REFUSE
+      · a `runtime-data` path with no staged directory             -> REFUSE
+
+    The second rule is what stops the declaration going vacuous: a list of paths
+    nobody checks against the file is a list that will eventually describe a
+    library we no longer ship.
+
+    ⚠ IT APPLIES ONLY WHERE THE STAGED COPY IS THE ONE THAT RUNS. When the target
+    supplies its own copy, our file is a build-time stand-in read for its export
+    table and NEVER LOADED — its baked-in directories belong to that machine, and
+    staging ours would ship the wrong data with a straight face."""
+    if member["runtimeCopy"] != "staged-beside-artefact":
+        return
+    who = "leg '%s' :: %s" % (label, member["as"])
+    declared = {e["path"]: e for e in member["embeddedPaths"]}
+    excused = set(loader_dependency_paths(blob))
+    found = [p for p in embedded_absolute_paths(blob) if p not in excused]
+
+    undeclared = [p for p in found if p not in declared]
+    if undeclared:
+        raise LegError(
+            "%s bakes in %d absolute path(s) the catalogue does not declare:\n"
+            "    %s\n"
+            "  This library is STAGED BESIDE THE ARTEFACT, so the copy that runs "
+            "is the copy we acquired — and a directory it reads at run time that "
+            "nobody staged is a failure NOTHING AT BUILD TIME CAN SEE (the link "
+            "succeeds, the binary runs, and it dies only on the code path that "
+            "touches the data).\n"
+            "  Declare each one under `embeddedPaths` as `runtime-data` (with a "
+            "`dataDirs` entry that stages it) or as `inert` (with a `$why` "
+            "saying what makes it unread). Both are claims a reviewer can check; "
+            "silence is not."
+            % (who, len(undeclared), "\n    ".join(undeclared)))
+
+    missing = [p for p in declared if p not in found]
+    if missing:
+        raise LegError(
+            "%s declares %d embedded path(s) that are NOT in the file:\n    %s\n"
+            "  The declaration describes a library this leg no longer stages. A "
+            "path list nobody checks against the bytes is how this guard would "
+            "come to pass for the wrong reason."
+            % (who, len(missing), "\n    ".join(sorted(missing))))
+
+    staged_roles = {d["role"] for d in member["dataDirs"]}
+    for path, entry in sorted(declared.items()):
+        if entry["kind"] != "runtime-data":
+            continue
+        if entry["role"] not in staged_roles:
+            raise LegError(
+                "%s bakes in the RUNTIME DATA directory %s (role %r) and this "
+                "leg stages no directory for it.\n  The acquired library is the "
+                "one that runs, so that path must resolve on the TARGET — and it "
+                "is the packager's prefix, which the target does not have. Add a "
+                "`dataDirs` entry with role %r."
+                % (who, path, entry["role"], entry["role"]))
+
+
+def _open_archive(path, fmt, url):
+    """The declared archive, opened as a tar. ONE function, so `deb` is a
+    CONTAINER this module understands rather than a second extraction path.
+
+    ⚠ `dpkg-deb` is deliberately not used: it is the tool the old
+    `ubuntu-ports-arm64` provider shelled out to, and no Windows or macOS host
+    has it — which is precisely how "any host builds any target" came to hold
+    only on Linux."""
+    import io
+    import tarfile
+    if fmt not in ARCHIVE_FORMATS:
+        raise LegError("archive %s declares archiveFormat %r, which this "
+                       "resolver cannot open (known: %s)"
+                       % (url, fmt, ", ".join(sorted(ARCHIVE_FORMATS))))
+    if fmt != "deb":
+        return tarfile.open(path, ARCHIVE_FORMATS[fmt])
+    with open(path, "rb") as f:
+        blob = f.read()
+    if blob[:8] != b"!<arch>\n":
+        raise LegError("%s is declared `deb` but does not start with the `ar` "
+                       "magic `!<arch>` — the declaration and the file disagree "
+                       "about what was downloaded." % url)
+    off, seen = 8, []
+    while off + 60 <= len(blob):
+        header = blob[off:off + 60]
+        name = header[0:16].decode("ascii", "replace").strip().rstrip("/")
+        try:
+            size = int(header[48:58].decode("ascii", "replace").strip())
+        except ValueError:
+            raise LegError("%s: malformed `ar` member header at offset %d"
+                           % (url, off))
+        body = off + 60
+        seen.append(name)
+        if name.startswith("data.tar"):
+            if name not in DEB_PAYLOAD_MODES:
+                raise LegError(
+                    "%s carries its payload as `%s`, which this resolver cannot "
+                    "open (known: %s).\n  ⚠ `data.tar.zst` is the common case "
+                    "here and it is a HARD wall, not an omission: zstd entered "
+                    "the Python standard library in 3.14, and this project's own "
+                    "hosts run 3.12 — so a zstd route would be a capability that "
+                    "exists on one host and not another, which is the same defect "
+                    "one level down from the one this mechanism exists to end.\n"
+                    "  Pin an archive whose payload is one of the above (Debian's "
+                    "are `data.tar.xz`; Ubuntu's are not)."
+                    % (url, name, ", ".join(sorted(DEB_PAYLOAD_MODES))))
+            return tarfile.open(fileobj=io.BytesIO(blob[body:body + size]),
+                                mode=DEB_PAYLOAD_MODES[name])
+        off = body + size + (size & 1)
+    raise LegError("%s: no `data.tar.*` member in the `ar` archive (members: %s)"
+                   % (url, ", ".join(seen) or "<none>"))
+
+
+def _sha256_tree(path):
+    """ONE digest over a whole directory: every relative path and every file's
+    own sha256, in sorted order. A staged data directory has to be pinned exactly
+    as a staged file is — otherwise the library is content-addressed and the
+    scripts it loads are not, which is half a pin."""
+    import hashlib
+    h = hashlib.sha256()
+    entries = []
+    for base, dirs, files in os.walk(path):
+        dirs.sort()
+        for name in sorted(files):
+            full = os.path.join(base, name)
+            rel = os.path.relpath(full, path).replace("\\", "/")
+            entries.append((rel, _sha256_file(full)))
+    for rel, digest in sorted(entries):
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        h.update(digest.encode("ascii"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _extract_tree(tf, member, dest, url):
+    """A DIRECTORY of the archive, materialised under `dest`.
+
+    Every regular file below `member/` is written; nothing is filtered, because a
+    data directory that is silently missing a file is the same class of defect as
+    one that is missing entirely. A symlink or a device node REFUSES rather than
+    being skipped — Tcl's script library has neither (✔MEASURED: 225 files, 4
+    subdirectories, 0 links in the MacPorts archive), so one appearing means the
+    archive is not the thing that was declared.
+
+    ⚠ Member paths are checked to stay UNDER `dest`: a tar can name `../` and
+    this code runs with the operator's own privileges.
+
+    ★ IT BUILDS INTO A PER-PROCESS TEMPORARY AND SWAPS, for the two reasons the
+    download's `.part` file already has: legs run CONCURRENTLY here, and a run
+    that fails half way must not leave a WORKING cache destroyed behind it. The
+    first draft cleared the destination first and a deliberately-broken
+    declaration wiped a good script library on its way to refusing — loud, but
+    it took a good cache with it."""
+    prefix = member.rstrip("/") + "/"
+    staging = "%s.%d.part" % (dest, os.getpid())
+    if os.path.isdir(staging):
+        shutil.rmtree(staging)
+    wrote = 0
+    for entry in tf.getmembers():
+        name = entry.name[2:] if entry.name.startswith("./") else entry.name
+        if not name.startswith(prefix):
+            continue
+        rel = name[len(prefix):]
+        if entry.isdir():
+            continue
+        if not entry.isfile():
+            raise LegError(
+                "%s :: %s%s is a %s, not a regular file. A data directory is "
+                "staged whole; skipping an entry would ship a library its own "
+                "runtime data cannot satisfy."
+                % (os.path.basename(url), prefix, rel,
+                   "symlink" if entry.issym() else
+                   "hard link" if entry.islnk() else "special file"))
+        out = os.path.normpath(os.path.join(staging, rel))
+        if not out.startswith(staging + os.sep):
+            raise LegError("%s :: %s escapes the staging directory (%s)"
+                           % (os.path.basename(url), name, out))
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        src = tf.extractfile(entry)
+        if src is None:
+            raise LegError("%s :: %s could not be read from the archive"
+                           % (os.path.basename(url), name))
+        with open(out, "wb") as f:
+            shutil.copyfileobj(src, f)
+        wrote += 1
+    if not wrote:
+        if os.path.isdir(staging):
+            shutil.rmtree(staging)
+        raise LegError(
+            "%s declares the data directory %r, and the archive has NO files "
+            "under it. An empty stage is worse than none: TCL_LIBRARY would "
+            "point at a directory with no init.tcl in it and the failure would "
+            "surface as `Can't find a usable init.tcl`, one interpreter later."
+            % (os.path.basename(url), member))
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    os.replace(staging, dest)
 
 
 def _extract_member(tf, name, url):
@@ -2915,6 +3370,113 @@ def sh_statements(text):
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _lint_member_runtime_data(who, m, as_name, import_name):
+    """The RUNTIME-DATA half of one acquired member's declaration.
+
+    D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY. Split out because the
+    rules are about a different question from the rest of `_lint_acquire`: not
+    "can we fetch this?" but "once fetched, is it SELF-SUFFICIENT?" — and the
+    answer turns entirely on which copy of the library actually runs."""
+    out = []
+    copy = m.get("runtimeCopy", "")
+    if copy not in RUNTIME_COPIES:
+        out.append(
+            "%s member %r: runtimeCopy %r is not one of %s. WHICH COPY RUNS is "
+            "not a detail: if the staged file is the one that runs, every data "
+            "directory it bakes in must be staged with it, and if the target "
+            "supplies its own, staging ours would ship the wrong data. There is "
+            "no safe default to omit it in favour of."
+            % (who, as_name, copy, ", ".join(sorted(RUNTIME_COPIES))))
+    # CROSS-CHECKED against the identity actually recorded, where that identity
+    # decides the answer — a declaration nothing contradicts is a declaration
+    # nothing tests.
+    beside = import_name.startswith(IMPORT_NAME_BESIDE_PREFIXES)
+    absolute = import_name.startswith("/") or (
+        len(import_name) > 2 and import_name[1] == ":")
+    if beside and copy == "target-supplies-its-own":
+        out.append(
+            "%s member %r: importName %r resolves NEXT TO THE LOADING BINARY, so "
+            "the copy that runs IS the one staged here — `runtimeCopy: "
+            "target-supplies-its-own` contradicts it."
+            % (who, as_name, import_name))
+    if absolute and copy == "staged-beside-artefact":
+        out.append(
+            "%s member %r: importName %r is an ABSOLUTE path, so the loader takes "
+            "the target machine's copy at that path, not the one staged here."
+            % (who, as_name, import_name))
+    for e in m.get("embeddedPaths", []):
+        path = e.get("path", "")
+        if not path.startswith("/") and not (len(path) > 2 and path[1] == ":"):
+            out.append("%s member %r: embeddedPaths entry %r is not an absolute "
+                       "path" % (who, as_name, path))
+        kind = e.get("kind", "")
+        if kind not in EMBEDDED_PATH_KINDS:
+            out.append("%s member %r: embeddedPaths %r declares kind %r, not one "
+                       "of %s" % (who, as_name, path, kind,
+                                  ", ".join(sorted(EMBEDDED_PATH_KINDS))))
+        elif kind == "runtime-data":
+            if e.get("role", "") not in DATA_DIR_ROLES:
+                out.append(
+                    "%s member %r: embeddedPaths %r is `runtime-data` but its "
+                    "role %r is not one of %s — the role is what ties it to the "
+                    "directory that satisfies it"
+                    % (who, as_name, path, e.get("role", ""),
+                       ", ".join(sorted(DATA_DIR_ROLES))))
+        elif not e.get("$why"):
+            out.append(
+                "%s member %r: embeddedPaths %r is declared `inert` with no "
+                "`$why`. \"Nothing reads this\" is exactly the sentence that was "
+                "WRONG about /opt/local/lib/tcl8.6, and it cost this project its "
+                "first Mach-O unit corpus. State what makes it unread."
+                % (who, as_name, path))
+    roles = {}
+    for d in m.get("dataDirs", []):
+        if not d.get("member"):
+            out.append("%s member %r: a dataDirs entry declares no `member` path"
+                       % (who, as_name))
+        if not d.get("as"):
+            out.append("%s member %r: a dataDirs entry declares no `as` name — "
+                       "it is the directory the driver is handed" % (who, as_name))
+        role = d.get("role", "")
+        if role not in DATA_DIR_ROLES:
+            out.append("%s member %r: dataDirs %r declares role %r, not one of %s"
+                       % (who, as_name, d.get("as", ""), role,
+                          ", ".join(sorted(DATA_DIR_ROLES))))
+        roles[role] = roles.get(role, 0) + 1
+        if copy == "target-supplies-its-own":
+            out.append(
+                "%s member %r: stages the data directory %r, but the TARGET "
+                "supplies its own copy of this library — so the target's own "
+                "data directory is the one its loader will use, and this one "
+                "would be a second, silently-unused copy (or worse, one paired "
+                "with a different build of the library)."
+                % (who, as_name, d.get("as", "")))
+    if roles.get("tclScriptLibrary", 0) > 1:
+        out.append("%s member %r: %d dataDirs claim role 'tclScriptLibrary'; "
+                   "TCL_LIBRARY names exactly one directory"
+                   % (who, as_name, roles["tclScriptLibrary"]))
+    # ★ THE DECLARATION-LEVEL HALF OF THE GUARD. `_audit_embedded_paths` catches
+    # this too, but only once the bytes are on disk — i.e. on the machine that
+    # runs the build, not in the lint that runs everywhere. A `runtime-data`
+    # path with nothing staged for it is EXACTLY the state the macho legs
+    # shipped in, and it is visible from the declaration alone.
+    if copy == "staged-beside-artefact":
+        for e in m.get("embeddedPaths", []):
+            if e.get("kind") != "runtime-data":
+                continue
+            if e.get("role") not in roles:
+                out.append(
+                    "%s member %r: %r is declared `runtime-data` with role %r "
+                    "and NO dataDirs entry stages it. The acquired library is "
+                    "the one that runs, so that path has to resolve on the "
+                    "TARGET — and it is the packager's own prefix, which the "
+                    "target does not have. This is the defect that cost the "
+                    "first Mach-O unit corpus: the link succeeded, the binary "
+                    "ran, and it died at `interp create`."
+                    % (who, as_name, e.get("path", ""), e.get("role", "")))
+    return out
+
+
 def _lint_acquire(label, spec, libs):
     """The `acquire` block's own defects. Split out because there are enough of
     them that inlining would bury the rest of the leg lint — and because every
@@ -3009,6 +3571,7 @@ def _lint_acquire(label, spec, libs):
                 # string, so the mutation looked like a passing test).
                 out.append("%s member %r: importName %r has leading/trailing "
                            "whitespace" % (who, as_name, imp))
+            out.extend(_lint_member_runtime_data(who, m, as_name, imp))
             if as_name in tcl_names:
                 saw_tcl = True
             elif as_name in z_names:
@@ -3496,6 +4059,7 @@ def _forbidden_runner(argv):
 
 
 def self_test(path=CATALOGUE, out=sys.stdout):
+    import struct
     passed = failed = 0
 
     def check(name, ok, detail=""):
@@ -3956,15 +4520,167 @@ def self_test(path=CATALOGUE, out=sys.stdout):
               % (tcl_i, z_i))
     # A provider with no acquisition route must produce no acquisition plan, or
     # a driver would call --acquire on a leg that declares nothing.
-    for leg in legs:
-        if leg["build"]["libraries"].get("provider") == "pinned-archive":
-            continue
-        check("a non-acquiring leg declares no archives (%s)" % leg["label"],
-              not acquire_plan(leg, root)["archives"])
-        tcl_i, z_i = acquired_import_names(leg)
-        check("a non-acquiring leg overrides no identity (%s)" % leg["label"],
-              not tcl_i and not z_i,
-              "a host-supplied library already carries the right one")
+    #
+    # ★ THE SUBJECT IS SYNTHETIC, and that is the point. Every leg in the
+    # catalogue now acquires (TF-C123 converted the last three), so drawing this
+    # leg from the catalogue made the assertion vanish the moment the gap it
+    # guards was closed — the shape of a check that quietly stops testing
+    # anything. A rule about "a leg with no route" is stated with a leg that has
+    # no route, whether or not one is currently shipped.
+    no_route = {"label": "synthetic-no-route",
+                "spec": "x86_64:elf64-x86_64-linux-exec",
+                "build": {"libraries": {"provider": "host-system",
+                                        "tclNames": [], "zNames": [],
+                                        "searchPaths": []}}}
+    check("a non-acquiring leg declares no archives",
+          not acquire_plan(no_route, root)["archives"])
+    check("a non-acquiring leg stages no script library",
+          acquire_plan(no_route, root)["scriptLibraryDir"] == "",
+          "a driver would export TCL_LIBRARY pointing at nothing")
+    tcl_i, z_i = acquired_import_names(no_route)
+    check("a non-acquiring leg overrides no identity",
+          not tcl_i and not z_i,
+          "a host-supplied library already carries the right one")
+
+    # ── A LIBRARY IS NOT ALWAYS SELF-CONTAINED ──────────────────────────────
+    # D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY. The dylib linked, the
+    # binary ran, one `.test` file passed — and the TIER driver died at
+    # `interp create` because acquisition had obtained Tcl's CODE and not its
+    # SCRIPT LIBRARY. Everything below is pure (plan-level or byte-level), so it
+    # holds on a gate machine with no network at all.
+    for leg in acquiring:
+        lbl = leg["label"]
+        ap = acquire_plan(leg, root)
+        members = [m for a in ap["archives"] for m in a["members"]]
+        check("every acquired member says WHICH COPY RUNS (%s)" % lbl,
+              all(m["runtimeCopy"] in RUNTIME_COPIES for m in members),
+              "%r — without it, nothing decides whether a baked-in data "
+              "directory has to be staged"
+              % [(m["as"], m["runtimeCopy"]) for m in members])
+        # ★ THE ONE THAT WOULD HAVE CAUGHT IT. A member that declares a
+        # `runtime-data` path and stages no directory for it is the exact state
+        # the macho legs shipped in.
+        for m in members:
+            for e in m["embeddedPaths"]:
+                if e["kind"] != "runtime-data":
+                    continue
+                check("a baked-in runtime data directory is STAGED (%s :: %s)"
+                      % (lbl, m["as"]),
+                      any(d["role"] == e["role"] for d in m["dataDirs"]),
+                      "%s is declared runtime-data with role %r and no dataDirs "
+                      "entry provides it — the library would look for it at the "
+                      "PACKAGER's prefix on the target machine"
+                      % (e["path"], e["role"]))
+        check("a staged data directory lands inside its own leg's cache (%s)" % lbl,
+              all(d["path"].startswith(ap["cacheDir"])
+                  for m in members for d in m["dataDirs"]),
+              "two legs sharing one staged tree makes 'which leg staged this?' "
+              "unanswerable")
+    # Every leg that stages a Tcl script library must SAY where it is, and the
+    # value must be one of the directories actually planned — a driver sets
+    # TCL_LIBRARY from this and from nothing else.
+    for leg in acquiring:
+        ap = acquire_plan(leg, root)
+        staged = [d["path"] for a in ap["archives"] for m in a["members"]
+                  for d in m["dataDirs"] if d["role"] == "tclScriptLibrary"]
+        check("scriptLibraryDir names a directory the plan actually stages (%s)"
+              % leg["label"],
+              ap["scriptLibraryDir"] in staged if staged
+              else ap["scriptLibraryDir"] == "",
+              "plan says %r, staged %r" % (ap["scriptLibraryDir"], staged))
+        check("every leg with an acquired Tcl stages its SCRIPT LIBRARY (%s)"
+              % leg["label"],
+              bool(staged),
+              "the acquired Tcl would hunt for init.tcl at the packager's "
+              "prefix and die at `interp create` — one interpreter later than "
+              "anything a build could see")
+    # THE FAILURE RETURN CARRIES THE SAME FIELDS AS THE SUCCESS RETURN.
+    # D-HARNESS-PINNED-ARCHIVE-FAILURE-RETURN-OMITS-ACQUIRED, closed once as an
+    # instance and stated here as the rule: one record type, both paths.
+    if acquiring:
+        ap = acquire_plan(acquiring[0], root)
+        ok = acquisition_record(ap, libraries=[{"as": "x"}], from_cache=True)
+        bad = acquisition_record(ap, error="boom")
+        check("the acquisition record has ONE shape on success and failure",
+              set(ok) == set(bad),
+              "success-only keys %r · failure-only keys %r"
+              % (sorted(set(ok) - set(bad)), sorted(set(bad) - set(ok))))
+        check("the FAILURE record still carries scriptLibraryDir",
+              bad["scriptLibraryDir"] == ap["scriptLibraryDir"] != "",
+              "a driver needs it most when acquisition just failed and it is "
+              "reporting why")
+        check("the failure record says what failed", bad["error"] == "boom")
+        check("a success record carries no error", ok["error"] == "")
+
+    # ── The embedded-path guard, on SYNTHESISED bytes ───────────────────────
+    # The rule is about BYTES, so it is tested against bytes rather than against
+    # a declaration — a guard asserted only through its own declaration is a
+    # guard that passes because it was told to.
+    _probe_blob = b"\x00stuff\x00/pkg/prefix/lib/tcl8.6\x00/pkg/prefix/bin\x00"
+    check("the scanner finds an absolute path baked into a library",
+          embedded_absolute_paths(_probe_blob)
+          == ["/pkg/prefix/bin", "/pkg/prefix/lib/tcl8.6"])
+    check("the scanner ignores a fragment that is not an absolute path",
+          embedded_absolute_paths(b"\x00relative/dir/thing\x00/one\x00") == [],
+          "a one-component path and a mid-word slash are noise, and a guard "
+          "that flags noise is a guard that gets switched off")
+
+    def _member(**over):
+        m = {"as": "libx.so", "runtimeCopy": "staged-beside-artefact",
+             "embeddedPaths": [], "dataDirs": []}
+        m.update(over)
+        return m
+
+    check("an UNDECLARED baked-in path is a refusal",
+          _raises(lambda: _audit_embedded_paths("L", _member(), _probe_blob)),
+          "this is the whole guard: a data directory nobody declared is a "
+          "runtime death nothing at build time can see")
+    check("a declared path that is NOT in the bytes is a refusal",
+          _raises(lambda: _audit_embedded_paths("L", _member(embeddedPaths=[
+              {"path": "/pkg/prefix/lib/tcl8.6", "kind": "runtime-data",
+               "role": "tclScriptLibrary"},
+              {"path": "/pkg/prefix/bin", "kind": "inert", "role": ""},
+              {"path": "/pkg/prefix/share/icu", "kind": "inert", "role": ""}],
+              dataDirs=[{"as": "tcl8.6", "role": "tclScriptLibrary"}]),
+              _probe_blob)),
+          "a path list nobody checks against the file is how this guard would "
+          "come to pass for the wrong reason")
+    check("a declared `runtime-data` path with NOTHING STAGED is a refusal",
+          _raises(lambda: _audit_embedded_paths("L", _member(embeddedPaths=[
+              {"path": "/pkg/prefix/lib/tcl8.6", "kind": "runtime-data",
+               "role": "tclScriptLibrary"},
+              {"path": "/pkg/prefix/bin", "kind": "inert", "role": ""}]),
+              _probe_blob)),
+          "EXACTLY the state the macho legs shipped in: the path was declared "
+          "by the packager, and nothing staged it")
+    check("a fully declared and staged member passes",
+          _audit_embedded_paths("L", _member(embeddedPaths=[
+              {"path": "/pkg/prefix/lib/tcl8.6", "kind": "runtime-data",
+               "role": "tclScriptLibrary"},
+              {"path": "/pkg/prefix/bin", "kind": "inert", "role": ""}],
+              dataDirs=[{"as": "tcl8.6", "role": "tclScriptLibrary"}]),
+              _probe_blob) is None)
+    check("the audit does NOT apply where the target supplies its own copy",
+          _audit_embedded_paths(
+              "L", _member(runtimeCopy="target-supplies-its-own"),
+              _probe_blob) is None,
+          "our file is never loaded there; staging its data would ship the "
+          "wrong data with a straight face")
+    # A Mach-O's own load commands are the loader's business, not data. The
+    # image is SYNTHESISED here (one LC_ID_DYLIB, nothing else) so the assertion
+    # does not depend on any file being present on the machine running it.
+    _id_name = b"/opt/x/lib/libz.1.dylib\0"
+    _id_name += b"\0" * (-(24 + len(_id_name)) % 8)
+    _lc_id = struct.pack("<IIIIII", LC_ID_DYLIB, 24 + len(_id_name), 24,
+                         0, 0, 0) + _id_name
+    _macho = (struct.pack("<IIIIIII", MH_MAGIC_64, 0x0100000C, 0, MH_DYLIB,
+                          1, len(_lc_id), 0) + b"\0" * 4 + _lc_id)
+    check("a Mach-O's LC_ID_DYLIB is excused from the data audit",
+          "/opt/x/lib/libz.1.dylib" in embedded_absolute_paths(_macho)
+          and "/opt/x/lib/libz.1.dylib" in loader_dependency_paths(_macho)
+          and _audit_embedded_paths("L", _member(), _macho) is None,
+          "it is IN the bytes, it IS reported as a loader dependency, and it "
+          "must not have to be declared as a data directory")
 
     # `--offline` must REFUSE, never fall back. Asserted against a cache root
     # that cannot exist, so a machine that happens to have the real cache
@@ -3979,10 +4695,8 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                                       downloader=_forbidden_downloader)))
         check("--acquire on a leg that declares no route is a refusal, not a "
               "search",
-              _raises(lambda: acquire(
-                  [l for l in legs
-                   if l["build"]["libraries"].get("provider") != "pinned-archive"][0],
-                  root, offline=True, downloader=_forbidden_downloader)))
+              _raises(lambda: acquire(no_route, root, offline=True,
+                                      downloader=_forbidden_downloader)))
 
     # ── The DSS argv for one resolved library ───────────────────────────────
     check("no override => the argv every leg has always used",
@@ -4388,7 +5102,13 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                           ("/opt/local/lib/libtcl8.6.dylib", "8.6"),
                           ("libtcl9.0.dylib", "9.0"), ("tcl86.dll", "8.6"),
                           ("tcl90.dll", "9.0"), ("libtcl.so", ""),
-                          ("tcl.dll", ""), ("libtcl8.6.a", ""), ("", "")):
+                          # ✔MEASURED on the pe64 leg's ACQUIRED library: the
+                          # threaded Windows build calls itself `tcl86t.dll`,
+                          # and until TF-C123 that matched nothing — silently
+                          # dropping this leg to a major-only version.
+                          ("tcl86t.dll", "8.6"), ("tcl90t.dll", "9.0"),
+                          ("tcl.dll", ""), ("tcl8t.dll", ""),
+                          ("libtcl8.6.a", ""), ("", "")):
         check("self-declared identity %r -> %r" % (_ident, _want),
               tcl_identity_version(_ident) == _want,
               "got %r" % tcl_identity_version(_ident))
@@ -5010,8 +5730,32 @@ def main(argv=None):
             legs = load_catalogue(args.catalogue)
             root = cache_root(args.cache_root)
             leg = leg_by_label(legs, label, args.catalogue)
-            result = (acquire_plan(leg, root) if args.acquire_plan
-                      else acquire(leg, root, offline=args.offline))
+            if args.acquire_plan:
+                result = acquire_plan(leg, root)
+            else:
+                # ★ THE RESULT IS PRINTED ON BOTH OUTCOMES, and it is the SAME
+                # RECORD SHAPE either way — D-HARNESS-PINNED-ARCHIVE-FAILURE-
+                # RETURN-OMITS-ACQUIRED: "a function whose SUCCESS return and
+                # FAILURE return carry different field sets is a silent-omission
+                # generator". A driver needs `scriptLibraryDir` most when
+                # acquisition has just failed and it is reporting why, so the
+                # failure record carries it too, computed from the PURE plan.
+                # The rc still names the failure; nothing here makes a failure
+                # look like a success.
+                try:
+                    result = acquire(leg, root, offline=args.offline)
+                except LegError as exc:
+                    try:
+                        failed = acquisition_record(acquire_plan(leg, root),
+                                                    error=str(exc))
+                    except LegError:
+                        # The PLAN itself is unbuildable, so there is no record
+                        # to print. Let the original refusal through unchanged
+                        # rather than replacing it with a second one.
+                        raise exc
+                    sys.stdout.write(
+                        json.dumps(failed, indent=1, sort_keys=True) + "\n")
+                    raise
             sys.stdout.write(json.dumps(result, indent=1, sort_keys=True) + "\n")
             return 0
         if args.header_stages:

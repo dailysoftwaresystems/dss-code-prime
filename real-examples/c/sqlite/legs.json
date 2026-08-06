@@ -42,8 +42,59 @@
         "$loadExtHelperNameComment": "The name sqlite's own test/loadext.test looks for on a `tcl_platform(platform) eq unix` fixture. See the top-level $targetCcComment for why the name is DECLARED per leg instead of spelled once in a driver.",
         "loadExtHelperName": "libtestloadext.so",
         "targetCc": { "candidates": ["cc", "gcc", "clang"], "package": "" },
+        "$librariesComment": "★ THIS LEG ACQUIRES ITS LIBRARIES TOO, and it is the one whose old provider looked harmless. `host-system` means 'hope this box has an x86_64 Linux libtcl' — true on WSL, FALSE on Windows, on a Mac, and on the arm64 VPS (which has aarch64 libraries, not x86_64 ones), so three of four hosts recorded `skipped-build-input-missing` for the most-tested leg in the harness. That is a BUILD failure, and the build half of D-HARNESS-CROSS-HOST-ANY-TARGET admits no exceptions. ⚠ THE SOURCE IS DEBIAN, NOT UBUNTU, AND THE REASON IS MEASURED (2026-08-06): every Ubuntu .deb — amd64 AND arm64, jammy through current — ships `data.tar.zst`, and zstd entered the Python stdlib only in 3.14 while this project's WSL host runs 3.12, so 'the Ubuntu amd64 archive, literal sibling of the arm64 provider' cannot be opened by a mechanism that must work on every host. The old arm64 provider opened one only because it shelled out to `dpkg-deb`, a tool no Windows or macOS box has — i.e. it was never the portable sibling it looked like. Debian bookworm's are `data.tar.xz`, which `tarfile` opens everywhere. ✔MEASURED: 883 exported symbols, 880 of them `Tcl*`, a SUPERSET of nothing missing against the MacPorts 8.6.17 library this harness already proved 110/110 against (the 11 names MacPorts has and this does not are all `TclMacOSX*`/`TclBN_mp_*`, none of which a Linux fixture references).",
         "libraries": {
-          "provider": "host-system",
+          "provider": "pinned-archive",
+          "$importNameComment": "The identities recorded are the ones the file DECLARES for itself — DT_SONAME `libtcl8.6.so` and `libz.so.1` — i.e. byte-for-byte what the old `host-system` route already recorded when it resolved the host's own copies. They are DECLARED anyway rather than left empty: an acquired library is a stand-in by construction, and 'the packager's identity happens to be right here' is a fact worth stating where a reader can check it, not a default to lean on.",
+          "acquire": {
+            "archives": [
+              {
+                "$urlComment": "Debian bookworm's pool. ⚠ The pool holds the CURRENT version of a package for a suite, so a point release can retire this file; the digest is pinned, so that failure is a loud 404 or a CHECKSUM MISMATCH and never a silently different library. snapshot.debian.org is the permanent mirror if it ever comes to that.",
+                "url": "https://deb.debian.org/debian/pool/main/t/tcl8.6/libtcl8.6_8.6.13+dfsg-2_amd64.deb",
+                "sha256": "976c4235b816635e1756016f3adbabb634e8b97a9f6b97cf901be099e4fd2487",
+                "archiveFormat": "deb",
+                "members": [
+                  { "member": "usr/lib/x86_64-linux-gnu/libtcl8.6.so", "as": "libtcl8.6.so",
+                    "universal": false, "importName": "libtcl8.6.so",
+                    "$runtimeCopyComment": "The staged directory goes on LD_LIBRARY_PATH for this leg's run, so the copy acquired here is the copy the fixture loads — which is why the script library below is not optional. Before this, the leg happened to work because Debian and Ubuntu spell the script directory the same way (`/usr/share/tcltk/tcl8.6`); that is a coincidence between two distributions, not a property of the target.",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [
+                      { "path": "/usr/share/tcltk/tcl8.6", "kind": "runtime-data", "role": "tclScriptLibrary" },
+                      { "path": "/usr/share/tcltk", "kind": "inert", "$why": "the PARENT of the script directory, used to build the search list `tclInit` walks. Staging the child is what makes the search succeed; the parent itself holds no file Tcl reads." },
+                      { "path": "/usr/lib/tcltk", "kind": "inert", "$why": "Debian's directory for Tcl EXTENSION packages (a second element of `tcl_pkgPath`). The testfixture loads no extension — its commands are compiled in." },
+                      { "path": "/usr/lib/tcltk/tcl8.6", "kind": "inert", "$why": "the versioned twin of the above, same reason." },
+                      { "path": "/usr/lib/tcltk/x86_64-linux-gnu", "kind": "inert", "$why": "the multiarch twin of the above, same reason. Note the TARGET's arch in the name — this is why the two elf legs' declarations differ at all." },
+                      { "path": "/usr/local/lib/tcltk", "kind": "inert", "$why": "the local-admin extension directory in `tcl_pkgPath`; on the target it usually does not exist, and nothing here requires it to." },
+                      { "path": "/usr/local/share/tcltk", "kind": "inert", "$why": "the local-admin twin of /usr/share/tcltk, same reason." },
+                      { "path": "/usr/lib", "kind": "inert", "$why": "TCL_EXEC_PREFIX/lib from tclConfig.sh, reported for build consumers." },
+                      { "path": "/usr/lib/x86_64-linux-gnu", "kind": "inert", "$why": "the multiarch libdir from the same tclConfig.sh block — where the packager's own copy of THIS library sits, not data." },
+                      { "path": "/usr/include/tcl8.6", "kind": "inert", "$why": "TCL_INCLUDE_SPEC, a BUILD-time answer. This harness stages its own tcl.h and cross-checks its version against this very library." },
+                      { "path": "/usr/share/man", "kind": "inert", "$why": "the manual page directory, from the same block. No interpreter code path reads it." },
+                      { "path": "/usr/bin", "kind": "inert", "$why": "the default PATH element Tcl's `exec` falls back on — a target path, not shipped data." },
+                      { "path": "/dev/null", "kind": "inert", "$why": "`exec`'s redirection sink; a device on the target." },
+                      { "path": "/dev/tty", "kind": "inert", "$why": "the controlling terminal for interactive prompting; same category as /dev/null." }
+                    ],
+                    "dataDirs": [
+                      { "member": "usr/share/tcltk/tcl8.6", "as": "tcl8.6", "role": "tclScriptLibrary" }
+                    ] }
+                ]
+              },
+              {
+                "$memberComment": "`lib/x86_64-linux-gnu/libz.so.1` is a SYMLINK to `libz.so.1.2.13` inside the .deb; the resolver follows it and materialises the target's bytes under the `as` name, exactly as it does for MacPorts' libz.",
+                "url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb",
+                "sha256": "d7dd1d1411fedf27f5e27650a6eff20ef294077b568f4c8c5e51466dc7c08ce4",
+                "archiveFormat": "deb",
+                "members": [
+                  { "member": "lib/x86_64-linux-gnu/libz.so.1", "as": "libz.so.1",
+                    "universal": false, "importName": "libz.so.1",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "$embeddedPathsComment": "EMPTY, and MEASURED: this .so carries no absolute path at all. zlib reads no data directory, which is what makes it the control for the Tcl declaration above.",
+                    "embeddedPaths": [],
+                    "dataDirs": [] }
+                ]
+              }
+            ]
+          },
           "tclNames": ["libtcl8.6.so", "libtcl8.6.so.0", "libtcl9.0.so", "libtcl.so"],
           "zNames": ["libz.so", "libz.so.1"],
           "searchPaths": []
@@ -76,8 +127,56 @@
         "loadExtHelperName": "libtestloadext.so",
         "$targetCcComment": "The CONTROL arm only (top-level $loadExtHelperBuilderComment). `package` is still declared so an operator who ASKS for the control (DSS_LOADEXT_HELPER=reference) is told what to install — the drivers no longer install it unasked, because a control must not mutate the machine it runs on.",
         "targetCc": { "candidates": ["aarch64-linux-gnu-gcc"], "package": "gcc-aarch64-linux-gnu" },
+        "$librariesComment": "★ THE ORIGINAL BESPOKE PROVIDER, RETIRED — D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE. This leg used to declare `ubuntu-ports-arm64`, ~80 lines of `curl` + `dpkg-deb` living inside build-and-test.sh and NOWHERE ELSE, so on Windows the leg returned a named refusal (`library provider … has no dispatch arm in build-and-test.ps1`) instead of building. The deferral that kept it was correct at the time and its reasoning still holds: the obvious generalisation needed a zstd reader, which is Python 3.14+, and this project has a 3.12 host — a capability that exists on one HOST and not another is the same defect one level down. What changed is the SOURCE, not the appetite: Debian's .debs are `data.tar.xz`, so the general route opens them with the stdlib on every host, and `dpkg-deb` is not needed at all. The self-retiring exemption in tests/harness/test_sqlite_harness_legs.cpp goes with it. ⓘ The old provider also fetched `libtommath1`; this one does not, because Debian's libtcl8.6 does not link it (✔MEASURED: DT_NEEDED = libz.so.1, libm.so.6, libc.so.6) and the old code itself treated it as optional.",
         "libraries": {
-          "provider": "ubuntu-ports-arm64",
+          "provider": "pinned-archive",
+          "$importNameComment": "See the elf64-x86_64 leg — same rule, same reasoning, and the SAME two names: DT_SONAME is architecture-independent.",
+          "acquire": {
+            "archives": [
+              {
+                "url": "https://deb.debian.org/debian/pool/main/t/tcl8.6/libtcl8.6_8.6.13+dfsg-2_arm64.deb",
+                "sha256": "b5244c01bb23472464eb9264e440a99c438358f39ccd014f8f56694bf638a22c",
+                "archiveFormat": "deb",
+                "$embeddedPathsComment": "The SAME fourteen paths as the amd64 sibling with the multiarch triple respelled — ✔MEASURED on both files, and the difference is exactly the two `x86_64-linux-gnu` -> `aarch64-linux-gnu` entries. A declaration that could not tell them apart would be a declaration that was not read from the bytes.",
+                "members": [
+                  { "member": "usr/lib/aarch64-linux-gnu/libtcl8.6.so", "as": "libtcl8.6.so",
+                    "universal": false, "importName": "libtcl8.6.so",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [
+                      { "path": "/usr/share/tcltk/tcl8.6", "kind": "runtime-data", "role": "tclScriptLibrary" },
+                      { "path": "/usr/share/tcltk", "kind": "inert", "$why": "the PARENT of the script directory, used to build the search list `tclInit` walks. Staging the child is what makes the search succeed; the parent itself holds no file Tcl reads." },
+                      { "path": "/usr/lib/tcltk", "kind": "inert", "$why": "Debian's directory for Tcl EXTENSION packages (a second element of `tcl_pkgPath`). The testfixture loads no extension — its commands are compiled in." },
+                      { "path": "/usr/lib/tcltk/tcl8.6", "kind": "inert", "$why": "the versioned twin of the above, same reason." },
+                      { "path": "/usr/lib/tcltk/aarch64-linux-gnu", "kind": "inert", "$why": "the multiarch twin of the above, same reason. THE TARGET's arch, not the host's — this entry is what an arch-blind copy of the amd64 declaration would have got wrong." },
+                      { "path": "/usr/local/lib/tcltk", "kind": "inert", "$why": "the local-admin extension directory in `tcl_pkgPath`; on the target it usually does not exist, and nothing here requires it to." },
+                      { "path": "/usr/local/share/tcltk", "kind": "inert", "$why": "the local-admin twin of /usr/share/tcltk, same reason." },
+                      { "path": "/usr/lib", "kind": "inert", "$why": "TCL_EXEC_PREFIX/lib from tclConfig.sh, reported for build consumers." },
+                      { "path": "/usr/lib/aarch64-linux-gnu", "kind": "inert", "$why": "the multiarch libdir from the same tclConfig.sh block — where the packager's own copy of THIS library sits, not data." },
+                      { "path": "/usr/include/tcl8.6", "kind": "inert", "$why": "TCL_INCLUDE_SPEC, a BUILD-time answer. This harness stages its own tcl.h and cross-checks its version against this very library." },
+                      { "path": "/usr/share/man", "kind": "inert", "$why": "the manual page directory, from the same block. No interpreter code path reads it." },
+                      { "path": "/usr/bin", "kind": "inert", "$why": "the default PATH element Tcl's `exec` falls back on — a target path, not shipped data." },
+                      { "path": "/dev/null", "kind": "inert", "$why": "`exec`'s redirection sink; a device on the target." },
+                      { "path": "/dev/tty", "kind": "inert", "$why": "the controlling terminal for interactive prompting; same category as /dev/null." }
+                    ],
+                    "dataDirs": [
+                      { "member": "usr/share/tcltk/tcl8.6", "as": "tcl8.6", "role": "tclScriptLibrary" }
+                    ] }
+                ]
+              },
+              {
+                "url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_arm64.deb",
+                "sha256": "52b8b8a145bbe1956bba82034f77022cbef0c3d0885c9e32d9817a7932fe1913",
+                "archiveFormat": "deb",
+                "members": [
+                  { "member": "lib/aarch64-linux-gnu/libz.so.1", "as": "libz.so.1",
+                    "universal": false, "importName": "libz.so.1",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [],
+                    "dataDirs": [] }
+                ]
+              }
+            ]
+          },
           "tclNames": ["libtcl8.6.so", "libtcl8.6.so.0"],
           "zNames": ["libz.so.1", "libz.so"],
           "searchPaths": []
@@ -112,19 +211,55 @@
         "loadExtHelperName": "testloadext.dll",
         "$targetCcComment": "`gcc` STAYS on this list and it is not a mistake: ✔MEASURED 2026-08-05 on this project's Windows box, `gcc -dumpmachine` prints `x86_64-w64-mingw32` (Git for Windows and Strawberry both ship mingw gcc under the bare name), so on a Windows host it IS this leg's correct compiler. What was missing is the CHECK, not a shorter list — see the top-level $targetCcComment.",
         "targetCc": { "candidates": ["x86_64-w64-mingw32-gcc", "gcc"], "package": "gcc-mingw-w64-x86-64" },
-        "$librariesComment": "pe64 --resolve-library reads a DLL's EXPORT table (.edata), so these must be real DLLs, not import .libs. A DLL is just a FILE: DSS reads a PE export table on any host, so a Linux or macOS box that HAS these files can build this leg. The search paths are candidates on every host (see $noHostKeyingComment).",
+        "$librariesComment": "pe64 --resolve-library reads a DLL's EXPORT table (.edata), so these must be real DLLs, not import .libs. A DLL is just a FILE: DSS reads a PE export table on any host, so ANY box that HAS these files can build this leg — and the old `search-paths` provider is precisely the reason no non-Windows box had them. ✔MEASURED: the leg was `skipped-build-input-missing` on the arm64 VPS and on macOS, because every declared search path was a Windows install location plus a cache nothing ever populated. Searching for a file the machine was never given is not acquisition. ⚠ THE OBVIOUS SOURCE IS BLOCKED, MEASURED 2026-08-06: msys2/mingw64 — the repo D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER names, and the source of the very `tcl86.dll` Git for Windows ships — publishes `.pkg.tar.zst` and NOTHING ELSE (every tcl and zlib package, checked directly). zstd entered the Python stdlib in 3.14 and this project has a 3.12 host, so that route would be a capability that exists on one host and not another. conda-forge's win-64 packages are plain `.tar.bz2`, unauthenticated HTTPS, content-addressable, and carry the SCRIPT LIBRARY as well — so the pe64 leg becomes self-contained instead of borrowing from an installed Git.",
         "libraries": {
-          "provider": "search-paths",
-          "tclNames": ["tcl86.dll", "tcl90.dll"],
-          "zNames": ["zlib1.dll"],
-          "searchPaths": [
-            "${env:DSS_PE_LIBDIR}",
-            "C:/Program Files/Git/mingw64/bin",
-            "C:/msys64/mingw64/bin",
-            "${env:HOME}/.cache/dss-code-prime/pe64libs",
-            "${env:USERPROFILE}/.cache/dss-code-prime/pe64libs",
-            "/mnt/c/Program Files/Git/mingw64/bin"
-          ]
+          "provider": "pinned-archive",
+          "$importNameComment": "Bare DLL names, and on Windows that IS the beside-the-artefact spelling: the loader searches the application's own directory FIRST, so a DLL staged next to the executable wins with no path recorded and no assumption about the target's layout — the same argument `@loader_path` makes on Darwin, spelled the way this loader spells it. Each DLL's own PE export-directory Name already agrees (`tcl86t.dll`, `zlib.dll`), so nothing is being displaced here; it is declared because 'the packager's identity happens to be right' is a fact a reader should be able to check.",
+          "$tclNamesComment": "`tcl86t.dll` is conda-forge's THREADED build — the `t` suffix is the Windows convention for `--enable-threads`, which is also how msys2 and ActiveState ship it, and what sqlite's testfixture wants. The older unsuffixed names stay in the list: they are what a `search-paths` era cache or a Git-for-Windows install still holds, and this list is matched against whatever is staged.",
+          "acquire": {
+            "archives": [
+              {
+                "$archiveComment": "conda-forge's `tk` package carries BOTH tcl86t.dll and tk86t.dll plus the whole `Library/lib/tcl8.6` script tree (830 files, ✔MEASURED, including init.tcl and Tcl's own tzdata). There is no separate `tcl` package for win-64 — Tcl ships inside `tk` — which is why the archive's name does not say Tcl.",
+                "url": "https://conda.anaconda.org/conda-forge/win-64/tk-8.6.12-h8ffe710_0.tar.bz2",
+                "sha256": "087795090a99a1d397ef1ed80b4a01fabfb0122efb141562c168e3c0a76edba6",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "Library/bin/tcl86t.dll", "as": "tcl86t.dll",
+                    "universal": false, "importName": "tcl86t.dll",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "$embeddedPathsComment": "★ THE GUARD EARNED ITS KEEP HERE. A first pass with a POSIX-only path scan reported ZERO embedded paths in this DLL and concluded Windows Tcl locates its scripts purely relative to the module — the resolver's own scanner, which understands `X:\\`, found FIVE, and one of them is the script library under conda's BUILD prefix on a machine that no longer exists. Had the scan been the naive one, this leg would have shipped a Tcl that hunts `D:\\bld\\…` for init.tcl and dies at `interp create`, which is exactly the failure the anchor is named after — found here by the guard rather than by a Mac.",
+                    "embeddedPaths": [
+                      { "path": "D:\\bld\\tk_1645032569673\\_h_env\\Library\\lib\\tcl8.6", "kind": "runtime-data", "role": "tclScriptLibrary" },
+                      { "path": "D:\\bld\\tk_1645032569673\\_h_env\\Library\\lib", "kind": "inert", "$why": "the build prefix's libdir, baked in as `tcl_pkgPath` for an extension search the testfixture never performs. It names a directory on conda-forge's build machine and cannot resolve anywhere else — which is harmless only because nothing reads it." },
+                      { "path": "D:\\bld\\tk_1645032569673\\_h_env\\Library\\bin", "kind": "inert", "$why": "the build prefix's bindir, from the same baked-in configuration block." },
+                      { "path": "D:\\bld\\tk_1645032569673\\_h_env\\Library\\include", "kind": "inert", "$why": "the build prefix's include dir — a BUILD-time answer for tclConfig consumers. This harness stages its own tcl.h." },
+                      { "path": "D:\\bld\\tk_1645032569673\\_h_env\\Library\\doc", "kind": "inert", "$why": "the build prefix's doc dir, from the same block. No interpreter code path reads it." }
+                    ],
+                    "dataDirs": [
+                      { "member": "Library/lib/tcl8.6", "as": "tcl8.6", "role": "tclScriptLibrary" }
+                    ] }
+                ]
+              },
+              {
+                "$archiveComment": "conda-forge splits zlib's runtime DLL into `libzlib`; the `zlib` package is the development half. The DLL is at `Library/bin/zlib.dll` and the archive also carries a top-level copy — the declaration names the `Library/` one so both members come from the same prefix.",
+                "url": "https://conda.anaconda.org/conda-forge/win-64/libzlib-1.2.13-hcfcfb64_4.tar.bz2",
+                "sha256": "184da12b4296088a47086f4e69e65eb5f8537a824ee3131d8076775e1d1ea767",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "Library/bin/zlib.dll", "as": "zlib.dll",
+                    "universal": false, "importName": "zlib.dll",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "$embeddedPathsComment": "EMPTY, and MEASURED with the same scanner that found five in tcl86t.dll — so the emptiness is a result, not an omission.",
+                    "embeddedPaths": [],
+                    "dataDirs": [] }
+                ]
+              }
+            ]
+          },
+          "tclNames": ["tcl86t.dll", "tcl86.dll", "tcl90.dll"],
+          "zNames": ["zlib.dll", "zlib1.dll"],
+          "$searchPathsComment": "EMPTIED with the provider change, deliberately. A candidate list nothing consults is worse than none: a reader would take it for the mechanism. The escape hatch that replaces `DSS_PE_LIBDIR` is `DSS_HARNESS_CACHE_ROOT` — it moves where the pinned archives are materialised, and unlike a search path it cannot silently substitute a different library, because what lands there is checked against the pinned digest.",
+          "searchPaths": []
         }
       }
     },
@@ -153,15 +288,33 @@
           "provider": "pinned-archive",
           "$acquireComment": "`universal: true` is not a formality. ✔MEASURED: handed the UNIVERSAL file, DSS refuses it — `error[F_UnsupportedBinaryFormat] readImports: '<path>' is a Mach-O FAT/universal binary (big-endian fat_header magic 0xCAFEBABE or 0xCAFEBABF). v1 supports single-arch Mach-O only — slice the required arch first (e.g. `lipo -thin arm64 in.dylib -output out.dylib`). Anchor D-FF1-MACHO-FAT.` — and handed the thin arm64 slice OF THE SAME FILE it succeeds with rc=0. So slicing is the contract that anchor states, performed here because the harness is the only layer that knows which arch this leg wants (`readImports(path, reporter)` takes no target). ⚠ THE REFUSAL'S SPELLING CHANGED INSIDE THIS CYCLE, and the first draft of this comment quoted the older one: `guessFormat` read the fat magic little-endian, so a real universal binary could never reach the arm above and fell into the unknown-magic catch-all instead — the anchor's own remediation was unreachable. That detection bug was fixed in the same cycle; the quote above is the post-fix message. ★ Slicing would be right even if DSS read fat files: a leg's build input should be a library FOR THAT LEG'S TARGET, not a container that also holds a foreign architecture, or 'which architecture did this leg resolve against?' has no answer from the input.",
           "$importNameComment": "★★ THE TRAP, AND WHY THE ANSWER IS `@loader_path` AND NOT A SYSTEM PATH. Both archives' LC_ID_DYLIB reads `/opt/local/lib/…` (✔MEASURED: `/opt/local/lib/libtcl8.6.dylib`, `/opt/local/lib/libz.1.dylib`), and DSS records a resolved library's EMBEDDED identity as the LC_LOAD_DYLIB — so linking naively produces a Mach-O that demands MacPorts at that prefix on the target Mac. That is a dyld LOAD failure, not a build error, so nothing on this host would catch it. The obvious fix is to record the system path instead — and this project cannot HONESTLY do that for Tcl: nobody here has measured what a Mac carries at /usr/lib for Tcl 8.6, and this repo's own darwin path installs Tcl through Homebrew, whose current `tcl-tk` is 9.x — so `/usr/lib/libtcl8.6.dylib` would be an unverified claim about someone else's machine, and a wrong one costs a dyld failure. `@loader_path/<name>` is TRUE BY CONSTRUCTION: dyld resolves it against the directory holding the executable, the driver stages the acquired dylib there beside the artefact, and the result assumes NOTHING about the target Mac's prefix layout or Tcl version. ⚠ For zlib a system path WOULD be defensible — this harness has measured that `/usr/lib/libz.1.dylib` resolves out of the dyld shared cache even though it cannot be opened as a file (see build-and-test.sh's darwin branch) — but mixing the two policies inside one artefact buys nothing and makes the rule harder to state. Flipping either back to a system path is a one-line edit HERE, which is the point of declaring it.",
+          "$scriptLibraryComment": "★★ THE DYLIB IS NOT THE WHOLE LIBRARY — D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY, and this is the declaration that closed it. ✔MEASURED on the operator's Mac at 11e97e0e: this leg's testfixture BUILDS (189 TUs, 0 diagnostics) and runs an individual `.test` file correctly (select1 → 0 errors out of 192), and then the TIER driver aborts INSTANTLY with `Can't find a usable init.tcl in the following directories: /opt/local/lib/tcl8.6 …` raised from `interp create tinterp`. `permutations.test` runs every unit in a fresh SLAVE interpreter and `interp create` re-enters `tclInit`, which needs Tcl's SCRIPT LIBRARY; the MAIN interpreter is already initialised when a directly-named file is sourced, which is why one path passed and the other could not. The acquired dylib bakes in `/opt/local/lib/tcl8.6` — MacPorts' own prefix — and MacPorts is not installed on that Mac; only the dylib was ever downloaded. ⇒ the SAME pinned archive also carries the scripts (✔MEASURED: 225 files, 4 subdirectories, ZERO symlinks under `opt/local/lib/tcl8.6/`, 1,948,034 bytes, `init.tcl` among them), so they are staged from it, pinned by a whole-tree digest, and handed to the drivers as `scriptLibraryDir` for TCL_LIBRARY. ⛔ NOT the host's Homebrew `tcl-tk@8` scripts: that works on ONE Mac, reintroduces exactly the host-dependence this arc exists to end, and pairs an 8.6.18 script library with a MacPorts 8.6.17 binary on nothing but a version-number coincidence.",
           "acquire": {
             "archives": [
               {
                 "url": "https://packages.macports.org/tcl/tcl-8.6.17_0+corefoundation+threads+universal.darwin_24.arm64-x86_64.tbz2",
                 "sha256": "47efa8a687d614d8c3c1c4bca19cfe9f1e95efd093ee3f31b9ff1c6d43306d0f",
                 "archiveFormat": "tar.bz2",
+                "$embeddedPathsComment": "EVERY absolute path this dylib carries, listed ONCE against a PINNED digest so it cannot drift under the declaration — the general guard from the anchor above. ✔MEASURED 2026-08-06: 14 tokens, of which 4 are the loader's own (LC_ID_DYLIB, LC_LOAD_DYLIB ×3) and are excused by the resolver from the file itself. The remaining 10 are here. Exactly ONE is runtime data, and it is the one that cost the corpus.",
                 "members": [
                   { "member": "opt/local/lib/libtcl8.6.dylib", "as": "libtcl8.6.dylib",
-                    "universal": true, "importName": "@loader_path/libtcl8.6.dylib" }
+                    "universal": true, "importName": "@loader_path/libtcl8.6.dylib",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [
+                      { "path": "/opt/local/lib/tcl8.6", "kind": "runtime-data", "role": "tclScriptLibrary" },
+                      { "path": "/opt/local/lib", "kind": "inert", "$why": "MacPorts' libdir, reported through `tcl_pkgPath`/`tcl_library` for a package search that this fixture never performs — the testfixture loads no Tcl EXTENSION (its own commands are compiled in), and the one directory `tclInit` MUST read is declared runtime-data above." },
+                      { "path": "/opt/local/bin", "kind": "inert", "$why": "TCL_PREFIX/bin, reported through `tcl_platform`/`info nameofexecutable` fallbacks. Nothing in the corpus execs out of it." },
+                      { "path": "/opt/local/include", "kind": "inert", "$why": "TCL_INCLUDE_SPEC, a BUILD-time answer baked in for tclConfig.sh consumers. This harness stages its own tcl.h (see the top-level Tcl coherence check) and never reads it." },
+                      { "path": "/opt/local/share/man", "kind": "inert", "$why": "the manual page directory, from the same tclConfig.sh block. No code path in a Tcl interpreter reads it." },
+                      { "path": "/usr/bin", "kind": "inert", "$why": "the default PATH element Tcl's `exec` falls back on. A TARGET path that exists on every Mac, not a packager path — nothing to stage." },
+                      { "path": "/dev/null", "kind": "inert", "$why": "`exec`'s redirection sink. A device on the target, not data we could ship." },
+                      { "path": "/dev/tty", "kind": "inert", "$why": "the controlling terminal, opened by `tcl_interactive` prompting. Same category as /dev/null." },
+                      { "path": "/var/tmp", "kind": "inert", "$why": "the fallback temp directory for `file tempfile` when TMPDIR is unset. A target location, not shipped data." },
+                      { "path": "/..namedfork/rsrc", "kind": "inert", "$why": "the HFS+ resource-fork suffix Tcl appends when opening a file's resource fork; a magic SUFFIX, not a directory anyone stages." }
+                    ],
+                    "dataDirs": [
+                      { "member": "opt/local/lib/tcl8.6", "as": "tcl8.6", "role": "tclScriptLibrary" }
+                    ] }
                 ]
               },
               {
@@ -171,7 +324,11 @@
                 "archiveFormat": "tar.bz2",
                 "members": [
                   { "member": "opt/local/lib/libz.1.dylib", "as": "libz.1.dylib",
-                    "universal": true, "importName": "@loader_path/libz.1.dylib" }
+                    "universal": true, "importName": "@loader_path/libz.1.dylib",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "$embeddedPathsComment": "EMPTY, and measured rather than assumed: the only two absolute paths in this dylib are its own LC_ID_DYLIB and LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib, both excused by the resolver as the loader's business. zlib reads no data directory — which is exactly why it is the CONTROL for the Tcl declaration above.",
+                    "embeddedPaths": [],
+                    "dataDirs": [] }
                 ]
               }
             ]
@@ -207,6 +364,7 @@
         "libraries": {
           "provider": "pinned-archive",
           "$importNameComment": "See macho64-arm64's $importNameComment — same trap, same answer, and deliberately the same policy on both macho legs so the artefact's dependency shape does not depend on which architecture it was built for.",
+          "$scriptLibraryComment": "See macho64-arm64's $scriptLibraryComment for the whole story (D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY). The scripts are ARCHITECTURE-INDEPENDENT `.tcl` text, so this leg stages the SAME tree from the SAME pinned archive — into its OWN cache directory, because a leg's staged inputs are that leg's, and a shared directory would make 'which leg staged this?' unanswerable. ✔MEASURED 2026-08-06: the two slices' embedded path sets are IDENTICAL (14 tokens each), which is why the declaration below is identical too.",
           "acquire": {
             "archives": [
               {
@@ -215,7 +373,23 @@
                 "archiveFormat": "tar.bz2",
                 "members": [
                   { "member": "opt/local/lib/libtcl8.6.dylib", "as": "libtcl8.6.dylib",
-                    "universal": true, "importName": "@loader_path/libtcl8.6.dylib" }
+                    "universal": true, "importName": "@loader_path/libtcl8.6.dylib",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [
+                      { "path": "/opt/local/lib/tcl8.6", "kind": "runtime-data", "role": "tclScriptLibrary" },
+                      { "path": "/opt/local/lib", "kind": "inert", "$why": "MacPorts' libdir, reported through `tcl_pkgPath`/`tcl_library` for a package search that this fixture never performs — the testfixture loads no Tcl EXTENSION (its own commands are compiled in), and the one directory `tclInit` MUST read is declared runtime-data above." },
+                      { "path": "/opt/local/bin", "kind": "inert", "$why": "TCL_PREFIX/bin, reported through `tcl_platform`/`info nameofexecutable` fallbacks. Nothing in the corpus execs out of it." },
+                      { "path": "/opt/local/include", "kind": "inert", "$why": "TCL_INCLUDE_SPEC, a BUILD-time answer baked in for tclConfig.sh consumers. This harness stages its own tcl.h (see the top-level Tcl coherence check) and never reads it." },
+                      { "path": "/opt/local/share/man", "kind": "inert", "$why": "the manual page directory, from the same tclConfig.sh block. No code path in a Tcl interpreter reads it." },
+                      { "path": "/usr/bin", "kind": "inert", "$why": "the default PATH element Tcl's `exec` falls back on. A TARGET path that exists on every Mac, not a packager path — nothing to stage." },
+                      { "path": "/dev/null", "kind": "inert", "$why": "`exec`'s redirection sink. A device on the target, not data we could ship." },
+                      { "path": "/dev/tty", "kind": "inert", "$why": "the controlling terminal, opened by `tcl_interactive` prompting. Same category as /dev/null." },
+                      { "path": "/var/tmp", "kind": "inert", "$why": "the fallback temp directory for `file tempfile` when TMPDIR is unset. A target location, not shipped data." },
+                      { "path": "/..namedfork/rsrc", "kind": "inert", "$why": "the HFS+ resource-fork suffix Tcl appends when opening a file's resource fork; a magic SUFFIX, not a directory anyone stages." }
+                    ],
+                    "dataDirs": [
+                      { "member": "opt/local/lib/tcl8.6", "as": "tcl8.6", "role": "tclScriptLibrary" }
+                    ] }
                 ]
               },
               {
@@ -224,7 +398,10 @@
                 "archiveFormat": "tar.bz2",
                 "members": [
                   { "member": "opt/local/lib/libz.1.dylib", "as": "libz.1.dylib",
-                    "universal": true, "importName": "@loader_path/libz.1.dylib" }
+                    "universal": true, "importName": "@loader_path/libz.1.dylib",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [],
+                    "dataDirs": [] }
                 ]
               }
             ]

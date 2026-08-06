@@ -1798,6 +1798,176 @@ TEST_F(HarnessLegs, AnAcquiredLibraryDeclaresTheIdentityItIsRecordedUnder) {
     EXPECT_NE(bad.output.find("importName"), std::string::npos) << bad.output;
 }
 
+// A LIBRARY IS NOT ALWAYS SELF-CONTAINED — D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-
+// SCRIPT-LIBRARY.
+//
+// The macho leg's testfixture BUILT (189 TUs, 0 diagnostics) and ran an
+// individual `.test` file correctly, and then the TIER driver died instantly at
+// `interp create` because `permutations.test` runs every unit in a fresh SLAVE
+// interpreter and `tclInit` needs Tcl's SCRIPT LIBRARY — which acquisition had
+// never obtained. Nothing at build time could see it.
+//
+// So: every leg that acquires a Tcl must ALSO stage that Tcl's scripts, and must
+// SAY where, because a driver sets TCL_LIBRARY from `scriptLibraryDir` and from
+// nothing else.
+//
+// RED-ON-DISABLE: delete a `dataDirs` entry from any acquiring leg and this
+// fails naming the leg; empty `scriptLibraryDir` and it fails too.
+TEST_F(HarnessLegs, EveryAcquiredTclStagesItsScriptLibraryAndSaysWhere) {
+    auto const doc      = json::parse(fileText(catalogue_));
+    unsigned   acquired = 0;
+    for (auto const& leg : doc.at("legs")) {
+        auto const  label = leg.at("label").get<std::string>();
+        auto const& libs  = leg.at("build").at("libraries");
+        if (libs.at("provider").get<std::string>() != "pinned-archive") continue;
+        ++acquired;
+        auto const r = run({"--acquire-plan", label});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        ASSERT_EQ(r.exitCode, 0u) << r.output;
+        auto const ap = json::parse(r.output);
+
+        std::set<std::string> staged;
+        for (auto const& a : ap.at("archives")) {
+            for (auto const& m : a.at("members")) {
+                // WHICH COPY RUNS is what decides whether a baked-in data
+                // directory has to be staged. There is no safe default.
+                auto const copy = m.at("runtimeCopy").get<std::string>();
+                EXPECT_TRUE(copy == "staged-beside-artefact"
+                            || copy == "target-supplies-its-own")
+                    << label << " :: " << m.at("as").get<std::string>()
+                    << ": runtimeCopy is '" << copy << "'";
+                for (auto const& d : m.at("dataDirs")) {
+                    if (d.at("role").get<std::string>() == "tclScriptLibrary")
+                        staged.insert(d.at("path").get<std::string>());
+                }
+                // A path the LIBRARY ITSELF bakes in and calls runtime data must
+                // have a staged directory answering to it. This is the exact
+                // state the macho legs shipped in.
+                for (auto const& e : m.at("embeddedPaths")) {
+                    if (e.at("kind").get<std::string>() != "runtime-data")
+                        continue;
+                    bool provided = false;
+                    for (auto const& d : m.at("dataDirs")) {
+                        if (d.at("role") == e.at("role")) provided = true;
+                    }
+                    EXPECT_TRUE(provided)
+                        << label << " :: " << m.at("as").get<std::string>()
+                        << " bakes in " << e.at("path").get<std::string>()
+                        << " as runtime data and stages nothing for it — the"
+                           " library would look for it at the PACKAGER's prefix"
+                           " on the target machine.";
+                }
+            }
+        }
+        EXPECT_EQ(staged.size(), 1u)
+            << label << ": a leg that acquires Tcl must stage exactly ONE script"
+                        " library. TCL_LIBRARY names one directory.";
+        auto const said = ap.at("scriptLibraryDir").get<std::string>();
+        EXPECT_FALSE(said.empty())
+            << label << ": the plan stages a script library and does not say"
+                        " where. A driver cannot set TCL_LIBRARY from silence.";
+        EXPECT_TRUE(staged.count(said))
+            << label << ": scriptLibraryDir '" << said
+            << "' is not one of the directories the plan stages.";
+    }
+    EXPECT_GT(acquired, 0u) << "no acquiring leg inspected — vacuous";
+}
+
+// THE FAILURE RETURN CARRIES THE SAME FIELDS AS THE SUCCESS RETURN.
+// D-HARNESS-PINNED-ARCHIVE-FAILURE-RETURN-OMITS-ACQUIRED was one instance of
+// this ("a function whose SUCCESS return and FAILURE return carry different
+// field sets is a silent-omission generator"); its own closing note asks for ONE
+// record type on both paths. `--acquire` therefore prints the record even when
+// acquisition fails — with the rc still naming the failure.
+//
+// RED-ON-DISABLE: drop the failure-path print, or omit any field from it, and
+// this fails naming the missing key.
+TEST_F(HarnessLegs, AcquisitionAnswersWithTheSameRecordShapeWhenItFails) {
+    auto const label = firstAcquiringLeg(catalogue_);
+    ASSERT_FALSE(label.empty()) << "no acquiring leg — vacuous";
+    auto const cold = scratch_->path() / "cold-record";
+    ASSERT_FALSE(fs::exists(cold)) << "the cache root must be absent: " << cold;
+
+    auto const bad = run({"--acquire", label, "--cache-root", cold.string(),
+                          "--offline"});
+    ASSERT_TRUE(bad.spawned) << bad.diagnostic;
+    EXPECT_NE(bad.exitCode, 0u)
+        << "acquisition must FAIL on a cold cache with --offline:\n"
+        << bad.output;
+    auto const brace = bad.output.find('{');
+    ASSERT_NE(brace, std::string::npos)
+        << "a failed --acquire printed no record at all. The driver needs"
+           " scriptLibraryDir most when acquisition has just failed and it is"
+           " reporting why:\n"
+        << bad.output;
+    auto const rec = json::parse(bad.output.substr(brace));
+    for (char const* key : {"leg", "targetArch", "cacheDir", "scriptLibraryDir",
+                            "libraries", "fromCache", "remediated",
+                            "loaderDependencies", "error"}) {
+        EXPECT_TRUE(rec.contains(key))
+            << "the FAILURE record omits '" << key
+            << "' — the exact shape of the bug this pin exists to prevent.";
+    }
+    EXPECT_FALSE(rec.at("error").get<std::string>().empty())
+        << "a failure record with an empty `error` reads as a success.";
+    EXPECT_FALSE(rec.at("scriptLibraryDir").get<std::string>().empty())
+        << "scriptLibraryDir is computed from the PURE plan and must survive a"
+           " failed acquisition.";
+}
+
+// THE DECLARATIONS THAT CARRY THE GUARD ARE THEMSELVES REQUIRED.
+// A rule enforced only when someone remembers to declare it is not enforced.
+// Each mutation below is the omission a hurried author would actually make.
+TEST_F(HarnessLegs, TheLintRefusesAnUnderdeclaredRuntimeDataSurface) {
+    struct Case {
+        char const* name;
+        char const* needle;      // must appear in the refusal
+        void (*mutate)(json&, bool&);
+    };
+    constexpr Case kCases[] = {
+        {"legs-no-runtime-copy", "runtimeCopy",
+         [](json& mem, bool& did) { mem.erase("runtimeCopy"); did = true; }},
+        {"legs-unstaged-script-library", "runtime-data",
+         [](json& mem, bool& did) {
+             // The EXACT defect: the library still declares that it bakes in a
+             // script directory, and nothing stages it any more.
+             if (mem.at("dataDirs").empty()) return;
+             mem["dataDirs"] = json::array();
+             did              = true;
+         }},
+        {"legs-inert-without-why", "$why",
+         [](json& mem, bool& did) {
+             for (auto& e : mem.at("embeddedPaths")) {
+                 if (e.at("kind").get<std::string>() != "inert") continue;
+                 e.erase("$why");
+                 did = true;
+             }
+         }},
+    };
+    for (auto const& c : kCases) {
+        MutatedCatalogue m{catalogue_, c.name};
+        bool             did = false;
+        for (auto& leg : m.doc().at("legs")) {
+            auto& libs = leg.at("build").at("libraries");
+            if (libs.at("provider").get<std::string>() != "pinned-archive")
+                continue;
+            for (auto& a : libs.at("acquire").at("archives")) {
+                for (auto& mem : a.at("members")) c.mutate(mem, did);
+            }
+            if (did) break;
+        }
+        ASSERT_TRUE(did) << c.name << ": nothing to mutate — vacuous";
+        auto const bad = runResolver({"--lint"}, m.commit());
+        ASSERT_TRUE(bad.spawned) << bad.diagnostic;
+        EXPECT_NE(bad.exitCode, 0u)
+            << c.name << ": the lint accepted it:\n" << bad.output;
+        EXPECT_NE(bad.output.find(c.needle), std::string::npos)
+            << c.name << ": the refusal never mentions '" << c.needle
+            << "', so a reader cannot act on it:\n"
+            << bad.output;
+    }
+}
+
 // A BUILD THAT FETCHES THIRD-PARTY BINARIES IS A SUPPLY-CHAIN SURFACE.
 // Every archive pins a sha256, the download is filed UNDER that digest (so "is
 // the cached copy the thing we pinned?" is answered by re-hashing rather than by
@@ -1873,37 +2043,44 @@ TEST_F(HarnessLegs, TheAcquisitionRouteIsChecksumPinnedAndContentAddressed) {
 // Naming it inside a "not implemented" message would otherwise satisfy a naive
 // substring search, which is exactly the state being repaired.
 //
-// ★ ONE PROVIDER IS EXEMPT, AND THE EXEMPTION RETIRES ITSELF.
-// `ubuntu-ports-arm64` is the ORIGINAL bespoke provider — `build-and-test.sh`
-// implements it with `curl` + `dpkg-deb`, and neither tool is a thing the .ps1
-// can call. Absorbing it into the general route needs a `.deb` reader in the
-// resolver, and MEASURED 2026-08-04 that is not safely doable yet: a modern
-// `.deb`'s inner archive can be zstd, whose stdlib module arrived in Python
-// 3.14 — this Windows host has 3.14, the WSL leg has 3.12 — so a zstd-based
-// route would be a capability that exists on one host and not another, which is
-// the same defect one level down. It is therefore listed HERE, by name, with
-// the anchor, rather than quietly passing.
+// ★ THE EXEMPTION LIST IS EMPTY, AND IT GOT THERE BY RETIRING ITSELF.
+// It held exactly one entry, `ubuntu-ports-arm64` — the original bespoke
+// provider, ~80 lines of `curl` + `dpkg-deb` inside `build-and-test.sh` and
+// nowhere else, so on Windows that leg could not build at all. The deferral was
+// admissible only because THIS TEST made it self-retiring, and that is precisely
+// how it ended: TF-C123 converted the leg to the shared `pinned-archive` route,
+// the provider stopped being declared, and the loop below went RED demanding the
+// entry be deleted. It was, in the same change. A deferral that reds on its own
+// closure is the only kind worth writing down.
 //
-// The exemption cannot rot: the loop below asserts a listed provider is STILL
-// missing from exactly one driver. Implement it and this test REDS, demanding
-// the entry be deleted. Add a second entry and the size assertion reds. An
-// allow-list that can only shrink is a ratchet; one that can grow is a licence.
+// ⚠ THE RATCHET IS NOW AT ZERO, which is a stronger claim than "one exemption":
+// EVERY declared provider must have a dispatch arm in BOTH drivers. Adding an
+// entry here reds the size assertion below, so a new driver-local capability
+// cannot be introduced quietly — it has to argue with a test first.
 [[nodiscard]] std::set<std::string> knownDriverLocalProviders() {
-    // D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
-    return {"ubuntu-ports-arm64"};
+    // D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE (closed)
+    return {};
 }
 
 // RED-ON-DISABLE: delete either driver's arm for any declared provider and this
 // fails naming the driver and the provider.
 TEST_F(HarnessLegs, BothDriversImplementEveryProviderTheCatalogueDeclares) {
     auto const providers = declaredProviders(catalogue_);
-    ASSERT_GE(providers.size(), 2u) << "one provider — the pin proves nothing";
+    // ⚠ THIS USED TO DEMAND TWO OR MORE PROVIDERS ("one provider — the pin
+    // proves nothing"), and TF-C123 made that reasoning obsolete rather than
+    // merely inconvenient. It was guarding a state where the ONE declared
+    // provider was also the EXEMPTED one, leaving nothing checked. With the
+    // exemption list empty (see knownDriverLocalProviders), converging on a
+    // single shared route is the GOAL, not a vacuity: every provider the
+    // catalogue declares — all one of them — must have a real dispatch arm in
+    // both drivers, and that is the strongest form this pin has ever had.
+    ASSERT_GE(providers.size(), 1u) << "no provider declared at all";
     auto const exempt = knownDriverLocalProviders();
-    EXPECT_EQ(exempt.size(), 1u)
-        << "the driver-local exemption list may only SHRINK. A second entry"
-           " means a new capability was added to one driver and not the other,"
-           " which is the defect D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-"
-           "LEG-IN-ONE-DRIVER exists to end.";
+    EXPECT_TRUE(exempt.empty())
+        << "the driver-local exemption list may only SHRINK, and it reached"
+           " ZERO in TF-C123. Any entry means a capability exists in one driver"
+           " and not the other, which is the defect D-HARNESS-LIBRARY-"
+           "ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER exists to end.";
     struct Driver {
         char const* name;
         bool        powershell;
