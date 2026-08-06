@@ -384,6 +384,15 @@ walkExportTrie(std::span<std::uint8_t const>    bytes,
             // surfacing as SymbolLinkage::Weak is gated: D-FF1-MACHO-WEAK-DEF.
             row.visibility = SymbolVisibility::Default;
             row.linkage    = SymbolLinkage::External;
+            // `row.elfSymbolVersion` stays `nullopt`, permanently. Mach-O has
+            // NO per-symbol version: LC_ID_DYLIB / LC_LOAD_DYLIB carry a
+            // dylib's current + COMPATIBILITY version and LC_BUILD_VERSION a
+            // platform floor, all per-LIBRARY; dyld's per-symbol availability
+            // story is `$ld$` linker-set aliases, which are distinct symbol
+            // NAMES rather than a version attached to one name. The export
+            // trie has no version field to read. See
+            // `ffi/import_surface.hpp` (D-FFI-BINARY-READER-SURFACES-NO-
+            // SYMBOL-VERSION).
 
             if ((flags & kExportReexport) != 0u) {
                 // Reexport (the PE-forwarder analog): payload is

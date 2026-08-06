@@ -258,6 +258,15 @@ TEST(BinaryReaderMacho, ExtractsInstallNameFromLcIdDylib) {
     for (auto const& row : *r) {
         EXPECT_EQ(row.soname, "@rpath/libwidget.dylib")
             << "install name must be kept whole (not leaf-reduced)";
+        // TF-C124 (D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION): Mach-O
+        // has NO per-symbol version. Its versions (LC_ID_DYLIB current +
+        // compatibility, LC_BUILD_VERSION) are per-LIBRARY, and dyld's
+        // per-symbol availability story is `$ld$` aliases — distinct symbol
+        // NAMES, not a version on one name. Permanently empty here.
+        EXPECT_FALSE(row.elfSymbolVersion.has_value())
+            << "Mach-O versions the DYLIB, not the symbol; mapping a "
+               "compatibility version onto a per-symbol field would invent "
+               "a requirement the format cannot express";
     }
     EXPECT_EQ(rep.errorCount(), 0u);
 }

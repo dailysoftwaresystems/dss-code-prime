@@ -18,6 +18,7 @@
 //     `K_SymbolUndefined`.
 
 #include "asm/asm.hpp"
+#include "ffi/binary_reader.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -26,10 +27,14 @@
 #include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
+#include "repo_root.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
@@ -3330,4 +3335,108 @@ TEST(ElfExecTls, StaticElfArmRejectsTlsItemsLoud) {
     }
     EXPECT_TRUE(saw) << "static-arm TLS items must reject "
                         "K_FormatLacksThreadLocalSupport (0x8015)";
+}
+
+// ── TF-C124: a version READ from a real library round-trips to verneed ───
+// D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION.
+//
+// The three c156 pins above hand the writer a version string this test file
+// typed. That proves the EMITTER, and it is exactly the shape that cannot
+// notice the defect this cycle fixes: the string had to be typed, because
+// until now nothing in the compiler could produce one from a library that has
+// no shipped descriptor — and no third-party library the project links (Tcl,
+// zlib) has one.
+//
+// So this arm types no version at all. It reads a REAL GNU ld 2.42 shared
+// library (`tests/ffi/data/libdssver.so.1`) with the SHIPPED FF1 reader, takes
+// whatever version that library records for its own export, and follows it
+// through the writer into `.gnu.version_r`. Every version string asserted
+// below is compared against the one the READER produced; the literals are a
+// second, independent statement of the same fact, so a reader that silently
+// returned "" could not make this test pass.
+//
+// ⚠ The read-back is a verneed decode here rather than another
+// `readImportsFromBytes` call, and that asymmetry is real, not laziness: what
+// a DSS image emits is a REQUIREMENT, carried on an SHN_UNDEF `.dynsym` row,
+// and `readElf64` deliberately surfaces only DEFINITIONS (an export surface
+// must not report a library's own imports —
+// D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED). The two
+// halves speak different sections by design: `.gnu.version_d` in, verneed out.
+TEST(ElfExecWriter, VersionReadFromRealLibraryRoundTripsIntoVerneed) {
+    auto const libPath = dss::test::repoRoot()
+                       / "tests" / "ffi" / "data" / "libdssver.so.1";
+    std::ifstream in(libPath, std::ios::binary);
+    ASSERT_TRUE(in.good()) << "missing real-linker fixture " << libPath.string();
+    std::vector<std::uint8_t> const libBytes(
+        (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(libBytes.empty());
+
+    // (1) READ — the shipped FF1 reader, on the real file.
+    DiagnosticReporter readRep;
+    auto rows = dss::ffi::readImportsFromBytes(libBytes, "libdssver.so.1", readRep);
+    ASSERT_TRUE(rows.has_value());
+    dss::ffi::ImportSurface const* row = nullptr;
+    for (auto const& r : *rows) {
+        if (r.mangledName == "dss_ver_default") { row = &r; break; }
+    }
+    ASSERT_NE(row, nullptr);
+    ASSERT_TRUE(row->elfSymbolVersion.has_value())
+        << "the reader recovered no version — nothing downstream can invent one";
+    std::string const observedVersion = row->elfSymbolVersion->name;
+    std::string const observedLibrary = row->soname;
+    EXPECT_EQ(observedVersion, "DSSVER_2.0");      // independent cross-check
+    EXPECT_EQ(observedLibrary, "libdssver.so.1");  // independent cross-check
+
+    // (2) EMIT — the observed strings, never a typed one, drive the writer.
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 1; rel.target = SymbolId{99}; rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp{SymbolId{99}, row->mangledName, observedLibrary};
+    imp.version = observedVersion;
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // (3) READ BACK — recover the version STRING out of the emitted image.
+    auto const dyn = dynEntries(bytes);
+    ASSERT_TRUE(dyn.count(0x6ffffff0u)) << "no DT_VERSYM";
+    ASSERT_TRUE(dyn.count(0x6ffffffeu)) << "no DT_VERNEED";
+    EXPECT_EQ(dyn.at(0x6fffffffu), 1u) << "exactly one Verneed (one library)";
+
+    int const vrIdx = findSectionByName(bytes, ".gnu.version_r");
+    ASSERT_GE(vrIdx, 0);
+    int const dynstrIdx = findSectionByName(bytes, ".dynstr");
+    ASSERT_GE(dynstrIdx, 0);
+    std::uint64_t const vrOff     = shOffset(bytes, vrIdx);
+    std::uint64_t const dynstrOff = shOffset(bytes, dynstrIdx);
+    // Elf64_Verneed: vn_file names the library; Elf64_Vernaux at +vn_aux
+    // names the required version.
+    std::string const emittedLibrary =
+        readCStr(bytes, dynstrOff + readU32LE(bytes, vrOff + 4));
+    std::uint64_t const aux = vrOff + readU32LE(bytes, vrOff + 8);
+    std::string const emittedVersion =
+        readCStr(bytes, dynstrOff + readU32LE(bytes, aux + 8));
+
+    // ★ The round-trip assertion: what came out is what the library said,
+    // compared to the READER's own output rather than to a literal.
+    EXPECT_EQ(emittedVersion, observedVersion);
+    EXPECT_EQ(emittedLibrary, observedLibrary);
+    EXPECT_EQ(readU32LE(bytes, aux + 0), testVerHash(observedVersion))
+        << "vna_hash must be elf_hash of the version the library recorded";
+
+    // And the import's own versym slot points AT that requirement (index >= 2),
+    // which is what makes ld.so bind it rather than the library's default.
+    int const vsymIdx = findSectionByName(bytes, ".gnu.version");
+    ASSERT_GE(vsymIdx, 0);
+    std::uint16_t const vnaOther = readU16LE(bytes, aux + 6);
+    EXPECT_GE(vnaOther, 2u);
+    EXPECT_EQ(readU16LE(bytes, shOffset(bytes, vsymIdx) + 2), vnaOther);
 }

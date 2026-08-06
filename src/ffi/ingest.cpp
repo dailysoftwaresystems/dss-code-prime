@@ -408,11 +408,67 @@ ingest(std::span<IngestionSource const> sources,
             !matched.declaredImportName.empty() ? matched.declaredImportName
           : !matched.row.soname.empty()         ? matched.row.soname
           :                                       matched.row.libraryPath;
-        // c156 (D-LK-ELF-SYMBOL-VERSIONING): carry the required symbol
-        // version (parity with the FF5 source-decl path). Dormant today
-        // (FF1 is the binary-reader ingestion path), but a versioned
-        // ExternDeclRef routed here must not silently drop its version.
+        // ── THE REQUIRED-SYMBOL-VERSION DECISION SITE ────────────────────
+        // c156 (D-LK-ELF-SYMBOL-VERSIONING) established the rail: a
+        // non-empty version here becomes a `.gnu.version_r` requirement
+        // against `meta.importLibrary` in the emitted ELF image, so ld.so
+        // binds THAT version instead of an unversioned reference silently
+        // landing on a library's OLDEST compat instance.
+        //
+        // TF-C124 (D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION) gives the
+        // rail a SECOND source. Until it, only `ext.version` — a shipped
+        // DESCRIPTOR's declaration — could ever be non-empty, so the whole
+        // mechanism was unreachable for every library acquired without a
+        // descriptor, which is every third-party library this project links
+        // (Tcl, zlib). The binary itself records the answer; now we read it.
+        //
+        //   1. the DECLARATION (`ext.version`) — a descriptor pinned this
+        //      symbol to an exact version for this (arch, format). Beats the
+        //      observation for the same reason `declaredImportName` beats
+        //      the binary's own soname above: a declaration is a statement
+        //      about the RUNTIME library, an observation is a fact about the
+        //      FILE WE READ, and those are allowed to differ.
+        //   2. the OBSERVATION (`matched.row.elfSymbolVersion`) — what the
+        //      library we read records for this export, under the two
+        //      conditions below.
+        //
+        // FORMAT-BLIND: no arm asks what object format is active. PE and
+        // Mach-O rows simply carry no `elfSymbolVersion` (their formats have
+        // no per-symbol version — see `ffi/import_surface.hpp`), so this
+        // expression yields the same empty string there that it always did.
         meta.version = std::string{ext.version};
+        if (meta.version.empty()) {
+            auto const& obs = matched.row.elfSymbolVersion;
+            // (a) DEFAULT VERSIONS ONLY. A `sym@VER` compat definition is
+            //     kept alive only for binaries that were linked before the
+            //     default moved; re-requesting one because we happened to
+            //     walk past it in `.dynsym` would MANUFACTURE the exact bug
+            //     D-LK-ELF-SYMBOL-VERSIONING was opened for — libc.so.6
+            //     exports both `realpath@@GLIBC_2.3` and the NULL-buffer-
+            //     rejecting `realpath@GLIBC_2.2.5`, and which one a
+            //     first-source-wins map keeps is a fact about `.dynsym`
+            //     ORDER. Leaving a compat row unversioned preserves today's
+            //     behaviour exactly: the reference binds the default.
+            // (b) ONLY ABOUT THE FILE WE ACTUALLY READ. `meta.importLibrary`
+            //     above may be a caller's DECLARED identity that deliberately
+            //     differs from the binary on disk — the cross-compilation
+            //     stand-in / `.tbd` contract (D-FFI-DECLARED-IMPORT-NAME).
+            //     The verneed we emit names `importLibrary`, so requesting a
+            //     version we saw in a DIFFERENT file would demand it of a
+            //     library whose version set we never observed, turning a
+            //     working link into a load-time failure. When the declared
+            //     identity agrees with what the file says about itself (or
+            //     there was no declaration), the file IS the library named
+            //     and its versions are ours to request.
+            if (obs.has_value() && obs->isDefaultVersion) {
+                std::string const& observedIdentity =
+                    matched.row.soname.empty() ? matched.row.libraryPath
+                                               : matched.row.soname;
+                if (meta.importLibrary == observedIdentity) {
+                    meta.version = obs->name;
+                }
+            }
+        }
         // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker (parity
         // with the FF5 source-decl path). Eager imports flow through
         // `synthesizeFfiFromSourceDecls`, not this binary-reader path — but an

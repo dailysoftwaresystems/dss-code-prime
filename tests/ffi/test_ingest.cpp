@@ -26,6 +26,7 @@
 #include "hir/hir_node.hpp"
 #include "link/object_format_schema.hpp"
 #include "byte_emit.hpp"
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -36,6 +37,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace dss;
@@ -1246,4 +1248,132 @@ TEST(FfiSynthesize, DiagnosticCodeNameRoundTripFFfiNoImportLibraryForFormat) {
     EXPECT_EQ(diagnosticCodeName(
                   DiagnosticCode::F_FfiNoImportLibraryForFormat),
               "F_FfiNoImportLibraryForFormat");
+}
+
+// ── TF-C124: an OBSERVED symbol version reaches FfiMetadata ──────────────
+// D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION.
+//
+// c156 built the rail that turns `FfiMetadata.version` into a
+// `.gnu.version_r` requirement in the emitted image, but the ONLY thing that
+// could ever put a string on that rail was a shipped DESCRIPTOR's declared
+// `version`. Every third-party library this project links (Tcl, zlib) has no
+// descriptor, so for those the mechanism was unreachable: a
+// `--resolve-library` import was unversioned no matter what the library said
+// about itself. These pin the second source — the binary's own record —
+// through the SHIPPED reader, against a REAL GNU ld 2.42 library
+// (`tests/ffi/data/libdssver.so.1`; see the header comment on the
+// `BinaryReaderElfSymbolVersion` suite for why it is a file and not
+// synthesized bytes).
+namespace {
+
+[[nodiscard]] fs::path versionedFixturePath() {
+    return dss::test::repoRoot() / "tests" / "ffi" / "data" / "libdssver.so.1";
+}
+
+// Run `ingest()` over the real versioned library, binding ONE extern.
+// `declaredVersion` is the DESCRIPTOR's declaration (level 1 of the version
+// decision); `declaredImportName` is the caller-STATED runtime identity.
+struct VersionIngestOutcome {
+    FfiMetadata meta;
+    bool        annotated = false;
+};
+
+[[nodiscard]] VersionIngestOutcome ingestOneFromVersionedLibrary(
+    std::string const& canonicalName,
+    std::string_view   declaredVersion    = {},
+    std::string const& declaredImportName = {}) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    EXPECT_TRUE(format.has_value());
+    if (!target || !format) return {};
+
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleWithExtern(ti);
+    HirFfiMap ffi{built.hir};
+    DiagnosticReporter rep;
+    std::array sources{IngestionSource{BinaryLibrarySource{
+        versionedFixturePath(), "libdssver-basename.so", declaredImportName}}};
+    std::array externs{ExternDeclRef{built.externNode, canonicalName, {},
+                                     false, declaredVersion}};
+    auto const result =
+        ingest(sources, externs, **target, **format, ffi, rep);
+    auto const* meta = ffi.tryGet(built.externNode);
+    return VersionIngestOutcome{meta != nullptr ? *meta : FfiMetadata{},
+                                result.externsAnnotated == 1u};
+}
+
+} // namespace
+
+TEST(FfiIngest, ObservedDefaultSymbolVersionReachesFfiMetadata) {
+    auto const out = ingestOneFromVersionedLibrary("dss_ver_default");
+    ASSERT_TRUE(out.annotated);
+    // The identity is the binary's own DT_SONAME (level 2 beats the
+    // basename), and the version is the one THAT library records for THAT
+    // export. Both come from the same file, which is the invariant the
+    // stand-in guard below protects.
+    EXPECT_EQ(out.meta.importLibrary, "libdssver.so.1");
+    EXPECT_EQ(out.meta.version, "DSSVER_2.0")
+        << "the reader saw dss_ver_default@@DSSVER_2.0; without this the "
+           "import would be emitted unversioned and bind whatever ld.so "
+           "considers default at RUN time";
+}
+
+TEST(FfiIngest, ObservedUnversionedExportStaysUnversioned) {
+    auto const out = ingestOneFromVersionedLibrary("dss_ver_plain");
+    ASSERT_TRUE(out.annotated);
+    EXPECT_EQ(out.meta.importLibrary, "libdssver.so.1");
+    EXPECT_TRUE(out.meta.version.empty())
+        << "this export carries versym VER_NDX_GLOBAL — there is no version "
+           "to request, and inventing one would emit a verneed for a version "
+           "the library does not define";
+}
+
+TEST(FfiIngest, DeclaredSymbolVersionOutranksTheObservedOne) {
+    // A descriptor's declaration is a statement about the RUNTIME library;
+    // the observation is a fact about the file we happened to read. Same
+    // ordering, and for the same reason, as declaredImportName > soname.
+    auto const out =
+        ingestOneFromVersionedLibrary("dss_ver_default", "DSSVER_1.0");
+    ASSERT_TRUE(out.annotated);
+    EXPECT_EQ(out.meta.version, "DSSVER_1.0")
+        << "the declaration must win; the observed DSSVER_2.0 must not "
+           "silently overwrite what a descriptor pinned on purpose";
+}
+
+TEST(FfiIngest, ObservedNonDefaultCompatVersionIsNeverPinned) {
+    // ★ THE ONE THAT MATTERS. `dss_ver_compat` has TWO definitions in this
+    // library: the NON-default `@DSSVER_1.0` compat instance at .dynsym
+    // index 1, and the default `@@DSSVER_2.0` at index 3. `ingest()` is
+    // first-source-wins, so the row it keeps is the COMPAT one — purely
+    // because of where ld placed it in `.dynsym`.
+    //
+    // Pinning that observation would emit a verneed requiring DSSVER_1.0 and
+    // MANUFACTURE the very bug D-LK-ELF-SYMBOL-VERSIONING was opened for:
+    // glibc exports both `realpath@@GLIBC_2.3` and the NULL-buffer-rejecting
+    // `realpath@GLIBC_2.2.5`, and binding the latter is what made a DSS
+    // binary print REALPATH_NULL and exit 3. Leaving a compat row unversioned
+    // preserves the pre-TF-C124 behaviour exactly: the reference binds the
+    // library's default.
+    auto const out = ingestOneFromVersionedLibrary("dss_ver_compat");
+    ASSERT_TRUE(out.annotated);
+    EXPECT_TRUE(out.meta.version.empty())
+        << "got '" << out.meta.version << "' — a NON-default (VERSYM_HIDDEN) "
+           "compat version must never be requested from a mere observation";
+}
+
+TEST(FfiIngest, ObservedVersionIsNotPinnedOntoADeclaredStandInIdentity) {
+    // D-FFI-DECLARED-IMPORT-NAME lets a caller read symbols out of a
+    // cross-compilation STAND-IN whose runtime counterpart is a different
+    // file. The emitted verneed names the DECLARED identity, so requesting a
+    // version observed in the stand-in would demand it of a library whose
+    // version set we never looked at — turning a working link into a
+    // load-time failure on the target.
+    auto const out = ingestOneFromVersionedLibrary(
+        "dss_ver_default", {}, "libdssver-runtime.so.1");
+    ASSERT_TRUE(out.annotated);
+    EXPECT_EQ(out.meta.importLibrary, "libdssver-runtime.so.1");
+    EXPECT_TRUE(out.meta.version.empty())
+        << "got '" << out.meta.version << "' — the version was observed in a "
+           "DIFFERENT file than the one this import will bind at runtime";
 }
