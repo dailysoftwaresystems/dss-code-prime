@@ -4655,6 +4655,16 @@ MIRROR_PAIRS = [
     {"sh": "str_gt", "ps1": None, "differential": "",
      "why": "byte-wise string comparison: PowerShell has "
             "[StringComparer]::Ordinal natively."},
+    {"sh": "first_file_after", "ps1": None, "differential": "",
+     "why": "a .sh-only hazard, not a missing capability. The sh driver runs under "
+            "`set -Eeuo pipefail`, where `files_after | head -1` returns 141 (SIGPIPE) "
+            "as soon as there is MORE THAN ONE match, because head closes the pipe — "
+            "measured, and it killed a real run inside the resume path. This helper "
+            "does the same job with `awk '{ print; exit }'`, no pipe. PowerShell has "
+            "no pipeline exit status to propagate and no SIGPIPE: verified, 5000 items "
+            "through `Select-Object -First 1` completes cleanly, and the .ps1's "
+            "Get-FilesAfter callers consume the WHOLE list anyway. So a twin would be "
+            "ceremony, not coverage."},
     {"sh": "ps_enum_available", "ps1": None, "differential": "",
      "why": "probes whether `ps -eo pid=,args=` can enumerate at all; the .ps1 "
             "uses Get-CimInstance, which has no equivalent failure mode to "
