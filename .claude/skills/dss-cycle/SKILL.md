@@ -62,6 +62,30 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      two `sel()`s emitted 4 `And`s, so dropping the clamp `And` stayed green). Pin the guarded
      value's **operand chain** (e.g. assert `Shl.operand[1]` IS the clamp `And`, not a bare `Sub`)
      and **demonstrate red-on-disable** by actually removing the guard, not merely asserting present.
+   - **★★ THE RED-ON-DISABLE DEMONSTRATION NEEDS ITS OWN GUARD — ASSERT THE MUTATION LANDED.**
+     Red-on-disable is this project's PRIMARY defence against vacuous tests (five vacuity species
+     in three cycles were each caught by it and by nothing else). It is therefore the one technique
+     whose own failure is unbounded: **a mutation that silently no-ops makes the pin report green,
+     and that green reads exactly like earned confidence.** ✔MEASURED 2026-08-06: a mutator process
+     was killed by a cygwin fork error before it edited anything; the pin passed, as it correctly
+     should have, and was briefly read as "the guard is not vacuous"
+     (`D-GATE-RED-ON-DISABLE-MUTATION-CAN-SILENTLY-NO-OP`). So every demonstration must be
+     **fail-closed**: the witness text is UNIQUE in the subject, the mutant DIFFERS byte-wise
+     (`cmp`/hash — **never a line count**, which a same-length replacement slips straight past),
+     the witness is ABSENT from the mutant, and the mutant still parses. Never infer that a mutator
+     ran from its exit code alone. **Never anchor a mutation to absolute line numbers** — it can
+     delete the wrong lines and produce a false red, which is untrustworthy in the other direction.
+   - **★★ A PIN MUST DRIVE ITS SUBJECT THROUGH THE SUBJECT'S REAL INPUT PATH — never re-type its
+     data.** ✔MEASURED 2026-08-06: a pin stubbed a driver's vocabulary list with eight hand-typed
+     tokens — clean by construction, in a shape the driver NEVER RECEIVES — and so could not see
+     that the real path returned `ran\r` on Windows (Python writes stdout in text mode; `read -r`
+     strips `\n` and keeps `\r`), which would have made the driver reject EVERY legitimate token
+     and fail every run (`D-TEST-A-PIN-THAT-STUBS-ITS-SUBJECTS-INPUT-IS-TESTING-THE-STUB`).
+     **A pin that supplies its subject's input in a form the subject never sees is testing the
+     stub.** Extract and execute the shipped code path. Where a stub is genuinely unavoidable,
+     assert the stub matches what the real path produces. ★ And prefer assertions on **CONTENT**
+     over **COUNT**: "eight tokens" was satisfied by eight corrupted tokens; "the tokens are clean"
+     was not.
    - **Multi-site / multi-form contracts** — the "apply X at every site/form of class C"
      class (e.g. "strip the specifier prefix at every positional decl resolution"). A green
      suite over a SUBSET of the sites/forms is NOT proof: latent misses at the unexercised
@@ -211,6 +235,27 @@ operator**.
 1. **Label every factual claim MEASURED / DOCUMENTED / INFERRED.** Never let an inferred
    claim wear the voice of a measured one. "I verified X" and "X is documented to be true"
    and "X follows from Y" are three different statements with three different failure modes.
+1b. **★★ BEFORE COMMISSIONING AN EXPERIMENT, GREP THE REGISTRY FOR A MATCHED CONTROL THAT
+   ALREADY EXISTS.** Search `_deferred-anchor-registry.md` for the failing artefact, the leg,
+   the test family and the symptom — then CITE what you find, or state explicitly that nothing
+   matched. ✔MEASURED 2026-08-06: a 2×2 attribution (compiler × rundir filesystem) was
+   commissioned from scratch for 57 sqlite failures; the identical experiment with the identical
+   verdict was **already in the registry** from seven cycles earlier
+   (`D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS`), and the row was findable — the leg name, the
+   driver and the word `rundir` all appear in it. ⇒ **the cost was not the duplicated work: the
+   un-cited row would have pre-empted THREE FALSE STATEMENTS that reached a commit** ("previously
+   green", "the Tcl move is the prime suspect", "the WAL/journal TIMING family"). ★ THE FAILURE
+   MODE IS SPECIFIC AND WORTH NAMING: I searched MEMORY for a matching *confound* and recall
+   surfaced a plausible NEIGHBOUR (the WSL2 clock defect — real, but the wrong population); a
+   grep would have surfaced the exact CONTROL. **Recall finds what is similar; grep finds what
+   is the same.** ⇒ anchoring every issue is worthless if the next cycle does not READ the
+   anchors before investigating (`D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE`).
+1c. **★ READ THE ASSERTION VALUES, NOT THE TEST NAMES.** ✔MEASURED the same day: a 57-failure
+   population named `wal2-*`, `walsetlk-*`, `journal3-*`, `e_walauto-*` was diagnosed as the
+   WAL/journal *timing* family and routed to a known clock defect. The values said
+   `expected [00644 00400 00644]` / `got [00777 00555 00777]` — it was the file-**permission**
+   family, and only 1 of the 57 was clock-related. A test's NAME is a label someone chose; its
+   ASSERTION is the measurement. Reading the values is what cracked it.
 2. **Never state what a loader/parser/config accepts, rejects, or defaults to without
    reading it.** "The sibling family does X" is a hypothesis. (Original case: `.format.json`
    was asserted twice to enforce a closed root-key set, and at the time it did not — unknown
