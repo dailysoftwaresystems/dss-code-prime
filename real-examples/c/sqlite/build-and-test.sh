@@ -3372,6 +3372,17 @@ resolve_abort_file() {         # resolve_abort_file <lasttest> <corpus-list-file
 # Every corpus basename byte-wise AFTER <boundary> — the SQLITE_TEST_PATTERN_LIST
 # superset sqlite intersects with the permutation's own -files.
 files_after() { LC_ALL=C awk -v b="$1" '$0 > b' "$2"; }
+# The FIRST basename after <boundary>, done inside awk rather than `files_after | head -1`.
+# ★ MEASURED 2026-08-06 (TF-C124): that pipeline returns **141 (SIGPIPE)** whenever there is
+#   more than one match — `head` closes the pipe, and under this driver's `set -Eeuo pipefail`
+#   the non-zero pipeline status is FATAL. It killed a real run inside the resume path, i.e.
+#   inside the very code whose job is to SURVIVE an abort.
+# ⚠ THE SHAPE IS WHY IT HID SO LONG: it fails on the NORMAL case (matches exist) and returns
+#   0 on the EMPTY one (no matches). So it could only fire once a leg actually needed a
+#   SECOND resume — every earlier run either resumed once or not at all.
+# ⇒ `exit` after the first hit: no pipe, so no SIGPIPE, and the intent is stated rather than
+#   implied by a downstream `head`.
+first_file_after() { LC_ALL=C awk -v b="$1" '$0 > b { print; exit }' "$2"; }
 # thousands separators, locale-free (a 4.2M headline is unreadable without them)
 group_digits() {
   LC_ALL=C awk -v n="$1" 'BEGIN{ s=sprintf("%d", n); out=""
@@ -5300,7 +5311,7 @@ for leg in "${LEG_ORDER[@]}"; do
     if [[ -z "$boundary" ]] || ! str_gt "$boundary" "$s_done"; then boundary="$s_done"; fi
     if ! str_gt "$boundary" "$last_boundary"; then
       forced=1
-      boundary="$(files_after "$last_boundary" "$scratch/files.txt" | head -1)"
+      boundary="$(first_file_after "$last_boundary" "$scratch/files.txt")"
     fi
     ABORTS+=("${perm:-?}/${abort_file:-?}")
     if [[ -n "$SEG_KILL_REASON" ]]; then how="KILLED: $SEG_KILL_REASON"; else how="rc=$segrc"; fi
