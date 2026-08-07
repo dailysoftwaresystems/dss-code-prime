@@ -3019,6 +3019,14 @@ function Read-CorpusSegment($logPath) {
     # `Time:` line, not an ` Ok`, not a summary. CONSULTED ONLY on the
     # zero-progress abort path, so it can never mislabel a healthy segment.
     Diagnostic = ''
+    # ── THE FILES THE TCL TRACEBACKS BLAME ───────────────────────────────────
+    # [D-HARNESS-ABORT-FILE-NAMED-ONLY-BY-THE-TRACEBACK.] One entry per traceback
+    # block, each the INNERMOST `(file "..." line N)` frame of its block — Tcl
+    # prints errorInfo innermost-first, so that is the unit that died and the
+    # later frames are permutations.test / veryquick.test driving it. The .sh
+    # sibling emits these as `B` facts and its header carries the measurement
+    # that motivated them; the LAST entry is the one the caller wants.
+    Blamed = New-Object 'System.Collections.Generic.List[string]'
   }
   $reSummary = [regex]'(\d+) errors? out of (\d+) tests'
   $reTime    = [regex]'^Time: (\S+) \d+ ms$'
@@ -3028,6 +3036,8 @@ function Read-CorpusSegment($logPath) {
   # (tester.tcl ~1304, `output2 -nonewline "!Failures on these tests:"`).
   $reFails   = [regex]'^!?Failures on these tests:\s*(.+)$'
   $rePerm    = [regex]'^"?(?:run_test_suite|run_tests)\s+([A-Za-z_][A-Za-z0-9_]*)'
+  $reBlame   = [regex]'\(file "([^"]*)" line \d+\)'
+  $tbSeen    = $false
   foreach ($line in [System.IO.File]::ReadLines($logPath)) {
     if ($line.Length -eq 0) { continue }
     # FIRST, before any `continue` below: a rule placed lower would never see a
@@ -3042,6 +3052,24 @@ function Read-CorpusSegment($logPath) {
     # Per-test tally. An ABORTED segment never prints a summary, so these counts are
     # the ONLY record of the work it did — see the derivation note at the union.
     if ($line.EndsWith(' Ok', [System.StringComparison]::Ordinal)) { $r.OkLines++ }
+    # ONE BLAMED FILE PER TRACEBACK. The flag is cleared by any line of NORMAL
+    # fixture output, so a block contributes exactly its first (innermost) frame
+    # and a later traceback contributes its own. Placed here, above the $c
+    # dispatch, for the same reason the .sh rule sits above its first `next`: a
+    # traceback line starts with spaces and would otherwise fall through every
+    # rule below, which is fine today and would stop being fine the moment one of
+    # them grows a `continue`.
+    if ($line.StartsWith('Time: ', [System.StringComparison]::Ordinal) -or
+        $line.EndsWith(' Ok', [System.StringComparison]::Ordinal) -or
+        $reTest.IsMatch($line)) { $tbSeen = $false }
+    if (-not $tbSeen) {
+      $mb = $reBlame.Match($line)
+      if ($mb.Success) {
+        $tbSeen = $true
+        $b = $mb.Groups[1].Value.Replace("`t", ' ')
+        if ($b) { $r.Blamed.Add($b) }
+      }
+    }
     $c = $line[0]
     if ($c -eq 'T') { $m = $reTime.Match($line);  if ($m.Success) { $r.Completed.Add($m.Groups[1].Value); continue } }
     if ($c -eq '!') {
@@ -3077,12 +3105,31 @@ function Read-CorpusSegment($logPath) {
   return $r
 }
 
-# Which corpus FILE was the fixture inside when it died? The last test it emitted
-# names it: pick the corpus stem that occurs RIGHTMOST in that test name on
-# delimiter boundaries (rightmost, then longest). `inmemory_journal.swarmvtabfault
-# -1.1-oom-persistent.143` -> swarmvtabfault.test (not swarmvtab.test: the 'f'
-# after it is not a delimiter; not the leading permutation token: it is left of it).
+# Which corpus FILE was the fixture inside when it died? Two things can name it,
+# and this resolver takes EITHER: a qualified test NAME (LastTest) or the SOURCE
+# PATH a Tcl traceback blames (Blamed). Pick the corpus stem that occurs RIGHTMOST
+# in it on delimiter boundaries (rightmost, then longest).
+# `inmemory_journal.swarmvtabfault-1.1-oom-persistent.143` -> swarmvtabfault.test
+# (not swarmvtab.test: the 'f' after it is not a delimiter; not the leading
+# permutation token: it is left of it).
+#
+# ★★ THE DIRECTORY PREFIX IS DISCARDED FIRST, ON EITHER SEPARATOR, AND THAT IS
+# WHAT MAKES THIS NAMESPACE-AGNOSTIC. The corpus list is a list of BASENAMES
+# (Get-CorpusFiles built it from .Name), so "which corpus file is this" is a
+# question about the last path component and nothing else — whose namespace the
+# prefix belongs to is then irrelevant. ✔MEASURED on the pe64 wine run: ONE log
+# carried `(file "Z:/home/.../symlink2.test" line 48)` (the launcher's spelling,
+# because wine resolved that path itself) beside `(file "/home/.../veryquick.test"
+# line 16)` (the driver's own argv, handed back verbatim), and NEITHER resolved —
+# not a wine quirk, since `/` was never one of the `.`/`-` delimiters this matcher
+# accepts. No path TRANSLATION is done and none is declared; see the .sh sibling's
+# header for why a `pathTranslation` verb would be the wrong instrument.
+# [System.IO.Path]::GetFileName is deliberately NOT used: it honours the HOST's
+# separators, and this input comes from a foreign namespace.
 function Resolve-AbortFile($lastTest, $corpusFiles) {
+  if (-not $lastTest) { return '' }
+  $cut = [Math]::Max($lastTest.LastIndexOf('/'), $lastTest.LastIndexOf('\'))
+  if ($cut -ge 0) { $lastTest = $lastTest.Substring($cut + 1) }
   if (-not $lastTest) { return '' }
   $bestFile = ''; $bestIdx = -1; $bestLen = -1
   foreach ($f in $corpusFiles) {
@@ -4328,7 +4375,21 @@ while ($si -lt $segments.Count) {
     $perm = $TierPerms[0]
     $permInferred = "INFERRED — no permutation prefix ever appeared, so the run never left '$($TierPerms[0])', the tier's first suite"
   }
-  $abortFile = Resolve-AbortFile $res.LastTest $CorpusFiles
+  # THE TRACEBACK FIRST, THE TEST NAME SECOND. The blamed frame is the fixture
+  # SAYING which file it was in; the last test name is a PROXY for it, and a
+  # measured-wrong one — the pe64 wine run resolved `symlink.test-sharedcache
+  # setting` to symlink.test, a file whose own `Time:` line was already in the
+  # same log, while the traceback named symlink2.test. LastTest stays because a
+  # KILLED segment prints no traceback at all, which is when resume matters most.
+  $blamed = if ($res.Blamed.Count) { $res.Blamed[$res.Blamed.Count - 1] } else { '' }
+  $abortSource = ''
+  $abortFile = Resolve-AbortFile $blamed $CorpusFiles
+  if ($abortFile) {
+    $abortSource = "named by the Tcl traceback ($blamed)"
+  } else {
+    $abortFile = Resolve-AbortFile $res.LastTest $CorpusFiles
+    if ($abortFile) { $abortSource = "INFERRED from the last test name ($($res.LastTest))" }
+  }
   # The boundary must STRICTLY advance every resume, or an aborting file could be
   # re-entered forever. If the aborting file could not be named (or is not past the
   # last completed one), fall back to the last completed file and then force the
@@ -4351,14 +4412,22 @@ while ($si -lt $segments.Count) {
   Info  "        permutation        : $(if ($perm) { $perm } else { '(UNDETERMINED)' })$(if ($permInferred) { "   [$permInferred]" })"
   Info  "        last file completed: $(if ($lastDone) { $lastDone } else { '(none)' })"
   Info  "        died inside file   : $(if ($abortFile) { $abortFile } else { '(unresolved)' })   last test: $(if ($res.LastTest) { $res.LastTest } else { '(none)' })"
+  Info  "        how it was named   : $(if ($abortSource) { $abortSource } else { '(could not be named — no traceback frame and no resolvable test name)' })"
   # The unit that died NEVER goes unreported — named when we can name it, described
   # by what we do know when we cannot. Silence about a unit is the defect.
   if ($abortFile) {
-    $notReached += "the REMAINDER of $abortFile under permutation '$(if ($perm) { $perm } else { '?' })' (aborted at $($res.LastTest))"
+    # "last test emitted", not "aborted at": the two are the same thing only when
+    # the file got as far as a do_test. symlink2.test died before its first one,
+    # so the last name in that log belonged to the PREVIOUS file — which is
+    # exactly the confusion the old wording invited.
+    $notReached += "the REMAINDER of $abortFile under permutation '$(if ($perm) { $perm } else { '?' })' ($(if ($abortSource) { $abortSource } else { 'source unrecorded' }); last test emitted: $(if ($res.LastTest) { $res.LastTest } else { 'none' }))"
   } else {
     $what = if ($forced) { "the resume boundary was FORCED to $(if ($boundary) { $boundary } else { 'the end of the corpus' }), so that one file may have been skipped without a verdict" }
             else { "the next segment resumes from $(if ($boundary) { $boundary } else { 'the end of the corpus' }) and will RE-ATTEMPT it" }
-    $notReached += "the UNNAMED file that aborted under permutation '$(if ($perm) { $perm } else { '?' })' after $(if ($lastDone) { $lastDone } else { 'the start of the permutation' }) — the log named no resolvable corpus file (last test: $(if ($res.LastTest) { $res.LastTest } else { 'none' })); $what"
+    # The traceback frame, when there was one, goes IN the report even though it
+    # did not resolve: "the log named nothing" and "the log named something that
+    # is not in this corpus" are different facts and the reader needs the second.
+    $notReached += "the UNNAMED file that aborted under permutation '$(if ($perm) { $perm } else { '?' })' after $(if ($lastDone) { $lastDone } else { 'the start of the permutation' }) — the log named no resolvable corpus file (last test: $(if ($res.LastTest) { $res.LastTest } else { 'none' }); traceback frame: $(if ($blamed) { $blamed } else { 'none' })); $what"
   }
   Get-Content $log -Tail 6 | ForEach-Object { Info "      $_" }
 

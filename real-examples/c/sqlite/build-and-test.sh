@@ -3296,6 +3296,7 @@ tier_permutations() {          # tier_permutations <tierfile>
 #   N <n>     completed file count       D <file>  the LAST completed file
 #   E <n>     errors      C <n>          tests     (parsed out of the summary line)
 #   K <n>     lines ending " Ok"         Q <n>     `! <name> expected:` lines
+#   B <path>  the SOURCE FILE a Tcl traceback blames, once per traceback
 # K and Q are the per-test tally: for a segment that ABORTED they are the ONLY
 # record of the work it did (no summary line exists) — see the union's derivation.
 # S is the WHOLE line ("0 errors out of 9 tests on <host> …"), which is what this
@@ -3335,6 +3336,44 @@ parse_segment() {              # parse_segment <log> <out-facts>
         gsub(/\t/, " ", diag)                 # the fact file is TAB-separated
         if (length(diag) > 400) diag = substr(diag, 1, 400) " …[truncated]"
       } }
+    # ── THE FILE THE TCL TRACEBACK BLAMES ────────────────────────────────────
+    # [D-HARNESS-ABORT-FILE-NAMED-ONLY-BY-THE-TRACEBACK.]
+    # ✔MEASURED 2026-08-06, pe64-x86_64 under the wine launcher, and it cost a
+    # unit its verdict TWICE IN ONE RUN in two different ways:
+    #   · corpus.log completed `Time: symlink.test 26 ms` and then died inside
+    #     symlink2.test. The last test NAME it had emitted was
+    #     `symlink.test-sharedcachesetting`, so the name-based resolver below
+    #     answered symlink.test — A FILE THAT HAD ALREADY COMPLETED AND BEEN
+    #     COUNTED — and the run reported "the REMAINDER of symlink.test" as not
+    #     run while symlink2.test, the file that actually died, went unnamed.
+    #   · the resume segment then re-entered symlink2.test, died at its line 48
+    #     BEFORE `do_test` printed a single `name...` line, and with T empty the
+    #     resolver had no input at all: "the UNNAMED file that aborted ... (last
+    #     test: none)", boundary FORCED, symlink2.test skipped without a verdict.
+    # In BOTH logs the file was named, in plain text, by the Tcl traceback:
+    #     (file "Z:/home/rafael/src/sqlite/test/symlink2.test" line 48)
+    # Nothing read it. The last test NAME is a PROXY for the aborting file; the
+    # traceback is the fixture SAYING it, so B is preferred over T at the use
+    # site and T stays as the fallback for a KILLED segment, which has no
+    # traceback at all.
+    # ★ ONE B PER TRACEBACK, and it is the INNERMOST frame: Tcl prints errorInfo
+    # innermost-first, so the first `(file …)` of a block is the unit that died
+    # and the later ones are permutations.test / veryquick.test driving it. The
+    # flag is cleared by any line of NORMAL fixture output (a `Time:`, an ` Ok`,
+    # a `name...`), so a block emits exactly one frame and a later traceback
+    # emits its own. `fact B` returns the LAST, i.e. the innermost frame of the
+    # last traceback — the one the process died in.
+    # NOTE no `next`: this rule is purely ADDITIVE and must not consume a line
+    # any existing rule below would otherwise have counted.
+    { if ($0 ~ /^Time: / || $0 ~ / Ok$/ || $0 ~ /^[^ \t]+\.\.\./) tbseen = 0 }
+    match($0, /\(file "[^"]*" line [0-9]+\)/) {
+      if (!tbseen) {
+        tbseen = 1
+        blame = substr($0, RSTART, RLENGTH)
+        sub(/^\(file "/, "", blame); sub(/" line [0-9]+\)$/, "", blame)
+        gsub(/\t/, " ", blame)                # the fact file is TAB-separated
+        if (blame != "") print "B\t" blame
+      } }
     /^Time: / { if (NF==4 && $4=="ms") { print "F\t" $2; nf++; lastdone=$2; next } }
     /^\*\*\* Giving up/ { gaveup=1; next }
     /^!?Failures on these tests:/ {
@@ -3367,14 +3406,44 @@ parse_segment() {              # parse_segment <log> <out-facts>
 }
 fact() { LC_ALL=C awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v}' "$2"; }
 facts() { LC_ALL=C awk -F'\t' -v k="$1" '$1==k{print $2}' "$2"; }
-# Which corpus FILE was the fixture inside when it died? The last test it emitted
-# names it: pick the corpus stem occurring RIGHTMOST in that test name on delimiter
-# boundaries (rightmost, then longest). `inmemory_journal.swarmvtabfault-1.1-oom-
-# persistent.143` -> swarmvtabfault.test (not swarmvtab.test: the 'f' after it is
-# not a delimiter; not the leading permutation token: it is left of it).
-resolve_abort_file() {         # resolve_abort_file <lasttest> <corpus-list-file>
+# Which corpus FILE was the fixture inside when it died? Two things can name it,
+# and this resolver takes EITHER: a qualified test NAME (the T fact) or the SOURCE
+# PATH a Tcl traceback blames (the B fact). Pick the corpus stem occurring
+# RIGHTMOST in it on delimiter boundaries (rightmost, then longest).
+# `inmemory_journal.swarmvtabfault-1.1-oom-persistent.143` -> swarmvtabfault.test
+# (not swarmvtab.test: the 'f' after it is not a delimiter; not the leading
+# permutation token: it is left of it).
+#
+# ★★ THE DIRECTORY PREFIX IS DISCARDED FIRST, ON EITHER SEPARATOR, AND THAT IS
+# WHAT MAKES THIS NAMESPACE-AGNOSTIC. The corpus list this matches against is a
+# list of BASENAMES — corpus_files() built it with `${f##*/}` — so the question
+# "which corpus file is this" is a question about the last path component and
+# nothing else. Whose namespace the prefix belongs to is then IRRELEVANT, which
+# is the property we want: the same log carries BOTH
+#     (file "Z:/home/rafael/src/sqlite/test/symlink2.test" line 48)     <- launcher
+#     (file "/home/rafael/src/sqlite/test/veryquick.test" line 16)      <- driver
+# because wine spells a path it resolved itself on its own Z: drive while the
+# driver-supplied argv comes back verbatim. NEITHER resolved before this change
+# (✔MEASURED: both answered EMPTY, so this is not a wine quirk — a plain POSIX
+# path did not resolve either, because `/` is not one of the `.`/`-` delimiters
+# the stem matcher accepts).
+# ⇒ NO path TRANSLATION is performed and none is declared. A `pathTranslation`
+# verb would be the wrong instrument twice over: it is defined for the ARGV
+# direction (how a launcher must be HANDED a path), and no single verb could be
+# right for a log that carries two namespaces at once. Reducing to the granularity
+# the corpus list is already in answers both without knowing either.
+#
+# ★ THE NAME ARRIVES THROUGH THE ENVIRONMENT, NOT `awk -v`. ✔MEASURED on this
+# host, gawk 5.3.2: `awk -v n='Z:\home\rafael\test'` yields `Z:homeafael<TAB>est`
+# — -v runs ESCAPE PROCESSING over its value, so `\h` collapses and `\t` becomes a
+# tab. That was harmless while this only ever saw test names; the moment it can
+# be handed a PATH it silently corrupts the input. ENVIRON is byte-exact (measured
+# in the same probe), and it is the same reason our_fixture_pids uses it.
+resolve_abort_file() {         # resolve_abort_file <name-or-path> <corpus-list-file>
   [[ -n "$1" ]] || return 0
-  LC_ALL=C awk -v name="$1" '
+  DSS_ABORT_NAME="$1" LC_ALL=C awk '
+    BEGIN { name = ENVIRON["DSS_ABORT_NAME"]
+            sub(/^.*\//, "", name); sub(/^.*\\/, "", name) }
     { f=$0; stem=f; sub(/\.test$/,"",stem); L=length(stem)
       off=0; s=name; best=0
       while (1) {
@@ -5221,6 +5290,9 @@ for leg in "${LEG_ORDER[@]}"; do
     s_sum="$(fact S "$facts_f")"; s_perm_log="$(fact P "$facts_f")"
     s_last="$(fact T "$facts_f")"; s_done="$(fact D "$facts_f")"
     s_nf="$(fact N "$facts_f")";   s_gaveup="$(fact G "$facts_f")"
+    # `fact` returns the LAST value for a key, so this is the innermost frame of
+    # the LAST traceback — see the B rule in parse_segment.
+    s_blame="$(fact B "$facts_f")"
     s_ok="$(fact K "$facts_f")";   s_fx="$(fact Q "$facts_f")"
     s_diag="$(fact A "$facts_f")"
     files_done=$((files_done + s_nf))
@@ -5321,7 +5393,20 @@ for leg in "${LEG_ORDER[@]}"; do
       perm="${TIER_PERMS[0]}"
       perm_inferred="INFERRED — no permutation prefix ever appeared, so the run never left '${TIER_PERMS[0]}', the tier's first suite"
     fi
-    abort_file="$(resolve_abort_file "$s_last" "$scratch/files.txt")"
+    # THE TRACEBACK FIRST, THE TEST NAME SECOND. B is the fixture SAYING which
+    # file it was in; T is a PROXY for it, and a measured-wrong one — the pe64
+    # wine run resolved `symlink.test-sharedcachesetting` to symlink.test, a file
+    # whose own `Time:` line was already in the same log, while the traceback
+    # named symlink2.test. T stays because a KILLED segment prints no traceback at
+    # all, which is exactly when resume matters most.
+    abort_source=""
+    abort_file="$(resolve_abort_file "$s_blame" "$scratch/files.txt")"
+    if [[ -n "$abort_file" ]]; then
+      abort_source="named by the Tcl traceback ($s_blame)"
+    else
+      abort_file="$(resolve_abort_file "$s_last" "$scratch/files.txt")"
+      [[ -z "$abort_file" ]] || abort_source="INFERRED from the last test name ($s_last)"
+    fi
     # The boundary must STRICTLY advance every resume, or an aborting file could be
     # re-entered forever. If the aborting file could not be named (or is not past
     # the last completed one), fall back to the last completed file, then force the
@@ -5343,17 +5428,25 @@ for leg in "${LEG_ORDER[@]}"; do
     info "        permutation        : ${perm:-(UNDETERMINED)}${perm_inferred:+   [$perm_inferred]}"
     info "        last file completed: ${s_done:-(none)}"
     info "        died inside file   : ${abort_file:-(unresolved)}   last test: ${s_last:-(none)}"
+    info "        how it was named   : ${abort_source:-(could not be named — no traceback frame and no resolvable test name)}"
     # The unit that died NEVER goes unreported — named when we can name it,
     # described by what we do know when we cannot. Silence about a unit is the defect.
     if [[ -n "$abort_file" ]]; then
-      NOT_REACHED+=("the REMAINDER of $abort_file under permutation '${perm:-?}' (aborted at ${s_last:-?})")
+      # "last test emitted", not "aborted at": the two are the same thing only
+      # when the file got as far as a do_test. symlink2.test died before its
+      # first one, so the last name in that log belonged to the PREVIOUS file —
+      # which is exactly the confusion the old wording invited.
+      NOT_REACHED+=("the REMAINDER of $abort_file under permutation '${perm:-?}' (${abort_source:-source unrecorded}; last test emitted: ${s_last:-none})")
     else
       if [[ "$forced" == 1 ]]; then
         what="the resume boundary was FORCED to ${boundary:-the end of the corpus}, so that one file may have been skipped without a verdict"
       else
         what="the next segment resumes from ${boundary:-the end of the corpus} and will RE-ATTEMPT it"
       fi
-      NOT_REACHED+=("the UNNAMED file that aborted under permutation '${perm:-?}' after ${s_done:-the start of the permutation} — the log named no resolvable corpus file (last test: ${s_last:-none}); $what")
+      # The traceback frame, when there was one, goes IN the report even though it
+      # did not resolve: "the log named nothing" and "the log named something that
+      # is not in this corpus" are different facts and the reader needs the second.
+      NOT_REACHED+=("the UNNAMED file that aborted under permutation '${perm:-?}' after ${s_done:-the start of the permutation} — the log named no resolvable corpus file (last test: ${s_last:-none}; traceback frame: ${s_blame:-none}); $what")
     fi
     tail -6 "$seglog" 2>/dev/null | sed 's/^/      /'
 

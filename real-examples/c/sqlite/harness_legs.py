@@ -4808,6 +4808,47 @@ MIRROR_CASES = {
                 "foreach ($nm in (Get-Content -LiteralPath $NAMESFILE)) {\n"
                 "  \"$nm`t$(Resolve-AbortFile $nm $corpus)\" }"),
     },
+    # ── THE ABORTING FILE, END TO END, ON A REAL LOG ────────────────────────
+    #
+    # D-HARNESS-ABORT-FILE-NAMED-ONLY-BY-THE-TRACEBACK. This is the ONE case that
+    # drives the WHOLE chain the resume engine actually uses — parse_segment ->
+    # the B fact -> resolve_abort_file — rather than a helper in isolation, and
+    # it drives it on `REAL_ABORT_SEGMENT_LOG`, the verbatim bytes of a segment
+    # log this harness really produced and really failed to read (provenance on
+    # that constant).
+    #
+    # ★ IT CARRIES AN `expect`, so it is checked for being RIGHT and not merely
+    # for the two drivers AGREEING. Agreement is the property the rest of this
+    # battery can offer, and it is a real one, but two copies of a resolver that
+    # both answer "" agree perfectly — which is precisely the state this case was
+    # written to end.
+    "abort-file-from-traceback": {
+        "sh": ('parse_segment "$ABORTLOG" "$ABORTFACTS"\n'
+               'facts B "$ABORTFACTS" | sed "s/^/B /"\n'
+               'printf "T %s\\n" "$(fact T "$ABORTFACTS")"\n'
+               'printf "N %s\\n" "$(fact N "$ABORTFACTS")"\n'
+               'printf "FILE %s\\n" '
+               '"$(resolve_abort_file "$(fact B "$ABORTFACTS")" "$LISTFILE")"'),
+        "ps1": ("$corpus = @(Get-Content -LiteralPath $LISTFILE)\n"
+                "$r = Read-CorpusSegment $ABORTLOG\n"
+                "foreach ($b in $r.Blamed) { \"B $b\" }\n"
+                "\"T $($r.LastTest)\"\n"
+                "\"N $($r.Completed.Count)\"\n"
+                "$b = if ($r.Blamed.Count) { $r.Blamed[$r.Blamed.Count - 1] } else { '' }\n"
+                "\"FILE $(Resolve-AbortFile $b $corpus)\""),
+        # The exact answer, stated here rather than derived, because a derived
+        # expectation is the same code twice. `T` and `N` are EMPTY/0 on purpose:
+        # they are what the old resolver had to work with, and they are why it
+        # could say nothing. `B` is the innermost frame of the ONE traceback in
+        # that log — the outer `permutations.test` frame of the same block is
+        # correctly NOT emitted.
+        "expect": [
+            "B Z:/home/rafael/src/sqlite/test/symlink2.test",
+            "T",
+            "N 0",
+            "FILE symlink2.test",
+        ],
+    },
     "files-after": {
         "sh": 'files_after "$BOUNDARY" "$LISTFILE"',
         "ps1": ("$corpus = @(Get-Content -LiteralPath $LISTFILE)\n"
@@ -4819,12 +4860,14 @@ MIRROR_CASES = {
         "sh": ('parse_segment "$LOGFILE" "$FACTFILE"\n'
                'facts F "$FACTFILE"\n'
                'facts X "$FACTFILE" | LC_ALL=C sort -u | sed "s/^/X /"\n'
+               'facts B "$FACTFILE" | sed "s/^/B /"\n'
                'for k in S E C P T G N D K Q A; do\n'
                '  printf "%s %s\\n" "$k" "$(fact "$k" "$FACTFILE")"\n'
                'done'),
         "ps1": ("$r = Read-CorpusSegment $LOGFILE\n"
                 "foreach ($f in $r.Completed) { $f }\n"
                 "foreach ($n in ($r.FailNames.Keys | Sort-Object)) { \"X $n\" }\n"
+                "foreach ($b in $r.Blamed) { \"B $b\" }\n"
                 "\"S $($r.Summary)\"\n"
                 "\"E $(if ($r.Summary) { $r.Errors } else { '' })\"\n"
                 "\"C $(if ($r.Summary) { $r.Tests } else { '' })\"\n"
@@ -4853,6 +4896,79 @@ def _mirror_normalise(raw):
     while lines and lines[-1] == "":
         lines.pop()
     return lines
+
+
+# ── A REAL SEGMENT LOG, VERBATIM ────────────────────────────────────────────
+#
+# D-HARNESS-ABORT-FILE-NAMED-ONLY-BY-THE-TRACEBACK. These are the bytes of a log
+# THIS HARNESS PRODUCED AND THEN COULD NOT READ — not a reconstruction of one.
+#
+#   provenance  build/real-examples/c/sqlite/pe64-x86_64/corpus.resume1.log,
+#               captured 2026-08-06, 1621 bytes, md5
+#               7c32798f56de31a672648722447eefc5. Split on CRLF and re-joined
+#               with it below; the round-trip was checked against that md5.
+#
+# WHAT IT IS: the pe64-x86_64 testfixture under the `wine` launcher on a Linux
+# host, re-entering symlink2.test after the previous segment aborted inside it.
+# It died at symlink2.test line 48 — inside canCreateWin32Symlink, BEFORE the
+# first do_test — so the log contains not one `name...` line and the T fact is
+# EMPTY. The harness reported "the UNNAMED file that aborted ... (last test:
+# none)", forced the resume boundary past symlink2.test, and that unit went
+# through the entire run WITHOUT A VERDICT.
+#
+# And the file is named, in plain text, on line 10:
+#     (file "Z:/home/rafael/src/sqlite/test/symlink2.test" line 48)
+#
+# ⚠ DO NOT TIDY THIS. The `Z:` prefix, the backslash-spelled first line, the CRLF
+# terminators, the outer `permutations.test` frame that must NOT win, and the
+# truncated `run_tests … vacuum5.test..."` argv dump are each a shape one of the
+# two copies has to survive. A cleaned-up fixture is a fixture for a log that
+# does not exist.
+REAL_ABORT_SEGMENT_LOG = [
+    b'Z:\\home\\rafael\\src\\dss-code-prime\\build\\real-examples\\c\\sqlite\\pe64-x86_64\\pe64-x86_64-windows-exec\\testfixture.exe: Z:\\home\\rafael\\src\\sqlite\\test\\lnk220.sym: File Not Found',
+    b'    while executing',
+    b'"exec -- $::env(ComSpec) /c del [file nativename $link]"',
+    b'    (procedure "deleteWin32Symlink" line 2)',
+    b'    invoked from within',
+    b'"deleteWin32Symlink $link"',
+    b'    (procedure "canCreateWin32Symlink" line 6)',
+    b'    invoked from within',
+    b'"canCreateWin32Symlink"',
+    b'    (file "Z:/home/rafael/src/sqlite/test/symlink2.test" line 48)',
+    b'    invoked from within',
+    b'"source Z:/home/rafael/src/sqlite/test/symlink2.test"',
+    b'    invoked from within',
+    b'"interp eval tinterp $script"',
+    b'    (procedure "slave_test_script" line 30)',
+    b'    invoked from within',
+    b'"slave_test_script [list source $zFile] "',
+    b'    invoked from within',
+    b'"time { slave_test_script [list source $zFile] }"',
+    b'    (procedure "slave_test_file" line 23)',
+    b'    invoked from within',
+    b'"slave_test_file $file"',
+    b'    (procedure "run_tests" line 36)',
+    b'    invoked from within',
+    b'"run_tests veryquick -presql {} -files {shared3.test func7.test upfrom4.test Z:/home/rafael/src/sqlite/test/../ext/fts5/test/fts5misc.test vacuum5.test..."',
+    b'    ("eval" body line 1)',
+    b'    invoked from within',
+    b'"eval [list run_tests $suite] $S $extra"',
+    b'    (procedure "main" line 34)',
+    b'    invoked from within',
+    b'"main $argv"',
+    b'    (file "/home/rafael/src/sqlite/test/permutations.test" line 1270)',
+    b'    invoked from within',
+    b'"source $argv0"',
+    b'    invoked from within',
+    b'"if {[llength $argv]>=1} {',
+    b'set new [list]',
+    b'foreach arg $argv {',
+    b'if {[string match -* $arg] || [file exists $arg]} {',
+    b'lappend new $arg',
+    b'} else {',
+    b'set once 0',
+    b'..."',
+]
 
 
 def _mirror_write_fixtures(work):
@@ -4889,16 +5005,38 @@ def _mirror_write_fixtures(work):
         fh.write("run_test_suite veryquick\n"
                  "  run_test_suite inmemory_journal\n"
                  "# run_test_suite mmap\n")
+    # BYTE-SORTED, like the real thing: files_after and first_file_after are
+    # ordinal comparisons over it. `symlink.test` sorts BEFORE `symlink2.test`
+    # ('.' 0x2E < '2' 0x32), which is exactly the adjacency that made the real
+    # defect visible — the name-based resolver answered the first while the
+    # traceback named the second.
     listfile = os.path.join(work, "corpus.lst")
     with open(listfile, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("alter.test\nswarmvtab.test\nswarmvtabfault.test\n"
+                 "symlink.test\nsymlink2.test\n"
                  "wal2.test\nwalsetlk.test\nzipfile.test\n")
+    # ★ THE LAST FOUR ARE PATHS, AND THEY ARE THE POINT OF THIS FIXTURE NOW.
+    # resolve_abort_file is handed a `(file "…" line N)` frame as well as a test
+    # NAME, so it has to answer the same thing for every spelling of the same
+    # file: the launcher's drive-letter one (wine maps the Linux root to Z:), the
+    # driver's own POSIX one (the same log carries both), the backslash form, and
+    # a bare basename.
+    # ⚠ THE BACKSLASH ROW IS LOAD-BEARING AND NOT DECORATION: it is the row that
+    # reds if the .sh copy ever goes back to `awk -v name="$1"`, whose escape
+    # processing turns `Z:\home\rafael\test` into `Z:homeafael<TAB>est`
+    # (✔MEASURED, gawk 5.3.2). The .ps1 has no such hazard, so the two answers
+    # DIVERGE and this battery says so.
     namesfile = os.path.join(work, "names.lst")
     with open(namesfile, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("inmemory_journal.swarmvtabfault-1.1-oom-persistent.143\n"
                  "mm-wal2-3.3\n"
                  "walsetlk-2.1.3\n"
-                 "nothing-matches-here.1\n")
+                 "nothing-matches-here.1\n"
+                 "symlink.test-sharedcachesetting\n"
+                 "Z:/home/rafael/src/sqlite/test/symlink2.test\n"
+                 "/home/rafael/src/sqlite/test/symlink2.test\n"
+                 "Z:\\home\\rafael\\src\\sqlite\\test\\symlink2.test\n"
+                 "symlink2.test\n")
     log = os.path.join(work, "segment.log")
     # BINARY, so the CRLF line below really is CRLF on every host. The .sh
     # region strips a trailing CR in its first awk rule and says why; if either
@@ -4913,8 +5051,25 @@ def _mirror_write_fixtures(work):
                  b"! walsetlk-2.1.3 expected: [1]\n"
                  b"! walsetlk-2.1.3 got: [0]\n"
                  b"!Failures on these tests: walsetlk-2.1.3 zipfile-25.0\n"
+                 # ── TWO TRACEBACK BLOCKS, which is what the B rule is for ────
+                 # Block 1 has TWO frames and must contribute exactly its FIRST
+                 # (Tcl prints errorInfo innermost-first, so the outer
+                 # permutations.test frame is the driver, not the unit). The
+                 # `Time:` line then RESETS the block flag, so block 2
+                 # contributes its own — spelled with BACKSLASHES, which the
+                 # extraction must pass through untouched.
+                 b'    (file "/opt/x/wal2.test" line 12)\n'
+                 b'    (file "/opt/x/permutations.test" line 99)\n'
+                 b"Time: zipfile.test 7 ms\n"
+                 b'    (file "Z:\\opt\\x\\zipfile.test" line 7)\n'
                  b"*** Giving up...\n"
                  b"2 errors out of 41 tests on somehost Linux 64-bit\n")
+    # ── THE REAL LOG, VERBATIM ──────────────────────────────────────────────
+    # Written as BYTES, CRLF preserved, because it is a real Windows-fixture log
+    # and the CR strip is one of the things it proves.
+    abortlog = os.path.join(work, "abort-segment.log")
+    with open(abortlog, "wb") as fh:
+        fh.write(b"\r\n".join(REAL_ABORT_SEGMENT_LOG) + b"\r\n")
     # ★ RELATIVE, and both arms run with `work` as their CWD. MEASURED while
     # writing this: handing Git Bash an absolute `C:\Users\…` path ate every
     # backslash (`C:UsersrafaeAppData…`), and an absolute path is a namespace
@@ -4924,7 +5079,8 @@ def _mirror_write_fixtures(work):
     return {"CORPUSDIR": "corpus", "PERMSFILE": "corpus/permutations.test",
             "TIERFILE": "tier.test", "LISTFILE": "corpus.lst",
             "NAMESFILE": "names.lst", "LOGFILE": "segment.log",
-            "FACTFILE": "facts.tsv", "BOUNDARY": "swarmvtab.test"}
+            "FACTFILE": "facts.tsv", "BOUNDARY": "swarmvtab.test",
+            "ABORTLOG": "abort-segment.log", "ABORTFACTS": "abort-facts.tsv"}
 
 
 def _mirror_run(lang, region, case, work, env):
@@ -5113,7 +5269,27 @@ def check_dss_regions(harness_dir, out=None):
                       "it is indistinguishable from one that was forgotten")
 
         # ── DIFFERENTIAL EXECUTION ──────────────────────────────────────────
-        cases = [p["differential"] for p in MIRROR_PAIRS if p.get("differential")]
+        # EVERY case in MIRROR_CASES runs, not only those a MIRROR_PAIRS row
+        # names. A case reachable from no row would otherwise sit in this file
+        # looking like coverage and never execute — the same shape as a region
+        # whose verifier does not read it, one level in. Pair-named cases keep
+        # their order; the rest follow, sorted.
+        for pair in MIRROR_PAIRS:
+            c = pair.get("differential")
+            if c:
+                check("MIRROR_PAIRS case `%s` is a defined MIRROR_CASES entry" % c,
+                      c in MIRROR_CASES,
+                      "the row names a battery case that does not exist, so that "
+                      "pair is verified by PAIRING ONLY while claiming otherwise")
+        # Keys are closed: a typo turns an `expect` into a silently-absent
+        # assertion, which is the vacuity class this battery exists to refuse.
+        for c in sorted(MIRROR_CASES):
+            unknown = sorted(set(MIRROR_CASES[c]) - {"sh", "ps1", "expect"})
+            check("MIRROR_CASES `%s` declares only known keys" % c, not unknown,
+                  "unknown key(s): %s" % ", ".join(unknown))
+        named = [p["differential"] for p in MIRROR_PAIRS
+                 if p.get("differential") and p["differential"] in MIRROR_CASES]
+        cases = named + [c for c in sorted(MIRROR_CASES) if c not in named]
         have_pwsh = _sh.which("pwsh")
         have_bash = _sh.which(os.environ.get("BASH", "bash")) or _sh.which("bash")
         if not (have_pwsh and have_bash):
@@ -5144,6 +5320,22 @@ def check_dss_regions(harness_dir, out=None):
                                      " | ".join(ps_out) or "<empty>"))
                     check("differential %s: identical answers (%d line(s))"
                           % (case, len(sh_out)), same, detail)
+                    # ★ AND, WHERE THE CASE DECLARES ONE, THE RIGHT ANSWER.
+                    # Agreement is what a differential battery can offer on its
+                    # own, and it is real — but two copies that both answer ""
+                    # agree perfectly, and that was the exact state of the
+                    # abort-file resolver before this case existed. `expect` is
+                    # checked PER ARM so a wrong-but-identical pair reds, and it
+                    # names which arm is wrong when only one is.
+                    want = MIRROR_CASES[case].get("expect")
+                    if want is None:
+                        continue
+                    for lang, got in (("sh", sh_out), ("ps1", ps_out)):
+                        check("differential %s: the .%s answer is CORRECT"
+                              % (case, lang), got == want,
+                              "expected: %s\n       got:      %s"
+                              % (" | ".join(want) or "<empty>",
+                                 " | ".join(got) or "<empty>"))
             finally:
                 _sh.rmtree(work, ignore_errors=True)
 

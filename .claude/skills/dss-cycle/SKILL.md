@@ -189,6 +189,37 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      explicit trigger + closing-work (§F/§D) — a later cycle is legitimate ONLY behind a named
      blocker or an unfired trigger. Either way it is *handled*: NEVER a silent skip, a masked
      test exclusion, a swallowed error, or a "temporarily disabled" that no anchor tracks.
+   - **★★ (c) THE QUICK-FIX RULE — AN ANCHOR IS NOT A PLACE TO PUT WORK YOU COULD HAVE DONE.**
+     The registry is an **audit trail**, not a backlog, and it is measurably drifting into one: it
+     passed **885 rows** on 2026-08-07, and rows are still being opened for defects that were then
+     fixed minutes later in the same cycle. A row that describes a defect nobody is going to fix
+     this year is not "handled" — it is the deferral §F.0 forbids, wearing a registry row as a
+     disguise. So:
+     - **THE COST TEST, and it is a hard rule: if writing an honest anchor row costs more than
+       fixing the thing, FIXING IS MANDATORY.** An honest row carries what/why/trigger/closing
+       work/cross-refs — for most small defects that is more thought and more keystrokes than the
+       fix. Whenever you catch yourself composing a row for a one-line guard, a stale comment, a
+       missing `rm -f` before a marker write, a wrong path spelling, a misleading diagnostic
+       string: **stop writing and fix it.** Then still write the row — **born `✅ CLOSED`**, as
+       the record of what happened, with the fix and its verification in it. A closed row costs
+       the next reader nothing; an open one costs them a decision every time they sweep.
+     - **DEFAULT TO CLOSING IN THE SAME COMMIT.** The question is never "should this be anchored?"
+       (it always should) but "is there a NAMED blocker stopping me closing it right now?" —
+       §F.0's (a)/(b)/(c) gate, applied to every candidate row, not only to the cycle's headline
+       work. "It is out of scope for this cycle" is NOT a named blocker for a five-minute fix; it
+       is the most common way the list grows.
+     - **THE SWEEP IS PART OF THE CYCLE, NOT A SEPARATE PROJECT.** When a cycle touches a file
+       that already carries OPEN rows against it, close the ones now within reach — you have the
+       context loaded, which is the expensive part, and it will not be loaded again for a while.
+       ★ ✔MEASURED 2026-08-07: a recipe defect was re-investigated from scratch because its row
+       had sat OPEN since 2026-08-05 with the fix already written in its closing cell. The open
+       row did not save that work; it *duplicated* it. An anchor only pays for itself if someone
+       later reads it — and the longer the OPEN list, the less likely that is.
+     - **REPORT THE OPEN COUNT AT STEP 10, EVERY CYCLE, WITH ITS DELTA.** A cycle that closes
+       fewer rows than it opens is not automatically wrong — a real investigation legitimately
+       opens rows — but a sustained positive delta means the quick-fix rule is being skipped, and
+       the number is what makes that visible instead of arguable. `tools/check-anchor-registry.sh`
+       already prints the total; the per-cycle honest line is "opened N, closed M, net ±K".
    A workaround that *hides* an issue (excluding a failing test, catch-and-swallow, "it's green
    on the other leg so ignore it here") is the exact silent-failure the bar exists to prevent —
    it violates §A.2 (no workarounds) and §A.4 (fail loud) as well as this rule. **Motivating
