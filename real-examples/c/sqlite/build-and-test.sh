@@ -5285,6 +5285,22 @@ for leg in "${LEG_ORDER[@]}"; do
       [[ -z "$k" ]] || { warn "[$leg] LEFTOVER FIXTURE: $k"; HYGIENE+=("$k"); }
     done <<< "$post_out"
     SEG_LOGS+=("$seglog"); SEG_LABELS+=("$s_label"); SEG_RCS+=("$segrc")
+    # ★★ SEG_COUNTS IS APPENDED HERE, WITH ITS THREE SIBLINGS, AND OVERWRITTEN LATER —
+    # never appended from inside a branch. ✔MEASURED 2026-08-07 on the arm64 VPS: it
+    # USED to be appended only in the two branches that compute a count, and the
+    # PRECONDITION-FAILURE branch `break`s BEFORE reaching them. So `nseg` (which is
+    # `${#SEG_LOGS[@]}`) counted a segment that SEG_COUNTS had no entry for, and the
+    # ledger loop below died with `SEG_COUNTS[$k]: unbound variable` under `set -u`.
+    # ⇒ **the driver crashed while reporting the failure it had just correctly
+    # diagnosed** — the precondition detector worked perfectly, named the cause
+    # (`qemu-x86_64: Could not open '/lib64/ld-linux-x86-64.so.2'`), refused to spend
+    # the remaining 9 resumes on an unresumable fault, and was then killed by its own
+    # reporter. An error path that cannot survive being taken is not an error path.
+    # ★ The fix is structural rather than "append it in that branch too": these four
+    # arrays are INDEX-PARALLEL, and an invariant maintained by remembering it at
+    # every append site is one append site away from breaking again. Appending all
+    # four together makes the parallelism true by construction.
+    SEG_COUNTS+=("tests: (none counted) / errors: (none counted)   [this segment produced no countable output — see its log]")
     facts_f="$scratch/facts.$seg_i"
     parse_segment "$seglog" "$facts_f"
     s_sum="$(fact S "$facts_f")"; s_perm_log="$(fact P "$facts_f")"
@@ -5306,7 +5322,7 @@ for leg in "${LEG_ORDER[@]}"; do
       seg_summary="$s_sum"
       seg_e="$(fact E "$facts_f")"; seg_c="$(fact C "$facts_f")"
       sum_errors=$((sum_errors + seg_e)); sum_tests=$((sum_tests + seg_c)); n_summarised=$((n_summarised + 1))
-      SEG_COUNTS+=("tests: $(group_digits "$seg_c") / errors: $seg_e   [source: sqlite's own summary line; per-test derivation independently gives $(group_digits "$seg_derived_tests")]")
+      SEG_COUNTS[$((${#SEG_COUNTS[@]} - 1))]="tests: $(group_digits "$seg_c") / errors: $seg_e   [source: sqlite's own summary line; per-test derivation independently gives $(group_digits "$seg_derived_tests")]"
       # self-calibration: where sqlite DID report, the derivation must agree. A
       # mismatch means the aborted-segment figures are off by a comparable margin,
       # and that is said out loud rather than assumed away.
@@ -5373,7 +5389,7 @@ for leg in "${LEG_ORDER[@]}"; do
     # it never reaches the headline at all.
     der_tests=$((der_tests + seg_derived_tests)); der_errors=$((der_errors + s_fx)); n_derived=$((n_derived + 1))
     total_tests=$((total_tests + seg_derived_tests)); total_errors=$((total_errors + s_fx))
-    SEG_COUNTS+=("tests: $(group_digits "$seg_derived_tests") / errors: $s_fx   [source: DERIVED from per-test lines — $(group_digits "$s_ok") ' Ok' + $s_fx '! expected:' + 1; this segment aborted and printed no summary]")
+    SEG_COUNTS[$((${#SEG_COUNTS[@]} - 1))]="tests: $(group_digits "$seg_derived_tests") / errors: $s_fx   [source: DERIVED from per-test lines — $(group_digits "$s_ok") ' Ok' + $s_fx '! expected:' + 1; this segment aborted and printed no summary]"
     perm="$s_perm_log"
     [[ -n "$perm" ]] || perm="$s_perm"
     [[ -n "$perm" || ${#TIER_PERMS[@]} -ne 1 ]] || perm="${TIER_PERMS[0]}"
@@ -5587,6 +5603,20 @@ for leg in "${LEG_ORDER[@]}"; do
     warn "[$leg] ${#scoped_excused[@]} failure(s) excused ONLY because this leg runs '$leg_mode': ${scoped_excused[*]}"
     warn "      these are NOT evidence of correctness on a native run of this target — and a crash-simulation"
     warn "      abort can TRUNCATE the rest of its .test file, so coverage there is partial."
+  fi
+  # ★ THE INDEX-PARALLEL INVARIANT, ASSERTED RATHER THAN ASSUMED. The four SEG_*
+  # arrays are indexed by the same k below. They are appended together now (see the
+  # note at the append site), so this cannot fire today — which is exactly when to
+  # write it down: the previous breakage produced `SEG_COUNTS[$k]: unbound variable`,
+  # a message that names bash's rule instead of the harness's contract and sent a
+  # reader to the wrong file. A guard that fires here NAMES the invariant, the leg,
+  # and the four lengths, so the next divergence is one line of triage rather than a
+  # hunt through a 5,700-line driver. Fail loud beats crash loud.
+  if [[ ${#SEG_COUNTS[@]} -ne $nseg || ${#SEG_LABELS[@]} -ne $nseg || ${#SEG_RCS[@]} -ne $nseg ]]; then
+    die "[$leg] INTERNAL: the per-segment arrays are not index-parallel — SEG_LOGS=$nseg SEG_LABELS=${#SEG_LABELS[@]} SEG_RCS=${#SEG_RCS[@]} SEG_COUNTS=${#SEG_COUNTS[@]}.
+      Every segment must append to ALL FOUR at the single append site; a branch that
+      exits the segment loop early (the PRECONDITION-FAILURE break is the one that did
+      this) must not be able to skip one. The ledger below indexes all four by the same k."
   fi
   # Per-unit ledger — every file that reached a verdict, every abort, every gap.
   { printf "sqlite unit ledger — leg '%s', tier '%s', %s segment(s), %s resume(s)\n" "$leg" "$DSS_TIER" "$nseg" "$resumes"
