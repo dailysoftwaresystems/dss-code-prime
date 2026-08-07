@@ -3128,6 +3128,53 @@ function Get-OurFixtureProcesses($fixturePath) {
     try { $path = $p.Path } catch { $path = $null }   # access denied on foreign processes
     if ($path -and ([System.IO.Path]::GetFullPath($path) -eq $want)) { $hits.Add($p) }
   }
+  # ── THE LAUNCHER ARM (D-HARNESS-SQLITE-PROCESS-HYGIENE-BLIND-UNDER-LAUNCHER) ──
+  # Everything above matches the fixture's OWN image. Under a declared launcher the
+  # OS process is the LAUNCHER's (`wsl.exe`, `qemu-x86_64`, `wine`) and the fixture
+  # is its ARGUMENT, so the loop above enumerates nothing — and an empty result from
+  # "there were none" is byte-identical to one from "I cannot see into that
+  # namespace". That is why this leg's hygiene said UNVERIFIED rather than clean.
+  #
+  # ★ THE SHORTCUT STAYS REFUSED. Matching the launcher by IMAGE NAME would kill a
+  # developer's unrelated `wine` or `qemu` — damaging the user's machine to make the
+  # harness look tidy. We match the FULL COMMAND LINE against our exact fixture path
+  # instead, which is as precise under a launcher as the path match is natively:
+  # that path contains this run's own per-leg rundir (…/dss-sqlite-harness/<leg>-<hash>/…),
+  # so it cannot collide with another checkout, another leg, or another developer.
+  # ★ THIS MIRRORS THE .sh, WHICH ALREADY DID IT — `our_fixture_pids` matches the
+  # fixture path anywhere in `ps -eo args=`. The two drivers disagreed about what
+  # "our fixture" means, and only the PowerShell half was blind.
+  # ⚠ SELF-EXCLUSION IS LOAD-BEARING, for the reason the .sh records from a MEASURED
+  # self-match: this driver's own process tree carries the fixture path in its argv,
+  # so without excluding ourselves the sweep finds the harness and tries to kill it.
+  # We exclude this process AND its ancestors — never a blanket "skip pwsh", which
+  # would let a genuinely leftover pwsh-hosted launcher survive.
+  $selfChain = @()
+  try {
+    $cur = $PID
+    for ($i = 0; $i -lt 16 -and $cur; $i++) {
+      $selfChain += $cur
+      $cur = (Get-CimInstance Win32_Process -Filter "ProcessId = $cur" -ErrorAction Stop).ParentProcessId
+    }
+  } catch { $selfChain = @($PID) }
+  $seen = @{}; foreach ($h in $hits) { $seen[$h.Id] = $true }
+  try {
+    foreach ($cp in (Get-CimInstance Win32_Process -ErrorAction Stop)) {
+      if (-not $cp.CommandLine) { continue }
+      if ($selfChain -contains $cp.ProcessId) { continue }
+      if ($seen[$cp.ProcessId]) { continue }
+      # Both spellings: the launcher may carry the path translated into ITS OWN
+      # namespace (legs.json `pathTranslation` turns C:\… into /mnt/c/…), so a
+      # Windows-only comparison would miss exactly the WSL case that motivated this.
+      if ($cp.CommandLine.Contains($want) -or $cp.CommandLine.Contains($fixturePath)) {
+        $proc = Get-Process -Id $cp.ProcessId -ErrorAction SilentlyContinue
+        if ($proc) { $hits.Add($proc); $seen[$cp.ProcessId] = $true }
+      }
+    }
+  } catch {
+    # Never silent: an enumeration we could not perform is NOT a clean bill.
+    Warn "process-hygiene sweep could not enumerate command lines ($($_.Exception.Message)) — launcher-hosted leftovers are UNVERIFIED for this sweep."
+  }
   return $hits
 }
 # ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING
@@ -4093,11 +4140,27 @@ $hygiene    = @()          # leftover/killed fixture processes — never silent
 foreach ($k in $legRec.PreflightKills) { $hygiene += $k }
 if ($LockStolen) { $hygiene += "took over a STALE run lock left by $LockStolen" }
 foreach ($n in $CloneLockNotes) { $hygiene += $n }
-if ($legLauncher.Count) {
-  # Stated in the ledger, not just in a comment: under a launcher the OS process
-  # is the launcher's, so the fixture-path process sweep below can see nothing.
-  $hygiene += "leg runs under launcher '$($legLauncher -join ' ')' — the leftover-fixture sweep matches OUR EXACT fixture PATH and therefore cannot see a launcher-hosted process; process hygiene for this leg is UNVERIFIED"
-}
+# ★ THE BLANKET `UNVERIFIED` THAT USED TO LIVE HERE IS GONE, and removing it was as
+# much a correctness fix as adding the sweep arm: once Get-OurFixtureProcesses
+# matches the launcher by FULL COMMAND LINE, declaring every launcher leg
+# unverified is no longer a cautious statement — it is a FALSE one, and a
+# permanent "UNVERIFIED" on every emulated leg trains a reader to ignore the field
+# on the day it means something. ✔MEASURED 2026-08-06, both halves separately:
+#   P1 a `wsl.exe -e <fixture> …` launcher IS enumerable and matchable by its
+#      CommandLine (2 processes matched on the exact path).
+#   P2 killing that Windows-side launcher REAPS the Linux-side process — the exact
+#      pid captured beforehand (438336) read GONE afterwards and `pgrep -x
+#      testfixture` came back empty.
+# ⚠ P2's FIRST measurement said the opposite, and it was an INSTRUMENT ARTEFACT:
+#   the prober asked `pgrep -f <marker>` inside `bash -c`, whose own command line
+#   carries the marker, so pgrep matched itself and reported a "survivor" whose pid
+#   (438287) was not either of the pids that had been running (438267/438277). That
+#   is the SAME self-match `our_fixture_pids` in the .sh already records from a
+#   measured incident. Re-run by pid identity — which cannot self-match — it
+#   reversed. The lesson is why this note exists: a survivor whose PID CHANGED was
+#   never a survivor.
+# An enumeration that FAILS is still reported, by Get-OurFixtureProcesses itself —
+# a sweep that could not run is not a clean bill, and that path warns.
 $resumes    = 0
 $lastBoundary = ''
 # The previous segment's first diagnostic, but ONLY when that segment completed

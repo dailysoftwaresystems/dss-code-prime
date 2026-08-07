@@ -539,6 +539,52 @@ if (Invoke-Mutation 'F5 make a failed run-dir operation look fine' $m5 "return @
   Red 'F5 a failed run-dir operation is REPORTED, never swallowed' 'Pin-RunDirArgv' $m5
 }
 
+# ── G  the leftover-fixture sweep must see a LAUNCHER-HOSTED fixture ─────────
+# D-HARNESS-SQLITE-PROCESS-HYGIENE-BLIND-UNDER-LAUNCHER. Under a launcher the OS
+# process is the LAUNCHER's and the fixture is its ARGUMENT, so an image-name +
+# path sweep enumerates nothing — and "found none" is indistinguishable from
+# "cannot see". This pin reproduces the SHAPE with `cmd /c`, which is on every
+# Windows box and needs no WSL: the point under test is whether the sweep reads
+# the COMMAND LINE, not which emulator is installed.
+function Pin-HygieneLauncher($driver) {
+  Invoke-Expression (Get-Fn $driver 'Get-OurFixtureProcesses')
+  # A path that does not exist on disk: the sweep must key on the ARGUMENT TEXT,
+  # never on resolving the file. It is under $Work so it can collide with nothing.
+  $marker = Join-Path $Work 'legdir\testfixture'
+  $decoy  = Start-Process -FilePath 'cmd.exe' `
+              -ArgumentList @('/c', "timeout /t 25 /nobreak >nul & rem $marker") `
+              -PassThru -WindowStyle Hidden
+  try {
+    Start-Sleep -Milliseconds 800
+    $hits = @(Get-OurFixtureProcesses $marker)
+    # CONTENT, not just count: a sweep that returned some unrelated process would
+    # satisfy "found >= 1" and then kill the wrong thing.
+    Ck 'a launcher-hosted fixture is FOUND by its command line' $true ($hits.Count -ge 1)
+    Ck '...and it is the launcher process itself' $true ($hits.Id -contains $decoy.Id)
+    # The negative control: an unrelated path must match NOTHING, or the sweep is
+    # not precise enough to be allowed to kill.
+    $none = @(Get-OurFixtureProcesses (Join-Path $Work 'other\testfixture'))
+    Ck 'an unrelated fixture path matches nothing' 0 $none.Count
+  } finally {
+    Stop-Process -Id $decoy.Id -Force -ErrorAction SilentlyContinue
+  }
+}
+Green 'G    the leftover sweep sees a launcher-hosted fixture' 'Pin-HygieneLauncher'
+
+# F6 - remove the launcher arm, leaving the original image-name+path sweep. The
+# pin must go red: that is exactly the blind state the anchor describes.
+$m6 = Join-Path $Work 'm6.ps1'
+if (Invoke-Mutation 'F6 blind the sweep to launcher-hosted processes' $m6 'if ($cp.CommandLine.Contains($want) -or $cp.CommandLine.Contains($fixturePath)) {' {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_.Contains('if ($cp.CommandLine.Contains($want) -or $cp.CommandLine.Contains($fixturePath)) {')) {
+          '      if ($false) {'
+        } else { $_ }
+      })
+    }) {
+  Red 'F6 the sweep sees a launcher-hosted fixture' 'Pin-HygieneLauncher' $m6
+}
+
 Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
 Write-Host ''
 Write-Host "passed=$($script:Passed) failed=$($script:Failed) skipped=$($script:Skipped)"
