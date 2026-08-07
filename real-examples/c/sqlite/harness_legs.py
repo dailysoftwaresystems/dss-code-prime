@@ -5346,7 +5346,17 @@ RUN_ORACLE = {
         # `skipped-by-runOn` for elf64-x86_64 while the driver had a working
         # Linux testfixture sitting on disk beside the verdict.
         "elf64-x86_64": "launched:wsl.exe",
-        "elf64-arm64": "skipped-by-runOn",
+        # ★ AND THE SAME CORRECTION AGAIN, ONE LEG LATER (TF-C126, 2026-08-07).
+        # This entry read `skipped-by-runOn` until a Windows run printed it beside
+        # a working aarch64 testfixture on disk — the identical shape the comment
+        # above records for elf64-x86_64, which should have been the hint to check
+        # its sibling at the time. The leg declared a Windows launcher only for
+        # hostArch arm64 (WSL2 runs the HOST's arch, so an arm64 Windows box gets
+        # an arm64 distro and needs no emulator); an x86_64 Windows host needs
+        # qemu-aarch64 INSIDE WSL, which is exactly how this project's WSL column
+        # has always run the leg. `launched:wsl.exe` — the oracle keys on
+        # launcher[0], and the emulator is the argument that follows it.
+        "elf64-arm64": "launched:wsl.exe",
         "pe64-x86_64": "native",
         "macho64-arm64": "skipped-by-runOn",
         "macho64-x86_64": "skipped-by-runOn",
