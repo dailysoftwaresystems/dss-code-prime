@@ -246,6 +246,39 @@ function Pin-Verdicts($driver) {
 # ═══════════════════════════════════════════════════════════════════════════
 # C - Read-CorpusSegment keeps the FIRST DIAGNOSTIC line
 # ═══════════════════════════════════════════════════════════════════════════
+function Pin-StageCapabilities($drivers) {
+  # SOURCE-LEVEL, because the failure being pinned is a MISSING CALL SITE —
+  # something no execution of the existing call sites can ever reveal. The
+  # defect it exists for had already happened: the sqlite3 CLI recipe carried
+  # -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE while the testfixture recipe,
+  # derived from the same tree in the same run, carried neither.
+  foreach ($drv in $drivers) {
+    if (-not (Test-Path -LiteralPath $drv)) { Bad "stage capabilities: $drv exists"; continue }
+    $name = Split-Path -Leaf $drv
+    $text = [System.IO.File]::ReadAllLines($drv)
+    # (1) no ./configure of the build dir is left bare.
+    $bare = @($text | Where-Object { $_ -match 'configure"\s*>' }).Count
+    Ck "$name : no ./configure invocation is left BARE" 0 $bare
+    # (2) every make of a target in $BLD carries the declared OPTIONS.
+    # ⚠ THE SITE COUNT IS ASSERTED FIRST, AND THAT IS NOT DECORATION: "no site
+    #   without OPTIONS = 0" is satisfied by a pattern that matches NO SITES AT
+    #   ALL, so a regex that silently stops matching converts this pin into a
+    #   permanent green. Prove the pin can still SEE its subject before asking
+    #   anything about it.
+    $mkSites = @($text | Where-Object { $_ -match 'cd "\$BLD" && make ' })
+    Ck "$name : the make-site matcher still finds sites (>0)" $true ($mkSites.Count -gt 0)
+    $noOpts = @($mkSites | Where-Object { $_ -notmatch 'OPTIONS=' }).Count
+    Ck "$name : no 'cd `$BLD && make' without OPTIONS=" 0 $noOpts
+    # (3) CALL SITES, not mentions — a first cut of the .sh twin counted every
+    #     occurrence of the name and reported 3-of-2 against a correct driver,
+    #     because the extra hits were prose in the surrounding comments.
+    $calls = @($text | Where-Object { $_ -match 'dss_bh_emit_recipe\s+\\$' }).Count
+    $opts  = @($text | Where-Object { $_ -match '--make-var "OPTIONS=\$STAGE_MAKE_OPTIONS"' }).Count
+    Ck "$name : the derivation matcher still finds call sites (>0)" $true ($calls -gt 0)
+    Ck "$name : every dss_bh_emit_recipe call passes OPTIONS= ($calls derivation(s))" $calls $opts
+  }
+}
+
 function Pin-ReadSegment($driver) {
   $fns = Get-Fns $driver @('Read-CorpusSegment')
   if (-not $fns) { return }
@@ -452,6 +485,13 @@ function Pin-RunDirArgv($driver) {
 
 Green 'A+B  the verdict recorders + the shared run decision' 'Pin-Verdicts'
 Green 'C    Read-CorpusSegment keeps the first diagnostic'   'Pin-ReadSegment'
+# ★★ THE PARITY PIN, RUN FROM THE PowerShell SIDE TOO. Its twin lives in
+#    test-driver-contracts.sh and already checks BOTH drivers — but THAT SUITE
+#    NEVER RUNS ON A WINDOWS-ONLY HOST: build-and-test.ps1 self-tests with this
+#    file, build-and-test.sh with the .sh one. A parity check that only exists in
+#    the suite one driver runs is itself the asymmetry it is meant to catch.
+Say '-- C2   the declared capability set reaches every build site, BOTH drivers'
+Pin-StageCapabilities @($PS1, (Join-Path $Here 'build-and-test.sh'))
 Green 'D+E  the loader variable + the acquisition field'     'Pin-LoaderVar'
 Green 'G    the confound supply follows the DECLARATION'     'Pin-ConfoundSupply'
 Green 'H    a failed run-dir operation is a VERDICT'         'Pin-RunDirArgv'

@@ -243,6 +243,10 @@ $LegsPy       = Join-Path $PSScriptRoot 'harness_legs.py'
 # The catalogue itself, named explicitly rather than left to the resolver's
 # default: stage-zinc.py takes it too, and both must be reading the SAME file.
 $LegsJson     = Join-Path $PSScriptRoot 'legs.json'
+# Legs whose corpus ran but left a DECLARED capability's witness file inert.
+# Run-wide rather than per-leg: the capability set is a property of the ONE
+# staged tree every leg compiles, so a gap on any leg indicts the stage.
+$script:CapabilityGaps = @()
 # The deferred-anchor registry, consulted AT the point a leg fails
 # (D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE).
 # Not required to exist: a checkout without .plans still runs, it just gets one
@@ -1476,7 +1480,68 @@ elif [ ! -e "$DIR/configure" ]; then
 fi
 [ -x "$DIR/configure" ] || { echo "no ./configure in $DIR — not a SQLite checkout" >&2; exit 1; }
 BLD="$DIR/bld-dss"; mkdir -p "$BLD"
-( cd "$BLD" && "$DIR/configure" >/dev/null 2>&1 )
+# ── WHICH SQLITE THIS RUN IS ACTUALLY TESTING ────────────────────────────────
+# DECLARED in legs.json `stageBuild`, resolved by harness_legs.py ONCE on the
+# PowerShell side and interpolated here. Byte-for-byte the same declaration
+# build-and-test.sh reads, and that is the whole point: the two drivers SHARE
+# $DIR, so a bare `configure` here would silently REVERT the .sh's capability
+# flags on the next Windows run and leave the tree half-configured — the
+# cross-driver spelling of the very defect this closes.
+#
+# ✔MEASURED 2026-08-06 on the elf64-x86_64 corpus: with these flags absent, 362
+# of the 1,241 files the run called COMPLETED asserted nothing — they returned at
+# their first `ifcapable` gate while DSS had already compiled the code they
+# would have tested. D-HARNESS-CORPUS-FILES-COMPLETE-WITHOUT-ASSERTING-BECAUSE-
+# CAPABILITIES-ARE-OFF.
+STAGE_CONFIGURE_FLAGS="__STAGE_CONFIGURE_FLAGS__"
+STAGE_MAKE_OPTIONS="__STAGE_MAKE_OPTIONS__"
+STAGE_REQUIRED_DEFINES="__STAGE_REQUIRED_DEFINES__"
+[ -n "$STAGE_CONFIGURE_FLAGS" ] || { echo "the stage build configuration did not reach the derive script -- legs.json stageBuild is the ONE declaration of which extensions the corpus tests, and configuring without it builds a sqlite with fts5/fts3/rtree/session OFF" >&2; exit 1; }
+# ★ THE SAME BUILD-CONFIGURATION STAMP THE .sh KEEPS, and for a reason that bites
+#   HARDER here: this driver did not have one at all, so the first run after a
+#   capability change would re-run configure (rewriting OPT_FEATURE_FLAGS) while
+#   every existing .o stayed NEWER than its .c — make skips them, and the fixture
+#   links from a MIXTURE of two configurations. It is not only objects: main.mk
+#   generates parse.c and keywordhash.h with $(OPT_FEATURE_FLAGS) too.
+#   An ABSENT stamp FIRES, deliberately: a tree we cannot prove was built with
+#   this configuration is exactly the tree that links a mixed fixture.
+STAGE_STAMP="$BLD/.dss-stage-identity"
+STAGE_STAMP_NOW="tclsh=$(echo 'puts $tcl_version' | tclsh 2>/dev/null || true) configure=$STAGE_CONFIGURE_FLAGS options=${STAGE_MAKE_OPTIONS:-<none>}"
+STAGE_STAMP_WAS="$(cat "$STAGE_STAMP" 2>/dev/null || true)"
+if [ "$STAGE_STAMP_WAS" != "$STAGE_STAMP_NOW" ]; then
+  # Look at the target before destroying it: the path this driver builds, under
+  # the checkout, carrying the marks of a configured sqlite build tree.
+  if [ "$BLD" = "$DIR/bld-dss" ] && { [ -f "$BLD/Makefile" ] || [ -f "$STAGE_STAMP" ] || [ -f "$BLD/.dss-tcl-identity" ] || [ -z "$(ls -A "$BLD" 2>/dev/null)" ]; }; then
+    echo "the build configuration behind $BLD changed -- REBUILDING IT FROM SCRATCH" >&2
+    echo "      was: ${STAGE_STAMP_WAS:-<no stamp: this tree predates the configuration stamp>}" >&2
+    echo "      now: $STAGE_STAMP_NOW" >&2
+    rm -rf "$BLD"; mkdir -p "$BLD"
+  else
+    echo "the build configuration behind $BLD changed, and that directory could not be identified as this driver's own -- refusing to delete it. Remove it by hand once you have confirmed what it is: rm -rf '$BLD'" >&2
+    exit 1
+  fi
+fi
+# shellcheck disable=SC2086
+( cd "$BLD" && "$DIR/configure" $STAGE_CONFIGURE_FLAGS >/dev/null 2>&1 )
+printf '%s\n' "$STAGE_STAMP_NOW" > "$STAGE_STAMP"
+rm -f "$BLD/.dss-tcl-identity"
+# DID THE FLAGS ACTUALLY TAKE? A configure flag can be accepted and do nothing
+# (✔MEASURED: `--memsys3` exits 0 and emits no define, MEMSYS5 wins), and upstream
+# can retire one at any pull. The $(OPTIONS) defines are NOT checked here — they
+# never reach OPT_FEATURE_FLAGS, they arrive on the make line — they are checked
+# on the derived recipe below, which is where they become visible.
+_optflags="$(sed -n 's/^OPT_FEATURE_FLAGS[[:space:]]*=[[:space:]]*//p' "$BLD/Makefile" | sed -n '1p')"
+_missing_cfg=""
+for _d in $STAGE_REQUIRED_DEFINES; do
+  case " $STAGE_MAKE_OPTIONS " in *" -D$_d "*) continue ;; esac
+  case " $_optflags " in *" -D$_d "*|*" -D$_d="*) ;; *) _missing_cfg="$_missing_cfg $_d" ;; esac
+done
+if [ -n "$_missing_cfg" ]; then
+  echo "configure accepted its flags and did NOT produce the defines they exist for -- missing from OPT_FEATURE_FLAGS:$_missing_cfg" >&2
+  echo "      flags passed: $STAGE_CONFIGURE_FLAGS" >&2
+  echo "      OPT_FEATURE_FLAGS: ${_optflags:-<empty>}" >&2
+  exit 1
+fi
 
 # ── the -L that TCL_LIBS needs but does not carry (Tcl 9 externalised tommath) ─
 # WHY THIS EXISTS — do NOT "simplify" the -L away:
@@ -1621,7 +1686,8 @@ if [ -n "$REF_LDFLAGS" ]; then
   # none — every WSL distro today — still configures EXACTLY ONCE.
   # (no "reference link" prefix in the text — the PowerShell side already adds one)
   ref_note "re-running configure with LDFLAGS=$REF_LDFLAGS to supply the missing search path"
-  ( cd "$BLD" && "$DIR/configure" "LDFLAGS=$REF_LDFLAGS" >/dev/null 2>&1 )
+  # shellcheck disable=SC2086
+  ( cd "$BLD" && "$DIR/configure" $STAGE_CONFIGURE_FLAGS "LDFLAGS=$REF_LDFLAGS" >/dev/null 2>&1 )
   # FAIL LOUD if it did not land. A silent miss — say sqlite reshapes the @LDFLAGS@
   # substitution upstream — would put us straight back to an oracle that quietly is
   # not there, which is the exact failure mode this block repairs.
@@ -1673,7 +1739,7 @@ fi
 # sources that are no longer the ones under test — strictly worse than none.
 REF_KEEP="$STAGE/reference-testfixture"
 REF_LOG="$STAGE/reference-build.log"
-if ( cd "$BLD" && make -s testfixture USE_AMALGAMATION=0 -j"$(nproc 2>/dev/null || echo 4)" ) > "$REF_LOG" 2>&1; then
+if ( cd "$BLD" && make -s testfixture USE_AMALGAMATION=0 "OPTIONS=$STAGE_MAKE_OPTIONS" -j"$(nproc 2>/dev/null || echo 4)" ) > "$REF_LOG" 2>&1; then
   # Plain `cp` + a best-effort `chmod +x`, NOT the .sh's `cp -p`. $STAGE is a
   # DrvFs (/mnt/c) path: `cp -p` there can fail on the ownership/timestamp
   # preservation it cannot honour and report non-zero for a copy that in fact
@@ -1716,6 +1782,7 @@ AR="$BLD/libsqlite3.a"; [ -f "$BLD/.libs/libsqlite3.a" ] && AR="$BLD/.libs/libsq
 if ! dss_bh_emit_recipe \
       --build-dir "$BLD" --make-target testfixture --recipe-file "$RECIPE" \
       --make-var USE_AMALGAMATION=0 \
+      --make-var "OPTIONS=$STAGE_MAKE_OPTIONS" \
       --prereq-mode link-line --always-make 1 --token-scope recipe \
       --archive "$AR" --archive-from-span 0 \
       --search-root "$DIR/src" --search-root "$DIR/ext" --search-root "$BLD" \
@@ -1747,14 +1814,14 @@ mapfile -t SQLITE_INCS < "$STAGE/recipe-includes.shell.txt"
 #   · derive in LINK-LINE mode: sqlite3d's prerequisites are .o files, and a
 #     whole-blob scrape absorbs tool/lemon.c + lempar.c + mksourceid.c
 #     (BUILD-HOST tools) whenever the objects are stale.
-if ( cd "$BLD" && make sqlite3.c shell.c tclsqlite3.c ) > "$STAGE/amalgamation-regen.log" 2>&1; then
+if ( cd "$BLD" && make sqlite3.c shell.c tclsqlite3.c "OPTIONS=$STAGE_MAKE_OPTIONS" ) > "$STAGE/amalgamation-regen.log" 2>&1; then
   echo "AMALGAMATION-REGEN=ok"
 else
   echo "AMALGAMATION-REGEN=FAILED (tolerated here -- the coherence gate renders the verdict). Log: $(win "$STAGE/amalgamation-regen.log")"
 fi
 REF_CLI_KEEP="$STAGE/reference-sqlite3"
 REF_CLI_LOG="$STAGE/reference-cli-build.log"
-if ( cd "$BLD" && make -s sqlite3d -j"$(nproc 2>/dev/null || echo 4)" ) > "$REF_CLI_LOG" 2>&1 && [ -x "$BLD/sqlite3d" ]; then
+if ( cd "$BLD" && make -s sqlite3d "OPTIONS=$STAGE_MAKE_OPTIONS" -j"$(nproc 2>/dev/null || echo 4)" ) > "$REF_CLI_LOG" 2>&1 && [ -x "$BLD/sqlite3d" ]; then
   # Plain `cp` + a tolerated `chmod`, for the DrvFs reason spelled out at the
   # reference TESTFIXTURE above — and then ASSERTED, for the reason spelled out
   # there too: an oracle announced without an exec bit is an oracle that will
@@ -1793,6 +1860,7 @@ CLI_RECIPE="$STAGE/sqlite3-cli-recipe.txt"
 #     call below sets to 18: two numbers for one fact, five lines apart.)
 if ! dss_bh_emit_recipe \
       --build-dir "$BLD" --make-target sqlite3d --recipe-file "$CLI_RECIPE" \
+      --make-var "OPTIONS=$STAGE_MAKE_OPTIONS" \
       --prereq-mode link-line --always-make 1 --token-scope recipe \
       --archive "$AR" --archive-from-span 1 \
       --search-root "$DIR/src" --search-root "$DIR/ext" --search-root "$BLD" \
@@ -1817,14 +1885,61 @@ printf '%s\n' "${CLI_TUS[@]}" | grep -qE '/shell\.c$' \
 grep -qx 'SQLITE_CORE' "$STAGE/cli-defines.txt" \
   || { echo "the CLI define set has no SQLITE_CORE -- the -D tokens were read from the link line alone; ext/icu/icu.c will demand <unicode/*.h>. Derived from $CLI_RECIPE" >&2; exit 1; }
 
+# ── THE DECLARED CAPABILITIES REACHED **BOTH** DERIVED RECIPES ───────────────
+# Asserted on BOTH targets because the asymmetry WAS the defect: ✔MEASURED
+# 2026-08-06, the CLI recipe carried -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE
+# while the testfixture recipe, derived from the SAME configured tree in the SAME
+# run, carried neither. And this is the ONLY check that can see the $(OPTIONS)
+# defines at all: they never appear in OPT_FEATURE_FLAGS, so if `--make-var
+# OPTIONS=…` is dropped from a call site, this is what fires.
+for _f in "testfixture:$STAGE/defines.txt:$RECIPE" "sqlite3-CLI:$STAGE/cli-defines.txt:$CLI_RECIPE"; do
+  _what="${_f%%:*}"; _rest="${_f#*:}"; _defs="${_rest%%:*}"; _from="${_rest#*:}"
+  _missing=""
+  for _d in $STAGE_REQUIRED_DEFINES; do
+    # `NAME` OR `NAME=VALUE` — same rule as the .sh twin, and as the
+    # OPT_FEATURE_FLAGS check above which already accepts `-DNAME=`.
+    grep -qE "^${_d}(=|$)" "$_defs" || _missing="$_missing $_d"
+  done
+  if [ -n "$_missing" ]; then
+    echo "the $_what recipe is MISSING declared capabilities:$_missing" >&2
+    echo "      declared (legs.json stageBuild.requiredDefines): $STAGE_REQUIRED_DEFINES" >&2
+    echo "      make OPTIONS passed:                            ${STAGE_MAKE_OPTIONS:-<none>}" >&2
+    echo "      derived from:                                   $_from" >&2
+    echo "      A missing one means the library about to be built does not have that capability," >&2
+    echo "      while the run would still report every one of its test files as 'completed' --" >&2
+    echo "      having asserted nothing in any of them." >&2
+    exit 1
+  fi
+done
+
 # ── stage: sqlite sources + generated derived sources + tcl8.6/zlib headers ──
-mkdir -p "$STAGE/sqlite/bld" "$STAGE/tclinc" "$STAGE/zinc-src" "$STAGE/test"
+mkdir -p "$STAGE/sqlite/bld" "$STAGE/tclinc" "$STAGE/zinc-src" "$STAGE/sqlite/test"
 cp -r "$DIR/src" "$STAGE/sqlite/src"
 cp -r "$DIR/ext" "$STAGE/sqlite/ext"
 cp "$BLD"/*.c "$STAGE/sqlite/bld/" 2>/dev/null || true
 cp "$BLD"/*.h "$STAGE/sqlite/bld/" 2>/dev/null || true
 # the .test corpus + its tcl harness (tester.tcl …) — testfixture.exe runs these
-cp -r "$DIR/test/." "$STAGE/test/" 2>/dev/null || true
+#
+# ★★ STAGED AT `$STAGE/sqlite/test`, NOT `$STAGE/test`, AND THE DIRECTORY IT SITS
+#    IN IS THE WHOLE POINT. It used to be `$STAGE/test`, whose parent has no
+#    `ext/` — and sqlite resolves a third of its corpus RELATIVE TO testdir:
+#    `test/permutations.test:90-104` builds `$alltests` from `$testdir/*.test`
+#    PLUS `glob -nocomplain $testdir/../ext/rtree/*.test`,
+#    `$testdir/../ext/fts5/test/*.test`, `$testdir/../ext/session/*.test` and
+#    five more. `-nocomplain` means a missing directory is not an error and not a
+#    warning: the globs simply returned NOTHING and the run looked complete.
+#    ✔MEASURED on the last Windows corpus.log before this change: 1,018 files
+#    completed, of which **fts5 0, rtree 0, session 0** — while fts3 (58),
+#    analyze3, wherelimit and mem5, which live directly in `test/`, were all
+#    there. So the three LARGEST capability families this cycle turned on —
+#    110 + 27 + 37 inert files — could never have run on the Windows driver,
+#    and the leg would have paid the whole extra compile cost for nothing.
+#    `$STAGE/sqlite/ext` is ALREADY staged two lines up, so putting the test dir
+#    beside it costs no extra copy and makes the staged tree mirror upstream's
+#    real layout instead of a flattened approximation of it.
+#    Everything downstream reads this path out of `testdir.win.txt`, so the move
+#    is confined to these two lines and the `win` call that records it.
+cp -r "$DIR/test/." "$STAGE/sqlite/test/" 2>/dev/null || true
 # real tcl8.6 headers (parsed agnostically — NO descriptor, D-FFI-SHIPPED-LIBS-OS-ONLY)
 # ★ KNOWN, STILL LATENT — NOT repaired by this cycle's Tcl-9 work above, and left
 #   here on purpose rather than silently half-fixed. Two 8.6-shaped assumptions:
@@ -1936,8 +2051,21 @@ _n_cli_src=${#CLI_TUS[@]}; _n_cli_dst="$(grep -c . "$STAGE/cli-tus.txt" || true)
 echo "CLI-TUS=$_n_cli_dst"
 echo "CLI-DEFS=$(grep -c . "$STAGE/cli-defines.txt" || true)"
 echo "CLI-INCS=$(grep -c . "$STAGE/cli-includes.base.txt" || true)"
-# the staged test dir (Windows path) for the corpus run
-win "$STAGE/test" > "$STAGE/testdir.win.txt"
+# the staged test dir (Windows path) for the corpus run. It MUST be the one whose
+# PARENT holds `ext/`, or sqlite's own `$testdir/../ext/**/*.test` globs resolve
+# to nothing and the fts5 / rtree / session families silently vanish from the run.
+win "$STAGE/sqlite/test" > "$STAGE/testdir.win.txt"
+# ★ FAIL LOUD RATHER THAN GLOB INTO SILENCE. `-nocomplain` is exactly why the
+#   previous layout produced a confident, complete-looking 1,018-file run with
+#   three whole capability families missing: sqlite does not consider an absent
+#   ext/ an error, so nothing anywhere said so. Assert the relationship the tier
+#   depends on, in the terms sqlite itself uses.
+for d in rtree fts5/test session; do
+  [ -d "$STAGE/sqlite/test/../ext/$d" ] || {
+    echo "the staged test dir has no ../ext/$d, so sqlite's permutations.test would glob it to NOTHING and drop that whole family from the corpus without any error -- 'testdir' and 'ext' must be siblings" >&2
+    exit 1
+  }
+done
 
 echo "RECIPE-TUS=$(wc -l < "$STAGE/tus.txt")"
 echo "RECIPE-DEFS=$(wc -l < "$STAGE/defines.txt")"
@@ -1978,7 +2106,47 @@ $cloneLockRegion = ($shLines[($lockStart + 1)..($lockEnd - 1)]) -join "`n"
 # the SAME Step-1 decision that chose the shell. `wslpath` is not even NAMED on a
 # host that has no WSL.
 $winPathBody = if ($script:HostNeedsWsl) { 'wslpath -m "$1"' } else { 'printf ''%s\n'' "$1"' }
-$deriveScript = $deriveScript.Replace('__CLONE_LOCK_REGION__', $cloneLockRegion).Replace('__SQLITE_WSL_DIR__', $SqliteWslDir).Replace('__STAGE_WSL__', $StageShell).Replace('__WIN_PATH_BODY__', $winPathBody).Replace('__BASE_HARNESS_SH__', (ToShellPath $BaseHarnessSh)) -replace "`r`n", "`n"
+# ── WHICH SQLITE THIS RUN IS ACTUALLY TESTING ────────────────────────────────
+# Resolved ONCE, HERE, from the SAME legs.json block build-and-test.sh reads, and
+# interpolated into the derive script. Not spelled out in either driver: the two
+# share $SqliteWslDir, so a capability set that lived in the .sh alone would be
+# silently reverted by the next Windows run's `configure`.
+# ★ FAIL LOUD IF IT CANNOT BE RESOLVED, never fall back to "no flags" — that
+#   fallback IS the bug: it configures a sqlite with fts5/fts3/rtree/session OFF,
+#   and the corpus then reports ~270 test files as completed having asserted
+#   nothing. D-HARNESS-CORPUS-FILES-COMPLETE-WITHOUT-ASSERTING-BECAUSE-
+#   CAPABILITIES-ARE-OFF.
+try {
+  # Same shape as the --plan call above: capture with 2>&1 and take $LASTEXITCODE
+  # DIRECTLY, never through a pipe, and keep the native call out of a context
+  # where $ErrorActionPreference='Stop' would replace the diagnostic with a stack.
+  $sbOut = @(& $python3.Source $LegsPy '--catalogue' $LegsJson '--stage-build' '--format' 'json' 2>&1)
+  $sbRc  = $LASTEXITCODE
+} catch {
+  $sbRc  = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+  $sbOut = @("$_")
+}
+if ($sbRc -ne 0) {
+  Die "could not resolve the sqlite stage build configuration (harness_legs.py --stage-build, rc=$sbRc):`n$(($sbOut | ForEach-Object { "      $_" }) -join "`n")`n      This is the ONE declaration of which extensions the corpus tests, shared with build-and-test.sh."
+}
+$StageBuild = $null
+try { $StageBuild = (($sbOut | ForEach-Object { "$_" }) -join "`n") | ConvertFrom-Json }
+catch { Die "harness_legs.py --stage-build exited 0 but did not print the JSON this driver reads ($($_.Exception.Message)). Output was:`n$(($sbOut | Select-Object -First 20 | ForEach-Object { "      $_" }) -join "`n")" }
+$StageConfigureFlags = ($StageBuild.configureFlags -join ' ')
+$StageMakeOptions    = [string]$StageBuild.makeOptions
+$StageRequiredDefines = ($StageBuild.requiredDefines -join ' ')
+if (-not $StageConfigureFlags -or -not $StageRequiredDefines) {
+  Die "harness_legs.py --stage-build returned a configuration with no configureFlags or no requiredDefines. That is a contract break between the resolver and this driver, not a property of this host."
+}
+Info "stage capabilities: $StageConfigureFlags$(if ($StageMakeOptions) { "   make OPTIONS=$StageMakeOptions" })"
+$deriveScript = $deriveScript.Replace('__CLONE_LOCK_REGION__', $cloneLockRegion).Replace('__SQLITE_WSL_DIR__', $SqliteWslDir).Replace('__STAGE_WSL__', $StageShell).Replace('__WIN_PATH_BODY__', $winPathBody).Replace('__BASE_HARNESS_SH__', (ToShellPath $BaseHarnessSh)).Replace('__STAGE_CONFIGURE_FLAGS__', $StageConfigureFlags).Replace('__STAGE_MAKE_OPTIONS__', $StageMakeOptions).Replace('__STAGE_REQUIRED_DEFINES__', $StageRequiredDefines) -replace "`r`n", "`n"
+# ★ ASSERT THE SUBSTITUTION LANDED. A `.Replace` whose token was renamed on the
+#   other side silently leaves the literal `__STAGE_…__` in the script, which
+#   would reach `configure` as an unknown flag — or, worse, reach the `-n` guard
+#   in the derive script as a NON-EMPTY string and pass it.
+if ($deriveScript -match '__STAGE_[A-Z_]+__') {
+  Die "the derive script still carries an unsubstituted stage-build token ($($Matches[0])). A literal `__STAGE_…__` is non-empty, so the derive script's own emptiness guard would ACCEPT it and hand it to ./configure."
+}
 $tmpSh = Join-Path $Work 'derive.sh'
 # UTF-8 WITHOUT a BOM. `-Encoding ascii` (what this used to be) replaces every
 # non-ASCII character with `?` — which silently mangled the injected shared-clone
@@ -3027,7 +3195,24 @@ function Read-CorpusSegment($logPath) {
     # sibling emits these as `B` facts and its header carries the measurement
     # that motivated them; the LAST entry is the one the caller wants.
     Blamed = New-Object 'System.Collections.Generic.List[string]'
+    # ── COMPLETED IS NOT THE SAME AS COVERED ─────────────────────────────────
+    # Files that ran to their `Time:` line having emitted no result of their own.
+    # The .sh sibling emits these as `I` facts; both drivers must count them, or
+    # a run's coverage claim depends on which driver printed it.
+    Inert = New-Object 'System.Collections.Generic.List[string]'
   }
+  # Result lines this file has emitted that are NOT the two the harness emits for
+  # EVERY file. ⚠ The teardown lines end in '...' with NO space before it, so the
+  # name to match is `<f>.test-closeallfiles...` — an anchored `-closeallfiles$`
+  # test silently never fires, which is exactly how a first cut of this counter
+  # reported zero inert files and agreed with nothing.
+  # ⚠ ANCHORED THE SAME WAY THE awk TWIN IS. awk tests `$1 !~ /…\.\.\.$/` — the
+  #   FIRST FIELD must END with it — so this must require the token to end there
+  #   too, not merely to start the line. Without the trailing `(\s|$)` the two
+  #   engines diverge on a line with text after the `...`, and the differential
+  #   is the only thing that would ever notice.
+  $reTeardown = [regex]'^\S+\.test-(closeallfiles|sharedcachesetting)\.\.\.(\s|$)'
+  $pend = 0
   $reSummary = [regex]'(\d+) errors? out of (\d+) tests'
   $reTime    = [regex]'^Time: (\S+) \d+ ms$'
   $reTest    = [regex]'^(\S+)\.\.\.'
@@ -3051,7 +3236,10 @@ function Read-CorpusSegment($logPath) {
     }
     # Per-test tally. An ABORTED segment never prints a summary, so these counts are
     # the ONLY record of the work it did — see the derivation note at the union.
-    if ($line.EndsWith(' Ok', [System.StringComparison]::Ordinal)) { $r.OkLines++ }
+    if ($line.EndsWith(' Ok', [System.StringComparison]::Ordinal)) {
+      $r.OkLines++
+      if (-not $reTeardown.IsMatch($line)) { $pend++ }
+    }
     # ONE BLAMED FILE PER TRACEBACK. The flag is cleared by any line of NORMAL
     # fixture output, so a block contributes exactly its first (innermost) frame
     # and a later traceback contributes its own. Placed here, above the $c
@@ -3071,7 +3259,13 @@ function Read-CorpusSegment($logPath) {
       }
     }
     $c = $line[0]
-    if ($c -eq 'T') { $m = $reTime.Match($line);  if ($m.Success) { $r.Completed.Add($m.Groups[1].Value); continue } }
+    if ($c -eq 'T') { $m = $reTime.Match($line)
+      if ($m.Success) {
+        $r.Completed.Add($m.Groups[1].Value)
+        if ($pend -eq 0) { $r.Inert.Add($m.Groups[1].Value) }
+        $pend = 0
+        continue
+      } }
     if ($c -eq '!') {
       $m = $reFails.Match($line)
       if ($m.Success) { foreach ($n in ($m.Groups[1].Value -split '\s+')) { if ($n) { $r.FailNames[$n] = $true } }; continue }
@@ -3080,7 +3274,7 @@ function Read-CorpusSegment($logPath) {
         $r.FailNames[$m.Groups[1].Value] = $true
         # one `expected:` per FAILED test (`got:` is its partner line) — the failure
         # tally that pairs with OkLines to reconstitute sqlite's own count.
-        if ($m.Groups[2].Value -eq 'expected') { $r.FailMarkers++ }
+        if ($m.Groups[2].Value -eq 'expected') { $r.FailMarkers++; $pend++ }
         continue
       }
     }
@@ -4485,9 +4679,10 @@ while ($si -lt $segments.Count) {
 # so it can never quietly drift out of agreement with sqlite's arithmetic.
 $sumTests = 0; $sumErrors = 0; $nSummarised = 0
 $derTests = 0; $derErrors = 0; $nDerived = 0
-$filesDone = 0; $failNames = @(); $calibration = @()
+$filesDone = 0; $filesInert = 0; $failNames = @(); $calibration = @()
 foreach ($r in $results) {
   $filesDone += $r.Completed.Count
+  $filesInert += $r.Inert.Count
   $failNames += $r.FailNames.Keys        # names ALWAYS flow, summary or not
   $r.DerivedTests  = $r.OkLines + $r.FailMarkers + 1
   $r.DerivedErrors = $r.FailMarkers
@@ -4567,6 +4762,11 @@ foreach ($r in $results) {
     $led.Add("   tests: $(Format-Count $r.DerivedTests) / errors: $($r.DerivedErrors)   [source: DERIVED from per-test lines — $(Format-Count $r.OkLines) ' Ok' + $($r.FailMarkers) '! expected:' + 1; this segment aborted and printed no summary]")
   }
   $led.Add("   files completed ($($r.Completed.Count)): $($r.Completed -join ' ')")
+  # ★ BESIDE "files completed", NEVER INSTEAD OF IT, and printed even at zero. A
+  #   count of files that ASSERTED NOTHING is what makes the line above honest:
+  #   without it a run in which a third of the corpus returned at its first
+  #   `ifcapable` gate reads exactly like a run in which all of it executed.
+  $led.Add("   of those, files that ASSERTED NOTHING ($($r.Inert.Count)): $($r.Inert -join ' ')")
   if ($r.FailNames.Count) { $led.Add("   failing test(s) seen here ($($r.FailNames.Count)): $(($r.FailNames.Keys | Sort-Object) -join ' ')") }
 }
 if ($calibration.Count) { $led.Add(""); $led.Add("== derivation calibration MISMATCH =="); foreach ($c in $calibration) { $led.Add("   $c") } }
@@ -4575,6 +4775,54 @@ if ($notReached.Count) { $led.Add(""); $led.Add("== NOT REACHED (no verdict) =="
 if ($hygiene.Count)    { $led.Add(""); $led.Add("== process hygiene =="); foreach ($h in $hygiene) { $led.Add("   $h") } }
 if ($TierExcludes.Count) { $led.Add(""); $led.Add("== EXCLUDED by operator (DSS_TIER_EXCLUDES -> QUICKTEST_OMIT) =="); $led.Add("   $($TierExcludes -join ' ')") }
 Set-Content -LiteralPath $Ledger -Value $led
+
+# ── DID THE DECLARED CAPABILITIES REACH THE TESTS? ───────────────────────────
+# The recipe assertions in the derive script proved each define reached the
+# COMPILER. That is not the property being claimed. A capability can be compiled
+# in and never exercised — which is the exact state this work was written
+# against, where DSS compiled fts5.c on every run and every fts5 test file
+# returned at its gate having asserted nothing. Each declared witness must have
+# emitted at least one real result. The witnesses were chosen from the MEASURED
+# inert set, so this gate was red before the capability set existed and goes
+# green only by it.
+if ($StageBuild -and $StageBuild.capabilityWitnesses -and $results.Count) {
+  $inertUnion = @{}; foreach ($r in $results) { foreach ($f in $r.Inert)     { $inertUnion[$f] = $true } }
+  $ranUnion   = @{}; foreach ($r in $results) { foreach ($f in $r.Completed) { $ranUnion[$f]   = $true } }
+  $gaps = @(); $absent = @(); $checked = 0
+  $declaredWitnesses = @($StageBuild.capabilityWitnesses.PSObject.Properties.Name)
+  foreach ($cap in ($declaredWitnesses | Sort-Object)) {
+    $file = "$($StageBuild.capabilityWitnesses.$cap.file).test"
+    # A witness this tier never reached is NOT a capability gap — it is a file
+    # outside this run's corpus, and calling it a gap would make the instrument
+    # lie in the very direction it exists to prevent.
+    # ★ IT IS NOT SILENT EITHER. ✔MEASURED on THIS driver 2026-08-07: fts5aa,
+    #   rtree1 and session1 were absent from the Windows corpus entirely (the
+    #   staged test dir had no sibling ext/, so sqlite's own
+    #   `glob -nocomplain $testdir/../ext/…` matched nothing) and this gate
+    #   announced "every declared capability reached the tests (7 witness
+    #   file(s))" over three families that could not have run. Counting what was
+    #   actually CHECKED is what stops that sentence being writable again.
+    if (-not $ranUnion.ContainsKey($file)) { $absent += "$cap($file)"; continue }
+    $checked++
+    if ($inertUnion.ContainsKey($file)) { $gaps += "$cap($file)" }
+  }
+  if ($absent.Count) {
+    Warn "[$LegTag] $($absent.Count) of $($declaredWitnesses.Count) capability witness(es) were NOT IN THIS RUN'S CORPUS, so nothing was proved about them: $($absent -join ' ')"
+    Warn "      A witness file that never appears is not a passing witness. Either the tier does not"
+    Warn "      include it, or the corpus this leg was handed is missing the directory it lives in."
+  }
+  if ($gaps.Count) {
+    $script:CapabilityGaps += "$LegTag : $($gaps -join ' ')"
+    Warn "[$LegTag] DECLARED CAPABILITIES DID NOT REACH THE TESTS — $($gaps -join ' ')"
+    Warn "      Each of those files ran to completion and asserted NOTHING: it returned at its"
+    Warn "      ``ifcapable`` gate. The define reached the compiler, so either the library was built"
+    Warn "      without the capability the flag was supposed to enable, or the fixture linked"
+    Warn "      objects from an older configuration. Reported at the end of the run."
+  } else {
+    # CHECKED-of-DECLARED, never just DECLARED.
+    Pass "[$LegTag] every capability witness that was IN THIS CORPUS reached the tests — $checked of $($declaredWitnesses.Count) declared"
+  }
+}
 
 $unitVerdict = ''; $unitFail = $false
 if ($preconditionFail) {
@@ -4588,7 +4836,7 @@ if ($preconditionFail) {
   $unitFail = $true
   Warn "[$LegTag] corpus FAIL — PRECONDITION FAILURE, no unit of this leg's corpus ever ran."
   Warn "      $preconditionFail"
-  Info "      $($results.Count) segment(s), $filesDone test file(s) completed, $resumes of $MaxResumes resume(s) used."
+  Info "      $($results.Count) segment(s), $filesDone test file(s) completed ($filesInert of them asserted NOTHING), $resumes of $MaxResumes resume(s) used."
   Info "      per-unit ledger: $Ledger"
 } elseif ($aborts.Count) {
   # An abort is itself a FAILURE. Resuming recovers the units behind it; it never
@@ -4600,7 +4848,7 @@ if ($preconditionFail) {
   if ($notReached.Count) { $unitVerdict += "; $($notReached.Count) unit group(s) NOT REACHED — see $Ledger" }
   $unitFail = $true
   Warn "[$LegTag] corpus FAIL — $($aborts.Count) abort(s): $($where -join ' ')"
-  Info "      union across $($results.Count) segment(s): $summaryText; $filesDone test file(s) completed"
+  Info "      union across $($results.Count) segment(s): $summaryText; $filesDone test file(s) completed ($filesInert of them asserted NOTHING)"
   if ($derivationText) { Info "        derived from: $derivationText" }
   if ($real.Count) { Info "      $($real.Count) GENUINE DSS failure(s): $($real -join ' ')" }
   foreach ($n in $notReached) { Warn "      NOT REACHED: $n" }
@@ -4677,7 +4925,7 @@ $legRec.Ledger      = $Ledger
 # always was.
 $rep = New-Object 'System.Collections.Generic.List[string]'
 if ($results.Count -gt 1 -or $aborts.Count -or $notReached.Count -or $hygiene.Count) {
-  [void]$rep.Add("segments : $($results.Count) ($resumes resume(s) of max $MaxResumes)   $filesDone test file(s) completed   ledger: $Ledger")
+  [void]$rep.Add("segments : $($results.Count) ($resumes resume(s) of max $MaxResumes)   $filesDone test file(s) completed ($filesInert asserted NOTHING)   ledger: $Ledger")
   if ($derivationText) { [void]$rep.Add("counts   : $derivationText") }
   foreach ($a in $aborts) { [void]$rep.Add("aborted  : permutation '$(if ($a.Perm) { $a.Perm } else { '?' })' file '$(if ($a.File) { $a.File } else { '?' })'$(if ($a.KillReason) { " [KILLED: $($a.KillReason)]" }) — its remaining cases did NOT run  ($($a.Log))") }
   foreach ($n in $notReached) { [void]$rep.Add("NOT RUN  : $n") }
@@ -4923,4 +5171,12 @@ $cliSmoked = @($CliSmokeVerdict.Keys | Where-Object { "$($CliSmokeVerdict[$_])" 
 # contradicted by this driver's own CLI ledger a few lines earlier. A leg that
 # did not build is not a leg this host could not run.
 Pass "sqlite3 CLI: BUILT on $($CliBuilt.Count) of $($AllLegs.Count) declared leg(s); the 14-assertion smoke gate passed on $cliSmoked (of the $($CliBuilt.Count) built, $($CliBuilt.Count - $cliSmoked) were NOT executed here — each named above; the $($AllLegs.Count - $CliBuilt.Count) that did not build are named there too)"
+# ★ A CAPABILITY GAP FAILS THE RUN, and it fails it HERE rather than mid-leg so
+#   the other legs still produce their verdicts — one stage defect must not cost
+#   four legs' results. It is a HARNESS failure, never a DSS one: the compiler
+#   built what it was handed, and what it was handed was wrong.
+if ($script:CapabilityGaps.Count) {
+  foreach ($g in $script:CapabilityGaps) { Warn "capability gap — $g" }
+  Die "the run built a sqlite that does NOT have capabilities this harness declares.`n      Every gap above is a test file that completed and asserted nothing, for a capability`n      legs.json stageBuild names explicitly. The corpus totals above are therefore an`n      OVERSTATEMENT of coverage: those files are counted as completed.`n      [D-HARNESS-CORPUS-FILES-COMPLETE-WITHOUT-ASSERTING-BECAUSE-CAPABILITIES-ARE-OFF]"
+}
 exit 0

@@ -387,7 +387,10 @@ pin_step8_gates() { # pin_step8_gates <driver>
 # ═══════════════════════════════════════════════════════════════════════════
 pin_parse_segment() { # pin_parse_segment <driver>
   local drv="$1"
-  load_fns "$drv" parse_segment fact || return 0
+  # `facts` (plural) as well as `fact`: the inert-file assertion below reads the
+  # NAMES, and a pin that could only read the count would pass over a counter
+  # that blamed the wrong file.
+  load_fns "$drv" parse_segment fact facts || return 0
 
   # (1) THE MEASURED PRECONDITION LOG, reproduced from the operator's Mac. The
   #     harness reported "the UNNAMED file that aborted … no resolvable corpus
@@ -438,6 +441,98 @@ LOG
   ck "crash log: files completed > 0"     "1" "$(fact N "$WORK/crash.facts")"
   ck "crash log: the last test is named"  "swarmvtabfault-1.1-oom-persistent.143" "$(fact T "$WORK/crash.facts")"
   ck "crash log: a diagnostic is captured too" "child process exited abnormally"  "$(fact A "$WORK/crash.facts")"
+
+  # (4) COMPLETED IS NOT COVERED — the inert-file counter, driven through the
+  #     SHIPPED parse_segment rather than a re-typing of what it is believed to
+  #     do. ✔The log below is the MEASURED shape, copied off a real corpus.log:
+  #     every file emits two harness teardown results, and an INERT file emits
+  #     ONLY those. ⚠ Note the `...` has NO space before it — `fts5aa.test-
+  #     closeallfiles...` — which is exactly the detail that made a first cut of
+  #     this counter report ZERO inert files: an anchored `-closeallfiles$`
+  #     match never fires, so teardown counted as coverage and every file looked
+  #     busy. That is why this pin asserts the NAMES and not just the count.
+  cat > "$WORK/inert.log" <<'LOG'
+select1-1.1... Ok
+select1-1.2... Ok
+select1.test-closeallfiles... Ok
+select1.test-sharedcachesetting... Ok
+Time: select1.test 42 ms
+fts5aa.test-closeallfiles... Ok
+fts5aa.test-sharedcachesetting... Ok
+Time: fts5aa.test 2 ms
+! wherelimit-1.1 expected: [1]
+! wherelimit-1.1 got: [0]
+wherelimit.test-closeallfiles... Ok
+wherelimit.test-sharedcachesetting... Ok
+Time: wherelimit.test 7 ms
+0 errors out of 8 tests on host Linux 64-bit
+LOG
+  parse_segment "$WORK/inert.log" "$WORK/inert.facts"
+  ck "inert log: three files completed"          "3" "$(fact N "$WORK/inert.facts")"
+  ck "inert log: exactly ONE asserted nothing"   "1" "$(fact M "$WORK/inert.facts")"
+  # BY NAME, not by count: "one inert file" is satisfied by the WRONG one, and a
+  # counter that blamed select1.test would be a worse instrument than none.
+  ck "inert log: and it is the one that ran nothing" "fts5aa.test" \
+     "$(facts I "$WORK/inert.facts" | tr '\n' ' ' | sed 's/ $//')"
+  # A file whose only output is a FAILURE has asserted something. Counting it as
+  # inert would let a capability gate go green over a file that ran and failed.
+  ck "inert log: a file that only FAILED is not inert" "1" "$(fact Q "$WORK/inert.facts")"
+  # And the healthy log from (2), which carries no teardown lines at all, must
+  # report ZERO — the counter must not depend on teardown being present.
+  ck "healthy log: nothing is inert" "0" "$(fact M "$WORK/healthy.facts")"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# D2 — the declared capability set reaches EVERY build site, in BOTH drivers
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★ THE PARITY PIN. "A capability in one driver and not the other" is this
+# project's canonical silent harness bug, and it had already happened INSIDE one
+# run: the sqlite3 CLI recipe carried -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE
+# while the testfixture recipe, built from the same tree, carried neither.
+# So this is asserted at the SOURCE level over BOTH drivers: every `make`
+# invocation that builds or dry-runs a target in $BLD must carry OPTIONS=, and
+# every `configure` invocation must carry the declared flags. A source-level pin
+# because the failure is a MISSING call-site — something no run of the existing
+# call sites can ever reveal.
+pin_stage_capabilities() { # pin_stage_capabilities <driver...>
+  local drv f n
+  for drv in "$@"; do
+    [ -f "$drv" ] || { ck "stage capabilities: $drv exists" "yes" "no"; continue; }
+    f="$(basename "$drv")"
+    # (1) every ./configure of the build dir carries the declared flags.
+    n="$(LC_ALL=C grep -cE '(configure)" +("\$\{CONFIGURE_ARGS\[@\]\}"|\$STAGE_CONFIGURE_FLAGS)' "$drv" || true)"
+    ck "$f: every ./configure carries the declared capability flags (count>0)" \
+       "yes" "$([ "${n:-0}" -gt 0 ] && echo yes || echo no)"
+    n="$(LC_ALL=C grep -cE '(configure)" *>' "$drv" || true)"
+    ck "$f: no ./configure invocation is left BARE" "0" "${n:-0}"
+    # (2) every make of a real target in the build dir carries OPTIONS=.
+    #     `make -n` derivations go through dss_bh_emit_recipe, checked in (3).
+    # ⚠ THE SITE COUNT IS ASSERTED FIRST. "no site without OPTIONS = 0" is
+    #   satisfied by a pattern that matches NO SITES AT ALL, so a matcher that
+    #   silently stops matching turns this pin into a permanent green. Prove it
+    #   can still SEE its subject before asking anything about it — the same
+    #   vacuity the sibling check in (3) actually hit while being written.
+    local sites
+    sites="$(LC_ALL=C grep -cE 'cd "\$BLD" && make ' "$drv" || true)"
+    ck "$f: the make-site matcher still finds sites" "yes" \
+       "$([ "${sites:-0}" -gt 0 ] && echo yes || echo no)"
+    n="$(LC_ALL=C grep -E 'cd "\$BLD" && make ' "$drv" | LC_ALL=C grep -cv 'OPTIONS=' || true)"
+    ck "$f: no 'cd \$BLD && make' without OPTIONS=" "0" "${n:-0}"
+    # (3) every recipe derivation passes OPTIONS= as a make variable. Counted
+    #     against the number of derivations so ADDING a third target without the
+    #     flag reds, which a mere ">0" would not catch.
+    # ⚠ CALL SITES, not mentions. A first cut counted every occurrence of the
+    #   name and reported 3-of-2 and 4-of-2 against drivers that were correct —
+    #   the extra hits were PROSE in the surrounding comments. A pin whose
+    #   denominator counts documentation cannot be green on a correct driver.
+    local derivations opts
+    derivations="$(LC_ALL=C grep -cE '(^|[^a-z_])dss_bh_emit_recipe \\$' "$drv" || true)"
+    opts="$(LC_ALL=C grep -c -- '--make-var "OPTIONS=\$STAGE_MAKE_OPTIONS"' "$drv" || true)"
+    ck "$f: the derivation matcher still finds call sites" "yes" \
+       "$([ "${derivations:-0}" -gt 0 ] && echo yes || echo no)"
+    ck "$f: every dss_bh_emit_recipe call passes OPTIONS= ($derivations derivation(s))" \
+       "$derivations" "$opts"
+  done
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -668,6 +763,14 @@ WSLENV=QUICKTEST_OMIT:TCL_LIBRARY" "$out"
 green "A+B  the not-run recorder + the shared run decision" pin_verdicts
 green "C    the Step-8 gate sequence, executed"             pin_step8_gates
 green "D    parse_segment keeps the first diagnostic"       pin_parse_segment
+# ★ Runs over BOTH drivers, deliberately — the property being pinned is that the
+#   two AGREE, so a pin that only ever saw the .sh could not fail on the exact
+#   defect it exists for. It is invoked directly rather than through green(),
+#   which passes $SH alone.
+printf -- '-- %s\n' "D2   the declared capability set reaches every build site, BOTH drivers"
+PIN_FAILS=0; QUIET=0
+pin_stage_capabilities "$SH" "$HERE/build-and-test.ps1"
+[ "$PIN_FAILS" -eq 0 ] || bad "D2 — $PIN_FAILS check(s) failed against the SHIPPED drivers"
 green "E    the precondition discriminator"                 pin_precondition
 green "F    acq_field over a REAL acquisition record"       pin_acq_field
 green "G    the loader variable is TARGET-keyed"            pin_loader_var
@@ -750,6 +853,33 @@ if mutate "H8 forward a DRIVER PATH by name, untranslated" "$WORK/m8.sh" 'call+=
       print "    call+=(--forward \"$n\"); carried=1"; next }
     { print }'; then
   red "H8 a DRIVER PATH may not be forwarded raw" pin_env_forward "$WORK/m8.sh"
+fi
+
+# H9 — count the harness's own teardown results as coverage. This is not a
+# hypothetical mutation: it is the ACTUAL defect a first cut of this counter had
+# (the teardown lines end in `...` with no space, so an anchored suffix match
+# never fired), and it reported ZERO inert files over a corpus with 362.
+# ⚠ The WITNESS is the CODE (`$1 !~ /\.test-closeallfiles`), never the bare file
+#   name — the name also appears in the comment above the rule, and a witness
+#   that survives in a comment is how a removed guard reports itself present.
+if mutate "H9 count harness teardown as coverage" "$WORK/m9.sh" '$1 !~ /\.test-closeallfiles' '
+    /^    \/ Ok\$\/ +\{ ok\+\+$/ {
+      print "    / Ok$/                     { ok++; pend++ }"; skip = 2; next }
+    skip > 0 { skip--; next }
+    { print }'; then
+  red "H9 a file whose only output is teardown asserted NOTHING" pin_parse_segment "$WORK/m9.sh"
+fi
+
+# H10 — build a target in $BLD without the declared capability defines. The
+# recipe would then be derived from a differently-configured build than the one
+# the reference oracle is built from, and STAT4 (which reaches the compiler ONLY
+# through `make OPTIONS=`, never through OPT_FEATURE_FLAGS) would vanish with no
+# other check in a position to see it.
+if mutate "H10 build the fixture without the declared OPTIONS" "$WORK/m10.sh" 'make -s testfixture USE_AMALGAMATION=0 "OPTIONS=$STAGE_MAKE_OPTIONS"' '
+    /make -s testfixture USE_AMALGAMATION=0 "OPTIONS=\$STAGE_MAKE_OPTIONS"/ {
+      sub(/ "OPTIONS=\$STAGE_MAKE_OPTIONS"/, ""); print; next }
+    { print }'; then
+  red "H10 every build of \$BLD carries the declared capability defines" pin_stage_capabilities "$WORK/m10.sh"
 fi
 
 printf '\n'

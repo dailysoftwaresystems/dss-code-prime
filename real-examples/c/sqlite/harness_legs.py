@@ -2364,6 +2364,142 @@ def load_catalogue(path=CATALOGUE):
     return legs
 
 
+# ── THE STAGE BUILD CONFIGURATION — one declaration, both drivers ────────────
+# WHICH sqlite the corpus tests is a property of the RUN, not of a leg: one
+# staged tree feeds all five legs, so the capability set cannot live per-leg and
+# must not live per-driver. It had already gone wrong the per-driver way — the
+# CLI recipe carried -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE and the
+# testfixture recipe, built from the same tree in the same run, carried neither.
+#
+# ★ THE CHARSET CHECKS ARE NOT PEDANTRY. These values are interpolated into a
+#   `./configure` argv and a `make VAR=…` command line by two drivers, one of
+#   which reaches them through a PowerShell here-string. A value carrying a
+#   quote or a space would either be silently split into two flags or would
+#   escape its quoting entirely, and the failure would present as "the capability
+#   did not take" — indistinguishable from upstream retiring the flag. So the
+#   shapes are refused HERE, once, where both drivers inherit the refusal.
+_STAGE_FLAG_RE = re.compile(r"^--[A-Za-z0-9][A-Za-z0-9._-]*$")
+_STAGE_DEFINE_RE = re.compile(r"^SQLITE_[A-Z0-9_]+$")
+_STAGE_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_STAGE_FILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def stage_build(path=CATALOGUE):
+    """The declared sqlite stage build configuration. Raises LegError rather
+    than returning a default: a MISSING declaration must never read as "no
+    extensions were wanted", which is precisely the state that let 362 of 1,241
+    corpus files complete without asserting anything."""
+    with open(path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    sb = doc.get("stageBuild")
+    if not isinstance(sb, dict):
+        raise LegError(
+            "leg catalogue %s declares no `stageBuild` block. It is REQUIRED, "
+            "and it is required precisely because its absence is silent: the "
+            "tree still configures, still builds and still reports every file "
+            "as completed, while a third of them return at their first "
+            "`ifcapable` gate having asserted nothing "
+            "[D-HARNESS-CORPUS-FILES-COMPLETE-WITHOUT-ASSERTING-BECAUSE-"
+            "CAPABILITIES-ARE-OFF]." % path)
+
+    def _list(key, pattern, what):
+        raw = sb.get(key)
+        if not isinstance(raw, list) or not raw:
+            raise LegError("stageBuild.%s must be a non-empty list of %s"
+                           % (key, what))
+        for item in raw:
+            if not isinstance(item, str) or not pattern.match(item):
+                raise LegError(
+                    "stageBuild.%s: %r is not a well-formed %s. Both drivers "
+                    "interpolate these into a shell command line, so a value "
+                    "carrying whitespace or quoting would be split or would "
+                    "escape its quotes, and the result would look exactly like "
+                    "the capability having no effect." % (key, item, what))
+        if len(set(raw)) != len(raw):
+            raise LegError("stageBuild.%s repeats an entry" % key)
+        return list(raw)
+
+    flags = _list("configureFlags", _STAGE_FLAG_RE, "configure flag (--name)")
+    defines = _list("optionDefines", _STAGE_DEFINE_RE, "bare SQLITE_* macro name")
+    required = _list("requiredDefines", _STAGE_DEFINE_RE, "bare SQLITE_* macro name")
+    # Every optionDefine is by construction something we asked for by name, so
+    # it must also be something we verify arrived. Anything else would let the
+    # one mechanism with no configure-side confirmation go unchecked.
+    missing = [d for d in defines if d not in required]
+    if missing:
+        raise LegError(
+            "stageBuild: %s appears in optionDefines but not in requiredDefines. "
+            "optionDefines is the mechanism with NO configure-side "
+            "confirmation — it is passed straight through as `make OPTIONS=…` — "
+            "so it is the one that most needs the derived-recipe assertion."
+            % ", ".join(sorted(missing)))
+    wit = sb.get("capabilityWitnesses")
+    if not isinstance(wit, dict) or not wit:
+        raise LegError("stageBuild.capabilityWitnesses must be a non-empty "
+                       "object of <ifcapable name>: {file, define}")
+    witnesses = {}
+    for cap, entry in sorted(wit.items()):
+        if not _STAGE_NAME_RE.match(cap or ""):
+            raise LegError("stageBuild.capabilityWitnesses: %r is not an "
+                           "`ifcapable` capability name" % cap)
+        if not isinstance(entry, dict):
+            raise LegError("stageBuild.capabilityWitnesses[%s] must be an "
+                           "object {file, define}" % cap)
+        stem, define = entry.get("file"), entry.get("define")
+        if not isinstance(stem, str) or not _STAGE_FILE_RE.match(stem):
+            raise LegError("stageBuild.capabilityWitnesses[%s].file: %r is not "
+                           "a test file stem (no directory, no extension)"
+                           % (cap, stem))
+        if not isinstance(define, str) or not _STAGE_DEFINE_RE.match(define):
+            raise LegError("stageBuild.capabilityWitnesses[%s].define: %r is "
+                           "not a bare SQLITE_* macro name" % (cap, define))
+        # The pairing is DECLARED, never inferred from the capability name:
+        # `mem5` ↔ SQLITE_ENABLE_MEMSYS5 share no substring, so every naming
+        # heuristic has to be weakened to accept it — at which point it stops
+        # catching the case it was written for.
+        if define not in required:
+            raise LegError(
+                "stageBuild.capabilityWitnesses[%s] expects %s, which is not in "
+                "requiredDefines. Its gate could then only ever be red: the "
+                "witness is waiting on a capability this configuration never "
+                "turns on." % (cap, define))
+        witnesses[cap] = {"file": stem, "define": define}
+    wit = witnesses
+    return {
+        "configureFlags": flags,
+        "optionDefines": defines,
+        "requiredDefines": sorted(required),
+        "capabilityWitnesses": dict(wit),
+        # The single string both drivers hand to `make`. Assembled HERE so the
+        # `-D` prefix is applied in exactly one place: a driver that spelled it
+        # itself could disagree, and `make OPTIONS=SQLITE_ENABLE_STAT4` (no -D)
+        # is accepted by make, reaches the compiler as a bare token, and is
+        # ignored — a capability lost with no error anywhere.
+        "makeOptions": " ".join("-D" + d for d in defines),
+    }
+
+
+def stage_build_sh(sb):
+    """The stage build configuration as shell assignments. build-and-test.sh
+    `eval`s this text, so it must be assignments and NOTHING else — asserted by
+    self_test through sh_statements(), the same guarantee emit_sh() carries.
+    A separate function rather than inline in main() so the test can execute the
+    SHIPPED emitter instead of re-typing what it believes the emitter does."""
+    return ("DSS_STAGE_CONFIGURE_FLAGS=%s\n"
+            "DSS_STAGE_MAKE_OPTIONS=%s\n"
+            "DSS_STAGE_REQUIRED_DEFINES=%s\n"
+            "DSS_STAGE_WITNESSES=%s\n" % (
+                # shlex.quote on every value, even though stage_build() has
+                # already refused everything that would need quoting. The
+                # validation is the guarantee; the quoting is what keeps a FUTURE
+                # loosening of it from becoming a shell injection into a driver.
+                shlex.quote(" ".join(sb["configureFlags"])),
+                shlex.quote(sb["makeOptions"]),
+                shlex.quote(" ".join(sb["requiredDefines"])),
+                shlex.quote(" ".join("%s=%s" % (c, w["file"]) for c, w
+                                     in sorted(sb["capabilityWitnesses"].items())))))
+
+
 def expand_path(raw):
     """Expand `${env:NAME}` in a declared search path. An UNSET variable drops
     the whole candidate (returns None) rather than leaving a literal `${env:...}`
@@ -4030,6 +4166,16 @@ def _lint_acquire(label, spec, libs):
 def lint(path=CATALOGUE):
     """Catalogue defects, host-independently. Returns a list of strings."""
     findings = []
+    # The run-wide stage build configuration is linted FIRST and by the same
+    # loader the drivers use, so `--lint` cannot pass over a declaration that
+    # would abort every run. Reported as a finding rather than raised: lint's
+    # job is to enumerate everything wrong, not to stop at the first thing.
+    try:
+        stage_build(path)
+    except LegError as exc:
+        findings.append("stageBuild: %s" % exc)
+    except (OSError, ValueError) as exc:
+        findings.append("stageBuild could not be read from %s: %s" % (path, exc))
     legs = load_catalogue(path)
     seen_labels, seen_specs = {}, {}
     # (targetArch, hostOs, hostArch) -> set of launcher spellings. One triple
@@ -4857,15 +5003,26 @@ MIRROR_CASES = {
     # THE ONE THAT CARRIES THE PARSING SEMANTICS. Both sides project into the
     # .sh region's own fact alphabet; see the normalisation note above.
     "parse-segment": {
+        # ★ `I` AND `M` ARE PROJECTED HERE OR THEY ARE NOT COMPARED AT ALL. This
+        #   projection is a FIXED alphabet, so a fact the two engines both
+        #   compute but neither side lists is silently outside the differential —
+        #   and `--check-regions` still reports "identical answers", which reads
+        #   as coverage. The inert counter is exactly the kind of thing that
+        #   needs this: it exists in two independent implementations (an awk rule
+        #   and a PowerShell regex) whose ONLY guarantee of agreement is this
+        #   comparison, and the teardown-matching detail they hinge on is one a
+        #   first cut already got wrong once.
         "sh": ('parse_segment "$LOGFILE" "$FACTFILE"\n'
                'facts F "$FACTFILE"\n'
+               'facts I "$FACTFILE" | sed "s/^/I /"\n'
                'facts X "$FACTFILE" | LC_ALL=C sort -u | sed "s/^/X /"\n'
                'facts B "$FACTFILE" | sed "s/^/B /"\n'
-               'for k in S E C P T G N D K Q A; do\n'
+               'for k in S E C P T G N M D K Q A; do\n'
                '  printf "%s %s\\n" "$k" "$(fact "$k" "$FACTFILE")"\n'
                'done'),
         "ps1": ("$r = Read-CorpusSegment $LOGFILE\n"
                 "foreach ($f in $r.Completed) { $f }\n"
+                "foreach ($f in $r.Inert) { \"I $f\" }\n"
                 "foreach ($n in ($r.FailNames.Keys | Sort-Object)) { \"X $n\" }\n"
                 "foreach ($b in $r.Blamed) { \"B $b\" }\n"
                 "\"S $($r.Summary)\"\n"
@@ -4875,6 +5032,7 @@ MIRROR_CASES = {
                 "\"T $($r.LastTest)\"\n"
                 "\"G $(if ($r.GaveUp) { '1' } else { '' })\"\n"
                 "\"N $($r.Completed.Count)\"\n"
+                "\"M $($r.Inert.Count)\"\n"
                 "\"D $(if ($r.Completed.Count) { $r.Completed[$r.Completed.Count - 1] } else { '' })\"\n"
                 "\"K $($r.OkLines)\"\n"
                 "\"Q $($r.FailMarkers)\"\n"
@@ -5062,6 +5220,20 @@ def _mirror_write_fixtures(work):
                  b'    (file "/opt/x/permutations.test" line 99)\n'
                  b"Time: zipfile.test 7 ms\n"
                  b'    (file "Z:\\opt\\x\\zipfile.test" line 7)\n'
+                 # ── AN INERT FILE, AND THE TEARDOWN SHAPE THAT DEFINES ONE ───
+                 # `swarmvtab.test` here emits ONLY the two results the harness
+                 # emits for every file, so both copies must call it inert; the
+                 # files above emit real results and must not be. Without these
+                 # lines the differential could not see the inert counter at all
+                 # — and the counter's whole correctness hinges on a detail this
+                 # is the only fixture that carries: the teardown names end in
+                 # `...` with NO SPACE before it, so a matcher anchored on
+                 # `-closeallfiles$` never fires and every file looks busy. That
+                 # was a real first cut, and it reported 0 inert over a corpus
+                 # with 362.
+                 b"swarmvtab.test-closeallfiles... Ok\n"
+                 b"swarmvtab.test-sharedcachesetting... Ok\n"
+                 b"Time: swarmvtab.test 2 ms\n"
                  b"*** Giving up...\n"
                  b"2 errors out of 41 tests on somehost Linux 64-bit\n")
     # ── THE REAL LOG, VERBATIM ──────────────────────────────────────────────
@@ -5644,6 +5816,59 @@ def self_test(path=CATALOGUE, out=sys.stdout):
 
     findings = lint(path)
     check("the leg catalogue lints clean", not findings, "\n      ".join(findings))
+
+    # ── the stage build configuration ────────────────────────────────────────
+    # Asserted on CONTENT, not on shape. "four keys are present" was satisfied
+    # by an earlier draft in which optionDefines carried a `-D` prefix that
+    # `make OPTIONS=` then passed to the compiler as a bare, ignored token — a
+    # capability lost with no error anywhere.
+    sb = stage_build(path)
+    check("stageBuild names the sqlite3 capability the operator asked for",
+          "SQLITE_ENABLE_FTS5" in sb["requiredDefines"],
+          "requiredDefines=%r" % (sb["requiredDefines"],))
+    check("stageBuild's makeOptions carries a -D per optionDefine",
+          sb["makeOptions"].split() ==
+          ["-D" + d for d in sb["optionDefines"]],
+          "makeOptions=%r optionDefines=%r"
+          % (sb["makeOptions"], sb["optionDefines"]))
+    check("no optionDefine is spelled with its own -D "
+          "(it would reach the compiler twice-prefixed and be ignored)",
+          not any(d.startswith("-D") for d in sb["optionDefines"]))
+    check("every configure flag is a --flag with no embedded whitespace",
+          all(f.startswith("--") and not any(c.isspace() for c in f)
+              for f in sb["configureFlags"]),
+          "configureFlags=%r" % (sb["configureFlags"],))
+    # A witness whose define is not among requiredDefines would wait on a
+    # capability this configuration never turns on, so its gate could only ever
+    # be red. ⚠ The pairing is checked against the DECLARED `define`, not
+    # derived from the capability name: the obvious structural rule ("the
+    # capability name appears inside its define") fails on the perfectly correct
+    # `mem5` ↔ `SQLITE_ENABLE_MEMSYS5`, and a heuristic that has to be weakened
+    # to accept real data is worth less than the explicit pairing it avoids.
+    for cap, w in sorted(sb["capabilityWitnesses"].items()):
+        check("witness capability '%s' names a required define" % cap,
+              w["define"] in sb["requiredDefines"],
+              "%r is not in requiredDefines" % w["define"])
+        check("witness capability '%s' names a test file stem, not a path" % cap,
+              "/" not in w["file"] and not w["file"].endswith(".test"),
+              "file=%r" % w["file"])
+    # build-and-test.sh EVALS this text, so it must be assignments and nothing
+    # else — the same guarantee emit_sh() carries, proved the same way and
+    # against the SHIPPED emitter rather than a re-typing of it.
+    sb_sh = stage_build_sh(sb)
+    sb_statements = sh_statements(sb_sh)
+    check("the stage-build sh emitter emits one statement per variable",
+          len(sb_statements) == 4,
+          "got %d: %r" % (len(sb_statements), sb_statements))
+    check("every stage-build sh statement is an assignment, never a command",
+          all(re.match(r"^DSS_STAGE_[A-Z_]+=", s) for s in sb_statements),
+          "%r" % (sb_statements,))
+    # And the values SURVIVE the round trip. "four assignments" was already true
+    # of an emitter that dropped the -D prefix; only reading the value back
+    # catches that.
+    check("the stage-build sh emitter carries makeOptions verbatim",
+          ("DSS_STAGE_MAKE_OPTIONS=" + shlex.quote(sb["makeOptions"])) in sb_statements,
+          "%r" % (sb_statements,))
 
     legs = load_catalogue(path)
     labels = [leg["label"] for leg in legs]
@@ -7307,6 +7532,16 @@ def main(argv=None):
                         "TARGET, and inheriting the DERIVING host's is "
                         "D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-"
                         "CONFIGURE-PROBES.")
+    p.add_argument("--stage-build", action="store_true",
+                   help="print the declared sqlite stage build configuration — "
+                        "the configure flags, the `make OPTIONS=` defines, the "
+                        "defines that MUST show up in the derived recipe, and "
+                        "the per-capability witness files. RUN-WIDE, not "
+                        "per-leg: one staged tree feeds every leg, so the "
+                        "capability set cannot be a leg property and must not "
+                        "be a driver property. `--format sh` emits shell "
+                        "assignments for build-and-test.sh and for the derive "
+                        "script build-and-test.ps1 runs.")
     p.add_argument("--path-translations", action="store_true",
                    help="print the closed path-translation vocabulary: "
                         "'<verb>\\t<translator argv>', one per line")
@@ -7542,9 +7777,10 @@ def main(argv=None):
             or args.resolve_target_cc or args.build_loadext_helper
             or args.loadext_builder or args.tcl_coherence
             or args.run_filesystems or args.run_dir_plan
+            or args.stage_build
             or args.registry_controls or args.check_regions):
         p.error("one of --verdict-vocabulary / --plan / --header-stages / "
-                "--config-stages / --lint "
+                "--config-stages / --stage-build / --lint "
                 "/ --self-test / --path-translations / --translate-path / "
                 "--assert-translated / --env-transfers / --env-transfer / "
                 "--registry-controls / --check-regions / "
@@ -7737,6 +7973,13 @@ def main(argv=None):
             for key, answers in configure_stages(load_catalogue(args.catalogue)).items():
                 sys.stdout.write("%s\t%s\n" % (key, " ".join(
                     "%s=%d" % (n, 1 if v else 0) for n, v in sorted(answers.items()))))
+            return 0
+        if args.stage_build:
+            sb = stage_build(args.catalogue)
+            if args.format == "sh":
+                sys.stdout.write(stage_build_sh(sb))
+            else:
+                sys.stdout.write(json.dumps(sb, indent=1, sort_keys=True) + "\n")
             return 0
         if args.tcl_coherence:
             if not args.staged_tcl_header:
