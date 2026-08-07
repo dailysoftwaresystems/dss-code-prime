@@ -195,7 +195,7 @@ constexpr ModelAxis kLlp64{DataModel::Llp64, ObjectFormatKind::Pe, "x86_64",
     return nlohmann::json::parse(in);
 }
 
-// D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: a PORTABLE scratch shipped descriptor
+// D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: a PORTABLE scratch shipped descriptor
 // modeling the `Tcl_GetWideIntFromObj` shape — a function whose pointer parameter
 // is the abstract width-based `ptr<i64>` (NOT `long long*`; the descriptor `i64`
 // is the ANONYMOUS I64, distinct-IDENTITY from every named C `long`/`long long`),
@@ -213,7 +213,7 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
 
 // Analyze `mainSrc` against `kFfiWideDescriptorJson` (written into `sysDir`) under
 // the axis `ax`. `flagOn` selects the SHIPPED schema (relaxation enabled) vs a
-// perturbed copy with `pointerConversions.ffiDescriptorIntPointeeCompat=false` —
+// perturbed copy with `pointerConversions.directCallIntPointeeCompat=false` —
 // the config red-on-disable axis (the `analyzeWithOverride` perturbation idiom).
 // The ScratchDir must outlive the returned model (the semantic phase reads the
 // descriptor file), so the caller owns it.
@@ -233,9 +233,20 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
     };
     if (flagOn) return build(loadShippedSchema("c-subset"));
     nlohmann::json doc = loadShippedCSubsetJson();
-    doc["semantics"]["pointerConversions"]["ffiDescriptorIntPointeeCompat"] = false;
+    doc["semantics"]["pointerConversions"]["directCallIntPointeeCompat"] = false;
     auto schema = GrammarSchema::loadFromText(doc.dump(), "<ffi-wide-flag-off>");
-    EXPECT_TRUE(schema.has_value());
+    // ★ FAIL-CLOSED, TF-C135: this was `EXPECT_TRUE`, which is NON-FATAL — so when
+    // the key was renamed and the perturbed schema stopped loading, the helper walked
+    // straight on to `*schema` and SEGFAULTED. A crash is a far worse verdict than a
+    // failed assertion: it takes the whole binary down, so every LATER test in this
+    // file reported nothing at all. An assertion that guards a dereference must stop
+    // the dereference; `ASSERT_*` cannot be used here (non-void return), so throw.
+    if (!schema.has_value()) {
+        throw std::runtime_error(
+            "perturbed c-subset schema failed to load — the "
+            "`directCallIntPointeeCompat` key was renamed or removed, so this "
+            "red-on-disable axis is testing nothing");
+    }
     return build(*schema);
 }
 
@@ -836,13 +847,29 @@ TEST(TypeIdentityVocabulary, InterlockedCompareExchangeTakesALongPointer) {
            "pointee would reject the very `long*` the intrinsic models";
     // And the negative direction, which is what makes the accept above meaningful:
     // an `int*` is NOT the parameter type, so it must DIAGNOSE.
+    //
+    // ★ CONTRACT CHANGED TF-C135 (D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT), AND THE
+    // CHANGE IS STATED HERE RATHER THAN ABSORBED. This used to assert `hasErrors()`.
+    // Widening the integer-pointee relaxation from "shipped-descriptor callee" to
+    // "any DIRECT callee" reaches this intrinsic too: on LLP64 `long` is I32 and so
+    // is `int`, so the two pointees now pass `sameRepresentation` and the call is
+    // admitted. That is NOT a silent collapse and the assertion below is what proves
+    // it: the compiler still says the types differ, at WARNING severity, which is
+    // exactly what MSVC (C4133) and clang (`-Wincompatible-pointer-types`) do for
+    // `int*` into `long*`. The identity claim this test exists for is untouched — the
+    // pointee is still the NAMED `long`, asserted above, and `_Generic` still splits
+    // them. Under `--warnings-as-errors` this is an error again.
     auto bad = analyzeWithShippedHeaders(
         "int f(void){ int v = 0;\n"
         "  return (int)_InterlockedCompareExchange(&v, 1, 0); }\n",
         kLlp64.dm, kLlp64.fmt, kLlp64.arch);
-    EXPECT_TRUE(bad.hasErrors())
+    EXPECT_FALSE(bad.hasErrors())
+        << "same-representation integer pointees are admitted at a direct call arg";
+    EXPECT_EQ(countCode(bad.diagnostics(),
+                  DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u)
         << "`int*` and `long*` are DIFFERENT types even at one representation — "
-           "accepting both would be the pre-change blanket collapse";
+           "admitting one for the other SILENTLY would be the blanket collapse this "
+           "test exists to forbid; the warning is the diagnostic that keeps it honest";
 }
 
 // Win32 `DWORD` IS `unsigned long`, so `LPDWORD` and `unsigned long*` must be
@@ -886,7 +913,7 @@ TEST(TypeIdentityVocabulary, WindowsDwordPointerIsUnsignedLongPointer) {
            "exactly the collapse this change undoes";
 }
 
-// ── D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT ────────────────────────────────
+// ── D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT ────────────────────────────────
 //
 // A shipped-FFI-descriptor `ptr<i64>` parameter accepts a real C integer pointer
 // of the SAME representation (size ∧ signedness ∧ integer-base-kind) AT THE
@@ -895,11 +922,53 @@ TEST(TypeIdentityVocabulary, WindowsDwordPointerIsUnsignedLongPointer) {
 // shipped-descriptor call arg, ONLY with the config flag on, and NEVER merges the
 // distinct type identities.
 
+// ★★ TF-C135 — THE CASE THE OLD `isShippedDescriptorFn` GATE COULD NOT REACH, AND
+// THE REASON THE GATE WAS WRONG. The callee here is an ORDINARY C PROTOTYPE, not a
+// shipped descriptor: the pointee types are what decide, so a `long long*` into a
+// `long*` parameter is admitted on LP64 exactly as it is for a descriptor's
+// `ptr<i64>`. This is upstream sqlite's Darwin shape — `tcl.h` declares
+// `Tcl_WideInt` as `long` there, and `sqlite3_int64` is `long long` — MEASURED to be
+// a `-Wincompatible-pointer-types` WARNING under Apple clang 21.0.0 and a hard
+// S0003 here before this change, which cost both mach-o legs their testfixture.
+//
+// THE ADMISSION IS DIAGNOSED, NOT SILENT: exactly one
+// S_IncompatiblePointerIntegerPointee. Asserting only `!hasErrors()` would pass just
+// as well over an implementation that accepted it QUIETLY, which is the failure this
+// project calls a silent accept — so the warning count is the load-bearing assertion,
+// not the error count.
+TEST(TypeIdentityVocabulary, DirectCallIntPointeeAdmitsAtAPlainCPrototypeAndWarns) {
+    std::string const src =
+        "void plain_take_long(long *p);\n"
+        "typedef long long sqlite3_int64;\n"
+        "int f(void){ sqlite3_int64 v = 0; plain_take_long(&v); return (int)v; }\n";
+    auto m = analyzeWithShippedHeaders(src, kLp64.dm, kLp64.fmt, kLp64.arch);
+    EXPECT_FALSE(m.hasErrors())
+        << "on LP64 `long` and `long long` are one representation — a direct call "
+           "arg admits it, whatever declared the callee";
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(m.diagnostics(),
+                  DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u)
+        << "the conversion must be DIAGNOSED — silence here is the whole failure "
+           "mode, and it is what distinguishes this from a blanket collapse";
+
+    // PER-TARGET, BY CONSTRUCTION AND WITH NO FORMAT BRANCH: on LLP64 `long` is I32
+    // while `long long` is I64, so `sameRepresentation` fails on the width axis and
+    // the SAME source stays a hard error. This is the negative control for the pin
+    // above — without it, "admitted on LP64" could equally describe a relaxation that
+    // admits everywhere.
+    auto llp = analyzeWithShippedHeaders(src, kLlp64.dm, kLlp64.fmt, kLlp64.arch);
+    EXPECT_TRUE(llp.hasErrors())
+        << "`long long*` into `long*` is a REAL width mismatch on LLP64";
+    EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_EQ(countCode(llp.diagnostics(),
+                  DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u);
+}
+
 // POSITIVE: `ptr<i64>` accepts `long long*`, a `typedef long long` (the
 // sqlite3_int64 shape), AND `long*` on LP64 (where `long` is I64) — no S0003. And
 // the IDENTITY WITNESS: the admission is a COMPAT match, never a TypeId merge.
 TEST(TypeIdentityVocabulary,
-     FfiDescriptorIntPointeeAdmitsWideIntPointerAtShippedCallArg) {
+     DirectCallIntPointeeAdmitsWideIntPointerAtShippedCallArg) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-pos"};
     std::string const src =
         "#include <ffiwide.h>\n"
@@ -932,7 +1001,7 @@ TEST(TypeIdentityVocabulary,
 // PER-TARGET (Condition 6): on LLP64/pe (where `long` is I32) the SAME `long*`
 // REFUSES the `ptr<i64>` parameter — emergent from the data model's `kind`, with
 // no format branch. `long long*` (I64 on both models) is still admitted.
-TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeePerTargetRefusesLongUnderLlp64) {
+TEST(TypeIdentityVocabulary, DirectCallIntPointeePerTargetRefusesLongUnderLlp64) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-llp64"};
     auto bad = analyzeFfiWide(sysDir,
         "#include <ffiwide.h>\n"
@@ -956,7 +1025,7 @@ TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeePerTargetRefusesLongUnderLlp
 // other integer/non-integer pointer STILL S0003 (proving the predicate
 // discriminates exactly where it is active).
 TEST(TypeIdentityVocabulary,
-     FfiDescriptorIntPointeePredicateNegativesStillRejectAtShippedBoundary) {
+     DirectCallIntPointeePredicateNegativesStillRejectAtShippedBoundary) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-neg"};
     std::string const src =
         "#include <ffiwide.h>\n"
@@ -977,7 +1046,7 @@ TEST(TypeIdentityVocabulary,
 // CONDITION 3 (red-on-disable): the relaxation is SCOPED to the call-arg boundary.
 // With the flag ON, the SAME sameRepresentation-distinct integer-pointer mismatch
 // at INIT / ASSIGNMENT / RETURN still S0003 — it never leaks past the call arg.
-TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeeScopedToCallArgNotInitAssignReturn) {
+TEST(TypeIdentityVocabulary, DirectCallIntPointeeScopedToCallArgNotInitAssignReturn) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-scope"};
     std::string const src =
         "#include <ffiwide.h>\n"
@@ -999,7 +1068,7 @@ TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeeScopedToCallArgNotInitAssign
 // CONFIG RED-ON-DISABLE: the whole relaxation is gated on
 // `pointerConversions.ffiDescriptorIntPointeeCompat`. Flip it FALSE (schema
 // perturbation) and the very admission above reverts to S0003.
-TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeeConfigFlagRedOnDisable) {
+TEST(TypeIdentityVocabulary, DirectCallIntPointeeConfigFlagRedOnDisable) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-flagoff"};
     std::string const src =
         "#include <ffiwide.h>\n"
@@ -1018,7 +1087,7 @@ TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeeConfigFlagRedOnDisable) {
 // anonymous `i64` parameter) routes the expression-callee path, which passes
 // calleeIsShippedFfi=false → STILL S0003 even for the `long long*` a direct call
 // admits.
-TEST(TypeIdentityVocabulary, FfiDescriptorIntPointeeIndirectCallStaysStrict) {
+TEST(TypeIdentityVocabulary, DirectCallIntPointeeIndirectCallStaysStrict) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-indirect"};
     auto direct = analyzeFfiWide(sysDir,
         "#include <ffiwide.h>\n"

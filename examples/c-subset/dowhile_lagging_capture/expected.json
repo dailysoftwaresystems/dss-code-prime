@@ -25,6 +25,12 @@
       "artifact": "main",
       "runOn": ["darwin"],
       "emulator": ""
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
     }
   ],
   "optimizedPipelines": [

@@ -245,6 +245,15 @@ DSS_TIER=veryquick DSS_CONFIG=release bash ./build-and-test.sh
   section would print that commit as if it were. Set `SRC_DIR=<checkout>` explicitly.
 - **Remote runs must survive the session close**: `setsid nohup … < /dev/null &`, then
   **verify with `pgrep`**. A launch line that printed is not a process that is running.
+  ⚠ **`pgrep -c` DOES NOT EXIST ON macOS, and the failure is silent-by-idiom.** BSD `pgrep`
+  has no `-c`; it exits 2 with a usage error, which the customary `|| echo 0` then converts
+  into a confident **`alive: 0`**. ✔MEASURED 2026-08-07: this reported a healthy multi-hour
+  macOS corpus run as DEAD, and the "recovery" relaunch truncated the live run's log before
+  the run lock correctly refused it. Use `ps ax -o command | grep -c '[b]uild-and-test.sh'`,
+  which is portable and self-excluding. ★ And keep the probe's own command line clear of the
+  marker: `pgrep -f <marker>` matches the shell that carries `<marker>` in its argv and
+  reports itself as a survivor — already anchored from the `.ps1` side
+  (`build-and-test.ps1`), and it bites the status probes exactly the same way.
 - **Pin Tcl when the host's default disagrees with the legs' libraries** (`DSS_TCL_VERSION=8.6`).
   Every leg's libtcl is 8.6; a host whose default Tcl is 9.0 will otherwise compile against a
   9.0 header and link an 8.6 library. The per-leg coherence check now catches this and says so.

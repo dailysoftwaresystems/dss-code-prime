@@ -2388,28 +2388,63 @@ struct DSS_EXPORT SemanticConfig {
         // pointer (`char*`, `int*`, `struct S*`) STAYS a loud reject regardless of
         // this flag.
         bool allowVoidPtrFnConvert = false;
-        // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a SHIPPED-FFI-DESCRIPTOR
-        // function's CALL-ARGUMENT boundary ONLY, admit a real C integer pointer
-        // (`long long*`, `sqlite3_int64*`, `long*`-on-LP64) into a descriptor
-        // parameter modeled as the abstract width-based `ptr<i64>` (…) whose pointee
-        // is the SAME representation (size ∧ signedness ∧ integer-base-kind, via
-        // TypeInterner::sameRepresentation) but a DISTINCT identity (the `_Generic`-
-        // splitting vocabulary NAME differs). The SQLite testfixture needs it for
-        // `Tcl_GetWideIntFromObj(interp, obj, &wideIntLvalue)`: gcc accepts the
-        // ABI-identical 8-byte pointer, DSS's strict pointer-pointee typing rejected
-        // it S0003. Read by `isAssignable` (admit — the trailing
-        // `ffiDescriptorPointeeIntCompat` arg, passed true ONLY by
-        // `checkCallAgainstSig` at a `isShippedDescriptorFn` DIRECT callee) and by
-        // `cst_to_hir.cpp::coerce` (realize — the node-mark-gated Ptr→Ptr bitcast), in
-        // lockstep. Default FALSE = strict: the boundary is SCOPED — native C-to-C
-        // pointer typing, init/assign/return, and the fn-pointer/indirect call paths
-        // ALL stay strict; identity is NEVER merged (a compat admission, not a
-        // canonicalization — `_Generic(long:,long long:)` still distinguishes). Only
-        // c-subset opts in. Per-target by construction: on LLP64/pe64 `long` is I32,
-        // so `long*` still REFUSES `ptr<i64>` (sameRepresentation's kind axis) with NO
-        // format branch. Sibling of `allowVoidPtrFnConvert` (the fn<->void* Option-B
-        // gate) — the same admit/realize-in-lockstep discipline.
-        bool ffiDescriptorIntPointeeCompat = false;
+        // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (was
+        // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT, TF-C41): at a DIRECT
+        // bare-name call's ARGUMENT boundary ONLY, admit an integer pointer whose
+        // pointee has the SAME representation (size ∧ signedness ∧
+        // integer-base-kind, via TypeInterner::sameRepresentation) but a DISTINCT
+        // identity (the `_Generic`-splitting vocabulary NAME differs) — e.g.
+        // `long long*`/`sqlite3_int64*` into a `long*` parameter on LP64 — and
+        // report S_IncompatiblePointerIntegerPointee as a WARNING rather than
+        // silently accepting it.
+        //
+        // ★ SCOPE WIDENED 2026-08-07 (TF-C135) FROM "shipped FFI descriptor callee"
+        // TO "any direct callee", BY MEASUREMENT, and the widening is the whole
+        // point of this note. TF-C41 gated the relaxation on
+        // `isShippedDescriptorFn` because the only known consumer was the tcl.json
+        // `ptr<i64>` parameter. That gate made the admission a property of WHERE THE
+        // DECLARATION CAME FROM rather than of WHAT THE TYPES ARE — and a real
+        // header hits the identical shape: on Darwin/LP64 `tcl.h` takes its
+        // `#ifdef __APPLE__ / #ifdef __LP64__` override, defines
+        // TCL_WIDE_INT_IS_LONG, and so declares `Tcl_WideInt` = `long`, while
+        // `sqlite3_int64` is `long long`. sqlite's own
+        // `ext/session/test_session.c:1744`
+        // `Tcl_GetWideIntFromObj(interp, objv[4], &iVal)` therefore passes
+        // `long long*` to a `long*` parameter on macOS and NOWHERE ELSE. ✔MEASURED
+        // on Apple clang 21.0.0 against every macOS SDK on the operator's machine
+        // (8.5.9 headers, MacOSX13.3/14.4/15.4/26.5): rc=0, 0 errors, 1
+        // `-Wincompatible-pointer-types` WARNING. DSS's hard S0003 there was
+        // stricter than the platform toolchain and cost the ENTIRE mach-o unit
+        // corpus on every host — a compiler that cannot build what the platform's
+        // own compiler builds is not portable, whatever the standard permits.
+        //
+        // C 6.5.2.2p7 makes this a CONSTRAINT VIOLATION requiring *a* diagnostic;
+        // both an error and a warning conform, so this is a policy choice and it is
+        // recorded as one. DSS now takes gcc's and clang's: diagnose, do not refuse.
+        // `--warnings-as-errors` restores the strict posture for anyone who wants
+        // it, so the strict reading remains available without being the default.
+        // ★ NOT a silent admission — the warning is the diagnostic the standard
+        // requires, and silence here would be exactly the fail-loud violation this
+        // flag's own default guards against.
+        //
+        // Read by `isAssignable` (admit — the trailing
+        // `intPointeeSameRepresentationCompat` arg, passed true ONLY by
+        // `checkCallAgainstSig` at a DIRECT callee) and by `cst_to_hir.cpp::coerce`
+        // (realize — the node-mark-gated Ptr→Ptr bitcast), in lockstep. Default
+        // FALSE = strict; only c-subset opts in. The boundary stays SCOPED:
+        // init/assign/return and the fn-pointer/indirect call paths ALL remain
+        // strict, and identity is NEVER merged (a compat admission, not a
+        // canonicalization — `_Generic(long:,long long:)` still distinguishes).
+        // Per-target by construction, with NO format branch: on LLP64/pe64 `long`
+        // is I32, so `long*` still REFUSES a `long long*`/`ptr<i64>` parameter on
+        // sameRepresentation's kind axis. ⚠ THE WIDENING HAS A MEASURED
+        // CONSEQUENCE ON LLP64 THAT THE OLD GATE HID: `int*` into
+        // `_InterlockedCompareExchange`'s `long*` was previously rejected because a
+        // BUILTIN is not a shipped descriptor; on pe64 both are I32, so it is now
+        // admitted-with-a-warning — which is what MSVC (C4133) and clang do.
+        // Sibling of `allowVoidPtrFnConvert` (the fn<->void* Option-B gate) — the
+        // same admit/realize-in-lockstep discipline.
+        bool directCallIntPointeeCompat = false;
     };
     PointerConversionRules pointerConversions;
 

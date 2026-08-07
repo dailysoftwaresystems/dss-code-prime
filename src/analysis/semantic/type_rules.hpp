@@ -224,7 +224,7 @@ namespace detail::type_rules {
     bool                                               charArrayFromStringLiteralInit = false,
     bool                                               bitIntConversions = false,
     bool                                               scalarConvertsToBool = false,
-    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT (default false): admit a `Ptr<A>` →
+    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (default false): admit a `Ptr<A>` →
     // `Ptr<B>` where BOTH pointees A,B are integer kinds AND
     // `interner.sameRepresentation(A,B)` — the shipped-FFI-descriptor abstract
     // width-based `ptr<i64>` accepting a real C `long long*`/`sqlite3_int64*`/
@@ -236,7 +236,7 @@ namespace detail::type_rules {
     // I32 so `long*` vs `ptr<i64>` FAILS `sameRepresentation`'s kind axis → still
     // rejected, NO format branch. Identity is UNTOUCHED — this is a COMPAT admission
     // that the coerce() Ptr→Ptr bitcast realizes, never a TypeId merge.
-    bool                                               ffiDescriptorPointeeIntCompat = false) noexcept {
+    bool                                               intPointeeSameRepresentationCompat = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
     // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
@@ -617,7 +617,7 @@ namespace detail::type_rules {
             // below (Ptr<int> → Ptr<float> is NOT implicit) — UNLESS the
             // shipped-descriptor integer-pointee relaxation below admits it.
         }
-        // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: at a shipped-FFI-descriptor
+        // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: at a shipped-FFI-descriptor
         // call-arg boundary ONLY (the sole caller passing this flag true — never
         // native C-to-C, never init/assign/return), a descriptor's abstract width-
         // based integer-pointee param (`ptr<i64>`, …) accepts a real C integer
@@ -635,7 +635,7 @@ namespace detail::type_rules {
         // realizes, never a TypeId merge (Condition 1); `_Generic(long:,long long:)`
         // still distinguishes. Cf. TF-C15/C16/C32 pointer-compat-policy notes +
         // D-LANG-TYPE-IDENTITY-VOCABULARY / LD-5 (identity nominal).
-        if (ffiDescriptorPointeeIntCompat
+        if (intPointeeSameRepresentationCompat
             && !lhsElem.empty() && !rhsElem.empty()) {
             auto const lpk = interner.kind(lhsElem[0]);
             auto const rpk = interner.kind(rhsElem[0]);

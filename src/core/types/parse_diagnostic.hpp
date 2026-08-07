@@ -1218,6 +1218,30 @@ enum class DiagnosticCode : std::uint16_t {
     // `unsuppressable_codes.cpp`.
     S_AttributeIgnoredForDeclarationKind = 0xE05F,
 
+    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (TF-C135): a DIRECT call argument
+    // whose pointee is an integer of the SAME REPRESENTATION as the parameter's
+    // but a DIFFERENT IDENTITY — `long long*` into `long*` on LP64, `int*` into
+    // `long*` on LLP64. C 6.5.2.2p7 makes it a constraint violation requiring a
+    // diagnostic; gcc (`-Wincompatible-pointer-types`), clang (same) and MSVC
+    // (C4133) all WARN, and DSS matches them rather than refusing code the
+    // platform toolchains compile. ✔MEASURED 2026-08-07: Apple clang 21.0.0
+    // compiles sqlite's `Tcl_GetWideIntFromObj(interp, objv[4], &iVal)` with
+    // exactly this warning and rc=0, on all four macOS SDKs present.
+    //
+    // WARNING, NOT ERROR, and the reasoning is recorded so it can be argued with:
+    // the representations are identical, so no load, store or call ABI changes —
+    // the realized Ptr→Ptr bitcast is a no-op — which means silence would be the
+    // dangerous choice and an error the merely-unportable one. `S_TypeMismatch`
+    // remains the ERROR for every mismatch this predicate does NOT admit
+    // (different width, different signedness, non-integer pointees, and the
+    // init/assign/return and indirect-call boundaries, which never relax).
+    //
+    // SUPPRESSIBLE, deliberately — `--warnings-as-errors` restores the strict
+    // pre-TF-C135 posture. Do NOT add it to `unsuppressable_codes.cpp`: a program
+    // that depends on this conversion is ABI-correct by construction, unlike the
+    // layout constraints that block belongs to.
+    S_IncompatiblePointerIntegerPointee = 0xE060,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
