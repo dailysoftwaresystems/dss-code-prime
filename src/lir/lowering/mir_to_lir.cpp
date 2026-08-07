@@ -650,6 +650,23 @@ struct Lowerer {
     MirAttribute<LirReg>            valueToReg;
     MirBlockAttribute<LirBlockId>   mirBlockToLirBlock;
 
+    // Per-TERMINATOR state — cleared at the top of EVERY `lowerTerminator`, not
+    // per function (each terminator owns its own edge splits; a stale entry from
+    // the previous block would silently redirect an unrelated branch).
+    //
+    // MIR successor block id → the synthetic LIR block that carries the phi-
+    // destination copies for the edge (this block → that successor). Populated
+    // only for a multi-successor terminator whose successor actually carries a
+    // Phi; see `lowerTerminator` for the miscompile that placement fixes.
+    // `lirSucc` is the ONE accessor every terminator lowerer routes its branch
+    // targets through, so a split can never be bypassed by a raw
+    // `mirBlockToLirBlock.get(...)` left behind at a branch site.
+    std::unordered_map<std::uint32_t, LirBlockId> edgeSplitTarget_;
+    // The same splits in CREATION order, paired with the MIR successor each one
+    // feeds. The fill loop needs both halves, and iteration order over the map
+    // above is unspecified — block layout must not depend on it.
+    std::vector<std::pair<MirBlockId, LirBlockId>> edgeSplits_;
+
     // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): MIR Alloca value id → its
     // 0-based scan-order slot index (the k threaded on a `lea_frame_slot`). An
     // Alloca is NOT entered into `valueToReg`; instead `regForValue` consults this
@@ -4834,7 +4851,12 @@ struct Lowerer {
                 reporter.report(std::move(d));
                 return false;
             }
-            lirSuccs.push_back(mirBlockToLirBlock.get(s));
+            // `lirSucc` for uniformity with every other terminator branch site
+            // (no branch target in this lowerer reads `mirBlockToLirBlock`
+            // directly). It is an identity here by construction: an IndirectBr
+            // edge is never split — see `terminatorOwnsEverySuccessorBranch` for
+            // why the `&&label` address makes that impossible.
+            lirSuccs.push_back(lirSucc(s));
         }
         std::array<LirOperand, 1> ops{LirOperand::makeReg(*addr)};
         emitIndirectBr(*opcode(MnemonicSlot::JmpIndirect), ops, lirSuccs);
@@ -7272,7 +7294,11 @@ struct Lowerer {
 
     // ── terminator + phi resolution ──────────────────────────────────
 
-    // Emit the phi-edge moves for one (predecessor, successor) edge.
+    // Emit the phi-edge moves for one (predecessor, successor) edge into the
+    // currently-open LIR block. WHICH block that is belongs to the caller:
+    // `lowerTerminator` puts them inline before a single-successor terminator
+    // and in a per-edge SPLIT block otherwise — the placement rule is stated
+    // (with the miscompile that forced it) there, not here.
     //
     // Algorithm — parallel-copy resolution via temporaries:
     //   For each phi P in `successorMir` with incoming I_P from
@@ -7384,6 +7410,75 @@ struct Lowerer {
         }
     }
 
+    // Does this MIR block carry at least one Phi? Scans the WHOLE block, not
+    // just the leading run, so it agrees exactly with `emitPhiMovesForEdge`'s
+    // own scan — a mis-positioned Phi (a structural violation `lowerBlock`
+    // reports separately) must not make the two disagree about whether an edge
+    // has copies to place.
+    [[nodiscard]] bool blockHasPhi(MirBlockId b) const {
+        std::uint32_t const n = mir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (mir.instOpcode(mir.blockInstAt(b, i)) == MirOpcode::Phi) return true;
+        }
+        return false;
+    }
+
+    // Does this terminator turn EVERY declared successor into a real branch
+    // whose TARGET BLOCK ID this lowerer chooses? Only such an edge can be
+    // split, because a split block is reached for exactly one reason: the
+    // terminator branches to it INSTEAD of to the original successor.
+    //
+    //   CondBr / Switch     yes — the jcc arms, the compare chain's arms and the
+    //                       jump table's slots all name their target block id
+    //                       outright, so redirecting the id redirects control.
+    //   Br                  one successor: the copies are already unconditional
+    //                       in the predecessor, so there is nothing to fix.
+    //   IndirectBr          NO — and this one is a STATED RESIDUAL, not a proof
+    //                       of safety. `goto *p` jumps to a `&&label` ADDRESS
+    //                       that `lowerBlockAddress` materialized from the
+    //                       ORIGINAL block's synthetic symbol; the successor
+    //                       list is CFG bookkeeping for liveness/DCE, NOT the
+    //                       dispatch. Redirecting it would leave the split block
+    //                       unreachable at run time and the phi NEVER written —
+    //                       strictly worse than what it replaced. So a
+    //                       multi-target computed goto keeps the inline
+    //                       placement, which is sound only while no phi register
+    //                       of one target is live along the path into another
+    //                       (it holds for the threaded-interpreter shape both
+    //                       computed-goto corpus examples use: every predecessor
+    //                       writes every target's phi with that predecessor's
+    //                       own incoming, so the value read on arrival is always
+    //                       the right one). Closing it properly needs the target
+    //                       block DUPLICATED per edge — the address must name
+    //                       the copy — which is a separate cycle.
+    //   SehTryBegin         no. succ[0] is an UNCONDITIONAL jmp into the guarded
+    //   SehFilterReturn     body, so inline copies already execute exactly on
+    //                       that edge; succ[1] is the H2 CFG-fiction edge the OS
+    //                       dispatches through the scope table and never a
+    //                       branch, so a split block for it would have no
+    //                       predecessor at all (D-WIN64-SEH-FUNCLETS).
+    //   Return/Unreachable  zero successors.
+    [[nodiscard]] static bool terminatorOwnsEverySuccessorBranch(MirOpcode op) {
+        return op == MirOpcode::CondBr || op == MirOpcode::Switch;
+    }
+
+    // The LIR block a terminator must branch to in order to reach MIR successor
+    // `s`: the split block when this edge has one, otherwise `s`'s own LIR
+    // block. EVERY branch-target site in EVERY terminator lowerer goes through
+    // here. (The split's OWN jump to `s` is the one deliberate exception — it
+    // uses `mirBlockToLirBlock` directly, since routing it through here would
+    // make the split jump to itself.)
+    [[nodiscard]] LirBlockId lirSucc(MirBlockId s) const {
+        if (auto it = edgeSplitTarget_.find(s.v); it != edgeSplitTarget_.end()) {
+            return it->second;
+        }
+        return mirBlockToLirBlock.get(s);
+    }
+
+    [[nodiscard]] bool edgeWasSplit(MirBlockId s) const {
+        return edgeSplitTarget_.find(s.v) != edgeSplitTarget_.end();
+    }
+
     // Returns true iff the terminator was emitted (block sealed). `false`
     // signals the caller to use the fallback seal.
     bool lowerTerminator(MirBlockId mb, MirInstId termId) {
@@ -7391,27 +7486,127 @@ struct Lowerer {
         MirOpcode const op = mir.instOpcode(termId);
         auto succs = mir.blockSuccessors(mb);
 
-        // Emit phi-edge moves for EVERY MIR successor of this block, in
-        // declared order, BEFORE the terminator. This dominates every use
-        // of the phi result in the successor regardless of which jcc arm
-        // ends up taking the edge.
-        for (MirBlockId s : succs) {
-            emitPhiMovesForEdge(mb, s);
+        edgeSplitTarget_.clear();
+        edgeSplits_.clear();
+
+        // ── WHERE the phi-destination copies for edge (mb → S) may be placed ──
+        //
+        // A copy into a phi's result register is correct only on the paths that
+        // ACTUALLY take the edge it belongs to. With ONE successor the
+        // predecessor IS the edge, so the copies go inline before the terminator
+        // — the cheapest correct placement, and byte-identical to every build
+        // before this cycle.
+        //
+        // With MORE than one successor, inline placement runs the copies for
+        // edges that are NOT taken. That is the classic lost-copy problem, and
+        // — this tree splits no critical edges anywhere — a MEASURED release-
+        // only silent miscompile (`--config=debug` and gcc are both correct):
+        //
+        //   int f(int n){ int i=0,e=-1; do { e=i; i++; } while(i<n); return e; }
+        //
+        //   b2: ->b2 ->b3           ; b2 carries the loop phi p14; b3 READS it
+        //       p12 = add p14 p13   ; i+1
+        //       p13 = mov p12       ; copies for the BACK edge b2->b2 …
+        //       p14 = mov p13       ; … clobber p14 even when we exit to b3
+        //       jcc                 ; -> b2 or b3
+        //   b3: ret p14             ; returns i, not the lagged e (5, want 4)
+        //
+        // So each such edge gets a block of its own: the terminator branches to
+        // the split block, the split block performs the copies and jumps on to
+        // S. The copies then execute exactly on the edge that owns them.
+        //
+        // The trigger is ">1 successor", NOT "strictly critical". A critical-
+        // edge test is too weak here: even when S has a single predecessor, the
+        // copies are wrong the moment they sit in a multi-successor predecessor,
+        // because it is the PREDECESSOR's OTHER edges that run them spuriously —
+        // exactly the self-loop above, where S (== b2) has two predecessors but
+        // the damage is done on the b2→b3 edge.
+        //
+        // A successor with no Phi contributes no copies, so it is never split:
+        // an `if`/`while` over phi-free blocks emits the same LIR it always did.
+        bool const wantSplit =
+            succs.size() > 1 && terminatorOwnsEverySuccessorBranch(op);
+        if (!wantSplit) {
+            for (MirBlockId const s : succs) {
+                emitPhiMovesForEdge(mb, s);
+            }
+        } else if (!opcode(MnemonicSlot::Jmp).has_value()) {
+            // A split block's own terminator is an unconditional jump to S.
+            // Without that opcode there is NO correct placement for the copies
+            // on this shape, so fail loud rather than silently fall back to the
+            // inline form the block comment above just disqualified.
+            reportMissingOpcode(MnemonicSlot::Jmp, "MIR phi-edge split");
+            return false;
+        } else {
+            for (MirBlockId const s : succs) {
+                if (!blockHasPhi(s)) continue;
+                // No LIR block for S: the per-opcode lowerer below reports it
+                // and bails. Creating a split that jumps nowhere would only
+                // trade that diagnostic for a builder abort.
+                if (!mirBlockToLirBlock.has(s)) continue;
+                // A successor listed twice (`c ? L : L`, two case labels on one
+                // block) is ONE edge with ONE set of copies — and both branch
+                // arms must land on the same split, or the second arm would skip
+                // them.
+                if (edgeWasSplit(s)) continue;
+                LirBlockId const split = lir.createBlock();
+                edgeSplitTarget_.emplace(s.v, split);
+                edgeSplits_.emplace_back(s, split);
+            }
         }
 
+        bool sealed = false;
         switch (op) {
-            case MirOpcode::Return:      return lowerReturn(termId);
-            case MirOpcode::Br:          return lowerBr(termId, succs);
-            case MirOpcode::CondBr:      return lowerCondBr(termId, succs);
-            case MirOpcode::Switch:      return lowerSwitch(termId, succs);
-            case MirOpcode::IndirectBr:  return lowerIndirectBr(termId, succs);
-            case MirOpcode::Unreachable: return lowerUnreachable(termId);
-            case MirOpcode::SehTryBegin:     return lowerSehTryBegin(termId, succs);
-            case MirOpcode::SehFilterReturn: return lowerSehFilterReturn(termId, succs);
-            default:                     break;
+            case MirOpcode::Return:      sealed = lowerReturn(termId); break;
+            case MirOpcode::Br:          sealed = lowerBr(termId, succs); break;
+            case MirOpcode::CondBr:      sealed = lowerCondBr(termId, succs); break;
+            case MirOpcode::Switch:      sealed = lowerSwitch(termId, succs); break;
+            case MirOpcode::IndirectBr:  sealed = lowerIndirectBr(termId, succs); break;
+            case MirOpcode::Unreachable: sealed = lowerUnreachable(termId); break;
+            case MirOpcode::SehTryBegin:
+                sealed = lowerSehTryBegin(termId, succs);
+                break;
+            case MirOpcode::SehFilterReturn:
+                sealed = lowerSehFilterReturn(termId, succs);
+                break;
+            default:
+                reportUnsupported(op, termId);
+                break;
         }
-        reportUnsupported(op, termId);
-        return false;
+
+        // Fill the split blocks AFTER the terminator, never before: the builder
+        // refuses to open a block while the current one is unterminated, and the
+        // terminator lowerers emit into (and seal) the predecessor. Nothing has
+        // to be "restored" afterwards — `lowerBlock` opens the next block itself,
+        // and every path out of here leaves the open block terminated.
+        if (!edgeSplits_.empty()) {
+            if (!sealed) {
+                // The terminator failed to lower and left the predecessor open.
+                // Apply the same fallback seal `lowerBlock` would have applied,
+                // HERE, so the split blocks can be opened — and report the block
+                // as sealed so it is not applied twice (the second one would
+                // land in the last split block, after that block's jump).
+                if (!opcode(MnemonicSlot::Ret).has_value()) {
+                    // Nothing can seal the block. The builder fails loud on it
+                    // (and on the never-opened splits) at `closeFunction`; the
+                    // terminator's own diagnostic already named the cause, and
+                    // this is not a NEW failure mode — an unsealed block was
+                    // already unbuildable before any split existed.
+                    return false;
+                }
+                emitReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
+                sealed = true;
+            }
+            for (auto const& [succMir, splitLir] : edgeSplits_) {
+                lir.beginBlock(splitLir);
+                emitPhiMovesForEdge(mb, succMir);
+                // `mirBlockToLirBlock`, NOT `lirSucc`: this is the one branch in
+                // the lowerer that must reach the ORIGINAL successor — `lirSucc`
+                // would hand back this very block and build an infinite loop.
+                emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(succMir));
+            }
+        }
+        return sealed;
     }
 
     // c116 SEH (D-WIN64-SEH-FUNCLETS): the `SehException{Code,Info}` VALUE ops are
@@ -7453,7 +7648,9 @@ struct Lowerer {
             reportUnsupported(MirOpcode::SehTryBegin, id);
             return false;
         }
-        emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(succs[0]));
+        // `lirSucc` for uniformity; an identity here (a SEH marker's edges are
+        // never split — see `terminatorOwnsEverySuccessorBranch`).
+        emitBr(*opcode(MnemonicSlot::Jmp), lirSucc(succs[0]));
         return true;
     }
 
@@ -7478,7 +7675,9 @@ struct Lowerer {
             reportUnsupported(MirOpcode::SehFilterReturn, id);
             return false;
         }
-        emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(succs[0]));
+        // `lirSucc` for uniformity; an identity here (one successor — nothing to
+        // split, see `lowerTerminator`).
+        emitBr(*opcode(MnemonicSlot::Jmp), lirSucc(succs[0]));
         return true;
     }
 
@@ -7586,7 +7785,7 @@ struct Lowerer {
             reporter.report(std::move(d));
             return false;
         }
-        emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(succs[0]));
+        emitBr(*opcode(MnemonicSlot::Jmp), lirSucc(succs[0]));
         return true;
     }
 
@@ -7616,8 +7815,11 @@ struct Lowerer {
             reporter.report(std::move(d));
             return false;
         }
-        LirBlockId const lirIfTrue  = mirBlockToLirBlock.get(succs[0]);
-        LirBlockId const lirIfFalse = mirBlockToLirBlock.get(succs[1]);
+        // `lirSucc`, not `mirBlockToLirBlock`: an arm whose phi-edge copies were
+        // moved into a split block must branch to THAT block, or the copies are
+        // skipped entirely (see `lowerTerminator`).
+        LirBlockId const lirIfTrue  = lirSucc(succs[0]);
+        LirBlockId const lirIfFalse = lirSucc(succs[1]);
         // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
         // ICmp+CondBr FUSION. When the cond operand was produced by
         // an ICmp instruction, replace the naive
@@ -7877,8 +8079,10 @@ struct Lowerer {
         std::uint8_t const discrimWidth = widthFlagsForType(mir.instType(operands[0]));
 
         // ── Bounds check, emitted into the still-open switch-bearing (header)
-        //    block so the phi-edge moves already emitted there keep dominating
-        //    every target (identical discipline to the compare chain). ──────────
+        //    block — the index arithmetic must precede the indirect branch and
+        //    belongs to no particular edge (identical discipline to the compare
+        //    chain). Each EDGE's phi copies live in their own split block, which
+        //    the table slots and the bounds-check branch reach via `lirSucc`. ───
         LirBlockId const header = lir.openBlock();
 
         // WIDEN the discriminant to a full 64-bit register FIRST, then do the
@@ -7926,7 +8130,7 @@ struct Lowerer {
             emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);  // 64-bit
         }
         LirBlockId const body        = lir.createBlock();
-        LirBlockId const defaultLir  = mirBlockToLirBlock.get(defaultMir);
+        LirBlockId const defaultLir  = lirSucc(defaultMir);
         {
             std::uint32_t const ugtCond =
                 static_cast<std::uint32_t>(TargetCondCode::Ugt);
@@ -7998,7 +8202,11 @@ struct Lowerer {
                 if (seen.insert(b.v).second) indSuccs.push_back(b);
             };
             for (std::size_t i = 0; i < caseCount; ++i) {
-                addSucc(mirBlockToLirBlock.get(succs[i]));
+                // `lirSucc`: the declared successor is whatever the TABLE SLOT
+                // points at (below) — a split block when the edge has one — so
+                // the CFG the liveness/DCE passes see matches the branch the
+                // machine actually takes.
+                addSucc(lirSucc(succs[i]));
             }
             addSucc(defaultLir);
         }
@@ -8024,10 +8232,30 @@ struct Lowerer {
             if (auto it = valueToCase.find(value); it != valueToCase.end()) {
                 targetMir = succs[it->second];
             }
-            LirBlockId const lirBlock = mirBlockToLirBlock.get(targetMir);
-            // Mint (dedup by MIR block) the synthetic per-block symbol.
-            SymbolId const blkSym = mintBlockSymbol(targetMir);
-            desc.blockSymbols[lirBlock.v] = blkSym;
+            // `lirSucc`: the slot must hold the address of the SPLIT block when
+            // this edge has one — the table IS the branch here, so a slot left
+            // pointing at the original block would jump straight past that
+            // edge's phi copies (the very miscompile the split exists to fix).
+            LirBlockId const lirBlock = lirSucc(targetMir);
+            // Mint the synthetic per-block symbol, deduped by LIR block (the
+            // map below is the dedup: many slots share one target).
+            //
+            // A split block has NO MIR block of its own, so it cannot use the
+            // MIR-keyed `mintBlockSymbol` — that id belongs to the ORIGINAL
+            // block and may ALSO be bound to it by an `&&label` block-address
+            // `lea` elsewhere in this function (D-CSUBSET-COMPUTED-GOTO), which
+            // would bind one symbol to two different byte offsets. It takes a
+            // fresh id from the same monotone sequence instead
+            // (`mintJumpTableSymbol` — undeduped by contract).
+            SymbolId blkSym;
+            if (auto const it = desc.blockSymbols.find(lirBlock.v);
+                it != desc.blockSymbols.end()) {
+                blkSym = it->second;
+            } else {
+                blkSym = edgeWasSplit(targetMir) ? mintJumpTableSymbol()
+                                                 : mintBlockSymbol(targetMir);
+                desc.blockSymbols[lirBlock.v] = blkSym;
+            }
             desc.slotBindings.emplace_back(lirBlock.v, j);
         }
         jumpTableDescriptors_.push_back(std::move(desc));
@@ -8042,11 +8270,14 @@ struct Lowerer {
     // `cmp discrim, case_const[i]; jcc(eq) case_target[i], next_compare`.
     // The chain terminates at a block that `jmp default_target`.
     //
-    // We've already emitted phi-edge moves for ALL successors at the top of
-    // `lowerTerminator`. The cascading-compare path here flows through
-    // freshly-created compare blocks; jumping into the case_target preserves
-    // the dominance of the phi moves (which were emitted at the END of the
-    // ORIGINAL switch-bearing block, before this first jmp).
+    // `lowerTerminator` has already placed each successor's phi-edge copies —
+    // for a multi-successor Switch, in a per-edge SPLIT block rather than in the
+    // switch-bearing block (a case target's copies must not run when a
+    // DIFFERENT case is taken; see the lost-copy comment there). Every branch
+    // target below therefore goes through `lirSucc`, which hands back the split
+    // block when the edge has one. The cascading-compare chain's own freshly-
+    // created compare blocks are unaffected: they carry no phi copies, only the
+    // compare/branch pair for the next case.
     bool lowerSwitch(MirInstId id, std::span<MirBlockId const> succs) {
         if (!opcode(MnemonicSlot::Cmp).has_value()) {
             reportMissingOpcode(MnemonicSlot::Cmp, "MIR Switch");
@@ -8176,7 +8407,7 @@ struct Lowerer {
                 static_cast<std::uint32_t>(TargetCondCode::Eq);
             LirBlockId nextBlock;
             bool const isLastCase = (i + 1 == caseCount);
-            LirBlockId const caseTarget = mirBlockToLirBlock.get(succs[i]);
+            LirBlockId const caseTarget = lirSucc(succs[i]);
             // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1
             // post-fold, code-reviewer C1): jcc now requires the
             // 2 BlockRef operands as its operand list (matches the
@@ -8195,7 +8426,7 @@ struct Lowerer {
                 emitCondBr(*opcode(MnemonicSlot::Jcc), jccOps,
                               caseTarget, defaultJump, eqCond);
                 lir.beginBlock(defaultJump);
-                emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(defaultMir));
+                emitBr(*opcode(MnemonicSlot::Jmp), lirSucc(defaultMir));
                 return true;
             }
             nextBlock = lir.createBlock();
@@ -8207,7 +8438,7 @@ struct Lowerer {
             lir.beginBlock(nextBlock);
         }
         // No cases (only default): jmp default.
-        emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(defaultMir));
+        emitBr(*opcode(MnemonicSlot::Jmp), lirSucc(defaultMir));
         return true;
     }
 
@@ -8323,9 +8554,10 @@ struct Lowerer {
             if (op != MirOpcode::Phi) sawNonPhi = true;
             lowerInst(inst);
         }
-        // Then the terminator (which is also responsible for emitting
-        // phi-edge moves to all its MIR successors BEFORE the LIR
-        // terminator itself).
+        // Then the terminator (which is also responsible for PLACING the
+        // phi-edge moves for all its MIR successors — inline ahead of itself
+        // when it has one successor, in per-edge split blocks when it has
+        // more — and for filling any split block it creates).
         bool sealed = false;
         if (isMirTerminator(mir.instOpcode(term))) {
             sealed = lowerTerminator(mb, term);
