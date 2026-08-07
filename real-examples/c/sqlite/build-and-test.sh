@@ -5940,7 +5940,7 @@ for leg in "${LEG_ORDER[@]}"; do
     warn "[$leg] corpus FAIL — ${#ABORTS[@]} abort(s): ${ABORTS[*]}"
     info "      union across $nseg segment(s): $union_summary; $files_done test file(s) completed ($files_inert of them asserted NOTHING)"
     [[ -z "$derivation" ]] || info "        derived from: $derivation"
-    [[ ${#real[@]} -eq 0 ]] || info "      ${#real[@]} GENUINE DSS failure(s): ${real[*]}"
+    [[ ${#real[@]} -eq 0 ]] || info "      ${#real[@]} UNCLASSIFIED failure(s) — not matched by any earned confound, NOT yet attributed to DSS: ${real[*]}"
     for n in ${NOT_REACHED[@]+"${NOT_REACHED[@]}"}; do warn "      NOT REACHED: $n"; done
     info "      per-unit ledger: $ledger"
   elif [[ -z "$summary" ]]; then
@@ -5974,7 +5974,7 @@ for leg in "${LEG_ORDER[@]}"; do
   else
     UNIT_VERDICT["$leg"]="FAIL:${#real[@]} genuine unit failure(s): ${real[*]}"
     UNIT_FAILS=$((UNIT_FAILS + 1))
-    warn "[$leg] corpus FAIL — $summary; ${#real[@]} GENUINE DSS failure(s): ${real[*]}"
+    warn "[$leg] corpus FAIL — $summary; ${#real[@]} UNCLASSIFIED failure(s) — run each against the gcc reference fixture before charging it to DSS: ${real[*]}"
     [[ ${#confound[@]} -gt 0 ]] && info "      (+${#confound[@]} known confound(s) ignored: ${confound[*]})"
   fi
   # ★ ONE call for EVERY failing branch above, deliberately placed after the

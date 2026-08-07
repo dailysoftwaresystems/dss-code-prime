@@ -4850,7 +4850,7 @@ if ($preconditionFail) {
   Warn "[$LegTag] corpus FAIL — $($aborts.Count) abort(s): $($where -join ' ')"
   Info "      union across $($results.Count) segment(s): $summaryText; $filesDone test file(s) completed ($filesInert of them asserted NOTHING)"
   if ($derivationText) { Info "        derived from: $derivationText" }
-  if ($real.Count) { Info "      $($real.Count) GENUINE DSS failure(s): $($real -join ' ')" }
+  if ($real.Count) { Info "      $($real.Count) UNCLASSIFIED failure(s) — not matched by any earned confound, NOT yet attributed to DSS: $($real -join ' ')" }
   foreach ($n in $notReached) { Warn "      NOT REACHED: $n" }
   Info "      per-unit ledger: $Ledger"
 } elseif (-not $results[0].Summary) {
@@ -4879,7 +4879,7 @@ if ($preconditionFail) {
   Pass "[$LegTag] corpus GREEN — $summaryText$(if ($confound.Count) { "; all $($confound.Count) failure(s) are known non-DSS confounds: $($confound -join ' ')" })"
 } else {
   $unitVerdict = "FAIL: $($real.Count) genuine unit failure(s): $($real -join ' ')"; $unitFail = $true
-  Warn "[$LegTag] corpus FAIL — $summaryText; $($real.Count) GENUINE DSS failure(s): $($real -join ' ')"
+  Warn "[$LegTag] corpus FAIL — $summaryText; $($real.Count) UNCLASSIFIED failure(s) — run each against the gcc reference fixture before charging it to DSS: $($real -join ' ')"
   if ($confound.Count) { Info "      (+$($confound.Count) known confound(s) ignored: $($confound -join ' '))" }
 }
 # ★ ONE call for EVERY failing branch above, deliberately placed after the chain
