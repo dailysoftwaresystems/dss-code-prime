@@ -122,9 +122,9 @@ natively and says so — it is still a row, never an omission.
 | Windows    | macho64-x86_64 | macOS (Rosetta)      |  ⬜  |  ⬜   |                       |
 | macOS      | macho64-arm64  | macOS (native)       |  ✅  |  ✅   | 14/14 · 1/331,745     |
 | macOS      | macho64-x86_64 | macOS (Rosetta)      |  ✅  |  ✅   | 14/14 · 1/331,741     |
-| macOS      | elf64-arm64    | Linux / VPS          |  ⬜  |  ✅   | 0 errors / 192        |
-| macOS      | elf64-x86_64   | Linux x86_64         |  ⬜  |  ⬜   |                       |
-| macOS      | pe64-x86_64    | Windows              |  ⬜  |  ⬜   |                       |
+| macOS      | elf64-arm64    | Linux / VPS          |  ✅  |  ✅   | 14/14 native on VPS   |
+| macOS      | elf64-x86_64   | Linux x86_64         |  ✅  |  ⬜   | 14/14 native on WSL   |
+| macOS      | pe64-x86_64    | Windows              |  ✅  |  ⬜   | 14/14 native on Win   |
 | Linux/WSL  | elf64-x86_64   | Linux (native)       |  ✅  |  ✅   |                       |
 | Linux/WSL  | elf64-arm64    | qemu / VPS           |  ⬜  |  ✅   |                       |
 | Linux/WSL  | pe64-x86_64    | Windows              |  ✅  |  ⬜   | banner+CRUD+integrity |
@@ -151,6 +151,26 @@ assertion had already succeeded. Staging the library and setting `TCL_LIBRARY` f
 to rc=0. Same family as the macOS `init.tcl` wall: **a library's code is not all a library
 needs.** When transporting an artifact by hand, carry its `scriptLibraryDir` (or the target
 host's own staged copy) and set the loader/data variables the driver would have set.
+
+★★ **AND CARRY THE RUNTIME LIBRARY CLOSURE — a one-file transport produces a failure that
+reads exactly like a compiler bug.** ✔MEASURED 2026-08-07, and it nearly reached a commit as
+a cross-host emission defect: a macOS-built `sqlite3.exe` was scp'd ALONE to a scratch
+directory on Windows and every one of the 14 smoke assertions failed with
+`rc=3221225781` = `0xC0000135` = STATUS_DLL_NOT_FOUND. The binary was byte-identical across
+the transport, so corruption was already excluded — the obvious reading was "macOS emits a
+broken PE". ★ It was killed by DIFFING THE IMPORT TABLES against the Windows-built binary:
+`kernel32.dll`, `msvcrt.dll`, `ucrtbase.dll`, `zlib.dll` — **identical**. The artifact was
+fine; the probe had left `zlib.dll` behind. Re-run with it: 14/14.
+- **Carry the NON-SYSTEM libraries only.** The OS ones (`kernel32`/`msvcrt`/`ucrtbase`, or
+  `libc`/`libm`) are resolved by the target's own loader, and shipping them is worse than
+  useless — a stale local copy shadowing the system one is its own defect class.
+- **The cheapest correct-by-construction transport is the leg's OUTPUT DIRECTORY**, which
+  already contains the staged libraries beside the binary (`libtcl8.6.so`, `libz.so.1`,
+  `zlib.dll`). Copy the directory, not the file. Hand-picking is how the omission happens.
+- ⚠ **A PASSING one-file round trip is not evidence the probe was right.** The earlier
+  VPS→WSL ELF cell passed 14/14 from a one-file transport — but only because *that* leg's
+  `libtcl`/`libz` happened to resolve from the destination's system paths. On a host without
+  them it fails identically, and nothing in the result would have pointed at the probe.
 
 ⚠ **The UNITS round trip is heavier than the CLI's and must not be quietly skipped for that
 reason.** Running a cross-built testfixture on the target needs the test corpus and Tcl's
