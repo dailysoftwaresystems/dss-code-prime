@@ -2105,16 +2105,35 @@ FIXTURE_INCS_FILE="$OUT_DIR/recipe-includes.base.txt"
 # needs and the CLI does not:
 #   · --make-var USE_AMALGAMATION=0   upstream's own switch for the full-source
 #                                     fixture (the amalgamation is banned here).
-#   · --prereq-mode whole-blob        `make -n testfixture` runs with every
-#                                     prerequisite already built, so the recipe
-#                                     IS essentially the one link command.
-#   · --token-scope all               same reason: there is no bootstrap in this
-#                                     recipe to keep foreign -D out of.
+#   · --prereq-mode link-line         select ONLY the `-o testfixture` line.
+#   · --always-make 1                 add `-B`, so the derive is DETERMINISTIC.
+#   · --token-scope recipe            compile lines UNION the link line; required
+#                                     with `-B`, whose output also prints the
+#                                     jimsh/lemon bootstrap and its foreign -D.
 #   · --archive-from-span 0           take EVERY archive member; the fixture links
 #                                     the whole library, not a named object list.
-# FLOORS 150/18: the fixture is ~192 TUs and ~20 defines. High enough that losing
-# the archive recovery (which leaves ~90) is an immediate named stop, low enough
-# not to red on upstream adding or dropping a source file.
+#
+# ★★ THOSE FIRST THREE CHANGED 2026-08-06 (TF-C126), AND THE COMMENT THEY REPLACE
+# IS WHY. It read: "`make -n testfixture` runs with every prerequisite already
+# built, so the recipe IS essentially the one link command" and "there is no
+# bootstrap in this recipe to keep foreign -D out of". Both were ASSUMPTIONS about
+# the state of $BLD, neither was asserted, and ✔MEASURED 2026-08-06 both are FALSE
+# on a tree whose bootstrap is not current: the derive harvested `tool/lemon.c`,
+# `tool/lempar.c` and `tool/mksourceid.c` as target TUs and every one of the five
+# legs failed to compile. `make -n` describes WHAT REMAINS TO BE DONE, not what the
+# build is — so $BLD is an INPUT to this derivation, and it was an unexamined one.
+# ⚠ THE SAME DEFECT WAS ALREADY FOUND AND FIXED FOR THE CLI ON 2026-08-05 (see
+# base-harness.sh's --always-make note: "a build that succeeded or failed depending
+# on the state of a build directory nobody thought of as an input"). The CLI moved
+# to link-line/-B; THIS call site was left on the unhardened path, and the two
+# derivations' own numbers are the matched control — across two runs hours apart
+# the CLI held at 103 TUs while the fixture drifted 189 -> 192.
+# FLOORS 150/18: ~189 TUs and ~20 defines. ⚠ The floor comment used to say "~192",
+# and 192 was the CONTAMINATED count (189 + the three tool sources above) — the
+# figure was taken from a poisoned derive on 2026-08-05 and had been the documented
+# normal ever since. High enough that losing the archive recovery (which leaves
+# ~90) is an immediate named stop, low enough not to red on upstream adding or
+# dropping a source file.
 #
 # ★ D-HARNESS-SH-TU-DEDUP-DEPENDS-ON-BASH-HASH-ORDER is closed HERE as a
 # consequence: the surviving path for two same-basename spellings is
@@ -2125,7 +2144,7 @@ FIXTURE_INCS_FILE="$OUT_DIR/recipe-includes.base.txt"
 if _fixture_summary="$(dss_bh_emit_recipe \
       --build-dir "$BLD" --make-target testfixture --recipe-file "$RECIPE" \
       --make-var USE_AMALGAMATION=0 \
-      --prereq-mode whole-blob --token-scope all \
+      --prereq-mode link-line --always-make 1 --token-scope recipe \
       --archive "$AR" --archive-from-span 0 \
       --search-root "$SQLITE_DIR/src" --search-root "$SQLITE_DIR/ext" --search-root "$BLD" \
       --min-tus 150 --min-defines 18 \

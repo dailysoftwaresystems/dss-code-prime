@@ -456,6 +456,48 @@ dss_bh_emit_recipe() {
   local drop_log="$DSS_BH_DROP_LOG"
   DSS_BH_DROP_LOG=""
 
+  # ★★ THE BUILD-HOST TOOL GUARD — a NAMED cause, placed with the others above the
+  # floors for the same reason they are: a symptom count that may or may not fire
+  # is a worse diagnostic than the thing that actually went wrong.
+  #
+  # ✔MEASURED 2026-08-06 (TF-C126): a `whole-blob` fixture derive on a tree whose
+  # bootstrap was not current harvested `tool/lemon.c`, `tool/lempar.c` and
+  # `tool/mksourceid.c` into the TU list — 192 TUs where the clean derive gives
+  # 189 — and ALL FIVE LEGS then failed to compile, because DSS was asked to
+  # cross-compile sqlite's PARSER GENERATOR to Mach-O. The failure presents as a
+  # front-end bug (lemon.c has a struct member named `include`), which is a long
+  # way from the harness state that caused it.
+  #
+  # ★ WHY A BELT AS WELL AS THE CALL-SITE FIX. The fixture call site moved to
+  # `--prereq-mode link-line --always-make 1` in the same cycle, which excludes
+  # these STRUCTURALLY (they never appear on the `-o <target>` line). This guard
+  # is deliberately CAUSE-AGNOSTIC on top of that, because the trigger for that
+  # particular cold tree was NEVER IDENTIFIED: two plausible suspects — the
+  # reference `make sqlite3d` and a configure re-run — were each EXONERATED by
+  # experiment, and the same driver on the arm64 VPS derived cleanly from the
+  # same commit and the same upstream. An unexplained intermittent that fails
+  # every leg at once gets a guard that does not depend on knowing why.
+  #
+  # `tool/` is upstream's OWN directory for programs built to run on the BUILD
+  # HOST (lemon, mkkeywordhash, mksourceid); `lempar.c` is not standalone C at
+  # all — it is lemon's parser TEMPLATE. Neither can ever be a legitimate TU for
+  # any target, in any mode, for any caller.
+  local host_tool_tus
+  host_tool_tus="$(grep -E '(^|/)tool/|(^|/)lempar\.c$' "$out_tus" || true)"
+  if [ -n "$host_tool_tus" ]; then
+    dss_bh_err "recipe derivation for '$target' harvested BUILD-HOST TOOL sources as target TUs:"
+    printf '%s\n' "$host_tool_tus" | while IFS= read -r _ht; do dss_bh_err "      $_ht"; done
+    dss_bh_err "Those are programs upstream builds to RUN ON THIS HOST (lemon/mkkeywordhash/mksourceid),"
+    dss_bh_err "or lemon's parser TEMPLATE (lempar.c), which is not standalone C. Cross-compiling any of"
+    dss_bh_err "them into a target artifact cannot work, and it fails EVERY leg at once with front-end"
+    dss_bh_err "diagnostics that point at the tool's source rather than at this derivation."
+    dss_bh_err "CAUSE: 'make -n' prints WHAT REMAINS TO BE DONE, so a build dir whose bootstrap is not"
+    dss_bh_err "current puts those compile lines INTO the recipe — the build directory is an input."
+    dss_bh_err "REMEDY: derive with '--prereq-mode link-line --always-make 1' (deterministic, and the"
+    dss_bh_err "bootstrap is excluded structurally), or bring '$bld' fully up to date before deriving."
+    return 1
+  fi
+
   local n_tus n_defs n_incs n_lost n_unresolved
   n_tus="$(grep -c . "$out_tus"  || true)"
   n_defs="$(grep -c . "$out_defs" || true)"
@@ -830,6 +872,32 @@ dss_bh_self_test() {
          "$T/one.c" "$(cat "$T/t.txt")"
   dss_bh_emit_recipe --build-dir "$T" >/dev/null 2>&1
   _bh_rc "emit_recipe rejects a missing required argument" 2 "$?"
+
+  # ── 7b. the BUILD-HOST TOOL guard ───────────────────────────────────────────
+  # ✔The defect this closes was MEASURED 2026-08-06 (TF-C126): a derive harvested
+  # tool/lemon.c, tool/lempar.c and tool/mksourceid.c as target TUs and all five
+  # legs failed to compile. Both arms are here on purpose — the NEGATIVE proves
+  # the guard fires, the POSITIVE control proves it is not simply failing
+  # everything (a guard that rejects every input is green on the negative and
+  # useless). Delete the guard in dss_bh_emit_recipe and the first two go red.
+  mkdir -p "$T/tool"; : > "$T/tool/lemon.c"; : > "$T/lempar.c"
+  ( cd "$T" && printf '#!/bin/sh\necho "cc -o prog tool/lemon.c one.c"\n' > make && chmod +x make )
+  ( PATH="$T:$PATH"; dss_bh_emit_recipe --build-dir "$T" --make-target prog \
+      --recipe-file "$T/r9.txt" --prereq-mode link-line --min-tus 1 --min-defines 0 \
+      --out-tus "$T/t.txt" --out-defines "$T/d.txt" --out-includes "$T/i.txt" ) >/dev/null 2>&1
+  _bh_rc "emit_recipe REFUSES a tool/ build-host source as a target TU" 1 "$?"
+  # lempar.c is the second pattern: not under tool/ once copied into the build
+  # dir, and not standalone C at all — it is lemon's parser TEMPLATE.
+  ( cd "$T" && printf '#!/bin/sh\necho "cc -o prog lempar.c one.c"\n' > make && chmod +x make )
+  ( PATH="$T:$PATH"; dss_bh_emit_recipe --build-dir "$T" --make-target prog \
+      --recipe-file "$T/r10.txt" --prereq-mode link-line --min-tus 1 --min-defines 0 \
+      --out-tus "$T/t.txt" --out-defines "$T/d.txt" --out-includes "$T/i.txt" ) >/dev/null 2>&1
+  _bh_rc "emit_recipe REFUSES lempar.c (lemon's template, not standalone C)" 1 "$?"
+  ( cd "$T" && printf '#!/bin/sh\necho "cc -o prog one.c"\n' > make && chmod +x make )
+  ( PATH="$T:$PATH"; dss_bh_emit_recipe --build-dir "$T" --make-target prog \
+      --recipe-file "$T/r11.txt" --prereq-mode link-line --min-tus 1 --min-defines 0 \
+      --out-tus "$T/t.txt" --out-defines "$T/d.txt" --out-includes "$T/i.txt" ) >/dev/null 2>&1
+  _bh_rc "emit_recipe ACCEPTS an ordinary TU (the control)" 0 "$?"
 
   # ── 8. the DROP LEDGER — the silent-TU-loss guard ───────────────────────────
   # Red-on-disable by construction: each assertion feeds a recoverer something it

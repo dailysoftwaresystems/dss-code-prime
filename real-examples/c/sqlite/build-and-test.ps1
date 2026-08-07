@@ -1716,7 +1716,7 @@ AR="$BLD/libsqlite3.a"; [ -f "$BLD/.libs/libsqlite3.a" ] && AR="$BLD/.libs/libsq
 if ! dss_bh_emit_recipe \
       --build-dir "$BLD" --make-target testfixture --recipe-file "$RECIPE" \
       --make-var USE_AMALGAMATION=0 \
-      --prereq-mode whole-blob --token-scope all \
+      --prereq-mode link-line --always-make 1 --token-scope recipe \
       --archive "$AR" --archive-from-span 0 \
       --search-root "$DIR/src" --search-root "$DIR/ext" --search-root "$BLD" \
       --min-tus 150 --min-defines 18 \
