@@ -260,6 +260,23 @@ operator**.
    grep would have surfaced the exact CONTROL. **Recall finds what is similar; grep finds what
    is the same.** ⇒ anchoring every issue is worthless if the next cycle does not READ the
    anchors before investigating (`D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE`).
+   ★★ **AND GREP THE DEFECT'S VOCABULARY, NOT THE NAME YOU WOULD PICK — the rule above was
+   FOLLOWED and still missed, by the operator who wrote it.** ✔MEASURED 2026-08-07 (TF-C126): a
+   recipe derivation was found harvesting `tool/lemon.c` / `lempar.c` / `mksourceid.c` as target
+   TUs. The registry WAS grepped first — for anchor NAMES matching `RECIPE|MAKE-N|DERIV|LEMON|
+   TU-LIST` — and returned nothing, so a fresh row was written. The existing row was
+   [[D-HARNESS-FIXTURE-TU-SCRAPE-ABSORBS-BUILD-HOST-TOOLS]]: same three files, same whole-blob
+   cause, the same fix prescribed — **and it had PRE-REGISTERED the exact firing condition that
+   had just fired** ("safe today only because its reference build normally builds `lemon` FIRST …
+   if that build fails early, the fixture set absorbs the tools too"). It was missed because it is
+   spelled `TU-SCRAPE` / `BUILD-HOST-TOOLS`, and neither token was in the search. ⇒ **grep the
+   SYMPTOM, the ARTEFACT and the FILE NAMES that appear in the evidence (`lemon.c`, `whole-blob`,
+   `link-line`), never only the title you have in mind** — a name-shaped grep finds the rows you
+   would have written, not the rows that exist. ⚠ Two costs, and the second is the larger: the
+   duplicated investigation, and the SPLIT AUDIT TRAIL — the original row's closing work demanded
+   the migration "show the BEFORE and AFTER sets and account for every difference", a requirement
+   the new row did not carry, so it was nearly satisfied by a COUNT match alone. **When a duplicate
+   is discovered: update the ORIGINAL in place, cross-reference both, delete NEITHER.**
 1c. **★ READ THE ASSERTION VALUES, NOT THE TEST NAMES.** ✔MEASURED the same day: a 57-failure
    population named `wal2-*`, `walsetlk-*`, `journal3-*`, `e_walauto-*` was diagnosed as the
    WAL/journal *timing* family and routed to a known clock defect. The values said
