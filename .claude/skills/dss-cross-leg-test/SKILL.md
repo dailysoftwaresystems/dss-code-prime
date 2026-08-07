@@ -128,8 +128,8 @@ natively and says so — it is still a row, never an omission.
 | Linux/WSL  | elf64-x86_64   | Linux (native)       |  ✅  |  ✅   |                       |
 | Linux/WSL  | elf64-arm64    | qemu / VPS           |  ⬜  |  ✅   |                       |
 | Linux/WSL  | pe64-x86_64    | Windows              |  ✅  |  ⬜   | banner+CRUD+integrity |
-| Linux/WSL  | macho64-arm64  | macOS                |  ⬜  |  ⬜   |                       |
-| Linux/WSL  | macho64-x86_64 | macOS                |  ⬜  |  ⬜   |                       |
+| Linux/WSL  | macho64-arm64  | macOS                |  ✅  |  ⬜   | 14/14 native on Mac   |
+| Linux/WSL  | macho64-x86_64 | macOS                |  ✅  |  ⬜   | 14/14 Rosetta on Mac  |
 | arm64 VPS  | elf64-arm64    | VPS (native)         |  ✅  |  ✅   | 14/14 · 1/331,333     |
 | arm64 VPS  | elf64-x86_64   | Linux x86_64         |  ⬜  |  ⬜   |                       |
 | arm64 VPS  | pe64-x86_64    | Windows (native)     |  ✅  |  ✅   | CRUD+integrity · 0/192|
@@ -171,6 +171,25 @@ fine; the probe had left `zlib.dll` behind. Re-run with it: 14/14.
   VPS→WSL ELF cell passed 14/14 from a one-file transport — but only because *that* leg's
   `libtcl`/`libz` happened to resolve from the destination's system paths. On a host without
   them it fails identically, and nothing in the result would have pointed at the probe.
+
+★★ **READ `--expect-source-id` OFF THE BINARY'S OWN VINTAGE, NEVER OFF "the tree" — A
+CONCURRENT RUN MOVES THE STAGED TREE UNDER YOUR ARTIFACT.** ✔MEASURED 2026-08-07: two
+WSL-built Mach-O binaries were smoke-tested on the Mac and came back **13/14, the single
+failure being `source-id-token-exact`, CHARGED TO DSS**. Both binaries report
+`2026-08-06 17:20:07 ee8ef5cd…`; WSL's `bld-dss/sqlite3.h` at that moment said
+`2026-08-07 05:31:08 fafefb59…`. Neither was wrong — a Windows harness run was IN FLIGHT
+against the same `~/src/sqlite`, and its Step-3 `git pull` had moved the tree forward AFTER
+those artifacts were built. ⇒ **the expectation was stale, not the binary**, and a probe that
+reads the id from whatever the tree says today will fabricate a DSS-charged failure whenever
+any other run has pulled since. Ask the ARTIFACT what vintage it is (`<cli> --version`) and
+use that, or pin the upstream commit for the whole comparison. This is
+[[D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE]] reaching the round-trip probes.
+
+⚠ **`--launcher` and dash-leading tokens:** `--launcher arch --launcher -x86_64` makes
+argparse read `-x86_64` as an option and die with `expected one argument`. Use the `=` form —
+`--launcher=arch --launcher=-x86_64`. Already anchored as
+[[D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION]]; noted here because the
+round-trip path is where a human types it by hand.
 
 ⚠ **The UNITS round trip is heavier than the CLI's and must not be quietly skipped for that
 reason.** Running a cross-built testfixture on the target needs the test corpus and Tcl's
