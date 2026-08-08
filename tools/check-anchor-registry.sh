@@ -154,10 +154,21 @@ for anchor in "${MISSING[@]}"; do
     # Same scanned set as the collection above — an anchor this guard FOUND must
     # also be LOCATABLE here, or the FAIL output names a name with no "cited in:"
     # line and the fix becomes a guessing game.
+    # ★ EACH grep IS `|| true`, AND THAT IS LOAD-BEARING — NOT DEFENSIVE NOISE.
+    # ✔MEASURED 2026-08-08: without it this guard reported only the FIRST missing
+    # anchor, printed NO `cited in:` lines, and swallowed the whole `Fix:` trailer
+    # below. Cause: `set -euo pipefail` (top of file) applies INSIDE this brace
+    # group, so an anchor cited ONLY under real-examples/ makes the first grep exit
+    # 1, `set -e` aborts the group before the second grep runs, and pipefail then
+    # kills the script mid-report. The failure mode is the worst kind for a guard:
+    # it fails LOUDLY about the wrong scope and hides the remediation text, so the
+    # reader fixes one anchor, re-runs, and is told about the next one — N runs for
+    # N anchors, with no clue why. A grep that finds nothing is a NORMAL outcome
+    # here (an anchor lives in exactly one of these roots), never an error.
     { grep -rln "${anchor}" src/ examples/ \
-        --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' 2>/dev/null; \
+        --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' 2>/dev/null || true; \
       grep -rln "${anchor}" real-examples/ \
-        --include='*.sh' --include='*.ps1' --include='*.py' 2>/dev/null; } \
+        --include='*.sh' --include='*.ps1' --include='*.py' 2>/dev/null || true; } \
         | sed 's/^/    cited in: /'
 done
 echo ""

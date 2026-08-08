@@ -394,7 +394,7 @@ $AcqScriptLibraryKey = 'scriptLibraryDir'
 # at the call site, so the two drivers read the contract the same way; and (b) an
 # ambient variable that is not in scope makes `PSObject.Properties[$null]` throw
 # "Index operation failed; the array index evaluated to null" - the exact trap this
-# file already records for `$oldLegEnv[$null]` at Step 8.
+# file already records for the launcher-environment read (Get-LegDeclaredEnvNames).
 function Get-AcquiredScriptLibrary($acq, $key) {
   if (-not $key) { Die "Get-AcquiredScriptLibrary was called with no contract field name. The acquisition report field is `$AcqScriptLibraryKey; a lookup with an empty key cannot distinguish 'no script library' from 'this driver forgot which field to read'." }
   # ABSENT or EMPTY is not an error HERE - a leg whose acquired library needs no
@@ -422,7 +422,16 @@ function Get-AcquiredScriptLibrary($acq, $key) {
 # uses. The .sh twin holds the identical table; the RIGHT long-term home is a
 # declared loader-variable name emitted by the shared resolver, so neither driver
 # holds it at all.
-function Get-LegLoaderPathVar($leg) {
+# ★★ AND THE SEPARATOR IS THE SAME QUESTION, WHICH THIS TABLE USED NOT TO ANSWER.
+# The variable holds a LIST, and who splits it is the TARGET's loader: `;` for the
+# Windows loader, `:` for ld.so and for dyld. ✔MEASURED 2026-08-07: this driver
+# joined that list with `[System.IO.Path]::PathSeparator` — a property of the HOST
+# it happens to be running on, `;` on Windows — and handed the result to an ELF
+# leg, whose ld.so reads the whole thing as ONE directory named `C:\a;C:\b` and
+# reports `libtcl8.6.so: cannot open shared object file` beside two libraries that
+# are staged and present. Keyed on the target for the same reason the NAME is: the
+# process that parses the value is the target's loader, never this driver.
+function Get-LegLoaderPathSpec($leg) {
   $os = "$($leg.build.configStageKey)"
   # `<container><bits>-<arch>-<os>-<kind>`: the OS is the second-to-last token.
   $parts = @("$($leg.format)".Split('-'))
@@ -430,11 +439,17 @@ function Get-LegLoaderPathVar($leg) {
   if (-not $os) { Die "[$($leg.label)] the resolved plan carries no target OS (build.configStageKey is empty). The runtime loader's search variable is a property of the TARGET; choosing one without knowing the target is how LD_LIBRARY_PATH came to be exported for a Darwin leg that cannot read it." }
   if ($os -ne $fmtOs) { Die "[$($leg.label)] the resolved plan disagrees with itself about this leg's target OS: configStageKey says '$os', the object format '$($leg.format)' says '$fmtOs'. One of them decides which loader variable this leg's libraries are exported under." }
   switch ($os) {
-    'windows' { return 'PATH' }
-    'linux'   { return 'LD_LIBRARY_PATH' }
-    'darwin'  { return 'DYLD_LIBRARY_PATH' }
+    'windows' { return [pscustomobject]@{ Name = 'PATH';              Separator = ';' } }
+    'linux'   { return [pscustomobject]@{ Name = 'LD_LIBRARY_PATH';   Separator = ':' } }
+    'darwin'  { return [pscustomobject]@{ Name = 'DYLD_LIBRARY_PATH'; Separator = ':' } }
     default   { Die "[$($leg.label)] target OS '$os' has no declared runtime-loader search variable in this driver. Known: windows (PATH) | linux (LD_LIBRARY_PATH) | darwin (DYLD_LIBRARY_PATH). A new target OS must DECLARE its answer; defaulting to one spelling is the defect this function exists to end." }
   }
+}
+# The NAME alone — for the callers that only save, restore or forward the variable
+# and never build its value. ONE table, two questions: a second switch keyed on the
+# same target OS is how the two answers would come to disagree.
+function Get-LegLoaderPathVar($leg) {
+  return (Get-LegLoaderPathSpec $leg).Name
 }
 
 $Stage        = Join-Path $Work 'stage'          # the staged sqlite tree + headers
@@ -719,6 +734,127 @@ function Resolve-LaunchEnvCarrier($verb, $pathVerb, $plain, $pathVars, $declared
                   ForEach-Object { "$_".Trim() } | Where-Object { $_ })
 }
 #
+# ── THE LOADER'S SEARCH PATH, BUILT IN THE LAUNCHER'S NAMESPACE ──────────────
+# THE FOURTH QUESTION, AND IT IS THE ONE THE FIRST THREE MADE POSSIBLE TO MISS.
+# `pathTranslation` spells an ARGUMENT the way the launcher reads it, `envTransfer`
+# gets a NAME across the boundary, `runFilesystem` says where the child writes.
+# None of them says a word about a value that is BOTH a list AND a set of paths,
+# which is exactly what a runtime loader's search variable is — so this driver
+# built one out of HOST spellings joined by a HOST separator and then handed it to
+# a foreign loader.
+#
+# ✔MEASURED 2026-08-07, elf64-arm64 on a Windows host: `libtcl8.6.so: cannot open
+# shared object file` with libtcl8.6.so (1,844,864 B) and libz.so.1 (133,520 B)
+# staged in the very directory the variable named — because the variable named
+# `C:\…\lib` and ld.so has never heard of a drive letter.
+#
+# ★ EVERY ELEMENT GOES THROUGH THE SAME DOOR THE ARGV ALREADY USES
+# (Convert-LaunchPath -> the leg's DECLARED pathTranslation -> harness_legs.py), so
+# this function knows nothing about `wslpath`, `/mnt/c`, or which host it is on.
+# The separator comes off the TARGET (Get-LegLoaderPathSpec), because the process
+# that splits the list is the target's loader.
+#
+# ★ AND THE VALUE ALREADY IN THE VARIABLE IS A NAMESPACE QUESTION TOO. It belongs
+# to THIS driver's environment, so it may be merged only when the launcher shares
+# this driver's namespace — which is precisely what `pathTranslation: none`
+# declares, and it is why a native leg's PATH still arrives intact. When the
+# launcher spells paths differently, a host value would cross as a list of
+# directories the target's loader cannot open, so it is DROPPED and said out loud
+# rather than passed along to fail quietly.
+function Get-LegLoaderSearchPath($leg, $dirs) {
+  $spec = Get-LegLoaderPathSpec $leg
+  $verb = "$($leg.run.pathTranslation)"
+  $parts = @()
+  foreach ($d in @($dirs | Where-Object { $_ })) {
+    $t = Convert-LaunchPath $verb "$d"
+    if ($parts -notcontains $t) { $parts += $t }
+  }
+  $cur = [Environment]::GetEnvironmentVariable($spec.Name)
+  if ($cur) {
+    if (-not $verb -or $verb -eq 'none') { $parts += $cur }
+    else { Info "[$($leg.label)] $($spec.Name) is SET in this driver's own environment and is NOT carried into the launcher's: its value is spelled in THIS namespace and the launcher declares pathTranslation '$verb', so it would reach the target's loader as directories it cannot open. Only this leg's staged library directories cross." }
+  }
+  return ($parts -join $spec.Separator)
+}
+#
+# The names the CATALOGUE declared for this leg's launcher (legs.json
+# `launchers[].env`, e.g. QEMU_LD_PREFIX), read in ONE place because the read has a
+# trap in it.
+# ★ `Where-Object { $_ }` IS LOAD-BEARING, MEASURED TF-C115 — NOT defensive noise.
+# Every leg the resolver plans carries `run.env`, and for a NATIVE run (or a
+# launcher declaring `"env": {}`) it is an EMPTY PSCustomObject. An empty object is
+# TRUTHY in PowerShell, so the `if` fires; `.PSObject.Properties.Name` over zero
+# properties yields a single $null, and `@($null)` is an array of ONE null. A
+# caller then indexes a hashtable with $null and PowerShell throws "Index operation
+# failed; the array index evaluated to null" — which killed Step 8 outright for the
+# ONE leg a Windows host can execute, with two good testfixtures already on disk.
+function Get-LegDeclaredEnvNames($leg) {
+  if (-not $leg.run.env) { return @() }
+  return @($leg.run.env.PSObject.Properties.Name | Where-Object { $_ })
+}
+#
+# ── APPLYING A LEG'S RUN ENVIRONMENT TO A CHILD, IN ONE PLACE ────────────────
+# D-HARNESS-PS1-CLI-SMOKE-IGNORES-THE-LEGS-DECLARED-LAUNCH-ENVIRONMENT.
+#
+# ✔MEASURED 2026-08-07: the elf64-arm64 CLI smoke gate failed EVERY assertion with
+# `rc=255  qemu-aarch64: Could not open '/lib/ld-linux-aarch64.so.1'` — and
+# legs.json had declared `QEMU_LD_PREFIX` for that launcher all along. The corpus
+# step applied it; the smoke step, twenty lines of its own inline environment
+# handling away, did not. TWO COPIES OF ONE DECISION, and only one of them was
+# ever fixed — this project's canonical silent harness bug, which is why the
+# decision now exists ONCE and both steps CALL it.
+#
+# There is no per-invocation environment parameter that also preserves the
+# redirections these call sites need, so the child's environment is this process's:
+# set here, restored by Pop-LegLaunchEnv in the caller's `finally`. EVERY name this
+# function assigns is snapshotted before it is written — including the ones the
+# resolver's own assignments name — so "was unset" is restored as unset rather than
+# as empty, and nothing leaks into the next leg.
+function Push-LegLaunchEnv($leg, $loaderPath, $plainNames, $pathNames) {
+  $verb  = "$($leg.run.envTransfer)"
+  $xlate = "$($leg.run.pathTranslation)"
+  $var   = Get-LegLoaderPathVar $leg
+  $declaredNames = @(Get-LegDeclaredEnvNames $leg)
+  $carrier = Get-LaunchEnvCarrierName $verb
+  $snap = @{ Names = @(); Old = @{} }
+  foreach ($n in @(@($var) + $declaredNames + @($carrier) | Where-Object { $_ })) {
+    if ($snap.Names -notcontains $n) { $snap.Names += $n; $snap.Old[$n] = [Environment]::GetEnvironmentVariable($n) }
+  }
+  [Environment]::SetEnvironmentVariable($var, $loaderPath)
+  foreach ($n in $declaredNames) { [Environment]::SetEnvironmentVariable($n, "$($leg.run.env.$n)") }
+  # LAST, because it reads the variables set above AND the ones the caller set:
+  # the launcher's declared environment TRANSFER, resolved from what is actually
+  # SET right now. For `inherit` this is empty and the spawn is byte-for-byte the
+  # one it always was.
+  # ★ THE LOADER VARIABLE CROSSES AS `declared`, AND THAT IS THE PRECISE CLAIM.
+  # `--forward-declared` is the resolver's door for a value that is ALREADY IN THE
+  # LAUNCHER'S NAMESPACE BY CONSTRUCTION and therefore crosses verbatim — which is
+  # exactly what Get-LegLoaderSearchPath just made it, element by element, through
+  # that launcher's own declared translator. It is emphatically NOT `--forward-path`
+  # (that door translates the value, and translating an already-translated LIST
+  # would hand ld.so a mangled string) and not `--forward` (that door is for a value
+  # with no namespace at all). Without naming it here the variable is set on this
+  # process and simply never crosses: WSLENV is what makes a Windows-side variable
+  # visible inside WSL, and a value nobody carried is indistinguishable from a leg
+  # whose libraries were never staged.
+  $carrierOld = if ($carrier) { $snap.Old[$carrier] } else { '' }
+  foreach ($a in (Resolve-LaunchEnvCarrier $verb $xlate $plainNames $pathNames `
+                                           (@($declaredNames) + @($var)) $carrierOld)) {
+    $kv = $a.Split('=', 2)
+    if ($snap.Names -notcontains $kv[0]) { $snap.Names += $kv[0]; $snap.Old[$kv[0]] = [Environment]::GetEnvironmentVariable($kv[0]) }
+    [Environment]::SetEnvironmentVariable($kv[0], $kv[1])
+  }
+  return $snap
+}
+# The other half, and it restores by SNAPSHOT rather than by recomputation: a
+# variable that was unset before the spawn is set back to unset, because an
+# empty-but-existing variable is a real setting to everything downstream — the same
+# distinction that made the carrier's own filter load-bearing.
+function Pop-LegLaunchEnv($snap) {
+  if (-not $snap) { return }
+  foreach ($n in @($snap.Names)) { [Environment]::SetEnvironmentVariable($n, $snap.Old[$n]) }
+}
+#
 # ── THE REGISTRY, AT THE POINT OF FAILURE ────────────────────────────────────
 # D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE.
 #
@@ -867,8 +1003,13 @@ if (-not $python3) { Die "python3 not found on PATH — needed to resolve the le
 #   test-driver-contracts.ps1  the LEG CONTRACTS — the verdict recorders, the
 #                              shared run decision, Read-CorpusSegment's first
 #                              diagnostic, the target-keyed loader variable and the
-#                              acquisition contract field, each with its
-#                              red-on-disable mutation asserted to have LANDED.
+#                              acquisition contract field, and the LAUNCHER RUN
+#                              ENVIRONMENT (the leg's declared variables, the loader
+#                              search path in the launcher's namespace with the
+#                              target's separator, the carrier that carries both,
+#                              and the CLI smoke gate applying them at all), each
+#                              with its red-on-disable mutation asserted to have
+#                              LANDED.
 #   test-mirror-regions.ps1    the `dss:` REGIONS — every region declared with who
 #                              verifies it (a claimed verifier that does not read
 #                              the region is a LOUD failure), and for a region
@@ -2947,6 +3088,121 @@ foreach ($lbl in $FilteredOut) {
   Set-LegVerdict $lbl 'not-selected-by-runner' "removed from this run by DSS_LEGS='$($env:DSS_LEGS)' — DECLARED coverage that was not exercised"
 }
 
+# ── WHAT EACH LAUNCHER NEEDS BEYOND ITS OWN argv[0] ─────────────────────────
+# >>> dss:launcher-prereq >>>
+# ★★ THE PLAN SAYS `launched` BECAUSE argv[0] RESOLVED, AND THAT IS A MUCH WEAKER
+# FACT THAN IT READS AS. On THIS host the arm64 leg's argv[0] is `wsl.exe` —
+# present on every machine with WSL — while the program that actually executes the
+# artefact is `qemu-aarch64` INSIDE the distro, which `shutil.which('wsl.exe')` has
+# never asked about. ✔MEASURED: that leg passed every gate this harness had on a
+# box with no qemu, every unit exited 255 with NO diagnostic, and fourteen of them
+# were charged to DSS — the harness accusing the compiler of a defect in the
+# machine it was running on.
+#
+# `--check-launcher` EXECUTES the leg's DECLARED prerequisite rows (legs.json
+# `launchers[].requires`) in the LAUNCHER's own namespace and answers rc 0 met /
+# 3 unmet / 2 catalogue defect. This driver only classifies the answer; it never
+# decides what a launcher needs and never probes anything itself.
+#
+# ★ THE OUTCOME IS `skipped-launcher-prerequisite-missing`, the closed
+# vocabulary's ENVIRONMENTAL sibling of `skipped-emulator-missing` — announced by
+# default, FATAL under DSS_STRICT_ARM_VERDICTS=1 through the SAME Step-9
+# $envSkipLegs list, and STILL BUILT. It is only ever about EXECUTION here.
+#
+# ⓘ WHY HERE AND NOT AT STEP 1b. It runs at the EARLIEST point this driver can
+# record a verdict at all — `Set-LegVerdict` and the closed vocabulary it validates
+# against are defined immediately above — and that is still before Steps 7/7b/7c/8,
+# which is what the gate has to precede. The .sh twin's structural equivalent is
+# Step 1, because there the verdict arrays exist from the plan onwards.
+# `--artifact` (the 4-D PT_INTERP/DT_NEEDED cross-check) is NOT passed: nothing is
+# built yet, and asking for it here would mean lying about the artefact.
+function Get-LauncherPrereqRows($report) {
+  # THE ROWS THE CATALOGUE DECLARED, not a summary of them. `provides` says what
+  # the missing thing is FOR, `why` says on what evidence it is declared, and
+  # `install` is the one line the operator actually needs — a diagnostic without
+  # the remedy is one nobody acts on.
+  $out = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($row in @($report.missing)) {
+    if (-not $row) { continue }
+    [void]$out.Add("MISSING [$(if ($row.kind) { $row.kind } else { '?' })] $(if ($row.path) { $row.path } else { '?' })")
+    [void]$out.Add("      provides: $(if ($row.provides) { $row.provides } else { '<not declared>' })")
+    [void]$out.Add("      why     : $(if ($row.why)      { $row.why }      else { '<not declared>' })")
+    [void]$out.Add("      install : $(if ($row.install)  { $row.install }  else { '<not declared>' })")
+    if (@($row.probe).Count) { [void]$out.Add("      probed  : $(@($row.probe) -join ' ')") }
+  }
+  foreach ($u in @($report.uncovered)) { if ($u) { [void]$out.Add("UNCOVERED $u") } }
+  return $out
+}
+function Test-LauncherPrereq($leg) {
+  # -> 'not-launched' | 'met' | 'unmet' | 'unreadable'. The verdict is RECORDED
+  # here, through the one guarded recorder, so there is no second place a fifth
+  # unguarded assignment can appear.
+  $lbl = $leg.label
+  # A leg this host runs NATIVELY has no launcher, and a leg the plan already
+  # skips has already been named. Neither is this gate's business.
+  if ("$($leg.run.mode)" -ne 'launched') { return 'not-launched' }
+  $declared = (@($leg.run.launcher) -join ' ')
+  $out = @(); $rc = 0
+  try {
+    # rc taken DIRECTLY off the call — $LASTEXITCODE on the very next statement,
+    # never after a pipe. The try/catch is not decoration: PowerShell 7.3+ can make
+    # a nonzero-exiting native command THROW under $ErrorActionPreference='Stop'.
+    $out = @(& $python3.Source $LegsPy '--check-launcher' $lbl '--host-os' $HostOs '--host-arch' $HostArch 2>&1)
+    $rc  = $LASTEXITCODE
+  } catch {
+    $rc  = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+    $out = @("$_")
+  }
+  $text = (@($out) | ForEach-Object { "$_" }) -join "`n"
+  if ($rc -eq 0) {
+    Info "[$lbl] launcher '$declared': every DECLARED prerequisite is present on this machine"
+    return 'met'
+  }
+  $report = $null
+  if ($rc -eq 3) { try { $report = $text | ConvertFrom-Json } catch { $report = $null } }
+  if ($rc -eq 3 -and $report) {
+    $rows = Get-LauncherPrereqRows $report
+    $n = @($report.missing).Count
+    Warn "[$lbl] LAUNCHER PREREQUISITE MISSING — this host HAS '$declared', and does NOT have everything that launcher DECLARES it needs."
+    foreach ($r in $rows) { Warn "      $r" }
+    Warn "      This leg is STILL BUILT. Its sqlite3 CLI smoke gate and its ENTIRE unit corpus are NOT run on this machine —"
+    Warn "      running them would exercise a launcher that cannot start the artefact, and every failure would be charged to the compiler."
+    # DOWNGRADED TO `skip`, with the answer the machine gave. The plan resolved
+    # `launched` from a fact that turned out to be too weak; this is the same
+    # statement `skipped-emulator-missing` already makes, one probe deeper. Both
+    # artifacts read it back through Test-LegRunSkipped.
+    $detail = "the DECLARED launcher '$declared' is present on this host but $n of its DECLARED prerequisite(s) are not — see the rows above for what each one provides and how to install it"
+    $leg.run.mode    = 'skip'
+    $leg.run.verdict = 'skipped-launcher-prerequisite-missing'
+    $leg.run.detail  = $detail
+    Set-LegVerdict $lbl 'skipped-launcher-prerequisite-missing' $detail
+    return 'unmet'
+  }
+  # rc 2 is the resolver's own FATAL (a catalogue/usage defect); anything else is
+  # an outcome this driver has no arm for — and so is an rc 3 whose report will not
+  # parse. NEVER assumed benign: an unreadable answer is not evidence that the
+  # launcher works, and running the corpus on that assumption is how a launch
+  # failure becomes a compiler accusation. `poisoned` is the closed vocabulary's
+  # FAILURE class — it reds the run, and the run CONTINUES to every other leg.
+  Warn "[$lbl] the launcher-prerequisite check exited $rc, which this driver does not recognise as a verdict class."
+  Warn "      $(if ($text) { $text } else { '<no diagnostic>' })"
+  Warn "      Treating it as a FAILURE rather than assuming the launcher is fine — an unreadable outcome is not evidence."
+  $detail = "harness_legs.py --check-launcher exited $rc for this leg, so whether its launcher can start the artefact is UNKNOWN on this machine: $(if ($text) { $text } else { '<no diagnostic>' })"
+  $leg.run.mode    = 'skip'
+  $leg.run.verdict = 'poisoned'
+  $leg.run.detail  = $detail
+  Set-LegVerdict $lbl 'poisoned' $detail
+  return 'unreadable'
+}
+$LauncherPrereqUnmet = 0
+foreach ($lg in $Legs) {
+  if ((Test-LauncherPrereq $lg) -notin @('met','not-launched')) { $LauncherPrereqUnmet++ }
+}
+if ($LauncherPrereqUnmet -gt 0) {
+  Warn "$LauncherPrereqUnmet leg(s) will NOT be executed on this machine because a DECLARED launcher prerequisite is absent. They are still BUILT, and Step 9 names each one."
+}
+# <<< dss:launcher-prereq <<<
+
 # Resolve every SELECTED leg's inputs up front, so the operator learns about a
 # missing input in the first minute rather than after the first leg's build.
 #
@@ -3922,6 +4178,122 @@ $CliExpectVersion  = $CliExpectVersion.Matches[0].Groups[1].Value
 $CliExpectSourceId = $CliExpectSourceId.Matches[0].Groups[1].Value
 Info "expecting version '$CliExpectVersion' / source id '$CliExpectSourceId' (from $StagedHeader)"
 if (-not $RefCli) { Warn "no gcc reference CLI — every smoke failure this run is UNATTRIBUTABLE and is charged to DSS by design." }
+# >>> dss:smoke-targets >>>
+# ── WHAT EACH BINARY ACTUALLY IS, READ OUT OF ITS OWN HEADER ────────────────
+# ★ `--identify-binary` prints `<arch>\t<container>\t<targetOs>` read from the ELF
+# e_machine/EI_OSABI, the PE Machine field or the Mach-O cputype — no external
+# tool, and rc 3 with a NAMED diagnostic on bytes it cannot identify. A DEFAULT
+# here would be the worst possible kind: the caller is deciding whether a binary
+# that would not run is this compiler's fault.
+function Get-BinaryTarget($path) {
+  # -> @{ Ok; Target; Why }. The path is spelled the way THIS driver reads files
+  # (the resolver runs here, not inside a launcher), so a WSL-namespace spelling
+  # would be a file this process cannot open.
+  $out = @(); $rc = 0
+  try {
+    $out = @(& $python3.Source $LegsPy '--identify-binary' $path 2>&1)
+    $rc  = $LASTEXITCODE
+  } catch {
+    $rc  = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+    $out = @("$_")
+  }
+  $text = (@($out) | ForEach-Object { "$_" }) -join "`n"
+  if ($rc -ne 0) {
+    return @{ Ok = $false; Target = ''; Why = "could not identify $path (rc=$rc): $(if ($text) { $text } else { '<no diagnostic>' })" }
+  }
+  # tab-separated -> the colon triple cli-smoke.py parses. NEVER fabricated: an
+  # unreadable header returns Ok=$false above and the caller says so out loud.
+  $triple = ((@($out) | ForEach-Object { "$_" } | Where-Object { $_.Trim() } | Select-Object -First 1) -replace "`t", ':').Trim()
+  if (-not $triple) {
+    return @{ Ok = $false; Target = ''; Why = "harness_legs.py --identify-binary $path exited 0 and printed NOTHING — a contract break, not a property of the file." }
+  }
+  return @{ Ok = $true; Target = $triple; Why = '' }
+}
+# ── AND HOW THIS HOST RUNS A BINARY OF THAT TARGET ──────────────────────────
+# ★★ THE HOST-IDENTITY BRANCH THAT USED TO PICK THE REFERENCE'S LAUNCHER IS GONE.
+# It tested this driver's own "am I on the host that needs WSL" flag and, when
+# true, appended a hardcoded `wsl.exe` + `-e` pair — and THAT is why the oracle was
+# unmatched: the reference ran host-native x86_64 while DSS ran arm64 under qemu,
+# and then every difference was charged to DSS. The launcher now comes from the leg
+# catalogue, keyed on the reference's OWN MEASURED target, through the same resolver
+# that answers for every other leg — so it can never again encode a fact about the
+# HOST where a fact about the TARGET belongs.
+# ⚠ AND THE FLAG'S NAME IS DELIBERATELY NOT WRITTEN ANYWHERE IN THIS BLOCK, not
+# even in this sentence. Its ABSENCE from Step 7c is what test-confound-scope.ps1
+# asserts, and it asserts it over the block's FULL TEXT — a prose mention would
+# make a correct driver red, and the usual cure (match a comment-stripped view)
+# would weaken the one guard whose whole content is "this string is not here".
+function Get-LauncherForTarget($target) {
+  # -> @{ Ok; Launcher = @(); Why }. rc 0 launched-or-native (a native target
+  # prints NOTHING and the reason is on stderr), 3 no leg matches / this host
+  # cannot run it, 2 a malformed triple — which would be OUR defect, since the
+  # triple came from --identify-binary.
+  $out = @(); $err = @(); $rc = 0
+  $errFile = Join-Path ([System.IO.Path]::GetTempPath()) ("dss-lft-" + [guid]::NewGuid().ToString('N') + '.txt')
+  try {
+    # stderr to its OWN file: the reason is always written there, on every outcome,
+    # and merging it into stdout would make it indistinguishable from the argv.
+    $out = @(& $python3.Source $LegsPy '--launcher-for-target' $target '--host-os' $HostOs '--host-arch' $HostArch 2>$errFile)
+    $rc  = $LASTEXITCODE
+  } catch {
+    $rc  = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+  }
+  if (Test-Path -LiteralPath $errFile) { $err = @(Get-Content -LiteralPath $errFile); Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue }
+  $why = (@($err) | ForEach-Object { "$_" }) -join ' '
+  if ($rc -ne 0) { return @{ Ok = $false; Rc = $rc; Launcher = @(); Why = $why } }
+  # The argv comes back shlex-quoted exactly as a plan's LEG_LAUNCH. Every token
+  # this catalogue declares is a bare word, and a quoted one is REFUSED rather than
+  # silently split on the space inside it — guessing would produce a launcher argv
+  # that is subtly not the declared one.
+  $line = (@($out) | ForEach-Object { "$_" } | Where-Object { $_.Trim() } | Select-Object -First 1)
+  $toks = @()
+  if ($line) {
+    if ($line -match "['`"]") {
+      return @{ Ok = $false; Rc = $rc; Launcher = @(); Why = "the launcher argv for $target contains a shlex-quoted token this driver will not split by hand: [$line]" }
+    }
+    $toks = @($line.Trim() -split '\s+' | Where-Object { $_ })
+  }
+  return @{ Ok = $true; Rc = 0; Launcher = $toks; Why = $why }
+}
+# The reference is ONE binary and it is the same for every leg, so it is measured
+# ONCE. A reference this host cannot identify or cannot execute is DROPPED, loudly:
+# cli-smoke.py's CONTROL_ABSENT is an honest state, and running a control that never
+# starts is the false-ACQUITTAL half of the same defect family
+# (D-HARNESS-ATTRIBUTION-ORACLE-EXONERATES-VIA-A-REFERENCE-THAT-NEVER-RAN).
+$RefCliTarget = ''
+$RefCliLaunch = @()
+if ($RefCli) {
+  # ⚠ $RefCliWin, NOT $RefCli. On a Windows host $RefCli is the WSL-namespace path
+  # the launcher will be handed; the identification is done by THIS process, which
+  # can only open the Windows spelling. On a native POSIX host `win()` is identity
+  # and the two are the same string.
+  $refId = Get-BinaryTarget $RefCliWin
+  if (-not $refId.Ok) {
+    Warn "the gcc reference CLI could not be IDENTIFIED — $($refId.Why)"
+    Warn "      It is DROPPED for this run rather than passed with a guessed target: an unattributable"
+    Warn "      smoke failure is an honest outcome, a fabricated control triple is not."
+    $RefCli = ''
+  } else {
+    $RefCliTarget = $refId.Target
+    $lft = Get-LauncherForTarget $RefCliTarget
+    if ($lft.Ok) {
+      $RefCliLaunch = @($lft.Launcher)
+      Info "reference CLI target: $RefCliTarget (MEASURED from its own header) — $($lft.Why)"
+      if ($RefCliLaunch.Count) { Info "reference CLI launcher: $($RefCliLaunch -join ' ')  (DECLARED by the catalogue for that target on this host, never inferred from the host's identity)" }
+    } elseif ($lft.Rc -eq 3) {
+      Warn "this host cannot EXECUTE the gcc reference CLI ($RefCliTarget) — $($lft.Why)"
+      Warn "      The reference is DROPPED: a control that cannot start would fail all fourteen assertions for one"
+      Warn "      reason and EXONERATE every DSS failure on every leg against a binary that never executed."
+      $RefCli = ''
+    } else {
+      Warn "harness_legs.py --launcher-for-target '$RefCliTarget' exited $($lft.Rc) — $(if ($lft.Why) { $lft.Why } else { '<no diagnostic>' })"
+      Warn "      That triple came from --identify-binary, so a malformed one is OUR defect, not this machine's."
+      Warn "      The reference is DROPPED rather than run with an unknown launcher."
+      $RefCli = ''
+    }
+  }
+}
+# <<< dss:smoke-targets <<<
 $CliSmokeVerdict = @{}
 $CliSmokeFails = 0
 # EVERY SELECTED LEG, matching Step 7b — a leg the CLI was built for must reach a
@@ -3951,10 +4323,27 @@ foreach ($leg in $Legs) {
   # is applied here. cli-smoke.py passes only RELATIVE names for its databases
   # and sets the child's cwd, so nothing else needs translating.
   $legXlate = "$($leg.run.pathTranslation)"
+  # ★ WHAT THIS LEG'S CLI ACTUALLY IS, MEASURED FROM ITS OWN HEADER — never assumed
+  # from the leg's name and never from the spec, which is the DECLARED side.
+  # cli-smoke.py compares the two and reports a leg that built the WRONG TARGET as
+  # its own non-verdict; that comparison is worth nothing if this driver feeds it
+  # the declaration twice. Identified through the DRIVER's spelling of the path,
+  # not the launcher's — this process is the one opening the file.
+  $cliId = Get-BinaryTarget $CliBuilt[$lbl]
+  if (-not $cliId.Ok) {
+    $CliSmokeFails++
+    $CliSmokeVerdict[$lbl] = "FAIL — the built CLI could not be IDENTIFIED ($($CliBuilt[$lbl])); no smoke verdict was taken"
+    Warn "[$lbl] CLI smoke NOT RUN — $($cliId.Why)"
+    Warn "      This is RED and it is NOT charged to the compiler: the gate needs the subject's MEASURED target and this"
+    Warn "      driver will not fabricate one. Counted as a failure so the run cannot exit 0 over a leg it never asserted about."
+    continue
+  }
   $smokeArgs = @($CliSmokePy,
     '--cli',              (Convert-LaunchPath $legXlate $CliBuilt[$lbl]),
     '--expect-version',   $CliExpectVersion,
     '--expect-source-id', $CliExpectSourceId,
+    '--leg-spec',         $leg.spec,
+    '--cli-target',       $cliId.Target,
     '--workdir',          $smokeDir,
     '--label',            $lbl,
     '--json',             (Join-Path $smokeDir 'result.json'))
@@ -3970,36 +4359,101 @@ foreach ($leg in $Legs) {
   # host, whose second token is `-x86_64`. Fixed here BEFORE that host ever runs it.
   # (D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION)
   foreach ($t in @($leg.run.launcher)) { if ($t) { $smokeArgs += @("--launcher=$t") } }
-  # The reference is a LINUX gcc build living in the shell's namespace. On a
-  # Windows host it is reached the same way anything else over there is — through
-  # the declared WSL entry point — and on a native POSIX host it runs directly.
+  # ★★ THE REFERENCE'S LAUNCHER IS RESOLVED FROM ITS MEASURED TARGET, NOT FROM THIS
+  # HOST'S IDENTITY. What stood here was a branch on this driver's own host flag
+  # that appended a hardcoded `wsl.exe` + `-e` pair, and it is WHY THE ORACLE WAS
+  # UNMATCHED: on a Windows host it ran the reference host-native x86_64 while DSS
+  # ran arm64 under qemu, and then every difference was charged to DSS. (The flag's
+  # name is not written here on purpose — see the note at Get-LauncherForTarget: its
+  # ABSENCE from this whole block is what the confound-scope test pins, over the
+  # block's FULL text.) The .sh twin had the same
+  # bug in its latent form (it passed NO reference launcher at all, correct only for
+  # as long as every host that owns a reference can execute it directly — which stops
+  # being true on the arm64 VPS). Both are now ONE question asked of the catalogue,
+  # `--launcher-for-target <the reference's MEASURED triple>`, resolved once above.
+  # `--reference-target` is that same MEASURED triple, and it is what lets
+  # cli-smoke.py refuse to exonerate anything against a control aimed elsewhere.
+  # ★ `=` FORM for every launcher token, same rule and same anchor as `--launcher`
+  # above (D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION): this is the
+  # very option whose SPACE form killed the pe64 gate before one assertion ran.
+  # ⚠ `wsl.exe -e` is still REQUIRED where WSL is the launcher, and it still is —
+  # legs.json DECLARES both tokens, which is why they no longer need to be spelled
+  # here. Without `-e` WSL routes the command line through the distro's default
+  # shell, which expands `$( )` on the WINDOWS side before bash ever sees it.
   if ($RefCli) {
-    $smokeArgs += @('--reference', $RefCli)
-    # ★ THE BUG THIS CYCLE MEASURED, and the `=` form is the fix: `-e` passed as a
-    # positional value made argparse report `argument --reference-launcher: expected
-    # one argument` and exit 2, so the smoke gate never ran a single assertion — yet
-    # the caller classified the non-zero rc as `FAIL — CHARGED TO DSS`. A harness
-    # argv defect was attributed to the compiler. That is the FALSE-ACCUSATION twin
-    # of D-HARNESS-ATTRIBUTION-ORACLE-EXONERATES-VIA-A-REFERENCE-THAT-NEVER-RAN, and
-    # it is the more dangerous direction: a false acquittal hides a real bug, a false
-    # accusation sends someone hunting one that does not exist.
-    # ⚠ `wsl.exe -e` is REQUIRED, not stylistic: without `-e` WSL routes the command
-    # line through the distro's default shell, which expands `$( )` on the WINDOWS
-    # side before bash ever sees it.
-    if ($script:HostNeedsWsl) { $smokeArgs += @('--reference-launcher=wsl.exe', '--reference-launcher=-e') }
+    $smokeArgs += @('--reference', $RefCli, '--reference-target', $RefCliTarget)
+    foreach ($t in @($RefCliLaunch)) { if ($t) { $smokeArgs += @("--reference-launcher=$t") } }
   }
-  $smokeOut = & $python3.Source @smokeArgs 2>&1
-  $srcc = $LASTEXITCODE
+  # ── THE LEG'S DECLARED RUN ENVIRONMENT, APPLIED TO THIS CHILD TOO ──────────
+  # D-HARNESS-PS1-CLI-SMOKE-IGNORES-THE-LEGS-DECLARED-LAUNCH-ENVIRONMENT. The
+  # spawn below used to stand bare, with nothing set around it, and the fourteen
+  # assertions behind it ran with NONE of the environment the leg declares:
+  #   ✔MEASURED 2026-08-07, elf64-arm64 on this host — every assertion rc=255,
+  #   `qemu-aarch64: Could not open '/lib/ld-linux-aarch64.so.1'`, while legs.json
+  #   had declared QEMU_LD_PREFIX for that very launcher and Step 8 was applying
+  #   it twenty lines away. A harness defect reported as `CHARGED TO DSS` on a
+  #   binary that is completely fine — the false-ACCUSATION direction, which sends
+  #   someone hunting a compiler bug that does not exist.
+  # ★ ONE MECHANISM, BOTH STEPS: Push-LegLaunchEnv is the same call Step 8 makes,
+  # so a leg that declares a launcher variable, or whose libraries were staged,
+  # cannot be honoured in one step and ignored in the other again.
+  # ★ THE LIBRARY DIRECTORY IS zlib's, NOT Tcl's, and that is not an omission: the
+  # CLI links zlib and does not embed Tcl, and this loop reaches legs whose Tcl
+  # never resolved at all (`$LegLibsAll`, not `$LegLibs`) — asking for a Tcl
+  # directory here would fail on exactly the leg the CLI was still built for. Same
+  # choice, same reason, as the .sh twin's smoke subshell.
+  $smokeLibDirs = @(@($LegLibsAll[$lbl].Z) | Where-Object { $_ } | ForEach-Object { Split-Path -Parent $_ })
+  $smokeEnv = Push-LegLaunchEnv $leg (Get-LegLoaderSearchPath $leg $smokeLibDirs) @() @()
+  try {
+    # WHAT ACTUALLY CROSSED, read back out of the environment rather than restated
+    # from what this driver meant to set — the whole class of defect above is a
+    # value that was intended and never arrived. Bounded, because a native leg's
+    # loader variable is the entire PATH.
+    Info "[$lbl] launcher run environment: $((@($smokeEnv.Names) | ForEach-Object { $v = "$([Environment]::GetEnvironmentVariable($_))"; if ($v.Length -gt 160) { $v = $v.Substring(0, 160) + '…' }; "$_=$v" }) -join '  ')"
+    $smokeOut = & $python3.Source @smokeArgs 2>&1
+    $srcc = $LASTEXITCODE
+  } finally { Pop-LegLaunchEnv $smokeEnv }
   Set-Content -LiteralPath (Join-Path $smokeDir 'smoke.log') -Value $smokeOut -Encoding utf8NoBOM
   foreach ($l in $smokeOut) { Info "      $l" }
+  # ★★ EVERY rc THE GATE CAN RETURN HAS ITS OWN ARM — `default` IS THE LAST RESORT,
+  # NOT THE DEFAULT VERDICT (D-HARNESS-CLI-SMOKE-CHARGES-A-LAUNCH-FAILURE-TO-THE-COMPILER).
+  # Until TF-C136 this switch had arms for 0 and 3 only, so EVERY other rc — including
+  # a gate that explicitly DECLINED to attribute, and an argv defect of our own — fell
+  # into `default` and printed as an accusation against the compiler. ✔MEASURED: 14 rows
+  # of "CHARGED TO DSS" over an elf64-arm64 binary that never launched, because qemu
+  # could not find the guest loader. A default arm that names a culprit will eventually
+  # name the wrong one; enumerate, and make the surviving `default` say "unknown rc".
+  # ⚠ CAPABILITY-PAIRED: the `.sh` twin's `case` carries the identical arms. Change one,
+  # change both, or the two harnesses disagree about who is at fault.
   switch ($srcc) {
     0 { $CliSmokeVerdict[$lbl] = 'PASS (14/14)'; Pass "[$lbl] CLI smoke: 14/14" }
+    1 { # ★ THE ARM THE ENUMERATION LEFT OUT, AND IT IS THE ACCUSATION ITSELF.
+        # rc 1 is the gate's "CHARGED TO DSS" — a MATCHED control passed where the
+        # subject failed. Until this line it had no arm and fell into `default`,
+        # which prints "an rc the driver does not understand is a driver defect.
+        # NOT charged to DSS": a genuine, matched, attributed compiler failure
+        # reported as a harness defect and quietly exonerated. That is the
+        # FALSE-ACQUITTAL direction — the one that HIDES a real bug — and it was
+        # introduced by the very change that removed the false-accusation default.
+        # Enumerating the rc table means enumerating ALL of it. Paired with the
+        # .sh twin's `1)` arm, in one change.
+        $CliSmokeFails++
+        $CliSmokeVerdict[$lbl] = "FAIL — CHARGED TO DSS (a MATCHED gcc control passes the assertions this leg fails); see $smokeDir\result.json"
+        Warn "[$lbl] CLI smoke RED and CHARGED TO DSS — the reference targets this leg's own target, it launched, and it passes what this binary fails." }
     3 { $CliSmokeFails++
         $CliSmokeVerdict[$lbl] = "FAIL — NOT DSS (the gcc reference fails identically); see $smokeDir\result.json"
         Warn "[$lbl] CLI smoke RED, but DSS is NOT implicated — the gcc reference fails the same assertions." }
+    4 { $CliSmokeFails++
+        $CliSmokeVerdict[$lbl] = "FAIL — NOT A VERDICT (unattributable); see $smokeDir\result.json"
+        # RED and counted, deliberately: an unattributable run is a FAILURE, never a
+        # warning. What changed is WHO it names — `dssImplicated` is null, not true.
+        Warn "[$lbl] CLI smoke RED, but this run is NOT A VERDICT about generated code — the subject never launched and/or there was no MATCHED control (the reference targets a different arch/format than this leg). See $smokeDir\result.json 'controlState' + 'subjectLaunched'." }
+    2 { $CliSmokeFails++
+        $CliSmokeVerdict[$lbl] = "FAIL — HARNESS ARGV DEFECT (the gate rejected its own arguments); see $smokeDir\smoke.log"
+        Warn "[$lbl] CLI smoke could not run: the gate REJECTED THE ARGUMENTS THIS DRIVER PASSED IT. That is our defect, not the compiler's — see $smokeDir\smoke.log." }
     default { $CliSmokeFails++
-        $CliSmokeVerdict[$lbl] = "FAIL — CHARGED TO DSS; see $smokeDir\result.json"
-        Warn "[$lbl] CLI smoke FAILED and is CHARGED TO DSS — see $smokeDir\smoke.log" }
+        $CliSmokeVerdict[$lbl] = "FAIL — UNKNOWN rc=$srcc from the smoke gate; see $smokeDir\result.json"
+        Warn "[$lbl] CLI smoke returned rc=$srcc, which this driver has no arm for. NOT charged to DSS — an rc the driver does not understand is a driver defect. Add an arm here and to the .sh twin." }
   }
 }
 
@@ -4235,9 +4689,19 @@ if ($Confounds.Count) {
 # the only case it can run natively; for an elf/macho leg it resolves to the
 # variable that target's loader actually reads, instead of a name chosen once and
 # then wrong for four of the five legs.
+#
+# ★★ AND SO IS THE SPELLING OF ITS VALUE. This line used to join the directories
+# with `[System.IO.Path]::PathSeparator` — the HOST's separator, `;` on Windows —
+# and pass them in the HOST's spelling, so an ELF leg was handed `C:\a;C:\b` and
+# ld.so looked for one directory of that name. ✔MEASURED 2026-08-07: the
+# elf64-arm64 fixture died `libtcl8.6.so: cannot open shared object file` with
+# both libraries staged in the directory the variable named. Get-LegLoaderSearchPath
+# builds it in the LAUNCHER's namespace, with the TARGET's separator, through the
+# leg's own DECLARED pathTranslation — and for a native leg (translation `none`,
+# target separator `;`) it yields byte-for-byte the string this line always made.
 $LegLoaderVar = Get-LegLoaderPathVar $leg
 $legLibDirs = @((Split-Path $LegLibs[$LegTag].Tcl), (Split-Path $LegLibs[$LegTag].Z)) | Select-Object -Unique
-$runEnvPath = ($legLibDirs -join [System.IO.Path]::PathSeparator) + [System.IO.Path]::PathSeparator + [Environment]::GetEnvironmentVariable($LegLoaderVar)
+$runEnvPath = Get-LegLoaderSearchPath $leg $legLibDirs
 # ★ THE ACQUIRED Tcl's SCRIPT LIBRARY WINS OVER THE HOST'S, and only for a leg
 # that HAS one [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]. $TclLibrary
 # is this machine's own copy: correct for a `host-system` leg (whose libtcl is
@@ -4411,23 +4875,15 @@ $lastBoundary = ''
 # is decided in one place. [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
 $prevZeroDiag = ''
 $preconditionFail = ''
-$oldLoaderPath = [Environment]::GetEnvironmentVariable($LegLoaderVar); $oldTclLib = $env:TCL_LIBRARY
+$oldTclLib = $env:TCL_LIBRARY
 $oldOmit = $env:QUICKTEST_OMIT; $oldPatterns = $env:SQLITE_TEST_PATTERN_LIST
 # The leg's DECLARED launcher environment (legs.json `launchers[].env`, e.g.
-# QEMU_LD_PREFIX). Snapshotted so it is restored exactly, including "was unset".
-# ★ `Where-Object { $_ }` IS LOAD-BEARING, MEASURED TF-C115 — NOT defensive noise.
-# Every leg the resolver plans carries `run.env`, and for a NATIVE run (or a
-# launcher declaring `"env": {}`) it is an EMPTY PSCustomObject. An empty object
-# is TRUTHY in PowerShell, so the `if` fires; `.PSObject.Properties.Name` over
-# zero properties yields a single $null, and `@($null)` is an array of ONE null.
-# The next line then evaluates `$oldLegEnv[$null]` and PowerShell throws
-# "Index operation failed; the array index evaluated to null" — killing Step 8
-# outright for the ONE leg a Windows host can execute. MEASURED: a full driver run
-# on 2026-08-04 built both legs and died HERE, at the first line of the corpus
-# step, with two good testfixtures already on disk.
-$legEnvNames = @(); if ($leg.run.env) { $legEnvNames = @($leg.run.env.PSObject.Properties.Name | Where-Object { $_ }) }
-$oldLegEnv = @{}
-foreach ($en in $legEnvNames) { $oldLegEnv[$en] = [Environment]::GetEnvironmentVariable($en) }
+# QEMU_LD_PREFIX) — read HERE only to name the candidates in the line below.
+# APPLYING it, snapshotting it and restoring it belong to Push/Pop-LegLaunchEnv,
+# which the CLI smoke gate calls too: this block used to do it inline, and the
+# smoke gate's own inline copy simply omitted it
+# [D-HARNESS-PS1-CLI-SMOKE-IGNORES-THE-LEGS-DECLARED-LAUNCH-ENVIRONMENT].
+$legEnvNames = @(Get-LegDeclaredEnvNames $leg)
 # ── the launcher's ENVIRONMENT namespace ─────────────────────────────────────
 # WHICH VARIABLES MAY CROSS IS THIS DRIVER'S KNOWLEDGE — it is the one that sets
 # them. `$env:PATH` stays ABSENT on purpose: a foreign fixture handed this host's
@@ -4441,12 +4897,25 @@ foreach ($en in $legEnvNames) { $oldLegEnv[$en] = [Environment]::GetEnvironmentV
 # would fail to find init.tcl again and the driver would blame the acquisition.
 # WHICH kind each name is, and the refusal of any name with no declared kind, is
 # the resolver's (LAUNCH_FORWARD_KINDS); HOW they cross belongs to the verb.
+# ★★ AND THE LOADER SEARCH VARIABLE IS ONE OF THEM, WHICH IT WAS NOT.
+# [D-HARNESS-PS1-LOADER-SEARCH-PATH-NEVER-CROSSES-THE-LAUNCHER-BOUNDARY.] The
+# value was built and set on THIS process and then named nowhere, so for a
+# launcher that does not inherit — every leg a Windows host launches — it never
+# crossed at all: WSLENV is what makes a Windows-side variable visible inside WSL.
+# The fixture then failed to load a library that was staged, present and correctly
+# spelled, which reads as a broken artefact rather than as a variable that never
+# arrived. It crosses as DECLARED (already in the launcher's namespace by
+# construction), never as a forwarded HOST path — see Push-LegLaunchEnv.
+# ⚠ AND IT DOES NOT CONTRADICT `$env:PATH stays ABSENT` ABOVE. For a `windows`
+# target the loader variable IS PATH — but a windows target is the one this driver
+# runs NATIVELY, whose envTransfer is `inherit`, so no carrier is built and PATH is
+# never named in one. A future windows-target-through-a-launcher cell would have to
+# answer that question deliberately rather than inherit this line's answer.
 $legEnvVerb      = "$($leg.run.envTransfer)"
 $legForwardPlain = @('SQLITE_TEST_PATTERN_LIST', 'QUICKTEST_OMIT')
 $legForwardPaths = @('TCL_LIBRARY')
-$legForward      = $legForwardPlain + $legForwardPaths + $legEnvNames
+$legForward      = $legForwardPlain + $legForwardPaths + $legEnvNames + @($LegLoaderVar)
 $legCarrierName = Get-LaunchEnvCarrierName $legEnvVerb
-$legCarrierOld  = if ($legCarrierName) { [Environment]::GetEnvironmentVariable($legCarrierName) } else { $null }
 if ($legCarrierName) {
   Info "[$LegTag] the launcher does NOT inherit this driver's environment (envTransfer '$legEnvVerb') — variables that are SET at spawn time cross via $legCarrierName; candidates: $($legForward -join ', ')"
 }
@@ -4458,33 +4927,31 @@ while ($si -lt $segments.Count) {
   else {
     Info "[$LegTag] segment $($si + 1): $($seg.Label)$(if ($seg.Patterns.Count) { "  (SQLITE_TEST_PATTERN_LIST: $($seg.Patterns.Count) candidate file(s))" })"
   }
+  $legEnv = $null
   try {
-    [Environment]::SetEnvironmentVariable($LegLoaderVar, $runEnvPath)
     if (Test-Path -LiteralPath $LegTclLibrary) { $env:TCL_LIBRARY = $LegTclLibrary }
     if ($TierExcludes.Count) { $env:QUICKTEST_OMIT = ($TierExcludes -join ',') }
-    # The leg's DECLARED launcher environment (QEMU_LD_PREFIX and friends). Set
-    # for the CHILD by setting it here and restoring in the finally — Start-Process
-    # inherits this process's block, and there is no per-invocation environment
-    # parameter that also preserves the redirections this call needs.
-    foreach ($en in $legEnvNames) { [Environment]::SetEnvironmentVariable($en, "$($leg.run.env.$en)") }
     # SQLITE_TEST_PATTERN_LIST is a Tcl LIST of globs; corpus basenames are
     # bare words, so a space join is a valid list.
     if ($seg.Patterns.Count) { $env:SQLITE_TEST_PATTERN_LIST = ($seg.Patterns -join ' ') } else { $env:SQLITE_TEST_PATTERN_LIST = $null }
-    # LAST, because it reads the variables set above: the launcher's declared
-    # environment TRANSFER, resolved PER SEGMENT from what is actually SET right
-    # now. For `inherit` this is empty and the block below is byte-for-byte the
-    # run it always was.
-    foreach ($a in (Resolve-LaunchEnvCarrier $legEnvVerb $legXlate $legForwardPlain `
-                                             $legForwardPaths $legEnvNames $legCarrierOld)) {
-      $kv = $a.Split('=', 2); [Environment]::SetEnvironmentVariable($kv[0], $kv[1])
-    }
+    # LAST, because it reads the three variables set above as well as its own: the
+    # leg's DECLARED launcher environment, its loader search path, and the
+    # launcher's environment TRANSFER, resolved PER SEGMENT from what is actually
+    # SET right now. For `inherit` the transfer is empty and the spawn below is
+    # byte-for-byte the run it always was.
+    # ★ THE SAME CALL THE CLI SMOKE GATE MAKES (Step 7c). It was two inline copies
+    # of one decision until 2026-08-07, and the copy that mattered — the smoke
+    # gate's — had never applied the leg's declared environment at all.
+    $legEnv = Push-LegLaunchEnv $leg $runEnvPath $legForwardPlain $legForwardPaths
     $run = Invoke-Fixture $fixture @($seg.Args) $rundir $log "$log.stderr" $SegStall $SegCap $legLauncher $legXlate $legLaunchFixture
     $segRc = $run.Rc
   } finally {
-    [Environment]::SetEnvironmentVariable($LegLoaderVar, $oldLoaderPath); $env:TCL_LIBRARY = $oldTclLib
+    # Pop FIRST: it restores every name it assigned, TCL_LIBRARY included (the
+    # carrier rewrites that one to its TRANSLATED spelling), and the three lines
+    # after it put back what this block set on its own.
+    Pop-LegLaunchEnv $legEnv
+    $env:TCL_LIBRARY = $oldTclLib
     $env:QUICKTEST_OMIT = $oldOmit; $env:SQLITE_TEST_PATTERN_LIST = $oldPatterns
-    foreach ($en in $legEnvNames) { [Environment]::SetEnvironmentVariable($en, $oldLegEnv[$en]) }
-    if ($legCarrierName) { [Environment]::SetEnvironmentVariable($legCarrierName, $legCarrierOld) }
   }
   if ($run.KillReason) { Warn "[$LegTag] segment $($si + 1) HUNG — killed: $($run.KillReason)"; $hygiene += "segment $($si + 1) TIMED OUT and was killed — $($run.KillReason)" }
   # POST-SEGMENT HYGIENE — a segment that spawned or left a fixture behind must not
@@ -4986,7 +5453,16 @@ Info "excluded : $(if ($TierExcludes.Count) { "$($TierExcludes -join ' ')   (ope
 # turns a gate back into a log. Every class is named, every declared leg is
 # counted, and if the classes do not SUM to the declared total the line says so
 # ABOUT ITSELF rather than quietly printing a breakdown that does not add up.
+# ★ `skipped-launcher-prerequisite-missing` IS ENVIRONMENTAL, beside
+# `skipped-emulator-missing`, and it has an arm here because it did NOT:
+# harness_legs.py added the token to the closed vocabulary while this `switch` is a
+# HARDCODED MIRROR, so a leg carrying it fell into `default` -> $vUnclassified and
+# printed as "★ LEDGER ACCOUNTING HOLE" — the ledger reporting a harness defect
+# about a leg that had been correctly classified. Its .sh twin's LEDGER_VOCAB did
+# the same thing via LEDGER_BOGUS. Both fixed together; a fix in one driver and not
+# the other is this project's canonical silent harness bug.
 $vRan = 0; $vExpect = 0; $vByRunOn = 0; $vNoEmu = 0; $vEmuMissing = 0
+$vLauncherPrereq = 0
 $vInputMissing = 0; $vNotSelected = 0; $vPoisoned = 0; $vUnclassified = @()
 foreach ($lbl in $LegOrder) {
   switch ("$($LegLedger[$lbl].Verdict)") {
@@ -4995,6 +5471,7 @@ foreach ($lbl in $LegOrder) {
     'skipped-by-runOn'             { $vByRunOn++ }
     'skipped-no-emulator-declared' { $vNoEmu++ }
     'skipped-emulator-missing'     { $vEmuMissing++ }
+    'skipped-launcher-prerequisite-missing' { $vLauncherPrereq++ }
     'skipped-build-input-missing'  { $vInputMissing++ }
     'not-selected-by-runner'       { $vNotSelected++ }
     'poisoned'                     { $vPoisoned++ }
@@ -5003,10 +5480,10 @@ foreach ($lbl in $LegOrder) {
 }
 $verified   = $vRan + $vExpect
 $structural = $vByRunOn + $vNoEmu
-$environmental = $vEmuMissing + $vInputMissing
+$environmental = $vEmuMissing + $vLauncherPrereq + $vInputMissing
 $skipped    = $structural + $environmental + $vNotSelected
 $accounted  = $verified + $skipped + $vPoisoned
-$countsLine = "$verified verified ($vRan ran, $vExpect expect-error), $skipped skipped [structural: $vByRunOn by-runOn, $vNoEmu no-emulator-declared; environmental: $vEmuMissing emulator-missing, $vInputMissing build-input-missing; harness: $vNotSelected not-selected], $vPoisoned poisoned  (of $($AllLegs.Count) declared legs)"
+$countsLine = "$verified verified ($vRan ran, $vExpect expect-error), $skipped skipped [structural: $vByRunOn by-runOn, $vNoEmu no-emulator-declared; environmental: $vEmuMissing emulator-missing, $vLauncherPrereq launcher-prerequisite-missing, $vInputMissing build-input-missing; harness: $vNotSelected not-selected], $vPoisoned poisoned  (of $($AllLegs.Count) declared legs)"
 if ($accounted -ne $AllLegs.Count) {
   # The runtime twin of renderCountsLine()'s accounting-hole branch: a breakdown
   # that does not sum to its own denominator reads like full accounting and is
@@ -5127,7 +5604,8 @@ if ($UnclassifiedVerdicts.Count) {
 # DSS_STRICT_ARM_VERDICTS=1, exactly as arm_verdict_ledger.hpp specifies: a
 # developer without the target's tcl runtime must still get a usable run, while
 # the gate opts in to demanding every declared input be present.
-$envSkipLegs = @($LegOrder | Where-Object { $LegLedger[$_].Verdict -eq 'skipped-emulator-missing' -or $LegLedger[$_].Verdict -eq 'skipped-build-input-missing' })
+$EnvironmentalVerdicts = @('skipped-emulator-missing','skipped-launcher-prerequisite-missing','skipped-build-input-missing')
+$envSkipLegs = @($LegOrder | Where-Object { $EnvironmentalVerdicts -contains $LegLedger[$_].Verdict })
 if ($envSkipLegs.Count) {
   if ($StrictVerdicts) {
     $failReasons += "DSS_STRICT_ARM_VERDICTS=1 and $($envSkipLegs.Count) leg(s) were skipped for an ENVIRONMENTAL reason: $($envSkipLegs -join ' ')"

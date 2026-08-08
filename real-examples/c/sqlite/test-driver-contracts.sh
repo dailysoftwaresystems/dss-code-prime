@@ -17,6 +17,18 @@
 #   F  acq_field                                the acquisition contract fields
 #   G  leg_loader_path_var                      the loader variable is TARGET-keyed
 #      [D-HARNESS-RUN-ENV-LD-LIBRARY-PATH-INERT-ON-DARWIN]
+#   L  the launcher-prerequisite gate           a launcher whose DECLARED needs are
+#                                               absent skips the leg by name; one
+#                                               whose needs are MET still REACHES
+#                                               the corpus; strict mode makes the
+#                                               skip fatal; and every smoke rc has
+#                                               its own verdict (4 and 2 are not
+#                                               accusations, 1 is)
+#   M  the Step-7c smoke argv                   --cli-target/--reference-target are
+#                                               MEASURED off the binaries' own
+#                                               headers, the reference launcher
+#                                               comes from the CATALOGUE, and no
+#                                               host-identity branch chooses it
 #   H  RED-ON-DISABLE                           every guard above is BROKEN in a
 #                                               copy and the pin MUST go red
 #
@@ -760,6 +772,347 @@ WSLENV=QUICKTEST_OMIT:TCL_LIBRARY" "$out"
   ck "a launcher that INHERITS is left byte-for-byte alone" "" "$out"
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# L — THE LAUNCHER-PREREQUISITE GATE
+# ═══════════════════════════════════════════════════════════════════════════
+# The plan says `launched` because argv[0] RESOLVED. For the arm64 leg on a
+# Windows host argv[0] is `wsl.exe` while the program that actually runs the
+# artefact is `qemu-aarch64` INSIDE the distro — so the leg passed every gate this
+# harness had on a box with no qemu, every unit exited 255 with no diagnostic, and
+# fourteen of them were charged to DSS.
+#
+# ★ THE DRIVER'S REAL GATE IS EXTRACTED AND RUN. What is stubbed is the RESOLVER
+# (a fake `harness_legs.py` that answers rc 0 / 3 / 2 on demand) — never the
+# driver's classification of that answer, which is the thing under test. A pin
+# that re-implemented the classification would stay green while the shipped one
+# rotted, and a pin that stubbed the driver would be testing the stub.
+#
+# ★★ AND THE MET CASE IS ASSERTED AS LOUDLY AS THE UNMET ONE
+# (D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-AVAILABLE). A new gate can
+# be made to pass by skipping everything; the mirror assertion — a leg whose
+# prerequisites are MET still REACHES the corpus, through the driver's OWN Step-8
+# gate sequence — is what makes over-skipping a failure rather than a green.
+FAKE_LEGS_PY="$WORK/fake_harness_legs.py"
+cat > "$FAKE_LEGS_PY" <<'FAKEPY'
+# A stand-in for harness_legs.py --check-launcher ONLY. The outcome is chosen by
+# PIN_CHECK_LAUNCHER so one pin can drive every arm; everything else is refused
+# loudly rather than answered, so a driver that calls this for some other purpose
+# cannot be silently satisfied by it.
+import json, os, sys
+if "--check-launcher" not in sys.argv:
+    sys.stderr.write("fake resolver: asked something other than --check-launcher: %s\n"
+                     % " ".join(sys.argv[1:]))
+    raise SystemExit(64)
+mode = os.environ.get("PIN_CHECK_LAUNCHER", "met")
+if mode == "met":
+    sys.stdout.write(json.dumps({"label": "lau", "ok": True, "verdict": "",
+                                 "missing": [], "uncovered": []}) + "\n")
+    raise SystemExit(0)
+if mode == "unmet":
+    sys.stdout.write(json.dumps({
+        "label": "lau", "ok": False,
+        "verdict": "skipped-launcher-prerequisite-missing",
+        "missing": [{"kind": "command", "path": "qemu-aarch64",
+                     "provides": "PIN-PROVIDES", "why": "PIN-WHY",
+                     "install": "PIN-INSTALL",
+                     "probe": ["wsl.exe", "-e", "sh", "-lc", "command -v qemu-aarch64"]}],
+        "uncovered": []}) + "\n")
+    raise SystemExit(3)
+sys.stderr.write("harness_legs.py: FATAL: the pin asked for an unreadable outcome\n")
+raise SystemExit(2)
+FAKEPY
+extract_env_skip_gate() { # extract_env_skip_gate <driver>
+  # The Step-9 ENVIRONMENTAL-skip classifier AND the exit line that makes it
+  # fatal. Two regions, because they are two statements in the shipped file and
+  # asserting only the first would prove the leg is LISTED, never that strict mode
+  # REDS the run.
+  LC_ALL=C awk '
+    /^declare -a ENV_SKIPS=\(\)$/ { inb = 1 }
+    inb { print }
+    inb && /^fi$/ { inb = 0; next }
+    /^if \[\[ \$\{#ENV_SKIPS\[@\]\} -gt 0 && "\$STRICT_VERDICTS" -eq 1 \]\]; then exit 1; fi$/ { print }' "$1"
+}
+run_env_skip_gate() { # run_env_skip_gate <gate-text> <strict 0|1> <verdict>  -> prints, rc
+  (
+    declare -a LEG_DECLARED=(lau)
+    declare -A LEG_VERDICT=([lau]="$3")
+    STRICT_VERDICTS="$2"
+    C_RED=""; C_RST=""
+    # ⚠ `warn` is RE-STUBBED here to PRINT. The file-level stub accumulates into
+    # $WARNINGS, and $WARNINGS is written in a SUBSHELL and discarded — so the
+    # non-strict arm's whole diagnostic would be invisible and the assertion about
+    # it would be asserting over nothing. The strict arm printfs directly and would
+    # have hidden the difference.
+    warn() { printf 'WARN %s\n' "$*"; }
+    eval "$1"
+    exit 0
+  ) 2>&1
+}
+extract_smoke_rc_case() { # extract_smoke_rc_case <driver>
+  LC_ALL=C awk '
+    /^  case "\$_srcc" in$/ { inb = 1 }
+    inb { print }
+    inb && /^  esac$/ { exit }' "$1"
+}
+extract_ledger_block() { # extract_ledger_block <driver>
+  # The Step-9 verdict ledger: LEDGER_VOCAB, the per-leg tally, the counts line
+  # and its own accounting-hole detector. The vocabulary there is a HARDCODED
+  # MIRROR of harness_legs.py's, so a token the resolver added and this list did
+  # not is filed under LEDGER_BOGUS — the ledger reporting a defect in the
+  # resolver about a leg that was classified perfectly well.
+  LC_ALL=C awk '
+    /^declare -A VERDICT_COUNT=\(\)$/ { inb = 1 }
+    inb { print }
+    inb && /^fi$/ { exit }' "$1"
+}
+run_ledger_block() { # run_ledger_block <block-text> <verdict>  -> printed + a state line
+  (
+    declare -a LEG_DECLARED=(lau)
+    declare -A LEG_VERDICT=([lau]="$2")
+    C_RED=""; C_RST=""
+    eval "$1"
+    printf 'STATE env=%s hole=%s bogus=[%s] unnamed=[%s]\n' \
+      "$LEDGER_ENVIRONMENTAL" "$LEDGER_HOLE" "${LEDGER_BOGUS[*]:-}" "${LEDGER_UNNAMED[*]:-}"
+  ) 2>&1
+}
+run_smoke_rc_case() { # run_smoke_rc_case <case-text> <rc>  -> the recorded verdict
+  (
+    declare -A CLI_SMOKE_VERDICT=()
+    CLI_SMOKE_FAILS=0
+    leg=x; _srcc="$2"; _smoke_dir="/pin/out"
+    pass() { :; }; warn() { :; }
+    eval "$1"
+    printf '%s|fails=%s' "${CLI_SMOKE_VERDICT[x]:-<none>}" "$CLI_SMOKE_FAILS"
+  )
+}
+pin_launcher_prereq() { # pin_launcher_prereq <driver>
+  local drv="$1" gates rc out envgate rccase ledger v
+  if ! command -v python3 >/dev/null 2>&1; then
+    [ "$QUIET" -eq 1 ] || skip "L: no python3 — the launcher-prerequisite gate cannot be exercised on this host"
+    return 0
+  fi
+  load_fns "$drv" launcher_prereq_rows apply_launcher_prereq_gate \
+                  leg_run_is_skipped unit_verdict_token_known unit_not_run || return 0
+  gates="$(LC_ALL=C awk '
+    /^  # ── the three ways a leg does not reach the corpus, each already NAMED ──────$/ { inb = 1 }
+    /^  bin="\$\{FIXTURE\[\$leg\]\}"/ { inb = 0 }
+    inb { print }' "$drv")"
+  if [ -z "$gates" ]; then
+    PIN_FAILS=$((PIN_FAILS + 1))
+    [ "$QUIET" -eq 1 ] || bad "could not extract the Step-8 gate sequence for the launcher pin — it would assert over nothing"
+    return 0
+  fi
+  run_gates() { # run_gates <leg> -> REACHED | SKIPPED
+    local REACHED=SKIPPED leg
+    for leg in "$1"; do
+      eval "$gates"
+      REACHED=REACHED
+    done
+    printf '%s' "$REACHED"
+  }
+  # ⚠ A SECOND ENTRY POINT, BECAUSE THE FIRST RUNS IN A SUBSHELL. `$(run_gates …)`
+  # discards every array the gate wrote — including the UNIT ledger entry, which is
+  # the whole point of asking. Reading UNIT_VERDICT after the substitution returns
+  # the value from BEFORE it, which is exactly how a pin reports success over an
+  # effect it could not observe. So the token is printed from INSIDE the subshell.
+  run_gates_unit() { # run_gates_unit <leg> -> the recorded unit verdict
+    local REACHED=SKIPPED leg
+    for leg in "$1"; do
+      eval "$gates"
+      REACHED=REACHED
+    done
+    printf '%s' "${UNIT_VERDICT[$1]:-}"
+  }
+  LEG_RESOLVER="$FAKE_LEGS_PY"; LEG_CATALOGUE="$CATALOGUE"
+  HOST_OS=linux; HOST_ARCH=x86_64
+  UNIT_VERDICT=(); UNIT_UNCLASSIFIED=0; UNIT_UNCLASSIFIED_LEGS=(); WARNINGS=""
+
+  # ── (3) THE MIRROR: a MET prerequisite REACHES the corpus ─────────────────
+  # FIRST, deliberately. A gate that over-skips passes every assertion below it
+  # and this is the only one that can see it.
+  LEG_RUN_MODE[lau]=launched; LEG_LAUNCH[lau]="wsl.exe -e qemu-aarch64"
+  LEG_SPEC[lau]="arm64:elf64-aarch64-linux-exec"
+  LEG_TCL_LIB[lau]=/cache/libtcl8.6.so; COMPILE_OK[lau]=1; FIXTURE[lau]=/out/testfixture
+  LEG_CC[lau]=""; LEG_VERDICT[lau]=""; LEG_VERDICT_DETAIL[lau]=""
+  LEG_RUN_VERDICT[lau]=""; LEG_RUN_DETAIL[lau]=""
+  PIN_CHECK_LAUNCHER=met apply_launcher_prereq_gate lau; rc=$?
+  ck "a MET prerequisite returns 0"                     "0"        "$rc"
+  ck "…and leaves the plan's run mode alone"            "launched" "${LEG_RUN_MODE[lau]}"
+  ck "…and records NO skip verdict"                     ""         "${LEG_VERDICT[lau]}"
+  ck "★ …and the leg REACHES the corpus"                "REACHED"  "$(run_gates lau)"
+
+  # ── (1) an UNMET prerequisite skips the leg, with the remedy printed ──────
+  WARNINGS=""
+  LEG_RUN_MODE[lau]=launched
+  LEG_VERDICT[lau]=""; LEG_VERDICT_DETAIL[lau]=""
+  PIN_CHECK_LAUNCHER=unmet apply_launcher_prereq_gate lau; rc=$?
+  ck "an UNMET prerequisite returns 1"  "1" "$rc"
+  ck "…and the leg's verdict is the NEW closed-vocabulary token" \
+     "skipped-launcher-prerequisite-missing" "${LEG_VERDICT[lau]}"
+  ck "…the RUN verdict too, so both artifacts read the same answer" \
+     "skipped-launcher-prerequisite-missing" "${LEG_RUN_VERDICT[lau]}"
+  ck "…and the run mode is downgraded to skip"  "skip" "${LEG_RUN_MODE[lau]}"
+  ck "★ …so the corpus is NOT entered"          "SKIPPED" "$(run_gates lau)"
+  ck "…and the unit ledger says so under that same token" \
+     "skipped-launcher-prerequisite-missing" \
+     "$(v="$(run_gates_unit lau)"; v="${v#not run [}"; printf '%s' "${v%%]*}")"
+  ck "…which the driver's OWN closed vocabulary accepts" "known" \
+     "$(unit_verdict_token_known skipped-launcher-prerequisite-missing && printf known || printf unknown)"
+  # THE REMEDY, not just the diagnosis. All three fields, because a row printed
+  # without `install` is a row nobody acts on.
+  # ⚠ THE FORMATTED SHAPE, NOT THE BARE VALUE. `PIN-PROVIDES` also occurs in the
+  # RAW JSON, which the driver echoes on its unreadable-answer path — so a bare
+  # substring assertion is satisfied by a driver that never formatted a row at
+  # all, and one of these mutations proves it: F11's .ps1 twin dumps the report
+  # verbatim and would have passed three of these four.
+  ck_has "…the missing row is named"   "$WARNINGS" "MISSING [command] qemu-aarch64"
+  ck_has "…with what it PROVIDES"      "$WARNINGS" "provides: PIN-PROVIDES"
+  ck_has "…with WHY it is declared"    "$WARNINGS" "why     : PIN-WHY"
+  ck_has "…and with HOW TO INSTALL it" "$WARNINGS" "install : PIN-INSTALL"
+
+  # ── an UNREADABLE answer is never assumed benign ──────────────────────────
+  WARNINGS=""; LEG_RUN_MODE[lau]=launched; LEG_VERDICT[lau]=""
+  PIN_CHECK_LAUNCHER=boom apply_launcher_prereq_gate lau; rc=$?
+  ck "an rc the driver has no arm for returns 2" "2" "$rc"
+  ck "…and is POISONED, not passed"  "poisoned" "${LEG_VERDICT[lau]}"
+  ck "…and the leg still does not reach the corpus" "SKIPPED" "$(run_gates lau)"
+
+  # ── a leg the plan runs NATIVELY is not this gate's business ──────────────
+  LEG_RUN_MODE[nat]=native; LEG_LAUNCH[nat]=""; LEG_VERDICT[nat]=""
+  LEG_TCL_LIB[nat]=/cache/libtcl8.6.so; COMPILE_OK[nat]=1; FIXTURE[nat]=/out/testfixture
+  LEG_CC[nat]=""; LEG_VERDICT_DETAIL[nat]=""
+  PIN_CHECK_LAUNCHER=unmet apply_launcher_prereq_gate nat; rc=$?
+  ck "a NATIVE leg is never probed (no launcher to have prerequisites)" "0" "$rc"
+  ck "…and keeps its run mode"                                          "native" "${LEG_RUN_MODE[nat]}"
+
+  # ── (2) DSS_STRICT_ARM_VERDICTS=1 turns the skip into a HARD FAILURE ──────
+  envgate="$(extract_env_skip_gate "$drv")"
+  if [ -z "$envgate" ]; then
+    PIN_FAILS=$((PIN_FAILS + 1))
+    [ "$QUIET" -eq 1 ] || bad "could not extract the Step-9 ENVIRONMENTAL-skip gate — this pin would assert over nothing"
+  else
+    out="$(run_env_skip_gate "$envgate" 0 skipped-launcher-prerequisite-missing)"; rc=$?
+    ck "by default the new skip WARNS and the run survives" "0" "$rc"
+    ck_has "…naming it as environmental" "$out" "ENVIRONMENTAL reason"
+    out="$(run_env_skip_gate "$envgate" 1 skipped-launcher-prerequisite-missing)"; rc=$?
+    ck "★ under DSS_STRICT_ARM_VERDICTS=1 it is a HARD FAILURE" "1" "$rc"
+    ck_has "…and says which variable made it one" "$out" "DSS_STRICT_ARM_VERDICTS=1"
+    # THE CONTROL: a STRUCTURAL skip must still survive strict mode, or the
+    # assertion above would be satisfied by a gate that fails on everything.
+    out="$(run_env_skip_gate "$envgate" 1 skipped-by-runOn)"; rc=$?
+    ck "a STRUCTURAL skip is NOT fatal even under strict" "0" "$rc"
+  fi
+
+  # ── (4) THE SMOKE GATE'S rc TABLE — every code has its OWN verdict ────────
+  # 4 and 2 must NEVER read as an accusation, and 1 must never read as anything
+  # else. `*)` is the last resort, not the default verdict.
+  rccase="$(extract_smoke_rc_case "$drv")"
+  if [ -z "$rccase" ]; then
+    PIN_FAILS=$((PIN_FAILS + 1))
+    [ "$QUIET" -eq 1 ] || bad "could not extract the Step-7c smoke rc case — this pin would assert over nothing"
+  else
+    out="$(run_smoke_rc_case "$rccase" 4)"
+    ck_has "rc 4 is its own verdict"                    "$out" "NOT A VERDICT"
+    case "$out" in *"CHARGED TO DSS"*) ck "…and is NOT charged to DSS" "absent" "present" ;;
+                   *) ck "…and is NOT charged to DSS" "absent" "absent" ;; esac
+    ck_has "…and still REDS the run"                    "$out" "fails=1"
+    out="$(run_smoke_rc_case "$rccase" 2)"
+    ck_has "rc 2 is named as OUR argv defect"           "$out" "HARNESS ARGV DEFECT"
+    case "$out" in *"CHARGED TO DSS"*) ck "…and is NOT charged to DSS" "absent" "present" ;;
+                   *) ck "…and is NOT charged to DSS" "absent" "absent" ;; esac
+    ck_has "…and still REDS the run"                    "$out" "fails=1"
+    # ★ THE OTHER DIRECTION, WHICH THE ENUMERATION HAD LOST: rc 1 IS the charge.
+    # Without an arm it fell into `*)` and printed "NOT charged to DSS" over a
+    # matched, attributed compiler failure — a false ACQUITTAL.
+    out="$(run_smoke_rc_case "$rccase" 1)"
+    ck_has "rc 1 IS charged to DSS"                     "$out" "CHARGED TO DSS"
+    case "$out" in *"UNKNOWN rc"*) ck "…and is not reported as an unknown rc" "absent" "present" ;;
+                   *) ck "…and is not reported as an unknown rc" "absent" "absent" ;; esac
+    out="$(run_smoke_rc_case "$rccase" 0)"
+    ck_has "rc 0 passes"                                "$out" "PASS (14/14)"
+    ck_has "…and costs the run nothing"                 "$out" "fails=0"
+    out="$(run_smoke_rc_case "$rccase" 9)"
+    ck_has "a genuinely unknown rc says so, and blames nobody" "$out" "UNKNOWN rc=9"
+  fi
+
+  # ── THE STEP-9 LEDGER KNOWS THE TOKEN, AND FILES IT AS ENVIRONMENTAL ──────
+  # Its vocabulary is a HARDCODED MIRROR of the resolver's. Executed, not read:
+  # "the token appears in the array" is satisfied by a token in the array and
+  # nowhere in the counts line, which is how a leg lands in a class no reader
+  # sees. ✔MEASURED before this cycle: the token was in NEITHER driver's list.
+  ledger="$(extract_ledger_block "$drv")"
+  if [ -z "$ledger" ]; then
+    PIN_FAILS=$((PIN_FAILS + 1))
+    [ "$QUIET" -eq 1 ] || bad "could not extract the Step-9 verdict ledger — this pin would assert over nothing"
+  else
+    out="$(run_ledger_block "$ledger" skipped-launcher-prerequisite-missing)"
+    ck_has "the ledger counts the new token as ENVIRONMENTAL" "$out" "STATE env=1"
+    ck_has "…with no accounting hole"                         "$out" "hole=0"
+    ck_has "…and it is NOT filed outside the closed vocabulary" "$out" "bogus=[]"
+    ck_has "…and the counts line NAMES the class"             "$out" "launcher-prerequisite-missing"
+    # THE CONTROL: a token neither list knows must still be caught, or the
+    # assertions above would be satisfied by a ledger that accepts anything.
+    out="$(run_ledger_block "$ledger" skipped-because-i-said-so)"
+    ck_has "an OFF-vocabulary token is still filed as bogus" "$out" "bogus=[lau=skipped-because-i-said-so]"
+    ck_has "…and announces the accounting hole"              "$out" "LEDGER ACCOUNTING HOLE"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# M — THE SMOKE GATE'S ARGV: WHAT IS MEASURED, AND WHAT IS DECLARED
+# ═══════════════════════════════════════════════════════════════════════════
+# SOURCE-LEVEL, and deliberately so — the same reason pin_stage_capabilities is:
+# the failure being pinned is a MISSING ARGUMENT and a WRONG SOURCE for one, which
+# no execution of the existing call site can reveal.
+#
+# cli-smoke.py compares a DECLARED target (`--leg-spec`, off the plan) against a
+# MEASURED one (`--cli-target`, read out of the binary's own header) and reports a
+# leg that built the wrong target as its own non-verdict. That comparison is worth
+# exactly nothing if the driver feeds it the declaration twice — so the pin asserts
+# that `--cli-target` comes from `identify_binary_triple` and not from the spec.
+#
+# ★ AND THE REFERENCE LAUNCHER MUST COME FROM THE CATALOGUE, keyed on the
+# reference's own MEASURED target. The .ps1 twin used to pick it from a HOST
+# identity flag, which is why the oracle was unmatched: it ran the reference
+# host-native x86_64 while DSS ran arm64 under qemu and charged the difference to
+# DSS. This driver's version of the same bug was passing NO reference launcher at
+# all — latent only while every host that owns a reference can execute it directly.
+extract_smoke_block() { # extract_smoke_block <driver>  -> CODE only, comments dropped
+  # ⚠ CODE ONLY. A driver's comment quotes the very expressions these assertions
+  # look for, so against the full text a removed line still "passes" — the exact
+  # shape that made an earlier pin in this repo vacuously green.
+  LC_ALL=C awk '
+    /^step "7c\/9/ { inb = 1 }
+    /^# ── Step 8 — run the .test UNIT CORPUS/ { inb = 0 }
+    inb && $0 !~ /^[[:space:]]*#/ { print }' "$1"
+}
+pin_smoke_argv() { # pin_smoke_argv <driver>
+  local drv="$1" blk
+  blk="$(extract_smoke_block "$drv")"
+  if [ -z "$blk" ]; then
+    PIN_FAILS=$((PIN_FAILS + 1))
+    [ "$QUIET" -eq 1 ] || bad "could not extract the Step-7c block — this pin would assert over nothing"
+    return 0
+  fi
+  # THE SUBJECT FIRST: prove the matcher can still SEE the block, or every
+  # assertion below becomes a permanent green.
+  ck_has "the Step-7c block still spawns the gate" "$blk" 'python3 "${_smoke_argv[@]}"'
+  ck_has "the leg's DECLARED spec is passed"       "$blk" '--leg-spec "${LEG_SPEC[$leg]}"'
+  ck_has "the subject's target is MEASURED from the binary" "$blk" 'identify_binary_triple "${CLI_BIN[$leg]}"'
+  ck_has "…and THAT is what --cli-target carries"  "$blk" '--cli-target "$_cli_target"'
+  ck_has "the reference's target is MEASURED too"  "$blk" 'identify_binary_triple "$REF_CLI"'
+  ck_has "…and is passed as --reference-target"    "$blk" '--reference-target "$REF_CLI_TARGET"'
+  ck_has "the reference launcher comes from the CATALOGUE, keyed on that target" \
+         "$blk" 'launcher_argv_for_target "$REF_CLI_TARGET"'
+  ck_has "…and every token is spelled with the \`=\` form" "$blk" '--reference-launcher=$_t'
+  # ABSENCE, asserted over the CODE: a host-identity branch is what this replaced.
+  case "$blk" in
+    *HostNeedsWsl*|*'if [[ "$HOST_OS"'*)
+      ck "no host-identity branch decides the reference launcher" "absent" "present" ;;
+    *) ck "no host-identity branch decides the reference launcher" "absent" "absent" ;;
+  esac
+}
+
 green "A+B  the not-run recorder + the shared run decision" pin_verdicts
 green "C    the Step-8 gate sequence, executed"             pin_step8_gates
 green "D    parse_segment keeps the first diagnostic"       pin_parse_segment
@@ -777,6 +1130,8 @@ green "G    the loader variable is TARGET-keyed"            pin_loader_var
 green "I    the confound supply is PER LEG"                 pin_confound_supply
 green "J    a failed run-dir operation is a VERDICT"        pin_run_dir_argv
 green "K    a forwarded PATH crosses through its declared group" pin_env_forward
+green "L    the launcher-prerequisite gate"                 pin_launcher_prereq
+green "M    the smoke argv: MEASURED targets, DECLARED launcher" pin_smoke_argv
 
 # ═══════════════════════════════════════════════════════════════════════════
 # H — RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.
@@ -880,6 +1235,73 @@ if mutate "H10 build the fixture without the declared OPTIONS" "$WORK/m10.sh" 'm
       sub(/ "OPTIONS=\$STAGE_MAKE_OPTIONS"/, ""); print; next }
     { print }'; then
   red "H10 every build of \$BLD carries the declared capability defines" pin_stage_capabilities "$WORK/m10.sh"
+fi
+
+# H11 — THE DEFECT THIS GATE EXISTS FOR, RESTORED: an UNMET prerequisite answered
+# as if it were met. The leg then enters the corpus behind a launcher that cannot
+# start the artefact, and every one of its ~330,000 units fails for one reason —
+# which is precisely how fourteen assertions came to be charged to the compiler.
+# ⚠ THE WITNESS IS THE RECORDING LINE, not the token: `skipped-launcher-
+#   prerequisite-missing` appears in the vocabulary mirror, in the ENV_SKIPS case
+#   and in prose, so a witness on the bare token would survive its own removal.
+if mutate "H11 answer an UNMET launcher prerequisite as met" "$WORK/m11.sh" 'LEG_RUN_VERDICT["$leg"]="skipped-launcher-prerequisite-missing"' '
+    /^    3\) rows="\$\(launcher_prereq_rows/ { print "    3) return 0 ;;"; skip = 1; next }
+    skip && /^       return 1 ;;$/ { skip = 0; next }
+    skip { next }
+    { print }'; then
+  red "H11 an unmet launcher prerequisite skips the leg" pin_launcher_prereq "$WORK/m11.sh"
+fi
+
+# H12 — drop the new token from the ENVIRONMENTAL class at Step 9. The leg is
+# still skipped and still ledgered; what disappears is DSS_STRICT_ARM_VERDICTS=1's
+# power to red the run over it — a gate that a one-word edit silently disables.
+if mutate "H12 declassify the launcher skip as environmental" "$WORK/m12.sh" '    skipped-emulator-missing|skipped-launcher-prerequisite-missing|skipped-build-input-missing) ENV_SKIPS+=("$leg") ;;' '
+    /^    skipped-emulator-missing\|skipped-launcher-prerequisite-missing\|skipped-build-input-missing\) ENV_SKIPS\+=\("\$leg"\) ;;$/ {
+      print "    skipped-emulator-missing|skipped-build-input-missing) ENV_SKIPS+=(\"$leg\") ;;"; next }
+    { print }'; then
+  red "H12 strict mode REDS the run over a launcher-prerequisite skip" pin_launcher_prereq "$WORK/m12.sh"
+fi
+
+# H13 — remove the smoke gate's rc-1 arm, which is the state the enumeration left
+# it in until this cycle: a MATCHED, attributed compiler failure falling into `*)`
+# and printing "NOT charged to DSS". The FALSE-ACQUITTAL direction — the one that
+# hides a real bug rather than inventing one.
+if mutate "H13 take the smoke gate's CHARGED-TO-DSS arm away" "$WORK/m13.sh" '    1) # ★ THE ARM THE ENUMERATION LEFT OUT' '
+    /^    1\) # ★ THE ARM THE ENUMERATION LEFT OUT/ { sub(/^    1\)/, "    11)"); print; next }
+    { print }'; then
+  red "H13 rc 1 from the smoke gate IS the accusation" pin_launcher_prereq "$WORK/m13.sh"
+fi
+
+# H14 — remove the new token from the Step-9 LEDGER_VOCAB mirror. This is the
+# MEASURED pre-cycle state: harness_legs.py had the token, this hardcoded list did
+# not, and a correctly-classified leg was filed under LEDGER_BOGUS as "a verdict
+# OUTSIDE the closed vocabulary".
+# ⚠ THE WITNESS IS THE VOCABULARY LINE WITH ITS OWN INDENTATION — the bare token
+#   appears on six other lines and would survive this removal untouched.
+if mutate "H14 drop the token from the ledger vocabulary" "$WORK/m14.sh" '                         skipped-launcher-prerequisite-missing' '
+    /^ +skipped-launcher-prerequisite-missing$/ { next }
+    { print }'; then
+  red "H14 the Step-9 ledger knows the token" pin_launcher_prereq "$WORK/m14.sh"
+fi
+
+# H15 — feed the smoke gate the DECLARED spec where the MEASURED target belongs.
+# The gate's wrong-target check then compares the declaration with itself and can
+# never fire, which is the "a pin that supplies its subject's input by hand is
+# testing the stub" shape moved into the shipped harness.
+if mutate "H15 pass the declared spec as the measured target" "$WORK/m15.sh" '--cli-target "$_cli_target"' '
+    /--cli-target "\$_cli_target"/ { sub(/\$_cli_target/, "${LEG_SPEC[$leg]}"); print; next }
+    { print }'; then
+  red "H15 --cli-target is MEASURED, never the declaration again" pin_smoke_argv "$WORK/m15.sh"
+fi
+
+# H16 — stop asking the catalogue how this host runs the reference. This is the
+# .sh's own latent form of the unmatched-oracle defect: no launcher at all, which
+# is right until the reference is not host-native.
+if mutate "H16 resolve no launcher for the reference" "$WORK/m16.sh" 'launcher_argv_for_target "$REF_CLI_TARGET"' '
+    /_lrc=0; launcher_argv_for_target "\$REF_CLI_TARGET" \|\| _lrc=\$\?/ {
+      print "    _lrc=0; LAUNCHER_FOR_ARGV=\"\"; LAUNCHER_FOR_WHY=\"\""; next }
+    { print }'; then
+  red "H16 the reference launcher comes from the catalogue" pin_smoke_argv "$WORK/m16.sh"
 fi
 
 printf '\n'

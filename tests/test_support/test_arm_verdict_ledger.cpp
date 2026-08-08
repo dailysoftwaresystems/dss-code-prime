@@ -159,16 +159,25 @@ TEST(ArmVerdict, TheCardinalitySentinelIsNotAVerdict) {
 // SkippedEmulatorMissing (or SkippedBuildInputMissing) into the structural set
 // and this fails.
 //
-// THE TWO ENVIRONMENTAL SKIPS, AND WHY THEY ARE SIBLINGS RATHER THAN ONE.
-// `SkippedEmulatorMissing` is "the machine cannot RUN it"; `SkippedBuildInput
-// Missing` is "the machine cannot BUILD it" — a declared resolve-library binary
-// or a leg's target compiler is absent (D-HARNESS-CROSS-HOST-ANY-TARGET). They
-// share a CLASS because they share an enforcement (warn by default, red under
+// THE THREE ENVIRONMENTAL SKIPS, AND WHY THEY ARE SIBLINGS RATHER THAN ONE.
+// `SkippedEmulatorMissing` is "the machine cannot RUN it"; `SkippedLauncher
+// PrerequisiteMissing` is "the machine CAN run it and the launcher's own
+// declared prerequisites are absent" — the launcher resolves, looks perfectly
+// usable, and its sysroot / its ELF interpreter / the program it crosses into a
+// distro to reach is not there; `SkippedBuildInputMissing` is "the machine
+// cannot BUILD it" — a declared resolve-library binary or a leg's target
+// compiler is absent (D-HARNESS-CROSS-HOST-ANY-TARGET). They share a CLASS
+// because they share an enforcement (warn by default, red under
 // DSS_STRICT_ARM_VERDICTS) and a remedy (install the missing thing), and they
-// stay SEPARATE names because a reader must be able to tell which half of the
-// pipeline the machine failed to supply.
-TEST(ArmVerdict, TheEnvironmentalSkipsAreExactlyTheTwoMachineSuppliedOnes) {
+// stay SEPARATE names because a reader must be able to tell which part of the
+// pipeline the machine failed to supply. Collapsing the middle one into
+// `SkippedEmulatorMissing` would say "missing" of an emulator that is present
+// and runs, which is the conflation that let 14 units be charged to the
+// compiler after a `which wsl.exe` answered for a `qemu-aarch64` inside it.
+TEST(ArmVerdict, TheEnvironmentalSkipsAreExactlyTheMachineSuppliedOnes) {
     EXPECT_TRUE(armVerdictIsEnvironmentalSkip(ArmVerdict::SkippedEmulatorMissing));
+    EXPECT_TRUE(armVerdictIsEnvironmentalSkip(
+        ArmVerdict::SkippedLauncherPrerequisiteMissing));
     EXPECT_TRUE(armVerdictIsEnvironmentalSkip(ArmVerdict::SkippedBuildInputMissing));
     EXPECT_FALSE(armVerdictIsEnvironmentalSkip(ArmVerdict::SkippedByRunOn));
     EXPECT_FALSE(armVerdictIsEnvironmentalSkip(ArmVerdict::SkippedNoEmulatorDeclared));
@@ -181,13 +190,15 @@ TEST(ArmVerdict, TheEnvironmentalSkipsAreExactlyTheTwoMachineSuppliedOnes) {
     EXPECT_FALSE(armVerdictIsVerified(ArmVerdict::SkippedEmulatorMissing));
     EXPECT_FALSE(armVerdictIsVerified(ArmVerdict::SkippedBuildInputMissing));
 
-    // The counted membership, so a THIRD environmental skip cannot be added
-    // without a deliberate visit here.
+    // The counted membership, so a FOURTH environmental skip cannot be added
+    // without a deliberate visit here. (It did its job: this number was 2 until
+    // `SkippedLauncherPrerequisiteMissing` was added, and the visit is what
+    // produced the paragraph above.)
     std::size_t environmental = 0;
     for (ArmVerdict const v : kAllArmVerdicts) {
         if (armVerdictIsEnvironmentalSkip(v)) ++environmental;
     }
-    EXPECT_EQ(environmental, 2u)
+    EXPECT_EQ(environmental, 3u)
         << "strict mode acts on exactly the environmental class; a new member"
            " changes what the gate reds on and must be reviewed here";
 }
@@ -258,6 +269,7 @@ TEST(ArmVerdictLedgerTest, CountsLineNamesEverySkipClass) {
     auto const line = ledger.renderCountsLine();
     for (char const* needle : {"verified", "ran", "expect-error", "by-runOn",
                                "no-emulator-declared", "emulator-missing",
+                               "launcher-prerequisite-missing",
                                "build-input-missing", "not-selected", "poisoned",
                                "declared arms"}) {
         EXPECT_NE(line.find(needle), std::string::npos)

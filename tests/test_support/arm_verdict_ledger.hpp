@@ -26,11 +26,16 @@
 //     is additionally a MANIFEST defect, and it is caught host-independently by
 //     `lintDeclaredEmulators` below rather than by reddening the host that
 //     happens to notice it.
-//   * ENVIRONMENTAL (`SkippedEmulatorMissing`, `SkippedBuildInputMissing`) —
-//     the manifest asked for something and the machine could not supply it. A
+//   * ENVIRONMENTAL (`SkippedEmulatorMissing`,
+//     `SkippedLauncherPrerequisiteMissing`, `SkippedBuildInputMissing`) — the
+//     manifest asked for something and the machine could not supply it. A
 //     developer without qemu must still get a usable green suite, so the
 //     DEFAULT is a visible warning; the gate opts in to
-//     `DSS_STRICT_ARM_VERDICTS=1` and the same skip becomes a RED.
+//     `DSS_STRICT_ARM_VERDICTS=1` and the same skip becomes a RED. The three
+//     are one CLASS and three NAMES because they share an enforcement and a
+//     remedy while naming three different things the machine did not supply:
+//     no launcher at all, a launcher whose own prerequisites are absent, and a
+//     build input.
 //   * HARNESS     (`NotSelectedByRunner`) — the CLI-subprocess runner binds only
 //     the FIRST target whose `runOn` matches the host
 //     (D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET), so later matching targets
@@ -151,6 +156,30 @@ enum class ArmVerdict {
     SkippedNoEmulatorDeclared,  // cross-arch arm with no `emulator` key
     // ENVIRONMENTAL skips — depend on the machine, not the manifest.
     SkippedEmulatorMissing,     // `emulator` declared but not found on PATH
+    SkippedLauncherPrerequisiteMissing,
+                                // the launcher itself is PRESENT and looks
+                                // perfectly usable, and something it DECLARED it
+                                // needs BEYOND its own argv[0] is not.
+                                // ✔MEASURED (arm64 VPS, sqlite leg elf64-x86_64
+                                // under qemu-x86_64): three corpus segments
+                                // aborted with glibc's `libgcc_s.so.1 must be
+                                // installed for pthread_exit to work`, one AFTER
+                                // its summary had printed. And the sharper case:
+                                // the sqlite catalogue's Windows launcher for the
+                                // arm64 leg is `["wsl.exe","-e","qemu-aarch64"]`,
+                                // so resolving argv[0] confirms **wsl.exe** and
+                                // never asks whether qemu exists inside the
+                                // distro — every unit then exits 255 and 14 of
+                                // them were charged to the compiler.
+                                // ★ NOT `SkippedEmulatorMissing`, deliberately:
+                                // that name says "missing" of a launcher that is
+                                // right there and runs, which is the very
+                                // conflation this verdict exists to end. Same
+                                // CLASS (environmental) because it has the same
+                                // enforcement and the same remedy — install the
+                                // thing — and a separate NAME because a reader
+                                // must be able to tell "no emulator here" from
+                                // "the emulator is here and its sysroot is not".
     SkippedBuildInputMissing,   // a DECLARED BUILD input is absent from this
                                 // machine — the sqlite harness's resolve-library
                                 // binaries (tcl86.dll for the pe64 leg, libtcl
@@ -191,6 +220,7 @@ inline constexpr ArmVerdict kAllArmVerdicts[] = {
     ArmVerdict::SkippedByRunOn,
     ArmVerdict::SkippedNoEmulatorDeclared,
     ArmVerdict::SkippedEmulatorMissing,
+    ArmVerdict::SkippedLauncherPrerequisiteMissing,
     ArmVerdict::SkippedBuildInputMissing,
     ArmVerdict::NotSelectedByRunner,
     ArmVerdict::Poisoned,
@@ -216,6 +246,8 @@ static_assert(std::size(kAllArmVerdicts) == kArmVerdictCount,
         case ArmVerdict::SkippedByRunOn:            return "skipped-by-runOn";
         case ArmVerdict::SkippedNoEmulatorDeclared: return "skipped-no-emulator-declared";
         case ArmVerdict::SkippedEmulatorMissing:    return "skipped-emulator-missing";
+        case ArmVerdict::SkippedLauncherPrerequisiteMissing:
+            return "skipped-launcher-prerequisite-missing";
         case ArmVerdict::SkippedBuildInputMissing:  return "skipped-build-input-missing";
         case ArmVerdict::NotSelectedByRunner:       return "not-selected-by-runner";
         case ArmVerdict::Poisoned:                  return "poisoned";
@@ -258,6 +290,7 @@ enum class ArmVerdictClass {
         case ArmVerdict::SkippedNoEmulatorDeclared:
             return ArmVerdictClass::StructuralSkip;
         case ArmVerdict::SkippedEmulatorMissing:
+        case ArmVerdict::SkippedLauncherPrerequisiteMissing:
         case ArmVerdict::SkippedBuildInputMissing:
             return ArmVerdictClass::EnvironmentalSkip;
         case ArmVerdict::NotSelectedByRunner:
@@ -409,6 +442,8 @@ public:
           << count(ArmVerdict::SkippedNoEmulatorDeclared) << " no-emulator-declared"
           << "; environmental: "
           << count(ArmVerdict::SkippedEmulatorMissing) << " emulator-missing, "
+          << count(ArmVerdict::SkippedLauncherPrerequisiteMissing)
+          << " launcher-prerequisite-missing, "
           << count(ArmVerdict::SkippedBuildInputMissing) << " build-input-missing"
           << "; harness: "
           << count(ArmVerdict::NotSelectedByRunner) << " not-selected], "

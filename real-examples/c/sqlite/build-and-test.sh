@@ -1291,6 +1291,148 @@ esac
 [[ "$STRICT_VERDICTS" -eq 0 ]] || \
   warn "DSS_STRICT_ARM_VERDICTS=1 — every ENVIRONMENTAL skip (a missing launcher, a missing declared build input) will FAIL this run."
 
+# ── WHAT EACH LAUNCHER NEEDS BEYOND ITS OWN argv[0] ─────────────────────────
+# >>> dss:launcher-prereq >>>
+# ★★ THE PLAN SAYS `launched` BECAUSE argv[0] RESOLVED, AND THAT IS A MUCH WEAKER
+# FACT THAN IT READS AS. For the arm64 leg on a Windows host argv[0] is `wsl.exe`
+# — present on every machine with WSL — while the program that actually executes
+# the artefact is `qemu-aarch64` INSIDE the distro, which `shutil.which('wsl.exe')`
+# has never asked about on any host. ✔MEASURED: that leg passed every gate this
+# harness had on a box with no qemu, every unit exited 255 with NO diagnostic, and
+# fourteen of them were charged to DSS — the harness accusing the compiler of a
+# defect in the machine it was running on.
+#
+# `--check-launcher` EXECUTES the leg's DECLARED prerequisite rows (legs.json
+# `launchers[].requires`) in the LAUNCHER's own namespace and answers rc 0 met /
+# 3 unmet / 2 catalogue defect. This driver only classifies the answer; it never
+# decides what a launcher needs and never probes anything itself.
+#
+# ★ THE OUTCOME IS `skipped-launcher-prerequisite-missing`, the closed
+# vocabulary's ENVIRONMENTAL sibling of `skipped-emulator-missing` — announced by
+# default, FATAL under DSS_STRICT_ARM_VERDICTS=1 through the SAME Step-9 ENV_SKIPS
+# list, and STILL BUILT. This gate is only ever about EXECUTION on this machine.
+#
+# ⓘ WHY HERE. It runs at Step 1, before Steps 7b/7c/8, so an operator learns in
+# the first minute rather than after an hour of compiling — and so the CLI smoke
+# gate and the unit corpus, which both ask `leg_run_is_skipped`, get the answer
+# from one place. `--artifact` (the 4-D PT_INTERP/DT_NEEDED cross-check) is NOT
+# passed: nothing is built yet, and asking for it here would mean either lying
+# about the artefact or moving the check to where it is too late to be cheap.
+#
+# ⚠ `launcher_prereq_rows` is a SEPARATE function on purpose: the report must be
+# printed with its `provides`, `why` AND `install`. A diagnostic without the
+# remedy is one nobody acts on — this project has a standing example in the
+# QEMU_LD_PREFIX note, which lived for months as an operational workaround rather
+# than as a checked prerequisite with an apt line beside it.
+launcher_prereq_rows() {       # launcher_prereq_rows <json>  -> formatted lines
+  # THE ROWS THE CATALOGUE DECLARED, not a summary of them. `provides` says what
+  # the missing thing is FOR, `why` says on what evidence it is declared, and
+  # `install` is the one line the operator actually needs.
+  printf '%s' "$1" | python3 -c '
+import json, sys
+# ★★ THE REPORT MUST SURVIVE ITS OWN CHARACTERS. ✔MEASURED 2026-08-08 against a
+# REAL --check-launcher report: legs.json writes its evidence with a ✔ in it,
+# harness_legs.py escapes it (json.dumps is ensure_ascii), json.loads turns it
+# back into U+2714 — and sys.stdout then encodes with the LOCALE codec, which on
+# a cp1252 host raises UnicodeEncodeError MID-REPORT. Two rows printed, the rest
+# lost, and the caller`s `|| true` swallowed the traceback: a remedy list silently
+# truncated to whatever fitted the codepage. An environment default nobody
+# declared, which is this project`s recurring instrument failure. `backslashreplace`
+# keeps the platform encoding and makes NO character able to end the report.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+except (AttributeError, ValueError):
+    pass
+raw = sys.stdin.read()
+try:
+    rep = json.loads(raw)
+except ValueError as exc:
+    # SAID OUT LOUD rather than swallowed: a report this driver cannot read is a
+    # contract break with harness_legs.py, not an empty list of missing rows.
+    sys.stdout.write("the --check-launcher report is not JSON (%s): %s\n"
+                     % (exc, raw[:400]))
+    raise SystemExit(0)
+for row in rep.get("missing", []):
+    sys.stdout.write("MISSING [%s] %s\n" % (row.get("kind", "?"), row.get("path", "?")))
+    sys.stdout.write("      provides: %s\n" % (row.get("provides") or "<not declared>",))
+    sys.stdout.write("      why     : %s\n" % (row.get("why") or "<not declared>",))
+    sys.stdout.write("      install : %s\n" % (row.get("install") or "<not declared>",))
+    probe = row.get("probe") or []
+    if probe:
+        sys.stdout.write("      probed  : %s\n" % (" ".join(probe),))
+for u in rep.get("uncovered", []):
+    sys.stdout.write("UNCOVERED %s\n" % (u,))
+'
+}
+LAUNCHER_PREREQ_JSON=""
+LAUNCHER_PREREQ_ERR=""
+apply_launcher_prereq_gate() { # apply_launcher_prereq_gate <leg>
+                               #   -> 0 met (or not launched) | 1 unmet | 2 unreadable
+  local leg="$1" errf out rc rows n _row
+  LAUNCHER_PREREQ_JSON=""; LAUNCHER_PREREQ_ERR=""
+  # A leg this host runs NATIVELY has no launcher, and a leg the plan already
+  # skips has already been named. Neither is this gate's business.
+  [[ "${LEG_RUN_MODE[$leg]:-}" == "launched" ]] || return 0
+  errf="$(mktemp)" || die "could not create a temp file for the launcher-prerequisite check's stderr."
+  # rc DIRECTLY off python3, never after a pipe, and stderr to its own file so a
+  # diagnostic can never be parsed as the report.
+  if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+              --check-launcher "$leg" --host-os "$HOST_OS" --host-arch "$HOST_ARCH" 2>"$errf")"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  LAUNCHER_PREREQ_JSON="$out"
+  LAUNCHER_PREREQ_ERR="$(cat "$errf" 2>/dev/null || true)"; rm -f "$errf"
+  case "$rc" in
+    0) info "[$leg] launcher '${LEG_LAUNCH[$leg]:-<none declared>}': every DECLARED prerequisite is present on this machine"
+       return 0 ;;
+    3) rows="$(launcher_prereq_rows "$LAUNCHER_PREREQ_JSON" 2>&1 || true)"
+       n="$(printf '%s\n' "$rows" | grep -c '^MISSING ' || true)"
+       warn "[$leg] LAUNCHER PREREQUISITE MISSING — this host HAS '${LEG_LAUNCH[$leg]:-<none declared>}', and does NOT have everything that launcher DECLARES it needs."
+       while IFS= read -r _row; do [[ -z "$_row" ]] || warn "      $_row"; done <<< "$rows"
+       warn "      This leg is STILL BUILT. Its sqlite3 CLI smoke gate and its ENTIRE unit corpus are NOT run on this machine —"
+       warn "      running them would exercise a launcher that cannot start the artefact, and every failure would be charged to the compiler."
+       # DOWNGRADED TO `skip`, with the answer the machine gave. The plan resolved
+       # `launched` from a fact that turned out to be too weak; this is the same
+       # class of statement `skipped-emulator-missing` already makes, one probe
+       # deeper. Both artifacts read it through `leg_run_is_skipped`.
+       LEG_RUN_MODE["$leg"]="skip"
+       LEG_RUN_VERDICT["$leg"]="skipped-launcher-prerequisite-missing"
+       LEG_RUN_DETAIL["$leg"]="the DECLARED launcher '${LEG_LAUNCH[$leg]:-<none declared>}' is present on this host but ${n:-0} of its DECLARED prerequisite(s) are not — see the rows above for what each one provides and how to install it"
+       LEG_VERDICT["$leg"]="skipped-launcher-prerequisite-missing"
+       LEG_VERDICT_DETAIL["$leg"]="${LEG_RUN_DETAIL[$leg]}"
+       return 1 ;;
+    *) # rc 2 is the resolver's own FATAL (a catalogue/usage defect); anything
+       # else is an outcome this driver has no arm for. NEVER assumed benign: an
+       # unreadable answer is not evidence that the launcher works, and running
+       # the corpus on that assumption is how a launch failure becomes a
+       # compiler accusation. `poisoned` is the closed vocabulary's FAILURE
+       # class — it reds the run and the run CONTINUES to every other leg.
+       warn "[$leg] the launcher-prerequisite check exited $rc, which this driver does not recognise as a verdict class."
+       warn "      ${LAUNCHER_PREREQ_ERR:-<no diagnostic on stderr>}"
+       warn "      Treating it as a FAILURE rather than assuming the launcher is fine — an unreadable outcome is not evidence."
+       LEG_RUN_MODE["$leg"]="skip"
+       LEG_RUN_VERDICT["$leg"]="poisoned"
+       LEG_RUN_DETAIL["$leg"]="harness_legs.py --check-launcher exited $rc for this leg (${LAUNCHER_PREREQ_ERR:-<no diagnostic>}), so whether its launcher can start the artefact is UNKNOWN on this machine"
+       LEG_VERDICT["$leg"]="poisoned"
+       LEG_VERDICT_DETAIL["$leg"]="${LEG_RUN_DETAIL[$leg]}"
+       return 2 ;;
+  esac
+}
+LAUNCHER_PREREQ_UNMET=0
+for _l in "${LEG_ORDER[@]}"; do
+  # ⚠ `|| _rc=$?`, NEVER `apply_launcher_prereq_gate "$_l"; _rc=$?`. Under
+  # `set -Eeuo pipefail` the bare form exits the script ON the non-zero, BEFORE
+  # the assignment runs, so every unmet leg would kill the run instead of being
+  # recorded — the same rule this file states at :3561 and at the smoke gate.
+  _plrc=0; apply_launcher_prereq_gate "$_l" || _plrc=$?
+  [[ "$_plrc" -eq 0 ]] || LAUNCHER_PREREQ_UNMET=$((LAUNCHER_PREREQ_UNMET + 1))
+done
+[[ "$LAUNCHER_PREREQ_UNMET" -eq 0 ]] || \
+  warn "$LAUNCHER_PREREQ_UNMET leg(s) will NOT be executed on this machine because a DECLARED launcher prerequisite is absent. They are still BUILT, and Step 9 names each one."
+# <<< dss:launcher-prereq <<<
+
 ensure_cmd curl curl
 curl -fsS --max-time 20 -o /dev/null https://github.com || die "offline — cannot reach https://github.com."
 pass "$HOST_OS/$HOST_ARCH host is online"
@@ -4678,6 +4820,104 @@ CLI_EXPECT_SOURCE_ID="$(sed -n 's/^#define SQLITE_SOURCE_ID  *"\(.*\)".*/\1/p' "
       them the gate would be asserting nothing, which must never pass quietly."
 info "expecting version '$CLI_EXPECT_VERSION' / source id '$CLI_EXPECT_SOURCE_ID' (from $BLD/sqlite3.h)"
 [[ -n "$REF_CLI" ]] || warn "no gcc reference CLI — every smoke failure this run is UNATTRIBUTABLE and is charged to DSS by design."
+# >>> dss:smoke-targets >>>
+# ── WHAT EACH BINARY ACTUALLY IS, READ OUT OF ITS OWN HEADER ────────────────
+# ★ `--identify-binary` prints `<arch>\t<container>\t<targetOs>` read from the
+# ELF e_machine/EI_OSABI, the PE Machine field or the Mach-O cputype — no external
+# tool, and rc 3 with a NAMED diagnostic on bytes it cannot identify. A DEFAULT
+# here would be the worst possible kind: the caller is deciding whether a binary
+# that would not run is this compiler's fault.
+# ⚠ THE ANSWER COMES BACK IN A GLOBAL, NOT ON STDOUT, AND THAT IS NOT STYLE. A
+# caller writing `t="$(identify_binary_triple x)"` runs the function in a SUBSHELL,
+# so its diagnostic assignment would be discarded and the failure path would have
+# nothing to print — the "a failing substitution leaves an empty field" trap this
+# driver already records for its leg plan, wearing the diagnostic's face.
+IDENTIFY_TRIPLE=""
+IDENTIFY_WHY=""
+identify_binary_triple() {     # identify_binary_triple <path>  -> 0 (IDENTIFY_TRIPLE) | 1 (IDENTIFY_WHY)
+  local path="$1" errf out rc
+  IDENTIFY_TRIPLE=""; IDENTIFY_WHY=""
+  errf="$(mktemp)" || die "could not create a temp file for --identify-binary's stderr."
+  # rc DIRECTLY, never after a pipe.
+  if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --identify-binary "$path" 2>"$errf")"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  IDENTIFY_WHY="$(cat "$errf" 2>/dev/null || true)"; rm -f "$errf"
+  if [[ "$rc" -ne 0 ]]; then
+    IDENTIFY_WHY="could not identify $path (rc=$rc): ${IDENTIFY_WHY:-<no diagnostic on stderr>}"
+    return 1
+  fi
+  # tab-separated -> the colon triple cli-smoke.py parses. NEVER fabricated: an
+  # unreadable header returns 1 above and the caller says so out loud.
+  IDENTIFY_TRIPLE="$(printf '%s' "$out" | tr '\t' ':' | tr -d '\r\n')"
+  [[ -n "$IDENTIFY_TRIPLE" ]] || { IDENTIFY_WHY="harness_legs.py --identify-binary $path exited 0 and printed NOTHING — a contract break, not a property of the file."; return 1; }
+  return 0
+}
+# ── AND HOW THIS HOST RUNS A BINARY OF THAT TARGET ──────────────────────────
+# ★★ THE HOST-IDENTITY BRANCH THAT USED TO PICK THE REFERENCE'S LAUNCHER IS GONE.
+# Its .ps1 twin read `if ($script:HostNeedsWsl) { --reference-launcher=wsl.exe … }`
+# and THAT is why the oracle was unmatched: on a Windows host it ran the reference
+# host-native x86_64 while DSS ran arm64 under qemu, then charged every difference
+# to DSS. This driver had the same bug in its LATENT form — it passed NO reference
+# launcher at all, which is correct only for as long as every host that owns a
+# reference happens to run it natively (it stops being true on the arm64 VPS).
+# The launcher now comes from the leg catalogue, keyed on the reference's OWN
+# MEASURED target, through the same resolver that answers for every other leg.
+LAUNCHER_FOR_ARGV=""
+LAUNCHER_FOR_WHY=""
+launcher_argv_for_target() {   # launcher_argv_for_target <triple>  -> 0 | the resolver's rc
+  local target="$1" errf out rc
+  LAUNCHER_FOR_ARGV=""; LAUNCHER_FOR_WHY=""
+  errf="$(mktemp)" || die "could not create a temp file for --launcher-for-target's stderr."
+  if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+              --launcher-for-target "$target" --host-os "$HOST_OS" --host-arch "$HOST_ARCH" 2>"$errf")"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  # The REASON is always on stderr, on every outcome — including the one where
+  # stdout is deliberately EMPTY because the target runs natively here. The argv
+  # is shlex-quoted EXACTLY as a plan's LEG_LAUNCH, so it is `eval`'d into an
+  # array by the caller and never word-split.
+  LAUNCHER_FOR_WHY="$(cat "$errf" 2>/dev/null || true)"; rm -f "$errf"
+  LAUNCHER_FOR_ARGV="$out"
+  return "$rc"
+}
+# The reference is ONE binary and it is the same for every leg, so it is measured
+# ONCE. A reference this host cannot identify or cannot execute is DROPPED, loudly:
+# cli-smoke.py's CONTROL_ABSENT is an honest state, and running a control that
+# never starts is the false-ACQUITTAL half of the same defect family
+# (D-HARNESS-ATTRIBUTION-ORACLE-EXONERATES-VIA-A-REFERENCE-THAT-NEVER-RAN).
+REF_CLI_TARGET=""
+declare -a REF_CLI_LAUNCH=()
+if [[ -n "$REF_CLI" ]]; then
+  _idrc=0; identify_binary_triple "$REF_CLI" || _idrc=$?
+  if [[ "$_idrc" -ne 0 ]]; then
+    warn "the gcc reference CLI could not be IDENTIFIED — $IDENTIFY_WHY"
+    warn "      It is DROPPED for this run rather than passed with a guessed target: an unattributable"
+    warn "      smoke failure is an honest outcome, a fabricated control triple is not."
+    REF_CLI=""
+  else
+    REF_CLI_TARGET="$IDENTIFY_TRIPLE"
+    _lrc=0; launcher_argv_for_target "$REF_CLI_TARGET" || _lrc=$?
+    case "$_lrc" in
+      0) eval "REF_CLI_LAUNCH=(${LAUNCHER_FOR_ARGV})"
+         info "reference CLI target: $REF_CLI_TARGET (MEASURED from its own header) — $LAUNCHER_FOR_WHY"
+         [[ ${#REF_CLI_LAUNCH[@]} -eq 0 ]] || info "reference CLI launcher: ${REF_CLI_LAUNCH[*]}  (DECLARED by the catalogue for that target on this host, never inferred from the host's identity)" ;;
+      3) warn "this host cannot EXECUTE the gcc reference CLI ($REF_CLI_TARGET) — $LAUNCHER_FOR_WHY"
+         warn "      The reference is DROPPED: a control that cannot start would fail all fourteen assertions for one"
+         warn "      reason and EXONERATE every DSS failure on every leg against a binary that never executed."
+         REF_CLI="" ;;
+      *) warn "harness_legs.py --launcher-for-target '$REF_CLI_TARGET' exited $_lrc — ${LAUNCHER_FOR_WHY:-<no diagnostic>}"
+         warn "      That triple came from --identify-binary, so a malformed one is OUR defect, not this machine's."
+         warn "      The reference is DROPPED rather than run with an unknown launcher."
+         REF_CLI="" ;;
+    esac
+  fi
+fi
+# <<< dss:smoke-targets <<<
 declare -A CLI_SMOKE_VERDICT=()
 CLI_SMOKE_FAILS=0
 for leg in "${LEG_ORDER[@]}"; do
@@ -4694,11 +4934,28 @@ for leg in "${LEG_ORDER[@]}"; do
     warn "[$leg] CLI smoke SKIPPED — built at ${CLI_BIN[$leg]} but this host cannot execute it: ${LEG_RUN_DETAIL[$leg]}"
     continue
   fi
+  # ★ WHAT THIS LEG'S CLI ACTUALLY IS, MEASURED FROM ITS OWN HEADER — never
+  # assumed from the leg's name and never from the spec, which is the DECLARED
+  # side. cli-smoke.py compares the two and reports a leg that built the WRONG
+  # TARGET as its own non-verdict; that comparison is worth nothing if this driver
+  # feeds it the declaration twice.
+  _cidrc=0; identify_binary_triple "${CLI_BIN[$leg]}" || _cidrc=$?
+  if [[ "$_cidrc" -ne 0 ]]; then
+    CLI_SMOKE_FAILS=$((CLI_SMOKE_FAILS + 1))
+    CLI_SMOKE_VERDICT["$leg"]="FAIL — the built CLI could not be IDENTIFIED (${CLI_BIN[$leg]}); no smoke verdict was taken"
+    warn "[$leg] CLI smoke NOT RUN — $IDENTIFY_WHY"
+    warn "      This is RED and it is NOT charged to the compiler: the gate needs the subject's MEASURED target and this"
+    warn "      driver will not fabricate one. Counted as a failure so the run cannot exit 0 over a leg it never asserted about."
+    continue
+  fi
+  _cli_target="$IDENTIFY_TRIPLE"
   _smoke_dir="$OUT_DIR/$leg/cli-smoke"
   rm -rf "$_smoke_dir"; mkdir -p "$_smoke_dir"
   declare -a _smoke_argv=("$CLI_SMOKE" --cli "${CLI_BIN[$leg]}"
                           --expect-version "$CLI_EXPECT_VERSION"
                           --expect-source-id "$CLI_EXPECT_SOURCE_ID"
+                          --leg-spec "${LEG_SPEC[$leg]}"
+                          --cli-target "$_cli_target"
                           --workdir "$_smoke_dir" --label "$leg"
                           --json "$_smoke_dir/result.json")
   # THE LAUNCHER IS DECLARED, NOT INFERRED — and it is `eval`'d, not word-split.
@@ -4724,8 +4981,27 @@ for leg in "${LEG_ORDER[@]}"; do
   # project's canonical silent harness bug.
   # (D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION)
   for _t in "${_smoke_launch[@]}"; do _smoke_argv+=("--launcher=$_t"); done
-  # The reference is a LOCAL gcc build, so it always runs natively — no launcher.
-  [[ -n "$REF_CLI" ]] && _smoke_argv+=(--reference "$REF_CLI")
+  # ★★ THE REFERENCE'S LAUNCHER IS RESOLVED FROM ITS MEASURED TARGET, NOT FROM
+  # THIS HOST'S IDENTITY. The line that used to stand here said "the reference is
+  # a LOCAL gcc build, so it always runs natively — no launcher", and passed none.
+  # That is only true while every host that owns a reference happens to be able to
+  # execute it directly; it is FALSE on a Windows host (its reference is a Linux
+  # ELF reached through `wsl.exe -e`) and it becomes false the moment an arm64 host
+  # is asked about an x86_64 leg. Its .ps1 twin patched exactly that with
+  # `if ($script:HostNeedsWsl)`, a hardcoded host branch, and THAT is why the
+  # oracle was unmatched: the reference ran host-native x86_64 while DSS ran arm64
+  # under qemu, and every difference was charged to DSS.
+  # Both are replaced by ONE question asked of the catalogue —
+  # `--launcher-for-target <the reference's MEASURED triple>` — resolved once,
+  # above. `--reference-target` is that same MEASURED triple, which is what lets
+  # cli-smoke.py refuse to exonerate anything against a control aimed elsewhere.
+  # ★ `=` FORM for every launcher token, same rule and same anchor as `--launcher`
+  # above (D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION): this is
+  # the very option whose SPACE form killed the pe64 gate before one assertion ran.
+  if [[ -n "$REF_CLI" ]]; then
+    _smoke_argv+=(--reference "$REF_CLI" --reference-target "$REF_CLI_TARGET")
+    for _t in ${REF_CLI_LAUNCH[@]+"${REF_CLI_LAUNCH[@]}"}; do _smoke_argv+=("--reference-launcher=$_t"); done
+  fi
   # ★ THE LEG'S RUNTIME ENVIRONMENT, APPLIED IN A SUBSHELL. Two things are
   # load-bearing here and both are DECLARED by the leg rather than known to this
   # file:
@@ -4780,15 +5056,44 @@ for leg in "${LEG_ORDER[@]}"; do
     python3 "${_smoke_argv[@]}"
   ) > "$_smoke_dir/smoke.log" 2>&1 || _srcc=$?
   sed 's/^/      /' "$_smoke_dir/smoke.log"
+  # ★★ EVERY rc THE GATE CAN RETURN HAS ITS OWN ARM — `*)` IS THE LAST RESORT, NOT
+  # THE DEFAULT VERDICT (D-HARNESS-CLI-SMOKE-CHARGES-A-LAUNCH-FAILURE-TO-THE-COMPILER).
+  # Until TF-C136 this case had arms for 0 and 3 only, so EVERY other rc — including
+  # a gate that explicitly declined to attribute, and an argv defect of our own — fell
+  # into `*)` and printed as an accusation against the compiler. ✔MEASURED: 14 rows of
+  # "CHARGED TO DSS" over an elf64-arm64 binary that never launched, because qemu could
+  # not find the guest loader. A default arm that names a culprit is a default arm that
+  # will eventually name the wrong one; the fix is to enumerate, and to make the
+  # remaining `*)` say "unknown rc" rather than "DSS".
   case "$_srcc" in
     0) CLI_SMOKE_VERDICT["$leg"]="PASS (14/14)"
        pass "[$leg] CLI smoke: 14/14" ;;
+    1) # ★ THE ARM THE ENUMERATION LEFT OUT, AND IT IS THE ACCUSATION ITSELF.
+       # rc 1 is the gate's "CHARGED TO DSS" — a MATCHED control passed where the
+       # subject failed. Until this line it had no arm and fell into `*)`, which
+       # prints "an rc the driver does not understand is a driver defect. NOT
+       # charged to DSS": a genuine, matched, attributed compiler failure reported
+       # as a harness defect and quietly exonerated. That is the FALSE-ACQUITTAL
+       # direction — the one that HIDES a real bug — and it was introduced by the
+       # very change that removed the false-accusation default. Enumerating the
+       # rc table means enumerating ALL of it.
+       CLI_SMOKE_FAILS=$((CLI_SMOKE_FAILS + 1))
+       CLI_SMOKE_VERDICT["$leg"]="FAIL — CHARGED TO DSS (a MATCHED gcc control passes the assertions this leg fails); see $_smoke_dir/result.json"
+       warn "[$leg] CLI smoke RED and CHARGED TO DSS — the reference targets this leg's own target, it launched, and it passes what this binary fails." ;;
     3) CLI_SMOKE_FAILS=$((CLI_SMOKE_FAILS + 1))
        CLI_SMOKE_VERDICT["$leg"]="FAIL — NOT DSS (the gcc reference fails identically); see $_smoke_dir/result.json"
        warn "[$leg] CLI smoke RED, but DSS is NOT implicated — the gcc reference fails the same assertions." ;;
+    4) CLI_SMOKE_FAILS=$((CLI_SMOKE_FAILS + 1))
+       CLI_SMOKE_VERDICT["$leg"]="FAIL — NOT A VERDICT (unattributable); see $_smoke_dir/result.json"
+       # RED and counted, deliberately: an unattributable run is a FAILURE, never a
+       # warning. What changed is WHO it names — `dssImplicated` is null, not true.
+       warn "[$leg] CLI smoke RED, but this run is NOT A VERDICT about generated code — the subject never launched and/or there was no MATCHED control (the reference targets a different arch/format than this leg). See $_smoke_dir/result.json 'controlState' + 'subjectLaunched'." ;;
+    2) CLI_SMOKE_FAILS=$((CLI_SMOKE_FAILS + 1))
+       CLI_SMOKE_VERDICT["$leg"]="FAIL — HARNESS ARGV DEFECT (the gate rejected its own arguments); see $_smoke_dir/smoke.log"
+       warn "[$leg] CLI smoke could not run: the gate REJECTED THE ARGUMENTS THIS DRIVER PASSED IT. That is our defect, not the compiler's — see $_smoke_dir/smoke.log." ;;
     *) CLI_SMOKE_FAILS=$((CLI_SMOKE_FAILS + 1))
-       CLI_SMOKE_VERDICT["$leg"]="FAIL — CHARGED TO DSS; see $_smoke_dir/result.json"
-       warn "[$leg] CLI smoke FAILED and is CHARGED TO DSS — see $_smoke_dir/smoke.log" ;;
+       CLI_SMOKE_VERDICT["$leg"]="FAIL — UNKNOWN rc=$_srcc from the smoke gate; see $_smoke_dir/result.json"
+       warn "[$leg] CLI smoke returned rc=$_srcc, which this driver has no arm for. NOT charged to DSS — an rc the driver does not understand is a driver defect. Add an arm here and to the .ps1 twin." ;;
   esac
 done
 
@@ -6161,8 +6466,17 @@ fi
 # bare "N skipped" re-creates exactly the conflation the ledger exists to end, and
 # a class that appears only when non-zero cannot be grepped for reliably.
 declare -A VERDICT_COUNT=()
+# ★ `skipped-launcher-prerequisite-missing` IS ENVIRONMENTAL, beside
+# `skipped-emulator-missing`, and it is here because it was NOT: harness_legs.py
+# added the token to the closed vocabulary and this list is a HARDCODED MIRROR, so
+# a leg carrying it fell through `${VERDICT_COUNT[$v]+set}` into LEDGER_BOGUS and
+# printed as "a verdict OUTSIDE the closed vocabulary" — the ledger accusing the
+# resolver of a defect in the ledger. Its .ps1 twin's `switch` did the same thing
+# via `$vUnclassified`, which is a "★ LEDGER ACCOUNTING HOLE". Both fixed together;
+# a fix in one driver and not the other is this project's canonical silent bug.
 declare -a LEDGER_VOCAB=(ran expect-error-asserted skipped-by-runOn
                          skipped-no-emulator-declared skipped-emulator-missing
+                         skipped-launcher-prerequisite-missing
                          skipped-build-input-missing not-selected-by-runner poisoned)
 for v in "${LEDGER_VOCAB[@]}"; do VERDICT_COUNT["$v"]=0; done
 declare -a LEDGER_UNNAMED=() LEDGER_BOGUS=()
@@ -6182,16 +6496,17 @@ for leg in "${LEG_DECLARED[@]}"; do
 done
 LEDGER_VERIFIED=$(( ${VERDICT_COUNT[ran]} + ${VERDICT_COUNT[expect-error-asserted]} ))
 LEDGER_STRUCTURAL=$(( ${VERDICT_COUNT[skipped-by-runOn]} + ${VERDICT_COUNT[skipped-no-emulator-declared]} ))
-LEDGER_ENVIRONMENTAL=$(( ${VERDICT_COUNT[skipped-emulator-missing]} + ${VERDICT_COUNT[skipped-build-input-missing]} ))
+LEDGER_ENVIRONMENTAL=$(( ${VERDICT_COUNT[skipped-emulator-missing]} + ${VERDICT_COUNT[skipped-launcher-prerequisite-missing]} + ${VERDICT_COUNT[skipped-build-input-missing]} ))
 LEDGER_HARNESS=$(( ${VERDICT_COUNT[not-selected-by-runner]} ))
 LEDGER_SKIPPED=$(( LEDGER_STRUCTURAL + LEDGER_ENVIRONMENTAL + LEDGER_HARNESS ))
 LEDGER_FAILED=$(( ${VERDICT_COUNT[poisoned]} ))
 LEDGER_ACCOUNTED=$(( LEDGER_VERIFIED + LEDGER_SKIPPED + LEDGER_FAILED ))
 LEDGER_TOTAL=${#LEG_DECLARED[@]}
-printf '   verdicts : %d verified (%d ran, %d expect-error), %d skipped [structural: %d by-runOn, %d no-emulator-declared; environmental: %d emulator-missing, %d build-input-missing; harness: %d not-selected], %d poisoned  (of %d declared legs)\n' \
+printf '   verdicts : %d verified (%d ran, %d expect-error), %d skipped [structural: %d by-runOn, %d no-emulator-declared; environmental: %d emulator-missing, %d launcher-prerequisite-missing, %d build-input-missing; harness: %d not-selected], %d poisoned  (of %d declared legs)\n' \
   "$LEDGER_VERIFIED" "${VERDICT_COUNT[ran]}" "${VERDICT_COUNT[expect-error-asserted]}" \
   "$LEDGER_SKIPPED" "${VERDICT_COUNT[skipped-by-runOn]}" "${VERDICT_COUNT[skipped-no-emulator-declared]}" \
-  "${VERDICT_COUNT[skipped-emulator-missing]}" "${VERDICT_COUNT[skipped-build-input-missing]}" \
+  "${VERDICT_COUNT[skipped-emulator-missing]}" "${VERDICT_COUNT[skipped-launcher-prerequisite-missing]}" \
+  "${VERDICT_COUNT[skipped-build-input-missing]}" \
   "${VERDICT_COUNT[not-selected-by-runner]}" "$LEDGER_FAILED" "$LEDGER_TOTAL"
 # FAIL LOUD IN THE SUMMARY LINE ITSELF. A breakdown that does not sum to its own
 # denominator is worse than no breakdown: it READS like full accounting. Same
@@ -6221,7 +6536,7 @@ done
 declare -a ENV_SKIPS=()
 for leg in "${LEG_DECLARED[@]}"; do
   case "${LEG_VERDICT[$leg]:-}" in
-    skipped-emulator-missing|skipped-build-input-missing) ENV_SKIPS+=("$leg") ;;
+    skipped-emulator-missing|skipped-launcher-prerequisite-missing|skipped-build-input-missing) ENV_SKIPS+=("$leg") ;;
   esac
 done
 if [[ ${#ENV_SKIPS[@]} -gt 0 ]]; then

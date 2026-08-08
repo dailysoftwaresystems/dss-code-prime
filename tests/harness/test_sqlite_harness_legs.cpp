@@ -434,6 +434,59 @@ TEST_F(HarnessLegs, TheLegCatalogueLintsClean) {
     EXPECT_NE(r.output.find("findings=0"), std::string::npos) << r.output;
 }
 
+// ── The SMOKE GATE's own self-test, run by the gate ────────────────────────
+//
+// `cli-smoke.py` is the file that decides whether a sqlite3 CLI failure is
+// CHARGED TO THE COMPILER. Until TF-C136 it had no self-test and no coverage of
+// any kind here, which is the wrong file to leave unwatched: it is an
+// ATTRIBUTION instrument, so its failure mode is not a red gate but a confident
+// wrong answer. It shipped one — a leg whose binary never launched (the guest
+// loader was absent) was reported as fourteen DSS defects
+// (D-HARNESS-CLI-SMOKE-CHARGES-A-LAUNCH-FAILURE-TO-THE-COMPILER).
+//
+// Its `--self-test` is self-contained: no network, no build, no sqlite, a few
+// seconds. It asserts the full cross product of {subject launched, not launched}
+// x {control matched, matched-but-unlaunched, target-mismatch, absent} x {row
+// passes, row fails} against verdict, rc and `dssImplicated`, and carries its own
+// red-on-disable mutations.
+//
+// ⚠ TWO CONSTRAINTS COLLIDE HERE, AND THE SHIM IS WHAT RECONCILES THEM.
+// `runBinary` builds `[launcherPrefix..., binaryPath]` and — on the POSIX arm —
+// `chmod`s `binaryPath`, so the LAST argv element must be a real file. The gate,
+// for its own good reasons, requires `--self-test` to be its ONLY argument, i.e.
+// the last element. Passing the flag as `binaryPath` "works" on Windows and fails
+// on Linux with a bare `spawned=false`, which is how it was found.
+// So the script rides last as the file the helper expects, and a one-line `-c`
+// shim forges the argv the gate wants. Do NOT "simplify" this back to putting the
+// flag last: the Windows arm will accept it and the Linux gate will not.
+TEST_F(HarnessLegs, TheCliSmokeGateSelfTestPasses) {
+    auto const py = pythonPath();
+    ASSERT_FALSE(py.empty())
+        << "python3 (or python) is not on PATH. Both drivers hard-require it, so"
+           " this is a real unmet dependency and not a reason to skip the check.";
+    auto const script = harnessDir() / "cli-smoke.py";
+    ASSERT_TRUE(fs::exists(script))
+        << "the sqlite3 CLI smoke gate is missing: " << script;
+    static constexpr char const* kSelfTestShim =
+        "import runpy,sys;p=sys.argv[1];sys.argv=[p,'--self-test'];"
+        "runpy.run_path(p,run_name='__main__')";
+    auto const res = dss::test_support::runBinary(
+        script, std::chrono::seconds{120}, /*captureStdout=*/true,
+        {py, "-c", kSelfTestShim});
+    ASSERT_TRUE(res.spawned && !res.timedOut) << res.diagnostic;
+    EXPECT_EQ(res.exitCode, 0u) << res.capturedStdout;
+    // CONTENT, not a count — and BOTH numbers, because either alone is
+    // satisfiable by a run that asserted nothing. "0 failed" is trivially true of
+    // an empty battery; "0 passed" is what catches it. The gate prints
+    // `cli-smoke.py --self-test: <N> passed, <M> failed`.
+    EXPECT_NE(res.capturedStdout.find("0 failed"), std::string::npos)
+        << res.capturedStdout;
+    EXPECT_EQ(res.capturedStdout.find("0 passed"), std::string::npos)
+        << "the smoke gate's self-test reported ZERO assertions — present but"
+           " exercising nothing, which reads exactly like coverage:\n"
+        << res.capturedStdout;
+}
+
 // ── The pipe-buffer pin (D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS) ────
 //
 // This test is the reason that anchor exists. `runBinary` used to drain the

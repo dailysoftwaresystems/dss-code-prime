@@ -55,6 +55,9 @@ USAGE
   harness_legs.py --path-translation VERB --assert-translated ARG [--assert-translated …]
   harness_legs.py --env-transfers
   harness_legs.py --env-transfer VERB --forward NAME [--forward NAME …] [--carrier-current V]
+  harness_legs.py --check-launcher LABEL [--artifact PATH]
+  harness_legs.py --identify-binary PATH
+  harness_legs.py --launcher-for-target ARCH:CONTAINER:TARGETOS
   harness_legs.py --lint
   harness_legs.py --self-test
 """
@@ -85,6 +88,13 @@ VERDICTS = [
     "skipped-no-emulator-declared",   # structural: host OS matches, arch does
                                       #   not, and no launcher is declared
     "skipped-emulator-missing",       # environmental: launcher declared, absent
+    "skipped-launcher-prerequisite-missing",
+                                      # environmental: the launcher itself is
+                                      #   PRESENT and looks fine, and something
+                                      #   it DECLARED it needs beyond argv[0]
+                                      #   (a sysroot, an ELF interpreter inside
+                                      #   it, a program inside the distro it
+                                      #   crosses into) is absent
     "skipped-build-input-missing",    # environmental: a DECLARED build input
                                       #   (a resolve-library binary, a target
                                       #   compiler) is absent from this machine
@@ -540,6 +550,12 @@ def launch_forward_assignments(env_verb, path_verb, forwards, declared=(),
 #                   `wsl.exe -e` exists precisely so no local shell re-parses it
 #                   (D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL), and a
 #                   `sh -c` form here would hand that property straight back.
+#   probeArgv       how to ASK, in the launcher's own filesystem, whether one of
+#                   its declared `requires` rows is satisfied — one template per
+#                   requirement kind, over `{path}`. `{}` means the launcher
+#                   shares this process's filesystem and the probe is answered
+#                   IN-PROCESS (os.path.isfile / isdir / shutil.which) with NO
+#                   SPAWN AT ALL. See `requirement_probe_argv`.
 #   validHostOs     the only host OS the mechanism exists on, so the lint CHECKS.
 RUN_FILESYSTEMS = {
     "driver": {
@@ -548,6 +564,11 @@ RUN_FILESYSTEMS = {
         "mkdirArgv": [],
         "rmTreeArgv": [],
         "copyArgv": [],
+        # {} is NOT "unimplemented" — it is the claim that goes with `root: ""`:
+        # this launcher's filesystem IS this process's, so the question is
+        # answered by asking THIS python, and spawning anything to ask it would
+        # be a round-trip whose answer could differ from the caller's own view.
+        "probeArgv": {},
         "validHostOs": "",
     },
     "wsl-linux": {
@@ -560,6 +581,31 @@ RUN_FILESYSTEMS = {
         "mkdirArgv": ["wsl.exe", "-e", "mkdir", "-p"],
         "rmTreeArgv": ["wsl.exe", "-e", "rm", "-rf"],
         "copyArgv": ["wsl.exe", "-e", "cp", "-f"],
+        # ⚠ THE `command` PROBE IS THE ONE PLACE A SHELL APPEARS IN THIS TABLE,
+        # AND IT IS AGAINST THE TABLE'S OWN RULE ABOVE. READ THIS BEFORE
+        # "FIXING" IT INTO A STRING.
+        #
+        # It is UNAVOIDABLE: "is <name> executable in this launcher's PATH?" is
+        # answered by `command -v`, which is a SHELL BUILTIN — there is no
+        # `/usr/bin/command`, and `which`/`type` are not guaranteed to exist as
+        # binaries on a minimal distro (which is exactly the kind of distro this
+        # probe was written to catch). So a shell is the instrument, not a
+        # convenience.
+        #
+        # It is SAFE for one reason and one reason only: the path is passed as a
+        # POSITIONAL ARGUMENT (`--` then `{path}`, read back as `$1`) and is
+        # NEVER interpolated into the script text. The script is a fixed,
+        # closed literal; nothing a catalogue can write reaches the parser.
+        # Interpolating `{path}` into the `sh -c` string would hand back exactly
+        # the property `wsl.exe -e` exists to guarantee
+        # (D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL) — a launcher argv
+        # nobody can prove was the argv that ran.
+        "probeArgv": {
+            "file":      ["wsl.exe", "-e", "test", "-f", "{path}"],
+            "directory": ["wsl.exe", "-e", "test", "-d", "{path}"],
+            "command":   ["wsl.exe", "-e", "sh", "-c",
+                          'command -v "$1" >/dev/null', "--", "{path}"],
+        },
         "validHostOs": "windows",
     },
 }
@@ -622,6 +668,332 @@ def launcher_run_dir(verb, label, driver_run_dir):
             "collision-free name in %s, and none was supplied" % (verb, root))
     digest = hashlib.sha256(driver_run_dir.encode("utf-8")).hexdigest()[:12]
     return "%s/%s-%s" % (root, label, digest)
+
+
+# ── WHAT A LAUNCHER NEEDS BEYOND ITS OWN argv[0] ────────────────────────────
+#
+# THE FOURTH THING A LAUNCHER ENTRY DECLARES, AND IT WAS FOUND THE WAY THE OTHER
+# THREE WERE — BY MEASURING A RUN THAT READ AS A COMPILER DEFECT AND WAS NOT ONE.
+#
+# ✔MEASURED on this project's NATIVE arm64 VPS, leg elf64-x86_64 under
+# `qemu-x86_64`: THREE corpus segments aborted with
+#     libgcc_s.so.1 must be installed for pthread_exit to work
+#     qemu: uncaught target signal 6 (Aborted)
+# one of them AFTER that segment's summary had already printed — i.e. at fixture
+# EXIT, which is where `pthread_exit` runs. That sentence is GLIBC'S. It is not
+# sqlite's and it is not DSS's, and no part of this harness could say so, because
+# the ONLY gate a launcher has ever passed is `launcher_available` — a
+# `shutil.which(command[0])` and nothing else.
+#
+# ★ AND THE SAME HOLE, ONE LAUNCHER OVER, IS WORSE. The elf64-arm64 leg's Windows
+# launcher is `["wsl.exe", "-e", "qemu-aarch64"]`. `shutil.which` confirms
+# **wsl.exe** — a Windows binary that is present on every machine with WSL — and
+# NEVER ASKS whether `qemu-aarch64` exists inside the distro. A box with WSL and
+# no qemu therefore passes the gate, every unit exits 255 with no diagnostic, and
+# 14 of them were charged to DSS before anyone read the loader's message.
+#
+# ⇒ A LAUNCHER DECLARES WHAT IT NEEDS BEYOND argv[0], AND EVERY ROW SHOWS ITS
+# WORK. `requires: []` is a CLAIM — "this launcher needs nothing but its own
+# program" — in exactly the way `confounds: []` is a claim about earned excuses,
+# so the key is REQUIRED on every entry and a missing one must be indistinguish-
+# able from nothing. All five fields are required; none is defaulted:
+#
+#   kind      file | directory | command — the closed vocabulary below. HOW each
+#             kind is asked is a property of the launcher's `runFilesystem`
+#             (RUN_FILESYSTEMS[verb]["probeArgv"]), never of this row.
+#   path      what to look for. `${NAME}` expands over THIS ENTRY'S OWN `env` map
+#             and over NOTHING ELSE — see expand_launcher_requirement_path.
+#   provides  what the run loses without it, in a reader's terms.
+#   why       THE EVIDENCE. This is `confounds`' `earnedOn`/`mechanism` discipline
+#             applied here: the lint REFUSES a row that does not show its work,
+#             because a prerequisite nobody can justify is a prerequisite the next
+#             person deletes.
+#   install   THE REMEDY. A diagnostic without one is a diagnostic nobody acts on
+#             — the whole cost of the two failures above was the hours between
+#             "255" and "install qemu-user-static / libc6-arm64-cross".
+LAUNCHER_REQUIREMENT_KINDS = {"file", "directory", "command"}
+
+# All five, on every row. Listed as data so the lint's refusal can NAME the
+# missing one instead of saying "malformed".
+LAUNCHER_REQUIREMENT_KEYS = ("kind", "path", "provides", "why", "install")
+
+# A POSIX environment-variable name. `launchers[].env` keys are handed to a
+# process's environment block verbatim, and a key that is not a name is not a
+# variable — it is a value nothing can ever read.
+_LAUNCHER_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# `${NAME}` as it appears in a requires path. Deliberately NOT the `${env:NAME}`
+# spelling `expand_path` uses for library search paths: that one reads the
+# PROCESS environment, this one must never, and two mechanisms that read
+# different things must not look alike.
+_LAUNCHER_REQUIRE_VAR_RE = re.compile(r"\$\{([^}]*)\}")
+
+
+def launcher_requirement_vars(raw):
+    """Every `${NAME}` a requires path references, in order of appearance."""
+    return _LAUNCHER_REQUIRE_VAR_RE.findall(raw or "")
+
+
+def expand_launcher_requirement_path(raw, env, where=""):
+    """`${NAME}` expanded over THIS ENTRY'S OWN `env` — and over nothing else.
+
+    ⚠ THE PROCESS ENVIRONMENT IS NOT CONSULTED, ON PURPOSE, and this is the whole
+    point of the function existing rather than a call to os.path.expandvars.
+    `QEMU_LD_PREFIX` is a variable this harness SETS for the launcher (it is in
+    the entry's `env`), and it is also a variable an operator's shell may already
+    hold with a different value. If a host's ambient value could silently decide
+    what got checked, then two machines with identical catalogues would be
+    checking different files and the check would be unreproducible — which is the
+    same defect `plan_leg`'s injected `available` exists to prevent one layer up.
+
+    An undeclared `${NAME}` is REFUSED BY NAME, never expanded to empty: an empty
+    expansion turns `${QEMU_LD_PREFIX}/lib/ld-linux-aarch64.so.1` into an
+    absolute path that exists on any Linux box, i.e. a check that passes for the
+    wrong reason."""
+    out, at = [], 0
+    for m in _LAUNCHER_REQUIRE_VAR_RE.finditer(raw or ""):
+        name = m.group(1)
+        if name not in env:
+            raise LegError(
+                "%srequires path %r references ${%s}, which this launcher entry's "
+                "own `env` does not declare (it declares: %s). A requirement's "
+                "path expands over the entry's OWN env map and over NOTHING else "
+                "— never the process environment — so that the same catalogue "
+                "checks the same file on every machine. Declare %s in this "
+                "entry's `env`, or spell the path literally."
+                % (("leg '%s': " % where) if where else "", raw, name,
+                   ", ".join(sorted(env)) or "nothing", name))
+        value = env[name]
+        if not isinstance(value, str) or not value:
+            raise LegError(
+                "%srequires path %r references ${%s}, which this entry's `env` "
+                "declares as %r. An empty or non-string value would expand to "
+                "nothing and leave a path that resolves somewhere else entirely."
+                % (("leg '%s': " % where) if where else "", raw, name, value))
+        out.append(raw[at:m.start()])
+        out.append(value)
+        at = m.end()
+    out.append((raw or "")[at:])
+    return "".join(out)
+
+
+def requirement_probe_argv(fs_verb, kind, path):
+    """The argv that ASKS whether one requirement is satisfied, or [] when the
+    launcher shares this process's filesystem and the answer is in-process.
+
+    The templates live on RUN_FILESYSTEMS because WHICH FILESYSTEM the question
+    is about is a property of the launcher, not of the thing being looked for:
+    `qemu-aarch64` means one file on a Linux driver and a completely different
+    one inside WSL, and the ONLY thing that distinguishes those two questions is
+    the launcher's declared `runFilesystem`."""
+    if kind not in LAUNCHER_REQUIREMENT_KINDS:
+        raise LegError(
+            "unknown launcher requirement kind %r (known: %s). A kind decides "
+            "HOW the machine is asked; an unrecognised one cannot be guessed at, "
+            "because every wrong guess answers a question nobody asked."
+            % (kind, ", ".join(sorted(LAUNCHER_REQUIREMENT_KINDS))))
+    templates = run_filesystem(fs_verb)["probeArgv"]
+    if not templates:
+        return []
+    tmpl = templates.get(kind)
+    if tmpl is None:
+        raise LegError(
+            "runFilesystem %r implements no probe for requirement kind %r "
+            "(it implements: %s). A kind with no probe on some filesystem is a "
+            "requirement that is silently never checked there."
+            % (fs_verb, kind, ", ".join(sorted(templates))))
+    return [x.replace("{path}", path) for x in tmpl]
+
+
+def _env_value_is_path(value):
+    """Does this `launchers[].env` VALUE denote a filesystem location?
+
+    ⚠ A DIFFERENT QUESTION FROM `FOREIGN_PATH_SHAPES`, and the two are used for
+    two different rules, so they are kept apart. `sourceShape` answers "is this a
+    path in the namespace this launcher translates FROM" — it is how a DRIVER
+    path caught crossing to a foreign launcher is refused. This answers the
+    broader "is this a path at all", which is what decides whether a declared
+    variable owes a `requires` row: `/usr/aarch64-linux-gnu` is a path and it is
+    NOT a windows-drive path, so the narrow predicate would call it a non-path
+    and let the very variable this whole section is about go unchecked."""
+    if not isinstance(value, str) or not value:
+        return False
+    return (value.startswith("/") or value.startswith("\\")
+            or _looks_like_windows_drive_path(value))
+
+
+def launcher_env_findings(label, entry):
+    """Everything wrong with ONE launcher entry's `env`, as findings.
+
+    `env` was optional and validated NOWHERE until requires paths started
+    expanding over it (it was read once, at plan_leg, and copied through). A map
+    that decides what a check looks at is load-bearing, so it is validated with
+    the same required-no-default discipline as its three sibling keys."""
+    where = "leg '%s': launcher for (%s, %s)" % (
+        label, entry.get("hostOs"), entry.get("hostArch"))
+    out = []
+    if "env" not in entry:
+        out.append(
+            "%s declares no `env`. Every launcher states the environment its own "
+            "declaration authors for the process it spawns — `{}` when it authors "
+            "none, which is the common answer. Required, because a missing key "
+            "cannot be told from an empty one, and `requires` paths expand over "
+            "this map: an absent map and a map with nothing in it must not read "
+            "the same way to the thing that expands them." % where)
+        return out
+    env = entry["env"]
+    if not isinstance(env, dict):
+        out.append("%s declares an `env` that is not an object, got %r"
+                   % (where, type(env).__name__))
+        return out
+    for name in sorted(env):
+        value = env[name]
+        if not _LAUNCHER_ENV_NAME_RE.match(name or ""):
+            out.append(
+                "%s declares env key %r, which is not an environment VARIABLE "
+                "NAME ([A-Za-z_][A-Za-z0-9_]*). A key that is not a name cannot "
+                "be read by the process it is set for." % (where, name))
+            continue
+        if not isinstance(value, str) or not value:
+            out.append(
+                "%s declares env %s=%r. A declared variable's value must be a "
+                "non-empty string: an empty one arrives at the launched process "
+                "as EMPTY-BUT-EXISTING, which reads as a real setting rather "
+                "than as absence — the same false-green shape that made the "
+                "WSLENV carrier filter load-bearing." % (where, name, value))
+            continue
+        # ── the value's NAMESPACE, for a launcher that has another one ──────
+        verb = entry.get("pathTranslation", "none")
+        shape = PATH_TRANSLATIONS.get(verb, {}).get("sourceShape", "")
+        predicate = FOREIGN_PATH_SHAPES.get(shape)
+        if predicate is not None and predicate(value):
+            out.append(
+                "%s declares env %s=%r, which is a '%s' path — THIS DRIVER'S "
+                "namespace — on a launcher whose pathTranslation is '%s'. The "
+                "value crosses the boundary VERBATIM (a WSLENV carrier forwards "
+                "bytes, it does not translate them), so the launched process "
+                "receives a path from a namespace it cannot resolve, opens a "
+                "relative file of that name, misses, and the run reads as a "
+                "broken binary rather than as a misdeclared variable."
+                % (where, name, value, shape, verb))
+            continue
+        # ── a path-valued variable owes a requires row ──────────────────────
+        # Otherwise the declaration is a value nobody ever looks at: the run sets
+        # QEMU_LD_PREFIX to a sysroot that is not on the machine, the loader
+        # resolves nothing, and the failure surfaces as the target program's exit
+        # code. Requiring the row is what turns that into a named prerequisite.
+        if _env_value_is_path(value):
+            referenced = any(
+                name in launcher_requirement_vars(row.get("path", ""))
+                for row in entry.get("requires", [])
+                if isinstance(row, dict))
+            if not referenced:
+                out.append(
+                    "%s declares the PATH-VALUED env %s=%r and NOTHING in its "
+                    "`requires` list references ${%s}. A launcher that points a program at a "
+                    "directory must state that the directory has to BE there: "
+                    "without a row nothing ever looks, the loader silently "
+                    "resolves nothing, and the run fails as the target program's "
+                    "exit code instead of as a named missing prerequisite."
+                    % (where, name, value, name))
+    return out
+
+
+def launcher_requires_findings(label, entry):
+    """Everything wrong with ONE launcher entry's `requires`, as findings.
+
+    THE RULES ARE WRITTEN ONCE, HERE. `resolve_launcher_requirements` raises the
+    first of these rather than re-deciding anything, so the lint's enumeration
+    and the resolver's refusal cannot drift into disagreeing about what a valid
+    row is."""
+    where = "leg '%s': launcher for (%s, %s)" % (
+        label, entry.get("hostOs"), entry.get("hostArch"))
+    if "requires" not in entry:
+        return ["%s declares no `requires`. Every launcher states what it needs "
+                "BEYOND its own argv[0] — `[]` when it needs nothing, which is a "
+                "CLAIM and not a silence. Required, because a missing key cannot "
+                "be told from an empty one, and the difference is the whole "
+                "defect: `shutil.which('wsl.exe')` says yes on a box with no "
+                "distro, no qemu inside it and no sysroot, and every unit then "
+                "exits 255 and is charged to the compiler." % where]
+    rows = entry["requires"]
+    if not isinstance(rows, list):
+        return ["%s declares a `requires` that is not a list, got %r"
+                % (where, type(rows).__name__)]
+    out, seen = [], set()
+    env = entry.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            out.append("%s declares a requirement that is not an object: %r — "
+                       "every row carries its kind, its path and its evidence"
+                       % (where, row))
+            continue
+        for key in LAUNCHER_REQUIREMENT_KEYS:
+            value = row.get(key)
+            if not isinstance(value, str) or not value.strip():
+                out.append(
+                    "%s declares a requirement with no `%s` (%r). All five of %s "
+                    "are required and none is defaulted: `why` is the row's "
+                    "EVIDENCE and `install` is its REMEDY, and a prerequisite "
+                    "that states neither is one a reader cannot act on and the "
+                    "next person deletes."
+                    % (where, key, row.get("path", row),
+                       ", ".join(LAUNCHER_REQUIREMENT_KEYS)))
+        kind = row.get("kind")
+        if isinstance(kind, str) and kind and kind not in LAUNCHER_REQUIREMENT_KINDS:
+            out.append(
+                "%s declares a requirement of unknown `kind` %r (known: %s). A "
+                "kind decides how the machine is asked; nothing implements this "
+                "one, so the row would read as configuration and check nothing."
+                % (where, kind, ", ".join(sorted(LAUNCHER_REQUIREMENT_KINDS))))
+        raw = row.get("path")
+        if isinstance(raw, str) and raw:
+            if raw in seen:
+                out.append("%s declares the requirement path %r twice"
+                           % (where, raw))
+            seen.add(raw)
+            try:
+                expand_launcher_requirement_path(raw, env, label)
+            except LegError as exc:
+                out.append("%s: %s" % (where, exc))
+        if isinstance(kind, str) and kind in LAUNCHER_REQUIREMENT_KINDS:
+            # A kind nothing can ASK about on this launcher's filesystem is a
+            # row that is silently never checked there — the same shape as the
+            # defect, one level up.
+            try:
+                requirement_probe_argv(entry.get("runFilesystem", "driver"),
+                                       kind, "/probe")
+            except LegError as exc:
+                out.append("%s: %s" % (where, exc))
+    return out
+
+
+def resolve_launcher_requirements(entry, where=""):
+    """This entry's `requires`, RESOLVED: paths expanded over the entry's own
+    env, probe argv built from the entry's own runFilesystem.
+
+    PURE — no filesystem, no spawn, no os.environ — so `plan_leg` can emit the
+    rows and a plan stays reproducible on any machine. Executing them is a
+    separate act with its own subcommand (`--check-launcher`)."""
+    findings = launcher_requires_findings(where or "<leg>", entry)
+    if findings:
+        raise LegError(findings[0])
+    fs_verb = entry.get("runFilesystem", "driver")
+    out = []
+    for row in entry.get("requires", []):
+        path = expand_launcher_requirement_path(row["path"], entry.get("env", {}),
+                                                where)
+        out.append({
+            "kind": row["kind"],
+            "path": path,
+            "provides": row["provides"],
+            "why": row["why"],
+            "install": row["install"],
+            "probe": requirement_probe_argv(fs_verb, row["kind"], path),
+        })
+    return out
 
 
 # ── EARNED CONFOUNDS ARE A PROPERTY OF THE LEG, NOT OF THE DRIVER ───────────
@@ -1354,6 +1726,275 @@ def binary_shared_lib_shape(blob):
         return ("", False, "a Mach-O FAT/universal archive, not a single-arch "
                            "shared library [D-FF1-MACHO-FAT]")
     return ("", False, "unrecognised: first 4 bytes %r" % (blob[:4],))
+
+
+# ── WHICH TARGET A BINARY IS FOR, READ OUT OF THE BINARY ────────────────────
+#
+# THE SIBLING OF `binary_shared_lib_shape`, AND IT ANSWERS THE OTHER HALF OF THE
+# SAME QUESTION. That one asks "is this the KIND of image the leg declared"; this
+# one asks "is this the TARGET the leg declared", which is what a smoke gate has
+# to know before it can attribute a failure to anything: a binary that will not
+# run because it is for another machine is not a compiler defect, and the two are
+# indistinguishable from an exit code alone.
+#
+# NO EXTERNAL TOOL. `file`, `objdump -f`, `lipo -info` and `dumpbin /headers`
+# each answer this on exactly one host, in a different vocabulary, and one of
+# them is the tool that reported success over a file that no longer existed. The
+# bytes are here; they are the same bytes on every host.
+#
+# ★ e_machine / IMAGE_FILE_HEADER.Machine / cputype are DOCUMENTED (ELF gABI;
+# PE/COFF §3.3.1; Mach-O <mach/machine.h>) and each was cross-checked against
+# this catalogue's own declarations: MACHO_CPU_TYPES already existed for slicing
+# universal archives and is INVERTED here rather than re-tabulated.
+EM_X86_64 = 0x3E
+EM_AARCH64 = 0xB7
+ELF_MACHINES = {EM_X86_64: "x86_64", EM_AARCH64: "arm64"}
+IMAGE_FILE_MACHINE_AMD64 = 0x8664
+IMAGE_FILE_MACHINE_ARM64 = 0xAA64
+PE_MACHINES = {IMAGE_FILE_MACHINE_AMD64: "x86_64",
+               IMAGE_FILE_MACHINE_ARM64: "arm64"}
+
+# EI_OSABI -> the target OS name this catalogue uses, over THE VALUES THIS
+# CATALOGUE'S OWN TARGETS PRODUCE AND NO OTHERS.
+#
+# ⚠ AND IT IS DELIBERATELY NOT A DEFAULT. ELF's identity does not carry an
+# operating system the way PE and Mach-O do — EI_OSABI is nearly always 0, and 0
+# means "System V", not "Linux". So the honest reading of an unknown value is a
+# REFUSAL, for the same reason `run_filesystem()` refuses an unknown verb: this
+# harness builds Linux ELF today, and the day it builds a FreeBSD one (EI_OSABI
+# 9) the wrong answer must be a loud one rather than a silent "linux" that sends
+# a driver looking for the wrong launcher.
+#
+# ✔MEASURED (this project's WSL/Ubuntu host): `/bin/ls` and `/usr/bin/qemu-aarch64`
+# both carry EI_OSABI=0 (`readelf -h` agrees: "UNIX - System V"), and every
+# shipped `src/dss-config/object-formats/elf64-*.format.json` declares
+# `"osabi": "sysv"`, which src/link/format/elf_backend.cpp:170 encodes as 0. So 0
+# is what BOTH compilers in every matched control emit. 3 (ELFOSABI_GNU /
+# ELFOSABI_LINUX) is the other value a GNU toolchain produces — it is stamped on
+# an image using GNU IFUNC relocations — and the reference fixture is exactly the
+# kind of binary that can carry it, so it is mapped rather than left to refuse a
+# control run.
+ELF_OSABI_TARGET_OS = {0: "linux", 3: "linux"}
+
+
+def binary_target_identity(blob):
+    """(arch, container, targetOs) read from a binary's OWN header.
+
+    PURE — takes BYTES, not a path — so every arm is asserted on any machine,
+    exactly as `binary_shared_lib_shape` is. Raises LegError on bytes it cannot
+    read: an unidentifiable binary must never be reported as some default
+    target, because the only consumer is a gate deciding whether a failure to
+    run is attributable to this compiler."""
+    import struct
+    if not blob:
+        raise LegError("cannot identify the target of an EMPTY file (0 bytes)")
+    if blob[:4] == b"\x7fELF":
+        if len(blob) < 20:
+            raise LegError("truncated ELF header (%d bytes) — cannot read "
+                           "e_machine" % len(blob))
+        if blob[4] != 2:
+            raise LegError("ELF but not 64-bit (EI_CLASS=%d); this catalogue "
+                           "declares only 64-bit targets" % blob[4])
+        end = "<" if blob[5] == 1 else ">"
+        machine, = struct.unpack(end + "H", blob[18:20])
+        arch = ELF_MACHINES.get(machine)
+        if arch is None:
+            raise LegError(
+                "ELF64 e_machine=0x%02X names no architecture this catalogue "
+                "targets (known: %s). Refused rather than guessed: the caller is "
+                "deciding whether a binary that would not run is this compiler's "
+                "fault." % (machine, ", ".join(
+                    "0x%02X=%s" % (k, v) for k, v in sorted(ELF_MACHINES.items()))))
+        osabi = blob[7]
+        target_os = ELF_OSABI_TARGET_OS.get(osabi)
+        if target_os is None:
+            raise LegError(
+                "ELF64 EI_OSABI=%d names no target OS this catalogue builds for "
+                "(known: %s). NOT defaulted to 'linux': ELF's identity does not "
+                "carry an OS the way PE and Mach-O do, so a value nobody has "
+                "mapped is a target nobody has declared, and answering 'linux' "
+                "would send a caller looking for the wrong launcher."
+                % (osabi, ", ".join("%d=%s" % (k, v) for k, v
+                                    in sorted(ELF_OSABI_TARGET_OS.items()))))
+        return (arch, "elf64", target_os)
+    if blob[:2] == b"MZ":
+        if len(blob) < 0x40:
+            raise LegError("truncated DOS header (%d bytes)" % len(blob))
+        e_lfanew, = struct.unpack("<I", blob[0x3C:0x40])
+        if e_lfanew + 6 > len(blob) or blob[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+            raise LegError("an MZ image whose e_lfanew (0x%X) does not point at "
+                           "a PE signature" % e_lfanew)
+        machine, = struct.unpack("<H", blob[e_lfanew + 4:e_lfanew + 6])
+        arch = PE_MACHINES.get(machine)
+        if arch is None:
+            raise LegError(
+                "PE IMAGE_FILE_HEADER.Machine=0x%04X names no architecture this "
+                "catalogue targets (known: %s)"
+                % (machine, ", ".join("0x%04X=%s" % (k, v) for k, v
+                                      in sorted(PE_MACHINES.items()))))
+        # PE carries no OS field: the container IS the OS contract (a PE image is
+        # loaded by the Windows loader, and this catalogue's only pe64 leg is a
+        # `-windows-` one). Stated here rather than derived from a table of one.
+        return (arch, "pe64", "windows")
+    if len(blob) >= 16:
+        magic, = struct.unpack("<I", blob[:4])
+        if magic == MH_MAGIC_64:
+            cputype, = struct.unpack("<I", blob[4:8])
+            # MACHO_CPU_TYPES is the arch -> cpu_type map universal-archive
+            # slicing already uses. INVERTED, never re-tabulated: two tables of
+            # the same fact drift, and this one is load-bearing in both
+            # directions.
+            for name, code in sorted(MACHO_CPU_TYPES.items()):
+                if code == cputype:
+                    return (name, "macho64", "darwin")
+            raise LegError(
+                "Mach-O cpu_type=0x%08X names no architecture this catalogue "
+                "targets (known: %s)"
+                % (cputype, ", ".join("%s=0x%08X" % (k, v) for k, v
+                                      in sorted(MACHO_CPU_TYPES.items()))))
+    if _fat_slices(blob):
+        raise LegError("a Mach-O FAT/universal archive carries SEVERAL targets; "
+                       "the leg's own slice must be selected before one can be "
+                       "named [D-FF1-MACHO-FAT]")
+    raise LegError("unrecognised object file: first 4 bytes %r" % (blob[:4],))
+
+
+# ── WHAT AN ARTEFACT ASKS THE LAUNCHER FOR, AT LOAD TIME ────────────────────
+#
+# The VALIDATOR half of `launchers[].requires` (see that section): after a leg
+# builds, the artefact itself states what it will demand of whatever runs it, and
+# every one of those demands must be covered by something the launcher DECLARED.
+#
+# ★★ AND THE ONE THAT PROVES THE LIST CANNOT BE DERIVED: `libgcc_s.so.1` IS
+# INVISIBLE TO THIS CHECK BY CONSTRUCTION. It is in no DT_NEEDED and no PT_INTERP
+# — glibc `dlopen()`s it lazily, from inside `pthread_exit`, at process TEARDOWN
+# — which is exactly why the VPS abort printed AFTER a segment summary. A
+# derived list would have been complete, correct, and would still have missed the
+# thing that killed three segments. That is the standing argument for
+# `requires` being DECLARED prose with evidence rather than a computed set, and
+# this function's job is only to prove the declared list is not SMALLER than what
+# the binary can be seen to ask for.
+PT_INTERP = 3
+PT_DYNAMIC = 2
+DT_NEEDED = 1
+
+
+def elf_runtime_dependencies(blob):
+    """(PT_INTERP path, [DT_NEEDED sonames]) for an ELF64 image, or ("", []).
+
+    Same reading discipline as `_elf_exports` directly below: endianness from
+    EI_DATA and never from the host, offsets bounds-checked against the blob, no
+    external tool. PT_INTERP comes from the PROGRAM headers because that is where
+    the KERNEL reads it from — a `.interp` section can be stripped while the
+    segment stays, and the kernel does not consult sections."""
+    import struct
+    if blob[:4] != b"\x7fELF" or len(blob) < 64 or blob[4] != 2:
+        return ("", [])
+    end = "<" if blob[5] == 1 else ">"
+    e_phoff, = struct.unpack(end + "Q", blob[0x20:0x28])
+    e_phentsize, e_phnum = struct.unpack(end + "HH", blob[0x36:0x3A])
+    interp, needed = "", []
+    dyn_spans = []
+    if e_phoff and e_phentsize >= 56:
+        for i in range(e_phnum):
+            o = e_phoff + i * e_phentsize
+            if o + 56 > len(blob):
+                break
+            p_type, = struct.unpack(end + "I", blob[o:o + 4])
+            p_offset, = struct.unpack(end + "Q", blob[o + 8:o + 16])
+            p_filesz, = struct.unpack(end + "Q", blob[o + 32:o + 40])
+            if p_type == PT_INTERP and p_offset + p_filesz <= len(blob):
+                interp = blob[p_offset:p_offset + p_filesz].split(b"\0")[0] \
+                    .decode("ascii", "replace")
+            elif p_type == PT_DYNAMIC:
+                dyn_spans.append((p_offset, p_filesz))
+    # DT_NEEDED through the SECTION headers, the same route _elf_exports takes,
+    # because .dynamic's sh_link names its string table directly while PT_DYNAMIC
+    # would have to be walked for DT_STRTAB and that address then mapped back
+    # through the program headers to a file offset.
+    e_shoff, = struct.unpack(end + "Q", blob[0x28:0x30])
+    e_shentsize, e_shnum = struct.unpack(end + "HH", blob[0x3A:0x3E])
+    if e_shoff and e_shentsize >= 64 and e_shnum:
+        secs = []
+        for i in range(e_shnum):
+            o = e_shoff + i * e_shentsize
+            if o + 64 > len(blob):
+                secs = []
+                break
+            _nm, stype, _fl, _ad, off, size, link, _in, _al, entsz = struct.unpack(
+                end + "IIQQQQIIQQ", blob[o:o + 64])
+            secs.append((stype, off, size, link, entsz))
+        for stype, off, size, link, _entsz in secs:
+            if stype != SHT_DYNAMIC:
+                continue
+            if link >= len(secs) or secs[link][0] != SHT_STRTAB:
+                continue
+            _t, soff, ssize, _l, _e = secs[link]
+            tab = blob[soff:soff + ssize]
+            p = off
+            while p + 16 <= off + size and p + 16 <= len(blob):
+                tag, val = struct.unpack(end + "qQ", blob[p:p + 16])
+                if tag == DT_NULL:
+                    break
+                if tag == DT_NEEDED and val < len(tab):
+                    stop = tab.find(b"\0", val)
+                    name = tab[val:stop if stop >= 0 else len(tab)]
+                    if name:
+                        needed.append(name.decode("ascii", "replace"))
+                p += 16
+    return (interp, needed)
+
+
+def dependency_coverage_findings(label, rows, interp, needed, staged=()):
+    """Every load-time demand of an artefact that NO declared requires row covers.
+
+    THE TWO HALVES ARE HELD TO DIFFERENT STANDARDS, ON PURPOSE:
+
+      * PT_INTERP must be covered by an explicit `file` ROW. It is the one
+        dependency named by ABSOLUTE PATH inside the image, the one a launcher's
+        sysroot silently re-roots (qemu prepends QEMU_LD_PREFIX), and the one
+        whose absence produces no diagnostic at all — the kernel simply refuses
+        the exec and the harness sees rc=255. A directory row does not cover it:
+        "the sysroot exists" and "the loader is inside it" are two different
+        facts, and it was the second one that was false.
+      * A DT_NEEDED soname is resolved by NAME through a search path, so it is
+        covered by a file row of that name, by any declared DIRECTORY (a sysroot
+        supplies the platform's libraries), or by a library this harness STAGES
+        beside the artefact.
+
+    Returns findings, so the caller decides whether they are a lint result or a
+    run-time refusal."""
+    files = [r["path"] for r in rows if r.get("kind") == "file"]
+    dirs = [r["path"] for r in rows if r.get("kind") == "directory"]
+    staged = {os.path.basename(s) for s in staged if s}
+    out = []
+    if interp:
+        if not any(p == interp or p.endswith(interp) for p in files):
+            out.append(
+                "leg '%s': the artefact's PT_INTERP is %s and NO declared "
+                "`requires` row of kind 'file' covers it (declared files: %s). "
+                "That is the file whose absence produced rc=255 with no "
+                "diagnostic and 14 units charged to this compiler. A sysroot "
+                "DIRECTORY row does not cover it: a launcher re-roots the "
+                "interpreter path into its sysroot, so 'the sysroot is there' "
+                "and 'the loader is inside it' are two separate facts and it was "
+                "the second one that was false."
+                % (label, interp, ", ".join(files) or "none"))
+    for soname in needed:
+        base = os.path.basename(soname)
+        if base in staged:
+            continue
+        if any(os.path.basename(p) == base for p in files):
+            continue
+        if dirs:
+            continue
+        out.append(
+            "leg '%s': the artefact declares DT_NEEDED %s, and this launcher "
+            "declares neither a `requires` row naming it nor any directory that "
+            "could supply it, and this harness does not stage it. Something has "
+            "to provide it or the artefact will not load."
+            % (label, soname))
+    return out
 
 
 def verify_shared_lib(path, want_container):
@@ -3610,9 +4251,15 @@ def plan_leg(leg, host_os, host_arch, available):
     # seeds to "none": on a NATIVE run the process is this machine's own and it
     # writes onto this driver's own filesystem — a claim, and a true one, rather
     # than an absence. Only a LAUNCHER can make it false, and only by declaring so.
+    # `requires` seeds to [] for the same reason, and it means the same thing it
+    # means in the catalogue: NOTHING beyond what is already here is needed. On a
+    # native run that is true by construction — there is no launcher to need
+    # anything — and the rows are RESOLVED (paths expanded, probe argv built) but
+    # never EXECUTED here, because `plan_leg` is pure and injectable and a plan
+    # that consulted the filesystem would stop being reproducible.
     run = {"mode": None, "launcher": [], "env": {}, "verdict": None, "detail": "",
            "pathTranslation": "none", "pathTranslator": [],
-           "envTransfer": "inherit", "runFilesystem": "driver"}
+           "envTransfer": "inherit", "runFilesystem": "driver", "requires": []}
 
     if os_ok and arch_ok:
         run["mode"] = "native"
@@ -3646,6 +4293,13 @@ def plan_leg(leg, host_os, host_arch, available):
             # that crosses into another OS's kernel usually does not.
             fs_verb = entry.get("runFilesystem", "driver")
             run_filesystem(fs_verb)
+            # WHAT THE LAUNCHER NEEDS BEYOND argv[0], resolved but NOT executed.
+            # Emitted on BOTH outcomes below: a driver reporting an unusable
+            # launcher wants the list as much as one about to run — and a caller
+            # that only ever saw the rows on the happy path would be reading a
+            # different declaration from the one it is failing on.
+            requires = resolve_launcher_requirements(entry, leg["label"])
+            run["requires"] = requires
             # A launcher is USABLE only if its translator is too. They are one
             # capability: `wsl.exe` present with no distro behind it resolves
             # neither, and the honest verdict for that machine is the
@@ -3743,6 +4397,172 @@ def plan(host_os, host_arch, available, path=CATALOGUE):
         "host": {"os": host_os, "arch": host_arch},
         "legs": [plan_leg(leg, host_os, host_arch, available) for leg in legs],
     }
+
+
+# ── EXECUTING WHAT THE PLAN RESOLVED ────────────────────────────────────────
+#
+# DELIBERATELY A SEPARATE ACT FROM `plan_leg`, and the split is the design.
+# `plan_leg` is PURE and its launcher availability is INJECTED, so a plan is the
+# same on every machine and both drivers can be tested against it without owning
+# a qemu. Probing the filesystem is the opposite kind of operation — it is the
+# machine ANSWERING — so it lives here, behind its own subcommand, and its result
+# is a verdict rather than a plan.
+
+def _probe_present(kind, path):
+    """The IN-PROCESS answer, for a launcher that shares this process's
+    filesystem. NOTHING IS SPAWNED: the question is about this machine, and a
+    subprocess could only give a second opinion about a fact this process can
+    read directly."""
+    if kind == "file":
+        return os.path.isfile(path)
+    if kind == "directory":
+        return os.path.isdir(path)
+    if kind == "command":
+        return shutil.which(path) is not None
+    raise LegError("unknown launcher requirement kind %r" % kind)
+
+
+def check_launcher(leg, host_os, host_arch, available, runner=None, checker=None,
+                   artifact=None):
+    """Are this leg's launcher's DECLARED prerequisites present on this machine?
+
+    Returns {ok, verdict, missing, ...}. `runner(argv) -> (rc, out, err)` and
+    `checker(kind, path) -> bool` are injected by the self-test so every arm is
+    asserted on any host — and so that a `driver`-filesystem probe can be PROVEN
+    not to spawn, by handing it a runner that raises if it is ever called.
+
+    `artifact` turns on the 4-D cross-check: the built binary's own PT_INTERP and
+    DT_NEEDED are read and every one must be covered by a declared row. That is
+    what keeps this declaration honest in the direction it can be checked in —
+    the other direction cannot be checked at all, which is why the rows carry
+    prose evidence (see `dependency_coverage_findings`, and libgcc_s.so.1)."""
+    resolved = plan_leg(leg, host_os, host_arch, available)
+    run = resolved["run"]
+    rows = run.get("requires", [])
+    missing, checked = [], []
+    for row in rows:
+        argv = row.get("probe", [])
+        if argv:
+            rc, _out, _err = (runner or _run_translator)(argv)
+            present = rc == 0
+            how = " ".join(argv)
+        else:
+            present = (checker or _probe_present)(row["kind"], row["path"])
+            how = "in-process %s(%s)" % (row["kind"], row["path"])
+        checked.append({"path": row["path"], "present": present, "probe": how})
+        if not present:
+            missing.append(dict(row, probe=argv))
+    detail = run.get("detail", "")
+    if not rows:
+        detail = ("this leg's run mode is '%s' and no launcher prerequisite is "
+                  "declared for (%s, %s)" % (run.get("mode"), host_os, host_arch))
+    uncovered, cross_check = [], "not requested"
+    if artifact:
+        try:
+            with open(artifact, "rb") as fh:
+                blob = fh.read()
+        except OSError as exc:
+            raise LegError(
+                "--artifact %s could not be read (%s). The cross-check is the "
+                "only thing that keeps the declared prerequisite list from "
+                "silently shrinking below what the artefact demands, so an "
+                "unreadable artefact stops the check rather than passing it."
+                % (_fwd(artifact), exc))
+        interp, needed = elf_runtime_dependencies(blob)
+        if interp or needed:
+            uncovered = dependency_coverage_findings(
+                leg["label"], rows, interp, needed, _staged_library_names(leg))
+            cross_check = ("applied: PT_INTERP=%s, %d DT_NEEDED"
+                           % (interp or "<none>", len(needed)))
+        else:
+            # SAID OUT LOUD rather than passing quietly. Only the ELF reader
+            # exists here, so a PE or Mach-O artefact — or a statically linked
+            # ELF — yields nothing to cross-check, and "no findings" would read
+            # as "checked and clean". A check that silently did not apply is the
+            # shape of every instrument in this project that reported success
+            # over something it could not observe.
+            container = ""
+            try:
+                container = binary_target_identity(blob)[1]
+            except LegError:
+                container = "unreadable"
+            cross_check = ("NOT APPLIED: %s declares no PT_INTERP and no "
+                           "DT_NEEDED that this module can read (container=%s). "
+                           "The declared rows stand on their own evidence here."
+                           % (_fwd(artifact), container or "?"))
+    ok = not missing and not uncovered
+    return {
+        "label": leg["label"],
+        "ok": ok,
+        # "" on success, for the same reason build_loadext_helper's verdictClass
+        # is: a verdict names a NON-outcome, and inventing one for the happy path
+        # would put a skip name in a log line about a leg that is about to run.
+        "verdict": "" if ok else "skipped-launcher-prerequisite-missing",
+        "launcher": run.get("launcher", []),
+        "runFilesystem": run.get("runFilesystem", "driver"),
+        "checked": checked,
+        "missing": missing,
+        "uncovered": uncovered,
+        "crossCheck": cross_check,
+        "detail": detail,
+    }
+
+
+def _staged_library_names(leg):
+    """The library file names this harness stages beside a leg's artefact.
+
+    Read off the leg's own acquisition declaration, so the dependency
+    cross-check knows the difference between "the launcher must supply this" and
+    "we ship this ourselves"."""
+    out = []
+    libs = leg.get("build", {}).get("libraries", {})
+    for archive in libs.get("acquire", {}).get("archives", []):
+        for member in archive.get("members", []):
+            if member.get("as"):
+                out.append(member["as"])
+    return out
+
+
+def launcher_for_target(legs, target, host_os, host_arch, available):
+    """(argv, reason) — how THIS host runs a binary built for `target`.
+
+    `target` is `<arch>:<container>:<targetOs>`, i.e. exactly the triple
+    `binary_target_identity` reads out of a file, so a caller that has a binary
+    in hand never has to translate between two vocabularies.
+
+    NO NEW VOCABULARY AND NO NEW DECISION: the leg is found by its own declared
+    `spec` and the answer comes from `plan_leg`, so this cannot disagree with the
+    plan a driver is running."""
+    parts = (target or "").split(":")
+    if len(parts) != 3 or not all(parts):
+        raise LegError(
+            "--launcher-for-target takes <arch>:<container>:<targetOs> (e.g. "
+            "arm64:elf64:linux), got %r. That is the triple --identify-binary "
+            "prints, so the two can be piped together." % target)
+    arch, container, target_os = parts
+    for leg in legs:
+        spec = leg.get("spec", "")
+        if (spec_target_arch(spec) == arch
+                and spec_format_container(spec) == container
+                and spec_target_os(spec) == target_os):
+            run = plan_leg(leg, host_os, host_arch, available)["run"]
+            if run["mode"] == "launched":
+                return (run["launcher"],
+                        "leg '%s' runs on %s/%s through its declared launcher"
+                        % (leg["label"], host_os, host_arch))
+            if run["mode"] == "native":
+                return ([], "leg '%s' runs NATIVELY on %s/%s — no launcher"
+                            % (leg["label"], host_os, host_arch))
+            return (None,
+                    "leg '%s' cannot run on %s/%s: %s (%s)"
+                    % (leg["label"], host_os, host_arch, run["verdict"],
+                       run["detail"]))
+    return (None,
+            "no leg in this catalogue declares a spec for target %s — its legs "
+            "are: %s. A binary of a target this harness does not build is not "
+            "this harness's to attribute."
+            % (target, ", ".join("%s (%s)" % (l.get("label"), l.get("spec"))
+                                 for l in legs)))
 
 
 def run_dir_plan(leg, host_os, host_arch, available, driver_run_dir):
@@ -4335,6 +5155,19 @@ def lint(path=CATALOGUE):
                             "a Linux sqlite corpus onto DrvFs."
                             % (label, entry["hostOs"], entry["hostArch"],
                                entry.get("pathTranslation")))
+            # ── the launcher's ENVIRONMENT, and what it points at ──────────
+            # `env` was OPTIONAL and validated NOWHERE until requires paths began
+            # expanding over it — it was read once, at plan_leg, and copied
+            # through to the drivers unexamined. A map that decides WHAT GETS
+            # CHECKED is load-bearing, so it earns the same treatment as its
+            # three sibling keys: required, no default, cross-checked against the
+            # host OS its namespace belongs to.
+            findings.extend(launcher_env_findings(label, entry))
+            # ── what the launcher needs BEYOND its own argv[0] ─────────────
+            # The gate that did not exist: `launcher_available` resolves
+            # `command[0]` and stops, so `wsl.exe` present with no distro, no
+            # qemu inside it and no sysroot passed every check this harness had.
+            findings.extend(launcher_requires_findings(label, entry))
             if entry["hostOs"] in leg.get("runOn", []) and entry["hostArch"] == arch:
                 findings.append("leg '%s': launcher declared for (%s, %s), which "
                                 "is this leg's NATIVE host — dead config: the "
@@ -4673,6 +5506,20 @@ def lint(path=CATALOGUE):
 #              their answers must be identical.
 #   why        required when `verifiers` is empty.
 DSS_REGIONS = {
+    # TF-C136. Both regions delimit a capability that must exist in BOTH drivers
+    # or the missing side runs a corpus that cannot start and charges every
+    # failure to the compiler — which is exactly what happened before they
+    # existed. `mirror` is deliberately NOT claimed: the two copies are the same
+    # CAPABILITY expressed in two languages, not the same text, and the
+    # differential battery would be asserting a sameness that was never true.
+    # What IS asserted is the pairing itself, by the verifiers below, which read
+    # these sentinels by name.
+    "launcher-prereq": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["test-confound-scope.sh", "test-confound-scope.ps1"]},
+    "smoke-targets": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["test-confound-scope.sh", "test-confound-scope.ps1"]},
     "corpus-engine": {
         "drivers": ["build-and-test.sh", "build-and-test.ps1"],
         "verifiers": ["harness_legs.py"], "mirror": True},
@@ -6153,6 +7000,287 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           "envTransfer" in _raise_text(lambda: launch_forward_assignments(
               "copy-the-block", "none", [("SOME_NEW_VAR", "x")])))
 
+    # ── WHAT A LAUNCHER NEEDS BEYOND ITS OWN argv[0] ─────────────────────────
+    # The gate that did not exist. `launcher_available` resolves `command[0]`
+    # and stops, so `["wsl.exe","-e","qemu-aarch64"]` passed every check this
+    # harness had on a box with WSL and no qemu — 14 units then exited 255 and
+    # were charged to DSS — and on the arm64 VPS a PRESENT qemu-x86_64 with an
+    # incomplete sysroot aborted three corpus segments inside glibc.
+    _lreq = {"kind": "file", "path": "${QEMU_LD_PREFIX}/lib/ld-linux-aarch64.so.1",
+             "provides": "the ELF interpreter", "why": "MEASURED",
+             "install": "apt-get install libc6-arm64-cross"}
+    _lentry = {"hostOs": "windows", "hostArch": "x86_64",
+               "command": ["wsl.exe", "-e", "qemu-aarch64"],
+               "env": {"QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu"},
+               "pathTranslation": "windows-to-wsl", "envTransfer": "wslenv",
+               "runFilesystem": "wsl-linux", "requires": [_lreq]}
+
+    # ★ REACHABILITY GUARD (the sibling of "some declared launcher needs a
+    # non-inherit envTransfer"). Every assertion below is about a mechanism, and
+    # a mechanism no shipped leg/host cell reaches is a mechanism whose tests
+    # prove nothing about this catalogue.
+    check("some shipped leg/host cell resolves a NON-EMPTY requires list",
+          any(leg["run"].get("requires")
+              for h in SELF_TEST_HOSTS
+              for leg in plan(h[0], h[1], every, path)["legs"]))
+    check("...and at least one of those rows is probed THROUGH a launcher "
+          "rather than in-process",
+          any(row.get("probe")
+              for h in SELF_TEST_HOSTS
+              for leg in plan(h[0], h[1], every, path)["legs"]
+              for row in leg["run"].get("requires", [])),
+          "an all-in-process catalogue would never exercise the wsl-linux "
+          "probe templates, which are the ones the defect was made of")
+
+    # ── ${VAR} EXPANDS OVER THE ENTRY'S OWN env AND NOTHING ELSE ────────────
+    check("${VAR} expands from THIS ENTRY'S env",
+          expand_launcher_requirement_path(
+              "${QEMU_LD_PREFIX}/lib/ld-linux-aarch64.so.1",
+              {"QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu"})
+          == "/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1")
+    check("an UNDECLARED ${VAR} RAISES rather than expanding to empty",
+          _raises(lambda: expand_launcher_requirement_path("${NOPE}/lib/x", {})))
+    check("...and the refusal NAMES the variable",
+          "NOPE" in _raise_text(
+              lambda: expand_launcher_requirement_path("${NOPE}/lib/x", {})),
+          "an empty expansion turns ${X}/lib/ld.so into an ABSOLUTE path that "
+          "exists on any Linux box — a check that passes for the wrong reason")
+    # ★ THE PROCESS ENVIRONMENT IS NOT A FALLBACK, asserted with a variable that
+    # is certainly set in this process: if os.environ were ever consulted, this
+    # would expand instead of refusing, and two machines with identical
+    # catalogues would be checking different files.
+    check("a variable that exists in THIS PROCESS but not in the entry's env "
+          "is still REFUSED",
+          _raises(lambda: expand_launcher_requirement_path("${PATH}/x", {})),
+          "os.environ has PATH=%r" % (os.environ.get("PATH", "")[:20] + "...",))
+    check("an entry env value that is empty RAISES rather than vanishing",
+          _raises(lambda: expand_launcher_requirement_path("${Q}/x", {"Q": ""})))
+
+    # ── THE PROBE ARGV IS A PROPERTY OF THE LAUNCHER'S FILESYSTEM ───────────
+    # Asserted as EXACT argv, so a template edit is VISIBLE here rather than
+    # merely still-passing: these strings are the whole instrument.
+    check("a wsl-linux FILE probe is the exact argv",
+          requirement_probe_argv("wsl-linux", "file", "/usr/lib/x.so")
+          == ["wsl.exe", "-e", "test", "-f", "/usr/lib/x.so"],
+          "%r" % (requirement_probe_argv("wsl-linux", "file", "/usr/lib/x.so"),))
+    check("a wsl-linux DIRECTORY probe is the exact argv",
+          requirement_probe_argv("wsl-linux", "directory", "/usr/aarch64-linux-gnu")
+          == ["wsl.exe", "-e", "test", "-d", "/usr/aarch64-linux-gnu"])
+    # ⚠ THE ONE SHELL IN THE TABLE. Pinned in full, including the `--` and the
+    # `"$1"`, because the ONLY thing that makes it safe is that the path arrives
+    # as a POSITIONAL ARGUMENT and is never interpolated into the script text.
+    # "Simplifying" it to `sh -c 'command -v %s'` would hand back exactly the
+    # property `wsl.exe -e` exists to guarantee.
+    check("a wsl-linux COMMAND probe passes the path as $1, NEVER inside the "
+          "script text",
+          requirement_probe_argv("wsl-linux", "command", "qemu-aarch64")
+          == ["wsl.exe", "-e", "sh", "-c", 'command -v "$1" >/dev/null', "--",
+              "qemu-aarch64"],
+          "%r" % (requirement_probe_argv("wsl-linux", "command", "qemu-aarch64"),))
+    check("...and the script text does NOT contain the path",
+          "qemu-aarch64" not in
+          requirement_probe_argv("wsl-linux", "command", "qemu-aarch64")[4])
+    check("a `driver` launcher has NO probe argv at all — the answer is "
+          "in-process",
+          requirement_probe_argv("driver", "file", "/x") == []
+          and requirement_probe_argv("driver", "command", "cc") == [])
+    check("an unknown requirement kind RAISES rather than probing something else",
+          _raises(lambda: requirement_probe_argv("wsl-linux", "socket", "/x")))
+    # Every filesystem that probes at all must probe EVERY kind: a kind with no
+    # template on some filesystem is a requirement silently never checked there.
+    for _fs, _spec in sorted(RUN_FILESYSTEMS.items()):
+        if not _spec["probeArgv"]:
+            continue
+        check("runFilesystem '%s' implements a probe for every kind" % _fs,
+              set(_spec["probeArgv"]) == LAUNCHER_REQUIREMENT_KINDS,
+              "implements %r, kinds are %r"
+              % (sorted(_spec["probeArgv"]), sorted(LAUNCHER_REQUIREMENT_KINDS)))
+
+    # ── check_launcher, WITH AN INJECTED PROBER ─────────────────────────────
+    _probe_leg = {"label": "fixture-leg", "spec": "arm64:elf64-aarch64-linux-exec",
+                  "runOn": ["linux"], "confounds": [], "build": {},
+                  "launchers": [_lentry]}
+    _seen = []
+
+    def _prober(argv):
+        _seen.append(list(argv))
+        return (0, "", "")
+
+    _rep = check_launcher(_probe_leg, "windows", "x86_64", {"wsl.exe"},
+                          runner=_prober)
+    check("check_launcher reports MET when every probe answers rc 0",
+          _rep["ok"] and _rep["verdict"] == "" and _rep["missing"] == [],
+          "%r" % (_rep,))
+    check("...and it probed THROUGH the launcher, with the expanded path",
+          _seen == [["wsl.exe", "-e", "test", "-f",
+                     "/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1"]],
+          "%r" % (_seen,))
+    _rep = check_launcher(_probe_leg, "windows", "x86_64", {"wsl.exe"},
+                          runner=lambda argv: (1, "", ""))
+    check("check_launcher reports UNMET when a probe answers non-zero",
+          not _rep["ok"] and len(_rep["missing"]) == 1, "%r" % (_rep,))
+    check("...under the NEW verdict, not `skipped-emulator-missing`",
+          _rep["verdict"] == "skipped-launcher-prerequisite-missing",
+          "the launcher is PRESENT and functional-looking; saying 'emulator "
+          "missing' of it is the conflation this verdict exists to end")
+    # A missing row must carry its REMEDY as well as its subject. A diagnostic
+    # without one is a diagnostic nobody acts on — the whole cost of the VPS
+    # abort was the hours between "signal 6" and "install libgcc-s1-*-cross".
+    check("a missing row carries provides AND install AND its probe",
+          all(_rep["missing"][0].get(k) for k in
+              ("kind", "path", "provides", "why", "install", "probe")),
+          "%r" % (_rep["missing"][0],))
+    check("...and the path in the report is the EXPANDED one, not ${VAR}",
+          "${" not in _rep["missing"][0]["path"],
+          "%r" % (_rep["missing"][0]["path"],))
+    # Per KIND, present and absent, so no arm rests on one template.
+    for _kind, _path in (("file", "/x/ld.so"), ("directory", "/x"),
+                         ("command", "qemu-aarch64")):
+        _e = dict(_lentry, requires=[dict(_lreq, kind=_kind, path=_path)])
+        _l = dict(_probe_leg, launchers=[_e])
+        _yes = check_launcher(_l, "windows", "x86_64", {"wsl.exe"},
+                              runner=lambda a: (0, "", ""))
+        _no = check_launcher(_l, "windows", "x86_64", {"wsl.exe"},
+                             runner=lambda a: (1, "", ""))
+        check("kind '%s' reports present and absent correctly" % _kind,
+              _yes["ok"] and not _no["ok"] and _no["missing"][0]["kind"] == _kind,
+              "%r / %r" % (_yes["ok"], _no["ok"]))
+    # ★ A `driver` FILESYSTEM MUST NOT SPAWN. `_forbidden_runner` raises a
+    # non-LegError, so "it spawned something" cannot be mistaken for a refusal.
+    _drv_entry = {"hostOs": "linux", "hostArch": "x86_64",
+                  "command": ["qemu-aarch64"],
+                  "env": {"QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu"},
+                  "pathTranslation": "none", "envTransfer": "inherit",
+                  "runFilesystem": "driver",
+                  "requires": [dict(_lreq, kind="directory",
+                                    path="${QEMU_LD_PREFIX}")]}
+    _drv_leg = dict(_probe_leg, launchers=[_drv_entry])
+    _rep = check_launcher(_drv_leg, "linux", "x86_64", {"qemu-aarch64"},
+                          runner=_forbidden_runner,
+                          checker=lambda kind, p: True)
+    check("a `driver`-filesystem probe answers IN-PROCESS and spawns NOTHING",
+          _rep["ok"] and _rep["checked"][0]["probe"].startswith("in-process"),
+          "%r" % (_rep["checked"],))
+    check("...and the in-process checker sees the EXPANDED path",
+          _rep["checked"][0]["path"] == "/usr/aarch64-linux-gnu")
+    _rep = check_launcher(_drv_leg, "linux", "x86_64", {"qemu-aarch64"},
+                          runner=_forbidden_runner,
+                          checker=lambda kind, p: False)
+    check("...and an absent one is UNMET, still without spawning",
+          not _rep["ok"] and _rep["missing"][0]["path"] == "/usr/aarch64-linux-gnu")
+    # A leg with no launcher for this host has nothing to check and says so —
+    # never a silent ok with no explanation.
+    _rep = check_launcher(_probe_leg, "linux", "arm64", {"wsl.exe"},
+                          runner=_forbidden_runner)
+    check("a leg that needs no launcher here is MET, with a stated reason",
+          _rep["ok"] and _rep["missing"] == [] and _rep["detail"],
+          "%r" % (_rep,))
+    check("the artefact cross-check announces that it was NOT requested",
+          _rep["crossCheck"] == "not requested", "%r" % (_rep["crossCheck"],))
+    check("an UNREADABLE --artifact stops the check instead of passing it",
+          _raises(lambda: check_launcher(
+              _probe_leg, "windows", "x86_64", {"wsl.exe"}, runner=_prober,
+              artifact=os.path.join(HERE, "no-such-artefact-fixture"))),
+          "a cross-check that silently did not run is the shape of every "
+          "instrument that ever reported success over what it could not see")
+
+    # ── plan_leg EMITS THE ROWS, RESOLVED, AND STAYS PURE ───────────────────
+    _planned = plan_leg(_probe_leg, "windows", "x86_64", {"wsl.exe"})["run"]
+    check("plan_leg emits run.requires with the path EXPANDED",
+          [r["path"] for r in _planned["requires"]]
+          == ["/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1"],
+          "%r" % (_planned["requires"],))
+    check("...and with the probe argv BUILT, so the plan is the whole answer",
+          _planned["requires"][0]["probe"][:4]
+          == ["wsl.exe", "-e", "test", "-f"])
+    check("...and every declared field survives into the plan",
+          all(k in _planned["requires"][0]
+              for k in LAUNCHER_REQUIREMENT_KEYS + ("probe",)))
+    # The rows are emitted on the UNAVAILABLE path too: a driver reporting an
+    # unusable launcher needs the list as much as one about to run.
+    _planned_none = plan_leg(_probe_leg, "windows", "x86_64", set())["run"]
+    check("an UNAVAILABLE launcher still carries its declared requirements",
+          _planned_none["verdict"] == "skipped-emulator-missing"
+          and len(_planned_none["requires"]) == 1,
+          "%r" % (_planned_none,))
+    check("a NATIVE run declares an empty requires list",
+          plan_leg(_probe_leg, "linux", "arm64", every)["run"]["requires"] == [])
+
+    # ── THE NEW VERDICT IS IN THE VOCABULARY, IN THE LEDGER'S POSITION ──────
+    # `tests/harness/test_sqlite_harness_legs.cpp` compares this list against
+    # armVerdictName() over kAllArmVerdicts IN ORDER, so the position is not a
+    # style choice — it is the pin. Asserted here too so a Python-side reorder
+    # is caught by the resolver's own self-test, not only by the C++ gate.
+    check("the launcher-prerequisite verdict is in VERDICTS",
+          "skipped-launcher-prerequisite-missing" in VERDICTS)
+    check("...immediately after its sibling skipped-emulator-missing",
+          VERDICTS.index("skipped-launcher-prerequisite-missing")
+          == VERDICTS.index("skipped-emulator-missing") + 1,
+          "%r" % (VERDICTS,))
+    check("...and before skipped-build-input-missing, so the two RUN-side "
+          "environmental skips stay adjacent",
+          VERDICTS.index("skipped-launcher-prerequisite-missing")
+          < VERDICTS.index("skipped-build-input-missing"))
+
+    # ── THE DECLARATION RULES, EACH REFUSED BY NAME ────────────────────────
+    # These are also driven end-to-end through `lint()` by the mutation table at
+    # the bottom of this self-test; asserted here as units so a failure says
+    # WHICH rule broke instead of only that some finding disappeared.
+    def _req_findings(**over):
+        return launcher_requires_findings("fx", dict(_lentry, **over))
+
+    def _env_findings(**over):
+        return launcher_env_findings("fx", dict(_lentry, **over))
+
+    check("a shipped-shaped entry has NO findings (the positive control)",
+          not _req_findings() and not _env_findings(),
+          "%r %r" % (_req_findings(), _env_findings()))
+    _no_key = dict(_lentry)
+    _no_key.pop("requires")
+    check("NO `requires` KEY AT ALL is refused — `[]` is a CLAIM",
+          any("requires" in f
+              for f in launcher_requires_findings("fx", _no_key)))
+    check("an empty `requires` is ACCEPTED — it is the claim, not the absence",
+          not _req_findings(requires=[]))
+    for _field in LAUNCHER_REQUIREMENT_KEYS:
+        _row = dict(_lreq)
+        _row.pop(_field)
+        check("a requirement with no `%s` is refused, naming the field" % _field,
+              any(_field in f for f in _req_findings(requires=[_row])))
+    check("an unknown requirement KIND is refused",
+          any("kind" in f for f in _req_findings(
+              requires=[dict(_lreq, kind="socket")])))
+    check("a ${VAR} this entry's env does not declare is refused BY NAME",
+          any("NOPE" in f for f in _req_findings(
+              requires=[dict(_lreq, path="${NOPE}/lib/x")])))
+    _no_env = dict(_lentry)
+    _no_env.pop("env")
+    check("NO `env` KEY AT ALL is refused — `{}` is a CLAIM too",
+          any("env" in f for f in launcher_env_findings("fx", _no_env)))
+    check("an env KEY that is not a variable name is refused",
+          any("2BAD" in f for f in _env_findings(env={"2BAD": "/x"})))
+    check("an env VALUE that is empty is refused",
+          any("QEMU_LD_PREFIX" in f
+              for f in _env_findings(env={"QEMU_LD_PREFIX": ""})))
+    # ★ A DRIVER-namespace path on a TRANSLATING launcher. The carrier forwards
+    # BYTES; it does not translate them, so this value arrives meaningless.
+    check("a windows-drive path in a windows-to-wsl launcher's env is refused",
+          any("windows-drive" in f for f in _env_findings(
+              env={"QEMU_LD_PREFIX": "C:\\sysroot"})))
+    check("...and the SAME value is fine on a non-translating launcher, "
+          "because there it is this driver's own namespace",
+          not launcher_env_findings("fx", dict(
+              _drv_entry, env={"QEMU_LD_PREFIX": "C:\\sysroot"},
+              requires=[dict(_lreq, kind="directory",
+                             path="${QEMU_LD_PREFIX}")])))
+    check("a PATH-VALUED env with no requires row referencing it is refused",
+          any("QEMU_LD_PREFIX" in f for f in _env_findings(
+              requires=[dict(_lreq, path="/absolute/ld.so")])))
+    check("...and a NON-path env value owes no row",
+          not launcher_env_findings("fx", dict(
+              _lentry, env={"SQLITE_TEST_PATTERN_LIST": "a,b"},
+              requires=[dict(_lreq, path="/absolute/ld.so")])))
+
     # ── THE REGISTRY AS AN INSTRUMENT ───────────────────────────────────────
     # D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE.
     # ★ DRIVEN THROUGH THE REAL INPUT PATH: a file on disk, in the registry's own
@@ -6991,19 +8119,32 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # on any machine. The three POSITIVE cells are the exact headers ✔MEASURED
     # from the artefacts DSS emitted on 2026-08-05 (readelf/objdump/file agreeing
     # with this reader on all three).
-    def _elf(etype, cls=2):
-        return (b"\x7fELF" + bytes([cls]) + b"\0" * 11
-                + etype.to_bytes(2, "little") + b"\0" * 8)
+    # ONE set of builders for BOTH header readers — `binary_shared_lib_shape`
+    # (what KIND of image is this?) and `binary_target_identity` (what TARGET is
+    # it for?). The identity fields carry defaults so every assertion below
+    # reads exactly as it did before they existed, and the endianness parameter
+    # is there because `binary_target_identity` takes byte order from EI_DATA
+    # and must be shown doing so.
+    def _elf(etype, cls=2, machine=EM_X86_64, osabi=0, endian="<"):
+        order = "little" if endian == "<" else "big"
+        head = bytearray(b"\x7fELF" + bytes([cls]) + b"\0" * 15 + b"\0" * 4)
+        head[5] = 1 if endian == "<" else 2      # EI_DATA
+        head[7] = osabi                          # EI_OSABI
+        head[16:18] = etype.to_bytes(2, order)   # e_type
+        head[18:20] = machine.to_bytes(2, order)  # e_machine
+        return bytes(head)
 
-    def _pe(chars):
+    def _pe(chars, machine=IMAGE_FILE_MACHINE_AMD64):
         head = bytearray(b"MZ" + b"\0" * 0x3E)
         head[0x3C:0x40] = (0x40).to_bytes(4, "little")
         pe = bytearray(b"PE\0\0" + b"\0" * 20)
+        pe[4:6] = machine.to_bytes(2, "little")
         pe[22:24] = chars.to_bytes(2, "little")
         return bytes(head) + bytes(pe)
 
-    def _macho(filetype):
-        return (MH_MAGIC_64.to_bytes(4, "little") + b"\0" * 8
+    def _macho(filetype, cputype=MACHO_CPU_TYPES["x86_64"]):
+        return (MH_MAGIC_64.to_bytes(4, "little")
+                + cputype.to_bytes(4, "little") + b"\0" * 4
                 + filetype.to_bytes(4, "little") + b"\0" * 16)
 
     for _blob, _want in [
@@ -7023,6 +8164,187 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("every shape carries a reason, on both outcomes",
           all(binary_shared_lib_shape(b)[2]
               for b in (b"", _elf(ET_DYN), _pe(0x22), _macho(2), b"junk")))
+
+    # ── WHICH TARGET A BINARY IS FOR, READ OUT OF THE BINARY ────────────────
+    # The other half of the same question, and the input a smoke gate needs
+    # before it can attribute anything: a binary that will not run because it is
+    # for another machine is not a compiler defect, and an exit code cannot tell
+    # the two apart. ALL FIVE of this catalogue's targets, over SYNTHESISED
+    # headers, so every arm is asserted on whatever host is running.
+    for _blob, _want in [
+        (_elf(2, machine=EM_X86_64), ("x86_64", "elf64", "linux")),
+        (_elf(2, machine=EM_AARCH64), ("arm64", "elf64", "linux")),
+        (_pe(0x22, machine=IMAGE_FILE_MACHINE_AMD64),
+         ("x86_64", "pe64", "windows")),
+        (_pe(0x22, machine=IMAGE_FILE_MACHINE_ARM64),
+         ("arm64", "pe64", "windows")),
+        (_macho(2, cputype=MACHO_CPU_TYPES["x86_64"]),
+         ("x86_64", "macho64", "darwin")),
+        (_macho(2, cputype=MACHO_CPU_TYPES["arm64"]),
+         ("arm64", "macho64", "darwin")),
+    ]:
+        check("a synthetic %s/%s/%s header identifies as itself" % _want,
+              binary_target_identity(_blob) == _want,
+              "got %r" % (binary_target_identity(_blob),))
+    # ✔MEASURED, this host, through the shipped CLI: a Windows notepad.exe reads
+    # x86_64/pe64/windows, WSL's /bin/ls reads x86_64/elf64/linux, and
+    # /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 reads arm64/elf64/linux.
+    # The synthetic cells above are what make the OTHER arms assertable here.
+    #
+    # A BIG-ENDIAN ELF is read correctly — byte order from EI_DATA, never from
+    # the host. Mirrors the same assertion on the Tcl reader below; a host-keyed
+    # struct format would report this one as x86_64 on every machine this
+    # project owns (0xB7 byte-swapped is 0xB700, which is in no table, so the
+    # failure would at least be loud — but it would be loud about the wrong
+    # thing).
+    check("the identity reader is not host-endian",
+          binary_target_identity(_elf(2, machine=EM_AARCH64, endian=">"))
+          == ("arm64", "elf64", "linux"))
+    # ★ AND THE REFUSALS. Every one of these must RAISE rather than default:
+    # the caller is deciding whether a binary that would not run is this
+    # compiler's fault, and a guess there is a verdict about the compiler.
+    check("an UNKNOWN EI_OSABI RAISES rather than defaulting to linux",
+          _raises(lambda: binary_target_identity(
+              _elf(2, machine=EM_X86_64, osabi=9))),
+          "ELFOSABI_FREEBSD=9 — ELF's identity does not carry an OS the way PE "
+          "and Mach-O do, so an unmapped value is a target nobody declared")
+    check("...and the refusal names EI_OSABI and the values it does know",
+          "EI_OSABI" in _raise_text(lambda: binary_target_identity(
+              _elf(2, machine=EM_X86_64, osabi=9))))
+    check("EI_OSABI 0 (SysV) and 3 (GNU) both read as linux — the two values "
+          "this catalogue's own compilers emit",
+          binary_target_identity(_elf(2, osabi=0))[2] == "linux"
+          and binary_target_identity(_elf(2, osabi=3))[2] == "linux",
+          "MEASURED: every shipped elf64-*.format.json declares osabi 'sysv' "
+          "(0), and /bin/ls on this host's WSL carries 0 too")
+    for _what, _blob in (
+            ("an e_machine no leg targets", _elf(2, machine=0x28)),
+            ("a PE Machine no leg targets", _pe(0x22, machine=0x1C0)),
+            ("a Mach-O cputype no leg targets", _macho(2, cputype=0x0000000C)),
+            ("a 32-bit ELF", _elf(2, cls=1)),
+            ("an empty file", b""),
+            ("bytes in no container at all", b"junk-not-a-binary"),
+            ("a Mach-O universal archive",
+             (0xCAFEBABE).to_bytes(4, "big") + (0).to_bytes(4, "big"))):
+        check("%s is REFUSED, never identified as something else" % _what,
+              _raises(lambda b=_blob: binary_target_identity(b)))
+
+    # ── 4-D: THE ARTEFACT'S OWN LOAD-TIME DEMANDS vs THE DECLARATION ────────
+    # After a leg builds, what it will ask of whatever runs it is READABLE, and
+    # every one of those demands must be covered by a declared `requires` row.
+    # ⚠ AND THE LIMIT OF THAT, WHICH IS THE POINT: libgcc_s.so.1 is in NO
+    # DT_NEEDED and NO PT_INTERP — glibc dlopen()s it inside pthread_exit, at
+    # teardown — so a derived list would have been complete, correct, and would
+    # still have missed the thing that aborted three corpus segments.
+    def _elf_exec(interp, needed, endian="<"):
+        """The smallest ELF64 with a PT_INTERP segment and DT_NEEDED entries —
+        the two tables `elf_runtime_dependencies` actually walks, and nothing
+        else."""
+        import struct
+        strtab = bytearray(b"\0")
+        offs = {}
+        for nm in needed:
+            offs[nm] = len(strtab)
+            strtab += nm.encode() + b"\0"
+        interp_b = interp.encode() + b"\0"
+        dyn = b"".join(struct.pack(endian + "qQ", DT_NEEDED, offs[n])
+                       for n in needed)
+        dyn += struct.pack(endian + "qQ", DT_NULL, 0)
+        o_interp = 64 + 56                       # after ehdr + one phdr
+        o_str = o_interp + len(interp_b)
+        o_dyn = o_str + len(strtab)
+        o_sh = o_dyn + len(dyn)
+        phdr = struct.pack(endian + "IIQQQQQQ", PT_INTERP, 4, o_interp, 0, 0,
+                           len(interp_b), len(interp_b), 1)
+        shdrs = b"".join(
+            struct.pack(endian + "IIQQQQIIQQ", 0, st, 0, 0, off, size, link,
+                        0, 0, esz)
+            for st, off, size, link, esz in (
+                (0, 0, 0, 0, 0),                              # SHT_NULL
+                (SHT_STRTAB, o_str, len(strtab), 0, 0),       # 1 .dynstr
+                (SHT_DYNAMIC, o_dyn, len(dyn), 1, 16)))       # 2 .dynamic
+        ehdr = bytearray(64)
+        ehdr[0:6] = b"\x7fELF" + bytes([2, 1 if endian == "<" else 2])
+        ehdr[16:18] = struct.pack(endian + "H", 2)            # ET_EXEC
+        ehdr[18:20] = struct.pack(endian + "H", EM_AARCH64)
+        ehdr[0x20:0x28] = struct.pack(endian + "Q", 64)       # e_phoff
+        ehdr[0x28:0x30] = struct.pack(endian + "Q", o_sh)     # e_shoff
+        ehdr[0x36:0x3A] = struct.pack(endian + "HH", 56, 1)   # phentsize/phnum
+        ehdr[0x3A:0x3E] = struct.pack(endian + "HH", 64, 3)   # shentsize/shnum
+        return bytes(ehdr) + phdr + interp_b + bytes(strtab) + dyn + shdrs
+
+    _ARTEFACT_INTERP = "/lib/ld-linux-aarch64.so.1"
+    _ARTEFACT_NEEDED = ["libtcl8.6.so", "libz.so.1", "libm.so.6", "libc.so.6"]
+    _art = _elf_exec(_ARTEFACT_INTERP, _ARTEFACT_NEEDED)
+    check("the ELF reader recovers PT_INTERP and every DT_NEEDED",
+          elf_runtime_dependencies(_art) == (_ARTEFACT_INTERP, _ARTEFACT_NEEDED),
+          "got %r" % (elf_runtime_dependencies(_art),))
+    check("...and it is not host-endian either",
+          elf_runtime_dependencies(_elf_exec(_ARTEFACT_INTERP, _ARTEFACT_NEEDED,
+                                             endian=">"))
+          == (_ARTEFACT_INTERP, _ARTEFACT_NEEDED))
+    check("a binary with neither segment yields empty, not a crash",
+          elf_runtime_dependencies(_elf(2)) == ("", []))
+    # THE SHIPPED DECLARATION, against a synthetic artefact with the real
+    # interpreter and library set. This is the POSITIVE CONTROL for the mutation
+    # row at the bottom of this self-test: if it did not pass here, that row
+    # would "red" for free and prove nothing.
+    _arm_leg = leg_by_label(legs, "elf64-arm64", path)
+    _arm_entry = launcher_for(_arm_leg, "windows", "x86_64")
+    _arm_rows = resolve_launcher_requirements(_arm_entry, "elf64-arm64")
+    _cov = dependency_coverage_findings("elf64-arm64", _arm_rows,
+                                        _ARTEFACT_INTERP, _ARTEFACT_NEEDED,
+                                        _staged_library_names(_arm_leg))
+    check("the SHIPPED elf64-arm64 Windows launcher covers everything its "
+          "artefact asks for at load time", not _cov, "\n      ".join(_cov))
+    check("dropping the ld-linux row leaves PT_INTERP UNCOVERED",
+          any("PT_INTERP" in f for f in dependency_coverage_findings(
+              "elf64-arm64",
+              [r for r in _arm_rows if "ld-linux" not in r["path"]],
+              _ARTEFACT_INTERP, _ARTEFACT_NEEDED,
+              _staged_library_names(_arm_leg))),
+          "a sysroot DIRECTORY row must NOT be allowed to cover the "
+          "interpreter: 'the sysroot exists' and 'the loader is inside it' are "
+          "two facts and it was the second one that was false")
+    check("a staged library is NOT demanded of the launcher",
+          "libtcl8.6.so" in _staged_library_names(_arm_leg)
+          and not dependency_coverage_findings(
+              "elf64-arm64", _arm_rows, "", ["libtcl8.6.so"],
+              _staged_library_names(_arm_leg)))
+    check("with NO directory row, an unstaged DT_NEEDED is reported",
+          any("libc.so.6" in f for f in dependency_coverage_findings(
+              "fx", [r for r in _arm_rows if r["kind"] == "file"],
+              "", ["libc.so.6"], [])))
+    # ★ AND THE CHECK MUST SAY WHEN IT DID NOT APPLY. Only the ELF reader lives
+    # here, so a PE or Mach-O artefact yields nothing to cross-check — and "no
+    # findings" would read as "checked and clean", which is the shape of every
+    # instrument in this project that has ever reported success over something
+    # it could not observe.
+    import tempfile as _atf
+    _adir = _atf.mkdtemp(prefix="dss-legs-artefact-")
+    try:
+        _apaths = {}
+        for _nm, _bytes in (("elf", _art), ("pe", _pe(0x22)),
+                            ("junk", b"not an object file")):
+            _apaths[_nm] = os.path.join(_adir, _nm + ".bin")
+            with open(_apaths[_nm], "wb") as _fh:
+                _fh.write(_bytes)
+        _r = check_launcher(_arm_leg, "windows", "x86_64", {"wsl.exe"},
+                            runner=lambda a: (0, "", ""),
+                            artifact=_apaths["elf"])
+        check("the cross-check reports that it APPLIED, and to what",
+              _r["crossCheck"].startswith("applied:")
+              and "ld-linux-aarch64.so.1" in _r["crossCheck"],
+              "%r" % (_r["crossCheck"],))
+        for _nm in ("pe", "junk"):
+            _r = check_launcher(_arm_leg, "windows", "x86_64", {"wsl.exe"},
+                                runner=lambda a: (0, "", ""),
+                                artifact=_apaths[_nm])
+            check("a %s artefact reports NOT APPLIED rather than clean" % _nm,
+                  _r["crossCheck"].startswith("NOT APPLIED") and _r["ok"],
+                  "%r" % (_r["crossCheck"],))
+    finally:
+        shutil.rmtree(_adir, ignore_errors=True)
 
     # ── the FOURTH, PER-LEG Tcl coherence check ──────────────────────────────
     # [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED]
@@ -7413,13 +8735,35 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         with open(path, "r", encoding="utf-8") as _f:
             _doc = json.load(_f)
         # (target OS the mutation is applied to, key it breaks, what it does,
-        # how). The KEY is carried explicitly rather than sniffed out of the
-        # label: a finding about the OTHER key would let a mutation pass for the
-        # wrong reason, which is how a red-on-disable becomes decorative. The
-        # target OS is carried too because a wrong declaration is only wrong on
-        # the target it disagrees with — `HAVE_PREAD64: true` is CORRECT on the
-        # Linux legs and is the shipped defect on the Darwin ones.
-        for _os, _key, _variant, _mutate in (
+        # how [, the CHECKER that must red]). The KEY is carried explicitly
+        # rather than sniffed out of the label: a finding about the OTHER key
+        # would let a mutation pass for the wrong reason, which is how a
+        # red-on-disable becomes decorative. The target OS is carried too because
+        # a wrong declaration is only wrong on the target it disagrees with —
+        # `HAVE_PREAD64: true` is CORRECT on the Linux legs and is the shipped
+        # defect on the Darwin ones.
+        #
+        # ★ THE OPTIONAL FIFTH ELEMENT is the checker the mutation must red
+        # under, defaulting to `lint`. One row needs it: the artefact's
+        # PT_INTERP/DT_NEEDED cross-check cannot live in `lint` because at lint
+        # time there IS no artefact — and it is exactly the check that decides
+        # whether the ld-linux declaration is load-bearing or decorative, so it
+        # gets driven here rather than trusted.
+        def _interp_cross_check(mutated_path):
+            _l = leg_by_label(load_catalogue(mutated_path), "elf64-arm64",
+                              mutated_path)
+            _e = launcher_for(_l, "windows", "x86_64")
+            _interp, _needed = elf_runtime_dependencies(_art)
+            return dependency_coverage_findings(
+                "elf64-arm64",
+                resolve_launcher_requirements(_e, "elf64-arm64"),
+                _interp, _needed, _staged_library_names(_l))
+
+        def _each_launcher(leg, fn):
+            for _e in leg.get("launchers", []):
+                fn(_e)
+
+        for _row in (
             ("windows", "loadExtHelperName", "a POSIX helper name on the Windows leg",
              lambda l: l["build"].update(loadExtHelperName="libtestloadext.so")),
             ("windows", "loadExtHelperName", "no helper name at all",
@@ -7459,7 +8803,50 @@ def self_test(path=CATALOGUE, out=sys.stdout):
             # nothing.
             ("darwin", "HAVE_OFF64_T", "an invented configure answer",
              lambda l: l["build"]["configureAnswers"].update(HAVE_OFF64_T=False)),
+            # ★ RED ON DISABLE FOR `launchers[].requires` AND ITS `env`. Every
+            # one of these was a state the catalogue could reach BEFORE this
+            # change and nothing anywhere said a word about it.
+            ("linux", "no `requires`", "a launcher declaring no requires at all",
+             lambda l: _each_launcher(l, lambda e: e.pop("requires", None))),
+            ("linux", "kind", "a requirement of a kind nothing implements",
+             lambda l: _each_launcher(
+                 l, lambda e: e["requires"] and e["requires"][0].update(kind="socket"))),
+            ("linux", "${QEMU_LD_PREFIX}",
+             "a ${VAR} this entry's own env does not declare",
+             lambda l: _each_launcher(
+                 l, lambda e: "QEMU_LD_PREFIX" in e.get("env", {})
+                 and e["env"].update({"SYSROOT_TYPO": e["env"].pop("QEMU_LD_PREFIX")}))),
+            ("linux", "install", "a requirement that states no remedy",
+             lambda l: _each_launcher(
+                 l, lambda e: [r.pop("install", None) for r in e.get("requires", [])])),
+            ("linux", "windows-drive",
+             "a DRIVER-namespace path in a windows-to-wsl launcher's env",
+             lambda l: _each_launcher(
+                 l, lambda e: e.get("pathTranslation") != "none"
+                 and "QEMU_LD_PREFIX" in e.get("env", {})
+                 and e["env"].update(QEMU_LD_PREFIX="C:\\sysroot"))),
+            ("linux", "QEMU_LD_PREFIX",
+             "a path-valued env with NO requires row referencing it",
+             lambda l: _each_launcher(
+                 l, lambda e: e.update(requires=[
+                     r for r in e.get("requires", [])
+                     if "${QEMU_LD_PREFIX}" not in r.get("path", "")]))),
+            # ★★ AND THE SHIPPED DEFECT ITSELF. `${QEMU_LD_PREFIX}/lib/
+            # ld-linux-aarch64.so.1` is the exact file whose absence produced
+            # rc=255 with no diagnostic and 14 units charged to this compiler.
+            # Drop that row and the artefact's own PT_INTERP is covered by
+            # NOTHING — if this does not red, the declaration is decorative and
+            # the next person to tidy the catalogue removes it for free.
+            ("linux", "ld-linux-aarch64.so.1",
+             "the ld-linux row dropped, against the artefact's own PT_INTERP",
+             lambda l: _each_launcher(
+                 l, lambda e: e.update(requires=[
+                     r for r in e.get("requires", [])
+                     if "ld-linux" not in r.get("path", "")])),
+             _interp_cross_check),
         ):
+            _os, _key, _variant, _mutate = _row[:4]
+            _checker = _row[4] if len(_row) > 4 else lint
             _copy = json.loads(json.dumps(_doc))
             for _l in _copy["legs"]:
                 if spec_target_os(_l["spec"]) == _os:
@@ -7467,9 +8854,10 @@ def self_test(path=CATALOGUE, out=sys.stdout):
             _p = os.path.join(_mut_dir, "legs.json")
             with open(_p, "w", encoding="utf-8") as _f:
                 json.dump(_copy, _f)
-            _found = [f for f in lint(_p) if _key in f]
+            _found = [f for f in _checker(_p) if _key in f]
             check("the lint REDS on %s" % _variant, bool(_found),
-                  "lint said nothing about %s — the check is dead config" % _key)
+                  "nothing said anything about %s — the check is dead config"
+                  % _key)
     finally:
         shutil.rmtree(_mut_dir, ignore_errors=True)
 
@@ -7767,6 +9155,41 @@ def main(argv=None):
     p.add_argument("--driver-run-dir", default="", metavar="DIR",
                    help="this driver's OWN run directory for the leg, as this "
                         "driver spells it (--run-dir-plan)")
+    # ── what a launcher needs BEYOND its own argv[0] ────────────────────────
+    p.add_argument("--check-launcher", default=None, metavar="LABEL",
+                   help="EXECUTE this leg's declared launcher prerequisites on "
+                        "THIS machine (legs.json `launchers[].requires`) and "
+                        "print the result as JSON: {ok, verdict, missing[]}. "
+                        "rc 0 met, 3 unmet. The plan stays pure — it RESOLVES "
+                        "the rows (paths expanded over the entry's own `env`, "
+                        "probe argv built from its own runFilesystem) and this "
+                        "runs them. Closes the hole where "
+                        "`shutil.which('wsl.exe')` answered for a launcher whose "
+                        "real argv[0] is `qemu-aarch64` INSIDE the distro.")
+    p.add_argument("--artifact", default="", metavar="PATH",
+                   help="with --check-launcher: ALSO cross-check the built "
+                        "binary's own PT_INTERP and DT_NEEDED against the "
+                        "declared rows, so the declaration cannot silently "
+                        "shrink below what the artefact demands. ⚠ It can never "
+                        "GROW the list either: libgcc_s.so.1 is dlopen()ed by "
+                        "glibc at pthread_exit and appears in no DT_NEEDED, "
+                        "which is why the rows are declared prose with evidence "
+                        "rather than a computed set.")
+    p.add_argument("--identify-binary", default=None, metavar="PATH",
+                   help="print '<arch>\\t<container>\\t<targetOs>' read from the "
+                        "binary's OWN header (ELF e_machine + EI_OSABI, PE "
+                        "Machine, Mach-O cputype). No external tool. rc 3 and a "
+                        "named diagnostic on bytes it cannot identify — never a "
+                        "default, because the caller is deciding whether a "
+                        "binary that would not run is this compiler's fault.")
+    p.add_argument("--launcher-for-target", default=None,
+                   metavar="ARCH:CONTAINER:TARGETOS",
+                   help="print the launcher argv THIS host runs that target's "
+                        "binaries with, shlex-quoted exactly as a plan's "
+                        "LEG_LAUNCH. Takes the triple --identify-binary prints, "
+                        "so the two pipe together. Empty stdout + a NAMED reason "
+                        "on stderr when the leg runs natively (rc 0) or when no "
+                        "leg matches / this host cannot run it (rc 3).")
     args = p.parse_args(argv)
 
     if not (args.verdict_vocabulary or args.plan or args.lint or args.self_test
@@ -7777,7 +9200,8 @@ def main(argv=None):
             or args.resolve_target_cc or args.build_loadext_helper
             or args.loadext_builder or args.tcl_coherence
             or args.run_filesystems or args.run_dir_plan
-            or args.stage_build
+            or args.stage_build or args.check_launcher or args.identify_binary
+            or args.launcher_for_target
             or args.registry_controls or args.check_regions):
         p.error("one of --verdict-vocabulary / --plan / --header-stages / "
                 "--config-stages / --stage-build / --lint "
@@ -7787,7 +9211,12 @@ def main(argv=None):
                 "--acquire / --acquire-plan / --resolve-library-argv / "
                 "--resolve-target-cc / --build-loadext-helper / "
                 "--loadext-builder / --tcl-coherence / --run-filesystems / "
-                "--run-dir-plan is required")
+                "--run-dir-plan / --check-launcher / --identify-binary / "
+                "--launcher-for-target is required")
+    if args.artifact and not args.check_launcher:
+        p.error("--artifact is the 4-D cross-check of --check-launcher (the "
+                "artefact's own PT_INTERP/DT_NEEDED against the declared rows) "
+                "and means nothing without it")
     if args.run_dir_plan and not args.driver_run_dir:
         p.error("--run-dir-plan requires --driver-run-dir <dir> — the launcher's "
                 "run directory is DERIVED from this driver's own so that two "
@@ -8026,6 +9455,26 @@ def main(argv=None):
         if args.run_filesystems:
             sys.stdout.write("\n".join(sorted(RUN_FILESYSTEMS)) + "\n")
             return 0
+        if args.identify_binary:
+            # Host-free: it reads bytes. Deliberately OUTSIDE the LegError
+            # handler's rc 2 — an unidentifiable binary is this subcommand's
+            # own named outcome (rc 3), not a catalogue defect, and a caller
+            # that has to tell the two apart cannot do it from one code.
+            try:
+                with open(args.identify_binary, "rb") as fh:
+                    blob = fh.read()
+            except OSError as exc:
+                sys.stderr.write("harness_legs.py: cannot read %s: %s\n"
+                                 % (_fwd(args.identify_binary), exc))
+                return 3
+            try:
+                arch, container, target_os = binary_target_identity(blob)
+            except LegError as exc:
+                sys.stderr.write("harness_legs.py: %s: %s\n"
+                                 % (_fwd(args.identify_binary), exc))
+                return 3
+            sys.stdout.write("%s\t%s\t%s\n" % (arch, container, target_os))
+            return 0
 
         if args.launchers_none and args.launchers_available is not None:
             p.error("--launchers-none and --launchers-available are exclusive")
@@ -8042,6 +9491,32 @@ def main(argv=None):
             json.dump(run_dir_plan(leg, host_os, host_arch, available,
                                    args.driver_run_dir), sys.stdout, indent=2)
             sys.stdout.write("\n")
+            return 0
+        if args.check_launcher:
+            legs = load_catalogue(args.catalogue)
+            leg = leg_by_label(legs, args.check_launcher, "--check-launcher")
+            report = check_launcher(leg, host_os, host_arch, available,
+                                    artifact=args.artifact or None)
+            # The REPORT on stdout on BOTH outcomes — a driver needs the rows
+            # most when one of them is missing — and the rc names the outcome so
+            # a caller never classifies prose. rc 3 sits with --resolve-target-cc's
+            # and --build-loadext-helper's, apart from the LegError rc 2.
+            sys.stdout.write(json.dumps(report, indent=1, sort_keys=True) + "\n")
+            return 0 if report["ok"] else 3
+        if args.launcher_for_target:
+            legs = load_catalogue(args.catalogue)
+            argv_, reason = launcher_for_target(legs, args.launcher_for_target,
+                                                host_os, host_arch, available)
+            sys.stderr.write("harness_legs.py: %s\n" % reason)
+            if argv_ is None:
+                return 3
+            # Quoted EXACTLY as emit_sh's LEG_LAUNCH, so a driver that already
+            # consumes that variable consumes this identically — a second
+            # quoting convention for the same argv is a silent harness bug.
+            # A NATIVE run prints NOTHING (its reason is on stderr) rather than
+            # an empty line: "" and "\n" are different answers to `read`.
+            if argv_:
+                sys.stdout.write(" ".join(shlex.quote(x) for x in argv_) + "\n")
             return 0
         resolved = plan(host_os, host_arch, available, args.catalogue)
         if args.format == "sh":

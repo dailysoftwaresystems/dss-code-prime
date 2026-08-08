@@ -28,9 +28,14 @@ function Warn($m) { "      WARN: $m" }
 # host's "OK (N assertions)". This file now has a skippable block of its own, so it
 # inherits the same hazard and the same cure.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN.
-$TotalAssertions = 63     # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
+$TotalAssertions = 95     # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
                           # + 5 structural + 8 staged sqlite_cfg.h (5 this driver, 3 .sh pairing)
                           # + 6 launcher argv form (4 structural + 2 behavioural, python-gated)
+                          # + 28 BOTH-DRIVERS pairing: the launcher-prerequisite
+                          #   gate (and that it precedes Step 7b), the MEASURED
+                          #   --cli-target/--reference-target, the
+                          #   catalogue-resolved reference launcher, the
+                          #   host-identity flag's ABSENCE, and the rc table
                           # + 6 THE SUPPLY (Get-LegConfounds) — the half that was
                           #   never tested, and where the defect actually was
 $pass = 0; $fail = 0; $skip = 0
@@ -417,7 +422,14 @@ Check "...and removes the deriving host's copy too"               ($shCode -matc
 # space form" would red on a CORRECT driver, and a full-text "emits the = form"
 # would stay green on a broken one.
 Check "the .ps1 emits the ``=`` form for --launcher"          ($ps1Code -match '--launcher=\$t')
-Check "...and for the sibling that actually broke the gate"   ($ps1Code -match '--reference-launcher=-e')
+# ⚠ THIS USED TO PIN THE LITERAL `--reference-launcher=-e`, and that spelling is
+# GONE ON PURPOSE. The `-e` was half of a hardcoded host branch, which is exactly
+# why the attribution oracle was unmatched: the reference ran host-native x86_64
+# while DSS ran arm64 under qemu. The tokens now come from the CATALOGUE, resolved
+# by --launcher-for-target off the reference's own MEASURED target - so what
+# survives here is the ARGV FORM the anchor is actually about: the `=` spelling on
+# a token that may begin with a dash.
+Check "...and for the sibling that actually broke the gate"   ($ps1Code -match '--reference-launcher=\$t')
 # ★ THE SPLIT SHAPE IS NOT A SPACE. MEASURED while demonstrating this guard:
 # reverting to `@("--launcher", "$t")` produces NO literal `--launcher ` anywhere,
 # because PowerShell passes the option and its value as two ARRAY ELEMENTS - so a
@@ -450,6 +462,95 @@ if (-not $py) {
   Check "...while the ``=`` form consumes BOTH tokens and reaches the required-arg check" `
         ($eqOut -match 'the following arguments are required: --cli')
 }
+
+# ── BOTH DRIVERS, OR THE CAPABILITY IS A SILENT HARNESS BUG ─────────────────
+# The twin of the pairing section in test-confound-scope.sh, run FROM THE
+# PowerShell SIDE — because that suite never runs on a Windows-only host
+# (build-and-test.ps1 self-tests with this file, build-and-test.sh with the .sh
+# one), and a parity check that exists only in the suite one driver runs is itself
+# the asymmetry it is meant to catch.
+"--- BOTH DRIVERS: the launcher-prerequisite gate + the MEASURED smoke targets ---"
+# A launcher's argv[0] resolving is a much weaker fact than it reads as: on a
+# Windows host the arm64 leg's argv[0] is `wsl.exe` while the program that runs the
+# artefact is `qemu-aarch64` INSIDE the distro. `--check-launcher` executes the
+# DECLARED prerequisite rows in the launcher's own namespace. A gate in one driver
+# and not the other would be INVISIBLE on the missing side: that driver would run a
+# corpus that cannot start and charge every failure to the compiler.
+# ── THE TWO NEW `dss:` REGIONS ARE MARKED IN BOTH DRIVERS ──────────────────
+# TF-C136. DSS_REGIONS names this file as a VERIFIER of both regions, and that
+# claim is only true if this file actually READS THE SENTINEL. A row claiming a
+# verifier that never mentions its region is the precise defect the region
+# registry exists to catch, so these four checks are what make the declaration
+# honest instead of decorative. They also stop the markers being deleted as
+# "just comments" — they are the boundary the contract sections extract.
+Check "the .ps1 marks the launcher-prerequisite region" ($ps1Txt -match 'dss:launcher-prereq')
+Check "the .sh marks it too"                            ($shTxt  -match 'dss:launcher-prereq')
+Check "the .ps1 marks the smoke-target-identity region" ($ps1Txt -match 'dss:smoke-targets')
+Check "the .sh marks it too"                            ($shTxt  -match 'dss:smoke-targets')
+Check "the .ps1 runs --check-launcher"        ($ps1Code -match '--check-launcher')
+Check "the .sh runs it too"                   ($shCode  -match '--check-launcher')
+Check "...the .ps1 names the new verdict"     ($ps1Code -match 'skipped-launcher-prerequisite-missing')
+Check "...the .sh names it too"               ($shCode  -match 'skipped-launcher-prerequisite-missing')
+# ★ AND IT RUNS BEFORE THE CORPUS IS ENTERED. Presence alone is satisfied by a
+# check that runs after the leg has already been executed, which is no check.
+# ⚠ Compared as LINE NUMBERS: a driver that calls --check-launcher twice would put
+# two of its own hits at the head of a merged match list and the Step-7b anchor
+# would never be examined.
+function FirstLine($pattern, $text) {
+  $ls = ($text -split "`n")
+  for ($i = 0; $i -lt $ls.Count; $i++) { if ($ls[$i].Contains($pattern)) { return $i } }
+  return -1
+}
+$psChk = FirstLine '--check-launcher' $ps1Code; $ps7b = FirstLine 'Step "7b/9' $ps1Code
+$shChk = FirstLine '--check-launcher' $shCode;  $sh7b = FirstLine 'step "7b/9' $shCode
+Check "the .ps1 gate precedes its Step 7b (at $psChk, before $ps7b)" ($psChk -ge 0 -and $ps7b -gt $psChk)
+Check "the .sh gate precedes its Step 7b (at $shChk, before $sh7b)"  ($shChk -ge 0 -and $sh7b -gt $shChk)
+# cli-smoke.py's new required args: `--leg-spec` is the DECLARATION off the plan,
+# `--cli-target` and `--reference-target` are MEASURED out of the binaries' own
+# headers by `--identify-binary`. Feeding it the declaration twice would make its
+# wrong-target check compare a value with itself.
+Check "the .ps1 identifies each binary"       ($ps1Code -match '--identify-binary')
+Check "the .sh identifies each binary"        ($shCode  -match '--identify-binary')
+# BOTH BINARIES, NAMED. "the driver calls --identify-binary" is satisfied by a
+# driver that identifies ONE of them and guesses the other — and the guess would be
+# the reference, which is the half that decides whether anything is exonerated.
+Check "...the .ps1 identifies the REFERENCE"  ($ps1Code -match '\$refId = Get-BinaryTarget \$RefCliWin')
+Check "...the .sh identifies the REFERENCE"   ($shCode  -match 'identify_binary_triple "\$REF_CLI"')
+Check "...the .ps1 identifies the LEG's CLI"  ($ps1Code -match '\$cliId = Get-BinaryTarget \$CliBuilt\[\$lbl\]')
+Check "...the .sh identifies the LEG's CLI"   ($shCode  -match 'identify_binary_triple "\$\{CLI_BIN\[\$leg\]\}"')
+Check "the .ps1 passes --leg-spec"            ($ps1Code -match '--leg-spec')
+Check "the .sh passes --leg-spec"             ($shCode  -match '--leg-spec')
+Check "the .ps1 passes a MEASURED --cli-target"       ($ps1Code -match "'--cli-target',\s+\`$cliId\.Target")
+Check "the .sh passes a MEASURED --cli-target"        ($shCode  -match '--cli-target "\$_cli_target"')
+Check "the .ps1 passes a MEASURED --reference-target" ($ps1Code -match "'--reference-target', \`$RefCliTarget")
+Check "the .sh passes a MEASURED --reference-target"  ($shCode  -match '--reference-target "\$REF_CLI_TARGET"')
+Check "the .ps1 asks --launcher-for-target for the reference's launcher" ($ps1Code -match '--launcher-for-target')
+Check "the .sh asks --launcher-for-target too"                          ($shCode  -match '--launcher-for-target')
+# ★★ AND THE ABSENCE, WHICH IS THE FIX. The host-identity flag that used to pick
+# the reference's launcher is what made the oracle unmatched — it ran the reference
+# host-native x86_64 while DSS ran arm64 under qemu, then charged every difference
+# to DSS. Asserted over the Step-7c block INCLUDING ITS COMMENTS: the driver is
+# written so the name appears nowhere there, precisely so this guard cannot be
+# weakened into a comment-stripped view. (The .sh never had such a flag; its half
+# of the same bug was passing NO reference launcher at all, pinned positively above.)
+$smokeStart = -1; $smokeEnd = -1
+for ($i = 0; $i -lt $lines.Count; $i++) {
+  if ($smokeStart -lt 0) { if ($lines[$i].Contains('Step "7c/9')) { $smokeStart = $i } }
+  elseif ($lines[$i].Contains('# ── Step 8 — ')) { $smokeEnd = $i; break }
+}
+# THE MATCHER'S OWN CONTROL FIRST: "no hits" is satisfied by a range that matches
+# nothing at all, which would make the absence assertion a permanent green.
+Check "the .ps1 Step-7c block is still found (so the absence below means something)" `
+      ($smokeStart -ge 0 -and $smokeEnd -gt $smokeStart + 20)
+$smokeBlock = if ($smokeStart -ge 0 -and $smokeEnd -gt $smokeStart) { ($lines[$smokeStart..($smokeEnd - 1)] -join "`n") } else { 'HostNeedsWsl' }
+Check "the host-identity flag is ABSENT from the .ps1 smoke block" (-not $smokeBlock.Contains('HostNeedsWsl'))
+# THE rc TABLE: 4 and 2 are not accusations, 1 is.
+Check "the .ps1 has an arm for rc 4"  ($ps1Code -match 'NOT A VERDICT \(unattributable\)')
+Check "the .sh has an arm for rc 4"   ($shCode  -match 'NOT A VERDICT \(unattributable\)')
+Check "the .ps1 has an arm for rc 2"  ($ps1Code -match 'HARNESS ARGV DEFECT')
+Check "the .sh has an arm for rc 2"   ($shCode  -match 'HARNESS ARGV DEFECT')
+Check "the .ps1 has an arm for rc 1"  ($ps1Code -match 'CHARGED TO DSS \(a MATCHED gcc control')
+Check "the .sh has an arm for rc 1"   ($shCode  -match 'CHARGED TO DSS \(a MATCHED gcc control')
 
 # ═══════════════════════════════════════════════════════════════════════════
 # THE SUPPLY - WHERE THAT PATTERN ARRAY CAME FROM
