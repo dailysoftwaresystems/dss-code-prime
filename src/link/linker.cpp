@@ -489,6 +489,180 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         strippedExterns.insert(ref.reference);
     }
 
+    // ── D-LK11-EXTERN-IMPORT-DEDUP — coalesce the merged CUs' duplicate extern
+    // imports into ONE row per imported DYNAMIC SYMBOL, and FOLD their payloads.
+    //
+    // Before this pass the extern path CONCATENATED. Two CUs both importing
+    // `puts` from `msvcrt.dll` produced TWO rows: `mergedIdFor` mints a FRESH id
+    // per extern (its name-fold consults `nameToId`, which is populated only from
+    // `image.resolvedGlobalDefs` — DEFINITIONS, never imports), so nothing ever
+    // folded them and the walkers faithfully emitted both. MEASURED at 2 CUs: PE
+    // → 2 IAT/ILT thunk rows + 2 `IMAGE_IMPORT_BY_NAME` in one descriptor; ELF →
+    // 2 `.dynsym` entries carrying the IDENTICAL name, 2 `.rela.dyn` GLOB_DAT
+    // rows, and a 24-byte `.got` where 16 is correct. 4 CUs → 4 of each.
+    //
+    // DEDUP KEY = (mangledName, libraryPath, version) — the triple that IDENTIFIES
+    // a dynamic symbol, and nothing weaker:
+    //   * `libraryPath` is IN the key: `foo` from `a.dll` and `foo` from `b.dll`
+    //     are different imports (it is the very field the walkers group DT_NEEDED
+    //     / IMAGE_IMPORT_DESCRIPTOR / LC_LOAD_DYLIB by).
+    //   * `version` is IN the key: `puts@GLIBC_2.2.5` and `puts@GLIBC_2.17` are
+    //     genuinely different dynamic symbols (c156 D-LK-ELF-SYMBOL-VERSIONING).
+    //     Folding them would bind one of the two call sites to the wrong glibc
+    //     compat form — precisely the misbind c156 exists to prevent, so a
+    //     name-only key would REINTRODUCE it here.
+    // The key is LENGTH-PREFIXED, not separator-joined: a mangledName is arbitrary
+    // bytes from a descriptor, so any separator-joined encoding is non-injective
+    // (two different triples could collide into one key and fold two UNRELATED
+    // imports). AGNOSTIC: the fold is structural equality on declared data — a
+    // `.dynsym` row and an IAT slot dedup by the same rule, no format/arch/
+    // language branch.
+    //
+    // RETARGETING IS FREE — pre-seeding `remap` is the WHOLE retarget. `mergedIdFor`
+    // consults `remap` FIRST, and every consumer of a symbol id routes through it:
+    // the single `retargetRelocs` chokepoint (functions AND data items),
+    // `combined.symbols`, and `userEntrySymbol`. Same mechanism the cross-CU
+    // reference bind above already uses.
+    //
+    // PLACEMENT is forced: AFTER the `resolvedGlobalDefs` pre-assignment and AFTER
+    // the thunk-slot mint (both seed `remap` / consume `nextId`), and BEFORE the
+    // emission loop (module 0's relocations are retargeted in that loop's first
+    // iteration, before module 1's externs would otherwise have been seen).
+    // A cross-CU-resolved extern is SKIPPED: its `remap` entry already points at
+    // the sibling def / thunk slot, and overwriting that would un-bind the call.
+    //
+    // ★ THE PAYLOAD IS FOLDED, NEVER DROPPED. Keeping the first row and discarding
+    // the rest is a SILENT MISCOMPILE, not a size win — see the per-field rules at
+    // each site below.
+    //
+    // ★★ THE TWO TIERS NOW AGREE, AND THAT IS LOAD-BEARING — keep them in step.
+    // The MIR-tier merge (mir_merge.cpp `ffiCanonicalForName` + `survivingExterns`)
+    // performs the same fold on the LIVE route (`--compile a.c b.c`, every
+    // `--project` build, both sqlite legs); this assembled-tier merge is reached
+    // only via `--resolve-library`. Both key on the SAME triple
+    // (mangledName, libraryPath, version) and both FAIL LOUD on the same four
+    // fields. ⚠ HISTORY, so the weaker shape is not re-introduced as a
+    // "simplification": until TF-C119 the MIR tier keyed on mangledName ALONE —
+    // folding across libraryPath AND across `version`, which is the c156
+    // D-LK-ELF-SYMBOL-VERSIONING misbind shape — and was first-wins on every field
+    // but `isEagerImport`. The safer tier had been hardened first and the reachable
+    // one left weaker; they were harmonized in the same cycle. A divergence here is
+    // a defect, not a design choice.
+    {
+        // Length-prefixed ⇒ injective over arbitrary field bytes.
+        auto const dedupKey = [](ExternImport const& e) {
+            return std::format("{}:{}|{}:{}|{}:{}",
+                               e.mangledName.size(), e.mangledName,
+                               e.libraryPath.size(), e.libraryPath,
+                               e.version.size(), e.version);
+        };
+        // A disagreement between two CUs about ONE dynamic symbol is a REAL
+        // conflict, never a pick-one. It gets its OWN code rather than borrowing
+        // `K_SymbolRedefinedAcrossUnits`: an import ATTRIBUTE conflict is not a
+        // redefinition, and a misfiled code sends the reader hunting the wrong
+        // fault — the defect class TF-C118 closed when every optimizer diagnostic
+        // was printing under the parser's letter.
+        auto const conflict = [&](ExternImport const& e, char const* field,
+                                  std::string const& kept,
+                                  std::string const& incoming) {
+            report(reporter, DiagnosticCode::K_ExternImportAttributeConflict,
+                   DiagnosticSeverity::Error,
+                   "extern import \"" + e.mangledName + "\"" +
+                   (e.libraryPath.empty() ? std::string{}
+                                          : " (library \"" + e.libraryPath + "\")") +
+                   (e.version.empty() ? std::string{}
+                                      : " (version \"" + e.version + "\")") +
+                   " is declared with conflicting " + field +
+                   " across CompilationUnits (" + kept + " vs " + incoming +
+                   ") — one dynamic symbol cannot be imported two ways "
+                   "(D-LK11-EXTERN-IMPORT-DEDUP).");
+        };
+        // `dataSizeBytes` / `dataAlignBytes` SIZE the ELF copy-relocation `.bss`
+        // slot (c84 D-LK-EXTERN-DATA-IMPORT). One CU legitimately holds an
+        // INCOMPLETE type (`extern const char v[];` ⇒ 0/0 — extern_import.hpp
+        // :76-81), so a zero is "unknown here", not a disagreement: take the
+        // non-zero. Two DIFFERING non-zero values would reserve the SAME slot two
+        // ways — the loader memcpy's `st_size` bytes, so picking either silently
+        // truncates or over-copies. Fail loud.
+        auto const foldNonZero = [&](std::uint64_t& kept, std::uint64_t incoming,
+                                     char const* field, ExternImport const& e) {
+            if (incoming == 0 || kept == incoming) return;  // incomplete / agrees
+            if (kept == 0) { kept = incoming; return; }     // the complete type wins
+            conflict(e, field, std::to_string(kept), std::to_string(incoming));
+        };
+        auto const boolStr = [](bool b) { return std::string{b ? "true" : "false"}; };
+
+        std::unordered_map<std::string, std::size_t> externIdxForKey;
+        for (std::size_t i = 0; i < modules.size(); ++i) {
+            for (auto const& ext : modules[i].externImports) {
+                LinkedSymbolKey const key{modules[i].cuId, ext.symbol};
+                if (strippedExterns.contains(key)) continue;  // bound to a sibling def
+                auto const [kit, firstOfItsKind] =
+                    externIdxForKey.try_emplace(dedupKey(ext),
+                                                combined.externImports.size());
+                if (firstOfItsKind) {
+                    ExternImport out = ext;
+                    out.symbol = SymbolId{mergedIdFor(i, ext.symbol)};  // the CANONICAL id
+                    combined.externImports.push_back(std::move(out));
+                    continue;
+                }
+                ExternImport& kept = combined.externImports[kit->second];
+                // THE retarget: every relocation / symbol row that named this CU's
+                // copy now resolves to the canonical id through `mergedIdFor`.
+                // A pre-existing DIFFERENT mapping is impossible (`buildCompoundIndex`
+                // guarantees an extern's SymbolId is unique within its CU, so an
+                // extern key can never collide with a pre-assigned definition key) —
+                // if it ever happens the compound-index contract was breached, and a
+                // silent overwrite would mis-bind a call, so say so LOUD.
+                if (auto const [rit, fresh] = remap.emplace(key, kept.symbol.v);
+                    !fresh && rit->second != kept.symbol.v) {
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           "extern import \"" + ext.mangledName + "\" (CU #" +
+                           std::to_string(modules[i].cuId.v) + ", symbol #" +
+                           std::to_string(ext.symbol.v) + ") already maps to merged "
+                           "id " + std::to_string(rit->second) + " but its dedup group "
+                           "is canonicalized to " + std::to_string(kept.symbol.v) +
+                           " — the (cuId, SymbolId) uniqueness contract the compound "
+                           "index enforces was breached (D-LK11-EXTERN-IMPORT-DEDUP).");
+                }
+                // `isEagerImport` — OR-COMBINE, as extern_import.hpp:112-114 mandates
+                // and the MIR-tier merge implements. Keeping a NON-eager row when a
+                // sibling CU declared the same import EAGER would let
+                // `rejectOrDropUnreferencedExterns` DROP a shipped-descriptor symbol
+                // the loader must bind (D-FFI-DESCRIPTOR-EAGER-IMPORT) — that is a
+                // LOAD failure (pe 0xC0000139 / elf exit 127), not a size regression.
+                // Order-INDEPENDENT: whichever CU lands first, the bit is ORed in.
+                kept.isEagerImport = kept.isEagerImport || ext.isEagerImport;
+                // `isData` / `isThreadLocal` — a disagreement is a REAL conflict, and
+                // silently picking either row is the D-LK-EXTERN-DATA-IMPORT
+                // silent-miscompile shape: `isData` decides whether the walker binds
+                // the name through the DATA-slot model (the ELF copy-relocation) or
+                // the function-import path, so the loser's CU would have every
+                // reference bound through the WRONG model — a PLT stub standing in
+                // for a data object, or a copy-reloc `.bss` slot standing in for a
+                // function. `isThreadLocal` likewise selects the (unimplemented,
+                // walker-rejected) initial-exec TLS model — D-CSUBSET-THREAD-LOCAL.
+                if (kept.isData != ext.isData) {
+                    conflict(ext, "`isData` (data object vs function import)",
+                             boolStr(kept.isData), boolStr(ext.isData));
+                }
+                if (kept.isThreadLocal != ext.isThreadLocal) {
+                    conflict(ext, "`isThreadLocal` (thread storage duration)",
+                             boolStr(kept.isThreadLocal), boolStr(ext.isThreadLocal));
+                }
+                foldNonZero(kept.dataSizeBytes,  ext.dataSizeBytes,
+                            "`dataSizeBytes` (copy-relocation slot size)", ext);
+                foldNonZero(kept.dataAlignBytes, ext.dataAlignBytes,
+                            "`dataAlignBytes` (copy-relocation slot alignment)", ext);
+                // Every remaining ExternImport field is accounted for: `symbol` IS the
+                // dedup output (replaced by the canonical merged id above), and
+                // `mangledName` / `libraryPath` / `version` are the KEY, hence equal
+                // by construction. No field is carried over silently.
+            }
+        }
+    }
+
     // A defined symbol (function or data) is SHADOWED when it is an externally-visible
     // (Global/Weak) definition whose name's WINNING definition (image.resolvedGlobalDefs)
     // lives at a DIFFERENT (cuId, SymbolId) — i.e. this body lost the weak-vs-strong /
@@ -529,14 +703,14 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             retargetRelocs(i, out.relocations);  // same chokepoint as the function path
             combined.dataItems.push_back(std::move(out));
         }
-        for (auto const& ext : m.externImports) {
-            // A cross-CU-resolved extern was bound to a sibling def + retargeted above —
-            // strip it so the walker emits no (spurious) library import for it.
-            if (strippedExterns.contains(LinkedSymbolKey{m.cuId, ext.symbol})) continue;
-            ExternImport out = ext;
-            out.symbol = SymbolId{mergedIdFor(i, ext.symbol)};
-            combined.externImports.push_back(std::move(out));
-        }
+        // `combined.externImports` is NOT built here: the extern path is owned
+        // ENTIRELY by the D-LK11-EXTERN-IMPORT-DEDUP pass above (it strips the
+        // cross-CU-resolved rows, canonicalizes each remaining import to one row,
+        // and folds the duplicates' payloads into it). Emitting here too would
+        // re-introduce the duplicates the pass just coalesced. Row ORDER is
+        // unchanged — that pass walks the same module-major traversal, so imports
+        // still appear in first-occurrence order.
+        //
         // Carry each SURVIVING definition's ModuleSymbol row (name / binding /
         // visibility), re-keyed to the merged id — the walkers' real-name surfaces
         // (the c150 ET_DYN `.dynsym` exports, the c139 ET_REL `.symtab` names, the
@@ -813,31 +987,127 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // the user fn (the trampoline's call target).
     //
     // Without this hook, the emitted executables point e_entry /
-    // AddressOfEntryPoint / LC_MAIN.entryoff directly at the user
-    // fn, which SEGVs on its `ret` epilogue (process entry has no
-    // return address). See §2.13 for the full design.
+    // AddressOfEntryPoint / LC_MAIN.entryoff directly at the user fn.
+    // ★ CORRECTED at the D-LK10-ENTRY entry-gate fold — this line
+    // previously read "which SEGVs on its `ret` epilogue (process
+    // entry has no return address)" as though it held for all three
+    // formats. It does NOT:
+    //   * ELF `e_entry` / PE `AddressOfEntryPoint` — TRUE (DOCUMENTED):
+    //     the kernel/loader JUMPS to the entry, so the user fn's `ret`
+    //     pops whatever the process-entry stack happens to hold (argc
+    //     on ELF) and transfers there. SEGV is the typical outcome.
+    //   * Mach-O `LC_MAIN.entryoff` — FALSE, and it was an untested
+    //     over-generalisation: dyld CALLS that entry, with argc/argv
+    //     already in the argument registers (DOCUMENTED, and pinned
+    //     in-tree by tests/link/test_object_format_schema.cpp
+    //     `ProcessArgsSubstrate.ShippedMachoExecsDeclareNoneAndPe...`),
+    //     and Apple's libdyld `start` wraps it as `exit(main(...))`
+    //     (INFERRED from Apple documentation — NOTHING in this tree
+    //     verifies it; that test asserts only the argc/argv register
+    //     convention, and the TF-C120 audit caught it being cited as
+    //     though it pinned this half too).
+    //     An un-trampolined Mach-O entry RETURNS cleanly and the
+    //     process exits with the returned status — no crash, which is
+    //     precisely why the missing-trampoline defect below survived
+    //     unnoticed: it produced a binary that WORKED for the trivial
+    //     `return 42` case while silently skipping every DSS-side
+    //     entry responsibility (argument materialization, the declared
+    //     exit mechanism).
+    // The trampoline is therefore justified as DSS POLICY — one entry
+    // shape across every exec-flavored format — not as a per-platform
+    // crash avoidance. See §2.13 for the full design.
     //
     // Bypass conditions: caller-provided `imageEntryOverride` (a
     // pre-injected trampoline; do not re-inject) OR empty functions
     // (no module to wrap).
     //
     // c150 (D-LK1-4): the condition is SCHEMA-driven by design — an
-    // ELF ET_DYN `.so` declares NO `processExit` (validate() rejects
-    // it there: entry machinery is exec-flavor-only), so no
+    // ELF ET_DYN `.so` is NOT exec-flavored (it declares none of the
+    // entry cluster, so `isExecFlavor()` is false for it), so no
     // trampoline is synthesized for a shared library (a `.so` has no
     // entry; e_entry = 0). c151 (the D-LK1-4 PIE half, landed):
-    // the ELF ET_DYN PIE schema declares `processExit` (one of its
-    // entry-cluster members) and gets the trampoline through this
-    // same condition — zero gate changes, exactly as designed; its
+    // the ELF ET_DYN PIE schema declares the full entry cluster, IS
+    // exec-flavored, and gets the trampoline through this same
+    // condition — zero gate changes, exactly as designed; its
     // e_entry is the trampoline's BASE-RELATIVE VA (ld.so adds the
-    // load base).
+    // load base). (Both sentences said "`processExit`" before the
+    // entry-gate fold repointed the predicate; on ET_DYN the two are
+    // interchangeable — `isExecFlavor()`'s dyn arm CONTAINS
+    // `processExit.has_value()` — but the exec-flavor spelling is the
+    // one that also holds for ET_EXEC / PE / Mach-O.)
+    //
+    // ★ THE GATE ASKS `isExecFlavor()`, NOT `processExit().has_value()`.
+    // The old spelling tested the very field the emitter would have
+    // failed on (`injectEntryTrampoline`'s opening `!peOpt.has_value()`
+    // refusal — entry_trampoline.cpp:219-229 today; grep the predicate,
+    // not the line, when it drifts) — so the emitter's own fail-loud
+    // was DEAD CODE BY
+    // CONSTRUCTION: the caller could never reach it. `false` here meant
+    // the whole injection block was skipped with NO diagnostic, and the
+    // walker then took its `functions[0]` default. MEASURED on
+    // `macho64-x86_64-darwin-exec` while that format declared no
+    // `processExit`: rc=0, a 4162-byte artifact, `LC_MAIN
+    // entryoff=0x1000`, bytes there `48 81 ec 10 00 00 00`
+    // (`sub rsp,0x10`) — a FUNCTION PROLOGUE, i.e. the image entry was
+    // `main` itself. Zero diagnostics.
+    //
+    // Asking the SCHEMA a capability question ("is this a program the
+    // OS starts?") and then requiring the mechanism separately is what
+    // turns the silent skip into a refusal. `isExecFlavor()` is a
+    // closed predicate the schema answers (object_format_schema.hpp),
+    // never a format-identity branch here.
     AssembledModule moduleCopy;
     AssembledModule const* moduleP = &inputModule;
-    bool const wantTrampoline =
-        objectFormatSchema.processExit().has_value()
+    bool const needsTrampoline =
+        objectFormatSchema.isExecFlavor()
      && !inputModule.functions.empty()
      && !inputModule.imageEntryOverride.has_value();
-    if (wantTrampoline) {
+    // ★ UNREACHABLE FROM THE SHIPPED-CONFIG PATH BY DESIGN, AND THAT IS
+    // DELIBERATE. `ObjectFormatData::validate()` now rejects an
+    // exec-flavored format that declares no `processExit` at CONFIG-LOAD
+    // time (the ⟺ biconditional in object_format_schema.cpp), so no
+    // schema reaching here through `loadShipped` / `loadFromFile` /
+    // `loadFromText` can fail this check. It is defence-in-depth for the
+    // IN-MEMORY construction path — `ObjectFormatSchema{ObjectFormatData}`
+    // is a public constructor that runs no validation, and every walker
+    // is likewise callable directly. The precedent is recorded in prose
+    // at the image-request gate above (linker.cpp:769-773): the first cut
+    // split the capability and bounds checks between the gate and the
+    // walker, and a direct `pe::encode` call then wrote an out-of-range
+    // stack reserve and reported success. A gate that is unreachable
+    // today is cheap; a bypass that is silent is not.
+    if (needsTrampoline && !objectFormatSchema.processExit().has_value()) {
+        report(reporter, DiagnosticCode::K_FormatLacksProcessExit,
+               DiagnosticSeverity::Error,
+               std::string{"linker: object format '"}
+                   + std::string{objectFormatSchema.name()}
+                   + "' is exec-flavored (the artifact is a program the OS "
+                     "starts) but declares no 'processExit' block. DSS "
+                     "ALWAYS synthesises an entry trampoline on an "
+                     "exec-flavored format -- the image entry IS that "
+                     "trampoline, and its last act is to call the mechanism "
+                     "'processExit' names -- so this format declares no "
+                     "mechanism for it to call and no entry can be built. "
+                     "This is a DSS policy about how DSS builds entries, NOT "
+                     "a claim that the platform cannot terminate otherwise "
+                     "(a Mach-O LC_MAIN entry, for one, is CALLED by dyld "
+                     "rather than jumped to). REMEDY: add a "
+                     "'processExit' block (mechanism 'syscall' or "
+                     "'by-name-import') plus the paired "
+                     "'entryCallingConvention' to this format's schema, or "
+                     "build for a format that declares them. The refusal is "
+                     "the point: before this gate the trampoline was skipped "
+                     "SILENTLY and the emitted image's entry pointed at the "
+                     "module's first function. (D-LK10-ENTRY 2.13.)");
+        image.resolvedFuncCount = 0;
+        return image;
+    }
+    // Past the refusal, `processExit` is guaranteed present whenever
+    // `needsTrampoline` holds — so the emitter's own `processExit`
+    // check (entry_trampoline.cpp) is now a genuine backstop for its
+    // OTHER callers rather than the dead code the old caller-side
+    // predicate made it.
+    if (needsTrampoline) {
         moduleCopy = inputModule;
         if (!injectEntryTrampoline(moduleCopy, targetSchema,
                                     objectFormatSchema, reporter)) {
@@ -1070,61 +1340,57 @@ LinkedImage link(std::span<AssembledModule const> modules,
                        "section (e.g. relocatable .obj).",
                        dataSectionKindName(d.section),
                        objectFormatSchema.name(),
-                       objectFormatKindName(
-                           objectFormatSchema.kind())));
+                       // TF-C125: byte-identical to the old
+                       // `objectFormatKindName(schema.kind())` on every input,
+                       // without the linker naming the enum at all.
+                       link::objectFormatBackendName(
+                           objectFormatSchema.backend())));
             image.resolvedFuncCount = 0;
             return image;
         }
     }
 
-    // Format-keyed dispatch — closed-enum switch, fail-loud on
-    // any format whose walker hasn't landed yet so the substrate
-    // discipline reports the missing walker instead of silently
-    // returning empty bytes.
-    switch (objectFormatSchema.kind()) {
-    case ObjectFormatKind::Unknown:
+    // ── Walker dispatch ─────────────────────────────────────────────────
+    //
+    // WAS a 6-arm `switch (objectFormatSchema.kind())` — one arm per format
+    // plus the `Unknown` sentinel — i.e. the linker enumerating every object
+    // format that exists. That is the hard veto the bar names, and the
+    // TF-C125 ruling admits no exception for it
+    // (D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES).
+    //
+    // The schema arrives carrying the backend the loader resolved it to, so
+    // the linker asks the schema to encode ITSELF. The `Unknown` arm becomes
+    // the null check: a schema with no backend never reached a walker before
+    // either — it just took a longer route to the same refusal.
+    //
+    // ★ AND THIS IS WHAT MAKES THE WALKERS' OWN SELF-GUARDS UNREACHABLE FROM
+    // HERE. `elf::encode` cannot be handed a PE schema through this path: the
+    // only thing that can produce `backend` is the resolver, and the resolver
+    // returns the backend whose `configName()` the document declared. The
+    // guards stay — they defend the PUBLIC free functions, which ~40 direct
+    // callers in `tests/` still use and which two tests explicitly assert
+    // reject a foreign schema — but nothing routed through the linker can
+    // trip them. See the note in `src/link/format/elf.cpp`.
+    if (auto const* backend = objectFormatSchema.backend();
+        backend != nullptr) {
+        // `request` goes to EVERY backend now. That is safe for exactly the
+        // reason the old switch gave for passing it to PE alone: the
+        // pre-walker gate above refuses any request whose vehicle the schema
+        // does not declare, and the LOADER refuses any schema declaring a
+        // vehicle its own backend does not implement
+        // (`ObjectFormatBackend::stackReserveVehicles()`). A walker with no
+        // vehicle can only ever be handed an empty request — "declared but
+        // silently dropped" stays unreachable, now by a capability chain
+        // instead of by a hand-maintained argument list that had to be
+        // remembered.
+        image.bytes = backend->encode(module, targetSchema,
+                                      objectFormatSchema, reporter, request);
+    } else {
         report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                DiagnosticSeverity::Error,
                "linker: format kind 'unknown' is the invalid sentinel; "
                "the object format schema was constructed without a valid "
                "format declaration");
-        break;
-    case ObjectFormatKind::Elf:
-        image.bytes = elf::encode(module, targetSchema,
-                                  objectFormatSchema, reporter);
-        break;
-    case ObjectFormatKind::Pe:
-        // `request` is threaded ONLY to the walkers that implement a
-        // declared vehicle for one of its fields (today: PE, for
-        // `stackReserveControl.vehicle = pe-optional-header`). The other
-        // walkers take no request BY CONSTRUCTION: their formats declare no
-        // capability, so the gate above has already refused any request that
-        // would reach them. A new vehicle lands WITH its walker's parameter,
-        // never before — so "declared but silently dropped" is unreachable.
-        image.bytes = pe::encode(module, targetSchema,
-                                 objectFormatSchema, reporter, request);
-        break;
-    case ObjectFormatKind::MachO:
-        image.bytes = macho::encode(module, targetSchema,
-                                     objectFormatSchema, reporter);
-        break;
-    case ObjectFormatKind::Wasm:
-        // LK8 skeleton: emits the 8-byte module preamble (magic +
-        // version). Plan 18 fills the section emitters; this
-        // walker is the substrate plumb-through that proves the
-        // format-blind dispatch routes WASM correctly.
-        image.bytes = wasm::encode(module, targetSchema,
-                                   objectFormatSchema, reporter);
-        break;
-    case ObjectFormatKind::Spirv:
-        // LK9 skeleton: emits the 5-word SPIR-V module header
-        // (magic + version + generator + bound + reserved) per
-        // SPIR-V Spec §2.3. Plan 17 fills the instruction stream;
-        // this walker is the substrate plumb-through that proves
-        // the format-blind dispatch routes SPIR-V correctly.
-        image.bytes = spirv::encode(module, targetSchema,
-                                    objectFormatSchema, reporter);
-        break;
     }
 
     // Post-walker error gate (architect O1 fold from LK6 cycle 2a):

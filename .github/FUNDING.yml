@@ -1,10 +1,30 @@
 # Renders the "Sponsor" button on the repository.
-# It links to the Daily Software Systems site, where you can support the project.
 # Docs: https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+#
+# NOTE: FUNDING.yml is a DESTINATION MAP ONLY — platform key -> username/URL.
+# It has NO field for a funding goal, target amount, or description. A goal
+# ("$500/month to help with costs") must be configured on the destination
+# platform itself, never here. See .temp/funding-sponsorship-and-consulting-plan.md.
+#
+# This repo is PUBLIC, so every destination below is live the moment it is
+# uncommented. Do not enable a key before its target page exists.
 
 custom: ["https://dailysoftwaresystems.com/"]
 
-# --- alternatives — uncomment / add as needed ---
-# github: [dailysoftwaresystems]        # requires GitHub Sponsors enabled on the account
-# polar: dailysoftwaresystems
+# --- staged, each blocked on one external prerequisite ---
+#
+# GitHub Sponsors — goal lives on the Sponsors profile and embeds into the README.
+# BLOCKED: the org has no Sponsors listing (verified 2026-08-05 via GraphQL:
+# organization(login:"dailysoftwaresystems").hasSponsorsListing == false).
+# Uncommenting now points the button at a 404. Enroll the org first
+# (Settings -> Sponsors: Stripe/bank onboarding + eligibility review).
+# github: [dailysoftwaresystems]
+#
+# Open Collective — goal with a progress bar plus a PUBLIC EXPENSE LEDGER, so
+# sponsors see CI minutes and the arm64 VPS itemized rather than a bare number.
+# BLOCKED: no collective exists yet; slug below is a placeholder, confirm on
+# creation (fiscal-host approval can take a few days).
 # open_collective: dss-code-prime
+#
+# Once sponsor.html ships on the site, switch `custom` to the deep link:
+# custom: ["https://dailysoftwaresystems.com/sponsor.html"]

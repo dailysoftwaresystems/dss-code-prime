@@ -12,6 +12,7 @@
 #include "core/types/tree_visitor.hpp"
 
 #include "analysis/compilation_unit/toy_cu_fixture.hpp"
+#include "repo_root.hpp"
 
 #include <gtest/gtest.h>
 
@@ -19,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -39,27 +41,25 @@ using dss::cu_test::loadShippedSchema;
 constexpr char kScratchGroup[] = "cu4-import-resolver";
 using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 
-// Read the shipped `<name>.lang.json` TEXT by walking up from cwd to the repo
-// `src/dss-config/sources/` directory — mirrors GrammarSchema::loadShipped's
-// search so the genericity test reads the exact bytes the loader would.
+// Read the shipped `<name>.lang.json` TEXT so the genericity test reads the
+// exact bytes GrammarSchema::loadShipped would. The directory comes from the ONE
+// test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the repo root CMake
+// bakes in → a cwd ancestor walk); this used to be a PRIVATE 8-hop cwd walk that
+// read none of the first two. Out of tree the cwd has no `src/dss-config` in its
+// ancestry, so that walk always missed — and its miss ended in `std::abort()`,
+// which kills the whole test BINARY, costing every sibling test in this file its
+// verdict. Both failure modes now THROW, so an unresolvable root (or an
+// unreadable config) reddens the ONE test that asked and names why.
 [[nodiscard]] std::string readShippedConfigText(std::string_view name) {
-    namespace fs = std::filesystem;
-    std::string const leaf = std::string{name} + ".lang.json";
-    std::error_code ec;
-    fs::path here = fs::current_path(ec);
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const candidate = here / "src" / "dss-config" / "sources" / leaf;
-        if (fs::exists(candidate, ec)) {
-            std::ifstream in(candidate, std::ios::binary);
-            return std::string(std::istreambuf_iterator<char>(in),
-                               std::istreambuf_iterator<char>());
-        }
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    std::filesystem::path const path =
+        dss::test::configRoot() / "sources" / (std::string{name} + ".lang.json");
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("cannot read shipped config '" +
+                                 std::string{name} + "' at " + path.string());
     }
-    ADD_FAILURE() << "could not locate shipped config '" << name << "'";
-    std::abort();
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
 }
 
 } // namespace
@@ -925,4 +925,170 @@ TEST(ImportResolver, NameMatchingIsDrivenByConfigNotLanguageName) {
     EXPECT_EQ(cu.crossRefs()[0].sourceTree, cu.trees()[1].id());
     EXPECT_EQ(cu.crossRefs()[0].targetTree, cu.trees()[0].id());
     EXPECT_EQ(countCode(cu.driverDiagnostics(), DiagnosticCode::D_UnresolvedReference), 0u);
+}
+
+// ── D-PP-HEADER-CASE-INSENSITIVE-PE ──────────────────────────────────────────
+//
+// The IMPORT RESOLVER owns both `F_ShippedHeaderNotFound` emit sites, so it —
+// not only the preprocessor — must carry the format's header-name case rule. If
+// only the preprocessor learned the policy, `#include <Windows.h>` would be
+// spliced-or-not by one tier and accepted-or-rejected by the other.
+//
+// Both policies are asserted against ONE on-disk `windows.json`, so whichever
+// host runs this, one arm contradicts that host's own filesystem convention.
+TEST(ImportResolver, AngleIncludeCaseFollowsFormatPolicyNotHostFilesystem) {
+    for (bool insensitive : {true, false}) {
+        TempDir srcDir;
+        TempDir sysDir;
+        auto main = srcDir.write("main.c",
+            "#include <Windows.h>\nint main() { return 0; }\n");
+        auto const want = sysDir.write("windows.json",
+            R"({ "library": { "pe": "kernel32.dll" },
+                 "symbols": [ { "name": "Sleep", "signature": "fn(i32) -> void" } ] })");
+
+        UnitBuilder builder{loadShippedSchema("c-subset")};
+        builder.addSystemDir(sysDir.path());
+        builder.setHeaderNameMatching(insensitive
+                                          ? HeaderNameMatching::CaseInsensitive
+                                          : HeaderNameMatching::CaseSensitive);
+        builder.addFile(main);
+        auto cu = std::move(builder).finish();
+
+        bool const missed = hasCode(cu.driverDiagnostics(),
+                                    DiagnosticCode::F_ShippedHeaderNotFound);
+        if (insensitive) {
+            EXPECT_FALSE(missed)
+                << "a pe/macho target must resolve <Windows.h> to windows.json "
+                   "on ANY build host — this is the sqlite CLI blocker";
+            ASSERT_EQ(cu.shippedLibDescriptors().size(), 1u);
+            std::error_code ec;
+            EXPECT_EQ(std::filesystem::weakly_canonical(
+                          cu.shippedLibDescriptors()[0].path, ec),
+                      std::filesystem::weakly_canonical(want, ec));
+        } else {
+            EXPECT_TRUE(missed)
+                << "a POSIX/elf target must REJECT <Windows.h> against "
+                   "windows.json even on a case-insensitive host — accepting it "
+                   "is the silent wrong-accept this axis closes";
+            EXPECT_TRUE(cu.shippedLibDescriptors().empty());
+        }
+    }
+}
+
+// The CONTROL for the pair above: the byte-exact spelling resolves under BOTH
+// policies, so the divergence is attributable to CASE and to nothing else
+// (a missing descriptor, a broken systemDir, a schema change).
+TEST(ImportResolver, AngleIncludeExactSpellingResolvesUnderBothCasePolicies) {
+    for (auto m : {HeaderNameMatching::CaseInsensitive,
+                   HeaderNameMatching::CaseSensitive}) {
+        TempDir srcDir;
+        TempDir sysDir;
+        auto main = srcDir.write("main.c",
+            "#include <windows.h>\nint main() { return 0; }\n");
+        sysDir.write("windows.json",
+            R"({ "library": { "pe": "kernel32.dll" },
+                 "symbols": [ { "name": "Sleep", "signature": "fn(i32) -> void" } ] })");
+
+        UnitBuilder builder{loadShippedSchema("c-subset")};
+        builder.addSystemDir(sysDir.path());
+        builder.setHeaderNameMatching(m);
+        builder.addFile(main);
+        auto cu = std::move(builder).finish();
+
+        EXPECT_FALSE(hasCode(cu.driverDiagnostics(),
+                             DiagnosticCode::F_ShippedHeaderNotFound))
+            << "the exact spelling must resolve under either policy";
+        EXPECT_EQ(cu.shippedLibDescriptors().size(), 1u);
+    }
+}
+
+// D-PP-HEADER-CASE-INSENSITIVE-PE (H3): the IMPORT RESOLVER's own fold-collision
+// emit site. This tier owns the DESCRIPTOR half of the angle form — the half
+// the preprocessor deliberately stays silent about to avoid a double-report —
+// so if this emit is wrong nothing else covers it.
+//
+// The fixture needs two `<stem>.json` files differing only by ASCII case, which
+// cannot exist on NTFS or a default APFS volume; the test asks the platform to
+// make its scratch dir case-sensitive first and records a NAMED skip if that is
+// unavailable. The code/severity/names-every-candidate contract is pinned
+// host-independently in `tests/core/test_header_name_matching.cpp`.
+namespace {
+
+void irTryMakeDirCaseSensitive(std::filesystem::path const& dir) {
+#ifdef _WIN32
+    std::string cmd = "fsutil.exe file setCaseSensitiveInfo \"";
+    cmd += dir.string();
+    cmd += "\" enable >nul 2>&1";
+    (void)std::system(cmd.c_str());
+#else
+    (void)dir;
+#endif
+}
+
+[[nodiscard]] std::size_t irCountCode(dss::DiagnosticReporter const& r,
+                                      dss::DiagnosticCode code) {
+    std::size_t n = 0;
+    for (auto const& d : r.all()) {
+        if (d.code == code) ++n;
+    }
+    return n;
+}
+
+[[nodiscard]] std::string irFirstMessage(dss::DiagnosticReporter const& r,
+                                         dss::DiagnosticCode code) {
+    for (auto const& d : r.all()) {
+        if (d.code == code) return d.actual;
+    }
+    return {};
+}
+
+} // namespace
+
+TEST(ImportResolver, AngleDescriptorFoldCollisionFailsLoudAndNamesCandidates) {
+    namespace fs = std::filesystem;
+    TempDir srcDir;
+    TempDir sysDir;
+    irTryMakeDirCaseSensitive(sysDir.path());
+
+    auto main = srcDir.write("main.c",
+        "#include <Kolide.h>\nint main() { return 0; }\n");
+    char const* body =
+        R"({ "library": { "pe": "k.dll" },
+             "symbols": [ { "name": "kf", "signature": "fn() -> i32" } ] })";
+    sysDir.write("kolide.json", body);
+    sysDir.write("Kolide.json", body);
+
+    std::error_code ec;
+    std::size_t entries = 0;
+    for (fs::directory_iterator it{sysDir.path(), ec}, end; !ec && it != end;
+         it.increment(ec)) {
+        ++entries;
+    }
+    if (entries != 2) {
+        GTEST_SKIP() << "this filesystem folds case, so a kolide.json/"
+                        "Kolide.json pair cannot be built here; the emit is "
+                        "pinned host-independently in "
+                        "core/test_header_name_matching and end-to-end on the "
+                        "case-sensitive leg";
+    }
+
+    UnitBuilder builder{loadShippedSchema("c-subset")};
+    builder.addSystemDir(sysDir.path());
+    builder.setHeaderNameMatching(HeaderNameMatching::CaseInsensitive);
+    builder.addFile(main);
+    auto cu = std::move(builder).finish();
+
+    EXPECT_EQ(irCountCode(cu.driverDiagnostics(),
+                          DiagnosticCode::F_HeaderNameCaseAmbiguous), 1u)
+        << "the descriptor half of an angle include is THIS tier's to report";
+    EXPECT_EQ(irCountCode(cu.driverDiagnostics(),
+                          DiagnosticCode::F_ShippedHeaderNotFound), 0u)
+        << "a collision must not be misreported as a plain miss — the miss "
+           "names the wrong defect and, unlike a collision, reads as a typo";
+    std::string const msg = irFirstMessage(cu.driverDiagnostics(),
+                                           DiagnosticCode::F_HeaderNameCaseAmbiguous);
+    EXPECT_NE(msg.find("kolide.json"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("Kolide.json"), std::string::npos) << msg;
+    EXPECT_TRUE(cu.shippedLibDescriptors().empty())
+        << "and nothing may be resolved: any pick would be host-dependent";
 }

@@ -1,6 +1,7 @@
 #include "analysis/preprocess/preprocessor.hpp"
 
 #include "analysis/preprocess/pp_if_eval.hpp"
+#include "core/types/header_case_diagnostic.hpp"   // reportHeaderCaseAmbiguity (the ONE fold-collision emit)
 #include "core/types/include_path_resolve.hpp"
 #include "core/types/literal_close_token.hpp"   // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN
 #include "core/substrate/phase_timers.hpp"
@@ -184,6 +185,23 @@ LineMap::Resolved LineMap::resolve(ByteOffset synthOffset) const noexcept {
                                  ? (synthOffset - best->synthStart) : 0;
     r.offset = best->originStart + delta;
     return r;
+}
+
+Token const& PreprocessResult::eofToken() const {
+    // Fail LOUD and NAMED rather than reading past the end. `preprocess()`'s
+    // single exit (`establishResultContract`) guarantees both conditions for
+    // every result it hands out, so reaching either message means a
+    // `PreprocessResult` was produced by something other than that exit.
+    if (tokens.empty()) {
+        ppFatal("PreprocessResult::eofToken: the token vector is EMPTY - every "
+                "result `preprocess()` returns is Eof-terminated by contract, "
+                "so this one did not come from that function's single exit");
+    }
+    if (tokens.back().coreKind != CoreTokenKind::Eof) {
+        ppFatal("PreprocessResult::eofToken: the token vector is NOT "
+                "Eof-terminated - its last token is not CoreTokenKind::Eof");
+    }
+    return tokens.back();
 }
 
 std::function<void(BufferId&, SourceSpan&)> PreprocessResult::makeRemap() const {
@@ -672,6 +690,11 @@ struct SynthBuilder {
     // the semantic `#include` gate use — an unavailable-on-this-format header is
     // treated like "no descriptor on the path" (left verbatim), all three agreeing.
     std::optional<ObjectFormatKind>      activeFormat;
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: the ACTIVE FORMAT's header-NAME case
+    // rule, applied by EVERY include search this builder performs. A SEPARATE
+    // input from `activeFormat` (a KIND): deriving the rule from the kind would
+    // be the identity branch the agnosticism bar forbids.
+    HeaderNameMatching                   headerNameMatching;
     DiagnosticReporter&                  rep;
     int                                  depth;
     std::vector<fs::path>&               includeStack;
@@ -802,27 +825,66 @@ struct SynthBuilder {
         return isConditionalInclusionOperator(n, cfg());
     }
 
-    std::optional<fs::path> resolveQuote(std::string_view filename,
-                                         fs::path const& includingDir) const {
+    // Quote-include resolution for the PRE-SCAN. Historically this was a
+    // PRIVATE second resolver that byte-sliced the path itself, bypassing the
+    // FC15c shared funnel; it now routes every candidate through the shared
+    // `resolveInDir`, so the pre-scan can never disagree with the authoritative
+    // pass about which file a name denotes -- including on the CASE question
+    // (D-PP-HEADER-CASE-INSENSITIVE-PE). What stays local is only the
+    // `is_regular_file` filter and the resulting "keep searching the next dir"
+    // behaviour, which the shared `resolveIncludePath` deliberately does not
+    // have (it stops at the first existing entry, directory or not).
+    //
+    // ★ RETURNS THE TRI-STATE, NOT AN OPTIONAL, AND THE REASON IS A BLOCKER
+    // THIS FUNCTION ONCE SHIPPED. It used to flatten `AmbiguousCase` to
+    // `nullopt`, on the stated grounds that "the authoritative
+    // `__has_include`, the `#embed` directive, and the import resolver
+    // re-resolve the same name and fail loud there". That was TRUE of the two
+    // operators and FALSE of the thing that matters most: a plain quote
+    // `#include`. `import_resolver.cpp`'s directive walk does `if (ppEnabled)
+    // return;` for every quote directive, and `SynthBuilder` only exists WHEN
+    // preprocess runs — the two conditions are exactly complementary, so for
+    // C (the only language with a preprocessor today) NOTHING re-resolves a
+    // quote include. The collision fell through to the quote->angle fallback,
+    // missed, and surfaced as a SUPPRESSABLE `P_PreprocessorIncludeError` with
+    // the directive dropped: `--suppress` on that code turned a case collision
+    // into a silently missing header.
+    //
+    // Handing the caller the full verdict is the fix at the level of the
+    // defect. `takeFound` (the one sanctioned collapse) then forces each caller
+    // to state its ambiguity policy explicitly.
+    HeaderSearchResult resolveQuote(std::string_view filename,
+                                    fs::path const& includingDir) const {
         // An empty include target names nothing -- fail loud (the caller
         // emits P_PreprocessorIncludeError). Only a REGULAR file is a valid
         // include target; `is_regular_file` excludes a directory (so
         // `#include ""` cannot resolve to the including dir itself, which
         // would later throw in SourceBuffer::fromFile).
-        if (filename.empty()) return std::nullopt;
-        fs::path const rel{filename};
+        if (filename.empty()) return HeaderSearchResult::notFound();
         std::error_code ec;
-        if (rel.is_absolute()) {
-            return fs::is_regular_file(rel, ec) ? std::optional<fs::path>{rel}
-                                                : std::nullopt;
-        }
+        // Per candidate dir: the shared policy-aware atom, then the local
+        // `is_regular_file` filter. A COLLISION is returned as-is and STOPS the
+        // search -- the same rule `resolveIncludePath` states in its header
+        // comment ("continuing to a later dir would make the answer depend on
+        // whether the host could even represent the collision"). The earlier
+        // cut of this function continued to the next dir here, quietly
+        // disagreeing with the shared resolver about the same question.
+        auto const tryDir = [&](fs::path const& dir) -> HeaderSearchResult {
+            HeaderSearchResult r = resolveInDir(dir, filename, headerNameMatching);
+            if (r.status != HeaderSearchStatus::Found) return r;
+            if (!fs::is_regular_file(r.path, ec)) return HeaderSearchResult::notFound();
+            return r;
+        };
+        if (fs::path{filename}.is_absolute()) return tryDir({});
         if (!includingDir.empty()) {
-            if (auto c = includingDir / rel; fs::is_regular_file(c, ec)) return c;
+            HeaderSearchResult r = tryDir(includingDir);
+            if (r.status != HeaderSearchStatus::NotFound) return r;
         }
         for (fs::path const& dir : includeDirs) {
-            if (auto c = dir / rel; fs::is_regular_file(c, ec)) return c;
+            HeaderSearchResult r = tryDir(dir);
+            if (r.status != HeaderSearchStatus::NotFound) return r;
         }
-        return std::nullopt;
+        return HeaderSearchResult::notFound();
     }
 
     void copyVerbatim(std::string const& spliced, LineMap const& localMap,
@@ -885,8 +947,16 @@ struct SynthBuilder {
                                                    bool reportMalformed,
                                                    fs::path* resolvedParentOut = nullptr) {
         if (systemDirs.empty()) return SystemMacroSplice::NotAvailable;
-        auto descPath = resolveSystemDescriptor(headerName, systemDirs);
-        if (!descPath) return SystemMacroSplice::NotAvailable;
+        // D-PP-HEADER-CASE-INSENSITIVE-PE: the SAME case policy every other
+        // include search uses. A fold COLLISION reads as NotAvailable here (the
+        // caller leaves the include verbatim) and is reported LOUD by the import
+        // resolver, which re-resolves the surviving directive — the same
+        // dead-branch-inert split the malformed-descriptor diagnostic makes.
+        HeaderSearchResult const desc =
+            resolveSystemDescriptor(headerName, systemDirs, headerNameMatching);
+        if (desc.status != HeaderSearchStatus::Found)
+            return SystemMacroSplice::NotAvailable;
+        fs::path const* descPath = &desc.path;
         // If the PARENT descriptor declares this header unavailable on the active
         // object-format, treat it EXACTLY like "no descriptor on the path" — the
         // semantic gate then fails loud + `__has_include` returns false, so all
@@ -952,7 +1022,7 @@ struct SynthBuilder {
         bool sawParent = false;
         std::unordered_set<std::string> visited;   // per-call (a splice is one root)
         ffi::forEachDescriptorInClosure(
-            *descPath, systemDirs, visited,
+            *descPath, systemDirs, headerNameMatching, visited,
             [&](fs::path const& p) {
                 bool const isParent = !sawParent;
                 sawParent = true;
@@ -970,7 +1040,10 @@ struct SynthBuilder {
                 if (!macros) { if (isParent) parentMacrosMalformed = true; return; }
                 for (auto const& macro : *macros) spliceMacro(macro);
             },
-            [&](std::string const&) { /* import resolver owns F_ShippedHeaderNotFound */ });
+            [&](std::string const&, HeaderSearchResult const&) {
+                /* import resolver owns F_ShippedHeaderNotFound AND
+                   F_HeaderNameCaseAmbiguous — both positioned on the
+                   `#include` line, both re-derived from the same closure. */ });
 
         if (parentMacrosMalformed) {
             // Malformed PARENT descriptor: report ONLY on a confidently-live include
@@ -1262,7 +1335,8 @@ struct SynthBuilder {
                 //   (a live `#include <h>` seeds via its own splice; a probe with no
                 //   matching include resolves nothing). Left as a pure existence answer.
                 AngleIncludeResolution const ar =
-                    resolveAngleInclude(filename, systemDirs, includeDirs);
+                    resolveAngleInclude(filename, systemDirs, includeDirs,
+                                        headerNameMatching);
                 switch (ar.kind) {
                     case AngleIncludeKind::Descriptor:
                         return !(activeFormat.has_value()
@@ -1272,10 +1346,23 @@ struct SynthBuilder {
                         return true;
                     case AngleIncludeKind::NotFound:
                         return false;
+                    case AngleIncludeKind::AmbiguousDescriptor:
+                    case AngleIncludeKind::AmbiguousSource:
+                        // Speculative pass — reporting here would break
+                        // dead-branch inertness (C 6.10p1). Answer 0. This is
+                        // safe for the OPERATOR specifically: the AUTHORITATIVE
+                        // `__has_include` (MacroExpander) re-evaluates every
+                        // LIVE `#if` operand through the same funnel and emits
+                        // there, so an operator whose answer can change the
+                        // build is never silently wrong.
+                        return false;
                 }
                 return false;   // unreachable — every AngleIncludeKind handled above
             }
-            return resolveQuote(filename, includingDir).has_value();
+            // Explicitly silent (speculative pass, see above); the
+            // AUTHORITATIVE quote `__has_include` re-resolves and emits.
+            return takeFound(resolveQuote(filename, includingDir),
+                             [](std::span<fs::path const>) {}).has_value();
         };
         // TF-C60 (c′): hand the per-eval product tail to the ICE — it assembles
         // `combined = synth.text() + productText()` and slices minted tokens
@@ -1297,7 +1384,10 @@ struct SynthBuilder {
             [this, &includingDir](std::string_view filename, bool isAngle,
                                   SourceSpan) -> int {
             if (isAngle) return 0;
-            auto resolved = resolveQuote(filename, includingDir);
+            // Explicitly silent (speculative pass); the AUTHORITATIVE
+            // `__has_embed` and the `#embed` directive both re-resolve + emit.
+            auto resolved = takeFound(resolveQuote(filename, includingDir),
+                                      [](std::span<fs::path const>) {});
             if (!resolved) return 0;                       // NOT_FOUND
             std::error_code ec;
             auto const sz = fs::file_size(*resolved, ec);
@@ -1820,8 +1910,30 @@ struct SynthBuilder {
                 // keeps the line for the import resolver's typed-surface injection;
                 // NotFound is left verbatim -> the resolver emits the hard
                 // F_ShippedHeaderNotFound). Only Source is new.
+                // D-PP-HEADER-CASE-INSENSITIVE-PE, corrected at H2. The two
+                // ambiguous arms are NOT interchangeable here:
+                //   * AmbiguousDescriptor — the import resolver re-resolves the
+                //     `<stem>.json` half and reports it; staying silent here
+                //     avoids a double-report (the malformed-descriptor
+                //     discipline directly above).
+                //   * AmbiguousSource — NOTHING downstream re-resolves the `-I`
+                //     source half (the import resolver's angle arm calls
+                //     `resolveSystemDescriptor` alone), so leaving it verbatim
+                //     surfaced it as `F_ShippedHeaderNotFound`: loud, but naming
+                //     the wrong defect, while the diagnostic that exists to list
+                //     the colliding paths never fired. THIS tier reports it.
+                // Gated on `includeResolvable()` for the same C 6.10p1
+                // dead-branch-inertness reason as every other emit in this pass.
                 AngleIncludeResolution const angleRes =
-                    resolveAngleInclude(angleName, systemDirs, includeDirs);
+                    resolveAngleInclude(angleName, systemDirs, includeDirs,
+                                        headerNameMatching);
+                if (angleRes.kind == AngleIncludeKind::AmbiguousSource
+                    && includeResolvable()) {
+                    reportHeaderCaseAmbiguity(rep, BufferId{},
+                                              SourceSpan::empty(0), angleName,
+                                              angleRes.ambiguousCandidates);
+                    continue;   // left verbatim; the macro pass elides it
+                }
 
                 // SOURCE fallback: a no-descriptor angle header that IS a real source
                 // file on the -I path — splice it TEXTUALLY and DROP the directive,
@@ -1868,6 +1980,7 @@ struct SynthBuilder {
                     copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
                     includeStack.push_back(canon);
                     SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
+                                       headerNameMatching,
                                        rep, depth + 1, includeStack, fatal,
                                        preScanDefinePrefix, effectivePredefines,
                                        resolvedDescriptorsOut, localMacros};
@@ -1947,7 +2060,35 @@ struct SynthBuilder {
                 dirEnd = literalEndPastCloser(*schema, toks, bodyIdx);
             }
 
-            auto resolved = resolveQuote(filename, includingDir);
+            // ★ H1 (D-PP-HEADER-CASE-INSENSITIVE-PE): THIS is the site whose
+            // silence was a blocker. We are past `includeResolvable()`, so the
+            // include is CONFIDENTLY LIVE and reporting here is dead-branch
+            // inert by construction — and this tier is the ONLY one that ever
+            // sees a quote directive once the preprocessor is enabled (the
+            // import resolver returns early on every quote include when
+            // `ppEnabled`). A collision therefore MUST fail loud right here,
+            // with the unsuppressable `F_HeaderNameCaseAmbiguous`, and must NOT
+            // be allowed to fall through to the quote->angle fallback and out
+            // the suppressable `P_PreprocessorIncludeError` exit below.
+            bool quoteCollision = false;
+            auto resolved = takeFound(
+                resolveQuote(filename, includingDir),
+                [&](std::span<fs::path const> candidates) {
+                    quoteCollision = true;
+                    reportHeaderCaseAmbiguity(rep, BufferId{},
+                                              SourceSpan::empty(0), filename,
+                                              candidates);
+                });
+            if (quoteCollision) {
+                // Sole reporter (the TF-C60 Finding-5 discipline): DROP the
+                // directive so the macro pass's unresolved-live-quote-include
+                // fail-loud does not re-report one root cause twice. Dropping is
+                // safe HERE precisely because the diagnostic we just emitted is
+                // unsuppressable — which is exactly what was not true before.
+                copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
+                copiedUpTo = dirEnd;
+                continue;
+            }
             if (!resolved) {
                 // QUOTE→ANGLE fallback (C 6.10.2p3, §B iii): a `#include "h"` NOT
                 // found on disk (self-dir + includeDirs, checked FIRST above so a
@@ -2032,7 +2173,8 @@ struct SynthBuilder {
             copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
 
             includeStack.push_back(canon);
-            SynthBuilder child{schema, includeDirs, systemDirs, activeFormat, rep,
+            SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
+                               headerNameMatching, rep,
                                depth + 1, includeStack, fatal, preScanDefinePrefix,
                                effectivePredefines, resolvedDescriptorsOut,
                                localMacros};
@@ -2194,6 +2336,11 @@ public:
                   std::shared_ptr<GrammarSchema const> schema,
                   DiagnosticReporter& rep, ByteOffset prefixLen,
                   LineMap const* lineMap,
+                  // D-PP-HEADER-CASE-INSENSITIVE-PE: REQUIRED, and ahead of
+                  // the defaulted block for the same reason `preprocess()`
+                  // states — a silent fallback here would put the choice back
+                  // out of sight at the one site that matters most.
+                  HeaderNameMatching headerNameMatching,
                   std::span<fs::path const> includeDirs = {},
                   std::span<fs::path const> systemDirs = {},
                   std::optional<ObjectFormatKind> activeFormat = {},
@@ -2207,6 +2354,7 @@ public:
           prefixLen_(prefixLen), lineMap_(lineMap),
           includeDirs_(includeDirs), systemDirs_(systemDirs),
           activeFormat_(activeFormat),
+          headerNameMatching_(headerNameMatching),
           includingDir_(std::move(includingDir)) {
         // FC15b (predefined macros; C 6.10.8): seed the predefined-macro map
         // (name -> def) from config. An identifier that is NOT a `#define`d
@@ -3453,7 +3601,8 @@ private:
                 //   does NOT seed -- the un-gated angle-`#include` splice is the SOLE
                 //   recorder, so the seed set stays == the finish() oracle's live set.
                 AngleIncludeResolution const ar =
-                    resolveAngleInclude(filename, systemDirs_, includeDirs_);
+                    resolveAngleInclude(filename, systemDirs_, includeDirs_,
+                                        headerNameMatching_);
                 switch (ar.kind) {
                     case AngleIncludeKind::Descriptor:
                         return !(activeFormat_.has_value()
@@ -3463,11 +3612,33 @@ private:
                         return true;
                     case AngleIncludeKind::NotFound:
                         return false;
+                    case AngleIncludeKind::AmbiguousDescriptor:
+                    case AngleIncludeKind::AmbiguousSource:
+                        // D-PP-HEADER-CASE-INSENSITIVE-PE: this is the
+                        // AUTHORITATIVE evaluation of a LIVE `#if` operand, so
+                        // reporting here is both allowed and REQUIRED — a
+                        // `__has_include`-guarded include is the one shape whose
+                        // collision no later tier would ever see (answer 0, the
+                        // `#include` never materializes, nothing else resolves
+                        // that name). Answering 0 SILENTLY was the silent-drop.
+                        // BOTH halves report here: unlike the splice arm, the
+                        // operator's answer is this tier's alone.
+                        reportHeaderCaseAmbiguity(rep_, BufferId{},
+                                                  SourceSpan::empty(0), filename,
+                                                  ar.ambiguousCandidates);
+                        return false;
                 }
                 return false;   // unreachable — every AngleIncludeKind handled above
             }
-            return resolveIncludePath(filename, includingDir_, includeDirs_)
-                .has_value();
+            HeaderSearchResult const q =
+                resolveIncludePath(filename, includingDir_, includeDirs_,
+                                   headerNameMatching_);
+            if (q.status == HeaderSearchStatus::AmbiguousCase) {
+                reportHeaderCaseAmbiguity(rep_, BufferId{}, SourceSpan::empty(0),
+                                          filename, q.ambiguousCandidates);
+                return false;
+            }
+            return q.status == HeaderSearchStatus::Found;
         };
         // FC15b: surface the accumulated product tail (a predefined/`#`/`##`
         // product expanded inside this `#if` operand materializes into it) so the
@@ -3485,13 +3656,22 @@ private:
             [this](std::string_view filename, bool isAngle,
                    SourceSpan opSpan) -> int {
             if (isAngle) return 0;   // D-PP-EMBED-ANGLE: nothing to resolve
-            auto resolved = resolveIncludePath(filename,
-                                               embedResolutionDir(opSpan),
-                                               includeDirs_);
-            if (!resolved) return 0;                            // NOT_FOUND
+            HeaderSearchResult const r =
+                resolveIncludePath(filename, embedResolutionDir(opSpan),
+                                   includeDirs_, headerNameMatching_);
+            if (r.status == HeaderSearchStatus::AmbiguousCase) {
+                // Authoritative + live (same argument as `__has_include`
+                // above): a `__has_embed`-guarded resource whose name
+                // fold-collides is seen by NO other tier.
+                reportHeaderCaseAmbiguity(rep_, BufferId{}, SourceSpan::empty(0),
+                                          filename, r.ambiguousCandidates);
+                return 0;
+            }
+            if (r.status != HeaderSearchStatus::Found) return 0;  // NOT_FOUND
+            auto const& resolved = r.path;
             std::error_code ec;
-            if (!fs::is_regular_file(*resolved, ec)) return 0;  // NOT_FOUND
-            auto const sz = fs::file_size(*resolved, ec);
+            if (!fs::is_regular_file(resolved, ec)) return 0;   // NOT_FOUND
+            auto const sz = fs::file_size(resolved, ec);
             if (ec) return 0;                                   // stat failed
             return sz == 0 ? 2 /*EMPTY*/ : 1 /*FOUND*/;
         };
@@ -3543,8 +3723,8 @@ private:
     // `std::ios::binary` is load-bearing on Windows -- a CR/LF/SUB byte in the
     // resource must survive verbatim (pinned by tests).
     static std::optional<std::string> readResourceBytes(fs::path const& path) {
-        // The shared `resolveIncludePath` matches on `fs::exists`, so it can hand
-        // back a DIRECTORY. Require a regular file (nullopt -> the caller's loud
+        // The shared `resolveIncludePath` matches any directory ENTRY, so it can
+        // hand back a DIRECTORY. Require a regular file (nullopt -> the caller's loud
         // unreadable diagnostic) so a directory-named resource fails LOUD, never
         // reads as a silently-empty embed.
         std::error_code ec;
@@ -3656,13 +3836,20 @@ private:
         // ── Resolve the resource EXACTLY as a quote-`#include` would (the ONE
         // shared quote search: absolute -> direct; else self-dir first, then the
         // include dirs), relative to the FILE that contains the directive. ──
-        auto resolved = resolveIncludePath(filename, embedResolutionDir(dirSpan),
-                                           includeDirs_);
-        if (!resolved) {
+        HeaderSearchResult const rr =
+            resolveIncludePath(filename, embedResolutionDir(dirSpan),
+                               includeDirs_, headerNameMatching_);
+        if (rr.status == HeaderSearchStatus::AmbiguousCase) {
+            reportHeaderCaseAmbiguity(rep_, synth_->id(), dirSpan, filename,
+                                      rr.ambiguousCandidates);
+            return;
+        }
+        if (rr.status != HeaderSearchStatus::Found) {
             emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
                    dirSpan, std::string{"#embed resource not found: "} + filename);
             return;
         }
+        auto const* resolved = &rr.path;
 
         // ── Read the bytes BINARY-exact (CRLF/SUB/NUL/0xFF preserved). ──
         auto bytes = readResourceBytes(*resolved);
@@ -4525,14 +4712,26 @@ private:
                 "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
             const int mon = (lt->tm_mon >= 0 && lt->tm_mon < 12) ? lt->tm_mon : 0;
-            char buf[16];
+            // Sized for the format's WORST CASE over arbitrary `int`, not for a
+            // well-formed date: `%s`(3) + ' ' + `%2d`(<=11, "-2147483648") + ' '
+            // + `%04d`(<=11) + NUL = 28. Truncation is therefore structurally
+            // impossible rather than merely improbable, which is the stronger
+            // property — `tm_mon` is range-checked just above, but `tm_mday` and
+            // `tm_year` are not, so a hostile/broken `localtime` could otherwise
+            // silently truncate `__DATE__` to a wrong spelling (snprintf would
+            // not overflow, so this is a correctness bug, never a memory one).
+            // ★ Surfaced by gcc-13 -Wformat-truncation on an aarch64 host, which
+            // inlines this far enough to see the bound; the x86_64 legs do not
+            // report it. D-PP-DATETIME-BUF-SIZED-FOR-VALID-TM-ONLY.
+            char buf[32];
             // SPACE-padded day (`%e` is not portable on MSVC), 4-digit year.
             std::snprintf(buf, sizeof(buf), "%s %2d %04d", kMon[mon],
                           lt->tm_mday, lt->tm_year + 1900);
             dateString_ = buf;
         }
         if (needTime) {
-            char buf[16];
+            // Same worst-case sizing: three `%02d` at <=11 each + 2 ':' + NUL = 36.
+            char buf[40];
             std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", lt->tm_hour,
                           lt->tm_min, lt->tm_sec);
             timeString_ = buf;
@@ -5108,6 +5307,9 @@ private:
     std::span<fs::path const>            includeDirs_;
     std::span<fs::path const>            systemDirs_;
     std::optional<ObjectFormatKind>      activeFormat_;
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: the active format's header-NAME case
+    // rule, applied by every include search the AUTHORITATIVE pass performs.
+    HeaderNameMatching                   headerNameMatching_;
     fs::path                             includingDir_;
     // FC14: the conditional-compilation frame stack (one frame per open
     // `#if`/`#ifdef`/`#ifndef`). See CondFrame + handleIf/Elif/Else/Endif.
@@ -5304,21 +5506,45 @@ MergedPredefinedMacros mergePredefinedMacros(
     return out;
 }
 
-PreprocessResult preprocess(
+namespace {
+
+// The preprocess RUN — the whole pass, MINUS the result-shape guarantee.
+// PRECONDITION (validated by the exported `preprocess()` wrapper below, which
+// is this function's ONLY caller): `mainSource` and `schema` are non-null and
+// `schema->preprocess().enabled` is true.
+//
+// ★ WHY THIS IS NOT THE EXPORTED ENTRY POINT
+//   ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]]).
+// `PreprocessResult` documents an invariant its consumers rely on: `tokens` is
+// Eof-terminated and `synthBuffer` is live. The happy path establishes that
+// invariant at its very TAIL (the Eof append + `SourceBuffer::fromString`
+// below). So the invariant held only for the path that ran to completion, and
+// EVERY early return silently shipped a result that broke the documented shape
+// — with no way for the caller to tell, because the shape is asserted in a
+// comment.
+//
+// That was not hypothetical. The predefined-macro-collision abort returned with
+// `tokens` EMPTY and `synthBuffer` NULL, and `compilation_unit.cpp`'s
+// `pp.tokens.back()` — carrying the comment "Eof-terminated by contract" —
+// dereferenced past the end of an empty vector. MEASURED TF-C115: the CLI
+// SEGFAULTED (rc 139 Linux / 0xC0000005 Windows) with NOT ONE diagnostic
+// printed, for a fault whose entire purpose is to be loud.
+//
+// Wrapping the run funnels every `return` — this one and every one a future
+// cycle adds — through ONE exit that establishes the contract. A new early
+// return can no longer reintroduce the crash by omission, which is the whole
+// point: the previous shape made "remember to Eof-terminate" a rule each
+// author had to know, and the fix makes it a rule no author can break.
+PreprocessResult preprocessRun(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<fs::path const>            includeDirs,
+    HeaderNameMatching                   headerNameMatching,
     std::span<fs::path const>            systemDirs,
     std::optional<ObjectFormatKind>      activeFormat,
     std::span<std::string const>         userDefines,
     std::span<PredefinedMacroDef const>  targetPredefinedMacros,
     std::span<PredefinedMacroDef const>  formatPredefinedMacros) {
-    if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
-    if (!schema->preprocess().enabled) {
-        ppFatal("preprocess: called with a schema whose preprocess pass is "
-                "disabled - caller must gate on preprocess().enabled");
-    }
-
     PreprocessResult result;
     result.diagnostics = std::make_unique<DiagnosticReporter>();
 
@@ -5333,7 +5559,14 @@ PreprocessResult preprocess(
     if (!merged.conflicts.empty()) {
         // A name owned by more than one config. None may silently win, so the
         // pass does not run at all: `fatal` stops the caller from treating the
-        // (empty) token stream as a successful preprocess.
+        // token stream as a successful preprocess.
+        //
+        // This return produces NO tokens and NO synth buffer. That is fine
+        // HERE and only here: the single exit in `preprocess()` turns it into
+        // the well-formed EMPTY translation unit the contract promises. Before
+        // TF-C115 this return went straight to the caller and crashed it —
+        // see `establishResultContract` for what "well-formed empty" means and
+        // why "refused to run" is representable rather than a hole.
         for (std::string const& msg : merged.conflicts) {
             emitPP(*result.diagnostics,
                    DiagnosticCode::C_ConflictingPredefinedMacro,
@@ -5476,6 +5709,7 @@ PreprocessResult preprocess(
     // across include boundaries in document order (both directions).
     std::unordered_map<std::string, SynthBuilder::SbMacro> preScanMacros;
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
+                         headerNameMatching,
                          *result.diagnostics, 0, includeStack, result.fatal,
                          preScanDefinePrefix, merged.effective,
                          resolvedParents, preScanMacros};
@@ -5499,7 +5733,9 @@ PreprocessResult preprocess(
     const ByteOffset prefixLen = static_cast<ByteOffset>(synthText.size());
     auto prefixBuffer = SourceBuffer::fromString(
         synthText, std::string{mainSource->name()});
-    result.mainSourceId = mainSource->id();
+    // (`result.mainSourceId` is stamped by `establishResultContract` on the
+    //  single exit, so an aborting return carries it too — it used to be set
+    //  here, i.e. on the happy path only.)
 
     // c17 (P000E fix): the main tokenize's diagnostics go to a PROVISIONAL
     // reporter, NOT straight onto `result.diagnostics`. A `P_IllegalChar` whose
@@ -5531,6 +5767,7 @@ PreprocessResult preprocess(
     // systemDirs).
     MacroExpander expander{prefixBuffer,  schema,      *result.diagnostics,
                            prefixLen,     &result.lineMap,
+                           headerNameMatching,
                            includeDirs,   systemDirs,   activeFormat,
                            fs::path{mainSource->name()}.parent_path(),
                            merged.effective};
@@ -5656,14 +5893,121 @@ PreprocessResult preprocess(
         for (auto const& [parent, off] : resolvedParents) {
             if (byteInDeadRegion(off)) continue;   // authoritatively-dead -> not seeded
             ffi::forEachDescriptorInClosure(
-                parent, systemDirs, visited,
+                parent, systemDirs, headerNameMatching, visited,
                 [&](fs::path const& p) {
                     result.resolvedShippedDescriptors.push_back(p);
                 },
-                [](std::string const&) { /* import resolver owns the loud miss */ });
+                [](std::string const&, HeaderSearchResult const&) {
+                    /* import resolver owns the loud miss AND the loud
+                       fold-collision — both on the `#include` line */ });
         }
     }
 
+    return result;
+}
+
+// Establish the `PreprocessResult` shape contract on the SINGLE exit every run
+// funnels through ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]]).
+//
+// Two situations, deliberately handled DIFFERENTLY, because they are not the
+// same fact:
+//
+//  (1) the run produced NO tokens at all. That is a LEGITIMATE abort state: the
+//      pass refused to run (today: a predefined-macro collision, which must not
+//      let either config silently win; tomorrow: whatever else must refuse).
+//      The honest representation of "refused" is a well-formed EMPTY
+//      translation unit — a real, empty synth buffer and the single Eof token
+//      that terminates it — NOT a hole every consumer must remember to test
+//      for. Nothing is swallowed: `fatal` is set and the diagnostics are
+//      reported, so the caller still parses an Eof-only stream, still surfaces
+//      the error, and still exits non-zero. What changes is that it does so
+//      instead of reading past the end of an empty vector.
+//
+//  (2) the run produced tokens but LOST the terminator. NO legitimate path can
+//      do that — the run appends the Eof itself, unconditionally, right before
+//      its normal return — so this is an internal invariant break and it fails
+//      LOUD. Silently appending an Eof here would paper over a real truncation
+//      bug behind a stream the parser happily accepts, which is the "traded a
+//      crash for a silent skip" outcome the fail-loud rule forbids.
+//
+// Everything it touches is DATA-DRIVEN: it reads the token vector's shape and
+// the main buffer's name/id. It knows no language, no architecture and no
+// object format.
+void establishResultContract(PreprocessResult& result,
+                             std::shared_ptr<SourceBuffer> const& mainSourcePtr) {
+    SourceBuffer const& mainSource = *mainSourcePtr;
+    // Every path reports through this; an abort before the run allocated one
+    // would otherwise hand the caller a null `unique_ptr` it dereferences.
+    if (!result.diagnostics) {
+        result.diagnostics = std::make_unique<DiagnosticReporter>();
+    }
+    result.mainSourceId = mainSource.id();
+    // The MAIN source is an origin buffer of every preprocess result, by
+    // definition — it is the input. The run derives `originBuffers` from the
+    // LINE MAP, which an abort leaves empty, so on an aborting path the main
+    // buffer was never collected and the diagnostics stamped with its id had
+    // nothing to resolve against: MEASURED TF-C115, the collision error
+    // rendered `--> <unknown-buffer:1>:offset 0` instead of naming the file the
+    // user compiled. Stating the invariant here (deduped by id, exactly as the
+    // run's own collection loop does) makes it hold on EVERY path rather than
+    // on the paths that happen to build a line map.
+    {
+        bool present = false;
+        for (auto const& ob : result.originBuffers) {
+            if (ob && ob->id() == mainSource.id()) { present = true; break; }
+        }
+        if (!present) result.originBuffers.push_back(mainSourcePtr);
+    }
+    if (!result.synthBuffer) {
+        // An EMPTY buffer under the MAIN FILE's name: every consumer that
+        // dereferences `synthBuffer` (the Parser's source, the CU sidecar's
+        // `source`, `makeRemap`'s synth id) gets a live object, and a span into
+        // it is attributed to the file the user actually named rather than to
+        // `<unknown-buffer>`.
+        result.synthBuffer =
+            SourceBuffer::fromString(std::string{}, std::string{mainSource.name()});
+    }
+    if (result.tokens.empty()) {
+        Token eof;
+        eof.coreKind = CoreTokenKind::Eof;
+        eof.span     = SourceSpan::empty(
+            static_cast<ByteOffset>(result.synthBuffer->size()));
+        result.tokens.push_back(eof);
+        return;
+    }
+    if (result.tokens.back().coreKind != CoreTokenKind::Eof) {
+        ppFatal("preprocess: the result token vector is NOT Eof-terminated - a "
+                "return path in preprocessRun produced tokens but dropped the "
+                "terminating Eof, breaking the PreprocessResult contract every "
+                "consumer reads (see establishResultContract)");
+    }
+}
+
+} // namespace
+
+PreprocessResult preprocess(
+    std::shared_ptr<SourceBuffer>        mainSource,
+    std::shared_ptr<GrammarSchema const> schema,
+    std::span<fs::path const>            includeDirs,
+    HeaderNameMatching                   headerNameMatching,
+    std::span<fs::path const>            systemDirs,
+    std::optional<ObjectFormatKind>      activeFormat,
+    std::span<std::string const>         userDefines,
+    std::span<PredefinedMacroDef const>  targetPredefinedMacros,
+    std::span<PredefinedMacroDef const>  formatPredefinedMacros) {
+    if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
+    if (!schema->preprocess().enabled) {
+        ppFatal("preprocess: called with a schema whose preprocess pass is "
+                "disabled - caller must gate on preprocess().enabled");
+    }
+    PreprocessResult result = preprocessRun(
+        mainSource, std::move(schema), includeDirs, headerNameMatching,
+        systemDirs, activeFormat, userDefines, targetPredefinedMacros,
+        formatPredefinedMacros);
+    // ★ THE SINGLE EXIT. Its value is that it is not optional: a `return` added
+    // anywhere inside `preprocessRun` — for a config fault nobody has thought
+    // of yet — cannot bypass it.
+    establishResultContract(result, mainSource);
     return result;
 }
 

@@ -1031,7 +1031,9 @@ TEST(ElfWriter, NonElfFormatKindEmitsK_NoMatchingObjectFormat) {
     // accepts the load but the ELF walker rejects).
     auto wasmJson = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-test","kind":"wasm"}
     })";
     auto wasm = ObjectFormatSchema::loadFromText(wasmJson);
@@ -1084,6 +1086,8 @@ namespace {
 loadStubFormat(std::string_view kindName) {
     std::string const json = std::string{"{\"dssObjectFormatVersion\":1,"
                                          "\"dataModel\":\"LP64\","
+                                         "\"headerNameMatching\":\"case-sensitive\","
+                                         "\"cSymbolDecoration\":{\"scheme\":\"none\"},"
                                          "\"format\":{\"name\":\"stub-"}
         + std::string{kindName} + "\",\"kind\":\"" + std::string{kindName}
         + "\"}}";

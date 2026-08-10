@@ -1218,6 +1218,30 @@ enum class DiagnosticCode : std::uint16_t {
     // `unsuppressable_codes.cpp`.
     S_AttributeIgnoredForDeclarationKind = 0xE05F,
 
+    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (TF-C135): a DIRECT call argument
+    // whose pointee is an integer of the SAME REPRESENTATION as the parameter's
+    // but a DIFFERENT IDENTITY — `long long*` into `long*` on LP64, `int*` into
+    // `long*` on LLP64. C 6.5.2.2p7 makes it a constraint violation requiring a
+    // diagnostic; gcc (`-Wincompatible-pointer-types`), clang (same) and MSVC
+    // (C4133) all WARN, and DSS matches them rather than refusing code the
+    // platform toolchains compile. ✔MEASURED 2026-08-07: Apple clang 21.0.0
+    // compiles sqlite's `Tcl_GetWideIntFromObj(interp, objv[4], &iVal)` with
+    // exactly this warning and rc=0, on all four macOS SDKs present.
+    //
+    // WARNING, NOT ERROR, and the reasoning is recorded so it can be argued with:
+    // the representations are identical, so no load, store or call ABI changes —
+    // the realized Ptr→Ptr bitcast is a no-op — which means silence would be the
+    // dangerous choice and an error the merely-unportable one. `S_TypeMismatch`
+    // remains the ERROR for every mismatch this predicate does NOT admit
+    // (different width, different signedness, non-integer pointees, and the
+    // init/assign/return and indirect-call boundaries, which never relax).
+    //
+    // SUPPRESSIBLE, deliberately — `--warnings-as-errors` restores the strict
+    // pre-TF-C135 posture. Do NOT add it to `unsuppressable_codes.cpp`: a program
+    // that depends on this conversion is ABI-correct by construction, unlike the
+    // layout constraints that block belongs to.
+    S_IncompatiblePointerIntegerPointee = 0xE060,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -1645,6 +1669,24 @@ enum class DiagnosticCode : std::uint16_t {
     //   stack. Runs fine when no VLA scope is involved. Mirrors the SEH
     //   H_SehEarlyExit IndirectGotoStmt arm.
     H_VlaComputedGotoInScope      = 0xF019,
+    // H_ShippedShimSignatureMismatch (TF-C112, D-FFI-PE-CRT-UCRT-MIGRATION): a
+    //   user prototype re-declares — and therefore goal-2 SUPPRESSES — a shipped
+    //   descriptor row that is realized as a COMPILER-SYNTHESIZED shim rather than
+    //   an FFI import (a row carrying `synthesize`), but the prototype's resolved
+    //   FnSig is NOT the row's declared signature.
+    //   The user's declaration legitimately wins on the SIGNATURE (goal 2) and the
+    //   platform legitimately owns the REALIZATION — orthogonal properties, and
+    //   normally both are honoured at once by synthesizing the shim for the user's
+    //   own prototype. They become irreconcilable exactly here: the synth pass emits
+    //   ONE FIXED body per recipe id, built against the DESCRIPTOR's signature, so
+    //   binding a divergent prototype to it would have the caller marshal arguments
+    //   under one ABI and the callee read them under another — a wrong-ABI call with
+    //   no diagnostic at any stage. Refusing is the only honest answer, and the
+    //   refused set is essentially clang's own "conflicting types for 'printf'": the
+    //   header this suppresses declares the standard signature.
+    //   NOT a substitute for the ordinary import path — an ordinary (recipe-less)
+    //   suppressed row is untouched by this check.
+    H_ShippedShimSignatureMismatch = 0xF01A,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -1784,6 +1826,29 @@ enum class DiagnosticCode : std::uint16_t {
     // are the ONE exemption and do not trip it. Interner-gated (needs
     // isAtomicQualified). Caught at every verify point (verify-after-every-pass).
     I_AtomicAccessNotLowered       = 0xA018,
+    // TF-C112 (D-MIR-VERIFIER-NO-CALLSITE-SIGNATURE-CHECK): a MIR `Call` whose
+    // operands do not match its STATICALLY-RESOLVED callee's FnSig — either the
+    // wrong number of argument operands (fewer than the fixed parameters for a
+    // variadic callee; not exactly equal for a non-variadic one) or an operand
+    // whose type is neither identical to, same-representation as, nor
+    // `void*`-slack-compatible with the parameter declared at that POSITION
+    // (a `ptr<void>` on either side matches any pointer — MEASURED: Mem2Reg
+    // erases a `va_list` operand's pointee to the frame leaf's `ptr<void>`).
+    // `HirVerifier::checkCallArguments`
+    // enforces this on every frontend-produced call; a MIR-tier synthesis pass
+    // (synth_stdio_shim / synth_threads_shim / synth_pe_startup / …) emits MIR
+    // DIRECTLY and so bypassed it entirely — a mis-wired shim would silently
+    // call the C runtime with arguments in the wrong slots, which is a wrong-
+    // BYTES miscompile with no build-time symptom at all. Only STATICALLY
+    // resolvable callees are checked (an indirect call through a register has
+    // no signature to check against and is skipped cleanly), and only where the
+    // Call's PHYSICAL operand list is provably 1:1 with the FnSig's parameters
+    // (a by-value aggregate parameter expands to a variable number of ABI
+    // pieces; a by-value-class return may prepend an unmarked sret pointer).
+    // ⚠ It cannot see a transposition of two operands whose parameter types are
+    // the same TypeId — that is a POSITION error no type check can read — so it
+    // supplements, never replaces, the per-body shim test pins.
+    I_CallSignatureMismatch        = 0xA019,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
@@ -2298,7 +2363,148 @@ enum class DiagnosticCode : std::uint16_t {
     //   Never silently clamped or rounded: a rounded reserve is a knob that
     //   lies about the number it was given.
     K_InvalidStackReserveRequest   = 0x801A,
-    // K-NEXT-SLOT: 0x801B — grep this marker before adding a K_* code.
+    // K_ExternImportAttributeConflict (D-LK11-EXTERN-IMPORT-DEDUP): two
+    //   compilation units declare the SAME dynamic symbol -- identical
+    //   (mangledName, libraryPath, version), the triple that IDENTIFIES an
+    //   import -- with CONTRADICTORY per-row ATTRIBUTES, so the merge that
+    //   folds them into one row has two answers and no basis to choose.
+    //   `isData` selects the BINDING MODEL (the ELF copy-relocation data slot
+    //   vs the function-import path), `isThreadLocal` selects the
+    //   (unimplemented, walker-rejected) initial-exec TLS model, and two
+    //   DIFFERING NON-ZERO `dataSizeBytes`/`dataAlignBytes` size ONE
+    //   copy-relocation `.bss` slot two ways (the loader memcpy's `st_size`
+    //   bytes -- picking either silently truncates or over-copies). A zero
+    //   size/align is an INCOMPLETE type ("unknown in this TU", legal C), not
+    //   a disagreement: the non-zero shape wins and no diagnostic fires.
+    //   DISTINCT FROM `K_SymbolRedefinedAcrossUnits` (0x8011): that code is
+    //   the DEFINITION-tier fault -- one name with multiple strong bodies.
+    //   This is a DECLARATION-tier fault about ONE imported symbol nobody
+    //   defines; the remediation is "make the two `extern` declarations agree",
+    //   not "delete one definition". Fires from BOTH merge tiers, which
+    //   deliberately enforce the SAME rules under the SAME code: the MIR
+    //   whole-program merge (`mir_merge.cpp` — the LIVE route: `--compile a.c
+    //   b.c` and every `--project` build) and the assembled-tier fold
+    //   (`link/linker.cpp:568`, reached via `--resolve-library`).
+    //   ⚠ A DIVERGENCE BETWEEN THE TWO TIERS IS A DEFECT, NOT A DESIGN CHOICE.
+    //   Until TF-C119 the MIR tier keyed on `mangledName` ALONE — folding
+    //   across `libraryPath` AND `version` (the c156 D-LK-ELF-SYMBOL-VERSIONING
+    //   misbind shape) and first-wins on every field but `isEagerImport` — i.e.
+    //   the REACHABLE tier was the weaker one. They were harmonized together.
+    //   ★ MEMBERSHIP IN `kUnsuppressableCodes` IS PART OF THIS CODE, not an
+    //   optional extra: outside that table the reporter's dedup window and
+    //   per-code cap can drop this diagnostic silently, which restores
+    //   first-wins with no flag and no trace. See the rationale block in
+    //   `core/types/unsuppressable_codes.cpp`.
+    K_ExternImportAttributeConflict = 0x801B,
+    // K_FormatLacksProcessExit (D-LK10-ENTRY §2.13): the emitted image's ENTRY
+    //   would have no process-exit path BECAUSE THE FORMAT DECLARES NO
+    //   MECHANISM TO BUILD ONE FROM. An EXEC-FLAVORED format (ELF ET_EXEC, ELF
+    //   ET_DYN PIE, PE PE32+ Exec, Mach-O MH_EXECUTE) carries no `processExit`
+    //   block, so the linker has nothing to build the `_start` trampoline out
+    //   of. DSS ALWAYS synthesises an entry trampoline on an exec-flavored
+    //   format -- that is DSS POLICY, not a platform fact (see the wording note
+    //   below) -- so a missing mechanism is a dead end, not a fallback.
+    //   ★ THE NAME *IS* THE PREDICATE: this code means EXACTLY
+    //   `!format.processExit().has_value()`, at every site that fires it. THREE
+    //   sites, one fault: the linker's pre-injection gate (`link/linker.cpp`,
+    //   the `needsTrampoline && !processExit()` refusal); the WALKER-tier arm
+    //   (`link/format/exec_reloc_apply.hpp`, `resolveEntryFnIdx`'s
+    //   `if (format.isExecFlavor())` arm — added by the TF-C120 audit, which
+    //   found the walker silently defaulting to functions[0] for exactly this
+    //   shape); and `injectEntryTrampoline`'s own backstop for callers that
+    //   reach it directly (`link/entry_trampoline.cpp`, the opening
+    //   `if (!peOpt.has_value())`). ⚠ CITED BY PREDICATE, NOT BY LINE, AND
+    //   THAT IS DELIBERATE: this block carried a line number for each of the
+    //   first two sites until the TF-C120 audit-fix round, and that round's OWN
+    //   edits to linker.cpp shifted the first one by six lines in the very
+    //   commit that was fixing stale citations. Line numbers drift; the
+    //   PREDICATE spellings do not — grep those.
+    //   ★ WHAT THIS CODE IS *NOT*. The walker-tier fault where the format DOES
+    //   declare `processExit` but the module arrived UN-TRAMPOLINED is
+    //   `K_ExecEntryNotTrampolined` (0x801D) below. It was briefly filed under
+    //   THIS code (caught in the same cycle's review, before either code
+    //   shipped), and that was a misnomer with a concrete cost: a reader greps
+    //   `K_FormatLacksProcessExit`, opens the format, finds
+    //   `processExit` sitting right there, and concludes the compiler is lying.
+    //   Do not re-merge the two — the predicates are opposite on that field.
+    //   ★ WORDING DISCIPLINE (do not "simplify" this into a platform claim):
+    //   the message must say DSS always synthesises the trampoline and this
+    //   format declares no mechanism for it to call. It must NOT say an exec
+    //   format cannot terminate without one -- that is FALSE for Mach-O.
+    //   TWO CLAIMS, TWO DIFFERENT EVIDENCE GRADES, and the second is NOT
+    //   verified in this tree (TF-C120 audit F3):
+    //     * dyld CALLS an LC_MAIN entry, with argc/argv already in the
+    //       argument registers -- DOCUMENTED, and pinned in-tree by
+    //       tests/link/test_object_format_schema.cpp
+    //       `ProcessArgsSubstrate.ShippedMachoExecsDeclareNoneAndPe...`,
+    //       which is what justifies the shipped Mach-O execs declaring no
+    //       `processArgs`;
+    //     * Apple's libdyld `start` wrapping that call as `exit(main(...))`
+    //       -- INFERRED from Apple documentation. NOTHING in this tree
+    //       verifies it: that test asserts only the argc/argv register
+    //       convention, and it was mis-cited as pinning this half too. Do
+    //       not put this half into a user-facing diagnostic string.
+    //   ★ MEMBERSHIP IN `kUnsuppressableCodes` IS PART OF THIS CODE: outside
+    //   that table the reporter's dedup window and per-code cap can drop the
+    //   diagnostic silently, which restores exactly the silent trampoline SKIP
+    //   (and therefore the silent wrong-entry emission) it exists to prevent.
+    K_FormatLacksProcessExit       = 0x801C,
+    // K_ExecEntryNotTrampolined (D-LK10-ENTRY §2.13): the WALKER-TIER backstop
+    //   for an image whose entry would be USER CODE. The format DOES declare a
+    //   `processExit` block -- which CONTRACTS that its image entry is the
+    //   DSS-synthesized `_start` trampoline -- but the `AssembledModule` handed
+    //   to `{elf,macho,pe}::encode` carries NO `imageEntryOverride`, so no
+    //   trampoline was ever injected into it. The fault is the MISSING
+    //   TRAMPOLINE, and this name says so; see the `K_FormatLacksProcessExit`
+    //   block above for why the two must not share a code (the predicates
+    //   DISAGREE on `processExit()`: absent there, PRESENT here).
+    //   ★ HOW A MODULE GETS HERE (INFERRED — from the call graph; this is the
+    //   only route found, not a proof that no other exists):
+    //   `injectEntryTrampoline` sets `module.imageEntryOverride = 0` as the last
+    //   act of every SUCCESSFUL injection (`link/entry_trampoline.cpp:732` — the
+    //   FILE'S ONLY assignment to that field, so grep it if the line has
+    //   drifted; a comment here cited `:708` for a while, which is a line about
+    //   `expectedFuncCount`. The one early return below the prepend rolls the
+    //   prepend back and returns false, so a module that got a trampoline ALWAYS
+    //   carries the override), and `resolveEntryFnIdx` honors it before it can
+    //   reach this arm. So an un-trampolined module AT THE WALKER means
+    //   `{elf,macho,pe}::encode` was driven DIRECTLY, bypassing `linker::link`.
+    //   That is a real shape, not a hypothetical: the tests drive it (the
+    //   `elf::encode` call in tests/link/test_lk10_entry_slice_c.cpp T2), and
+    //   the walkers are public entry points any embedder can call.
+    //   ★ AND, UNLIKE 0x801C's LINKER ARM, THIS ONE IS REACHABLE WITH A PERFECTLY
+    //   VALID SHIPPED FORMAT. `ObjectFormatData::validate()` rejects an
+    //   exec-flavored format declaring no `processExit` at CONFIG-LOAD time (the
+    //   ⟺ biconditional in `link/object_format_schema.cpp`; DOCUMENTED, pinned by
+    //   the `loadFromText` refusal in tests/link/test_lk10_entry_slice_c.cpp), so
+    //   0x801C's linker arm is unreachable from any config that loads. NOTHING
+    //   validates the DRIVE, so this code's surface stays live forever.
+    //   ★ WHAT IT REPLACES (MEASURED, before the gate existed): defaulting to
+    //   `functions[0]` silently made the user's first function the process
+    //   entry -- `int main(void){return 42;}` at
+    //   `--target x86_64:macho64-x86_64-darwin-exec` produced rc=0, a 4162-byte
+    //   artifact, and `LC_MAIN entryoff=0x1000` whose bytes are
+    //   `48 81 ec 10 00 00 00` (`sub rsp,0x10`) -- a FUNCTION PROLOGUE. Such an
+    //   entry never materializes argc/argv and never calls the declared exit
+    //   mechanism; the program runs off the end of `main` into whatever bytes
+    //   follow it.
+    //   ★ A WALKER-TIER DUPLICATE OF A LINKER-TIER CHECK IS DELIBERATE, NOT
+    //   REDUNDANT. The precedent is recorded in prose at `link/linker.cpp:769-773`
+    //   (the image-request gate): the first cut split the CAPABILITY and BOUNDS
+    //   checks between the linker gate and the walker, and a direct `pe::encode`
+    //   call then wrote an out-of-range stack reserve AND REPORTED SUCCESS. Here
+    //   the case is stronger still -- `linker::link`'s `needsTrampoline` gate
+    //   CANNOT see this fault (the fault is precisely that `link` was never
+    //   called), so the walker is not a second opinion, it is the ONLY tier the
+    //   direct path passes through.
+    //   ★ MEMBERSHIP IN `kUnsuppressableCodes` IS PART OF THIS CODE, not an
+    //   optional extra: outside that table the reporter's dedup window and
+    //   per-code cap can drop the diagnostic with no flag and no trace, and this
+    //   failure has NO other trace -- the build reports success and the wrong
+    //   entry ships. See the rationale block in
+    //   `core/types/unsuppressable_codes.cpp`.
+    K_ExecEntryNotTrampolined      = 0x801D,
+    // K-NEXT-SLOT: 0x801E — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
@@ -2652,6 +2858,23 @@ enum class DiagnosticCode : std::uint16_t {
     //   exists there. Member of `kUnsuppressableCodes` (a silent-loader-death
     //   guard). (D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS, 2026-07-30.)
     F_ShippedSymbolUnavailableForTarget = 0x5024,
+    // F_HeaderNameCaseAmbiguous: an `#include` header name matched MORE THAN
+    //   ONE distinct file under the active object format's declared
+    //   case-INSENSITIVE header-name convention
+    //   (`headerNameMatching: "case-insensitive"` — pe / macho). Example: a
+    //   `-I` directory (or a shipped descriptor directory) holding BOTH
+    //   `foo.json` and `Foo.json`, reached by `#include <Foo.h>`.
+    //   Fail-loud, and deliberately NOT resolved by preferring the exact
+    //   spelling: such a directory CANNOT EXIST on NTFS or on a default
+    //   APFS/HFS+ volume, so any pick made here would resolve differently
+    //   depending on which host ran the build — reintroducing exactly the
+    //   host-dependence `headerNameMatching` exists to remove, one layer
+    //   down. The message names every colliding path. Remediation: rename so
+    //   the two names differ by more than ASCII case (a case-only pair cannot
+    //   be checked out on Windows or default macOS at all). Member of
+    //   `kUnsuppressableCodes` — suppressing it would restore the silent
+    //   host-dependent pick. (D-PP-HEADER-CASE-INSENSITIVE-PE, 2026-08-04.)
+    F_HeaderNameCaseAmbiguous      = 0x5025,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

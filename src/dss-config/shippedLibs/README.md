@@ -16,7 +16,8 @@ active compilation target's object format — exactly like real C. See
 `examples/c-subset/shipped_include_abs/` (stdlib) for end-to-end proofs.
 
 **Model 3 (2026-06-09)** — descriptors are **platform-neutral**: ONE descriptor
-per header (a flat `<stem>.json`, no per-platform directories), carrying a
+per header (`<stem>.json`, at the header's own path — no per-platform
+directories), carrying a
 per-object-format `library` map (`{"pe":…,"elf":…,"macho":…}`). The active
 target's object format selects its runtime image at `compile_pipeline`
 resolution time (keyed by `objectFormatKindName`), so the same descriptor serves
@@ -27,21 +28,63 @@ The universal reader is `src/ffi/shipped_lib_descriptor.{hpp,cpp}`. It is
 **source/target/linker agnostic**: pure `nlohmann/json` + the single
 `parseTypeFromText` codec, with no language/CPU/format identity branch.
 
+## ★★ SCOPE — OS LIBRARIES ONLY. THIRD-PARTY LIBRARIES NEVER BELONG HERE.
+
+This directory describes **the operating system's own surface** and nothing else:
+libc/POSIX, Win32, libSystem, the platform's headers. That is DSS's *own*
+vocabulary for a target platform, which is why it can ship it, version it, and
+guarantee it on every host.
+
+A third-party library — Tcl, zlib, OpenSSL, anything a *user* chose to depend on
+— is **NOT** part of that surface and must never get a descriptor here. It is
+supplied as a **per-leg compilation input**, declared by the build that consumes
+it. DSS supports both dynamic and **static** third-party libraries through that
+channel, so a project can compile against whatever it needs without the compiler
+adopting responsibility for it.
+
+**Why the rule is absolute, and not merely tidy.** A descriptor here is a promise
+DSS makes about every target it supports. Admitting one third-party library makes
+DSS's platform vocabulary responsible for someone else's release cycle, ABI and
+symbol set — and it sets the precedent that the *next* dependency gets the same
+treatment. The directory then stops meaning "the platform" and starts meaning
+"whatever happened to be convenient", which is unfixable once it has begun.
+
+⚠ **This rule was breached in proposal on 2026-08-04 and caught only because the
+operator was reading.** The sqlite testfixture links Tcl (~102 symbols) and zlib
+(8 symbols), and because those two lack descriptors, `--resolve-library` must read
+a real binary's export table to learn their names — which is impossible for a
+Darwin target on a non-Mac host. "Just give them descriptors" is the obvious fix,
+it is wrong, and it was recommended by an agent *and* by the orchestrator before
+being rejected. **The rule was nowhere in this README at the time, which is
+precisely why it was proposed.** It is here now. See
+`D-HARNESS-MACHO-LEG-INPUTS-UNOBTAINABLE-OFF-MAC` for the correct direction: a
+per-leg declared library input, living with the build, not with the platform.
+
 ---
 
 ## Directory layout
 
+**49 descriptors** today: **37** at the top level, plus **12** under `sys/` and
+`malloc/`.
+
 ```
 shippedLibs/
-  stdio.json             <stdio.h>   — I/O
-  stdlib.json            <stdlib.h>  — general utilities, alloc, conversion
-  string.json            <string.h>  — byte-string / memory ops
-  ctype.json             <ctype.h>   — character classification
-  math.json              <math.h>    — floating-point math
+  stdio.json             <stdio.h>       — I/O
+  stdlib.json            <stdlib.h>      — general utilities, alloc, conversion
+  string.json            <string.h>      — byte-string / memory ops
+  ctype.json             <ctype.h>       — character classification
+  math.json              <math.h>        — floating-point math
+  …                                      — 32 more C / POSIX / Win32 headers
+  sys/stat.json          <sys/stat.h>    — the header's PATH is the descriptor's path
+  sys/time.json          <sys/time.h>
+  …                                      — 9 more under sys/ (11 in all), 1 under malloc/
 ```
 
-FLAT and platform-neutral (Model 3): one descriptor per header, each carrying a
-per-object-format `library` map. There are no per-platform subdirectories — the
+NOT flat, but still platform-neutral (Model 3): one descriptor per header, each
+carrying a per-object-format `library` map. The nesting that exists mirrors the
+C **header namespace** — the resolver maps a header name to `<stem>.json`
+verbatim, so `<sys/stat.h>` → `sys/stat.json` and `<malloc/malloc.h>` →
+`malloc/malloc.json`. There are still no per-**platform** subdirectories: the
 target's object format picks the runtime image from the map at resolution time.
 
 ---
@@ -53,7 +96,7 @@ target's object format picks the runtime image from the map at resolution time.
   "header":   "stdio.h",        // REQUIRED — provenance: which C header
   "standard": "c89",            // optional — provenance: which language standard
   "library": {                  // per-object-format runtime image (Model 3)
-    "pe":    "msvcrt.dll",
+    "pe":    "ucrtbase.dll",
     "elf":   "libc.so.6",
     "macho": "/usr/lib/libSystem.B.dylib"
   },
@@ -66,18 +109,22 @@ target's object format picks the runtime image from the map at resolution time.
 }
 ```
 
-The table below is the **complete** closed key set the reader accepts. Any other
-top-level key **fails loud** (`F_ShippedLibDescriptorMalformed`, `(root)`), so a
-typo is never a silently-ignored surface.
+The table below is the **complete** closed key set the reader accepts at the
+ROOT. Any other top-level key **fails loud**
+(`F_ShippedLibDescriptorMalformed`, `(root)`), so a typo is never a
+silently-ignored surface. Every nested surface is its own closed set on the
+same terms — the `symbols` row below spells its eleven keys out in full,
+because an entry key omitted from this document is one an author will never
+know exists.
 
 | Field       | Required | Meaning |
 |-------------|----------|---------|
 | `header`    | **yes**  | The header these symbols come from (`stdio.h`). This is the provenance answer to *"where does `puts` come from?"* — a descriptor that omitted it would defeat the purpose, so the reader **fails loud** (`F_ShippedLibDescriptorMalformed`) if it is missing or empty. |
 | `standard`  | no       | The language standard the surface targets (`c89`, `c99`, …). Provenance only. |
-| `library`   | no       | A per-OBJECT-FORMAT MAP (`"pe"`/`"elf"`/`"macho"` → runtime image). The active compilation target's object format selects its entry at `compile_pipeline` resolution (keyed by `objectFormatKindName`). **Optional**: a map MISSING the active format's key (or absent entirely) inherits the language's `externLibraryByFormat[format]` default for that format. A key NOT in the object-format vocabulary (a typo like `"pee"`) **fails loud** (`F_ShippedLibDescriptorMalformed`) on read. |
+| `library`   | no       | A per-OBJECT-FORMAT MAP (`"pe"`/`"elf"`/`"macho"` → runtime image). The active compilation target's object format selects its entry at `compile_pipeline` resolution (keyed by `objectFormatKindName`). **Optional**: a map MISSING the active format's key (or absent entirely) inherits the language's `externLibraryByFormat[format]` default for that format. A key NOT in the object-format vocabulary (a typo like `"pee"`) **fails loud** (`F_ShippedLibDescriptorMalformed`) on read. **What the 30 descriptors that carry a map actually name today** (copy these, not the historical `msvcrt.dll`): 18 declare a `pe` entry — **15** `ucrtbase.dll` (the UCRT, since the TF-C111 pe CRT migration), 2 `kernel32.dll` (`threads.json`, `windows.json`) and 1 residual `msvcrt.dll` (`setjmp.json`, not yet migrated); every `elf` entry is `libc.so.6` except `math.json`/`tgmath.json` (`libm.so.6`), and every `macho` entry is `/usr/lib/libSystem.B.dylib`. |
 | `availableObjectFormats` | no | Per-target AVAILABILITY — which object formats this header EXISTS on (the sibling axis to `library`, which says which IMAGE per format). ABSENT/EMPTY = available on **every** format (C-standard headers omit it); a POSIX-only header carries `["elf","macho"]`, so `#include <sys/time.h>` **fails loud** for a windows-pe target and `__has_include` answers the per-target truth. Same object-format vocabulary as `library` — an unknown name **fails loud** on read. A `symbols` entry may carry its own `availableObjectFormats` to gate one symbol (see `stdio.json`'s `__stdinp` / `_wfopen`). |
 | `includes`  | no       | The transitive sibling headers this header `#include`s in the real world (`inttypes.json` declares `["stdint.h"]`, mirroring C 7.8p1). Including the parent injects each declared sibling's surface too, walking the config-declared graph cycle-safely. Each entry is a header NAME resolved by the same `<stem>.json` convention as a source angle-include (`"sys/uio.h"` → `sys/uio.json`). ABSENT/EMPTY = no transitive edges. **`includes` does NOT count toward "declares something"** — an includes-only descriptor still fails loud. |
-| `symbols`   | no\*     | The exported LINK surface (extern functions/objects). Each entry: `name`, `signature` (a hir-text type string), `kind`, `linkage`; optionally `availableObjectFormats` and a symbol `version`. |
+| `symbols`   | no\*     | The exported LINK surface (extern functions/objects). An entry accepts **TWELVE** keys and no more — an unknown one **fails loud** (`symbols[i]`) exactly as at the root. **`name`** (REQUIRED) — the undecorated C identifier; the linker-visible form is produced downstream by FF4 mangling. **`signature`** (REQUIRED) — a hir-text type string: a full `fn(…) -> …` FnSig for a function, or the value type for an object, decoded by the one shared `parseTypeFromText` codec. **`signatureByDataModel`** — a per-DATA-MODEL override map (`"LP64"`/`"LLP64"`/`"ILP32"` → signature string); the ACTIVE model's entry replaces `signature`, and EVERY declared override is parsed on every read, so a form that only Windows selects can never lurk malformed. An unknown model key fails loud. **`kind`** — `"function"` (default) or `"object"`; selects `ExternFunction` vs `ExternGlobal`. **`linkage`** — `"external"` (default) or `"weak"`; validated and carried (the synthesis path currently emits Strong for every shipped import). **`availableObjectFormats`** — per-SYMBOL availability, the symbol-granularity sibling of the header-level key. Load-bearing, not cosmetic: DSS imports EVERY declared shipped extern whether the program references it or not, so a name absent from the active format's runtime image must not be declared there or nothing links. **`noreturn`** — this extern never returns (`abort`, `exit`, `longjmp`, `thrd_exit`). A shipped extern has no user prototype to carry C11 `_Noreturn`, so the descriptor declares it and a direct call lowers to `Block{ call, Unreachable }`. **`returnsTwice`** — C11 7.13.1.1 (`setjmp`, `_setjmp`); rides to MIR as `MirInstFlags::ReturnsTwice`, which is what stops mem2reg promoting a live-across-`setjmp` local and stops the inliner taking the callee. **`synthesize`** — this symbol is NOT an import but a COMPILER-SYNTHESIZED body; the value is a recipe id from a CLOSED vocabulary and MUST equal `name` (the synth pass identifies each recipe by symbol name, so both an unknown id and a mismatch are rejected on read). Live use: `threads.json`'s `<threads.h>` shim (21 pe rows over kernel32, 21 macho rows over pthread/libSystem — the elf rows are ordinary glibc imports) and `stdio.json`'s five pe printf/scanf rows over the UCRT `__stdio_common_v*` cores, which `ucrtbase.dll` does not export as `printf`/`fprintf`/`sprintf`/`sscanf`/`vfprintf` at all. **`version`** — the ELF symbol VERSION this import must bind (`stdlib.json`'s `realpath` → `GLIBC_2.3` on x86_64-elf), so a reference does not misbind to a multi-versioned glibc symbol's OLDEST compat instance. A flat string, or per-target `variants` (`when` + `value`) since the version is genuinely per-target. Empty = unversioned; ELF-only semantics, carried and unused on PE/Mach-O. **`linkName`** — the UNDECORATED name the shipped library actually EXPORTS for this C identifier ON THIS TARGET, when it is not the identifier itself. Same shape as `version` (flat string, or per-target `variants` with `when` + `value`) and read by the same decoder. Live use: Darwin's modern 64-bit-inode ABI is reached through `$INODE64` asm-label aliases on **x86_64** and through the plain names on **arm64**, so `sys/stat.json`'s `stat`/`fstat`/`lstat`, `unistd.json`'s `statfs`/`fstatfs` and `dirent.json`'s `opendir`/`readdir` each carry a `when:{format:"macho",arch:"x86_64"}` arm; every other target matches nothing and keeps the identifier. ★ Write the BASE name only — `"fstat$INODE64"`, never `"_fstat$INODE64"`. Mach-O's leading underscore is a per-FORMAT fact the ENGINE composes (`ffi::linkNameFor` → `applyCMangling`), exactly as `version` composes `realpath` + `GLIBC_2.3` into `realpath@GLIBC_2.3` rather than making you spell it. ★ NOT the same thing as a user's C `__asm("x")` (which is verbatim and BYPASSES mangling); this is the INPUT to mangling, and a user `__asm` outranks it. ★ AUTHORING CHECK, and it REPLACES the older "verify the symbol is exported" rule for this class: an export check does NOT catch a wrong link name, because BOTH `_fstat` and `_fstat$INODE64` exist in libSystem's x86_64 slice. The check that works is **"does a real compiler for THIS target emit THIS name for THIS C identifier"** — compile a one-line TU with the platform toolchain and read the undefined symbol it emits. Getting this wrong does not fail loud: a descriptor SHADOWS the SDK header entirely, so the platform's own asm label never participates, the plain name resolves against the LEGACY implementation, and the program links, loads, and misbinds (MEASURED — it made `fstat` return `st_size == 0` and sqlite call every database "malformed"). **`library`** — a per-symbol OVERRIDE of the descriptor's map, same `{pe,elf,macho}` shape, MERGED over it (symbol keys win; an omitted format inherits). Counts today: `availableObjectFormats` 157 entries, `synthesize` 47, `noreturn` 6, `signatureByDataModel` 6, `returnsTwice` 2, `version` 1, `linkName` 7 — and the per-symbol `library` override is used by **no** descriptor at present. Its last user was `stdio.json`'s `__stdio_common_vsprintf` row, retired when this file's own `pe` default became `ucrtbase.dll`; it is documented because the reader accepts it and the next split-runtime symbol will need it, not because anything depends on it today. |
 | `constants` | no\*     | The header's object-like `#define` macro-CONSTANTS as NEUTRAL named integer constants (e.g. `CHAR_BIT`). Each entry: `name`, `value` (a JSON integer — the int64 BIT-PATTERN; for an unsigned `type` the uint64 value reinterpreted, so the full unsigned range round-trips), `type` (a hir-text INTEGER-SCALAR type, `i8`…`u128`), OR per-target `variants` (`when` + `value` + `type`). The semantic phase injects each as a compile-time constant that folds to a literal in VALUE and CONSTANT-EXPRESSION position (`int a[CHAR_BIT]`). A non-integer-scalar type, an out-of-range / negative-for-unsigned value, or an unknown key **fails loud**. A function-like macro belongs in `macros`; a float one in `floatConstants`. |
 | `floatConstants` | no\* | The header's FLOATING-point macro-constants (`math.json` ships `INFINITY` and `HUGE_VAL`) — the `constants` surface is integer-ONLY, so a float there fails loud. Each entry: `name`, `value` (a **string** — JSON has no Infinity/NaN, so `"inf"`/`"+inf"`/`"-inf"` map to the IEEE-754 infinities and any other string is a finite literal parsed by the one float decoder), `type` (a FLOAT scalar, `f32`/`f64`). A finite literal that OVERFLOWS to ±inf **fails loud** — only the explicit `inf` tokens may produce an infinity. |
 | `typedefs`  | no\*     | The header's `typedef`s as NEUTRAL type aliases (e.g. `size_t`). Each entry: `name`, and EITHER a flat `type` (any hir-text type) OR per-target `variants` (`when` + `type`). Injected as a type-position name. A builtin type of the same name wins. |
@@ -116,13 +163,13 @@ language. C types map as: `int`→`i32`, `unsigned int`→`u32`, `size_t`→`u64
 
 ---
 
-## ABI deltas — the `long`-width data-model split (deferred)
+## ABI deltas — the `long`-width data-model split
 
 The C type `long` (and `unsigned long`) is **not** the same width everywhere:
 **LP64** (Linux + macOS) makes it 64-bit; **LLP64** (Windows) makes it 32-bit.
 Six symbols across two headers bear a `long` and so are data-model-dependent:
 
-| Symbol (header)        | LP64 (linux/macos) — the form authored here | LLP64 (windows) — deferred |
+| Symbol (header)        | `signature` — the LP64 (linux/macos) base form | `signatureByDataModel.LLP64` (windows) |
 |------------------------|---------------------------------------------|----------------------------|
 | `atol` (stdlib)        | `fn(ptr<char>) -> i64`                      | `… -> i32`                 |
 | `strtol` (stdlib)      | `… -> i64`                                  | `… -> i32`                 |
@@ -131,16 +178,20 @@ Six symbols across two headers bear a `long` and so are data-model-dependent:
 | `fseek` offset (stdio) | `fn(ptr<…FILE…>, i64, i32) -> i32`          | `fn(ptr<…FILE…>, i32, …)`  |
 | `ftell` (stdio)        | `… -> i64`                                  | `… -> i32`                 |
 
-Because a descriptor is now **platform-neutral** (Model 3), these six carry a
-SINGLE authored form — the **LP64 (i64/u64)** form, correct for the runnable
-linux/macos targets. The Windows LLP64 (i32/u32) form is **latently deferred**:
-it is UNEXERCISED by any corpus/test, and is tracked by
-**`D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH`** (a `long` whose width depends on
-the data model). When that anchor lands a per-target primitive-width model, the
-neutral `long` will resolve to i32 on Windows and i64 on Unix automatically; the
-test `ShippedLibDescriptor.ShippedStdlibSignaturesAreLp64` guards the current
-form. Every other symbol uses fixed-width or model-invariant types
-(`int`, `double`, `size_t`, pointers) and is width-identical everywhere.
+A descriptor is **platform-neutral** (Model 3), so all six live in ONE file:
+each carries the **LP64 (i64/u64)** form as its base `signature` and declares
+the Windows form in a per-symbol **`signatureByDataModel.LLP64`** override
+(see the `symbols` row above). The active object format's `dataModel` picks
+one — `pe` is LLP64, `elf`/`macho` are LP64 — and the reader parses BOTH on
+every read, so the inactive arm cannot rot. This closed
+**`D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH`** on 2026-06-10 (FC3 c1) together
+with the `coreByDataModel` axis that resolves the `long` KEYWORD the same way.
+Two tests hold the two halves: `ShippedLibDescriptor.ShippedStdlibSignaturesAreLp64`
+pins the LP64 base form for all six, and `Fc3Descriptor.FseekOffsetFollowsTheDataModel`
+reads the SHIPPED `stdio.json` twice and pins that `fseek`'s offset comes back
+i64 under LP64 and i32 under LLP64 — the model every `pe` format declares. Every
+other symbol uses fixed-width or model-invariant types (`int`, `double`,
+`size_t`, pointers) and is width-identical everywhere.
 
 ---
 
@@ -214,16 +265,80 @@ sweep over every descriptor × every shipped target):
 
 ---
 
-## What is deliberately NOT here — variadic functions
+## Variadic functions — encodable, and shipped where a consumer exists
 
-`printf`, `fprintf`, `scanf`, `sscanf`, `snprintf`, and the rest of the
-variadic surface are **excluded**. The IR type-text `fn(...)` grammar has no
-variadic marker yet, so a variadic signature is currently unencodable — and the
-reader fails loud rather than mint a wrong fixed-arity stand-in. This is pinned
-as **`D-FFI-DESCRIPTOR-VARIADIC-SIGNATURE`** (trigger: add a variadic marker to
-the `fn` grammar, then these descriptors gain their `printf`-family symbols).
-Until then, a program needing `printf` declares it with an inline `extern` of
-the concrete arity it calls.
+The IR type-text `fn` grammar takes a **trailing `...`**, so a variadic
+signature is spellable and a descriptor can carry one. Twelve symbol entries
+across four descriptors do:
+
+| Descriptor | Variadic symbols |
+|------------|------------------|
+| `stdio.json`     | `printf`, `fprintf`, `sprintf`, `sscanf`, `snprintf` — each authored twice: an `[elf,macho]` import row and a `[pe]` `synthesize` row. `snprintf` reached that shape LAST (TF-C119; its macho half 2026-08-05) — see the note below for the measurement that unblocked it, and for the closing instrument that turned out to be broken. |
+| `fcntl.json`     | `open`, `fcntl` |
+| `io.json`        | `_open` |
+| `sys/ioctl.json` | `ioctl` |
+
+What is still absent is **not a grammar limit** — it is the ordinary
+need-driven rule this whole directory follows: a symbol ships when a real
+consumer lands, because DSS eager-imports every declared extern. So
+`scanf`, `fscanf`, `vsnprintf`, `vsprintf` and the rest of the
+family are simply not authored yet. (`vfprintf` IS shipped — it is not
+variadic; it takes a `va_list`.)
+
+**`snprintf` SHIPPED 2026-08-05 (TF-C119)** — its consumer, the SQLite CLI,
+landed. ⚠ Three corrections to what this paragraph used to say, kept because
+each was load-bearing and each was wrong:
+
+- It said the CLI "needs `snprintf` on the POSIX legs". ✔MEASURED: `snprintf`
+  was missing on **all three** of `elf64-x86_64`, `elf64-aarch64` **and**
+  `pe64-x86_64` — shipped nowhere, so the POSIX framing implied a specificity
+  that did not exist.
+- The tracking anchor's remediation hint named `__stdio_common_vsnprintf` as
+  the UCRT backing symbol. ✔MEASURED with `objdump -p` over
+  `C:/Windows/System32/ucrtbase.dll` (2,484 exports): **that symbol does not
+  exist**, and neither does a bare `snprintf`. Adding it would have broken
+  every pe binary's LOAD with `0xC0000139` under
+  `D-FFI-DESCRIPTOR-EAGER-IMPORT`. The real core is `__stdio_common_vsprintf`
+  (ordinal 117), already shipped for `sprintf`, so the pe arm is a
+  `synthesize` shim adding **zero** new imports.
+- It said macho was **deliberately not shipped**: the row was gated `["elf"]`
+  because the libSystem export was INFERRED and never measured (the operator's
+  Mac was unreachable and the build host carries no macOS SDK). That staging
+  was the correct call at the time, and it is now **CLOSED**. ✔MEASURED
+  2026-08-05 on the operator's real Mac over ssh (**macOS 26.5.2, arm64**) —
+  with `SDK=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk`,
+  `grep -rwq -e _snprintf $SDK/usr/lib/libSystem.B.tbd` reports **PRESENT**, as
+  do `_vsnprintf _popen _pclose _fileno _sysctl _sysctlbyname _exit _fstat64`
+  in the same pass. The row is `["elf","macho"]` and the darwin arm of
+  `examples/c-subset/shipped_snprintf_ucrt` is restored — in the SAME edit,
+  because either half alone is red. ⚠ **The closing instrument this file and
+  the anchor both pinned — `nm -gU /usr/lib/libSystem.B.dylib | grep
+  ' _snprintf$'` — is BROKEN. Do not re-run it.** ✔MEASURED on that same host:
+  `ls: /usr/lib/libSystem.B.dylib: No such file or directory`. Modern macOS
+  keeps libSystem only in the dyld shared cache and ships no such file, so `nm`
+  on that path returns nothing for **every** symbol and would have reported a
+  **false ABSENT for all nine names above**. Under
+  `D-FFI-DESCRIPTOR-EAGER-IMPORT` that is the *dangerous* direction of wrong:
+  it breaks no build, it silently withholds a real export and makes the staging
+  look permanently justified. The correct **file-based** instrument for "does
+  libSystem export X on Darwin" is the SDK `.tbd` text stub — a real readable
+  file — grepped `-w` for the **mangled** C name with its leading underscore
+  (so `_snprintf` does not match `_vsnprintf`). ★ `popen`/`pclose` were held at
+  `["elf"]` alongside it on the rule that this directory ships on a
+  **consumer**, not on a confirmed export — the `.tbd` pass showed Darwin has
+  both, and that alone was deliberately not enough. **THE CONSUMER HAS SINCE
+  LANDED** (the macho64-arm64 SQLite CLI, where those two names were the last
+  remaining descriptor errors on the 103-TU build), so the SAME rule now ships
+  them: both rows read `["elf","macho"]`. ✔The export is MEASURED, not
+  inferred — on the operator's Mac (macOS 26.5.2, arm64) by sqlite's own probe
+  methodology, an `extern void f(void);` TU **compiled AND linked** against
+  `/usr/bin/cc`: `popen` LINK-OK, `pclose` LINK-OK, with `_popen`/`_pclose`
+  concurring in `$SDK/usr/lib/libSystem.B.tbd`.
+
+**`D-FFI-DESCRIPTOR-VARIADIC-SIGNATURE`** is the tracking anchor. Its original
+subject — the missing `fn` grammar marker — no longer exists; what remains under
+it is per-symbol authoring as consumers appear. A name absent from a descriptor
+still fails LOUD at the reference, never silently.
 
 ---
 
@@ -241,21 +356,31 @@ shared substrate, and it dissolved the former `D-FFI-SHIPPED-LIB-PLATFORM-SELECT
 deferral entirely (a single descriptor set serves all targets).
 
 `examples/c-subset/shipped_include_puts` proves it end to end: `#include
-<stdio.h>` + `puts("hello")` links `puts` against msvcrt.dll on Windows-PE,
-libc.so.6 on Linux-ELF (x86_64 + arm64), and libSystem on macOS-Mach-O — from
-the one `stdio.json`.
+<stdio.h>` + `puts("hello")` links `puts` against ucrtbase.dll on Windows-PE
+(msvcrt.dll until the TF-C111 CRT migration), libc.so.6 on Linux-ELF (x86_64 +
+arm64), and libSystem on macOS-Mach-O — from the one `stdio.json`.
 
 ---
 
 ## Adding or extending a descriptor
 
-1. Pick the right `<header>.json` (create it if the header is new — flat, no
-   per-platform subdir).
+0. **Check the scope rule first (see "SCOPE" above). Is this header part of the
+   OPERATING SYSTEM's surface?** libc/POSIX, Win32, libSystem: yes. Tcl, zlib,
+   OpenSSL, curl, or anything a *user* chose to depend on: **NO — stop here.**
+   That library is a per-leg compilation input declared by the build that
+   consumes it, not a descriptor. If you are here because a build cannot find a
+   third-party library's symbols on some host, adding a descriptor is the wrong
+   fix and will be rejected in review.
+1. Pick the right `<header>.json` (create it if the header is new — at the path
+   the HEADER has, so `<sys/foo.h>` → `sys/foo.json`; never a per-platform subdir).
 2. Add the symbol with its hir-text signature (see `docs/ir-type-text.md` for
-   the vocabulary). If it involves `long`, author the **LP64** (i64/u64) form
-   and note the `D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH` deferral (see above).
-3. Set `header` (required) and the per-format `library` map (`pe`/`elf`/`macho`);
-   `standard` is optional provenance.
+   the vocabulary). If it involves `long`, author the **LP64** (i64/u64) form as
+   the base `signature` **and** the Windows form as a
+   `signatureByDataModel.LLP64` override — both are parsed on every read, so
+   neither arm can rot (see "ABI deltas" above).
+3. Set `header` (required) and the per-format `library` map (`pe`/`elf`/`macho`
+   — `ucrtbase.dll` for a pe libc surface, not `msvcrt.dll`); `standard` is
+   optional provenance.
 4. `AllShippedDescriptorsDecode` will validate the new file decodes and every
    signature parses. Add an end-to-end corpus under `examples/c-subset/` if it
    introduces a runtime-observable path not yet exercised.

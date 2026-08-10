@@ -66,6 +66,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -263,6 +264,20 @@ struct DSS_EXPORT PreprocessResult {
     // origin (buffer id + offset-shifted span). Diagnostics on other buffers
     // pass through untouched.
     [[nodiscard]] std::function<void(BufferId&, SourceSpan&)> makeRemap() const;
+
+    // The Eof token that terminates `tokens`.
+    //
+    // ★ USE THIS, NEVER `tokens.back()` ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]]).
+    // A consumer that needs an Eof-only stream (the D-PP-FATAL-HALTS-PARSE arm
+    // in `compilation_unit.cpp`) used to reach for `tokens.back()` under a
+    // comment asserting the vector is "Eof-terminated by contract" — a contract
+    // the consumer had no way to verify. When a producer path broke it, the
+    // result was not a diagnostic but a SEGFAULT (MEASURED TF-C115: rc 139 /
+    // 0xC0000005 on the predefined-macro-collision abort, with no output at
+    // all). This accessor is the ONE place the contract is checked on the read
+    // side: `preprocess()`'s single exit makes the violation impossible, and
+    // this makes any residual violation LOUD and named instead of undefined.
+    [[nodiscard]] Token const& eofToken() const;
 };
 
 // ── TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS) + TF-C97
@@ -369,10 +384,29 @@ struct DSS_EXPORT MergedPredefinedMacros {
 // more than one family is FATAL (`C_ConflictingPredefinedMacro`), never
 // silently resolved. Both default to {} ⇒ output byte-identical to pre-TF-C74,
 // so every existing caller compiles and behaves unchanged.
+// D-PP-HEADER-CASE-INSENSITIVE-PE: `headerNameMatching` is the ACTIVE OBJECT
+// FORMAT's declared header-NAME case rule (`*.format.json`'s
+// `headerNameMatching`), applied by EVERY include search this pass performs —
+// the angle `#include <h>` arm, the quote arm, both `__has_include` callbacks
+// (pre-scan + authoritative), the descriptor macro-splice, and `#embed`. It is
+// a SEPARATE input from `activeFormat`: that is a format KIND, and deriving a
+// case rule from a kind would be the `if (kind == Pe)` identity branch the
+// agnosticism bar forbids. Defaults to `kDefaultHeaderNameMatching`
+// (case-SENSITIVE — the conservative POSIX rule) so the LSP / direct-API /
+// test callers behave exactly as a conforming POSIX toolchain would.
 [[nodiscard]] DSS_EXPORT PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<std::filesystem::path const> includeDirs,
+    // ★ REQUIRED, AND ITS POSITION IS LOAD-BEARING. It sits in the required
+    // block — ahead of every defaulted parameter — because C++ only lets a
+    // parameter be un-defaultable if nothing before it is defaulted, and a
+    // defaulted case rule is a silent choice at every call site. "The compiler
+    // enforces that every caller states its policy" is only true when there is
+    // nothing to fall back to. A caller with no active object format passes
+    // `kDefaultHeaderNameMatching` EXPLICITLY, which makes that decision
+    // greppable instead of invisible.
+    HeaderNameMatching                   headerNameMatching,
     std::span<std::filesystem::path const> systemDirs = {},
     std::optional<ObjectFormatKind>      activeFormat = std::nullopt,
     std::span<std::string const>         userDefines  = {},

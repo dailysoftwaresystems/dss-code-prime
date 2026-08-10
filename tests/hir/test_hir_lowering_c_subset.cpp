@@ -19,6 +19,7 @@
 #include "hir/hir_intrinsic_registry.hpp"
 #include "hir/hir_text.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "repo_root.hpp"
 #include "tokenizer/token_stream.hpp"
 #include "tokenizer/tokenizer.hpp"
 
@@ -127,26 +128,28 @@ namespace {
     return {};
 }
 
-// The shipped c-subset JSON text (for shiftResult perturbation), found by
-// walking up from cwd exactly as loadShipped does. Returned as raw text so the
-// perturbation is a surgical textual swap of the closed verb value — no JSON
-// library dependency in this target.
+// The shipped c-subset JSON text (for shiftResult perturbation), located
+// through the ONE test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the
+// CMake-baked repo root → the cwd ancestor walk). It used to carry a private
+// copy of that walk, which resolves nothing in an OUT-OF-TREE build — the cwd
+// there has no `src/dss-config` anywhere in its ancestry — and the empty text it
+// then returned fell into the caller's `std::abort()`, taking down the whole
+// test BINARY and every sibling test's verdict with it. `configRoot()` throws
+// instead, which GoogleTest reports as a failure of the one running test.
+// Returned as raw text so the perturbation is a surgical textual swap of the
+// closed verb value — no JSON library dependency in this target.
 [[nodiscard]] std::string shippedCSubsetText() {
-    fs::path dir = fs::current_path();
-    for (int i = 0; i < 12; ++i) {
-        fs::path const cand =
-            dir / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-        if (fs::exists(cand)) {
-            std::ifstream in{cand, std::ios::binary};
-            std::stringstream ss;
-            ss << in.rdbuf();
-            return ss.str();
-        }
-        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
-        dir = dir.parent_path();
+    fs::path const cand =
+        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+    std::ifstream in{cand, std::ios::binary};
+    if (!in) {
+        ADD_FAILURE() << "cannot open shipped c-subset.lang.json at "
+                      << cand.string();
+        return {};
     }
-    ADD_FAILURE() << "could not locate shipped c-subset.lang.json above cwd";
-    return {};
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
 }
 
 // Lower `void f(int a, long b) { a << b; }` under a schema whose
@@ -5174,17 +5177,15 @@ TEST(HirLoweringCSubset, ConcatAllNarrowUnchanged) {
 
 namespace {
 
+// The goldens tree, via the ONE test-side resolver (`repo_root.hpp`:
+// $DSS_CONFIG_ROOT → the CMake-baked repo root → the cwd ancestor walk). The
+// private walk this replaces resolved nothing in an OUT-OF-TREE build and then
+// called `std::abort()` — which kills the whole test BINARY, so one unresolvable
+// goldens path cost every sibling test in this executable its verdict.
+// `repoRoot()` throws, and GoogleTest reports a throw as a failure of the one
+// running test.
 [[nodiscard]] fs::path findLoweringGoldens() {
-    fs::path cwd = fs::current_path();
-    for (int hops = 0; hops < 8; ++hops) {
-        auto const cand = cwd / "tests" / "hir" / "lowering_goldens";
-        if (fs::is_directory(cand)) return cand;
-        if (!cwd.has_parent_path() || cwd == cwd.parent_path()) break;
-        cwd = cwd.parent_path();
-    }
-    ADD_FAILURE() << "could not locate tests/hir/lowering_goldens from "
-                  << fs::current_path().string();
-    std::abort();
+    return dss::test::repoRoot() / "tests" / "hir" / "lowering_goldens";
 }
 
 [[nodiscard]] bool goldenRefreshRequested() {
@@ -5204,6 +5205,58 @@ namespace {
 }
 
 } // namespace
+
+// D-DIAG-BRACE-INIT-AGGREGATE-SOURCE-SPAN: the TOP-LEVEL `ConstructAggregate` a
+// brace initializer lowers to MUST carry a source span. It is the node every later
+// tier reports AGAINST — the MIR brace-init refusals name it — and before this pin
+// `lowerBraceInit` returned it WITHOUT `track(...)`, so those diagnostics printed
+// with no `--> file:line` and the offending construct had to be found by grepping
+// the source by hand. MEASURED cost: that is exactly how sqlite's `shell.c:25283`
+// `struct stat x = {0};` had to be located.
+//
+// RED-ON-DISABLE: drop the `track(...)` wrapper on either `lowerBraceInit`'s or
+// `lowerUnionBraceInit`'s returned aggregate and the matching arm below goes red.
+TEST(HirLoweringCSubset, BraceInitAggregateCarriesASourceSpan) {
+    SemanticModel model = analyzeCSubset(
+        "struct S { int a; int b; };\n"
+        "union U { int i; };\n"
+        "int f(void) {\n"
+        "  struct S s = {1, 2};\n"
+        "  int arr[3] = {7};\n"
+        "  union U u = {5};\n"
+        "  return s.a + arr[0] + u.i;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    // The three top-level aggregates are the ones whose TYPE is the declared
+    // struct / array / union — i.e. the direct init child of a VarDecl. Nested
+    // zero-fill children are C's implicit defaults and stay span-less on purpose.
+    unsigned checked = 0;
+    // Arena slot 0 is the reserved sentinel; real ids run [1, nodeCount()).
+    for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+        HirNodeId const n{i};
+        if (res->hir.kind(n) != HirKind::VarDecl) continue;
+        auto const kids = res->hir.children(n);
+        if (kids.empty()) continue;
+        HirNodeId const init = kids.back();
+        if (res->hir.kind(init) != HirKind::ConstructAggregate) continue;
+        auto const* loc = res->sourceMap.tryGet(init);
+        ASSERT_NE(loc, nullptr)
+            << "a brace-init aggregate with NO source-map entry makes every "
+               "diagnostic reported against it unlocatable";
+        EXPECT_TRUE(loc->isPresent())
+            << "the aggregate's span must name a real buffer";
+        EXPECT_TRUE(loc->spansText())
+            << "the span must cover the `{...}` text, not be an empty caret";
+        ++checked;
+    }
+    EXPECT_EQ(checked, 3u)
+        << "expected the struct, array, and union brace inits to be checked";
+}
 
 TEST(HirLoweringCSubset, GoldenRepresentativeProgram) {
     SemanticModel model = analyzeCSubset(
@@ -6398,16 +6451,11 @@ TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
     // Read the shipped c-subset config text and flip the enumDecl's
     // `liftToEnclosingScope` from true to false. The rest of the
     // schema (incl. `compositeKind: "enum"`) stays untouched.
-    fs::path here = fs::current_path();
-    fs::path schemaPath;
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const cand = here / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-        if (fs::exists(cand)) { schemaPath = cand; break; }
-        fs::path const par = here.parent_path();
-        if (par == here) break;
-        here = par;
-    }
-    ASSERT_FALSE(schemaPath.empty()) << "cannot locate c-subset.lang.json";
+    // The path comes from the ONE test-side resolver (`repo_root.hpp`), not a
+    // private cwd walk: the walk that stood here found nothing in an
+    // OUT-OF-TREE build, whose cwd has no `src/dss-config` in its ancestry.
+    fs::path const schemaPath =
+        dss::test::configRoot() / "sources" / "c-subset.lang.json";
     std::ifstream in{schemaPath, std::ios::binary};
     ASSERT_TRUE(in.is_open()) << "cannot open " << schemaPath.string();
     std::ostringstream buf; buf << in.rdbuf();
@@ -8303,4 +8351,274 @@ TEST(HirLoweringCSubset, SameNamedInlineFunctionTypedParamsStayFunctionLocal) {
         ++checked;
     }
     EXPECT_EQ(checked, 2u) << "both functions must be present and checked";
+}
+
+// ── TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): a user re-declaration of a
+//    SYNTHESIZED shipped row inherits the SHIM, never a raw import ───────────
+//
+// THE DEFECT THESE PIN, stated as it was measured rather than as it was
+// theorised. `#include <stdio.h>` followed by the legal, ubiquitous
+// `int printf(const char *, ...);` makes goal-2 suppress the descriptor's own
+// printf row, and the bare-prototype extern synthesis then re-exported the name
+// as an ordinary import bound to the suppressed row's library. Post-UCRT-flip
+// that library is `ucrtbase.dll`, which exports NO bare printf/fprintf/sprintf/
+// vfprintf/sscanf at all — only the `__stdio_common_v*` cores those five names
+// are SHIMMED over. Since DSS eager-imports every declared shipped extern
+// (D-FFI-DESCRIPTOR-EAGER-IMPORT), the result compiled rc=0 with no diagnostic
+// at any stage and then failed to LOAD with 0xC0000139 at process start.
+// MEASURED at the TF-C111 HEAD on exactly the three lines below: `objdump -p`
+// showed `printf` sitting in the ucrtbase import table beside the four
+// correctly-shimmed siblings it should have joined.
+//
+// Pre-flip the identical code path bound `msvcrt.dll`, which DOES export all
+// five, so the channel was always open and merely inert. That is why these pins
+// are structural (recipe map / import rows) and not "does it still build".
+//
+// ★ NOT the same defect as D-CSUBSET-PE-BARE-EXTERN-STILL-MSVCRT-AFTER-UCRT-
+//   FLIP. That one is the `extern`-KEYWORD path, which never consults
+//   `suppressedShippedSymbolFor` at all, takes the language default library,
+//   and yields a CRT split that still loads. Different mechanism, different
+//   symptom; do not merge these pins with that one's.
+
+namespace {
+
+// Analyze `src` against the real shippedLibs under a GIVEN object format. The
+// format is threaded to BOTH the UnitBuilder (the macro `variants` splice) and
+// `analyze` (the per-SYMBOL availability gate), exactly as the driver does —
+// load-bearing here, because stdio.json carries two `printf` rows and only the
+// pe one is tagged `synthesize`.
+[[nodiscard]] SemanticModel analyzeRealStdioAt(std::string src,
+                                               ObjectFormatKind format,
+                                               DataModel dataModel) {
+    // The REAL shipped system-include dir — the descriptors the production
+    // driver ships — so a regression in stdio.json itself turns these pins red
+    // instead of being mirrored green by a scratch copy. Resolved through the
+    // ONE test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the
+    // CMake-baked repo root → the cwd ancestor walk); the private walk that
+    // used to stand here found nothing in an OUT-OF-TREE build and the miss
+    // ended in `std::abort()`, which kills the whole test BINARY and costs
+    // every sibling test its verdict. `configRoot()` throws instead.
+    fs::path const shipped = dss::test::configRoot() / "shippedLibs";
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    UnitBuilder builder{*loaded};
+    builder.addSystemDir(shipped);
+    builder.setActiveFormat(format);
+    builder.addInMemory(std::move(src), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    return analyze(cu, dataModel, std::nullopt, std::nullopt, format, "x86_64");
+}
+
+// How many `externDecls` rows carry `name` — i.e. how many IMPORTS the lowering
+// planted for it. For a shim symbol the only correct answer is zero.
+[[nodiscard]] std::size_t externRowsNamed(CstToHirResult const& res,
+                                          std::string_view name) {
+    std::size_t n = 0;
+    for (auto const& e : res.externDecls) if (e.canonicalName == name) ++n;
+    return n;
+}
+
+// The FIRST symbol spelled `name`, or an invalid id.
+[[nodiscard]] SymbolId symbolIdNamed(SemanticModel const& model,
+                                     std::string_view name) {
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == name)
+            return SymbolId{static_cast<std::uint32_t>(i)};
+    return SymbolId{};
+}
+
+// The reproducer, verbatim.
+constexpr char const* kPrintfRedeclSrc =
+    "#include <stdio.h>\n"
+    "int printf(const char *fmt, ...);\n"
+    "int main(void) { return printf(\"hi\\n\"); }\n";
+
+} // namespace
+
+// THE PRIMARY PIN. Under pe the re-declared `printf` must reach the synth
+// recipe map — keyed by the USER prototype's symbol, since goal-2 deleted the
+// descriptor's — and must plant NO import row. Both halves are asserted: a
+// recipe entry alongside a surviving import would still fail the load, and no
+// import with no recipe would be an undefined symbol.
+//
+// RED BEFORE TF-C112 on BOTH assertions: the map was empty and the import row
+// was present.
+TEST(HirLoweringCSubset, TFC112RedeclaredPeShimSymbolLowersToARecipeNotAnImport) {
+    SemanticModel model = analyzeRealStdioAt(kPrintfRedeclSrc,
+                                             ObjectFormatKind::Pe,
+                                             DataModel::Llp64);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok);
+
+    SymbolId const printfSym = symbolIdNamed(model, "printf");
+    ASSERT_TRUE(printfSym.valid());
+    auto const it = res->synthRecipeBySymbol.find(printfSym.v);
+    ASSERT_NE(it, res->synthRecipeBySymbol.end())
+        << "the user's prototype must inherit the suppressed row's REALIZATION: "
+           "without a recipe entry HIR->MIR never seeds the symbol and no shim "
+           "body is ever emitted";
+    EXPECT_EQ(it->second, "printf");
+
+    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u)
+        << "ucrtbase.dll exports no bare `printf` — an import row here is a "
+           "binary that fails to LOAD (0xC0000139) with no diagnostic anywhere";
+
+    // The four SIBLINGS this TU did not re-declare take the injected path and
+    // must be unaffected — the fix must not have moved the whole family.
+    for (char const* sibling : {"fprintf", "sprintf", "vfprintf", "sscanf"})
+        EXPECT_EQ(externRowsNamed(*res, sibling), 0u) << sibling;
+    // ...while the UCRT cores the shims call ARE ordinary imports.
+    EXPECT_EQ(externRowsNamed(*res, "__stdio_common_vfprintf"), 1u);
+}
+
+// THE AGNOSTICISM PIN. The SAME source under elf: glibc exports a real
+// `printf`, the elf row carries no `synthesize`, so the prototype must still
+// synthesize an ordinary libc import and NOTHING may reach the recipe map. If
+// the shim arm ever keys on something other than the descriptor's own tag, this
+// goes red by dropping a working import.
+TEST(HirLoweringCSubset, TFC112RedeclaredElfStdioSymbolStaysAnOrdinaryImport) {
+    SemanticModel model = analyzeRealStdioAt(kPrintfRedeclSrc,
+                                             ObjectFormatKind::Elf,
+                                             DataModel::Lp64);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok);
+
+    SymbolId const printfSym = symbolIdNamed(model, "printf");
+    ASSERT_TRUE(printfSym.valid());
+    EXPECT_EQ(res->synthRecipeBySymbol.count(printfSym.v), 0u)
+        << "no elf stdio row declares a synthesize recipe";
+    ASSERT_EQ(externRowsNamed(*res, "printf"), 1u)
+        << "the c86 bare-proto synthesis must still re-bind the suppressed "
+           "descriptor's library — dropping it is an undefined symbol at link";
+    for (auto const& e : res->externDecls) {
+        if (e.canonicalName != "printf") continue;
+        ASSERT_TRUE(e.libraryOverride.contains("elf"));
+        EXPECT_EQ(e.libraryOverride.at("elf"), "libc.so.6");
+    }
+}
+
+// THE REFUSAL. A prototype that suppresses a recipe row but does NOT agree with
+// its declared signature cannot be reconciled: the synth pass emits ONE fixed
+// body per recipe id, built against the descriptor's signature, so binding a
+// divergent prototype to it would marshal the call under one ABI and answer it
+// under another — silently. Refusing is the only honest answer, and the refused
+// set is essentially clang's own "conflicting types for 'printf'".
+//
+// Asserted THREE-SIDED: the diagnostic fires, the lowering is NOT ok, and
+// neither escape hatch is taken — no recipe entry (which would emit a wrong-ABI
+// shim) and no import row (which would not load).
+TEST(HirLoweringCSubset, TFC112IncompatibleRedeclarationOfAShimSymbolFailsLoud) {
+    SemanticModel model = analyzeRealStdioAt(
+        "#include <stdio.h>\n"
+        "int printf(const char *fmt);\n"   // NOT variadic — cannot be the shim
+        "int main(void) { return printf(\"hi\\n\"); }\n",
+        ObjectFormatKind::Pe, DataModel::Llp64);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 1u)
+        << "a silently wrong-ABI call is exactly the class this project refuses "
+           "to ship; the mismatch must be named, not absorbed";
+    SymbolId const printfSym = symbolIdNamed(model, "printf");
+    ASSERT_TRUE(printfSym.valid());
+    EXPECT_EQ(res->synthRecipeBySymbol.count(printfSym.v), 0u);
+    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u);
+}
+
+// THE ARITY ARM of the same refusal, on a DIFFERENT recipe — so the gate is
+// pinned as a rule over descriptor data rather than as one hard-coded shape,
+// and so the "which axis diverged" reporting has a second witness.
+TEST(HirLoweringCSubset, TFC112WrongArityRedeclarationOfAShimSymbolFailsLoud) {
+    SemanticModel model = analyzeRealStdioAt(
+        "#include <stdio.h>\n"
+        "int sprintf(char *b, const char *f, int extra, ...);\n"
+        "int main(void) { char b[8]; return sprintf(b, \"%d\", 1, 2); }\n",
+        ObjectFormatKind::Pe, DataModel::Llp64);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 1u);
+    EXPECT_EQ(externRowsNamed(*res, "sprintf"), 0u);
+}
+
+// THE NON-SHIM SUPPRESSED ROW IS UNTOUCHED (the selectivity guard). `puts` is a
+// real ucrtbase export with no `synthesize` tag, and re-declaring it must still
+// take the c86 import path — the shim arm keys on the ROW's recipe, not on "is
+// this a suppressed stdio symbol". RED if the arm is ever widened to fire on
+// every suppressed row.
+TEST(HirLoweringCSubset, TFC112RedeclaredNonRecipePeRowStillSynthesizesTheImport) {
+    SemanticModel model = analyzeRealStdioAt(
+        "#include <stdio.h>\n"
+        "int puts(const char *s);\n"
+        "int main(void) { return puts(\"hi\"); }\n",
+        ObjectFormatKind::Pe, DataModel::Llp64);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok);
+    SymbolId const putsSym = symbolIdNamed(model, "puts");
+    ASSERT_TRUE(putsSym.valid());
+    EXPECT_EQ(res->synthRecipeBySymbol.count(putsSym.v), 0u);
+    ASSERT_EQ(externRowsNamed(*res, "puts"), 1u);
+    for (auto const& e : res->externDecls) {
+        if (e.canonicalName != "puts") continue;
+        ASSERT_TRUE(e.libraryOverride.contains("pe"));
+        EXPECT_EQ(e.libraryOverride.at("pe"), "ucrtbase.dll");
+    }
+}
+
+// THE SECOND SITE, and it is why the fix is a SHARED helper rather than an
+// inline arm. C99 6.7.4p7: a file-scope function every one of whose
+// declarations spelled `inline` without `extern` provides NO external
+// definition, so TF-C79's `lowerInlineDefinitionAsDeclaration` suppresses the
+// body and leaves a DECLARATION behind — a second place a user declaration
+// displaces a shipped row and then synthesizes an extern for it. It carried the
+// identical defect, and it was found only by tracing every reader of
+// `suppressedShippedSymbolFor` instead of only the site the defect report
+// named. MEASURED before the refactor, on exactly this source: the same
+// `ExternImport{printf, ucrtbase.dll}`, rc=0, no diagnostic, and the same
+// 0xC0000139 at process start.
+//
+// Handing the shim over is not a workaround for the suppression — the external
+// definition 6.7.4p7 sends the call to IS the shim on such a target.
+TEST(HirLoweringCSubset, TFC112InlineDefinitionOfAShimSymbolAlsoInheritsTheShim) {
+    SemanticModel model = analyzeRealStdioAt(
+        "#include <stdio.h>\n"
+        "inline int printf(const char *fmt, ...) { return -1; }\n"
+        "int main(void) { return printf(\"inl\\n\"); }\n",
+        ObjectFormatKind::Pe, DataModel::Llp64);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok);
+    SymbolId const printfSym = symbolIdNamed(model, "printf");
+    ASSERT_TRUE(printfSym.valid());
+    auto const it = res->synthRecipeBySymbol.find(printfSym.v);
+    ASSERT_NE(it, res->synthRecipeBySymbol.end());
+    EXPECT_EQ(it->second, "printf");
+    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u)
+        << "the suppressed inline definition must inherit the shim, not plant a "
+           "ucrtbase import that cannot load";
+}
+
+// ...and its refusal arm, so the signature gate is pinned at BOTH sites rather
+// than only at the one the shared helper was written for.
+TEST(HirLoweringCSubset, TFC112IncompatibleInlineDefinitionOfAShimSymbolFailsLoud) {
+    SemanticModel model = analyzeRealStdioAt(
+        "#include <stdio.h>\n"
+        "inline int printf(const char *fmt) { return -1; }\n"   // not variadic
+        "int main(void) { return printf(\"inl\\n\"); }\n",
+        ObjectFormatKind::Pe, DataModel::Llp64);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 1u);
+    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u);
 }

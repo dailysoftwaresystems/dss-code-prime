@@ -22,12 +22,21 @@
 #include "ffi/binary_reader.hpp"
 #include "byte_emit.hpp"
 #include "diagnostic_count.hpp"
+#include "repo_root.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 using namespace dss;
@@ -356,6 +365,98 @@ TEST(BinaryReaderElf, SkipsLocalBindSymbols) {
     EXPECT_EQ((*r)[0].mangledName, "exported_fn");
 }
 
+namespace {
+// The surfaced names, comma-joined, so an assertion can compare CONTENT in
+// one shot and a failure prints exactly which names came back. Comparing the
+// joined string (rather than a size) is deliberate: an equal-size surface
+// holding the WRONG name must fail.
+[[nodiscard]] std::string surfacedNames(std::vector<ImportSurface> const& rows) {
+    std::string joined;
+    for (auto const& row : rows) {
+        if (!joined.empty()) joined += ",";
+        joined += row.mangledName;
+    }
+    return joined;
+}
+}  // namespace
+
+// ── SHN_UNDEF rows are the library's IMPORTS, never its exports ──
+//
+// D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED — the
+// root-cause pin. `.dynsym` is not an export table: it holds the
+// definitions the library offers AND the references it makes, told apart
+// only by `st_shndx` (SHN_UNDEF == a reference). This reader surfaced
+// both, so DSS believed libtcl8.6.so EXPORTED the 14 zlib names it merely
+// IMPORTS; `ingest()`'s first-source-wins then bound `deflateBound` to
+// libtcl8.6.so and libz.so.1 vanished from the emitted DT_NEEDED set.
+//
+// The assertion is on CONTENT, not on the count: a size-only check passes
+// for a surface holding the WRONG one of the two names.
+TEST(BinaryReaderElf, SkipsUndefinedSymbolsWhichAreImportsNotExports) {
+    std::vector<std::string> names = {"tcl_defines_this", "zlib_defines_this"};
+    std::vector<Sym> syms;
+    // A real definition: st_shndx = 1 (a real section index).
+    syms.push_back({0, info(1 /*STB_GLOBAL*/, 2 /*STT_FUNC*/), 0, 1, 0x1000, 16});
+    // A reference this library MAKES: st_shndx = 0 (SHN_UNDEF), which is
+    // exactly the shape libtcl8.6.so carries for every zlib name.
+    syms.push_back({0, info(1 /*STB_GLOBAL*/, 2 /*STT_FUNC*/), 0, 0, 0, 0});
+
+    auto const bytes = buildMinimalElf64(syms, names);
+    DiagnosticReporter rep;
+    auto const r = readImportsFromBytes(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+        "libtcl-like.so", rep);
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+
+    EXPECT_EQ(surfacedNames(*r), "tcl_defines_this")
+        << "the SHN_UNDEF row is a reference this library MAKES, not a symbol "
+           "it exports; surfacing it makes `ingest()` bind a caller's extern "
+           "to a library that does not define it (the DT_NEEDED defect)";
+}
+
+// A WEAK undefined reference is still a reference. glibc-style weak imports
+// (`__pthread_key_create` and friends) are SHN_UNDEF with STB_WEAK, so a
+// filter written on the bind class instead of `st_shndx` would let them
+// through. Content-anchored: the defined weak export MUST survive, so this
+// cannot pass by filtering weakness itself.
+TEST(BinaryReaderElf, WeakUndefinedIsSkippedButWeakDefinedSurvives) {
+    std::vector<std::string> names = {"weak_defined_here", "weak_referenced_only"};
+    std::vector<Sym> syms;
+    syms.push_back({0, info(2 /*STB_WEAK*/, 2), 0, 1, 0x1000, 16});
+    syms.push_back({0, info(2 /*STB_WEAK*/, 2), 0, 0, 0, 0});
+
+    auto const bytes = buildMinimalElf64(syms, names);
+    DiagnosticReporter rep;
+    auto const r = readImportsFromBytes(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+        "libweak.so", rep);
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+
+    ASSERT_EQ(surfacedNames(*r), "weak_defined_here");
+    EXPECT_EQ((*r)[0].linkage, SymbolLinkage::Weak)
+        << "definedness is the filter; the weak BIND must still be reported";
+}
+
+// SHN_ABS (0xFFF1) is a DEFINITION with no section — a version-script
+// absolute, a linker-provided address constant. Only SHN_UNDEF means
+// "not defined here", so the filter must not overreach to every special
+// index. This is the control that keeps the fix from becoming
+// `st_shndx < SHN_LORESERVE`.
+TEST(BinaryReaderElf, AbsoluteSectionIndexIsADefinitionAndSurvives) {
+    std::vector<std::string> names = {"abs_constant"};
+    std::vector<Sym> syms;
+    syms.push_back({0, info(1, 1 /*STT_OBJECT*/), 0, 0xFFF1 /*SHN_ABS*/, 0x40, 8});
+
+    auto const bytes = buildMinimalElf64(syms, names);
+    DiagnosticReporter rep;
+    auto const r = readImportsFromBytes(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+        "libabs.so", rep);
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+
+    EXPECT_EQ(surfacedNames(*r), "abs_constant");
+}
+
 // ── Failure modes ────────────────────────────────────────────────
 
 TEST(BinaryReader, EmptyFileFailsLoud) {
@@ -397,8 +498,14 @@ TEST(BinaryReader, PeMagicTooShortToBeValidIsCorrupted) {
 // route to UnsupportedFormat with remediation-specific messages —
 // anchors D-FF1-MACHO-FAT and D-FF1-MACHO-32).
 TEST(BinaryReader, MachoFatMagicDispatchesToUnsupportedFormat) {
-    // 0xCAFEBABE LE — universal/FAT binary header.
-    std::vector<std::uint8_t> fat = {0xBE, 0xBA, 0xFE, 0xCA, 0x00};
+    // FAT_MAGIC on disk. `struct fat_header` is BIG-ENDIAN ON DISK by
+    // definition (Apple <mach-o/fat.h>), so 0xCAFEBABE is the byte
+    // sequence CA FE BA BE — NOT the BE BA FE CA this fixture used to
+    // carry. That stale spelling was the byte-swapped FAT_CIGAM view, and
+    // it made this test green against a `guessFormat` that could never
+    // classify a real universal binary. See the D-FF1-MACHO-FAT block in
+    // tests/ffi/test_binary_reader_macho.cpp for the full fixtures.
+    std::vector<std::uint8_t> fat = {0xCA, 0xFE, 0xBA, 0xBE, 0x00};
     DiagnosticReporter rep;
     auto r = readImportsFromBytes(fat, "fake.dylib", rep);
     ASSERT_FALSE(r.has_value());
@@ -406,6 +513,44 @@ TEST(BinaryReader, MachoFatMagicDispatchesToUnsupportedFormat) {
     EXPECT_NE(r.error().detail.find("FAT"), std::string::npos)
         << "operator must see remediation guidance (lipo -thin)";
     EXPECT_NE(r.error().detail.find("D-FF1-MACHO-FAT"), std::string::npos);
+}
+
+// The byte-SWAPPED spelling (FAT_CIGAM, 0xBEBAFECA) is what a
+// little-endian host computes when it loads a real `fat_header` in HOST
+// order — it is never the on-disk byte sequence of a universal binary.
+// A file that literally starts BE BA FE CA is therefore NOT fat and must
+// not borrow the `lipo -thin` remediation. This is exactly the input the
+// pre-fix little-endian `readU32(b,0) == 0xCAFEBABE` test was matching.
+TEST(BinaryReader, ByteSwappedFatSpellingIsNotAcceptedAsFat) {
+    std::vector<std::uint8_t> swapped = {0xBE, 0xBA, 0xFE, 0xCA, 0x00};
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(swapped, "swapped.bin", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::UnknownFormat)
+        << "BE BA FE CA is FAT_CIGAM (a host-order artifact), not a "
+           "universal binary — accepting it as fat would hand the "
+           "operator a `lipo -thin` instruction that cannot work";
+}
+
+// Diagnostic honesty: the UnknownFormat message enumerates what IS
+// recognised, and `ar` archives ARE (FormatGuess::Ar → readAr). Omitting
+// them told an operator holding a `.a` that static archives are not
+// understood, which is false.
+TEST(BinaryReader, UnknownFormatMessageEnumeratesEveryRecognisedMagic) {
+    std::vector<std::uint8_t> garbage = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE};
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(garbage, "garbage.bin", rep);
+    ASSERT_FALSE(r.has_value());
+    auto const& d = r.error().detail;
+    EXPECT_NE(d.find("\\x7FELF"), std::string::npos) << d;
+    EXPECT_NE(d.find("MZ"), std::string::npos) << d;
+    EXPECT_NE(d.find("!<arch>"), std::string::npos)
+        << "`ar` archives dispatch to readAr — the recognised list must "
+           "say so: " << d;
+    EXPECT_NE(d.find("0xFEEDFACF"), std::string::npos) << d;
+    EXPECT_NE(d.find("0xCAFEBABE"), std::string::npos) << d;
+    EXPECT_NE(d.find("0xCAFEBABF"), std::string::npos)
+        << "FAT_MAGIC_64 is recognised too (fat_arch_64 entries): " << d;
 }
 
 TEST(BinaryReader, Macho32MagicDispatchesToUnsupportedFormat) {
@@ -782,8 +927,291 @@ TEST(BinaryReaderReporter, CorruptedBinaryAlsoEmitsFCodeThroughReporter) {
     EXPECT_GE(countCode(rep, DiagnosticCode::F_CorruptedBinary), 1u);
 }
 
+// ── TF-C124: per-symbol EXPORT versions, read from a REAL library ────────
+// D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION.
+//
+// ★ WHY THESE READ A FILE INSTEAD OF SYNTHESIZING BYTES LIKE EVERY TEST
+// ABOVE. The rest of this suite hand-assembles ELF images, which is the
+// right instrument for "does the parser reject a truncated section table" —
+// the shapes are ones no linker would ever emit, so no linker can supply
+// them. Symbol versioning is the opposite case: the ONLY thing worth
+// proving is that our decode agrees with what a REAL linker really writes,
+// and a hand-built versym/verdef pair proves only that this file's encoder
+// agrees with this file's decoder. Both could be wrong about bit 15, about
+// whether index 1 names a version, about `vd_aux` being relative to the
+// Verdef rather than the section — and the suite would stay green.
+//
+// ⚠ THE FIXTURE IS A COMMITTED BINARY, AND IT IS SELF-WITNESSING. No
+// `.gitattributes` glob names it, so it rides git's own binary detection
+// (`git ls-files --eol` reports `w/-text`; ELF's e_ident NULs make the
+// detection unambiguous). Should a future broad `tests/** text eol=lf` rule
+// ever capture it — the exact accident `examples/**/*.bin binary` had to be
+// added to undo — the CR injection corrupts the section table and these
+// tests go RED at `readImportsFromBytes`, loudly, on the first fresh clone.
+// A latent corruption that announces itself is the property to keep; if you
+// are pinning globs anyway, add `tests/ffi/data/** binary`.
+//
+// `tests/ffi/data/libdssver.so.1` is therefore GNU ld 2.42's own output
+// (`gcc -shared -Wl,--version-script=`; the exact source and version script
+// are committed beside it as `libdssver.source.c` + `libdssver.map`). It
+// carries, in one image, all four shapes this feature must tell apart:
+//   dss_ver_default@@DSSVER_2.0   default-versioned function
+//   dss_ver_compat@DSSVER_1.0     NON-default compat  ┐ two definitions of
+//   dss_ver_compat@@DSSVER_2.0    the default         ┘ ONE name — the
+//                                                       glibc realpath shape
+//   dss_ver_plain                 unversioned export (versym VER_NDX_GLOBAL)
+//   dss_ver_data@@DSSVER_2.0      versioned DATA object, not a function
+// `readelf -V` on it prints `2h(DSSVER_1.0)` for the compat row — the `h`
+// IS the VERSYM_HIDDEN bit this code reads, produced by ld, not by us.
+//
+// ★ AND IT DELIBERATELY IMPORTS A VERSIONED SYMBOL TOO. The fixture calls
+// glibc `realpath`, so ld emits a `.gnu.version_r` alongside the verdef —
+// and ld numbers vernaux entries in the SAME index space it just used for
+// verdef: verdef holds 1..3 (base, DSSVER_1.0, DSSVER_2.0) and verneed
+// continues at 4 (GLIBC_2.3) and 5 (GLIBC_2.2.5), which verdef defines
+// NEITHER of. A reader that resolved every versym slot through the verdef
+// table without first discarding SHN_UNDEF rows would therefore hit indices
+// that resolve to nothing — so `RealLibraryDefaultVersionedFunctionExport`
+// asserting ZERO partial-corruption warnings is not decoration, it is the
+// pin that those two undefined rows never reach the version lookup.
+
+namespace {
+
+[[nodiscard]] std::vector<std::uint8_t> readFixtureBytes(
+    std::filesystem::path const& rel) {
+    auto const path = dss::test::repoRoot() / rel;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in),
+                                      std::istreambuf_iterator<char>());
+}
+
+[[nodiscard]] std::vector<std::uint8_t> readVersionedFixture() {
+    return readFixtureBytes(
+        std::filesystem::path{"tests"} / "ffi" / "data" / "libdssver.so.1");
+}
+
+[[nodiscard]] ImportSurface const* findRow(
+    std::vector<ImportSurface> const& rows, std::string_view name) {
+    for (auto const& r : rows) if (r.mangledName == name) return &r;
+    return nullptr;
+}
+
+} // namespace
+
+TEST(BinaryReaderElfSymbolVersion, RealLibraryDefaultVersionedFunctionExport) {
+    auto const bytes = readVersionedFixture();
+    ASSERT_FALSE(bytes.empty()) << "tests/ffi/data/libdssver.so.1 is missing "
+                                  "or empty — this suite's only real-linker "
+                                  "oracle cannot be substituted";
+    DiagnosticReporter rep;
+    auto rows = readImportsFromBytes(bytes, "libdssver.so.1", rep);
+    ASSERT_TRUE(rows.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_BinaryReaderPartialCorruption), 0u)
+        << "a well-formed GNU ld image must produce no corruption warning — "
+           "and specifically, this image's two VERSIONED UNDEFINED rows "
+           "(realpath@GLIBC_2.3, __cxa_finalize@GLIBC_2.2.5) carry versym "
+           "indices 4 and 5 that live in the VERNEED table, which the verdef "
+           "chain does not define. If they ever reached the version lookup "
+           "each would be counted as a dangling index and reported here";
+    // Same fact, asserted positively: the library's own IMPORTS are not
+    // exports, so nothing named realpath is in this surface at all.
+    EXPECT_EQ(findRow(*rows, "realpath"), nullptr);
+
+    auto const* row = findRow(*rows, "dss_ver_default");
+    ASSERT_NE(row, nullptr) << "the reader did not surface dss_ver_default at "
+                               "all — its `@@DSSVER_2.0` suffix must NOT leak "
+                               "into mangledName";
+    ASSERT_TRUE(row->elfSymbolVersion.has_value());
+    EXPECT_EQ(row->elfSymbolVersion->name, "DSSVER_2.0");
+    EXPECT_TRUE(row->elfSymbolVersion->isDefaultVersion)
+        << "`sym@@VER` is the DEFAULT definition (VERSYM_HIDDEN clear)";
+}
+
+TEST(BinaryReaderElfSymbolVersion, RealLibraryCompatAndDefaultOfOneNameDiffer) {
+    auto const bytes = readVersionedFixture();
+    ASSERT_FALSE(bytes.empty());
+    DiagnosticReporter rep;
+    auto rows = readImportsFromBytes(bytes, "libdssver.so.1", rep);
+    ASSERT_TRUE(rows.has_value());
+
+    // ONE name, TWO definitions — the shape that makes `isDefaultVersion`
+    // load-bearing rather than decorative. Both rows must surface, and they
+    // must be distinguishable, because a consumer that cannot tell them
+    // apart will sooner or later request the compat one.
+    std::vector<std::pair<std::string, bool>> compat;
+    for (auto const& r : *rows) {
+        if (r.mangledName != "dss_ver_compat") continue;
+        ASSERT_TRUE(r.elfSymbolVersion.has_value());
+        compat.emplace_back(r.elfSymbolVersion->name,
+                            r.elfSymbolVersion->isDefaultVersion);
+    }
+    ASSERT_EQ(compat.size(), 2u)
+        << "libdssver.so.1 defines dss_ver_compat at BOTH DSSVER_1.0 and "
+           "DSSVER_2.0; the reader must surface both rows";
+    std::sort(compat.begin(), compat.end());
+    EXPECT_EQ(compat[0].first, "DSSVER_1.0");
+    EXPECT_FALSE(compat[0].second)
+        << "`sym@VER` is the NON-default compat definition — ld marks it with "
+           "the VERSYM_HIDDEN bit (readelf prints `2h`), and mistaking it for "
+           "the default is exactly the realpath@GLIBC_2.2.5 misbind";
+    EXPECT_EQ(compat[1].first, "DSSVER_2.0");
+    EXPECT_TRUE(compat[1].second);
+}
+
+TEST(BinaryReaderElfSymbolVersion, RealLibraryUnversionedExportCarriesNoVersion) {
+    auto const bytes = readVersionedFixture();
+    ASSERT_FALSE(bytes.empty());
+    DiagnosticReporter rep;
+    auto rows = readImportsFromBytes(bytes, "libdssver.so.1", rep);
+    ASSERT_TRUE(rows.has_value());
+
+    auto const* row = findRow(*rows, "dss_ver_plain");
+    ASSERT_NE(row, nullptr);
+    EXPECT_FALSE(row->elfSymbolVersion.has_value())
+        << "this export's versym slot is VER_NDX_GLOBAL (1), which names the "
+           "verdef BASE entry — the FILE's own soname. Recording that as a "
+           "version would make every unversioned export look versioned at "
+           "`libdssver.so.1`, and the emitted verneed would demand a version "
+           "no library defines";
+}
+
+TEST(BinaryReaderElfSymbolVersion, RealLibraryVersionedDataObjectIsVersionedToo) {
+    auto const bytes = readVersionedFixture();
+    ASSERT_FALSE(bytes.empty());
+    DiagnosticReporter rep;
+    auto rows = readImportsFromBytes(bytes, "libdssver.so.1", rep);
+    ASSERT_TRUE(rows.has_value());
+
+    // Versioning is a property of the SYMBOL, not of code: a DATA export
+    // carries a versym slot exactly like a function, and a data import binds
+    // through the same verneed.
+    auto const* row = findRow(*rows, "dss_ver_data");
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(row->kind, SymbolKind::Object);
+    ASSERT_TRUE(row->elfSymbolVersion.has_value());
+    EXPECT_EQ(row->elfSymbolVersion->name, "DSSVER_2.0");
+}
+
+TEST(BinaryReaderElfSymbolVersion, SynthesizedLibraryWithNoVersionSectionsIsSilent) {
+    // The complement of the fixture: an image with NO `.gnu.version` at all
+    // (the overwhelmingly common case) must leave every row unversioned and
+    // must NOT report an anomaly. This one IS synthesized on purpose — it is
+    // an assertion about ABSENT sections, which no linker can be asked for.
+    std::vector<Sym> syms;
+    syms.push_back(Sym{0, info(1 /*STB_GLOBAL*/, 2 /*STT_FUNC*/), 0, 1, 0x1000, 0});
+    std::vector<std::string> const names = {"unversioned_fn"};
+    auto const bytes = buildMinimalElf64(syms, names);
+    DiagnosticReporter rep;
+    auto rows = readImportsFromBytes(bytes, "libplain.so", rep);
+    ASSERT_TRUE(rows.has_value());
+    ASSERT_EQ(rows->size(), 1u);
+    EXPECT_FALSE((*rows)[0].elfSymbolVersion.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_BinaryReaderPartialCorruption), 0u);
+}
+
+TEST(BinaryReaderElfSymbolVersion, VersionSectionsResolveInEitherHeaderOrder) {
+    // GNU ld emits `.gnu.version` BEFORE `.gnu.version_d` (this host's
+    // libz.so.1: sections 6 then 7; the fixture: 4 then 5), and a reader that
+    // stops scanning once it has found the verdef therefore works — right up
+    // until a linker orders them the other way, at which point every version
+    // in the image vanishes with nothing reporting it. Section ORDER is a
+    // linker convention, not a gABI guarantee.
+    //
+    // Rather than hand-author an ELF in the reversed order (which would put
+    // this file's idea of the layout under test instead of the reader's),
+    // take the REAL fixture and swap the two 64-byte SECTION HEADER records.
+    // Nothing else moves: section CONTENT stays where it is, and no `sh_link`
+    // anywhere in this image names either of the two swapped indices, so the
+    // result is the same library described in the other order.
+    auto bytes = readVersionedFixture();
+    ASSERT_FALSE(bytes.empty());
+    std::uint64_t const shoff = static_cast<std::uint64_t>(bytes[40])
+        | (static_cast<std::uint64_t>(bytes[41]) << 8)
+        | (static_cast<std::uint64_t>(bytes[42]) << 16)
+        | (static_cast<std::uint64_t>(bytes[43]) << 24);
+    std::uint16_t const shnum =
+        static_cast<std::uint16_t>(bytes[60] | (bytes[61] << 8));
+    auto sectionType = [&](std::uint16_t i) {
+        std::size_t const o = static_cast<std::size_t>(shoff) + i * 64u + 4u;
+        return static_cast<std::uint32_t>(bytes[o]) | (bytes[o + 1] << 8)
+             | (bytes[o + 2] << 16) | (bytes[o + 3] << 24);
+    };
+    int versymIdx = -1, verdefIdx = -1;
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        if (sectionType(i) == 0x6fffffffu) versymIdx = i;   // SHT_GNU_versym
+        if (sectionType(i) == 0x6ffffffdu) verdefIdx = i;   // SHT_GNU_verdef
+    }
+    ASSERT_GE(versymIdx, 0);
+    ASSERT_GE(verdefIdx, 0);
+    ASSERT_LT(versymIdx, verdefIdx)
+        << "the fixture is expected to carry ld's usual order; if this ever "
+           "flips, the swap below stops being the reversal it claims to be";
+    std::array<std::uint8_t, 64> tmp{};
+    std::size_t const a = static_cast<std::size_t>(shoff) + versymIdx * 64u;
+    std::size_t const b = static_cast<std::size_t>(shoff) + verdefIdx * 64u;
+    std::memcpy(tmp.data(), bytes.data() + a, 64);
+    std::memcpy(bytes.data() + a, bytes.data() + b, 64);
+    std::memcpy(bytes.data() + b, tmp.data(), 64);
+
+    DiagnosticReporter rep;
+    auto rows = readImportsFromBytes(bytes, "libdssver.so.1", rep);
+    ASSERT_TRUE(rows.has_value());
+    auto const* row = findRow(*rows, "dss_ver_default");
+    ASSERT_NE(row, nullptr);
+    ASSERT_TRUE(row->elfSymbolVersion.has_value())
+        << "with `.gnu.version_d` ahead of `.gnu.version` in the section "
+           "header table, the version decode must still find both";
+    EXPECT_EQ(row->elfSymbolVersion->name, "DSSVER_2.0");
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_BinaryReaderPartialCorruption), 0u);
+}
+
+TEST(BinaryReaderElfSymbolVersion, RealSystemZlibDeflateBoundIsVersioned) {
+    // The third-party oracle the anchor was written from: a library nobody
+    // in this repository authored, built by a distribution, with a version
+    // script that versions SOME of its exports and not others. MEASURED on
+    // this workstation's WSL (zlib 1.3, glibc 2.39): `deflateBound` is
+    // `@@ZLIB_1.2.0` while `deflate` and `compress2` are unversioned — a
+    // fact about libz's own `zlib.map`, not a defect anywhere.
+    //
+    // Host-conditional by necessity (there is no `.so` on a Windows host)
+    // and therefore a SUPPLEMENT to the committed fixture above, never a
+    // substitute for it: the four pins that matter run on every leg.
+    std::filesystem::path const libz{
+        "/usr/lib/x86_64-linux-gnu/libz.so.1"};
+    std::error_code ec;
+    if (!std::filesystem::exists(libz, ec)) {
+        GTEST_SKIP() << "no " << libz.string() << " on this host — the "
+                        "committed libdssver.so.1 pins are the ones that "
+                        "must hold everywhere; this arm adds a third-party "
+                        "library on the Linux legs";
+    }
+    std::ifstream in(libz, std::ios::binary);
+    ASSERT_TRUE(in.good());
+    std::vector<std::uint8_t> const bytes(
+        (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(bytes.empty());
+
+    DiagnosticReporter rep;
+    auto rows = readImportsFromBytes(bytes, "libz.so.1", rep);
+    ASSERT_TRUE(rows.has_value());
+
+    auto const* bound = findRow(*rows, "deflateBound");
+    ASSERT_NE(bound, nullptr);
+    ASSERT_TRUE(bound->elfSymbolVersion.has_value());
+    EXPECT_EQ(bound->elfSymbolVersion->name, "ZLIB_1.2.0");
+    EXPECT_TRUE(bound->elfSymbolVersion->isDefaultVersion);
+
+    auto const* plain = findRow(*rows, "deflate");
+    ASSERT_NE(plain, nullptr);
+    EXPECT_FALSE(plain->elfSymbolVersion.has_value())
+        << "libz versions deflateBound but not deflate; a reader that made "
+           "both look alike would be inventing one of the two";
+}
+
 // (Former `Ff1ProducedRowsHaveNoCSignature` test removed at FF2
 // post-#2 type-design fold: `cSignature` field dropped from
 // `ImportSurface` since no producer or consumer needed it.
 // Anchored D-FF2-1: re-add `optional<FnSigTypeId>` only if FF3 needs
 // to attach the resolved sig to the row instead of the HIR node.)
+

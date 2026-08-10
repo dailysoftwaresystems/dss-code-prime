@@ -45,6 +45,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
+#include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "link/format/macho.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
@@ -68,6 +69,10 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::countWithMessage;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -712,8 +717,21 @@ void expectExternSlotBind(Loaded const&    loaded,
                           std::string_view symName,
                           std::int64_t     addend = 0) {
     ASSERT_TRUE(loaded.target && loaded.format);
-    auto const bytes =
-        encodeDylib(makeExternSlotModule(externIsData, addend), loaded);
+    AssembledModule mod = makeExternSlotModule(externIsData, addend);
+    // D-LK10-ENTRY 2.13 gate 6 (`resolveEntryFnIdx`): a format declaring
+    // `processExit` CONTRACTS that its image entry is the `_start`
+    // trampoline, which only `linker::link` injects. This helper drives
+    // `dss::macho::encode` DIRECTLY, so on the EXEC arm the module must
+    // state that its untrampolined entry IS functions[0] — semantically a
+    // no-op (index 0 is what the pre-gate default returned), so no bind /
+    // rebase / slot byte pinned below moves. Keyed on the FORMAT's own
+    // `processExit` rather than on the caller so the DYLIB arm is left
+    // alone: a dylib declares none, has no entry, and its walker REJECTS a
+    // caller-supplied override outright (ImageEntryOverrideFailsLoud).
+    if (loaded.format->processExit().has_value()) {
+        mod.imageEntryOverride = 0u;
+    }
+    auto const bytes = encodeDylib(mod, loaded);
 
     auto const di = readDyldInfo(bytes);
     ASSERT_TRUE(di.found);
@@ -1058,7 +1076,9 @@ namespace {
                                         std::string_view textVa = "16384") {
     std::string s = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dylib","kind":"macho"},
       )";
     s += extraTopLevel;
@@ -1135,13 +1155,23 @@ TEST(MachoDylibFormatJsonValidate, InstallNameOnExecRejected) {
     // executable schema.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"t-exec-badid","kind":"macho"},
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
       "image": { "pageZeroSize": 4294967296, "segmentPageSize": 16384, "dylinkerPath": "/usr/lib/dyld", "installName": "@rpath/x.dylib", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294983680}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED: this fixture is exec-flavored (filetype "execute") but
+    // declares neither `processExit` nor `entryCallingConvention`, so
+    // D-LK10-ENTRY 2.13's entry-cluster requirement fires ALONGSIDE the
+    // installName-on-exec rule this test pins -- two independent
+    // defects, not a knock-on of one.
+    EXPECT_EQ(errorCount(r), 2u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/installName"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 1u) << rejectSummary(r);
 }
 
 TEST(MachoDylibFormatJsonValidate, MissingInstallNameRejected) {
@@ -1149,13 +1179,21 @@ TEST(MachoDylibFormatJsonValidate, MissingInstallNameRejected) {
     // from the output file name, so an unset installName fails HERE.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dylib-noid","kind":"macho"},
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "dylib", "flags": 1048709 },
       "image": { "segmentPageSize": 16384, "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":16384}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: pageZeroSize/dylinkerPath default to the
+    // values a dylib requires, loadDylibs is non-empty, and __text's
+    // virtualAddress (16384) already equals segmentPageSize, so the
+    // empty installName is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/installName"), 1u) << rejectSummary(r);
 }
 
 // -- (8) c171: the x86_64 .dylib variant-parity sibling -----------

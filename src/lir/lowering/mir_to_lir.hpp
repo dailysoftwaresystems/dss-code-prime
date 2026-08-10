@@ -84,8 +84,12 @@ struct DSS_EXPORT JumpTableDescriptor {
     std::vector<std::pair<std::uint32_t /*lirBlock.v*/, std::size_t /*slotIndex*/>>
         slotBindings;
     // Each distinct target LIR block (`lirBlock.v`) → its synthetic per-block
-    // SymbolId (minted via mintBlockSymbol; deduped by the MIR block id, so
-    // duplicate case targets and every gap-to-default share one symbol).
+    // SymbolId (deduped by LIR block, so duplicate case targets and every
+    // gap-to-default share one symbol). A case whose phi-edge copies were moved
+    // into a per-edge SPLIT block points at THAT block and carries a symbol
+    // minted fresh from the same monotone sequence — a split block has no MIR
+    // block, and the MIR-keyed `mintBlockSymbol` id belongs to the original
+    // block (which an `&&label` `lea` may bind to a different byte offset).
     std::unordered_map<std::uint32_t, SymbolId> blockSymbols;
 };
 

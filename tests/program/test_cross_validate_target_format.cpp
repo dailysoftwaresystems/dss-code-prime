@@ -45,7 +45,9 @@ std::shared_ptr<ObjectFormatSchema const>
 makeElfFormat(std::uint16_t machine) {
     std::string const json = std::string{R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine": )"}
       + std::to_string(machine) + R"(}
@@ -65,7 +67,9 @@ std::shared_ptr<ObjectFormatSchema const>
 makePeFormat(std::uint16_t machine) {
     std::string const json = std::string{R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-pe","kind":"pe"},
       "pe": {"machine": )"} + std::to_string(machine) + R"(}
     })";
@@ -84,7 +88,9 @@ std::shared_ptr<ObjectFormatSchema const>
 makeMachOFormat(std::uint32_t cputype) {
     std::string const json = std::string{R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-macho","kind":"macho"},
       "macho": {"cputype": )"} + std::to_string(cputype) + R"(}
     })";
@@ -265,7 +271,9 @@ TEST(CrossValidateTargetFormat, RegisterMachineWithWasmFormatFailsLoud) {
     ASSERT_TRUE(target.has_value());
     auto wasm = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-wasm","kind":"wasm"}
     })");
     ASSERT_TRUE(wasm.has_value());
@@ -280,7 +288,9 @@ TEST(CrossValidateTargetFormat, RegisterMachineWithSpirvFormatFailsLoud) {
     ASSERT_TRUE(target.has_value());
     auto spirv = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-spirv","kind":"spirv"}
     })");
     ASSERT_TRUE(spirv.has_value());
@@ -325,7 +335,9 @@ TEST(TargetSchemaLoader, LeadingTrailingWhitespaceTargetNameRejected) {
 TEST(ObjectFormatSchemaLoader, EmptyFormatNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"","kind":"elf"}
     })");
     ASSERT_FALSE(r.has_value());
@@ -334,7 +346,9 @@ TEST(ObjectFormatSchemaLoader, EmptyFormatNameRejected) {
 TEST(ObjectFormatSchemaLoader, WhitespaceFormatNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":" elf64 ","kind":"elf"}
     })");
     ASSERT_FALSE(r.has_value());

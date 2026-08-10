@@ -1,9 +1,9 @@
 {
-  "$comment": "c105 (the MSVC-profile flip): shipped <malloc.h> — the Microsoft CRT allocation-introspection header (pe-only; a glibc/darwin program gets malloc from <stdlib.h>, and DSS's elf/macho surfaces never reference <malloc.h>). SCOPE: exactly what the sqlite amalgamation uses under `#if defined(_MSC_VER) && !defined(SQLITE_WITHOUT_MSIZE)` — `_msize(void*) -> size_t` (LLP64 size_t = u64), the allocation-size query backing sqlite3MemSize. `_msize` is a REAL msvcrt.dll export (dumpbin-verified; the c101 eager-import lesson: a `symbols` block may carry ONLY real exports).",
+  "$comment": "★ TF-C111 (D-FFI-PE-CRT-UCRT-MIGRATION P3): `library.pe` is now ucrtbase.dll. This file moved with the whole co-state group (malloc/stdlib/string/stdio/io/errno/direct/process/sys-stat in ONE commit) and is in fact the group's CORE MEMBER — `_msize` interrogates a heap block, so it must name the same runtime whose `malloc` produced it; asking one CRT the size of the other's block walks a foreign heap and returns garbage or faults, never a diagnostic. `_msize` is dual-exported (MEASURED at TF-C111: ucrtbase YES / msvcrt YES, `objdump -p`), so the rebind is a pure name-of-DLL change with no signature or spelling churn. | c105 (the MSVC-profile flip): shipped <malloc.h> — the Microsoft CRT allocation-introspection header (pe-only; a glibc/darwin program gets malloc from <stdlib.h>, and DSS's elf/macho surfaces never reference <malloc.h>). SCOPE: exactly what the sqlite amalgamation uses under `#if defined(_MSC_VER) && !defined(SQLITE_WITHOUT_MSIZE)` — `_msize(void*) -> size_t` (LLP64 size_t = u64), the allocation-size query backing sqlite3MemSize. `_msize` was dumpbin-verified as a real msvcrt export at c105 (the c101 eager-import lesson: a `symbols` block may carry ONLY real exports).",
   "header": "malloc.h",
   "standard": "msvcrt",
   "availableObjectFormats": ["pe"],
-  "library": { "pe": "msvcrt.dll" },
+  "library": { "pe": "ucrtbase.dll" },
   "symbols": [
     { "name": "_msize", "signature": "fn(ptr<void>) -> u64", "kind": "function", "linkage": "external" }
   ]

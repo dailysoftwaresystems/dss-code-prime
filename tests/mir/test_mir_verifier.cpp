@@ -17,6 +17,8 @@
 
 #include <algorithm>
 #include <array>
+#include <string>
+#include <string_view>
 
 using namespace dss;
 using dss::test_support::countCode;
@@ -1022,4 +1024,649 @@ TEST(MirVerifier, AtomicInitExemptStorePasses) {
     MirVerifier v{m, &interner};
     EXPECT_TRUE(v.verify(r)) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(countCode(r, DiagnosticCode::I_AtomicAccessNotLowered), 0u);
+}
+
+// ── TF-C112 (D-MIR-VERIFIER-NO-CALLSITE-SIGNATURE-CHECK) ────────────────────
+//
+// The CALL-SITE signature belt. `checkTypeInvariants` checks an `Arg` against
+// the ENCLOSING function's FnSig; until this rule NOTHING cross-checked a
+// `Call`'s operands against its CALLEE's FnSig, so every hand-built call in
+// every MIR-tier synthesis pass could pass the wrong number of arguments, or
+// the wrong type at a position, and no tier objected. (The frontend path was
+// already covered — `HirVerifier::checkCallArguments` runs the same arity +
+// per-position rule on every cst_to_hir-produced call — but a pass that emits
+// MIR DIRECTLY bypasses HIR entirely.) These tests build MIR BY HAND, never
+// through a frontend.
+//
+// ⚠ Two LIMITS are pinned as tests too, deliberately, so nobody reads the belt
+// as more coverage than it is: `SameTypedTranspositionStaysInvisible` and
+// `ByValueAggregateParamCallIsSkippedNotFlagged`. Read those before concluding
+// this rule covers "the call is wired correctly" — it does not.
+
+namespace {
+
+// Does some I_CallSignatureMismatch diagnostic mention `needle`? The rule's
+// value to a human debugging a miscompile is that it names the POSITION, so
+// these tests assert on the TEXT, not merely on a count.
+[[nodiscard]] bool anyCallDiagContains(DiagnosticReporter const& r,
+                                       std::string_view needle) {
+    for (auto const& d : r.all()) {
+        if (d.code == DiagnosticCode::I_CallSignatureMismatch
+            && d.actual.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+MirLiteralValue litOf(std::int64_t v, TypeKind core) {
+    MirLiteralValue lit;
+    lit.value = v;
+    lit.core  = core;
+    return lit;
+}
+
+// Every diagnostic's text joined — the `<<` payload for a failing EXPECT, so a
+// red shows WHAT fired instead of only a count.
+[[nodiscard]] std::string allActuals(DiagnosticReporter const& r) {
+    std::string s;
+    for (auto const& d : r.all()) { s += "\n  "; s += d.actual; }
+    return s;
+}
+
+} // namespace
+
+// ★ THE HEADLINE SHAPE: a TRANSPOSITION. `f(i32, ptr<i32>)` called with
+// `(ptr<i32>, i32)` — the right VALUES in the wrong SLOTS. Before this rule the
+// module verified clean. Both positions are named.
+TEST(MirVerifier, CallWithTransposedOperandsRejectedAtBothPositions) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pI32   = in.pointer(i32);
+    std::array<TypeId, 2> const ps{i32, pI32};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const n  = b.addConst(litOf(7, TypeKind::I32), i32);
+    MirInstId const p  = b.addInst(MirOpcode::Alloca, {}, pI32, /*bytes=*/4);
+    std::array<MirInstId, 3> const ops{ga, p, n};   // TRANSPOSED
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 2u)
+        << allActuals(r);
+    EXPECT_TRUE(anyCallDiagContains(r, "POSITION 0")) << allActuals(r);
+    EXPECT_TRUE(anyCallDiagContains(r, "POSITION 1")) << allActuals(r);
+}
+
+// ⚠ LIMIT #1, PINNED SO NOBODY MISREADS THE BELT AS COVERAGE.
+// `f(ptr<char>, ptr<char>)` called with its two `ptr<char>` operands SWAPPED
+// verifies CLEAN — and always will. This is the EXACT bug that motivated the
+// rule (transposing `buf` and `fmt` in synthesizeStdioShim's `sprintf` arm,
+// both `char*`, at parameters 1 and 3 of one signature): only POSITION tells
+// them apart and no type check at any tier can read position. The same holds
+// for `__stdio_common_vsprintf` / `__stdio_common_vsscanf`, which deliberately
+// SHARE one FnSig TypeId — mis-wiring a recipe to the wrong one of that pair is
+// a SYMBOL-level error invisible here. Those shapes are caught ONLY by per-body
+// test pins. If this test ever starts FAILING, the rule has grown a claim it
+// cannot honour — work out what changed; do not "fix" it by relaxing anything.
+TEST(MirVerifier, SameTypedTranspositionStaysInvisible) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const charTy = in.primitive(TypeKind::Char);
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pChar  = in.pointer(charTy);
+    std::array<TypeId, 2> const ps{pChar, pChar};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga  = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const buf = b.addInst(MirOpcode::Alloca, {}, pChar, /*bytes=*/64);
+    MirInstId const fmt = b.addInst(MirOpcode::Alloca, {}, pChar, /*bytes=*/8);
+    std::array<MirInstId, 3> const ops{ga, fmt, buf};   // swapped vs (buf, fmt)
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u)
+        << "a same-TypeId transposition is unreachable for a TYPE rule — this "
+           "test documents the hole, it does not endorse it";
+}
+
+// Wrong arity, TOO FEW: a 2-parameter non-variadic callee given 1 argument.
+TEST(MirVerifier, CallWithTooFewArgumentsRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 2> const ps{i32, i32};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const n  = b.addConst(litOf(1, TypeKind::I32), i32);
+    std::array<MirInstId, 2> const ops{ga, n};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+        << allActuals(r);
+    EXPECT_TRUE(anyCallDiagContains(r, "passes 1 argument operand(s)"))
+        << allActuals(r);
+    EXPECT_TRUE(anyCallDiagContains(r, "declares 2 parameter(s)"))
+        << allActuals(r);
+}
+
+// Wrong arity, TOO MANY: a 2-parameter non-variadic callee given 3 arguments.
+// The variadic `>=`-not-`==` relaxation must NOT leak into the fixed case.
+TEST(MirVerifier, CallWithTooManyArgumentsRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 2> const ps{i32, i32};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const a  = b.addConst(litOf(1, TypeKind::I32), i32);
+    MirInstId const c  = b.addConst(litOf(2, TypeKind::I32), i32);
+    MirInstId const d  = b.addConst(litOf(3, TypeKind::I32), i32);
+    std::array<MirInstId, 4> const ops{ga, a, c, d};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+        << allActuals(r);
+    EXPECT_TRUE(anyCallDiagContains(r, "passes 3 argument operand(s)"))
+        << allActuals(r);
+}
+
+// A WRONG-TYPED operand at ONE position: `f(i32, i32, i32)` given
+// `(i32, ptr<i32>, i32)`. Exactly one diagnostic, and it names POSITION 1 —
+// the whole point of the rule for a human reading a verifier finding.
+TEST(MirVerifier, CallWithWrongTypedOperandNamesThePosition) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pI32   = in.pointer(i32);
+    std::array<TypeId, 3> const ps{i32, i32, i32};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const a  = b.addConst(litOf(1, TypeKind::I32), i32);
+    MirInstId const p  = b.addInst(MirOpcode::Alloca, {}, pI32, /*bytes=*/4);
+    MirInstId const c  = b.addConst(litOf(3, TypeKind::I32), i32);
+    std::array<MirInstId, 4> const ops{ga, a, p, c};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+        << allActuals(r);
+    EXPECT_TRUE(anyCallDiagContains(r, "POSITION 1")) << allActuals(r);
+    EXPECT_FALSE(anyCallDiagContains(r, "POSITION 0")) << allActuals(r);
+    EXPECT_FALSE(anyCallDiagContains(r, "POSITION 2")) << allActuals(r);
+}
+
+// A NON-void pointee mismatch is still a violation: `f(ptr<char>)` given a
+// `ptr<i32>`. This is the boundary of the `void*` slack below — the class
+// nearest the shim bug the rule exists for (a `FILE*` wired into a `char*`
+// slot) stays LOUD. Relaxing this to "all pointers are interchangeable" is
+// exactly the weakening that would make the rule stop paying for itself.
+TEST(MirVerifier, NonVoidPointeeMismatchStillRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const charTy = in.primitive(TypeKind::Char);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pChar  = in.pointer(charTy);
+    TypeId const pI32   = in.pointer(i32);
+    std::array<TypeId, 1> const ps{pChar};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const p  = b.addInst(MirOpcode::Alloca, {}, pI32, /*bytes=*/4);
+    std::array<MirInstId, 2> const ops{ga, p};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+        << allActuals(r);
+}
+
+// ★ THE TYPE-QUALIFIER ARM. `T*` → `volatile T*` at a call argument is an
+// IMPLICIT QUALIFICATION CONVERSION (C17 6.5.16.1p1) — legal with no cast, and
+// bit-identical, so the tree emits no Cast for it. The interner already calls a
+// qualifier skin representation-neutral (`sameRepresentation`: "`volatile long`
+// and `long` compare equal here"), but compares a composite's OPERANDS by raw
+// TypeId, so the neutrality does not survive one level of indirection.
+//
+// MEASURED at TF-C112 against sqlite `src/func.c`: `kahanBabuskaNeumaierInit/
+// Step/StepInt64` are declared `(volatile SumCtx *, …)` and called from
+// `sumStep`/`sumInverse` with a plain `SumCtx *p` — 11 call sites, 3 callees,
+// one shape, and gcc 13.2.0 accepts the reduction at `-std=c17 -Wall -Wextra
+// -pedantic` with zero diagnostics. There is only ONE interned `SumCtx`: the
+// param pointee is a VolatileQual skin whose `stripVolatile` returns the
+// argument pointee's own TypeId.
+//
+// RED-ON-DISABLE: delete the qualifier arm in `checkCallSignatures` and this
+// test fails with 1 mismatch at POSITION 0.
+TEST(MirVerifier, QualifiedPointeeOnEitherSideIsCompatible) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const f64    = in.primitive(TypeKind::F64);
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 2> const fields{f64, f64};
+    TypeId const sumCtx  = in.structType("SumCtx", fields);
+    TypeId const volCtx  = in.volatileQualified(sumCtx);
+    ASSERT_NE(sumCtx.v, volCtx.v) << "the qualifier skin must split identity";
+    ASSERT_EQ(in.stripVolatile(volCtx).v, sumCtx.v)
+        << "one interning + a transparent skin, not two internings";
+    TypeId const pCtx    = in.pointer(sumCtx);
+    TypeId const pVolCtx = in.pointer(volCtx);
+    ASSERT_NE(pCtx.v, pVolCtx.v);
+    // param 0 = `volatile SumCtx*` fed a plain `SumCtx*` (sqlite's shape);
+    // param 1 = plain `SumCtx*` fed a `volatile SumCtx*` (the other direction —
+    // a C constraint violation the FRONT END owns, not a representation error,
+    // so MIR must not encode one source language's qualifier rules here).
+    std::array<TypeId, 2> const ps{pVolCtx, pCtx};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const p  = b.addInst(MirOpcode::Alloca, {}, pCtx, /*bytes=*/16);
+    MirInstId const q  = b.addInst(MirOpcode::Alloca, {}, pVolCtx, /*bytes=*/16);
+    std::array<MirInstId, 3> const ops{ga, p, q};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u);
+}
+
+// THE BOUNDARY of the arm above, and the reason it is a qualifier arm rather
+// than a pointer arm. Stripping the skin does NOT make pointers interchangeable:
+// two DIFFERENT structs stay a violation even when BOTH sides are volatile-
+// qualified, because the arm compares the stripped pointees by interned IDENTITY
+// (not `sameRepresentation`, which would have let `ptr<long>` into a
+// `ptr<long long>` slot). A `FILE*` wired into a `char*` slot — the shim bug the
+// whole rule exists for — is still LOUD, qualified or not.
+TEST(MirVerifier, QualifiedButDistinctPointeesStillRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const f64    = in.primitive(TypeKind::F64);
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 2> const fa{f64, f64};
+    std::array<TypeId, 1> const fb{i32};
+    TypeId const volA = in.volatileQualified(in.structType("A", fa));
+    TypeId const volB = in.volatileQualified(in.structType("B", fb));
+    std::array<TypeId, 1> const ps{in.pointer(volA)};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const p  = b.addInst(MirOpcode::Alloca, {}, in.pointer(volB),
+                                   /*bytes=*/4);
+    std::array<MirInstId, 2> const ops{ga, p};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+        << allActuals(r);
+}
+
+// ★ THE `void*` SLACK, and why it is not a red-driven relaxation. `ptr<void>`
+// is MIR's canonical "an ADDRESS whose pointee is unknown or irrelevant"
+// spelling — the ABSENCE of a type claim. MEASURED at TF-C112: running
+// **Mem2Reg** over `int vsum(int, va_list)`'s caller promotes the `va_list ap`
+// local and forwards the `VaHomeArgAreaAddr` leaf — typed `ptr<void>` — into a
+// parameter declared `ptr<i8>` (Win64 `va_list`), erasing the pointee with no
+// retagging Cast (one would invent a runtime instruction for a bit-identical
+// conversion). So pointee identity at a call operand is not a MIR invariant
+// after optimization. Both directions are admitted: a `void*` ARGUMENT (the
+// Mem2Reg shape) and a `void*` PARAMETER (every synthesis pass spells an opaque
+// OS/CRT handle that way — synth_threads_shim passes `&__dss_once_tramp`, a
+// `ptr<FnSig>`, into InitOnceExecuteOnce's `void*`-declared slot).
+TEST(MirVerifier, VoidPointerOnEitherSideIsCompatible) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i8     = in.primitive(TypeKind::I8);
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pVoid  = in.pointer(voidTy);
+    TypeId const pI8    = in.pointer(i8);
+    // param 0 = `va_list` (ptr<i8>) fed a ptr<void>; param 1 = ptr<void> fed a
+    // ptr<FnSig> (a function address, the once-trampoline shape).
+    std::array<TypeId, 2> const ps{pI8, pVoid};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    // The Mem2Reg-promoted va_list leaf: a frame address typed ptr<void>.
+    MirInstId const ap = b.addInst(MirOpcode::VaHomeArgAreaAddr, {}, pVoid,
+                                   /*payload=*/2);
+    MirInstId const fn = b.addGlobalAddr(SymbolId{3}, in.pointer(calleeSig));
+    std::array<MirInstId, 3> const ops{ga, ap, fn};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u);
+}
+
+// Positive: a correctly-wired call passes. Pins that the rule does not
+// false-positive on the intended form.
+TEST(MirVerifier, CorrectlyWiredCallPasses) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pI32   = in.pointer(i32);
+    std::array<TypeId, 2> const ps{i32, pI32};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const n  = b.addConst(litOf(7, TypeKind::I32), i32);
+    MirInstId const p  = b.addInst(MirOpcode::Alloca, {}, pI32, /*bytes=*/4);
+    std::array<MirInstId, 3> const ops{ga, n, p};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u);
+}
+
+// Positive: a VARIADIC callee accepts MORE operands than its fixed parameter
+// count, and the vararg tail is UNTYPED by construction (C's default argument
+// promotions + the platform vararg ABI own it) — so a `ptr` in the tail of a
+// `(char*, ...)` signature is not a finding. HirVerifier's convention verbatim.
+TEST(MirVerifier, VariadicCallWithExtraArgumentsPasses) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const charTy = in.primitive(TypeKind::Char);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pChar  = in.pointer(charTy);
+    std::array<TypeId, 1> const ps{pChar};
+    TypeId const calleeSig =
+        in.fnSig(ps, i32, CallConv::CcSysV, /*isVariadic=*/true);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga  = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const fmt = b.addInst(MirOpcode::Alloca, {}, pChar, /*bytes=*/8);
+    MirInstId const v0  = b.addConst(litOf(1, TypeKind::I32), i32);
+    MirInstId const v1  = b.addInst(MirOpcode::Alloca, {}, pChar, /*bytes=*/8);
+    std::array<MirInstId, 4> const ops{ga, fmt, v0, v1};
+    b.addInst(MirOpcode::Call, ops, i32, /*payload=*/0);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u);
+}
+
+// Negative: variadic relaxes the UPPER bound only — FEWER operands than the
+// fixed parameter count is still a violation.
+TEST(MirVerifier, VariadicCallWithFewerThanFixedArgumentsRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const charTy = in.primitive(TypeKind::Char);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pChar  = in.pointer(charTy);
+    std::array<TypeId, 2> const ps{pChar, i32};
+    TypeId const calleeSig =
+        in.fnSig(ps, i32, CallConv::CcSysV, /*isVariadic=*/true);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga  = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const fmt = b.addInst(MirOpcode::Alloca, {}, pChar, /*bytes=*/8);
+    std::array<MirInstId, 2> const ops{ga, fmt};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+        << allActuals(r);
+    EXPECT_TRUE(anyCallDiagContains(r, "declares 2 fixed parameter(s)"))
+        << allActuals(r);
+}
+
+// Positive: an INDIRECT call — the callee is a register value (here an `Arg`
+// holding a function pointer, the synth_threads_shim once-adapter shape) — has
+// NO static callee, so there is no signature to check against. It must be
+// skipped CLEANLY, never flagged. Its operands deliberately match no signature.
+TEST(MirVerifier, IndirectCallWithNoStaticCalleeIsSkipped) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pVoid  = in.pointer(voidTy);
+    std::array<TypeId, 1> const cps{pVoid};
+    TypeId const callerSig = in.fnSig(cps, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const fp = b.addArg(0, pVoid);            // the callee, in a register
+    MirInstId const n  = b.addConst(litOf(9, TypeKind::I32), i32);
+    std::array<MirInstId, 2> const ops{fp, n};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u);
+}
+
+// The OTHER shipped callee spelling. hir_to_mir's direct-call arm types the
+// callee GlobalAddr with the HIR Ref's own type — the FnSig ITSELF, not
+// `Ptr<FnSig>` (which is what `&fn` and every synthesis pass produce). Pins
+// that the rule engages on that spelling too rather than silently skipping the
+// entire frontend-produced call population.
+TEST(MirVerifier, DirectFnSigTypedCalleeIsAlsoChecked) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 2> const ps{i32, i32};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, calleeSig);   // FnSig DIRECTLY
+    MirInstId const n  = b.addConst(litOf(1, TypeKind::I32), i32);
+    std::array<MirInstId, 2> const ops{ga, n};                      // 1 arg, needs 2
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+        << allActuals(r);
+}
+
+// D-LANG-TYPE-IDENTITY-VOCABULARY: an operand whose type is identity-DISTINCT
+// from the parameter but REPRESENTATIONALLY identical (`i64` vs `i64 "long"`)
+// is accepted. A same-representation conversion changes NO bits, so the tree
+// RETAGS rather than emitting a Cast for it — rejecting it here would make the
+// verifier contradict the lowering.
+TEST(MirVerifier, SameRepresentationDistinctIdentityOperandAccepted) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64Anon = in.primitive(TypeKind::I64);
+    TypeId const i64Long = in.primitive(TypeKind::I64, "long");
+    TypeId const i32     = in.primitive(TypeKind::I32);
+    TypeId const voidTy  = in.primitive(TypeKind::Void);
+    ASSERT_NE(i64Anon.v, i64Long.v) << "the vocabulary tag must split identity";
+    std::array<TypeId, 1> const ps{i64Long};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const n  = b.addConst(litOf(5, TypeKind::I64), i64Anon);
+    std::array<MirInstId, 2> const ops{ga, n};
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u);
+}
+
+// ⚠ LIMIT #2: the PHYSICAL-vs-SEMANTIC gate. A MIR Call's operand list is
+// ABI-LOWERED — a by-value aggregate parameter expands into a target-dependent
+// number of register pieces / carriers, and MIR must not know the target's
+// classifier (the agnosticism bar). So a call whose callee declares a
+// by-value-class parameter is SKIPPED WHOLE: here `f(struct S)` is called with
+// TWO i64 register pieces, which a naive arity rule would call a 2-vs-1
+// violation. Skipping is the check DECLINING TO JUDGE a list it cannot align,
+// not a relaxation — narrowing it needs the ABI classification recorded ON the
+// Call, which is a MIR-tier change, not a verifier one.
+TEST(MirVerifier, ByValueAggregateParamCallIsSkippedNotFlagged) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64    = in.primitive(TypeKind::I64);
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 2> const fields{i64, i64};
+    TypeId const sTy = in.structType("S", fields);
+    std::array<TypeId, 1> const ps{sTy};
+    TypeId const calleeSig = in.fnSig(ps, i32, CallConv::CcSysV);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig));
+    MirInstId const p0 = b.addConst(litOf(1, TypeKind::I64), i64);
+    MirInstId const p1 = b.addConst(litOf(2, TypeKind::I64), i64);
+    std::array<MirInstId, 3> const ops{ga, p0, p1};   // 2 pieces for 1 param
+    b.addInst(MirOpcode::Call, ops, i32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &in};
+    EXPECT_TRUE(v.verify(r)) << allActuals(r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u);
+}
+
+// Interner-gated like every other type rule: with NO interner the callee's
+// FnSig cannot be decoded, so a blatantly wrong call is not judged (a raw
+// fixture's TypeIds are untagged stand-ins that resolve to nothing).
+TEST(MirVerifier, CallSignatureRuleSkippedWithoutInterner) {
+    MirBuilder b;
+    (void)b.addFunction(kFnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const ga = b.addGlobalAddr(SymbolId{2}, kVoidFn);
+    MirInstId const n  = b.addConst(intLit(1), kI32);
+    std::array<MirInstId, 2> const ops{ga, n};
+    b.addInst(MirOpcode::Call, ops, kI32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m};                     // no interner
+    EXPECT_TRUE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u);
 }

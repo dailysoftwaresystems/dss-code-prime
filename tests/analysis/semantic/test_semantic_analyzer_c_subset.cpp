@@ -11,6 +11,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -20,6 +21,7 @@
 #include <format>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 
@@ -12253,20 +12255,28 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Resolve the REAL shipped system-include dir (src/dss-config/shippedLibs) by
-// the same 8-level upward walk program.cpp's applySystemDirs uses, so the pins
-// exercise the descriptor the production driver ships.
+// Resolve the REAL shipped system-include dir (src/dss-config/shippedLibs)
+// through the ONE test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the
+// repo root CMake bakes in → a cwd ancestor walk), so the pins exercise the
+// descriptor the production driver ships.
+//
+// This was a private 8-level upward walk mirroring program.cpp's applySystemDirs
+// — and it read neither of the first two sources, so an out-of-tree build (whose
+// cwd has no `src/dss-config` in its ancestry) missed on every hop, returned
+// `{}`, and each of the four callers below answered with `std::abort()`.
+// `abort()` kills the whole test BINARY, so ONE unresolvable directory cost
+// every other test in this file its verdict — the harness could not even say
+// which unit was unhappy. This THROWS instead, which GoogleTest reports as a
+// failure of the one test that asked; the four `.empty()`/`abort()` guards are
+// gone with it because the path can no longer come back empty.
 [[nodiscard]] fs::path findRealShippedLibsDir() {
+    fs::path const dir = dss::test::configRoot() / "shippedLibs";
     std::error_code ec;
-    fs::path here = fs::current_path(ec);
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const candidate = here / "src" / "dss-config" / "shippedLibs";
-        if (fs::is_directory(candidate, ec)) return candidate;
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    if (!fs::is_directory(dir, ec)) {
+        throw std::runtime_error(
+            "the shipped-lib descriptor directory is missing: " + dir.string());
     }
-    return {};
+    return dir;
 }
 
 // Build + analyze `mainSrc` with the REAL shippedLibs dir on the system path
@@ -12277,11 +12287,7 @@ namespace fs = std::filesystem;
 [[nodiscard]] SemanticModel analyzeRealTgmath(std::string mainSrc,
                                               ObjectFormatKind format,
                                               DataModel dataModel) {
-    fs::path const shipped = findRealShippedLibsDir();
-    if (shipped.empty()) {
-        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
-        std::abort();
-    }
+    fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
     builder.addSystemDir(shipped);
@@ -13735,11 +13741,7 @@ namespace {
 // same descriptors the production driver ships — so a regression in stdint.json
 // itself flips the pin red rather than being mirrored green by a scratch copy.
 [[nodiscard]] SemanticModel analyzeWithRealShippedLibs(std::string mainSrc) {
-    fs::path const shipped = findRealShippedLibsDir();
-    if (shipped.empty()) {
-        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
-        std::abort();
-    }
+    fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
     builder.addSystemDir(shipped);
@@ -14728,11 +14730,7 @@ namespace {
 [[nodiscard]] SemanticModel analyzeRealShippedForTarget(
     std::string mainSrc, ObjectFormatKind format, std::string_view arch,
     DataModel dataModel) {
-    fs::path const shipped = findRealShippedLibsDir();
-    if (shipped.empty()) {
-        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
-        std::abort();
-    }
+    fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
     UnitBuilder builder{schema};
     builder.addSystemDir(shipped);
@@ -15137,4 +15135,197 @@ TEST(SemanticAnalyzerCSubset, StructMemberLeadingAlignasAndAttributeCompose) {
     EXPECT_EQ(*p->explicitAlignment, 16u);
     EXPECT_TRUE(p->isNoreturn)
         << "and the attribute branch beside it must still reach its own";
+}
+
+// ── TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): a goal-2 SUPPRESSED descriptor row
+//    must carry its REALIZATION, not just its library ────────────────────────
+//
+// A descriptor row declares two independent things: WHERE the symbol resolves
+// (`library`) and WHETHER it is an import at all (`synthesize`). Goal-2 hands a
+// user re-declaration authority over the SIGNATURE — never over the platform's
+// realization — so a suppressed row has to forward BOTH or the second property
+// is silently lost for the declarations users write most often.
+//
+// The cost of losing it is not theoretical and not graceful. `ucrtbase.dll`
+// exports none of printf/fprintf/sprintf/vfprintf/sscanf (only the
+// `__stdio_common_v*` cores), so those five pe rows are compiler-SYNTHESIZED.
+// A suppressed row forwarding only the library made the user's prototype
+// re-export the name as a raw eager import, and DSS eager-imports every
+// declared shipped extern — so `#include <stdio.h>` + `int printf(const char*,
+// ...);` compiled rc=0, emitted no diagnostic anywhere, and died at PROCESS
+// START with 0xC0000139 (MEASURED at the TF-C111 HEAD).
+//
+// These pins are the SEMANTIC half of the fix: the row's recipe id and its
+// declared signature survive suppression. The HIR half (recipe → shim, never an
+// import row; and the signature refusal) is pinned in test_hir_lowering_c_subset.
+
+namespace {
+
+// Build + analyze `mainSrc` against the REAL src/dss-config/shippedLibs under a
+// GIVEN object format — the `analyzeRealTgmath` shape, re-declared here so these
+// pins read against the descriptors the production driver ships (a regression in
+// stdio.json itself flips them red rather than being mirrored green by a scratch
+// copy). The format is threaded to BOTH the UnitBuilder (macro `variants` splice)
+// and `analyze` (the per-symbol availability gate) exactly as the driver does —
+// which is load-bearing here: stdio.json carries TWO `printf` rows, and only the
+// pe one has a `synthesize` tag.
+[[nodiscard]] SemanticModel analyzeRealStdio(std::string mainSrc,
+                                             ObjectFormatKind format,
+                                             DataModel dataModel,
+                                             std::string_view arch) {
+    fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
+    auto schema = loadShippedSchema("c-subset");
+    UnitBuilder builder{schema};
+    builder.addSystemDir(shipped);
+    builder.setActiveFormat(format);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, dataModel, std::nullopt, std::nullopt, format, arch);
+}
+
+// The reproducer, verbatim: legal C that clang and GCC both accept, and the
+// single most-redeclared identifier in the language.
+constexpr char const* kPrintfRedeclSrc =
+    "#include <stdio.h>\n"
+    "int printf(const char *fmt, ...);\n"
+    "int main(void) { return printf(\"hi\n\"); }\n";
+
+} // namespace
+
+// PE: the suppressed row keeps its `synthesize` recipe. RED before TF-C112 —
+// `SuppressedShippedSymbol` had no such field, so the answer was structurally
+// unavailable.
+TEST(SemanticAnalyzerCSubset, TFC112SuppressedPeStdioRowCarriesItsSynthesizeRecipe) {
+    auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Pe,
+                                  DataModel::Llp64, "x86_64");
+    EXPECT_FALSE(model.hasErrors());
+    auto const* sup = model.suppressedShippedSymbolFor("printf");
+    ASSERT_NE(sup, nullptr)
+        << "goal-2 suppressed the descriptor's printf — the row must be recorded";
+    EXPECT_EQ(sup->recipeId, "printf")
+        << "the pe row is realized as a compiler-synthesized shim; a suppressed "
+           "copy that forgets the recipe re-exports it as a ucrtbase import that "
+           "cannot load (0xC0000139)";
+    // The per-format library still rides too — the c86/c156 contract is intact,
+    // not replaced. Which ROW was recorded is decided by the availability gate,
+    // and `ucrtbase.dll` here proves the PE row won (the elf/macho `printf` row
+    // carries no recipe, so recording it would have looked identical to the
+    // pre-fix bug).
+    ASSERT_TRUE(sup->library.contains("pe"));
+    EXPECT_EQ(sup->library.at("pe"), "ucrtbase.dll");
+}
+
+// PE: and the row's DECLARED SIGNATURE, which is the shim-compatibility oracle.
+// Two-sided on purpose — "valid" alone would pass on any type at all. The pin is
+// that it is EXACTLY the type the user's own prototype resolved to, because that
+// identity is what licenses the lowerer to hand this prototype the shim.
+TEST(SemanticAnalyzerCSubset, TFC112SuppressedRowSignatureMatchesTheUserPrototype) {
+    auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Pe,
+                                  DataModel::Llp64, "x86_64");
+    EXPECT_FALSE(model.hasErrors());
+    auto const* sup = model.suppressedShippedSymbolFor("printf");
+    ASSERT_NE(sup, nullptr);
+    ASSERT_TRUE(sup->signature.valid())
+        << "without the declared signature there is no oracle to judge a "
+           "re-declaration against, and the shim would be handed out blind";
+    auto const* user = findSymbolNamed(model, "printf");
+    ASSERT_NE(user, nullptr);
+    ASSERT_TRUE(user->type.valid());
+    EXPECT_EQ(user->type.v, sup->signature.v)
+        << "`int printf(const char*, ...)` IS stdio.json's `fn(ptr<char>, ...) "
+           "-> i32` — interner TypeId equality is structural FnSig equality, and "
+           "`const` is not interned. If this ever diverges the lowerer starts "
+           "REFUSING the commonest legal declaration in C, so it is pinned here "
+           "rather than left to the refusal path to discover.";
+    // Exactly ONE printf symbol exists: goal-2 deleted the descriptor's own
+    // injection, so the user's prototype is the sole declaration and the only
+    // thing that can carry the call.
+    EXPECT_EQ(countSymbolsNamed(model, "printf"), 1u);
+}
+
+// ELF: the SAME source, and the row that wins there carries NO recipe — glibc
+// exports a real `printf`, so it stays an ordinary FFI import. This is the
+// agnosticism pin: the recipe comes from per-format DESCRIPTOR DATA selected by
+// the availability gate, never from a format test in the compiler.
+TEST(SemanticAnalyzerCSubset, TFC112SuppressedElfStdioRowCarriesNoRecipe) {
+    auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Elf,
+                                  DataModel::Lp64, "x86_64");
+    EXPECT_FALSE(model.hasErrors());
+    auto const* sup = model.suppressedShippedSymbolFor("printf");
+    ASSERT_NE(sup, nullptr);
+    EXPECT_TRUE(sup->recipeId.empty())
+        << "the elf printf row is a plain libc.so.6 import — tagging it would "
+           "drop a working import in favour of a shim nothing asked for";
+    ASSERT_TRUE(sup->library.contains("elf"));
+    EXPECT_EQ(sup->library.at("elf"), "libc.so.6");
+}
+
+// ── TF-C121: the suppressed row also carries its per-target LINK BASE NAME ────
+//
+// `SuppressedShippedSymbol::linkName` is the THIRD property a suppressed
+// descriptor row must forward, joining `version` (c156) and `recipeId`
+// (TF-C112). It shipped with NO test coverage anywhere under tests/analysis/,
+// on a field whose sibling properties each got a pin ONLY AFTER the same two
+// suppression sites had already dropped one of them — which is what the two
+// TFC112 tests above are. Same field family, same failure mode, so the same
+// guard.
+//
+// THE SCENARIO IS THE ONE THE FIELD'S OWN COMMENT NAMES: a user restating
+// `fstat`'s C signature over `#include <sys/stat.h>`. That is legal C and
+// exactly what portable code writes. The prototype restates the SIGNATURE and
+// says NOTHING about which name libSystem exports for it on this arch, so a
+// suppressed row that forgets the link name silently re-binds Darwin-x86_64's
+// LEGACY 32-bit-inode `_fstat` — which reads st_size from offset 96 of a
+// structure that writes it at 72, reporting 0. It LINKS CLEAN either way, so
+// nothing fails loud and only a pin like this one can see it.
+//
+// BOTH ARMS, for the reason the reader-side sibling
+// (`ShippedLibDescriptor.SymbolLinkNameVariantSelectsPerArchBothArms`) gives:
+// x86_64 must carry the alias and arm64 must carry NOTHING, because arm64 has
+// one inode ABI and its plain name is already correct. A flat string would
+// satisfy one arm while corrupting the other.
+//
+// ⚠ SCOPE, so a green run is not over-read: this pins the SEMANTIC rail — that
+// the suppressed row RECORDS the resolved name. The two CST→HIR threading sites
+// that carry it onward into `HirExternRecord` (the bare-prototype arm and
+// `claimSuppressedShimSymbol`) are a separate rail and are NOT pinned here; the
+// shipped `shipped_linkname_inode64` corpus example exercises the ordinary
+// INJECTION path, not this suppression path, so that rail's pin belongs in
+// tests/hir/test_hir_lowering_c_subset.cpp and does not exist yet.
+namespace {
+// `fn(i32, ptr<void>) -> i32` IS sys/stat.json's declared shape for `fstat`, so
+// this prototype interns to the same TypeId and goal-2 suppression fires.
+constexpr char const* kFstatRedeclSrc =
+    "#include <sys/stat.h>\n"
+    "int fstat(int fd, void *buf);\n"
+    "int main(void) { return fstat(0, (void *)0); }\n";
+} // namespace
+
+TEST(SemanticAnalyzerCSubset, TFC121SuppressedDarwinRowCarriesItsPerTargetLinkName) {
+    auto const linkNameOn = [](std::string_view arch) -> std::string {
+        auto model = analyzeRealShippedForTarget(kFstatRedeclSrc,
+                                                 ObjectFormatKind::MachO, arch,
+                                                 DataModel::Lp64);
+        EXPECT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty()
+                    ? "" : model.diagnostics().all()[0].actual);
+        auto const* sup = model.suppressedShippedSymbolFor("fstat");
+        if (sup == nullptr) {
+            ADD_FAILURE()
+                << "goal-2 must have suppressed the descriptor's fstat for arch "
+                << arch << " — with no recorded row there is nothing to forward";
+            return "<missing>";
+        }
+        return sup->linkName;
+    };
+    EXPECT_EQ(linkNameOn("x86_64"), "fstat$INODE64")
+        << "the suppressed row must carry Darwin-x86_64's $INODE64 alias. "
+           "Dropping it hands the user's prototype the LEGACY 32-bit-inode "
+           "callee — a SILENT misbind: it links, it runs, and st_size reads 0";
+    EXPECT_EQ(linkNameOn("arm64"), "")
+        << "arm64-Darwin has ONE inode ABI, so no variant matches and the "
+           "resolved name is EMPTY, meaning 'use `name`'. A flat (non-variant) "
+           "link name would put `_fstat$INODE64` here and break the arch that "
+           "was already correct";
 }

@@ -62,6 +62,40 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      two `sel()`s emitted 4 `And`s, so dropping the clamp `And` stayed green). Pin the guarded
      value's **operand chain** (e.g. assert `Shl.operand[1]` IS the clamp `And`, not a bare `Sub`)
      and **demonstrate red-on-disable** by actually removing the guard, not merely asserting present.
+   - **★★ THE RED-ON-DISABLE DEMONSTRATION NEEDS ITS OWN GUARD — ASSERT THE MUTATION LANDED.**
+     Red-on-disable is this project's PRIMARY defence against vacuous tests (five vacuity species
+     in three cycles were each caught by it and by nothing else). It is therefore the one technique
+     whose own failure is unbounded: **a mutation that silently no-ops makes the pin report green,
+     and that green reads exactly like earned confidence.** ✔MEASURED 2026-08-06: a mutator process
+     was killed by a cygwin fork error before it edited anything; the pin passed, as it correctly
+     should have, and was briefly read as "the guard is not vacuous"
+     (`D-GATE-RED-ON-DISABLE-MUTATION-CAN-SILENTLY-NO-OP`). So every demonstration must be
+     **fail-closed**: the witness text is UNIQUE in the subject, the mutant DIFFERS byte-wise
+     (`cmp`/hash — **never a line count**, which a same-length replacement slips straight past),
+     the witness is ABSENT from the mutant, and the mutant still parses. Never infer that a mutator
+     ran from its exit code alone. **Never anchor a mutation to absolute line numbers** — it can
+     delete the wrong lines and produce a false red, which is untrustworthy in the other direction.
+     ★★ **AND THE MUTANT MUST NOT CONTAIN THE WITNESS STRING — not even in a comment.**
+     ✔MEASURED 2026-08-06, hours after the rule above was written and by the agent following it:
+     a mutant was spelled `$legForwardPaths = @()  # MUTANT: TCL_LIBRARY dropped again` — and the
+     pin, which searches for `TCL_LIBRARY`, **stayed green over a guard that had been removed**,
+     because the comment announcing the mutation carried the very token being searched for. (The
+     helper stripped whole-line comments, not trailing ones.) ⇒ every fail-closed check passed —
+     the witness *was* unique, the mutant *did* differ, it *did* parse — and the demonstration was
+     still worthless. **Add a fourth check: assert the witness is absent from the mutant BY THE
+     SAME MATCHER THE PIN USES**, not by eye and not by a different reader. Describe a mutation in
+     the harness's output, never inside the mutated file.
+   - **★★ A PIN MUST DRIVE ITS SUBJECT THROUGH THE SUBJECT'S REAL INPUT PATH — never re-type its
+     data.** ✔MEASURED 2026-08-06: a pin stubbed a driver's vocabulary list with eight hand-typed
+     tokens — clean by construction, in a shape the driver NEVER RECEIVES — and so could not see
+     that the real path returned `ran\r` on Windows (Python writes stdout in text mode; `read -r`
+     strips `\n` and keeps `\r`), which would have made the driver reject EVERY legitimate token
+     and fail every run (`D-TEST-A-PIN-THAT-STUBS-ITS-SUBJECTS-INPUT-IS-TESTING-THE-STUB`).
+     **A pin that supplies its subject's input in a form the subject never sees is testing the
+     stub.** Extract and execute the shipped code path. Where a stub is genuinely unavoidable,
+     assert the stub matches what the real path produces. ★ And prefer assertions on **CONTENT**
+     over **COUNT**: "eight tokens" was satisfied by eight corrupted tokens; "the tokens are clean"
+     was not.
    - **Multi-site / multi-form contracts** — the "apply X at every site/form of class C"
      class (e.g. "strip the specifier prefix at every positional decl resolution"). A green
      suite over a SUBSET of the sites/forms is NOT proof: latent misses at the unexercised
@@ -155,6 +189,37 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      explicit trigger + closing-work (§F/§D) — a later cycle is legitimate ONLY behind a named
      blocker or an unfired trigger. Either way it is *handled*: NEVER a silent skip, a masked
      test exclusion, a swallowed error, or a "temporarily disabled" that no anchor tracks.
+   - **★★ (c) THE QUICK-FIX RULE — AN ANCHOR IS NOT A PLACE TO PUT WORK YOU COULD HAVE DONE.**
+     The registry is an **audit trail**, not a backlog, and it is measurably drifting into one: it
+     passed **885 rows** on 2026-08-07, and rows are still being opened for defects that were then
+     fixed minutes later in the same cycle. A row that describes a defect nobody is going to fix
+     this year is not "handled" — it is the deferral §F.0 forbids, wearing a registry row as a
+     disguise. So:
+     - **THE COST TEST, and it is a hard rule: if writing an honest anchor row costs more than
+       fixing the thing, FIXING IS MANDATORY.** An honest row carries what/why/trigger/closing
+       work/cross-refs — for most small defects that is more thought and more keystrokes than the
+       fix. Whenever you catch yourself composing a row for a one-line guard, a stale comment, a
+       missing `rm -f` before a marker write, a wrong path spelling, a misleading diagnostic
+       string: **stop writing and fix it.** Then still write the row — **born `✅ CLOSED`**, as
+       the record of what happened, with the fix and its verification in it. A closed row costs
+       the next reader nothing; an open one costs them a decision every time they sweep.
+     - **DEFAULT TO CLOSING IN THE SAME COMMIT.** The question is never "should this be anchored?"
+       (it always should) but "is there a NAMED blocker stopping me closing it right now?" —
+       §F.0's (a)/(b)/(c) gate, applied to every candidate row, not only to the cycle's headline
+       work. "It is out of scope for this cycle" is NOT a named blocker for a five-minute fix; it
+       is the most common way the list grows.
+     - **THE SWEEP IS PART OF THE CYCLE, NOT A SEPARATE PROJECT.** When a cycle touches a file
+       that already carries OPEN rows against it, close the ones now within reach — you have the
+       context loaded, which is the expensive part, and it will not be loaded again for a while.
+       ★ ✔MEASURED 2026-08-07: a recipe defect was re-investigated from scratch because its row
+       had sat OPEN since 2026-08-05 with the fix already written in its closing cell. The open
+       row did not save that work; it *duplicated* it. An anchor only pays for itself if someone
+       later reads it — and the longer the OPEN list, the less likely that is.
+     - **REPORT THE OPEN COUNT AT STEP 10, EVERY CYCLE, WITH ITS DELTA.** A cycle that closes
+       fewer rows than it opens is not automatically wrong — a real investigation legitimately
+       opens rows — but a sustained positive delta means the quick-fix rule is being skipped, and
+       the number is what makes that visible instead of arguable. `tools/check-anchor-registry.sh`
+       already prints the total; the per-cycle honest line is "opened N, closed M, net ±K".
    A workaround that *hides* an issue (excluding a failing test, catch-and-swallow, "it's green
    on the other leg so ignore it here") is the exact silent-failure the bar exists to prevent —
    it violates §A.2 (no workarounds) and §A.4 (fail loud) as well as this rule. **Motivating
@@ -211,6 +276,44 @@ operator**.
 1. **Label every factual claim MEASURED / DOCUMENTED / INFERRED.** Never let an inferred
    claim wear the voice of a measured one. "I verified X" and "X is documented to be true"
    and "X follows from Y" are three different statements with three different failure modes.
+1b. **★★ BEFORE COMMISSIONING AN EXPERIMENT, GREP THE REGISTRY FOR A MATCHED CONTROL THAT
+   ALREADY EXISTS.** Search `_deferred-anchor-registry.md` for the failing artefact, the leg,
+   the test family and the symptom — then CITE what you find, or state explicitly that nothing
+   matched. ✔MEASURED 2026-08-06: a 2×2 attribution (compiler × rundir filesystem) was
+   commissioned from scratch for 57 sqlite failures; the identical experiment with the identical
+   verdict was **already in the registry** from seven cycles earlier
+   (`D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS`), and the row was findable — the leg name, the
+   driver and the word `rundir` all appear in it. ⇒ **the cost was not the duplicated work: the
+   un-cited row would have pre-empted THREE FALSE STATEMENTS that reached a commit** ("previously
+   green", "the Tcl move is the prime suspect", "the WAL/journal TIMING family"). ★ THE FAILURE
+   MODE IS SPECIFIC AND WORTH NAMING: I searched MEMORY for a matching *confound* and recall
+   surfaced a plausible NEIGHBOUR (the WSL2 clock defect — real, but the wrong population); a
+   grep would have surfaced the exact CONTROL. **Recall finds what is similar; grep finds what
+   is the same.** ⇒ anchoring every issue is worthless if the next cycle does not READ the
+   anchors before investigating (`D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE`).
+   ★★ **AND GREP THE DEFECT'S VOCABULARY, NOT THE NAME YOU WOULD PICK — the rule above was
+   FOLLOWED and still missed, by the operator who wrote it.** ✔MEASURED 2026-08-07 (TF-C126): a
+   recipe derivation was found harvesting `tool/lemon.c` / `lempar.c` / `mksourceid.c` as target
+   TUs. The registry WAS grepped first — for anchor NAMES matching `RECIPE|MAKE-N|DERIV|LEMON|
+   TU-LIST` — and returned nothing, so a fresh row was written. The existing row was
+   [[D-HARNESS-FIXTURE-TU-SCRAPE-ABSORBS-BUILD-HOST-TOOLS]]: same three files, same whole-blob
+   cause, the same fix prescribed — **and it had PRE-REGISTERED the exact firing condition that
+   had just fired** ("safe today only because its reference build normally builds `lemon` FIRST …
+   if that build fails early, the fixture set absorbs the tools too"). It was missed because it is
+   spelled `TU-SCRAPE` / `BUILD-HOST-TOOLS`, and neither token was in the search. ⇒ **grep the
+   SYMPTOM, the ARTEFACT and the FILE NAMES that appear in the evidence (`lemon.c`, `whole-blob`,
+   `link-line`), never only the title you have in mind** — a name-shaped grep finds the rows you
+   would have written, not the rows that exist. ⚠ Two costs, and the second is the larger: the
+   duplicated investigation, and the SPLIT AUDIT TRAIL — the original row's closing work demanded
+   the migration "show the BEFORE and AFTER sets and account for every difference", a requirement
+   the new row did not carry, so it was nearly satisfied by a COUNT match alone. **When a duplicate
+   is discovered: update the ORIGINAL in place, cross-reference both, delete NEITHER.**
+1c. **★ READ THE ASSERTION VALUES, NOT THE TEST NAMES.** ✔MEASURED the same day: a 57-failure
+   population named `wal2-*`, `walsetlk-*`, `journal3-*`, `e_walauto-*` was diagnosed as the
+   WAL/journal *timing* family and routed to a known clock defect. The values said
+   `expected [00644 00400 00644]` / `got [00777 00555 00777]` — it was the file-**permission**
+   family, and only 1 of the 57 was clock-related. A test's NAME is a label someone chose; its
+   ASSERTION is the measurement. Reading the values is what cracked it.
 2. **Never state what a loader/parser/config accepts, rejects, or defaults to without
    reading it.** "The sibling family does X" is a hypothesis. (Original case: `.format.json`
    was asserted twice to enforce a closed root-key set, and at the time it did not — unknown

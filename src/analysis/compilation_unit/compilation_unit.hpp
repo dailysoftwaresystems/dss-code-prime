@@ -17,6 +17,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -301,6 +302,25 @@ public:
     // distinct object-format. Aborts if called after finish().
     void setActiveFormat(ObjectFormatKind fmt);
 
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: declare how the active object format
+    // matches an `#include` header NAME against the filesystem
+    // (`ObjectFormatSchema::headerNameMatching()`), so `#include <Windows.h>`
+    // resolves `windows.json` for a pe/macho target and does NOT for an elf
+    // one — on EVERY build host. Threaded to the preprocessor AND to the
+    // import resolver's `ResolutionContext`, because the two must agree
+    // (`__has_include` lives in the former, both `F_ShippedHeaderNotFound`
+    // emit sites in the latter).
+    //
+    // ★ THIS IS NOT DERIVABLE FROM `setActiveFormat`. That takes a format
+    // KIND; deriving the case rule from the kind would be exactly the
+    // `if (kind == Pe)` identity branch the agnosticism bar forbids. The
+    // value comes from the format FILE's declared `headerNameMatching`.
+    // UNSET (the default) ⇒ `kDefaultHeaderNameMatching` = case-SENSITIVE:
+    // the conservative POSIX rule the LSP / direct-API / test callers keep.
+    // Because it can change the preprocessed token stream, the driver's CU
+    // cache key carries it. Aborts if called after finish().
+    void setHeaderNameMatching(HeaderNameMatching matching);
+
     // c105 (D-PP-USER-DEFINE): declare the CLI `--define NAME[=VALUE]` entries
     // (verbatim). Each lowers to a `#define` line in the preprocessor's
     // synthetic "<command-line>" prologue — command-line macros are ORDINARY
@@ -417,6 +437,8 @@ private:
     std::vector<std::filesystem::path>   includeDirs_;
     std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
     std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: the active format's header-NAME case rule.
+    HeaderNameMatching                   headerNameMatching_ = kDefaultHeaderNameMatching;
     std::vector<std::string>             userDefines_;  // c105: --define NAME[=VALUE]
     std::vector<PredefinedMacroDef>      targetPredefinedMacros_;  // TF-C74: per-arch identity predefines
     std::vector<PredefinedMacroDef>      formatPredefinedMacros_;  // TF-C97: per-format data-model predefines

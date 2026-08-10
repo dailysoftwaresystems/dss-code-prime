@@ -4,6 +4,7 @@
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
 #include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
 #include "core/substrate/thread_pool.hpp"       // D-PERF-4-CU-PARALLELISM: per-CU build pool
+#include "core/types/config_path_walk.hpp"      // findShippedConfigDir — shared src/dss-config/<dir> resolver
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/glob_match.hpp"  // D-AP2-SOURCES-GLOB: expand sources[] patterns
 #include "core/types/grammar_schema.hpp"
@@ -139,6 +140,81 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 void drainDiagnosticsToStderr(DiagnosticReporter const& rep) {
     static BufferRegistry const kEmpty;
     drainDiagnosticsToStderr(rep, kEmpty);
+}
+
+// ── THE BUILD'S STATEMENT OF RECORD ABOUT WHAT IT PRODUCED ─────────────────
+// D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118).
+//
+// ★ WHY THIS EXISTS. Until now a SUCCESSFUL build said nothing at all about
+// the file it had written, so every consumer had to RECONSTRUCT the name —
+// and reconstructing it requires the artifact-extension table, which is
+// `TargetSpec::outputExtension` keyed on the closed object-format enum. Two
+// partial copies of that table had already escaped into the sqlite harness,
+// they disagreed with each other, and the disagreement threw away a REAL
+// cross-host success: a Linux host cross-built the Windows `testfixture.exe`
+// for pe64 with zero diagnostics, and the driver — looking for a suffix-less
+// `testfixture` — recorded the leg as a build FAILURE. The fix is not a third
+// copy of the table. It is for the compiler to SAY what it wrote.
+//
+// ★ WHY A PLAIN REPORT LINE AND NOT AN `info[...]` DIAGNOSTIC. A diagnostic is
+// DROPPABLE, through three independent gates in `DiagnosticReporter::report`:
+// `--suppress` naming the code, the per-code cap (50), and the global cap
+// (1000, after which every further report is discarded in silence). Any one of
+// them re-creates precisely the false negative this line exists to end — a
+// build that succeeded, saying nothing, read as a build that produced nothing.
+// Escaping all three would mean joining `kUnsuppressableCodes`, whose first
+// Info-severity member is itself a KNOWN open question
+// (D-FF2-UNSUPP-INFO-WAE-ASYMMETRY). This is a driver REPORT, not an opinion
+// about the program, so it goes out the way `--time`'s report does: same
+// stream, same `dss-code-prime: ` prefix, no policy in the way.
+//
+// ★ THE SHAPE, and each part of it is load-bearing for a machine reader:
+//
+//     dss-code-prime: artifact <targetSpec> <absolute path>
+//
+//   · a FIXED leading marker, so a consumer matches a prefix and never a
+//     regex over prose;
+//   · the TARGET SPEC second, because `TargetSpec::parse` REFUSES whitespace
+//     in either half — the spec is a single token by construction, so a
+//     multi-target build stays unambiguous and a consumer can select the line
+//     belonging to the target it asked for;
+//   · the PATH last, so a path containing spaces is still the unambiguous
+//     REMAINDER of the line, and ABSOLUTE, because `--output` is stored
+//     verbatim (`cli_args.cpp`) and would otherwise leave the reader guessing
+//     which cwd to resolve against.
+//
+// Nothing here is keyed on language, processor or object format: the path was
+// already computed from the closed format enum above, and this only reports
+// it.
+[[nodiscard]] std::string artifactPathForReport(fs::path const& p) {
+    // `generic_string()` throws for a path the current locale cannot encode;
+    // the u8 fallback mirrors `link/writer.cpp`'s `pathForDiag`, which the
+    // write-failure diagnostics for this very artifact already use. Forward
+    // slashes on every host — that is what this codebase prints, and every
+    // consumer of the line (POSIX shell, PowerShell, .NET `Path`) takes them.
+    try {
+        return p.generic_string();
+    } catch (...) {
+        auto const u8 = p.u8string();
+        return std::string(reinterpret_cast<char const*>(u8.data()), u8.size());
+    }
+}
+
+// Called ONCE per artifact, and ONLY after the write path reported success.
+void reportArtifactWritten(std::string const& targetSpec,
+                           fs::path const&    outPath) {
+    // Lexical only. `absolute` needs the cwd; `lexically_normal` folds the
+    // `.`/`..` a relative `--output` may have contributed. Neither touches the
+    // disk — the bytes are already committed, and re-statting here would only
+    // create a way for the report to disagree with the write.
+    std::error_code ec;
+    fs::path abs = fs::absolute(outPath, ec);
+    // Not a silent fallback: `outPath` IS the path the writer committed to, so
+    // the line stays TRUE either way. Only the ABSOLUTE guarantee is lost, and
+    // only when the process has no usable cwd to resolve against.
+    if (ec) abs = outPath;
+    std::cerr << "dss-code-prime: artifact " << targetSpec << ' '
+              << artifactPathForReport(abs.lexically_normal()) << '\n';
 }
 
 // Emit a driver-tier D_* diagnostic. Wraps `dss::report` so all
@@ -443,6 +519,19 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         return false;
     }
 
+    // D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118):
+    // THE ONE report site for the three link/write dispatches below (static
+    // archive / single CU / merged multi-CU). They are three routes to the
+    // SAME `outPath`, so the report is attached at their only common ancestor
+    // rather than copied into each — and it is attached to their RESULT, so
+    // the line cannot be printed for a write that failed. Every `return` of a
+    // link/write result below goes through here; a route added later that does
+    // not is a route whose artifact goes unreported, which is the whole defect.
+    auto const reported = [&](bool wrote) {
+        if (wrote) reportArtifactWritten(targetSpecStr, outPath);
+        return wrote;
+    };
+
     // c165 (D-LK-STATIC-LINK): partition `--resolve-library` into DYNAMIC
     // libraries (`.so`/`.dll`/`.dylib` -- read for their export surface during
     // per-CU FFI synthesis, the c162 path) and STATIC `ar` archives (pulled +
@@ -454,13 +543,18 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // unreadable path stays DYNAMIC -- the dynamic path's eager open-probe
     // (compile_pipeline step 2.5-pre) fails it loud, so a bad path is never
     // silently dropped.
+    // D-FFI-DECLARED-IMPORT-NAME: a STATED import name is meaningful only on
+    // the DYNAMIC side (it names a runtime dependency); a static archive is
+    // merged into the image and records no import at all. The partition keeps
+    // the whole spec on the dynamic side and takes only the PATH for archives,
+    // so nothing is silently dropped where it would have had an effect.
     std::vector<std::filesystem::path> staticArchives;
     CompileOptions perCuOpts = compileOpts;
     {
-        std::vector<std::filesystem::path> dynamicLibs;
+        std::vector<ResolveLibrarySpec> dynamicLibs;
         for (auto const& lib : compileOpts.resolveLibraries) {
-            if (isArArchiveFile(lib)) staticArchives.push_back(lib);
-            else                      dynamicLibs.push_back(lib);
+            if (isArArchiveFile(lib.path)) staticArchives.push_back(lib.path);
+            else                           dynamicLibs.push_back(lib);
         }
         perCuOpts.resolveLibraries = std::move(dynamicLibs);
     }
@@ -631,9 +725,9 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                 memberNames.push_back(std::move(extracted->names[i]));
             }
         }
-        return linkAndWriteStaticArchive(members, memberNames,
-                                         **targetR, **formatR, outPath, reporter,
-                                         imageRequest);
+        return reported(linkAndWriteStaticArchive(members, memberNames,
+                                                  **targetR, **formatR, outPath,
+                                                  reporter, imageRequest));
     }
     // N==1 (the CU5 multi-file-single-CU case): lower the sole CU + link it. UNCHANGED
     // from cycle 24 — byte-identical single-CU output. Routing N==1 through the merge
@@ -649,9 +743,9 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         // c165 (D-LK-STATIC-LINK): link against any `ar` static archives named on
         // `--resolve-library` (pull the referenced members + merge them in). With
         // no static archives this is `linkAndWrite({mod})`, unchanged.
-        return linkAndWriteWithStaticArchives(
+        return reported(linkAndWriteWithStaticArchives(
             std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
-            **targetR, **formatR, outPath, reporter, imageRequest);
+            **targetR, **formatR, outPath, reporter, imageRequest));
     }
 
     // N>1 (CU6 multi-CU): WHOLE-PROGRAM MIR MERGE (Cycle 25 Stage C). Fold the N per-CU
@@ -666,6 +760,13 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // match the externs' already-mangled `mangledName` on macho (identity on elf/pe). Both
     // the def↔extern resolution and the `main` entry match key on this same convention.
     ObjectFormatKind const fmtKind = (*formatR)->kind();
+    // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN (step C4): the C-symbol decoration
+    // rule is now READ FROM THE SCHEMA rather than looked up in a C++ table keyed
+    // on `fmtKind`. Both merge rails below (`nameOf` for definitions, the entry-name
+    // set) take THIS one value, so they cannot diverge — and `validate()` guarantees
+    // it is a real scheme, never the `Unspecified` sentinel.
+    CSymbolDecorationScheme const cSymDecor =
+        (*formatR)->cSymbolDecoration().scheme;
     std::vector<MergeCuInput> mergeInputs;
     mergeInputs.reserve(cuMirs.size());
     for (auto& cuMir : cuMirs) {
@@ -679,9 +780,11 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         // name run through the FORMAT'S C MANGLING (`applyCMangling`), so it matches the
         // extern's already-mangled `mangledName` — on Mach-O a shell.c reference to
         // `_sqlite3_libversion` now matches sqlite3.c's definition `sqlite3_libversion`
-        // (mangled to `_sqlite3_libversion`). applyCMangling is config-driven
-        // (`kCManglingRules`): IDENTITY on elf/pe (their cross-CU match is unchanged),
-        // one leading `_` on macho. Safe by construction — every format writer names its
+        // (mangled to `_sqlite3_libversion`). applyCMangling is config-driven in the
+        // literal sense since TF-C122 (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN C4): it
+        // is handed the format's DECLARED `cSymbolDecoration.scheme`, not a C++ table
+        // keyed on the format identity. `none` is IDENTITY (elf/pe -- their cross-CU
+        // match is unchanged); `leading-underscore` adds one `_` (macho). Safe by construction — every format writer names its
         // on-binary defined symbols synthetically (`_sym_<id>` / `sym_<id>`), so this key
         // is a MATCH key only, never the emitted symbol name (no double-mangle). Capturing
         // `&cuMir` is safe — `cuMirs` is done growing.
@@ -695,9 +798,14 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         // arm only would leave `definedNames.count(e.mangledName)` missing, the
         // sibling-defined extern unstripped, and an intra-image call silently
         // emitted as a dynamic import. Byte-identical for every unlabelled symbol.
-        in.nameOf = [cuMirP = &cuMir, fmtKind](SymbolId s) -> std::string {
+        in.nameOf = [cuMirP = &cuMir, cSymDecor](SymbolId s) -> std::string {
+            // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the fourth
+            // input is passed here too — a required parameter precisely so a rail
+            // cannot quietly omit it and reintroduce the divergence described
+            // above with a different override channel.
             if (SymbolRecord const* r = cuMirP->model.recordFor(s)) {
-                return dss::ffi::linkNameFor(r->name, r->asmName, fmtKind);
+                return dss::ffi::linkNameFor(r->name, r->asmName, cSymDecor,
+                                             r->linkName);
             }
             for (auto const& e : cuMirP->externImports) {
                 if (e.symbol.v == s.v) return e.mangledName;
@@ -705,11 +813,12 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
             return std::string{};
         };
         in.externImports = cuMir.externImports;
-        // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): this CU's referenced-only pe64
-        // <threads.h> shim symbols, so the merge planning assigns them a merged id
-        // (else the clone aborts on a shim GlobalAddr — the multi-CU threads defect).
+        // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER) + D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3):
+        // this CU's referenced-only shipped-library shim symbols (BOTH the <threads.h> and
+        // <stdio.h> families), so the merge planning assigns them a merged id (else the
+        // clone aborts on a shim GlobalAddr — the multi-CU threads defect).
         // Non-owning; `cuMir` (in `cuMirs`) outlives the merge.
-        in.synthRecipes = &cuMir.threadsRecipes;
+        in.synthRecipes = &cuMir.libraryShimRecipes;
         mergeInputs.push_back(std::move(in));
     }
 
@@ -737,7 +846,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
             // convention as the merge's DEFINITION keys (nameOf mangles too), so the merged
             // `userEntrySymbol` scan — `entrySet.count(nameOf(func))` in mergeCuMirs — still
             // finds `main` on macho (both keyed `_main`). Identity on elf/pe.
-            entryNames.push_back(dss::ffi::applyCMangling(n, fmtKind));
+            entryNames.push_back(dss::ffi::applyCMangling(n, cSymDecor));
         }
     }
 
@@ -797,7 +906,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         for (auto const& e : merged->externImports) definedOrImported.insert(e.symbol.v);
         // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): PARTITION the reconstructed recipe map by
         // `dss::ffi::shimFamilyOf` BEFORE calling either synth pass — the SAME split
-        // `lowerCuMirToAssembly` applies to the single-CU `threadsRecipes` map
+        // `lowerCuMirToAssembly` applies to the single-CU `libraryShimRecipes` map
         // (compile_pipeline.cpp), for the identical reason: each pass fails loud on a
         // recipe id it has no switch arm for (its own anti-vocab-drift backstop), so one
         // pass seeing the other family's ids would abort a build that never should have
@@ -810,7 +919,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         // object-format config for what is a recipe-table defect).
         std::unordered_map<std::uint32_t, std::string> mergedThreadsRecipes, mergedStdioRecipes;
         for (auto const& [symV, name] : merged->symbolNames) {
-            std::string const bare = dss::ffi::unapplyCMangling(name, fmtKind);
+            std::string const bare = dss::ffi::unapplyCMangling(name, cSymDecor);
             if (!dss::ffi::isKnownSynthesizeRecipe(bare)
                 || definedOrImported.find(symV) != definedOrImported.end()) {
                 continue;
@@ -835,25 +944,28 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         }
         if (!synthesizeThreadsShim(merged->mir, merged->host.interner(),
                                    mergedThreadsRecipes, (*formatR)->librarySynthesis(),
-                                   fmtKind, merged->externImports, reporter)) {
+                                   cSymDecor, merged->externImports, reporter)) {
             return false;  // internal invariant breach (vocab/switch drift) — reported.
         }
         // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —
         // see `synth_stdio_shim.hpp` for the full contract. A clean no-op when
-        // `mergedStdioRecipes` is empty. The va_list strategy is read from the SAME
+        // `mergedStdioRecipes` is empty. The va_list block is read from the SAME
         // resolved CC (`abi->cc`, D-FF3-3 above) the merged module's calling-convention
-        // index was derived from — no second lookup, no format-name branch. A CC that
-        // declares no `vaListLayout` propagates as `nullopt`, NOT as a defaulted strategy:
+        // index was derived from — no second lookup, no format-name branch. It is passed
+        // WHOLE, not narrowed to `.strategy`: `variadicUsesOverflowBase` is what selects
+        // the shim's va leaf, and dropping it here would silently emit the home-base leaf
+        // on an overflow-base target (see `CuMirModule::vaListLayout`). A CC that declares
+        // no `vaListLayout` propagates as `nullopt`, NOT as a default-constructed layout:
         // "nothing declared" must stay distinguishable from a real declaration all the way
         // to the synth pass, which refuses it loudly (the single-CU seam threads the same
-        // optional through `CuMirModule::vaListStrategy`). Consulted only if a stdio recipe
+        // optional through `CuMirModule::vaListLayout`). Consulted only if a stdio recipe
         // actually appears.
-        std::optional<VaListStrategy> vaListStrategy;
+        std::optional<VaListLayout> vaListLayout;
         if (abi->cc != nullptr && abi->cc->vaListLayout.has_value()) {
-            vaListStrategy = abi->cc->vaListLayout->strategy;
+            vaListLayout = *abi->cc->vaListLayout;
         }
         if (!synthesizeStdioShim(merged->mir, merged->host.interner(),
-                                 mergedStdioRecipes, vaListStrategy,
+                                 mergedStdioRecipes, vaListLayout,
                                  merged->externImports, reporter)) {
             return false;  // recipe/helper-import/va-strategy mismatch — reported.
         }
@@ -929,9 +1041,9 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // against any `ar` static archives named on `--resolve-library` the same way
     // the single-CU path does (pull referenced members + merge). No archives =>
     // `linkAndWrite({mod})`, unchanged.
-    return linkAndWriteWithStaticArchives(
+    return reported(linkAndWriteWithStaticArchives(
         std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
-        **targetR, **formatR, outPath, reporter, imageRequest);
+        **targetR, **formatR, outPath, reporter, imageRequest));
 }
 
 // c9 (Phase-2): the ObjectFormatKind a target spec compiles to, or nullopt if the
@@ -984,10 +1096,20 @@ struct CuBuildKey {
     std::string                     targetName;
     std::string                     formatName;
     std::optional<ObjectFormatKind> format;
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: the active FORMAT FILE's declared
+    // header-NAME case rule. It belongs in the KEY on the same principle every
+    // other member is here for — it can change the preprocessed token stream
+    // (`__has_include(<Windows.h>)` answers differently under it), so a CU
+    // built under one value must never be reused under another. In practice it
+    // is a function of `formatName` and adds no extra builds; carrying it makes
+    // the key's rule ("everything that changes the preprocessed source") true
+    // by construction rather than by an argument a reader has to reconstruct.
+    HeaderNameMatching              headerNameMatching = kDefaultHeaderNameMatching;
     [[nodiscard]] bool operator<(CuBuildKey const& o) const noexcept {
         if (targetName != o.targetName) return targetName < o.targetName;
         if (formatName != o.formatName) return formatName < o.formatName;
-        return format < o.format;
+        if (format != o.format) return format < o.format;
+        return headerNameMatching < o.headerNameMatching;
     }
 };
 
@@ -1017,7 +1139,7 @@ int runCusToTargets(
     bool                                        perFormatOutputSubdir,
     CompileConfig                               config,
     ::dss::opt::OptPipeline const*              pipelineOverride,
-    std::vector<std::filesystem::path> const&   resolveLibraries,
+    std::vector<ResolveLibrarySpec> const&      resolveLibraries,
     // D-PERF-4-CU-PARALLELISM: the per-CU build executor (nullptr ⇒ internal
     // pool) + the `--jobs` override, threaded verbatim to `compileOneTarget`.
     substrate::IExecutor*                       executor,
@@ -1217,6 +1339,11 @@ int runCusToTargets(
             // by the pre-flight above and every surviving spec's format is in
             // it — a failed load already returned at the drain.
             formatPredefines  = formatByName.at(key.formatName)->predefinedMacros();
+            // D-PP-HEADER-CASE-INSENSITIVE-PE: read the rule off the FORMAT
+            // FILE (never derived from `key.format`, the KIND — that would be
+            // the identity branch the agnosticism bar forbids).
+            key.headerNameMatching =
+                formatByName.at(key.formatName)->headerNameMatching();
         }
         keyPerTarget.push_back(key);
         if (cuByKey.find(key) == cuByKey.end()) {
@@ -1338,14 +1465,11 @@ int Program::run(int argc, char* argv[]) {
     setStackReserveBytes(args.stackReserveBytes);
     // c162 (D-FF1-READER-CONSUMER): thread `--resolve-library <path>` into the
     // kernel so compile_pipeline step 2.5 reads each named binary's export
-    // surface to resolve + validate this run's externs. Map the CLI strings to
-    // filesystem paths (the same setOutputDir/setCompileConfig stamp pattern).
-    {
-        std::vector<std::filesystem::path> libs;
-        libs.reserve(args.resolveLibraries.size());
-        for (auto const& s : args.resolveLibraries) libs.emplace_back(s);
-        setResolveLibraries(std::move(libs));
-    }
+    // surface to resolve + validate this run's externs. The parser already
+    // produced `ResolveLibrarySpec`s (path + the OPTIONAL declared import
+    // name, D-FFI-DECLARED-IMPORT-NAME), so this is a straight stamp — no
+    // re-parse, and no layer in between can drop the declared name.
+    setResolveLibraries(args.resolveLibraries);
     // `--time`: report the compilation's wall-clock to stderr when this run
     // returns — covers EVERY compile-producing mode (project / transpile /
     // directory / compile) via ONE scoped reporter, no per-mode duplication.
@@ -1551,9 +1675,14 @@ int Program::compileProject(
                              pc.defines.begin(), pc.defines.end());
         setUserDefines(std::move(mergedDefines));
 
-        std::vector<fs::path> mergedLibs = resolveLibraries();
+        // D-FFI-DECLARED-IMPORT-NAME: the manifest parses into the SAME
+        // `ResolveLibrarySpec` the CLI does, so the merge is a plain append —
+        // a manifest entry's declared import name survives the join with the
+        // CLI-stamped entries instead of being flattened back to a bare path.
+        std::vector<ResolveLibrarySpec> mergedLibs = resolveLibraries();
         mergedLibs.reserve(mergedLibs.size() + pc.resolveLibraries.size());
-        for (auto const& s : pc.resolveLibraries) mergedLibs.emplace_back(s);
+        mergedLibs.insert(mergedLibs.end(),
+                          pc.resolveLibraries.begin(), pc.resolveLibraries.end());
         setResolveLibraries(std::move(mergedLibs));
     }
 
@@ -1707,29 +1836,38 @@ int Program::transpile(
 // FF11: declare the language's SYSTEM include dirs (its
 // `semantics.shippedLibDirs`, the /usr/include analogue) on `builder`
 // so the angle form `#include <h>` resolves against them. Each config
-// string is a subdirectory under `src/dss-config/`; resolve it to an
-// absolute dir by walking up from cwd (mirroring `findShippedConfig`'s
-// 8-level walk, so it works from repo root, build/, or a nested ctest
-// cwd). A dir not found in the ancestry is skipped — a header miss then
-// hard-fails downstream with F_ShippedHeaderNotFound, which is the
-// correct fail-loud surface (vs. silently swallowing here). NO language
-// branch: the dirs come entirely from the schema's per-language config.
+// string is a subdirectory under `src/dss-config/`; `findShippedConfigDir`
+// resolves it with the SHARED precedence — `$DSS_CONFIG_ROOT` first, then
+// the 8-level cwd walk — so it works from repo root, build/, a nested
+// ctest cwd, or anywhere at all when the override is set. A dir that
+// resolves NOWHERE is skipped — a header miss then hard-fails downstream
+// with F_ShippedHeaderNotFound, which is the correct fail-loud surface
+// (vs. silently swallowing here). NO language branch: the dirs come
+// entirely from the schema's per-language config.
+//
+// ⚠ THIS USED TO BE A PRIVATE COPY OF THE WALK THAT NEVER READ THE
+// OVERRIDE, and the comment claimed it mirrored `findShippedConfig` while
+// omitting the one branch that makes discovery cwd-independent. MEASURED:
+// same binary, `DSS_CONFIG_ROOT` set in BOTH arms, `#include <stdio.h>` —
+// cwd inside the repo gave rc 0, cwd `C:\` gave `error[F001A]: got
+// stdio.h`. The shipped CLI could not resolve an angle include from any
+// working directory outside its own source tree. Do not re-open a local
+// walk here.
 void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
     auto const& dirs = grammar.semantics().shippedLibDirs;
     if (dirs.empty()) return;
     std::error_code ec;
     for (std::string const& sub : dirs) {
-        fs::path here = fs::current_path(ec);
-        for (int i = 0; i < 8 && !here.empty(); ++i) {
-            fs::path const candidate = here / "src" / "dss-config" / sub;
-            if (fs::is_directory(candidate, ec)) {
-                builder.addSystemDir(candidate);
-                break;
-            }
-            fs::path const parent = here.parent_path();
-            if (parent == here) break;   // hit filesystem root
-            here = parent;
-        }
+        auto const resolved = findShippedConfigDir(sub);
+        if (!resolved) continue;   // fail loud downstream, not here
+        // ABSOLUTE, because `ResolutionContext::systemDirs` documents its
+        // dirs as absolute: the cwd walk produced that for free, but a
+        // RELATIVE `DSS_CONFIG_ROOT` (permitted — see config_path_walk.hpp)
+        // would not. Same idiom as `applyIncludeDirs` below: on an `absolute`
+        // failure keep the raw path rather than drop the dir.
+        fs::path const abs = fs::absolute(*resolved, ec);
+        builder.addSystemDir(ec ? *resolved : abs);
+        ec.clear();
     }
 }
 
@@ -1829,6 +1967,9 @@ int Program::compileFiles(
                 UnitBuilder builder{grammar};
                 applySystemDirs(builder, *grammar);
                 if (key.format) builder.setActiveFormat(*key.format);
+                // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
+                // header-name case rule (NOT derived from the format kind).
+                builder.setHeaderNameMatching(key.headerNameMatching);
                 // TF-C74: the active target's per-architecture identity macros.
                 builder.setTargetPredefinedMacros(
                     {targetPredefines.begin(), targetPredefines.end()});
@@ -1925,6 +2066,9 @@ int Program::compileUnits(
                     UnitBuilder builder{grammar};
                     applySystemDirs(builder, *grammar);
                     if (key.format) builder.setActiveFormat(*key.format);
+                    // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
+                    // header-name case rule (NOT derived from the format kind).
+                    builder.setHeaderNameMatching(key.headerNameMatching);
                     // TF-C74: the active target's per-architecture identity macros.
                     builder.setTargetPredefinedMacros(
                         {targetPredefines.begin(), targetPredefines.end()});

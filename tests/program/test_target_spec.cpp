@@ -8,6 +8,7 @@
 //     for new format kinds.
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "link/object_format_backend.hpp"
 #include "link/object_format_schema.hpp"
 #include "program/target_spec.hpp"
 
@@ -170,7 +171,12 @@ TEST(TargetSpec, OutputExtensionUnknownKindReturnsEmpty) {
     // guards against future drift (e.g. someone adding a new arm
     // without an Unknown fallback).
     dss::detail::ObjectFormatData data;
-    data.kind = ObjectFormatKind::Unknown;
+    // TF-C125: `data.kind = ObjectFormatKind::Unknown` became "no backend".
+    // The default IS null now, so this line documents the intent rather than
+    // establishing it — and that is the improvement: the old field defaulted
+    // to `ObjectFormatKind::Elf`, so the sentinel had to be written down or a
+    // fixture accidentally claimed an ELF identity.
+    data.backend = nullptr;
     data.name = "synthetic-unknown";
     ObjectFormatSchema synth{std::move(data)};
     TargetSpec spec{"x86_64", "synthetic-unknown"};

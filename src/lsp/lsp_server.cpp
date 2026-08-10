@@ -434,7 +434,23 @@ void LspServer::enqueueParse_(std::string uri) {
         // editor take LP64 header arms in a workspace that might build LLP64.
         // Same trigger — both channels light up together the day the LSP learns
         // the workspace's `<target>:<format>` pair.
+        //
+        // ★ D-PP-HEADER-CASE-INSENSITIVE-PE (2026-08-04) — THIS ONE IS
+        // USER-VISIBLE TODAY, unlike the two above, so it is stated rather than
+        // inherited. With no active format the editor takes the conservative
+        // POSIX rule, which means that on a pe64 project the LSP SQUIGGLES
+        // `#include <Windows.h>` — the exact line this axis exists to make
+        // build — while the compiler accepts it. That is a false positive in
+        // the editor, not a wrong build, and it is the safe direction of the
+        // two (the alternative, guessing case-insensitive, would hide a real
+        // error on an elf workspace). It is written EXPLICITLY here rather than
+        // taken from a default so the gap cannot be mistaken for an oversight.
+        // Trigger to revisit: the same one as the two channels above — the day
+        // the LSP learns the workspace's `<target>:<format>` pair, all three
+        // light up together. Anchored as
+        // `D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE`.
         dss::UnitBuilder builder{snap.schema};
+        builder.setHeaderNameMatching(dss::kDefaultHeaderNameMatching);
         builder.addInMemory(snap.text, uri);
         auto cu = std::make_shared<dss::CompilationUnit>(
             std::move(builder).finish());

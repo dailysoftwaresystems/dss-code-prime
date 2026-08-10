@@ -1,4 +1,5 @@
 #include "link/format/macho_object_reader.hpp"
+#include "link/format/object_format_backends.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
@@ -226,11 +227,40 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     };
 
     // -- (0) Format sanity: this reader speaks Mach-O only -----------
-    if (objectFormatSchema.kind() != ObjectFormatKind::MachO) {
+    // ── SELF-GUARD (D-LINK-…-KIND-IDENTITY-BRANCHES, TF-C125) ──────────
+    //
+    // ★★ THIS GUARD SURVIVED THE IDENTITY-BRANCH REMOVAL, AND THE REASON IS
+    // MEASURED FOR THIS SITE. The TF-C125 brief expected it to become
+    // redundant: with walkers reached only through a backend the loader
+    // resolved, a walker "can never be handed a schema of another kind", so
+    // the guard would be unreachable by construction and safely deletable.
+    //
+    // That premise is FALSE here. `macho::readRelocatableObject` is a PUBLIC free function with
+    // 10 direct call sites in `tests/`, none of which route through the
+    // linker — and `MachoObjectReader.NonMachOFormatSchemaFailsLoud`
+    // (tests/link/test_macho_object_reader.cpp) hands it a FOREIGN schema on purpose and asserts this
+    // exact refusal. Deleting the guard would not remove dead code; it would
+    // delete tested behaviour and leave a public entry point that mis-encodes
+    // silently. Refused, with evidence.
+    //
+    // ⚠ THE CITATION ABOVE IS PER-SITE ON PURPOSE. The first version of this
+    // comment was one block pasted into all eight guards, every copy naming
+    // the ELF writer's test as its proof — so seven of the eight cited a
+    // measurement that was not about them. An independent audit caught it.
+    // A comment stamped MEASURED that names the wrong measurement is worse
+    // than no comment, under this project's own rule.
+    //
+    // What it stops being is an IDENTITY branch. It no longer compares an
+    // enumerator; it compares the schema's resolved backend against the
+    // singleton THIS TU implements — a pointer identity on an opaque handle,
+    // in the sanctioned realization tier, which is exactly the tier permitted
+    // to know which format it is. Unreachable from the linker (the resolver
+    // cannot produce a mismatched pair), live for every direct caller.
+    if (objectFormatSchema.backend() != &link::format::machoBackend()) {
         return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
             std::string{"macho::readRelocatableObject: object format schema '"}
                 + std::string{objectFormatSchema.name()} + "' is kind "
-                + std::string{objectFormatKindName(objectFormatSchema.kind())}
+                + std::string{link::objectFormatBackendName(objectFormatSchema.backend())}
                 + ", not Mach-O -- the Mach-O reader cannot parse it.");
     }
 
@@ -242,8 +272,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     }
     std::uint32_t const magic = rdU32(bytes, kHdrMagicOff);
     if (magic != kMachOMagic64) {
-        // Reject FAT (0xCAFEBABE), big-endian (0xCEFAEDFE), and 32-bit
-        // (0xFEEDFACE) up front -- this reader is 64-bit LE Mach-O only.
+        // Reject FAT/universal, big-endian, and 32-bit up front -- this
+        // reader is 64-bit LE Mach-O only. Stated as ON-DISK BYTES,
+        // because `rdU32` is little-endian and the three do not agree on
+        // byte order: 32-bit thin is CE FA ED FE (LE-reads 0xFEEDFACE),
+        // big-endian thin is FE ED FA CE (LE-reads 0xCEFAEDFE), and a
+        // universal header is CA FE BA BE / CA FE BA BF -- which
+        // LE-reads 0xBEBAFECA / 0xBFBAFECA, NOT the 0xCAFEBABE the
+        // format names it by, since `fat_header` is big-endian on disk.
+        // (See ffi/binary_readers/reader_common.hpp: naming the wrong
+        // one of that pair in an equality test is a bug that already
+        // happened once.) All three fall out of the single
+        // `!= 0xFEEDFACF` gate above; none needs its own arm.
         return fail(DiagnosticCode::F_UnknownBinaryFormat,
             "macho::readRelocatableObject: header magic is not 0xFEEDFACF "
             "(64-bit little-endian Mach-O) -- FAT / big-endian / 32-bit are "

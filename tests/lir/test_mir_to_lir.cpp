@@ -2991,6 +2991,120 @@ TEST(MirToLir, PhiResolutionUsesFprClassForFloatPhi) {
     ADD_FAILURE() << "no ret block found";
 }
 
+// The lost-copy pin: phi-destination copies for an edge out of a MULTI-successor
+// block must NOT sit in that block. Emitting them inline there runs them on
+// whichever edge is taken, so the copies for the edge NOT taken clobber a phi
+// register that is still live — a MEASURED release-only silent miscompile:
+//
+//   int f(int n){ int i=0,e=-1; do { e=i; i++; } while(i<n); return e; }
+//
+// returned n (5) instead of n-1 (4), because the back edge's `phi = i+1` copies
+// ran on the way OUT of the loop, where the exit block still reads the phi.
+// `examples/c-subset/dowhile_lagging_capture` is the runtime witness (exit 11
+// instead of 42); this is the LIR-shape pin for the same defect, built directly
+// on MIR so no optimizer pass has to cooperate to produce the phi.
+//
+// RED-ON-DISABLE: put the `emitPhiMovesForEdge` calls back inline in
+// `lowerTerminator` (drop the edge split) and assertion A fires — the two-
+// successor block defines the register the exit block returns.
+TEST(MirToLir, MultiSuccessorBlockDoesNotCarryItsPhiEdgeCopies) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i32   = interner.primitive(::dss::TypeKind::I32);
+    auto const boolT = interner.primitive(::dss::TypeKind::Bool);
+    std::array<::dss::TypeId, 1> params{i32};
+    auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+
+    // entry: n = arg0; i0 = 0;             br loop
+    // loop:  i = phi [i0, entry] [iNext, loop];  iNext = i + 1
+    //        c = i32 iNext < n;            condbr c -> loop, exit
+    // exit:  ret i                         ← the LAGGING value the defect ate
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const entry = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    ::dss::MirBlockId const loop  = mb.createBlock(::dss::StructCfMarker::Linear);
+    ::dss::MirBlockId const exitB = mb.createBlock(::dss::StructCfMarker::Linear);
+
+    ::dss::MirLiteralValue zeroLit;
+    zeroLit.value = static_cast<std::int64_t>(0);
+    zeroLit.core  = ::dss::TypeKind::I32;
+    ::dss::MirLiteralValue oneLit;
+    oneLit.value = static_cast<std::int64_t>(1);
+    oneLit.core  = ::dss::TypeKind::I32;
+
+    mb.beginBlock(entry);
+    ::dss::MirInstId const n     = mb.addArg(0, i32);
+    ::dss::MirInstId const iInit = mb.addConst(zeroLit, i32);
+    mb.addBr(loop);
+
+    mb.beginBlock(loop);
+    ::dss::MirInstId const iPhi = mb.addPhi(i32);
+    ::dss::MirInstId const one  = mb.addConst(oneLit, i32);
+    std::array<::dss::MirInstId, 2> addOps{iPhi, one};
+    ::dss::MirInstId const iNext = mb.addInst(::dss::MirOpcode::Add, addOps, i32);
+    std::array<::dss::MirInstId, 2> cmpOps{iNext, n};
+    ::dss::MirInstId const cond = mb.addInst(::dss::MirOpcode::ICmpSlt, cmpOps, boolT);
+    mb.addCondBr(cond, loop, exitB);
+    mb.addPhiIncoming(iPhi, ::dss::MirPhiIncoming{iInit, entry});
+    mb.addPhiIncoming(iPhi, ::dss::MirPhiIncoming{iNext, loop});   // back edge
+
+    mb.beginBlock(exitB);
+    mb.addReturn(iPhi);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    ASSERT_TRUE(result.ok) << "a self-looping i32 phi must lower cleanly";
+
+    ::dss::Lir const& lir = result.lir;
+    auto const retOp = *sch.opcodeByMnemonic("ret");
+    LirFuncId const fn = lir.funcAt(0);
+
+    // The register the exit block returns IS the phi's pre-allocated vreg.
+    LirReg phiReg = InvalidLirReg;
+    for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+        LirInstId const term = lir.blockTerminator(lir.funcBlockAt(fn, b));
+        if (lir.instOpcode(term) != retOp) continue;
+        auto const ops = lir.instOperands(term);
+        ASSERT_EQ(ops.size(), 1u);
+        ASSERT_EQ(ops[0].kind, LirOperandKind::Reg);
+        phiReg = ops[0].reg;
+        break;
+    }
+    ASSERT_TRUE(phiReg.valid()) << "no `ret <reg>` block found";
+
+    int multiSuccBlocks = 0;
+    int phiWritesInMultiSucc = 0;
+    int phiWritesInSingleSucc = 0;
+    for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+        LirBlockId const bb = lir.funcBlockAt(fn, b);
+        std::size_t const succCount = lir.blockSuccessors(bb).size();
+        if (succCount > 1) ++multiSuccBlocks;
+        for (std::uint32_t k = 0; k < lir.blockInstCount(bb); ++k) {
+            if (lir.instResult(lir.blockInstAt(bb, k)) != phiReg) continue;
+            if (succCount > 1) ++phiWritesInMultiSucc;
+            else               ++phiWritesInSingleSucc;
+        }
+    }
+
+    ASSERT_EQ(multiSuccBlocks, 1)
+        << "the shape under test needs exactly one two-successor block "
+           "(the loop latch's condbr)";
+    // A — the pin.
+    EXPECT_EQ(phiWritesInMultiSucc, 0)
+        << "a block with >1 successor must not write a phi result register: "
+           "the copies would run on the edge NOT taken and clobber a value "
+           "the other successor still reads (the lost-copy miscompile)";
+    // B — relocated, not dropped. The entry edge's copy is unconditional (one
+    // successor) and the back edge's copy now lives in its own split block.
+    EXPECT_GE(phiWritesInSingleSucc, 2)
+        << "both incoming edges must still write the phi register — one copy "
+           "per edge, in a block that only that edge reaches";
+}
+
 TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
     // Parallel to WideLiteralRoutesThroughLiteralPool but for the string
     // variant (rating 7 from pr-test-analyzer). Closes the cycle-3c

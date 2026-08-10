@@ -1,0 +1,149 @@
+name: DCO
+
+# Enforces the Developer Certificate of Origin on every commit in a pull request.
+# The contract this implements is stated in CONTRIBUTING.md ("Sign your commits
+# (DCO)") and the certificate itself is the DCO file at the repo root.
+#
+# ★ HAND-ROLLED, NOT A THIRD-PARTY ACTION, AND THAT IS DELIBERATE. This repository
+#   already vendors its CI logic rather than calling a reusable workflow (see the
+#   header of pipeline-pr.yml), and a governance gate is the worst place to take a
+#   supply-chain dependency: an action that can be retagged upstream decides
+#   whether a legal certification was made. The whole check is ~40 lines of shell
+#   over `git log` — the cost of owning it is far below the cost of trusting it.
+#
+# ★ SEPARATE WORKFLOW, NOT A JOB IN pipeline-pr.yml, ALSO DELIBERATE. That pipeline
+#   is gated behind a `Run Pipes` label and self-cancels; sign-off is not optional
+#   and must not be skippable by omitting a label.
+
+on:
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened]
+
+# Read-only. This job renders a verdict; it never writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: dco-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sign-off:
+    name: Every commit is signed off
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The check walks base..head, so the shallow default clone is not
+          # enough — with it `git rev-list` reports an empty range and this job
+          # would pass having examined nothing.
+          fetch-depth: 0
+
+      - name: Verify the Developer Certificate of Origin sign-off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          # No `set -e`: this script must examine EVERY commit and report ALL of
+          # them, then exit once. Bailing on the first offender turns an N-commit
+          # fix into N pushes, each revealing one more — the failure mode a
+          # sibling guard in this repo actually shipped.
+          set -uo pipefail
+
+          range="${BASE_SHA}..${HEAD_SHA}"
+          total=$(git rev-list --count "$range" 2>/dev/null || echo 0)
+
+          # ── THE VACUITY GUARD, AND IT IS THE MOST IMPORTANT LINE HERE ────────
+          # A checker that finds nothing to check and reports SUCCESS is worse
+          # than no checker: it produces a green tick that reads as "every commit
+          # is signed off". An empty range means the refs did not resolve — a
+          # broken checkout, a force-push mid-run, a shallow clone — never that
+          # the certification was made.
+          if [ "$total" -eq 0 ]; then
+            echo "::error::DCO check examined ZERO commits for range ${range}."
+            echo "The range did not resolve, so this run proves nothing about sign-off."
+            echo "Most likely a shallow checkout (fetch-depth) or a force-push while the job was starting."
+            exit 1
+          fi
+
+          mapfile -t commits < <(git rev-list --no-merges "$range")
+          if [ "${#commits[@]}" -eq 0 ]; then
+            echo "All ${total} commit(s) in ${range} are merge commits, which git"
+            echo "generates and which the DCO does not cover. Nothing to certify."
+            exit 0
+          fi
+
+          bad=0
+          for sha in "${commits[@]}"; do
+            author_name=$(git log -1 --format='%an' "$sha")
+            author_mail=$(git log -1 --format='%ae' "$sha")
+            subject=$(git log -1 --format='%s' "$sha")
+
+            # Trailers only: a `Signed-off-by:` mentioned inside prose does not
+            # certify anything. `git log --format=%B` gives the raw body; the
+            # trailer must start the line.
+            matched=0
+            while IFS= read -r line; do
+              # `Signed-off-by: Some Name <addr@example.com>` — capture the addr.
+              mail=$(printf '%s' "$line" | sed -n 's/^[Ss]igned-off-by:.*<\(.*\)>[[:space:]]*$/\1/p')
+              [ -n "$mail" ] || continue
+              # Case-insensitive: git preserves the case a contributor typed, and
+              # mail domains are not case-sensitive. Matching the AUTHOR is the
+              # rule GitHub's own DCO app applies.
+              if [ "$(printf '%s' "$mail" | tr '[:upper:]' '[:lower:]')" \
+                 = "$(printf '%s' "$author_mail" | tr '[:upper:]' '[:lower:]')" ]; then
+                matched=1
+                break
+              fi
+            done < <(git log -1 --format='%B' "$sha" | grep -i '^signed-off-by:' || true)
+
+            if [ "$matched" -eq 0 ]; then
+              bad=$((bad + 1))
+              echo "::error::Missing or mismatched DCO sign-off on ${sha}"
+              echo "  commit : ${sha}"
+              echo "  subject: ${subject}"
+              echo "  author : ${author_name} <${author_mail}>"
+              # Show what IS there, so a mismatch is distinguishable from an
+              # absence. Those are two different mistakes with two different fixes.
+              present=$(git log -1 --format='%B' "$sha" | grep -i '^signed-off-by:' || true)
+              if [ -n "$present" ]; then
+                echo "  found  : ${present}"
+                echo "           ...but no sign-off matches the author's address."
+              else
+                echo "  found  : (no Signed-off-by trailer at all)"
+              fi
+              echo ""
+            fi
+          done
+
+          echo "checked ${#commits[@]} non-merge commit(s) of ${total} in ${range}; ${bad} unsigned"
+
+          if [ "$bad" -gt 0 ]; then
+            # A diagnostic without a remedy is a diagnostic nobody acts on.
+            cat <<'REMEDY'
+
+          ── How to fix ──────────────────────────────────────────────────────
+          The DCO is a statement that you have the right to send us what you are
+          sending. It is not a contributor agreement and takes no rights from you.
+          Read it once — it is short: ./DCO
+
+          Sign future commits automatically:
+              git commit -s -m "your message"
+
+          Fix the LAST commit:
+              git commit --amend -s --no-edit
+              git push --force-with-lease
+
+          Fix SEVERAL commits (replace N with how many):
+              git rebase --signoff HEAD~N
+              git push --force-with-lease
+
+          Use a real name and an address that reaches you: the sign-off becomes
+          part of the permanent public git history, as clause (d) of the DCO says.
+          REMEDY
+            exit 1
+          fi
+
+          echo "Every non-merge commit carries a sign-off matching its author."

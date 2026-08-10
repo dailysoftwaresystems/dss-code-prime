@@ -49,6 +49,7 @@
 #include "ffi/binary_reader.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "host_native_target.hpp"
+#include "image_dependency_table.hpp"
 #include "program/program.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
@@ -96,6 +97,20 @@ constexpr std::string_view kMixedSrc =
     "extern int puts(const char*);\n"
     "extern int dss_lib_answer(void);\n"
     "int main(void){ puts(\"hi\"); return dss_lib_answer(); }\n";
+// D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED: the
+// two-library chain. `dssalpha` REFERENCES a symbol `dssbeta` DEFINES, which
+// is what puts an SHN_UNDEF row for `dss_beta_answer` into dssalpha's ELF
+// `.dynsym` -- the libtcl8.6.so-imports-zlib shape, built out of DSS's own
+// artifacts so the pin needs no third-party library on any host.
+constexpr std::string_view kTwoLibBetaSrc =
+    "int dss_beta_answer(void){ return 20; }\n";
+constexpr std::string_view kTwoLibAlphaSrc =
+    "extern int dss_beta_answer(void);\n"
+    "int dss_alpha_answer(void){ return dss_beta_answer() + 22; }\n";
+constexpr std::string_view kTwoLibMainSrc =
+    "extern int dss_alpha_answer(void);\n"
+    "extern int dss_beta_answer(void);\n"
+    "int main(void){ return dss_alpha_answer() + dss_beta_answer() - 20; }\n";
 // A TU with NO source-declared externs -- nothing routes to ingest(). Used to
 // pin the eager `--resolve-library` path validation (a bad path must still
 // fail loud here, not be silently ignored).
@@ -125,6 +140,29 @@ int buildOne(fs::path const& outDir,
                           "c-subset", std::vector<std::string>{target}, rep);
 }
 
+// Same as `buildOne`, but each `--resolve-library` entry also STATES the
+// runtime identity to record (D-FFI-DECLARED-IMPORT-NAME, the
+// `<path>=<import-name>` form). Needed wherever two stand-in libraries must
+// stay distinguishable in the emitted dependency table.
+int buildOneWithSpecs(fs::path const& outDir,
+                      std::vector<ResolveLibrarySpec> const& resolveLibs,
+                      std::string const& srcPath,
+                      std::string const& target,
+                      DiagnosticReporter& rep) {
+    Program p;
+    p.setOutputDir(outDir);
+    if (!resolveLibs.empty()) p.setResolveLibraries(resolveLibs);
+    return p.compileFiles(std::vector<std::string>{srcPath},
+                          "c-subset", std::vector<std::string>{target}, rep);
+}
+
+// The emitted image's bytes, for the dependency-table extractors.
+[[nodiscard]] std::vector<std::uint8_t> readWholeBinary(fs::path const& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in),
+                                     std::istreambuf_iterator<char>());
+}
+
 // The DSS-built library exports the symbol we resolve against -- proven by
 // reading its real export surface with the SAME FF1 reader `ingest()` uses.
 // This is the "validation source" the round-trip rests on.
@@ -137,6 +175,23 @@ int buildOne(fs::path const& outDir,
                        [&](ffi::ImportSurface const& row) {
                            return row.mangledName == symbol
                                && row.kind == ffi::SymbolKind::Function;
+                       });
+}
+
+// Does the library's read surface carry this NAME at all, regardless of the
+// kind the reader assigned it? `libraryExportsSymbol` above additionally
+// requires SymbolKind::Function, and a DSS-emitted ELF import row is
+// STT_NOTYPE -- so the kind check alone would answer "no" for a reason that
+// has nothing to do with definedness. This is the predicate that actually
+// distinguishes "the reader treats this library's REFERENCE as an EXPORT".
+[[nodiscard]] bool libraryExposesName(fs::path const& libPath,
+                                      std::string_view symbol) {
+    DiagnosticReporter rep;
+    auto surface = ffi::readImports(libPath, rep);
+    if (!surface.has_value()) return false;
+    return std::any_of(surface->begin(), surface->end(),
+                       [&](ffi::ImportSurface const& row) {
+                           return row.mangledName == symbol;
                        });
 }
 
@@ -410,11 +465,35 @@ TEST(FfiResolveLibraryRoundTrip, ShippedSymbolFormatOracleContract) {
     EXPECT_FALSE(availableOn("fdatasync", ObjectFormatKind::Pe));
 
     // (e) An ASYMMETRIC per-symbol gate that excludes a format the descriptor
-    //     itself allows: stdlib.json's `atexit` is ["pe","macho"] (elf routes
-    //     through __cxa_atexit instead).
-    EXPECT_TRUE(availableOn("atexit", ObjectFormatKind::Pe));
+    //     itself allows: stdlib.json's `atexit` is ["macho"] ALONE — elf routes
+    //     through __cxa_atexit and pe through _crt_atexit, each a per-format
+    //     macro over a DIFFERENT real export.
+    //
+    //     ★ D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) NARROWED this from
+    //     ["pe","macho"], and the pin is TIGHTENED to match: the three
+    //     membership probes are now backed by an EXACT set equality (the (d)/(g)
+    //     form), so a future row that re-widens `atexit` to any extra format
+    //     reds here even if the three probes below would still pass. That
+    //     narrowing is load-bearing, not bookkeeping: ucrtbase.dll exports NO
+    //     `atexit` at all (MEASURED, objdump -p), and under
+    //     D-FFI-DESCRIPTOR-EAGER-IMPORT a pe-available row for an absent export
+    //     breaks EVERY pe binary's LOAD with 0xC0000139. The pe replacement is
+    //     the real ucrtbase export `_crt_atexit`, pinned immediately below —
+    //     WITHOUT that second block this case would merely record that pe lost a
+    //     symbol, and a migration that dropped `atexit` and forgot its
+    //     replacement would look identical.
+    ASSERT_NE(availability("atexit"), nullptr);
+    EXPECT_EQ(*availability("atexit"), (std::vector<std::string>{"macho"}));
+    EXPECT_FALSE(availableOn("atexit", ObjectFormatKind::Pe));
     EXPECT_TRUE(availableOn("atexit", ObjectFormatKind::MachO));
     EXPECT_FALSE(availableOn("atexit", ObjectFormatKind::Elf));
+
+    //     The pe arm's replacement export, gated the mirror-image way.
+    ASSERT_NE(availability("_crt_atexit"), nullptr);
+    EXPECT_EQ(*availability("_crt_atexit"), (std::vector<std::string>{"pe"}));
+    EXPECT_TRUE(availableOn("_crt_atexit", ObjectFormatKind::Pe));
+    EXPECT_FALSE(availableOn("_crt_atexit", ObjectFormatKind::MachO));
+    EXPECT_FALSE(availableOn("_crt_atexit", ObjectFormatKind::Elf));
 
     // (f) FALLBACK TIER 3 — a row with NO per-symbol gate in a descriptor with
     //     NO document gate is available EVERYWHERE, spelled as the EMPTY set
@@ -687,6 +766,146 @@ TEST(FfiResolveLibraryRoundTrip, MissingResolveLibraryPathFailsLoudEvenWithNoExt
                   rep, DiagnosticCode::F_FileOpenFailed), 0u)
         << "must fire F_FileOpenFailed -- the eager path probe honors the "
            "documented open-at-compile-time contract";
+}
+
+// ══ D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED ════════
+//
+// The END-TO-END pin, and the only tier that can catch this defect: it is a
+// COMPOSITION bug. The reader, `ingest()`, and the writer were each doing
+// what they were told; the damage appeared only when a library that IMPORTS
+// another library's symbol was named on `--resolve-library` before it.
+//
+// The shape, exactly as the sqlite testfixture hits it (libtcl8.6.so imports
+// 14 zlib names, and both libraries are named on the command line):
+//
+//   dssbeta   defines  dss_beta_answer
+//   dssalpha  defines  dss_alpha_answer  AND REFERENCES dss_beta_answer,
+//             so dssalpha's ELF `.dynsym` carries an SHN_UNDEF row for it
+//   twolib    references BOTH, built with `--resolve-library dssalpha`
+//             FIRST and `--resolve-library dssbeta` second
+//
+// MEASURED before the fix (real driver, real binaries): the ELF reader
+// surfaced dssalpha's SHN_UNDEF row as an EXPORT, `ingest()`'s
+// first-source-wins bound `dss_beta_answer` to dssalpha, and dssbeta reached
+// the linker in no `ExternImport.libraryPath` — so the emitted DT_NEEDED set
+// held dssalpha and NOT dssbeta. Reversing the two `--resolve-library`
+// arguments produced both: the artifact's declared dependencies were a
+// function of COMMAND-LINE ORDER. The PE and Mach-O legs were already
+// correct (their readers read `.edata` / the export trie, which cannot
+// contain a reference), and they are here because a pin that only asks the
+// broken format is a pin that cannot notice the next format to break.
+//
+// NOT host-gated and nothing is RUN: "did every resolved library get
+// recorded?" is a COMPILE-time judgment about the emitted bytes, so all
+// three formats stay live on every host — the same reasoning as
+// `kFormatLegs`.
+//
+// The library identity is STATED via `--resolve-library <path>=<name>`
+// (D-FFI-DECLARED-IMPORT-NAME) rather than left to the binary's embedded
+// identity, because the shipped Mach-O dylib schema declares a single
+// `installName` ("@rpath/libdss.dylib") that BOTH stand-ins would inherit —
+// two libraries collapsing to one recorded name would make the Mach-O leg
+// pass for a reason unrelated to the defect.
+TEST(FfiResolveLibraryRoundTrip, EveryResolvedLibraryReachesTheEmittedDependencyTable) {
+    struct TwoLibLeg {
+        char const* label;
+        char const* libTarget;
+        char const* execTarget;
+        char const* alphaArtifact;
+        char const* betaArtifact;
+        char const* execArtifact;
+        // The ON-BINARY spellings. Mach-O's C decoration prepends an
+        // underscore, so the name a reader recovers is format-dependent and
+        // must be stated per leg rather than assumed.
+        char const* alphaExport;
+        char const* betaExport;
+        std::vector<std::string> (*deps)(std::vector<std::uint8_t> const&);
+    };
+    TwoLibLeg const legs[] = {
+        {"elf",   "x86_64:elf64-x86_64-linux-dyn",
+                  "x86_64:elf64-x86_64-linux-exec",
+         "dssalpha.so", "dssbeta.so", "twolib",
+         "dss_alpha_answer", "dss_beta_answer",
+         &::dss::test_support::elfNeededLibraries},
+        {"pe",    "x86_64:pe64-x86_64-windows-dll",
+                  "x86_64:pe64-x86_64-windows-exec",
+         "dssalpha.dll", "dssbeta.dll", "twolib.exe",
+         "dss_alpha_answer", "dss_beta_answer",
+         &::dss::test_support::peImportedLibraries},
+        {"macho", "x86_64:macho64-x86_64-darwin-dylib",
+                  "x86_64:macho64-x86_64-darwin-exec",
+         "dssalpha.dylib", "dssbeta.dylib", "twolib",
+         "_dss_alpha_answer", "_dss_beta_answer",
+         &::dss::test_support::machoLoadedDylibs},
+    };
+
+    // Each leg runs through a lambda so a leg that ABORTS on an ASSERT_ costs
+    // only its own verdict: an ASSERT_ in a bare loop body returns from the
+    // whole TEST and silently stops testing every format after it.
+    auto checkLeg = [](TwoLibLeg const& leg) {
+        ScratchDir scratch{Location::InsideRepo, "ffi-two-library-deps"};
+        auto const dir = scratch.path();
+        auto const betaSrc  = writeSrc(dir, "dssbeta.c", kTwoLibBetaSrc);
+        auto const alphaSrc = writeSrc(dir, "dssalpha.c", kTwoLibAlphaSrc);
+        auto const mainSrc  = writeSrc(dir, "twolib.c", kTwoLibMainSrc);
+
+        // 1. beta: defines the symbol alpha will reference.
+        DiagnosticReporter betaRep;
+        ASSERT_EQ(buildOne(dir, {}, betaSrc.string(),
+                           std::string{leg.libTarget}, betaRep), 0)
+            << (betaRep.all().empty() ? "" : betaRep.all().front().actual);
+        auto const betaPath = dir / leg.betaArtifact;
+        ASSERT_TRUE(fs::exists(betaPath));
+        ASSERT_TRUE(libraryExportsSymbol(betaPath, leg.betaExport));
+
+        // 2. alpha: RESOLVES its reference against beta, so alpha's own
+        //    symbol table records `dss_beta_answer` as something it NEEDS.
+        DiagnosticReporter alphaRep;
+        ASSERT_EQ(buildOneWithSpecs(
+                      dir, {{betaPath, leg.betaArtifact}}, alphaSrc.string(),
+                      std::string{leg.libTarget}, alphaRep), 0)
+            << (alphaRep.all().empty() ? "" : alphaRep.all().front().actual);
+        auto const alphaPath = dir / leg.alphaArtifact;
+        ASSERT_TRUE(fs::exists(alphaPath));
+        ASSERT_TRUE(libraryExportsSymbol(alphaPath, leg.alphaExport));
+        // The precondition the whole pin rests on, asserted rather than
+        // assumed: alpha's read surface must NOT carry beta's symbol at all.
+        // MEASURED: on ELF this was TRUE before the fix (the reader surfaced
+        // alpha's SHN_UNDEF row for `dss_beta_answer`) and is FALSE after.
+        // Name-only on purpose -- see `libraryExposesName`.
+        EXPECT_FALSE(libraryExposesName(alphaPath, leg.betaExport))
+            << "alpha REFERENCES " << leg.betaExport << "; a reference is not "
+               "an export, and reading it as one is the defect this pins";
+
+        // 3. main: references both, with ALPHA NAMED FIRST — the order that
+        //    made the second library disappear.
+        DiagnosticReporter mainRep;
+        ASSERT_EQ(buildOneWithSpecs(dir,
+                                    {{alphaPath, leg.alphaArtifact},
+                                     {betaPath,  leg.betaArtifact}},
+                                    mainSrc.string(),
+                                    std::string{leg.execTarget}, mainRep), 0)
+            << (mainRep.all().empty() ? "" : mainRep.all().front().actual);
+        auto const execPath = dir / leg.execArtifact;
+        ASSERT_TRUE(fs::exists(execPath));
+
+        auto const bytes = readWholeBinary(execPath);
+        ASSERT_FALSE(bytes.empty());
+        auto const recorded = leg.deps(bytes);
+        EXPECT_EQ(::dss::test_support::dependencyOccurrences(
+                      recorded, leg.alphaArtifact), 1u)
+            << "got [" << ::dss::test_support::joinDependencies(recorded) << "]";
+        EXPECT_EQ(::dss::test_support::dependencyOccurrences(
+                      recorded, leg.betaArtifact), 1u)
+            << "the SECOND library is the one that went missing: alpha was "
+               "credited with beta's symbol, so beta reached the writer in no "
+               "import row at all. got ["
+            << ::dss::test_support::joinDependencies(recorded) << "]";
+    };
+    for (auto const& leg : legs) {
+        SCOPED_TRACE(leg.label);
+        checkLeg(leg);
+    }
 }
 
 // ── PE dynamic round-trip (Windows host) -- the native witness + (b) ───────

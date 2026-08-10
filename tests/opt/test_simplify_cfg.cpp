@@ -1297,3 +1297,337 @@ TEST(SimplifyCfg, AddressTakenTrampolineNotElided) {
     EXPECT_TRUE(anyAddressTaken)
         << "the &&label target block survives SimplifyCfg (MF-B guard held)";
 }
+
+// ─── D-OPT-SIMPLIFYCFG-EMPTY-SELF-LOOP-REDIRECT-CYCLE ───────────────────────
+//
+// THE DEFECT. A trampoline is a block whose only instruction is `Br(S)`. When
+// a CFG cycle consists ENTIRELY of trampolines, every member is a jump-thread
+// candidate, so `jumpThreadMap_` acquires B1->B2->...->Bk->B1 and the
+// downstream `resolveTransitive` walk never reaches a non-key: the pass
+// ABORTED the whole compiler (`resolveTransitive exceeded chain length`,
+// rc=127, no binary emitted).
+//
+// WHAT THESE FIXTURES ARE IN SOURCE TERMS. `int main(void){for(;;){}}` lowers
+// to header:`Br(body)` / body:`Br(header)` — the k=2 fixture. The SAME k=2 map
+// comes out of `l1: goto l2; l2: goto l1;` with no loop statement anywhere,
+// and k=3 out of a three-label goto ring. The fixtures are therefore stated
+// over MIR block shape and never over a source spelling: the pass sees only
+// "a cycle of 1-instruction Br blocks".
+//
+// THE REFUTED HYPOTHESIS, PINNED AS A TEST. The defect was originally
+// suspected to be a SELF-referential redirect. It is not — a self-redirect is
+// precisely the ONE length that already worked, because the collection loop
+// carried a bespoke `if (tgt.v == b.v) continue;` covering k=1 only. That
+// guard is now DELETED and the general cycle break subsumes it, so
+// `TrampolineSelfLoopIsBrokenByTheGeneralCycleBreak` is a live regression pin
+// on the deletion, not a restatement of the bug.
+//
+// RED-ON-DISABLE for this whole group: restore `if (tgt.v == b.v) continue;`
+// in simplify_cfg.cpp's trampoline loop and delete the `breakJumpThreadCycles`
+// call. Every k>=2 fixture then reaches `pathCompressAndVerify` with a cyclic
+// map and `std::abort()`s the test binary.
+
+namespace {
+
+// Successor ids of function 0's `idx`-th block, as a plain vector so the EXACT
+// successor sequence can be compared — not merely its size.
+std::vector<std::uint32_t> succIds(Mir const& mir, std::uint32_t idx) {
+    MirFuncId const fn = mir.funcAt(0);
+    std::vector<std::uint32_t> out;
+    for (MirBlockId const s : mir.blockSuccessors(mir.funcBlockAt(fn, idx))) {
+        out.push_back(s.v);
+    }
+    return out;
+}
+
+std::uint32_t blockIdAt(Mir const& mir, std::uint32_t idx) {
+    return mir.funcBlockAt(mir.funcAt(0), idx).v;
+}
+
+} // namespace
+
+// k=2 — the `for(;;){}` MIR shape, the exact reported repro.
+// entry: Br(h) | h: Br(l) | l: Br(h). Both h and l are trampolines, so the
+// redirect map is h->l, l->h: a cycle.
+TEST(SimplifyCfg, AllTrampolineTwoCycleCollapsesToSelfLoop) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const h     = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const l     = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry); mb.addBr(h);
+    mb.beginBlock(h);     mb.addBr(l);
+    mb.beginBlock(l);     mb.addBr(h);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(totalBlockCount(mir), 3u) << "before: entry + h + l";
+
+    DiagnosticReporter rep;
+    // THE TERMINATION PIN: pre-fix this call did not return — it aborted the
+    // process inside `resolveTransitive`. Reaching the next line at all is
+    // this test's primary assertion.
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+
+    ASSERT_EQ(totalBlockCount(mir), 2u)
+        << "exactly one member of an all-trampoline cycle survives as its anchor";
+    EXPECT_EQ(r.blocksJumpThreaded, 1u)
+        << "one of the two trampolines is threaded away; the other is kept";
+    EXPECT_EQ(succIds(mir, 0), std::vector<std::uint32_t>{blockIdAt(mir, 1)})
+        << "entry branches to the surviving anchor";
+    EXPECT_EQ(succIds(mir, 1), std::vector<std::uint32_t>{blockIdAt(mir, 1)})
+        << "the anchor branches to ITSELF — the infinite empty loop is "
+           "PRESERVED, not deleted. Deleting it would be a miscompile: the "
+           "program must still never terminate.";
+
+    // WELL-FORMEDNESS, not merely termination. "The pass returned" is a weak
+    // property; this asserts the CFG it produced is one the verifier accepts —
+    // no orphan island (I_UnreachableBlock) from the threaded-away member, and
+    // a block that is its own predecessor is legal. Under the default posture
+    // `rederiveStructCfMarkers` has already re-stamped every marker from the
+    // NEW shape, so the marker check is meaningful here too.
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the collapsed self-loop is a well-formed CFG";
+    EXPECT_EQ(rep.errorCount(), 0u) << "zero error-severity diagnostics";
+}
+
+// k=3 — length-generality. A fix that special-cased only the 2-cycle (or only
+// the self-loop) leaves this one aborting, so this pins that the cycle break
+// is stated over ARBITRARY cycle length.
+TEST(SimplifyCfg, AllTrampolineThreeCycleCollapsesToSelfLoop) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const a     = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const b     = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const c     = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry); mb.addBr(a);
+    mb.beginBlock(a);     mb.addBr(b);
+    mb.beginBlock(b);     mb.addBr(c);
+    mb.beginBlock(c);     mb.addBr(a);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    ASSERT_EQ(totalBlockCount(mir), 2u)
+        << "a 3-cycle collapses to entry + one anchor, exactly as a 2-cycle does";
+    EXPECT_EQ(r.blocksJumpThreaded, 2u)
+        << "two of the three members are threaded away";
+    EXPECT_EQ(succIds(mir, 1), std::vector<std::uint32_t>{blockIdAt(mir, 1)})
+        << "the anchor self-loops";
+}
+
+// k=1 — REGRESSION PIN ON A DELETION. `l1: goto l1;` compiled clean BEFORE the
+// fix, because the collection loop carried a bespoke self-target check. That
+// check is gone; the general cycle break must now cover this length too. If a
+// future edit removes `breakJumpThreadCycles` without restoring the bespoke
+// guard, THIS test aborts — which is exactly why it is kept.
+TEST(SimplifyCfg, TrampolineSelfLoopIsBrokenByTheGeneralCycleBreak) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const spin  = mb.createBlock(StructCfMarker::LoopHeader);
+    mb.beginBlock(entry); mb.addBr(spin);
+    mb.beginBlock(spin);  mb.addBr(spin);   // Br to SELF — the k=1 cycle
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    ASSERT_EQ(totalBlockCount(mir), 2u) << "entry + the self-looping block";
+    EXPECT_EQ(r.blocksJumpThreaded, 0u)
+        << "a self-looping block is its own cycle's anchor — nothing to thread";
+    EXPECT_EQ(succIds(mir, 1), std::vector<std::uint32_t>{blockIdAt(mir, 1)})
+        << "the self-loop is preserved verbatim";
+}
+
+// THE DISCRIMINATING FIXTURE — anchor IDENTITY + external-entry redirect.
+//
+// Two properties are pinned here that no other fixture in this group can see:
+//
+//  (1) WHICH member survives. The rule is "the RPO-EARLIEST member of the
+//      cycle" — the loop header — NOT "the member the walk happened to
+//      re-reach first". This shape separates them: the walk starts at the
+//      RPO-first trampoline `q`, enters the cycle at `latch`, and re-reaches
+//      `latch`, so a naive `erase(the re-reached block)` keeps `latch` while
+//      the RPO rule keeps `head`. The rule is what makes the pass
+//      DETERMINISTIC — without an RPO-anchored choice the anchor would depend
+//      on `unordered_map` iteration order.
+//      ANTI-INERTNESS: both candidates land at the SAME block INDEX in the
+//      rebuilt function, so no count- or index-based assertion can tell them
+//      apart. Identity is read from the surviving block's MARKER, which needs
+//      `maintainMarkers=false` (the RELEASE posture, under which the rebuild
+//      copies source markers through verbatim instead of re-deriving them).
+//
+//  (2) That an external edge into a NON-surviving member still lands on the
+//      anchor: `q: Br(latch)` must come out as `q -> head`, resolved
+//      transitively through the opened chain.
+//
+// entry: CondBr(cond, p, q) | p: [Const, Br(head)] (2 insts — NOT a trampoline,
+// so it survives and keeps a real edge) | q: Br(latch) (a trampoline entering
+// the cycle at the LATCH) | head: Br(latch) | latch: Br(head).
+TEST(SimplifyCfg, TrampolineCycleAnchorIsRpoEarliestMemberAndAbsorbsExternalEntries) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const p     = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const q     = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const head  = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const latch = mb.createBlock(StructCfMarker::LoopLatch);
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    mb.addCondBr(cond, p, q);
+    mb.beginBlock(p);
+    MirLiteralValue v; v.value = std::int64_t{7}; v.core = TypeKind::I32;
+    mb.addConst(v, i32);           // second instruction — keeps `p` off the
+    mb.addBr(head);                // trampoline list so it survives
+    mb.beginBlock(q);     mb.addBr(latch);   // trampoline INTO the latch
+    mb.beginBlock(head);  mb.addBr(latch);
+    mb.beginBlock(latch); mb.addBr(head);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    // maintainMarkers=false — the RELEASE posture. Source markers ride the
+    // rebuild verbatim, so the anchor's marker names WHICH source block it was.
+    // (Under the default posture `rederiveStructCfMarkers` re-stamps it from
+    // the new CFG and erases that evidence.)
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep,
+                                               /*maintainMarkers=*/false);
+    EXPECT_TRUE(r.ok);
+    ASSERT_EQ(totalBlockCount(mir), 3u)
+        << "entry + p + one cycle anchor (q and one cycle member are threaded)";
+    EXPECT_EQ(r.blocksJumpThreaded, 2u) << "q and the non-surviving member";
+
+    // (1) ANCHOR IDENTITY. Blocks are emitted in the RPO order of the
+    // survivors, so index 2 is the cycle anchor.
+    MirFuncId const fn = mir.funcAt(0);
+    EXPECT_EQ(mir.blockMarker(mir.funcBlockAt(fn, 2)), StructCfMarker::LoopHeader)
+        << "the RPO-EARLIEST cycle member (the header) is the anchor that "
+           "survives — NOT the latch, which is merely the block the cycle walk "
+           "re-reached first. A LoopLatch here means the anchor rule degraded "
+           "to 'whatever the walk hit', losing the determinism guarantee.";
+
+    // (2) EXACT successor sets — every edge lands on the anchor.
+    std::uint32_t const anchor = blockIdAt(mir, 2);
+    EXPECT_EQ(succIds(mir, 0),
+              (std::vector<std::uint32_t>{blockIdAt(mir, 1), anchor}))
+        << "entry's CondBr keeps p on the true arm; its false arm (q, threaded) "
+           "resolves to the anchor";
+    EXPECT_EQ(succIds(mir, 1), std::vector<std::uint32_t>{anchor})
+        << "p's Br(head) points at the anchor";
+    EXPECT_EQ(succIds(mir, 2), std::vector<std::uint32_t>{anchor})
+        << "the anchor self-loops";
+}
+
+// COMPOSITION with D-CSUBSET-COMPUTED-GOTO (MF-B): a cycle of Br-only blocks,
+// one of which is ADDRESS-TAKEN. That block is not a jump-thread candidate at
+// all, so it already breaks the map chain — the cycle break must therefore do
+// NOTHING here, and in particular must not "help" by eliding the address-taken
+// block, which would dangle its synthetic block symbol.
+// entry: [BlockAddress(tgt), Br(a)] | a: Br(tgt) | tgt: Br(a).
+TEST(SimplifyCfg, AddressTakenMemberOfTrampolineCycleIsTheAnchor) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const vptr  = interner.pointer(interner.primitive(TypeKind::Void));
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const a     = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const tgt   = mb.createBlock(StructCfMarker::LoopHeader);
+    mb.beginBlock(entry);
+    mb.addBlockAddress(tgt, vptr);   // makes `tgt` address-taken
+    mb.addBr(a);
+    mb.beginBlock(a);   mb.addBr(tgt);
+    mb.beginBlock(tgt); mb.addBr(a);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.blocksJumpThreaded, 1u)
+        << "only `a` is threaded — the address-taken block is never a candidate";
+    bool anyAddressTaken = false;
+    MirFuncId const fn = mir.funcAt(0);
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(fn); ++bi) {
+        if (mir.isBlockAddressTaken(mir.funcBlockAt(fn, bi))) anyAddressTaken = true;
+    }
+    EXPECT_TRUE(anyAddressTaken)
+        << "the &&label target survives the cycle break (MF-B guard composes)";
+}
+
+// TWO DISJOINT all-trampoline cycles in ONE function: the break is per-CYCLE,
+// not per-function. A sweep that stopped after opening the first cycle aborts
+// on the second; a sweep that mis-shares visited marks across walks keeps zero
+// or two anchors in the second one.
+// entry: CondBr(cond, x, y) | x: Br(x2) | x2: Br(x) | y: Br(y2) | y2: Br(y).
+TEST(SimplifyCfg, TwoDisjointTrampolineCyclesEachKeepExactlyOneAnchor) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const x     = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const x2    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const y     = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const y2    = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    mb.addCondBr(cond, x, y);
+    mb.beginBlock(x);  mb.addBr(x2);
+    mb.beginBlock(x2); mb.addBr(x);
+    mb.beginBlock(y);  mb.addBr(y2);
+    mb.beginBlock(y2); mb.addBr(y);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    ASSERT_EQ(totalBlockCount(mir), 3u) << "entry + exactly one anchor per cycle";
+    EXPECT_EQ(r.blocksJumpThreaded, 2u)
+        << "one member threaded away in each cycle";
+    // Both anchors self-loop — the two cycles stayed separate, with no
+    // cross-contamination between walks.
+    EXPECT_EQ(succIds(mir, 1), std::vector<std::uint32_t>{blockIdAt(mir, 1)});
+    EXPECT_EQ(succIds(mir, 2), std::vector<std::uint32_t>{blockIdAt(mir, 2)});
+    // Entry's CondBr keeps its (ifTrue=x, ifFalse=y) arm order, each arm now
+    // naming that cycle's anchor. NOTE the index mapping: `mirReversePostOrder`
+    // is a stack-based post-order, so the LAST successor's subtree (y's cycle)
+    // is numbered first — RPO is [entry, y, y2, x, x2], so the surviving
+    // blocks are emitted entry=0, y-anchor=1, x-anchor=2. The true arm (x)
+    // is therefore index 2 and the false arm (y) index 1.
+    EXPECT_EQ(succIds(mir, 0),
+              (std::vector<std::uint32_t>{blockIdAt(mir, 2), blockIdAt(mir, 1)}))
+        << "entry's CondBr reaches one DISTINCT anchor per arm, arm order "
+           "preserved (true=x's anchor, false=y's anchor)";
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "two independently collapsed self-loops still form a well-formed CFG";
+    EXPECT_EQ(rep.errorCount(), 0u) << "zero error-severity diagnostics";
+}

@@ -15,7 +15,9 @@
 //     return nullptr on miss.
 
 #include "core/types/parse_diagnostic.hpp"
+#include "link/object_format_backend.hpp"
 #include "link/object_format_schema.hpp"
+#include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 
 #include <gtest/gtest.h>
 
@@ -27,6 +29,10 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::countWithMessage;
+using dss::link_format::test::rejectSummary;
 
 // ── Closed-enum round-trip ─────────────────────────────────────────────
 
@@ -84,7 +90,9 @@ TEST(ObjectFormatSchemaEnum, SymbolVisibilityNameRoundTrip) {
 namespace {
 constexpr std::string_view kElfMinimal = R"({
   "dssObjectFormatVersion": 1,
+  "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
   "format": {
     "name": "elf64-x86_64-linux",
     "version": "1.0",
@@ -137,7 +145,9 @@ TEST(ObjectFormatSchemaLoader, WrongVersionRejected) {
 TEST(ObjectFormatSchemaLoader, UnknownKindRejected) {
     auto r = ObjectFormatSchema::loadFromText(
         R"({"dssObjectFormatVersion":1,
-  "dataModel": "LP64","format":{"name":"x","kind":"notafmt"}})");
+  "dataModel": "LP64","headerNameMatching": "case-sensitive",
+  "cSymbolDecoration": { "scheme": "none" },
+  "format":{"name":"x","kind":"notafmt"}})");
     ASSERT_FALSE(r.has_value());
 }
 
@@ -245,7 +255,9 @@ TEST(ObjectFormatSchemaLoader, DssLinkedArm64FormatsOmitExternAddrBinding) {
 TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
     auto ok = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 183 },
       "externAddrBinding": "got",
@@ -261,7 +273,9 @@ TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
     // field).
     auto bad = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 183 },
       "externAddrBinding": "plt",
@@ -272,39 +286,74 @@ TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
 }
 
 TEST(ObjectFormatSchemaLoader, DuplicateRelocationNameRejected) {
+    // MEASURED: the original fixture (no `elf` identity block, no
+    // `nativeId` on either relocation row) never reached the duplicate-
+    // name check at all — BOTH rows were dropped first for a missing
+    // `nativeId` (unconditionally required on every format-side
+    // relocation row; `loadRelocationsTable`'s `extendRow` callback
+    // rejects a row missing it BEFORE the name-uniqueness check ever
+    // runs), and the missing `elf` block added three more diagnostics on
+    // top of that. Repaired so the duplicate name is the fixture's only
+    // remaining defect.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
+      "elf": {"class":"elf64","data":"lsb","machine":62},
       "relocations":[
-        {"name":"R_FOO","kind":1},
-        {"name":"R_FOO","kind":2}
+        {"name":"R_FOO","kind":1,"nativeId":1},
+        {"name":"R_FOO","kind":2,"nativeId":2}
       ]
     })");
-    ASSERT_FALSE(r.has_value());
+    ASSERT_FALSE(r.has_value()) << "duplicate relocation name must reject";
+    EXPECT_EQ(countAtPath(r, "/relocations/1/name"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(ObjectFormatSchemaLoader, ZeroKindRejected) {
+    // MEASURED: same `nativeId` gap as DuplicateRelocationNameRejected
+    // above — without it the loader drops the row for a missing-field
+    // reason before `validateRelocationsTable`'s zero-kind sentinel check
+    // ever sees it (a dropped row is never appended to `data.relocations`,
+    // so the downstream belt-and-suspenders pass has nothing to inspect).
+    // Repaired the same way.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
-      "relocations":[{"name":"R_BAD","kind":0}]
+      "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocations":[{"name":"R_BAD","kind":0,"nativeId":1}]
     })");
-    ASSERT_FALSE(r.has_value());
+    ASSERT_FALSE(r.has_value())
+        << "relocation kind 0 (the invalid sentinel) must reject";
+    EXPECT_EQ(countAtPath(r, "/relocations/0/kind"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(ObjectFormatSchemaLoader, DuplicateRelocationKindRejected) {
+    // MEASURED: same `nativeId` gap as the two tests above — both rows
+    // were dropped before the duplicate-kind check ever ran. Repaired the
+    // same way (distinct `nativeId` per row; `nativeId` itself carries no
+    // uniqueness constraint).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
+      "elf": {"class":"elf64","data":"lsb","machine":62},
       "relocations":[
-        {"name":"R_A","kind":7},
-        {"name":"R_B","kind":7}
+        {"name":"R_A","kind":7,"nativeId":1},
+        {"name":"R_B","kind":7,"nativeId":2}
       ]
     })");
-    ASSERT_FALSE(r.has_value());
+    ASSERT_FALSE(r.has_value()) << "duplicate relocation kind must reject";
+    EXPECT_EQ(countAtPath(r, "/relocations/1/kind"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(ObjectFormatSchemaLoader, UnknownSentinelKindRejectedByValidate) {
@@ -321,7 +370,9 @@ TEST(ObjectFormatSchemaLoader, UnknownSentinelKindRejectedByValidate) {
     // reason, and a bare ASSERT_FALSE could never tell the difference.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"unknown"},
       "relocations":[]
     })");
@@ -353,7 +404,9 @@ TEST(ObjectFormatSchemaLoader, UnknownSentinelKindRejectedByValidate) {
 TEST(ObjectFormatSchemaLoader, SentinelKindDoesNotCascadeIntoIdentityBlockNoise) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"unknown"},
       "elf": {"machine": 183, "type": "exec"},
       "relocations":[]
@@ -366,13 +419,22 @@ TEST(ObjectFormatSchemaLoader, SentinelKindDoesNotCascadeIntoIdentityBlockNoise)
 }
 
 TEST(ObjectFormatSchemaLoader, RelocationsNotArrayRejected) {
+    // MEASURED: the `elf` identity block is required so the non-array
+    // `relocations` value is the fixture's only defect (without it, the
+    // missing elf.class / elf.data / elf.machine fields added three more
+    // diagnostics).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
+      "elf": {"class":"elf64","data":"lsb","machine":62},
       "relocations": "oops"
     })");
-    ASSERT_FALSE(r.has_value());
+    ASSERT_FALSE(r.has_value()) << "'relocations' as a non-array must reject";
+    EXPECT_EQ(countAtPath(r, "/relocations"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 // ── Shipped ARM64 ELF format.json files (D-LK6-1 sibling cycle) ──
@@ -519,13 +581,49 @@ namespace {
 // tests all follow `loadFromText(json) + EXPECT_FALSE` shape. One
 // helper collapses ~6 sites; the JSON literal stays inline (it IS
 // the test fixture).
-inline void expectRejected(std::string_view jsonText,
-                            std::string_view why) {
+//
+// UPGRADED (subsumption-sweep hardening, see the vacuity history at the top
+// of format_reject_support.hpp): a bare `EXPECT_FALSE(r.has_value())` says
+// only "SOMETHING was wrong" — it never says WHICH rule fired. When
+// D-LK10-ENTRY added a new load rule, every exec-flavored negative fixture
+// in this file was instantly rejected for the NEW reason instead of the one
+// it was written to pin, and the suite stayed green while every one of
+// those tests went vacuous in place. Taking a `path` forces the test to
+// name which diagnostic fired, so the NEXT new rule that starts rejecting a
+// fixture for an unrelated reason reds this line instead of hiding behind
+// it. `totalErrors` is the other half of the repair: it pins that the load
+// fails for ONLY its own defect (or its own defect plus an explicitly
+// named, MEASURED knock-on) — never a defect plus a silently-accumulating
+// pile of unrelated ones.
+inline void expectRejectedAtPath(std::string_view jsonText,
+                                 std::string_view path,
+                                 std::string_view why,
+                                 std::size_t      totalErrors = 1u) {
     auto r = ObjectFormatSchema::loadFromText(jsonText);
-    EXPECT_FALSE(r.has_value()) << why;
+    ASSERT_FALSE(r.has_value()) << why;
+    EXPECT_EQ(countAtPath(r, path), 1u) << why << " -- " << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), totalErrors) << why << " -- " << rejectSummary(r);
 }
 }  // namespace
 
+// D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) REPOINTED THIS PAIR from kernel32
+// `ExitProcess` to ucrtbase `exit`, and the pin is re-aimed, not relaxed —
+// still two EXACT string equalities, so a drift back to the OS primitive
+// reds on the first one.
+//
+// WHY the shipped format had to change: the old spine delivered C's
+// return-from-main semantics only as a SIDE EFFECT of msvcrt's DLL-detach
+// handler draining the app's onexit table. ucrtbase's detach flushes streams
+// but does NOT run that table (in a real MSVC program `exit()` drains it, in
+// the static startup code). So once stdlib.json's `atexit` became
+// `_crt_atexit`, an `ExitProcess` spine would have left every registered
+// handler UNCALLED — silently, with no diagnostic. This row and that macro
+// are one change and must stay in lock-step.
+//
+// RED-on-disable: revert pe64-x86_64-windows-exec.format.json's processExit
+// to kernel32/ExitProcess and BOTH string EXPECTs fail here — plus
+// examples/c-subset/shipped_atexit goes red end-to-end on the Windows leg,
+// which is the runtime witness this unit pin stands in for.
 TEST(LK10EntrySliceB, ShippedPeExecHasByNameImportProcessExit) {
     auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
     ASSERT_TRUE(r.has_value());
@@ -533,8 +631,12 @@ TEST(LK10EntrySliceB, ShippedPeExecHasByNameImportProcessExit) {
     ASSERT_TRUE(pe.has_value())
         << "PE Exec must declare processExit (D-LK10-ENTRY Slice B)";
     EXPECT_EQ(pe->mechanism, ExitMechanism::ByNameImport);
-    EXPECT_EQ(pe->importLibraryPath, "kernel32.dll");
-    EXPECT_EQ(pe->importMangledName, "ExitProcess");
+    EXPECT_EQ(pe->importLibraryPath, "ucrtbase.dll")
+        << "the pe spine terminates through the CRT the program is bound to, "
+           "NOT kernel32 (D-FFI-PE-CRT-UCRT-MIGRATION P3)";
+    EXPECT_EQ(pe->importMangledName, "exit")
+        << "the canonical C name `exit` — pe adds no leading underscore; this "
+           "is what drains the `_crt_atexit` table before the streams flush";
     EXPECT_EQ((*r)->entryCallingConvention(), "ms_x64");
 }
 
@@ -608,25 +710,42 @@ TEST(LibrarySynthesis, ShippedElfExecOmitsVehicle) {
 // A PRESENT block is strict: an unknown vehicle is a fail-loud at load (never a silent
 // degrade to "no synth support").
 TEST(LibrarySynthesis, UnknownVehicleRejected) {
+    // MEASURED: the original fixture omitted `dataModel` and
+    // `headerNameMatching` (both REQUIRED on every format), so the load
+    // failed for those two reasons in addition to the unknown vehicle.
+    // Added so the vehicle check is the fixture's only remaining defect.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "relocations": [],
       "librarySynthesis": { "vehicle": "bogus", "libraryPath": "libc.so.6" }
     })");
-    EXPECT_FALSE(r.has_value()) << "an unknown librarySynthesis vehicle must fail loud at load";
+    ASSERT_FALSE(r.has_value())
+        << "an unknown librarySynthesis vehicle must fail loud at load";
+    EXPECT_EQ(countAtPath(r, "/librarySynthesis/vehicle"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(LibrarySynthesis, MissingLibraryPathRejected) {
+    // MEASURED: same dataModel/headerNameMatching gap as UnknownVehicleRejected.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "relocations": [],
       "librarySynthesis": { "vehicle": "pthread" }
     })");
-    EXPECT_FALSE(r.has_value()) << "a librarySynthesis block without libraryPath must fail loud";
+    ASSERT_FALSE(r.has_value())
+        << "a librarySynthesis block without libraryPath must fail loud";
+    EXPECT_EQ(countAtPath(r, "/librarySynthesis/libraryPath"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(LK10EntrySliceB, EntryCallingConventionResolvesAgainstTarget) {
@@ -654,9 +773,18 @@ TEST(LK10EntrySliceB, EntryCallingConventionResolvesAgainstTarget) {
 }
 
 TEST(LK10EntrySliceB, ProcessExitWithoutEntryCcRejected) {
-    auto r = ObjectFormatSchema::loadFromText(R"({
+    // MEASURED knock-on: this fixture's `elf` block declares no `type`, so
+    // it defaults to ET_REL (not exec-flavored). `processExit` itself is
+    // present and valid, so besides the pairing rule this test pins on
+    // `/entryCallingConvention`, validate()'s INDEPENDENT "processExit is
+    // only legal on exec-flavored formats" rule also fires on
+    // `/processExit` — a second, legitimate rejection from the same
+    // deliberately-minimal (non-exec) fixture.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "processExit": {
@@ -665,43 +793,62 @@ TEST(LK10EntrySliceB, ProcessExitWithoutEntryCcRejected) {
         "syscallNumGpr": "rax",
         "syscallOpcodeBytes": [15, 5]
       }
-    })");
-    EXPECT_FALSE(r.has_value())
-        << "processExit without entryCallingConvention must reject "
-           "at validate() — the trampoline emitter needs both";
+    })", "/entryCallingConvention",
+        "processExit without entryCallingConvention must reject "
+        "at validate() — the trampoline emitter needs both", 2u);
 }
 
 TEST(LK10EntrySliceB, EntryCcWithoutProcessExitRejected) {
-    auto r = ObjectFormatSchema::loadFromText(R"({
+    // MEASURED knock-on: the mirror image of ProcessExitWithoutEntryCcRejected
+    // above — this ET_REL-default fixture declares `entryCallingConvention`
+    // alone, so besides the pairing rule this test pins on `/processExit`,
+    // validate()'s independent "entryCallingConvention is only legal on
+    // exec-flavored formats" rule also fires on `/entryCallingConvention`.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64"
-    })");
-    EXPECT_FALSE(r.has_value())
-        << "entryCallingConvention without processExit must reject "
-           "— the fields are paired (D-LK10-ENTRY §2.13)";
+    })", "/processExit",
+        "entryCallingConvention without processExit must reject "
+        "— the fields are paired (D-LK10-ENTRY §2.13)", 2u);
 }
 
 TEST(LK10EntrySliceB, UnknownMechanismRejected) {
-    auto r = ObjectFormatSchema::loadFromText(R"({
+    // MEASURED knock-on: an unrecognized mechanism means `processExit` is
+    // never stored (the loader drops the whole block once its own
+    // mechanism is invalid), so validate() ALSO fires its
+    // processExit/entryCallingConvention pairing rule (`/processExit`) and
+    // its exec-flavor rule (`/entryCallingConvention`, since this
+    // ET_REL-default fixture is not exec-flavored) — two legitimate
+    // knock-ons alongside the mechanism rejection this test pins.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
       "processExit": { "mechanism": "bogus" }
-    })");
-    EXPECT_FALSE(r.has_value())
-        << "unknown processExit.mechanism must reject — closed-enum "
-           "vocabulary is the only accepted set";
+    })", "/processExit/mechanism",
+        "unknown processExit.mechanism must reject — closed-enum "
+        "vocabulary is the only accepted set", 3u);
 }
 
 TEST(LK10EntrySliceB, SyscallArmMissingNumberRejected) {
-    auto r = ObjectFormatSchema::loadFromText(R"({
+    // Same 2 knock-ons as UnknownMechanismRejected above: a rejected
+    // syscall arm leaves `processExit` unstored, so the pairing +
+    // exec-flavor validate() rules fire against the ET_REL-default
+    // fixture too.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -710,15 +857,19 @@ TEST(LK10EntrySliceB, SyscallArmMissingNumberRejected) {
         "syscallNumGpr": "rax",
         "syscallOpcodeBytes": [15, 5]
       }
-    })");
-    EXPECT_FALSE(r.has_value())
-        << "syscall arm requires syscallNumber";
+    })", "/processExit/syscallNumber",
+        "syscall arm requires syscallNumber", 3u);
 }
 
 TEST(LK10EntrySliceB, ByNameImportArmMissingLibraryRejected) {
-    auto r = ObjectFormatSchema::loadFromText(R"({
+    // Same knock-on shape, on the PE side: pe.objectType defaults to Obj
+    // (not exec), so the pairing + exec-flavor rules fire alongside the
+    // missing-field rejection this test pins.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "pe" },
       "pe": { "machine": 34404, "characteristics": 34 },
       "entryCallingConvention": "ms_x64",
@@ -726,15 +877,17 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingLibraryRejected) {
         "mechanism": "by-name-import",
         "importMangledName": "ExitProcess"
       }
-    })");
-    EXPECT_FALSE(r.has_value())
-        << "by-name-import arm requires importLibraryPath";
+    })", "/processExit/importLibraryPath",
+        "by-name-import arm requires importLibraryPath", 3u);
 }
 
 TEST(LK10EntrySliceB, OpcodeByteOutOfRangeRejected) {
-    auto r = ObjectFormatSchema::loadFromText(R"({
+    // Same 2 knock-ons as SyscallArmMissingNumberRejected.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -744,9 +897,8 @@ TEST(LK10EntrySliceB, OpcodeByteOutOfRangeRejected) {
         "syscallNumGpr": "rax",
         "syscallOpcodeBytes": [15, 256]
       }
-    })");
-    EXPECT_FALSE(r.has_value())
-        << "syscallOpcodeBytes entries must fit in u8 (0..255)";
+    })", "/processExit/syscallOpcodeBytes/1",
+        "syscallOpcodeBytes entries must fit in u8 (0..255)", 3u);
 }
 
 // test-analyzer H1 (7425905 audit fold): pin the `ExitMechanism::
@@ -755,37 +907,50 @@ TEST(LK10EntrySliceB, OpcodeByteOutOfRangeRejected) {
 // branch at object_format_schema_json.cpp's mechanism-resolve was
 // dead-coverage.
 TEST(LK10EntrySliceB, MechanismNoneStringRejected) {
-    expectRejected(R"({
+    // Same 2 knock-ons as UnknownMechanismRejected: mechanism="none" is
+    // rejected at the loader, so processExit is never stored and the
+    // pairing + exec-flavor validate() rules fire too.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
       "processExit": { "mechanism": "none" }
-    })", "mechanism=\"none\" is the sentinel; loader rejects "
-         "explicitly to prevent the sentinel from leaking through");
+    })", "/processExit/mechanism",
+        "mechanism=\"none\" is the sentinel; loader rejects "
+        "explicitly to prevent the sentinel from leaking through", 3u);
 }
 
 // dim-2 HIGH #1 (7425905 audit fold): pin the missing-key path
 // distinct from the wrong-value path.
 TEST(LK10EntrySliceB, MechanismKeyOmittedRejected) {
-    expectRejected(R"({
+    // Same 2 knock-ons.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
       "processExit": { "syscallNumber": 231 }
-    })", "processExit object missing the `mechanism` key entirely "
-         "must reject (different path from `mechanism=\"bogus\"`)");
+    })", "/processExit/mechanism",
+        "processExit object missing the `mechanism` key entirely "
+        "must reject (different path from `mechanism=\"bogus\"`)", 3u);
 }
 
 // test-analyzer H2 (7425905 audit fold): pin the syscallNumGpr-
 // missing arm explicitly.
 TEST(LK10EntrySliceB, SyscallArmMissingNumGprRejected) {
-    expectRejected(R"({
+    // Same 2 knock-ons.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -794,15 +959,19 @@ TEST(LK10EntrySliceB, SyscallArmMissingNumGprRejected) {
         "syscallNumber": 231,
         "syscallOpcodeBytes": [15, 5]
       }
-    })", "syscall arm without syscallNumGpr must reject");
+    })", "/processExit/syscallNumGpr",
+        "syscall arm without syscallNumGpr must reject", 3u);
 }
 
 // dim-2 #4 (7425905 audit fold): pin the empty-array
 // syscallOpcodeBytes branch explicitly (separate from omitted).
 TEST(LK10EntrySliceB, SyscallOpcodeBytesEmptyArrayRejected) {
-    expectRejected(R"({
+    // Same 2 knock-ons.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -812,15 +981,19 @@ TEST(LK10EntrySliceB, SyscallOpcodeBytesEmptyArrayRejected) {
         "syscallNumGpr": "rax",
         "syscallOpcodeBytes": []
       }
-    })", "syscallOpcodeBytes empty array must reject");
+    })", "/processExit/syscallOpcodeBytes",
+        "syscallOpcodeBytes empty array must reject", 3u);
 }
 
 // test-analyzer M1 (7425905 audit fold): pin the ByNameImport
 // missing-mangled-name arm.
 TEST(LK10EntrySliceB, ByNameImportArmMissingMangledNameRejected) {
-    expectRejected(R"({
+    // Same knock-on shape as ByNameImportArmMissingLibraryRejected.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "pe" },
       "pe": { "machine": 34404, "characteristics": 34 },
       "entryCallingConvention": "ms_x64",
@@ -828,7 +1001,8 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingMangledNameRejected) {
         "mechanism": "by-name-import",
         "importLibraryPath": "kernel32.dll"
       }
-    })", "by-name-import arm without importMangledName must reject");
+    })", "/processExit/importMangledName",
+        "by-name-import arm without importMangledName must reject", 3u);
 }
 
 // silent-failure H1 (7425905 audit fold): pin the isExecFlavor gate.
@@ -836,9 +1010,17 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingMangledNameRejected) {
 // trampolines; declaring processExit/entryCallingConvention on a
 // relocatable schema is meaningless dead data.
 TEST(LK10EntrySliceB, ProcessExitOnRelocatableFormatRejected) {
-    expectRejected(R"({
+    // MEASURED: `processExit` and `entryCallingConvention` are BOTH
+    // present and individually valid, so validate()'s "only legal on
+    // exec-flavored formats" rule fires against EACH of them independently
+    // (elf.type is explicitly "rel" here) — `/processExit` (this test's
+    // own pin) plus `/entryCallingConvention` as the legitimate second
+    // half of the same rule pair.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-obj", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62,
                "type": "rel" },
@@ -849,17 +1031,32 @@ TEST(LK10EntrySliceB, ProcessExitOnRelocatableFormatRejected) {
         "syscallNumGpr": "rax",
         "syscallOpcodeBytes": [15, 5]
       }
-    })", "processExit on ET_REL must reject — only exec-flavored "
-         "formats have an entry trampoline");
+    })", "/processExit",
+        "processExit on ET_REL must reject — only exec-flavored "
+        "formats have an entry trampoline", 2u);
 }
 
 // dim-2 HIGH #2 (7425905 audit fold): entryCallingConvention with
 // whitespace silently passed schema-load before the audit;
 // loader now rejects.
 TEST(LK10EntrySliceB, EntryCcLeadingWhitespaceRejected) {
-    expectRejected(R"({
+    // SPECIAL CASE — not routed through expectRejectedAtPath. The leading
+    // space is rejected by the LOADER (a whitespace check on the raw
+    // string) AND, because a rejected value is never stored, validate()'s
+    // processExit/entryCallingConvention pairing rule ALSO fires — at the
+    // SAME JSON pointer `/entryCallingConvention`, with a different
+    // message. `countAtPath` cannot tell the two apart (MEASURED: it
+    // returns 2 at that path), so this uses `countWithMessage` on wording
+    // unique to the loader's whitespace check instead — exactly the
+    // two-rules-one-pointer situation `format_reject_support.hpp`
+    // documents `countWithMessage` for. The third diagnostic
+    // (`/processExit`, "only legal on exec-flavored formats") is the same
+    // ET_REL-default knock-on seen throughout this suite.
+    auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": " sysv_amd64",
@@ -869,21 +1066,52 @@ TEST(LK10EntrySliceB, EntryCcLeadingWhitespaceRejected) {
         "syscallNumGpr": "rax",
         "syscallOpcodeBytes": [15, 5]
       }
-    })", "leading whitespace in entryCallingConvention must reject "
-         "— would silently fail at Slice C callingConventionByName");
+    })");
+    ASSERT_FALSE(r.has_value())
+        << "leading whitespace in entryCallingConvention must reject "
+           "— would silently fail at Slice C callingConventionByName";
+    EXPECT_EQ(countWithMessage(r, "no whitespace"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 3u) << rejectSummary(r);
 }
 
 // dim-2 HIGH #3 (7425905 audit fold): Wasm/SPIR-V format kinds
 // have no trampoline emitter; processExit/entryCallingConvention
 // are meaningless on those formats. Defense-in-depth.
 TEST(LK10EntrySliceB, WasmFormatRejectsProcessExit) {
-    expectRejected(R"({
+    // SPECIAL CASE — not routed through expectRejectedAtPath. A
+    // well-formed `processExit` block on a wasm format is independently
+    // rejected TWICE at the same pointer `/processExit`: once by the
+    // wasm/spirv universal-field guard in the loader ("must not declare a
+    // top-level 'processExit' field") and once by validate()'s generic
+    // "processExit is only legal on exec-flavored formats" rule (wasm is
+    // never exec-flavored). `countAtPath` cannot distinguish them
+    // (MEASURED: 2 at that path), so this pins the wasm-specific wording
+    // via `countWithMessage`. The pairing rule also fires a third,
+    // legitimate diagnostic at `/entryCallingConvention` (declared nowhere
+    // in this fixture, so `processExit` alone trips it). The processExit
+    // block itself is deliberately COMPLETE and valid (unlike the
+    // original minimal `{"mechanism":"syscall"}`) so it carries no
+    // incidental "missing syscall field" noise of its own — the whole
+    // point here is the wasm/exec-flavor rejection, not a malformed arm.
+    auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-wasm", "version": "0.1", "kind": "wasm" },
-      "processExit": { "mechanism": "syscall" }
-    })", "WASM format must reject `processExit` — no trampoline "
-         "emitter applies on operand-stack ABIs");
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": [15, 5]
+      }
+    })");
+    ASSERT_FALSE(r.has_value())
+        << "WASM format must reject `processExit` — no trampoline "
+           "emitter applies on operand-stack ABIs";
+    EXPECT_EQ(countWithMessage(r, "must not declare a top-level"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 3u) << rejectSummary(r);
 }
 
 TEST(LK10EntrySliceB, RelocatableFormatOmitsProcessExitOk) {
@@ -968,9 +1196,15 @@ TEST(ProcessArgsSubstrate, ShippedMachoExecsDeclareNoneAndPeDeclaresCrtOutParam)
 }
 
 TEST(ProcessArgsSubstrate, UnknownMechanismRejected) {
-    expectRejected(R"({
+    // Same knock-on shape as LK10EntrySliceB.UnknownMechanismRejected:
+    // this ET_REL-default fixture's valid processExit +
+    // entryCallingConvention are independently rejected by validate()'s
+    // "only legal on exec-flavored formats" rule.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -981,14 +1215,18 @@ TEST(ProcessArgsSubstrate, UnknownMechanismRejected) {
         "syscallOpcodeBytes": [15, 5]
       },
       "processArgs": { "mechanism": "bogus" }
-    })", "unknown processArgs.mechanism must reject — closed-enum "
-         "vocabulary, a typo can never silently skip argument setup");
+    })", "/processArgs/mechanism",
+        "unknown processArgs.mechanism must reject — closed-enum "
+        "vocabulary, a typo can never silently skip argument setup", 3u);
 }
 
 TEST(ProcessArgsSubstrate, MechanismNoneStringRejected) {
-    expectRejected(R"({
+    // Same knock-on shape.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -999,14 +1237,18 @@ TEST(ProcessArgsSubstrate, MechanismNoneStringRejected) {
         "syscallOpcodeBytes": [15, 5]
       },
       "processArgs": { "mechanism": "none" }
-    })", "mechanism=\"none\" is the sentinel; absence is encoded by "
-         "omitting the block (the ProcessExit discipline)");
+    })", "/processArgs/mechanism",
+        "mechanism=\"none\" is the sentinel; absence is encoded by "
+        "omitting the block (the ProcessExit discipline)", 3u);
 }
 
 TEST(ProcessArgsSubstrate, StackVectorMissingArgcOffsetRejected) {
-    expectRejected(R"({
+    // Same knock-on shape.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -1018,14 +1260,18 @@ TEST(ProcessArgsSubstrate, StackVectorMissingArgcOffsetRejected) {
       },
       "processArgs": { "mechanism": "stack-vector",
                        "argvStackOffset": 8 }
-    })", "stack-vector arm requires an explicit argcStackOffset — a "
-         "silent default would read argc from the wrong slot");
+    })", "/processArgs/argcStackOffset",
+        "stack-vector arm requires an explicit argcStackOffset — a "
+        "silent default would read argc from the wrong slot", 3u);
 }
 
 TEST(ProcessArgsSubstrate, StackVectorMissingArgvOffsetRejected) {
-    expectRejected(R"({
+    // Same knock-on shape.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -1037,15 +1283,19 @@ TEST(ProcessArgsSubstrate, StackVectorMissingArgvOffsetRejected) {
       },
       "processArgs": { "mechanism": "stack-vector",
                        "argcStackOffset": 0 }
-    })", "stack-vector arm requires an explicit argvStackOffset");
+    })", "/processArgs/argvStackOffset",
+        "stack-vector arm requires an explicit argvStackOffset", 3u);
 }
 
 TEST(ProcessArgsSubstrate, OffsetBeyondInt32Rejected) {
     // The offsets feed a MemOffset LIR operand (int32 displacement);
-    // a value above 2^31-1 would wrap negative at the cast.
-    expectRejected(R"({
+    // a value above 2^31-1 would wrap negative at the cast. Same knock-on
+    // shape as the sibling ProcessArgsSubstrate tests above.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "entryCallingConvention": "sysv_amd64",
@@ -1058,17 +1308,30 @@ TEST(ProcessArgsSubstrate, OffsetBeyondInt32Rejected) {
       "processArgs": { "mechanism": "stack-vector",
                        "argcStackOffset": 0,
                        "argvStackOffset": 2147483648 }
-    })", "an offset beyond int32 must reject at load — it would wrap "
-         "negative in the trampoline's memory displacement");
+    })", "/processArgs/argvStackOffset",
+        "an offset beyond int32 must reject at load — it would wrap "
+        "negative in the trampoline's memory displacement", 3u);
 }
 
 TEST(ProcessArgsSubstrate, ProcessArgsWithoutProcessExitRejected) {
     // processArgs rides the trampoline emitter, which requires a
     // declared processExit — a processArgs-only format would be dead
     // config whose argument setup silently never emits.
-    expectRejected(R"({
+    //
+    // MEASURED knock-on: this fixture IS genuinely exec-flavored (ET_EXEC
+    // + pageAlign + a Text section with a non-zero virtualAddress), so it
+    // does NOT hit the "only legal on exec-flavored formats" knock-on the
+    // sibling ProcessArgsSubstrate tests above do. Instead it hits the
+    // INDEPENDENT "exec-flavored format must declare processExit" rule
+    // (the ⇒ half of D-LK10-ENTRY's biconditional) — also at
+    // `/processExit`, alongside the `/processArgs` pairing rule this test
+    // pins. Both trace to the same root fact (no processExit declared),
+    // so 2 is the honest measured count.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth", "version": "0.1", "kind": "elf" },
       "entryPoint": "",
       "elf": {
@@ -1083,15 +1346,25 @@ TEST(ProcessArgsSubstrate, ProcessArgsWithoutProcessExitRejected) {
       "processArgs": { "mechanism": "stack-vector",
                        "argcStackOffset": 0,
                        "argvStackOffset": 8 }
-    })", "processArgs without processExit must reject — the argument "
-         "materialization is emitted by the entry trampoline "
-         "(D-RUNTIME-MAIN-ARGC-ARGV pairing rule)");
+    })", "/processArgs",
+        "processArgs without processExit must reject — the argument "
+        "materialization is emitted by the entry trampoline "
+        "(D-RUNTIME-MAIN-ARGC-ARGV pairing rule)", 2u);
 }
 
 TEST(ProcessArgsSubstrate, ProcessArgsOnRelocatableFormatRejected) {
-    expectRejected(R"({
+    // MEASURED: `processExit`, `entryCallingConvention` AND `processArgs`
+    // are all present and individually valid, so validate()'s "only legal
+    // on exec-flavored formats" rule fires against BOTH `/processExit`
+    // and `/entryCallingConvention` in addition to the `/processArgs`
+    // rejection this test pins — three independent firings of
+    // structurally the same rule, one per field that declares entry-
+    // trampoline machinery on an explicit ET_REL.
+    expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-obj", "version": "0.1", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62,
                "type": "rel" },
@@ -1105,20 +1378,37 @@ TEST(ProcessArgsSubstrate, ProcessArgsOnRelocatableFormatRejected) {
       "processArgs": { "mechanism": "stack-vector",
                        "argcStackOffset": 0,
                        "argvStackOffset": 8 }
-    })", "processArgs on ET_REL must reject — relocatable artifacts "
-         "have no entry trampoline to materialize arguments in");
+    })", "/processArgs",
+        "processArgs on ET_REL must reject — relocatable artifacts "
+        "have no entry trampoline to materialize arguments in", 3u);
 }
 
 TEST(ProcessArgsSubstrate, WasmFormatRejectsProcessArgs) {
-    expectRejected(R"({
+    // SPECIAL CASE — mirrors LK10EntrySliceB.WasmFormatRejectsProcessExit.
+    // A well-formed `processArgs` block on a wasm format is rejected
+    // THREE times at the SAME pointer `/processArgs`: the wasm/spirv
+    // universal-field guard ("must not declare a top-level 'processArgs'
+    // field"), validate()'s "processArgs without processExit" pairing
+    // rule (no processExit is declared in this fixture), and validate()'s
+    // "only legal on exec-flavored formats" rule. `countAtPath` cannot
+    // distinguish these (MEASURED: 3 at that path), so this pins the
+    // wasm-specific wording via `countWithMessage`.
+    auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-wasm", "version": "0.1", "kind": "wasm" },
       "processArgs": { "mechanism": "stack-vector",
                        "argcStackOffset": 0,
                        "argvStackOffset": 8 }
-    })", "WASM format must reject `processArgs` — no trampoline "
-         "emitter applies on operand-stack ABIs");
+    })");
+    ASSERT_FALSE(r.has_value())
+        << "WASM format must reject `processArgs` — no trampoline "
+           "emitter applies on operand-stack ABIs";
+    EXPECT_EQ(countWithMessage(r, "must not declare a top-level"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 3u) << rejectSummary(r);
 }
 
 TEST(ProcessArgsSubstrate, ArgsMechanismEnumRoundTrip) {
@@ -1141,7 +1431,9 @@ namespace {
 std::string elfWithArtifactProfiles(std::string_view profilesArrayJson) {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
       "artifactProfiles": )"} + std::string{profilesArrayJson} + R"(
@@ -1166,7 +1458,9 @@ TEST(ObjectFormatArtifactProfiles, ParsesDeclaredSet) {
 TEST(ObjectFormatArtifactProfiles, AbsentIsEmptyServesNothing) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62}
     })");
@@ -1268,8 +1562,24 @@ TEST(StaticLibraryFormats, AllFiveShippedStaticLibFormatsLoadValidateAndAreArchi
 // (relocatable, accepted) — the guard fires on the former and not the latter.
 TEST(StaticLibraryFormats, ArchiveContainerRejectedOnImageFlavor) {
     dss::detail::ObjectFormatData data;
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: like `dataModel`, the header-name case
+    // rule is REQUIRED and its zero value is the INVALID sentinel, so a
+    // hand-built ObjectFormatData must set it or `validate()` reports it (which
+    // is the point — see HeaderNameMatchingIsRequired).
+    data.headerNameMatching = HeaderNameMatching::CaseSensitive;
+    // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN: the same story one axis over —
+    // REQUIRED, zero == the INVALID sentinel, and enforced on THIS (hand-built,
+    // loader-bypassing) path by validate() alone. Left unset, the `archive`
+    // guard below would still fire but `relProblems.empty()` would red for a
+    // reason that has nothing to do with containers.
+    data.cSymbolDecoration.scheme = CSymbolDecorationScheme::None;
     data.name             = "synth-staticlib";
-    data.kind             = ObjectFormatKind::Elf;
+    // TF-C125: a hand-built `ObjectFormatData` now names its format by
+    // resolving the BACKEND, exactly as the loader does. `data.kind` is
+    // gone — the field defaulted to `ObjectFormatKind::Elf`, so a
+    // default-constructed struct silently claimed an ELF identity with
+    // `elf.machine == 0`; the pointer's default is null and fails closed.
+    data.backend          = dss::link::objectFormatBackendByConfigName("elf");
     data.dataModel        = DataModel::Lp64;
     data.elf.fileClass    = 2;   // ELFCLASS64
     data.elf.dataEncoding = 1;   // ELFDATA2LSB
@@ -1314,7 +1624,9 @@ TEST(StaticLibraryFormats, UnknownContainerSpellingFailsLoud) {
     // static-lib format as a lone object).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
       "container": "bogus"
@@ -1356,7 +1668,9 @@ namespace {
 std::string peWithStackReserveControl(std::string_view blockJson) {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-pe","version":"1.0","kind":"pe"},
       "pe": {"machine": 34404},
       "stackReserveControl": )"} + std::string{blockJson} + R"(
@@ -1366,7 +1680,9 @@ std::string peWithStackReserveControl(std::string_view blockJson) {
 std::string elfWithStackReserveControl(std::string_view blockJson) {
     return std::string{R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-elf","version":"1.0","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
       "stackReserveControl": )"} + std::string{blockJson} + R"(
@@ -1495,7 +1811,9 @@ TEST(StackReserveControl, ValidBlockLoadsAndIsExposedVerbatim) {
     // never an error, never a defaulted-in block.
     auto none = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-pe","version":"1.0","kind":"pe"},
       "pe": {"machine": 34404}
     })");
@@ -1662,7 +1980,9 @@ TEST(StackReserveControl, WasmSchemaRejectsTheWholeBlock) {
     // the walker would silently ignore.
     expectRejectedAt(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "ILP32",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"synth-wasm","version":"0.1","kind":"wasm"},
       "stackReserveControl": {
         "vehicle": "pe-optional-header",
@@ -1825,6 +2145,102 @@ TEST(FormatRootKeyVocabulary, AllShippedFormatsLoadCleanUnderClosedVocabulary) {
             << name << ".format.json must load clean under the closed "
                        "root-key vocabulary";
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// D-LK10-ENTRY entry-gate fold — EVERY exec-flavored shipped format
+// declares `processExit`. The whole population, not a sample: this is
+// exactly the multi-site class where a green subset hides the miss, and
+// the miss it hides is a SILENT one. MEASURED 2026-08-05, before the
+// validate() rule landed: `macho64-x86_64-darwin-exec` declared no
+// `processExit`, and `int main(void){return 42;}` built against it
+// produced rc=0, a 4162-byte artifact and `LC_MAIN entryoff=0x1000`
+// pointing at `main`'s own `48 81 ec 10 00 00 00` (`sub rsp,0x10`)
+// prologue — the image entry was the user function, with ZERO
+// diagnostics.
+//
+// The sweep is over the SAME 24-name list above (single source of truth
+// for "what ships"), filtered by the schema's own `isExecFlavor()`
+// predicate rather than by a hand-kept list of exec names — so a 25th
+// format added without `processExit` reds HERE, and one added WITH it
+// needs no edit to this test.
+//
+// ★ WHAT THIS DOES NOT PROVE: nothing about the ELF ET_DYN (PIE) arm of
+// `isExecFlavor()`. That arm qualifies only via `elfDynPieShape`, which
+// contains `processExit.has_value()`, so for the two `-pie` formats the
+// assertion below is a TAUTOLOGY — it cannot fail, and it is not
+// evidence. Their real guard is the all-or-none entry-cluster rule
+// (`clusterCount`, object_format_schema.cpp) — ★ AT CONFIG LOAD, which is
+// the only tier this sweep reaches, since every format here arrives via
+// `loadShipped` and therefore through `validate()`. That qualifier is
+// load-bearing: the same sentence WITHOUT it appears at the linker and
+// walker tiers, where `clusterCount` does NOT run (an in-memory schema
+// never passes through `validate()`), and there a hand-built 3-of-4
+// ET_DYN is invisible to `isExecFlavor()` and `processExit()` alike. Its
+// guard there is the ELF walker's own PARTIAL-PIE belt (`elf.cpp`,
+// `encodeElfExecDynamic`), MEASURED by
+// `EntryGateFold.ElfWalkerRefusesHandBuiltEtDynPartialEntryCluster`.
+// Said out loud so the row count here is never read as coverage it is not.
+// ═════════════════════════════════════════════════════════════════════
+TEST(FormatRootKeyVocabulary, EveryShippedExecFlavorFormatDeclaresProcessExit) {
+    constexpr std::string_view kAll[] = {
+        "elf64-aarch64-linux-dyn",      "elf64-aarch64-linux-exec",
+        "elf64-aarch64-linux-pie",      "elf64-aarch64-linux-staticlib",
+        "elf64-aarch64-linux",          "elf64-x86_64-linux-dyn",
+        "elf64-x86_64-linux-exec",      "elf64-x86_64-linux-pie",
+        "elf64-x86_64-linux-staticlib", "elf64-x86_64-linux",
+        "macho64-arm64-darwin-dylib",   "macho64-arm64-darwin-exec",
+        "macho64-arm64-darwin-staticlib", "macho64-arm64-darwin",
+        "macho64-x86_64-darwin-dylib",  "macho64-x86_64-darwin-exec",
+        "macho64-x86_64-darwin-staticlib", "macho64-x86_64-darwin",
+        "pe64-x86_64-windows-dll",      "pe64-x86_64-windows-exec",
+        "pe64-x86_64-windows-staticlib", "pe64-x86_64-windows",
+        "spirv-1.6",                    "wasm32-v1"};
+    static_assert(std::size(kAll) == 24,
+                  "all 24 shipped .format.json files must be listed — a sample "
+                  "is exactly how a multi-site miss stays green");
+    std::size_t execSeen = 0;
+    for (auto const name : kAll) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value())
+            << name << " must load — a format that cannot load cannot be "
+                       "swept, which would silently shrink this population";
+        auto const& fmt = **r;
+        if (!fmt.isExecFlavor()) {
+            // The negative half, and it is not filler: `processExit` on a
+            // NON-exec format is the ⇐ half of the same biconditional and
+            // is likewise rejected at load. Asserting both directions here
+            // is what makes this a sweep of the RULE rather than of one
+            // key's presence.
+            EXPECT_FALSE(fmt.processExit().has_value())
+                << name << " is not exec-flavored and must NOT declare "
+                           "`processExit` (the ⇐ half of the ⟺ rule)";
+            continue;
+        }
+        ++execSeen;
+        EXPECT_TRUE(fmt.processExit().has_value())
+            << name << " is EXEC-FLAVORED and must declare `processExit`. "
+                       "DSS always synthesises an entry trampoline on an "
+                       "exec-flavored format; without a declared mechanism "
+                       "the linker used to SKIP injection silently and the "
+                       "image entry became the module's first function.";
+        // The inseparable partner — validate()'s §2.13 pairing rule. A
+        // format passing the line above while failing this one would have
+        // a mechanism the emitter cannot build a call for.
+        EXPECT_FALSE(fmt.entryCallingConvention().empty())
+            << name << " declares `processExit` and must therefore declare "
+                       "`entryCallingConvention` (§2.13 pairing rule)";
+    }
+    // Guards the sweep itself: if `isExecFlavor()` were ever broken to
+    // return false everywhere, every EXPECT above would vacuously pass and
+    // this test would report success while checking nothing. 7 = the two
+    // `-exec` ELFs + the two `-pie` ELFs + the two darwin `-exec` +
+    // pe64-x86_64-windows-exec (COUNTED from the list above, 2026-08-05).
+    EXPECT_EQ(execSeen, 7u)
+        << "the exec-flavored population must be 7 of the 24 shipped "
+           "formats — a different number means either a format was added/"
+           "removed without updating this sweep, or `isExecFlavor()` "
+           "changed meaning and every assertion above just went vacuous";
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2019,4 +2435,127 @@ TEST(FormatPredefinedMacros, ShippedPopulationFollowsDataModelNotFormatName) {
     // shows up here rather than passing vacuously.
     EXPECT_EQ(lp64Seen, 18u);
     EXPECT_EQ(otherSeen, 6u);
+}
+
+// ── D-PP-HEADER-CASE-INSENSITIVE-PE: `headerNameMatching` ────────────────────
+//
+// The header-NAME case rule is a REQUIRED, closed-enum root key. Required
+// rather than optional-with-default is the load-bearing part: an optional key
+// would let a future pe/macho format file silently regress to case-sensitive
+// matching and reject `<Windows.h>` again with nothing in the tree to say why.
+// A new format file that omits it must fail at LOAD, and these pin that.
+
+namespace {
+// The minimal ELF document these pins vary ONE key of, so every rejection is
+// attributable to that key and not to a missing sibling.
+[[nodiscard]] std::string headerCaseFormatJson(std::string_view matchingLine) {
+    return std::string{R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LP64",
+      )"} + std::string{matchingLine} + R"(
+      "format": { "name": "hnm-stub", "version": "1.0", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 }
+    })";
+}
+} // namespace
+
+TEST(ObjectFormatSchemaLoader, HeaderNameMatchingIsRequired) {
+    // The CONTROL: identical document WITH the key loads clean, so the
+    // rejection below is attributable to the omission alone.
+    auto ok = ObjectFormatSchema::loadFromText(
+        headerCaseFormatJson(R"("headerNameMatching": "case-sensitive",)"));
+    ASSERT_TRUE(ok.has_value());
+
+    auto missing = ObjectFormatSchema::loadFromText(headerCaseFormatJson(""));
+    ASSERT_FALSE(missing.has_value())
+        << "a format file that omits headerNameMatching must fail at LOAD — a "
+           "silent default is how a new pe/macho file would regress to "
+           "case-sensitive matching unnoticed";
+    bool sawMissingField = false;
+    for (auto const& d : missing.error()) {
+        if (d.code == DiagnosticCode::C_MissingField
+            && d.path == "/headerNameMatching") sawMissingField = true;
+    }
+    EXPECT_TRUE(sawMissingField)
+        << "the rejection must NAME the missing key, not just fail";
+}
+
+TEST(ObjectFormatSchemaLoader, HeaderNameMatchingIsAClosedVocabulary) {
+    // Both legal spellings parse and are EXPOSED (parsed, not merely accepted).
+    auto cs = ObjectFormatSchema::loadFromText(
+        headerCaseFormatJson(R"("headerNameMatching": "case-sensitive",)"));
+    ASSERT_TRUE(cs.has_value());
+    EXPECT_EQ((*cs)->headerNameMatching(), HeaderNameMatching::CaseSensitive);
+
+    auto ci = ObjectFormatSchema::loadFromText(
+        headerCaseFormatJson(R"("headerNameMatching": "case-insensitive",)"));
+    ASSERT_TRUE(ci.has_value());
+    EXPECT_EQ((*ci)->headerNameMatching(), HeaderNameMatching::CaseInsensitive);
+
+    // A typo'd VALUE fails LOUD — never a silent degrade to one of the two.
+    for (char const* bad : {R"("headerNameMatching": "caseinsensitive",)",
+                            R"("headerNameMatching": "insensitive",)",
+                            R"("headerNameMatching": "Case-Insensitive",)",
+                            R"("headerNameMatching": true,)"}) {
+        EXPECT_FALSE(ObjectFormatSchema::loadFromText(headerCaseFormatJson(bad))
+                         .has_value())
+            << "unknown headerNameMatching value must fail loud: " << bad;
+    }
+    // A typo'd KEY is caught by the closed root-key vocabulary, not ignored.
+    EXPECT_FALSE(
+        ObjectFormatSchema::loadFromText(
+            headerCaseFormatJson(R"("headerNameMatchng": "case-sensitive",)"))
+            .has_value());
+}
+
+// Every shipped format declares the key, and its value matches the platform's
+// real filesystem convention. This is a CONFIG pin, deliberately expressed as a
+// table here rather than as engine logic — the engine must never derive the
+// rule from the format kind (that would be the identity branch the agnosticism
+// bar forbids), so the only place the kind↔rule correspondence may be written
+// down is a test that reads the shipped files.
+TEST(ObjectFormatSchemaLoader, EveryShippedFormatDeclaresHeaderNameMatching) {
+    constexpr std::string_view kAll[] = {
+        "elf64-aarch64-linux-dyn",      "elf64-aarch64-linux-exec",
+        "elf64-aarch64-linux-pie",      "elf64-aarch64-linux-staticlib",
+        "elf64-aarch64-linux",          "elf64-x86_64-linux-dyn",
+        "elf64-x86_64-linux-exec",      "elf64-x86_64-linux-pie",
+        "elf64-x86_64-linux-staticlib", "elf64-x86_64-linux",
+        "macho64-arm64-darwin-dylib",   "macho64-arm64-darwin-exec",
+        "macho64-arm64-darwin-staticlib", "macho64-arm64-darwin",
+        "macho64-x86_64-darwin-dylib",  "macho64-x86_64-darwin-exec",
+        "macho64-x86_64-darwin-staticlib", "macho64-x86_64-darwin",
+        "pe64-x86_64-windows-dll",      "pe64-x86_64-windows-exec",
+        "pe64-x86_64-windows-staticlib", "pe64-x86_64-windows",
+        "spirv-1.6",                    "wasm32-v1"};
+    static_assert(std::size(kAll) == 24,
+                  "all 24 shipped .format.json files must be listed");
+
+    std::size_t insensitive = 0, sensitive = 0;
+    for (auto const name : kAll) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value()) << name;
+        auto const m = (*r)->headerNameMatching();
+        ASSERT_NE(m, HeaderNameMatching::Invalid) << name;
+        switch ((*r)->kind()) {
+            case ObjectFormatKind::Pe:
+            case ObjectFormatKind::MachO:
+                EXPECT_EQ(m, HeaderNameMatching::CaseInsensitive)
+                    << name << ": Windows (NTFS) and default macOS (APFS/HFS+) "
+                               "fold header names, and their SDKs rely on it";
+                ++insensitive;
+                break;
+            default:
+                EXPECT_EQ(m, HeaderNameMatching::CaseSensitive)
+                    << name << ": POSIX matches byte-exact; the declared-only "
+                               "skeletons take the conservative value";
+                ++sensitive;
+                break;
+        }
+    }
+    // 4 pe + 8 macho fold; 10 elf + spirv + wasm32 do not. Pinned so a file
+    // added or dropped without a decision shows up here rather than vacuously.
+    EXPECT_EQ(insensitive, 12u);
+    EXPECT_EQ(sensitive, 12u);
 }

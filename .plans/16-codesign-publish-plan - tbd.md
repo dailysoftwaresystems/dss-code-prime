@@ -80,7 +80,7 @@ tests/codesign/
 └── publish/                         # CS8 driver smoke + redaction pin
 ```
 
-`src/codesign/` is a new top-level peer to `src/codegen/` and `src/linker/`. It runs **after** the linker has produced an artifact with placeholder signature load commands / directory entries; codesign fills those placeholders in place.
+~~`src/codesign/` is a new top-level peer to `src/codegen/` and `src/linker/`.~~ ⚠ **THIS LAYOUT CLAIM IS STALE — ✔MEASURED 2026-08-04: none of the three directories exists.** The back end is `src/asm/` + `src/lir/` (codegen) and `src/link/` (linker), and Mach-O signing ALREADY SHIPPED **inside** the linker at `src/link/format/macho_codesign.{hpp,cpp}` — DSS's own ad-hoc `CS_SuperBlob`, AMFI-accepted on real Apple Silicon (TF-C113). So the "new top-level peer" shape is a design intent that was not what got built; a future `src/codesign/` would have to justify moving signing OUT of `src/link/format/`. It runs **after** the linker has produced an artifact with placeholder signature load commands / directory entries; codesign fills those placeholders in place.
 
 ### 2.2 Apple codesign (Mach-O)
 

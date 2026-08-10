@@ -72,10 +72,35 @@ typeKindFromName(std::string_view s) noexcept;
         case TypeKind::Param:     return "Param";
         case TypeKind::Bind:      return "Bind";
         case TypeKind::Extension: return "Extension";
+        // FC17.9(d) qualifier skin + C23 nullptr_t (D-CSUBSET-QUAL-BITSET /
+        // D-CSUBSET-NULLPTR). Both enumerators were appended to `TypeKind`
+        // WITHOUT an arm here, so both fell to the trailing `"?"` sentinel.
+        // MEASURED consequence before this fix: the emitter wrote `core ?`,
+        // `?` lexes as an `Unknown` token (not an `Ident`), and the pool
+        // parser's token-kind guard rejected it — "expected TypeKind name
+        // after 'core', got '?'". So the `.dsslir` text of ANY module holding
+        // a VolatileQual- or NullptrT-tagged pool entry was simply
+        // UNPARSEABLE: loud, but a hole in a format whose whole contract is
+        // lossless round-trip.
+        // ⚠ That token-kind guard is the ONLY thing that kept it loud. `"?"`
+        // is un-injective by construction — `typeKindFromName` walks THIS
+        // function, so it maps `"?"` back to whichever kind renders it FIRST
+        // (VolatileQual), and a NullptrT entry would have silently become a
+        // VolatileQual one had `?` ever lexed as an identifier. Naming every
+        // kind removes the sentinel from the valid-kind image entirely rather
+        // than relying on that. Names match the sibling table in
+        // `type_lattice/type_reintern.cpp`, which never drifted.
+        case TypeKind::VolatileQual: return "VolatileQual";
+        case TypeKind::NullptrT:     return "NullptrT";
         case TypeKind::BitInt:    return "BitInt";
         case TypeKind::Complex:   return "Complex";   // D-CSUBSET-COMPLEX (round-trip tag)
         case TypeKind::Count_:    break;
     }
+    // Out-of-range-ordinal backstop ONLY (and the `-Wreturn-type` / MSVC C4715
+    // satisfier — an enum switch is not exhaustive for control-flow purposes).
+    // Every real enumerator returns its own name above, so `"?"` is no longer
+    // mintable from a valid kind and `typeKindFromName("?")` now correctly
+    // yields nullopt → the parser's loud `I_TextUnknownName`.
     return "?";
 }
 
@@ -602,6 +627,14 @@ public:
             if (pk.kind == TokKind::Ident && pk.text == "function") {
                 lex_.take();
                 parseFunction();
+                // Same reason as the block loop's guard: the next
+                // `parseFunction` calls `builder_.addFunction`, which runs
+                // `closeFunction_` and `abort()`s on the unterminated block
+                // this parse just refused to seal. `finalize` sees `errors_`
+                // (set by the same `refuseTerminator` call) and returns the
+                // empty result WITHOUT calling `builder_.finish()` — so the
+                // refusal reaches the caller as a diagnostic, never a crash.
+                if (unterminatedBlock_) return finalize(errBefore);
             } else {
                 emit(DiagnosticCode::I_TextMalformed,
                      std::format("expected 'function' inside module, got '{}'",
@@ -641,6 +674,14 @@ private:
     // count for the dispatch fork (0=Ret/Unreachable, 1=Br, 2=CondBr).
     std::vector<std::uint32_t>                  currentBlockSuccSlots_;
     bool                                        errors_ = false;
+    // Set ONLY by `refuseTerminator` — "the open block was left without a
+    // terminator, on purpose, with a diagnostic already reported". Distinct
+    // from `errors_` (which every recoverable diagnostic sets and the parser
+    // deliberately keeps parsing through, so one bad inst still yields one
+    // diagnostic per bad inst). This flag is NOT recoverable: `LirBuilder`
+    // hard-`abort()`s on the NEXT `beginBlock`/`addFunction` when a block is
+    // unterminated, so the parse must stop driving the builder immediately.
+    bool                                        unterminatedBlock_ = false;
 
     void emit(DiagnosticCode code, std::string what) {
         ParseDiagnostic d;
@@ -649,6 +690,19 @@ private:
         d.actual   = std::move(what);
         reporter_.report(std::move(d));
         errors_ = true;
+    }
+
+    // Refuse a terminator the dispatch cannot materialize: report, and mark
+    // the open block unterminated. The two halves are INSEPARABLE, which is
+    // why they live in one helper rather than at each call site:
+    //   * reporting without the flag = "diagnostic, then `std::abort()`" —
+    //     the builder's `beginBlock`/`closeFunction_` invariant check fires
+    //     next and kills the process, naming the builder instead of the
+    //     opcode the parser actually refused;
+    //   * flagging without the diagnostic = the silent drop this closes.
+    void refuseTerminator(std::string what) {
+        emit(DiagnosticCode::I_TextMalformed, std::move(what));
+        unterminatedBlock_ = true;
     }
 
     [[nodiscard]] std::unique_ptr<LirParseResult> makeEmptyResult() {
@@ -1019,6 +1073,12 @@ private:
                 continue;
             }
             parseBlock();
+            // A refused terminator (see `refuseTerminator`) left this block
+            // unterminated; the next `parseBlock` would call
+            // `builder_.beginBlock`, which `abort()`s on exactly that. Stop
+            // here — the diagnostic is already reported and `finalize` will
+            // discard the half-built module.
+            if (unterminatedBlock_) return;
         }
         (void)expect(TokKind::RBrace);
     }
@@ -1422,10 +1482,14 @@ private:
                     auto ts = resolveTargets();
                     if (!ts.has_value() || ts->size() != 1) {
                         if (ts.has_value()) {
-                            emit(DiagnosticCode::I_TextMalformed,
+                            refuseTerminator(
                                  std::format("Br opcode '{}' requires 1 "
                                              "successor; block declared {}",
                                              mnem.text, ts->size()));
+                        } else {
+                            // `resolveTargets` already reported the unknown
+                            // successor; still a refusal, so flag the block.
+                            unterminatedBlock_ = true;
                         }
                         return;
                     }
@@ -1436,10 +1500,13 @@ private:
                     auto ts = resolveTargets();
                     if (!ts.has_value() || ts->size() != 2) {
                         if (ts.has_value()) {
-                            emit(DiagnosticCode::I_TextMalformed,
+                            refuseTerminator(
                                  std::format("CondBr opcode '{}' requires 2 "
                                              "successors; block declared {}",
                                              mnem.text, ts->size()));
+                        } else {
+                            // Ditto the Br arm: `resolveTargets` reported it.
+                            unterminatedBlock_ = true;
                         }
                         return;
                     }
@@ -1448,19 +1515,62 @@ private:
                     break;
                 }
                 case TargetTerminatorKind::Switch:
-                    emit(DiagnosticCode::I_TextMalformed,
+                    refuseTerminator(
                          std::format("Switch terminator opcode '{}' not yet "
                                      "supported in `.dsslir` round-trip "
                                      "(reserved for LIR Switch lowering)",
                                      mnem.text));
                     return;
+                case TargetTerminatorKind::IndirectBr: {
+                    // D-CSUBSET-COMPUTED-GOTO. This arm did not exist before
+                    // TF-C112 — the enumerator was simply MISSED when computed
+                    // goto landed, so an `indirect-br` opcode fell straight
+                    // THROUGH this switch: no builder call, the block left
+                    // unterminated, and the next `beginBlock`/`closeFunction_`
+                    // then `std::abort()`ed with "block has no terminator" —
+                    // a process kill naming the builder, from a parser that
+                    // had reported nothing.
+                    //
+                    // Wired rather than refused because the round-trip
+                    // contract was HALF-implemented, not unimplemented: the
+                    // sibling dispatch `lir_pass_util::emitTerminator` already
+                    // routes this kind to `addIndirectBr`, and `emitBlock`
+                    // already WRITES it correctly. A format that can write
+                    // what it cannot read back is a hole in a shipped
+                    // guarantee. Everything the call needs is already on the
+                    // page: the variadic address-taken successors ride the
+                    // block header's `-> [...]` list (same channel CondBr
+                    // uses — they are NOT BlockRef operands on the inst), and
+                    // the address register is the sole non-BlockRef operand.
+                    //
+                    // Arity mirrors `CondBr` with the kind's own shape from
+                    // `kTargetTerminatorShapes`: >=1 successor (255 =
+                    // unbounded), not exactly 2. An empty successor list is
+                    // refused, NOT silently built — dropping the edge set
+                    // would delete every live `&&label` target.
+                    auto ts = resolveTargets();
+                    if (!ts.has_value() || ts->empty()) {
+                        if (ts.has_value()) {
+                            refuseTerminator(
+                                 std::format("IndirectBr opcode '{}' requires "
+                                             ">=1 successor; block declared 0",
+                                             mnem.text));
+                        } else {
+                            // Ditto the Br arm: `resolveTargets` reported it.
+                            unterminatedBlock_ = true;
+                        }
+                        return;
+                    }
+                    builder_.addIndirectBr(op, nonBlock, *ts, payload, flags);
+                    break;
+                }
                 case TargetTerminatorKind::None:
                     // Unreachable: `isTerm` derives from `terminatorKind
                     // != None`, so this arm is unreachable by
                     // construction. Kept as a `default`-style fail-loud
                     // guard in case a future hand-built `Lir` ever lies
                     // about its opcode's role.
-                    emit(DiagnosticCode::I_TextMalformed,
+                    refuseTerminator(
                          std::format("opcode '{}' has terminatorKind=none "
                                      "but reached terminator dispatch "
                                      "(substrate invariant violation)",

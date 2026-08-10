@@ -365,10 +365,79 @@ jobs:
         # The repair was NOT a bigger budget: the shuffle arms were 44% of the leg
         # while being the weaker instrument on it, and now scale per-leg at the
         # dss_add_shuffle_arm chokepoint in tests/CMakeLists.txt. Projected ~20.2 min.
-        # See D-TEST-SHUFFLE-ARM-REPEAT-BUDGET-IS-PER-LEG. If this leg approaches
-        # ~25 min again, re-measure the arms FIRST — that is where the cost hides.
-        run: ctest ${{ '--output-on-failure --no-tests=error --parallel 4' }}
-        timeout-minutes: 30
+        # See D-TEST-SHUFFLE-ARM-REPEAT-BUDGET-IS-PER-LEG.
+        #
+        # ★ 2026-08-10 — IT HAPPENED AGAIN, AND THIS TIME THE BUDGET *IS* THE ANSWER.
+        # ✔MEASURED, run 31278675175 job 93156338162 (linux-clang-asan, PR #48): Test
+        # ran 21:27:01 -> 21:57:14 = 30m13s against the 30-min cap and was killed
+        # ("Terminate orphan process: pid (5677) (ctest)"), at 774 of 801 tests —
+        # EVERY ONE OF THEM PASSED. 96.6% of the leg's wall clock bought 0% of a
+        # verdict. The arms are not the cost this time: they were already taken to
+        # their practical floor in TF-C110 (one arm alone is 475 s of 739 s and
+        # already sits at repeat=1), and the corpus simply grew 773 -> 801. The
+        # anchor row named exactly this fork and reserved it for the operator —
+        # "more headroom has to come from the suite itself or from the budget, which
+        # is a separate decision the operator has NOT been asked to make". The
+        # operator was asked on 2026-08-10 and chose the budget: 60 minutes.
+        # ⇒ NEW REVISIT TRIGGER, replacing the old ~25-min one: this step exceeding
+        #   ~45 min, or the shuffle arms climbing back above ~20% of the leg.
+        #   Re-measure the arms FIRST — that is still where the cost hides.
+        #
+        # ★★ AND ctest NOW GETS ITS OWN BUDGET, STRICTLY INSIDE THE STEP'S.
+        # [D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG.] A `timeout-minutes` kill is a hard
+        # signal-kill: ctest writes Testing/Temporary/LastTest.log on COMPLETION, so
+        # killed it writes nothing, the upload step finds nothing, and the run above
+        # had to be diagnosed by scraping 2,892 raw job-log lines to learn it died at
+        # 774/801. That was the SECOND time. With --stop-time ctest finalises itself
+        # and the log survives. ✔MEASURED LOCALLY 2026-08-10, all four facts:
+        #   · it writes the log — 765,947 B with a real "End testing:" tail;
+        #   · it exits 8, so a truncated run still FAILS the step (a partial run must
+        #     never be green);
+        #   · the time must be LOCAL time-of-day. A UTC form ("%H:%M:%S +0000") was
+        #     ACCEPTED AND SILENTLY IGNORED — ctest ran straight past it. A guard
+        #     that no-ops is worse than none, which is why this is measured and not
+        #     assumed;
+        #   · a stop time already in the past wraps to TOMORROW (verified: ctest ran
+        #     the test normally rather than stopping instantly), so a run straddling
+        #     midnight is safe.
+        # BUDGET = 50, not 55: --stop-time stops ctest STARTING new tests, and one
+        # already running continues — the longest single test on this leg measured
+        # ~8 min, so 50 + 8 still lands inside the 60-min step.
+        run: |
+          BUDGET_MIN=50
+          # ⚠ `|| true` ON BOTH, AND IT IS NOT DECORATION. GitHub runs this block as
+          # `bash -e {0}`, under which a failing command substitution in an assignment
+          # ABORTS THE SCRIPT — so a bare `NOW=$(date …)` on a runner with no usable
+          # `date` kills the step at that line, before the diagnostic below can say
+          # why. ✔MEASURED while writing this: that exact shape exited 1 with NO
+          # message at all. A guard that dies silently is not a guard.
+          NOW=$(date "+%H:%M:%S" 2>/dev/null || true)
+          # GNU (ubuntu, git-bash) then BSD (macOS). No third form exists here.
+          STOP=$(date -d "+${BUDGET_MIN} minutes" "+%H:%M:%S" 2>/dev/null \
+              || date -v+${BUDGET_MIN}M "+%H:%M:%S" 2>/dev/null || true)
+          if [ -z "$NOW" ] || [ -z "$STOP" ]; then
+            echo "::error::Cannot compute a ctest stop time: neither GNU (date -d) nor BSD (date -v) relative-date syntax works on this runner."
+            echo "Refusing to run ctest without its own budget. Without it a step that runs long is killed by timeout-minutes and writes NO test log at all, which is the exact blind spot this guard closes (D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG)."
+            exit 1
+          fi
+          # ★★ ASSERT THE OFFSET ACTUALLY APPLIED, AND THIS CHECK IS THE LOAD-BEARING ONE.
+          # An EMPTY result is the easy failure. The dangerous one is a `date` that
+          # ACCEPTS the flag and ignores the offset — BSD's `-d` means "set the DST
+          # flag", so on a host where it does not error, STOP comes back as ~NOW. And
+          # a stop time already reached does not stop ctest: it wraps to TOMORROW
+          # (measured). So the budget would silently be ~24 h, the step would once
+          # again be killed by timeout-minutes, and we would be back at the exact
+          # defect this block closes — with a green-looking guard in the file.
+          _secs() { awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }' <<< "$1"; }
+          DELTA=$(( ( $(_secs "$STOP") - $(_secs "$NOW") + 86400 ) % 86400 ))
+          if [ "$DELTA" -lt $(( BUDGET_MIN * 60 - 120 )) ] || [ "$DELTA" -gt $(( BUDGET_MIN * 60 + 120 )) ]; then
+            echo "::error::The computed ctest stop time is ${DELTA}s away, not the ~$(( BUDGET_MIN * 60 ))s asked for (now=$NOW stop=$STOP)."
+            echo "This runner's \`date\` accepted a relative-offset flag and did not apply it. Refusing to run: ctest treats an already-passed stop time as TOMORROW, so the budget would silently be ~24h and the step would be killed by timeout-minutes with no test log — the defect this guard exists to close (D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG)."
+            exit 1
+          fi
+          echo "ctest stop-time: $STOP (LOCAL, ${DELTA}s out) — ${BUDGET_MIN} min, inside this step's timeout-minutes"
+          ctest --stop-time "$STOP" ${{ '--output-on-failure --no-tests=error --parallel 4' }}
+        timeout-minutes: 60
 
       - name: Upload test logs on failure
         if: ${{ failure() }}
@@ -378,7 +447,13 @@ jobs:
           path: |
             ${{ '.' }}/${{ 'build' }}/Testing/Temporary/LastTest.log
             ${{ '.' }}/${{ 'build' }}/Testing/Temporary/LastTestsFailed.log
-          if-no-files-found: ignore
+          # `warn`, NOT `ignore` — the second half of
+          # D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG. This step only runs on failure,
+          # so "the logs a failing leg was supposed to leave are not there" is
+          # always worth saying out loud; `ignore` made that absence silent, and
+          # the absence is itself the diagnosis (the step was killed rather than
+          # having failed a test).
+          if-no-files-found: warn
           retention-days: 7
 
   ci-check:

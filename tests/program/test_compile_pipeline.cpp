@@ -389,6 +389,271 @@ TEST(Program_CompileFiles, SingleCuMachOObjectSymbolCarriesLeadingUnderscore) {
            "symbol name (ld64 convention) — proves the single-CU nameOf mangle";
 }
 
+// ── D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-ABSENT ─────
+//
+// The END-TO-END half of that closure. `macho64-x86_64-darwin` and its
+// `-staticlib` sibling declared `text` and nothing else, so ANY translation
+// unit carrying a string literal or a global was refused on those tiers —
+// `K_NoMatchingObjectFormat ... does not advertise that section` — while the
+// arm64 siblings emitted the same source at rc=0.
+//
+// ★ WHY THIS TEST EXISTS ALONGSIDE THE SCHEMA PIN.
+// `ObjectFormatFamilySymmetry.EveryMachoFormatDeclaresItsDataSectionsWithTheir
+// Rows` reads the shipped JSON and asserts what it DECLARES. That is the
+// always-on guard, but a declaration is a CLAIM: it cannot show that the
+// walker actually placed the bytes. This test drives the REAL pipeline
+// (source → HIR → MIR → LIR → asm → link → writeImage → a file on disk) and
+// then parses the emitted section_64 table with a reader that shares no code
+// with DSS, so it cannot inherit a DSS bug.
+//
+// ★ THE MATCHED CONTROL IS INSIDE THE TEST, not alongside it. The identical
+// source is compiled on FOUR arms — the bare `.o` and the `-staticlib` archive
+// on BOTH Darwin arches — and their (segment, section, flags) sequences are
+// required to be EQUAL. Mach-O segment/section names carry no arch axis and an
+// archive member IS a relocatable object, so a divergence anywhere in that
+// square is a config defect; the arm64 arm is the one with a real
+// Apple-Silicon runtime witness behind it. The `-staticlib` arms are not
+// redundant: they run a SECOND writer (`ar`) over the member, and the anchor
+// names that cell explicitly.
+//
+// ⛔ WHAT IT DOES NOT SHOW, stated rather than implied: NOTHING RUNS. A
+// relocatable object has no entry point; it is an INPUT to a later ld64 link,
+// and no Mac is reachable from this host. The claim is "the walker places the
+// bytes and the object parses", never "ld64 accepted it".
+namespace {
+
+struct MachoSectionRow {
+    std::string   segment;
+    std::string   name;
+    std::uint64_t addr   = 0;
+    std::uint64_t size   = 0;
+    std::uint32_t offset = 0;
+    std::uint32_t align  = 0;   // section_64.align — a LOG2 exponent
+    std::uint32_t nreloc = 0;
+    std::uint32_t flags  = 0;   // section_64.flags (S_REGULAR / S_ZEROFILL…)
+};
+
+[[nodiscard]] std::uint32_t readU32(std::string const& b, std::size_t off) {
+    if (off + 4 > b.size()) return 0;
+    return static_cast<std::uint32_t>(static_cast<unsigned char>(b[off]))
+         | (static_cast<std::uint32_t>(static_cast<unsigned char>(b[off + 1])) << 8)
+         | (static_cast<std::uint32_t>(static_cast<unsigned char>(b[off + 2])) << 16)
+         | (static_cast<std::uint32_t>(static_cast<unsigned char>(b[off + 3])) << 24);
+}
+
+[[nodiscard]] std::uint64_t readU64(std::string const& b, std::size_t off) {
+    return static_cast<std::uint64_t>(readU32(b, off))
+         | (static_cast<std::uint64_t>(readU32(b, off + 4)) << 32);
+}
+
+[[nodiscard]] std::string readName16(std::string const& b, std::size_t off) {
+    std::string s;
+    for (std::size_t i = 0; i < 16 && off + i < b.size(); ++i) {
+        if (b[off + i] == '\0') break;
+        s.push_back(b[off + i]);
+    }
+    return s;
+}
+
+// The first Mach-O member of an `ar` archive, or the whole file when it is
+// already a bare object. Empty on any structural surprise.
+[[nodiscard]] std::string unwrapArchiveMember(std::string const& raw) {
+    constexpr std::string_view kArMagic = "!<arch>\n";
+    if (raw.size() < kArMagic.size()
+        || raw.compare(0, kArMagic.size(), kArMagic) != 0) {
+        return raw;                       // already a bare Mach-O
+    }
+    std::size_t pos = kArMagic.size();
+    while (pos + 60 <= raw.size()) {
+        std::size_t const bodyOff = pos + 60;
+        std::size_t bodySize = 0;
+        try {
+            bodySize = static_cast<std::size_t>(
+                std::stoull(raw.substr(pos + 48, 10)));
+        } catch (...) {
+            return {};
+        }
+        if (bodyOff + bodySize > raw.size()) return {};
+        std::string body = raw.substr(bodyOff, bodySize);
+        if (body.size() >= 4 && readU32(body, 0) == 0xFEEDFACFu) return body;
+        pos = bodyOff + bodySize + (bodySize & 1u);   // members are 2-aligned
+    }
+    return {};
+}
+
+// Hand-rolled MH_OBJECT section_64 reader (an `ar` archive is unwrapped to its
+// first Mach-O member first). Returns EMPTY on any structural surprise so the
+// caller's own assertions report it — never a silent partial list that would
+// let a dropped section read as a pass.
+[[nodiscard]] std::vector<MachoSectionRow>
+readMachoSectionTable(fs::path const& p) {
+    std::ifstream in(p, std::ios::binary | std::ios::ate);
+    if (!in.good()) return {};
+    auto const size = static_cast<std::streamoff>(in.tellg());
+    std::string raw(static_cast<std::size_t>(size), '\0');
+    in.seekg(0);
+    in.read(raw.data(), size);
+    std::string const b = unwrapArchiveMember(raw);
+    if (b.size() < 32 || readU32(b, 0) != 0xFEEDFACFu) return {};  // MH_MAGIC_64
+
+    std::vector<MachoSectionRow> rows;
+    std::uint32_t const ncmds = readU32(b, 16);
+    std::size_t off = 32;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t const cmd     = readU32(b, off);
+        std::uint32_t const cmdsize = readU32(b, off + 4);
+        if (cmdsize == 0 || off + cmdsize > b.size()) return {};
+        if (cmd == 0x19u) {                       // LC_SEGMENT_64
+            std::uint32_t const nsects = readU32(b, off + 64);
+            std::size_t so = off + 72;
+            for (std::uint32_t s = 0; s < nsects; ++s) {
+                if (so + 80 > b.size()) return {};
+                MachoSectionRow r;
+                r.name    = readName16(b, so);
+                r.segment = readName16(b, so + 16);
+                r.addr    = readU64(b, so + 32);
+                r.size    = readU64(b, so + 40);
+                r.offset  = readU32(b, so + 48);
+                r.align   = readU32(b, so + 52);
+                r.nreloc  = readU32(b, so + 60);
+                r.flags   = readU32(b, so + 64);
+                rows.push_back(std::move(r));
+                so += 80;
+            }
+        }
+        off += cmdsize;
+    }
+    return rows;
+}
+
+// rodata + data + bss + relro in one TU, so no declared row is unexercised.
+constexpr char kEveryDataSectionSource[] =
+    "const char msg[] = \"hello from a mach-o data section\";\n"  // rodata
+    "int counter = 7;\n"                                          // data
+    "int zero_global;\n"                                          // bss
+    "static int backing = 3;\n"
+    "int *const p_backing = &backing;\n"                          // relro
+    "int alpha(void) { return 1; }\n"
+    "int beta(void)  { return 2; }\n"
+    "typedef int (*fn_t)(void);\n"
+    "static fn_t const table[2] = { alpha, beta };\n"             // relro
+    "int probe_sum(void) {\n"
+    "    return (int)msg[0] + counter + zero_global + *p_backing\n"
+    "         + table[0]() + table[1]();\n"
+    "}\n";
+
+}  // namespace
+
+TEST(Program_CompileFiles, MachORelocatableTiersPlaceEveryDeclaredDataSection) {
+    // Both x86_64 cells the anchor names — the bare `.o` and the `-staticlib`
+    // archive, which runs a SECOND writer (`ar`) over the same member — each
+    // with its arm64 sibling as the matched control.
+    struct Arm { char const* spec; char const* artifact; };
+    constexpr int kArms = 4;
+    Arm const arms[kArms] = {
+        {"x86_64:macho64-x86_64-darwin",           "datasections.o"},
+        {"arm64:macho64-arm64-darwin",             "datasections.o"},
+        {"x86_64:macho64-x86_64-darwin-staticlib", "datasections.a"},
+        {"arm64:macho64-arm64-darwin-staticlib",   "datasections.a"},
+    };
+    std::vector<MachoSectionRow> byArm[kArms];
+
+    for (int i = 0; i < kArms; ++i) {
+        ScratchDir scratch{Location::InsideRepo, "program"};
+        auto const src = writeCSubsetSource(scratch.path(), "datasections.c",
+                                            kEveryDataSectionSource);
+        scratch.useAsCwd();
+        auto const outDir = scratch.path() / "out";
+
+        Program prog;
+        prog.setOutputDir(outDir);
+        int const rc = prog.compileFiles({src.generic_string()}, "c-subset",
+                                         {arms[i].spec});
+        ASSERT_EQ(rc, 0)
+            << arms[i].spec
+            << ": a TU with a string literal and a global must COMPILE. Before "
+               "D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-ABSENT "
+               "closed, the x86_64 arms died here with K_NoMatchingObjectFormat "
+               "(section=rodata not advertised) while this same source built "
+               "on arm64 — a shipped format that could not serve its own tier.";
+        auto const artifact = outDir / arms[i].artifact;
+        ASSERT_TRUE(fs::exists(artifact)) << arms[i].spec;
+
+        byArm[i] = readMachoSectionTable(artifact);
+        ASSERT_FALSE(byArm[i].empty())
+            << arms[i].spec << ": no readable section_64 table in "
+            << arms[i].artifact
+            << " — not a 64-bit Mach-O, structurally short, or (for the "
+               "archive) no Mach-O member found";
+    }
+
+    // Every arm: the same five sections, in the same order, with the same
+    // Mach-O flags. Names/segments have no arch axis; a divergence is config.
+    for (int i = 0; i < kArms; ++i) {
+        auto const& rows = byArm[i];
+        char const* who = arms[i].spec;
+        ASSERT_EQ(rows.size(), 5u)
+            << who << ": expected __text + the four data sections; got "
+            << rows.size() << ". A missing row means the walker silently "
+                              "dropped a data kind instead of placing it.";
+
+        struct Want { char const* seg; char const* sec; std::uint32_t flags; };
+        Want const want[5] = {
+            {"__TEXT", "__text",  0x80000400u},  // PURE|SOME_INSTRUCTIONS
+            {"__TEXT", "__const", 0x00000000u},  // rodata, S_REGULAR
+            {"__DATA", "__data",  0x00000000u},  // data,   S_REGULAR
+            {"__DATA", "__const", 0x00000000u},  // relro,  S_REGULAR
+            {"__DATA", "__bss",   0x00000001u},  // bss,    S_ZEROFILL
+        };
+        for (std::size_t k = 0; k < 5; ++k) {
+            EXPECT_EQ(rows[k].segment, want[k].seg) << who << " row " << k;
+            EXPECT_EQ(rows[k].name,    want[k].sec) << who << " row " << k;
+            EXPECT_EQ(rows[k].flags,   want[k].flags)
+                << who << " (" << want[k].seg << "," << want[k].sec
+                << ") section_64.flags";
+        }
+
+        // The rodata row must hold the string literal's bytes, file-backed.
+        EXPECT_GE(rows[1].size, 33u)
+            << who << ": __TEXT,__const is too small to hold the 33-byte "
+                      "string literal — the literal did not land in rodata";
+        EXPECT_NE(rows[1].offset, 0u) << who << ": rodata must be file-backed";
+
+        // relro carries its OWN relocation_info table — the whole point of
+        // keeping it a distinct section on the relocatable tier. Three fixups:
+        // p_backing→backing and table[0..1]→alpha/beta.
+        EXPECT_EQ(rows[3].nreloc, 3u)
+            << who << ": __DATA,__const must carry the relro fixup table "
+                      "(p_backing + two function-pointer slots). Zero means "
+                      "the pointers were emitted with no relocation and would "
+                      "read as absolute garbage after ld64 laid the object out "
+                      "(D-LK-RELRO-CONST-DATA-RELOCATABLE).";
+
+        // S_ZEROFILL end to end: a real size, and NO file bytes.
+        EXPECT_GE(rows[4].size, 4u) << who << ": __DATA,__bss holds the int";
+        EXPECT_EQ(rows[4].offset, 0u)
+            << who << ": an S_ZEROFILL section must carry section_64.offset=0 "
+                      "— a non-zero offset means the walker wrote file bytes "
+                      "for a zero-fill section.";
+    }
+
+    for (int i = 1; i < kArms; ++i) {
+        for (std::size_t k = 0; k < byArm[0].size(); ++k) {
+            EXPECT_EQ(byArm[0][k].segment, byArm[i][k].segment)
+                << arms[i].spec << " row " << k;
+            EXPECT_EQ(byArm[0][k].name, byArm[i][k].name)
+                << arms[i].spec << " row " << k;
+            EXPECT_EQ(byArm[0][k].flags, byArm[i][k].flags)
+                << arms[i].spec << " row " << k
+                << ": this arm disagrees with macho64-x86_64-darwin about a "
+                   "section's identity. Mach-O segment/section names have no "
+                   "arch axis and an archive member IS a relocatable object, "
+                   "so all four arms must agree — a divergence here is a "
+                   "config defect, not an ABI one.";
+        }
+    }
+}
+
 // ── TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the SINGLE-CU definition rail ──
 //
 // ★ THIS TEST EXISTS BECAUSE THE CORPUS EXAMPLE CANNOT REACH THIS CODE PATH, AND
@@ -442,6 +707,147 @@ TEST(Program_CompileFiles, SingleCuAsmLabelReplacesTheMachOMangling) {
            "`myglobal`, and every __DARWIN_ALIAS header writes its own `_`)";
     EXPECT_EQ(data.find(std::string("_labelled_fn")), std::string::npos)
         << "the C identifier must NOT reach the object once a label renames it";
+}
+
+// ── TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the per-target ──────
+// ── link BASE name, end-to-end on the EMITTED BYTES, both arches ─────────────
+//
+// ★ THIS IS THE TEST WHOSE ABSENCE LET A SILENT MISBINDING SHIP. Darwin reaches
+// its modern 64-bit-inode ABI through `$INODE64` asm-label ALIASES on x86_64 and
+// through the PLAIN names on arm64 (`sys/cdefs.h`: `__DARWIN_ONLY_64_BIT_INO_T`
+// is 0 on x86_64, 1 on arm64). DSS declared the plain names, so an x86_64
+// Darwin build bound the LEGACY 32-bit-inode implementations while compiling the
+// MODERN 144-byte `struct stat` — the callee writes 120 bytes, `st_size` is read
+// at 96 and written at 72, `fstat` reports 0, and sqlite calls every database
+// "malformed". It never failed loud: a descriptor SHADOWS the SDK header
+// entirely, so the platform's own asm label never participates, and libSystem
+// exports BOTH spellings so the plain import resolves.
+//
+// GROUND TRUTH, MEASURED on real Darwin (macOS 26.5.2) with a MATCHED TWO-ARCH
+// CONTROL — one TU, only `-arch` differs, `cc -c` then `nm -u`:
+//   x86_64 → _stat$INODE64 _fstat$INODE64 _lstat$INODE64 _opendir$INODE64
+//            _readdir$INODE64   (and _closedir PLAIN)
+//   arm64  → _stat _fstat _lstat _opendir _readdir            (and _closedir)
+// These assertions reproduce exactly that, through DSS's own pipeline.
+//
+// BOTH ARMS ARE PINNED because the per-arch SPLIT is the property. A flat alias
+// would satisfy the x86_64 arm and be WRONG on arm64 — merely relocating the
+// defect — so an x86_64-only pin would be worse than none.
+//
+// ★ `_closedir` IS ASSERTED PLAIN ON BOTH ARMS, and that is not decoration: it
+// is the per-SYMBOL control proving the divergence belongs to individual
+// symbols, not to `<dirent.h>`. A "suffix everything in this header" fix goes
+// red here.
+//
+// RED-ON-DISABLE (MEASURED, by reverting and re-running): remove `linkName`
+// from `sys/stat.json`'s `fstat` row and the x86_64 object carries `_fstat`
+// instead of `_fstat$INODE64`, failing the first EXPECT_NE below. Drop
+// `ext.linkName` from the shipped-descriptor `HirExternRecord` producer in
+// `cst_to_hir.cpp` and BOTH `$INODE64` names vanish while arm64 stays green —
+// which is precisely the "it passed on the arch I tested" shape.
+namespace {
+
+// Compile `source` for `spec`, read the emitted artifact's bytes.
+[[nodiscard]] std::string
+compileAndReadArtifact(char const* scratchTag, char const* fileName,
+                       std::string const& source, char const* spec,
+                       char const* artifact) {
+    ScratchDir scratch{Location::InsideRepo, scratchTag};
+    auto const src = writeCSubsetSource(scratch.path(), fileName, source);
+    scratch.useAsCwd();
+    auto const outDir = scratch.path() / "out";
+    Program prog;
+    prog.setOutputDir(outDir);
+    int const rc =
+        prog.compileFiles({src.generic_string()}, "c-subset", {spec});
+    EXPECT_EQ(rc, 0) << "compile failed for " << spec;
+    auto const obj = outDir / artifact;
+    EXPECT_TRUE(fs::exists(obj)) << "no artifact at " << obj.generic_string();
+    if (!fs::exists(obj)) return {};
+    std::ifstream in(obj, std::ios::binary | std::ios::ate);
+    EXPECT_TRUE(in.good());
+    auto const size = static_cast<std::streamoff>(in.tellg());
+    std::string data(static_cast<std::size_t>(size), '\0');
+    in.seekg(0);
+    in.read(data.data(), size);
+    return data;
+}
+
+// The one TU both arms compile — references the five diverging symbols plus the
+// non-diverging `closedir` control. Deliberately a REAL `#include` of the
+// shipped descriptors, not a hand-written extern: the whole defect lives in the
+// descriptor rows, so a test that declared the externs itself would pin nothing.
+constexpr char const* kInode64Probe =
+    "#include <sys/stat.h>\n"
+    "#include <dirent.h>\n"
+    "int main(void) {\n"
+    "    struct stat st;\n"
+    "    DIR *d;\n"
+    "    if (fstat(0, &st) != 0) return 1;\n"
+    "    if (stat(\"/\", &st) != 0) return 2;\n"
+    "    if (lstat(\"/\", &st) != 0) return 3;\n"
+    "    d = opendir(\"/\");\n"
+    "    if (d == 0) return 4;\n"
+    "    if (readdir(d) == 0) return 5;\n"
+    "    return closedir(d);\n"
+    "}\n";
+
+}  // namespace
+
+TEST(Program_CompileFiles, MachOX86_64ShippedLinkNameEmitsInode64Aliases) {
+    std::string const data = compileAndReadArtifact(
+        "program", "inode64.c", kInode64Probe,
+        "x86_64:macho64-x86_64-darwin-exec", "inode64");
+    ASSERT_FALSE(data.empty());
+    for (char const* sym : {"fstat", "stat", "lstat", "opendir", "readdir"}) {
+        std::string const aliased = std::string("_") + sym + "$INODE64";
+        EXPECT_NE(data.find(aliased), std::string::npos)
+            << "x86_64-Darwin must import " << aliased
+            << " — the plain name binds the LEGACY 32-bit-inode callee, which "
+               "writes 120 of 144 bytes and reports st_size 0 (MEASURED)";
+    }
+    EXPECT_NE(data.find(std::string("_closedir")), std::string::npos)
+        << "closedir does NOT diverge per arch (MEASURED: `cc -arch x86_64` "
+           "emits the plain name) — the per-SYMBOL control";
+    EXPECT_EQ(data.find(std::string("__fstat$INODE64")), std::string::npos)
+        << "the descriptor declares the UNDECORATED base name and the ENGINE "
+           "composes the format's `_`; a config-side underscore would "
+           "double-decorate";
+}
+
+TEST(Program_CompileFiles, MachOArm64ShippedLinkNameKeepsThePlainNames) {
+    std::string const data = compileAndReadArtifact(
+        "program", "inode64.c", kInode64Probe,
+        "arm64:macho64-arm64-darwin-exec", "inode64");
+    ASSERT_FALSE(data.empty());
+    EXPECT_EQ(data.find(std::string("$INODE64")), std::string::npos)
+        << "arm64-Darwin has ONE inode ABI — no variant may match, and an alias "
+           "here would import a symbol libSystem's arm64 slice does not export";
+    for (char const* sym : {"_fstat", "_stat", "_lstat", "_opendir", "_readdir",
+                            "_closedir"}) {
+        EXPECT_NE(data.find(std::string(sym)), std::string::npos)
+            << "arm64-Darwin must import the plain " << sym
+            << " (the MATCHED CONTROL that must stay green)";
+    }
+}
+
+// The DEFAULT path on a format whose decoration is EMPTY: the same descriptor
+// rows, no variant matching, no underscore. This is the second half of "the
+// override path and the default path go through ONE decoration rule" — if the
+// `_` had been baked into config or composed in the semantic injector, elf
+// would carry it too.
+TEST(Program_CompileFiles, ElfShippedLinkNameDefaultsToTheBareIdentifier) {
+    std::string const data = compileAndReadArtifact(
+        "program", "inode64.c", kInode64Probe,
+        "x86_64:elf64-x86_64-linux-exec", "inode64");
+    ASSERT_FALSE(data.empty());
+    EXPECT_EQ(data.find(std::string("$INODE64")), std::string::npos)
+        << "no Linux symbol carries a Darwin inode alias";
+    EXPECT_EQ(data.find(std::string("_fstat")), std::string::npos)
+        << "ELF adds NO leading underscore — a `_fstat` here would mean the "
+           "decoration leaked out of the Mach-O rule";
+    EXPECT_NE(data.find(std::string("fstat")), std::string::npos)
+        << "the bare C identifier is the ELF import name";
 }
 
 // ── D-LK3-MACHO-ARM64-OBJECT: the arm64 sibling emits a real .o ──

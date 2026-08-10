@@ -26,6 +26,7 @@
 #include "link/object_format_schema.hpp"
 #include "link_test_support.hpp"
 #include "diagnostic_count.hpp"
+#include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 
 #include <gtest/gtest.h>
 
@@ -40,6 +41,10 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::countWithMessage;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -499,12 +504,21 @@ TEST(PeFormatJson, NonZeroVirtualAddressRejected) {
     // no-op. Added in LK1 cycle 2 alongside the new field.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe-va","kind":"pe"},
       "pe": { "machine": 34404 },
       "sections":[{"kind":"text","name":".text","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: pe.machine is valid, no optionalHeader
+    // is declared (so its own "must not declare" rule can't co-fire),
+    // and 'segment' is empty, so the non-zero virtualAddress on this
+    // (default) PE .obj row is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/virtualAddress"), 1u)
+        << rejectSummary(r);
 }
 
 // ── PE section with `segment` field rejected (cross-format check) ──
@@ -517,12 +531,19 @@ TEST(PeFormatJson, SegmentFieldRejectedOnPeSection) {
     // silently drop the PE arm (test-analyzer convergence).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe-seg","kind":"pe"},
       "pe": { "machine": 34404 },
       "sections":[{"kind":"text","name":".text","segment":"__TEXT","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: pe.machine is valid and virtualAddress
+    // defaults to 0 (satisfying the default PE .obj rule), so the
+    // non-empty 'segment' is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/segment"), 1u) << rejectSummary(r);
 }
 
 // ── pe.machine = 0 validate rejection ──────────────────────────
@@ -532,11 +553,17 @@ TEST(PeFormatJson, ZeroMachineRejectedByValidate) {
     // rejection so a regression that drops the rule ships loud.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe","kind":"pe"},
       "pe": { "machine": 0 }
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: no optionalHeader/sections declared, so
+    // pe.machine==0 is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/pe/machine"), 1u) << rejectSummary(r);
 }
 
 // ── PE relocation addend=non-zero fails loud ───────────────────
@@ -1304,6 +1331,33 @@ namespace {
     }
     return out;
 }
+
+// ★ THE ONE DOOR every EXEC-flavored byte-level writer test below uses to
+// reach `pe::encode`. D-LK10-ENTRY entry gate (`resolveEntryFnIdx`,
+// src/link/format/exec_reloc_apply.hpp): a format declaring `processExit`
+// has CONTRACTED that its image entry is the DSS-synthesized `_start`
+// trampoline, and ONLY `linker::link` injects one (entry_trampoline.cpp
+// sets `imageEntryOverride = 0` on every injection). Reaching the walker
+// with neither is now K_FormatLacksProcessExit instead of a silent
+// functions[0] default.
+//
+// These tests drive the walker DIRECTLY on purpose — they pin emitted
+// BYTES, not the trampoline. Stamping the override says so out loud;
+// semantically it is a no-op (index 0 is exactly what the pre-gate default
+// produced implicitly), it just makes the choice DECLARED rather than
+// assumed. Funnelled through one helper because ~40 call sites are 40
+// chances to miss one. The DLL arm and the .obj arm deliberately do NOT
+// come through here: a dll module carrying an override is itself a
+// fail-loud case (pe.cpp's `isDll` branch), and .obj resolves no entry.
+[[nodiscard]] std::vector<std::uint8_t>
+encodeUntrampolined(AssembledModule           mod,  // by value: stamped copy
+                    TargetSchema const&       target,
+                    ObjectFormatSchema const& fmt,
+                    DiagnosticReporter&       reporter,
+                    ImageRequest const&       request = {}) {
+    mod.imageEntryOverride = std::size_t{0};
+    return pe::encode(mod, target, fmt, reporter, request);
+}
 } // namespace
 
 TEST(PeExecFormatJson, ShippedFileLoadsCleanly) {
@@ -1389,7 +1443,7 @@ TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
         ExternImport{SymbolId{99}, "puts", "msvcrt.dll"});
 
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(img.empty());
@@ -1477,7 +1531,7 @@ TEST(PeExecWriter, DataExternBindsToIatSlotInIdataNotTextThunk) {
     mod.externImports.push_back(std::move(dataExt));
 
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u)
         << "the data-import gate must admit the declared got-indirect "
@@ -1576,7 +1630,7 @@ TEST(PeExecWriter, MixedFunctionAndDataExternsThunkForFunctionSlotForData) {
     mod.externImports.push_back(std::move(dataExt));
 
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(img.empty());
@@ -1664,10 +1718,15 @@ TEST(PeExecWriter, DataExternUnderForeignDataImportBindingFailsLoud) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-exec-foreign-data-binding","kind":"pe"},
       "externCallDispatch": "direct-plt",
       "dataImportBinding": "copy-relocation",
+      "$entryClusterComment": "D-LK10-ENTRY: validate() now REJECTS an exec-flavored format that declares no processExit, so a synthetic pe-exec schema must carry the pair. Values copied verbatim from the shipped pe64-x86_64-windows-exec.format.json; inert here (the walker is driven directly, no trampoline) but required to load.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
@@ -1686,7 +1745,7 @@ TEST(PeExecWriter, DataExternUnderForeignDataImportBindingFailsLoud) {
     dataExt.isData = true;
     mod.externImports.push_back(std::move(dataExt));
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, **target, **fmt, rep);
+    auto img = encodeUntrampolined(mod, **target, **fmt, rep);
     EXPECT_TRUE(img.empty());
     EXPECT_GE(::dss::test_support::countCode(
                   rep, DiagnosticCode::K_FormatLacksImportSupport),
@@ -1777,7 +1836,7 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);   // the FPR save no longer fails loud
     ASSERT_FALSE(img.empty());
@@ -1864,7 +1923,7 @@ TEST(PeExecWriter, FunctionUnwindInfoStackProbePrologueUsesFixedAllocLen) {
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
 
@@ -1957,7 +2016,7 @@ TEST(PeExecWriter, SehScopeTableEmitsEhandlerFlagAndScopeRecord) {
                      /*isData=*/false});
 
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(img.empty());
@@ -2045,7 +2104,7 @@ TEST(PeExecWriter, SehGuardingFunctionSavingNonVolatileXmmFailsLoud) {
                      /*isData=*/false});
 
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_GT(rep.errorCount(), 0u)
         << "a SEH-guarding function saving a non-volatile xmm must fail loud "
            "(D-WIN64-XMM-UNWIND-RESTORE), not silently omit its restore";
@@ -2055,7 +2114,7 @@ TEST(PeExecWriter, DosHeaderMzSignature) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_GE(bytes.size(), 0x40u);
     EXPECT_EQ(bytes[0], 'M');
@@ -2068,7 +2127,7 @@ TEST(PeExecWriter, PeSignatureAtZero80) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_GE(bytes.size(), 0x84u);
     EXPECT_EQ(bytes[0x80], 'P');
@@ -2081,7 +2140,7 @@ TEST(PeExecWriter, OptionalHeaderFieldsByteForByte) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // IMAGE_FILE_HEADER at 0x84:
@@ -2139,7 +2198,7 @@ TEST(PeExecWriter, IntraModuleRel32CallAppliedByteForByte) {
     mod.functions.push_back(std::move(f1));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // Locate .text file offset from IMAGE_SECTION_HEADER at 0x188
@@ -2187,7 +2246,7 @@ TEST(PeExecWriter, Abs64RodataSlotEmitsDir64BaseRelocation) {
     mod.dataItems.push_back(std::move(slot));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     constexpr std::uint64_t kImageBase = 0x140000000ull;
@@ -2258,7 +2317,7 @@ TEST(PeExecWriter, RelRoConstSlotFoldsIntoRdataAndEmitsDir64BaseReloc) {
     mod.dataItems.push_back(std::move(slot));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a relro item must NOT fail loud in a PE exec image";
 
@@ -2328,7 +2387,7 @@ TEST(PeExecTls, ThreadLocalEmitsTlsDirectorySectionAndIndex) {
     mod.dataItems.push_back(makeTbssItem(43, 4, 4));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -2419,7 +2478,7 @@ TEST(PeExecTls, SecrelPatchedIntoFunctionRelocIsPositiveTemplateOffset) {
     mod.dataItems.push_back(makeTbssItem(43, 4, 4));             // counter @ 4
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto const text = findExecSection(bytes, {'.', 't', 'e', 'x', 't', 0, 0, 0});
     ASSERT_NE(text.first, 0u);
@@ -2454,7 +2513,7 @@ TEST(PeExecTls, DataItemRelocTargetingTlsSymbolFailsLoud) {
     mod.dataItems.push_back(std::move(p));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool saw = false;
     for (auto const& diag : rep.all())
@@ -2486,7 +2545,7 @@ TEST(PeExecTls, FunctionTlsKindRelocTargetingNonTlsSymbolFailsLoud) {
     mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool saw = false;
     for (auto const& diag : rep.all())
@@ -2514,7 +2573,7 @@ TEST(PeExecTls, OveralignedThreadLocalFailsLoud) {
     mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 32));  // _Alignas(32)
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool saw = false;
     for (auto const& diag : rep.all())
@@ -2541,10 +2600,14 @@ TEST(PeExecTls, SixteenByteAlignedThreadLocalCompilesClean) {
     mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 16));  // _Alignas(16)
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_EQ(rep.errorCount(), 0u)
         << "16-byte alignment == the PE x64 TLS block-base guarantee — clean";
-    EXPECT_FALSE(bytes.empty());
+    // FATAL, not EXPECT: `findExecSection` below indexes the buffer at 0x86
+    // through an unchecked `std::span::operator[]`, so a non-fatal guard let
+    // an empty `bytes` run straight into UB — MEASURED as a SEGV that killed
+    // the binary after 83 of 97 tests and hid the 14 that follow.
+    ASSERT_FALSE(bytes.empty());
     auto const tls = findExecSection(bytes, {'.', 't', 'l', 's', 0, 0, 0, 0});
     EXPECT_NE(tls.first, 0u) << ".tls still emitted for the 16-aligned var";
 }
@@ -2563,7 +2626,7 @@ TEST(PeExecWriter, ExternTargetFailsLoudAsUndefined) {
     fn.relocations.push_back(rel);
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
@@ -2572,39 +2635,102 @@ TEST(PeExecWriter, ExternTargetFailsLoudAsUndefined) {
     EXPECT_TRUE(sawCode);
 }
 
+// ── PE32+ exec negative-load pins ───────────────────────────────
+//
+// Each fixture below carries exactly ONE deliberate defect and asserts
+// THAT diagnostic — never a bare `ASSERT_FALSE(r.has_value())`.
+//
+// Two properties make the bare form unsafe here. `validate()`
+// ACCUMULATES diagnostics (no early return before its `return
+// problems;`), and `loadFromText` rejects when ANY accumulated
+// diagnostic is an error — so the moment a NEW load rule starts
+// rejecting a fixture, the bare assertion keeps passing while the rule
+// the test exists to pin can be deleted outright. That already happened
+// once: D-LK10-ENTRY 2.13 ("an exec-flavored format MUST declare
+// `processExit`") emptied this entire family in place, silently, with
+// the suite still green.
+//
+// So each fixture declares the entry cluster (`processExit` +
+// `entryCallingConvention`) AND `pe.characteristics` = 34, all copied
+// VERBATIM from the shipped pe64-x86_64-windows-exec.format.json —
+// closing the two rejection reasons that are NOT the defect under test.
+// And each asserts `countAtPath` on the rule's own JSON pointer plus
+// `countAtPath(r, "/processExit") == 0`, the anti-subsumption half that
+// goes red if the entry-cluster reason ever comes back.
 TEST(PeExecFormatJsonValidate, MissingImageBaseRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe-exec","kind":"pe"},
-      "pe": { "machine": 34404, "type": "exec" },
+      "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/optionalHeader/imageBase"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(PeExecFormatJsonValidate, ObjWithOptionalHeaderRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"obj-with-opt-hdr","kind":"pe"},
       "pe": { "machine": 34404, "type": "obj" },
       "optionalHeader": { "magic": 523 }
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: pe.machine is valid and no sections are
+    // declared, so the optionalHeader-on-.obj rule is the only
+    // diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/optionalHeader"), 1u) << rejectSummary(r);
 }
 
 TEST(PeExecFormatJsonValidate, NonPow2SectionAlignmentRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"odd-align","kind":"pe"},
-      "pe": { "machine": 34404, "type": "exec" },
+      "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 3000, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 3 reasons, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    // THREE, all consequences of the one value: 3000 is not a power
+    // of two, is below the 4096 page floor, and does not divide the
+    // 0x1000 .text RVA. Nothing unrelated to sectionAlignment fires.
+    EXPECT_EQ(errorCount(r), 3u) << rejectSummary(r);
+    // TWO of those three land at this pointer (power-of-two + page
+    // floor), so `GE` here; the message pin names the one this test
+    // exists for.
+    EXPECT_GE(countAtPath(r, "/optionalHeader/sectionAlignment"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "must be a positive power-of-two"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 // ── New tests folded from 7-agent review of LK2 cycle 2 ────────
@@ -2615,49 +2741,115 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentBelowPageSizeRejected) {
     // rejects sub-page alignment with STATUS_INVALID_IMAGE_FORMAT.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"sub-page","kind":"pe"},
-      "pe": { "machine": 34404, "type": "exec" },
+      "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 512, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    // 512 IS a power of two -- the sole defect is the sub-page value, so
+    // exactly one diagnostic lands here. The message pin separates it
+    // from the power-of-two rule that shares this pointer.
+    EXPECT_EQ(countAtPath(r, "/optionalHeader/sectionAlignment"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "must be >= 4096 (page size)"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(PeExecFormatJsonValidate, MissingSubsystemRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"no-subsystem","kind":"pe"},
-      "pe": { "machine": 34404, "type": "exec" },
+      "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/optionalHeader/subsystem"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(PeExecFormatJsonValidate, MissingStackHeapSizesRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"no-stack","kind":"pe"},
-      "pe": { "machine": 34404, "type": "exec" },
+      "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    // This rule reports at the BLOCK pointer `/optionalHeader` (one
+    // diagnostic naming all four fields), so the message pin is what
+    // distinguishes it from every `/optionalHeader/<field>` sibling that
+    // `countAtPath`'s substring match would also count.
+    EXPECT_EQ(countAtPath(r, "/optionalHeader"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "requires non-zero sizeOfStackReserve"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(PeExecFormatJsonValidate, SectionAlignmentLessThanFileAlignmentRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"sect-lt-file","kind":"pe"},
-      "pe": { "machine": 34404, "type": "exec" },
+      "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 8192, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/optionalHeader/sectionAlignment"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(
+                  r, "sectionAlignment (4096) >= fileAlignment (8192)"),
+              1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(PeExecFormatJsonValidate, VirtualAddressNotMultipleOfSectionAlignmentRejected) {
@@ -2665,13 +2857,29 @@ TEST(PeExecFormatJsonValidate, VirtualAddressNotMultipleOfSectionAlignmentReject
     // of sectionAlignment per PE/COFF §3.4.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"misaligned-va","kind":"pe"},
-      "pe": { "machine": 34404, "type": "exec" },
+      "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4097}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/virtualAddress"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "must be a multiple of 'sectionAlignment'"),
+              1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(PeExecWriter, DllArmEncodesEntrylessImage) {
@@ -2686,7 +2894,9 @@ TEST(PeExecWriter, DllArmEncodesEntrylessImage) {
     // non-empty image with AddressOfEntryPoint == 0.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"a-dll","kind":"pe"},
       "pe": { "machine": 34404, "characteristics": 8226, "type": "dll" },
       "optionalHeader": { "magic": 523, "imageBase": 6442450944, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 2, "dllCharacteristics": 352, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2715,7 +2925,7 @@ TEST(PeExecWriter, EmptyTextFailsLoud) {
     // bytes intentionally empty
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     EXPECT_GT(rep.errorCount(), 0u);
 }
@@ -2738,7 +2948,7 @@ TEST(PeExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
     f1.bytes  = {0xC3, 0xC3, 0xC3, 0xC3};
     mod.functions.push_back(std::move(f1));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
@@ -2756,7 +2966,7 @@ TEST(PeExecWriter, LoadBearingOptionalHeaderFieldsPinnedByteForByte) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Per PE/COFF §3.4 (PE32+ optional header layout):
     //   [0xD0] SizeOfImage (u32) — must be ≥ secText.RVA + textVS.
@@ -2799,7 +3009,7 @@ TEST(PeExecWriter, DisplacementOverflowFailsLoud) {
     fn.relocations.push_back(rel);
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
@@ -2842,7 +3052,7 @@ TEST(PeExecWriter, ExternImportProducesIDataSectionAndPatchesReloc) {
     AssembledModule mod = makeModuleWithOneExtern(
         {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3}, 1, 99, 1);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -2905,7 +3115,7 @@ TEST(PeExecWriter, IDataContainsExitProcessNameAndKernel32DllName) {
     AssembledModule mod = makeModuleWithOneExtern(
         {0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     constexpr std::size_t kSecondSecHdr = 0x188 + 40;
     std::uint32_t const idataFileOff =
@@ -2925,7 +3135,7 @@ TEST(PeExecWriter, NoExternImportsEmitsSingleSection) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(readU16LE(bytes, 0x86), 1u);
     EXPECT_EQ(readU32LE(bytes, 0x110), 0u);
@@ -2941,7 +3151,7 @@ TEST(PeExecWriter, IltAndIatHoldIdenticalThunksAtFileImageTime) {
     AssembledModule mod = makeModuleWithOneExtern(
         {0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Read ImageImportDescriptor[0] @ idata + 0:
     //   OriginalFirstThunk (ILT RVA) @ +0
@@ -2990,7 +3200,7 @@ TEST(PeExecWriter, MultipleExternsInOneLibraryProduceDistinctIatSlots) {
     mod.externImports.push_back(
         ExternImport{SymbolId{11}, "GetStdHandle", "kernel32.dll"});
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(readU16LE(bytes, 0x86), 2u);
     // 1 lib + null terminator descriptor = 2 × 20 = 40
@@ -3034,7 +3244,7 @@ TEST(PeExecWriter, MultipleLibrariesEachWithOneExtern) {
     mod.externImports.push_back(
         ExternImport{SymbolId{11}, "printf",      "msvcrt.dll"});
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // 2 libs + null terminator = 3 × 20 = 60
     EXPECT_EQ(readU32LE(bytes, 0x114), 60u);
@@ -3085,7 +3295,7 @@ TEST(PeExecWriter, MixedExternAndIntraModuleCallInOneFunction) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "ExitProcess", "kernel32.dll"});
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Intra-call: from text @ +1 to fn[1] @ +11 (fn[0] is 11 bytes).
     // value = 11 - 1 - 4 = 6.
@@ -3253,9 +3463,14 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"elf-lazy-gate","kind":"elf"},
       "entryPoint": "",
+      "$entryClusterComment": "D-LK10-ENTRY: an ELF ET_EXEC schema is exec-flavored, and validate() now REJECTS an exec-flavored format declaring no processExit -- without this pair the schema no longer LOADS and this test dies at its ASSERT_TRUE(fmt.has_value()) before it can exercise the bindNow=false walker gate at all. Values copied verbatim from the shipped elf64-x86_64-linux-exec.format.json. The link path DOES build a trampoline from them; the walker still fails loud on bindNow=false, which is what this test pins.",
+      "processExit": { "mechanism": "by-name-import", "importMangledName": "exit", "importLibraryPath": "libc.so.6" },
+      "entryCallingConvention": "sysv_amd64",
       "elf": {
         "class":"elf64","data":"lsb","machine":62,"type":"exec",
         "pageAlign":4096,
@@ -3319,7 +3534,7 @@ TEST(PeExecWriter, RodataSectionEmittedWhenDataItemsNonEmpty) {
     d.alignment = Alignment::of<1>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // NumberOfSections at IMAGE_FILE_HEADER offset 0x86: 2 sections
     // (.text + .rdata; no .idata since externImports empty).
@@ -3370,7 +3585,7 @@ TEST(PeExecWriter, RodataAndIdataCoexistInCorrectOrder) {
     d.bytes   = {'x'};
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // 3 sections.
     EXPECT_EQ(readU16LE(bytes, 0x86), 3u);
@@ -3415,7 +3630,7 @@ TEST(PeExecWriter, MultipleRodataItemsLayWithAlignmentPadding) {
     b.alignment = Alignment::of<8>();
     mod.dataItems.push_back(std::move(b));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     constexpr std::size_t kSecHdrTable = 0x188;
     constexpr std::size_t kSecHdrSize  = 40;
@@ -3444,7 +3659,7 @@ TEST(PeExecWriter, NoRodataItemsEmitsNoRdataSection) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Single section (.text only).
     EXPECT_EQ(readU16LE(bytes, 0x86), 1u);
@@ -3509,9 +3724,27 @@ TEST(LinkerEndToEnd, ElfAcceptsRodataDataItemsAfterD_LK1_ELF_EXEC_DATA_SECTIONS)
            "D-LK1-ELF-EXEC-DATA-SECTIONS has closed";
 }
 
-TEST(LinkerEndToEnd, MachORejectsDataItemsUntilD_LK3_RODATA) {
-    // Parallel to the ELF test — Mach-O declares no
-    // `supportedDataSections`; D-LK3-RODATA still anchored.
+// FLIPPED 2026-08-05 — was `MachORejectsDataItemsUntilD_LK3_RODATA`,
+// the negative twin of the ELF test above, whose whole content was
+// "Mach-O declares no `supportedDataSections`; D-LK3-RODATA still
+// anchored". D-LK3-RODATA IS NOW CLOSED FOR BOTH DARWIN EXEC FORMATS:
+// `macho64-arm64-darwin-exec` closed it (runtime-witnessed on Apple
+// Silicon) and `macho64-x86_64-darwin-exec` joined it on 2026-08-05
+// with the rest of its runnable-CLI key set. The walker arm is the
+// SAME shared `exec_data_section.hpp` substrate the ELF arm uses.
+//
+// So this becomes the POSITIVE pin its ELF twin already is, asserted
+// just as strictly and in the same shape — not deleted, not softened:
+// every assertion below is the exact mirror of
+// `ElfAcceptsRodataDataItemsAfterD_LK1_ELF_EXEC_DATA_SECTIONS`, and
+// each one goes red if the format JSON's `supportedDataSections` row
+// or its `__TEXT,__const` `sections[]` row is removed without
+// re-anchoring the walker arm. The sweep in
+// `AsmSubstrate.ShippedExecFormatsRodataSectionPerWalkerArm` covers
+// the CONFIG half across every shipped exec format; this covers the
+// END-TO-END half for Mach-O — that a rodata item survives the
+// linker's gate and reaches a walker that links it cleanly.
+TEST(LinkerEndToEnd, MachOAcceptsRodataDataItemsAfterD_LK3_RODATA) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped(
@@ -3520,15 +3753,20 @@ TEST(LinkerEndToEnd, MachORejectsDataItemsUntilD_LK3_RODATA) {
     DiagnosticReporter rep;
     LinkedImage img =
         runLinkerWithRodataItem(**target, **fmt, rep);
-    EXPECT_FALSE(img.ok());
-    EXPECT_EQ(::dss::test_support::countCode(rep,
-                  DiagnosticCode::K_NoMatchingObjectFormat),
-              1u);
-    EXPECT_EQ(img.resolvedFuncCount, 0u);
-    EXPECT_FALSE((**fmt).acceptsDataSection(
+    EXPECT_TRUE(img.ok())
+        << "Mach-O exec must now accept a Rodata dataItem end-to-end "
+           "(D-LK3-RODATA)";
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // resolvedFuncCount == 2: the user `ret` function PLUS the
+    // synthetic `_start` trampoline the linker prepends for exec
+    // images (D-LK10-ENTRY Slice C) — the same count the ELF twin
+    // pins, and the marker of a clean link vs the pre-close
+    // rejection at 0.
+    EXPECT_EQ(img.resolvedFuncCount, 2u);
+    EXPECT_TRUE((**fmt).acceptsDataSection(
         DataSectionKind::Rodata))
-        << "Mach-O exec format JSON must not advertise rodata "
-           "until D-LK3-RODATA closes";
+        << "Mach-O exec format JSON must advertise rodata now that "
+           "D-LK3-RODATA has closed";
 }
 
 // D-LK4-DATA-PRODUCER writer pin (was RejectsDataKindDataItem… — flipped when
@@ -3546,7 +3784,7 @@ TEST(PeExecWriter, DataSectionEmittedWritable) {
     d.alignment = Alignment::of<4>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "PE writer must ACCEPT a Data item now that D-LK4-DATA-PRODUCER "
            "closed (it was fail-loud before)";
@@ -3590,7 +3828,7 @@ TEST(PeExecWriter, BssSectionEmittedNobitsWritable) {
     d.alignment    = Alignment::of<4>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "PE writer must ACCEPT a Bss item now that D-LK4-DATA-PRODUCER closed";
     ASSERT_FALSE(bytes.empty());
@@ -3625,7 +3863,9 @@ TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
     char const* const kJson = R"({
       "$comment": "Synthetic PE-Exec schema for D-LK2-RODATA require-section test — declares rodata capability but omits the section row.",
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name": "pe-exec-rodata-no-row", "version": "1.0", "kind": "pe"},
       "entryPoint": "",
       "processExit": {"mechanism": "by-name-import", "importLibraryPath": "kernel32.dll", "importMangledName": "ExitProcess"},
@@ -3667,7 +3907,7 @@ TEST(PeExecWriter, SizeOfInitializedDataSumsRdataAndIdata) {
     d.bytes   = {'x'};
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // OH64 starts at file-offset 0x98 (DOS 64 + stub 64 + PE sig 4
     // + file hdr 20 = 152 = 0x98); SizeOfInitializedData is at +8.
@@ -3688,7 +3928,7 @@ TEST(PeExecWriter, SizeOfImageReflectsRdataExtentInRodataOnlyArm) {
     d.bytes   = {'x'};
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // SizeOfImage field at OH64+56 (per the existing
     // LoadBearingOptionalHeaderFieldsPinnedByteForByte test).
@@ -3711,7 +3951,9 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
     char const* const kJson = R"({
       "$comment": "Synthetic PE-Exec schema for D-LK2-RODATA cert-table-shift test — declares non-zero attributeCertReserveSize so the walker computes cert table offset past rdata+idata.",
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name": "pe-exec-cert-shift", "version": "1.0", "kind": "pe"},
       "entryPoint": "",
       "processExit": {"mechanism": "by-name-import", "importLibraryPath": "kernel32.dll", "importMangledName": "ExitProcess"},
@@ -3739,7 +3981,7 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
     d.bytes   = {'x'};
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Data directory base in OH64: per PE §3.4 the directories
     // sit at offset 112 from OH64 start. Cert is entry 4 → +32.

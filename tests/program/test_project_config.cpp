@@ -347,8 +347,12 @@ TEST(ProjectConfigLoader, FlagArraysPopulatedParseExactly) {
     EXPECT_EQ(pc->defines[0], "NDEBUG");
     EXPECT_EQ(pc->defines[1], "MAX=64");
     ASSERT_EQ(pc->resolveLibraries.size(), 2u);
-    EXPECT_EQ(pc->resolveLibraries[0], "libfoo.so");
-    EXPECT_EQ(pc->resolveLibraries[1], "libbar.a");
+    EXPECT_EQ(pc->resolveLibraries[0].path, "libfoo.so");
+    EXPECT_EQ(pc->resolveLibraries[1].path, "libbar.a");
+    // D-FFI-DECLARED-IMPORT-NAME: a PLAIN string entry states NOTHING — the
+    // byte-for-byte pre-existing meaning every shipped manifest relies on.
+    EXPECT_TRUE(pc->resolveLibraries[0].declaredImportName.empty());
+    EXPECT_TRUE(pc->resolveLibraries[1].declaredImportName.empty());
 }
 
 // Each field ABSENT → empty vector (the default; no error).
@@ -420,6 +424,128 @@ TEST(ProjectConfigLoader, NonArrayResolveLibrariesFailsLoud) {
     auto pc = parseProjectConfig(R"({
       "language": "c-subset", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "resolveLibraries": 42
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+// ── D-FFI-DECLARED-IMPORT-NAME: the extended `resolveLibraries` entry ────────
+//
+// Each entry is EITHER a plain path string (nothing stated) OR an object
+// `{"path", "importName"}` that additionally STATES the runtime identity to
+// record — the manifest spelling of the CLI's `<path>=<import-name>` suffix,
+// and (having no separator character) the escape hatch for a path containing
+// `=`. The two forms MIX freely in one array.
+
+TEST(ProjectConfigLoader, ResolveLibrariesMixedPlainAndExtendedEntriesParse) {
+    // The plain form must survive BYTE-FOR-BYTE alongside the new object form
+    // — many shipped manifests are all-plain, and a loader that only accepted
+    // one shape (or that quietly rewrote the other) would break them.
+    // RED-ON-DISABLE: revert the entry reader to the plain-string-only helper
+    // and the object entry fails C_MalformedJson instead of parsing.
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["arm64:macho64-arm64-darwin-exec"], "sources": ["main.c"],
+      "resolveLibraries": [
+        "libplain.so",
+        {"path": "/opt/local/lib/libtcl8.6.dylib",
+         "importName": "@rpath/libtcl8.6.dylib"},
+        {"path": "/weird/dir=name/libz.dylib", "importName": "/usr/lib/libz.1.dylib"}
+      ]
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(pc->resolveLibraries.size(), 3u);
+
+    EXPECT_EQ(pc->resolveLibraries[0].path, "libplain.so");
+    EXPECT_TRUE(pc->resolveLibraries[0].declaredImportName.empty())
+        << "a plain string states NOTHING";
+
+    EXPECT_EQ(pc->resolveLibraries[1].path, "/opt/local/lib/libtcl8.6.dylib");
+    EXPECT_EQ(pc->resolveLibraries[1].declaredImportName,
+              "@rpath/libtcl8.6.dylib");
+
+    // The object form has no separator, so a path containing `=` round-trips
+    // intact — the very case the CLI's last-`=` split cannot express.
+    EXPECT_EQ(pc->resolveLibraries[2].path, "/weird/dir=name/libz.dylib");
+    EXPECT_EQ(pc->resolveLibraries[2].declaredImportName, "/usr/lib/libz.1.dylib");
+}
+
+TEST(ProjectConfigLoader, ResolveLibrariesExtendedEntryMissingImportNameFailsLoud) {
+    // The object form exists SOLELY to state an identity, so an object without
+    // one is a typo or noise and the plain string says it better. One spelling
+    // per meaning — the degenerate variant rejects rather than aliasing.
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "resolveLibraries": [{"path": "libfoo.so"}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+TEST(ProjectConfigLoader, ResolveLibrariesExtendedEntryMissingPathFailsLoud) {
+    // An identity for NO file reads no export surface at all.
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "resolveLibraries": [{"importName": "libfoo.so.1"}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+TEST(ProjectConfigLoader, ResolveLibrariesExtendedEntryEmptyMemberFailsLoud) {
+    // An EMPTY importName would record a DT_NEEDED / LC_LOAD_DYLIB the loader
+    // can never resolve: a link that succeeds and an artifact that dies at
+    // load. Same rule as the plain form's empty-string reject.
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "resolveLibraries": [{"path": "libfoo.so", "importName": ""}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+TEST(ProjectConfigLoader, ResolveLibrariesExtendedEntryUnknownMemberFailsLoud) {
+    // Same rule + same rationale as the top-level unknown-key gate: a mistyped
+    // `"importname"` would otherwise SILENTLY DROP the identity the entry
+    // exists to state, and the build would link against the stand-in's own
+    // embedded soname with no diagnostic at all.
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "resolveLibraries": [{"path": "libfoo.so", "importname": "libfoo.so.1"}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+TEST(ProjectConfigLoader, ResolveLibrariesNonStringNonObjectEntryFailsLoud) {
+    // Neither shape ⇒ reject. Never a silent skip of the entry.
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "resolveLibraries": [42]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+}
+
+TEST(ProjectConfigLoader, ResolveLibrariesEmptyPlainStringEntryFailsLoud) {
+    // The plain form's own degenerate case, unchanged by the extension.
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "resolveLibraries": [""]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
     EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);

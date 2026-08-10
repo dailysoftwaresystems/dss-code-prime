@@ -1,6 +1,20 @@
 # Linker unit tests (plan 14 LK4 substrate).
 
 dss_add_test(NAME link/test_object_format_schema SOURCES test_object_format_schema.cpp)
+
+# D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN — the per-format C-symbol decoration
+# axis (`cSymbolDecoration`), given its own file the way the sibling
+# `headerNameMatching` axis has `tests/core/test_header_name_matching.cpp`:
+# the closed vocabulary + its non-nameable sentinel, the loader's REQUIRED
+# rule, the loader-BYPASSING `validate()` rule (which no JSON-fed test can
+# cover), the unconditional-across-every-flavor proof, and the
+# enumerated-from-disk sweep over all 24 shipped formats.
+dss_add_test(NAME link/test_c_symbol_decoration  SOURCES test_c_symbol_decoration.cpp)
+# Parses a shipped `.format.json` directly so its "shipped file MINUS exactly one
+# key" fixture is copied VERBATIM and cannot drift from the real file — hence the
+# json link (the `ffi/test_shipped_type_consistency` precedent).
+target_link_libraries(dss_link_test_c_symbol_decoration
+                      PRIVATE nlohmann_json::nlohmann_json)
 dss_add_test(NAME link/test_linker               SOURCES test_linker.cpp)
 # Cycle 24 — the pure cross-CU DEFINITION resolver tripwire (shared by the linker
 # today + a future whole-program MIR merge). Direct value-in/value-out policy pins.
@@ -148,3 +162,40 @@ dss_add_test(NAME link/test_macho_object_reader SOURCES test_macho_object_reader
 # nativeId, out-of-range SymbolTableIndex, out-of-range SectionNumber), non-PE
 # schema fail-loud, and the DTYPE_FUNCTION extern isData inference.
 dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)
+
+# D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED: the
+# cross-format dependency-table pin. ONE two-library import set through the
+# ELF, PE, and Mach-O writers; each format's real dependency table (DT_NEEDED
+# / IMAGE_IMPORT_DESCRIPTOR.Name / LC_LOAD_DYLIB) is parsed back out of the
+# emitted bytes and must name EVERY resolved library. The defect it guards
+# survived because nothing compared the three writers on shared input.
+dss_add_test(NAME link/test_image_library_deps
+             SOURCES test_image_library_deps.cpp)
+
+# D-FORMAT-MACHO-X86_64-STATICLIB-DECLARES-NO-EXTERN-CALL-DISPATCH — the CLASS,
+# not the instance. Groups the 24 shipped `.format.json` files into families by
+# stripping the ARCH token, then diffs each arm's declared ROOT-KEY SET against
+# its siblings: an asymmetry must be justified at the site by a
+# `$absentKeyRationale` entry, AND every such entry must still correspond to a
+# real absence (both directions fail loud, so the table can neither be skipped
+# nor rot). Three gaps of this exact shape shipped in three cycles because
+# nothing ever compared a format against its own siblings; applying the method
+# by hand found a fourth. Reads the JSON directly — the whole subject is which
+# keys are DECLARED, which the loaded schema object can no longer tell you —
+# hence the json link (the `test_c_symbol_decoration` precedent).
+dss_add_test(NAME link/test_object_format_family_symmetry
+             SOURCES test_object_format_family_symmetry.cpp)
+target_link_libraries(dss_link_test_object_format_family_symmetry
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES (TF-C125) — the
+# backend seam. Fail-closed resolution FIRST (a null backend that meant "skip
+# the rules" would let all 24 formats validate clean while validating nothing),
+# then a whole-family MUTATION PROBE: break each required identity field of each
+# shipped format and demand a reject at that exact JSON pointer. Reads the
+# shipped `.format.json` files and mutates them in memory, so the fixtures
+# cannot drift from what we ship — hence the json link.
+dss_add_test(NAME link/test_object_format_backend_registry
+             SOURCES test_object_format_backend_registry.cpp)
+target_link_libraries(dss_link_test_object_format_backend_registry
+                      PRIVATE nlohmann_json::nlohmann_json)

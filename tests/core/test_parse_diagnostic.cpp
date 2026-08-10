@@ -2,6 +2,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <format>
+#include <string>
+#include <string_view>
+
 using dss::diagnosticCodeName;
 using dss::diagnosticCodePrefix;
 using dss::DiagnosticCode;
@@ -53,6 +58,95 @@ TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::H_TypeUnresolved),   "H0001");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::H_InvalidBreak),     "H0002");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::H_VerifierFailure),  "H0003");
+    // X_* prefix; the 0x2 high nibble renders as 'X' and is stripped from the
+    // numeric portion (like A/C/D/S/H). Spot checks at both ends of the band —
+    // the band-wide property is pinned by
+    // PrefixOptimizerBandRendersAsXWithNibbleStripped below.
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_UnknownPassId),          "X0001");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_PipelineVersionMismatch), "X0002");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_InlineMalformedCallSite), "X0008");
+}
+
+// D-DIAG-OPT-FAMILY-NIBBLE-CLAIMED-IN-HEADER-BUT-NOT-IN-RENDERER.
+//
+// The X_* optimizer family was allocated in the 0x2xxx band in
+// parse_diagnostic.hpp, but diagnosticCodePrefix() shipped with no 0x2000u
+// arm — so the whole family rendered under the parser's default letter with
+// the family nibble left in the number ("P2002" instead of "X0002"). Plan 00
+// §0.3 requires claiming a new family in the header AND in the renderer in
+// the same PR; only the header half had landed.
+//
+// This pin is deliberately BAND-WIDE rather than a couple of spot checks: it
+// asserts the PROPERTY (every allocated 0x2xxx code renders 'X' + a stripped
+// nibble) rather than two instances of it. Two halves:
+//
+//   (1) the eight currently-allocated codes, named explicitly, so a failure
+//       report names the enumerator;
+//   (2) a DISCOVERY scan of the whole 0x2000..0x2FFF band. DiagnosticCode has
+//       a fixed underlying type (std::uint16_t), so every value in that range
+//       is a valid enum value and `diagnosticCodeName` answers "Unknown" for
+//       the unallocated ones. That makes the band enumerable WITHOUT an
+//       iterable-enum facility — and it means a NINTH X_* code added later
+//       inherits this guarantee automatically instead of silently escaping a
+//       hand-maintained list, which is how the original defect survived.
+//
+// The scan carries a FLOOR (same reasoning as tools/check-anchor-registry.sh's
+// per-root floors): a scan that discovers nothing would otherwise pass while
+// checking nothing.
+TEST(DiagnosticCode, PrefixOptimizerBandRendersAsXWithNibbleStripped) {
+    // The property under test, applied to one code.
+    const auto expectRendersAsX = [](DiagnosticCode code) {
+        const auto raw = static_cast<std::uint16_t>(code);
+        const std::string rendered = diagnosticCodePrefix(code);
+        // The whole point of the fix: letter 'X', not the default 'P'.
+        EXPECT_EQ(rendered.front(), 'X')
+            << diagnosticCodeName(code) << " rendered as " << rendered;
+        // ...and the family nibble is STRIPPED, so 0x2002 is "X0002" not "X2002".
+        EXPECT_EQ(rendered, std::format("X{:04X}", raw & 0x0FFFu))
+            << diagnosticCodeName(code) << " rendered as " << rendered;
+    };
+
+    // (1) Every X_* code allocated as of TF-C118, 0x2001..0x2008.
+    constexpr DiagnosticCode kOptimizerBand[] = {
+        DiagnosticCode::X_UnknownPassId,
+        DiagnosticCode::X_PipelineVersionMismatch,
+        DiagnosticCode::X_UnknownPassName,
+        DiagnosticCode::X_PipelineMalformed,
+        DiagnosticCode::X_PipelineNameResolutionFailed,
+        DiagnosticCode::X_OptReturnFalseWithoutDiagnostic,
+        DiagnosticCode::X_OptPassSkipped,
+        DiagnosticCode::X_InlineMalformedCallSite,
+    };
+
+    int named = 0;
+    for (const DiagnosticCode code : kOptimizerBand) {
+        // Guards the list itself: anything listed must really be in the band.
+        ASSERT_EQ(static_cast<std::uint16_t>(code) & 0xF000u, 0x2000u)
+            << diagnosticCodeName(code) << " is not in the 0x2xxx optimizer band";
+        expectRendersAsX(code);
+        ++named;
+    }
+    // Non-vacuity: a COUNTER incremented in the loop, not sizeof the array —
+    // the latter is a compile-time tautology that stays green even if the loop
+    // never executes.
+    EXPECT_EQ(named, 8);
+
+    // (2) Discovery scan of the entire band — catches any X_* code that exists
+    // but is missing from the list above.
+    int discovered = 0;
+    for (std::uint32_t v = 0x2000u; v <= 0x2FFFu; ++v) {
+        const auto code = static_cast<DiagnosticCode>(static_cast<std::uint16_t>(v));
+        if (diagnosticCodeName(code) == std::string_view{"Unknown"}) {
+            continue;  // unallocated slot in the band
+        }
+        expectRendersAsX(code);
+        ++discovered;
+    }
+    // Floor, not equality: a new X_* code should not fail this test, but a
+    // COLLAPSED scan (discovering nothing, e.g. if diagnosticCodeName stopped
+    // answering) must not pass as clean.
+    EXPECT_GE(discovered, named)
+        << "band scan discovered fewer codes than are explicitly listed";
 }
 
 TEST(DiagnosticSeverity, NameMapping) {

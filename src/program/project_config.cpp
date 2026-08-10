@@ -141,6 +141,123 @@ bool readOptionalStringArray(json const& doc,
     return true;
 }
 
+// D-FFI-DECLARED-IMPORT-NAME — read the OPTIONAL `resolveLibraries` array.
+//
+// Mirrors `readOptionalStringArray` (absent ⇒ empty + no error; a
+// present-but-empty `[]` is allowed; a non-array fails loud) but each ENTRY
+// may take EITHER of two shapes:
+//
+//   "dist/libfoo.so"                                  the PLAIN form
+//   {"path": "…/libtcl8.6.dylib",                     the EXTENDED form
+//    "importName": "@rpath/libtcl8.6.dylib"}
+//
+// The plain form is byte-for-byte what every shipped manifest already writes
+// and produces an EMPTY `declaredImportName` (nothing stated ⇒ the binary's
+// own embedded soname wins downstream). The extended form additionally STATES
+// the runtime identity to record, which outranks that soname.
+//
+// Every degenerate shape fails loud `C_MalformedJson`, never a silent drop:
+// a non-string / non-object entry, an empty plain string, a missing or
+// non-string or empty `path` / `importName`, and any UNKNOWN key inside the
+// object (matching this loader's top-level unknown-key rejection — a typo'd
+// `"importname"` must not silently discard the identity).
+bool readOptionalResolveLibraries(json const& doc,
+                                  char const* key,
+                                  std::vector<ResolveLibrarySpec>& out,
+                                  std::string_view label,
+                                  DiagnosticReporter& rep) {
+    out.clear();  // defensive: never inherit a caller's stale contents
+    if (!doc.contains(key)) {
+        return true;  // absent ⇒ empty (the caller left `out` empty); no error
+    }
+    json const& v = doc.at(key);
+    if (!v.is_array()) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         std::string{"field '"} + key
+                         + "' must be an array of strings or "
+                           "{\"path\", \"importName\"} objects");
+        return false;
+    }
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        json const& e = v[i];
+        std::string const at = std::string{"field '"} + key + "' entry ["
+                             + std::to_string(i) + "] ";
+
+        // Read one REQUIRED non-empty string member of the entry object.
+        auto member = [&](char const* name, std::string& dst) -> bool {
+            if (!e.contains(name)) {
+                emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                 at + "is missing required member '" + name
+                                 + "'");
+                return false;
+            }
+            json const& mv = e.at(name);
+            if (!mv.is_string()) {
+                emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                 at + "member '" + name + "' must be a string");
+                return false;
+            }
+            dst = mv.get<std::string>();
+            if (dst.empty()) {
+                emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                 at + "member '" + name
+                                 + "' must be a non-empty string");
+                return false;
+            }
+            return true;
+        };
+
+        if (e.is_string()) {
+            std::string s = e.get<std::string>();
+            if (s.empty()) {
+                emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                 at + "must be a non-empty string");
+                return false;
+            }
+            out.push_back(ResolveLibrarySpec{std::move(s), {}});
+            continue;
+        }
+        if (!e.is_object()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "must be a non-empty string (the library "
+                                  "path) or an object {\"path\": …, "
+                                  "\"importName\": …}");
+            return false;
+        }
+
+        // Unknown keys inside the entry object reject, same rule + same
+        // rationale as the top-level unknown-key gate: a mistyped member is a
+        // silent drop of the identity the entry exists to state.
+        static constexpr std::string_view kEntryKeys[] = {"path", "importName"};
+        for (auto it = e.begin(); it != e.end(); ++it) {
+            std::string const& k = it.key();
+            bool known = false;
+            for (auto const& known_k : kEntryKeys) {
+                if (known_k == k) { known = true; break; }
+            }
+            if (!known) {
+                emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                 at + "has unknown member '" + k
+                                 + "' (recognized members: path, importName)");
+                return false;
+            }
+        }
+
+        // `importName` is REQUIRED here: the object form exists SOLELY to
+        // state an identity, so an object without one is a typo or noise and
+        // the plain string form says the same thing better. One spelling per
+        // meaning, and the degenerate variant rejects rather than aliasing.
+        ResolveLibrarySpec spec;
+        std::string path;
+        if (!member("path", path)) return false;
+        if (!member("importName", spec.declaredImportName)) return false;
+        spec.path = std::move(path);
+        out.push_back(std::move(spec));
+    }
+    // A present-but-empty `[]` is ALLOWED — no "at least one entry" check.
+    return true;
+}
+
 } // namespace
 
 std::optional<ProjectConfig>
@@ -201,15 +318,19 @@ parseProjectConfig(std::string_view jsonText,
 
     // The OPTIONAL compile-flag arrays (the file-driven counterparts of the
     // CLI `-I` / `--define` / `--resolve-library`). Absent ⇒ empty (no error);
-    // present must be an array of non-empty strings (else C_MalformedJson); a
+    // present must be an array of non-empty strings (else C_MalformedJson) —
+    // `resolveLibraries` additionally accepts the extended
+    // `{"path", "importName"}` object entry (D-FFI-DECLARED-IMPORT-NAME); a
     // present-but-empty `[]` is allowed. `Program::compileProject` threads
     // these (merge/append) onto the Program's current state.
     if (!readOptionalStringArray(doc, "includes", pc.includes, sourceLabel, rep))
         return std::nullopt;
     if (!readOptionalStringArray(doc, "defines", pc.defines, sourceLabel, rep))
         return std::nullopt;
-    if (!readOptionalStringArray(doc, "resolveLibraries", pc.resolveLibraries,
-                                 sourceLabel, rep))
+    // D-FFI-DECLARED-IMPORT-NAME: `resolveLibraries` entries are a plain path
+    // STRING *or* an extended `{"path", "importName"}` object — its own reader.
+    if (!readOptionalResolveLibraries(doc, "resolveLibraries",
+                                      pc.resolveLibraries, sourceLabel, rep))
         return std::nullopt;
 
     // `output` is an OPTIONAL user-authored hint: validate its type when

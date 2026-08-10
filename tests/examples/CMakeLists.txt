@@ -31,13 +31,35 @@ target_include_directories(dss_examples_runner
 
 # Reuse the shared test PCH (defined in tests/CMakeLists.txt). The extra
 # nlohmann_json include dir on this target is additive and does not affect the
-# precompiled STL/gtest set. No-op in Debug (PCH disabled).
-target_precompile_headers(dss_examples_runner REUSE_FROM dss_test_pch)
+# precompiled STL/gtest set.
+#
+# ★ GUARDED 2026-08-03 (TF-C112), D-BUILD-PCH-REUSE-FROM-UNGUARDED-IN-DEBUG — the
+# SECOND of the two unguarded REUSE_FROM sites (the other is tests/CMakeLists.txt).
+# This comment previously ended "No-op in Debug (PCH disabled)", which was FALSE and
+# is the reason both sites survived review: a CONSUMER `REUSE_FROM` call is NOT a
+# no-op when CMAKE_DISABLE_PRECOMPILE_HEADERS is set — it warns, once per emission,
+# per target. Only the PRODUCER form (`target_precompile_headers(... PRIVATE ...)`,
+# src/CMakeLists.txt:51) is genuinely silent, and that asymmetry is what made the
+# claim look true. MEASURED on this tree: the two sites together emitted 633
+# CMake warnings per Debug configure, and they were 633 of 633 — i.e. this single
+# message WAS the entire warning channel, so any real CMake warning was invisible.
+# Guard on the same variable the sibling dss_pch_reproducible() opens with, so the
+# two cannot drift apart.
+if(NOT CMAKE_DISABLE_PRECOMPILE_HEADERS)
+    target_precompile_headers(dss_examples_runner REUSE_FROM dss_test_pch)
+endif()
 dss_pch_reproducible(dss_examples_runner)  # consumer must match producer's PCH flags
 
 file(GLOB_RECURSE EXAMPLE_MANIFESTS
     CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/examples/*/*/expected.json")
+
+# D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR: the corpus emulator lint is a
+# CORPUS-wide question with one corpus-wide answer, so it is ONE entry, not 558.
+# The per-example entries exclude it; the lint entry selects it and receives the
+# corpus ROOT as argv[1] instead of an example dir. The filter goes AFTER the
+# directory argument so argv[1] keeps its meaning in both shapes.
+set(EXAMPLES_LINT_SUITE "ExamplesCorpusLint")
 
 foreach(MANIFEST ${EXAMPLE_MANIFESTS})
     get_filename_component(EXAMPLE_DIR ${MANIFEST} DIRECTORY)
@@ -47,5 +69,12 @@ foreach(MANIFEST ${EXAMPLE_MANIFESTS})
     set(TEST_NAME "examples/${LANG_NAME}/${EXAMPLE_NAME}")
     add_test(NAME ${TEST_NAME}
              COMMAND dss_examples_runner ${EXAMPLE_DIR}
+                     --gtest_filter=-${EXAMPLES_LINT_SUITE}.*
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    dss_strict_arm_verdicts(${TEST_NAME})
 endforeach()
+
+add_test(NAME "examples/manifest-emulator-lint"
+         COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
+                 --gtest_filter=${EXAMPLES_LINT_SUITE}.*
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

@@ -31,10 +31,12 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "link/entry_trampoline.hpp"
 #include "link/format/macho.hpp"
 #include "link/object_format_schema.hpp"
 #include "macho_test_support.hpp"
+#include "repo_root.hpp"
 
 #include <gtest/gtest.h>
 
@@ -50,6 +52,9 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -59,23 +64,24 @@ using dss::macho::test::findSection;
 using dss::macho::test::readU32LE;
 using dss::macho::test::readU64LE;
 
-// Ancestor-walk to the shipped arm64-darwin-exec format JSON (mirrors
-// findShippedConfig so the test works whether ctest runs from build/ or
-// the repo root). Returns the parsed schema or nullptr (with an
-// ADD_FAILURE) on miss.
+// The shipped Darwin exec format JSON, located through the ONE test-side
+// resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT → the CMake-baked repo
+// root → the cwd ancestor walk). The private ancestor-walk that stood
+// here found nothing in an OUT-OF-TREE build — that cwd has no
+// `src/dss-config/` above it — which turned this ALWAYS-ON guard off on
+// exactly the legs that cannot run the corpus binary. Returns the parsed
+// schema or nullptr (with an ADD_FAILURE) on miss.
 [[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
 loadDarwinExecByName(char const* fname) {
-    fs::path here = fs::current_path();
-    fs::path shipped;
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const candidate = here / "src" / "dss-config"
-            / "object-formats" / fname;
-        if (fs::exists(candidate)) { shipped = candidate; break; }
-        here = here.parent_path();
+    auto const root = dss::test::findRepoRoot();
+    if (!root) {
+        ADD_FAILURE() << fname << ": " << dss::test::repoRootDiagnostic();
+        return nullptr;
     }
-    if (shipped.empty()) {
-        ADD_FAILURE() << fname << " not found in any ancestor "
-                         "src/dss-config/object-formats";
+    fs::path const shipped =
+        *root / "src" / "dss-config" / "object-formats" / fname;
+    if (!fs::exists(shipped)) {
+        ADD_FAILURE() << shipped.generic_string() << " does not exist";
         return nullptr;
     }
     auto f = ObjectFormatSchema::loadFromFile(shipped.string());
@@ -120,6 +126,18 @@ loadArm64DarwinExecFormat() {
     mod.functions.push_back(std::move(fn));
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "_abs", "/usr/lib/libSystem.B.dylib"});
+    // D-LK10-ENTRY 2.13 gate 6 (`resolveEntryFnIdx`, exec_reloc_apply.hpp):
+    // a format declaring `processExit` — as macho64-arm64-darwin-exec does
+    // — CONTRACTS that its image entry is the `_start` trampoline, and only
+    // `linker::link` injects one (entry_trampoline.cpp:732 — the file's
+    // ONLY assignment to that field — sets this override on every
+    // successful injection). Every pin built on this fixture drives
+    // `macho::encode` DIRECTLY, so no trampoline exists: state that the
+    // untrampolined entry IS functions[0] deliberately. Semantically a
+    // no-op — index 0 is exactly what the pre-gate default returned, so no
+    // emitted byte moves. Contrast TrampolineEmitsDirectBlForExitImport,
+    // which builds its own module and goes through injectEntryTrampoline.
+    mod.imageEntryOverride = 0u;
     return mod;
 }
 
@@ -365,12 +383,28 @@ TEST(MachOArm64Exit, IndirectSlotDispatchOnMachOFailsLoud) {
     // x86_64 cputype keeps the fixture host-encodable; the guard is
     // CPU-agnostic (it checks dispatch vs the symbolVa target, which is
     // the stub on every cputype).
+    // D-LK10-ENTRY 2.13: an exec-flavored (MH_EXECUTE) schema MUST declare
+    // `processExit` + its paired `entryCallingConvention` or `validate()`
+    // REJECTS it at load — so the entry cluster below is what keeps this
+    // synthetic fixture loadable at all. Values copied verbatim from the
+    // shipped macho64-x86_64-darwin-exec.format.json, matching this
+    // fixture's x86_64 cputype (`sysv_amd64`, NOT the arm64 sibling's
+    // `apple_arm64`). Nothing resolves the cc name here: no trampoline is
+    // built, and the guard under test fires before entry resolution.
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-indirect-bad","kind":"macho"},
       "entryPoint": "",
       "externCallDispatch": "indirect-slot",
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -402,6 +436,13 @@ TEST(MachOArm64Exit, IndirectSlotDispatchOnMachOFailsLoud) {
     mod.functions.push_back(std::move(fn));
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "_abs", "/usr/lib/libSystem.B.dylib"});
+    // D-LK10-ENTRY 2.13 gate 6: this drives `macho::encode` directly, so
+    // state the deliberate untrampolined functions[0] entry. The dispatch
+    // guard under test fires BEFORE entry resolution, so this changes
+    // nothing today — it keeps the failure attributable to the DISPATCH
+    // coherence check rather than to a missing trampoline if the walker's
+    // guard order ever shifts.
+    mod.imageEntryOverride = 0u;
 
     DiagnosticReporter rep;
     auto bytes = macho::encode(mod, *target, *fmt, rep);
@@ -549,23 +590,90 @@ TEST(MachOArm64Exit, Arm64ExecEmitsBuildVersionMacOs) {
 // 4096, so the x86 layout is byte-identical to before this cycle. Pin the
 // default explicitly (a knob-that-lies guard: prove the absence path
 // yields 4096, not 0 or 16384).
+//
+// ★ RE-VALIDATED 2026-08-05, the cycle that filled in that format's
+// runnable-CLI key set (artifactProfiles / dataImportBinding /
+// supportedDataSections + rows / image.codeSignature). NEITHER key this
+// test asserts was touched, deliberately, and each for its own reason —
+// the assertions below are UNCHANGED and still mean exactly what they
+// meant. The comments are what needed correcting.
+//
+//  * segmentPageSize: 4096 is already what the absent-key path yields
+//    and it is the correct x86_64 macOS VM page, so declaring it
+//    explicitly would change no emitted byte — while quietly gutting
+//    THIS test, whose whole subject is the ABSENCE path. It would stay
+//    green and stop proving anything. Left absent on purpose.
+//
+//  * buildVersion: ★ the old one-liner here said "Intel/Rosetta is
+//    lenient". Do not read that as established. It is DOCUMENTED at
+//    best and nothing in this project has measured it: LC_BUILD_VERSION
+//    is how dyld4 identifies a main executable's PLATFORM, which is an
+//    OS-version property rather than a CPU one, so the leniency claim
+//    may not survive contact with a current macOS. It stays absent here
+//    for a CONCRETE reason instead: `macho::encodeExec` (the static
+//    exec arm) REJECTS a schema carrying image.buildVersion LOUD
+//    (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION), and several walker
+//    tests drive this format with zero-extern modules straight down
+//    that arm — so declaring it today turns tests red for a reason that
+//    has nothing to do with macOS. IF the first Rosetta run of a
+//    DSS-built x86_64 Mach-O fails at load with a platform /
+//    EBADMACHO-class error, this EXPECT_FALSE is the line to flip (to
+//    a buildVersion assertion mirroring Arm64ExecEmitsBuildVersionMacOs
+//    above), and that static-arm gap is what must land with it.
 TEST(MachOArm64Exit, X86DarwinExecDefaultsTo4KSegmentPageSize) {
     auto fmt = loadDarwinExecByName("macho64-x86_64-darwin-exec.format.json");
     ASSERT_TRUE(fmt);
     EXPECT_EQ(fmt->machoImage().segmentPageSize, 4096u);
-    // x86 declares no buildVersion (Intel/Rosetta is lenient).
+    // x86 declares no buildVersion — see the block comment above; this
+    // is a live open question, not a settled platform fact.
     EXPECT_FALSE(fmt->machoImage().buildVersion.has_value());
+    // ★ The load-bearing half of "4096 is right here", added with the
+    // runnable-CLI key set: validate()'s Mach-O mmap-congruence rule
+    // reads BOTH this page size and the __text row's virtualAddress,
+    // and 0x100001000 is congruent under 4 KiB and NOT under 16 KiB.
+    // Pin the pair together, so a future edit that clones the arm64
+    // sibling's 16384 into this schema is caught HERE — by the
+    // arithmetic that explains why it is wrong — rather than as an
+    // opaque config-load rejection somewhere downstream.
+    auto const* text = fmt->sectionByKind(SectionKind::Text);
+    ASSERT_NE(text, nullptr);
+    EXPECT_EQ((text->virtualAddress - fmt->machoImage().pageZeroSize)
+                  % fmt->machoImage().segmentPageSize,
+              0u)
+        << "__text VA 0x" << std::hex << text->virtualAddress
+        << " is not congruent to pageZeroSize 0x"
+        << fmt->machoImage().pageZeroSize << " under segmentPageSize 0x"
+        << fmt->machoImage().segmentPageSize
+        << " — the kernel rejects such an image at exec (EBADMACHO)";
 }
 
 // ── validate() fail-loud: a non-power-of-two segmentPageSize ──────────
 TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
     // segmentPageSize = 12288 (0x3000) — a multiple of 4096 but NOT a
     // power of two; alignUp() would corrupt the layout. Must reject.
+    //
+    // D-LK10-ENTRY 2.13: an MH_EXECUTE schema that declares no
+    // `processExit` is rejected for THAT reason too, which would confound
+    // this pin (validate() accumulates; the loader rejects on ANY error).
+    // The entry cluster below is copied VERBATIM from the shipped
+    // src/dss-config/object-formats/macho64-arm64-darwin-exec.format.json,
+    // matching this fixture's OWN arm64 cputype 16777228 (`apple_arm64` —
+    // deliberately NOT the x86_64 sibling's `sysv_amd64`). Inert for the
+    // pin: the load IS the test, so nothing builds a trampoline and no cc
+    // name is resolved against a target.
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-badpage","kind":"macho"},
       "entryPoint": "",
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "apple_arm64",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -582,12 +690,31 @@ TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
     auto res = ObjectFormatSchema::loadFromText(json);
     ASSERT_FALSE(res.has_value())
         << "non-power-of-two segmentPageSize must fail validate";
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 2 reasons, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    // TWO, the second a KNOCK-ON of the value under test: a 0x3000
+    // page cannot divide the 0x1000 __text offset above __PAGEZERO,
+    // so the mmap-congruence rule fires on the same bad page size.
+    EXPECT_EQ(errorCount(res), 2u) << rejectSummary(res);
     bool sawMsg = false;
     for (auto const& d : res.error())
         if (d.message.find("segmentPageSize") != std::string::npos
          && d.message.find("power of two") != std::string::npos)
             sawMsg = true;
     EXPECT_TRUE(sawMsg) << "expected a segmentPageSize power-of-two diag";
+    // Pin the rule's own JSON pointer, and pin that the entry-cluster
+    // rule is NOT among the reasons (the anti-subsumption assertion: it
+    // goes red the moment this fixture starts being rejected for the
+    // D-LK10-ENTRY reason again). NOTE the deliberate absence of a
+    // /sections/<text>/virtualAddress zero-count: 0x100004000 IS
+    // 16 KiB-congruent but NOT 12288-congruent, so the mmap-congruence
+    // rule legitimately fires as a SECOND consequence of the very value
+    // under test — a different pointer, so the EQ below is unaffected.
+    EXPECT_EQ(countAtPath(res, "/image/segmentPageSize"), 1u)
+        << rejectSummary(res);
+    EXPECT_EQ(countAtPath(res, "/processExit"), 0u) << rejectSummary(res);
 }
 
 // ── validate() fail-loud: the EXACT 16 KiB-vs-4 KiB-VA bug ────────────
@@ -597,11 +724,26 @@ TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
 // must reject it at schema-load (host-independent, fast), not leave it to
 // the encode-time walker. This pins the congruence guard red-on-disable.
 TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
+    // Entry cluster: same reason as
+    // SegmentPageSizeNonPowerOfTwoFailsLoud above — without it
+    // D-LK10-ENTRY 2.13 rejects this MH_EXECUTE schema a SECOND time and
+    // the congruence pin goes vacuous. Values VERBATIM from the shipped
+    // src/dss-config/object-formats/macho64-arm64-darwin-exec.format.json,
+    // matching this fixture's OWN arm64 cputype 16777228 (`apple_arm64`,
+    // NOT the x86_64 sibling's `sysv_amd64`); inert (no trampoline).
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-badva","kind":"macho"},
       "entryPoint": "",
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "apple_arm64",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -618,12 +760,24 @@ TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
     auto res = ObjectFormatSchema::loadFromText(json);
     ASSERT_FALSE(res.has_value())
         << "4 KiB-congruent text VA under a 16 KiB page must fail validate";
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(res), 1u) << rejectSummary(res);
     bool sawMsg = false;
     for (auto const& d : res.error())
         if (d.message.find("EBADMACHO") != std::string::npos
          || d.message.find("segmentPageSize") != std::string::npos)
             sawMsg = true;
     EXPECT_TRUE(sawMsg) << "expected an mmap-congruence diag";
+    // The congruence rule's own pointer — exactly one diagnostic, since
+    // the sibling below-__PAGEZERO rule at the same pointer is the
+    // `else` arm of the same `if` (0x100001000 IS above pageZeroSize)
+    // and the image-flavor `virtualAddress != 0` gate does not fire.
+    EXPECT_EQ(countAtPath(res, "/sections/<text>/virtualAddress"), 1u)
+        << rejectSummary(res);
+    EXPECT_EQ(countAtPath(res, "/processExit"), 0u) << rejectSummary(res);
 }
 
 // ── __TEXT,__const read-only data section (D-LK1-MACHO-EXEC-DATA-SECTIONS)
@@ -746,6 +900,10 @@ enum class CodeReloc {
     d.bytes     = {0x2a, 0x00, 0x00, 0x00};   // int answer = 42;
     d.alignment = Alignment::of<4>();
     mod.dataItems.push_back(std::move(d));
+    // D-LK10-ENTRY 2.13 gate 6 — same reason as makeArm64DynamicModule
+    // above: these __const pins call `macho::encode` directly, so the
+    // untrampolined functions[0] entry must be stated, not defaulted.
+    mod.imageEntryOverride = 0u;
     return mod;
 }
 

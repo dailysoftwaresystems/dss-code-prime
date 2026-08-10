@@ -1,0 +1,37 @@
+{
+  "$comment": "Runtime witness for the pe64 STREAM printf family -- `printf`, `fprintf` (stdout AND stderr), `vfprintf` and `sscanf` (D-FFI-PE-CRT-UCRT-MIGRATION, Phase 3), baseline AND the `release` shippedPipeline arm. WHY IT EXISTS ALONGSIDE shipped_sprintf_ucrt{,_crosscu}: those cover only the BUFFER member of the family. `sprintf` routes through UCRT's `__stdio_common_vsprintf` and touches nothing but the CALLER's buffer; every entry point here routes through `__stdio_common_vfprintf` / `__stdio_common_vsscanf`, which take a `FILE *` -- a CRT-OWNED handle -- and therefore drag in a dependency no sprintf witness can reach. MEASURED against the real DLLs (objdump -p plus an explicit LoadLibrary/GetProcAddress probe of C:\\Windows\\System32): msvcrt.dll exports `__iob_func` and ucrtbase.dll does NOT; ucrtbase.dll exports `__acrt_iob_func` and msvcrt.dll does NOT; and ucrtbase.dll exports NO bare printf/fprintf/sprintf/vfprintf/sscanf at all, only the `__stdio_common_v*` cores. `stdout`/`stderr` are pe MACROS over that accessor, so their binding must move in lockstep with the rest of stdio.json, and the two failure modes sit at opposite ends of the loudness scale. Naming an accessor the runtime does not export is LOUD but LATE: DSS eagerly imports every declared symbol (D-FFI-DESCRIPTOR-EAGER-IMPORT), so it is not a build error at all -- the LOADER rejects the binary with 0xC0000139, which a compile-only test cannot see and this example dies at startup on. A WRONG INDEX, by contrast, is silent: `stdout` and `stderr` differ only by the 1 vs 2 passed to the accessor, and a program writing the right text to the wrong stream still produces plausible output -- only asserting the merged byte sequence with each stream carrying DISTINGUISHABLE text (the p*/f*/v* lines vs the E* lines) pins that. Worth recording what is NOT a hazard, because the earlier shape had it and the current one does not: the pe macro is a CALL, `(__acrt_iob_func(N))`, over an OPAQUE `struct FILE {}` -- not `(&__iob_func()[N])`, which was pointer arithmetic over `sizeof(FILE)` and would have silently mis-addressed the stream from a stale record size. The accessor-call form removes that whole class. ★ THE UCRT PROOF is the `e1` line: a RUNTIME 1.0/3.0 printed at `%.25e`. Two independent divergences ride in that one string, both MEASURED (msvcrt!sprintf vs ucrtbase!__stdio_common_vsprintf, same format, same double): (a) PRECISION -- legacy msvcrt stops generating digits after ~17 SIGNIFICANT ones and zero-fills, printing 3.3333333333333331000000000e-001, while UCRT emits the exact decimal expansion of the binary double, 3.3333333333333331482961626e-01, as glibc and Darwin libc do; this is the mechanism behind the long-standing sqlite fpconv1-2.0 failure. (b) EXPONENT WIDTH -- msvcrt renders three digits (e-001), UCRT the C-conformant two (e-01). So that single line fails loudly if the pe stream family ever regresses to the legacy CRT, and because all three modern libcs expand exactly it is simultaneously the cross-target agreement check. COVERAGE: %d, %s, %c, %x (p1); %lld past INT32_MAX, %08d, %+d and a float (p2); fprintf to an explicit `stdout` (f1); vfprintf through a real va_list in the shell.c cli_printf shape (v1); the high-precision %e (e1); sscanf parsing %d/%s/%x/%lf off one runtime buffer and printing the results back (s1); then fprintf and vfprintf to `stderr` (E1, E2). `stdout == stderr` is rejected up front -- a wrong iob index or FILE stride can collapse the two onto one record, and every text check would still pass because the harness MERGES the two pipes. ANTI-FOLD, two layers: every formatted operand is a mutable global rather than a literal argument (the shipped_sprintf_ucrt convention), and the %e operand additionally comes from a runtime division of two `volatile` doubles -- a value no constant-folder may precompute even with whole-program visibility, so the `release` arm cannot fold the formatting away and leave a witness that witnesses nothing. STREAM ORDERING IS PINNED, NOT ASSUMED: the harness merges the child's stdout AND stderr into ONE buffer (run_binary.hpp sets si.hStdOutput == si.hStdError on Windows and dup2s the same pipe onto fds 1 and 2 on POSIX), and piped stdout is fully buffered while stderr is not -- so every stderr write is preceded by an explicit fflush(stdout) and followed by fflush(stderr), making the merged byte sequence deterministic. LINE ENDINGS follow the shipped_atexit convention: the Windows CRT translates \\n to \\r\\n on a text-mode stream, so the manifest-level pin is the pe (CRLF) form and each elf/macho target overrides with the LF form. The `n != <count>` return-value checks in the source are PLATFORM-INVARIANT and that is measured, not hoped for: the Microsoft CRT returns the count BEFORE translation (probed directly -- a 27-byte expansion with one \\n returns 27 while the file on disk is 28), so one set of constants is correct everywhere. The LF expectation and every byte count were derived INDEPENDENTLY by compiling this exact source with real gcc 13.3.0 under glibc and running it (exit 42 at both -O0 and -O2), not by hand; the glibc %e output matched the ucrtbase probe byte-for-byte. exit = 42; a distinct code per check (50..73).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "p1 12345|printf|Q|deadbeef\r\np2 9223372036854775807|00000042|+7|3.50\r\nf1 12345/printf/Q/deadbeef/-42\r\nv1 -42 3.50 printf\r\ne1 3.3333333333333331482961626e-01\r\ns1 4 -4242 beta 7b 2.50\r\nE1 12345|-42|3.50|printf\r\nE2 printf|7b|+7\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "p1 12345|printf|Q|deadbeef\np2 9223372036854775807|00000042|+7|3.50\nf1 12345/printf/Q/deadbeef/-42\nv1 -42 3.50 printf\ne1 3.3333333333333331482961626e-01\ns1 4 -4242 beta 7b 2.50\nE1 12345|-42|3.50|printf\nE2 printf|7b|+7\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "p1 12345|printf|Q|deadbeef\np2 9223372036854775807|00000042|+7|3.50\nf1 12345/printf/Q/deadbeef/-42\nv1 -42 3.50 printf\ne1 3.3333333333333331482961626e-01\ns1 4 -4242 beta 7b 2.50\nE1 12345|-42|3.50|printf\nE2 printf|7b|+7\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "p1 12345|printf|Q|deadbeef\np2 9223372036854775807|00000042|+7|3.50\nf1 12345/printf/Q/deadbeef/-42\nv1 -42 3.50 printf\ne1 3.3333333333333331482961626e-01\ns1 4 -4242 beta 7b 2.50\nE1 12345|-42|3.50|printf\nE2 printf|7b|+7\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

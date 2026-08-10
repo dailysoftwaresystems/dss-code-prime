@@ -101,13 +101,13 @@ readSource(IngestionSource const& src, DiagnosticReporter& reporter,
 //                                     F_MangleMissingExpectedPrefix
 //                                     already in the reporter
 [[nodiscard]] std::optional<std::string>
-toCanonicalName(ImportSurface const& row, ObjectFormatKind format,
+toCanonicalName(ImportSurface const& row, CSymbolDecorationScheme scheme,
                 bool fromBinary, DiagnosticReporter& reporter) {
     if (!fromBinary) {
         // FF2 header-parser rows are already canonical by design.
         return row.mangledName;
     }
-    auto canonical = unapplyCManglingStrict(row.mangledName, format, reporter);
+    auto canonical = unapplyCManglingStrict(row.mangledName, scheme, reporter);
     if (!canonical) {
         // Underlying diagnostic already emitted by strict unapply.
         return std::nullopt;
@@ -235,6 +235,12 @@ ingest(std::span<IngestionSource const> sources,
     struct TaggedRow {
         ImportSurface row;
         bool fromBinary = false;
+        // D-FFI-DECLARED-IMPORT-NAME: the caller-STATED runtime identity of the
+        // SOURCE this row came from (`BinaryLibrarySource::declaredImportName`;
+        // empty == not stated). Carried per-row because the precedence is
+        // decided per-EXTERN below, where only the matched row is in scope --
+        // the source it came from is no longer reachable there.
+        std::string declaredImportName;
     };
     std::vector<TaggedRow> aggregated;
 
@@ -250,15 +256,19 @@ ingest(std::span<IngestionSource const> sources,
         // import records the loader-resolvable soname/DLL-name (the file's
         // basename) rather than the absolute build-time path. Empty leaves
         // the reader's label intact (the pre-c162 header/JSON behavior).
+        // This is precedence LEVEL 3 -- levels 1 + 2 are ranked over it at
+        // the per-extern decision site below.
+        std::string declaredImportName;  // D-FFI-DECLARED-IMPORT-NAME (level 1)
         if (fromBinary) {
             auto const& bin = std::get<BinaryLibrarySource>(src);
             if (!bin.importName.empty()) {
                 for (auto& r : rows) r.libraryPath = bin.importName;
             }
+            declaredImportName = bin.declaredImportName;
         }
         aggregated.reserve(aggregated.size() + rows.size());
         for (auto& r : rows) {
-            aggregated.push_back({std::move(r), fromBinary});
+            aggregated.push_back({std::move(r), fromBinary, declaredImportName});
         }
         ++result.sourcesProcessed;
     }
@@ -274,7 +284,8 @@ ingest(std::span<IngestionSource const> sources,
     bySymbol.reserve(aggregated.size());
     for (auto const& tagged : aggregated) {
         auto canonical = toCanonicalName(
-            tagged.row, format.kind(), tagged.fromBinary, reporter);
+            tagged.row, format.cSymbolDecoration().scheme, tagged.fromBinary,
+            reporter);
         if (!canonical) continue;  // strict-unapply already reported
         // post-fold #6 silent-failure C1: empty canonical name would
         // emplace `bySymbol[""]` and silently shadow every subsequent
@@ -351,9 +362,15 @@ ingest(std::span<IngestionSource const> sources,
         // `__DARWIN_ALIAS_C(open)` is `_open…` on disk — so keying on the C
         // identifier would silently miss the row and drop the extern through to the
         // format-default library with no diagnostic.
+        // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the descriptor's
+        // per-target link BASE name rides the same call for the same reason —
+        // libSystem's x86_64 slice exports `_fstat$INODE64`, so that (un-
+        // decorated: `fstat$INODE64`) is the only key that can match its row.
         std::string const linkerName =
-            linkNameFor(ext.canonicalName, ext.asmName, format.kind());
-        auto it = bySymbol.find(unapplyCMangling(linkerName, format.kind()));
+            linkNameFor(ext.canonicalName, ext.asmName,
+                        format.cSymbolDecoration().scheme, ext.linkName);
+        auto it = bySymbol.find(
+            unapplyCMangling(linkerName, format.cSymbolDecoration().scheme));
         if (it == bySymbol.end()) continue;  // unmatched -> caller applies policy
         TaggedRow const& matched = *it->second;
 
@@ -361,36 +378,115 @@ ingest(std::span<IngestionSource const> sources,
         meta.mangledName   = linkerName;
         meta.linkage       = toFfiLinkage(matched.row.linkage);
         meta.visibility    = toFfiVisibility(matched.row.visibility);
-        // D-FF1-READER-SONAME (c171): PREFER the binary's OWN embedded identity
-        // (ELF DT_SONAME / Mach-O LC_ID_DYLIB install name / PE export DllName,
-        // extracted by the FF1 readers into `row.soname`) as the recorded
-        // import library — it is exactly what a real linker records as the
-        // DT_NEEDED / LC_LOAD_DYLIB / import DllName the LOADER resolves at
-        // runtime. Falls back to the reader's `libraryPath` label (the c162
-        // driver-supplied basename stand-in, `BinaryLibrarySource.importName`)
-        // when the binary declares no soname. This COMPLETES the "honest
-        // stand-in until FF1 extracts them" transition the c162 importName
-        // override documented (ingest.hpp). The linker's DT_NEEDED is emitted
-        // from `ExternImport.libraryPath` == this field, so preferring the
-        // soname HERE is what makes the runtime dependency correct.
-        meta.importLibrary = matched.row.soname.empty()
-                                 ? matched.row.libraryPath
-                                 : matched.row.soname;
-        // c156 (D-LK-ELF-SYMBOL-VERSIONING): carry the required symbol
-        // version (parity with the FF5 source-decl path). Dormant today
-        // (FF1 is the binary-reader ingestion path), but a versioned
-        // ExternDeclRef routed here must not silently drop its version.
+        // ★ THE RECORDED-IMPORT-IDENTITY DECISION SITE ★ — the ONE place the
+        // three levels documented on `BinaryLibrarySource` (ingest.hpp) are
+        // ranked. The linker's DT_NEEDED / LC_LOAD_DYLIB / PE import-descriptor
+        // name is emitted from `ExternImport.libraryPath` == this field, so
+        // this expression IS the artifact's runtime dependency.
+        //
+        //   1. D-FFI-DECLARED-IMPORT-NAME — the caller STATED the identity.
+        //      Beats everything: the file we READ may be a cross-compilation
+        //      STAND-IN whose own embedded identity names a path that will not
+        //      exist on the target (a MacPorts `/opt/local/...` LC_ID_DYLIB
+        //      read on a Windows host). Symbols from the file, identity from
+        //      the declaration -- the sysroot-stub / `.tbd` / `-dylib_file`
+        //      contract. Empty == not stated, so it falls through.
+        //   2. D-FF1-READER-SONAME (c171) — the binary's OWN embedded identity
+        //      (ELF DT_SONAME / Mach-O LC_ID_DYLIB install name / PE export
+        //      DllName, all normalised into `row.soname` by the FF1 readers).
+        //      Exactly what a real linker records when it is handed the real
+        //      library, so it is right whenever no declaration overrides it.
+        //   3. the reader's `libraryPath` label — the c162 driver-supplied
+        //      basename stand-in (`BinaryLibrarySource::importName`), for a
+        //      library that declares no soname at all (the `gcc -shared`
+        //      no-`-soname` shape).
+        //
+        // FORMAT-BLIND: no arm of this branches on ObjectFormatKind -- the
+        // readers already collapsed all three formats' embedded identities
+        // into `row.soname`.
+        meta.importLibrary =
+            !matched.declaredImportName.empty() ? matched.declaredImportName
+          : !matched.row.soname.empty()         ? matched.row.soname
+          :                                       matched.row.libraryPath;
+        // ── THE REQUIRED-SYMBOL-VERSION DECISION SITE ────────────────────
+        // c156 (D-LK-ELF-SYMBOL-VERSIONING) established the rail: a
+        // non-empty version here becomes a `.gnu.version_r` requirement
+        // against `meta.importLibrary` in the emitted ELF image, so ld.so
+        // binds THAT version instead of an unversioned reference silently
+        // landing on a library's OLDEST compat instance.
+        //
+        // TF-C124 (D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION) gives the
+        // rail a SECOND source. Until it, only `ext.version` — a shipped
+        // DESCRIPTOR's declaration — could ever be non-empty, so the whole
+        // mechanism was unreachable for every library acquired without a
+        // descriptor, which is every third-party library this project links
+        // (Tcl, zlib). The binary itself records the answer; now we read it.
+        //
+        //   1. the DECLARATION (`ext.version`) — a descriptor pinned this
+        //      symbol to an exact version for this (arch, format). Beats the
+        //      observation for the same reason `declaredImportName` beats
+        //      the binary's own soname above: a declaration is a statement
+        //      about the RUNTIME library, an observation is a fact about the
+        //      FILE WE READ, and those are allowed to differ.
+        //   2. the OBSERVATION (`matched.row.elfSymbolVersion`) — what the
+        //      library we read records for this export, under the two
+        //      conditions below.
+        //
+        // FORMAT-BLIND: no arm asks what object format is active. PE and
+        // Mach-O rows simply carry no `elfSymbolVersion` (their formats have
+        // no per-symbol version — see `ffi/import_surface.hpp`), so this
+        // expression yields the same empty string there that it always did.
         meta.version = std::string{ext.version};
+        if (meta.version.empty()) {
+            auto const& obs = matched.row.elfSymbolVersion;
+            // (a) DEFAULT VERSIONS ONLY. A `sym@VER` compat definition is
+            //     kept alive only for binaries that were linked before the
+            //     default moved; re-requesting one because we happened to
+            //     walk past it in `.dynsym` would MANUFACTURE the exact bug
+            //     D-LK-ELF-SYMBOL-VERSIONING was opened for — libc.so.6
+            //     exports both `realpath@@GLIBC_2.3` and the NULL-buffer-
+            //     rejecting `realpath@GLIBC_2.2.5`, and which one a
+            //     first-source-wins map keeps is a fact about `.dynsym`
+            //     ORDER. Leaving a compat row unversioned preserves today's
+            //     behaviour exactly: the reference binds the default.
+            // (b) ONLY ABOUT THE FILE WE ACTUALLY READ. `meta.importLibrary`
+            //     above may be a caller's DECLARED identity that deliberately
+            //     differs from the binary on disk — the cross-compilation
+            //     stand-in / `.tbd` contract (D-FFI-DECLARED-IMPORT-NAME).
+            //     The verneed we emit names `importLibrary`, so requesting a
+            //     version we saw in a DIFFERENT file would demand it of a
+            //     library whose version set we never observed, turning a
+            //     working link into a load-time failure. When the declared
+            //     identity agrees with what the file says about itself (or
+            //     there was no declaration), the file IS the library named
+            //     and its versions are ours to request.
+            if (obs.has_value() && obs->isDefaultVersion) {
+                std::string const& observedIdentity =
+                    matched.row.soname.empty() ? matched.row.libraryPath
+                                               : matched.row.soname;
+                if (meta.importLibrary == observedIdentity) {
+                    meta.version = obs->name;
+                }
+            }
+        }
         // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker (parity
         // with the FF5 source-decl path). Eager imports flow through
         // `synthesizeFfiFromSourceDecls`, not this binary-reader path — but an
         // eager ExternDeclRef routed here must not silently drop the field.
         meta.isEagerImport = ext.isEagerImport;
-        // The raw embedded soname, at its semantic home (the DT_SONAME of
-        // `importLibrary`). Populated now that the FF1 readers extract it;
-        // `ExternImport` carries no separate soname yet, so DT_NEEDED rides
-        // `importLibrary` above (a distinct ExternImport.soname path is the
-        // future refinement, not needed for the runtime-correct dependency).
+        // The raw OBSERVED embedded soname of the binary that was READ.
+        // Populated now that the FF1 readers extract it; `ExternImport` carries
+        // no separate soname yet, so DT_NEEDED rides `importLibrary` above (a
+        // distinct ExternImport.soname path is the future refinement, not
+        // needed for the runtime-correct dependency).
+        //
+        // NOT re-pointed by a level-1 declaration (D-FFI-DECLARED-IMPORT-NAME):
+        // this field answers "what did the file we read declare about itself",
+        // `importLibrary` answers "what identity do we RECORD". When a caller
+        // states an identity the two legitimately differ (that is the whole
+        // point of a stand-in binary), and forging this one to match would
+        // destroy the only evidence of which file was actually read. Consumed
+        // today only by the HIR text dump (`hir_text.cpp`).
         meta.soname = matched.row.soname;
 
         ffiMap.set(ext.node, std::move(meta));
@@ -492,8 +588,14 @@ synthesizeFfiFromSourceDecls(
         // rail (`program.cpp`'s merge-key lambda), which routes through the same
         // function, or a labelled definition and a labelled reference to it stop
         // collapsing at merge time and the call is emitted as a dynamic import.
+        // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): `linkName` is the
+        // fourth input to the SAME single naming point — the descriptor-declared
+        // base name for this target, decorated by the format's rule (so the
+        // definition rail's `nameOf`, which passes the SymbolRecord's copy of the
+        // identical string, produces the identical bytes).
         meta.mangledName   = linkNameFor(ext.canonicalName, ext.asmName,
-                                         format.kind());
+                                         format.cSymbolDecoration().scheme,
+                                         ext.linkName);
         meta.linkage       = FfiLinkage::Strong;
         meta.visibility    = FfiVisibility::Default;
         // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3): a

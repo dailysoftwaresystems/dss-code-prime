@@ -18,6 +18,7 @@
 #include "link/format/wasm.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
+#include "format_reject_support.hpp"   // countAtPath / rejectSummary
 
 #include <gtest/gtest.h>
 
@@ -25,6 +26,9 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -51,31 +55,43 @@ TEST(WasmFormatJson, WasmKindWithElfBlockRejected) {
     // the LK8 cross-kind guard. Now rejected at load.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-with-elf-block","kind":"wasm"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel" }
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/elf"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(WasmFormatJson, WasmKindWithPeBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-with-pe-block","kind":"wasm"},
       "pe": { "machine": 34404, "type": "obj" }
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/pe"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(WasmFormatJson, WasmKindWithMachoBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-with-macho-block","kind":"wasm"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 }
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/macho"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(WasmFormatJson, WasmKindWithUniversalFieldRejected) {
@@ -85,11 +101,15 @@ TEST(WasmFormatJson, WasmKindWithUniversalFieldRejected) {
     // be silently ignored by the walker. Validate-reject at load.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-with-relocations","kind":"wasm"},
       "relocations": [{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/relocations"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(ObjectFormatJsonCrossKind, ElfKindWithPeBlockRejected) {
@@ -99,22 +119,32 @@ TEST(ObjectFormatJsonCrossKind, ElfKindWithPeBlockRejected) {
     // a rule fails fast.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"elf-with-pe-block","kind":"elf"},
+      "$elfBlockComment": "kind:elf REQUIRES its own identity block populated (elf.class/data/machine all reject at 0 -- object_format_schema.cpp's unconditional ELF-identity check) -- without it this fixture would be rejected for THREE reasons unrelated to the cross-kind defect it pins. type:rel keeps it minimal (no pageAlign/Text-row requirement).",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel" },
       "pe": { "machine": 34404, "type": "obj" }
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/pe"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(ObjectFormatJsonCrossKind, PeKindWithMachoBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-with-macho-block","kind":"pe"},
       "pe": { "machine": 34404, "type": "obj" },
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 }
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/macho"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(ObjectFormatJsonCrossKind, MachoKindWithOptionalHeaderBlockRejected) {
@@ -123,12 +153,16 @@ TEST(ObjectFormatJsonCrossKind, MachoKindWithOptionalHeaderBlockRejected) {
     // the 5 rules are unreachable.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-with-pe-oh-block","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "object", "flags": 0 },
       "optionalHeader": { "magic": 523 }
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/optionalHeader"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 // ── Walker emits the 8-byte WebAssembly v1 preamble ──────────────────

@@ -113,6 +113,26 @@ struct DSS_EXPORT HirExternRecord {
     // declarator to read one from; each producer that DOES have a SymbolRecord sets
     // it explicitly below.
     std::string asmName;
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the per-target LINK
+    // BASE NAME a shipped-library descriptor declared for this extern, already
+    // resolved for the active (arch, format) and UNDECORATED (`fstat$INODE64`).
+    // EMPTY for every extern that did not come from an opted-in descriptor row ⇒
+    // downstream naming is byte-identical to pre-TF-C121.
+    //
+    // ★ IT RIDES THE `canonicalName` RAIL, NOT THE FOLDED-MAP RAIL — same as
+    // `version` above and for the same reason: the per-target choice was already
+    // made by the descriptor READER, so what travels here is one plain string,
+    // not a per-format map awaiting a fold.
+    //
+    // ★ DISTINCT FROM `asmName` ONE FIELD UP. `asmName` REPLACES the format's C
+    // mangling (a user's `__asm` is the symbol, verbatim); this one replaces the
+    // BASE that the mangling is applied TO. `ffi::linkNameFor` holds both and
+    // their precedence; nothing else in the pipeline decorates a name.
+    //
+    // ★ LAST FIELD, for the reason `asmName` was: the three positional aggregate
+    // producers (bare-proto, inline-synthesis, shipped-descriptor) keep
+    // compiling, and a producer with nothing to say defaults it to "".
+    std::string linkName;
 };
 
 struct DSS_EXPORT CstToHirResult {

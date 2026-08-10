@@ -124,6 +124,50 @@ Non-negotiable rules for anything under `real-examples/`:
   Test targets are `dss_<dir>_test_<x>`; the matching ctest names are `<dir>/test_<x>`.
   **Run a FULL build (no `--target`) whenever a shared header struct changed.**
 
+### 3.1 Real non-x86-Windows hardware is reachable over SSH (added 2026-08-04)
+
+Two physical machines are now scriptable, which changes what "verified" can mean for the
+non-native targets. Both are reached through **capability-paired** helpers in `tools/`:
+`ssh-arm64-vps.{sh,ps1}` and `ssh-macos.{sh,ps1}`.
+
+| host | what it is | why it matters |
+|---|---|---|
+| **aarch64 Ubuntu 24.04 VPS** | native arm64 Linux, 4 cores / 23 GB | Every prior arm64 result came from **qemu**, which says nothing about real silicon. The `.sh` driver was first exercised end-to-end here (2026-08-04: **331,330 tests, 1 known non-DSS confound**, `elf64-arm64` running NATIVELY). Also a genuinely *third* host for the de-host-locking property. |
+| **macOS 26.5.2, arm64** | the operator's personal MacBook | macOS is the ONE target with **no off-Mac emulator** — nothing on Windows or Linux runs a Mach-O. It is the only way a Darwin artefact is ever proven to RUN. |
+
+**Contract, and it is not optional:**
+
+- **Connection data is NEVER tracked.** Precedence is CLI parameter → env → `.secrets/<name>.env`
+  → **fail loud naming what to set**. `.secrets/` is gitignored; this repo is slated to go
+  public (PR #37). It holds host names, logins and key **PATHS** — never key material, never
+  a password.
+- **Key-based auth only.** Both helpers pass `BatchMode=yes` so ssh **fails** rather than
+  hanging at a prompt. Password auth is not supported by design: it cannot be automated
+  without putting the secret in the environment, and a credential in a repo script is a
+  committed secret.
+- **★★ THE MAC IS A PERSONAL MACHINE, NOT CI. It is usually OFF. ASK THE OPERATOR TO TURN IT
+  ON BEFORE USING IT.** Never wake it, never poll for it. "Cannot reach" is the EXPECTED
+  state, not an error to route around.
+- Use a **temp directory** for build experiments on either host; do not scribble in the repo.
+
+**Two measured traps, both already cost time:**
+
+- **The Mac's IP changes every lease** — it is resolved by `.local` mDNS per invocation, which
+  is also why `StrictHostKeyChecking=no` is kept deliberately (a moving address would trip a
+  host-key mismatch on every reconnect). That forgoes MITM protection: fine on a home LAN,
+  not on an untrusted one.
+- **`Test-Connection <host>.local` resolves the IPv6 link-local FIRST**, so `.IPv4Address` is
+  `$null` and a naive script reports "cannot resolve" for a Mac that is powered on and
+  answering pings. Use `Resolve-DnsName` filtered to IPv4. MEASURED 2026-08-04.
+- `.local` very often does **not** resolve from WSL (no mDNS responder); the `.sh` helper says
+  so and names the literal-IP override rather than leaving it to be discovered.
+
+**What the Mac settled that nothing else could** (MEASURED 2026-08-04): it carries **no
+`/usr/lib/libtcl*.dylib` at all**; system Tcl is a *framework* at **8.5**; Homebrew is not
+installed. So the testfixture's Tcl **8.6** symbols cannot come from the Mac even natively —
+the MacPorts `pinned-archive` acquisition is the only source, and `@loader_path` bundling is
+the correct shipping shape rather than a fallback.
+
 ---
 
 ## 4. The Tree / Node Model — Core Domain

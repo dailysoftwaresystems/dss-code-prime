@@ -50,30 +50,78 @@ namespace dss::ffi {
 // here when a new ingest shape arrives (e.g. archive `.a`/`.lib`,
 // JSON-described surface, etc.).
 
+// ── D-FFI-DECLARED-IMPORT-NAME — the recorded-identity precedence ──
+//
+// Reading a library binary answers TWO separate questions, and this struct
+// keeps them separate:
+//   * WHICH SYMBOLS exist -> always the file at `path` (the FF1 reader).
+//   * WHAT IDENTITY to record for them (the ELF DT_NEEDED / Mach-O
+//     LC_LOAD_DYLIB / PE import-descriptor name the LOADER resolves at
+//     runtime) -> a THREE-LEVEL precedence, highest first:
+//
+//       1. `declaredImportName`  — the caller STATES it (below).
+//       2. `row.soname`          — the binary's OWN embedded identity, which
+//                                  the FF1 readers extract (c171,
+//                                  D-FF1-READER-SONAME): ELF DT_SONAME /
+//                                  Mach-O LC_ID_DYLIB install name / PE
+//                                  export-directory DllName.
+//       3. `importName`          — the path-derived basename FALLBACK (below).
+//
+// The decision site is `ingest()` in `ingest.cpp` (search
+// `meta.importLibrary =`); it is the ONLY place the three levels are ranked.
+// FORMAT-BLIND on purpose: the readers normalise all three object formats'
+// embedded identities into the one `row.soname` field, so the precedence has
+// no per-format arm.
 struct DSS_EXPORT BinaryLibrarySource {
     // Path to a `.so` / `.dll` / `.dylib`. FF1 binary readers
     // discover the library's mangledName + identity from the
     // binary itself; no caller-supplied importLibrary required.
     std::filesystem::path path;
-    // c162 (D-FF1-READER-CONSUMER): the library IDENTITY to record in
-    // each resolved extern's import (the ELF DT_NEEDED / PE import
-    // descriptor / Mach-O LC_LOAD_DYLIB name). EMPTY (the default) ⇒
-    // `ingest()` binds each matched extern to the binary reader's own
-    // `libraryPath` label (== the on-disk path passed to `readImports`)
-    // -- the pre-c162 behavior every header/JSON caller relies on.
-    // NON-EMPTY ⇒ `ingest()` OVERRIDES every row read from THIS source
-    // to carry `importName` as its `libraryPath`, so the linker records
-    // the soname/DLL-name the loader resolves at runtime rather than the
-    // absolute build-time path (a Windows path in an ELF DT_NEEDED would
-    // never load). As of c171 (`D-FF1-READER-SONAME`) the FF1 readers now
-    // EXTRACT the binary's OWN embedded identity (ELF DT_SONAME / Mach-O
-    // LC_ID_DYLIB install name / PE export DllName), and `ingest()` PREFERS
-    // that over this override when the binary declares one — so `importName`
-    // is now the FALLBACK the driver supplies for a library that carries NO
-    // embedded soname (the file's basename, exactly what a foreign linker
-    // records for a `-l<name>` / `gcc -shared` library with no explicit
-    // `-soname`), rather than the primary source it was before FF1 extraction.
+    // PRECEDENCE LEVEL 3 (LOWEST) — the path-derived basename FALLBACK.
+    //
+    // c162 (D-FF1-READER-CONSUMER) introduced this as the library IDENTITY to
+    // record in each resolved extern's import. EMPTY (the default) ⇒ `ingest()`
+    // binds each matched extern to the binary reader's own `libraryPath` label
+    // (== the on-disk path passed to `readImports`) -- the pre-c162 behavior
+    // every header/JSON caller relies on. NON-EMPTY ⇒ `ingest()` replaces
+    // `libraryPath` on every row read from THIS source with `importName`, so
+    // the linker records a loader-resolvable name rather than the absolute
+    // build-time path (a Windows path in an ELF DT_NEEDED would never load).
+    //
+    // c171 (`D-FF1-READER-SONAME`) demoted it: the FF1 readers now EXTRACT the
+    // binary's OWN embedded identity into `row.soname`, and `ingest()` PREFERS
+    // that whenever the binary declares one. So this is the FALLBACK the driver
+    // supplies for a library carrying NO embedded soname (the file's basename,
+    // exactly what a foreign linker records for a `-l<name>` / `gcc -shared`
+    // library with no explicit `-soname`), NOT the primary source it once was.
+    //
+    // Historical note, because the word matters: c162's comment called this an
+    // "override". It is NOT the override any more -- `declaredImportName` is.
     std::string importName;
+    // PRECEDENCE LEVEL 1 (HIGHEST) — the caller-STATED runtime identity.
+    //
+    // EMPTY (the default) = NOT STATED ⇒ falls through to level 2 (the embedded
+    // soname), then level 3. NON-EMPTY ⇒ this string IS the recorded import
+    // library, beating even an embedded soname. Never whitespace-only or
+    // otherwise degenerate: the CLI / project-manifest boundary rejects those
+    // LOUD (`CliArgsError::InvalidResolveLibrary` / `C_MalformedJson`) so an
+    // unusable identity can never reach here silently.
+    //
+    // WHY it must outrank the embedded soname: CROSS-COMPILATION from a
+    // STAND-IN library binary. To build a Darwin artifact on a Windows/Linux
+    // host we read the Tcl symbols out of a MacPorts `.dylib` whose
+    // LC_ID_DYLIB is `/opt/local/lib/libtcl8.6.dylib`. Level 2 would record
+    // that MacPorts prefix as the LC_LOAD_DYLIB, and the artifact would then
+    // demand MacPorts at that exact path on the target Mac -- a dyld load
+    // FAILURE at runtime, with no build error anywhere. A real toolchain
+    // covers this with a sysroot stub / `.tbd` / `-dylib_file`: SYMBOLS from
+    // the file you can read, IDENTITY from the declaration. This field is that
+    // declaration, and it is the only level a caller can state.
+    //
+    // LAST field so every existing positional aggregate initializer
+    // (`BinaryLibrarySource{path, basename}`, fixtures included) keeps
+    // compiling and defaults it to "" == not stated.
+    std::string declaredImportName;
 };
 
 struct DSS_EXPORT CHeaderSource {
@@ -145,6 +193,24 @@ struct DSS_EXPORT ExternDeclRef {
     // positional aggregate initializers (fixtures included) keep compiling and
     // default it to "".
     std::string_view asmName{};
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the per-target LINK
+    // BASE NAME a shipped-library descriptor declared for this extern, already
+    // resolved for the active (arch, format) by the descriptor reader and
+    // UNDECORATED — threaded verbatim from `HirExternRecord.linkName`. EMPTY =
+    // none ⇒ every downstream name is computed exactly as before this cycle.
+    //
+    // When set it replaces the BASE that `ffi::linkNameFor` decorates (NOT the
+    // decoration itself, which `asmName` above does): `linkName:"fstat$INODE64"`
+    // yields `_fstat$INODE64` on Mach-O and `fstat$INODE64` on ELF, because the
+    // leading underscore belongs to the FORMAT. It also becomes the un-decorated
+    // key the binary-match lookup uses, for the same reason `asmName` does — the
+    // library really exports the aliased name, so keying on the plain C
+    // identifier would silently miss the row.
+    //
+    // LAST field, mirroring `HirExternRecord`, so existing positional aggregate
+    // initializers (the ~30 fixtures in tests/ffi) keep compiling and default it
+    // to "".
+    std::string_view linkName{};
 };
 
 // ── HirIngestResult ─────────────────────────────────────────────

@@ -1,0 +1,11 @@
+DSSVER_1.0 {
+  global:
+    dss_ver_compat;
+};
+DSSVER_2.0 {
+  global:
+    dss_ver_default;
+    dss_ver_compat;
+    dss_ver_data;
+    dss_ver_uses_realpath;
+} DSSVER_1.0;

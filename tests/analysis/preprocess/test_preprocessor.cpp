@@ -18,12 +18,14 @@
 #include "link/object_format_schema.hpp"  // TF-C97: per-format data-model predefines
 #include "tokenizer/tokenizer.hpp"
 #include "test_support/golden_file.hpp"   // TF-C85: findCorpusRoot / readFile
+#include "test_support/repo_root.hpp"     // the ONE repo/config-root resolver
 #include "test_support/scratch_dir.hpp"   // the per-run scratch root (see ppScratchRoot)
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -146,7 +148,7 @@ static_assert(std::is_reference_v<decltype(cSubset())>,
     auto schema = cSubset();
     auto buf = SourceBuffer::fromString(std::move(text), "main.c");
     std::vector<std::filesystem::path> noDirs;
-    out = preprocess(buf, schema, noDirs);
+    out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     std::vector<std::string> lexs;
     for (Token const& t : out.tokens) {
         if (t.coreKind == CoreTokenKind::Eof) continue;
@@ -164,28 +166,35 @@ static_assert(std::is_reference_v<decltype(cSubset())>,
     return false;
 }
 
-// Read the shipped c-subset config TEXT (walk up to src/dss-config/sources) so
-// a test can REBIND a single config field and reload, proving the engine reads
-// that field from config rather than hard-coding a lexeme. Returns "" if not
-// found (the caller asserts). Mirrors the inline walk in
-// FunctionLikeOpenTokenIsConfigDrivenNotHardcoded.
+// Read the shipped c-subset config TEXT so a test can REBIND a single config
+// field and reload, proving the engine reads that field from config rather than
+// hard-coding a lexeme. Returns "" if not found — the ~14 callers each already
+// assert non-empty, so that contract is UNCHANGED; what is new is that the
+// REASON is reported here instead of being guessed at fourteen call sites.
+//
+// The directory comes from the ONE test-side resolver (`repo_root.hpp`:
+// $DSS_CONFIG_ROOT → the repo root CMake bakes in → a cwd ancestor walk). It
+// used to be a private 8-hop cwd walk, duplicated verbatim inside
+// FunctionLikeOpenTokenIsConfigDrivenNotHardcoded (which now calls this one):
+// out of tree the cwd has no `src/dss-config` in its ancestry, so BOTH copies
+// missed and every rebind test in this file went red at once, for a reason none
+// of them named.
 [[nodiscard]] std::string loadShippedCSubsetText() {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    fs::path here = fs::current_path(ec);
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        fs::path const cand =
-            here / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-        if (fs::exists(cand, ec)) {
-            std::ifstream in(cand, std::ios::binary);
-            return std::string(std::istreambuf_iterator<char>(in),
-                               std::istreambuf_iterator<char>());
-        }
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    auto const root = dss::test::findRepoRoot();
+    if (!root) {
+        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        return {};
     }
-    return {};
+    std::filesystem::path const cand =
+        *root / "src" / "dss-config" / "sources" / "c-subset.lang.json";
+    std::ifstream in(cand, std::ios::binary);
+    if (!in) {
+        ADD_FAILURE() << "cannot read the shipped c-subset config: "
+                      << cand.string();
+        return {};
+    }
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
 }
 
 } // namespace
@@ -819,7 +828,7 @@ TEST(Preprocessor, NonDirectiveInputIsIdentity) {
     auto buf = SourceBuffer::fromString(
         std::string{"int main(void) { return 1 + 2; }\n"}, "main.c");
     std::vector<std::filesystem::path> noDirs;
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(r.diagnostics->hasErrors());
 
     Tokenizer tk{r.synthBuffer, schema};
@@ -876,27 +885,14 @@ TEST(Preprocessor, EnabledIsConfigDrivenPerLanguage) {
 TEST(Preprocessor, FunctionLikeOpenTokenIsConfigDrivenNotHardcoded) {
     auto loadedText = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(loadedText.has_value());
-    // Read the shipped c-subset config text (walk up to src/dss-config/sources).
+    // Read the shipped c-subset config text. This WAS a byte-for-byte copy of
+    // the cwd walk `loadShippedCSubsetText()` used to carry; the copy is gone,
+    // because a second implementation is a second place to forget when the
+    // resolution rules change — which is precisely what an out-of-tree build
+    // exposed (neither copy read $DSS_CONFIG_ROOT, so both missed together).
     namespace fs = std::filesystem;
-    std::string text;
-    {
-        std::error_code ec;
-        fs::path here = fs::current_path(ec);
-        for (int i = 0; i < 8 && !here.empty(); ++i) {
-            fs::path const cand =
-                here / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-            if (fs::exists(cand, ec)) {
-                std::ifstream in(cand, std::ios::binary);
-                text.assign(std::istreambuf_iterator<char>(in),
-                            std::istreambuf_iterator<char>());
-                break;
-            }
-            fs::path const parent = here.parent_path();
-            if (parent == here) break;
-            here = parent;
-        }
-        ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
-    }
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
     // Rebind ONLY the function-like opener to `BlockOpen` (a real, declared
     // c-subset token). The token name must resolve (validated at load), so this
     // is a well-formed schema -- just one where `(` is no longer the opener.
@@ -919,7 +915,7 @@ TEST(Preprocessor, FunctionLikeOpenTokenIsConfigDrivenNotHardcoded) {
     auto buf = SourceBuffer::fromString(
         std::string{"#define F(x) ((x)+1)\nint v = 0;\n"}, "main.c");
     std::vector<fs::path> noDirs;
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
         << "with the `(` opener rebound away, `#define F(x)` must be treated "
            "as object-like -- proving the opener is read from config, not "
@@ -965,7 +961,7 @@ TEST(Preprocessor, VariadicMarkerIsConfigDrivenNotHardcoded) {
     auto buf = SourceBuffer::fromString(
         std::string{"#define V(...) 0\nint v = 0;\n"}, "main.c");
     std::vector<fs::path> noDirs;
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
         << "with the variadic marker rebound off `...`, a `#define V(...)` must "
            "NOT trip the variadic fail-loud via the `...` spelling -- proving "
@@ -1143,7 +1139,7 @@ TEST(Preprocessor, FunctionLikeCloseAndSeparatorAreConfigDrivenNotHardcoded) {
         ASSERT_EQ(schema->preprocess().functionLikeCloseToken, "BracketClose");
         auto buf = SourceBuffer::fromString(
             std::string{"#define F(a,b) ((a)+(b))\nint v = F(1,2);\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(r.diagnostics->hasErrors())
             << "with the `)` close token rebound away, a function-like define's "
                "parameter list cannot terminate -- it must fail loud";
@@ -1172,7 +1168,7 @@ TEST(Preprocessor, FunctionLikeCloseAndSeparatorAreConfigDrivenNotHardcoded) {
         ASSERT_EQ(schema->preprocess().functionLikeArgSeparatorToken, "Colon");
         auto buf = SourceBuffer::fromString(
             std::string{"#define CNT(x) 1\nint v = CNT(a,b);\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
             << "with the `,` separator rebound away, `CNT(a,b)` collects ONE "
                "argument (no arity error) -- proving the separator is read from "
@@ -1206,7 +1202,7 @@ TEST(Preprocessor, VaArgsNameIsConfigDrivenNotHardcoded) {
         auto buf = SourceBuffer::fromString(
             std::string{"#define V(...) g(__REST__)\nint v = V(1,2);\n"},
             "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_FALSE(r.diagnostics->hasErrors());
         std::vector<std::string> lexs;
         for (Token const& t : r.tokens) {
@@ -1230,7 +1226,7 @@ TEST(Preprocessor, VaArgsNameIsConfigDrivenNotHardcoded) {
     {
         auto buf = SourceBuffer::fromString(
             std::string{"#define OBJ __VA_ARGS__\nint v = 0;\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
             << "with the catch-all rebound to __REST__, the literal __VA_ARGS__ "
                "is an ordinary identifier and must NOT trip the misuse guard -- "
@@ -1834,7 +1830,7 @@ TEST(Preprocessor, ConditionalDirectiveWordIsConfigDrivenNotHardcoded) {
     {
         auto buf = SourceBuffer::fromString(
             std::string{"#whenever 0\nint dead;\n#endif\nint x;\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_FALSE(r.diagnostics->hasErrors());
         std::vector<std::string> lexs;
         for (Token const& t : r.tokens) {
@@ -1853,7 +1849,7 @@ TEST(Preprocessor, ConditionalDirectiveWordIsConfigDrivenNotHardcoded) {
     {
         auto buf = SourceBuffer::fromString(
             std::string{"#if 0\nint a;\n#endif\nint x;\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
             << "with `if` rebound to `whenever`, a literal `#if` is an unknown "
                "directive -- proving the conditional word is read from config";
@@ -2429,7 +2425,7 @@ TEST(Preprocessor, FC15bFileInIncludedHeaderReportsHeaderName) {
     auto mainBuf = SourceBuffer::fromFile(mainPath);
     ASSERT_NE(mainBuf, nullptr);
     std::vector<fs::path> noDirs;
-    PreprocessResult r = preprocess(mainBuf, schema, noDirs);
+    PreprocessResult r = preprocess(mainBuf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(r.diagnostics->hasErrors());
 
     std::vector<std::string> lexs;
@@ -2562,7 +2558,7 @@ TEST(Preprocessor, FC15bPredefinedNameIsConfigDrivenNotHardcoded) {
     {
         auto buf = SourceBuffer::fromString(
             std::string{"int a;\nint x = __CURLINE__;\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_FALSE(r.diagnostics->hasErrors());
         std::vector<std::string> lexs;
         for (Token const& t : r.tokens) {
@@ -2580,7 +2576,7 @@ TEST(Preprocessor, FC15bPredefinedNameIsConfigDrivenNotHardcoded) {
     {
         auto buf = SourceBuffer::fromString(
             std::string{"int x = __LINE__;\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_FALSE(r.diagnostics->hasErrors());
         std::vector<std::string> lexs;
         for (Token const& t : r.tokens) {
@@ -2641,8 +2637,19 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // `__GNUC__`/`__GNUC_MINOR__`/`__GNUC_PATCHLEVEL__` and `__clang__`) and 1
     // macho-gated (`__APPLE_CC__`). 11+5=16 un-gated, 11 pe-gated, 2+1=3
     // macho-gated = 30.
-    EXPECT_EQ(pms.size(), 30u)
-        << "c-subset declares 16 un-gated + 11 pe-gated + 3 macho-gated predefined macros";
+    //
+    // TF-C115 (D-PP-ENDIANNESS-PREDEFINES): +3 UN-GATED rows — the byte-order
+    // NAMING VOCABULARY `__ORDER_LITTLE_ENDIAN__`/`__ORDER_BIG_ENDIAN__`/
+    // `__ORDER_PDP_ENDIAN__` (1234/4321/3412). They are on the LANGUAGE, not the
+    // target, because MEASURED 2026-08-04 (`clang-19 -dM -E -x c /dev/null
+    // -target <triple>`) they are IDENTICAL on every triple DSS targets AND on
+    // the big-endian control `aarch64_be-linux-gnu` — they are names, not the
+    // machine's answer, so they vary by nothing. The per-CPU ANSWER
+    // (`__LITTLE_ENDIAN__`, `__BYTE_ORDER__`) is on the TARGET and is therefore
+    // absent from this list, exactly like the TF-C74 identity spellings.
+    // 16+3=19 un-gated, 11 pe-gated, 3 macho-gated = 33.
+    EXPECT_EQ(pms.size(), 33u)
+        << "c-subset declares 19 un-gated + 11 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -2679,11 +2686,15 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
            "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
            "TargetConditionals.h:342 conjunction that gates the whole Darwin ladder";
-    EXPECT_EQ(ungated, 16u)
+    EXPECT_EQ(ungated, 19u)
         << "the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
            "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) + the 5 TF-C83 "
            "un-gated identity rows (__DSSCP__, __GNUC__, __GNUC_MINOR__, "
-           "__GNUC_PATCHLEVEL__, __clang__) are un-gated (every format); "
+           "__GNUC_PATCHLEVEL__, __clang__) + the 3 TF-C115 __ORDER_* byte-order "
+           "vocabulary rows (D-PP-ENDIANNESS-PREDEFINES — measured identical on "
+           "every triple INCLUDING the big-endian control, so they are names "
+           "rather than a per-CPU fact and belong here rather than on a target) "
+           "are un-gated (every format); "
            "__STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
            "complete on all legs) are both REMOVED";
     EXPECT_EQ(peGated, 11u)
@@ -2944,10 +2955,14 @@ namespace {
 [[nodiscard]] std::vector<std::string> ppLexemesWithDirs(
     std::string text, PreprocessResult& out,
     std::vector<std::filesystem::path> includeDirs,
-    std::vector<std::filesystem::path> systemDirs) {
+    std::vector<std::filesystem::path> systemDirs,
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: the active format's header-name case
+    // rule. Defaults to the production default so every existing caller is
+    // byte-identical; the case pins pass it explicitly.
+    dss::HeaderNameMatching matching = dss::kDefaultHeaderNameMatching) {
     auto schema = cSubset();
     auto buf = SourceBuffer::fromString(std::move(text), "main.c");
-    out = preprocess(buf, schema, includeDirs, systemDirs);
+    out = preprocess(buf, schema, includeDirs, matching, systemDirs);
     std::vector<std::string> lexs;
     for (Token const& t : out.tokens) {
         if (t.coreKind == CoreTokenKind::Eof) continue;
@@ -3036,7 +3051,7 @@ TEST(Preprocessor, TfC82UnknownPragmaIsErrorFalseRestoresSilence) {
     auto buf = SourceBuffer::fromString(
         std::string{"#pragma GCC optimize(\"O2\")\nint v=1;\n"}, "main.c");
     std::vector<std::filesystem::path> noDirs;
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_TRUE(r.diagnostics->all().empty())
         << "with `unknownPragmaIsError` false an unregistered pragma is ignored "
            "in silence — C 6.10.6p2's licence, taken deliberately rather than by "
@@ -3177,7 +3192,7 @@ TEST(Preprocessor, TfC82PragmaOperatorIsConfigDrivenOrdinaryIdentifierWhenAbsent
     auto buf = SourceBuffer::fromString(
         std::string{"int _Pragma;\n"}, "main.c");
     std::vector<std::filesystem::path> noDirs;
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_TRUE(r.diagnostics->all().empty())
         << "with no `pragmaOperator` declared, `_Pragma` is just an identifier";
     std::size_t seen = 0;
@@ -3234,7 +3249,7 @@ TEST(Preprocessor, TfC82PragmaPackPushWordIsConfigDriven) {
     {
         auto buf = SourceBuffer::fromString(
             std::string{"#pragma pack(push, 4)\nint x;\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
             << "with no `pragmaPackPushWord` declared the push form is an "
                "unbuilt form and must be REFUSED, never silently ignored";
@@ -3242,7 +3257,7 @@ TEST(Preprocessor, TfC82PragmaPackPushWordIsConfigDriven) {
     {
         auto buf = SourceBuffer::fromString(
             std::string{"#pragma pack(4)\nint x;\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
             << "the set/reset forms are independent of the stack vocabulary";
     }
@@ -3263,7 +3278,7 @@ void ppUnderFormat(std::string text, std::optional<ObjectFormatKind> fmt,
     auto buf    = SourceBuffer::fromString(std::move(text), "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string>           noDefines;
-    out = preprocess(buf, schema, noDirs, {}, fmt, noDefines);
+    out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, fmt, noDefines);
 }
 // TRUE iff the token spelled `name` was emitted inside a `#pragma optimize("",
 // off)` region — the exact lookup the semantic tier performs on a function
@@ -3312,7 +3327,7 @@ TEST(Preprocessor, TfC85WarningRowIsWhatMakesTheWarningPragmaSilent) {
     std::vector<std::filesystem::path> noDirs;
     auto buf = SourceBuffer::fromString(
         std::string{"#pragma warning(disable: 4127)\nint x;\n"}, "main.c");
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
         << "with no row claiming `warning` the pragma is UNREGISTERED and loud — "
            "which is precisely the state that broke pe64 for 1685 of 2135 lines";
@@ -3354,7 +3369,7 @@ TEST(Preprocessor, TfC85IntrinsicRowIsWhatMakesTheIntrinsicPragmaSilent) {
     std::vector<std::filesystem::path> noDirs;
     auto buf = SourceBuffer::fromString(
         std::string{"#pragma intrinsic(_byteswap_ulong)\nint x;\n"}, "main.c");
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
         << "with no row claiming `intrinsic` the pragma is UNREGISTERED and loud "
            "— 448 of the 2135 pe64 failures";
@@ -3437,7 +3452,7 @@ TEST(Preprocessor, TfC85OptimizeRowAndItsStateWordsAreConfigDriven) {
         std::vector<std::filesystem::path> noDirs;
         auto buf = SourceBuffer::fromString(
             std::string{"#pragma optimize(\"\", off)\nint x;\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma));
         EXPECT_TRUE(r.pragmaNoOptimizeByOffset.empty())
             << "and nothing is stamped — the sink is inert without its row";
@@ -3451,7 +3466,7 @@ TEST(Preprocessor, TfC85OptimizeRowAndItsStateWordsAreConfigDriven) {
         std::vector<std::filesystem::path> noDirs;
         auto buf = SourceBuffer::fromString(
             std::string{"#pragma optimize(\"\", off)\nint x;\n"}, "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPragma))
             << "with no `pragmaOptimizeOffWord` declared the off form is an "
                "unbuilt form and must be REFUSED, never silently ignored";
@@ -3602,7 +3617,7 @@ TEST(Preprocessor, FC15cPragmaIsConfigDrivenFailsLoudWhenStripped) {
     auto buf = SourceBuffer::fromString(
         std::string{"#pragma GCC optimize(\"O2\")\nint v=1;\n"}, "main.c");
     std::vector<fs::path> noDirs;
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
         << "with `pragmaDirective` stripped, `#pragma` must fail loud as an "
            "unsupported directive -- proving the directive word is read from "
@@ -4018,7 +4033,7 @@ TEST(Preprocessor, FC15cHasIncludeIsConfigDrivenOptOut) {
         std::string{"#if __has_include\nint yes;\n#else\nint no;\n#endif\n"},
         "main.c");
     std::vector<fs::path> noDirs;
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
         << "with the operator stripped, `__has_include` is ordinary -- no "
            "has-include diagnostic";
@@ -4079,7 +4094,7 @@ TEST(Preprocessor, FC15cAngleDelimiterIsConfigKindNotByte) {
     auto buf = SourceBuffer::fromString(
         std::string{"#if __has_include(<stdio.h>)\nint a;\n#endif\n"}, "main.c");
     std::vector<fs::path> noDirs;
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorHasInclude))
         << "with the angle-open token rebound off `<`, a `<h>` operand must fail "
            "loud -- proving the delimiter is matched by config KIND, not the `<` "
@@ -4282,7 +4297,7 @@ TEST(Preprocessor, FC15GnuCommaElisionIsConfigDriven) {
         std::string{"#define LOG(fmt, ...) f(fmt, ## __VA_ARGS__)\nLOG(42)\n"},
         "main.c");
     std::vector<fs::path> noDirs;
-    PreprocessResult r = preprocess(buf, *loaded, noDirs);
+    PreprocessResult r = preprocess(buf, *loaded, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
     std::vector<std::string> lexs;
     for (Token const& t : r.tokens) {
@@ -4485,7 +4500,7 @@ TEST(Preprocessor, Tf60GateDefinedInChildHeaderMakesParentIncludeLive) {
         "int f(void) { EMPTY( return 7; ); return 42; }\n",
         "main.c");
     std::vector<fs::path> includeDirs{dir};
-    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    auto out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, {});
     EXPECT_FALSE(out.diagnostics->hasErrors())
         << "a gate macro defined in an INCLUDED header must make the parent's "
            "#if-gated include LIVE — dropping inner.h leaves EMPTY undefined "
@@ -4519,7 +4534,7 @@ TEST(Preprocessor, Tf60GateDefinedInParentSourceMakesChildIncludeLive) {
         "int f(void) { EMPTY( return 7; ); return 42; }\n",
         "main.c");
     std::vector<fs::path> includeDirs{dir};
-    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    auto out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, {});
     EXPECT_FALSE(out.diagnostics->hasErrors())
         << "a parent-source #define before the include must be visible to the "
            "CHILD's pre-scan so its #if GATE-gated include is LIVE";
@@ -4574,7 +4589,7 @@ TEST(Preprocessor, Tf60CharLiteralMacroReplacementSurvivesGuardEval) {
         "#define NL '\\n'\n#if NL == 10\n#include \"inner.h\"\n#endif\nint y;\n",
         "main.c");
     std::vector<fs::path> includeDirs{dir};
-    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    auto out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, {});
     EXPECT_FALSE(out.diagnostics->hasErrors())
         << "a char-literal macro replacement must round-trip into the guard "
            "evaluation — losing the literal's closing delimiter makes the guard "
@@ -4623,7 +4638,7 @@ TEST(Preprocessor, Tf60MintedProductSlicesExactValueThroughChain) {
         auto buf = SourceBuffer::fromString(
             "#define A B\n#define B 424242\n#if A == 424242\n"
             "#include \"inner.h\"\n#endif\nint y;\n", "main.c");
-        auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+        auto out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, {});
         EXPECT_FALSE(out.diagnostics->hasErrors());
         bool saw = false;
         for (Token const& t : out.tokens)
@@ -4667,7 +4682,7 @@ TEST(Preprocessor, Tf60FunclikeGuardedUndefMoreLiveEdgeStaysBenign) {
         "int y;\n",
         "main.c");
     std::vector<fs::path> includeDirs{dir};
-    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    auto out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, {});
     bool sawMarker = false;
     for (Token const& t : out.tokens) {
         if (std::string{out.synthBuffer->slice(t.span)} == "morelive_marker_zzz")
@@ -4727,7 +4742,7 @@ TEST(Preprocessor, CommandLineDefineMakesIfdefIncludeLive) {
         "#ifdef GATE\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> defines{"GATE"};
-    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, defines);
     EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "a command-line --define GATE must make #ifdef GATE live in the include-"
            "gating pre-scan so its quote-#include resolves "
@@ -4745,7 +4760,7 @@ TEST(Preprocessor, CommandLineDefineViaDefinedOperatorIncludeLive) {
         "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> defines{"GATE"};
-    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, defines);
     EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "#if defined(GATE) must agree with #ifdef GATE for a command-line define "
            "(the unified sbNameDefined oracle)";
@@ -4770,7 +4785,7 @@ TEST(Preprocessor, CommandLineDefineSeedThreadsIntoChildBuilders) {
         "#ifdef GATE\n#include \"outer.h\"\n#endif\nint x;\n", "main.c");
     std::vector<fs::path> includeDirs{dir};
     std::vector<std::string> defines{"GATE"};
-    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, defines);
+    auto out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, defines);
     EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "the command-line define seed must thread into the child builder so "
            "outer.h's own #ifdef GATE-gated include is LIVE (D-PP-PRESCAN-"
@@ -4798,7 +4813,7 @@ TEST(Preprocessor, Tf59LineDirectiveInHeaderDoesNotRenumberIncluder) {
     auto buf = SourceBuffer::fromString(
         "#include \"h.h\"\nint after = __LINE__;\n", "main.c");
     std::vector<fs::path> includeDirs{dir};
-    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, {});
+    auto out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, {});
     EXPECT_FALSE(out.diagnostics->hasErrors());
     bool saw700 = false, saw2 = false;
     for (Token const& t : out.tokens) {
@@ -4823,7 +4838,7 @@ TEST(Preprocessor, CommandLineDefineSeedDoesNotContaminateOutput) {
                                         "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> defines{"GATE=7"};
-    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, defines);
     EXPECT_FALSE(out.diagnostics->hasErrors());
     std::vector<std::string> lexs;
     for (Token const& t : out.tokens) {
@@ -4856,7 +4871,7 @@ TEST(Preprocessor, CommandLineDefineValueMakesIfIncludeLive) {
         "#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> defines{"M=1"};
-    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, defines);
     EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "a command-line --define M=1 must make the VALUE guard #if M live in the "
            "include-gating pre-scan so its quote-#include resolves "
@@ -4874,14 +4889,14 @@ TEST(Preprocessor, CommandLineDefineValueAndDefinednessAgree) {
         auto buf = SourceBuffer::fromString(
             "#if defined(M)\n#include \"still_missing.h\"\n#endif\nint x;\n",
             "main.c");
-        auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+        auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, defines);
         EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
             << "#if defined(M) must gate the include LIVE for --define M=1";
     }
     {
         auto buf = SourceBuffer::fromString(
             "#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
-        auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+        auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, defines);
         EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
             << "#if M (value) must agree with #if defined(M) for --define M=1";
     }
@@ -4897,7 +4912,7 @@ TEST(Preprocessor, CommandLineDefineValueZeroKeepsIncludeDead) {
         "#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> defines{"M=0"};
-    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, defines);
     EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "--define M=0 must leave #if M dead so its quote-#include is not resolved "
            "(no P0016 over-resolution)";
@@ -4915,7 +4930,7 @@ TEST(Preprocessor, CommandLineDefineValuePrefixNotEmittedIntoSynthText) {
                                         "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> defines{"GATE=7"};
-    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, defines);
     std::string_view syn = out.synthBuffer->text();
     std::size_t count = 0;
     for (std::size_t pos = syn.find("#define GATE");
@@ -4941,7 +4956,7 @@ TEST(Preprocessor, PredefinedValueGuardMakesIncludeLive) {
         "int x;\n", "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> noDefs;
-    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, noDefs);
+    auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, noDefs);
     EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "a predefined VALUE guard (#if __STDC_VERSION__ >= 201112L) must gate the "
            "quote-#include LIVE (closes D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE)";
@@ -4957,7 +4972,7 @@ TEST(Preprocessor, PredefinedValueGuardFalseKeepsIncludeDead) {
         "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> noDefs;
-    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, noDefs);
+    auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, noDefs);
     EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "#if __STDC_VERSION__ < 0 must stay dead (the seeded predefined value is "
            "real, not a blanket predefined->live)";
@@ -4983,7 +4998,7 @@ TEST(Preprocessor, FunctionLikePredefinedNotValueSeededIntoPrescan) {
         "#if __declspec\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> noDefs;
-    auto out = preprocess(buf, schema, noDirs, {}, ObjectFormatKind::Pe, noDefs);
+    auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, ObjectFormatKind::Pe, noDefs);
     EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "a function-like predefine (__declspec) must NOT be value-seeded into the "
            "pre-scan: #if __declspec stays dead so its quote-#include is not resolved";
@@ -4999,7 +5014,7 @@ TEST(Preprocessor, CommandLineDefineThenUndefComposesDead) {
         "#undef M\n#if M\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string> defines{"M=1"};
-    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    auto out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, std::nullopt, defines);
     EXPECT_FALSE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "an in-source #undef M must compose with --define M=1 (Option 2 seeds the "
            "value into localMacros, which #undef erases) -> #if M dead -> no include";
@@ -5269,7 +5284,7 @@ TEST(Preprocessor, DeadBranchIncludeSkipIsConfigDrivenNotHardcoded) {
     auto buf = SourceBuffer::fromString(
         std::string{"#whenever 0\n#include \"nope.h\"\n#endif\nint x;\n"},
         "main.c");
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
         << "the dead-branch include skip must use the CONFIG conditional word "
            "(#whenever), not a hard-coded #if";
@@ -5436,7 +5451,7 @@ TEST(Preprocessor, DeadRegionCloseUsesConfigEndifWordNotHardcoded) {
 
     auto buf = SourceBuffer::fromString(
         std::string{"#if 0\n#endwhile\n$\nint x;\n"}, "main.c");
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
         << "the dead-region close must use the CONFIG `#endwhile`, so the `$` "
            "AFTER it is LIVE and reports -- not a hard-coded `#endif`";
@@ -5625,7 +5640,7 @@ TEST(Preprocessor, PositionalDefineInsideLiveIfBranch) {
     auto schema = cSubset();
     auto buf = SourceBuffer::fromString(std::move(text), "main.c");
     std::vector<std::filesystem::path> noDirs;
-    out = preprocess(buf, schema, noDirs, {}, fmt, defines);
+    out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, fmt, defines);
     std::vector<std::string> lexs;
     for (Token const& t : out.tokens) {
         if (t.coreKind == CoreTokenKind::Eof) continue;
@@ -5958,7 +5973,7 @@ TEST(Preprocessor, ElifdefWordIsConfigDrivenNotHardcoded) {
             std::string{"#define B\n#ifdef A\nint a;\n#elifwhendef B\nint b;\n"
                         "#else\nint c;\n#endif\n"},
             "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_FALSE(r.diagnostics->hasErrors());
         auto lexs = lexemesOf(r);
         ASSERT_EQ(lexs.size(), 3u) << "#elifwhendef B is taken: int b ;";
@@ -5971,7 +5986,7 @@ TEST(Preprocessor, ElifdefWordIsConfigDrivenNotHardcoded) {
             std::string{"#define A\n#ifdef A\nint a;\n#elifdef B\nint b;\n"
                         "#endif\n"},
             "main.c");
-        PreprocessResult r = preprocess(buf, schema, noDirs);
+        PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
             << "with elifdef rebound, a literal #elifdef in a live branch is an "
                "unknown directive -- proving the word is read from config";
@@ -5993,7 +6008,7 @@ TEST(Preprocessor, ElifdefIsConfigDrivenFailsLoudWhenStripped) {
         std::string{"#define A\n#ifdef A\nint a;\n#elifdef B\nint b;\n#endif\n"},
         "main.c");
     std::vector<fs::path> noDirs;
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
         << "with `elifdefDirective` stripped, `#elifdef` must fail loud as an "
            "unsupported directive -- proving the directive word is read from "
@@ -6095,7 +6110,7 @@ ppEmbedTokens(std::string text, PreprocessResult& out,
     auto schema = cSubset();
     auto buf = SourceBuffer::fromString(std::move(text), "main.c");
     std::vector<fsemb::path> noSys;
-    out = preprocess(buf, schema, includeDirs, noSys);
+    out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, noSys);
     std::vector<Token> sig;
     for (Token const& t : out.tokens) {
         if (t.coreKind == CoreTokenKind::Eof) continue;
@@ -6210,7 +6225,7 @@ TEST(Preprocessor, FC179EmbedResolvesRelativeToIncludingHeader) {
                                         (root / "main.c").string());
     auto schema = cSubset();
     std::vector<fsemb::path> dirs{root};
-    auto r = preprocess(buf, schema, dirs);
+    auto r = preprocess(buf, schema, dirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(r.diagnostics->hasErrors())
         << "#embed inside a spliced header resolves relative to the HEADER's dir";
     bool has42 = false;
@@ -6406,7 +6421,7 @@ TEST(Preprocessor, FC179EmbedDirectiveIsConfigDrivenNotHardcoded) {
         auto buf = SourceBuffer::fromString(
             "static const unsigned char x[] = {\n#embed \"missing.bin\"\n};\n",
             "main.c");
-        auto r = preprocess(buf, schema, noDirs);
+        auto r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
             << "with the word rebound, `#embed` is an unknown directive (P0015)";
         EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
@@ -6415,7 +6430,7 @@ TEST(Preprocessor, FC179EmbedDirectiveIsConfigDrivenNotHardcoded) {
         auto buf = SourceBuffer::fromString(
             "static const unsigned char x[] = {\n#embad \"missing.bin\"\n};\n",
             "main.c");
-        auto r = preprocess(buf, schema, noDirs);
+        auto r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
             << "the rebound `#embad` word now drives the embed handler";
     }
@@ -6454,7 +6469,7 @@ TEST(Preprocessor, FC179HasEmbedPreScanParityGatesQuoteInclude) {
         (dir / "main.c").string());
     auto schema = cSubset();
     std::vector<fsemb::path> dirs{dir};
-    auto r = preprocess(buf, schema, dirs);
+    auto r = preprocess(buf, schema, dirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(r.diagnostics->hasErrors());
     // The header's `typedef` keyword appears ONLY if the pre-scan took the
     // __has_embed branch and spliced defs.h (main.c has no `typedef` of its own).
@@ -6960,7 +6975,7 @@ TEST(Preprocessor, TfC70ErrorDirectiveIsConfigDrivenNotHardcoded) {
     std::vector<fs::path> noDirs;
     {
         auto buf = SourceBuffer::fromString("#error x\nint v=1;\n", "main.c");
-        auto r = preprocess(buf, schema, noDirs);
+        auto r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
             << "with the word rebound, `#error` is an unknown directive (P0015)";
         EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
@@ -6968,7 +6983,7 @@ TEST(Preprocessor, TfC70ErrorDirectiveIsConfigDrivenNotHardcoded) {
     }
     {
         auto buf = SourceBuffer::fromString("#errr x\nint v=1;\n", "main.c");
-        auto r = preprocess(buf, schema, noDirs);
+        auto r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorErrorDirective))
             << "the rebound `#errr` word now drives the `#error` handler";
         EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported));
@@ -6989,7 +7004,7 @@ TEST(Preprocessor, TfC70WarningDirectiveIsConfigDrivenNotHardcoded) {
     std::vector<fs::path> noDirs;
     {
         auto buf = SourceBuffer::fromString("#warning x\nint v=1;\n", "main.c");
-        auto r = preprocess(buf, schema, noDirs);
+        auto r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
             << "with the word rebound, `#warning` is an unknown directive";
         EXPECT_FALSE(
@@ -6998,7 +7013,7 @@ TEST(Preprocessor, TfC70WarningDirectiveIsConfigDrivenNotHardcoded) {
     }
     {
         auto buf = SourceBuffer::fromString("#warnn x\nint v=1;\n", "main.c");
-        auto r = preprocess(buf, schema, noDirs);
+        auto r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
         EXPECT_TRUE(
             hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
             << "the rebound `#warnn` word now drives the `#warning` handler";
@@ -7363,7 +7378,7 @@ namespace {
     auto schema = cSubset();
     auto buf    = SourceBuffer::fromString(std::move(text), "main.c");
     std::vector<std::string> noDefines;
-    out = preprocess(buf, schema, includeDirs, {}, fmt, noDefines, targetMacros);
+    out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, {}, fmt, noDefines, targetMacros);
     std::vector<std::string> lexs;
     for (Token const& t : out.tokens) {
         if (t.coreKind == CoreTokenKind::Eof) continue;
@@ -7564,7 +7579,7 @@ TEST(Preprocessor, TFC74CollidingPredefineFailsLoudNamingBothPaths) {
     auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string>           noDefines;
-    PreprocessResult r = preprocess(buf, schema, noDirs, {},
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {},
                                     ObjectFormatKind::Elf, noDefines, tms);
 
     EXPECT_TRUE(r.fatal)
@@ -7601,13 +7616,109 @@ TEST(Preprocessor, TFC74CollisionDetectedBeforeFormatFilter) {
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string>           noDefines;
     // ELF: the language's pe-gated `_WIN32` would NOT survive the filter.
-    PreprocessResult r = preprocess(buf, schema, noDirs, {},
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {},
                                     ObjectFormatKind::Elf, noDefines, tms);
     EXPECT_TRUE(r.fatal);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro))
         << "a pe-GATED language `_WIN32` must still collide with an UNGATED "
            "target `_WIN32` on an ELF build — gating decides which formats SEE "
            "a macro, not who OWNS the name";
+}
+
+// ── TF-C115: the ABORT PATH MUST STILL HONOUR THE RESULT CONTRACT ─────────
+//    ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]])
+//
+// The two tests above prove the collision is DETECTED. They say nothing about
+// whether the `PreprocessResult` handed back is USABLE — and it was not. The
+// abort returned with `tokens` EMPTY and `synthBuffer` NULL, while
+// `PreprocessResult` documents `tokens` as "Eof-terminated" and every consumer
+// dereferences `synthBuffer`. `compilation_unit.cpp` did `pp.tokens.back()` on
+// that empty vector, so the DOCUMENTED FAIL-LOUD DIAGNOSTIC WAS ACTUALLY A
+// SEGFAULT: MEASURED before the fix, the CLI exited 139 (Linux) / 0xC0000005
+// (Windows) printing NOTHING at all. The whole suite stayed green because
+// nobody asserted the SHAPE of an aborting result.
+//
+// RED-ON-DISABLE: delete the `establishResultContract(...)` call from
+// `preprocess()`'s single exit and every EXPECT below fails.
+TEST(Preprocessor, TFC115CollisionAbortReturnsUsableResult) {
+    auto schema = cSubset();
+    std::vector<PredefinedMacroDef> tms{targetMacro("__LINE__", "1")};
+    auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {},
+                                    ObjectFormatKind::Elf, noDefines, tms);
+
+    // The abort is still an abort — the contract must not have quietly turned
+    // the refusal into a successful (and silently one-sided) preprocess.
+    ASSERT_TRUE(r.fatal);
+    ASSERT_TRUE(hasPPCode(r, DiagnosticCode::C_ConflictingPredefinedMacro));
+
+    // (1) Eof-termination. This is the exact byte the crash read past.
+    ASSERT_FALSE(r.tokens.empty())
+        << "an aborting preprocess must still return the Eof-terminated token "
+           "vector `PreprocessResult` documents — an empty vector is what the "
+           "consumer's `tokens.back()` dereferenced past the end of";
+    EXPECT_EQ(r.tokens.back().coreKind, CoreTokenKind::Eof);
+    EXPECT_EQ(r.tokens.size(), 1u)
+        << "a refused pass produces the EMPTY translation unit: the Eof alone, "
+           "never a partially-merged token stream a caller could mistake for a "
+           "successful preprocess";
+    // The checked read the consumer now uses must agree and must not abort.
+    EXPECT_EQ(r.eofToken().coreKind, CoreTokenKind::Eof);
+
+    // (2) every other field a consumer dereferences without asking first.
+    ASSERT_NE(r.synthBuffer, nullptr)
+        << "the Parser takes `synthBuffer` as its source and the CU sidecar "
+           "stores it; a null here is the NEXT crash after the token one";
+    EXPECT_TRUE(r.synthBuffer->text().empty());
+    EXPECT_NE(r.mainSourceId, BufferId{});
+    ASSERT_NE(r.diagnostics, nullptr);
+
+    // (3) the diagnostic must be RENDERABLE, not just present. Its span is
+    // stamped with the MAIN buffer's id, so that buffer has to be among the
+    // origins the caller registers — otherwise the error prints
+    // `--> <unknown-buffer:1>` and cannot say which file to fix (MEASURED:
+    // exactly what it did before the origin invariant moved to the exit).
+    bool mainIsAnOrigin = false;
+    for (auto const& ob : r.originBuffers) {
+        if (ob && ob->id() == buf->id()) mainIsAnOrigin = true;
+    }
+    EXPECT_TRUE(mainIsAnOrigin)
+        << "the main source is an origin buffer of EVERY preprocess result — "
+           "it is the input — so a diagnostic stamped with its id resolves";
+}
+
+// The SAME contract on a HAPPY-path result, as the matched control: the single
+// exit must not have changed the shape of a successful preprocess (in
+// particular it must not append a SECOND Eof, and must not duplicate the main
+// buffer in `originBuffers`).
+// RED-ON-DISABLE: make `establishResultContract` append its Eof
+// unconditionally, or push the main buffer without the dedup scan.
+TEST(Preprocessor, TFC115ContractExitLeavesHappyPathShapeUnchanged) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string>           noDefines;
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {},
+                                    ObjectFormatKind::Elf, noDefines, {});
+    EXPECT_FALSE(r.fatal);
+    ASSERT_FALSE(r.tokens.empty());
+    EXPECT_EQ(r.tokens.back().coreKind, CoreTokenKind::Eof);
+    // EXACTLY ONE Eof — a second one would be the exit double-terminating.
+    std::size_t eofs = 0;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) ++eofs;
+    }
+    EXPECT_EQ(eofs, 1u);
+    // The main buffer appears exactly once among the origins.
+    std::size_t mainHits = 0;
+    for (auto const& ob : r.originBuffers) {
+        if (ob && ob->id() == buf->id()) ++mainHits;
+    }
+    EXPECT_EQ(mainHits, 1u)
+        << "the exit's origin invariant must DEDUPE against what the run "
+           "already collected from the line map, not append a duplicate";
 }
 
 // ── the NO-REGRESSION invariant: empty target span == legacy ──────────────
@@ -7636,13 +7747,13 @@ TEST(Preprocessor, TFC74EmptyTargetSpanIsByteIdenticalToLegacy) {
         // spells it (the target-predefine parameter defaulted away).
         auto legacyBuf = SourceBuffer::fromString(kSrc, "main.c");
         PreprocessResult legacy =
-            preprocess(legacyBuf, schema, noDirs, {}, fmt, noDefines);
+            preprocess(legacyBuf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, fmt, noDefines);
 
         // NEW shape: explicitly empty target span.
         auto newBuf = SourceBuffer::fromString(kSrc, "main.c");
         std::vector<PredefinedMacroDef> none;
         PreprocessResult withEmpty =
-            preprocess(newBuf, schema, noDirs, {}, fmt, noDefines, none);
+            preprocess(newBuf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, fmt, noDefines, none);
 
         ASSERT_FALSE(legacy.fatal);
         ASSERT_FALSE(withEmpty.fatal);
@@ -7735,8 +7846,12 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
         ASSERT_TRUE(m.conflicts.empty())
             << "the shipped language and arm64 configs must not collide";
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::MachO)),
-                  (std::vector<std::string>{"__ARM_ARCH_ISA_A64", "__aarch64__",
-                                            "__arm64", "__arm64__"}));
+                  (std::vector<std::string>{"__ARM_ARCH_ISA_A64", "__BYTE_ORDER__",
+                                            "__LITTLE_ENDIAN__", "__aarch64__",
+                                            "__arm64", "__arm64__"}))
+            << "TF-C115 (D-PP-ENDIANNESS-PREDEFINES): the two endianness rows "
+               "are UNGATED, so they appear on macho alongside the Apple-only "
+               "identity pair; `__BIG_ENDIAN__` must appear on NO leg";
     }
     // arm64 on ELF: the Apple-only pair is GONE, and `__CHAR_UNSIGNED__`
     // APPEARS — the two gates point in OPPOSITE directions on the same target,
@@ -7757,12 +7872,17 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
         ASSERT_TRUE(m.conflicts.empty());
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::Elf)),
                   (std::vector<std::string>{"__ARM_ARCH_ISA_A64",
+                                            "__BYTE_ORDER__",
                                             "__CHAR_UNSIGNED__",
+                                            "__LITTLE_ENDIAN__",
                                             "__aarch64__"}))
             << "`__arm64__`/`__arm64` are Apple-only and must NOT leak onto "
                "ELF, while `__CHAR_UNSIGNED__` is ELF-only and MUST appear "
                "there — it is the preprocessor face of the target's "
-               "`charIsUnsigned` default, which macho/pe override to signed";
+               "`charIsUnsigned` default, which macho/pe override to signed. "
+               "TF-C115: the two endianness rows are UNGATED and therefore "
+               "appear on BOTH legs — the negative that matters is "
+               "`__BIG_ENDIAN__`, which appears on none";
     }
     // x86_64: the same four spellings on every format.
     for (ObjectFormatKind fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO,
@@ -7772,8 +7892,66 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
         ASSERT_TRUE(m.conflicts.empty())
             << "the shipped language and x86_64 configs must not collide";
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(fmt)),
-                  (std::vector<std::string>{"__amd64", "__amd64__", "__x86_64",
-                                            "__x86_64__"}));
+                  (std::vector<std::string>{"__BYTE_ORDER__", "__LITTLE_ENDIAN__",
+                                            "__amd64", "__amd64__", "__x86_64",
+                                            "__x86_64__"}))
+            << "TF-C115: x86_64 is little-endian under elf64, macho64 AND pe64, "
+               "so the two endianness rows are UNGATED and identical on all "
+               "three — the property `__LP64__` did NOT have (LP64 on elf/macho, "
+               "LLP64 on pe), which is why that one lives on the object format "
+               "and these live here";
+    }
+}
+
+// TF-C115 (D-PP-ENDIANNESS-PREDEFINES) — THE CROSS-LAYER PIN.
+//
+// `__BYTE_ORDER__` is declared on the TARGET but its value NAMES
+// `__ORDER_LITTLE_ENDIAN__`, which is declared on the LANGUAGE. Two things must
+// hold and neither is implied by the per-layer exact sets above:
+//   (a) the reference RESOLVES — the value text must be exactly the vocabulary
+//       name the language declares, so `#if __BYTE_ORDER__ ==
+//       __ORDER_LITTLE_ENDIAN__` is a comparison of two DEFINED integers rather
+//       than C 6.10.1p4's `0 == 0`;
+//   (b) `__BIG_ENDIAN__` is declared by NO layer, on NO format. That is not a
+//       missing feature, it is the declaration that DSS ships no big-endian
+//       target (MEASURED 2026-08-04: clang defines it only for
+//       aarch64_be-linux-gnu), and Apple's libkern/OSByteOrder.h:165 tests it
+//       BEFORE the little-endian arm, so a stray row silently selects
+//       byte-swapping macros on a little-endian machine.
+TEST(Preprocessor, TFC115EndiannessPredefinesCrossLayerCoherence) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    for (char const* arch : {"arm64", "x86_64"}) {
+        auto t = TargetSchema::loadShipped(arch);
+        ASSERT_TRUE(t.has_value()) << arch;
+        for (ObjectFormatKind fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO,
+                                     ObjectFormatKind::Pe}) {
+            auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                           (*t)->predefinedMacros(), {}, fmt);
+            ASSERT_TRUE(m.conflicts.empty()) << arch;
+            std::optional<std::string> byteOrderValue;
+            std::optional<std::string> orderLittleValue;
+            bool sawBigEndianSpelling = false;
+            for (auto const& pm : m.effective) {
+                if (pm.name == "__BYTE_ORDER__")           byteOrderValue   = pm.value;
+                if (pm.name == "__ORDER_LITTLE_ENDIAN__")  orderLittleValue = pm.value;
+                if (pm.name == "__BIG_ENDIAN__")           sawBigEndianSpelling = true;
+            }
+            ASSERT_TRUE(byteOrderValue.has_value())
+                << arch << ": __BYTE_ORDER__ must be in the effective set on every format";
+            ASSERT_TRUE(orderLittleValue.has_value())
+                << arch << ": __ORDER_LITTLE_ENDIAN__ must be in the effective set";
+            EXPECT_EQ(*byteOrderValue, "__ORDER_LITTLE_ENDIAN__")
+                << arch << ": __BYTE_ORDER__'s body must NAME the language-declared "
+                           "vocabulary constant, not restate its literal — the "
+                           "reference is what keeps the two layers from drifting";
+            EXPECT_EQ(*orderLittleValue, "1234")
+                << arch << ": the vocabulary constant must carry its measured value";
+            EXPECT_FALSE(sawBigEndianSpelling)
+                << arch << ": __BIG_ENDIAN__ must be declared by NO layer on ANY "
+                           "format — DSS ships no big-endian target, and Apple's "
+                           "libkern/OSByteOrder.h tests this spelling FIRST";
+        }
     }
 }
 
@@ -8057,7 +8235,7 @@ TEST(Preprocessor, TFC86OperatorDefinednessIsConfigDrivenNotHardcoded) {
         std::string{"#ifndef __has_include\nint yes;\n#else\nint no;\n#endif\n"},
         "main.c");
     std::vector<fs::path> noDirs;
-    PreprocessResult r = preprocess(buf, schema, noDirs);
+    PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(r.diagnostics->hasErrors());
     std::vector<std::string> lexs;
     for (Token const& t : r.tokens) {
@@ -8668,7 +8846,7 @@ TEST(Preprocessor, Tf87GuardDetectionReadsIfndefSpellingFromConfigNotHardcoded) 
     auto buf = SourceBuffer::fromString(
         "#include \"outer.h\"\nint m = OUTER_MARK;\n", "main.c");
     std::vector<fs::path> dirs{dir};
-    auto out = preprocess(buf, schema, dirs);
+    auto out = preprocess(buf, schema, dirs, dss::kDefaultHeaderNameMatching);
     EXPECT_FALSE(out.diagnostics->hasErrors())
         << "the guard detector must recognise the CONFIG-declared `#ifndef` "
            "spelling — a hard-coded \"ifndef\" refuses this legal header";
@@ -8783,7 +8961,7 @@ namespace {
     auto buf    = SourceBuffer::fromString(std::move(text), "main.c");
     std::vector<std::filesystem::path> noDirs;
     std::vector<std::string>           noDefines;
-    out = preprocess(buf, schema, noDirs, {}, fmt, noDefines, targetMacros,
+    out = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, fmt, noDefines, targetMacros,
                      formatMacros);
     std::vector<std::string> lexs;
     for (Token const& t : out.tokens) {
@@ -8837,7 +9015,7 @@ TEST(Preprocessor, TFC97CollisionCoversEveryPairOfTheThreeFamilies) {
         auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
         std::vector<std::filesystem::path> noDirs;
         std::vector<std::string>           noDefines;
-        return preprocess(buf, schema, noDirs, {}, ObjectFormatKind::Elf,
+        return preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, ObjectFormatKind::Elf,
                           noDefines, tgt, fmt);
     };
 
@@ -8958,10 +9136,10 @@ TEST(Preprocessor, TFC97EmptyFormatSpanIsByteIdenticalToLegacy) {
         std::vector<PredefinedMacroDef>    none;
 
         auto legacyBuf = SourceBuffer::fromString(kSrc, "main.c");
-        PreprocessResult legacy = preprocess(legacyBuf, schema, noDirs, {}, fmt,
+        PreprocessResult legacy = preprocess(legacyBuf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, fmt,
                                              noDefines, none);
         auto newBuf = SourceBuffer::fromString(kSrc, "main.c");
-        PreprocessResult withEmpty = preprocess(newBuf, schema, noDirs, {}, fmt,
+        PreprocessResult withEmpty = preprocess(newBuf, schema, noDirs, dss::kDefaultHeaderNameMatching, {}, fmt,
                                                 noDefines, none, none);
         ASSERT_FALSE(legacy.fatal);
         ASSERT_FALSE(withEmpty.fatal);
@@ -9030,4 +9208,316 @@ TEST(Preprocessor, TFC97ShippedFormatsGiveACoherentDataModelWorld) {
     }
     EXPECT_EQ(lp64Legs, 5u);
     EXPECT_EQ(llp64Legs, 2u);
+}
+
+// ── D-PP-HEADER-CASE-INSENSITIVE-PE ──────────────────────────────────────────
+//
+// `__has_include` and `#include` must give the SAME answer, and that answer is
+// the TARGET FORMAT's case convention — never the build host's filesystem.
+//
+// Each pin asserts BOTH policies against ONE on-disk file, because each
+// direction of the defect is only observable on one kind of host: the
+// case-INSENSITIVE arm goes red on ext4 if DSS stops folding for itself, and
+// the case-SENSITIVE arm goes red on NTFS/APFS if DSS lets the host fold.
+TEST(Preprocessor, HeaderCaseHasIncludeAngleFollowsFormatPolicyNotHost) {
+    namespace fs = std::filesystem;
+    auto sysdir = ppScratchRoot() / "dss_header_case_sys";
+    fs::create_directories(sysdir);
+    { std::ofstream(sysdir / "windows.json", std::ios::binary) << "{}\n"; }
+
+    char const* src = "#if __has_include(<Windows.h>)\nint yes;\n#else\nint no;\n#endif\n";
+    {   // pe / macho convention: `<Windows.h>` IS available.
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(src, r, {}, {sysdir},
+                                      dss::HeaderNameMatching::CaseInsensitive);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "a case-insensitive format must see <Windows.h> -> windows.json "
+               "on ANY build host (sqlite3.c:67322 spells it with a capital W)";
+    }
+    {   // elf convention: it is NOT — byte-exact or nothing.
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(src, r, {}, {sysdir},
+                                      dss::HeaderNameMatching::CaseSensitive);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "no")
+            << "a POSIX/elf target must NOT fold <Windows.h> onto windows.json "
+               "even when the build host's filesystem would";
+    }
+    {   // CONTROL: the byte-exact spelling is available under both policies, so
+        // the divergence above is attributable to CASE and nothing else.
+        char const* exact =
+            "#if __has_include(<windows.h>)\nint yes;\n#else\nint no;\n#endif\n";
+        for (auto m : {dss::HeaderNameMatching::CaseSensitive,
+                       dss::HeaderNameMatching::CaseInsensitive}) {
+            PreprocessResult r;
+            auto lexs = ppLexemesWithDirs(exact, r, {}, {sysdir}, m);
+            ASSERT_EQ(lexs.size(), 3u);
+            EXPECT_EQ(lexs[1], "yes");
+        }
+    }
+    std::error_code ec;
+    fs::remove_all(sysdir, ec);
+}
+
+// The QUOTE form takes the same policy — `#include "Windows.h"` was measured
+// succeeding on a Windows host for an elf target, the same silent accept.
+TEST(Preprocessor, HeaderCaseHasIncludeQuoteFollowsFormatPolicyNotHost) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_header_case_quote";
+    fs::create_directories(inc);
+    { std::ofstream(inc / "myheader.h", std::ios::binary) << "int q;\n"; }
+
+    char const* src = "#if __has_include(\"MyHeader.h\")\nint yes;\n#else\nint no;\n#endif\n";
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(src, r, {inc}, {},
+                                      dss::HeaderNameMatching::CaseInsensitive);
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes");
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(src, r, {inc}, {},
+                                      dss::HeaderNameMatching::CaseSensitive);
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "no")
+            << "a case-mismatched QUOTE include must be rejected for a "
+               "case-sensitive target on a case-insensitive host";
+    }
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// AGREEMENT: whatever `__has_include` says, the `#include` must do. Here the
+// header is a REAL source header on the -I path (the angle source-fallback
+// arm), so a live include SPLICES its text — observable in the token stream.
+// Without the policy in BOTH the `__has_include` callback and the splice arm,
+// this test shows `yes` with no spliced `MARKER`, or vice versa: the exact
+// drift the FC15c single-funnel design exists to prevent.
+TEST(Preprocessor, HeaderCaseIncludeAndHasIncludeAgreeUnderBothPolicies) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_header_case_agree";
+    fs::create_directories(inc);
+    { std::ofstream(inc / "marker.h", std::ios::binary) << "int spliced_marker;\n"; }
+
+    char const* src =
+        "#if __has_include(<Marker.h>)\n"
+        "#include <Marker.h>\n"
+        "int probe_yes;\n"
+        "#else\n"
+        "int probe_no;\n"
+        "#endif\n";
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(src, r, {inc}, {},
+                                      dss::HeaderNameMatching::CaseInsensitive);
+        auto has = [&](char const* n) {
+            return std::find(lexs.begin(), lexs.end(), std::string{n}) != lexs.end();
+        };
+        EXPECT_TRUE(has("probe_yes")) << "__has_include said 0 under the "
+                                         "case-insensitive policy";
+        EXPECT_TRUE(has("spliced_marker"))
+            << "__has_include answered 1 but the #include did not resolve — the "
+               "two disagreed on the SAME name";
+        EXPECT_FALSE(has("probe_no"));
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(src, r, {inc}, {},
+                                      dss::HeaderNameMatching::CaseSensitive);
+        auto has = [&](char const* n) {
+            return std::find(lexs.begin(), lexs.end(), std::string{n}) != lexs.end();
+        };
+        EXPECT_TRUE(has("probe_no"));
+        EXPECT_FALSE(has("probe_yes"));
+        EXPECT_FALSE(has("spliced_marker"))
+            << "__has_include answered 0 but the header was spliced anyway";
+    }
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// ── D-PP-HEADER-CASE-INSENSITIVE-PE, H1/H2/H3: the fold-collision EMIT SITES ──
+//
+// These reach the real emit paths through the real filesystem, so they need a
+// directory holding two names that differ only by ASCII case. That directory
+// cannot exist on NTFS or a default APFS volume, so each test first ASKS the
+// platform to make its scratch dir case-sensitive (the Windows 10+
+// per-directory flag) and, if that is unavailable, records a NAMED skip rather
+// than a silent pass. The host-independent half of this coverage — the code,
+// the severity and the names-every-candidate contract — lives in
+// `tests/core/test_header_name_matching.cpp` and runs everywhere.
+namespace {
+
+void ppTryMakeDirCaseSensitive(std::filesystem::path const& dir) {
+#ifdef _WIN32
+    std::string cmd = "fsutil.exe file setCaseSensitiveInfo \"";
+    cmd += dir.string();
+    cmd += "\" enable >nul 2>&1";
+    (void)std::system(cmd.c_str());
+#else
+    (void)dir;   // the POSIX filesystems this project builds on already qualify
+#endif
+}
+
+// Build `<dir>/<lower>` and `<dir>/<upper>` and report whether BOTH survived.
+[[nodiscard]] bool ppMakeCollidingPair(std::filesystem::path const& dir,
+                                       char const* lower, char const* upper,
+                                       char const* body) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    ppTryMakeDirCaseSensitive(dir);
+    { std::ofstream(dir / lower, std::ios::binary) << body; }
+    { std::ofstream(dir / upper, std::ios::binary) << body; }
+    std::size_t seen = 0;
+    for (fs::directory_iterator it{dir, ec}, end; !ec && it != end;
+         it.increment(ec)) {
+        ++seen;
+    }
+    return seen == 2;
+}
+
+[[nodiscard]] std::size_t ppCountCode(PreprocessResult const& r,
+                                      dss::DiagnosticCode code) {
+    std::size_t n = 0;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code == code) ++n;
+    }
+    return n;
+}
+
+[[nodiscard]] std::string ppFirstMessage(PreprocessResult const& r,
+                                         dss::DiagnosticCode code) {
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code == code) return d.actual;
+    }
+    return {};
+}
+
+} // namespace
+
+// H1 — THE BLOCKER. A quote-`#include` fold collision must fail loud with the
+// UNSUPPRESSABLE `F_HeaderNameCaseAmbiguous`. It used to flatten to nullopt,
+// fall through the quote-to-angle fallback, and exit as a SUPPRESSABLE
+// `P_PreprocessorIncludeError` with the directive dropped, so suppressing that
+// code turned a case collision into a silently missing header. Nothing
+// downstream re-resolves a quote include once the preprocessor is enabled (the
+// import resolver returns early on every quote directive), so this tier is the
+// only possible reporter.
+TEST(Preprocessor, HeaderCaseQuoteIncludeCollisionFailsLoudNotSuppressably) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_hdrcase_quote_collide";
+    if (!ppMakeCollidingPair(inc, "foo.h", "Foo.h", "int q;\n")) {
+        GTEST_SKIP() << "this filesystem folds case, so a foo.h/Foo.h pair "
+                        "cannot be built here; the emit is pinned "
+                        "host-independently in core/test_header_name_matching "
+                        "and end-to-end on the case-sensitive leg";
+    }
+    PreprocessResult r;
+    (void)ppLexemesWithDirs("#include \"Foo.h\"\nint after;\n", r, {inc}, {},
+                            dss::HeaderNameMatching::CaseInsensitive);
+
+    EXPECT_EQ(ppCountCode(r, dss::DiagnosticCode::F_HeaderNameCaseAmbiguous), 1u)
+        << "a quote-include collision must be reported HERE — no other tier "
+           "ever sees a quote directive when the preprocessor is enabled";
+    EXPECT_EQ(ppCountCode(r, dss::DiagnosticCode::P_PreprocessorIncludeError), 0u)
+        << "and NOT as the suppressable not-found error, which is what let a "
+           "suppression hide the collision entirely";
+    std::string const msg =
+        ppFirstMessage(r, dss::DiagnosticCode::F_HeaderNameCaseAmbiguous);
+    EXPECT_NE(msg.find("foo.h"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("Foo.h"), std::string::npos) << msg;
+
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// H2 — the ANGLE form's SOURCE half. The import resolver's angle arm calls
+// `resolveSystemDescriptor` alone, so it never sees a collision among real
+// `-I` headers; leaving it verbatim surfaced it as `F_ShippedHeaderNotFound`,
+// naming the wrong defect while the diagnostic that lists the colliding paths
+// never fired. The preprocessor is the only tier that can report this one.
+TEST(Preprocessor, HeaderCaseAngleSourceCollisionIsReportedNotMisdiagnosed) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_hdrcase_angle_collide";
+    if (!ppMakeCollidingPair(inc, "bar.h", "Bar.h", "int b;\n")) {
+        GTEST_SKIP() << "filesystem folds case — pinned on the case-sensitive leg";
+    }
+    PreprocessResult r;
+    // NO systemDirs at all, so the descriptor half misses and the search
+    // reaches the `-I` source half where the collision lives.
+    (void)ppLexemesWithDirs("#include <Bar.h>\nint after;\n", r, {inc}, {},
+                            dss::HeaderNameMatching::CaseInsensitive);
+
+    EXPECT_EQ(ppCountCode(r, dss::DiagnosticCode::F_HeaderNameCaseAmbiguous), 1u)
+        << "the -I source half must be reported by the PREPROCESSOR";
+    std::string const msg =
+        ppFirstMessage(r, dss::DiagnosticCode::F_HeaderNameCaseAmbiguous);
+    EXPECT_NE(msg.find("bar.h"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("Bar.h"), std::string::npos) << msg;
+
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// The AUTHORITATIVE `__has_include` arms (angle + quote). A collision behind a
+// `__has_include` guard is the one shape NO later tier can see: the operator
+// answers 0, the guarded `#include` never materializes, and nothing else ever
+// resolves that name. Answering 0 silently was a silent drop.
+TEST(Preprocessor, HeaderCaseHasIncludeCollisionIsReportedInBothForms) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_hdrcase_hasinc_collide";
+    if (!ppMakeCollidingPair(inc, "baz.h", "Baz.h", "int z;\n")) {
+        GTEST_SKIP() << "filesystem folds case — pinned on the case-sensitive leg";
+    }
+    for (char const* src :
+         {"#if __has_include(<Baz.h>)\nint y;\n#else\nint n;\n#endif\n",
+          "#if __has_include(\"Baz.h\")\nint y;\n#else\nint n;\n#endif\n"}) {
+        PreprocessResult r;
+        auto const lexs =
+            ppLexemesWithDirs(src, r, {inc}, {},
+                              dss::HeaderNameMatching::CaseInsensitive);
+        EXPECT_GE(ppCountCode(r, dss::DiagnosticCode::F_HeaderNameCaseAmbiguous),
+                  1u)
+            << "a __has_include-guarded collision must fail loud: " << src;
+        std::string const msg =
+            ppFirstMessage(r, dss::DiagnosticCode::F_HeaderNameCaseAmbiguous);
+        EXPECT_NE(msg.find("baz.h"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("Baz.h"), std::string::npos) << msg;
+        // The operator still answers something (0), but the build cannot
+        // proceed silently because the error is unsuppressable.
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "n");
+    }
+    std::error_code ec;
+    fs::remove_all(inc, ec);
+}
+
+// The `#embed` directive's own resolution (FC17.9(h)) goes through the same
+// policy-aware quote search, so it carries the same collision surface.
+TEST(Preprocessor, HeaderCaseEmbedResourceCollisionIsReported) {
+    namespace fs = std::filesystem;
+    auto inc = ppScratchRoot() / "dss_hdrcase_embed_collide";
+    if (!ppMakeCollidingPair(inc, "res.bin", "Res.bin", "AB")) {
+        GTEST_SKIP() << "filesystem folds case — pinned on the case-sensitive leg";
+    }
+    PreprocessResult r;
+    (void)ppLexemesWithDirs("int a[] = {\n#embed \"Res.bin\"\n};\n", r, {inc}, {},
+                            dss::HeaderNameMatching::CaseInsensitive);
+    EXPECT_EQ(ppCountCode(r, dss::DiagnosticCode::F_HeaderNameCaseAmbiguous), 1u)
+        << "#embed must not silently resolve a host-dependent resource name";
+    EXPECT_EQ(ppCountCode(r, dss::DiagnosticCode::P_PreprocessorEmbed), 0u)
+        << "and must not degrade to the generic not-found embed error";
+    std::string const msg =
+        ppFirstMessage(r, dss::DiagnosticCode::F_HeaderNameCaseAmbiguous);
+    EXPECT_NE(msg.find("res.bin"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("Res.bin"), std::string::npos) << msg;
+
+    std::error_code ec;
+    fs::remove_all(inc, ec);
 }

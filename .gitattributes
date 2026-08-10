@@ -42,3 +42,82 @@ examples/**/*.bin binary
 # LSP replay session goldens — line-compared by test_lsp_replay.cpp. The reader
 # already strips trailing CR, but pin LF so the goldens are platform-stable.
 tests/lsp/sessions/** text eol=lf
+
+# The real-example HARNESS DRIVERS (real-examples/c/sqlite/). Their whole promise
+# is "clone the repo and run ONE command", on ANY host — so a fresh clone must
+# not be able to break them before they start. `core.autocrlf=true` is the
+# Git-for-Windows INSTALLER DEFAULT, and under it a Windows clone rewrites
+# `build-and-test.sh` / `check-source-coherence.sh` to CRLF; bash then fails on
+# the stray `\r` (classically `$'\r': command not found`) and the driver is dead
+# on arrival on the very host it was meant to run from. MEASURED here only as
+# the NEGATIVE: this workstation has `core.autocrlf=false` (both --local and
+# --global), which is exactly why the hazard has never been observed in-tree —
+# it is latent on a DIFFERENT machine, i.e. the same shape as the host-locking
+# defect D-HARNESS-CROSS-HOST-ANY-TARGET exists to end.
+# Listed by EXTENSION rather than as `real-examples/** text eol=lf`, because the
+# broad form would also force text normalization onto any binary fixture added
+# later — the corruption the `examples/**/*.bin binary` rule above had to be
+# added to undo.
+real-examples/**/*.sh   text eol=lf
+real-examples/**/*.ps1  text eol=lf
+real-examples/**/*.py   text eol=lf
+real-examples/**/*.json text eol=lf
+
+# ── D-REPO-GITATTRIBUTES-PINS-EOL-FOR-CONFIGS-BUT-NOT-FOR-SOURCES ──────────
+# THE SOURCE TREE ITSELF. Every rule above pins a CONFIG, a GOLDEN or a
+# DRIVER — i.e. a file some test reads byte-exactly — and not one of them
+# covers a `.cpp`. MEASURED 2026-08-06 before this block existed:
+# `git check-attr text eol -- src/link/linker.cpp tests/link/test_pe_writer.cpp`
+# reported `unspecified` for both, so NO C/C++/CMake source anywhere in this
+# tree had a pinned line ending.
+#
+# That is not a hypothetical: the defect had ALREADY LANDED SIX TIMES.
+# `git grep -I -l -P '\r$' HEAD -- src tests real-examples tools` returned
+# src/CMakeLists.txt, src/core/compiler.{cpp,hpp}, src/core/export.hpp,
+# src/main.cpp and tests/ffi/test_shipped_lib_descriptor.cpp — the last
+# WHOLLY CRLF (6206 CRs). They are normalised in their own dedicated commit;
+# a pin does not retroactively rewrite committed content.
+#
+# HOW IT GETS IN: a tool's platform default, never a decision. The measured
+# instance was a delegated agent editing fixtures through Python
+# `pathlib.write_text`, whose `newline` default applies platform translation
+# and so silently rewrites LF -> CRLF on Windows. This pin takes that choice
+# away from the tool: the clean filter normalises on `git add` regardless of
+# `core.autocrlf`, so the bytes this repo STORES can no longer depend on
+# which OS an author (or an agent) happened to run on.
+#
+# ⚠ These globs are LAST, and last-match wins — so each one is checked
+# against the `examples/**/*.bin binary` rule above: none of `*.c`, `*.h`,
+# `*.cpp`, `*.hpp`, `*.cmake`, `CMakeLists.txt`, `*.md`, `/VERSION` can match
+# a `.bin`, so the `#embed` resource bytes that rule exists to protect stay
+# binary. VERIFIED, not assumed: `git ls-files --eol` over exactly this glob
+# set reports 1346 `i/lf` + 9 `i/crlf` + 1 `i/none` and ZERO `-text`, i.e.
+# git detects no binary content anywhere in the captured set.
+*.c            text eol=lf
+*.h            text eol=lf
+*.cpp          text eol=lf
+*.hpp          text eol=lf
+CMakeLists.txt text eol=lf
+*.cmake        text eol=lf
+
+# `*.md` and `/VERSION` ride the same block because the SAME normalisation
+# commit rewrites them: the repo-wide sweep (`git grep -I -l -P '\r$' HEAD`,
+# no pathspec) found four MORE CRLF blobs outside src/tests — the three
+# `.plans/*.md` files and `VERSION`. Normalising a file whose extension is
+# NOT pinned would be the same defect scheduled to recur, so they are pinned
+# in the same breath they are fixed. `VERSION` is anchored to the repo root
+# (`/VERSION`) because it is a single specific file, not an extension class.
+*.md           text eol=lf
+/VERSION       text eol=lf
+
+# Binary TEST FIXTURES (`tests/**/data/`). Committed object files, shared libraries and
+# other byte-exact inputs a test parses. Declared `binary` for the same reason as the
+# `examples/**/*.bin` rule above, and the reason is worth restating: WITHOUT a declaration
+# these ride on git's binary AUTO-DETECTION, which happened to classify them correctly —
+# i.e. they worked by inference rather than by declaration. MEASURED 2026-08-06 (TF-C124):
+# `tests/ffi/data/libdssver.so.1`, a real GNU ld 2.42 output whose versym/verdef bytes a
+# reader test decodes, was covered by nothing in this file. The EOL pin added the same day
+# named SOURCE extensions and forgot that test DATA is the category most likely to need the
+# OPPOSITE treatment — a pin's blast radius is exactly what it names, and what it omits is
+# invisible (D-REPO-GITATTRIBUTES-DOES-NOT-COVER-BINARY-TEST-FIXTURES).
+tests/**/data/** binary

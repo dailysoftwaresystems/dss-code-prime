@@ -106,6 +106,37 @@ struct DSS_EXPORT SymbolRecord {
     // deffn(int x){…}` emits `mydeffn`), so `mergeOrCollideRedeclaration` carries
     // a non-empty label from the absorbed declaration onto the survivor.
     std::string asmName;
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the per-target LINK
+    // BASE NAME a SHIPPED-LIBRARY DESCRIPTOR declared for this symbol, already
+    // resolved for the active (arch, format) and UNDECORATED. EMPTY for every
+    // user-written declaration and for every descriptor row that does not opt in.
+    //
+    // ★ IT IS NOT `asmName` ABOVE, AND THE DIFFERENCE IS THE MANGLING. `asmName`
+    // is the user's C `__asm("x")`: C says that string IS the symbol, so it
+    // BYPASSES `applyCMangling`. This is DSS's answer to "which base name does
+    // the shipped library export on this target", so it is the INPUT to
+    // `applyCMangling` — `linkName:"fstat$INODE64"` must reach Mach-O as
+    // `_fstat$INODE64`, with the `_` supplied by the FORMAT rule and not by
+    // config. Both are folded into the ONE naming function `ffi::linkNameFor`,
+    // which is where their precedence (asmName > linkName > name) is stated.
+    //
+    // ★ IT LIVES HERE FOR THE SAME FORCED REASON `asmName` DOES: `compile_
+    // pipeline`'s `nameOf` and `program.cpp`'s cross-CU merge key read
+    // `SemanticModel`, never HIR. The import rail carries the identical string
+    // (ShippedExternSymbol → HirExternRecord → ExternDeclRef), and BOTH rails
+    // must hand `linkNameFor` the same inputs or `mir_merge`'s
+    // `definedNames.count(e.mangledName)` misses and an intra-image call is
+    // silently emitted as a dynamic import.
+    //
+    // ★ IT NEEDS NO REDECLARATION-MERGE CARRY, unlike `asmName` above, and the
+    // reason is structural rather than an oversight: descriptor injection is
+    // gated on `userDeclaredNames`, which is a WHOLE-TU, POSITION-BLIND name set
+    // — so a symbol carrying a `linkName` was, by construction, never declared by
+    // the user anywhere in the TU and can never reach
+    // `mergeOrCollideRedeclaration`. The case that DOES arise — a user
+    // prototype SUPPRESSING a descriptor row — is served by
+    // `SuppressedShippedSymbol::linkName`, not by a merge.
+    std::string linkName;
     ScopeId     scope{};
     NodeId      declNode{};         // the declaration's name node (or the rule node if no name child)
     NodeId      declRuleNode{};     // the declaration rule node itself (for diagnostic spans)
@@ -448,19 +479,15 @@ struct DSS_EXPORT SymbolRecord {
     // (determinate cases already work — a Call is a memory barrier and longjmp restores
     // callee-saved+SP), never a silent miscompile. Default false.
     bool            returnsTwice = false;
-    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: TRUE iff this FUNCTION symbol was
-    // MINTED from a resolved shipped-library FFI descriptor (tcl.json, stdio.json,
-    // …) — the descriptor-injection sibling of `isNoreturn`/`returnsTwice`. Set
-    // ONLY in the shipped-lib injection loop for `kind==Function`; the SEPARATE
-    // builtin/intrinsic injection loop deliberately leaves it FALSE (both loops use
-    // `tree==InvalidTree`, so that field cannot distinguish them — this flag is the
-    // discriminator that keeps `_InterlockedCompareExchange`'s `int*`-pointee reject
-    // pinned). Read ONLY by `checkCallAgainstSig` at the DIRECT-symbol call site to
-    // decide whether the config-gated integer-pointee pointer-arg relaxation
-    // (`ptr<i64>` accepting a same-representation `long long*`/`long*`-on-LP64) may
-    // fire AT THE CALL-ARG BOUNDARY (never native C-to-C, never init/assign/return).
-    // Default false → every non-shipped callee stays strict.
-    bool            isShippedDescriptorFn = false;
+    // ~~ REMOVED TF-C135 (D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT): the
+    // `isShippedDescriptorFn` flag lived here ONLY to gate the integer-pointee
+    // pointer-arg relaxation on whether a callee came from a shipped FFI descriptor.
+    // That made the admission a property of the DECLARATION'S PROVENANCE rather than
+    // of the TYPES, and a real header (Darwin `tcl.h`, where `Tcl_WideInt` is `long`)
+    // hits the identical shape and was still refused. The gate is now "is this a
+    // DIRECT call", threaded as a parameter at the one call site that knows, so no
+    // per-symbol field is needed. If you find yourself re-adding a provenance flag to
+    // widen or narrow a TYPE rule, that is the same mistake — narrow the PREDICATE.
     // FC17 (D-CSUBSET-CONSTEXPR): TRUE iff this symbol was declared with the C23
     // 6.7.1 `constexpr` OBJECT storage-class. Set at Pass-1 minting when the
     // declaration's specifier prefix carries the language's
@@ -586,6 +613,16 @@ struct DSS_EXPORT ShippedExternSymbol {
     // Carried verbatim to HirExternRecord.version → the ELF writer's
     // .gnu.version_r; ELF-only (unused on PE/Mach-O).
     std::string version;
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the descriptor's
+    // per-target LINK BASE NAME, already resolved for the active (arch, format)
+    // — UNDECORATED (`fstat$INODE64`, never `_fstat$INODE64`). EMPTY ⇒ the
+    // canonical `name`. Carried verbatim to HirExternRecord.linkName →
+    // ExternDeclRef.linkName → `ffi::linkNameFor`, which applies the FORMAT's
+    // decoration to it exactly as it would to `name`. The SAME string is also
+    // stamped on this symbol's `SymbolRecord.linkName` at injection so the
+    // definition rail and the import rail feed `linkNameFor` identical inputs
+    // (the byte-for-byte agreement its header documents).
+    std::string linkName;
 };
 
 // c86 + c156: the link identity of a goal-2 SUPPRESSED shipped descriptor
@@ -598,6 +635,13 @@ struct DSS_EXPORT ShippedExternSymbol {
 // unversioned reference to the library's OLDEST compat instance (the exact
 // D-LK-ELF-SYMBOL-VERSIONING realpath@GLIBC_2.2.5 bug the descriptor path
 // fixes). Availability-gated + first-wins at record time (mirroring injection).
+//
+// TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): and so must the row's REALIZATION —
+// its `synthesize` recipe id plus the declared signature that recipe answers
+// to. A suppressed row is the ONLY channel by which a descriptor symbol reaches
+// the link WITHOUT passing through `SemanticModel::shippedExterns()`, so every
+// property the injected path reads off a row has to ride here too or that
+// property is silently dropped for exactly the declarations users write most.
 struct DSS_EXPORT SuppressedShippedSymbol {
     // The descriptor's per-object-format `library` map ("pe"/"elf"/"macho" →
     // runtime image), carried verbatim; folded to one string per target
@@ -606,6 +650,44 @@ struct DSS_EXPORT SuppressedShippedSymbol {
     // The required ELF symbol version, already resolved for the active target
     // (e.g. "GLIBC_2.3"); EMPTY ⇒ unversioned (D-LK-ELF-SYMBOL-VERSIONING).
     std::string version;
+    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): the suppressed row's `synthesize`
+    // RECIPE id (`ShippedExternSymbol::recipeId`'s sibling), or EMPTY for an
+    // ordinary FFI-import row. ★ THIS FIELD IS THE FIX FOR A HARD LOAD FAILURE,
+    // not a convenience: the LIBRARY and the REALIZATION are two independent
+    // properties of a descriptor row, and carrying only the first is what made
+    // the pe UCRT flip lethal on the redeclaration path. `ucrtbase.dll` exports
+    // NONE of printf/fprintf/sprintf/vfprintf/sscanf — only the
+    // `__stdio_common_v*` cores — so those five rows are COMPILER-SYNTHESIZED
+    // shims, not imports. Pre-flip the same rows bound `msvcrt.dll`, which does
+    // export all five, so a suppressed row re-exported as a plain import was
+    // inert; post-flip it plants an `ExternImport{printf, ucrtbase.dll}` that
+    // the loader rejects with 0xC0000139 (D-FFI-DESCRIPTOR-EAGER-IMPORT) — at
+    // PROCESS START, with rc=0 and no diagnostic at any compile stage.
+    // MEASURED at TF-C112 HEAD on the three-line reproducer
+    // (`#include <stdio.h>` + `int printf(const char*, ...);` + one call).
+    std::string recipeId;
+    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): the descriptor row's DECLARED
+    // signature, interned in THIS model's lattice (the `ShippedExternSymbol::
+    // signature` discipline — the same interner the CST→HIR lowerer lowers
+    // through, so a TypeId comparison against a user prototype's resolved type
+    // is meaningful). It is the SHIM-COMPATIBILITY ORACLE: the synth pass emits
+    // one FIXED body per recipe id, matching this row, so a user prototype that
+    // suppresses a recipe row may inherit the shim ONLY if it agrees with this
+    // signature — otherwise the call would be made under the user's ABI and
+    // answered under the descriptor's. Carried for EVERY suppressed row (a
+    // recipe-less row's copy is simply unread today) so the field's meaning is
+    // "what the descriptor declared", never "what one consumer needed".
+    TypeId signature;
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the suppressed row's
+    // per-target LINK BASE NAME (`ShippedSymbol::linkName`, already resolved for
+    // the active target), or EMPTY. Rides here for the SAME reason `version`
+    // does, one field family up: a user bare prototype of `fstat` over
+    // `#include <sys/stat.h>` — the feature-test pattern real code writes — must
+    // still import Darwin-x86_64's `_fstat$INODE64`, or the suppression silently
+    // reinstates the exact 32-bit-inode misbinding this field exists to kill.
+    // The descriptor is the authority on which name the LIBRARY exports; a user
+    // prototype restates the C signature, never the platform's link identity.
+    std::string linkName;
 };
 
 class DSS_EXPORT SemanticModel {
@@ -623,7 +705,7 @@ public:
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
                   UnitAttribute<bool>                    nullPointerConstantNodes,
-                  UnitAttribute<bool>                    ffiIntPointeeCompatNodes,
+                  UnitAttribute<bool>                    intPointeeCompatNodes,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
@@ -640,7 +722,7 @@ public:
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
           nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
-          ffiIntPointeeCompatNodes_(std::move(ffiIntPointeeCompatNodes)),
+          intPointeeCompatNodes_(std::move(intPointeeCompatNodes)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
@@ -715,7 +797,7 @@ public:
         return nullPointerConstantNodes_.has(id);
     }
 
-    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: true iff `id` is a call-ARG source
+    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: true iff `id` is a call-ARG source
     // node the analyzer admitted via the shipped-FFI-descriptor integer-pointee
     // pointer relaxation (a real C integer pointer — `long long*` etc. — passed to
     // a descriptor `ptr<i64>`-style param whose pointee is same-REPRESENTATION but
@@ -726,8 +808,8 @@ public:
     // succeed), so a strictly-compatible arg is never marked. Callers MUST guard
     // `id.valid()` before calling (the UnitAttribute routes by arenaTag; an untagged
     // InvalidNode is ambiguous in a multi-tree CU).
-    [[nodiscard]] bool isFfiIntPointeeCompat(NodeId id) const {
-        return ffiIntPointeeCompatNodes_.has(id);
+    [[nodiscard]] bool isIntPointeeCompat(NodeId id) const {
+        return intPointeeCompatNodes_.has(id);
     }
 
     // The full attributes — convenient for tooling / forEach iteration.
@@ -753,6 +835,11 @@ public:
     // misbind) or as an undefined symbol. Availability-gated + first-wins at
     // record time (exactly mirroring injection). Returns nullptr when no
     // suppressed descriptor symbol carries this name.
+    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): the same reader also asks whether
+    // the suppressed row carried a `synthesize` RECIPE — a row realized as a
+    // compiler-emitted shim must not be re-exported as a raw import merely
+    // because the user re-declared its name (`ucrtbase.dll` exports no bare
+    // `printf`, so that import fails the LOAD at 0xC0000139).
     [[nodiscard]] SuppressedShippedSymbol const*
     suppressedShippedSymbolFor(std::string const& name) const noexcept {
         auto const it = suppressedShippedLibraries_.find(name);
@@ -797,12 +884,12 @@ private:
     // TREE-KEYED UnitAttribute (NodeId is tree-local — a flat set would alias node
     // indices across a multi-source CU's trees → cross-tree silent miscompile).
     UnitAttribute<bool>                                   nullPointerConstantNodes_;
-    // D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: call-arg source nodes the analyzer
+    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: call-arg source nodes the analyzer
     // admitted via the shipped-descriptor integer-pointee pointer relaxation. The
-    // CST→HIR lowerer reads `isFfiIntPointeeCompat` to materialize the Ptr→Ptr
+    // CST→HIR lowerer reads `isIntPointeeCompat` to materialize the Ptr→Ptr
     // bitcast retyping the arg to the param type. TREE-KEYED UnitAttribute for the
     // same cross-tree-aliasing reason as `nullPointerConstantNodes_`.
-    UnitAttribute<bool>                                   ffiIntPointeeCompatNodes_;
+    UnitAttribute<bool>                                   intPointeeCompatNodes_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.

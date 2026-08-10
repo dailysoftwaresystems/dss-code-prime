@@ -59,7 +59,9 @@ namespace {
 // `test_elf_writer.cpp`).
 constexpr std::string_view kFormatMatchingX86_64 = R"({
   "dssObjectFormatVersion": 1,
+  "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
   "format": {"name": "test-elf", "kind": "elf"},
   "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
   "sections": [
@@ -82,7 +84,9 @@ constexpr std::string_view kFormatMatchingX86_64 = R"({
 // declared so the ELF walker doesn't pollute the diagnostic count.
 constexpr std::string_view kFormatMissingReloc = R"({
   "dssObjectFormatVersion": 1,
+  "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
   "format": {"name": "test-elf-bare", "kind": "elf"},
   "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
   "sections": [
@@ -253,9 +257,14 @@ TEST(Linker, ImageWithNoDataBindingStillRejectsReferencedDataExtern) {
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"pe-exec-no-data-binding","kind":"pe"},
       "externCallDispatch": "direct-plt",
+      "$entryClusterComment": "D-LK10-ENTRY: validate() now REJECTS an exec-flavored format that declares no processExit, so this synthetic pe-exec schema must carry the pair or it never LOADS -- and the reverted-dataImportBinding shape this test exists for would never be reached. Values copied verbatim from the shipped pe64-x86_64-windows-exec.format.json. Behaviour-inert here: the data-import gate in link/linker.cpp -- the `isImageFlavor() && !dataImportBinding().has_value()` refusal that reports K_FormatLacksImportSupport -- fires and RETURNS before the entry injection guarded by `needsTrampoline`, so no entry machinery is built on this path. ** CITED BY PREDICATE, NOT BY LINE, per the rule stated in src/core/types/parse_diagnostic.hpp: the line numbers drift, the PREDICATE spellings do not -- grep those if a citation goes stale. (This value stays STRICTLY ASCII: it is not a C++ comment, it is JSON this test feeds to loadFromText, and the surrounding block is ASCII-only.) This comment previously cited `linker.cpp:920-942` and `linker.cpp:1053`; MEASURED 2026-08-05 (TF-C120), the second had already drifted -- :1053 is now a comment line and the `needsTrampoline` computation it meant had moved to :1061-1064.",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
@@ -1926,6 +1935,14 @@ TEST(LinkerStackReserve, WalkerEnforcesTheDeclaredBoundsNotJustTheCapability) {
     fn.symbol = SymbolId{1};
     fn.bytes  = {0xC3};                     // ret — a valid, non-empty .text
     mod.functions.push_back(std::move(fn));
+    // D-LK10-ENTRY entry gate (`resolveEntryFnIdx`): pe64-x86_64-windows-exec
+    // declares `processExit`, which CONTRACTS that its image entry is the
+    // synthesized `_start` trampoline — and only `linker::link` injects one.
+    // This pin deliberately does NOT go through the linker (see above), so it
+    // states the untrampolined intent itself: index 0 is exactly what the
+    // walker's pre-gate default produced implicitly. Without it the in-range
+    // CONTROL below fails loud instead of writing the header.
+    mod.imageEntryOverride = std::size_t{0};
 
     struct Case { std::uint64_t value; char const* why; };
     Case const cases[] = {

@@ -426,6 +426,15 @@ readPe(std::span<std::uint8_t const> bytes,
         row.soname      = dllName;   // export-directory DllName (empty if none)
         row.visibility  = SymbolVisibility::Default;   // PE export table carries no STV_* granularity
         row.linkage     = SymbolLinkage::External;     // an export is external by definition
+        // `row.elfSymbolVersion` stays `nullopt`, permanently. PE has NO
+        // per-symbol version: an import binds by NAME or by ORDINAL out of an
+        // IMAGE_IMPORT_DESCRIPTOR and there is no third coordinate to record.
+        // What PE versions is the FILE — a VERSIONINFO resource, or the
+        // version baked into an api-set DLL's own name
+        // (`api-ms-win-crt-stdio-l1-1-0.dll`) — i.e. library IDENTITY, which
+        // `soname`/`libraryPath` above already carry. Nothing here is
+        // "pending"; see `ffi/import_surface.hpp` (D-FFI-BINARY-READER-
+        // SURFACES-NO-SYMBOL-VERSION) for the full statement.
 
         // Classify. Forwarder FIRST: the export directory lives in a
         // (data) section, so an in-span RVA would otherwise misclassify

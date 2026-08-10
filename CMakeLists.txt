@@ -51,6 +51,55 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 # ── Options ──
 option(DSS_BUILD_TESTS "Build unit tests" ON)
 
+# D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT — strict arm verdicts.
+#
+# WHAT IT DOES. Both corpus harnesses ledger a verdict for every declared target
+# arm. An ENVIRONMENTAL skip — the manifest declared an `emulator` and this
+# machine does not have it on PATH — is a visible WARNING by default and a hard
+# FAILURE when `DSS_STRICT_ARM_VERDICTS=1` is in the test's environment.
+#
+# WHY IT IS OFF BY DEFAULT, and this is a requirement rather than timidity: a
+# developer without qemu must still get a usable green suite. On a Linux x86_64
+# box without `qemu-aarch64`, strict mode reds 449 corpus manifests — correctly,
+# but that is a GATE posture, not a working-tree posture.
+#
+# WHY THE CMAKE OPTION EXISTS AT ALL, given the env var already works. The gate
+# is driven by scripts OUTSIDE this repo (the operator's 3-leg driver), which
+# this project cannot edit. A cache variable is the one chokepoint that reaches
+# them: configure once with `-DDSS_STRICT_ARM_VERDICTS=ON` and EVERY subsequent
+# `ctest` from any script, in any shell, inherits it — no recipe edit required.
+# Exporting the variable in each gate shell would work too and is the documented
+# alternative; the two are equivalent by design, because the runners read only
+# the environment and neither knows which one set it.
+#
+# ⚠ DELIBERATELY NOT TURNED ON IN `.github/workflows/pipeline-pr.yml`. Those legs
+# install no qemu at all, so strict mode there would red ~449 arms x 2 legs on
+# the first PR. D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT sequences the LEDGER
+# before any qemu-in-CI work precisely so that adding an emulator later is a
+# measurable delta rather than an unverifiable claim. Flip CI on in the same
+# change that installs qemu, not before.
+option(DSS_STRICT_ARM_VERDICTS
+       "Fail (not warn) when a corpus arm declared an emulator this machine lacks"
+       OFF)
+
+# Stamp the strict-mode variable onto ONE ctest entry. A no-op when the option
+# is OFF, so the property is absent rather than present-and-false — an
+# `ENVIRONMENT` entry spelling `=0` would work, but it would also silently
+# OVERRIDE an operator who exported `=1` in their gate shell, which is the exact
+# "a stale value quietly disabled the gate" failure the runners' strict parse
+# refuses to allow.
+function(dss_strict_arm_verdicts test_name)
+    if(NOT DSS_STRICT_ARM_VERDICTS)
+        return()
+    endif()
+    get_test_property(${test_name} ENVIRONMENT existing_env)
+    if(existing_env STREQUAL "NOTFOUND")
+        set(existing_env "")
+    endif()
+    list(APPEND existing_env "DSS_STRICT_ARM_VERDICTS=1")
+    set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "${existing_env}")
+endfunction()
+
 # ── External dependencies (FetchContent) ──
 include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
@@ -225,6 +274,20 @@ if(DSS_BUILD_TESTS)
     # Dispatches to the platform-appropriate script. The bash
     # variant runs on Linux/macOS CI; the PowerShell variant runs
     # on Windows CI. Both share the same contract + registry file.
+    # Tracked-blob line-ending guard (2026-08-06 —
+    # D-REPO-GITATTRIBUTES-PINS-EOL-FOR-CONFIGS-BUT-NOT-FOR-SOURCES).
+    # No tracked TEXT blob may carry a line-terminating CR unless it
+    # DECLARES `eol=crlf`. Wired here, beside the anchor guard,
+    # deliberately: `.gitattributes` now pins `eol=lf` for the source
+    # tree, but a pin is only as good as its GLOB COVERAGE — the pin
+    # that existed before covered configs/goldens/drivers and still
+    # let six CRLF blobs land in src/ and tests/ because no `.cpp` was
+    # ever named. The pin is the mechanism; THIS is the invariant, and
+    # an invariant nothing executes is a convention.
+    #
+    # Same WIN32 dispatch, same contract, same exit codes as the
+    # anchor guard above; both scripts drive identical `git`
+    # subcommands so the two shells only marshal arguments.
     if(WIN32)
         find_program(POWERSHELL_EXE NAMES pwsh powershell REQUIRED)
         add_test(
@@ -233,10 +296,20 @@ if(DSS_BUILD_TESTS)
                     -NoProfile -ExecutionPolicy Bypass
                     -File "${CMAKE_SOURCE_DIR}/tools/check-anchor-registry.ps1"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        add_test(
+            NAME line_endings_guard
+            COMMAND ${POWERSHELL_EXE}
+                    -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_SOURCE_DIR}/tools/check-line-endings.ps1"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     else()
         add_test(
             NAME anchor_registry_guard
             COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-anchor-registry.sh"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        add_test(
+            NAME line_endings_guard
+            COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-line-endings.sh"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     endif()
 endif()

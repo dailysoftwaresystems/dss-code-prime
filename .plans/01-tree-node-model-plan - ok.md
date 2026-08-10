@@ -35,7 +35,7 @@ Updated as work progresses. Detailed phase status lives in §7.
 | C++ standard | **23** |
 | Compilers verified | Local dev: GCC 13.2 (MinGW-W64 ucrt) on Windows. CI matrix: Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, macOS/AppleClang+Homebrew-LLVM/Release — all green per [`03-substrate-hardening-plan - ok.md`](./03-substrate-hardening-plan - ok.md) SH2 + SH4a. |
 | Deps via FetchContent | **nlohmann/json 3.12.0**, **GoogleTest 1.17.0** |
-| Test suite | **531 cases across 26 ctest suites — 100% pass** (v1 T0–T12 baseline + v2 PR0–PR8 + SH3 cross-tree death tests + SH4c nested-AltChoice tests + SH4b switch end-to-end). |
+| Test suite | ✔ **CURRENT — MEASURED 2026-08-04 at HEAD `a3af1320` (`ctest -N` in `build-dbg`): 787→788 cases across 17 registered test-name groups** (the case count moved mid-measurement — the TF-C118 cycle was landing tests). **This figure moves every cycle — re-measure, never re-quote.** · **HISTORICAL (the v1+v2 baseline this row was written for): 531 cases across 26 ctest suites — 100% pass** (v1 T0–T12 baseline + v2 PR0–PR8 + SH3 cross-tree death tests + SH4c nested-AltChoice tests + SH4b switch end-to-end). |
 | Substrate hardening | ✅ done — SH1, SH2, SH3, SH4 all shipped. See [`03-substrate-hardening-plan - ok.md`](./03-substrate-hardening-plan - ok.md). The cross-tree `NodeId` caveat that used to live in §5.10 below is **closed by SH3** — `NodeId` carries a `treeTag`; cross-tree access aborts loudly with both tree ids in the message. |
 
 **Files now in `src/core/types/` (all on `core` static lib):**
@@ -71,13 +71,13 @@ tree_views.hpp               ← header-only typed views (Identifier/Literal/Bin
 - `raw_tree_builder.hpp` — `RawTreeBuilder` for hand-fabricating trees with shapes `TreeBuilder` can't produce (pre-flagged Missing nodes, Synthetic leaves, EmptySpace Internal wrappers).
 
 **Shipped configs:**
-- `src/source-config/languages/toy.lang.json` — minimal Toy language (multi-typed `+`/`<`, scope forbid, sequence/alt/repeat shapes). Loads via `GrammarSchema::loadShipped("toy")`.
+- `src/dss-config/sources/toy.lang.json` — minimal Toy language (multi-typed `+`/`<`, scope forbid, sequence/alt/repeat shapes). Loads via `GrammarSchema::loadShipped("toy")`.
 
 **Deviations from spec, captured intentionally:**
 1. `detail::Node` is **40 bytes** (not 32) — `DiagnosticIndex` added during the rigor-review pass pushed past the original cacheline-doubled budget. Still 1.6 nodes per 64 B line; performance impact negligible.
 2. `RuleInterner` is now `using RuleInterner = Interner<RuleId>;` — header-only template `Interner<Id>` is the shared source. Uses C++20 transparent heterogeneous lookup (`std::hash<string_view>` + `equal_to<>`) so `find()`/`contains()`/`intern()` accept `string_view` without allocating temporaries. Identifier interner (plan §9 item 2) becomes a one-line addition.
 3. `GrammarSchemaData` POD mirrors the Tree/TreeData split — instead of friending the JSON loader, the loader builds a movable POD that the schema's public ctor consumes.
-4. `GrammarSchema::loadShipped` walks parent dirs to find `src/source-config/languages/<name>.lang.json`, so the lookup is independent of cwd (ctest, repo root, build dir all work).
+4. `GrammarSchema::loadShipped` walks parent dirs to find `src/dss-config/sources/<name>.lang.json`, so the lookup is independent of cwd (ctest, repo root, build dir all work).
 5. `Tree::cursor()` / `Tree::astCursor()` ✅ restored in T6. `Tree::childrenOfRule()` and `Tree::firstChildOfRule()` remain deferred — neither was needed by T6's consumers and the right design (zero-alloc range view vs. eager vector) is best decided when a real semantic-analysis pass demands them.
 6. `T11` (CMake wireup) is folded into each checkpoint as files land — there's no separate "wire all files" phase at the end. The standalone T11 row in §7 is retained for the docs/discoverability angle.
 7. **T5 scope limit:** the builder validates *within* an open frame (lexeme resolution, scope filter, priority tiebreak, scope-stack mutation, recovery, EOF synthesis, HasError propagation, internal invariants). It does **not** drive the schema's compiled shape graph for sequence/alt validation — that requires extending `GrammarSchema` with a navigable shape instruction stream. The parser (parent-plan phase #7) is the source of truth for "this `open(rule)` is valid here" until the shape walker lands.
@@ -126,7 +126,7 @@ Design and implement a **single, language-agnostic tree data structure** that:
 | D7 | **Source text owned alongside the tree** | `Tree` holds the source buffer + a precomputed line-offset table. Nodes store byte spans (`{start, end}`); line/column derive lazily. Removes per-node duplication of `(file, line, col)`. |
 | D8 | **Empty-space is a flag, not a node kind** | Whitespace, comments, and any other ignorable content carry a `NodeFlag::EmptySpace` bit on the node. A *single* bit-test (`flags & EmptySpace`) skips them — no string compares, no kind switches. The flag is distinct from `NodeKind`: an Internal grouping can also be flagged empty-space (e.g. a blank-line block) if a config models it that way. AST cursor mode skips by flag, not by kind. |
 | D9 | **Schema-driven parsing prevents invalid syntax** | The language config compiles into a `GrammarSchema` — a tree of *expected* node shapes plus token definitions, scope rules, and validation predicates. The `TreeBuilder` walks this schema in lock-step with the source. Anything that doesn't match an allowed transition becomes a marked `Error` node carrying a structured `ParseDiagnostic` ("expected `;` or `,`, got `}`"). The tree can never contain silently-invalid syntax — every deviation is named and located. |
-| D10 | **Language definitions are config files, not C++ classes** | The compiler **ships defaults** as JSON files under `src/source-config/languages/` (`csharp.lang.json`, `dart.lang.json`, `tsql.lang.json`, `sqlite.lang.json` — to be authored later). At runtime, callers either pick a shipped default by name (`--language csharp`) or supply a custom file (`--language-config ./my-dsl.lang.json`). Adding a language or tweaking an existing one **never** requires recompiling the engine. `GrammarSchema` only knows how to *load* a config; it does not embed any language's rules in code. |
+| D10 | **Language definitions are config files, not C++ classes** | The compiler **ships defaults** as JSON files under `src/dss-config/sources/` (`csharp.lang.json`, `dart.lang.json`, `tsql.lang.json`, `sqlite.lang.json` — to be authored later). At runtime, callers either pick a shipped default by name (`--language csharp`) or supply a custom file (`--language-config ./my-dsl.lang.json`). Adding a language or tweaking an existing one **never** requires recompiling the engine. `GrammarSchema` only knows how to *load* a config; it does not embed any language's rules in code. |
 | D11 | **C++23 + std-library-first, cross-platform from day one** | Engine targets **C++23** (MSVC 17.5+, GCC 13+, Clang 16+ — all current LTS-grade releases). Standard-library types are the default: `std::expected<T, E>` for fallible loaders, `std::format` for diagnostic rendering, `std::filesystem::path` for all paths, `std::span` for non-owning ranges, `std::optional` for nullable values, `std::ranges` for traversal. External dependencies are limited to **nlohmann/json** (config parsing) and **GoogleTest** (testing), both header-mostly, MIT/BSD-3, pulled via CMake `FetchContent` — no system packages required on any platform. Build system requires **CMake 4.0+** (current latest-stable on project inception; tested with 4.3.2). No POSIX-only APIs, no Win32 calls outside dedicated target backends. The minimum-version floor is updated to whatever the latest mainline GCC/Clang/MSVC support; we do not freeze to old compilers. |
 
 ---
@@ -137,7 +137,7 @@ The current repo already has placeholders for this work:
 
 | Scaffold path | What's there today | What this plan adds |
 |---|---|---|
-| `src/core/types/.gitkeep` | Empty placeholder | All tree / node / span / token types |
+| ~~`src/core/types/.gitkeep`~~ → `src/core/types/` (✔MEASURED 2026-08-04: 63 headers, no `.gitkeep`) | ~~Empty placeholder~~ — long since populated | All tree / node / span / token types |
 | `src/core/compiler.hpp` | Empty `Compiler` class | Will own a `Tree` during compilation (later sub-plan) |
 | `src/core/export.hpp` | `DSS_EXPORT` macro | Re-used on every public type |
 | `src/core/CMakeLists.txt` | Builds `core` static lib | Add the new `.cpp` files here |
@@ -229,7 +229,7 @@ tests/core/
 And one canonical sample config used by the end-to-end test:
 
 ```
-src/source-config/languages/
+src/dss-config/sources/
 ├── toy.lang.json                  # minimal expression-language config used by tests
 ├── csharp.lang.json                # shipped defaults (authored in a later plan)
 ├── dart.lang.json
@@ -1033,7 +1033,7 @@ private:
 
 ```
 GrammarSchema::loadShipped("csharp")
-  ↓  reads src/source-config/languages/csharp.lang.json (relative to binary)
+  ↓  reads src/dss-config/sources/csharp.lang.json (relative to binary)
   ↓  parses JSON (in detail/grammar_schema_json.cpp — nlohmann/json stays here)
   ↓  validates structure → collects ConfigDiagnostic vector, bails on errors
   ↓  intern rule + token-kind names → RuleInterner, SchemaTokenInterner
@@ -1272,7 +1272,7 @@ Each phase produces a self-contained, testable deliverable. Land them in order; 
 | T1  | ✅ done | `tree-source-types`   | Source primitives + strong IDs | `strong_ids.hpp`, `source_buffer.*`, `source_span.*`, `token.hpp`, `interner.hpp`, `rule_id.hpp` (+ stub `rule_id.cpp`), `schema_token_interner.hpp` | `DSS_STRONG_ID` macro; `SourceSpan::of()` factory; `Interner<Id>` template (RuleInterner and SchemaTokenInterner are using-aliases); `freeze()` enforced. **8 + 9 + 10 + 4 + 8 = 39 test cases.** |
 | T2  | ✅ done | `tree-storage`        | `Tree` arena + `Node` struct + `NodeFlags` | `tree_node.hpp`, `tree.hpp/.cpp`, stub `grammar_schema.hpp`, stub `diagnostic_reporter.hpp` | `detail::Node` is 40 bytes (relaxed from 32 once `DiagnosticIndex` was added); `NodeFlags` ops `inline constexpr`; discriminant-asserting `rule()`/`tokenKind()`/`diagnostic()`; release-fatal `node_(id)` bounds check. **9 + 10 = 19 test cases including a death test.** |
 | T3  | ✅ done | `tree-diagnostics`    | Diagnostic types + reporter + policy | `scope_kind.hpp/.cpp`, `parse_diagnostic.hpp/.cpp`, `diagnostic_reporter.hpp/.cpp` | `DiagnosticCode` as `enum class : uint16_t` (P/C/S/I prefix ranges); `RelatedLocation`, scopeStack on every diag; `DiagnosticPolicy` (suppress/overrides/warningsAsErrors); `Config{maxDiagnostics,maxPerCode,dedupWindow}`; FNV-1a64 hash dedup including `ruleContext`; `BufferRegistry`. `format()` produces caret-pointed line + scope + related; `formatAll()` sorts by (buffer, span). **5 + 18 = 23 test cases** (includes ruleContext-in-hash regression). |
-| T4  | ✅ done | `tree-schema-loader`  | `GrammarSchema` + `SchemaCursor` + `ScopeKind` + JSON loader + toy config | `grammar_schema.hpp/.cpp`, `grammar_schema_json.hpp/.cpp`, `schema_cursor.hpp`, `src/source-config/languages/toy.lang.json` | `GrammarSchemaData` POD mirrors Tree/TreeData split (no friend gymnastics). `LoadResult<T>` = `std::expected<T, vector<ConfigDiagnostic>>`. Pre-interns `Identifier`/`IntLiteral`/etc. as built-in token kinds. Walks parent dirs in `loadShipped` to be cwd-agnostic. nlohmann/json linked PRIVATE — no leak. **19 test cases** covering happy path + every C_* code. |
+| T4  | ✅ done | `tree-schema-loader`  | `GrammarSchema` + `SchemaCursor` + `ScopeKind` + JSON loader + toy config | `grammar_schema.hpp/.cpp`, `grammar_schema_json.hpp/.cpp`, `schema_cursor.hpp`, `src/dss-config/sources/toy.lang.json` | `GrammarSchemaData` POD mirrors Tree/TreeData split (no friend gymnastics). `LoadResult<T>` = `std::expected<T, vector<ConfigDiagnostic>>`. Pre-interns `Identifier`/`IntLiteral`/etc. as built-in token kinds. Walks parent dirs in `loadShipped` to be cwd-agnostic. nlohmann/json linked PRIVATE — no leak. **19 test cases** covering happy path + every C_* code. |
 | T5  | ✅ done | `tree-builder`        | Schema-aware `TreeBuilder` with RAII `OpenScope` | `tree_builder.hpp/.cpp` | (a) Happy path verified. (b) `P_UnknownToken`/`P_UnexpectedToken` both produce Error nodes with scope-stack snapshot and HasError ancestor walk. (c) `P_PrematureEndOfInput` per unclosed shape, ruleContext-distinct via dedup-hash fix in reporter. (d) EmptySpace flag landed from `meaning.flagsApplied`. (e) `P_AmbiguousToken` warning + first-declared wins. (f) Forward progress guaranteed structurally (one token per `pushToken` call). (g) `OpenScope` RAII + move-only + idempotent close + cascade-cookie tracking. (h) Builder invariants (no-open-frame, popScope underflow, LIFO violation, double-finish) all emit `P_BuilderInvariant` in release. **+9 review-fix improvements** (rvalue-disqualified `open()`, leftover-scope diagnostic, `currentRule()` peek, empty-tree finish, etc.). **22 test cases** including OpenScope move semantics, LIFO cascade, death-test for double `finish()`. |
 | T6  | ✅ done | `tree-cursor`      | CST + AST cursors | `tree_cursor.hpp/.cpp`, `Tree::cursor()`/`astCursor()` entry points restored (v1 §0 deviation #5 closed), `tests/core/raw_tree_builder.hpp`, `tests/core/toy_harness.hpp` | AST skips by `isEmptySpace()` ONLY — `Missing`/`Synthetic` ARE visible (load-bearing). `Bookmark` is opaque (private fields + `friend TreeCursor`) and carries `TreeId` to catch ABA. `restore()` distinguishes three failure modes with distinct fatal messages (invalid / cross-tree / stale TreeId). Movement methods are `[[nodiscard]]`; empty-tree cursor fails cleanly without aborting (every method short-circuits on invalid position). Cycle caps in `depth()` and AST `gotoParent` prevent infinite loops on corrupt parent chains. Convenience forwarders: `text()`, `span()`, `rule()`, `tokenKind()`. **19 test cases** including empty-tree, hand-fabricated Missing/Synthetic preservation, mode-mixing bookmark, cycle paths. |
 | T7  | ✅ done | `tree-visitor`     | Walk helpers | `tree_visitor.hpp`, `tests/core/test_tree_visitor.cpp` | Header-only `walkPreOrder` / `walkPostOrder` over `TreeCursor`. Auto-detects `void`- or `WalkAction`-returning visitors via `if constexpr`. `WalkAction::{Continue, SkipChildren, Stop}`. Subtree-bounded — walks never ascend past the start node (depth-0 guard before sibling/parent moves). Zero allocations on the hot path (state is cursor + one int) — verified by a global `operator new` counter wrapped around 10K-node pre- and post-order walks. Three overloads each (cursor / `Tree`+start / whole `Tree`). **23 test cases** covering void/WalkAction/move-only visitor signatures, pre-/post-order ordering, Skip and Stop control at both mid-walk and start-node positions, symmetric subtree bounding from both left and right internal starts, single-leaf start, AST-mode propagation across BOTH pre- and post-order walks, empty-tree + invalid-start no-ops, and the zero-allocation 10K-node acceptance check. |
@@ -1295,7 +1295,7 @@ Downstream phases now have well-defined inputs/outputs against the tree:
 
 | Parent-plan phase | Consumes | Produces |
 |---|---|---|
-| `source-config-schema` (#3) | the JSON schema spec | shipped `*.lang.json` files under `src/source-config/languages/` |
+| `source-config-schema` (#3) | the JSON schema spec | shipped `*.lang.json` files under `src/dss-config/sources/` |
 | `source-factory` (#4) | a `.lang.json` path or shipped name | a `GrammarSchema` (this sub-plan's §5.12) |
 | `tokenizer` (#5) | `SourceBuffer` + `GrammarSchema` | `std::vector<Token>` with multi-typed lexeme metadata |
 | `analysis-lexical` (#6) | `[Token]` + `GrammarSchema` | validated `[Token]`; emits diagnostics into the same `DiagnosticReporter` |
@@ -1341,7 +1341,7 @@ Once the tree model is solid, adding **C#**, **Dart**, **Transact-SQL**, and **S
 
 For each shipped language:
 
-1. Author `src/source-config/languages/<lang>.lang.json` (tokens + scope rules + expected shapes).
+1. Author `src/dss-config/sources/<lang>.lang.json` (tokens + scope rules + expected shapes).
 2. Run the schema-aware `TreeBuilder` against a corpus of sample source files; assert clean parse (`!hasErrors()`).
 3. Walk the tree; assert key shapes (every C# `MethodDeclaration` has an `Identifier` child, etc.).
 4. (Optional) Hand-write typed views unique to that language (e.g., T-SQL `CteView`) — engine code, but optional ergonomics, not required for compilation.

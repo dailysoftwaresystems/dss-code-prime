@@ -26,6 +26,10 @@ target_include_directories(integrated_tests
     PRIVATE
         ${CMAKE_SOURCE_DIR}/tests/test_support
 )
+# Same repo root the `tests/` targets bake in (tests/CMakeLists.txt,
+# dss_add_test), so `tests/test_support/repo_root.hpp` resolves here too.
+target_compile_definitions(integrated_tests PRIVATE
+    DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 set_target_properties(integrated_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/dss
 )
@@ -38,3 +42,27 @@ add_test(
             $<TARGET_FILE:dss-code-prime>
             ${CMAKE_SOURCE_DIR}/examples
 )
+
+# ── The SPAWNED CLI needs this in its ENVIRONMENT, not just baked ──────────
+# This runner's whole job is to invoke `dss-code-prime` as a SUBPROCESS, and
+# that subprocess resolves shipped config through its own
+# `core/types/config_path_walk.cpp`, which reads $DSS_CONFIG_ROOT and otherwise
+# walks up from ITS cwd. An out-of-tree build gives it a cwd with no
+# src/dss-config/ in any ancestor, and until now nothing in this directory set
+# the variable at all — `grep DSS_CONFIG_ROOT integrated_tests/` returned
+# nothing. MEASURED consequence at a3af1320, and it is the exact silent-harness
+# -bug shape the note below warns about: the IN-PROCESS corpus runner
+# (tests/examples/examples_runner) PASSED while this CLI-subprocess sibling
+# failed all 561 manifests with error[C_InvalidLanguageName] /
+# error[D_SchemaLoadFailed]. A compile definition cannot fix this one — the
+# value has to be in the environment for the child process to inherit it.
+# (CTest ENVIRONMENT is a ';'-separated list; a repo path containing a literal
+# ';' would mis-split — impossible on normal Windows/WSL paths.)
+set_tests_properties(integrated_tests PROPERTIES
+    ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}")
+
+# D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the same strict-arm-verdict wiring
+# the in-process corpus entries get. The capability MUST land on both harnesses
+# together — one runner enforcing an arm's verdict while its sibling shrugs is a
+# silent harness bug, which is the class this whole change closes.
+dss_strict_arm_verdicts(integrated_tests)

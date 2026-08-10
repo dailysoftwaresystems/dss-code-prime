@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 134> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 140> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -127,6 +127,14 @@ constexpr std::array<DiagnosticCode, 134> kUnsuppressableCodes{{
     // restore exactly that silent loader death — the class this fail-loud exists
     // to convert into a compile-time error.
     DiagnosticCode::F_ShippedSymbolUnavailableForTarget,
+    // F_HeaderNameCaseAmbiguous (D-PP-HEADER-CASE-INSENSITIVE-PE, 2026-08-04): an
+    // `#include` name fold-matched TWO OR MORE distinct files under a
+    // case-INSENSITIVE format's header-name convention. Suppressing it would
+    // force the resolver to pick one — and since a case-only pair cannot exist on
+    // NTFS or default APFS at all, the pick would differ by BUILD HOST. That is
+    // the precise host-dependence the `headerNameMatching` axis removes, so a
+    // suppressible form of this code would reinstate the defect one layer down.
+    DiagnosticCode::F_HeaderNameCaseAmbiguous,
     // F_ShippedStructVariantAmbiguous (p18 Cluster G, plan 25, 2026-06-26): a
     // shipped `structs` entry's per-target `variants` had MORE THAN ONE match the
     // active (arch, format). The selection contract is exactly-one-matches;
@@ -210,6 +218,17 @@ constexpr std::array<DiagnosticCode, 134> kUnsuppressableCodes{{
     // `u"a" U"b";` statement typed Array<Char,3> "ab"). Closed here so a mixed-prefix
     // concat is never silent.
     DiagnosticCode::H_ConflictingStringLiteralPrefixes,
+    // H_ShippedShimSignatureMismatch (TF-C112, D-FFI-PE-CRT-UCRT-MIGRATION): a
+    // user prototype re-declares a shipped row realized as a compiler-synthesized
+    // SHIM with a signature that is not the row's. Unlike its H_* neighbours this
+    // one has NO second line of defence: the refusal is the only thing standing
+    // between the mismatch and a shim body that answers the call under a different
+    // ABI than the caller made it — nothing downstream re-derives the callee's
+    // signature from the prototype, so nothing else can notice. Suppressed, the
+    // build goes GREEN and emits a wrong-ABI call. It also guards the surface the
+    // whole cycle exists to close: the alternative realization for that symbol is a
+    // raw `ucrtbase.dll` import, which does not load at all (0xC0000139).
+    DiagnosticCode::H_ShippedShimSignatureMismatch,
 
     // I_* MIR-verifier band — frozen-module invariants. A suppressed
     // violation here would let a miscompile sail past the verifier.
@@ -243,6 +262,13 @@ constexpr std::array<DiagnosticCode, 134> kUnsuppressableCodes{{
     // non-atomic access to atomic memory sail past (the exact miscompile `_Atomic`
     // exists to prevent).
     DiagnosticCode::I_AtomicAccessNotLowered,
+    // I_CallSignatureMismatch (TF-C112, D-MIR-VERIFIER-NO-CALLSITE-SIGNATURE-CHECK):
+    // the call-site signature belt — a MIR `Call` whose operands do not match its
+    // statically-resolved callee's FnSig (arity, or the type at a POSITION). A
+    // member like every I_* verifier invariant; suppressed, a mis-wired synthesis
+    // shim would call the C runtime with arguments in the wrong slots and ship
+    // green — a wrong-BYTES miscompile with no other build-time symptom.
+    DiagnosticCode::I_CallSignatureMismatch,
 
     // K_* linker band — image refused / undefined extern + the LK10
     // image-write contract codes. Suppressing any K_ImageWrite* code
@@ -296,6 +322,44 @@ constexpr std::array<DiagnosticCode, 134> kUnsuppressableCodes{{
     // with no diagnostic trail back to the dropped request.
     DiagnosticCode::K_FormatLacksStackReserveControl,
     DiagnosticCode::K_InvalidStackReserveRequest,
+    // K_FormatLacksProcessExit / K_ExecEntryNotTrampolined (D-LK10-ENTRY §2.13)
+    // — the entry-trampoline contract, the same format-capability shape as the
+    // two codes above. They are TWO codes because their predicates DISAGREE on
+    // one field, and both REPLACE A SILENT WRONG-ENTRY EMISSION, so suppressing
+    // either restores exactly the defect it closed:
+    //   K_FormatLacksProcessExit — an exec-flavored format that declares NO
+    //     `processExit` skipped trampoline synthesis with NO diagnostic
+    //     (linker.cpp's gate tested the same predicate the emitter would have
+    //     failed on, making the emitter's own check dead code by construction).
+    //   K_ExecEntryNotTrampolined — a walker reached DIRECTLY (bypassing
+    //     `linker::link`) with no `imageEntryOverride`, under a format that DOES
+    //     declare `processExit`, defaulted the image entry to `functions[0]` —
+    //     MEASURED: a Mach-O exec whose LC_MAIN entryoff pointed at `main`'s
+    //     `sub rsp,0x10` prologue, rc=0, zero diagnostics.
+    // Neither has a runtime symptom that points back here: the program simply
+    // runs the wrong entry (or falls off it), so the diagnostic IS the only
+    // trace and must be undroppable. ★ And suppression is not even required to
+    // lose it — a code absent from this table is droppable by the reporter's
+    // dedup window and per-code cap, so membership is part of CREATING the
+    // code, not a follow-up.
+    DiagnosticCode::K_FormatLacksProcessExit,
+    DiagnosticCode::K_ExecEntryNotTrampolined,
+
+    // The extern-import dedup fold (D-LK11-EXTERN-IMPORT-DEDUP) at BOTH merge
+    // tiers — linker.cpp `mergeModules` and mir_merge.cpp — collapses N CUs'
+    // imports of one dynamic symbol into one row. Four fields cannot be folded
+    // and must be a hard stop: `isData` and `isThreadLocal` SELECT THE BINDING
+    // MODEL, and two differing non-zero `dataSizeBytes`/`dataAlignBytes` size
+    // one copy-relocation `.bss` slot two ways.
+    // Suppressing this restores first-wins EXACTLY — the merge proceeds with
+    // one CU's answer and the other CU's calls bind through the wrong model
+    // (a PLT stub standing in for a data object: D-LK-EXTERN-DATA-IMPORT).
+    // ★ AND SUPPRESSION IS NOT EVEN REQUIRED TO LOSE IT: a code absent from
+    // this table is also droppable by the reporter's dedup window and its
+    // per-code cap, so on a link the size of the 103-TU SQLite CLI the
+    // diagnostic can vanish with NO flag and no trace. That is why membership
+    // here is part of creating the code, not a follow-up.
+    DiagnosticCode::K_ExternImportAttributeConflict,
 
     // L_* LIR verifier / lowering band — structural invariants
     // (cannot reach assembler-tier codegen without violating

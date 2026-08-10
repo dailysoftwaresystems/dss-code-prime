@@ -9,11 +9,14 @@
 #include "lir/lir_pass_util.hpp"
 
 #include <bit>
+#include <cmath>     // D-MIR-OVERLAP-STRUCT-ZERO-INIT: std::signbit (rejects -0.0)
 #include <cstring>
 #include <format>
 #include <limits>
 #include <optional>
+#include <string>
 #include <unordered_map>
+#include <variant>
 
 namespace dss {
 
@@ -812,6 +815,27 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
     return std::nullopt;   // monostate / string / MirAggregateValue
 }
 
+// D-MIR-OVERLAP-STRUCT-ZERO-INIT: is every leaf of this static initializer a ZERO
+// whose object representation is all-zero BYTES? The static-data twin of the MIR
+// lowering's `isAllZeroAggregateInit`, and deliberately the same admissions and the
+// same CONSERVATIVE default — an unrecognized arm answers FALSE so the caller keeps
+// its refusal. `-0.0` is rejected: numerically zero, but its sign bit is SET, so a
+// pre-zeroed buffer does NOT carry its bytes. Symbol addresses / `_BitInt` / wide
+// floats / strings each need their own representation proof and get none here.
+[[nodiscard]] bool isAllZeroMirLiteral(MirLiteralValue const& v) {
+    if (auto const* b = std::get_if<bool>(&v.value))          return !*b;
+    if (auto const* i = std::get_if<std::int64_t>(&v.value))  return *i == 0;
+    if (auto const* u = std::get_if<std::uint64_t>(&v.value)) return *u == 0;
+    if (auto const* d = std::get_if<double>(&v.value))
+        return *d == 0.0 && !std::signbit(*d);
+    if (auto const* a = std::get_if<MirAggregateValue>(&v.value)) {
+        for (MirLiteralValue const& f : a->fields)
+            if (!isAllZeroMirLiteral(f)) return false;
+        return true;
+    }
+    return false;
+}
+
 // Recursively encode an aggregate (or scalar) literal `v` of type `ty` into
 // `buf` at absolute byte offset `base`. `buf` is pre-sized to the TOP
 // aggregate's layout `size` and zero-filled by the caller, so every padding
@@ -840,23 +864,71 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
 // RELOCATION at its member offset (into `relocs`) over the pre-zeroed 8-byte
 // pointer slot; `absPtrRelocKind` is the target's abs64 tag (nullopt ⇒ the
 // target declares no abs64 reloc ⇒ fail loud, as the F5 scalar arm does).
+//
+// A1 (audit fold) — WHY the `why` out-param: this is a free function in the
+// file's anonymous namespace, so it cannot reach the caller's `emit()` (a lambda
+// closing over a `DiagnosticReporter` local to `lowerMirGlobalsToDataItems`).
+// Every `return false` therefore surfaced through ONE generic caller message
+// that enumerates the causes it knew about ("a type↔value shape mismatch or an
+// unencodable leaf — e.g. f16/f80/f128, or an address-relocated leaf…"). The
+// overlapping-struct refusal below is NONE of those, so a user hitting it —
+// MEASURED reachable today as `static ULARGE_INTEGER g = {1,0,0};` on pe64,
+// `windows.json`'s explicit-offset OVERLAY — was pointed at the wrong thing. An
+// arm with a SPECIFIC cause writes it into `why`; the recursion threads the SAME
+// reference, so a nested member's cause reaches the top unchanged, and the
+// caller prefers a non-empty `why` over its generic text. Left EMPTY the
+// behaviour is bit-identical to before — no arm is forced to invent a reason it
+// does not have, and the generic message keeps covering the arms that share it.
 [[nodiscard]] bool
 encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
                      TypeInterner const& in, AggregateLayoutParams lp,
                      DataModel dm, std::vector<std::uint8_t>& buf,
                      std::uint64_t base, std::vector<Relocation>& relocs,
-                     std::optional<RelocationKind> absPtrRelocKind) {
+                     std::optional<RelocationKind> absPtrRelocKind,
+                     std::string& why) {
     TypeKind const k = in.kind(ty);
 
     if (k == TypeKind::Struct || k == TypeKind::Union) {
         if (!std::holds_alternative<MirAggregateValue>(v.value)) return false;
         auto const& agg = std::get<MirAggregateValue>(v.value);
-        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a static initializer of an
-        // explicit-offset (overlapping) struct would positionally write fields whose
-        // byte ranges overlap — a later field silently overwrites an earlier one in
-        // `buf`. An FFI overlap type is only member-accessed at runtime, never
-        // brace-inited; refuse LOUD rather than emit wrong static bytes.
-        if (in.hasExplicitOffsets(ty)) return false;
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a static initializer of a struct
+        // whose members SHARE BYTES would positionally write fields whose byte
+        // ranges overlap — a later field silently overwrites an earlier one in
+        // `buf`. Refuse LOUD rather than emit wrong static bytes.
+        //
+        // D-MIR-OVERLAP-STRUCT-ZERO-INIT: except when the initializer is ALL ZERO —
+        // `{}` / `{0}` denote a whole object of zero bytes, which is unambiguous no
+        // matter how many members alias those bytes. `buf` is PRE-ZEROED to the
+        // layout size by the caller (`d.bytes.assign(lay->size, 0u)`), so the correct
+        // encoding is to write NOTHING. The runtime twin of this rule lives at the
+        // MIR brace-init lowering; both ask the same two questions — does the field
+        // set overlap, and is every supplied element zero — and both key on ACTUAL
+        // overlap, never on the mere presence of explicit offsets.
+        //
+        // ★ THE FALL-THROUGH IS A THIRD OUTCOME, not a leftover: a DISJOINT
+        // explicit-offset struct (a descriptor pinning a foreign layout that simply
+        // is not the natural one) drops past this gate and encodes MEMBER-WISE at
+        // `lay->fieldOffsets[i]` — which for such a struct are the DECLARED offsets,
+        // not natural ones (type_layout.cpp's explicit-offset arm copies them
+        // verbatim). Refusing it was a FALSE refusal; nothing about disjoint offsets
+        // is ambiguous, so the ordinary positional walk below is exactly right.
+        // Pinned byte-exactly by AsmAggregateGlobal.DisjointExplicitOffsetStruct*.
+        //
+        // A1: the non-zero half gets its OWN reason. The caller's generic text
+        // names shape mismatches and unencodable leaves; this is neither, and the
+        // remedy is specific and actionable, so it is stated in the SAME words the
+        // MIR twin uses (hir_to_mir.cpp `lowerAggregateInitIntoSlot`) — one rule,
+        // one wording, whichever tier the user's declaration happens to hit.
+        if (compositeFieldsOverlap(ty, in, lp, dm)) {
+            if (!isAllZeroMirLiteral(v)) {
+                why = "static initialization of an overlapping explicit-offset "
+                      "struct is unsupported — its members share bytes; assign "
+                      "the members individually (an ALL-ZERO initializer `{0}` / "
+                      "`{}` IS supported — D-MIR-OVERLAP-STRUCT-ZERO-INIT)";
+                return false;
+            }
+            return true;
+        }
         auto const  lay = computeLayout(ty, in, lp, dm);
         if (!lay.has_value()) return false;
         auto const ops = in.operands(ty);
@@ -881,7 +953,7 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
                 if (in.fieldBitWidth(ty, i).has_value()) continue;
                 if (!encodeAggregateValue(ops[i], agg.fields[i], in, lp, dm, buf,
                                           base + lay->fieldOffsets[i], relocs,
-                                          absPtrRelocKind))
+                                          absPtrRelocKind, why))
                     return false;
                 continue;
             }
@@ -956,7 +1028,8 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         std::uint64_t const stride = elemLay->align.alignUp(elemLay->size);
         for (std::size_t i = 0; i < agg.fields.size(); ++i)
             if (!encodeAggregateValue(elem, agg.fields[i], in, lp, dm, buf,
-                                      base + i * stride, relocs, absPtrRelocKind))
+                                      base + i * stride, relocs, absPtrRelocKind,
+                                      why))
                 return false;
         return true;
     }
@@ -1367,18 +1440,29 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // partial-init tail, and union slack is then 0 by construction —
             // the recursion writes only the provided leaves.
             d.bytes.assign(static_cast<std::size_t>(lay->size), 0u);
+            // A1 (audit fold): `why` carries the SPECIFIC cause when the encoder
+            // knows one (today: the overlapping explicit-offset refusal). Prefer
+            // it verbatim; fall back to the enumerating text only for the arms
+            // that genuinely share it — a diagnostic that names a cause the user
+            // does not have is worse than one that names a set they do.
+            std::string why;
             if (!encodeAggregateValue(ty, v, interner, *aggregateLayout,
                                       dataModel, d.bytes, 0, d.relocations,
-                                      absPtrRelocKind)) {
+                                      absPtrRelocKind, why)) {
                 emit(DiagnosticCode::K_NoMatchingObjectFormat,
-                     std::format("lowerMirGlobalsToDataItems: global "
-                                 "SymbolId={{ {} }} aggregate initializer "
-                                 "could not be encoded (a type↔value shape "
-                                 "mismatch or an unencodable leaf — e.g. "
-                                 "f16/f80/f128, or an address-relocated leaf when "
-                                 "the target declares no abs64 reloc) "
-                                 "(D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
-                                 sym.v));
+                     why.empty()
+                         ? std::format("lowerMirGlobalsToDataItems: global "
+                                       "SymbolId={{ {} }} aggregate initializer "
+                                       "could not be encoded (a type↔value shape "
+                                       "mismatch or an unencodable leaf — e.g. "
+                                       "f16/f80/f128, or an address-relocated leaf when "
+                                       "the target declares no abs64 reloc) "
+                                       "(D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
+                                       sym.v)
+                         : std::format("lowerMirGlobalsToDataItems: global "
+                                       "SymbolId={{ {} }} {} "
+                                       "(D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
+                                       sym.v, why));
                 continue;
             }
             // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): an aggregate that

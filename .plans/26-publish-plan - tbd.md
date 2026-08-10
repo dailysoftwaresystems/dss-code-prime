@@ -1,7 +1,7 @@
 # 26 — Publish Plan: `dsscp` → OS package managers
 
 > **Status:** SCAFFOLDED (inert) — not yet live.
-> **Branch / PR:** `feature/enhance-workflows` / PR #45 (commit `b832e843`).
+> **Branch / PR:** `feature/enhance-workflows` / PR #45 (commit `b832e843`) — ✅ **MERGED 2026-07-16** (✔verified 2026-08-04 via `gh pr view 45`: state `MERGED`, `mergedAt 2026-07-16T20:23:42Z`). This is no longer an in-flight PR; **P0.1 / P0.2 below are still genuinely OPEN and are unaffected by the merge.**
 > **Goal:** every `dsscp` release auto-publishes to Windows / Linux / macOS package managers.
 > **Deep reference (per-manager commands + gotchas):** [`packaging/README.md`](../packaging/README.md).
 > **Machinery already built:**

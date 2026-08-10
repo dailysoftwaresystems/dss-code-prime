@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,70 @@ enum class SymbolLinkage : std::uint8_t {
     Local    = 2,  // ELF STB_LOCAL (rare in `.dynsym`; common in `.symtab`)
 };
 
+// ── Per-symbol VERSIONING — an ELF-only concept, said in the type ──
+//
+// TF-C124 (D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION). ELF is the
+// ONLY one of the three object formats with a PER-SYMBOL version, so this
+// is the one place `ImportSurface`'s otherwise format-blind rows carry a
+// format-named member — deliberately, because the honest alternative to a
+// name that says ELF is a field named `version` that silently means
+// NOTHING on two thirds of the readers.
+//
+// The mechanism (gABI + the Sun/GNU version extension): `.gnu.version`
+// (SHT_GNU_versym) holds ONE u16 per `.dynsym` row. For a DEFINED symbol
+// that index selects an entry of `.gnu.version_d` (SHT_GNU_verdef) — the
+// versions this library DEFINES for its own exports. For an UNDEFINED row
+// it selects a `.gnu.version_r` (verneed) vernaux instead — the versions
+// the library REQUIRES of OTHERS. ⚠ Only the FORMER can answer "what
+// version does this library export this name at": `.gnu.version_r`
+// describes the library's own IMPORTS, i.e. exactly the SHN_UNDEF rows
+// `readElf64` filters out as not-exports
+// ([[D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED]]).
+// MEASURED on this host: `libz.so.1` records `deflateBound@@ZLIB_1.2.0`
+// in a 15-entry `.gnu.version_d`, while its 1-entry `.gnu.version_r`
+// speaks only about the glibc symbols libz itself calls.
+//
+// The other two formats, STATED rather than mapped onto this field:
+//   * PE — has NO per-symbol version, at all. An import binds by NAME or
+//     by ORDINAL out of an IMAGE_IMPORT_DESCRIPTOR and there is no third
+//     coordinate. What PE versions is the FILE (a VERSIONINFO resource,
+//     or the version baked into an api-set DLL's own NAME, e.g.
+//     `api-ms-win-crt-stdio-l1-1-0.dll`) — library identity, which this
+//     row already carries as `libraryPath` / `soname`.
+//   * Mach-O — also has no per-symbol version. `LC_ID_DYLIB` /
+//     `LC_LOAD_DYLIB` carry a dylib's current + COMPATIBILITY version,
+//     and `LC_BUILD_VERSION` a platform floor; both are per-LIBRARY, and
+//     dyld's per-symbol availability story is `$ld$` linker-set aliases,
+//     which are distinct SYMBOL NAMES rather than a version attached to
+//     one name.
+// So this stays `nullopt` on every PE and Mach-O row by those formats'
+// CONSTRUCTION — not "pending a reader that will fill it in later".
+struct DSS_EXPORT ElfSymbolVersion {
+    // The version NAME exactly as the binary records it: "ZLIB_1.2.0",
+    // "GLIBC_2.3". NEVER empty in a live value — a row with no version
+    // carries no `ElfSymbolVersion` at all, which is precisely why the
+    // member below is an `optional` rather than a possibly-empty string
+    // (an empty string cannot say whether the reader looked and found
+    // nothing, or never looked).
+    std::string name;
+    // TRUE  — `sym@@VER`: the DEFAULT definition of this name. An
+    //         unversioned reference to the name binds HERE, and a
+    //         reference REQUESTING this version binds here too. Safe to
+    //         re-request from an observation.
+    // FALSE — `sym@VER`: a NON-default (VERSYM_HIDDEN, the 0x8000 bit of
+    //         the versym slot) COMPAT definition, kept alive only for
+    //         binaries linked before the default moved. ⚠ Pinning one of
+    //         these from a mere observation is how a working import
+    //         becomes a broken one: libc.so.6 defines BOTH
+    //         `realpath@@GLIBC_2.3` and `realpath@GLIBC_2.2.5`, and the
+    //         latter is the pre-2.3 form that EINVALs a NULL resolved
+    //         buffer — the exact misbind [[D-LK-ELF-SYMBOL-VERSIONING]]
+    //         was opened for. The consumer must NOT treat the two alike;
+    //         `ffi/ingest.cpp` requires this bit to re-request a version
+    //         it only OBSERVED.
+    bool isDefaultVersion = true;
+};
+
 // One row in the import surface — describes a single symbol the
 // dynamic library exports. FF3 (ABI catalog) will resolve typed
 // signatures off the HIR side-table — not via a field on this row —
@@ -105,6 +170,19 @@ struct DSS_EXPORT ImportSurface {
     // rejecting the export) keeps a forwarder-heavy binary like kernel32
     // readable — the consumer follows the redirect to the real owner.
     std::string      forwardTarget;
+    // TF-C124 (D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION): the
+    // PER-SYMBOL version this binary records for this export, or `nullopt`
+    // for "no version" — see `ElfSymbolVersion` above for the mechanism and
+    // for why PE and Mach-O rows are permanently `nullopt`. Populated ONLY
+    // by `readElf64`, from `.gnu.version` + `.gnu.version_d`. Without it a
+    // `--resolve-library` import was ALWAYS unversioned and only a shipped
+    // DESCRIPTOR could pin a version — which made
+    // [[D-LK-ELF-SYMBOL-VERSIONING]]'s emission mechanism unreachable for
+    // every third-party library this project acquires (Tcl, zlib), none of
+    // which has a descriptor. LAST field, so every positional aggregate
+    // initializer in the FF1 test fixtures keeps compiling and defaults to
+    // "no version".
+    std::optional<ElfSymbolVersion> elfSymbolVersion;
 };
 
 } // namespace dss::ffi

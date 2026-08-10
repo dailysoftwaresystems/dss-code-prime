@@ -28,6 +28,7 @@
 #include <format>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace dss;
@@ -985,6 +986,247 @@ TEST(LirTextRoundTrip, UnreachableTerminatorRoundTripsLossless) {
     EXPECT_NE(text.find("unreachable ; payload=0 flags=0"),
               std::string::npos)
         << "unreachable round-trips with no operands AND zero payload/flags";
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// TF-C112 — closed-enum dispatch coverage in `lir_text.cpp`.
+// Every pin below covers an enumerator that was appended to its enum
+// WITHOUT an arm in this file's switches, and that only the clang
+// `-Wswitch` leg ever complained about (`TargetTerminatorKind::IndirectBr`;
+// `TypeKind::VolatileQual` / `TypeKind::NullptrT`). The per-file
+// `-Werror=switch` / `/we4062` gate added in `src/lir/CMakeLists.txt` makes
+// the NEXT such omission a build error; these tests pin the BEHAVIOUR the
+// omissions produced, so the fixes cannot silently regress under a compiler
+// that does not implement the warning.
+// ═════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Flatten a reporter into `<code>: <text>` lines. Every assertion below that
+// expects a CLEAN parse prints this on failure — "expected true, was false" on
+// a parse verdict is unactionable without the diagnostics that produced it.
+[[nodiscard]] std::string diagText(DiagnosticReporter const& rep) {
+    std::string s;
+    for (auto const& d : rep.all()) {
+        s += std::format("  [{}] {}\n", static_cast<int>(d.code), d.actual);
+    }
+    return s;
+}
+
+// A three-block `jmp_indirect` function whose entry block's successor list is
+// the ONLY thing the caller varies. The refusal pin and its matched control
+// therefore differ in exactly that one construct — everything else (preamble,
+// symbols, the non-terminator prelude, the `payload=`/`flags=` tails, the two
+// successor blocks) is shared, so a red in the refusal case cannot be blamed
+// on hand-written text that was malformed for some unrelated reason.
+[[nodiscard]] std::string
+indirectBrFunctionText(TargetSchema const& sch, std::string_view successors) {
+    std::string const v{sch.version()};
+    return std::format(
+        "dsslir 1\n"
+        "target {} version \"{}\"\n"
+        "symbols {{\n  %1 \"main\"\n}}\n"
+        "literal_pool {{}}\n"
+        "module {{\n"
+        "  function %1 \"main\" {{\n"
+        "    block ^b0 [entry] -> [{}] {{\n"
+        "      rax = mov #0 ; payload=0 flags=0\n"
+        "      jmp_indirect rax ; payload=0 flags=0\n"
+        "    }}\n"
+        "    block ^b1 -> [] {{\n"
+        "      ret ; payload=0 flags=0\n"
+        "    }}\n"
+        "    block ^b2 -> [] {{\n"
+        "      ret ; payload=0 flags=0\n"
+        "    }}\n"
+        "  }}\n"
+        "}}\n",
+        sch.name(), v, successors);
+}
+
+} // namespace
+
+TEST(LirTextRoundTrip, IndirectBrRoundTripsWithSuccessorSetAndAddressOperand) {
+    // D-CSUBSET-COMPUTED-GOTO. `TargetTerminatorKind::IndirectBr` had NO arm in
+    // `parseInst`'s dispatch, so an `indirect-br` opcode fell straight through
+    // the switch: no `LirBuilder` call, the block left unterminated, and the
+    // builder's own invariant check then `std::abort()`ed. The EMITTER was
+    // always correct — only the parse side dropped it — so the format could
+    // write a computed goto it could not read back.
+    //
+    // ★ Byte-identity ALONE would not catch that: a bug that drops the
+    // terminator on BOTH emissions re-emits byte-identically. So this pins the
+    // reconstructed STRUCTURE as well — the terminator survives as the block's
+    // LAST instruction, under the indirect-br opcode, carrying the same
+    // address register and the same address-taken successor SET.
+    auto sch = shippedX86();
+    auto const movOp = sch->opcodeByMnemonic("mov");
+    auto const jmpIndOp = sch->opcodeByMnemonic("jmp_indirect");
+    auto const retOp = sch->opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value() && jmpIndOp.has_value() && retOp.has_value());
+
+    LirBuilder b{*sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    LirBlockId const labelA = b.createBlock();
+    LirBlockId const labelB = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const rax = makePhysicalReg(0, LirRegClass::GPR);
+    std::array<LirOperand, 1> mov{LirOperand::makeImmInt32(0)};
+    b.addInst(*movOp, rax, mov);
+    // operand[0] = the target ADDRESS register; the two address-taken labels
+    // are SUCCESSORS, not operands — they ride the block header on emit.
+    std::array<LirOperand, 1> addr{LirOperand::makeReg(rax)};
+    std::array<LirBlockId, 2> targets{labelA, labelB};
+    b.addIndirectBr(*jmpIndOp, addr, targets);
+    b.beginBlock(labelA);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    b.beginBlock(labelB);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirTextContext ctx;
+    std::string const text =
+        roundTripOrFail(lir, *sch, ctx, "IndirectBr computed goto");
+    EXPECT_NE(text.find("block ^b0 [entry] -> [^b1, ^b2]"), std::string::npos)
+        << "the variadic address-taken successors live on the block header, "
+           "the same channel CondBr uses";
+    EXPECT_NE(text.find("jmp_indirect rax ; payload=0 flags=0"),
+              std::string::npos)
+        << "the address register is the sole operand on the inst itself";
+
+    // Structural re-check on the PARSED module — the half byte-identity
+    // cannot see.
+    DiagnosticReporter rep;
+    auto result = parseLir(text, *sch, rep);
+    ASSERT_TRUE(result->ok) << diagText(rep);
+    Lir const& re = result->lir;
+    ASSERT_EQ(re.moduleFuncCount(), 1u);
+    LirFuncId const fn = re.funcAt(0);
+    ASSERT_EQ(re.funcBlockCount(fn), 3u);
+    LirBlockId const reEntry = re.funcEntry(fn);
+    ASSERT_EQ(re.blockInstCount(reEntry), 2u)
+        << "the terminator must survive as an instruction, not be dropped "
+           "(byte-identity would still hold if it vanished from both emits)";
+    LirInstId const term = re.blockInstAt(reEntry, 1);
+    EXPECT_EQ(re.instOpcode(term), *jmpIndOp);
+    auto const termOps = re.instOperands(term);
+    ASSERT_EQ(termOps.size(), 1u);
+    EXPECT_EQ(termOps[0].kind, LirOperandKind::Reg);
+    EXPECT_TRUE(termOps[0].reg == rax)
+        << "the address register must survive the round-trip unchanged";
+    auto const succs = re.blockSuccessors(reEntry);
+    ASSERT_EQ(succs.size(), 2u)
+        << "dropping a successor would delete a live `&&label` edge";
+    EXPECT_EQ(succs[0].v, re.funcBlockAt(fn, 1).v);
+    EXPECT_EQ(succs[1].v, re.funcBlockAt(fn, 2).v);
+}
+
+TEST(LirTextParser, IndirectBrWithZeroSuccessorsIsRefusedLoudlyNotAborted) {
+    // The arity half of the dispatch arm. `kTargetTerminatorShapes` gives
+    // IndirectBr >=1 successor, so an empty `-> []` is a genuinely malformed
+    // input — and it must REFUSE, not build an edgeless computed goto and not
+    // fall through to the `abort()` that the missing arm used to cause.
+    //
+    // This is what keeps the refusal machinery under test now that the happy
+    // path is wired: `refuseTerminator` + the `unterminatedBlock_` unwind are
+    // still the only thing standing between a rejected terminator and
+    // `LirBuilder::beginBlock`'s hard abort on the FOLLOWING block.
+    auto sch = shippedX86();
+    std::string const text = indirectBrFunctionText(*sch, "");
+    DiagnosticReporter rep;
+    auto result = parseLir(text, *sch, rep);
+
+    // (a) the parse RETURNED — reaching this line at all is half the pin.
+    // (b) the verdict is a refusal, and
+    // (c) NO half-built module escapes.
+    EXPECT_FALSE(result->ok);
+    EXPECT_EQ(result->lir.moduleFuncCount(), 0u)
+        << "a refused terminator must discard the partially-built module, not "
+           "hand back a function whose block has no terminator";
+    bool sawRefusal = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::I_TextMalformed
+            && d.actual.find("jmp_indirect") != std::string::npos
+            && d.actual.find(">=1 successor") != std::string::npos) {
+            sawRefusal = true;
+        }
+    }
+    EXPECT_TRUE(sawRefusal)
+        << "the refusal must name the opcode AND the arity it required:\n"
+        << diagText(rep);
+    // (d) and it must be ONE diagnostic. Unwinding out of the block/function
+    // loops rather than continuing to drive the builder is what makes that
+    // true; a refusal that kept walking would cascade "expected '}'"-class
+    // noise over the real cause.
+    EXPECT_EQ(rep.errorCount(), 1u) << diagText(rep);
+}
+
+TEST(LirTextParser, IndirectBrMatchedControlWithSuccessorsParsesGreen) {
+    // MATCHED CONTROL for the refusal above: byte-for-byte the same text
+    // except the entry block declares `^b1, ^b2`. Without it, the refusal pin
+    // would also pass if the parser choked on the shared scaffolding for some
+    // unrelated reason — it proves the refusal is caused by the SUCCESSOR
+    // ARITY and nothing else.
+    auto sch = shippedX86();
+    std::string const text = indirectBrFunctionText(*sch, "^b1, ^b2");
+    DiagnosticReporter rep;
+    auto result = parseLir(text, *sch, rep);
+    EXPECT_TRUE(result->ok)
+        << "the shared scaffolding must parse clean — otherwise the "
+           "zero-successor pin proves nothing. Diagnostics:\n"
+        << diagText(rep);
+    ASSERT_EQ(result->lir.moduleFuncCount(), 1u);
+    EXPECT_EQ(result->lir.blockSuccessors(
+                  result->lir.funcEntry(result->lir.funcAt(0))).size(),
+              2u);
+}
+
+TEST(LirTextRoundTrip, LiteralPoolCoreTagIsInjectiveForLateAddedTypeKinds) {
+    // `typeKindName` had no arm for `TypeKind::VolatileQual` or
+    // `TypeKind::NullptrT`, so BOTH rendered the trailing `"?"` sentinel.
+    // MEASURED pre-fix behaviour (both assertions below fire): the emitter
+    // writes `core ?`, and the reparse REJECTS it — "expected TypeKind name
+    // after 'core', got '?'", because `?` lexes as an Unknown token rather
+    // than an identifier. So the round-trip was not silently wrong, it was
+    // impossible: any module carrying such a pool entry could not be read
+    // back at all.
+    //
+    // Both halves are asserted deliberately. The `core ?` check pins the
+    // EMITTER (the codec must be total over TypeKind — `"?"` is un-injective
+    // by construction, since `typeKindFromName` maps it to whichever kind
+    // renders it first, so it must never be reachable from a valid kind); the
+    // per-entry kind checks pin the PARSER actually reconstructing each
+    // distinct kind rather than collapsing both onto one.
+    auto sch = shippedX86();
+    LirBuilder b{*sch};
+    LirLiteralValue volLit;
+    volLit.value = std::uint64_t{7};
+    volLit.core  = TypeKind::VolatileQual;
+    std::uint32_t const volIdx = b.literalPoolAdd(std::move(volLit));
+    LirLiteralValue nullLit;
+    nullLit.value = std::int64_t{0};
+    nullLit.core  = TypeKind::NullptrT;
+    std::uint32_t const nullIdx = b.literalPoolAdd(std::move(nullLit));
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep1, rep2;
+    LirTextContext ctx;
+    std::string const text = emitLir(lir, *sch, ctx, rep1);
+    // No VALID kind may render the `"?"` sentinel: `"?"` is the one spelling
+    // `typeKindFromName` cannot inverse-map, so a kind that emits it is a
+    // silently lossy tag by construction — regardless of which kinds collide.
+    EXPECT_EQ(text.find("core ?"), std::string::npos)
+        << "the `core <TypeKind>` codec must be TOTAL over TypeKind; emitted:\n"
+        << text;
+
+    auto result = parseLir(text, *sch, rep2);
+    ASSERT_TRUE(result->ok) << diagText(rep2);
+    ASSERT_EQ(result->lir.literalPool().size(), 2u);
+    EXPECT_EQ(result->lir.literalValue(volIdx).core, TypeKind::VolatileQual);
+    EXPECT_EQ(result->lir.literalValue(nullIdx).core, TypeKind::NullptrT)
+        << "NullptrT and VolatileQual must reconstruct as DISTINCT kinds — "
+           "they shared the one `\"?\"` spelling, which no inverse can split";
 }
 
 TEST(LirTextRoundTrip, IntrinsicCallPayloadAndArgsRoundTrip) {

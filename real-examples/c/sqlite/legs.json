@@ -1,0 +1,759 @@
+{
+  "$comment": "THE SQLITE HARNESS LEG CATALOGUE — the declared, HOST-FREE answer to 'which targets does this harness build?'. D-HARNESS-CROSS-HOST-ANY-TARGET item (2). ★ THE RULE THIS FILE EXISTS TO ENFORCE: the set of legs is a property of the HARNESS, not of the machine running it. Read this file on Windows, on Linux, on an arm64 VPS or on a Mac and you get the SAME five legs. What the host changes is ONLY whether it can EXECUTE a leg's artifact — a separate question, answered by `runOn` + `launchers` below and never by an `if host == ...` in a driver. Before this file existed, build-and-test.sh derived its leg list from `uname` (pe64 was unreachable from any host, macho only from a Mac) and build-and-test.ps1 refused to start unless $IsWindows (pe64 was its ONLY leg, hardcoded). Each driver therefore conflated HOST with TARGET, which is the opposite of the user's hard requirement: 'build ANY target inside ANY host, this MUST work.'",
+
+  "$vocabularyComment": "The declaration vocabulary is the CORPUS's, not a new one: `spec` and `runOn` mean exactly what they mean in examples/**/expected.json, and the verdicts a driver records for a leg come from the closed 7+1-name set in tests/test_support/arm_verdict_ledger.hpp (pinned by tests/harness/test_sqlite_harness_legs.cpp, which compares this catalogue's resolver output against that C++ enum). `launchers` is the ONE strict extension: the corpus's `emulator` key covers a cross-ARCH host on the SAME OS, and this harness additionally needs the cross-OS case (a pe64 artifact under Wine on Linux), so both are expressed as one ordered list of declared launchers keyed by (hostOs, hostArch). Absence of a matching launcher entry IS the 'none declared' declaration — there is no empty-string spelling, so a reader cannot mistake 'we looked and there is none' for 'nobody filled this in'. ★ EVERY launcher entry additionally declares `pathTranslation`: the PATH NAMESPACE its argv lives in, from the closed set in harness_legs.py (`none`, `windows-to-wsl`). It is required on every entry, never defaulted, for the same reason `zconfGuards` is: a reader must not have to know a default, and `none` — 'this launcher takes the driver's paths verbatim' — is a CLAIM about the launcher, not an absence. It exists because a launcher need not share a filesystem namespace with the driver that spawns it: `wine /home/me/x.exe` takes the driver's own path, `wsl.exe` needs `/mnt/c/...` where the driver holds a drive-letter path, and an untranslated path does not fail as a path error — the callee opens a relative file by that name, misses, and the run reads as a broken binary. The verb is resolved and APPLIED by harness_legs.py (`--translate-path` / `--assert-translated`), so the translator is named in one file and not in two drivers. ★★ AND `envTransfer`, THE SECOND HALF OF THE SAME FACT, found by measuring the first: a launcher in another OS namespace does not inherit the driver's ENVIRONMENT either. ✔MEASURED 2026-08-04 — a `wsl.exe`-launched fixture saw `SQLITE_TEST_PATTERN_LIST` and `QUICKTEST_OMIT` as EMPTY, so the corpus RESUME ENGINE (which selects its files through that variable) silently re-ran the corpus from the beginning instead of from the abort point: a harness that looks like it is working and is not. `inherit` = the child gets this driver's environment block (qemu, Wine, `arch`); `wslenv` = each variable must be NAMED in the `WSLENV` carrier. Resolved by harness_legs.py (`--env-transfer`), so the carrier and its separator are spelled once. ★★★ AND THE THIRD NAMESPACE, `runFilesystem`, FOUND THE SAME WAY THE SECOND WAS — BY MEASURING THE FIRST TWO AND FINDING THEM INSUFFICIENT [[D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]]. `pathTranslation` says how a launcher SPELLS a path; `envTransfer` says whether it sees this driver's environment; NEITHER says which FILESYSTEM the launched process writes its databases onto — and the subject of this corpus is a database engine, so that is the one property it tests hardest. ✔MEASURED 2026-08-06 on this host, one process, two directories: `/mnt/c/…` (`9p … aname=drvfs`, **no `metadata` option**) answers `chmod 644` with **777** and `chmod 400` with **555**, because DrvFs derives the entire POSIX mode from the single Windows read-only ATTRIBUTE; `/tmp` (ext4) answers 644 and 400. ✔AND MEASURED BY A 2x2 MATCHED CONTROL ({DSS fixture, gcc reference} x {DrvFs rundir, ext4 rundir}, same staged corpus): **all 60 failures reproduce IDENTICALLY under the GCC REFERENCE on DrvFs and VANISH on ext4** — wal2 20, zipfile 12, e_walauto 10, journal3 8, attach 2, tkt3457 1, plus a `pager4` ABORT — i.e. ZERO of them are DSS-attributable. `driver` = the launched process writes where this driver writes (Wine's Z: mapping, qemu, `arch` — all one machine, one kernel, one filesystem); `wsl-linux` = the launcher crosses into a Linux kernel whose own filesystem is ext4 and which reaches this driver's files only through that compatibility mount. Required on EVERY entry, never defaulted, because `driver` is a CLAIM and it was the unexamined one. Resolved by harness_legs.py (`--run-dir-plan`), which also splices the launcher's working-directory option and hands back the argv prefixes that create/clear/populate the directory — so neither driver spells `--cd`, `mkdir`, `rm -rf` or `cp` for a foreign filesystem, and neither knows where in an argv an option has to go. ⛔ THE 60 FAILURES ARE NOT CONFOUNDS AND MUST NEVER BECOME ONE: the mechanism is ours and it is fixable, so a `confounds` row for them would launder a harness misconfiguration into 'expected' using the very mechanism that key exists to keep honest.",
+
+  "$confoundsComment": "★★ AN EARNED CONFOUND IS A PROPERTY OF THE LEG, NOT OF THE DRIVER YOU HAPPENED TO RUN [[D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG]], [[D-HARNESS-SQLITE-CONFOUNDS-NOT-DECLARED-PER-LEG]], [[D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY]]. A confound is a unit failure this harness has PROVEN is not the compiler's, by a matched control, on a named leg, on a named date — and since the count of GENUINE failures is what every verdict rests on, which failures are excused decides what this project believes about itself. Until this key existed the answer depended on WHICH DRIVER YOU RAN: `build-and-test.sh` read one global `DSS_CONFOUNDS` and applied it to EVERY leg including legs where nothing had ever been measured, while `build-and-test.ps1` returned an earned list for `pe64-x86_64` and an EMPTY one for everything else — and all six of its patterns had been earned on LINUX x86_64, so the Windows driver handed a Linux-earned list to the one leg that could not use it and withheld it from the legs that had earned it. ✔MEASURED CONSEQUENCE: the same elf64-x86_64 artefact's `zipfile-25.0` was a 'known non-DSS confound' under one driver and a 'genuine failure' under the other, in the same project on the same day, so no two legs' genuine-failure counts were comparable. ⇒ the declaration lives HERE, per leg, and every pattern carries `earnedOn` / `earnedAt` / `mechanism` / `anchor`; the lint REFUSES a pattern that does not show its work, refuses a duplicate, refuses one that does not compile as a regex, and refuses a missing key — because `[]` (nothing has ever been earned on this leg, every failure counts) is a CLAIM a catalogue has to make out loud, and a missing key could not be told from it. `scope` is the drivers' long-standing `native:`/`emulated:` vocabulary as a FIELD: `any` excuses however the leg runs, `native` only when this host executes the artefact directly, `emulated` only when it goes through a declared launcher. ⚠ THE OPERATOR OVERRIDE (`DSS_CONFOUNDS`) IS UNCHANGED AND STILL APPLIES TO EVERY LEG: an operator naming a pattern is stating intent for this run, not inheriting one, and both drivers announce which of the two is in force.",
+
+  "$noHostKeyingComment": "NOTHING in this file may be keyed on the host. `build.libraries.searchPaths` is the one place host-shaped STRINGS appear, and they are CANDIDATES, not decisions: every path is tried on every host, a hit is used and a miss costs nothing. A driver that skips a search path because of the host it is on has reintroduced the defect. ⚠ If you are tempted to add a `\"onlyOnHost\"` key here, stop: the question you are answering is either 'can this host EXECUTE it' (that is `runOn`/`launchers`) or 'is a declared build input present' (that is a filesystem probe whose failure is the LOUD `skipped-build-input-missing` verdict) — never 'is this leg allowed to exist'.",
+
+  "$configureAnswersComment": "★★ AND THE SAME STORY ONE LAYER UP, FOR SQLITE'S OWN `./configure` (D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES). The recipe is derived by running `make -n` on the DERIVING host, and the ONE host-probe define left on that command line is `_HAVE_SQLITE_CONFIG_H` — which makes `sqliteInt.h` `#include \"sqlite_cfg.h\"`, and the include path points at the deriving host's build dir. So EVERY leg inherited THAT machine's ~52 configure answers wholesale. ✔MEASURED, the whole chain, on the macho64-arm64 CLI: the Linux `sqlite_cfg.h` sets `HAVE_PREAD64`/`HAVE_PWRITE64` → `os_unix.c` `#if defined(HAVE_PREAD64) && defined(HAVE_PWRITE64)` → `USE_PREAD64` → the `osPread64`/`osPwrite64` macros, typed with **`off64_t`** — a type Darwin does not have. `off64_t` + `pread64` + `pwrite64` are ONE defect, not three. ⛔ There is NO `HAVE_OFF64_T` macro anywhere in sqlite; the pe64 leg's `$recipeTransformComment` used to name one, and it never existed — that prose is corrected below. ★ THE CLASS IS CLOSED BY MACHINE DIFF, not by reasoning about the header: the deriving Linux `sqlite_cfg.h` against the Mac's OWN configure-generated one differ on EXACTLY THREE LINES — `HAVE_PREAD64`, `HAVE_PWRITE64`, `HAVE_MALLOC_H` — and all ~49 other answers (`HAVE_FDATASYNC`, `HAVE_GMTIME_R`, `HAVE_LOCALTIME_R`, `HAVE_USLEEP`, `HAVE_UTIME`, `HAVE_ISNAN`, `HAVE_NANOSLEEP`, `HAVE_REALPATH`, `HAVE_DLOPEN`, `HAVE_ZLIB`, the `HAVE_INT*_T` family, `SIZEOF_OFF_T 8`, …) are BYTE-IDENTICAL. That is why each leg declares THREE answers and not fifty: it declares only what `configure` actually VARIES across the targets this harness builds, and the deriving host answers the rest — correctly, because on those rows the two machines agree. Each leg's `build.configureAnswers` is REQUIRED, its values are real JSON booleans, and harness_legs.py's lint CROSS-CHECKS every one against the leg's own target (a Darwin leg declaring `HAVE_PREAD64: true` is refused, naming the evidence), so a wrong declaration fails the lint instead of shipping. The drivers then stage ONE `sqlite_cfg.h` per TARGET OS — the deriving host's answers for the identical rows, the leg's declared answers for the three that vary — into the harness's OWN cfg/ dir, placed AHEAD of the deriving host's build dir on the include list. `_HAVE_SQLITE_CONFIG_H` STAYS. ⚠ NOTE THE KEY IS THE TARGET OS AND NOT THE `recipeTransform`: four legs share `\"none\"` and they are TWO configurations (two Linux, two Darwin), so keying this on the transform would hand Darwin the Linux answers again — which is the defect. ⛔ TWO ALTERNATIVES WERE REJECTED, recorded because both are the obvious thing to reach for. (1) DERIVE THE RECIPE PER TARGET, on a machine of that target: that is what upstream's build system expects and it is why a native build never has this bug, but it makes the Darwin legs unbuildable on the four hosts out of five that are not a Mac — flatly the host-lock this file exists to end. (2) A BLUNT `darwin-selfconfig` TRANSFORM that just drops `_HAVE_SQLITE_CONFIG_H`, mirroring `windows-selfconfig`: ✔MEASURED to WORK, and still wrong — it discards ~49 CORRECT answers to fix 3 wrong ones, ~10 of them with real consequences (`HAVE_GMTIME_R`/`HAVE_LOCALTIME_R` fall back to the NON-REENTRANT `gmtime`/`localtime` in a SQLITE_THREADSAFE=1 build; `HAVE_FDATASYNC` becomes `#define fdatasync fsync`; `HAVE_USLEEP` drops sqlite3_sleep to 1-SECOND granularity, which the timing-sensitive corpus WILL notice). The same blunt drop is acceptable on WINDOWS only because `SQLITE_OS_WIN` re-configures the whole `os_win.c` path and none of those Unix answers is consulted there.",
+
+  "$stagedHeadersComment": "★ THE THIRD-PARTY HEADERS A LEG COMPILES AGAINST ARE A TARGET FACT, NOT A HOST ONE (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED, closed TF-C115). The staged zlib header is copied from the DERIVING POSIX host, where `./configure` baked ITS OWN probe results into zconf.h — `#if 1 → #define Z_HAVE_UNISTD_H` and friends. Those are facts about the deriving machine, exactly like the recipe's HAVE_*/Z_HAVE_* defines that `recipeTransform` exists to drop, and handing them to a foreign target is the same cross-compile category error one level down. Each leg therefore DECLARES `build.zconfGuards` — the value ITS target has for each guard `./configure` may have set — and the drivers stage ONE zinc/ PER `recipeTransform` (stage-zinc.py, called by both) and give each leg an include list pointing at its own. Two legs may share a zinc/ only by sharing a recipeTransform, and the lint refuses a catalogue where same-transform legs declare different guards. Before this, ONE pe-shaped zinc/ served every leg and the .ps1 REFUSED (`poisoned`) any leg that was not `windows-selfconfig` rather than compile it against the wrong header — the right call, and the reason this key exists is to make the refusal unnecessary instead of relaxing it.",
+
+  "$loadExtHelperBuilderComment": "★★★ THE COMPILER THIS REPOSITORY SHIPS BUILDS THE CORPUS'S dlopen()ed HELPER — NO HOST NEEDS A THIRD-PARTY CROSS-COMPILER FOR ANY LEG. Operator, 2026-08-05: 'why do we need mingw? since dss code prime should not have dependencies?' / 'I installed mingw in wsl, but we should NOT depend on a tool'. The `$targetCcComment` below is still TRUE and its rule is unchanged — a compiler's name is not a declaration of its target — but the SHAPE it left behind made every leg's RUN conditional on this machine owning a cross-compiler for that leg's target (a mingw gcc for pe64, aarch64-linux-gnu-gcc for the arm64 leg, an Apple clang for the two macho legs), and a leg without one recorded `skipped-build-input-missing` and did not run its ~330,000 units. That is the same host-lock D-HARNESS-CROSS-HOST-ANY-TARGET exists to end, one layer down from the fixture. ⇒ each leg now DECLARES `build.sharedLibFormat` and DSS emits the helper for it. ✔MEASURED 2026-08-05 on this project's WINDOWS box — one host, all five legs, rc=0 and zero diagnostics on every one: pe64 8,704 B · elf64-x86_64 13,912 B · elf64-aarch64 13,912 B · macho64-arm64 67,426 B · macho64-x86_64 17,890 B. The three a machine here can LOAD were loaded THROUGH SQLITE'S OWN `sqlite3_load_extension()` (dlopen + dlsym `testloadext_init`, exactly what test/loadext.test does) and `SELECT half(9.0)` returned 4.500 — pe64 natively on Windows, elf64-x86_64 in WSL, elf64-aarch64 under qemu-aarch64; the loading program was built by the REFERENCE compiler each time, so the only thing under test was the DSS artefact. ★ THE CONTROL IS KEPT, DELIBERATELY, BECAUSE DSS IS NOW TESTING DSS: a defect SHARED by the fixture and the helper (both compile sqlite3ext.h) could cancel and read as green. So wherever a VERIFIED target compiler happens to exist, the same source is ALSO built with it and both artefacts are reported side by side — never gating, never staging — and `DSS_LOADEXT_HELPER=reference` STAGES the control instead, which makes the corpus itself the differential. There is NO automatic fallback: a DSS emission failure is a compiler defect and this harness exists to surface them, so it is `poisoned` with the diagnostics quoted, never quietly rebuilt another way.",
+
+  "$targetCcComment": "★★ A COMPILER'S NAME IS NOT A DECLARATION OF ITS TARGET, and this catalogue once said it was. ⚠ READ `$loadExtHelperBuilderComment` FIRST: since 2026-08-05 this key governs the optional CONTROL arm, not a required build input — a leg whose `targetCc` resolves to nothing on this host still builds its helper (with DSS) and still runs its corpus. D-HARNESS-LOADEXT-HELPER-TARGET-BLINDNESS-NOW-ABORTS-THE-RUN. `build.targetCc.candidates` is a list of names to TRY, in order; it is NOT a list of compilers that are known to build this leg. ✔MEASURED 2026-08-05 on a WSL/Ubuntu x86_64 host: both elf legs ran GREEN (6 err / 331,351 and 5 err / 331,355, all known confounds) and the run then DIED in /usr/bin/ld — 'relocation R_X86_64_PC32 against symbol `sqlite3_api` can not be used when making a shared object; recompile with -fPIC' — building the pe64 leg's loadext helper, and pe64's units never ran. The mingw cross-compiler was absent, this leg listed plain `gcc` as an ALTERNATIVE, and so a LINUX compiler was picked, legitimately, to build a WINDOWS shared object. build-and-test.sh:2615 and :3804 both forbid exactly that fallback in so many words; neither guard fired, because the config had already licensed what the guards were watching for. ⇒ THE RESOLVER NOW ASKS THE COMPILER. harness_legs.py `--resolve-target-cc <leg>` accepts a candidate only if `<cc> -dumpmachine` names this leg's own target arch AND target OS, both derived from the leg's declared `spec`. No new key, because the leg already declares its target; no host test; no format-name branch. A candidate that CANNOT state its target (the probe fails) is REFUSED, never assumed — the leg is still BUILT, it records `skipped-build-input-missing`, and its corpus does not run. ★ AND THE RULE IS NOT pe64-SHAPED: the elf64-x86_64 leg's `cc`/`gcc`/`clang` resolve to an aarch64 compiler on this project's native arm64 Linux VPS, which is the wrong-arch helper D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO is named after; the same one check refuses it. ★★ WHAT IT BUILDS is the corpus's dlopen()ed helper extension, whose FILE NAME is also a target fact — see each leg's `loadExtHelperName`.",
+
+  "$stageBuildComment": "★★★ WHICH SQLITE THE CORPUS IS ACTUALLY TESTING — DECLARED ONCE, FOR EVERY LEG AND BOTH DRIVERS. Operator, 2026-08-06: 'yes, we need tests with the fts5 and other extensions enabled too'. ✔MEASURED on the elf64-x86_64 corpus.log of 2026-08-06: 362 of the 1,241 files the run reported as COMPLETED asserted NOTHING — they emitted only the two teardown lines every file emits (`<f>.test-closeallfiles... Ok`, `<f>.test-sharedcachesetting... Ok`) and returned at their first `ifcapable` gate (`fts5aa.test:19  ifcapable !fts5 { finish_test; return }`). The capability histogram over that inert set: fts5 110 files · fts3 86 · session 37 · rtree 27 · stat4 14 · then a long tail. ⚠ THE COMPILER WAS ALREADY COMPILING THE CODE THOSE FILES WOULD HAVE TESTED — `fts5.c`, `fts5_tcl.c`, `fts5_test_mi.c` and `fts5_test_tok.c` were 4 of the 189 TUs, preprocessed down to nothing. So the run paid to compile and to load every one of them and got no coverage back, and a headline of '1,241 files completed' counted all 362. ⇒ THE CAPABILITY SET IS NOW A DECLARATION, not a per-driver accident. ★ WHY THESE FLAGS AND NOT A SET I INVENTED: `--enable-all` is UPSTREAM'S OWN aggregate (configure --help: 'Enable these extensions: fts4 fts5 rtree geopoly session dbpage dbstat carray'), and it is the spelling sqlite's own test matrix uses — test/testrunner_data.tcl `build(All-O0)`, `build(All-Debug)`, `build(Sanitize)`. The rest are the flags upstream's own richest configurations add on top (`Check-Symbols`, `Debug-One`, `Update-Delete-Limit`). ⚠ `--memsys3` IS DELIBERATELY ABSENT: ✔MEASURED — configure accepts it, exits 0, and emits NO define, because MEMSYS5 wins. A declared flag that silently does nothing is the same defect as an undeclared one, so it is not declared. That is also exactly what `requiredDefines` exists to catch on every future run. ★ `optionDefines` is a SEPARATE MECHANISM because upstream offers no configure flag for these: main.mk's `OPT_FEATURE_FLAGS = … $(OPTIONS)` is the documented client knob and it is passed on the MAKE command line. ✔MEASURED: `OPTS=` handed to configure lands in the Makefile but NEVER on a testfixture compile line, while `make OPTIONS=-DSQLITE_ENABLE_STAT4` reached 106 of them.",
+
+  "stageBuild": {
+    "$comment": "Consumed by build-and-test.sh AND build-and-test.ps1 through `harness_legs.py --stage-build`. Neither driver spells any of it out: a capability enabled in one driver and not the other is this project's canonical silent harness bug, and it had ALREADY HAPPENED here — the sqlite3 CLI recipe carried -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE while the testfixture recipe built from the SAME tree carried neither, so 'which extensions exist' had two answers inside one run.",
+    "$requiredDefinesComment": "THE FAIL-LOUD LINK between a flag and its effect. Every name here MUST appear in the -D set the harness derives from `make -n`, or the run DIES before compiling anything. This is not belt-and-braces: a configure flag can be accepted and do nothing (`--memsys3`, measured above), upstream can rename or retire a flag, and either way the corpus would go on reporting files as 'completed' while asserting nothing — which is the exact failure this whole block exists to end. Derived by MEASUREMENT from the OPT_FEATURE_FLAGS that these flags produced, never assumed from their names.",
+    "$capabilityWitnessesComment": "AFTER the corpus runs, each capability's witness file must have emitted at least ONE non-teardown result. `requiredDefines` proves the define reached the COMPILER; a witness proves the capability reached the TESTS, which is the property the operator actually asked for. ★ Every witness was chosen from the MEASURED inert set and has exactly ONE decisive gate, so it is red today and turns green by this change — the red-on-disable demonstration is a property of the declaration rather than a separate experiment. A file with two gates would stay inert for a capability this set does NOT enable and report the gate red for the wrong reason; that is why `fts4aa` (gates `!fts3` + `fts4_deferred`) was not used, and why fts4/geopoly/column_metadata have no witness at all and rest on `requiredDefines` alone. ⚠ `define` IS DECLARED RATHER THAN DERIVED FROM THE CAPABILITY NAME, and the self-test found out why: the pair `mem5` ↔ `SQLITE_ENABLE_MEMSYS5` shares no substring, so the obvious structural check ('the capability name appears inside its define') fails on a perfectly correct row. A heuristic that has to be weakened to accept real data is worth less than the explicit pairing it was trying to avoid writing. ★★ **VET A WITNESS FOR *ANY* EARLY RETURN, NOT JUST FOR `ifcapable` — MEASURED THE HARD WAY 2026-08-07.** The first vetting pass grepped only `ifcapable` and declared `mem5` single-gated. It is not: `test/mem5.test:26` also exits on `if {[info exists ::G(perm:presql)]} { finish_test; return }`, a PERMUTATION gate with nothing to do with the capability — and the first real run duly reported `mem5.test` inert while `SQLITE_ENABLE_MEMSYS5` sat in the recipe at line 17 of 35. That is a gate going red for a reason its capability cannot fix, which is worse than no witness at all, so `mem5` was REMOVED (the define-level check still proves MEMSYS5 compiled in). `analyze3` was replaced by `analyze6` for the same reason — `analyze3.test:31` exits on a `[permutation]` equality test against the `prepare` permutation. The surviving witnesses have exactly one exit in their preamble; `rtree1` and `session1` also carry the boilerplate `if {![info exists testdir]}` source-guard, which sets a variable rather than returning.",
+    "$scanstatusComment": "⛔ `--scanstatus` IS DELIBERATELY ABSENT, and it is the one capability this harness cannot currently ask for. ✔MEASURED 2026-08-07, TF-C132, by running it: `SQLITE_ENABLE_STMT_SCANSTATUS` is one of the three macros that make `src/vdbe.c:27-30` include `src/hwtime.h`, whose line 43 is GNU EXTENDED inline assembly — `__asm__ __volatile__ (\"rdtsc\" : \"=a\" (lo), \"=d\" (hi));`. DSS parses neither the `__volatile__` alternate spelling (`error[P0009]: expected 'ParenOpen' or 'VolatileKeyword' — got '__volatile__'`) nor the `:` operand lists, and the parser then desynchronises through the rest of vdbe.c: 54 errors on the fixture and 54 on the CLI, every one of them in vdbe.c / hwtime.h / vdbeInt.h and NONE anywhere else — so this flag was the whole blocker and the other eleven capabilities compile clean. It buys exactly TWO test files (scanstatus, scanstatus2). ⚠ It is NOT dropped because it is unimportant: upstream's own `build(Default)` in test/testrunner_data.tcl carries `-DSQLITE_ENABLE_STMT_SCANSTATUS`, so DSS cannot yet build sqlite's DEFAULT configuration. That is a compiler gap with its own anchor — [[D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED]] — not a harness decision to be quietly re-litigated here. Re-add the flag in the same change that closes it; `requiredDefines` will then prove it took.",
+    "configureFlags": ["--enable-all", "--fts3", "--update-limit", "--column-metadata", "--memsys5"],
+    "optionDefines": ["SQLITE_ENABLE_STAT4"],
+    "requiredDefines": [
+      "SQLITE_ENABLE_COLUMN_METADATA",
+      "SQLITE_ENABLE_FTS3",
+      "SQLITE_ENABLE_FTS4",
+      "SQLITE_ENABLE_FTS5",
+      "SQLITE_ENABLE_GEOPOLY",
+      "SQLITE_ENABLE_MEMSYS5",
+      "SQLITE_ENABLE_PREUPDATE_HOOK",
+      "SQLITE_ENABLE_RTREE",
+      "SQLITE_ENABLE_SESSION",
+      "SQLITE_ENABLE_STAT4",
+      "SQLITE_ENABLE_UPDATE_DELETE_LIMIT"
+    ],
+    "capabilityWitnesses": {
+      "fts3":                {"file": "fts3aa",     "define": "SQLITE_ENABLE_FTS3"},
+      "fts5":                {"file": "fts5aa",     "define": "SQLITE_ENABLE_FTS5"},
+      "rtree":               {"file": "rtree1",     "define": "SQLITE_ENABLE_RTREE"},
+      "session":             {"file": "session1",   "define": "SQLITE_ENABLE_SESSION"},
+      "stat4":               {"file": "analyze6",   "define": "SQLITE_ENABLE_STAT4"},
+      "update_delete_limit": {"file": "wherelimit", "define": "SQLITE_ENABLE_UPDATE_DELETE_LIMIT"}
+    }
+  },
+
+  "dssHarnessLegsVersion": 1,
+
+  "legs": [
+    {
+      "label": "elf64-x86_64",
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "runOn": ["linux"],
+      "$launchersComment": "qemu-x86_64 lets an arm64 Linux host run this leg. ★ NOTE THE ASYMMETRY WITH THE CORPUS, which is a finding and not a copy error: examples/**/expected.json declares NO emulator on its (x86_64, linux) arms, so on the native arm64 Linux VPS every one of them is a structural skip even though qemu-x86_64 exists. This catalogue declares it; the corpus's omission is tracked separately (D-TEST-CORPUS-NO-QEMU-X86_64-ON-ARM64-HOST). ★★ `wsl.exe` IS THE SECOND ENTRY AND IT CLOSES D-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS. A Windows host BUILDS this leg (TF-C115 did) and could always have RUN it — the artefact built by build-and-test.ps1 passed 330,436 tests under WSL BY HAND — but nothing declared the launcher, so the driver recorded `skipped-by-runOn` beside a binary it had just produced. It is not a plain command entry: wsl.exe lives in a DIFFERENT PATH NAMESPACE from the driver that spawns it (`pathTranslation`) AND in a different ENVIRONMENT namespace (`envTransfer`). The second was found by measuring the first — with paths translated but the environment assumed to inherit, the corpus resume engine's file selection arrived EMPTY and the resume re-ran the whole corpus while looking like it worked. ★★★ AND THE THIRD NAMESPACE, WHICH IS THE ARGV ITSELF: the command is `wsl.exe -e`, and this entry said `wsl.exe --` until 2026-08-04. `--` is documented as 'pass the remaining command line as is' and it is NOT the same as `-e`/`--exec` — ✔MEASURED on this host, one variable changed: `wsl.exe -- /nope` answers `/bin/bash: line 1: /nope: No such file` while `wsl.exe -e /nope` answers `execvpe(/nope) failed`, i.e. `--` reconstructs a command LINE and feeds it to the distro's DEFAULT SHELL. That shell then expands the fixture's argv a second time — MEASURED, a single argument `/mnt/c/.../g/*.test` came back to the callee as TWO arguments under `--` and as one under `-e`, and `$`, backticks, `;` and the backslash escape are live there too. A launcher whose argv is silently re-parsed cannot be trusted to have run the file the driver named, which is the same class of defect as an untranslated path. Recorded as D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL and pinned by tests/harness/test_sqlite_harness_legs.cpp.",
+      "$requiresComment": "★★ WHAT THE LAUNCHER NEEDS BEYOND ITS OWN argv[0] — THE GATE THAT DID NOT EXIST, and THIS LEG'S FIRST ENTRY IS WHERE IT WAS MEASURED. Until now the ONLY question ever asked of a launcher was `shutil.which(command[0])`. ✔MEASURED on this project's NATIVE arm64 VPS, this leg under `qemu-x86_64`: THREE corpus segments aborted with `libgcc_s.so.1 must be installed for pthread_exit to work` + `qemu: uncaught target signal 6 (Aborted)`, one of them AFTER that segment's summary had already printed — i.e. at fixture EXIT, where pthread_exit runs. That sentence is GLIBC'S; it is not sqlite's and it is not DSS's, and nothing in this harness could say so. ⇒ every entry DECLARES its prerequisites, `[]` is a CLAIM (`this launcher needs nothing but its own program`) exactly as `confounds: []` is, and every row carries `why` (its EVIDENCE) and `install` (its REMEDY) because a prerequisite that states neither is one a reader cannot act on and the next person deletes. Executed by `harness_legs.py --check-launcher <leg>`; `${NAME}` expands over THIS ENTRY'S OWN `env` and over NOTHING else, so an operator's ambient QEMU_LD_PREFIX cannot silently change what was checked.",
+      "launchers": [
+        { "hostOs": "linux", "hostArch": "arm64", "command": ["qemu-x86_64"],
+          "env": { "QEMU_LD_PREFIX": "/usr/x86_64-linux-gnu" },
+          "pathTranslation": "none", "envTransfer": "inherit",
+          "runFilesystem": "driver",
+          "requires": [
+            { "kind": "command", "path": "qemu-x86_64",
+              "provides": "the user-mode emulator that executes this leg's x86_64 artefact on an arm64 Linux host",
+              "why": "DECLARED — it is this entry's own argv[0], and `launcher_available` already resolves it. Stated as a row anyway so the report a driver prints names EVERY prerequisite in one list rather than one here and one in a different mechanism.",
+              "install": "apt-get install qemu-user-static (Debian/Ubuntu)" },
+            { "kind": "directory", "path": "${QEMU_LD_PREFIX}",
+              "provides": "the x86_64 sysroot qemu re-roots every library lookup into; without it the target's loader, libc and libm resolve to NOTHING",
+              "why": "MEASURED (arm64 VPS): this is the value this entry hands qemu, and qemu prepends it to the ELF interpreter path and to every library search. An absent sysroot is not a load error the harness sees — it is the target program exiting 255.",
+              "install": "apt-get install libc6-amd64-cross (Debian/Ubuntu arm64 host)" },
+            { "kind": "file", "path": "${QEMU_LD_PREFIX}/lib/ld-linux-x86-64.so.2",
+              "provides": "the ELF interpreter the artefact names in its own PT_INTERP; the kernel maps it before a single instruction of the fixture runs",
+              "why": "DOCUMENTED (x86-64 psABI: the program interpreter is /lib64/ld-linux-x86-64.so.2, which qemu resolves under QEMU_LD_PREFIX) + MEASURED as the exact class of failure on the sibling arm64 entry, where its absence produced rc=255 with NO diagnostic and 14 units charged to DSS. A directory row does not cover this: `the sysroot exists` and `the loader is inside it` are two different facts.",
+              "install": "apt-get install libc6-amd64-cross" },
+            { "kind": "file", "path": "${QEMU_LD_PREFIX}/lib/libgcc_s.so.1",
+              "provides": "the unwinder glibc dlopen()s from inside pthread_exit, at process TEARDOWN",
+              "why": "✔MEASURED, arm64 VPS, THIS leg under qemu-x86_64: three corpus segments died `libgcc_s.so.1 must be installed for pthread_exit to work` + `qemu: uncaught target signal 6 (Aborted)`, one AFTER its segment summary had printed. ★ IT IS IN NO DT_NEEDED AND NO PT_INTERP — it is dlopen()ed by SONAME at exit — so no cross-check over the artefact can derive it. THAT is why this list is DECLARED prose and not a computed set.",
+              "install": "apt-get install libgcc-s1-amd64-cross" }
+          ] },
+        { "hostOs": "windows", "hostArch": "x86_64", "command": ["wsl.exe", "-e"],
+          "env": {},
+          "pathTranslation": "windows-to-wsl", "envTransfer": "wslenv",
+          "runFilesystem": "wsl-linux",
+          "$requiresComment": "⚠ THE SAME HOLE, AND ON THIS ENTRY IT IS WORSE THAN ON THE qemu ONE: `wsl.exe` is a Windows binary present on every machine with WSL installed, so `shutil.which` says yes for a launcher whose real work happens inside a distro that may not be registered, may not boot, and may not contain a single one of these programs. Every row below is probed THROUGH the launcher (`wsl.exe -e test -f …`), which is the only namespace in which the question means anything.",
+          "requires": [
+            { "kind": "command", "path": "sh",
+              "provides": "proof that a distro is registered and EXECUTES — the one fact `which wsl.exe` cannot establish",
+              "why": "MEASURED on this host (`wsl.exe -e sh -c …` -> rc 0). It is also the shell the `command` probe itself uses: `command -v` is a POSIX shell BUILTIN, there is no /usr/bin/command, and `which`/`type` are not guaranteed as binaries on a minimal distro.",
+              "install": "wsl --install -d Ubuntu (then start it once so first-run setup completes)" },
+            { "kind": "command", "path": "mkdir",
+              "provides": "the run directory, created by this launcher's declared runFilesystem mkdirArgv (`wsl.exe -e mkdir -p`)",
+              "why": "DECLARED by RUN_FILESYSTEMS['wsl-linux'].mkdirArgv in harness_legs.py — the driver never spells it, so the prerequisite is read off the same declaration the argv is built from. MEASURED present on this host.",
+              "install": "part of coreutils; present in every stock distro" },
+            { "kind": "command", "path": "rm",
+              "provides": "clearing a stale run directory between runs (rmTreeArgv `wsl.exe -e rm -rf`)",
+              "why": "DECLARED by RUN_FILESYSTEMS['wsl-linux'].rmTreeArgv. MEASURED present on this host.",
+              "install": "part of coreutils; present in every stock distro" },
+            { "kind": "command", "path": "cp",
+              "provides": "staging the fixture and the corpus INTO the launcher's own filesystem (copyArgv `wsl.exe -e cp -f`)",
+              "why": "DECLARED by RUN_FILESYSTEMS['wsl-linux'].copyArgv. MEASURED present on this host.",
+              "install": "part of coreutils; present in every stock distro" },
+            { "kind": "directory", "path": "/tmp",
+              "provides": "the parent of this launcher's run-directory root (/tmp/dss-sqlite-harness), which is ext4 and NOT the DrvFs compatibility mount",
+              "why": "✔MEASURED 2026-08-06 on this host: /mnt/c is 9p/drvfs with no `metadata` option and answers chmod 644 with 777, while /tmp is ext2/ext3 and answers 644 — and a 2x2 matched control ({DSS, gcc} x {DrvFs, ext4}) showed all 60 permission-family failures reproducing under gcc on DrvFs and VANISHING on ext4. The root is DECLARED in RUN_FILESYSTEMS['wsl-linux'].root; this row is the check that it can exist.",
+              "install": "every POSIX distro has /tmp; a WSL distro without one is broken" },
+            { "kind": "directory", "path": "/lib",
+              "provides": "the distro's own shared-library root, where a NATIVE run resolves libc/libm/libdl by name",
+              "why": "DOCUMENTED (every merged-/usr distro resolves /lib to /usr/lib; Alpine ships /lib directly) + MEASURED present on this host. Declared because this launcher runs the artefact NATIVELY inside the distro — there is no sysroot to re-root into, so the distro itself is what supplies the DT_NEEDED set, and the 4-D cross-check needs that stated rather than assumed.",
+              "install": "part of the base distro" },
+            { "kind": "file", "path": "/lib64/ld-linux-x86-64.so.2",
+              "provides": "the ELF interpreter this leg's artefact names in its own PT_INTERP",
+              "why": "DOCUMENTED (x86-64 psABI fixes the program interpreter at exactly this path) + ✔MEASURED on this host's WSL, where it is a symlink to ../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2. Its absence is the rc=255-with-no-diagnostic failure this whole key exists to name.",
+              "install": "part of the base distro's libc6; a distro without it runs no dynamically linked binary at all" }
+          ] }
+      ],
+      "$confoundsComment": "See the top-level $confoundsComment. THIS IS THE LEG EVERY MATCHED CONTROL IN THE PROJECT WAS RUN ON — the DSS fixture and a gcc-built full-source REFERENCE testfixture, same box, same sqlite tree, same libtcl8.6.so — so it is the only leg whose rows are earned by a compiler-vs-compiler experiment rather than by observation. ⚠ THE FIRST FOUR ARE ONE DEFECT WEARING FOUR NAMES: this host's CLOCK_REALTIME oscillates between two values ~34.47 s apart, flipping every ~5 s (two instruments, 49 and 48 steps, spread 35.164 s), and every wall-clock assertion in the corpus reads its number from Tcl's `time`, which lives entirely outside DSS-compiled code. When that clock is fixed these rows should be RE-EVALUATED and most of them are expected to evaporate — a confound list that only ever grows is a list nobody is reading.",
+      "confounds": [
+        { "pattern": "^walsetlk-", "scope": "any",
+          "earnedOn": "elf64-x86_64, native on this project's WSL2/Ubuntu x86_64 host",
+          "earnedAt": "2026-08-01",
+          "mechanism": "WAL set-lock assertions read Tcl's `time` either side of a wait, and this host's CLOCK_REALTIME steps ~34.47 s every ~5 s, so a test that straddles a flip mismeasures the wait by +/-34.5 s. MATCHED CONTROL, one experiment: the DSS-built and the gcc-built reference testfixture ran full.test CONCURRENTLY on the same box and the same tree — DSS failed 2.1.3/2.1.12/2.1.14/2.2.6/2.2.8, the reference failed 2.1.8. Different members, same family, same run: the signature of an intermittent environment effect and not of codegen. VERIFIED, not assumed: ldd resolves libtcl8.6.so to the SAME library for both fixtures and `nm -D --defined-only` finds Tcl_GetTime defined in NEITHER.",
+          "anchor": "D-ENV-WSL2-CLOCK-REALTIME-STEPS-34S" },
+        { "pattern": "^walsetlk_recover-", "scope": "any",
+          "earnedOn": "elf64-x86_64, native on this project's WSL2/Ubuntu x86_64 host",
+          "earnedAt": "2026-07-26 (re-validated 2026-08-01)",
+          "mechanism": "walsetlk_recover.test hardcodes a wall-clock window and the stepped clock produces a NEGATIVE elapsed. MATCHED CONTROL, 6 runs each, same machine, same tree, both linking the same libtcl8.6.so: gcc 4 pass / 2 FAIL (tm -35334590, -35331430), DSS 3 pass / 3 FAIL (tm -35335818, +36338628, -35333129) — same intermittency, same ~35.3 s magnitude, both signs. Re-validated on 2026-08-01 with both fixtures negative and near-identical (DSS -33,932,622 us, reference -33,923,905 us). Every magnitude ever recorded falls inside the clock's measured 35.164 s spread. ★ A SEPARATE PATTERN FROM `^walsetlk-` ON PURPOSE: a different test FILE must not be swept in by family resemblance — it is excused only by its own row, earned by its own control.",
+          "anchor": "D-SQLITE-WALSETLK-RECOVER-NEGATIVE-ELAPSED" },
+        { "pattern": "^busy2-", "scope": "any",
+          "earnedOn": "elf64-x86_64, native on this project's WSL2/Ubuntu x86_64 host",
+          "earnedAt": "2026-08-01",
+          "mechanism": "busy2.test asserts a bare lower bound on a 1000 ms busy timeout; the stepped clock reports the wait as shorter than it was. Compounded by sqlite's own unixSleep (src/os_unix.c) calling nanosleep with no EINTR retry while sqliteDefaultBusyCallback credits the NOMINAL delay from its totals[] table, so a caught signal shortens the real wait with the handler none the wiser. MATCHED CONTROL, earned as a CLASS: both fixtures failed a busy2 wall-clock assertion in the concurrent full.test run, DIFFERENT members each (DSS busy2-2.2.5, reference busy2-1.2.3). ⚠ THIS IS THE BROADEST PATTERN IN THE CATALOGUE — a whole-FILE match where the per-NAME rows below are the standard. Narrowing it needs per-name controls that do not exist yet, and misc7-7.0, which fails by the SAME mechanism, is deliberately NOT excused anywhere: family resemblance is not a control.",
+          "anchor": "D-SQLITE-MISC7-BUSYTIMEOUT-DELAY-WINDOW-GENUINE" },
+        { "pattern": "^recoverfault", "scope": "any",
+          "earnedOn": "elf64-x86_64, native on this project's WSL2/Ubuntu x86_64 host",
+          "earnedAt": "2026-08-01",
+          "mechanism": "An OOM-oracle artefact: the fault injector and the test's oracle disagree about which allocation to stop at. THE STRONGEST CONTROL IN THIS CATALOGUE — the SAME FOUR NAMES failed in BOTH fixtures in the concurrent full.test run (recoverfault-{1,2}-oom-{persistent,transient}.{459,460}), and a compiler cannot change which allocation an OOM oracle stops at.",
+          "anchor": "D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY" },
+        { "pattern": "^zipfile-25\\.0$", "scope": "any",
+          "earnedOn": "elf64-x86_64, native on this project's WSL2/Ubuntu x86_64 host",
+          "earnedAt": "2026-07-26",
+          "mechanism": "AN UPSTREAM TEST-ISOLATION LEAK, not an environment difference (the earlier 'error-message-text env diff' description was WRONG). symlink.test:163 does `file mkdir x` and never removes it, and symlink sorts BEFORE zipfile in the shared testdir, so by the time zipfile-25.0 asserts that `zipfile('x')` fails with 'cannot open file: x' a DIRECTORY named x exists. On POSIX, fopen() on a directory SUCCEEDS, so it fails later in fread() instead. PROVEN BY A 4-CASE PROBE IN ONE PROCESS varying ONLY the filesystem: x absent -> 'cannot open file: x' (expected); x = empty file -> success; x = DIRECTORY -> 'error in fread()', the corpus string byte-for-byte. ONE BINARY, THREE OUTCOMES => cannot be codegen. ⚠ THE `$` ANCHOR IS LOAD-BEARING: a launched leg on a DrvFs run directory produces TWELVE OTHER zipfile-1.*a.2.* failures that are a DISTINCT population with a DIFFERENT cause (D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS), and a `^zipfile-` pattern would silently swallow all of them.",
+          "anchor": "D-SQLITE-ZIPFILE25-SYMLINK-TESTDIR-LEAK" },
+        { "pattern": "^date-2\\.4c$", "scope": "any",
+          "earnedOn": "elf64-x86_64, native on this project's WSL2/Ubuntu x86_64 host — AND DELIBERATELY NOT PROPAGATED TO ANY OTHER LEG",
+          "earnedAt": "2026-07-24",
+          "mechanism": "A sqlite date-format/version/env difference, not a miscompile: a GCC-built testfixture fails it IDENTICALLY (expected NULL, got a date). ★ THIS ROW IS THE ONE THAT MOTIVATED THE WHOLE PER-LEG DESIGN. It was the single pattern build-and-test.sh carried and build-and-test.ps1 did not, and the asymmetry was CORRECT and deliberate: date-2.4c has never been observed failing on any other leg, and copying it across would pre-suppress a failure never shown to be non-DSS there. Under the old global list that intent survived only as a comment in one driver; here it is the declaration itself. ⓘ NOT to be confused with fpconv1-2.0, which is deliberately NOT a confound: a debug DSS fixture and a GCC fixture both PASS it while a release DSS fixture fails all 500k values, so it is a genuine release-optimizer defect the harness must flag red until fixed.",
+          "anchor": "D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY" },
+        { "pattern": "^sessionnoact-4\\.3$", "scope": "any",
+          "earnedOn": "elf64-x86_64, native on this project's WSL2/Ubuntu x86_64 host — AND DELIBERATELY NOT PROPAGATED TO ANY OTHER LEG, because no other leg has yet RUN the session corpus (SQLITE_ENABLE_SESSION was only enabled in TF-C132). The cause is target- and host-independent, so the row is expected to be earned elsewhere too — but it must be earned by its own measurement there, not inherited by family resemblance.",
+          "earnedAt": "2026-08-07",
+          "mechanism": "AN UPSTREAM TEST-ISOLATION BUG, root-caused to the line. `ext/session/sessionconflict.test:25` calls `test_sqlite3_log log`, which is sqlite3_config(SQLITE_CONFIG_LOG) — PROCESS-GLOBAL C state that registers a callback by the NAME of a Tcl proc. That file contains exactly ONE `test_sqlite3_log` call and never unregisters, unlike `session3.test` (registers :36, resets :211) and `sessionat.test` (:33, :306) which both do. Every .test file runs in a FRESH slave interpreter, so once sessionconflict's interpreter is gone the global callback still points at the name `log`; when a later file makes sqlite emit a log message the callback fires into an interpreter with no such proc. `sessionnoact.test:250` `S diff aux t1` is that later file, and it dies with `invalid command name \"log\"` — a TCL error, never a wrong value. ★★ MATCHED CONTROL, one experiment, same instrument both sides: the file pair `sessionconflict.test sessionnoact.test` handed to BOTH fixtures via SQLITE_TEST_PATTERN_LIST produced BYTE-IDENTICAL failures — gcc reference `1 errors out of 40`, DSS `1 errors out of 40`, both `got: [invalid command name \"log\"]`. ⓘ AND THE ORDER MATTERS, which is what makes it isolation rather than content: run sessionnoact.test ALONE and both fixtures PASS it (`0 errors out of 32`), and the pair `session3.test sessionnoact.test` also passes under both, because session3 resets the callback. ⚠ NOT to be fixed by patching the staged tree or excluding the file: the corpus is unmodified upstream and the harness surviving this is the property we want.",
+          "anchor": "D-UPSTREAM-SQLITE-SESSIONCONFLICT-LEAKS-THE-GLOBAL-LOG-CALLBACK" }
+      ],
+      "build": {
+        "recipeTransform": "none",
+        "$zconfGuardsComment": "See the pe64 leg for the whole story. This target HAS <unistd.h>, so zlib must see it — which is what the deriving Linux host's ./configure already decided, so these values are the staged header's own.",
+        "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
+        "$configureAnswersComment": "See the top-level $configureAnswersComment. THIS leg is the DERIVING host's own target, so these three are exactly what its `./configure` wrote and the staged header is byte-identical to the one it generated — which is the point of staging it anyway rather than special-casing 'the deriving host's leg needs no stage': that special case is a HOST fact, and it would be wrong the moment the harness is driven from a Mac.",
+        "configureAnswers": { "HAVE_PREAD64": true, "HAVE_PWRITE64": true, "HAVE_MALLOC_H": true },
+        "stackReserveBytes": 0,
+        "sharedLibFlags": ["-shared", "-fPIC"],
+        "$sharedLibFormatComment": "★ THE OBJECT FORMAT DSS EMITS THIS LEG'S loadext HELPER IN — see the top-level $loadExtHelperBuilderComment. It is DECLARED rather than derived for the same reason `loadExtHelperName` is: this string IS the `--target <arch>:<format>` argument, there is no separate --object-format flag, and the arch and the format spell arm64 DIFFERENTLY (`arm64:elf64-aarch64-linux-dyn` — arch arm64, format aarch64), which has cost this project failed invocations. A reader of this file must be able to SEE the exact argument. It is then cross-checked by harness_legs.py's lint against this leg's own `spec`: same container/arch/OS, kind replaced by the container's shared-library kind (elf64 -> dyn, pe64 -> dll, macho64 -> dylib — ✔MEASURED from the shipped src/dss-config/object-formats/, where each container ships exactly one). `sharedLibFlags` above stays: it is the CONTROL arm's recipe, and a control whose command changed alongside the thing it controls is not a control.",
+        "sharedLibFormat": "elf64-x86_64-linux-dyn",
+        "$loadExtHelperNameComment": "The name sqlite's own test/loadext.test looks for on a `tcl_platform(platform) eq unix` fixture. See the top-level $targetCcComment for why the name is DECLARED per leg instead of spelled once in a driver.",
+        "loadExtHelperName": "libtestloadext.so",
+        "targetCc": { "candidates": ["cc", "gcc", "clang"], "package": "" },
+        "$librariesComment": "★ THIS LEG ACQUIRES ITS LIBRARIES TOO, and it is the one whose old provider looked harmless. `host-system` means 'hope this box has an x86_64 Linux libtcl' — true on WSL, FALSE on Windows, on a Mac, and on the arm64 VPS (which has aarch64 libraries, not x86_64 ones), so three of four hosts recorded `skipped-build-input-missing` for the most-tested leg in the harness. That is a BUILD failure, and the build half of D-HARNESS-CROSS-HOST-ANY-TARGET admits no exceptions. ⚠ THE SOURCE IS DEBIAN, NOT UBUNTU, AND THE REASON IS MEASURED (2026-08-06): every Ubuntu .deb — amd64 AND arm64, jammy through current — ships `data.tar.zst`, and zstd entered the Python stdlib only in 3.14 while this project's WSL host runs 3.12, so 'the Ubuntu amd64 archive, literal sibling of the arm64 provider' cannot be opened by a mechanism that must work on every host. The old arm64 provider opened one only because it shelled out to `dpkg-deb`, a tool no Windows or macOS box has — i.e. it was never the portable sibling it looked like. Debian bookworm's are `data.tar.xz`, which `tarfile` opens everywhere. ✔MEASURED: 883 exported symbols, 880 of them `Tcl*`, a SUPERSET of nothing missing against the MacPorts 8.6.17 library this harness already proved 110/110 against (the 11 names MacPorts has and this does not are all `TclMacOSX*`/`TclBN_mp_*`, none of which a Linux fixture references).",
+        "libraries": {
+          "provider": "pinned-archive",
+          "$importNameComment": "The identities recorded are the ones the file DECLARES for itself — DT_SONAME `libtcl8.6.so` and `libz.so.1` — i.e. byte-for-byte what the old `host-system` route already recorded when it resolved the host's own copies. They are DECLARED anyway rather than left empty: an acquired library is a stand-in by construction, and 'the packager's identity happens to be right here' is a fact worth stating where a reader can check it, not a default to lean on.",
+          "acquire": {
+            "archives": [
+              {
+                "$urlComment": "Debian bookworm's pool. ⚠ The pool holds the CURRENT version of a package for a suite, so a point release can retire this file; the digest is pinned, so that failure is a loud 404 or a CHECKSUM MISMATCH and never a silently different library. snapshot.debian.org is the permanent mirror if it ever comes to that.",
+                "url": "https://deb.debian.org/debian/pool/main/t/tcl8.6/libtcl8.6_8.6.13+dfsg-2_amd64.deb",
+                "sha256": "976c4235b816635e1756016f3adbabb634e8b97a9f6b97cf901be099e4fd2487",
+                "archiveFormat": "deb",
+                "members": [
+                  { "member": "usr/lib/x86_64-linux-gnu/libtcl8.6.so", "as": "libtcl8.6.so",
+                    "universal": false, "importName": "libtcl8.6.so",
+                    "$runtimeCopyComment": "The staged directory goes on LD_LIBRARY_PATH for this leg's run, so the copy acquired here is the copy the fixture loads — which is why the script library below is not optional. Before this, the leg happened to work because Debian and Ubuntu spell the script directory the same way (`/usr/share/tcltk/tcl8.6`); that is a coincidence between two distributions, not a property of the target.",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [
+                      { "path": "/usr/share/tcltk/tcl8.6", "kind": "runtime-data", "role": "tclScriptLibrary" },
+                      { "path": "/usr/share/tcltk", "kind": "inert", "$why": "the PARENT of the script directory, used to build the search list `tclInit` walks. Staging the child is what makes the search succeed; the parent itself holds no file Tcl reads." },
+                      { "path": "/usr/lib/tcltk", "kind": "inert", "$why": "Debian's directory for Tcl EXTENSION packages (a second element of `tcl_pkgPath`). The testfixture loads no extension — its commands are compiled in." },
+                      { "path": "/usr/lib/tcltk/tcl8.6", "kind": "inert", "$why": "the versioned twin of the above, same reason." },
+                      { "path": "/usr/lib/tcltk/x86_64-linux-gnu", "kind": "inert", "$why": "the multiarch twin of the above, same reason. Note the TARGET's arch in the name — this is why the two elf legs' declarations differ at all." },
+                      { "path": "/usr/local/lib/tcltk", "kind": "inert", "$why": "the local-admin extension directory in `tcl_pkgPath`; on the target it usually does not exist, and nothing here requires it to." },
+                      { "path": "/usr/local/share/tcltk", "kind": "inert", "$why": "the local-admin twin of /usr/share/tcltk, same reason." },
+                      { "path": "/usr/lib", "kind": "inert", "$why": "TCL_EXEC_PREFIX/lib from tclConfig.sh, reported for build consumers." },
+                      { "path": "/usr/lib/x86_64-linux-gnu", "kind": "inert", "$why": "the multiarch libdir from the same tclConfig.sh block — where the packager's own copy of THIS library sits, not data." },
+                      { "path": "/usr/include/tcl8.6", "kind": "inert", "$why": "TCL_INCLUDE_SPEC, a BUILD-time answer. This harness stages its own tcl.h and cross-checks its version against this very library." },
+                      { "path": "/usr/share/man", "kind": "inert", "$why": "the manual page directory, from the same block. No interpreter code path reads it." },
+                      { "path": "/usr/bin", "kind": "inert", "$why": "the default PATH element Tcl's `exec` falls back on — a target path, not shipped data." },
+                      { "path": "/dev/null", "kind": "inert", "$why": "`exec`'s redirection sink; a device on the target." },
+                      { "path": "/dev/tty", "kind": "inert", "$why": "the controlling terminal for interactive prompting; same category as /dev/null." }
+                    ],
+                    "dataDirs": [
+                      { "member": "usr/share/tcltk/tcl8.6", "as": "tcl8.6", "role": "tclScriptLibrary" }
+                    ] }
+                ]
+              },
+              {
+                "$memberComment": "`lib/x86_64-linux-gnu/libz.so.1` is a SYMLINK to `libz.so.1.2.13` inside the .deb; the resolver follows it and materialises the target's bytes under the `as` name, exactly as it does for MacPorts' libz.",
+                "url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb",
+                "sha256": "d7dd1d1411fedf27f5e27650a6eff20ef294077b568f4c8c5e51466dc7c08ce4",
+                "archiveFormat": "deb",
+                "members": [
+                  { "member": "lib/x86_64-linux-gnu/libz.so.1", "as": "libz.so.1",
+                    "universal": false, "importName": "libz.so.1",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "$embeddedPathsComment": "EMPTY, and MEASURED: this .so carries no absolute path at all. zlib reads no data directory, which is what makes it the control for the Tcl declaration above.",
+                    "embeddedPaths": [],
+                    "dataDirs": [] }
+                ]
+              }
+            ]
+          },
+          "tclNames": ["libtcl8.6.so", "libtcl8.6.so.0", "libtcl9.0.so", "libtcl.so"],
+          "zNames": ["libz.so", "libz.so.1"],
+          "searchPaths": []
+        }
+      }
+    },
+
+    {
+      "label": "elf64-arm64",
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "runOn": ["linux"],
+      "$launchersComment": "qemu-aarch64 for a cross-ARCH Linux host, and `wsl.exe` for the cross-OS case — the same pair, one arch over. ⚠ THE wsl.exe ENTRY IS DECLARED AND NOT MEASURED, and it is labelled so rather than omitted: WSL2 runs the HOST's architecture, so an arm64 Windows box runs an arm64 Linux distro and therefore this leg (DOCUMENTED, Microsoft's WSL2-on-ARM64 support; no arm64 Windows machine exists in this project to measure it on). Omitting it would have been the worse error — it would say `wsl.exe only works for x86_64`, which is a claim about the launcher that is FALSE, and a Windows/arm64 host would then record `skipped-by-runOn` for the one Linux target it can actually execute. ★ `-e` (not `--`) for the reason spelled out on the elf64-x86_64 leg: `--` re-parses the fixture's argv in the distro's default shell. That fact is about wsl.exe and not about either arch, so unlike the entry itself it is MEASURED, not merely declared.",
+      "launchers": [
+        { "hostOs": "linux", "hostArch": "x86_64", "command": ["qemu-aarch64"],
+          "env": { "QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu" },
+          "pathTranslation": "none", "envTransfer": "inherit",
+          "runFilesystem": "driver",
+          "requires": [
+            { "kind": "command", "path": "qemu-aarch64",
+              "provides": "the user-mode emulator that executes this leg's arm64 artefact on an x86_64 Linux host",
+              "why": "MEASURED present on this project's WSL host (/usr/bin/qemu-aarch64). It is this entry's own argv[0]; stated as a row so one report names every prerequisite.",
+              "install": "apt-get install qemu-user-static" },
+            { "kind": "directory", "path": "${QEMU_LD_PREFIX}",
+              "provides": "the aarch64 sysroot qemu re-roots the interpreter path and every library lookup into",
+              "why": "✔MEASURED present on this host (/usr/aarch64-linux-gnu). This is the value this entry hands qemu — and the operational note the whole project carries (`QEMU_LD_PREFIX=/usr/aarch64-linux-gnu or ~450 arm64 examples false-red at exit 255`) is exactly this row's failure mode, stated as a workaround instead of as a checked prerequisite.",
+              "install": "apt-get install libc6-arm64-cross" },
+            { "kind": "file", "path": "${QEMU_LD_PREFIX}/lib/ld-linux-aarch64.so.1",
+              "provides": "the ELF interpreter the artefact names in its own PT_INTERP; the kernel maps it before any fixture code runs",
+              "why": "✔MEASURED present on this host. ★ THE EXACT FILE whose absence produces rc=255 with NO diagnostic — the failure that put 14 units on this compiler's account. A `directory` row for the sysroot does NOT cover it, which is why the 4-D cross-check demands a `file` row for PT_INTERP specifically.",
+              "install": "apt-get install libc6-arm64-cross" },
+            { "kind": "file", "path": "${QEMU_LD_PREFIX}/lib/libgcc_s.so.1",
+              "provides": "the unwinder glibc dlopen()s from inside pthread_exit, at process TEARDOWN",
+              "why": "✔MEASURED present on this host, and ✔MEASURED ABSENT (arm64 VPS, sibling leg under qemu-x86_64) where it aborted three corpus segments with `libgcc_s.so.1 must be installed for pthread_exit to work`. It is in NO DT_NEEDED — dlopen()ed by SONAME at exit — so no artefact cross-check can ever derive it.",
+              "install": "apt-get install libgcc-s1-arm64-cross" }
+          ] },
+        { "hostOs": "windows", "hostArch": "arm64", "command": ["wsl.exe", "-e"],
+          "env": {},
+          "pathTranslation": "windows-to-wsl", "envTransfer": "wslenv",
+          "runFilesystem": "wsl-linux",
+          "$requiresComment": "⚠ DECLARED, NOT MEASURED — like the entry itself, and for the same reason: no arm64 Windows machine exists in this project. The rows are the arm64 twins of the elf64-x86_64 leg's Windows entry, which IS measured; what makes them declarable is that WSL2 runs the HOST's architecture, so the distro here is an arm64 one and its own loader is the aarch64 psABI's. Labelled rather than omitted — omitting them would say `this launcher needs nothing`, which is the claim that was false everywhere it was checked.",
+          "requires": [
+            { "kind": "command", "path": "sh",
+              "provides": "proof that a distro is registered and EXECUTES — the fact `which wsl.exe` cannot establish",
+              "why": "DOCUMENTED (POSIX: `sh` is the shell every distro provides, and `command -v` is a shell builtin with no binary form). Measured on the x86_64 twin of this entry, not here.",
+              "install": "wsl --install -d Ubuntu (then start it once)" },
+            { "kind": "command", "path": "mkdir",
+              "provides": "the run directory (runFilesystem mkdirArgv `wsl.exe -e mkdir -p`)",
+              "why": "DECLARED by RUN_FILESYSTEMS['wsl-linux'].mkdirArgv in harness_legs.py.",
+              "install": "part of coreutils" },
+            { "kind": "command", "path": "rm",
+              "provides": "clearing a stale run directory (rmTreeArgv `wsl.exe -e rm -rf`)",
+              "why": "DECLARED by RUN_FILESYSTEMS['wsl-linux'].rmTreeArgv.",
+              "install": "part of coreutils" },
+            { "kind": "command", "path": "cp",
+              "provides": "staging the fixture and corpus into the launcher's filesystem (copyArgv `wsl.exe -e cp -f`)",
+              "why": "DECLARED by RUN_FILESYSTEMS['wsl-linux'].copyArgv.",
+              "install": "part of coreutils" },
+            { "kind": "directory", "path": "/tmp",
+              "provides": "the parent of the run-directory root (/tmp/dss-sqlite-harness) — ext4, not the DrvFs mount that fails 60 permission-family units under ANY compiler",
+              "why": "DECLARED by RUN_FILESYSTEMS['wsl-linux'].root; the DrvFs measurement behind it was taken on the x86_64 twin.",
+              "install": "every POSIX distro has /tmp" },
+            { "kind": "directory", "path": "/lib",
+              "provides": "the distro's own shared-library root, where this NATIVE arm64 run resolves libc/libm/libdl by name",
+              "why": "DOCUMENTED (merged-/usr on every current distro). Declared because this launcher runs the artefact natively — there is no sysroot to re-root into.",
+              "install": "part of the base distro" },
+            { "kind": "file", "path": "/lib/ld-linux-aarch64.so.1",
+              "provides": "the ELF interpreter this leg's artefact names in its own PT_INTERP",
+              "why": "DOCUMENTED — the AArch64 ELF psABI fixes the program interpreter at /lib/ld-linux-aarch64.so.1 (note: NOT under /lib64, which is the x86-64 spelling; getting that wrong is a row that can never be satisfied). Not measured here: no arm64 Windows host exists in this project.",
+              "install": "part of the base distro's libc6" }
+          ] },
+        { "hostOs": "windows", "hostArch": "x86_64", "command": ["wsl.exe", "-e", "qemu-aarch64"],
+          "env": { "QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu" },
+          "pathTranslation": "windows-to-wsl", "envTransfer": "wslenv",
+          "runFilesystem": "wsl-linux",
+          "$requiresComment": "★★★ THE ENTRY THE WHOLE `requires` KEY WAS WRITTEN FOR. Its argv[0] is `wsl.exe` — a Windows binary present on every machine with WSL — while the program that actually does the work is `qemu-aarch64` INSIDE the distro. `launcher_available` resolves argv[0] and stops, so this launcher passed every gate this harness had on a box with WSL and no qemu, every unit exited 255 with no diagnostic, and 14 of them were charged to DSS. Every row below is probed THROUGH the launcher, which is the only namespace where the question means anything: `wsl.exe -e test -f /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1` asks about the file that was missing; `shutil.which('wsl.exe')` never asked about anything.",
+          "requires": [
+            { "kind": "command", "path": "qemu-aarch64",
+              "provides": "the arm64 user-mode emulator — the program that actually runs this leg's artefact, INSIDE the distro",
+              "why": "✔MEASURED present in this host's WSL (/usr/bin/qemu-aarch64). ★ THIS IS THE ROW THE DEFECT IS NAMED AFTER: it is NOT this entry's argv[0] (that is wsl.exe), so no `which` on the Windows side has ever asked about it, on any host, ever.",
+              "install": "wsl.exe -e sudo apt-get install qemu-user-static" },
+            { "kind": "directory", "path": "${QEMU_LD_PREFIX}",
+              "provides": "the aarch64 sysroot qemu re-roots the interpreter path and every library lookup into, inside the distro",
+              "why": "✔MEASURED present in this host's WSL (/usr/aarch64-linux-gnu). ⚠ Note the value is a LINUX path even though this entry's pathTranslation is `windows-to-wsl`: `env` values cross the WSLENV carrier VERBATIM (a carrier forwards bytes, it does not translate them), so a value here MUST already be in the launcher's namespace — a `C:\\…` here would be meaningless and the lint refuses it.",
+              "install": "wsl.exe -e sudo apt-get install libc6-arm64-cross" },
+            { "kind": "file", "path": "${QEMU_LD_PREFIX}/lib/ld-linux-aarch64.so.1",
+              "provides": "the ELF interpreter the artefact names in its own PT_INTERP, resolved by qemu under the sysroot",
+              "why": "✔MEASURED present in this host's WSL. ★ THE EXACT FILE whose absence produced rc=255 and 14 false DSS charges. A sysroot DIRECTORY row does not cover it — `the sysroot is there` and `the loader is inside it` are two facts and it was the second that was false — which is why the 4-D PT_INTERP cross-check demands a `file` row and reds without one.",
+              "install": "wsl.exe -e sudo apt-get install libc6-arm64-cross" },
+            { "kind": "file", "path": "${QEMU_LD_PREFIX}/lib/libgcc_s.so.1",
+              "provides": "the unwinder glibc dlopen()s from inside pthread_exit, at process TEARDOWN",
+              "why": "✔MEASURED present in this host's WSL, and ✔MEASURED ABSENT on the arm64 VPS for the sibling leg, where it aborted three corpus segments (`libgcc_s.so.1 must be installed for pthread_exit to work` + `qemu: uncaught target signal 6 (Aborted)`), one AFTER that segment's summary printed. INVISIBLE to any artefact-derived check: no DT_NEEDED, no PT_INTERP.",
+              "install": "wsl.exe -e sudo apt-get install libgcc-s1-arm64-cross" },
+            { "kind": "command", "path": "sh",
+              "provides": "proof that a distro is registered and EXECUTES",
+              "why": "MEASURED on this host. Also the shell the `command` probe itself uses — `command -v` is a builtin with no binary form.",
+              "install": "wsl --install -d Ubuntu (then start it once)" },
+            { "kind": "command", "path": "mkdir",
+              "provides": "the run directory (runFilesystem mkdirArgv `wsl.exe -e mkdir -p`)",
+              "why": "DECLARED by RUN_FILESYSTEMS['wsl-linux'].mkdirArgv. MEASURED present on this host.",
+              "install": "part of coreutils" },
+            { "kind": "command", "path": "rm",
+              "provides": "clearing a stale run directory (rmTreeArgv `wsl.exe -e rm -rf`)",
+              "why": "DECLARED by RUN_FILESYSTEMS['wsl-linux'].rmTreeArgv. MEASURED present on this host.",
+              "install": "part of coreutils" },
+            { "kind": "command", "path": "cp",
+              "provides": "staging the fixture and corpus into the launcher's filesystem (copyArgv `wsl.exe -e cp -f`)",
+              "why": "DECLARED by RUN_FILESYSTEMS['wsl-linux'].copyArgv. MEASURED present on this host.",
+              "install": "part of coreutils" },
+            { "kind": "directory", "path": "/tmp",
+              "provides": "the parent of the run-directory root (/tmp/dss-sqlite-harness) — ext4, not DrvFs",
+              "why": "✔MEASURED 2026-08-06: /mnt/c is 9p/drvfs with no `metadata` option (chmod 644 -> 777) while /tmp is ext2/ext3 (644 -> 644), and a 2x2 matched control showed all 60 permission-family failures reproducing under the gcc reference on DrvFs and vanishing on ext4.",
+              "install": "every POSIX distro has /tmp" }
+          ] }
+      ],
+      "$confoundsComment": "See the top-level $confoundsComment. ★★ READ THE `earnedOn` FIELDS HERE MORE CAREFULLY THAN ON ANY OTHER LEG, BECAUSE THEY ARE NOT ALL THE SAME STRENGTH. Exactly ONE row below was earned by an experiment run on THIS leg (`emulated:^writecrash-`, with a gcc-built aarch64 control). The clock rows were earned by a matched control on elf64-x86_64 and are OBSERVED here; they are declared because the mechanism is a property of the HOST'S CLOCK, which both Linux legs share when this harness is driven from this box, and because the alternative — reporting a root-caused kernel defect as a compiler defect on one of two legs that suffer it identically — is the same lie in the other direction (D-SQLITE-CONFOUND-PERMUTATION-PREFIX: crying wolf on 30 benign rows is exactly as useless as hiding one real bug). ⛔ NO MATCHED gcc CONTROL HAS EVER BEEN RUN ON THIS LEG — still worth closing. ✔ THE SECOND HALF OF THIS WARNING IS NOW RETIRED, and it is corrected here rather than quietly dropped: it used to read \"there is NO native-arm64-hardware corpus run anywhere in the record — the arm64 VPS has only ever resolved build inputs\". FALSIFIED 2026-08-07 (TF-C126): the VPS ran this leg's veryquick corpus on NATIVE aarch64 hardware — PASS, 1 error out of 331,333 tests, that one being zipfile-25.0, the same declared confound every POSIX leg carries. So the clock-family rows below are no longer excused ONLY under qemu on this box; the leg now has a native run to compare against.",
+      "confounds": [
+        { "pattern": "^walsetlk-", "scope": "any",
+          "earnedOn": "elf64-x86_64 (matched gcc control, WSL2 x86_64) — OBSERVED on THIS leg under qemu-aarch64 on the same host, NOT independently controlled here",
+          "earnedAt": "2026-08-01 (control); 2026-08-05 observed here",
+          "mechanism": "The host's stepped CLOCK_REALTIME, exactly as on elf64-x86_64 — see that leg's row for the control. The clock is the kernel/hypervisor's, so it is shared by every leg this box runs and is compiler-independent by construction. OBSERVED HERE, itemized: TF-C120 (2026-08-05) recorded elf64-arm64 under qemu at 5 errors / 331,355 tests, of which walsetlk-2.1.3, walsetlk-2.1.6 and walsetlk-2.1.10.",
+          "anchor": "D-ENV-WSL2-CLOCK-REALTIME-STEPS-34S" },
+        { "pattern": "^walsetlk_recover-", "scope": "any",
+          "earnedOn": "elf64-x86_64 (matched gcc control, WSL2 x86_64) — on THIS leg only a LUMPED observation, never itemized",
+          "earnedAt": "2026-07-26 (control); 2026-07-31 lumped here",
+          "mechanism": "Same stepped-clock mechanism as elf64-x86_64's row, which holds the 6-runs-each control. ⚠ THE OBSERVATION ON THIS LEG IS WEAKER THAN ANY OTHER ROW IN THIS CATALOGUE and is recorded as such: TF-C107 (2026-07-31) reported both Linux legs together as '6 and 7 errors / 331,331, all known confounds — walsetlk*, walsetlk_recover*, zipfile-25.0' WITHOUT saying which leg contributed which name. Itemize it on the next full run of this leg and either narrow this row or promote it.",
+          "anchor": "D-SQLITE-WALSETLK-RECOVER-NEGATIVE-ELAPSED" },
+        { "pattern": "^busy2-", "scope": "any",
+          "earnedOn": "elf64-x86_64 (matched gcc control, WSL2 x86_64) — MEASURED TWICE on THIS leg, itemized both times",
+          "earnedAt": "2026-08-01 (control); 2026-07-31 and 2026-08-05 measured here",
+          "mechanism": "The host's stepped clock plus unixSleep's un-retried nanosleep — see elf64-x86_64's row for the control. ★ THE CROSS-LEG DATUM IS THE STRONGEST EVIDENCE IN THE CATALOGUE THAT THIS IS NOT CODEGEN: in the 2026-07-31 `full` run the SAME NAME, busy2-2.1.3, failed on the host x86_64 leg AND on the arm64-under-qemu leg — TWO DIFFERENT CODE GENERATORS and TWO DIFFERENT INSTRUCTION SETS producing the identical timing failure in ONE run. Measured again here at TF-C120 (2026-08-05): busy2-1.2.3 among this leg's 5 errors.",
+          "anchor": "D-SQLITE-MISC7-BUSYTIMEOUT-DELAY-WINDOW-GENUINE" },
+        { "pattern": "^recoverfault", "scope": "any",
+          "earnedOn": "elf64-x86_64 (matched gcc control, WSL2 x86_64) — on THIS leg a CLASS-LEVEL observation, no test names recorded",
+          "earnedAt": "2026-08-01 (control); 2026-07-26 observed here",
+          "mechanism": "An OOM-oracle artefact — see elf64-x86_64's row, where the same four names failed in both fixtures. On THIS leg the record is class-level only: the 2026-07-26 arm64-under-qemu full run 'recognised 10 real confounds (recoverfault/walsetlk/zipfile)' without naming members. Itemize on the next full run of this leg.",
+          "anchor": "D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY" },
+        { "pattern": "^zipfile-25\\.0$", "scope": "any",
+          "earnedOn": "elf64-x86_64 (one-binary 4-case filesystem probe) — MEASURED on THIS leg, itemized",
+          "earnedAt": "2026-07-26 (probe); 2026-08-05 measured here",
+          "mechanism": "The upstream symlink.test testdir leak — see elf64-x86_64's row for the one-binary three-outcome probe that rules out codegen. It reproduces on every POSIX target because the load-bearing behaviour is fopen() on a DIRECTORY succeeding. MEASURED HERE: zipfile-25.0 among this leg's 5 itemized errors at TF-C120 (2026-08-05). ⚠ The `$` anchor is load-bearing — see elf64-x86_64's row.",
+          "anchor": "D-SQLITE-ZIPFILE25-SYMLINK-TESTDIR-LEAK" },
+        { "pattern": "^writecrash-", "scope": "emulated",
+          "earnedOn": "elf64-arm64 under qemu-aarch64 on a WSL2 x86_64 host — THE ONE ROW IN THIS CATALOGUE EARNED ON THIS LEG, BY ITS OWN CONTROL",
+          "earnedAt": "2026-07-26 (control); confirmed live 2026-07-27",
+          "mechanism": "writecrash.test deliberately abort()s a writer inside the VFS xWrite, and sqlite's crash harness compares the CHILD'S CAPTURED OUTPUT against an expected result — into which qemu-user injects 'qemu: uncaught target signal 6 (Aborted) - core dumped'. A CONTROL THAT NEVER TOUCHES DSS reproduces that string exactly: a three-line C file calling abort(), built with aarch64-linux-gnu-gcc, run under the same qemu-aarch64 + QEMU_LD_PREFIX. The same source built natively prints no such line. ★★ SCOPED `emulated` AND NOT `any`, DELIBERATELY: the NATIVE host leg passes all 988 writecrash assertions, so a bare pattern would suppress a future genuine regression there; and this is a property of QEMU-USER, not of arm64 — on real arm64 hardware it should PASS, so nothing here is evidence about arm64 hardware. ⚠ KNOWN LIMIT OF THE SCOPE VOCABULARY, stated rather than discovered: `emulated` means 'went through a declared launcher', so on an arm64 WINDOWS host this leg's wsl.exe launcher would also satisfy it even though WSL is native there. Narrow it if that host is ever used for a corpus run. ⚠ AND EVEN EXCUSED, THE TRUNCATED writecrash TAIL DID NOT RUN — a crash-simulation abort can truncate the rest of its .test file, so coverage there is partial and both drivers say so out loud.",
+          "anchor": "D-SQLITE-ARM64-WRITECRASH-QEMU-ABORT-ARTIFACT" },
+        { "pattern": "^sessionnoact-4\\.3$", "scope": "any",
+          "earnedOn": "elf64-arm64, under qemu-aarch64 on this project's WSL2 host — OBSERVED HERE INDEPENDENTLY, not inherited. ★ THE REFUSAL TO PRE-PROPAGATE IS WHAT MADE THIS HONEST: TF-C134 declared the row on elf64-x86_64 ONLY and said so, so when this leg ran it reported the failure as UNCLASSIFIED rather than swallowing it, and the row is added now because THIS leg measured it.",
+          "earnedAt": "2026-08-07",
+          "mechanism": "The SAME upstream test-isolation bug root-caused on elf64-x86_64, and confirmed here by the FAILURE TEXT rather than by the test name: `expected: []` / `got: [invalid command name \"log\"]`, byte-identical to the x86_64 observation. `ext/session/sessionconflict.test:25` calls `test_sqlite3_log log` — sqlite3_config(SQLITE_CONFIG_LOG), PROCESS-GLOBAL C state registering a callback by the NAME of a Tcl proc — and never unregisters, unlike `session3.test` (:36 register, :211 reset) and `sessionat.test` (:33, :306). Each .test file runs in a FRESH slave interpreter, so a later file that provokes a log message fires the callback into an interpreter with no such proc. ★★ THE MATCHED CONTROL IS THE MECHANISM'S, NOT A PER-ARCH RE-DERIVATION, AND THAT DISTINCTION IS STATED RATHER THAN BLURRED: on elf64-x86_64 the pair `sessionconflict.test sessionnoact.test` was handed to BOTH the DSS and the gcc reference fixture and produced byte-identical failures (1 error out of 40 each), while `sessionnoact.test` alone passes under both (0 of 32) and the pair `session3.test sessionnoact.test` also passes under both. That establishes the cause as order-dependent and compiler-independent. There is no aarch64 gcc reference fixture on this host to repeat it against, so what is earned HERE is the OBSERVATION of the same failure text from the same cause — not a second independent control. ⓘ The cause is Tcl-level and target-independent, which is why the same text appears on both arches.",
+          "anchor": "D-UPSTREAM-SQLITE-SESSIONCONFLICT-LEAKS-THE-GLOBAL-LOG-CALLBACK" }
+      ],
+      "build": {
+        "recipeTransform": "none",
+        "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
+        "$configureAnswersComment": "Same target OS as the elf64-x86_64 leg, so the SAME three answers and the SAME staged sqlite_cfg.h — the stage key is the TARGET OS, and two legs on one OS share one header (harness_legs.py refuses a catalogue where they disagree). `pread64`/`pwrite64` are glibc LFS64 names, not x86-64 ones: the arm64 glibc exports them too.",
+        "configureAnswers": { "HAVE_PREAD64": true, "HAVE_PWRITE64": true, "HAVE_MALLOC_H": true },
+        "stackReserveBytes": 0,
+        "sharedLibFlags": ["-shared", "-fPIC"],
+        "$sharedLibFormatComment": "★ NOTE THE TWO SPELLINGS OF arm64 IN ONE ARGUMENT — the target arch is `arm64` (from this leg's spec) and the FORMAT says `aarch64`. `--target arm64:elf64-aarch64-linux-dyn` is what harness_legs.py's shared_lib_spec() assembles from the two; neither driver spells it.",
+        "sharedLibFormat": "elf64-aarch64-linux-dyn",
+        "loadExtHelperName": "libtestloadext.so",
+        "$targetCcComment": "The CONTROL arm only (top-level $loadExtHelperBuilderComment). `package` is still declared so an operator who ASKS for the control (DSS_LOADEXT_HELPER=reference) is told what to install — the drivers no longer install it unasked, because a control must not mutate the machine it runs on.",
+        "targetCc": { "candidates": ["aarch64-linux-gnu-gcc"], "package": "gcc-aarch64-linux-gnu" },
+        "$librariesComment": "★ THE ORIGINAL BESPOKE PROVIDER, RETIRED — D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE. This leg used to declare `ubuntu-ports-arm64`, ~80 lines of `curl` + `dpkg-deb` living inside build-and-test.sh and NOWHERE ELSE, so on Windows the leg returned a named refusal (`library provider … has no dispatch arm in build-and-test.ps1`) instead of building. The deferral that kept it was correct at the time and its reasoning still holds: the obvious generalisation needed a zstd reader, which is Python 3.14+, and this project has a 3.12 host — a capability that exists on one HOST and not another is the same defect one level down. What changed is the SOURCE, not the appetite: Debian's .debs are `data.tar.xz`, so the general route opens them with the stdlib on every host, and `dpkg-deb` is not needed at all. The self-retiring exemption in tests/harness/test_sqlite_harness_legs.cpp goes with it. ⓘ The old provider also fetched `libtommath1`; this one does not, because Debian's libtcl8.6 does not link it (✔MEASURED: DT_NEEDED = libz.so.1, libm.so.6, libc.so.6) and the old code itself treated it as optional.",
+        "libraries": {
+          "provider": "pinned-archive",
+          "$importNameComment": "See the elf64-x86_64 leg — same rule, same reasoning, and the SAME two names: DT_SONAME is architecture-independent.",
+          "acquire": {
+            "archives": [
+              {
+                "url": "https://deb.debian.org/debian/pool/main/t/tcl8.6/libtcl8.6_8.6.13+dfsg-2_arm64.deb",
+                "sha256": "b5244c01bb23472464eb9264e440a99c438358f39ccd014f8f56694bf638a22c",
+                "archiveFormat": "deb",
+                "$embeddedPathsComment": "The SAME fourteen paths as the amd64 sibling with the multiarch triple respelled — ✔MEASURED on both files, and the difference is exactly the two `x86_64-linux-gnu` -> `aarch64-linux-gnu` entries. A declaration that could not tell them apart would be a declaration that was not read from the bytes.",
+                "members": [
+                  { "member": "usr/lib/aarch64-linux-gnu/libtcl8.6.so", "as": "libtcl8.6.so",
+                    "universal": false, "importName": "libtcl8.6.so",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [
+                      { "path": "/usr/share/tcltk/tcl8.6", "kind": "runtime-data", "role": "tclScriptLibrary" },
+                      { "path": "/usr/share/tcltk", "kind": "inert", "$why": "the PARENT of the script directory, used to build the search list `tclInit` walks. Staging the child is what makes the search succeed; the parent itself holds no file Tcl reads." },
+                      { "path": "/usr/lib/tcltk", "kind": "inert", "$why": "Debian's directory for Tcl EXTENSION packages (a second element of `tcl_pkgPath`). The testfixture loads no extension — its commands are compiled in." },
+                      { "path": "/usr/lib/tcltk/tcl8.6", "kind": "inert", "$why": "the versioned twin of the above, same reason." },
+                      { "path": "/usr/lib/tcltk/aarch64-linux-gnu", "kind": "inert", "$why": "the multiarch twin of the above, same reason. THE TARGET's arch, not the host's — this entry is what an arch-blind copy of the amd64 declaration would have got wrong." },
+                      { "path": "/usr/local/lib/tcltk", "kind": "inert", "$why": "the local-admin extension directory in `tcl_pkgPath`; on the target it usually does not exist, and nothing here requires it to." },
+                      { "path": "/usr/local/share/tcltk", "kind": "inert", "$why": "the local-admin twin of /usr/share/tcltk, same reason." },
+                      { "path": "/usr/lib", "kind": "inert", "$why": "TCL_EXEC_PREFIX/lib from tclConfig.sh, reported for build consumers." },
+                      { "path": "/usr/lib/aarch64-linux-gnu", "kind": "inert", "$why": "the multiarch libdir from the same tclConfig.sh block — where the packager's own copy of THIS library sits, not data." },
+                      { "path": "/usr/include/tcl8.6", "kind": "inert", "$why": "TCL_INCLUDE_SPEC, a BUILD-time answer. This harness stages its own tcl.h and cross-checks its version against this very library." },
+                      { "path": "/usr/share/man", "kind": "inert", "$why": "the manual page directory, from the same block. No interpreter code path reads it." },
+                      { "path": "/usr/bin", "kind": "inert", "$why": "the default PATH element Tcl's `exec` falls back on — a target path, not shipped data." },
+                      { "path": "/dev/null", "kind": "inert", "$why": "`exec`'s redirection sink; a device on the target." },
+                      { "path": "/dev/tty", "kind": "inert", "$why": "the controlling terminal for interactive prompting; same category as /dev/null." }
+                    ],
+                    "dataDirs": [
+                      { "member": "usr/share/tcltk/tcl8.6", "as": "tcl8.6", "role": "tclScriptLibrary" }
+                    ] }
+                ]
+              },
+              {
+                "url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_arm64.deb",
+                "sha256": "52b8b8a145bbe1956bba82034f77022cbef0c3d0885c9e32d9817a7932fe1913",
+                "archiveFormat": "deb",
+                "members": [
+                  { "member": "lib/aarch64-linux-gnu/libz.so.1", "as": "libz.so.1",
+                    "universal": false, "importName": "libz.so.1",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [],
+                    "dataDirs": [] }
+                ]
+              }
+            ]
+          },
+          "tclNames": ["libtcl8.6.so", "libtcl8.6.so.0"],
+          "zNames": ["libz.so.1", "libz.so"],
+          "searchPaths": []
+        }
+      }
+    },
+
+    {
+      "label": "pe64-x86_64",
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "runOn": ["windows"],
+      "$launchersComment": "Wine is the declared cross-OS launcher. It is a DECLARATION, not a claim that it is installed: a host without it records `skipped-emulator-missing` (environmental, loud, promotable to a hard failure) rather than vanishing. No launcher is declared for a non-x86_64 host: Wine alone does not emulate the ISA.",
+      "launchers": [
+        { "hostOs": "linux",  "hostArch": "x86_64", "command": ["wine"], "env": {},
+          "pathTranslation": "none", "envTransfer": "inherit",
+          "runFilesystem": "driver",
+          "requires": [
+            { "kind": "command", "path": "wineserver",
+              "provides": "the per-session Wine server every `wine` process connects to; `wine` without it starts nothing",
+              "why": "DOCUMENTED (wine(1)/wineserver(1): the loader connects to a wineserver and starts one if none is running; the two ship together and neither works alone). NOT MEASURED — no host in this project has Wine installed, which is exactly why the row is DECLARED rather than derived from a machine that happens to be right. It is the one prerequisite `which wine` cannot establish: a distro `wine` wrapper script resolves on PATH with no server behind it.",
+              "install": "apt-get install wine64 (Debian/Ubuntu) — the same package supplies both" }
+          ] },
+        { "hostOs": "darwin", "hostArch": "x86_64", "command": ["wine"], "env": {},
+          "pathTranslation": "none", "envTransfer": "inherit",
+          "runFilesystem": "driver",
+          "requires": [
+            { "kind": "command", "path": "wineserver",
+              "provides": "the per-session Wine server every `wine` process connects to",
+              "why": "DOCUMENTED, same as the linux entry above (wineserver(1)). NOT MEASURED — no Mac in this project has Wine. ⓘ The two entries are byte-identical on purpose: this is a property of WINE, not of the host OS underneath it, and giving them different rows would be a claim nothing supports.",
+              "install": "brew install --cask wine-stable" }
+          ] }
+      ],
+      "$confoundsComment": "★★★ IT STARTED EMPTY, AND THAT WAS THE MEASURED ANSWER — NOT AN OVERSIGHT AND NOT A LEG NOBODY LOOKED AT. ⓘ IT IS NO LONGER EMPTY (2026-08-10), AND THE RULE THAT ENDS THIS COMMENT IS WHY IT TOOK TWO ROWS TO GET HERE: neither was inherited from another leg. win32longpath-1.3 was earned by holding the COMPILER constant and varying the RUNTIME; sessionnoact-4.3 by holding the COMPILER constant and varying the test ORDER — both experiments run on THIS leg's own binary, on the platform the row excuses. The rule stands exactly as written, and the rows below are what paying it looks like. This is the most conspicuous consequence of moving the ledger here, so it is written down. build-and-test.ps1 used to hand THIS leg six patterns and give every other leg none, on the strength of a function whose entire body was `if ($legLabel -eq 'pe64-x86_64')` — and ALL SIX had been earned on LINUX x86_64. The file conceded it for two of them in its own comment ('That control was earned on LINUX and does NOT transfer here — it says nothing about pe64') three lines above a claim that 'EVERY ENTRY IN IT WAS EARNED ON pe64'; both sentences shipped, in the same file, contradicting each other. ✔THE MEASUREMENT THAT SETTLES IT: this leg's `full` tier has reported 0 errors out of 979,736 and its veryquick tier 0 out of ~330,970 — i.e. those six patterns suppressed NOTHING here, so removing them is behaviour-neutral AND honest. ★ AND ONE OF THEM WAS MECHANISTICALLY IMPOSSIBLE HERE: zipfile-25.0 turns on POSIX fopen() SUCCEEDING on a directory, which Windows does not do — so on this target the test gets its expected 'cannot open file: x' and PASSES, which is exactly what every pe64 run has shown. ⇒ every failure on this leg counts, and the first one to appear must be earned with a pe64 CONTROL (the reference testfixture this driver already builds), never inherited from a Linux row.",
+      "confounds": [
+        {
+          "pattern": "^win32longpath-1\\.3$",
+          "scope": "emulated",
+          "earnedOn": "pe64-x86_64 UNDER WINE, on this project's WSL2/Ubuntu x86_64 host",
+          "earnedAt": "2026-08-06",
+          "mechanism": "The test asserts that Windows REFUSES to open a database at a path beyond MAX_PATH: expected [1 {unable to open database file}]. Under wine the open SUCCEEDS, so the expected error never occurs and the assertion sees [0 {}] — a wine-vs-Windows path-limit divergence, not a codegen fault. MATCHED CONTROL, compiler held constant and only the RUNTIME varied: the SAME dss-built testfixture.exe runs `win32longpath-1.3... Ok` on REAL Windows (measured in that leg's own corpus.log, 16 win32longpath mentions, leg headline 0 errors out of 330,970). ‘scope: emulated’ confines it to runs under a declared emulator/launcher (here wine), so it can never excuse a failure on native Windows — which is the platform that actually proves this test.",
+          "anchor": "D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE"
+        },
+        {
+          "pattern": "^sessionnoact-4\\.3$",
+          "scope": "any",
+          "earnedOn": "pe64-x86_64, NATIVE on this project's Windows host (PCRAFAEL2025, Windows NT 64-bit) — EARNED HERE BY AN EXPERIMENT RUN ON THIS LEG, not inherited from the ELF rows. Also observed independently on this leg UNDER WINE from a WSL2 host, which is why the scope is `any` and not `emulated`: it is not a property of either runtime.",
+          "earnedAt": "2026-08-10 (this leg's own control); first observed here 2026-08-08",
+          "mechanism": "AN UPSTREAM TEST-ISOLATION BUG — see elf64-x86_64's row for the root-cause to the line and for the DSS-vs-gcc matched control. `ext/session/sessionconflict.test:25` calls `test_sqlite3_log log`, i.e. sqlite3_config(SQLITE_CONFIG_LOG), PROCESS-GLOBAL C state that registers a callback by the NAME of a Tcl proc, and never unregisters — unlike session3.test (:36 register, :211 reset) and sessionat.test (:33, :306). Every .test file runs in a FRESH slave interpreter, so a later file that provokes a log message fires the callback into an interpreter with no such proc. ★★ THE CONTROL WAS RUN ON THIS LEG AND IT IS AN ORDER CONTROL, NOT A COMPILER ONE — STATED PLAINLY BECAUSE THIS LEG HAS NO SAME-PLATFORM ORACLE TO RUN A COMPILER CONTROL AGAINST (D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE). ✔MEASURED 2026-08-10: ONE testfixture.exe, ONE tier, ONE host, ONE Tcl, three file sets handed to it via SQLITE_TEST_PATTERN_LIST, and THREE outcomes — `sessionconflict.test sessionnoact.test` -> rc=1, `1 errors out of 40 tests on PCRAFAEL2025 Windows NT 64-bit`, `! sessionnoact-4.3 got: [invalid command name \"log\"]`; `sessionnoact.test` ALONE -> rc=0, `0 errors out of 34`; `session3.test sessionnoact.test` -> rc=0, `0 errors out of 50`, the matched NEGATIVE that fails only if the mechanism is something other than the missing reset. The compiler is held constant across all three arms and the ONLY variable is which files precede the subject in the process ⇒ codegen cannot be the cause, and this leg says so with its own evidence rather than by resemblance to a Linux row. ⓘ CORROBORATED BY THE FULL-CORPUS RUN'S OWN ORDERING: in that run's corpus.log sessionconflict-1.0 appears at :52629 and sessionnoact-1.0 at :52757, one process (a single `errors out of` summary), conflict first — so the precondition the control isolates is exactly what the real run satisfied. ★ AND THE FAILURE IS A TCL ERROR, NEVER A WRONG VALUE: `invalid command name \"log\"` is the interpreter's own message for a missing proc. ⚠ NOT to be fixed by patching the staged tree or excluding the file: the corpus is unmodified upstream and the harness surviving this is the property we want.",
+          "anchor": "D-UPSTREAM-SQLITE-SESSIONCONFLICT-LEAKS-THE-GLOBAL-LOG-CALLBACK"
+        }
+      ],
+      "build": {
+        "$recipeTransformComment": "The recipe is derived from a POSIX `make -n`, so any host feature-probe define it carries is a fact about the DERIVING host, never about this target. `windows-selfconfig` drops those and adds SQLITE_OS_WIN=1 so SQLite self-configures its Windows build. ⚠ WHICH DEFINES, PRECISELY — ✔MEASURED 2026-08-05 (TF-C121) against the recipe this harness actually derives: `_HAVE_SQLITE_CONFIG_H` is the ONE such define on the command line. There is NO bare `HAVE_*` and NO `Z_HAVE_*` in `stage/defines.txt` or `stage/cli-defines.txt` at all (the only near-miss is `SQLITE_HAVE_ZLIB=1`, a project feature flag the transform's `^(HAVE_|Z_HAVE_)` regex deliberately does not match). This comment used to list `HAVE_*/Z_HAVE_*` alongside it as if all three families were present; the regex arm is a standing guard against a future recipe, not a description of this one. See `$configureAnswersComment` above, which states the same fact, and gen-pe64-manifest.py's transform block. Keyed on THIS LEG, which is why the rule moved out of gen-pe64-manifest.py's prose ('this generator is pe-only, so keying the rule on the pe target is inherent here') into a declaration any driver can read.",
+        "recipeTransform": "windows-selfconfig",
+        "$zconfGuardsComment": "THE HEADER HALF OF THE SAME CROSS-COMPILE CATEGORY ERROR the recipeTransform fixes, and until TF-C115 the ONLY leg it was applied for — by a `perl -0777 -pi` flip buried in one driver's staging step, against ONE zinc/ shared by every leg, which is why a non-pe leg had to be REFUSED (`poisoned`) rather than built. The staged zconf.h comes from the deriving POSIX host, where ./configure wrote `#if 1 → #define Z_HAVE_UNISTD_H`; that is a fact about THAT HOST, and on a Windows TARGET <unistd.h> does not exist. Each guard is now DECLARED per leg and one zinc/ is staged per recipeTransform (stage-zinc.py), so every leg parses a zlib header configured for ITS OWN target and no leg is refused. ★ Z_HAVE_STDARG_H stays true: <stdarg.h> is C-standard and exists on pe. ★ MEASURED (TF-C115) on the elf64-x86_64 leg, both gcc and DSS: with these recipe defines the ONLY thing the guard changes is `z_off_t` = off_t vs long — the same 8-byte `long` on LP64 — and SEEK_*/z_off64_t/the gz* symbol names are byte-identical either way. So the flip is BENIGN on LP64; it is NOT benign on the pe target, where the guard's `#include <unistd.h>` simply does not resolve.",
+        "zconfGuards": { "Z_HAVE_UNISTD_H": false, "Z_HAVE_STDARG_H": true },
+        "$configureAnswersComment": "★ DECLARED, AND INERT ON THIS LEG — both halves matter. INERT: `windows-selfconfig` drops `_HAVE_SQLITE_CONFIG_H`, so sqliteInt.h never includes ANY sqlite_cfg.h here and no answer below is read. DECLARED ANYWAY: every leg declares every answer so a reader never has to know a default, and — more to the point — these are claims about the TARGET, which stay true whatever a transform does with them. `pread64`/`pwrite64` are glibc LFS64 names that no Windows CRT has. `HAVE_MALLOC_H` is TRUE: ✔MEASURED on this project's Windows box, the UCRT ships `malloc.h` under the Windows SDK's `ucrt/` include dir (`C:/Program Files (x86)/Windows Kits/10/Include/<ver>/ucrt/malloc.h`), so declaring it false would be a false statement about the target that happens to be unread. If this leg ever stops dropping `_HAVE_SQLITE_CONFIG_H`, these are already the right answers and nothing here needs revisiting.",
+        "configureAnswers": { "HAVE_PREAD64": false, "HAVE_PWRITE64": false, "HAVE_MALLOC_H": true },
+        "$stackReserveComment": "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH — Windows defaults a process to 1 MiB; e_fkey-63.1.x recurses to SQLITE_MAX_TRIGGER_DEPTH and overflows it (a NATIVE gcc build overflows too). 8 MiB = what Linux hands the process for free.",
+        "stackReserveBytes": 8388608,
+        "sharedLibFlags": ["-shared"],
+        "$sharedLibFormatComment": "★ THE LEG THAT MADE THE CASE. Until 2026-08-05 running this leg REQUIRED a mingw cross-compiler on the host — `x86_64-w64-mingw32-gcc`, or a `gcc` that reports `x86_64-w64-mingw32` — and on a Linux/WSL box without one its whole corpus was skipped. ✔MEASURED 2026-08-05: DSS emits this format from a Windows host in well under a second (8,704 bytes), the artefact is a real PE with IMAGE_FILE_DLL set and exports `testloadext_init`/`testbrokenext_init`/`sqlite3_api`, and sqlite's own `sqlite3_load_extension()` loaded it and answered `SELECT half(9.0)` = 4.500.",
+        "sharedLibFormat": "pe64-x86_64-windows-dll",
+        "$loadExtHelperNameComment": "★ THE ONE LEG WHOSE NAME IS DIFFERENT, and the reason this key exists. ✔MEASURED from the staged upstream tree, test/loadext.test:26-29: a `tcl_platform(platform) eq windows` fixture looks for `./testloadext.dll` — the drivers hardcoded `libtestloadext.so` for every leg, so a pe64 fixture never found the staged helper and fell through to loadext.test's own hardcoded-`gcc` self-build, which is precisely the fallback the pre-staging exists to prevent [D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO].",
+        "loadExtHelperName": "testloadext.dll",
+        "$targetCcComment": "`gcc` STAYS on this list and it is not a mistake: ✔MEASURED 2026-08-05 on this project's Windows box, `gcc -dumpmachine` prints `x86_64-w64-mingw32` (Git for Windows and Strawberry both ship mingw gcc under the bare name), so on a Windows host it IS this leg's correct compiler. What was missing is the CHECK, not a shorter list — see the top-level $targetCcComment.",
+        "targetCc": { "candidates": ["x86_64-w64-mingw32-gcc", "gcc"], "package": "gcc-mingw-w64-x86-64" },
+        "$librariesComment": "pe64 --resolve-library reads a DLL's EXPORT table (.edata), so these must be real DLLs, not import .libs. A DLL is just a FILE: DSS reads a PE export table on any host, so ANY box that HAS these files can build this leg — and the old `search-paths` provider is precisely the reason no non-Windows box had them. ✔MEASURED: the leg was `skipped-build-input-missing` on the arm64 VPS and on macOS, because every declared search path was a Windows install location plus a cache nothing ever populated. Searching for a file the machine was never given is not acquisition. ⚠ THE OBVIOUS SOURCE IS BLOCKED, MEASURED 2026-08-06: msys2/mingw64 — the repo D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER names, and the source of the very `tcl86.dll` Git for Windows ships — publishes `.pkg.tar.zst` and NOTHING ELSE (every tcl and zlib package, checked directly). zstd entered the Python stdlib in 3.14 and this project has a 3.12 host, so that route would be a capability that exists on one host and not another. conda-forge's win-64 packages are plain `.tar.bz2`, unauthenticated HTTPS, content-addressable, and carry the SCRIPT LIBRARY as well — so the pe64 leg becomes self-contained instead of borrowing from an installed Git.",
+        "libraries": {
+          "provider": "pinned-archive",
+          "$importNameComment": "Bare DLL names, and on Windows that IS the beside-the-artefact spelling: the loader searches the application's own directory FIRST, so a DLL staged next to the executable wins with no path recorded and no assumption about the target's layout — the same argument `@loader_path` makes on Darwin, spelled the way this loader spells it. Each DLL's own PE export-directory Name already agrees (`tcl86t.dll`, `zlib.dll`), so nothing is being displaced here; it is declared because 'the packager's identity happens to be right' is a fact a reader should be able to check.",
+          "$tclNamesComment": "`tcl86t.dll` is conda-forge's THREADED build — the `t` suffix is the Windows convention for `--enable-threads`, which is also how msys2 and ActiveState ship it, and what sqlite's testfixture wants. The older unsuffixed names stay in the list: they are what a `search-paths` era cache or a Git-for-Windows install still holds, and this list is matched against whatever is staged.",
+          "acquire": {
+            "archives": [
+              {
+                "$archiveComment": "conda-forge's `tk` package carries BOTH tcl86t.dll and tk86t.dll plus the whole `Library/lib/tcl8.6` script tree (830 files, ✔MEASURED, including init.tcl and Tcl's own tzdata). There is no separate `tcl` package for win-64 — Tcl ships inside `tk` — which is why the archive's name does not say Tcl.",
+                "url": "https://conda.anaconda.org/conda-forge/win-64/tk-8.6.12-h8ffe710_0.tar.bz2",
+                "sha256": "087795090a99a1d397ef1ed80b4a01fabfb0122efb141562c168e3c0a76edba6",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "Library/bin/tcl86t.dll", "as": "tcl86t.dll",
+                    "universal": false, "importName": "tcl86t.dll",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "$embeddedPathsComment": "★ THE GUARD EARNED ITS KEEP HERE. A first pass with a POSIX-only path scan reported ZERO embedded paths in this DLL and concluded Windows Tcl locates its scripts purely relative to the module — the resolver's own scanner, which understands `X:\\`, found FIVE, and one of them is the script library under conda's BUILD prefix on a machine that no longer exists. Had the scan been the naive one, this leg would have shipped a Tcl that hunts `D:\\bld\\…` for init.tcl and dies at `interp create`, which is exactly the failure the anchor is named after — found here by the guard rather than by a Mac.",
+                    "embeddedPaths": [
+                      { "path": "D:\\bld\\tk_1645032569673\\_h_env\\Library\\lib\\tcl8.6", "kind": "runtime-data", "role": "tclScriptLibrary" },
+                      { "path": "D:\\bld\\tk_1645032569673\\_h_env\\Library\\lib", "kind": "inert", "$why": "the build prefix's libdir, baked in as `tcl_pkgPath` for an extension search the testfixture never performs. It names a directory on conda-forge's build machine and cannot resolve anywhere else — which is harmless only because nothing reads it." },
+                      { "path": "D:\\bld\\tk_1645032569673\\_h_env\\Library\\bin", "kind": "inert", "$why": "the build prefix's bindir, from the same baked-in configuration block." },
+                      { "path": "D:\\bld\\tk_1645032569673\\_h_env\\Library\\include", "kind": "inert", "$why": "the build prefix's include dir — a BUILD-time answer for tclConfig consumers. This harness stages its own tcl.h." },
+                      { "path": "D:\\bld\\tk_1645032569673\\_h_env\\Library\\doc", "kind": "inert", "$why": "the build prefix's doc dir, from the same block. No interpreter code path reads it." }
+                    ],
+                    "dataDirs": [
+                      { "member": "Library/lib/tcl8.6", "as": "tcl8.6", "role": "tclScriptLibrary" }
+                    ] }
+                ]
+              },
+              {
+                "$archiveComment": "conda-forge splits zlib's runtime DLL into `libzlib`; the `zlib` package is the development half. The DLL is at `Library/bin/zlib.dll` and the archive also carries a top-level copy — the declaration names the `Library/` one so both members come from the same prefix.",
+                "url": "https://conda.anaconda.org/conda-forge/win-64/libzlib-1.2.13-hcfcfb64_4.tar.bz2",
+                "sha256": "184da12b4296088a47086f4e69e65eb5f8537a824ee3131d8076775e1d1ea767",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "Library/bin/zlib.dll", "as": "zlib.dll",
+                    "universal": false, "importName": "zlib.dll",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "$embeddedPathsComment": "EMPTY, and MEASURED with the same scanner that found five in tcl86t.dll — so the emptiness is a result, not an omission.",
+                    "embeddedPaths": [],
+                    "dataDirs": [] }
+                ]
+              }
+            ]
+          },
+          "tclNames": ["tcl86t.dll", "tcl86.dll", "tcl90.dll"],
+          "zNames": ["zlib.dll", "zlib1.dll"],
+          "$searchPathsComment": "EMPTIED with the provider change, deliberately. A candidate list nothing consults is worse than none: a reader would take it for the mechanism. The escape hatch that replaces `DSS_PE_LIBDIR` is `DSS_HARNESS_CACHE_ROOT` — it moves where the pinned archives are materialised, and unlike a search path it cannot silently substitute a different library, because what lands there is checked against the pinned digest.",
+          "searchPaths": []
+        }
+      }
+    },
+
+    {
+      "label": "macho64-arm64",
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "$launchersComment": "EMPTY, and the emptiness is the hardest-won fact in this file: there is NO off-Mac emulator for a Darwin arm64 executable. Unlike pe-under-Wine or aarch64-under-qemu, the only way to observe this artifact RUN is a real Mac — which is exactly why TF-C113 proved it by BUILDING it on a Windows host and shipping the binary to one. So this leg's build is attempted everywhere and its run is a structural skip everywhere but Darwin/arm64. Do not invent a launcher here.",
+      "runOn": ["darwin"],
+      "launchers": [],
+      "$confoundsComment": "See the top-level $confoundsComment. THE FIRST LEG BESIDES elf64-x86_64 TO EARN A ROW WITH A SAME-PLATFORM COMPILER ORACLE — the harness's OWN reference fixture, which is why that oracle was repaired the cycle before. (⚠ 'the only leg' until 2026-08-10; pe64-x86_64 now carries two rows of its own, earned by varying the RUNTIME and the test ORDER rather than the compiler, because that leg has no oracle to vary. Same standard, different instrument.) ⚠ THE CLOCK FAMILY IS ABSENT FROM THIS LEG ON PURPOSE: walsetlk/busy2/recoverfault are a property of a WSL2 host's broken CLOCK_REALTIME, and this leg runs on a Mac whose clock has never been shown to step. Not one of them has ever been observed here, and the 2026-07-31 macOS `full` run's other '5 already-earned confounds' were never NAMED, so they cannot be mined for rows — an unnamed count is not evidence about a pattern.",
+      "confounds": [
+        { "pattern": "^zipfile-25\\.0$", "scope": "any",
+          "earnedOn": "macho64-arm64, native on the operator's Apple Silicon Mac — MEASURED HERE, and it is this leg's ONLY failure",
+          "earnedAt": "2026-07-31 (TF-C102), re-measured 2026-08-06",
+          "mechanism": "The upstream symlink.test testdir leak — see the elf64-x86_64 row for the one-binary, three-outcome filesystem probe that rules out codegen. It reproduces on every POSIX target because the load-bearing behaviour is fopen() on a DIRECTORY succeeding, which Darwin does exactly as Linux does. MEASURED HERE, twice: 1 error out of 332,109 (2026-07-31) and 1 error out of 331,745 (2026-08-06), the single error being this test on both occasions.",
+          "anchor": "D-SQLITE-ZIPFILE25-SYMLINK-TESTDIR-LEAK" },
+        { "pattern": "^loadext-2\\.1$", "scope": "any",
+          "earnedOn": "macho64-arm64, native on the operator's Apple Silicon Mac (macOS 26.5.2, build 25F84) — EARNED HERE, by this harness's own reference oracle",
+          "earnedAt": "2026-07-31 (TF-C103)",
+          "mechanism": "loadext.test:64-65 hardcodes the macOS dyld error string as {dlopen.%s, 10.: .*image.*found.*}, and macOS 26.5.2 changed that string in TWO independent ways — the dlopen flags now print in HEX (0x000A) where the regex wants DECIMAL (10), and the phrase is now '(no such file)' inside a 'tried: <path>, <path>, ...' enumeration where the regex wants 'image not found'. EXONERATION, NOT RESEMBLANCE: the reference cc-built full-source testfixture, which contains NO DSS-compiled code at all, fails the SAME TWO tests on the SAME machine and tree — '2 errors out of 52 tests', '!Failures on these tests: loadext-2.1 loadext-2.2' — and emits the identical new-format string. A COMPILER CANNOT CHANGE WHAT dyld PRINTS. ★ SCOPED DELIBERATELY NARROW — to these two test NAMES and NOT to `^loadext-`, because the extension-loading path is exactly where a codegen or linkage defect would plausibly show up. Revisit when sqlite updates the regex upstream or the macOS string changes again.",
+          "anchor": "D-SQLITE-LOADEXT-MACOS26-DLERROR-FORMAT" },
+        { "pattern": "^loadext-2\\.2$", "scope": "any",
+          "earnedOn": "macho64-arm64, native on the operator's Apple Silicon Mac (macOS 26.5.2, build 25F84) — EARNED HERE, by this harness's own reference oracle",
+          "earnedAt": "2026-07-31 (TF-C103)",
+          "mechanism": "The second of the two names in the macOS 26.5.2 dyld-string change — see the ^loadext-2\\.1$ row for the mechanism and the reference-fixture control that failed both names identically. Declared as its own row rather than as `^loadext-2\\.[12]$` so that each excused NAME is visible to a reader counting them.",
+          "anchor": "D-SQLITE-LOADEXT-MACOS26-DLERROR-FORMAT" },
+        { "pattern": "^sessionnoact-4\\.3$", "scope": "any",
+          "earnedOn": "macho64-arm64, native on the operator's Apple Silicon Mac — OBSERVED HERE INDEPENDENTLY, not inherited. ★ THE REFUSAL TO PRE-PROPAGATE IS WHAT MADE THIS HONEST: the row was declared on elf64-x86_64 ONLY and said so, so when this leg ran it reported the failure as UNCLASSIFIED rather than swallowing it, and it is added now because THIS leg measured it.",
+          "earnedAt": "2026-08-07 (observed here); declared 2026-08-10",
+          "mechanism": "The SAME upstream test-isolation bug root-caused on elf64-x86_64 — `ext/session/sessionconflict.test:25` calls `test_sqlite3_log log`, i.e. sqlite3_config(SQLITE_CONFIG_LOG), PROCESS-GLOBAL C state registering a callback by the NAME of a Tcl proc, and never unregisters, unlike session3.test (:36, :211) and sessionat.test (:33, :306). Each .test file runs in a FRESH slave interpreter, so a later file that provokes a log message fires the callback into an interpreter with no such proc. CONFIRMED HERE BY THE FAILURE VALUES, NOT BY THE TEST NAME: `expected: []` / `got: [invalid command name \"log\"]`, byte-identical to the x86_64, arm64-Linux and Windows observations — a TCL interpreter error, never a wrong value, and no compiler can make an interpreter forget a proc name. ★★ WHAT IS EARNED HERE IS THE OBSERVATION, NOT A SECOND CONTROL, AND THAT DISTINCTION IS STATED RATHER THAN BLURRED. The compiler control is the mechanism's: on elf64-x86_64 the pair `sessionconflict.test sessionnoact.test` was handed to BOTH the DSS and the gcc reference fixture and produced byte-identical failures (1 error out of 40 each), while `sessionnoact.test` alone passes under both and `session3.test sessionnoact.test` also passes under both. An ORDER control of that same shape was additionally run on pe64-x86_64's own binary (three file sets, three outcomes, 2026-08-10). Neither was repeated on this leg: the Mac is a personal machine and was not reachable when the row was written, and inventing a per-arch re-derivation we did not run would be worse than saying so. ⚠ NOT to be fixed by patching the staged tree or excluding the file: the corpus is unmodified upstream and the harness surviving this is the property we want.",
+          "anchor": "D-UPSTREAM-SQLITE-SESSIONCONFLICT-LEAKS-THE-GLOBAL-LOG-CALLBACK" }
+      ],
+      "build": {
+        "$recipeTransformComment": "★ `none` IS RIGHT AFTER ALL, AND THE FIX WENT SOMEWHERE ELSE — read `$configureAnswersComment` at the top of this file first. THE HISTORY IS KEPT because the diagnosis in it was correct and only the REMEDY moved: this comment used to say `none` IS WRONG HERE. TF-C117 was the cycle that could finally see the failure (before it, the leg died at Step 6 for want of a Darwin libtcl on a non-Mac), and ✔MEASURED the fixture then failed with 8 diagnostics whose load-bearing ones were `error[S0001] got pread64`, `got pwrite64` and `error[S0006] got off64_t` — LINUX names, inherited from the deriving host. ⛔ ONE THING IT SAID WAS SIMPLY FALSE and is corrected here rather than quietly dropped: it named `HAVE_OFF64_T` as an inherited configure answer. THERE IS NO SUCH MACRO IN SQLITE. `off64_t` arrives through `HAVE_PREAD64` + `HAVE_PWRITE64` → `os_unix.c` `USE_PREAD64` → the `osPread64`/`osPwrite64` macro casts; the three are ONE defect with ONE cause, and a reader hunting for `HAVE_OFF64_T` would find nothing and conclude the chain was unexplained. WHY `none` STAYS: the leak is not on the command line, it is INSIDE a header (`_HAVE_SQLITE_CONFIG_H` → `sqliteInt.h` → `#include \"sqlite_cfg.h\"`), so a recipe transform is the wrong instrument — the only transform that could reach it is the blunt one that drops `_HAVE_SQLITE_CONFIG_H` wholesale, and that discards ~49 CORRECT answers to fix 3 wrong ones (rejected, with its measured consequences, in `$configureAnswersComment`). The leg instead DECLARES its three answers below and the drivers stage it a Darwin `sqlite_cfg.h`. ✔MEASURED 2026-08-05 on the real 103-TU CLI manifest at `--config=release`, from a WINDOWS host: recipe verbatim → 4 errors (`off64_t`×2, `pread64`, `pwrite64`); with the staged header → ZERO, and a real Mach-O arm64 executable. ★ Without the leak sqlite self-configures Darwin CORRECTLY — `os_unix.c` keys on `__APPLE__`, which DSS already predefines for macho. (The `sysctlbyname`/`CTL_HW`/`HW_AVAILCPU`/`HW_NCPU` diagnostics that used to accompany these were a SEPARATE and genuine gap — a Darwin `<sys/sysctl.h>` descriptor DSS did not ship — and have since been closed.)",
+        "recipeTransform": "none",
+        "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
+        "$configureAnswersComment": "★ THE LEG THAT MADE THE CASE — see the top-level $configureAnswersComment for the whole chain. All three are FALSE on Darwin, and all three are MEASURED on the operator's real Mac (macOS 26.5.2, arm64) TWICE OVER: once as that Mac's OWN `./configure`-generated `sqlite_cfg.h` (`/* #undef HAVE_PREAD64 */`, `/* #undef HAVE_PWRITE64 */`, `/* #undef HAVE_MALLOC_H */`), and once by re-running sqlite's own probe methodology against `/usr/bin/cc` — `pread64`/`pwrite64` LINK-FAIL (plain `pread`/`pwrite` LINK-OK), `malloc.h` HDR-MISS, `off64_t` TYPE-MISS, `off_t` TYPE-OK at 8 bytes. ⚠ `HAVE_MALLOC_H` has never actually fired: `mem1.c` reads `#if HAVE_MALLOC_H && HAVE_MALLOC_USABLE_SIZE`, and `HAVE_MALLOC_USABLE_SIZE` is absent on the deriving host too. It is declared anyway because it is the same leak from the same header, and 'it happens not to fire today' is not a reason to ship an answer that is false about this target.",
+        "configureAnswers": { "HAVE_PREAD64": false, "HAVE_PWRITE64": false, "HAVE_MALLOC_H": false },
+        "stackReserveBytes": 0,
+        "sharedLibFlags": ["-dynamiclib"],
+        "$sharedLibFormatComment": "★ THE FILE NAME AND THE FORMAT DISAGREE ON THIS TARGET, AND BOTH ARE RIGHT. The declared `loadExtHelperName` below is `libtestloadext.so` — sqlite's own choice, MEASURED, see its comment — while the object format is a `dylib`. DSS emits `<stem>.dylib` and the driver STAGES it under the name the corpus looks for; the extension in a Mach-O file's name has never been what makes it loadable. ✔MEASURED 2026-08-05 from a Windows host: 67,426 bytes, `Mach-O 64-bit arm64 dynamically linked shared library, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|NO_REEXPORTED_DYLIBS>`. ⚠ It has NOT been LOADED — there is no off-Mac loader for it, which is the same structural fact this leg's empty `launchers` list already declares. Emission is measured; loading is not, and is not claimed.",
+        "sharedLibFormat": "macho64-arm64-darwin-dylib",
+        "$loadExtHelperNameComment": "The `.so` spelling, on a Darwin target, is NOT a copy error. ✔MEASURED at test/loadext.test:26-32: the name is chosen from `tcl_platform(platform)` (`unix` on a Mac), and the `tcl_platform(os) eq Darwin` branch three lines down changes only the COMPILER FLAGS (`-dynamiclib`, which is what this leg's sharedLibFlags already say) — never the file name.",
+        "loadExtHelperName": "libtestloadext.so",
+        "targetCc": { "candidates": ["clang", "cc"], "package": "" },
+        "$librariesComment": "★ THIS LEG ACQUIRES ITS LIBRARIES (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER). It used to declare `host-system`, which on any non-Mac means 'hope this box has a Darwin libtcl' — i.e. it never built anywhere but a Mac, in flat contradiction of the harness's own contract that every leg is BUILT everywhere and only RUN is gated. MacPorts publishes unauthenticated-HTTPS binary archives, and the two we need are UNIVERSAL (one download carries both the arm64 and the x86_64 slice, which is why the sibling macho leg names the SAME url + digest and differs only in the slice it takes). ✔MEASURED 2026-08-04: 110/110 required symbols present on BOTH arches — all 102 `Tcl*` the testfixture imports, 0 missing, plus 8/8 zlib — so there is no eager-import hazard [[D-FFI-DESCRIPTOR-EAGER-IMPORT]].",
+        "libraries": {
+          "provider": "pinned-archive",
+          "$acquireComment": "`universal: true` is not a formality. ✔MEASURED: handed the UNIVERSAL file, DSS refuses it — `error[F_UnsupportedBinaryFormat] readImports: '<path>' is a Mach-O FAT/universal binary (big-endian fat_header magic 0xCAFEBABE or 0xCAFEBABF). v1 supports single-arch Mach-O only — slice the required arch first (e.g. `lipo -thin arm64 in.dylib -output out.dylib`). Anchor D-FF1-MACHO-FAT.` — and handed the thin arm64 slice OF THE SAME FILE it succeeds with rc=0. So slicing is the contract that anchor states, performed here because the harness is the only layer that knows which arch this leg wants (`readImports(path, reporter)` takes no target). ⚠ THE REFUSAL'S SPELLING CHANGED INSIDE THIS CYCLE, and the first draft of this comment quoted the older one: `guessFormat` read the fat magic little-endian, so a real universal binary could never reach the arm above and fell into the unknown-magic catch-all instead — the anchor's own remediation was unreachable. That detection bug was fixed in the same cycle; the quote above is the post-fix message. ★ Slicing would be right even if DSS read fat files: a leg's build input should be a library FOR THAT LEG'S TARGET, not a container that also holds a foreign architecture, or 'which architecture did this leg resolve against?' has no answer from the input.",
+          "$importNameComment": "★★ THE TRAP, AND WHY THE ANSWER IS `@loader_path` AND NOT A SYSTEM PATH. Both archives' LC_ID_DYLIB reads `/opt/local/lib/…` (✔MEASURED: `/opt/local/lib/libtcl8.6.dylib`, `/opt/local/lib/libz.1.dylib`), and DSS records a resolved library's EMBEDDED identity as the LC_LOAD_DYLIB — so linking naively produces a Mach-O that demands MacPorts at that prefix on the target Mac. That is a dyld LOAD failure, not a build error, so nothing on this host would catch it. The obvious fix is to record the system path instead — and this project cannot HONESTLY do that for Tcl: nobody here has measured what a Mac carries at /usr/lib for Tcl 8.6, and this repo's own darwin path installs Tcl through Homebrew, whose current `tcl-tk` is 9.x — so `/usr/lib/libtcl8.6.dylib` would be an unverified claim about someone else's machine, and a wrong one costs a dyld failure. `@loader_path/<name>` is TRUE BY CONSTRUCTION: dyld resolves it against the directory holding the executable, the driver stages the acquired dylib there beside the artefact, and the result assumes NOTHING about the target Mac's prefix layout or Tcl version. ⚠ For zlib a system path WOULD be defensible — this harness has measured that `/usr/lib/libz.1.dylib` resolves out of the dyld shared cache even though it cannot be opened as a file (see build-and-test.sh's darwin branch) — but mixing the two policies inside one artefact buys nothing and makes the rule harder to state. Flipping either back to a system path is a one-line edit HERE, which is the point of declaring it.",
+          "$scriptLibraryComment": "★★ THE DYLIB IS NOT THE WHOLE LIBRARY — D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY, and this is the declaration that closed it. ✔MEASURED on the operator's Mac at 11e97e0e: this leg's testfixture BUILDS (189 TUs, 0 diagnostics) and runs an individual `.test` file correctly (select1 → 0 errors out of 192), and then the TIER driver aborts INSTANTLY with `Can't find a usable init.tcl in the following directories: /opt/local/lib/tcl8.6 …` raised from `interp create tinterp`. `permutations.test` runs every unit in a fresh SLAVE interpreter and `interp create` re-enters `tclInit`, which needs Tcl's SCRIPT LIBRARY; the MAIN interpreter is already initialised when a directly-named file is sourced, which is why one path passed and the other could not. The acquired dylib bakes in `/opt/local/lib/tcl8.6` — MacPorts' own prefix — and MacPorts is not installed on that Mac; only the dylib was ever downloaded. ⇒ the SAME pinned archive also carries the scripts (✔MEASURED: 225 files, 4 subdirectories, ZERO symlinks under `opt/local/lib/tcl8.6/`, 1,948,034 bytes, `init.tcl` among them), so they are staged from it, pinned by a whole-tree digest, and handed to the drivers as `scriptLibraryDir` for TCL_LIBRARY. ⛔ NOT the host's Homebrew `tcl-tk@8` scripts: that works on ONE Mac, reintroduces exactly the host-dependence this arc exists to end, and pairs an 8.6.18 script library with a MacPorts 8.6.17 binary on nothing but a version-number coincidence.",
+          "acquire": {
+            "archives": [
+              {
+                "url": "https://packages.macports.org/tcl/tcl-8.6.17_0+corefoundation+threads+universal.darwin_24.arm64-x86_64.tbz2",
+                "sha256": "47efa8a687d614d8c3c1c4bca19cfe9f1e95efd093ee3f31b9ff1c6d43306d0f",
+                "archiveFormat": "tar.bz2",
+                "$embeddedPathsComment": "EVERY absolute path this dylib carries, listed ONCE against a PINNED digest so it cannot drift under the declaration — the general guard from the anchor above. ✔MEASURED 2026-08-06: 14 tokens, of which 4 are the loader's own (LC_ID_DYLIB, LC_LOAD_DYLIB ×3) and are excused by the resolver from the file itself. The remaining 10 are here. Exactly ONE is runtime data, and it is the one that cost the corpus.",
+                "members": [
+                  { "member": "opt/local/lib/libtcl8.6.dylib", "as": "libtcl8.6.dylib",
+                    "universal": true, "importName": "@loader_path/libtcl8.6.dylib",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [
+                      { "path": "/opt/local/lib/tcl8.6", "kind": "runtime-data", "role": "tclScriptLibrary" },
+                      { "path": "/opt/local/lib", "kind": "inert", "$why": "MacPorts' libdir, reported through `tcl_pkgPath`/`tcl_library` for a package search that this fixture never performs — the testfixture loads no Tcl EXTENSION (its own commands are compiled in), and the one directory `tclInit` MUST read is declared runtime-data above." },
+                      { "path": "/opt/local/bin", "kind": "inert", "$why": "TCL_PREFIX/bin, reported through `tcl_platform`/`info nameofexecutable` fallbacks. Nothing in the corpus execs out of it." },
+                      { "path": "/opt/local/include", "kind": "inert", "$why": "TCL_INCLUDE_SPEC, a BUILD-time answer baked in for tclConfig.sh consumers. This harness stages its own tcl.h (see the top-level Tcl coherence check) and never reads it." },
+                      { "path": "/opt/local/share/man", "kind": "inert", "$why": "the manual page directory, from the same tclConfig.sh block. No code path in a Tcl interpreter reads it." },
+                      { "path": "/usr/bin", "kind": "inert", "$why": "the default PATH element Tcl's `exec` falls back on. A TARGET path that exists on every Mac, not a packager path — nothing to stage." },
+                      { "path": "/dev/null", "kind": "inert", "$why": "`exec`'s redirection sink. A device on the target, not data we could ship." },
+                      { "path": "/dev/tty", "kind": "inert", "$why": "the controlling terminal, opened by `tcl_interactive` prompting. Same category as /dev/null." },
+                      { "path": "/var/tmp", "kind": "inert", "$why": "the fallback temp directory for `file tempfile` when TMPDIR is unset. A target location, not shipped data." },
+                      { "path": "/..namedfork/rsrc", "kind": "inert", "$why": "the HFS+ resource-fork suffix Tcl appends when opening a file's resource fork; a magic SUFFIX, not a directory anyone stages." }
+                    ],
+                    "dataDirs": [
+                      { "member": "opt/local/lib/tcl8.6", "as": "tcl8.6", "role": "tclScriptLibrary" }
+                    ] }
+                ]
+              },
+              {
+                "$memberComment": "The archive ships `libz.1.dylib` as a SYMLINK to `libz.1.3.2.dylib`. The declaration names the link, and the resolver follows it inside the archive and materialises the TARGET's bytes under the `as` name — a symlink is not creatable on Windows without privilege and is not a library DSS can read, so one declaration has to work on every host.",
+                "url": "https://packages.macports.org/zlib/zlib-1.3.2_0+universal.darwin_24.arm64-x86_64.tbz2",
+                "sha256": "0461347fb0ac90cefe12e1be1bcc16d0b159649f322b2c3e03e9bcf33476bbc2",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "opt/local/lib/libz.1.dylib", "as": "libz.1.dylib",
+                    "universal": true, "importName": "@loader_path/libz.1.dylib",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "$embeddedPathsComment": "EMPTY, and measured rather than assumed: the only two absolute paths in this dylib are its own LC_ID_DYLIB and LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib, both excused by the resolver as the loader's business. zlib reads no data directory — which is exactly why it is the CONTROL for the Tcl declaration above.",
+                    "embeddedPaths": [],
+                    "dataDirs": [] }
+                ]
+              }
+            ]
+          },
+          "tclNames": ["libtcl8.6.dylib", "libtcl9.0.dylib", "libtcl.dylib"],
+          "zNames": ["libz.dylib", "libz.1.dylib"],
+          "searchPaths": []
+        }
+      }
+    },
+
+    {
+      "label": "macho64-x86_64",
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "$launchersComment": "Rosetta 2 runs an x86_64 Mach-O on Apple Silicon TRANSPARENTLY, i.e. with no launcher command — but this harness will not model that as 'native', because it is not: it depends on a translation layer that may be absent. `arch -x86_64` is the declared, observable launcher; `arch` is present on every Mac, so a Rosetta-less machine fails at RUN time with a real error instead of a silent pass.",
+      "runOn": ["darwin"],
+      "launchers": [
+        { "hostOs": "darwin", "hostArch": "arm64", "command": ["arch", "-x86_64"], "env": {},
+          "pathTranslation": "none", "envTransfer": "inherit",
+          "runFilesystem": "driver",
+          "$requiresComment": "★ THIS ENTRY IS WHY `requires` IS NOT A qemu-SHAPED KEY. The $launchersComment above already states the problem in prose — `arch` is present on every Mac, so a Rosetta-less machine fails at RUN time with a real error instead of a silent pass — and a run-time error on a translation layer is precisely the failure this key turns into a NAMED, pre-flight prerequisite with a remedy attached.",
+          "requires": [
+            { "kind": "directory", "path": "/Library/Apple/usr/libexec/oah",
+              "provides": "the Rosetta 2 translation runtime, without which `arch -x86_64` cannot execute an x86_64 image on Apple Silicon at all",
+              "why": "DOCUMENTED — Apple installs the Rosetta 2 runtime under /Library/Apple/usr/libexec/oah (`oah` is the translator's own directory) and it is absent until an operator opts in. NOT MEASURED: the only Apple Silicon machine in this project's record belongs to the operator and its macOS results are user-reported, never taken here. ⚠ `arch` itself is NOT declared as a row — it ships in /usr/bin on every macOS and it IS this entry's argv[0], so `launcher_available` already answers for it; what it cannot answer for is whether the thing behind it exists.",
+              "install": "softwareupdate --install-rosetta --agree-to-license" }
+          ] }
+      ],
+      "$confoundsComment": "See the top-level $confoundsComment. ⚠ THIS LEG HAS TWO DATA IN THE ENTIRE RECORD — a veryquick run on 2026-08-06 (1 error out of 331,741 under Rosetta) and one on 2026-08-07 (2 errors out of 394,035, after SQLITE_ENABLE_SESSION widened the corpus) — so its rows are the weakest in the catalogue and are labelled that way in their own `earnedOn` fields rather than in a comment a driver never prints. ⓘ THE COUNT IN THIS SENTENCE IS LOAD-BEARING AND WAS WRONG FOR THREE DAYS: it said 'EXACTLY ONE DATUM' after a second run had already happened. Update it when this leg runs again, or it becomes the thing it warns about. The two dyld rows are DECLARED BY MECHANISM: this leg loads through the SAME dyld, on the SAME machine and the SAME macOS build, as macho64-arm64 which earned them with a reference-fixture control — but no `full` tier has ever been run HERE, so nothing below has been independently re-measured on this leg. ⛔ NOTE WHAT IS DELIBERATELY ABSENT: `emulated:^writecrash-`. This leg reaches its target through `arch -x86_64` (Rosetta), so the resolver's run mode is `launched` and an `emulated`-scoped pattern WOULD match here — but the writecrash artefact is a property of QEMU-USER injecting a signal message into captured output, and Rosetta has never been shown to inject anything. That row belongs to elf64-arm64 and stays there; a per-leg ledger is precisely what stops a scope name from carrying it across.",
+      "confounds": [
+        { "pattern": "^zipfile-25\\.0$", "scope": "any",
+          "earnedOn": "macho64-x86_64 under Rosetta on the operator's Apple Silicon Mac — MEASURED HERE, and it is this leg's ONLY recorded failure",
+          "earnedAt": "2026-08-06",
+          "mechanism": "The upstream symlink.test testdir leak — see the elf64-x86_64 row for the one-binary, three-outcome filesystem probe that rules out codegen; it reproduces on every POSIX target because the load-bearing behaviour is fopen() on a DIRECTORY succeeding. MEASURED HERE: 1 error out of 331,741 tests, and it was this test.",
+          "anchor": "D-SQLITE-ZIPFILE25-SYMLINK-TESTDIR-LEAK" },
+        { "pattern": "^loadext-2\\.1$", "scope": "any",
+          "earnedOn": "macho64-arm64 (reference-fixture control, macOS 26.5.2 build 25F84) — NOT independently re-measured on THIS leg, which has never run a `full` tier",
+          "earnedAt": "2026-07-31 (TF-C103, on the sibling leg)",
+          "mechanism": "The macOS 26.5.2 dyld error-string change loadext.test:64-65 hardcodes a regex against — see the macho64-arm64 row for the full mechanism and the reference-fixture control that failed the same two names with NO DSS-compiled code in the binary. ★ WHY THIS IS DECLARED ON A LEG THAT HAS NOT MEASURED IT, stated plainly rather than hidden: the mechanism is what DYLD PRINTS, and both macho legs are loaded by the SAME dyld on the SAME machine and OS build — the target ARCHITECTURE is not on that path. This is the narrowest defensible transfer in the catalogue and it is still a transfer; re-measure it the first time this leg runs a `full` tier, and if it does not appear, DELETE this row.",
+          "anchor": "D-SQLITE-LOADEXT-MACOS26-DLERROR-FORMAT" },
+        { "pattern": "^loadext-2\\.2$", "scope": "any",
+          "earnedOn": "macho64-arm64 (reference-fixture control, macOS 26.5.2 build 25F84) — NOT independently re-measured on THIS leg, which has never run a `full` tier",
+          "earnedAt": "2026-07-31 (TF-C103, on the sibling leg)",
+          "mechanism": "The second of the two names in the macOS 26.5.2 dyld-string change — see this leg's ^loadext-2\\.1$ row for why a same-dyld transfer is declared here at all, and for the instruction to delete both rows if a `full` tier on this leg does not reproduce them.",
+          "anchor": "D-SQLITE-LOADEXT-MACOS26-DLERROR-FORMAT" },
+        { "pattern": "^sessionnoact-4\\.3$", "scope": "any",
+          "earnedOn": "macho64-x86_64 under Rosetta on the operator's Apple Silicon Mac — OBSERVED HERE INDEPENDENTLY. ★ UNLIKE THE TWO dyld ROWS ABOVE, THIS ONE IS NOT A SAME-MACHINE TRANSFER FROM THE SIBLING LEG: this leg ran it and this leg failed it, with its own verbatim values in the run output.",
+          "earnedAt": "2026-08-07 (observed here); declared 2026-08-10",
+          "mechanism": "The SAME upstream test-isolation bug root-caused on elf64-x86_64 — `ext/session/sessionconflict.test:25` calls `test_sqlite3_log log`, i.e. sqlite3_config(SQLITE_CONFIG_LOG), PROCESS-GLOBAL C state registering a callback by the NAME of a Tcl proc, and never unregisters, unlike session3.test (:36, :211) and sessionat.test (:33, :306). Each .test file runs in a FRESH slave interpreter, so a later file that provokes a log message fires the callback into an interpreter with no such proc. CONFIRMED HERE BY THE FAILURE VALUES, NOT BY THE TEST NAME: `expected: []` / `got: [invalid command name \"log\"]`, byte-identical to the observation on all four sibling legs — a TCL interpreter error, never a wrong value. ⓘ THE ROSETTA LAYER IS NOT ON THIS PATH AND THE SCOPE SAYS SO: `any`, not `emulated`. The cause is Tcl-level and target-independent, which is exactly why the same text appears on two architectures, three object formats and three operating systems; scoping it to the translation layer would imply Rosetta is load-bearing when nothing shows that it is. ★★ WHAT IS EARNED HERE IS THE OBSERVATION, NOT A CONTROL. The compiler control is the mechanism's, run on elf64-x86_64 (DSS and gcc reference fixtures, byte-identical `1 errors out of 40` on the pair, both passing the subject alone and the session3 pair); an ORDER control of the same shape was run on pe64-x86_64's own binary 2026-08-10. Neither was repeated here — the Mac is a personal machine and was not reachable when the row was written. ⚠ NOT to be fixed by patching the staged tree or excluding the file: the corpus is unmodified upstream and the harness surviving this is the property we want.",
+          "anchor": "D-UPSTREAM-SQLITE-SESSIONCONFLICT-LEAKS-THE-GLOBAL-LOG-CALLBACK" }
+      ],
+      "build": {
+        "recipeTransform": "none",
+        "zconfGuards": { "Z_HAVE_UNISTD_H": true, "Z_HAVE_STDARG_H": true },
+        "$configureAnswersComment": "Same target OS as macho64-arm64, so the SAME three answers and the SAME staged sqlite_cfg.h — the stage key is the TARGET OS (see the top-level $configureAnswersComment), and the measurements behind these values were taken on that Mac's arm64 slice. Nothing here is arch-dependent: `pread64`/`pwrite64` are glibc names and `<malloc.h>` a glibc/Microsoft header, and Darwin has none of the three on either architecture. ✔MEASURED 2026-08-05 from a WINDOWS host: with the staged Darwin header this leg's CLI compiles with ZERO errors and links a real x86_64 Mach-O executable.",
+        "configureAnswers": { "HAVE_PREAD64": false, "HAVE_PWRITE64": false, "HAVE_MALLOC_H": false },
+        "stackReserveBytes": 0,
+        "sharedLibFlags": ["-dynamiclib"],
+        "$sharedLibFormatComment": "See macho64-arm64's $sharedLibFormatComment — same story, other slice. ✔MEASURED 2026-08-05 from a Windows host: 17,890 bytes, a single-arch Mach-O 64 x86_64 MH_DYLIB. Not loaded here, for the same reason, and not claimed to have been.",
+        "sharedLibFormat": "macho64-x86_64-darwin-dylib",
+        "loadExtHelperName": "libtestloadext.so",
+        "targetCc": { "candidates": ["clang", "cc"], "package": "" },
+        "$librariesComment": "The SAME two MacPorts archives as macho64-arm64 — same url, same pinned digest — because they are UNIVERSAL. What differs is only which slice this leg takes, and that is DERIVED from the leg's own target arch rather than spelled here (see harness_legs.py MACHO_CPU_TYPES). The download is content-addressed by its digest, so the two legs share one fetch and the second is a cache hit with no network at all.",
+        "libraries": {
+          "provider": "pinned-archive",
+          "$importNameComment": "See macho64-arm64's $importNameComment — same trap, same answer, and deliberately the same policy on both macho legs so the artefact's dependency shape does not depend on which architecture it was built for.",
+          "$scriptLibraryComment": "See macho64-arm64's $scriptLibraryComment for the whole story (D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY). The scripts are ARCHITECTURE-INDEPENDENT `.tcl` text, so this leg stages the SAME tree from the SAME pinned archive — into its OWN cache directory, because a leg's staged inputs are that leg's, and a shared directory would make 'which leg staged this?' unanswerable. ✔MEASURED 2026-08-06: the two slices' embedded path sets are IDENTICAL (14 tokens each), which is why the declaration below is identical too.",
+          "acquire": {
+            "archives": [
+              {
+                "url": "https://packages.macports.org/tcl/tcl-8.6.17_0+corefoundation+threads+universal.darwin_24.arm64-x86_64.tbz2",
+                "sha256": "47efa8a687d614d8c3c1c4bca19cfe9f1e95efd093ee3f31b9ff1c6d43306d0f",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "opt/local/lib/libtcl8.6.dylib", "as": "libtcl8.6.dylib",
+                    "universal": true, "importName": "@loader_path/libtcl8.6.dylib",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [
+                      { "path": "/opt/local/lib/tcl8.6", "kind": "runtime-data", "role": "tclScriptLibrary" },
+                      { "path": "/opt/local/lib", "kind": "inert", "$why": "MacPorts' libdir, reported through `tcl_pkgPath`/`tcl_library` for a package search that this fixture never performs — the testfixture loads no Tcl EXTENSION (its own commands are compiled in), and the one directory `tclInit` MUST read is declared runtime-data above." },
+                      { "path": "/opt/local/bin", "kind": "inert", "$why": "TCL_PREFIX/bin, reported through `tcl_platform`/`info nameofexecutable` fallbacks. Nothing in the corpus execs out of it." },
+                      { "path": "/opt/local/include", "kind": "inert", "$why": "TCL_INCLUDE_SPEC, a BUILD-time answer baked in for tclConfig.sh consumers. This harness stages its own tcl.h (see the top-level Tcl coherence check) and never reads it." },
+                      { "path": "/opt/local/share/man", "kind": "inert", "$why": "the manual page directory, from the same tclConfig.sh block. No code path in a Tcl interpreter reads it." },
+                      { "path": "/usr/bin", "kind": "inert", "$why": "the default PATH element Tcl's `exec` falls back on. A TARGET path that exists on every Mac, not a packager path — nothing to stage." },
+                      { "path": "/dev/null", "kind": "inert", "$why": "`exec`'s redirection sink. A device on the target, not data we could ship." },
+                      { "path": "/dev/tty", "kind": "inert", "$why": "the controlling terminal, opened by `tcl_interactive` prompting. Same category as /dev/null." },
+                      { "path": "/var/tmp", "kind": "inert", "$why": "the fallback temp directory for `file tempfile` when TMPDIR is unset. A target location, not shipped data." },
+                      { "path": "/..namedfork/rsrc", "kind": "inert", "$why": "the HFS+ resource-fork suffix Tcl appends when opening a file's resource fork; a magic SUFFIX, not a directory anyone stages." }
+                    ],
+                    "dataDirs": [
+                      { "member": "opt/local/lib/tcl8.6", "as": "tcl8.6", "role": "tclScriptLibrary" }
+                    ] }
+                ]
+              },
+              {
+                "url": "https://packages.macports.org/zlib/zlib-1.3.2_0+universal.darwin_24.arm64-x86_64.tbz2",
+                "sha256": "0461347fb0ac90cefe12e1be1bcc16d0b159649f322b2c3e03e9bcf33476bbc2",
+                "archiveFormat": "tar.bz2",
+                "members": [
+                  { "member": "opt/local/lib/libz.1.dylib", "as": "libz.1.dylib",
+                    "universal": true, "importName": "@loader_path/libz.1.dylib",
+                    "runtimeCopy": "staged-beside-artefact",
+                    "embeddedPaths": [],
+                    "dataDirs": [] }
+                ]
+              }
+            ]
+          },
+          "tclNames": ["libtcl8.6.dylib", "libtcl9.0.dylib", "libtcl.dylib"],
+          "zNames": ["libz.dylib", "libz.1.dylib"],
+          "searchPaths": []
+        }
+      }
+    }
+  ]
+}

@@ -19,7 +19,19 @@
 // emission surfaces even on the wrong host. The `runOn` array in
 // `expected.json` lists host OS names ("windows" / "linux" /
 // "darwin") on which the binary should spawn.
+//
+// A SKIP IS NOT A PASS (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT). Every
+// declared arm — every target x every optimizedPipelines arm — lands in an
+// `ArmVerdictLedger` with a named reason, and the entry prints the accounting
+// on stdout. Skips whose cause is the MACHINE rather than the manifest (a
+// declared `emulator` that is not on PATH) are a warning by default and a hard
+// failure under `DSS_STRICT_ARM_VERDICTS=1`. The vocabulary, the strict parse
+// and the emulator lint are shared with the CLI-subprocess sibling
+// (`integrated_tests/runner.cpp`) via `tests/test_support/arm_verdict_ledger.hpp`
+// — a capability in one corpus harness and not the other is a silent harness
+// bug, which is how this defect survived in both for as long as it did.
 
+#include "arm_verdict_ledger.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -36,6 +48,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <optional>
 #include <set>
@@ -54,76 +67,17 @@ using namespace dss::test_support;
 
 namespace {
 
-[[nodiscard]] std::string currentHostOs() noexcept {
-#if defined(_WIN32)
-    return "windows";
-#elif defined(__APPLE__)
-    return "darwin";
-#elif defined(__linux__)
-    return "linux";
-#else
-    return "unknown";
-#endif
-}
-
-// D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): host ARCH detection, returning the
-// SAME identifier strings the target configs use as their `name` (so a
-// spec's target prefix can be compared directly). Used by the cross-
-// arch run gate: a binary whose target arch differs from the host's
-// needs an emulator.
-[[nodiscard]] std::string currentHostArch() noexcept {
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return "arm64";
-#elif defined(__x86_64__) || defined(_M_X64)
-    return "x86_64";
-#else
-    return "unknown";
-#endif
-}
-
-// The target portion of a manifest spec ("arm64:elf64-aarch64-linux-exec"
-// → "arm64"). This IS the arch identifier compared against
-// currentHostArch().
-[[nodiscard]] std::string specTargetArch(std::string const& spec) {
-    auto const colon = spec.find(':');
-    return colon == std::string::npos ? spec : spec.substr(0, colon);
-}
-
-// Resolve an executable name against $PATH (e.g. "qemu-aarch64"),
-// returning its full path or "" if not found. Used to gate cross-arch
-// example runs on emulator availability — absent ⇒ SkippedCrossHost
-// (never a test failure). AGNOSTIC: the emulator name is supplied by
-// the manifest, not hardcoded here.
-[[nodiscard]] std::string findOnPath(std::string const& exe) {
-    char const* const pathEnv = std::getenv("PATH");
-    if (pathEnv == nullptr) return {};
-#if defined(_WIN32)
-    char const sep = ';';
-    std::vector<std::string> const exts = {"", ".exe"};
-#else
-    char const sep = ':';
-    std::vector<std::string> const exts = {""};
-#endif
-    std::string const path = pathEnv;
-    std::size_t start = 0;
-    while (start <= path.size()) {
-        auto const end = path.find(sep, start);
-        std::string const dir = path.substr(
-            start, end == std::string::npos ? std::string::npos : end - start);
-        if (!dir.empty()) {
-            for (auto const& ext : exts) {
-                fs::path const cand = fs::path(dir) / (exe + ext);
-                std::error_code ec;
-                if (fs::exists(cand, ec) && fs::is_regular_file(cand, ec)) {
-                    return cand.generic_string();
-                }
-            }
-        }
-        if (end == std::string::npos) break;
-        start = end + 1;
-    }
-    return {};
-}
+// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: `currentHostOs`, `currentHostArch`,
+// `specTargetArch` and `findOnPath` used to live here AND, byte-identically, in
+// `integrated_tests/runner.cpp`. They now come from the shared
+// `arm_verdict_ledger.hpp`, so the two corpus harnesses cannot disagree about
+// what host they are on or whether a declared emulator exists.
+using ::dss::test_support::ArmVerdict;
+using ::dss::test_support::ArmVerdictLedger;
+using ::dss::test_support::currentHostArch;
+using ::dss::test_support::currentHostOs;
+using ::dss::test_support::findOnPath;
+using ::dss::test_support::specTargetArch;
 
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): one PREREQUISITE artifact a
 // target build depends on — a LIBRARY the runner builds FIRST, then threads
@@ -566,21 +520,26 @@ buildPipeline(OptimizedArm const& arm, fs::path const& manifestPath) {
     return p;
 }
 
-// Per-arm compile+spawn outcome. The tri-state distinguishes the
-// three reasons the caller might receive no exit-code/stdout pair
-// to compare. Conflating them (the original `skipped: bool` shape)
-// would let a baseline that secretly failed to compile produce a
-// silently-bypassed differential-verify assertion.
-enum class ArmStatus {
-    Ran,              // compile + spawn succeeded; exitCode + capturedStdout are populated
-    SkippedCrossHost, // compile succeeded; binary exists; runOn excludes this host (expected)
-    Poisoned,         // compile failed OR artifact missing — every EXPECT_ already fired
-};
-
+// Per-arm compile+spawn outcome. The states distinguish every reason the
+// caller might receive no exit-code/stdout pair to compare. Conflating them
+// (the original `skipped: bool` shape) would let a baseline that secretly
+// failed to compile produce a silently-bypassed differential-verify assertion.
+//
+// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the single `SkippedCrossHost` that
+// used to cover all three skip reasons is GONE. It was the defect: a
+// `runOn`-excluded arm (structural, expected), an arm whose manifest declares
+// no emulator (a manifest defect) and an arm whose declared emulator is absent
+// from THIS machine (environmental, and the one strict mode reds) are three
+// different facts, and one name for them made all three unreportable. The
+// verdict vocabulary now lives in the shared `ArmVerdict`.
 struct ArmResult {
-    ArmStatus   status = ArmStatus::Poisoned;
+    ArmVerdict  verdict = ArmVerdict::Poisoned;
     int         exitCode = 0;
     std::string capturedStdout;
+    // WHY, in the manifest's own vocabulary — carried into the ledger so the
+    // summary can name the runOn list / the missing emulator rather than
+    // reprint a bare status.
+    std::string detail;
 };
 
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build ONE
@@ -701,7 +660,7 @@ compileAndRunArm(fs::path const& exampleDir,
             ADD_FAILURE() << "manifest source '" << s
                           << "' not found in example dir "
                           << exampleDir.generic_string();
-            armResult.status = ArmStatus::Poisoned;
+            armResult.verdict = ArmVerdict::Poisoned;
             return armResult;
         }
         srcPaths.push_back(sp.generic_string());
@@ -721,7 +680,7 @@ compileAndRunArm(fs::path const& exampleDir,
         auto depArtifact = buildDependencyArtifact(dep, scratch.path(), outDir,
                                                    exampleDir, m.language);
         if (!depArtifact.has_value()) {
-            armResult.status = ArmStatus::Poisoned;
+            armResult.verdict = ArmVerdict::Poisoned;
             return armResult;
         }
         resolveLibs.push_back(std::move(*depArtifact));
@@ -759,7 +718,7 @@ compileAndRunArm(fs::path const& exampleDir,
         << "expected zero error-severity diagnostics for spec="
         << t.spec << " arm=" << armLabel << diagDump.str();
     if (rc != 0 || rep.errorCount() != 0u) {
-        armResult.status = ArmStatus::Poisoned;
+        armResult.verdict = ArmVerdict::Poisoned;
         return armResult;
     }
 
@@ -767,7 +726,7 @@ compileAndRunArm(fs::path const& exampleDir,
     if (!fs::exists(artifactPath)) {
         ADD_FAILURE() << "artifact missing at " << artifactPath.generic_string()
                       << " (arm=" << armLabel << ")";
-        armResult.status = ArmStatus::Poisoned;
+        armResult.verdict = ArmVerdict::Poisoned;
         return armResult;
     }
     // Use the no-throw overload — a non-existent path past the
@@ -782,13 +741,13 @@ compileAndRunArm(fs::path const& exampleDir,
     if (sz_ec) {
         ADD_FAILURE() << "file_size failed: " << sz_ec.message()
                       << " (arm=" << armLabel << ")";
-        armResult.status = ArmStatus::Poisoned;
+        armResult.verdict = ArmVerdict::Poisoned;
         return armResult;
     }
     if (sz == 0u) {
         ADD_FAILURE() << "artifact is empty: " << artifactPath.generic_string()
                       << " (arm=" << armLabel << ")";
-        armResult.status = ArmStatus::Poisoned;
+        armResult.verdict = ArmVerdict::Poisoned;
         return armResult;
     }
 
@@ -796,12 +755,17 @@ compileAndRunArm(fs::path const& exampleDir,
     bool const shouldRun = std::any_of(t.runOn.begin(), t.runOn.end(),
         [&](std::string const& s) { return s == host; });
     if (!shouldRun) {
-        GTEST_LOG_(INFO) << "spec=" << t.spec
-                        << " arm=" << armLabel
-                        << " produced an artifact but runOn=["
-                        << (t.runOn.empty() ? "" : t.runOn.front())
-                        << "...] excludes host=" << host;
-        armResult.status = ArmStatus::SkippedCrossHost;
+        std::ostringstream why;
+        why << "runOn=[";
+        for (std::size_t i = 0; i < t.runOn.size(); ++i) {
+            if (i != 0) why << ',';
+            why << t.runOn[i];
+        }
+        why << "] excludes host=" << host;
+        GTEST_LOG_(INFO) << "spec=" << t.spec << " arm=" << armLabel
+                         << " produced an artifact but " << why.str();
+        armResult.verdict = ArmVerdict::SkippedByRunOn;
+        armResult.detail  = why.str();
         return armResult;
     }
 
@@ -809,27 +773,40 @@ compileAndRunArm(fs::path const& exampleDir,
     // the host OS; now reconcile the host ARCH. A binary whose target
     // arch differs from the host's cannot exec natively — it needs an
     // emulator (e.g. qemu-aarch64 for an AArch64 ELF on x86_64). The
-    // emulator is declared per-target in the manifest; if it isn't on
-    // PATH we SkippedCrossHost (never a failure — a host without the
-    // emulator simply can't run the cross-arch binary; the compile
-    // step already asserted clean on every host).
+    // emulator is declared per-target in the manifest.
+    //
+    // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the two outcomes below used to
+    // share one status and one shrug. They do not share a meaning. NO EMULATOR
+    // DECLARED is a property of the MANIFEST — no machine can fix it, and
+    // `lintDeclaredEmulators` reds it host-independently rather than leaving it
+    // to whichever leg happens to notice. EMULATOR MISSING is a property of
+    // this MACHINE — a developer without qemu still gets a green suite, while
+    // the gate sets DSS_STRICT_ARM_VERDICTS=1 and the same skip becomes a RED.
+    // Both are ledgered either way; neither can be read as a pass again.
     std::vector<std::string> launcherPrefix;
     if (std::string const targetArch = specTargetArch(t.spec);
         !targetArch.empty() && targetArch != currentHostArch()) {
         if (t.emulator.empty()) {
+            std::ostringstream why;
+            why << "target arch '" << targetArch << "' != host arch '"
+                << currentHostArch() << "' and the manifest declares no"
+                   " 'emulator'";
             GTEST_LOG_(INFO) << "spec=" << t.spec << " arm=" << armLabel
-                << " targets arch '" << targetArch << "' != host '"
-                << currentHostArch() << "' with no emulator declared — "
-                   "skipping run";
-            armResult.status = ArmStatus::SkippedCrossHost;
+                             << ' ' << why.str() << " — skipping run";
+            armResult.verdict = ArmVerdict::SkippedNoEmulatorDeclared;
+            armResult.detail  = why.str();
             return armResult;
         }
         auto const emuPath = findOnPath(t.emulator);
         if (emuPath.empty()) {
+            std::ostringstream why;
+            why << "declared emulator '" << t.emulator
+                << "' is not on PATH (target arch '" << targetArch
+                << "' != host arch '" << currentHostArch() << "')";
             GTEST_LOG_(INFO) << "spec=" << t.spec << " arm=" << armLabel
-                << " emulator '" << t.emulator
-                << "' not found on PATH — skipping cross-arch run";
-            armResult.status = ArmStatus::SkippedCrossHost;
+                             << ' ' << why.str() << " — skipping cross-arch run";
+            armResult.verdict = ArmVerdict::SkippedEmulatorMissing;
+            armResult.detail  = why.str();
             return armResult;
         }
         launcherPrefix.push_back(emuPath);
@@ -860,12 +837,13 @@ compileAndRunArm(fs::path const& exampleDir,
     // garbage. Without this, the differential-verify ASSERT_EQ would
     // compare two arms' bogus exit codes and could spuriously pass
     // when both arms time out (silent-bypass re-opens the very gap
-    // the ArmStatus tri-state was introduced to close).
+    // the ArmVerdict states were introduced to close).
     if (!result.spawned || result.timedOut) {
-        armResult.status = ArmStatus::Poisoned;
+        armResult.verdict = ArmVerdict::Poisoned;
+        armResult.detail  = result.spawned ? "spawn timed out" : "spawn failed";
         return armResult;
     }
-    armResult.status         = ArmStatus::Ran;
+    armResult.verdict        = ArmVerdict::Ran;
     armResult.exitCode       = result.exitCode;
     armResult.capturedStdout = result.capturedStdout;
     return armResult;
@@ -873,21 +851,36 @@ compileAndRunArm(fs::path const& exampleDir,
 
 void runOneTarget(fs::path const&        exampleDir,
                   ExampleManifest const& m,
-                  ExampleTarget const&   t) {
+                  ExampleTarget const&   t,
+                  std::string const&     exampleId,
+                  ArmVerdictLedger&      ledger) {
     ASSERT_FALSE(t.spec.empty())
         << "target spec missing in manifest";
     ASSERT_FALSE(t.artifact.empty())
         << "artifact filename missing in target";
 
     // Baseline arm: no pipeline override; compile_pipeline picks the
-    // default. Two non-Ran outcomes are distinguished:
+    // default. Non-Ran outcomes are distinguished by ArmVerdict:
     //   Poisoned → compile failed; EXPECT already fired; return.
-    //   SkippedCrossHost → compile clean; binary won't run on this
-    //                      host; arm-comparison is N/A → return.
+    //   Skipped* → compile clean; the binary won't run on this host for a
+    //              named reason; arm-comparison is N/A → return.
     auto const baseline = compileAndRunArm(exampleDir, m, t,
                                            /*pipelineOverride*/ nullptr,
                                            "baseline");
-    if (baseline.status != ArmStatus::Ran) {
+    ledger.record(exampleId, t.spec, "baseline", baseline.verdict,
+                  baseline.detail);
+    if (baseline.verdict != ArmVerdict::Ran) {
+        // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the declared optimized arms
+        // are NOT compiled when the baseline does not run (the early return is
+        // also what D-TEST-EXAMPLES-CROSS-HOST-RELEASE-ARM-NEVER-COMPILED owns).
+        // They are DECLARED work, so they get a verdict too rather than
+        // vanishing from the accounting — carrying the baseline's reason, and
+        // saying plainly that not even the compile was attempted.
+        for (auto const& arm : m.optimizedPipelines) {
+            ledger.record(exampleId, t.spec, arm.label, baseline.verdict,
+                          baseline.detail
+                              + " (compile not attempted: baseline arm did not run)");
+        }
         return;
     }
 
@@ -923,17 +916,24 @@ void runOneTarget(fs::path const&        exampleDir,
     for (auto const& arm : m.optimizedPipelines) {
         SCOPED_TRACE("optimizedPipeline=" + arm.label);
         auto const pipeline = buildPipeline(arm, exampleDir / "expected.json");
-        if (!pipeline.has_value()) continue;  // ADD_FAILURE already fired
+        if (!pipeline.has_value()) {
+            // ADD_FAILURE already fired; the arm still gets a verdict so the
+            // ledger's total matches the manifest's declared arm count.
+            ledger.record(exampleId, t.spec, arm.label, ArmVerdict::Poisoned,
+                          "optimizedPipelines arm could not be resolved");
+            continue;
+        }
         auto const optResult = compileAndRunArm(exampleDir, m, t, &*pipeline,
                                                  arm.label.c_str());
-        // The two arms must share the runOn outcome: both runOn-true
-        // (compare) or both runOn-false (skip). A SkippedCrossHost
-        // baseline already returned above; here the optimized arm
-        // must agree.
-        ASSERT_EQ(static_cast<int>(optResult.status),
-                  static_cast<int>(ArmStatus::Ran))
+        ledger.record(exampleId, t.spec, arm.label, optResult.verdict,
+                      optResult.detail);
+        // The two arms must share the run outcome: both ran (compare) or both
+        // skipped. A skipped baseline already returned above; here the
+        // optimized arm must agree.
+        ASSERT_EQ(static_cast<int>(optResult.verdict),
+                  static_cast<int>(ArmVerdict::Ran))
             << "differential-verify: optimized arm '" << arm.label
-            << "' status=" << static_cast<int>(optResult.status)
+            << "' verdict=" << armVerdictName(optResult.verdict)
             << " — baseline ran but optimized arm did not";
         ASSERT_EQ(optResult.exitCode, baseline.exitCode)
             << "differential-verify FAIL: optimized arm '" << arm.label
@@ -955,7 +955,19 @@ void runOneTarget(fs::path const&        exampleDir,
 // generically (code NAME + 1-based line:col) — no language/code hardcoded.
 void runErrorTarget(fs::path const&        exampleDir,
                     ExampleManifest const& m,
-                    ExampleTarget const&   t) {
+                    ExampleTarget const&   t,
+                    std::string const&     exampleId,
+                    ArmVerdictLedger&      ledger) {
+    // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: an expect-error arm is VERIFIED
+    // without ever being spawned — its assertion is the exact diagnostic set
+    // below, which is host-independent. Recorded up-front (rather than after
+    // the asserts) so that an ASSERT_ returning early still leaves the arm
+    // accounted for; a failed assertion is already the loud signal, and a
+    // MISSING ledger row would understate the declared work.
+    ledger.record(exampleId, t.spec, "expect-error",
+                  ArmVerdict::ExpectErrorAsserted,
+                  "compile must fail with the declared diagnostic set"
+                  " (nothing is spawned)");
     ASSERT_FALSE(t.spec.empty())
         << "expect-error target needs a 'spec' to drive the compile";
     // Single-source keeps position resolution unambiguous: one source
@@ -1060,15 +1072,71 @@ TEST(Examples, RunFromManifest) {
         << "expected.json missing in " << exampleDir.generic_string();
     auto const m = readManifest(manifestPath);
     ASSERT_FALSE(m.targets.empty()) << "manifest declared no targets";
+
+    // `<lang>/<name>` — the SAME example id the CLI-subprocess runner prints,
+    // so a ledger line from either harness is greppable the same way.
+    auto const exampleId =
+        exampleDir.parent_path().filename().generic_string() + "/"
+        + exampleDir.filename().generic_string();
+
+    ArmVerdictLedger ledger;
     for (auto const& t : m.targets) {
         SCOPED_TRACE("target spec=" + t.spec);
         // V2-4 Part C: an `expectDiagnostics` manifest asserts a failed
         // compile + positioned diagnostics; otherwise the source must
         // compile + run cleanly.
         if (m.expectDiagnostics.empty()) {
-            runOneTarget(exampleDir, m, t);
+            runOneTarget(exampleDir, m, t, exampleId, ledger);
         } else {
-            runErrorTarget(exampleDir, m, t);
+            runErrorTarget(exampleDir, m, t, exampleId, ledger);
+        }
+    }
+
+    // ── D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the ledger ───────────────
+    //
+    // EVERY declared arm is now in `ledger`, and it is printed unconditionally.
+    // ctest hides a passing test's stdout by default, which is precisely why
+    // the ledger is not the enforcement — the STRICT GATE below is. The print
+    // is what makes `ctest -V` / `--output-on-failure` answer "what did this
+    // entry actually verify?" without re-deriving it from the manifest.
+    std::cout << "[arm-ledger] " << exampleId << ": "
+              << ledger.renderCountsLine() << '\n'
+              << ledger.renderSkipDetail("[arm-ledger]   ");
+
+    // Nothing declared, nothing verified: an entry that produced NO verdict at
+    // all is the defect in its purest form, so it is a failure on every host
+    // regardless of strict mode.
+    ASSERT_GT(ledger.total(), 0u)
+        << "no arm produced a verdict for " << exampleId
+        << " — a ctest entry that verifies nothing must never read as a pass";
+
+    // Strict mode. ENVIRONMENTAL skips only: a `runOn` exclusion is the
+    // manifest's intent and a missing `emulator` KEY is a manifest defect the
+    // corpus lint reds host-independently, but "the manifest asked for a run
+    // and this machine could not supply it" is exactly the condition the gate
+    // must not be allowed to call green.
+    auto const strict = ::dss::test_support::readStrictArmVerdicts();
+    ASSERT_FALSE(strict.malformed)
+        << ::dss::test_support::kStrictArmVerdictsEnv << " has unexpected value '"
+        << strict.raw << "' — use '1' to require every declared arm to run,"
+           " unset (or '0') otherwise. Refusing to interpret it, because a"
+           " typo that silently disabled the gate is the failure this variable"
+           " exists to prevent.";
+    for (auto const& r : ledger.environmentalSkips()) {
+        if (strict.on) {
+            ADD_FAILURE()
+                << "STRICT ARM VERDICTS: " << r.example << " spec=" << r.spec
+                << " arm=" << r.arm << " did not run — " << r.detail
+                << ". This machine cannot supply what the manifest declared;"
+                   " install the emulator or unset "
+                << ::dss::test_support::kStrictArmVerdictsEnv << '.';
+        } else {
+            std::cout << "[arm-ledger] WARNING " << r.example
+                      << " spec=" << r.spec << " arm=" << r.arm
+                      << " did not run — " << r.detail
+                      << " (set "
+                      << ::dss::test_support::kStrictArmVerdictsEnv
+                      << "=1 to make this a failure)\n";
         }
     }
 }
@@ -1106,4 +1174,71 @@ TEST(RunHarnessStack, GenerousSpawnStackBumpIsWired) {
     EXPECT_GE(rl.rlim_cur, atLeast)
         << "RLIMIT_STACK soft limit must be raised toward 256 MiB";
 #endif
+}
+
+// ── D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR: the corpus emulator lint ───
+//
+// Registered as ONE extra ctest entry (`examples/manifest-emulator-lint`)
+// rather than running inside all 558 per-example entries: the question is
+// corpus-wide, the answer is identical for every entry, and re-deriving it 558
+// times would cost the suite a corpus re-walk per test for no new information.
+// The per-example entries exclude it by `--gtest_filter`; this entry selects it
+// and is handed the corpus ROOT as argv[1] (see tests/examples/CMakeLists.txt).
+//
+// It deliberately reuses THIS file's `readManifest` — the same parser the
+// in-process runner drives the corpus with — so the lint can never be reading a
+// different manifest shape than the run does. The subprocess runner's copy of
+// the lint does the same with ITS parser, and both call the one shared rule in
+// `lintDeclaredEmulators`.
+//
+// Host-independent BY CONSTRUCTION: nothing below consults the host OS or arch,
+// so the omission is caught on whichever leg the author happens to run rather
+// than only on a leg whose arch differs from the arm's.
+TEST(ExamplesCorpusLint, EveryArmAgreesWithItsSiblingsOnTheEmulator) {
+    auto const argv = ::testing::internal::GetArgvs();
+    ASSERT_GE(argv.size(), 2u)
+        << "the corpus lint entry needs the examples ROOT as argv[1]";
+    fs::path const corpusRoot = argv[1];
+    ASSERT_TRUE(fs::is_directory(corpusRoot))
+        << "argv[1] is not a directory: " << corpusRoot.generic_string();
+
+    std::vector<::dss::test_support::DeclaredArm> arms;
+    std::size_t manifestCount = 0;
+    for (auto const& langEntry : fs::directory_iterator(corpusRoot)) {
+        if (!langEntry.is_directory()) continue;
+        for (auto const& nameEntry : fs::directory_iterator(langEntry.path())) {
+            if (!nameEntry.is_directory()) continue;
+            auto const mp = nameEntry.path() / "expected.json";
+            if (!fs::exists(mp)) continue;
+            ++manifestCount;
+            auto const m = readManifest(mp);
+            auto const exampleId =
+                langEntry.path().filename().generic_string() + "/"
+                + nameEntry.path().filename().generic_string();
+            for (auto const& t : m.targets) {
+                for (auto const& osName : t.runOn) {
+                    arms.push_back({exampleId, t.spec, osName, t.emulator});
+                }
+            }
+        }
+    }
+    // A lint that silently linted nothing is the same class of defect as the
+    // skip it exists to catch.
+    ASSERT_GT(manifestCount, 0u)
+        << "no expected.json manifests under " << corpusRoot.generic_string()
+        << " — the lint measured nothing and must not report success";
+    ASSERT_FALSE(arms.empty())
+        << "no target arm in the corpus declares a runOn host";
+
+    auto const findings = ::dss::test_support::lintDeclaredEmulators(arms);
+    std::ostringstream report;
+    for (auto const& f : findings) {
+        report << "\n  " << (f.manifest.empty() ? "corpus" : f.manifest);
+        if (!f.spec.empty()) report << " spec=" << f.spec;
+        report << ": " << f.message;
+    }
+    EXPECT_TRUE(findings.empty())
+        << findings.size() << " manifest emulator finding(s) over "
+        << manifestCount << " manifests / " << arms.size()
+        << " declared (arm x runOn) pairs:" << report.str();
 }

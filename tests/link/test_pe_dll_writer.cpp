@@ -45,6 +45,7 @@
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link_test_support.hpp"
+#include "format_reject_support.hpp"   // countAtPath / rejectSummary
 
 #include <gtest/gtest.h>
 
@@ -57,6 +58,9 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -175,6 +179,25 @@ struct Loaded {
 }
 [[nodiscard]] Loaded loadShippedExec() {
     return loadShippedPe("pe64-x86_64-windows-exec");
+}
+
+// ★ The one door the EXEC-arm guards below use to reach `pe::encode`.
+// D-LK10-ENTRY entry gate (`resolveEntryFnIdx`): a format declaring
+// `processExit` contracts that its image entry is the synthesized
+// `_start` trampoline, which ONLY `linker::link` injects (it stamps
+// `imageEntryOverride = 0`). These are byte-level writer pins driven
+// straight at the walker, so they state the untrampolined intent
+// themselves — index 0 is what the pre-gate default gave implicitly.
+// The DLL sites deliberately keep calling `pe::encode` raw: an
+// override on a dll module is itself a fail-loud case, pinned by
+// PeDllWriter.ImageEntryOverrideFailsLoud below.
+[[nodiscard]] std::vector<std::uint8_t>
+encodeUntrampolined(AssembledModule           mod,  // by value: stamped copy
+                    TargetSchema const&       target,
+                    ObjectFormatSchema const& fmt,
+                    DiagnosticReporter&       reporter) {
+    mod.imageEntryOverride = std::size_t{0};
+    return pe::encode(mod, target, fmt, reporter);
 }
 
 // ── Module builders (mirror test_elf_dyn_writer.cpp) ─────────────
@@ -577,7 +600,7 @@ TEST(PeExecWriterExternSlot, DataItemRelocTargetingExternDataFailsLoudOnExecToo)
     auto loaded = loadShippedExec();
     AssembledModule mod = makeExternSlotModule(/*externIsData=*/true);
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(img.empty());
     EXPECT_GT(rep.errorCount(), 0u);
     EXPECT_TRUE(sawDiagnosticContaining(
@@ -639,7 +662,9 @@ namespace {
                                           = "8226") {
     std::string s = R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dll","kind":"pe"},
       )";
     s += extraTopLevel;
@@ -689,13 +714,30 @@ TEST(PeDllFormatJsonValidate, ExecWithImageFileDllBitRejected) {
     // The symmetric copy-paste guard: 0x2022 on an EXEC schema.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
       "format": {"name":"t-exe","kind":"pe"},
+      "$entryClusterComment": "D-LK10-ENTRY 2.13: validate() REJECTS an exec-flavored format declaring no processExit, and this fixture is pe.type=exec -- without the pair it would be rejected for a reason unrelated to the IMAGE_FILE_DLL bit it exists to pin. Verbatim from the shipped pe64-x86_64-windows-exec.format.json; inert here (a load test builds no trampoline).",
+      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 8226, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    // Pin THE diagnostic, not merely "something was wrong": `validate()`
+    // accumulates, so a bare has_value() check stays green when a future
+    // rule rejects this fixture for an unrelated reason -- which is how
+    // D-LK10-ENTRY 2.13 silently emptied this family once already. The
+    // `/processExit` zero-count is that anti-subsumption half.
+    EXPECT_EQ(countAtPath(r, "/pe/characteristics"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 // ── (7) Exec byte-surface guard ──────────────────────────────────
@@ -706,7 +748,7 @@ TEST(PeExecWriterExportGuard, ExecImageKeepsZeroExportDirectoryAndNoEdata) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeExportModule();   // symbols present!
     DiagnosticReporter rep;
-    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_FALSE(img.empty());
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(readU32LE(img, kExportDirOff), 0u);

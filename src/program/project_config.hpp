@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "program/cli_args.hpp"  // ResolveLibrarySpec (shared with the CLI surface)
 
 #include <cstdint>
 #include <filesystem>
@@ -60,6 +61,24 @@ namespace dss {
 //   * `resolveLibraries`— OPTIONAL library paths whose export surfaces resolve
 //                         this build's externs; the counterpart of the CLI
 //                         `--resolve-library <path>`. Empty when absent.
+//                         D-FFI-DECLARED-IMPORT-NAME: each entry is EITHER a
+//                         plain non-empty STRING (the path; nothing stated —
+//                         the byte-for-byte pre-existing form every shipped
+//                         manifest uses) OR an extended OBJECT
+//                         `{"path": <non-empty>, "importName": <non-empty>}`
+//                         that additionally STATES the runtime identity to
+//                         record (DT_NEEDED / LC_LOAD_DYLIB / PE import name),
+//                         outranking the binary's own embedded soname. The
+//                         object form is the manifest spelling of the CLI's
+//                         `<path>=<import-name>` suffix — and, having no
+//                         separator character, it is also the escape hatch for
+//                         a path that itself contains `=`.
+//                         `importName` is REQUIRED in the object form: an
+//                         object stating nothing is either a typo or noise,
+//                         and the plain string says it better. Both an unknown
+//                         key inside the object and a missing/empty member
+//                         fail loud `C_MalformedJson` — never a silent drop of
+//                         the very identity the entry exists to carry.
 //   The three flag arrays MERGE (append) onto the Program's current state in
 //   `Program::compileProject` — they ADD to any CLI-provided flags, never
 //   replace them. A present-but-empty `[]` is allowed (⇒ empty list).
@@ -79,7 +98,10 @@ struct DSS_EXPORT ProjectConfig {
     // above. Threaded (merge/append) by Program::compileProject.
     std::vector<std::string> includes;         // → setIncludeDirs      (CLI -I <dir>)
     std::vector<std::string> defines;          // → setUserDefines      (CLI --define NAME[=VALUE])
-    std::vector<std::string> resolveLibraries; // → setResolveLibraries (CLI --resolve-library <path>)
+    // → setResolveLibraries (CLI --resolve-library <path>[=<import-name>]).
+    // The SAME type the CLI parses into, so the declared import name cannot be
+    // lost at the manifest/CLI join where the two sources merge.
+    std::vector<ResolveLibrarySpec> resolveLibraries;
     // OPTIONAL per-PROGRAM stack reserve in BYTES (manifest key
     // `stackReserve`; D-SQLITE-PE64-FULL-TIER-STACK-DEPTH). nullopt iff the
     // field is absent ⇒ the object format's declared default stands.

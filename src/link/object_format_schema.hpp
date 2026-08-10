@@ -5,12 +5,14 @@
 #include "core/types/aggregate_layout.hpp"    // BitFieldStrategy (D-CSUBSET-BITFIELD-ABI-EXACT — the per-ABI bit-field rule, FORMAT-determined)
 #include "core/types/data_model.hpp"          // DataModel (FC3 c1 — the per-OS width triple)
 #include "core/types/grammar_schema.hpp"      // ConfigDiagnostic + LoadResult
+#include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE — the per-OS `#include` case rule)
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind + kObjectFormatKindTable
 #include "core/types/preprocess_config.hpp"   // PredefinedMacroDef (TF-C97 — the format's data-model predefines)
 #include "core/types/section_kind.hpp"        // SectionKind + kSectionKindTable
 #include "core/types/strong_ids.hpp"
 #include "core/types/symbol_attrs.hpp"        // SymbolBinding / SymbolVisibility (lifted to core/types for MIR-tier producers)
 #include "core/types/target_schema.hpp"       // EnumNameTable<E,N>
+#include "link/object_format_backend.hpp"     // D-LINK-…-KIND-IDENTITY-BRANCHES: the format-identity SEAM
 
 #include <array>
 #include <cstdint>
@@ -744,7 +746,24 @@ struct DSS_EXPORT ObjectFormatData {
     ObjectFormatSchemaId id{};
     std::string          name;         // "elf64-x86_64-linux" etc.
     std::string          version;
-    ObjectFormatKind     kind = ObjectFormatKind::Elf;
+
+    // ── D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES ──
+    //
+    // WAS: `ObjectFormatKind kind = ObjectFormatKind::Elf;` — a field that
+    // both (a) let 26 sites in this tier ask "which format is this?" and
+    // (b) DEFAULTED TO ELF, so a default-constructed `ObjectFormatData`
+    // silently claimed an ELF identity with `elf.machine == 0` (EM_NONE).
+    //
+    // NOW: the resolved backend, or `nullptr`. Null is the invalid sentinel
+    // and it FAILS CLOSED at every reader — `validate()` refuses the
+    // document, `isImageFlavor()`/`isExecFlavor()` answer false,
+    // `allowsUndefinedImports()` answers false (the STRICT direction), and
+    // the linker refuses to walk. There is no default-format path left to
+    // fall into. `ObjectFormatSchema{ObjectFormatData}` remains a public,
+    // validation-free constructor, so this pointer is the one thing standing
+    // between a hand-built struct and the engine; every accessor that reads
+    // it is written to survive it being null.
+    link::ObjectFormatBackend const* backend = nullptr;
 
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): output container ──
     //
@@ -774,6 +793,46 @@ struct DSS_EXPORT ObjectFormatData {
     // hand-built ObjectFormatData that never set it is rejected by
     // validate() (the loader path always sets it or fails).
     DataModel            dataModel{};
+
+    // ── D-PP-HEADER-CASE-INSENSITIVE-PE: the `#include` header-NAME case rule ──
+    //
+    // REQUIRED top-level `"headerNameMatching"` field ("case-sensitive" /
+    // "case-insensitive"; closed enum, loader fails loud on missing OR
+    // unknown). Like `dataModel` it is an OS property carried by the FORMAT
+    // (one x86_64 CPU target serves pe64-windows's case-insensitive rule AND
+    // elf64-linux's case-sensitive one), and like `dataModel` it is REQUIRED
+    // rather than optional-with-default: an optional key would let a future
+    // pe/macho format file silently regress to case-sensitive matching, which
+    // is the whole failure class the axis closes.
+    //
+    // Consumed by `core/types/include_path_resolve.hpp`, which does the ASCII
+    // folding ITSELF rather than letting `fs::exists` (i.e. the BUILD HOST's
+    // filesystem) decide a case question. The zero default is the INVALID
+    // sentinel: a hand-built ObjectFormatData that never set it is rejected by
+    // validate() (the loader path always sets it or fails).
+    HeaderNameMatching   headerNameMatching{};
+
+    // ── D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN: the C-symbol decoration rule ──
+    //
+    // REQUIRED top-level `"cSymbolDecoration"` BLOCK (`{"scheme": "none"}` /
+    // `{"scheme": "leading-underscore"}`; closed enum, loader fails loud on
+    // missing OR unknown). How this format decorates a canonical C identifier
+    // to obtain the LINKER-visible name. Like `dataModel` and
+    // `headerNameMatching` it is a per-(OS × format) fact one CPU target
+    // cannot answer — the same x86_64 target decorates under
+    // macho64-x86_64-darwin and does not under elf64-x86_64-linux — and like
+    // them it is REQUIRED rather than optional-with-default, because the whole
+    // defect being closed is a per-format fact with TWO OWNERS that nothing
+    // forced to agree. A silent default would simply make the C++ table's
+    // answer the winner again, invisibly, for any file that forgot the key.
+    //
+    // See `CSymbolDecoration` (core/types/object_format_kind.hpp) for the
+    // full rationale, the closed-enum-vs-prefix-string decision, and the
+    // MEASURED evidence that `_exit` already names a DIFFERENT function on
+    // both undecorated formats. The zero-scheme default is the INVALID
+    // sentinel: a hand-built ObjectFormatData that never set it is rejected
+    // by validate() (the loader path always sets it or fails).
+    CSymbolDecoration    cSymbolDecoration{};
 
     // ── D-CSUBSET-BITFIELD-ABI-EXACT: the per-ABI bit-field PACKING strategy ──
     //
@@ -1133,6 +1192,33 @@ struct DSS_EXPORT ObjectFormatData {
     //   * ELF identity: when kind == Elf, fileClass / dataEncoding /
     //     machine must all be != 0.
     [[nodiscard]] std::vector<ConfigDiagnostic> validate() const;
+
+    // EXEC-flavor predicate — THE single implementation. `validate()`
+    // computes its entry-machinery rules from this, and the public
+    // `ObjectFormatSchema::isExecFlavor()` forwards to it, so the
+    // rule that rejects a config and the predicate a linker gate asks
+    // can never drift apart. (It lives on the DATA type rather than
+    // on the schema class because `validate()` is a member of the
+    // data type and runs BEFORE any `ObjectFormatSchema` exists —
+    // duplicating the four arms into the schema class would have
+    // created exactly the two-copy divergence this arc is closing.)
+    // See the public forwarder for the full semantics + the ET_DYN
+    // caveat.
+    // ★ THE DERIVATION MOVED TO THE BACKENDS; IT DID NOT COLLAPSE INTO A
+    // DECLARED FLAG. The ELF backend still re-derives the ET_DYN PIE shape
+    // from ALL FOUR cluster members (interpreter + processExit +
+    // entryCallingConvention + processArgs) rather than trusting one of
+    // them, for the reason this function has always carried: a hand-built,
+    // validate-bypassing `ObjectFormatData` must not be able to fake a PIE
+    // by setting a single field, and `ObjectFormatSchema{ObjectFormatData}`
+    // is a public constructor that runs no validation. Had this become a
+    // declared `"execFlavor": true` key, the single-field fake would be
+    // handed straight back. See `elf_backend.cpp`.
+    //
+    // Null backend ⇒ false: an unresolved format is not an executable.
+    [[nodiscard]] bool isExecFlavor() const noexcept {
+        return backend != nullptr && backend->isExecFlavor(*this);
+    }
 };
 
 } // namespace detail
@@ -1150,7 +1236,34 @@ public:
     [[nodiscard]] ObjectFormatSchemaId id()      const noexcept { return d_.id; }
     [[nodiscard]] std::string_view     name()    const noexcept { return d_.name; }
     [[nodiscard]] std::string_view     version() const noexcept { return d_.version; }
-    [[nodiscard]] ObjectFormatKind     kind()    const noexcept { return d_.kind; }
+    // ★ THE BRIDGE ACCESSOR — kept for the identity branches that still live
+    // OUTSIDE this cycle's authorized file set (`src/program/compile_pipeline
+    // .cpp`, `src/program/program.cpp`, `src/program/cross_validate_target_
+    // format.cpp`, `src/ffi/abi/abi_catalog.cpp` — all anchored, all the same
+    // species). The schema tier cannot even spell `ObjectFormatKind::Elf` any
+    // more — see the compile-error pin at the top of `object_format_schema.cpp`
+    // / `_json.cpp`. When those callers close, this accessor goes with them.
+    //
+    // ⚠ ONE `src/link/` CALLER REMAINS. An earlier draft said "NOTHING in
+    // `src/link/` calls it any more"; an independent audit measured otherwise.
+    // `linker.cpp` sets `LinkedImage::format = schema.kind()` — a value carried
+    // out for consumers and asserted by three tests, never branched on
+    // (`writer.cpp` states that as its own rule, and it holds: no `==`, switch
+    // or table anywhere in `src/` is keyed on `image.format`).
+    // Null backend ⇒ `Unknown`, the project's universal invalid sentinel —
+    // never a spurious ELF identity, which is exactly what the old
+    // `ObjectFormatKind kind = ObjectFormatKind::Elf` default produced.
+    [[nodiscard]] ObjectFormatKind kind() const noexcept {
+        return d_.backend != nullptr ? d_.backend->kind()
+                                     : ObjectFormatKind::Unknown;
+    }
+    // The resolved backend, or nullptr when the document declared no
+    // resolvable format. `src/link/format/`'s walkers compare THIS against
+    // their own singleton to police their public entry points — a pointer
+    // identity on an opaque handle, not an enumerator comparison.
+    [[nodiscard]] link::ObjectFormatBackend const* backend() const noexcept {
+        return d_.backend;
+    }
     // D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): the output container —
     // `Archive` iff this format's driver output is an `ar` static
     // library (`.a`/`.lib`) bundling relocatable members. The driver
@@ -1168,6 +1281,24 @@ public:
     // Always a valid member for a loader-produced schema (the field is
     // REQUIRED + closed-enum at load).
     [[nodiscard]] DataModel            dataModel() const noexcept { return d_.dataModel; }
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: how an `#include` header NAME is matched
+    // against the filesystem for THIS format ("case-sensitive" / "case-
+    // insensitive"). Always a valid member for a loader-produced schema (the
+    // field is REQUIRED + closed-enum at load). Threaded by the driver into the
+    // CU build key, and from there to every include resolver, so `#include` and
+    // `__has_include` answer the TARGET's convention on any build host.
+    [[nodiscard]] HeaderNameMatching   headerNameMatching() const noexcept {
+        return d_.headerNameMatching;
+    }
+    // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN: how THIS format decorates a
+    // canonical C identifier to obtain the linker-visible name (`none` /
+    // `leading-underscore`). Always a REAL scheme for a loader-produced
+    // schema — the field is REQUIRED + closed-enum at load, and
+    // `validate()` rejects the `Unspecified` sentinel on the in-memory
+    // path too, so no caller has to defend against it.
+    [[nodiscard]] CSymbolDecoration const& cSymbolDecoration() const noexcept {
+        return d_.cSymbolDecoration;
+    }
     // D-CSUBSET-BITFIELD-ABI-EXACT: the format's declared bit-field strategy, or
     // `None` if it declared none (the caller falls back to the target's value via
     // `effectiveBitFieldStrategy`). Read by the driver when resolving the
@@ -1260,21 +1391,68 @@ public:
     // undefined externs" — that policy is the SEPARATE
     // `allowsUndefinedImports()` below (a .so is an image AND may
     // carry undefined symbols).
-    // The `isExecFlavor` rule inside `validate()` remains
-    // EXEC-only by design (it gates entry/processExit machinery a
-    // `.so` / `.dylib` must not declare) — the two predicates
-    // diverged at c150 and no longer mirror each other.
+    // `isExecFlavor()` (below) remains EXEC-only by design (it gates
+    // entry/processExit machinery a `.so` / `.dylib` must not
+    // declare) — the two predicates diverged at c150 and no longer
+    // mirror each other.
+    // The 3-arm `switch (d_.kind)` this used to be is now the backends'
+    // own `isImageFlavor()`. Null backend ⇒ false (fail-closed).
     [[nodiscard]] bool isImageFlavor() const noexcept {
-        switch (d_.kind) {
-            case ObjectFormatKind::Elf:
-                return d_.elf.objectType != ElfObjectType::Rel;
-            case ObjectFormatKind::Pe:
-                return d_.pe.objectType != PeObjectType::Obj;
-            case ObjectFormatKind::MachO:
-                return d_.macho.filetype != MachOObjectType::Object;
-            default:
-                return false;
-        }
+        return d_.backend != nullptr && d_.backend->isImageFlavor(d_);
+    }
+
+    // Cross-format EXEC-flavor predicate. True iff the schema
+    // describes a PROGRAM the OS starts — the four arms are ELF
+    // ET_EXEC, ELF ET_DYN carrying the full PIE entry cluster, PE
+    // PE32+ Exec, and Mach-O MH_EXECUTE. FALSE for every entry-less
+    // image (ELF `.so`, PE Dll, Mach-O MH_DYLIB) and for every
+    // relocatable. Strictly narrower than `isImageFlavor()` above.
+    //
+    // Promoted from a `validate()`-local at the D-LK10-ENTRY
+    // entry-gate fold so `link/linker.cpp` can ask "does this format
+    // need an entry trampoline?" WITHOUT switching on the format
+    // kind itself. The closed-verb switch lives INSIDE the schema
+    // (the `isImageFlavor()` precedent directly above); the
+    // agnosticism bar forbids format-identity branching in the
+    // linker, not a closed predicate the schema answers.
+    // Single-sourced: forwards to `detail::ObjectFormatData::
+    // isExecFlavor()`, the SAME member `validate()` computes its
+    // entry-machinery rules from.
+    //
+    // ★ FOOTGUN FOR FUTURE CALLERS — the ET_DYN arm is NOT
+    // independent of `processExit()`. `elfDynPieShape` includes
+    // `processExit.has_value()` as one of its four cluster members,
+    // so on an ELF ET_DYN schema `isExecFlavor()` IMPLIES
+    // `processExit().has_value()` by construction. Consequences:
+    //   * a rule of the form "exec-flavored ⇒ must declare
+    //     processExit" is a TAUTOLOGY on the dyn arm and enforces
+    //     nothing there. ET_DYN's real enforcement is PER TIER, and
+    //     saying only the first half of this was the over-claim the
+    //     TF-C120 audit caught: AT CONFIG LOAD it is the all-or-none
+    //     `clusterCount` rule in object_format_schema.cpp (the `/elf`
+    //     PARTIAL-cluster failure) — a `validate()` rule, therefore
+    //     ABSENT on the in-memory
+    //     `ObjectFormatSchema{ObjectFormatData}` path; IN MEMORY it is
+    //     the ELF walker's own half-cluster belt in
+    //     `elf::encodeElfExecDynamic` (`isPie != !interpreter.empty()`),
+    //     which refuses loud before any entry is resolved (MEASURED by
+    //     `EntryGateFold.ElfWalkerRefusesHandBuiltEtDynPartial...` in
+    //     tests/link/test_lk10_entry_slice_c.cpp);
+    //   * consequently a 3-of-4 ET_DYN missing only `processExit`
+    //     is invisible to BOTH this predicate and
+    //     `processExit().has_value()` — do not reach for either one
+    //     to police that shape;
+    //   * do NOT use this predicate to decide anything about a
+    //     format that has just had `processExit` edited — the
+    //     predicate's own value can move underneath you.
+    // The other three arms derive purely from `objectType` /
+    // `filetype` and carry no such dependency. (INFERRED from the
+    // cluster definition; the tautology is exercised by no test on
+    // purpose — a test claiming to cover the dyn arm would be
+    // asserting a truth of the predicate's definition, not of the
+    // rule.)
+    [[nodiscard]] bool isExecFlavor() const noexcept {
+        return d_.isExecFlavor();
     }
 
     // Undefined-extern policy (c150 + c151, D-LK1-4 — the c143
@@ -1315,11 +1493,34 @@ public:
     // `-undefined dynamic_lookup`), but that is a DIFFERENT bind
     // model the eager two-level machinery deliberately does not
     // ship; a flat-namespace schema knob would flip this arm then.
+    //
+    // ★ AFTER THE D-LK10-ENTRY ENTRY-GATE FOLD, read the "faithful
+    // single-member witness" sentence above precisely: it is the
+    // ALL-OR-NONE `clusterCount` rule (object_format_schema.cpp, the
+    // `/elf` PARTIAL-cluster failure) that makes `processExit`
+    // presence stand for the whole PIE cluster — NOT the new
+    // "exec-flavored ⇒ must declare processExit" rule, which is
+    // VACUOUS on the ET_DYN arm (`isExecFlavor()`'s dyn arm already
+    // contains `processExit.has_value()`; see the footgun note on
+    // that accessor). The line below is therefore left keyed on
+    // `d_.processExit` rather than rewritten as `!isExecFlavor()`:
+    // the two agree on every LOADED schema and diverge only on a
+    // hand-built validate-bypassing one (dyn + processExit but no
+    // interpreter), where the cluster-member spelling is the one
+    // that stays honest about what it read.
+    //
+    // ★ NULL-BACKEND DIRECTION, STATED BECAUSE IT IS THE ONE PLACE WHERE
+    // "fail closed" IS NOT THE SAME AS "return false EVERYWHERE". Every other
+    // predicate here answers `false` on a null backend and that IS the strict
+    // answer. Here `true` is the PERMISSIVE answer (it lets an unresolved
+    // extern through to a later binder), and `!isImageFlavor()` is `true` on a
+    // null backend — so the plain relocatable short-circuit would have made an
+    // unresolvable schema the most permissive one in the tree. The explicit
+    // null test below comes FIRST for exactly that reason.
     [[nodiscard]] bool allowsUndefinedImports() const noexcept {
+        if (d_.backend == nullptr) return false;  // unresolved ⇒ strictest
         if (!isImageFlavor()) return true;   // relocatable: later linker resolves
-        return d_.kind == ObjectFormatKind::Elf
-            && d_.elf.objectType == ElfObjectType::Dyn
-            && !d_.processExit.has_value();  // .so only — a PIE is an executable
+        return d_.backend->allowsUndefinedImports(d_);
     }
 
     // Image-side entry-point symbol name. Empty for relocatable

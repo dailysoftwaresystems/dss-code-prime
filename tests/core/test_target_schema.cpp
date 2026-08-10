@@ -1776,11 +1776,29 @@ TEST(TargetSchema, TFC74Arm64PredefinedMacrosExactSet) {
                   // MEASURED 2026-07-28, `/usr/bin/clang -dM -E`: defined for
                   // aarch64-linux-gnu only.
                   {"__CHAR_UNSIGNED__",  K::Constant, "1", {"elf"}},
+                  // TF-C115 (D-PP-ENDIANNESS-PREDEFINES): the per-CPU byte-order
+                  // ANSWER. UNGATED — MEASURED 2026-08-04 (`clang-19 -dM -E -x c
+                  // /dev/null -target <triple>`), __LITTLE_ENDIAN__ is 1 on
+                  // arm64-apple-darwin AND aarch64-linux-gnu (and every other
+                  // triple DSS targets), so unlike __arm64__ it is NOT an
+                  // Apple-only spelling. __BYTE_ORDER__'s value is a MACRO
+                  // REFERENCE, not a literal: it names __ORDER_LITTLE_ENDIAN__,
+                  // which is declared on the LANGUAGE because it is invariant
+                  // across every triple including the big-endian control.
+                  // ★ __BIG_ENDIAN__ MUST NOT APPEAR IN THIS LIST — MEASURED, it
+                  // is defined only on a big-endian triple (aarch64_be-linux-gnu),
+                  // and Apple's libkern/OSByteOrder.h:165 tests it BEFORE the
+                  // little-endian arm, so a stray row silently selects
+                  // byte-swapping macros. This exact-set comparison is what keeps
+                  // it out.
+                  {"__LITTLE_ENDIAN__",  K::Constant, "1", {}},
+                  {"__BYTE_ORDER__",     K::Constant, "__ORDER_LITTLE_ENDIAN__", {}},
               }))
         << "arm64 must predefine the two UNIVERSAL AArch64 spellings ungated, "
-           "the two APPLE-ONLY spellings gated to macho, and __CHAR_UNSIGNED__ "
+           "the two APPLE-ONLY spellings gated to macho, __CHAR_UNSIGNED__ "
            "gated to elf — the one row whose gate is an ABI property rather "
-           "than a vendor spelling";
+           "than a vendor spelling — and the two UNGATED endianness rows, with "
+           "NO __BIG_ENDIAN__ anywhere";
 }
 
 // The x86_64 twin: MEASURED identical on x86_64-linux-gnu, x86_64-apple-darwin
@@ -1797,9 +1815,21 @@ TEST(TargetSchema, TFC74X86_64PredefinedMacrosExactSet) {
                   {"__x86_64",   K::Constant, "1", {}},
                   {"__amd64__",  K::Constant, "1", {}},
                   {"__amd64",    K::Constant, "1", {}},
+                  // TF-C115 (D-PP-ENDIANNESS-PREDEFINES): the arm64 twin's rows,
+                  // identical here because endianness is a per-CPU fact and
+                  // x86_64 is little-endian under elf64, macho64 AND pe64 —
+                  // which is exactly the test __LP64__ FAILED (LP64 on
+                  // elf/macho, LLP64 on pe), sending it to the object format.
+                  // MEASURED 2026-08-04: __LITTLE_ENDIAN__ 1 on
+                  // x86_64-unknown-linux-gnu, x86_64-apple-darwin AND
+                  // x86_64-pc-windows-msvc, so UNGATED like the four above.
+                  // ★ __BIG_ENDIAN__ MUST NOT APPEAR — see the arm64 twin.
+                  {"__LITTLE_ENDIAN__", K::Constant, "1", {}},
+                  {"__BYTE_ORDER__",    K::Constant, "__ORDER_LITTLE_ENDIAN__", {}},
               }))
         << "x86_64 predefines all four spellings UNGATED (measured present on "
-           "linux, darwin and windows-msvc alike)";
+           "linux, darwin and windows-msvc alike), plus the two UNGATED "
+           "endianness rows and NO __BIG_ENDIAN__";
 }
 
 // A target declaring NO `predefinedMacros` is legal and yields an EMPTY span —

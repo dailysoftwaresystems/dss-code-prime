@@ -275,6 +275,16 @@ TEST(BinaryReaderPe, ExtractsDllNameFromExportDirectory) {
     ASSERT_EQ(r->size(), 2u);
     for (auto const& row : *r) {
         EXPECT_EQ(row.soname, "widget.dll");
+        // TF-C124 (D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION): PE has
+        // NO per-symbol version — an import binds by name or by ordinal and
+        // there is no third coordinate — so this stays empty PERMANENTLY,
+        // by the format's construction rather than pending a reader. Pinned
+        // rather than merely commented, so that a future "let's make the
+        // field uniform across formats" edit has to argue with a test.
+        EXPECT_FALSE(row.elfSymbolVersion.has_value())
+            << "PE carries no per-symbol version; what PE versions is the "
+               "FILE (VERSIONINFO / an api-set DLL's own name), which is "
+               "library identity and already lives in soname";
     }
     // The path label stays on libraryPath — soname is the SEPARATE
     // embedded DllName, NOT the on-disk basename.

@@ -1053,7 +1053,10 @@ TEST(CliArgs, DefineFlagCollectsRepeatableVerbatim) {
 
 TEST(CliArgs, ResolveLibraryFlagCollectsRepeatable) {
     // Both spellings (`--resolve-library <path>` / `--resolve-library=<path>`),
-    // repeatable, carried verbatim to CliArgs::resolveLibraries.
+    // repeatable, carried verbatim to CliArgs::resolveLibraries. NO `=` inside
+    // the value ⇒ the PLAIN form: nothing is stated, so `declaredImportName`
+    // stays EMPTY and the pre-D-FFI-DECLARED-IMPORT-NAME precedence (embedded
+    // soname, else basename) applies unchanged.
     Argv a{"dss-code-prime", "--compile", "main.c",
            "--language", "c-subset",
            "--target", "x86_64:elf64-x86_64-linux-exec",
@@ -1062,8 +1065,12 @@ TEST(CliArgs, ResolveLibraryFlagCollectsRepeatable) {
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_TRUE(r.has_value());
     ASSERT_EQ(r->resolveLibraries.size(), 2u);
-    EXPECT_EQ(r->resolveLibraries[0], "out/dsslib.so");
-    EXPECT_EQ(r->resolveLibraries[1], "out/other.so");
+    EXPECT_EQ(r->resolveLibraries[0].path, "out/dsslib.so");
+    EXPECT_EQ(r->resolveLibraries[1].path, "out/other.so");
+    EXPECT_TRUE(r->resolveLibraries[0].declaredImportName.empty())
+        << "no '=' in the value ⇒ nothing stated";
+    EXPECT_TRUE(r->resolveLibraries[1].declaredImportName.empty())
+        << "no '=' in the value ⇒ nothing stated";
 }
 
 TEST(CliArgs, ResolveLibraryFlagEmptyValueRejected) {
@@ -1076,6 +1083,96 @@ TEST(CliArgs, ResolveLibraryFlagEmptyValueRejected) {
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+// ── D-FFI-DECLARED-IMPORT-NAME: `--resolve-library <path>[=<import-name>]` ───
+
+TEST(CliArgs, ResolveLibraryDeclaredImportNameParsedOnBothFlagSpellings) {
+    // The `=<import-name>` suffix STATES the runtime identity to record. It
+    // must parse identically through BOTH flag spellings -- including
+    // `--resolve-library=<path>=<name>`, where the flag's own `=` and the
+    // value's `=` are DIFFERENT separators (`equalsValue` strips only the
+    // flag's; the value's LAST `=` splits path from name). A parser that
+    // consumed the wrong `=` would silently produce path="" or a name
+    // containing the path.
+    Argv a{"dss-code-prime", "--compile", "main.c",
+           "--language", "c-subset",
+           "--target", "arm64:macho64-arm64-darwin-exec",
+           "--resolve-library", "/opt/local/lib/libtcl8.6.dylib=@rpath/libtcl8.6.dylib",
+           "--resolve-library=/opt/local/lib/libz.dylib=/usr/lib/libz.1.dylib"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_EQ(r->resolveLibraries.size(), 2u);
+    EXPECT_EQ(r->resolveLibraries[0].path, "/opt/local/lib/libtcl8.6.dylib");
+    EXPECT_EQ(r->resolveLibraries[0].declaredImportName, "@rpath/libtcl8.6.dylib");
+    EXPECT_EQ(r->resolveLibraries[1].path, "/opt/local/lib/libz.dylib");
+    EXPECT_EQ(r->resolveLibraries[1].declaredImportName, "/usr/lib/libz.1.dylib");
+}
+
+TEST(CliArgs, ResolveLibraryDeclaredImportNameSplitsOnTheLastEquals) {
+    // THE SPLIT DIRECTION IS LOAD-BEARING and is the OPPOSITE of `--define`
+    // (which splits on the FIRST `=`, because a macro VALUE may contain one).
+    // Here the PATH is the `=`-tolerant side: an import name (a soname / DLL
+    // name / install name) does not contain `=`. Splitting on the FIRST `=`
+    // would yield path="/opt/a" and name="b=libtcl.dylib=libtcl8.6.dylib" --
+    // a path that does not exist and an identity no loader could resolve.
+    Argv a{"dss-code-prime", "--compile", "main.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux-exec",
+           "--resolve-library", "/opt/a=b/libtcl.dylib=libtcl8.6.dylib"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_EQ(r->resolveLibraries.size(), 1u);
+    EXPECT_EQ(r->resolveLibraries[0].path, "/opt/a=b/libtcl.dylib")
+        << "the LAST '=' splits -- an '=' inside the PATH must stay in the path";
+    EXPECT_EQ(r->resolveLibraries[0].declaredImportName, "libtcl8.6.dylib");
+}
+
+TEST(CliArgs, ResolveLibraryDeclaredImportNameEmptyPathRejected) {
+    // `=libfoo.so` states an identity for NO file. An empty path reads no
+    // export surface at all, so accepting it would bind nothing while looking
+    // like it bound something. Hard reject, dedicated kind.
+    Argv a{"dss-code-prime", "--compile", "main.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux-exec",
+           "--resolve-library", "=libfoo.so"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidResolveLibrary);
+}
+
+TEST(CliArgs, ResolveLibraryDeclaredImportNameEmptyNameRejected) {
+    // `libfoo.so=` states an EMPTY identity. Silently treating it as "nothing
+    // stated" would be a fallthrough the user did not ask for; recording it
+    // would emit an empty DT_NEEDED / LC_LOAD_DYLIB the loader can never
+    // resolve -- a link that succeeds and an artifact that dies at load.
+    // Reject, and the message must point at omitting the '=' entirely.
+    Argv a{"dss-code-prime", "--compile", "main.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux-exec",
+           "--resolve-library=libfoo.so="};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidResolveLibrary);
+    EXPECT_NE(r.error().detail.find("Omit the '=' entirely"), std::string::npos)
+        << "the diagnostic must name the remediation, not merely refuse; got: "
+        << r.error().detail;
+}
+
+TEST(CliArgs, InvalidResolveLibraryErrorNameRoundTrip) {
+    // The `cliArgsErrorName` switch is what every failure message prints — a
+    // missing case degrades silently to "Unknown", which names nothing the
+    // user can act on.
+    EXPECT_EQ(cliArgsErrorName(CliArgsError::InvalidResolveLibrary),
+              "InvalidResolveLibrary");
+}
+
+TEST(CliArgs, HelpTextDocumentsTheResolveLibraryImportNameSuffix) {
+    // Operator-visible documentation: a capability nobody can discover is a
+    // capability nobody uses. Pin the SPELLING, not merely the flag name.
+    auto const text = cliHelpText();
+    EXPECT_NE(text.find("--resolve-library <path>[=<import-name>]"),
+              std::string::npos);
 }
 
 TEST(CliArgs, DefineFlagFunctionLikeRejected) {

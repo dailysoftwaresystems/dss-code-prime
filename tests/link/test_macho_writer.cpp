@@ -23,6 +23,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "link/format/macho.hpp"
 #include "link/format/macho_chained_fixups.hpp"
 #include "link/linker.hpp"
@@ -43,6 +44,10 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::countWithMessage;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -112,6 +117,46 @@ struct Loaded {
     return mod;
 }
 
+// ── THE ONE DOOR TO THE WRITER (D-LK10-ENTRY 2.13 gate 6) ────────
+//
+// `resolveEntryFnIdx` (src/link/format/exec_reloc_apply.hpp) treats a
+// format that declares `processExit` as having CONTRACTED that its
+// image entry is the DSS-synthesized `_start` trampoline — and only
+// `linker::link` injects one (entry_trampoline.cpp:732 — the file's ONLY
+// assignment to that field — sets `imageEntryOverride = 0` on every
+// successful injection). Reaching the walker's
+// `entryPoint`-empty default with no override therefore means the
+// module never came through the linker, and the walker now fails loud
+// instead of silently making the user's first function the process
+// entry.
+//
+// EVERY test in this file drives the writer DIRECTLY: these are
+// byte-level writer pins, not link pins. So they all deliberately want
+// an UNTRAMPOLINED image, and each must say so. Rather than repeat
+// `mod.imageEntryOverride = 0` at ~70 call sites — the duplication that
+// breeds the missed site — every direct-writer call in this file goes
+// through this ONE helper, so the contract holds by construction and a
+// test added later inherits it for free.
+//
+// Setting index 0 is semantically a NO-OP: 0 is exactly what the
+// pre-gate default handed back, so not a single emitted byte, offset,
+// count or size pinned below changes. The condition is the format's own
+// `processExit` — mirroring the gate's own predicate — so the MH_OBJECT
+// fixtures (which have no entry at all, and whose walker never consults
+// the field) and any non-Mach-O format passed here route through
+// untouched, and no library-flavored walker ever sees an override it
+// would rightly reject.
+[[nodiscard]] std::vector<std::uint8_t>
+encodeUntrampolined(AssembledModule&          module,
+                    TargetSchema const&       target,
+                    ObjectFormatSchema const& format,
+                    DiagnosticReporter&       reporter) {
+    if (format.processExit().has_value()) {
+        module.imageEntryOverride = 0u;
+    }
+    return macho::encode(module, target, format, reporter);
+}
+
 } // namespace
 
 // ── Shipped JSON loads ───────────────────────────────────────────
@@ -141,7 +186,7 @@ TEST(MachOWriter, MachHeader64IdentityBytesMatchAppleAbi) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 42);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_GE(bytes.size(), 32u);
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -171,7 +216,7 @@ TEST(MachOWriter, LcSegment64ContainsOneSectionWithTwoLevelNaming) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 42);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_GE(bytes.size(), 32u + 72u + 80u);
 
@@ -216,7 +261,7 @@ TEST(MachOWriter, LcSymtabReferencesNlist64AndStringTable) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 7);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // LC_SYMTAB starts at byte 32 + 72 + 80 = 184
@@ -279,7 +324,7 @@ TEST(MachOWriter, ObjectSymtabEmitsPipelineMangledNameVerbatimNoDoubleUnderscore
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // Single-symbol layout matches the LcSymtab test: LC_SYMTAB at 184,
@@ -323,7 +368,7 @@ TEST(MachOWriter, ObjectNlistCouplesNameAndBindingStaticLocalDropsNExt) {
                                        SymbolBinding::Local, SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // LC_SYMTAB at byte 184; symoff @ +8, nsyms @ +12, stroff @ +16.
@@ -379,7 +424,7 @@ TEST(MachOWriter, ObjectWeakDefinedFunctionFailsLoud) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty())
         << "a weak defined symbol must emit no bytes (loud-fail path), never a "
            "silently-degraded N_SECT|N_EXT record";
@@ -417,7 +462,7 @@ TEST(MachOWriter, RelocationInfoPacksTypeLengthPcrelExternSymbolnum) {
     mod.functions.push_back(std::move(caller));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // section_64.reloff @ offset 104 + 16 + 16 + 8 + 8 + 4 + 4 = 160
@@ -473,7 +518,7 @@ TEST(MachOWriter, MachHeader64Arm64IdentityBytesMatchAppleAbi) {
     auto loaded = loadShippedArm64();
     AssembledModule mod = makeTrivialModule({0xC0, 0x03, 0x5F, 0xD6}, 42); // arm64 RET
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_GE(bytes.size(), 32u);
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(readU32LE(bytes, 0), 0xFEEDFACFu);    // MH_MAGIC_64
@@ -523,7 +568,7 @@ TEST(MachOWriter, Arm64ObjectExternCallEmitsUndefImportRealName) {
     mod.externImports.push_back(std::move(ext));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "an MH_OBJECT with an extern-call import must encode";
 
@@ -576,7 +621,7 @@ TEST(MachOWriter, Arm64RelocationInfoPacksPage21) {
     mod.functions.push_back(std::move(caller));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     std::uint32_t const relocOff = readU32LE(bytes, 160);
     ASSERT_EQ(readU32LE(bytes, 164), 1u);           // one reloc
@@ -651,7 +696,7 @@ TEST(MachOWriter, Arm64ObjectRodataItemEmitsConstSectionAndDataSymbol) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -735,7 +780,7 @@ TEST(MachOWriter, Arm64ObjectStaticDataItemDropsNExt) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -778,7 +823,7 @@ TEST(MachOWriter, Arm64ObjectWeakDefinedDataFailsLoud) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty())
         << "a weak defined DATA symbol must emit no bytes (loud-fail path)";
     EXPECT_EQ(rep.errorCount(), 1u)
@@ -827,7 +872,7 @@ TEST(MachOWriter, Arm64ObjectRelRoFnPtrSlotEmitsUnsignedRelocAndInSlotAddend) {
     mod.dataItems.push_back(std::move(tab));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -906,7 +951,7 @@ TEST(MachOWriter, Arm64ObjectJumpTableBlockSymbolIsLocalDefinedNotUndef) {
     mod.dataItems.push_back(std::move(tab));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a jump-table slot targeting a block symbol must encode";
 
@@ -966,7 +1011,7 @@ TEST(MachOWriter, Arm64ObjectBssItemIsZeroFillWithVmsizeButNoFileBytes) {
     mod.dataItems.push_back(std::move(g));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -998,7 +1043,7 @@ TEST(MachOWriter, Arm64ObjectDataFreeModuleKeepsSingleSectionLayout) {
     auto loaded = loadShippedArm64();
     AssembledModule mod = makeTrivialModule({0xC0, 0x03, 0x5F, 0xD6}, 42);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(readU32LE(bytes, 16), 2u);     // ncmds
     EXPECT_EQ(readU32LE(bytes, 20), 176u);   // sizeofcmds = 72 + 80 + 24
@@ -1073,7 +1118,7 @@ TEST(MachOWriter, Arm64ObjectRodataItemWithRelocationFailsLoud) {
     mod.dataItems.push_back(std::move(d));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     EXPECT_GT(rep.errorCount(), 0u);
 }
@@ -1106,7 +1151,7 @@ TEST(MachOWriter, Arm64ObjectDataRelocOnlyExternGetsUndefNlist) {
     mod.externImports.push_back(std::move(ext));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a data-reloc-only extern must be covered by the undefined-"
            "extern scan (the ELF c145 mirror)";
@@ -1143,7 +1188,7 @@ TEST(MachOWriter, Arm64ObjectThreadLocalItemFailsLoud) {
     mod.dataItems.push_back(std::move(t));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool saw = false;
     for (auto const& d : rep.all()) {
@@ -1173,7 +1218,7 @@ TEST(MachOWriter, Arm64ObjectDuplicateDataSymbolFailsLoud) {
     mod.dataItems.push_back(std::move(d));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool saw = false;
     for (auto const& diag : rep.all()) {
@@ -1211,7 +1256,7 @@ TEST(MachOWriter, Arm64ObjectAllFourDataSectionsOrderAndOrdinals) {
     addItem(13, DataSectionKind::Bss, {}, 8);
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // 5 sections: sizeofcmds = 72 + 5*80 + 24 = 496; header+cmds = 528.
@@ -1260,7 +1305,7 @@ TEST(MachOWriter, NonMachOFormatKindEmitsK_NoMatchingObjectFormat) {
 
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, **elf, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, **elf, rep);
     EXPECT_TRUE(bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
@@ -1274,11 +1319,17 @@ TEST(MachOWriter, NonMachOFormatKindEmitsK_NoMatchingObjectFormat) {
 TEST(MachOFormatJson, ZeroCputypeRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-macho","kind":"macho"},
       "macho": { "cputype": 0, "filetype": 1 }
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: no sections/image block to trip any
+    // other rule, so cputype==0 is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/macho/cputype"), 1u) << rejectSummary(r);
 }
 
 // ── Mach-O section row missing `segment` rejected ──────────────
@@ -1286,12 +1337,18 @@ TEST(MachOFormatJson, ZeroCputypeRejectedByValidate) {
 TEST(MachOFormatJson, EmptySegmentRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-macho-seg","kind":"macho"},
       "macho": { "cputype": 16777223, "filetype": 1 },
       "sections":[{"kind":"text","name":"__text","type":0,"flags":0,"addrAlign":4,"entrySize":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: cputype is valid and virtualAddress
+    // defaults to 0, so the empty 'segment' is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/segment"), 1u) << rejectSummary(r);
 }
 
 // ── ELF/PE section row with `segment` set rejected ─────────────
@@ -1299,12 +1356,19 @@ TEST(MachOFormatJson, EmptySegmentRejectedByValidate) {
 TEST(ElfFormatJson, SegmentFieldRejectedOnElfSection) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-elf","kind":"elf"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62 },
       "sections":[{"kind":"text","name":".text","segment":"__TEXT","type":1,"flags":6,"addrAlign":16,"entrySize":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: class/data/machine are all valid and
+    // virtualAddress defaults to 0 (ET_REL default), so the non-empty
+    // 'segment' is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/segment"), 1u) << rejectSummary(r);
 }
 
 // ── Mach-O MH_OBJECT section with non-zero virtualAddress rejected ──
@@ -1317,12 +1381,20 @@ TEST(MachOFormatJson, NonZeroVirtualAddressRejectedOnMhObject) {
     // a future MachO-row edit can't silently no-op.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-macho-va","kind":"macho"},
       "macho": { "cputype": 16777223, "filetype": 1 },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":4,"entrySize":0,"virtualAddress":4198400}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: cputype is valid and 'segment' is
+    // non-empty, so the non-zero virtualAddress on this MH_OBJECT row
+    // is the only diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/0/virtualAddress"), 1u)
+        << rejectSummary(r);
 }
 
 // ── D-LK10-ENTRY-MACHO-SECTIONVA-COMPUTED: schema __text VA inconsistent
@@ -1339,13 +1411,27 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
     // LOUD on the mismatch rather than emit a section_64.addr dyld would
     // mis-map. RED-on-disable: without the `textSegmentVaMatchesFileOff` check
     // the encode SUCCEEDS and `bytes.empty()` flips to false.
+    // The `processExit` + `entryCallingConvention` pair below is what
+    // keeps this synthetic MH_EXECUTE schema LOADABLE at all: an
+    // exec-flavored format must declare both or validate() rejects it
+    // (D-LK10-ENTRY 2.13). Values are the shipped
+    // macho64-x86_64-darwin-exec ones, matching this fixture's x86_64
+    // cputype; nothing here builds a trampoline, so they emit nothing.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
       "format": { "name": "macho-va-inconsistent-test", "version": "1.0", "kind": "macho" },
       "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
       "bitFieldStrategy": "gnu_packed",
       "entryPoint": "",
       "externCallDispatch": "direct-plt",
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -1371,7 +1457,7 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
     ASSERT_TRUE(target.has_value());
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, fmt, rep);
     EXPECT_TRUE(bytes.empty())
         << "an inconsistent schema VA must abort the encode, not emit a "
            "mis-mapped binary";
@@ -1402,7 +1488,7 @@ TEST(MachOWriter, NonZeroAddendFailsLoud) {
     mod.functions.push_back(std::move(caller));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     EXPECT_GT(rep.errorCount(), 0u);
 }
@@ -1428,7 +1514,7 @@ TEST(MachOWriter, MultiFunctionModuleEmitsSequentialTextBytesAndIndices) {
     mod.functions.push_back(std::move(b));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // symoff via LC_SYMTAB at byte 184; symoff field at +8 = 192.
@@ -1505,7 +1591,7 @@ TEST(MachOExecWriter, MachHeaderFiletypeEqualsMhExecute) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_GE(bytes.size(), 32u);
     // mach_header_64.filetype @ +12 = MH_EXECUTE = 2.
@@ -1518,7 +1604,7 @@ TEST(MachOExecWriter, PageZeroSegmentEmittedFirst) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // First load command at offset 32 is LC_SEGMENT_64 (0x19).
     ASSERT_GE(bytes.size(), 32u + 72u);
@@ -1546,14 +1632,20 @@ TEST(MachOExecWriter, LcMainEntryOffPointsToFirstFunction) {
     b.bytes  = {0xC3};
     mod.functions.push_back(std::move(b));
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
-    // Default entryPoint = functions[0] (cycle-2 convention) — entryoff
-    // = textFileOff + 0. textFileOff = headerAndCmds page-aligned.
-    // No easy way to derive textFileOff in the test without parsing
-    // the load commands. Instead pin the property: LC_MAIN.entryoff
-    // is a multiple of the page size (because textFileOff is page-
-    // aligned and entryFnIdx=0 contributes 0).
+    // ★ WHAT THIS PINS, RESTATED SINCE D-LK10-ENTRY 2.13 gate 6.
+    // The entry is functions[0] — entryoff = textFileOff + 0, and
+    // textFileOff is headerAndCmds page-aligned, so entryoff is a
+    // multiple of the page size. f[1] would land at textFileOff + 2,
+    // which is NOT, so the assertion below still discriminates index 0
+    // from index 1 (that is why the fixture carries TWO functions).
+    // What CHANGED is only where index 0 comes from: it used to be the
+    // walker's silent `entryPoint`-empty default, and that default is
+    // now a fail-loud on a `processExit`-declaring format. The helper
+    // supplies `imageEntryOverride = 0` — the same value, now STATED —
+    // so this pin covers the override path, and the old default path no
+    // longer exists to cover.
     // Locate LC_MAIN by scanning load commands.
     std::size_t off = 32;  // start of load commands
     bool sawLcMain = false;
@@ -1629,7 +1721,7 @@ TEST(MachOExecWriter, SymbolAddressDataGlobalEmitsDyldRebaseStream) {
     mod.dataItems.push_back(std::move(p));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *format, rep);
+    auto bytes = encodeUntrampolined(mod, *target, *format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -1726,7 +1818,7 @@ TEST(MachOExecWriter, RelRoConstItemFoldsIntoDataAndEmitsDyldRebase) {
     mod.dataItems.push_back(std::move(p));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *format, rep);
+    auto bytes = encodeUntrampolined(mod, *target, *format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a relro item must NOT fail loud in a Mach-O exec image";
     ASSERT_FALSE(bytes.empty());
@@ -1781,7 +1873,7 @@ TEST(MachOExecWriter, DataExternGetsGotSlotButNoStub) {
     mod.externImports.push_back(std::move(dataExt));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *format, rep);
+    auto bytes = encodeUntrampolined(mod, *target, *format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -1843,7 +1935,7 @@ TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
     mod.functions.push_back(std::move(f1));
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // Locate __text file offset by parsing the __TEXT segment's
@@ -1885,7 +1977,7 @@ TEST(MachOExecWriter, ExternTargetFailsLoudAsUndefined) {
     fn.relocations.push_back(rel);
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
@@ -1897,13 +1989,22 @@ TEST(MachOExecWriter, ExternTargetFailsLoudAsUndefined) {
 TEST(MachOExecFormatJsonValidate, ObjWithImageBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"obj-with-image","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": 1, "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: the single `fail("/image", ...)` call
+    // site fires once regardless of which image field triggered its
+    // `anySet` check (here pageZeroSize/dylinkerPath/loadDylibs); cputype
+    // is valid and the section row is otherwise clean, so it is the only
+    // diagnostic.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image"), 1u) << rejectSummary(r);
 }
 
 TEST(MachOExecFormatJsonValidate, ObjWithBindNowFalseRejected) {
@@ -1914,25 +2015,57 @@ TEST(MachOExecFormatJsonValidate, ObjWithBindNowFalseRejected) {
     // LK6 cycle 2c post-fold review.)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"obj-with-bindnow-false","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": 1, "flags": 0 },
       "image": { "bindNow": false },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: same `fail("/image", ...)` call site as
+    // ObjWithImageBlockRejected, this time tripped by `bindNow: false`
+    // alone; cputype is valid and the section row is otherwise clean.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image"), 1u) << rejectSummary(r);
 }
 
 TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
+    // The entry cluster (`processExit` + `entryCallingConvention`) is
+    // present so the ONLY reason this fixture is rejected is its own
+    // defect — the missing `image.loadDylibs`. Without it D-LK10-ENTRY
+    // 2.13 rejects any MH_EXECUTE schema that declares no `processExit`,
+    // which would confound the pin (validate() accumulates; the loader
+    // rejects on ANY error). Values copied VERBATIM from the shipped
+    // src/dss-config/object-formats/macho64-x86_64-darwin-exec.format.json,
+    // matching this fixture's x86_64 cputype (`sysv_amd64`, NOT the arm64
+    // sibling's `apple_arm64`). Inert here: the load IS the test, so no
+    // trampoline is built and no cc name is resolved.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-dylibs","kind":"macho"},
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld" },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/loadDylibs"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 // ── New tests folded from 7-agent review of LK3 cycle 2 ────────
@@ -1947,47 +2080,105 @@ TEST(MachOExecFormatJsonValidate, DylibWithoutDylibImageShapeRejected) {
     // is pinned in test_macho_dylib_writer.cpp.)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"a-dylib","kind":"macho"},
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
-    bool sawInstallName = false;
-    for (auto const& d : r.error()) {
-        if (d.message.find("installName") != std::string::npos) {
-            sawInstallName = true;
-        }
-    }
-    EXPECT_TRUE(sawInstallName)
-        << "expected the dylib installName requirement to fire";
+    // MEASURED: this bare-minimum dylib fixture is missing THREE
+    // independent parts of the dylib shape at once -- loadDylibs and
+    // installName default to empty, and __text's virtualAddress
+    // defaults to 0 while segmentPageSize defaults to 0x1000, so the
+    // "must equal segmentPageSize" rule fires too. Each is its own
+    // `fail()` call in validate(); the path pin below targets
+    // installName (this test's namesake), and errorCount documents
+    // that the other two legitimately co-fire so a future edit can't
+    // silently drop one without this test noticing.
+    EXPECT_EQ(errorCount(r), 3u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/installName"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/loadDylibs"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/<text>/virtualAddress"), 1u)
+        << rejectSummary(r);
 }
 
 TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
     // silent-failure H4 + code-reviewer C2: __text virtualAddress
     // must be >= pageZeroSize, else sectionVa - pageZeroSize
     // underflows.
+    //
+    // The entry cluster is present so the below-__PAGEZERO VA is the ONLY
+    // reason this fixture is rejected (D-LK10-ENTRY 2.13 rejects an
+    // MH_EXECUTE schema declaring no `processExit`, which would confound
+    // the pin). Values VERBATIM from the shipped
+    // src/dss-config/object-formats/macho64-x86_64-darwin-exec.format.json,
+    // matching this fixture's x86_64 cputype; inert (no trampoline is
+    // built — the load IS the test).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"underflow","kind":"macho"},
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/sections/<text>/virtualAddress"), 1u)
+        << rejectSummary(r);
+    // Two DIFFERENT rules emit at that pointer (below-__PAGEZERO vs the
+    // segmentPageSize mmap-congruence check), so pin the message unique
+    // to the underflow rule under test.
+    EXPECT_EQ(countWithMessage(r, "is below __PAGEZERO end"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
+    // Entry cluster present so the missing `image.dylinkerPath` is the
+    // ONLY rejection reason (D-LK10-ENTRY 2.13 would otherwise reject
+    // this MH_EXECUTE schema for declaring no `processExit` too). Values
+    // VERBATIM from the shipped
+    // src/dss-config/object-formats/macho64-x86_64-darwin-exec.format.json,
+    // matching this fixture's x86_64 cputype; inert (no trampoline).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"no-dyld","kind":"macho"},
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/dylinkerPath"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOExecWriter, EmptyTextFailsLoud) {
@@ -1998,7 +2189,7 @@ TEST(MachOExecWriter, EmptyTextFailsLoud) {
     fn.symbol = SymbolId{1};
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     EXPECT_GT(rep.errorCount(), 0u);
 }
@@ -2021,7 +2212,7 @@ TEST(MachOExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
     f1.bytes  = {0xC3, 0xC3, 0xC3, 0xC3};
     mod.functions.push_back(std::move(f1));
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
@@ -2039,7 +2230,7 @@ TEST(MachOExecWriter, TextSegmentVmaddrEqualsPageZeroEnd) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Walk load commands until __TEXT (the 2nd LC_SEGMENT_64).
     std::size_t off = 32;  // start of load commands
@@ -2080,7 +2271,7 @@ TEST(MachOExecWriter, LcLoadDylibStructurePinnedByteForByte) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     std::size_t off = 32;
     bool sawDylib = false;
@@ -2153,7 +2344,7 @@ TEST(MachOExecWriter, DisplacementOverflowFailsLoud) {
     fn.relocations.push_back(rel);
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
@@ -2189,7 +2380,7 @@ TEST(MachOExecWriter, ExternImportsProduceDynamicImage) {
     imp.libraryPath = "/usr/lib/libSystem.B.dylib";
     mod.externImports.push_back(std::move(imp));
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     // filetype @ +12 = MH_EXECUTE (2)
@@ -2247,7 +2438,7 @@ TEST(MachOExecWriter, NonLibSystemImportAutoEmitsLcLoadDylibAndBindsToItsOrdinal
                      "/usr/lib/libz.1.dylib"});
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a referenced non-libSystem import must AUTO-EMIT LC_LOAD_DYLIB, "
            "not be rejected (D-FFI-MACHO-NONDEFAULT-DYLIB-LOAD).";
@@ -2361,7 +2552,7 @@ TEST(MachOExecWriter, NonLibSystemImportAutoEmitsLcLoadDylibAndBindsToItsOrdinal
         ExternImport{SymbolId{100}, "_puts",
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter baseRep;
-    auto baseBytes = macho::encode(baseMod, *loaded.target, *loaded.format,
+    auto baseBytes = encodeUntrampolined(baseMod, *loaded.target, *loaded.format,
                                    baseRep);
     ASSERT_EQ(baseRep.errorCount(), 0u);
     ASSERT_FALSE(baseBytes.empty());
@@ -2394,7 +2585,7 @@ TEST(MachOExecWriter, EmptyLibraryPathImportFailsLoud) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "_mystery", ""});  // no library
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
     EXPECT_GT(rep.errorCount(), 0u)
         << "a library-less import must fail loud, not ship a bindless binary.";
@@ -2421,7 +2612,7 @@ TEST(MachOExecWriter, DynamicImageEmitsExpectedSegments) {
         ExternImport{SymbolId{99}, "_printf",
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     std::string_view fv{
@@ -2437,13 +2628,24 @@ TEST(MachOExecWriter, DynamicImageEmitsExpectedSegments) {
 TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
     // The lazy-binding upgrade is anchored at D-LK6-13. Until it
     // lands, the walker must fail loud on `image.bindNow = false`.
+    // The entry cluster in the JSON is required by validate() on any
+    // MH_EXECUTE schema (D-LK10-ENTRY 2.13) — shipped
+    // macho64-x86_64-darwin-exec values, this fixture's cputype.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-lazy-pending","kind":"macho"},
       "entryPoint": "",
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -2475,7 +2677,7 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
         ExternImport{SymbolId{99}, "_printf",
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     EXPECT_TRUE(bytes.empty());
     bool sawAnchor = false;
     for (auto const& d : rep.all()) {
@@ -2491,10 +2693,20 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
 // accepts the `useChainedFixups` flag. Defaults to false (legacy
 // LC_DYLD_INFO_ONLY opcode stream path stays fully supported).
 TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
+    // Entry cluster required by validate() on an MH_EXECUTE schema
+    // (D-LK10-ENTRY 2.13) — shipped macho64-x86_64-darwin-exec values.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-default","kind":"macho"},
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -2510,10 +2722,20 @@ TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
 }
 
 TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
+    // Entry cluster required by validate() on an MH_EXECUTE schema
+    // (D-LK10-ENTRY 2.13) — shipped macho64-x86_64-darwin-exec values.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-on","kind":"macho"},
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -2530,10 +2752,24 @@ TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
 }
 
 TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
+    // Entry cluster present so the non-boolean `useChainedFixups` is the
+    // ONLY rejection reason (D-LK10-ENTRY 2.13 would otherwise reject
+    // this MH_EXECUTE schema for declaring no `processExit` too). Values
+    // VERBATIM from the shipped
+    // src/dss-config/object-formats/macho64-x86_64-darwin-exec.format.json,
+    // matching this fixture's x86_64 cputype; inert (no trampoline).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-bad","kind":"macho"},
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -2546,6 +2782,18 @@ TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
       ]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/useChainedFixups"), 1u) << rejectSummary(r);
+    // Three DIFFERENT rules emit at that pointer (this loader type check,
+    // plus the MH_OBJECT and MH_DYLIB validate() rejects), so pin the
+    // message unique to the type check under test.
+    EXPECT_EQ(countWithMessage(r, "'useChainedFixups' must be a boolean"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 // D-LK6-14-INTEGRATION-PAYLOAD closed 2026-06-01: wire
@@ -2561,14 +2809,27 @@ namespace {
 // Inline-test fixture used by the 4 chained-fixups integration
 // pins below. Same shape as the legacy BindNowFalse fixture —
 // one extern, one function, one BRANCH relocation — but with
-// `image.useChainedFixups = true`.
+// `image.useChainedFixups = true`. Its `processExit` +
+// `entryCallingConvention` pair is required by validate() on any
+// MH_EXECUTE schema (D-LK10-ENTRY 2.13); the values are the shipped
+// macho64-x86_64-darwin-exec ones, matching the fixture's cputype.
+// They emit nothing here — the trampoline they describe is injected
+// only by `linker::link`, and these pins drive the writer directly.
 [[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
 loadChainedFixupsExecFormat() {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-integration","kind":"macho"},
       "entryPoint": "",
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -2619,7 +2880,7 @@ TEST(MachOExecWriter, ChainedFixupsLcPresent) {
     ASSERT_NE(fmt, nullptr);
     auto mod = chainedFixupsTestModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     EXPECT_TRUE(dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups).has_value())
@@ -2640,7 +2901,7 @@ TEST(MachOExecWriter, ChainedFixupsLcCmdsizeIs16Bytes) {
     ASSERT_NE(fmt, nullptr);
     auto mod = chainedFixupsTestModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
     ASSERT_TRUE(lcOff.has_value());
@@ -2673,7 +2934,7 @@ TEST(MachOExecWriter, ChainedFixupsPayloadImportsCountMatchesExterns) {
     ASSERT_NE(fmt, nullptr);
     auto mod = chainedFixupsTestModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
     ASSERT_TRUE(lcOff.has_value());
@@ -2701,7 +2962,7 @@ TEST(MachOExecWriter, ChainedFixupsSymbolsPoolContainsExternName) {
     ASSERT_NE(fmt, nullptr);
     auto mod = chainedFixupsTestModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
     ASSERT_TRUE(lcOff.has_value());
@@ -2746,7 +3007,7 @@ TEST(MachOExecWriter, ChainedFixupsDropsLcDysymtab) {
     ASSERT_NE(fmt, nullptr);
     auto mod = chainedFixupsTestModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     EXPECT_FALSE(
         dss::macho::test::findLoadCommand(bytes, kLcDysymtab).has_value())
@@ -2785,7 +3046,7 @@ TEST(MachOExecWriter, ChainedFixupsGotSlotsHaveBindBitfield) {
         ExternImport{SymbolId{100}, "_b",
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // Walk LC_SEGMENT_64s, find __DATA_CONST, read its fileoff so we
     // can read the 8-byte __got slots directly. segment_command_64
@@ -2873,7 +3134,7 @@ TEST(MachOExecWriter, ChainedFixupsPayloadHasStartsInSegment) {
     ASSERT_NE(fmt, nullptr);
     auto mod = chainedFixupsTestModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto const lcOff =
         dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
@@ -2935,11 +3196,23 @@ TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     // Legacy fixture (useChainedFixups absent → defaults to false).
+    // Its entry cluster mirrors the chained fixture's — required by
+    // validate() on an MH_EXECUTE schema (D-LK10-ENTRY 2.13) and
+    // IDENTICAL on both sides, so the sizeofcmds delta pinned below
+    // isolates exactly the LC_DYLD_INFO_ONLY/LC_DYSYMTAB swap.
     auto fmtLegacy = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-legacy-for-delta","kind":"macho"},
       "entryPoint": "",
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -2958,11 +3231,11 @@ TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
     ASSERT_TRUE(fmtLegacy.has_value());
     auto mod = chainedFixupsTestModule();
     DiagnosticReporter rep;
-    auto bytesLegacy = macho::encode(mod, **target, **fmtLegacy, rep);
+    auto bytesLegacy = encodeUntrampolined(mod, **target, **fmtLegacy, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto fmtChained = loadChainedFixupsExecFormat();
     ASSERT_NE(fmtChained, nullptr);
-    auto bytesChained = macho::encode(mod, **target, *fmtChained, rep);
+    auto bytesChained = encodeUntrampolined(mod, **target, *fmtChained, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     // sizeofcmds field is at mach_header_64 offset 20 (u32).
     std::uint32_t const sizeofcmdsLegacy =
@@ -3019,7 +3292,7 @@ TEST(MachOExecWriter, ChainedFixupsMultiPageGotFailsLoud) {
             "/usr/lib/libSystem.B.dylib"});
     }
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     EXPECT_TRUE(bytes.empty())
         << "Multi-page __got must emit no bytes (loud-fail path).";
     EXPECT_EQ(rep.errorCount(), 1u)
@@ -3064,7 +3337,7 @@ TEST(MachOExecWriter, ChainedFixupsTwoImportsHaveCorrectSymbolOrdering) {
         ExternImport{SymbolId{100}, "_beta",
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto const lcOff = dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
     ASSERT_TRUE(lcOff.has_value());
@@ -3139,7 +3412,7 @@ TEST(MachOExecWriter, ChainedFixupsNameOffsetOverflowFailsLoud) {
         ExternImport{SymbolId{99}, std::move(longName),
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, *fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     EXPECT_TRUE(bytes.empty())
         << "name-offset overflow must abort emission";
     bool sawAnchor = false;
@@ -3156,10 +3429,20 @@ TEST(MachOExecWriter, ChainedFixupsNameOffsetOverflowFailsLoud) {
 }
 
 TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
+    // Entry cluster required by validate() on an MH_EXECUTE schema
+    // (D-LK10-ENTRY 2.13) — shipped macho64-x86_64-darwin-exec values.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bindnow-default","kind":"macho"},
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3179,10 +3462,25 @@ TEST(MachOExecFormatJson, PageZeroSizeMustBePowerOfTwo) {
     // pageZeroSize so mmap-congruence requires it). Validate must
     // reject non-power-of-two values. (pr-test-analyzer Gap 1 fold
     // — LK6 cycle 2c post-fold review.)
+    //
+    // Entry cluster present so the non-power-of-two pageZeroSize is the
+    // ONLY rejection reason (D-LK10-ENTRY 2.13 would otherwise reject
+    // this MH_EXECUTE schema for declaring no `processExit` too). Values
+    // VERBATIM from the shipped
+    // src/dss-config/object-formats/macho64-x86_64-darwin-exec.format.json,
+    // matching this fixture's x86_64 cputype; inert (no trampoline).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bad-pagezero","kind":"macho"},
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 12884901888,
@@ -3194,6 +3492,18 @@ TEST(MachOExecFormatJson, PageZeroSizeMustBePowerOfTwo) {
       ]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/pageZeroSize"), 1u) << rejectSummary(r);
+    // Three DIFFERENT rules emit at that pointer (the exec non-zero
+    // requirement, the MH_DYLIB must-be-zero rule, and this power-of-two
+    // check), so pin the message unique to the rule under test.
+    EXPECT_EQ(countWithMessage(r, "must be a power of two"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOExecWriter, TextSegmentFilesizeCoversStubsEnd) {
@@ -3218,7 +3528,7 @@ TEST(MachOExecWriter, TextSegmentFilesizeCoversStubsEnd) {
         ExternImport{SymbolId{99}, "_printf",
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     // Walk to LC_SEGMENT_64 __TEXT; read filesize + fileoff +
@@ -3301,10 +3611,24 @@ TEST(MachOExecWriter, TextSegmentFilesizeCoversStubsEnd) {
 }
 
 TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
+    // Entry cluster present so the non-boolean `bindNow` is the ONLY
+    // rejection reason (D-LK10-ENTRY 2.13 would otherwise reject this
+    // MH_EXECUTE schema for declaring no `processExit` too). Values
+    // VERBATIM from the shipped
+    // src/dss-config/object-formats/macho64-x86_64-darwin-exec.format.json,
+    // matching this fixture's x86_64 cputype; inert (no trampoline).
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bindnow-wrong","kind":"macho"},
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3317,19 +3641,36 @@ TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
       ]
     })");
     ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin: this fixture is rejected for EXACTLY
+    // 1 reason, and `errorCount` is the machine check that keeps it
+    // that way -- a comment claiming isolation rots, this line goes red
+    // the day an unrelated rule starts rejecting the fixture too.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/image/bindNow"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
 TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
     // 2-extern × 2-library smoke test — both dylib paths appear
     // in the file (both LC_LOAD_DYLIB strings + both bind opcode
-    // dylib ordinals).
+    // dylib ordinals). The JSON's entry cluster is required by
+    // validate() on an MH_EXECUTE schema (D-LK10-ENTRY 2.13); its
+    // libSystem importLibraryPath is already loadDylibs[0] here.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-two-libs","kind":"macho"},
       "entryPoint": "",
+      "processExit": {
+        "mechanism": "by-name-import",
+        "importMangledName": "_exit",
+        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
+      },
+      "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3366,7 +3707,7 @@ TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
         ExternImport{SymbolId{100}, "_objc_msgSend",
                      "/usr/lib/libobjc.A.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     std::string_view fv{
@@ -3399,7 +3740,7 @@ TEST(MachOExecWriter, BindStreamEmitsExpectedOpcodeShape) {
         ExternImport{SymbolId{99}, "_printf",
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     // Walk to LC_DYLD_INFO_ONLY: header at +32, scan load cmds.
@@ -3482,7 +3823,7 @@ TEST(MachOExecWriter, StubDispPointsAtGotSlot) {
         ExternImport{SymbolId{99}, "_printf",
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     // Walk LCs to find __stubs section (in __TEXT segment) and
@@ -3579,7 +3920,7 @@ TEST(MachOExecWriter, DysymtabIundefsymNundefsymCorrect) {
         ExternImport{SymbolId{99}, "_printf",
                      "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     std::uint32_t ncmds =
@@ -3648,7 +3989,7 @@ TEST(MachOExecWriter, UndeclaredDylibInExternImportAutoEmitsLcLoadDylib) {
         ExternImport{SymbolId{99}, "_undeclared",
                      "/usr/lib/libNotDeclared.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a named non-schema import library must AUTO-EMIT LC_LOAD_DYLIB, "
            "not be rejected.";
@@ -3821,7 +4162,7 @@ TEST(MachOTlvWriter, ThreeThreadSectionsCarryStdThreadLocalFlags) {
     ASSERT_TRUE(L.target && L.format);
     auto mod = buildMachoTlvModule(/*withTbss=*/true);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    auto bytes = encodeUntrampolined(mod, *L.target, *L.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
     auto dec = decodeMacho(bytes);
@@ -3848,7 +4189,7 @@ TEST(MachOTlvWriter, DescriptorWord2IsZeroBasedBlockOffset) {
     ASSERT_TRUE(L.target && L.format);
     auto mod = buildMachoTlvModule(/*withTbss=*/true);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    auto bytes = encodeUntrampolined(mod, *L.target, *L.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto dec = decodeMacho(bytes);
     auto const* tv = dec.sec("__thread_vars");
@@ -3881,7 +4222,7 @@ TEST(MachOTlvWriter, BootstrapBindPerDescriptorTargetsWord0) {
     ASSERT_TRUE(L.target && L.format);
     auto mod = buildMachoTlvModule(/*withTbss=*/true);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    auto bytes = encodeUntrampolined(mod, *L.target, *L.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto dec = decodeMacho(bytes);
     auto const* tv = dec.sec("__thread_vars");
@@ -3916,7 +4257,7 @@ TEST(MachOTlvWriter, TlsImageHeaderAdvertisesTlvDescriptorsFlagRuntimeClosure) {
     ASSERT_TRUE(L.target && L.format);
     auto mod = buildMachoTlvModule(/*withTbss=*/true);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    auto bytes = encodeUntrampolined(mod, *L.target, *L.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_GE(bytes.size(), 28u);
     // mach_header_64.flags @ +24 (magic/cputype/cpusubtype/filetype/ncmds/sizeofcmds).
@@ -3952,7 +4293,7 @@ TEST(MachOTlvWriter, AddressOfThreadLocalInDataItemFailsLoudCrit1) {
     p.relocations.push_back(Relocation{0u, SymbolId{50}, abs64, 0});
     mod.dataItems.push_back(std::move(p));
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    auto bytes = encodeUntrampolined(mod, *L.target, *L.format, rep);
     EXPECT_TRUE(bytes.empty());
     EXPECT_TRUE(sawDiag(rep, DiagnosticCode::K_RelocationKindMismatch))
         << "a data-item reloc targeting a thread-local must fail loud (CRIT-1)";
@@ -3967,7 +4308,7 @@ TEST(MachOTlvWriter, PlainThreadLocalLinksCleanCrit1Positive) {
     ASSERT_TRUE(L.target && L.format);
     auto mod = buildMachoTlvModule(/*withTbss=*/true);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    auto bytes = encodeUntrampolined(mod, *L.target, *L.format, rep);
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_FALSE(bytes.empty());
 }
@@ -3980,7 +4321,7 @@ TEST(MachOTlvWriter, OverAlignedThreadLocalFailsLoudM3) {
     ASSERT_TRUE(L.target && L.format);
     auto mod = buildMachoTlvModule(/*withTbss=*/false, /*tdataAlign=*/32);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    auto bytes = encodeUntrampolined(mod, *L.target, *L.format, rep);
     EXPECT_TRUE(bytes.empty());
     EXPECT_TRUE(sawDiag(rep, DiagnosticCode::K_ThreadLocalOveralignedForFormat));
 }
@@ -3992,7 +4333,7 @@ TEST(MachOTlvWriter, SixteenByteAlignedThreadLocalLinksCleanM3) {
     ASSERT_TRUE(L.target && L.format);
     auto mod = buildMachoTlvModule(/*withTbss=*/false, /*tdataAlign=*/16);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    auto bytes = encodeUntrampolined(mod, *L.target, *L.format, rep);
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_FALSE(bytes.empty());
 }
@@ -4013,7 +4354,7 @@ TEST(MachOTlvWriter, NoThreadLocalEmitsNoThreadSectionsSqliteDormant) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "_exit", "/usr/lib/libSystem.B.dylib"});
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    auto bytes = encodeUntrampolined(mod, *L.target, *L.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto dec = decodeMacho(bytes);
     EXPECT_EQ(dec.sec("__thread_vars"), nullptr);

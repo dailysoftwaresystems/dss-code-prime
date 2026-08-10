@@ -442,8 +442,29 @@ namespace dss::link::format {
 //   1. `module.imageEntryOverride` (D-LK10-ENTRY Slice C) — bounds-
 //      checked; out-of-range emits K_SymbolUndefined.
 //   2. `format.entryPoint()` — non-empty: scan functions[] for
-//      synthesized name match.
-//   3. Default = 0 (first function).
+//      synthesized name match; no match emits K_SymbolUndefined.
+//   3. `format.entryPoint()` EMPTY, no override — a THREE-way split
+//      (D-LK10-ENTRY entry-gate fold; the second arm was added by the
+//      TF-C120 audit, which found the two-way version closed only half
+//      the defect):
+//        * the format DECLARES `processExit` ⇒ it contracted that its
+//          entry is the synthesized trampoline, but none was injected
+//          ⇒ fail loud with K_ExecEntryNotTrampolined rather than
+//          silently making functions[0] the process entry. NOT
+//          `K_FormatLacksProcessExit` (0x801C): that code means the
+//          format declares NO `processExit`, which is the exact
+//          OPPOSITE of the condition tested here — a reader sent to
+//          their format by that name finds the block present and
+//          concludes the compiler is lying;
+//        * NO `processExit` but the schema is EXEC-FLAVORED ⇒
+//          K_FormatLacksProcessExit, and that name is EXACTLY right
+//          here: the code's documented predicate (parse_diagnostic.hpp)
+//          is literally `!format.processExit().has_value()`. Such a
+//          format never had a mechanism to build an entry out of, so
+//          functions[0] would be the user's own first function;
+//        * NEITHER ⇒ default = 0 (first function). Only the genuinely
+//          entry-less shapes (.so / dylib / dll / relocatable) reach
+//          this arm, and their callers ignore the result anyway.
 //
 // Returns nullopt on fail-loud paths (diagnostic already emitted).
 [[nodiscard]] inline std::optional<std::size_t> resolveEntryFnIdx(
@@ -466,7 +487,156 @@ namespace dss::link::format {
         return *module.imageEntryOverride;
     }
     auto const ep = format.entryPoint();
-    if (ep.empty()) return std::size_t{0};
+    if (ep.empty()) {
+        // ★ THE DISCRIMINATOR IS NOT `entryPoint`. Every shipped exec
+        // format declares `"entryPoint": ""`, and returning 0 IS the
+        // correct normal path there — because by the time a walker
+        // runs, `linker::link` has PREPENDED the `_start` trampoline
+        // as functions[0]. What actually distinguishes normal from
+        // broken is the OVERRIDE: `entry_trampoline.cpp:732` sets
+        // `module.imageEntryOverride = 0` as the LAST act of every
+        // SUCCESSFUL injection (the one early return below the prepend
+        // rolls the prepend back and returns false, so there is no
+        // trampolined-but-override-less outcome), and the override
+        // branch above returns before this point. So reaching HERE
+        // means no trampoline was ever injected into this module.
+        // (This comment cited `:708` until the misnomer fix; that line
+        // is a comment about `expectedFuncCount` — VERIFIED by grepping
+        // `imageEntryOverride` in entry_trampoline.cpp: ONE assignment,
+        // at 732.)
+        //
+        // If the format declares `processExit`, it has CONTRACTED that
+        // its image entry is a DSS-synthesized trampoline. An
+        // un-trampolined module under that contract can only have come
+        // from a DIRECT `{elf,macho,pe}::encode` call that bypassed
+        // `linker::link` — and silently defaulting to functions[0]
+        // there makes the user's first function the process entry.
+        // MEASURED (the defect this closes, via the sibling gate in
+        // linker.cpp): `LC_MAIN entryoff=0x1000` whose bytes were
+        // `48 81 ec 10 00 00 00` (`sub rsp,0x10`) — a function
+        // prologue — with rc=0 and zero diagnostics.
+        //
+        // ★ THE PREDICATE IS THE UNION `processExit() || isExecFlavor()`,
+        // AND THE EARLIER `processExit()`-ONLY VERSION WAS AN INCOMPLETE
+        // ENUMERATION. That version reasoned: "a format WITHOUT
+        // `processExit` (a `.so`, a dylib, a relocatable) never had a
+        // trampoline to begin with". Those three shapes are not the whole
+        // domain — it omitted an EXEC-FLAVORED format that declares no
+        // `processExit`, which is bit-for-bit the defect this fold exists
+        // to close. MEASURED (TF-C120 audit-fix round, by reverting the
+        // widening and re-running the test below): such a schema handed
+        // straight to `{elf,macho,pe}::encode` with no `imageEntryOverride`
+        // took the `return 0` arm — NON-EMPTY bytes, ZERO diagnostics,
+        // functions[0] as the image entry. Structurally identical to the
+        // `LC_MAIN entryoff=0x1000` / `sub rsp,0x10` shape quoted above,
+        // reached by a different route.
+        // The linker-tier twin (linker.cpp's `needsTrampoline` refusal)
+        // catches it ONLY on the `linker::link` path, and this walker's
+        // whole reason for existing is the threat model where `link` was
+        // never called.
+        //
+        // WHY BOTH TERMS, not one:
+        //   * `processExit()` alone misses exec-flavored-without-exit
+        //     (above);
+        //   * `isExecFlavor()` alone misses a format that DECLARES
+        //     `processExit` while failing the exec-flavor arms — a
+        //     hand-built ET_DYN with `processExit` but no interpreter,
+        //     say. `validate()` rejects that at load, but nothing
+        //     validates an in-memory `ObjectFormatSchema{ObjectFormatData}`,
+        //     which is the tier this gate defends.
+        // The union is a strict SUPERSET of the old predicate, so no
+        // case that used to fail loud stops doing so.
+        //
+        // WHICH CODE IS CHOSEN BY PREDICATE, NEVER BY SITE — that split
+        // is the whole reason two codes were shipped. The selector below
+        // is `processExit().has_value()`, which keeps
+        // `K_FormatLacksProcessExit`'s documented invariant literally
+        // true ("★ THE NAME *IS* THE PREDICATE ... EXACTLY
+        // `!format.processExit().has_value()`, at every site that fires
+        // it" — parse_diagnostic.hpp).
+        //
+        // ★ NOT COVERED HERE, AND IT DOES NOT NEED TO BE: an ELF ET_DYN
+        // carrying a 3-of-4 entry cluster (interpreter + cc + args, no
+        // `processExit`) satisfies NEITHER term — `isExecFlavor()`'s dyn
+        // arm contains `processExit.has_value()`. It is not silent
+        // though: the ELF walker's own half-cluster belt
+        // (`elf::encodeElfExecDynamic`, the `isPie != !interpreter.empty()`
+        // refusal) fires FIRST and returns no bytes, so this resolver is
+        // never reached on that shape. MEASURED — see
+        // `EntryGateFold.ElfWalkerRefusesHandBuiltEtDynPartialEntryCluster`
+        // in tests/link/test_lk10_entry_slice_c.cpp.
+        if (format.processExit().has_value()) {
+            // ★ THE CODE NAMES THE MISSING TRAMPOLINE, NOT A MISSING
+            // FORMAT CAPABILITY. `K_FormatLacksProcessExit` (0x801C)
+            // stood here until the review that split the codes, and it
+            // was a MISNOMER the whole time: this arm runs ONLY when
+            // `processExit` IS declared (the `if` directly above), so a
+            // reader who greps that name and opens the format finds the
+            // block present and is sent looking for a schema bug that
+            // does not exist. The format kept its half of the contract;
+            // the DRIVE broke the other half.
+            emit(reporter, DiagnosticCode::K_ExecEntryNotTrampolined,
+                 prefixStr + ": object format '"
+                 + std::string{format.name()}
+                 + "' declares a 'processExit' block -- which CONTRACTS "
+                   "that this image's entry is the DSS-synthesized "
+                   "`_start` trampoline -- but the module carries no "
+                   "`imageEntryOverride`, so NO TRAMPOLINE WAS EVER "
+                   "INJECTED into it. The format is fine; the fault is "
+                   "the missing entry trampoline. Defaulting the image "
+                   "entry to functions[0] would silently make the "
+                   "module's FIRST FUNCTION the process entry: it would "
+                   "never materialize arguments and never call the "
+                   "declared exit mechanism, so the program would run "
+                   "off the end of that function. REMEDY: route this "
+                   "module through `linker::link`, which injects the "
+                   "trampoline and sets the override -- or, if an "
+                   "UNTRAMPOLINED entry is genuinely intended, set "
+                   "`imageEntryOverride` explicitly to the function "
+                   "index that is to be the image entry. Do NOT add or "
+                   "remove a 'processExit' block to silence this: that "
+                   "block is not what is wrong. (D-LK10-ENTRY 2.13.)");
+            return std::nullopt;
+        }
+        // ★ THE CODE NAMES THE MISSING FORMAT CAPABILITY, AND HERE THAT
+        // NAME IS CORRECT. `processExit` is genuinely absent (the `if`
+        // directly above returned), and the schema still claims to be a
+        // program the OS starts. Same fault class, same code, as the
+        // linker-tier gate (linker.cpp) and `injectEntryTrampoline`'s own
+        // backstop: "the emitted entry would have no process-exit path"
+        // must not present under a different code depending on which tier
+        // noticed it.
+        if (format.isExecFlavor()) {
+            emit(reporter, DiagnosticCode::K_FormatLacksProcessExit,
+                 prefixStr + ": object format '"
+                 + std::string{format.name()}
+                 + "' is exec-flavored (the artifact is a program the OS "
+                   "starts) but declares NO 'processExit' block, and the "
+                   "module carries no `imageEntryOverride`. DSS ALWAYS "
+                   "synthesises an entry trampoline on an exec-flavored "
+                   "format -- the image entry IS that trampoline, and its "
+                   "last act is to call the mechanism 'processExit' names "
+                   "-- so this format declares no mechanism for it to "
+                   "call and no entry can be built. Defaulting the image "
+                   "entry to functions[0] would silently make the "
+                   "module's FIRST FUNCTION the process entry: it would "
+                   "never materialize arguments and never call any exit "
+                   "mechanism, so the program would run off the end of "
+                   "that function. REMEDY: add a 'processExit' block "
+                   "(mechanism 'syscall' or 'by-name-import') plus the "
+                   "paired 'entryCallingConvention' to this format's "
+                   "schema, or build for a format that declares them. "
+                   "This is a DSS policy about how DSS builds entries, "
+                   "NOT a claim that the platform cannot terminate "
+                   "otherwise. NOTE this fired at the WALKER: a schema "
+                   "with this shape is rejected at CONFIG LOAD, so it "
+                   "reached here through an in-memory "
+                   "`ObjectFormatSchema{ObjectFormatData}` or a direct "
+                   "`{elf,macho,pe}::encode` call. (D-LK10-ENTRY 2.13.)");
+            return std::nullopt;
+        }
+        return std::size_t{0};
+    }
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
         std::string const cand = std::string{synthNamePrefix}
                                + std::to_string(module.functions[i].symbol.v);

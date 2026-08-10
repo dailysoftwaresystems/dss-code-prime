@@ -240,10 +240,35 @@ public:
     /// the in-process round-trip harness (and tests) sets it directly before
     /// building the `main` that links against a DSS-built library. Threaded to
     /// `CompileOptions.resolveLibraries` at the per-target build.
-    void setResolveLibraries(std::vector<std::filesystem::path> libs) {
+    ///
+    /// D-FFI-DECLARED-IMPORT-NAME: each entry may additionally STATE the
+    /// runtime identity to record for the symbols read out of it (the CLI
+    /// `<path>=<import-name>` suffix / the manifest's `{"path","importName"}`
+    /// object). That is what `ResolveLibrarySpec` carries.
+    void setResolveLibraries(std::vector<ResolveLibrarySpec> libs) {
         resolveLibraries_ = std::move(libs);
     }
-    [[nodiscard]] std::vector<std::filesystem::path> const&
+    /// Plain-path convenience overload — the "no identity stated anywhere"
+    /// shorthand, exactly parallel to the manifest's plain-string entry form.
+    /// Every entry gets an EMPTY `declaredImportName`, so the recorded import
+    /// identity is decided exactly as it was before this capability landed
+    /// (embedded soname, else basename). Kept as a first-class spelling rather
+    /// than a migration shim: the overwhelming majority of callers resolve a
+    /// DSS-BUILT library whose own soname is already correct, and making them
+    /// write an empty second member would be noise.
+    ///
+    /// NOTE (overload-resolution): `ResolveLibrarySpec` is an aggregate with no
+    /// converting constructor from `std::filesystem::path`, so a braced call
+    /// like `setResolveLibraries({somePath})` resolves UNAMBIGUOUSLY to this
+    /// overload — the spec overload is not viable for it.
+    void setResolveLibraries(std::vector<std::filesystem::path> libs) {
+        resolveLibraries_.clear();
+        resolveLibraries_.reserve(libs.size());
+        for (auto& p : libs) {
+            resolveLibraries_.push_back(ResolveLibrarySpec{std::move(p), {}});
+        }
+    }
+    [[nodiscard]] std::vector<ResolveLibrarySpec> const&
     resolveLibraries() const noexcept { return resolveLibraries_; }
 
     /// D-PERF-4-CU-PARALLELISM: inject an executor for the per-CU build loop.
@@ -296,7 +321,7 @@ private:
     CompileConfig                          compileConfig_ = CompileConfig::Debug;
     std::vector<std::string>               userDefines_;  // c105: --define
     std::vector<std::string>               includeDirs_;  // -I<dir> quote-include search path
-    std::vector<std::filesystem::path>     resolveLibraries_;  // c162: --resolve-library
+    std::vector<ResolveLibrarySpec>        resolveLibraries_;  // c162: --resolve-library
     substrate::IExecutor*                  executor_ = nullptr;  // D-PERF-4 (non-owning; tests inject)
     unsigned                               jobs_     = 0;         // D-PERF-4: --jobs (0 = auto)
     // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve / manifest

@@ -26,6 +26,7 @@
 #include "hir/hir_node.hpp"
 #include "link/object_format_schema.hpp"
 #include "byte_emit.hpp"
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -36,6 +37,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace dss;
@@ -718,6 +720,132 @@ TEST(FfiIngest, IngestPrefersSonameOverBasenameForImportLibrary) {
     EXPECT_TRUE(fallback.soname.empty());
 }
 
+// ── D-FFI-DECLARED-IMPORT-NAME: the caller-STATED identity outranks both ──
+//
+// Reading a library answers two separate questions: WHICH SYMBOLS exist (the
+// file at `path`) and WHAT IDENTITY to record for them. Until this landed only
+// the file could answer the second, which makes a cross-compilation STAND-IN
+// binary unusable: a MacPorts `.dylib` whose LC_ID_DYLIB is
+// `/opt/local/lib/libtcl8.6.dylib` would stamp that MacPorts prefix into the
+// artifact's LC_LOAD_DYLIB, and the artifact would then demand MacPorts at
+// that exact path on the target Mac (a dyld load failure at RUNTIME, with no
+// build error anywhere).
+//
+// The precedence, highest first: declaredImportName > row.soname > basename.
+// The sibling test above pins levels 2 vs 3; this one pins level 1 over BOTH,
+// plus the empty-means-unstated fallthrough that keeps every pre-existing
+// build byte-identical.
+//
+// FORMAT-BLIND by construction: the fixture drives ELF because that is the
+// format `buildElfSo` can synthesize in-process, but the production decision
+// site reads `row.soname`, which the ELF / Mach-O / PE readers all populate
+// from their own embedded identity -- there is no per-format arm to test.
+TEST(FfiIngest, IngestDeclaredImportNameOutranksSonameAndBasename) {
+    ScratchDir scratch{Location::Temp, "ff5-declared-import"};
+    auto const dir = scratch.path();
+
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(format.has_value());
+
+    // Build a `.so` exporting `puts` (optionally carrying `soname`), run
+    // ingest() against it with `importName` = "widget-basename.so" (level 3)
+    // and the given `declared` (level 1), and return the resolved metadata.
+    auto runIngest = [&](std::string const& fileName,
+                         std::string const& soname,
+                         std::string const& declared) -> FfiMetadata {
+        auto const path = dir / fileName;
+        {
+            auto const bytes = buildElfSo("puts", soname);
+            std::ofstream out{path, std::ios::binary};
+            out.write(reinterpret_cast<char const*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+        }
+        TypeInterner ti = makeInterner();
+        auto built = buildModuleWithExtern(ti);
+        HirFfiMap ffi{built.hir};
+        DiagnosticReporter rep;
+        std::array sources{IngestionSource{BinaryLibrarySource{
+            path, "widget-basename.so", declared}}};
+        std::array externs{ExternDeclRef{built.externNode, "puts"}};
+        auto result = ingest(sources, externs, **target, **format, ffi, rep);
+        EXPECT_TRUE(result.ok()) << "rep.errorCount=" << rep.errorCount();
+        EXPECT_EQ(result.externsAnnotated, 1u);
+        auto const* meta = ffi.tryGet(built.externNode);
+        EXPECT_NE(meta, nullptr);
+        return meta ? *meta : FfiMetadata{};
+    };
+
+    // (a) LEVEL 1 BEATS LEVEL 2: the binary declares DT_SONAME
+    // `/opt/local/lib/libwidget.so.2` (the MacPorts-shaped absolute install
+    // name that motivates the whole capability) AND the caller states
+    // `libwidget.so.2`. The STATED name must win.
+    // RED-ON-DISABLE: drop the level-1 arm from the decision site and this
+    // reads the `/opt/local/...` soname -- exactly the artifact that would
+    // fail to load on the target.
+    FfiMetadata const stated =
+        runIngest("libwidget.so", "/opt/local/lib/libwidget.so.2",
+                  "libwidget.so.2");
+    EXPECT_EQ(stated.importLibrary, "libwidget.so.2")
+        << "a caller-STATED import name must outrank the embedded DT_SONAME";
+    // The OBSERVED embedded identity is NOT forged to match: it still records
+    // what the file we actually read declared about itself. Losing this would
+    // destroy the only evidence of which binary was read.
+    EXPECT_EQ(stated.soname, "/opt/local/lib/libwidget.so.2")
+        << "meta.soname records the file's OWN identity, not the declaration";
+
+    // (b) LEVEL 1 BEATS LEVEL 3: no DT_SONAME at all, so level 2 is out of the
+    // way and the STATED name must still beat the basename fallback.
+    FfiMetadata const statedNoSoname =
+        runIngest("libplain.so", "", "libwidget.so.2");
+    EXPECT_EQ(statedNoSoname.importLibrary, "libwidget.so.2")
+        << "a caller-STATED import name must outrank the basename fallback";
+    EXPECT_TRUE(statedNoSoname.soname.empty());
+
+    // (c) EMPTY == NOT STATED ⇒ falls through to LEVEL 2. This is the arm that
+    // keeps every build predating this capability byte-identical.
+    // RED-ON-DISABLE: make the level-1 arm unconditional (`declaredImportName`
+    // always wins, even empty) and this reads "" instead of the soname.
+    FfiMetadata const unstated =
+        runIngest("libwidget2.so", "libwidget.so.2", "");
+    EXPECT_EQ(unstated.importLibrary, "libwidget.so.2")
+        << "an EMPTY declaration means NOT STATED -- fall through to the soname";
+
+    // (d) EMPTY declaration AND no soname ⇒ all the way down to LEVEL 3.
+    FfiMetadata const unstatedNoSoname = runIngest("libplain2.so", "", "");
+    EXPECT_EQ(unstatedNoSoname.importLibrary, "widget-basename.so")
+        << "nothing stated + no soname ⇒ the basename fallback still applies";
+}
+
+// The STRUCT contract, independent of any binary read: the new field exists,
+// defaults EMPTY (== not stated, so a positional aggregate initializer written
+// before this capability keeps its exact old meaning), and survives into the
+// IngestionSource variant. Pins the FIELD ORDER too -- `declaredImportName` is
+// LAST, so `BinaryLibrarySource{path, basename}` still means "basename is the
+// level-3 fallback", not "basename is the level-1 declaration". Getting that
+// backwards would silently promote every existing caller's basename to the top
+// of the precedence.
+TEST(FfiIngest, BinaryLibrarySourceDeclaredImportNameDefaultsEmptyAndIsLast) {
+    BinaryLibrarySource none{"/tmp/libdsslib.so"};
+    EXPECT_TRUE(none.importName.empty());
+    EXPECT_TRUE(none.declaredImportName.empty());
+
+    BinaryLibrarySource twoArg{"/build/abs/libdsslib.so", "libdsslib.so"};
+    EXPECT_EQ(twoArg.importName, "libdsslib.so")
+        << "the SECOND positional is still the level-3 basename fallback";
+    EXPECT_TRUE(twoArg.declaredImportName.empty())
+        << "a two-arg initializer states NOTHING -- old callers unchanged";
+
+    BinaryLibrarySource declared{"/opt/local/lib/libtcl8.6.dylib",
+                                 "libtcl8.6.dylib", "@rpath/libtcl8.6.dylib"};
+    EXPECT_EQ(declared.declaredImportName, "@rpath/libtcl8.6.dylib");
+    IngestionSource src{declared};
+    ASSERT_TRUE(std::holds_alternative<BinaryLibrarySource>(src));
+    EXPECT_EQ(std::get<BinaryLibrarySource>(src).declaredImportName,
+              "@rpath/libtcl8.6.dylib");
+}
+
 // ── FF3 (resolveAbi) gate: bad (target, format) pair fails ingest ─
 
 TEST(FfiIngest, AbiResolveFailureSkipsIngestion) {
@@ -1120,4 +1248,132 @@ TEST(FfiSynthesize, DiagnosticCodeNameRoundTripFFfiNoImportLibraryForFormat) {
     EXPECT_EQ(diagnosticCodeName(
                   DiagnosticCode::F_FfiNoImportLibraryForFormat),
               "F_FfiNoImportLibraryForFormat");
+}
+
+// ── TF-C124: an OBSERVED symbol version reaches FfiMetadata ──────────────
+// D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION.
+//
+// c156 built the rail that turns `FfiMetadata.version` into a
+// `.gnu.version_r` requirement in the emitted image, but the ONLY thing that
+// could ever put a string on that rail was a shipped DESCRIPTOR's declared
+// `version`. Every third-party library this project links (Tcl, zlib) has no
+// descriptor, so for those the mechanism was unreachable: a
+// `--resolve-library` import was unversioned no matter what the library said
+// about itself. These pin the second source — the binary's own record —
+// through the SHIPPED reader, against a REAL GNU ld 2.42 library
+// (`tests/ffi/data/libdssver.so.1`; see the header comment on the
+// `BinaryReaderElfSymbolVersion` suite for why it is a file and not
+// synthesized bytes).
+namespace {
+
+[[nodiscard]] fs::path versionedFixturePath() {
+    return dss::test::repoRoot() / "tests" / "ffi" / "data" / "libdssver.so.1";
+}
+
+// Run `ingest()` over the real versioned library, binding ONE extern.
+// `declaredVersion` is the DESCRIPTOR's declaration (level 1 of the version
+// decision); `declaredImportName` is the caller-STATED runtime identity.
+struct VersionIngestOutcome {
+    FfiMetadata meta;
+    bool        annotated = false;
+};
+
+[[nodiscard]] VersionIngestOutcome ingestOneFromVersionedLibrary(
+    std::string const& canonicalName,
+    std::string_view   declaredVersion    = {},
+    std::string const& declaredImportName = {}) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    EXPECT_TRUE(format.has_value());
+    if (!target || !format) return {};
+
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleWithExtern(ti);
+    HirFfiMap ffi{built.hir};
+    DiagnosticReporter rep;
+    std::array sources{IngestionSource{BinaryLibrarySource{
+        versionedFixturePath(), "libdssver-basename.so", declaredImportName}}};
+    std::array externs{ExternDeclRef{built.externNode, canonicalName, {},
+                                     false, declaredVersion}};
+    auto const result =
+        ingest(sources, externs, **target, **format, ffi, rep);
+    auto const* meta = ffi.tryGet(built.externNode);
+    return VersionIngestOutcome{meta != nullptr ? *meta : FfiMetadata{},
+                                result.externsAnnotated == 1u};
+}
+
+} // namespace
+
+TEST(FfiIngest, ObservedDefaultSymbolVersionReachesFfiMetadata) {
+    auto const out = ingestOneFromVersionedLibrary("dss_ver_default");
+    ASSERT_TRUE(out.annotated);
+    // The identity is the binary's own DT_SONAME (level 2 beats the
+    // basename), and the version is the one THAT library records for THAT
+    // export. Both come from the same file, which is the invariant the
+    // stand-in guard below protects.
+    EXPECT_EQ(out.meta.importLibrary, "libdssver.so.1");
+    EXPECT_EQ(out.meta.version, "DSSVER_2.0")
+        << "the reader saw dss_ver_default@@DSSVER_2.0; without this the "
+           "import would be emitted unversioned and bind whatever ld.so "
+           "considers default at RUN time";
+}
+
+TEST(FfiIngest, ObservedUnversionedExportStaysUnversioned) {
+    auto const out = ingestOneFromVersionedLibrary("dss_ver_plain");
+    ASSERT_TRUE(out.annotated);
+    EXPECT_EQ(out.meta.importLibrary, "libdssver.so.1");
+    EXPECT_TRUE(out.meta.version.empty())
+        << "this export carries versym VER_NDX_GLOBAL — there is no version "
+           "to request, and inventing one would emit a verneed for a version "
+           "the library does not define";
+}
+
+TEST(FfiIngest, DeclaredSymbolVersionOutranksTheObservedOne) {
+    // A descriptor's declaration is a statement about the RUNTIME library;
+    // the observation is a fact about the file we happened to read. Same
+    // ordering, and for the same reason, as declaredImportName > soname.
+    auto const out =
+        ingestOneFromVersionedLibrary("dss_ver_default", "DSSVER_1.0");
+    ASSERT_TRUE(out.annotated);
+    EXPECT_EQ(out.meta.version, "DSSVER_1.0")
+        << "the declaration must win; the observed DSSVER_2.0 must not "
+           "silently overwrite what a descriptor pinned on purpose";
+}
+
+TEST(FfiIngest, ObservedNonDefaultCompatVersionIsNeverPinned) {
+    // ★ THE ONE THAT MATTERS. `dss_ver_compat` has TWO definitions in this
+    // library: the NON-default `@DSSVER_1.0` compat instance at .dynsym
+    // index 1, and the default `@@DSSVER_2.0` at index 3. `ingest()` is
+    // first-source-wins, so the row it keeps is the COMPAT one — purely
+    // because of where ld placed it in `.dynsym`.
+    //
+    // Pinning that observation would emit a verneed requiring DSSVER_1.0 and
+    // MANUFACTURE the very bug D-LK-ELF-SYMBOL-VERSIONING was opened for:
+    // glibc exports both `realpath@@GLIBC_2.3` and the NULL-buffer-rejecting
+    // `realpath@GLIBC_2.2.5`, and binding the latter is what made a DSS
+    // binary print REALPATH_NULL and exit 3. Leaving a compat row unversioned
+    // preserves the pre-TF-C124 behaviour exactly: the reference binds the
+    // library's default.
+    auto const out = ingestOneFromVersionedLibrary("dss_ver_compat");
+    ASSERT_TRUE(out.annotated);
+    EXPECT_TRUE(out.meta.version.empty())
+        << "got '" << out.meta.version << "' — a NON-default (VERSYM_HIDDEN) "
+           "compat version must never be requested from a mere observation";
+}
+
+TEST(FfiIngest, ObservedVersionIsNotPinnedOntoADeclaredStandInIdentity) {
+    // D-FFI-DECLARED-IMPORT-NAME lets a caller read symbols out of a
+    // cross-compilation STAND-IN whose runtime counterpart is a different
+    // file. The emitted verneed names the DECLARED identity, so requesting a
+    // version observed in the stand-in would demand it of a library whose
+    // version set we never looked at — turning a working link into a
+    // load-time failure on the target.
+    auto const out = ingestOneFromVersionedLibrary(
+        "dss_ver_default", {}, "libdssver-runtime.so.1");
+    ASSERT_TRUE(out.annotated);
+    EXPECT_EQ(out.meta.importLibrary, "libdssver-runtime.so.1");
+    EXPECT_TRUE(out.meta.version.empty())
+        << "got '" << out.meta.version << "' — the version was observed in a "
+           "DIFFERENT file than the one this import will bind at runtime";
 }

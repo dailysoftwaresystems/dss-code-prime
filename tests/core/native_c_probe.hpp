@@ -173,6 +173,46 @@ struct ProbeResult {
 #endif
 }
 
+// Run an ALREADY-ASSEMBLED command string with BOTH streams captured into `out`.
+// [D-TEST-NATIVE-PROBE-COMPILE-FAILURE-DISCARDS-ITS-OWN-OUTPUT.]
+//
+// Distinct from `redirectCmd` above, which takes an executable PATH and quotes it.
+// Here the caller already holds a full command line (on Windows a
+// `"…vcvars64.bat" && cl …` chain), so quoting it again would corrupt it — the
+// redirection is appended to it instead. cmd.exe still needs the outer pair for the
+// same reason redirectCmd needs it: a command line that BEGINS with a quote has its
+// first and last quote stripped, and the build command does begin with one.
+//
+// ⚠ AND `2>&1` IS THE POINT, not a detail. A compiler says why it failed on stderr.
+[[nodiscard]] inline std::string captureCmd(std::string const& cmd, fs::path const& out) {
+#if defined(_WIN32)
+    return "\"" + cmd + " > \"" + out.string() + "\" 2>&1\"";
+#else
+    return cmd + " > \"" + out.string() + "\" 2>&1";
+#endif
+}
+
+// The tail of a captured log, folded into a failure detail.
+//
+// ★ THE THREE OUTCOMES ARE KEPT APART — unreadable, empty, and present are three
+//   different facts about a failed build, and collapsing them into "" would put the
+//   reader back where this whole file started.
+[[nodiscard]] inline std::string tailOf(fs::path const& p, std::size_t maxLines) {
+    std::ifstream in{p};
+    if (!in) {
+        return "\n  (no build output: the capture log `" + p.string()
+             + "` could not be opened, so WHY it failed is not known here)";
+    }
+    std::vector<std::string> lines;
+    for (std::string l; std::getline(in, l);) lines.push_back(l);
+    if (lines.empty()) return "\n  (the build command produced NO output at all)";
+    std::size_t const from = lines.size() > maxLines ? lines.size() - maxLines : 0;
+    std::string out = "\n  --- build output, last " + std::to_string(lines.size() - from)
+                    + " of " + std::to_string(lines.size()) + " line(s) ---";
+    for (std::size_t i = from; i < lines.size(); ++i) out += "\n  " + lines[i];
+    return out;
+}
+
 // A located host C compiler: its family, plus a shell-ready command that builds
 // `<src>` into `<exe>`.
 struct Compiler {
@@ -311,10 +351,20 @@ struct CompilerLocation {
         // Generate a build batch: call vcvars64, then cl. Quote everything.
         fs::path const bat = work / "build_probe.bat";
         std::ofstream b{bat};
+        // ★ `cl` IS NO LONGER SILENCED. [D-TEST-NATIVE-PROBE-COMPILE-FAILURE-DISCARDS-ITS-OWN-OUTPUT.]
+        // `>nul 2>&1` here threw the compiler's diagnostics away INSIDE the batch,
+        // so the caller's capture — added in the same pass — collected an empty log
+        // and could only report "the build command produced NO output at all". ✔That
+        // is exactly what it reported when the arm was first exercised, which is how
+        // this line was found: the capture was right and was pointed at a stream
+        // already emptied one level down.
+        // `call vcvars` KEEPS its silencer: on success it prints a banner that is
+        // pure noise, and its failure mode is already covered upstream — this batch
+        // is only written after `locateMsvcToolchain` has validated the path.
         b << "@echo off\r\n"
           << "call \"" << vcvars.string() << "\" >nul 2>&1\r\n"
           << "cl /nologo /W3 /Fe:\"" << exe.string() << "\" \""
-          << src.string() << "\" >nul 2>&1\r\n";
+          << src.string() << "\"\r\n";
         b.close();
         return "\"\"" + bat.string() + "\"\"";
     };
@@ -413,9 +463,26 @@ runNativeCProbe(std::string_view tag,
     writeSource(src, loc.compiler->kind);
 
     std::string const build = loc.compiler->buildCmd(src, exe);
-    if (build.empty() || std::system(build.c_str()) != 0) {
+    // ★ CAPTURE THE BUILD'S OWN OUTPUT. [D-TEST-NATIVE-PROBE-COMPILE-FAILURE-DISCARDS-ITS-OWN-OUTPUT.]
+    // ⚠ AND THIS ARM HAS AN OPEN, UNEXPLAINED OCCURRENCE BEHIND IT:
+    // [D-TEST-NATIVE-PROBE-COMPILE-FAILS-UNDER-CONCURRENT-LOAD] — one non-reproducing
+    // failure under a concurrently-running second gate, scratch-dir collision ruled
+    // out by construction, mechanism NOT established. Do not "fix" it with a retry
+    // and do not serialize the gates around it (the operator refused that class of
+    // remedy). The capture below IS the experiment the next occurrence needs.
+    // ✔MEASURED 2026-08-10: a one-shot NATIVE-PROBE-COMPILE-FAILED in a parallel
+    // ctest run (`core/test_packed_abi_conformance`, which then passed alone in two
+    // shells) left NOTHING to diagnose — the detail named which command failed and
+    // the compiler's own explanation had gone to a discarded stream. Every other
+    // status in this file distinguishes what broke; this one knew and threw it away.
+    // The `build.empty()` test stays FIRST so `captureCmd` is never handed an empty
+    // command — `||` short-circuits, exactly as before.
+    fs::path const buildLog = work / "build_output.txt";
+    if (build.empty()
+        || std::system(captureCmd(build, buildLog).c_str()) != 0) {
         r.status = ProbeStatus::CompileFailed;
-        r.detail = "build command `" + build + "`";
+        r.detail = "build command `" + build + "`"
+                 + (build.empty() ? std::string{} : tailOf(buildLog, 30));
         return r;
     }
     if (!fileExists(exe)) {

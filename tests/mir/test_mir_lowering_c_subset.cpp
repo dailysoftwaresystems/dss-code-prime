@@ -574,7 +574,7 @@ namespace {
     };
 }
 
-// D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT: lower a program that calls a shipped
+// D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: lower a program that calls a shipped
 // descriptor's `fn(ptr<i64>)` with a real C `long long*` arg through the FULL
 // pipeline (scratch descriptor on the system path — the lowerAtomicProgram
 // discipline). Used to witness that the admitted call-arg REALIZES as a Ptr→Ptr
@@ -5955,7 +5955,7 @@ TEST(MirLoweringCSubset, MixedSignCompareLowersUnsignedWithExplicitCast) {
         << "the I64 operand's conversion to U64 must be a REAL cast inst";
 }
 
-// D-LANG-FFI-DESCRIPTOR-INT-POINTEE-COMPAT (realize + verifier backstop): the
+// D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (realize + verifier backstop): the
 // admitted shipped-descriptor call-arg (`long long*` into a `ptr<i64>` param)
 // REALIZES as a Ptr→Ptr Cast — a bitcast that HIR→MIR maps to a no-op, changing NO
 // bits. And admit⟺realize by construction: the semantic tier ADMITS (model clean)
@@ -5968,7 +5968,7 @@ TEST(MirLoweringCSubset, MixedSignCompareLowersUnsignedWithExplicitCast) {
 // an UNDEFINED shipped extern needs the FFI-synthesis the unit `lowerToMir` harness
 // (ffiMap=nullptr) does not run, so `L.mir.ok` is not asserted here — the whole
 // program links + runs in `examples/c-subset/shipped_tcl_wideint` (the RUN witness).
-TEST(MirLoweringCSubset, FfiDescriptorIntPointeeArgRealizesAsPtrBitcast) {
+TEST(MirLoweringCSubset, DirectCallIntPointeeArgRealizesAsPtrBitcast) {
     // A `long long*` PARAMETER (no `= 0` init to add an unrelated width cast) passed
     // straight into the descriptor's `fn(ptr<i64>)`.
     auto L = lowerFfiWideProgram(

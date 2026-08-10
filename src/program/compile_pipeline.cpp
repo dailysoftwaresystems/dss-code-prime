@@ -262,18 +262,28 @@ static std::optional<CuMirModule> buildCuMirImpl(
         analyzeLayout = target.aggregateLayout();
         analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
     }
-    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): thread the RESOLVED CC's
-    // va_list lowering strategy so the semantic `va_list`-type injection sizes the
-    // `ap` local per ABI (SysV __va_list_tag[1]=24B vs Win64 char*=8B). Read from
-    // the SAME resolved CC the MirLoweringConfig reads its `vaListLayout` from
-    // (below); `nullopt` when the CC declares no variadic-callee ABI ⇒ the
-    // SysV-family default (a CC with no vaListLayout has no variadic-callee surface
-    // anyway, so the injected type is inert).
-    std::optional<VaListStrategy> analyzeVaStrategy;
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): capture the RESOLVED CC's
+    // WHOLE `vaListLayout` block. Read from the SAME resolved CC the MirLoweringConfig
+    // reads its `vaListLayout` from (below); `nullopt` when the CC declares no
+    // variadic-callee ABI.
+    //
+    // TWO consumers, each taking the part it needs from this ONE lookup:
+    //   * the semantic `va_list`-type injection wants only `.strategy`, to size the `ap`
+    //     local per ABI (SysV __va_list_tag[1]=24B vs Win64 char*=8B). `nullopt` there ⇒
+    //     the SysV-family default, which is inert (a CC with no vaListLayout has no
+    //     variadic-callee surface at all).
+    //   * D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): `synthesizeStdioShim`, across the MIR/LIR
+    //     seam, needs the WHOLE block — `.variadicUsesOverflowBase` is what selects its
+    //     va leaf, and reading only `.strategy` there was a latent silent miscompile (see
+    //     `CuMirModule::vaListLayout`). Same resolved CC, resolved ONCE.
+    std::optional<VaListLayout> analyzeVaLayout;
     if (auto const* cc = target.callingConvention(callingConventionIndex);
         cc != nullptr && cc->vaListLayout.has_value()) {
-        analyzeVaStrategy = cc->vaListLayout->strategy;
+        analyzeVaLayout = *cc->vaListLayout;
     }
+    std::optional<VaListStrategy> const analyzeVaStrategy =
+        analyzeVaLayout.has_value() ? std::optional<VaListStrategy>{analyzeVaLayout->strategy}
+                                    : std::nullopt;
     // c97: sequential per-phase scoping via optional emplace — emplace
     // destroys the prior Scope (closing its accumulation window) BEFORE
     // opening the next, and any early return closes the live one.
@@ -317,7 +327,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
     if (!opts.resolveLibraries.empty()) {
         auto const probeEntry = reporter.errorCount();
         for (auto const& lib : opts.resolveLibraries) {
-            std::ifstream probe(lib, std::ios::binary);
+            std::ifstream probe(lib.path, std::ios::binary);
             if (!probe) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::F_FileOpenFailed;
@@ -326,7 +336,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
                     "--resolve-library: failed to open '{}' for reading "
                     "(the resolve-library binary must exist + be readable at "
                     "compile time). Check the path.",
-                    lib.generic_string());
+                    lib.path.generic_string());
                 reporter.report(std::move(d));
             }
         }
@@ -422,11 +432,17 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // name so FF5/FF1 name the import with it VERBATIM instead of the
             // C-mangled identifier. Empty for every extern without a label ⇒ the
             // downstream naming is byte-identical there.
+            // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): carry the
+            // descriptor's per-target link BASE name so FF5/FF1 decorate IT with
+            // the format's rule instead of the canonical identifier. Already
+            // resolved per (arch, format) at descriptor-read time — a plain
+            // string like `version`, not a per-format map needing the fold above.
             refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
                             r.noLibraryBinding,
                             r.version,   // D-LK-ELF-SYMBOL-VERSIONING (c156)
                             r.isEagerImport,
-                            r.asmName});
+                            r.asmName,
+                            r.linkName});
         }
 
         auto const ffiEntry = reporter.errorCount();
@@ -507,15 +523,22 @@ static std::optional<CuMirModule> buildCuMirImpl(
                     .push_back(refs[i]);
             }
 
-            // The resolve-library binaries become `ingest()` sources. The
-            // file BASENAME is the loader-resolvable identity recorded in
-            // the import (DT_NEEDED / import descriptor) -- see
-            // BinaryLibrarySource::importName.
+            // The resolve-library binaries become `ingest()` sources. Three
+            // levels decide the identity recorded in the import (DT_NEEDED /
+            // LC_LOAD_DYLIB / PE import descriptor), ranked in `ingest()` and
+            // documented on `ffi::BinaryLibrarySource`:
+            //   1. `declaredImportName` -- what the CLI/manifest STATED for
+            //      this entry (D-FFI-DECLARED-IMPORT-NAME; empty = unstated);
+            //   2. the binary's own embedded soname, read by FF1;
+            //   3. the file BASENAME supplied here as the last-resort fallback.
+            // All three are plain strings: no arm of this is language-,
+            // target-, or object-format-keyed.
             std::vector<ffi::IngestionSource> binarySources;
             binarySources.reserve(opts.resolveLibraries.size());
-            for (auto const& libPath : opts.resolveLibraries) {
+            for (auto const& lib : opts.resolveLibraries) {
                 binarySources.push_back(ffi::BinaryLibrarySource{
-                    libPath, libPath.filename().string()});
+                    lib.path, lib.path.filename().string(),
+                    lib.declaredImportName});
             }
 
             // (i) `ingest()` BINDS every governed extern the named binaries
@@ -781,25 +804,28 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // strategy so the LOWER half lays out bit-field globals byte-ABI-exact.
         effectiveBfStrategy,
     };
-    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): carry the pe64 <threads.h> shim recipe
-    // table across the MIR/LIR seam so the LOWER half's `synthesizeThreadsShim` can
-    // define each shim. `hir` (the CstToHirResult) is still alive here — lowerToMir read
-    // its maps by pointer, it was not consumed. Empty for the overwhelming majority.
-    cuMir.threadsRecipes = hir->synthRecipeBySymbol;
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER) + D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3):
+    // carry the shim recipe table — BOTH families, pe64 <threads.h> and pe64 <stdio.h> —
+    // across the MIR/LIR seam so the LOWER half can define each shim. `hir` (the
+    // CstToHirResult) is still alive here — lowerToMir read its maps by pointer, it was not
+    // consumed. Empty for the overwhelming majority.
+    cuMir.libraryShimRecipes = hir->synthRecipeBySymbol;
     // D-CSUBSET-C11-THREADS-MACHO: capture the format's synth vehicle (win32/pthread +
-    // import library) the SAME post-construction way as threadsRecipes, so the LOWER
+    // import library) the SAME post-construction way as libraryShimRecipes, so the LOWER
     // half's `synthesizeThreadsShim` picks the right primitive family. nullopt on elf.
     cuMir.librarySynthesis = format.librarySynthesis();
-    cuMir.objectFormat     = format.kind();   // for the synth pass's per-format helper mangling
-    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): capture the RESOLVED CC's va_list strategy so
-    // the LOWER half's `synthesizeStdioShim` knows the target's variadic-forwarding model.
-    // Reuses `analyzeVaStrategy` (computed above from the SAME resolved CC for the semantic
-    // `va_list`-type injection) rather than re-resolving the CC a second time. The optional
-    // is assigned THROUGH — its EMPTINESS is part of the signal, not noise to be defaulted
-    // away: a CC that declares no `vaListLayout` must reach the synth pass as "nothing
-    // declared", which that pass refuses loudly, rather than as a real strategy it could
-    // not tell from a genuine declaration. Consulted only if a stdio recipe appears.
-    cuMir.vaListStrategy = analyzeVaStrategy;
+    // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN (C4): the DECLARED rule, not the identity.
+    cuMir.cSymbolDecoration = format.cSymbolDecoration().scheme;
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): capture the RESOLVED CC's WHOLE `vaListLayout`
+    // so the LOWER half's `synthesizeStdioShim` knows the target's variadic-forwarding
+    // model — strategy AND `variadicUsesOverflowBase`, which is what picks the va leaf.
+    // Reuses `analyzeVaLayout` (resolved above from the SAME CC that also feeds the
+    // semantic `va_list`-type injection) rather than re-resolving the CC a second time. The
+    // optional is assigned THROUGH — its EMPTINESS is part of the signal, not noise to be
+    // defaulted away: a CC that declares no `vaListLayout` must reach the synth pass as
+    // "nothing declared", which that pass refuses loudly, rather than as a real layout it
+    // could not tell from a genuine declaration. Consulted only if a stdio recipe appears.
+    cuMir.vaListLayout = analyzeVaLayout;
     return cuMir;
 }
 
@@ -1427,9 +1453,9 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         }
     }
 
-    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): PARTITION `cuMir.threadsRecipes` (the single
-    // combined synthesize-recipe map CST→HIR seeded — its name predates the <stdio.h>
-    // family and is now a misnomer) by `dss::ffi::shimFamilyOf` BEFORE calling EITHER synth
+    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): PARTITION `cuMir.libraryShimRecipes` (the
+    // single combined synthesize-recipe map CST→HIR seeded, carrying BOTH families) by
+    // `dss::ffi::shimFamilyOf` BEFORE calling EITHER synth
     // pass. Each pass fails loud on a recipe id it has no switch arm for (its own anti-
     // vocab-drift backstop), so handing the WHOLE map to one pass would make it reject the
     // other family's ids and abort a build that never should have failed. A `nullopt`
@@ -1443,7 +1469,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // for what is a recipe-table defect. The merged-module seam (program.cpp) emits the
     // SAME code for the SAME breach.
     std::unordered_map<std::uint32_t, std::string> threadsRecipes, stdioRecipes;
-    for (auto const& [symV, recipe] : cuMir.threadsRecipes) {
+    for (auto const& [symV, recipe] : cuMir.libraryShimRecipes) {
         auto const family = dss::ffi::shimFamilyOf(recipe);
         if (!family.has_value()) {
             ParseDiagnostic d;
@@ -1473,19 +1499,20 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // the CU model's; the vehicle comes from `cuMir.librarySynthesis`.
     if (!synthesizeThreadsShim(cuMir.mir, model.lattice().interner(),
                                threadsRecipes, cuMir.librarySynthesis,
-                               cuMir.objectFormat, cuMir.externImports, reporter)) {
+                               cuMir.cSymbolDecoration, cuMir.externImports,
+                               reporter)) {
         return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
     }
 
     // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling — see
     // `synth_stdio_shim.hpp` for the full contract. A clean no-op when `stdioRecipes` is
     // empty (every elf/macho build and every pe TU that includes no <stdio.h> printf
-    // family). `cuMir.vaListStrategy` is the RESOLVED CC's va_list model (captured at BUILD
-    // time in `buildCuMirImpl`, above) — the shim's variadic-forwarding arm reads it to pick
-    // the HomogeneousPointer MIR leaf or fail loud on a strategy this pass has no arm for
-    // (SysVRegisterSave, until a consumer exists).
+    // family). `cuMir.vaListLayout` is the RESOLVED CC's WHOLE va_list block (captured at
+    // BUILD time in `buildCuMirImpl`, above) — the shim's variadic-forwarding arm reads
+    // `.strategy` to take the HomogeneousPointer arm (or fail loud on a model it has no arm
+    // for) and `.variadicUsesOverflowBase` to pick the va leaf WITHIN it.
     if (!synthesizeStdioShim(cuMir.mir, model.lattice().interner(),
-                             stdioRecipes, cuMir.vaListStrategy,
+                             stdioRecipes, cuMir.vaListLayout,
                              cuMir.externImports, reporter)) {
         return std::nullopt;  // recipe/helper-import/va-strategy mismatch — reported.
     }
@@ -1518,9 +1545,15 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // DEFINITION rail; `program.cpp`'s merge-key lambda is its cross-CU twin and
     // MUST route through the same function (see linkNameFor's own comment for what
     // a divergence between the two silently produces).
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): `linkName` is passed
+    // EXPLICITLY (the parameter is required, not defaulted) so this rail and the
+    // import rail hand `linkNameFor` the same four inputs. The semantic injector
+    // writes the identical string onto BOTH the SymbolRecord read here and the
+    // ShippedExternSymbol that becomes the import row.
     auto nameOf = [&](SymbolId s) -> std::string {
         SymbolRecord const* r = model.recordFor(s);
-        return r ? dss::ffi::linkNameFor(r->name, r->asmName, fmtKind)
+        return r ? dss::ffi::linkNameFor(r->name, r->asmName,
+                                         cuMir.cSymbolDecoration, r->linkName)
                  : std::string{};
     };
 

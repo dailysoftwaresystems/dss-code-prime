@@ -15,8 +15,14 @@
   "artifactProfiles": [
     "staticlib"
   ],
+  "$externCallDispatchComment": "D-FORMAT-MACHO-X86_64-STATICLIB-DECLARES-NO-EXTERN-CALL-DISPATCH (closed 2026-08-06) -- MIRRORED from the `macho64-x86_64-darwin` relocatable sibling, per this file's standing 'kept in sync by hand' rule. An archive member IS a relocatable MH_OBJECT, so the extern-call contract is identical: a plain x86_64 `E8 disp32` call plus an X86_64_RELOC_BRANCH against an N_UNDF|N_EXT symbol carrying its real import name, with the FINAL linker synthesizing the stub/__got. MEASURED before this key existed: a TU whose only extern is `puts` failed at MIR->LIR with `error[L_RequiredLirOpcodeMissing] [target=x86_64:macho64-x86_64-darwin-staticlib] ... declares no externCallDispatch shape`, while `macho64-arm64-darwin-staticlib` compiled the same source at rc=0 -- i.e. a shipped static-archive format could not serve its own tier for any TU that calls a libc function.",
+  "externCallDispatch": "direct-plt",
   "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LP64",
+  "$headerNameMatchingComment": "D-PP-HEADER-CASE-INSENSITIVE-PE: macOS ships on APFS/HFS+ volumes that are CASE-INSENSITIVE by default (the installer default since 10.13; a case-sensitive volume is opt-in), and Apple's own SDK headers rely on it -- `<TargetConditionals.h>` / `<CoreFoundation/CoreFoundation.h>` are routinely spelled with divergent case. REQUIRED closed-enum field. DSS ASCII-folds the comparison ITSELF per path component rather than delegating to fs::exists, so a Darwin cross-build from a case-sensitive Linux host resolves exactly as it does natively.",
+  "headerNameMatching": "case-insensitive",
+  "$cSymbolDecorationComment": "D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN: Apple's C ABI prefixes EVERY C symbol with exactly ONE leading underscore, on both 32- and 64-bit Mach-O -- the rule has no bitness axis and no per-arch axis (the arm64 and x86_64 slices of the universal libSystem decorate identically), which is why it is declared per FORMAT and not per target. EVIDENCE, EACH LABELLED. MEASURED-BY-EXECUTION (recorded TF-C113, the macOS cross-build arc): a Windows host cross-emitted a mach-o arm64 binary whose only process-exit path is the `_exit` import, and it RAN on the operator's Apple Silicon Mac and exited correctly -- an undecorated `exit` would have been an unresolved dyld bind, not a cosmetic difference. MEASURED (recorded TF-C121): libSystem's x86_64 slice exports BOTH `_fstat` and `_fstat$INODE64`, i.e. the C identifier `fstat` reaches the linker as `_fstat`. NOT RE-MEASURED THIS CYCLE, stated rather than buried: the Mac is a personal machine and was not declared reachable, so nothing here rests on a probe taken today. This key is the single owner of a fact that previously had TWO: the closed C++ table `kCManglingRules` (src/ffi/mangling/c_mangle.cpp, keyed on ObjectFormatKind) and, redundantly, a literal encoding in the descriptors themselves -- the macho64-*-exec files spell `processExit.importMangledName` as `_exit` while their elf/pe siblings spell it `exit`. Two owners in two languages, with nothing forcing them to agree. RED-ON-DISABLE, stated precisely for the tier that exists today (MEASURED 2026-08-06 by actually removing the key from a shipped file and running the suite): DELETE this key and the format is REFUSED AT LOAD -- TWO errors at /cSymbolDecoration, one C_MissingField from the loader and one from ObjectFormatData::validate(), which loadFromText runs before returning -- so every test and example that loads this format goes red, naming the file. CHANGING the value is now an equally REAL lever, and this sentence was corrected the moment it became true: before step C4 the engine still read a C++ table and the value here changed no emitted binary. C4 landed (same cycle, TF-C122), and the effect is MEASURED 2026-08-06 -- flipping macho64-arm64-darwin-exec from `leading-underscore` to `none` and RECOMPILING NOTHING made the engine emit `printf` where it had emitted `_printf`, reddening tests/ffi/test_c_mangle.cpp's SchemeIsReadFromTheShippedSchemaNotACppTable. That is the whole point of the anchor: the answer lives in this file, so editing this file changes what the compiler emits. Two further pins guard the value: tests/link/test_c_symbol_decoration.cpp asserts the per-kind answer across all 24 shipped files and cross-checks it against this family's own processExit.importMangledName.",
+  "cSymbolDecoration": { "scheme": "leading-underscore" },
   "$predefinedMacrosComment": "TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the C-visible face of this file's `dataModel` above, DERIVED FROM THAT VALUE AND NEVER FROM THIS FILE'S NAME -- the loader synthesizes no macro name and the engine performs no format-identity branch; it merges whatever rows are declared here with the language's `preprocess.predefinedMacros` and the target's `predefinedMacros`, applying `availableObjectFormats` exactly once. DECLARED ON THE FORMAT because the data model is per-(OS x format), not per-CPU: the same x86_64 target is LP64 here and LLP64 under pe64-x86_64-windows-*, so a target-side row would be wrong on one of its own formats -- which is exactly what both .target.json files say when they record `__LP64__`/`_LP64` as DELIBERATELY NOT SHIPPED and defer to the format. BOTH spellings, each value 1: MEASURED 2026-07-30 with `/usr/bin/clang -dM -E -x c /dev/null -target <triple>` (Apple clang 21.0.0), __LP64__ and _LP64 are BOTH defined as 1 on arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu and x86_64-unknown-linux-gnu, and NEITHER is defined on x86_64-pc-windows-msvc. COLLISION POLICY: a name declared by this file AND the language or target config is FATAL (C_ConflictingPredefinedMacro) -- no side silently wins. WHAT IT UNBLOCKS, MEASURED: the macOS SDK gates 234 occurrences across 91 headers on __LP64__, so without these rows DSS compiled the SDK's ILP32 arms while its own widths were LP64 (sizeof(long)==8), and $SDK/usr/include/mach/port.h:113-114 then asserted the user32 struct size 12 instead of user64's 16 -- sqlite mem1.c's three error[S0029]. RED-ON-DISABLE: delete this key and examples/c-subset/predefined_lp64_macho stops exiting 42.",
   "predefinedMacros": [
     { "name": "__LP64__", "kind": "constant", "value": "1" },
@@ -26,6 +32,8 @@
   "bitFieldStrategy": "gnu_packed",
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: macOS x86_64 `long double` = x87 80-bit, 16/16 (SysV). See macho64-x86_64-darwin-exec.",
   "longDoubleFormat": "x87-80",
+  "$supportedDataSectionsComment": "D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-ABSENT (closed 2026-08-06) — MIRRORED from the `macho64-x86_64-darwin` relocatable sibling under this file's standing 'kept in sync by hand' rule, and closed in the SAME change as it, which is what the anchor demanded: an archive MEMBER *is* a relocatable MH_OBJECT written by the same walker, so the set and the `sections[]` rows below are not merely similar to that file's, they are the same contract. Read that file's `$supportedDataSectionsComment` for the full argument (the two keys must land together; the MH_OBJECT arm fails loud on a declared-but-rowless kind; the arm64 sibling was NOT bulk-copied; tdata/tbss stay undeclared because the MH_OBJECT walker emits no TLV machinery on any arch). ★ MEASURED SEPARATELY ON THIS FORMAT, not inferred from the sibling, because a `.a` runs a second writer (`ar`) the `.o` does not: one TU carrying a string literal + `int counter = 7;` + a tentative `int zero_global;` + two const-with-load-time-relocation globals compiled rc=1 with `error[K_NoMatchingObjectFormat] [target=x86_64:macho64-x86_64-darwin-staticlib] ... section=rodata ... does not advertise that section in its 'supportedDataSections' set` BEFORE, and rc=0 with the archive emitted AFTER, with `macho64-arm64-darwin-staticlib` at rc=0 throughout as the matched control. ⛔ UNRUN: no Mac was reachable from this host, so this archive has never been fed to ld64 and nothing built from it has executed — the claim is structural emission, not link acceptance.",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
   "macho": {
     "$comment": "mach_header_64 identity. cputype = CPU_TYPE_X86_64 (0x01000007 — CPU_ARCH_ABI64 bit OR'd with x86 ABI type 7). cpusubtype = CPU_SUBTYPE_X86_64_ALL (3). filetype = MH_OBJECT (1). flags = 0 — MH_SUBSECTIONS_VIA_SYMBOLS (0x2000) is intentionally NOT set: the cycle-1 walker emits one flat `__text` blob with no N_ALT_ENTRY subsection markers, so advertising the flag would lie to ld64 about function-granular dead-strip safety (silent-failure-hunter HIGH-1 convergence). The flag will return when the substrate emits per-function subsections — anchored at plan 14 §3.1 D-LK3-2.",
     "cputype": 16777223,
@@ -42,6 +50,46 @@
       "type": 2147484672,
       "flags": 0,
       "addrAlign": 4,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Read-only initialized data (string literals, const globals with NO relocations) — `__const` inside the R+X `__TEXT` segment, S_REGULAR (the substrate `type` field = 0), no write attribute. addrAlign 8 is a RAW-BYTE FLOOR for the shared `buildExecDataSection` substrate, NOT the literal log2 the `__text` row above carries; the walker H1-raises it and writes section_64.align as log2. No `virtualAddress`: an archive member's section addrs are walker-computed in the flat `.o` space and validate() rejects a non-zero VA on an object row. MIRROR of `macho64-x86_64-darwin`'s row — that file's comment is the long form.",
+      "kind": "rodata",
+      "name": "__const",
+      "segment": "__TEXT",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Writable initialized globals — `__DATA,__data`, S_REGULAR (`type` = 0). A reloc-bearing mutable pointer global lands here and the walker emits this section's own relocation_info table through this file's `X86_64_RELOC_UNSIGNED_8` row (kind 2 = x86_64.target.json's `abs64`). addrAlign 8 = raw-byte floor. MIRROR of `macho64-x86_64-darwin`'s row.",
+      "kind": "data",
+      "name": "__data",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-RELRO-CONST-DATA-RELOCATABLE: a CONST global carrying LOAD-TIME relocations (`int *const p = &x;`, a const function-pointer table) — `__DATA,__const`, the `.o` precursor ld64 gathers into the image's __DATA_CONST. A DISTINCT row rather than the `-exec`/`-dylib` fold into `__data`, because the relocatable arm hands ld64 the input shape clang would have produced; the (segment, section) PAIR is the Mach-O identity, so (`__DATA`,`__const`) is a different section from the (`__TEXT`,`__const`) rodata row above. Addend written IN the 8-byte slot (Mach-O has no addend column). MIRROR of `macho64-x86_64-darwin`'s row.",
+      "kind": "relro",
+      "name": "__const",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Zero-initialized globals (tentative `int g;`) — `__DATA,__bss`, S_ZEROFILL (`type` = 1): a size and an addr but NO file bytes (section_64.offset = 0), emitted LAST per the zerofill-last convention. addrAlign 8 = raw-byte floor. MIRROR of `macho64-x86_64-darwin`'s row.",
+      "kind": "bss",
+      "name": "__bss",
+      "segment": "__DATA",
+      "type": 1,
+      "flags": 0,
+      "addrAlign": 8,
       "entrySize": 0
     }
   ],

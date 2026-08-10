@@ -580,3 +580,58 @@ TEST(DisasmDefensive, Fixed32SlotInX86VariableWalkerFailsLoud) {
         << "a fixed32 slot reaching the x86-variable disasm walker must fail "
            "loud (A_RoundTripMismatch), not return a silent nullopt";
 }
+
+// TF-C112: `roundTripVerify`'s closed `LirOperandKind` switch had drifted —
+// `ByValueStackAgg` (FC12a-struct) and `SpillSlotRef` (c77) were added to the
+// enum with no arm, so both fell out of the switch leaving `expected` at its
+// initializer 0. That is the EXACT hazard the switch's own comment says it
+// exists to prevent: a leaked marker whose encoded slot happens to hold 0
+// round-trips as "match" and the oracle reports SUCCESS on an instruction it
+// never actually verified.
+//
+// So the imm being ZERO is load-bearing, not incidental — with any non-zero
+// immediate the pre-fix code coincidentally returns false (0 != imm) and the
+// test would pass while the hole stayed open. RED-on-disable (measured by
+// deleting the two new arms): `roundTripVerify` returns TRUE and no diagnostic
+// is reported.
+TEST(DisasmDefensive, LeakedPassInternalOperandMarkerFailsLoudNotSilentZero) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const movOp = (*schema)->opcodeByMnemonic("mov");
+    auto const retOp = (*schema)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value() && retOp.has_value());
+    LirReg const rcx = gpr(**schema, "rcx");
+
+    // REX.W 0x48 + 0xC7 + ModRM(mod=3 /0 rm=rcx) 0xC1 + imm32 LE 0 — a
+    // perfectly well-formed `mov rcx, 0`. The BYTES are honest; what is wrong
+    // is that the LIR inst's wire-0 operand is a pass-internal marker that
+    // `materializeCallingConvention` should have consumed long before the
+    // encoder, so there is nothing for the oracle to compare against.
+    std::array<std::uint8_t, 7> const immZeroBytes{
+        0x48, 0xC7, 0xC1, 0x00, 0x00, 0x00, 0x00
+    };
+
+    auto const probe = [&](LirOperand marker, char const* name) {
+        LirBuilder b{**schema};
+        (void)b.addFunction(SymbolId{1});
+        auto blk = b.createBlock();
+        b.beginBlock(blk);
+        LirOperand const ops[] = { marker };
+        LirInstId const movInst = b.addInst(*movOp, rcx, ops);
+        (void)b.addReturn(*retOp, {});
+        Lir lir = std::move(b).finish();
+
+        DiagnosticReporter rep;
+        EXPECT_FALSE(roundTripVerify(**schema, lir, movInst, immZeroBytes, rep))
+            << name << " leaked to the encoder must REFUSE, not match the zero "
+               "immediate by accident";
+        EXPECT_EQ(test_support::asm_::countDiagnostics(
+                      rep, DiagnosticCode::A_RoundTripMismatch),
+                  1u)
+            << name << " refusal must be a real diagnostic, exactly one";
+    };
+    probe(LirOperand::makeByValueStackAgg(/*bytes=*/16), "ByValueStackAgg");
+    probe(LirOperand::makeSpillSlotRef(
+              /*slotV=*/3, static_cast<std::uint8_t>(LirRegClass::GPR)),
+          "SpillSlotRef");
+}

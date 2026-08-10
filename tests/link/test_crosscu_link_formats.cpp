@@ -55,6 +55,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -169,6 +170,38 @@ readDynSyms(std::vector<std::uint8_t> const& b, std::vector<Shdr> const& secs) {
                          readU64LE(b, off + 8));
     }
     return out;
+}
+
+// `.dynsym` rows with the two fields a COPY-RELOCATION slot's shape is readable
+// from. Elf64_Sym: name u32 @0, info u8 @4, other u8 @5, shndx u16 @6,
+// st_value u64 @8, st_size u64 @16 (24 bytes). For a data import on the ET_EXEC
+// arm the linker exports a DEFINED OBJECT whose `st_size` IS the folded
+// `dataSizeBytes` (elf.cpp:1332-1337) and whose `st_value` is its `.bss` copy-slot
+// VA (patched post-layout) — which is how the merged row's numbers can be read
+// back out of the emitted image rather than inferred from whether it linked.
+struct DynSymRow {
+    std::string   name;
+    std::uint64_t value = 0;
+    std::uint64_t size  = 0;
+};
+[[nodiscard]] std::vector<DynSymRow>
+readDynSymRows(std::vector<std::uint8_t> const& b, std::vector<Shdr> const& secs) {
+    std::vector<DynSymRow> out;
+    Shdr const* ds = findSection(secs, ".dynsym");
+    Shdr const* st = findSection(secs, ".dynstr");
+    if (ds == nullptr || st == nullptr) return out;
+    for (std::uint64_t p = 0; p + 24 <= ds->size; p += 24) {
+        std::uint64_t const off = ds->offset + p;
+        out.push_back(DynSymRow{readCStr(b, st->offset + readU32LE(b, off)),
+                                readU64LE(b, off + 8), readU64LE(b, off + 16)});
+    }
+    return out;
+}
+
+[[nodiscard]] std::optional<DynSymRow>
+findDynSym(std::vector<DynSymRow> const& rows, std::string const& name) {
+    for (auto const& r : rows) if (r.name == name) return r;
+    return std::nullopt;
 }
 
 struct Loaded {
@@ -318,6 +351,115 @@ findBytes(std::vector<std::uint8_t> const& hay, std::uint64_t begin,
         if (match) return i;
     }
     return std::nullopt;
+}
+
+// ── D-LK11-EXTERN-IMPORT-DEDUP fixtures ──────────────────────────
+
+// One CU per spec. Each CU declares its OWN ExternImport row (always local
+// `SymbolId{2}`) — the shape N separately-compiled TUs that each `#include`
+// the same header and reference the same library symbol produce. `referenced`
+// picks the function body:
+//   * true  → `call rel32` (the reloc that must retarget onto the deduped
+//             import) ++ the unique `mov eax, tag` locator ++ `ret`
+//   * false → the locator ++ `ret` only, so the import is UNREFERENCED and the
+//             reference gate's eager law is what decides whether it survives.
+// The locator (`B8 tag 00 00 00 C3`, unique per CU) is how a byte pin finds
+// this CU's call site in the merged `.text` without depending on the walker's
+// layout. CU #1 names the entry when `withEntry`.
+struct ImportCuSpec {
+    ExternImport import;             // symbol is overwritten with SymbolId{2}
+    bool         referenced = true;
+};
+
+[[nodiscard]] std::uint8_t importCuTag(std::size_t i) {
+    return static_cast<std::uint8_t>(0xA1u + i);
+}
+
+[[nodiscard]] std::vector<AssembledModule>
+makeImportCus(std::vector<ImportCuSpec> const& specs, bool withEntry) {
+    std::vector<AssembledModule> mods;
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        AssembledModule m;
+        m.cuId = CompilationUnitId{static_cast<std::uint32_t>(i + 1)};
+        m.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        if (specs[i].referenced) {
+            fn.bytes = {0xE8, 0, 0, 0, 0,                      // call rel32
+                        0xB8, importCuTag(i), 0x00, 0x00, 0x00, // mov eax,tag
+                        0xC3};                                  // ret
+            Relocation rel;
+            rel.offset = 1;
+            rel.target = SymbolId{2};        // the extern import
+            rel.kind   = RelocationKind{1};  // rel32 (bias -4 in-schema)
+            rel.addend = 0;
+            fn.relocations.push_back(rel);
+        } else {
+            fn.bytes = {0xB8, importCuTag(i), 0x00, 0x00, 0x00, 0xC3};
+        }
+        m.functions.push_back(std::move(fn));
+        ExternImport ext = specs[i].import;
+        ext.symbol = SymbolId{2};
+        m.externImports.push_back(std::move(ext));
+        m.symbols.push_back(ModuleSymbol{SymbolId{1},
+                                         "fn" + std::to_string(i + 1),
+                                         SymbolBinding::Global,
+                                         SymbolVisibility::Default});
+        if (withEntry && i == 0) m.userEntrySymbol = SymbolId{1};
+        mods.push_back(std::move(m));
+    }
+    return mods;
+}
+
+[[nodiscard]] ExternImport libImport(std::string name, std::string lib,
+                                     std::string version = {}) {
+    ExternImport e;
+    e.mangledName = std::move(name);
+    e.libraryPath = std::move(lib);
+    e.version     = std::move(version);
+    return e;
+}
+
+// N CUs all importing the IDENTICAL (name, lib, version), all referencing it.
+[[nodiscard]] std::vector<AssembledModule>
+makeSharedImportCus(std::size_t cuCount, bool withEntry,
+                    std::string const& name    = "puts",
+                    std::string const& lib     = "libc.so.6",
+                    std::string const& version = {}) {
+    std::vector<ImportCuSpec> specs;
+    for (std::size_t i = 0; i < cuCount; ++i)
+        specs.push_back(ImportCuSpec{libImport(name, lib, version), true});
+    return makeImportCus(specs, withEntry);
+}
+
+[[nodiscard]] std::size_t countName(std::vector<std::string> const& v,
+                                    std::string const& name) {
+    return static_cast<std::size_t>(std::count(v.begin(), v.end(), name));
+}
+
+// The VA the CU-`i` call site's `call rel32` resolves to, located via that
+// CU's unique `mov eax,tag` marker in `.text`.
+[[nodiscard]] std::optional<std::uint64_t>
+callTargetVaOfCu(std::vector<std::uint8_t> const& bytes, Shdr const& text,
+                 std::size_t i) {
+    std::vector<std::uint8_t> const marker{0xB8, importCuTag(i),
+                                           0x00, 0x00, 0x00, 0xC3};
+    auto const markerOff =
+        findBytes(bytes, text.offset, text.offset + text.size, marker);
+    if (!markerOff.has_value()) return std::nullopt;
+    std::uint64_t const siteOff = *markerOff - 5;   // the E8 opcode
+    if (bytes[siteOff] != 0xE8u) return std::nullopt;
+    std::int32_t const disp = static_cast<std::int32_t>(readU32LE(bytes, siteOff + 1));
+    std::uint64_t const nextVa = text.addr + (siteOff - text.offset) + 5;
+    return nextVa + static_cast<std::int64_t>(disp);
+}
+
+[[nodiscard]] bool anyDiagContains(DiagnosticReporter const& rep,
+                                   DiagnosticCode code, std::string const& needle) {
+    for (auto const& d : rep.all()) {
+        if (d.code == code && d.actual.find(needle) != std::string::npos) return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -550,4 +692,477 @@ TEST(CrossCuLinkFormats, Abs64GateFiresOnlyOnTheIndirectSlotArm) {
             << (rep.all().empty() ? "" : rep.all().front().actual);
         EXPECT_FALSE(image.bytes.empty());
     }
+}
+
+// ── D-LK11-EXTERN-IMPORT-DEDUP ───────────────────────────────────
+//
+// N CUs importing the SAME dynamic symbol must merge to EXACTLY ONE
+// ExternImport row, with every CU's referencing relocation retargeted onto it
+// and the duplicates' per-row payload FOLDED (not dropped). Pre-fix the merge
+// concatenated blindly (`mergedIdFor` mints a fresh id per extern; its name-fold
+// reads `resolvedGlobalDefs` — definitions, never imports), so 2 CUs produced
+// 2 rows and 4 CUs produced 4 — MEASURED as 2 `.dynsym` entries of the identical
+// name, 2 `.rela.dyn` GLOB_DAT rows and a 24-byte `.got` on ELF, 2 IAT/ILT thunks
+// on PE. RED-ON-DISABLE for the whole group: comment out the dedup pass in
+// `mergeModules` and every exact-count assertion below reports the pre-fix N.
+
+// The row count is ONE per (name, lib, version), uniformly across shipped
+// formats — the fold is structural, so no format sees a different answer.
+TEST(CrossCuLinkFormats, DuplicateExternImportsCoalesceToOneRowOnEveryFormat) {
+    struct Leg {
+        char const* label;
+        char const* format;
+        char const* lib;
+        bool        withEntry;
+    };
+    Leg const legs[] = {
+        {"elf-exec", "elf64-x86_64-linux-exec",  "libc.so.6",  true},
+        {"elf-dyn",  "elf64-x86_64-linux-dyn",   "libc.so.6",  false},
+        {"pe-exec",  "pe64-x86_64-windows-exec", "msvcrt.dll", true},
+    };
+    for (auto const& leg : legs) {
+        SCOPED_TRACE(leg.label);
+        auto loaded = loadShippedPair("x86_64", leg.format);
+        ASSERT_TRUE(loaded.target && loaded.format);
+        auto mods = makeSharedImportCus(/*cuCount=*/2, leg.withEntry, "puts", leg.lib);
+        DiagnosticReporter rep;
+        auto image = linker::link(
+            std::span<AssembledModule const>{mods.data(), mods.size()},
+            *loaded.target, *loaded.format, rep);
+        EXPECT_FALSE(rep.hasErrors())
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_FALSE(image.bytes.empty());
+        EXPECT_EQ(countName(image.externImportNames, "puts"), 1u)
+            << "two CUs importing the same (name, library, version) must merge to "
+               "EXACTLY one import row (pre-fix: 2)";
+        EXPECT_EQ(image.externImportNames.size(), 1u)
+            << "and no other import may appear";
+    }
+}
+
+// The byte-level consequence on ELF, plus the retarget: the merged exec carries
+// exactly ONE `.dynsym` entry for the imported name, its `.got` is the SAME size
+// as a single-CU image importing the same symbol once, and BOTH CUs' `call rel32`
+// sites resolve to the SAME VA (the one PLT stub) — i.e. both relocations were
+// retargeted onto the single canonical import id. Pre-fix: 2 `.dynsym` rows, a
+// `.got` 8 bytes larger, and two distinct stub targets.
+TEST(CrossCuLinkFormats, DedupedImportEmitsOneDynsymRowAndBothCallsShareTheStub) {
+    auto loaded = loadShippedPair("x86_64", "elf64-x86_64-linux-exec");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // Control: ONE CU importing `puts` once (the single-CU path — no merge).
+    std::uint64_t singleCuGotSize = 0;
+    {
+        auto mods = makeSharedImportCus(/*cuCount=*/1, /*withEntry=*/true);
+        DiagnosticReporter rep;
+        auto image = linker::link(
+            std::span<AssembledModule const>{mods.data(), mods.size()},
+            *loaded.target, *loaded.format, rep);
+        ASSERT_FALSE(rep.hasErrors())
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        ASSERT_FALSE(image.bytes.empty());
+        auto const secs = readSections(image.bytes);
+        Shdr const* got = findSection(secs, ".got");
+        ASSERT_NE(got, nullptr);
+        singleCuGotSize = got->size;
+    }
+
+    auto mods = makeSharedImportCus(/*cuCount=*/2, /*withEntry=*/true);
+    DiagnosticReporter rep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{mods.data(), mods.size()},
+        *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(rep.hasErrors())
+        << (rep.all().empty() ? "" : rep.all().front().actual);
+    ASSERT_FALSE(image.bytes.empty());
+
+    auto const secs = readSections(image.bytes);
+    Shdr const* text = findSection(secs, ".text");
+    Shdr const* got  = findSection(secs, ".got");
+    ASSERT_NE(text, nullptr);
+    ASSERT_NE(got, nullptr);
+
+    std::size_t putsRows = 0;
+    for (auto const& [n, v] : readDynSyms(image.bytes, secs)) {
+        (void)v;
+        if (n == "puts") ++putsRows;
+    }
+    EXPECT_EQ(putsRows, 1u)
+        << "one dynamic symbol must produce exactly one `.dynsym` entry, however "
+           "many CUs imported it (pre-fix: 2 entries of the identical name)";
+    EXPECT_EQ(got->size, singleCuGotSize)
+        << "the merged image's `.got` must be the SAME size as the single-CU "
+           "image's — pre-fix the duplicate import added another 8-byte slot";
+
+    auto const cu1Target = callTargetVaOfCu(image.bytes, *text, 0);
+    auto const cu2Target = callTargetVaOfCu(image.bytes, *text, 1);
+    ASSERT_TRUE(cu1Target.has_value()) << "CU#1 call site not found in .text";
+    ASSERT_TRUE(cu2Target.has_value()) << "CU#2 call site not found in .text";
+    EXPECT_EQ(*cu1Target, *cu2Target)
+        << "both CUs' relocations must retarget onto the ONE canonical import "
+           "(the same PLT stub), not one stub each";
+}
+
+// A FOLD, not a pairwise special case: 4 CUs still yield exactly 1 row, and all
+// four call sites share the stub.
+TEST(CrossCuLinkFormats, FourCusImportingOneSymbolStillYieldExactlyOneRow) {
+    auto loaded = loadShippedPair("x86_64", "elf64-x86_64-linux-exec");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto mods = makeSharedImportCus(/*cuCount=*/4, /*withEntry=*/true);
+    DiagnosticReporter rep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{mods.data(), mods.size()},
+        *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(rep.hasErrors())
+        << (rep.all().empty() ? "" : rep.all().front().actual);
+    ASSERT_FALSE(image.bytes.empty());
+    EXPECT_EQ(countName(image.externImportNames, "puts"), 1u)
+        << "the dedup must be a FOLD over all N CUs (pre-fix: 4 rows)";
+
+    auto const secs = readSections(image.bytes);
+    Shdr const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+    auto const first = callTargetVaOfCu(image.bytes, *text, 0);
+    ASSERT_TRUE(first.has_value());
+    for (std::size_t i = 1; i < 4; ++i) {
+        SCOPED_TRACE(i);
+        auto const target = callTargetVaOfCu(image.bytes, *text, i);
+        ASSERT_TRUE(target.has_value()) << "CU call site not found in .text";
+        EXPECT_EQ(*target, *first) << "every CU's call must reach the same stub";
+    }
+}
+
+// CONTROL — the key is not the bare name. `foo` from `a.dll` and `foo` from
+// `b.dll` are DIFFERENT imports (libraryPath is what the walkers group
+// DT_NEEDED / IMAGE_IMPORT_DESCRIPTOR by), so they must NOT fold.
+TEST(CrossCuLinkFormats, SameNameDifferentLibraryDoesNotFold) {
+    auto loaded = loadShippedPair("x86_64", "pe64-x86_64-windows-exec");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto mods = makeImportCus({{libImport("foo", "a.dll"), true},
+                               {libImport("foo", "b.dll"), true}},
+                              /*withEntry=*/true);
+    DiagnosticReporter rep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{mods.data(), mods.size()},
+        *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(rep.hasErrors())
+        << (rep.all().empty() ? "" : rep.all().front().actual);
+    EXPECT_EQ(countName(image.externImportNames, "foo"), 2u)
+        << "two DIFFERENT libraries owning one name are two distinct imports — "
+           "folding them would bind one CU's calls into the wrong DLL";
+}
+
+// CONTROL — nor is `version` foldable. `puts@GLIBC_2.2.5` and `puts@GLIBC_2.17`
+// are genuinely different dynamic symbols (c156 D-LK-ELF-SYMBOL-VERSIONING);
+// folding them would reintroduce exactly the compat-form misbind c156 fixed.
+TEST(CrossCuLinkFormats, SameNameAndLibraryDifferentVersionDoesNotFold) {
+    auto loaded = loadShippedPair("x86_64", "elf64-x86_64-linux-exec");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto mods = makeImportCus(
+        {{libImport("puts", "libc.so.6", "GLIBC_2.2.5"), true},
+         {libImport("puts", "libc.so.6", "GLIBC_2.17"),  true}},
+        /*withEntry=*/true);
+    DiagnosticReporter rep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{mods.data(), mods.size()},
+        *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(rep.hasErrors())
+        << (rep.all().empty() ? "" : rep.all().front().actual);
+    EXPECT_EQ(countName(image.externImportNames, "puts"), 2u)
+        << "two symbol VERSIONS of one name are two dynamic symbols — folding "
+           "them would bind a call to the wrong glibc compat form";
+}
+
+// ── THE KEY'S INJECTIVITY, WITH THE COLLISION ITS OWN COMMENT DESCRIBES ─────
+//
+// `linker.cpp`'s `dedupKey` LENGTH-PREFIXES every field — "injective over
+// arbitrary field bytes" — because a mangledName and a libraryPath are arbitrary
+// bytes out of a descriptor. MEASURED (TF-C119): every fixture in tests/ used
+// `foo` / `puts` / `a.dll` / `b.dll` / `GLIBC_2.x`, not one containing a `:` or a
+// `|`, so replacing BOTH tiers' key builders with the naive
+// `mangledName + ":" + libraryPath + ":" + version` left every one of them green.
+// The claim was pinned only by prose.
+//
+// This is the pre-image pair that prose implies. Naive: both key to `a:b:c:` and
+// fold. Length-prefixed: `3:a:b|1:c|0:` vs `1:a|3:b:c|0:`, two rows. The
+// consequence of the fold is not a lost row — it is CU#2's call site silently
+// retargeted onto a DIFFERENT dynamic symbol in a DIFFERENT library, so the call
+// target VAs are asserted DISTINCT as well as the row count.
+// (The MIR tier's twin is `MirMerge.LengthPrefixedKeyKeepsAColludingNameLibrary
+// PairApart` — both tiers key identically, so both need the pin.)
+TEST(CrossCuLinkFormats, LengthPrefixedKeyKeepsAColludingNameLibraryPairApart) {
+    auto loaded = loadShippedPair("x86_64", "elf64-x86_64-linux-exec");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // "a:b" from "c"  vs  "a" from "b:c" — one naive key, two real imports.
+    auto mods = makeImportCus({{libImport("a:b", "c"), true},
+                               {libImport("a", "b:c"), true}},
+                              /*withEntry=*/true);
+    DiagnosticReporter rep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{mods.data(), mods.size()},
+        *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(rep.hasErrors())
+        << (rep.all().empty() ? "" : rep.all().front().actual);
+    ASSERT_FALSE(image.bytes.empty());
+
+    EXPECT_EQ(image.externImportNames.size(), 2u)
+        << "★ a separator-joined key maps BOTH triples to `a:b:c:` and folds two "
+           "UNRELATED dynamic symbols into one import row";
+    EXPECT_EQ(countName(image.externImportNames, "a:b"), 1u)
+        << "the name must survive VERBATIM — the keying may not re-spell it";
+    EXPECT_EQ(countName(image.externImportNames, "a"), 1u);
+
+    auto const secs = readSections(image.bytes);
+    Shdr const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+    auto const cu1Target = callTargetVaOfCu(image.bytes, *text, 0);
+    auto const cu2Target = callTargetVaOfCu(image.bytes, *text, 1);
+    ASSERT_TRUE(cu1Target.has_value() && cu2Target.has_value());
+    EXPECT_NE(*cu1Target, *cu2Target)
+        << "★ THE MISCOMPILE: under a colliding key both call sites retarget onto "
+           "ONE stub, so CU#2 calls the symbol \"a:b\" in library \"c\" — a "
+           "different function in a different image, with no diagnostic anywhere";
+}
+
+// ★ The load-failure path. `isEagerImport` must OR-combine, not first-win: fold
+// an eager descriptor row onto a non-eager sibling and keep the non-eager bit,
+// and `rejectOrDropUnreferencedExterns` DROPS the surviving row when nobody
+// references it — the loader can no longer bind a symbol the descriptor promised
+// (D-FFI-DESCRIPTOR-EAGER-IMPORT; pe 0xC0000139 / elf exit 127). NEITHER CU
+// references the import here, so the folded row's eager bit is the ONLY thing
+// keeping it alive, and the import's survival IS the observation.
+//
+// The all-non-eager control below is what makes that observation load-bearing:
+// it proves this fixture's unreferenced import really is dropped absent the
+// eager bit, so a surviving row can only mean the bit was ORed in. Both orders
+// are checked — the fold is order-INDEPENDENT.
+//
+// RED-ON-DISABLE for this pin is the FOLD RULE, not the whole pass: turn
+// `kept.isEagerImport = kept.isEagerImport || ext.isEagerImport` into first-wins
+// and the "non-eager first" order drops to 0 imports. (Disabling the whole dedup
+// pass canNOT witness this one — two independent rows let the eager row survive
+// on its own; that state is what the row-count pins above measure.)
+TEST(CrossCuLinkFormats, EagerImportBitOrCombinesAcrossTheFoldInBothOrders) {
+    auto loaded = loadShippedPair("x86_64", "elf64-x86_64-linux-exec");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    ExternImport eager = libImport("puts", "libc.so.6");
+    eager.isEagerImport = true;
+    ExternImport lazy = libImport("puts", "libc.so.6");   // isEagerImport = false
+
+    auto const importsAfterLink = [&](ExternImport const& a, ExternImport const& b) {
+        auto mods = makeImportCus({{a, /*referenced=*/false},
+                                   {b, /*referenced=*/false}},
+                                  /*withEntry=*/true);
+        DiagnosticReporter rep;
+        auto image = linker::link(
+            std::span<AssembledModule const>{mods.data(), mods.size()},
+            *loaded.target, *loaded.format, rep);
+        EXPECT_FALSE(rep.hasErrors())
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        return countName(image.externImportNames, "puts");
+    };
+
+    // CONTROL: with NO eager contributor the unreferenced import is dropped —
+    // so a surviving row in the two cases below can only come from the OR-fold.
+    EXPECT_EQ(importsAfterLink(lazy, lazy), 0u)
+        << "an unreferenced non-eager import must be dropped by the reference "
+           "gate — without this the eager assertions below prove nothing";
+    EXPECT_EQ(importsAfterLink(lazy, eager), 1u)
+        << "non-eager first: the folded row must be EAGER — a first-wins fold "
+           "keeps the non-eager bit and the reference gate then drops the "
+           "import the descriptor promised the loader";
+    EXPECT_EQ(importsAfterLink(eager, lazy), 1u)
+        << "eager first: the fold must be order-independent";
+}
+
+// A cross-CU disagreement about ONE dynamic symbol is a REAL conflict, never a
+// pick-one. `isData` selects the binding MODEL (the ELF copy-relocation data
+// slot vs the function-import path), so silently keeping either row would bind
+// the loser CU's references through the wrong one — the D-LK-EXTERN-DATA-IMPORT
+// silent-miscompile shape. Same for `isThreadLocal`, and for two DIFFERING
+// non-zero `dataSizeBytes` (they size the copy-relocation `.bss` slot).
+TEST(CrossCuLinkFormats, ConflictingExternImportAttributesFailLoud) {
+    auto loaded = loadShippedPair("x86_64", "elf64-x86_64-linux-exec");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const linkPair = [&](ExternImport const& a, ExternImport const& b,
+                              DiagnosticReporter& rep) {
+        auto mods = makeImportCus({{a, true}, {b, true}}, /*withEntry=*/true);
+        return linker::link(
+            std::span<AssembledModule const>{mods.data(), mods.size()},
+            *loaded.target, *loaded.format, rep);
+    };
+
+    {   // isData: function import in CU#1, data object in CU#2.
+        SCOPED_TRACE("isData");
+        ExternImport fnRow = libImport("shared", "libc.so.6");
+        ExternImport dataRow = libImport("shared", "libc.so.6");
+        dataRow.isData         = true;
+        dataRow.dataSizeBytes  = 8;
+        dataRow.dataAlignBytes = 8;
+        DiagnosticReporter rep;
+        auto image = linkPair(fnRow, dataRow, rep);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u);
+        EXPECT_TRUE(anyDiagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
+                                    "conflicting `isData` (data object vs function "
+                                    "import) across CompilationUnits (false vs true)"))
+            << "the diagnostic must name the field and both values; got: "
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_TRUE(anyDiagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
+                                    "D-LK11-EXTERN-IMPORT-DEDUP"));
+        EXPECT_TRUE(image.bytes.empty()) << "a conflicting merge must emit nothing";
+    }
+    {   // isThreadLocal: same name/library, one CU calls it thread-local data.
+        SCOPED_TRACE("isThreadLocal");
+        ExternImport plain = libImport("tlsvar", "libc.so.6");
+        plain.isData         = true;
+        plain.dataSizeBytes  = 4;
+        plain.dataAlignBytes = 4;
+        ExternImport tls = plain;
+        tls.isThreadLocal = true;
+        DiagnosticReporter rep;
+        auto image = linkPair(plain, tls, rep);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u);
+        EXPECT_TRUE(anyDiagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
+                                    "conflicting `isThreadLocal` (thread storage "
+                                    "duration) across CompilationUnits (false vs true)"))
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_TRUE(image.bytes.empty());
+    }
+    {   // Two DIFFERING non-zero sizes for one copy-relocation slot.
+        SCOPED_TRACE("dataSizeBytes");
+        ExternImport small = libImport("gvar", "libc.so.6");
+        small.isData         = true;
+        small.dataSizeBytes  = 4;
+        small.dataAlignBytes = 4;
+        ExternImport big = small;
+        big.dataSizeBytes = 8;
+        DiagnosticReporter rep;
+        auto image = linkPair(small, big, rep);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u);
+        EXPECT_TRUE(anyDiagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
+                                    "conflicting `dataSizeBytes` (copy-relocation "
+                                    "slot size) across CompilationUnits (4 vs 8)"))
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_TRUE(image.bytes.empty());
+    }
+}
+
+// ── CONTROL + FOLD: a ZERO size/align is an INCOMPLETE TYPE, not a conflict ─────
+//
+// `extern const char v[];` in one TU beside a sized declaration in another is legal
+// C (extern_import.hpp — both fields stay 0 for an incomplete type), so the merge
+// takes the NON-ZERO shape per field and reports nothing.
+//
+// ★ WHAT THIS TEST REPLACED, and why the replacement is not gold-plating. The
+// previous form of this control lived inline in the conflict test above and asserted
+// exactly two things: zero conflict diagnostics, and one surviving row. It never read
+// the FOLDED NUMBERS back, so it discriminated only INDIRECTLY — via elf.cpp:1023-1037
+// refusing a zero-size / zero-align copy slot — and it ran ONE order. Three real gaps
+// followed: the SIZED-FIRST order was untested, a `dataAlignBytes`-ONLY fold was
+// untested (nothing forced the align field to fold INDEPENDENTLY of the size field),
+// and a fold that produced a WRONG NON-ZERO number would have passed it. The MIR tier's
+// twin (`MirMerge.IncompleteExternDataTypeFoldsToTheSizedShapeNotAConflict`) already
+// checks both orders and asserts the pair `{8, 8}`; this brings the link tier to the
+// same standard by reading the numbers out of the EMITTED IMAGE:
+//   * `dataSizeBytes` → the copy slot's `.dynsym` `st_size` (elf.cpp:1332-1337);
+//   * `dataAlignBytes` → the DISTANCE from a deliberately 1-byte-and-1-aligned PAD
+//     import's slot to the subject's, which is `alignUp(1, foldedAlign)` == the folded
+//     alignment itself (elf.cpp:1743-1749). Hence the pad: without something ahead of
+//     it the subject's slot sits at offset 0 and the alignment is unobservable.
+// Every row is EAGER and UNREFERENCED — a data object is not called, so the fixture
+// does not aim a `call rel32` at one, and the eager bit is what keeps the reference
+// gate from dropping the rows.
+TEST(CrossCuLinkFormats, IncompleteExternDataFoldsToTheSizedShapeInEitherOrder) {
+    auto loaded = loadShippedPair("x86_64", "elf64-x86_64-linux-exec");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    ExternImport pad = libImport("padvar", "libc.so.6");
+    pad.isData = true;
+    pad.dataSizeBytes  = 1;
+    pad.dataAlignBytes = 1;
+    pad.isEagerImport  = true;
+
+    // Reads back (st_size, slotDistanceFromPad) for the subject "gvar2".
+    auto const foldedShape = [&](ExternImport const& first, ExternImport const& second)
+        -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
+        auto mods = makeImportCus({{pad, /*referenced=*/false},
+                                   {first, /*referenced=*/false},
+                                   {second, /*referenced=*/false}},
+                                  /*withEntry=*/true);
+        DiagnosticReporter rep;
+        auto image = linker::link(
+            std::span<AssembledModule const>{mods.data(), mods.size()},
+            *loaded.target, *loaded.format, rep);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::K_ExternImportAttributeConflict), 0u)
+            << "a zero size/align is an incomplete type, not a disagreement; got: "
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::K_FormatLacksImportSupport), 0u)
+            << "★ a copy slot that folded to 0 is REJECTED by the ELF writer — this "
+               "count firing means the fold kept the incomplete shape; got: "
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_EQ(countName(image.externImportNames, "gvar2"), 1u)
+            << "one (name, library, version) is ONE import row";
+        if (image.bytes.empty()) {
+            ADD_FAILURE() << "no image emitted — the walker refused the folded shape";
+            return std::nullopt;
+        }
+        auto const rows    = readDynSymRows(image.bytes, readSections(image.bytes));
+        auto const subject = findDynSym(rows, "gvar2");
+        auto const padRow  = findDynSym(rows, "padvar");
+        if (!subject.has_value() || !padRow.has_value()) {
+            ADD_FAILURE() << "the copy-relocation slots must export through .dynsym";
+            return std::nullopt;
+        }
+        EXPECT_EQ(padRow->size, 1u) << "the pad's own shape must be untouched";
+        return std::pair{subject->size, subject->value - padRow->value};
+    };
+
+    // Each order gets its OWN verdict: the check body is a void lambda, so a failing
+    // order reports and the remaining ones still run. (Written that way deliberately —
+    // a bare `ASSERT_TRUE` in the TEST body returns from the WHOLE test, which would let
+    // the first failing order hide whether the others fold correctly, and the whole
+    // point of this fixture is that the orders are independent observations.)
+    auto const expectFoldsToSizedShape =
+        [&](char const* trace, ExternImport const& first, ExternImport const& second) {
+        SCOPED_TRACE(trace);
+        auto const shape = foldedShape(first, second);
+        if (!shape.has_value()) return;   // `foldedShape` already reported why
+        EXPECT_EQ(shape->first, 8u)
+            << "the COMPLETE type SIZES the copy-relocation slot; the loader memcpy's "
+               "st_size bytes, so a 0 is an unsized slot and any other number "
+               "truncates or over-copies";
+        EXPECT_EQ(shape->second, 32u)
+            << "…and ALIGNS it: the subject's slot must sit at alignUp(1, 32) past the "
+               "pad's, so this number IS the folded `dataAlignBytes`";
+    };
+
+    ExternImport sized = libImport("gvar2", "libc.so.6");
+    sized.isData = true;
+    sized.dataSizeBytes  = 8;
+    sized.dataAlignBytes = 32;   // deliberately > any default so the read-back is exact
+    sized.isEagerImport  = true;
+
+    ExternImport incomplete = libImport("gvar2", "libc.so.6");
+    incomplete.isData = true;          // 0 / 0 — the shape is unknown in THIS unit
+    incomplete.isEagerImport = true;
+
+    // ★ THE DISCRIMINATING ORDER: the incomplete declaration comes FIRST, so a
+    // first-wins merge keeps 0/0 and ships an unsized, unaligned copy slot…
+    expectFoldsToSizedShape("incomplete first", incomplete, sized);
+    // …and the other order must agree — the fold is order-INDEPENDENT.
+    expectFoldsToSizedShape("sized first", sized, incomplete);
+
+    // ★ THE ALIGN FIELD FOLDS ON ITS OWN. Both rows carry the SAME non-zero size, so
+    // `dataSizeBytes` never moves at all here and ONLY the alignment can — a merge that
+    // folds size but first-wins alignment (they are two independent `foldNonZero`
+    // calls) passes every other case in this file and reds only on these two rows.
+    ExternImport alignUnknown = libImport("gvar2", "libc.so.6");
+    alignUnknown.isData = true;
+    alignUnknown.dataSizeBytes  = 8;   // size AGREES
+    alignUnknown.dataAlignBytes = 0;   // only the ALIGNMENT is unknown here
+    alignUnknown.isEagerImport  = true;
+    expectFoldsToSizedShape("alignment alone unknown, unknown first", alignUnknown, sized);
+    expectFoldsToSizedShape("alignment alone unknown, sized first", sized, alignUnknown);
 }

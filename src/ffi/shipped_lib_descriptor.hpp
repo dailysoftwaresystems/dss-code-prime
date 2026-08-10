@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
+#include "core/types/include_path_resolve.hpp" // HeaderNameMatching + HeaderSearchResult (the `includes` closure walk's case policy)
 #include "core/types/named_type_binding.hpp" // NamedTypeBinding (c82 va_list alias thread-through)
 #include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
 #include "core/types/strong_ids.hpp"   // TypeId
@@ -190,6 +191,58 @@ struct DSS_EXPORT ShippedSymbol {
     // case). A flat string is also accepted (arch-invariant). ELF-only
     // semantics; carried but unused on PE/Mach-O.
     std::string version;
+    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): optional per-target
+    // LINK BASE NAME — the UNDECORATED name the shipped library actually exports
+    // for this C identifier ON THIS TARGET, when it is not the identifier itself.
+    // EMPTY (default, every symbol until opted in) ⇒ the `name` above, which is
+    // byte-identical to the pre-TF-C121 image.
+    //
+    // ★ WHY IT EXISTS — MEASURED, a SILENT MISBINDING, not a theoretical gap.
+    // Darwin reaches its modern 64-bit-inode ABI through `$INODE64` asm-label
+    // ALIASES on x86_64 (`sys/cdefs.h`: `__DARWIN_SUF_64_BIT_INO_T` is
+    // `"$INODE64"` on x86_64 and EMPTY otherwise), while on arm64 that ABI is the
+    // only one and the plain names are correct. Declaring the plain name on
+    // x86_64 binds the LEGACY 32-bit-inode implementation while DSS compiles the
+    // MODERN 144-byte `struct stat`: the callee writes only 120 bytes, `st_size`
+    // is read at offset 96 but written at 72, `fstat` hands back `st_size == 0`,
+    // and sqlite concludes every database file is empty ("database disk image is
+    // malformed"). Four-arm differential: `cc -arch x86_64` imports
+    // `_fstat$INODE64` and sees st_size 4096; DSS imported `_fstat` and saw 0,
+    // with bytes 120-143 still holding the pre-call 0xA5 poison.
+    //
+    // ★ IT DECLARES THE UNDECORATED BASE NAME — the leading `_` is composed by
+    // the ENGINE (`ffi::linkNameFor` -> `applyCMangling`), NEVER written here.
+    // That `_` is a per-FORMAT fact. When this field landed (TF-C121) the fact
+    // had TWO owners -- a closed C++ table `kCManglingRules` and the format
+    // descriptors' `importMangledName` literals -- and a per-symbol third copy
+    // would have grown with the descriptor corpus and drifted. That two-owner
+    // problem is now CLOSED (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN step C4,
+    // TF-C122): the C++ table is gone and the rule is the format's declared
+    // `cSymbolDecoration.scheme`. The argument against writing `_` here is
+    // UNCHANGED and is now simply the ordinary one -- a per-format fact belongs
+    // on the format, not repeated on every symbol that happens to use it. The ELF `version` field
+    // above is the exact precedent and it COMPOSES the same way: config says
+    // `realpath` + `version:"GLIBC_2.3"`, never `realpath@GLIBC_2.3`.
+    //
+    // ★ NOT `asmName`. `asmName` answers "the user's C source wrote `__asm("x")`"
+    // — verbatim, C semantics, and it BYPASSES the mangling. This answers "which
+    // base name does the shipped library export on this target" — DSS vocabulary,
+    // and it is the INPUT to the mangling. A user `__asm` still outranks it.
+    //
+    // PER-TARGET by the SAME `variants` (when:{arch?,format?,dataModel?})
+    // mechanism `version`/structs/constants/typedefs use — `{"variants":[{"when":
+    // {"format":"macho","arch":"x86_64"},"value":"fstat$INODE64"}]}` — resolved
+    // by the reader to THIS single string for the ACTIVE target (0 matches ⇒
+    // empty ⇒ the canonical name; the arm64-Darwin and Linux arms). A flat string
+    // is also accepted (target-invariant).
+    //
+    // ★ AUTHORING CHECK — the old "verify the symbol is exported" rule does NOT
+    // catch this class: BOTH `_fstat` and `_fstat$INODE64` exist in libSystem's
+    // x86_64 slice, so an export check passes on the wrong one. The check that
+    // works is "does a REAL compiler for THIS target emit THIS name for THIS C
+    // identifier" — compile a one-line TU with the platform toolchain and read
+    // the undefined symbol it emits.
+    std::string linkName;
     // Optional per-SYMBOL `library` OVERRIDE — the per-object-format runtime
     // image for THIS symbol alone, SAME shape as the descriptor-level `library`
     // map ("pe"/"elf"/"macho" -> image name). EMPTY (default, almost every
@@ -597,12 +650,26 @@ readShippedLibIncludes(std::filesystem::path const& path,
 //     caller surfaces LOUD (the import resolver positions an
 //     `F_ShippedHeaderNotFound` on the `#include` line; this is the ONLY tier that
 //     can catch it, since the interner-less semantic tier has no `systemDirs`).
+//   * `matching` is the ACTIVE OBJECT FORMAT's header-name case rule
+//     (D-PP-HEADER-CASE-INSENSITIVE-PE). The closure's `includes` entries are
+//     header NAMES resolved by the same funnel a source `#include <h>` uses, so
+//     they MUST honour the same case policy — a descriptor declaring
+//     `includes:["Windows.h"]` has to reach `windows.json` on a pe build from a
+//     case-sensitive host exactly as the source spelling does.
+//   * `onUnresolvedInclude(headerName, outcome)` fires for any entry that did
+//     NOT resolve to exactly one descriptor. `outcome.status` separates a plain
+//     miss (NotFound) from a fold COLLISION (AmbiguousCase, whose
+//     `ambiguousCandidates` name every colliding file) so the caller can emit
+//     the right loud diagnostic; collapsing the two would report a typo for a
+//     tree that actually holds two case-colliding descriptors.
 DSS_EXPORT void forEachDescriptorInClosure(
     std::filesystem::path const&                            startPath,
     std::span<std::filesystem::path const>                  systemDirs,
+    HeaderNameMatching                                      matching,
     std::unordered_set<std::string>&                        visited,
     std::function<void(std::filesystem::path const&)> const& visit,
-    std::function<void(std::string const&)> const&           onUnresolvedInclude);
+    std::function<void(std::string const&,
+                       HeaderSearchResult const&)> const&    onUnresolvedInclude);
 
 // True iff a header carrying availability set `availableObjectFormats` is
 // available on object-format `fmt`. EMPTY set ⇒ available on EVERY format

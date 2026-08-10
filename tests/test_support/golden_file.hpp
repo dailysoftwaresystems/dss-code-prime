@@ -9,43 +9,40 @@
 // + the CRLF-normalized compare live in EXACTLY ONE place and cannot
 // drift between the two.
 
+#include "repo_root.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace dss::test_support {
 
-// Walk up from the running test binary's working directory looking for
-// the `tests/corpus/` tree. The CI / local-dev cwd is the build
-// directory, somewhere under the repo root — same walk-up pattern
-// `GrammarSchema::loadShipped` uses to find shipped configs. Aborts
-// loudly if not found (a silent skip would let the whole corpus suite
-// pass by testing nothing).
+// The `tests/corpus/` tree, via the ONE test-side resolver
+// (`repo_root.hpp`: $DSS_CONFIG_ROOT → the CMake-baked repo root → the cwd
+// ancestor walk). This used to be a private cwd-walk that ended in
+// `std::abort()`, which is why an out-of-tree build reported twelve corpus
+// suites as "Subprocess aborted": `abort()` takes down the whole test BINARY,
+// so one unresolvable corpus root cost every sibling test in that executable
+// its verdict — the harness could not even say which unit was unhappy.
+// `repoRoot()` throws instead, and GoogleTest reports a throw as a failure of
+// the one running test.
 [[nodiscard]] inline std::filesystem::path findCorpusRoot() {
-    namespace fs = std::filesystem;
-    fs::path cwd = fs::current_path();
-    for (int hops = 0; hops < 8; ++hops) {
-        const auto candidate = cwd / "tests" / "corpus";
-        if (fs::is_directory(candidate)) return candidate;
-        if (!cwd.has_parent_path() || cwd == cwd.parent_path()) break;
-        cwd = cwd.parent_path();
-    }
-    ADD_FAILURE() << "could not locate tests/corpus/ from cwd "
-                  << fs::current_path().string();
-    std::abort();
+    return dss::test::corpusRoot();
 }
 
+// Throws rather than `abort()`ing for the same reason as above: a missing
+// golden must cost ONE test its verdict, not the executable's whole roster.
 [[nodiscard]] inline std::string readFile(std::filesystem::path const& path) {
     std::ifstream in{path, std::ios::binary};
     if (!in) {
-        ADD_FAILURE() << "cannot open " << path.string();
-        std::abort();
+        throw std::runtime_error("cannot open " + path.string());
     }
     std::ostringstream buf;
     buf << in.rdbuf();
@@ -66,10 +63,12 @@ namespace dss::test_support {
     if (v.empty() || v == "0" || v == "false" || v == "FALSE" || v == "no") {
         return false;
     }
-    ADD_FAILURE() << "DSS_REFRESH_GOLDENS has unexpected value '" << v
-                  << "' — use '1' to refresh, unset (or '0') otherwise. "
-                     "Refusing to interpret to avoid silently masking drift.";
-    std::abort();
+    // Throws rather than `abort()`ing: the refusal must redden the test that
+    // asked, not delete the verdicts of every other test in the binary.
+    throw std::runtime_error(
+        "DSS_REFRESH_GOLDENS has unexpected value '" + std::string{v}
+        + "' — use '1' to refresh, unset (or '0') otherwise. "
+          "Refusing to interpret to avoid silently masking drift.");
 }
 
 // Generic golden-text comparison. `actual` is the freshly-rendered text

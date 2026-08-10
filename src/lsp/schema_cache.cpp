@@ -1,5 +1,7 @@
 #include "lsp/schema_cache.hpp"
 
+#include "core/types/config_path_walk.hpp"  // findShippedConfigDir — the ONE src/dss-config/<dir> resolver
+
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -40,30 +42,49 @@ namespace {
 
 } // namespace
 
-ShippedDiscoveryResult SchemaCache::discoverShippedLanguages(
-    std::optional<std::filesystem::path> startPath) {
+// Scan one `src/dss-config/sources` directory for `*.lang.json` stems.
+// Factored out so the DSS_CONFIG_ROOT branch and the cwd-walk branch below
+// cannot drift in what they consider a candidate language.
+[[nodiscard]] static ShippedDiscoveryResult scanSourcesDir(
+    std::filesystem::path const& candidate) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::path here = startPath.value_or(fs::current_path(ec));
-    for (int i = 0; i < 8 && !here.empty(); ++i) {
-        const fs::path candidate = here / "src" / "dss-config" / "sources";
-        if (fs::is_directory(candidate, ec)) {
-            std::vector<std::string> names;
-            for (auto const& entry : fs::directory_iterator(candidate, ec)) {
-                if (!entry.is_regular_file()) continue;
-                const auto name = entry.path().filename().string();
-                constexpr std::string_view kSuffix = ".lang.json";
-                if (name.size() <= kSuffix.size()) continue;
-                if (name.compare(name.size() - kSuffix.size(),
-                                 kSuffix.size(), kSuffix) != 0) continue;
-                names.push_back(name.substr(0, name.size() - kSuffix.size()));
-            }
-            std::sort(names.begin(), names.end());
-            return {std::move(names), candidate};
-        }
-        const fs::path parent = here.parent_path();
-        if (parent == here) break;
-        here = parent;
+    std::vector<std::string> names;
+    for (auto const& entry : fs::directory_iterator(candidate, ec)) {
+        if (!entry.is_regular_file()) continue;
+        const auto name = entry.path().filename().string();
+        constexpr std::string_view kSuffix = ".lang.json";
+        if (name.size() <= kSuffix.size()) continue;
+        if (name.compare(name.size() - kSuffix.size(),
+                         kSuffix.size(), kSuffix) != 0) continue;
+        names.push_back(name.substr(0, name.size() - kSuffix.size()));
+    }
+    std::sort(names.begin(), names.end());
+    return {std::move(names), candidate};
+}
+
+ShippedDiscoveryResult SchemaCache::discoverShippedLanguages(
+    std::optional<std::filesystem::path> startPath) {
+    // ── DSS_CONFIG_ROOT first (D-LSP-SHIPPED-DISCOVERY-IGNORES-DSS-CONFIG-ROOT)
+    // This walk was one of THREE hand-rolled copies of "resolve a directory
+    // under src/dss-config/", and it ignored the override entirely. The result
+    // was a tree that lied to itself out-of-tree: `resolveByName` worked,
+    // because it routes through `loadShipped` -> `findShippedConfig`, which
+    // reads the env — while `resolveByExtension` failed, because its candidate
+    // list comes from THIS lookup. MEASURED: with a build directory outside the
+    // source tree and DSS_CONFIG_ROOT set, the three resolveByName tests in
+    // `lsp/test_schema_cache` passed and the three resolveByExtension tests
+    // failed.
+    // The precedence now lives ONCE, in `findShippedConfigDir` (env override,
+    // then an 8-hop cwd walk, then not-found) — the same substrate the file
+    // form uses, so the copies can no longer drift apart.
+    // An EXPLICIT `startPath` still wins outright — it is the caller saying
+    // "discover from exactly here", which the tests rely on to point discovery
+    // at a scratch dir; honouring the ambient environment over it would make
+    // those fixtures untestable. That property is a documented contract of the
+    // shared primitive, not something this call site re-implements.
+    if (auto const dir = findShippedConfigDir("sources", startPath)) {
+        return scanSourcesDir(*dir);
     }
     // Walk exhausted without finding the directory. Distinguishing this
     // "not located" outcome from "located but empty" is load-bearing —

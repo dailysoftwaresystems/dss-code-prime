@@ -31,7 +31,7 @@ The result is a **hermetic, auditable toolchain**. DSS writes its own machine co
 
 DSS Code Prime already compiles and runs **real, unmodified, production software**:
 
-- **SQLite — compiled from the complete upstream source tree, and passing SQLite's own test suite.** Not just the amalgamation: **189 translation units** of unmodified upstream source go through a single `--project` manifest to build SQLite's own `testfixture`, which then runs **SQLite's own unit corpus**. At the `full` tier that is **~1.06 million assertions per run**: Linux x86_64 **7 failures / 1,061,830**, Linux arm64 **12 / 1,060,828**, Windows x86_64 **0 / 979,736**. Every residual failure is a known **non-DSS confound backed by a matched control** — a GCC-built reference `testfixture`, containing no DSS-compiled code, fails it identically on the same machine. **Nothing in the SQLite tree is patched and no test file is excluded to get there.** The amalgamation is compiled too, on **four OS × ISA targets** — Linux (x86_64 + arm64), Windows (x86_64), macOS (arm64) — with **zero special flags**: `sqlite3 --version` → 3.54.0 and a `CREATE` / `INSERT` / `SELECT` round-trip returns the correct result.
+- **SQLite — compiled from the complete upstream source tree, and passing SQLite's own test suite.** Not just the amalgamation: **189 translation units** of unmodified upstream source go through a single `--project` manifest to build SQLite's own `testfixture`, which then runs **SQLite's own unit corpus**. At the `full` tier that is **~1.06 million assertions per run**: Linux x86_64 **7 failures / 1,061,830**, Linux arm64 **12 / 1,060,828**, Windows x86_64 **0 / 979,736**. Every residual failure is a known **non-DSS confound backed by a matched control** — a GCC-built reference `testfixture`, containing no DSS-compiled code, fails it identically on the same machine. **Nothing in the SQLite tree is patched and no test file is excluded to get there.** ⚠ **Read the numerator, not the denominator.** Those three totals were each taken against a *different* upstream revision of SQLite: the harness re-clones upstream on every run, so the corpus it executes is whatever SQLite shipped that day and the denominator moves with it — which is why the three differ. It is not a fixed yardstick and we do not offer it as one; the load-bearing figure is the **numerator**, the count of *DSS-attributable* failures, and that is **zero** in all three. A total quoted without the upstream commit it ran against is not comparable to any other; the most recent run we have pinned is 2026-08-04, SQLite upstream `0a5f27711f`, DSS `a3af1320` — **1 error / 331,333** on native arm64 Linux (`zipfile-25.0`, a known non-DSS confound) and **8 / 331,351** on x86_64 Linux, all eight likewise confounds. Those denominators are a smaller corpus tier than the `full`-tier figures above, which is precisely the point. The amalgamation is compiled too, on **four OS × ISA targets** — Linux (x86_64 + arm64), Windows (x86_64), macOS (arm64) — with **zero special flags**: `sqlite3 --version` → 3.54.0 and a `CREATE` / `INSERT` / `SELECT` round-trip returns the correct result.
 - **Cross-checked against GCC where it counts.** DSS's **ABI** — struct and bit-field layout — is verified byte-for-byte against GCC, Clang, and MSVC, and its **preprocessor** output byte-for-byte against `gcc -E`. It runs SQLite to correct results on every target, and continuously audits itself for **silent miscompiles** — the one failure class this project treats as unacceptable.
 - **770+ internal tests, 100% green** on every leg (Windows x86_64, Linux x86_64, Linux arm64), backed by a test corpus nearly as large as the engine itself (~143,000 lines).
 - **The whole pipeline is in-tree and complete**: tokenizer → parser → semantic analysis → three-tier IR (HIR → MIR → LIR) → register allocation → **its own assembler** (x86_64 + arm64 byte encoding with a round-trip oracle) → **its own linker** (ELF / PE / Mach-O, static and dynamic).
@@ -153,9 +153,12 @@ Targets are JSON-configured (`src/dss-config/targets/*.target.json`); the substr
 src/
 ├── program/          Public API — project, file list, or directory input
 ├── core/             Shared substrate (Tree/HIR/MIR/LIR types, schemas, diagnostics)
-├── dss-config/       Language + target JSON configs
-│   ├── sources/      .lang.json — per-language grammar / semantics / lowering
-│   └── targets/      .target.json — per-target opcode / register / ABI
+├── dss-config/       Language + target + format + FFI JSON configs
+│   ├── sources/         .lang.json — per-language grammar / semantics / lowering
+│   ├── targets/         .target.json — per-target opcode / register / ABI
+│   ├── object-formats/  .format.json — per-container layout, relocations, data model
+│   ├── shippedLibs/     Neutral FFI descriptors for the OS libraries DSS ships against
+│   └── pipelines/       .pipeline.json — the shipped optimizer pipelines (debug / release)
 ├── tokenizer/        Character stream → token stream
 ├── analysis/         Lexical → syntactic (CST) → semantic (types, scopes) + multi-file units
 ├── hir/              High-level IR (typed, language-neutral) + verifier + .dsshir text
@@ -163,6 +166,7 @@ src/
 ├── lir/              Low-level IR (per-target, post-regalloc) + regalloc + callconv + .dsslir text
 ├── opt/              Optimizer passes over MIR
 ├── asm/              In-tree assembler — shape-keyed byte encoders + round-trip oracle disassembler
+├── ffi/              FFI — import surface, ELF/PE/Mach-O binary readers, ABI + name mangling, shipped-lib descriptor reader
 ├── link/             In-tree linker — ObjectFormatSchema + format-blind engine + ELF/PE/Mach-O/WASM/SPIR-V writers
 └── lsp/              Language Server Protocol (stdio JSON-RPC + diagnostics)
 ```
@@ -185,6 +189,8 @@ cd build && ctest --output-on-failure
 ## Contributing
 
 Issues and discussions are open — the [issue forms](.github/ISSUE_TEMPLATE) will guide you. The one hard rule: the shared engine stays **source-, target-, and format-agnostic** (no `if (arch/format/language == …)` in the substrate), and the project **fails loud** rather than ever silently miscompiling. New behavior comes with a test that goes red when it regresses.
+
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full guide — what to send, the bar in detail, and how code contributions are licensed.
 
 ## Support the project
 

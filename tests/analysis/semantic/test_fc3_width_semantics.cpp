@@ -23,6 +23,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "link/object_format_schema.hpp"
+#include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
 #include <nlohmann/json.hpp>
@@ -38,6 +39,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -94,20 +96,27 @@ namespace {
     return TypeKind::Void;
 }
 
-// The shipped c-subset JSON text (for loader perturbation tests). Found
-// the same way loadShipped finds it — walk up from cwd.
+// The shipped c-subset JSON text (for loader perturbation tests). The directory
+// now comes from the ONE test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT →
+// the repo root CMake bakes in → a cwd ancestor walk) rather than the private
+// 12-hop cwd walk this used to carry, which read neither of the first two
+// sources — so an out-of-tree build, whose cwd has no `src/dss-config` in its
+// ancestry, missed every time.
+//
+// It THROWS rather than returning `{}`: the sole consumer that could not check
+// (`loadShippedCSubsetJson` below) fed the empty path to `json::parse`, turning
+// "I cannot find the config" into a parse error about an unopened stream. A
+// throw is reported by GoogleTest as a failure of the ONE running test, and
+// carries either the resolver's three-source diagnostic (root unresolvable) or
+// the path it did resolve and could not find (config missing).
 [[nodiscard]] std::filesystem::path findShippedSourceConfig() {
-    namespace fs = std::filesystem;
-    fs::path dir = fs::current_path();
-    for (int i = 0; i < 12; ++i) {
-        fs::path const candidate =
-            dir / "src" / "dss-config" / "sources" / "c-subset.lang.json";
-        if (fs::exists(candidate)) return candidate;
-        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
-        dir = dir.parent_path();
+    std::filesystem::path const path =
+        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+    if (!std::filesystem::exists(path)) {
+        throw std::runtime_error("shipped c-subset.lang.json is missing: " +
+                                 path.string());
     }
-    ADD_FAILURE() << "could not locate shipped c-subset.lang.json above cwd";
-    return {};
+    return path;
 }
 
 [[nodiscard]] nlohmann::json loadShippedCSubsetJson() {
@@ -828,7 +837,9 @@ namespace {
 [[nodiscard]] std::string minimalElfFormatJson(char const* dataModelLine) {
     return std::string{R"({
   "dssObjectFormatVersion": 1,
+  "cSymbolDecoration": { "scheme": "none" },
   )"} + dataModelLine + R"(
+  "headerNameMatching": "case-sensitive",
   "format": { "name": "fc3-stub", "version": "1.0", "kind": "elf" },
   "elf": { "class": "elf64", "data": "lsb", "machine": 62 }
 })";
@@ -958,8 +969,9 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
     // and the LLP64 i32 offset under LLP64 — the reader resolves the
     // per-symbol signatureByDataModel against the threaded model.
     namespace fs = std::filesystem;
-    auto base = findShippedSourceConfig();   // …/src/dss-config/sources/…
-    ASSERT_FALSE(base.empty());
+    // …/src/dss-config/sources/… — throws (never returns `{}`) if unresolvable,
+    // so the old `ASSERT_FALSE(base.empty())` here would now be vacuous.
+    auto base = findShippedSourceConfig();
     fs::path const desc =
         base.parent_path().parent_path() / "shippedLibs" / "stdio.json";
     ASSERT_TRUE(fs::exists(desc));

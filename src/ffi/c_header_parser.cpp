@@ -293,7 +293,16 @@ readCHeaderFromText(std::string_view    text,
     // real format rather than through the preprocessor. Trigger to revisit: the
     // first shipped header that gates a DECLARATION (not a signature) on
     // `__LP64__`.
+    //
+    // D-PP-HEADER-CASE-INSENSITIVE-PE: this reader takes no object FORMAT
+    // parameter either, so it states the conservative POSIX rule EXPLICITLY.
+    // Benign here in a way it is not for the LSP: this parser reads DSS's own
+    // shipped headers, whose names are byte-exact by construction and are kept
+    // so by the repo-wide case-collision guard, so no spelling it will ever see
+    // depends on folding. Trigger to revisit: this reader gaining a target/
+    // format parameter, or being pointed at a third-party SDK header tree.
     UnitBuilder builder{*loaded};
+    builder.setHeaderNameMatching(kDefaultHeaderNameMatching);
     builder.addInMemory(std::string{text}, std::string{headerPathLabel});
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     SemanticModel model = analyze(cu);

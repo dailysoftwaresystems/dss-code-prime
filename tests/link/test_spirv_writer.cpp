@@ -24,6 +24,7 @@
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "link_test_support.hpp"
+#include "format_reject_support.hpp"   // countAtPath / rejectSummary
 
 #include <gtest/gtest.h>
 
@@ -32,6 +33,9 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::countAtPath;
+using dss::link_format::test::errorCount;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -71,11 +75,15 @@ TEST(SpirvFormatJson, SpirvKindWithElfBlockRejected) {
     // schema with a stray `elf` block is rejected at load.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"spirv-with-elf-block","kind":"spirv"},
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"rel" }
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/elf"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 TEST(SpirvFormatJson, SpirvKindWithUniversalFieldRejected) {
@@ -84,11 +92,15 @@ TEST(SpirvFormatJson, SpirvKindWithUniversalFieldRejected) {
     // so a top-level `relocations[]` would be silently dropped.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
   "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
       "format": {"name":"spirv-with-relocations","kind":"spirv"},
       "relocations": [{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");
     ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/relocations"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
 // ── Walker emits the 20-byte SPIR-V module header ────────────────────

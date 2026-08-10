@@ -21,20 +21,57 @@ function(dss_add_test)
     # Reuse the shared test PCH (heavy STL + <gtest/gtest.h>). All test
     # targets compile with identical flags (DSS_SHARED_BUILD via the lib's
     # PUBLIC define, the same includes), so the one precompiled header is
-    # valid for every one of them. No-op in Debug (CMAKE_DISABLE_PRECOMPILE_
-    # HEADERS), so the linux-clang-asan leg builds PCH-free.
-    target_precompile_headers(${target} REUSE_FROM dss_test_pch)
+    # valid for every one of them.
+    #
+    # GUARDED, not unconditional (D-BUILD-PCH-REUSE-FROM-UNGUARDED-IN-DEBUG).
+    # The Debug canary sets CMAKE_DISABLE_PRECOMPILE_HEADERS (../CMakeLists.txt
+    # ~:162) so the linux-clang-asan leg builds PCH-free — but REUSE_FROM is NOT
+    # a no-op under it the way a producer call is. CMake still records the
+    # property, then complains at generate time that the producer has PCH
+    # disabled: MEASURED on a Debug Ninja configure, 633 `CMake Warning ...
+    # "PRECOMPILE_HEADERS_REUSE_FROM" ... has set "DISABLE_PRECOMPILE_HEADERS";
+    # ignoring` lines (3 per consumer x 211 dss_add_test targets), and they were
+    # 633 of the configure's 633 warnings — i.e. the entire warning channel was
+    # this one line, which is exactly where a real warning goes unseen.
+    #
+    # Same predicate as the sibling on the next line: dss_pch_reproducible opens
+    # with `if(CMAKE_DISABLE_PRECOMPILE_HEADERS) return()`. Both must key off the
+    # one variable, because both are about the same fact ("there is no PCH here");
+    # this one reads inverted only because a function body follows it and there is
+    # nothing to early-return from mid-helper.
+    if(NOT CMAKE_DISABLE_PRECOMPILE_HEADERS)
+        target_precompile_headers(${target} REUSE_FROM dss_test_pch)
+    endif()
     dss_pch_reproducible(${target})  # consumer must match producer's PCH flags
+
+    # Repo root, baked at CONFIGURE time. This is candidate (2) of
+    # `tests/test_support/repo_root.hpp` and the reason an out-of-tree build
+    # resolves config with NO environment at all — the ENVIRONMENT property
+    # below only reaches a process ctest itself launches, so it cannot help a
+    # binary run directly from a shell, and it is exactly what the
+    # `regression/out_of_tree_baked_root` arm strips to prove this path works
+    # on its own. Must ALSO be on dss_test_pch (see the producer below): GCC
+    # invalidates a precompiled header whose consumer has a different -D set,
+    # which is why the "identical flags" note above is load-bearing.
+    target_compile_definitions(${target} PRIVATE
+        DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 
     add_test(NAME ${DSS_NAME} COMMAND ${target})
 
-    # Shipped-config discovery: findShippedConfig() prefers $DSS_CONFIG_ROOT
-    # (a directory containing src/dss-config/) over its cwd-walk. Point it at
-    # the repo root so every test resolves shipped config regardless of build
-    # location — an OUT-OF-TREE build's ctest cwd is a build subdirectory with
-    # no src/dss-config/ in its ancestry, which would otherwise null the loader
-    # (loadShipped → nullptr → downstream null-deref). In-tree builds already
-    # walk to the config; this makes out-of-tree/CI builds work identically.
+    # Shipped-config discovery: findShippedConfig() — and, since TF-C118, the
+    # test-side resolver in tests/test_support/repo_root.hpp — prefers
+    # $DSS_CONFIG_ROOT (a directory containing src/dss-config/) over its
+    # cwd-walk. Point it at the repo root so every test resolves shipped config
+    # regardless of build location — an OUT-OF-TREE build's ctest cwd is a build
+    # subdirectory with no src/dss-config/ in its ancestry, which would
+    # otherwise null the loader (loadShipped → nullptr → downstream null-deref).
+    # In-tree builds already walk to the config; this makes out-of-tree/CI
+    # builds work identically.
+    # ⚠ SETTING IT WAS NEVER SUFFICIENT. This property has been here since the
+    # out-of-tree gap was first noticed, and an out-of-tree ctest still failed
+    # 28 entries, because seventeen test-side helpers carried private cwd-walks
+    # that never READ the variable. The fix was the shared resolver; this line
+    # is one of the three candidates it consults, not the mechanism.
     # (CTest ENVIRONMENT is a ';'-separated list; a repo path containing a
     # literal ';' would mis-split — impossible on normal Windows/WSL paths.)
     set_tests_properties(${DSS_NAME} PROPERTIES
@@ -56,6 +93,13 @@ target_include_directories(dss_test_pch
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/tests/test_support
 )
+# Same -D the consumers get from dss_add_test. NOT optional: GCC rejects a
+# precompiled header whose consumer's command-line macro set differs from the
+# producer's, so omitting it here would turn every test TU's `-Winvalid-pch`
+# into a rebuild-from-source (or an error), which is the "identical flags"
+# invariant the comment above depends on.
+target_compile_definitions(dss_test_pch PRIVATE
+    DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 target_precompile_headers(dss_test_pch PRIVATE ${DSS_PCH_HEADERS} <gtest/gtest.h>)
 dss_pch_reproducible(dss_test_pch)  # producer: timestamp-free PCH → ccache hits
 
@@ -77,6 +121,7 @@ add_subdirectory(ffi)
 add_subdirectory(program)
 add_subdirectory(lsp)
 add_subdirectory(examples)
+add_subdirectory(harness)
 
 # ── TF-C91 (D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE) — the ORDER arm ──
 #
@@ -294,3 +339,90 @@ dss_add_shuffle_arm(NAME hir/test_hir_lowering_multi_lang REPEAT 20)
 dss_add_shuffle_arm(NAME lsp/test_schema_cache REPEAT 20)
 dss_add_shuffle_arm(NAME analysis/semantic/test_semantic_analyzer_c_subset REPEAT 3)
 dss_add_shuffle_arm(NAME analysis/semantic/test_fc3_width_semantics REPEAT 20)
+
+# ── TF-C118 — THE OUT-OF-TREE REGRESSION GUARD ──────────────────────────────
+#
+# WHAT BROKE. A build directory OUTSIDE the source tree failed 29 of 787 ctest
+# entries (MEASURED, Windows/Release, a3af1320; the operator measured the same
+# shape as 28/787 on macOS arm64). ~19 test-side helpers each carried a private
+# "walk up from cwd looking for src/dss-config" and never read $DSS_CONFIG_ROOT,
+# so out-of-tree — where no ancestor of the cwd holds src/dss-config — they all
+# missed, and the ones that answered a miss with std::abort() took their whole
+# test BINARY down with them. They now share one resolver,
+# tests/test_support/repo_root.hpp, whose candidates are:
+#   (1) $DSS_CONFIG_ROOT   (2) the CMake-baked DSS_TEST_REPO_ROOT   (3) the walk
+#
+# WHY AN ARM AND NOT JUST A TEST. Candidates (1) and (3) both work in an
+# ordinary in-tree ctest run, so a normal green suite CANNOT observe (2) at all.
+# Delete the baked definition and every entry stays green while the out-of-tree
+# build silently rots back to 29 red. This arm is the only place where (1) and
+# (3) are BOTH unavailable, which is the only condition under which (2) is
+# load-bearing enough to fail.
+#
+# ★ ENVIRONMENT_MODIFICATION, not ENVIRONMENT. dss_add_test sets
+# DSS_CONFIG_ROOT on every entry; `ENVIRONMENT` can only overwrite it with
+# another value, and any value at all satisfies candidate (1) and makes the arm
+# vacuous. `unset:` (CMake 3.22+) is what actually removes it.
+#
+# ★ THE WORKING DIRECTORY MUST HAVE NO REPO ANCESTRY, and "the build dir" is
+# NOT sufficient — for an in-tree build (build-dbg/) the repo root is an
+# ancestor, candidate (3) resolves, and the arm proves nothing again. So the
+# location is chosen per build layout and then VERIFIED below.
+cmake_path(IS_PREFIX CMAKE_SOURCE_DIR "${CMAKE_BINARY_DIR}" NORMALIZE
+           _dss_binary_inside_source)
+if (_dss_binary_inside_source)
+    # In-tree build: anything under the build dir inherits the repo as an
+    # ancestor, so step OUT of the repo entirely.
+    set(_dss_norepo_cwd "${CMAKE_SOURCE_DIR}/../dss-no-repo-ancestry-cwd")
+else()
+    set(_dss_norepo_cwd "${CMAKE_BINARY_DIR}/no-repo-ancestry-cwd")
+endif()
+cmake_path(SET _dss_norepo_cwd NORMALIZE "${_dss_norepo_cwd}")
+file(MAKE_DIRECTORY "${_dss_norepo_cwd}")
+
+# VERIFY the property rather than trusting the branch above. A guard whose own
+# precondition can rot silently is not a guard; if someone nests a checkout such
+# that this directory gains a src/dss-config ancestor, that is a CONFIGURE-time
+# error here, not a quietly-vacuous green arm later. (The runtime half of the
+# same check lives in BakedRootOnly.PreconditionsHold, which re-verifies from
+# inside the running process where ctest's cwd actually applies.)
+set(_dss_probe "${_dss_norepo_cwd}")
+foreach(_dss_hop RANGE 12)
+    if (IS_DIRECTORY "${_dss_probe}/src/dss-config")
+        message(FATAL_ERROR
+            "dss: the out-of-tree regression arm's working directory "
+            "'${_dss_norepo_cwd}' has repo ancestry at '${_dss_probe}' "
+            "(it contains src/dss-config). The arm would then resolve via the "
+            "cwd ancestor walk and silently stop testing the CMake-baked "
+            "DSS_TEST_REPO_ROOT, which is the only thing it exists to test.")
+    endif()
+    cmake_path(GET _dss_probe PARENT_PATH _dss_parent)
+    if (_dss_parent STREQUAL _dss_probe)
+        break()
+    endif()
+    set(_dss_probe "${_dss_parent}")
+endforeach()
+
+# ★ ONE entry, not three — and the reason is a MEASURED constraint, not a
+# preference. The obvious design is to point this condition at real consumers
+# (say analysis/syntactic/test_corpus for corpusRoot() and
+# core/test_header_name_matching for configRoot()). Those binaries also call the
+# COMPILER-side loader — `GrammarSchema::loadShipped` -> `findShippedConfig`
+# (src/core/types/config_path_walk.cpp), whose candidates are only
+# $DSS_CONFIG_ROOT and the cwd walk. It has NO baked value ON PURPOSE: baking a
+# build machine's repo path into the shipped compiler would be wrong. So
+# stripping DSS_CONFIG_ROOT breaks those binaries for a reason that has nothing
+# to do with the test-side resolver, and the arm would be red forever.
+# MEASURED, from the no-repo cwd with the variable unset:
+# `dss_analysis_syntactic_test_corpus` fails at golden_file.hpp — and would go
+# on to fail `loadShipped("c-subset")` even with the corpus root resolved.
+# So the guard suite is itself the representative consumer: BakedRootOnly drives
+# `dss::test_support::findCorpusRoot()` — the exact entry point the twelve
+# suites that used to abort() go through — and resolves a real file under both
+# corpusRoot() and configRoot(), which is the whole of what this arm can
+# honestly claim.
+add_test(NAME regression/out_of_tree_baked_root
+         COMMAND dss_test_support_test_repo_root --gtest_filter=BakedRootOnly.*
+         WORKING_DIRECTORY "${_dss_norepo_cwd}")
+set_tests_properties(regression/out_of_tree_baked_root PROPERTIES
+    ENVIRONMENT_MODIFICATION "DSS_CONFIG_ROOT=unset:")
