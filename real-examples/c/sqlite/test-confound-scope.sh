@@ -1004,4 +1004,13 @@ if [ "$accounted" -ne "$TOTAL_ASSERTIONS" ]; then
   echo "       self-test report a pass over assertions it never ran. Fix the count — never delete this check."
   exit 1
 fi
-[ "$fail" -eq 0 ]
+# ★ EXPLICIT ON BOTH ARMS, matching test-driver-contracts.sh, and the CHANGE IS THE
+# SECOND LINE ONLY. [D-TEST-CONFOUND-SCOPE-PS1-LEAKS-A-STALE-EXIT-CODE.] This file's
+# answer was already CORRECT — `[ "$fail" -eq 0 ]` as the final command makes the
+# test's own status the script's — while its .ps1 twin, which has no such rule, fell
+# off the end and exited with a stale $LASTEXITCODE of 2 over a green suite. What was
+# wrong here was only that the right answer was INCIDENTAL: append one line after that
+# test and this file breaks the same way. ⚠ NOT a bare `exit 0` — that would report
+# success over a failing suite, which is the regression this shape avoids.
+[ "$fail" -eq 0 ] || exit 1
+exit 0

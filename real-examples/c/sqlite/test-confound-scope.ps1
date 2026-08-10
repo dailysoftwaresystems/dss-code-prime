@@ -638,3 +638,14 @@ if ($accounted -ne $TotalAssertions) {
   exit 1
 }
 if ($fail -gt 0) { exit 1 }
+# ★ EXPLICIT, AND IT IS A FIX, NOT A TIDY-UP. [D-TEST-CONFOUND-SCOPE-PS1-LEAKS-A-STALE-EXIT-CODE.]
+# Falling off the end of a .ps1 does not exit 0 — it exits with whatever
+# $LASTEXITCODE the last NATIVE command left behind, and several assertions here
+# deliberately provoke a REFUSAL from harness_legs.py and then assert it. ✔MEASURED
+# 2026-08-10: this file printed `passed=95 failed=0 skipped=0` and exited **2**,
+# i.e. it reported a green suite with a red exit code, inherited from a refusal it
+# had just scored as a PASS. Verified pre-existing by running HEAD's own copy
+# against HEAD's legs.json — same 95/0, same rc=2 — so it is not a regression, it
+# is a hole that was always there. Its twin ends in `[ "$fail" -eq 0 ] || exit 1`
+# and answered 0 correctly, which is exactly how a capability-paired defect hides.
+exit 0

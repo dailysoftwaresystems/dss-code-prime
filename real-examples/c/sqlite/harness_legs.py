@@ -7456,20 +7456,68 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # ★ THE INTENT, unchanged since TF-C123: pe64 must never re-inherit a SIBLING's
     # confounds. All six patterns it once carried were earned on LINUX, and its own
     # native tier measured 0 errors / 979,736 — so a bare pattern here is a copy.
-    # ⚠ THE ORIGINAL FORM OF THIS PIN ASSERTED THE SET WAS EMPTY, which was a true
-    # measurement in TF-C123 and became WRONG in TF-C124: `win32longpath-1.3` was then
-    # genuinely EARNED on pe64 UNDER WINE, with a matched control (the same dss-built
-    # testfixture.exe runs `win32longpath-1.3... Ok` on REAL Windows — compiler held
-    # constant, only the runtime varied). Pinning the empty SET would have made an
-    # honestly-earned entry fail the self-test, i.e. it would have punished the very
-    # discipline it exists to enforce. So pin the RULE, not the count:
-    #   every pe64 confound must be `emulated:`-scoped.
-    # That is what keeps a native-Windows failure unexcusable, which is the platform
-    # that actually proves this leg.
+    # ⚠ THIS PIN HAS NOW HAD TO GIVE GROUND TWICE, AND THE SECOND TIME IS WHY IT IS
+    # WRITTEN THE WAY IT IS BELOW — a guard that is weakened every time it fires ends
+    # up asserting nothing, so the question each time must be "what did it actually
+    # protect?", never "what is the smallest edit that makes it green?".
+    # [D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT.]
+    #   TF-C123: it asserted the SET WAS EMPTY. True when written; WRONG in TF-C124,
+    #     when `win32longpath-1.3` was genuinely EARNED on pe64 UNDER WINE with a
+    #     matched control (the same dss-built testfixture.exe runs
+    #     `win32longpath-1.3... Ok` on REAL Windows — compiler held constant, only the
+    #     runtime varied). It was re-pinned as: every pe64 confound is `emulated:`.
+    #   2026-08-10: that too became wrong, and in the honest direction. `sessionnoact-4.3`
+    #     was earned on pe64 by an experiment run on NATIVE WINDOWS — one testfixture.exe,
+    #     three file sets, three outcomes (pair -> 1 error out of 40 with
+    #     `got: [invalid command name "log"]`; the subject ALONE -> 0 of 34; the
+    #     session3 pair, which resets the leaked callback -> 0 of 50). An
+    #     `emulated:`-only rule would have forced that row to lie about where it was
+    #     earned, or to be dropped.
+    # ★ SO PIN THE RULE THE PROXY WAS STANDING IN FOR. The intent was never "wine only";
+    #   it was pe64 MUST NOT RE-INHERIT A SIBLING'S CONFOUNDS — all six patterns it once
+    #   carried were earned on LINUX while its own native tier measured 0 errors /
+    #   979,736. Two checks say that directly:
+    #     (a) every pe64 row's provenance NAMES pe64 — a sibling-only `earnedOn` is
+    #         exactly the copy that shipped before, and this rejects all six of them.
+    #     (b) a row that can excuse a NATIVE Windows failure (scope `any`) must SAY it
+    #         was earned natively. That blocks the one bad move the scope proxy really
+    #         guarded: taking a wine-only observation and widening it to cover the
+    #         platform that actually proves this leg.
     _pe = _sets["pe64-x86_64"]
-    check("every pe64 confound is emulated-scoped (native Windows stays unexcusable)",
-          all(p.startswith("emulated:") for p in _pe),
-          "got %r" % _pe)
+    _pe_rows = [l for l in legs if l["label"] == "pe64-x86_64"][0]["confounds"]
+    # startswith, NOT `"pe64" in ...`: a containment test is satisfied by a row that
+    # merely MENTIONS this leg while being earned on another ("…not re-measured on
+    # pe64"), which is the exact sentence a transfer would carry. The leg's own
+    # $confoundsComment forbids transfers here — every row must be earned on pe64 —
+    # so the provenance must OPEN with the leg, and both shipped rows do.
+    check("every pe64 confound names pe64 FIRST in its own provenance (no sibling copies)",
+          all(r["earnedOn"].startswith("pe64-x86_64") for r in _pe_rows),
+          "a pe64 row earned on a sibling leg is the TF-C123 defect returning, and "
+          "this leg admits no transfers at all; got %r"
+          % [(r["pattern"], r["earnedOn"][:60]) for r in _pe_rows])
+    check("an `any`-scoped pe64 confound declares it was earned NATIVELY",
+          all(r["scope"] != "any" or "NATIVE" in r["earnedOn"].upper()
+              for r in _pe_rows),
+          "scope `any` excuses a failure on real Windows, which is the platform that "
+          "proves this leg — a wine-only observation may not be widened to cover it; "
+          "got %r" % [(r["pattern"], r["scope"], r["earnedOn"][:60])
+                      for r in _pe_rows])
+    # The six that shipped on this leg in the old global list, by name. `_pe` holds
+    # WIRE strings, so drop the scope prefix first — and drop it as a KNOWN prefix
+    # from the scope vocabulary, not with lstrip() (a character SET, correct here
+    # only by the accident that every pattern starts with `^`) and not with a bare
+    # split(":") (a regex is free to contain a colon, and that one would then eat
+    # the pattern's own head and read as clean).
+    def _unscoped(wire):
+        for s in CONFOUND_SCOPES:
+            pre = confound_scope_prefix(s)
+            if pre and wire.startswith(pre):
+                return wire[len(pre):]
+        return wire
+    _POSIX_EARNED = ("^walsetlk", "^busy2", "^recoverfault", "^date-2", "^zipfile")
+    check("pe64 still carries no copy of a POSIX-earned pattern",
+          not any(_unscoped(p).startswith(_POSIX_EARNED) for p in _pe),
+          "these were earned on Linux and once shipped here wholesale; got %r" % _pe)
     # A scoped pattern must reach the drivers WITH its scope, or the qemu-only
     # writecrash excusal silently becomes a bare one and suppresses a future
     # genuine regression on a native run.
