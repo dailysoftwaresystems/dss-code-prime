@@ -10073,3 +10073,303 @@ TEST(PreprocessorVaOpt, VaOptNameIsConfigDrivenNotHardcoded) {
         << "under the rebound config `DSS_OPT(w)` must expand, proving the "
            "spelling is read from config rather than hard-coded";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// D-PP-STRINGIZE-EXPANDED-ARG-SLICES-WRONG-BYTES — `#` spells a TOKEN SEQUENCE
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `#` used to build its product by slicing ONE contiguous byte range,
+// `[raw.front().span.start(), raw.back().span.end())`. That is only exact while
+// the stringizing argument really is unbroken call-site text. The `XSTR(...)`
+// idiom breaks it: the inner macro receives an argument that has ALREADY been
+// expanded, so its tokens come from the `#define` line, the call site and
+// `productText_` interleaved, and `front()..back()` spans whatever lies between
+// two unrelated buffer positions. No diagnostic — the wrong string just shipped.
+//
+// EVERY expectation below is ✔MEASURED on four reference preprocessors that
+// agreed exactly: clang-18 `-std=c23`, clang-19 `-std=c23`, gcc-13 `-std=c2x`,
+// and cl 19.51.36252 `/std:clatest /Zc:preprocessor`.
+//
+// RED-ON-DISABLE: restore the slice and `NestedStringize*` reports the `#define`
+// line's own text (`"g(a, b)"`), a comment (`"a/*x*/b"`), or the remainder of the
+// file; drop the per-token spelling and `*InsideATokenSpelling` collapses the two
+// spaces it must keep; restore `applySpacing`'s span loop and
+// `*ArgumentThatArrivedThroughAnExpansion` says `"z +b"`.
+
+// ★ THE CORE DIFFERENTIAL. The argument is the EXPANSION of an inner macro, so
+// its tokens are not contiguous anywhere; the product must spell those tokens.
+TEST(PreprocessorStringizeTokenSequence,
+     NestedStringizeSpellsTheExpandedArgumentNotTheDefineLine) {
+    // The two-level idiom shared by every real "stringify after expansion" macro.
+    const std::string prelude =
+        "#define STR(...) #__VA_ARGS__\n"
+        "#define XSTR(...) STR(__VA_ARGS__)\n"
+        "#define PLAIN(a,b) g(a, b)\n"
+        "#define VA(f,...) k(f, __VA_ARGS__)\n"
+        "#define MIX(a) q(a, w)\n";
+
+    // CONTROL (single level): `#` does NOT pre-expand its own operand, so the raw
+    // spelling survives. This passed before the fix too — it is here so a failure
+    // in the cases below cannot be blamed on stringize being broken generally.
+    PreprocessResult rc0;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "STR(PLAIN(1,2))\n", rc0)),
+              "\"PLAIN(1,2)\"")
+        << "a `#` operand is never pre-expanded (C 6.10.3.2p2)";
+    EXPECT_FALSE(rc0.diagnostics->hasErrors());
+
+    PreprocessResult r1;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR(PLAIN(1,2))\n", r1)),
+              "\"g(1, 2)\"")
+        << "the product must spell the ARGUMENT's tokens; a contiguous slice "
+           "reads PLAIN's `#define` line instead and yields \"g(a, b)\"";
+    EXPECT_FALSE(r1.diagnostics->hasErrors());
+
+    PreprocessResult r2;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR(VA(1,2,3))\n", r2)),
+              "\"k(1, 2,3)\"")
+        << "note the ASYMMETRIC spacing is correct: the `, ` comes from VA's "
+           "replacement list and the `2,3` from the call site, where there is "
+           "no space — a blind space-join would say \"k(1, 2, 3)\"";
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+
+    // The argument mixes a CALL-SITE token (`z`) with REPLACEMENT-ORIGIN ones.
+    PreprocessResult r3;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR(MIX(z))\n", r3)), "\"q(z, w)\"");
+    EXPECT_FALSE(r3.diagnostics->hasErrors());
+
+    // Two levels of the inner macro, then two levels of stringize.
+    PreprocessResult r4;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR(PLAIN(PLAIN(1,2),3))\n", r4)),
+              "\"g(g(1, 2), 3)\"");
+    EXPECT_FALSE(r4.diagnostics->hasErrors());
+
+    // Three levels of stringize indirection still lands on the same answer.
+    PreprocessResult r5;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "#define YSTR(...) XSTR(__VA_ARGS__)\n"
+                                          "YSTR(PLAIN(1,2))\n", r5)),
+              "\"g(1, 2)\"");
+    EXPECT_FALSE(r5.diagnostics->hasErrors());
+
+    // CONTROL (negative): an operand that is not a macro is unchanged by the
+    // extra expansion level, so both idioms agree. Guards against a "fix" that
+    // makes every product go through some transform.
+    PreprocessResult r6;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR(notamacro)\n", r6)),
+              "\"notamacro\"");
+    EXPECT_FALSE(r6.diagnostics->hasErrors());
+}
+
+// ★ WHITE SPACE INSIDE A TOKEN'S OWN SPELLING SURVIVES VERBATIM. C23 6.10.5.2p2
+// collapses white space BETWEEN the argument's preprocessing tokens; two spaces
+// inside a string or character literal are part of THAT TOKEN and are not
+// between anything. The old whole-slice collapse could not tell the difference.
+TEST(PreprocessorStringizeTokenSequence,
+     StringizePreservesWhiteSpaceInsideATokenSpelling) {
+    const std::string def = "#define S(x) #x\n";
+
+    // CONTROL: white space BETWEEN tokens still collapses to exactly one space.
+    PreprocessResult rc0;
+    EXPECT_EQ(ppConcat(ppLexemes(def + "S(a     b)\n", rc0)), "\"a b\"")
+        << "a run of white space BETWEEN tokens is one space (6.10.5.2p2)";
+    EXPECT_FALSE(rc0.diagnostics->hasErrors());
+
+    PreprocessResult r1;
+    EXPECT_EQ(ppConcat(ppLexemes(def + "S(\"a  b\")\n", r1)),
+              "\"\\\"a  b\\\"\"")
+        << "both interior spaces belong to the literal's spelling and must "
+           "survive; collapsing them ships a string the source never wrote";
+    EXPECT_FALSE(r1.diagnostics->hasErrors());
+
+    PreprocessResult r2;
+    EXPECT_EQ(ppConcat(ppLexemes(def + "S(\"a\tb\")\n", r2)),
+              "\"\\\"a\tb\\\"\"")
+        << "an interior TAB is preserved as a TAB, not turned into a space";
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+
+    PreprocessResult r3;
+    EXPECT_EQ(ppConcat(ppLexemes(def + "S('a  b')\n", r3)), "\"'a  b'\"")
+        << "the rule is about the TOKEN, so a character constant behaves alike";
+    EXPECT_FALSE(r3.diagnostics->hasErrors());
+
+    // Escaping and interior spacing are independent and must both hold.
+    PreprocessResult r4;
+    EXPECT_EQ(ppConcat(ppLexemes(def + "S(\"a  \\\"  b\")\n", r4)),
+              "\"\\\"a  \\\\\\\"  b\\\"\"")
+        << "an escaped quote inside the literal gains its `\\` AND keeps its "
+           "surrounding interior spaces";
+    EXPECT_FALSE(r4.diagnostics->hasErrors());
+
+    PreprocessResult r5;
+    EXPECT_EQ(ppConcat(ppLexemes(def + "S(\"a  \\\\  b\")\n", r5)),
+              "\"\\\"a  \\\\\\\\  b\\\"\"");
+    EXPECT_FALSE(r5.diagnostics->hasErrors());
+
+    // ★★ THE CASE THAT PINS BOTH RULES AT ONCE, and the reason the spelling has
+    // to be built per-token: the same product collapses between tokens while
+    // preserving inside them. No byte-range walk can express this.
+    PreprocessResult r6;
+    EXPECT_EQ(ppConcat(ppLexemes(def + "S(f(\"a  b\" ,   \"c  d\"))\n", r6)),
+              "\"f(\\\"a  b\\\" , \\\"c  d\\\")\"")
+        << "interior white space kept, between-token white space collapsed, in "
+           "ONE product";
+    EXPECT_FALSE(r6.diagnostics->hasErrors());
+
+    // ... and it still holds when the literal reaches `#` through an expansion.
+    PreprocessResult r7;
+    EXPECT_EQ(ppConcat(ppLexemes("#define STR(...) #__VA_ARGS__\n"
+                                 "#define XSTR(...) STR(__VA_ARGS__)\n"
+                                 "#define PLAIN(a,b) g(a, b)\n"
+                                 "XSTR(PLAIN(\"a  b\",2))\n", r7)),
+              "\"g(\\\"a  b\\\", 2)\"");
+    EXPECT_FALSE(r7.diagnostics->hasErrors());
+
+    // CONTROL (negative): a literal with NO interior white space is untouched,
+    // so the fix cannot be "stop normalizing anything at all".
+    PreprocessResult r8;
+    EXPECT_EQ(ppConcat(ppLexemes(def + "S(\"ab\")\n", r8)), "\"\\\"ab\\\"\"");
+    EXPECT_FALSE(r8.diagnostics->hasErrors());
+}
+
+// ★ THE THIRD SITE. `applySpacing` reconstructed tokens 2..N of a substituted run
+// with `span.start() != prev.span.end()`, on the same false contiguity premise.
+// This was already REACHABLE through `#__VA_OPT__(X)` — i.e. it was a live
+// wrong-bytes defect, not a latent one.
+TEST(PreprocessorStringizeTokenSequence,
+     StringizeSpacingOfAnArgumentThatArrivedThroughAnExpansion) {
+    const std::string prelude =
+        "#define SP(X, ...) #__VA_OPT__(X)\n"
+        "#define CAT2(a) a+b\n"
+        "#define CAT3(a) a + b\n";
+
+    // CONTROL: a one-token argument has no interior adjacency to get wrong.
+    PreprocessResult rc0;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "SP(q, 1)\n", rc0)), "\"q\"");
+    EXPECT_FALSE(rc0.diagnostics->hasErrors());
+
+    // CONTROL: an argument whose tokens ARE one contiguous `#define` line. This
+    // is the case the span reconstruction got right by luck, and it must stay
+    // right — so a fix cannot simply hardcode "never spaced".
+    PreprocessResult rc1;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "#define TIGHT x+y\nSP(TIGHT, 1)\n",
+                                 rc1)),
+              "\"x+y\"");
+    EXPECT_FALSE(rc1.diagnostics->hasErrors());
+    PreprocessResult rc2;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "#define SPACED x + y\nSP(SPACED, 1)\n",
+                                 rc2)),
+              "\"x + y\"");
+    EXPECT_FALSE(rc2.diagnostics->hasErrors());
+
+    // ★ THE DEFECT: `z` is a CALL-SITE token, `+` and `b` come from CAT2's
+    // `#define` line. Nothing separates them in the construct, but they are far
+    // apart in the buffers, so span arithmetic invents a space -> "z +b".
+    PreprocessResult r1;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "SP(CAT2(z), 1)\n", r1)), "\"z+b\"")
+        << "adjacency belongs to the construct; the tokens' byte positions are "
+           "unrelated once the argument came through an expansion";
+    EXPECT_FALSE(r1.diagnostics->hasErrors());
+
+    // The same shape spelled WITH spaces must still report them — so the fix is
+    // carrying the real answer, not suppressing spaces.
+    PreprocessResult r2;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "SP(CAT3(z), 1)\n", r2)), "\"z + b\"");
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+}
+
+// ★ ADJACENCY MUST SURVIVE EVERY BOUNDARY A TOKEN CROSSES: a comment, an
+// object-like replacement, a substitution taking a macro name's place, and a
+// `##` product. Each of these is a place the bit is PROPAGATED rather than
+// recomputed, and each was measured against the four oracles.
+TEST(PreprocessorStringizeTokenSequence,
+     StringizeSpacingAcrossSubstitutionAndPasteBoundaries) {
+    const std::string prelude =
+        "#define STR(...) #__VA_ARGS__\n"
+        "#define XSTR(...) STR(__VA_ARGS__)\n"
+        "#define PLAIN(a,b) g(a, b)\n";
+
+    // A COMMENT is white space (translation phase 3), so it becomes one space —
+    // and must not appear in the product. The slice used to copy it verbatim.
+    PreprocessResult r1;
+    EXPECT_EQ(ppConcat(ppLexemes("#define S(x) #x\nS(a/*x*/b)\n", r1)), "\"a b\"")
+        << "a comment is white space, not spelling: it must never reach the "
+           "string literal";
+    EXPECT_FALSE(r1.diagnostics->hasErrors());
+    PreprocessResult r2;
+    EXPECT_EQ(ppConcat(ppLexemes("#define S(x) #x\nS(a/*x*/  b)\n", r2)),
+              "\"a b\"")
+        << "a comment plus real spaces is still exactly one space";
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+
+    // An OBJECT-LIKE replacement list carries its own adjacency, read from the
+    // `#define` line's spans (trivia is dropped at definition time, but the list
+    // is one contiguous run of that line, so the gap is exact).
+    PreprocessResult r3;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "#define OBJ p+q\nXSTR(OBJ)\n", r3)),
+              "\"p+q\"");
+    EXPECT_FALSE(r3.diagnostics->hasErrors());
+    PreprocessResult r4;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "#define OBJS p + q\nXSTR(OBJS)\n", r4)),
+              "\"p + q\"");
+    EXPECT_FALSE(r4.diagnostics->hasErrors());
+
+    // A SUBSTITUTION takes the invoking NAME's place, so its first token keeps
+    // the spacing that preceded the invocation — not the define line's.
+    PreprocessResult r5;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR(a PLAIN(1,2))\n", r5)),
+              "\"a g(1, 2)\"")
+        << "the `g` inherits the space that preceded `PLAIN`";
+    EXPECT_FALSE(r5.diagnostics->hasErrors());
+    PreprocessResult r6;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR(a+PLAIN(1,2))\n", r6)),
+              "\"a+g(1, 2)\"")
+        << "...and inherits NO space when the invocation had none";
+    EXPECT_FALSE(r6.diagnostics->hasErrors());
+
+    // A `##` PRODUCT stands where its LEFT operand stood: the paste consumed the
+    // boundary BETWEEN the operands, not the one before them.
+    PreprocessResult r7;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "#define P(a,b) a##b\nXSTR(x P(1,2))\n",
+                                 r7)),
+              "\"x 12\"");
+    EXPECT_FALSE(r7.diagnostics->hasErrors());
+    PreprocessResult r8;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "#define P(a,b) a##b\nXSTR(x+P(1,2))\n",
+                                 r8)),
+              "\"x+12\"");
+    EXPECT_FALSE(r8.diagnostics->hasErrors());
+
+    // A `##` product built from an ARGUMENT and a replacement-list token.
+    PreprocessResult r9;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "#define SUF(a) a##_z\nXSTR(w SUF(v))\n",
+                                 r9)),
+              "\"w v_z\"");
+    EXPECT_FALSE(r9.diagnostics->hasErrors());
+
+    // LEADING/TRAILING white space of the stringizing argument is DELETED
+    // (6.10.5.2p2), even when the argument arrived through an expansion.
+    PreprocessResult r10;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR(   PLAIN(1,2)   )\n", r10)),
+              "\"g(1, 2)\"");
+    EXPECT_FALSE(r10.diagnostics->hasErrors());
+
+    // A replacement list whose own tokens are SPACED, with arguments substituted
+    // into it: the space is the define line's, the values are the call site's.
+    PreprocessResult r11;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "#define TWO(a,b) a b\nXSTR(TWO(1,2))\n",
+                                 r11)),
+              "\"1 2\"")
+        << "the slice used to answer \"1,2\" — the call site's comma, which is "
+           "not in the construct at all";
+    EXPECT_FALSE(r11.diagnostics->hasErrors());
+
+    // An ARGUMENT with interior white space, carried through the nesting.
+    PreprocessResult r12;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR(PLAIN(x  y,2))\n", r12)),
+              "\"g(x y, 2)\"");
+    EXPECT_FALSE(r12.diagnostics->hasErrors());
+
+    // CONTROL: an empty stringizing argument is still `""` (6.10.5.2p4).
+    PreprocessResult r13;
+    EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR()\n", r13)), "\"\"");
+    EXPECT_FALSE(r13.diagnostics->hasErrors());
+}

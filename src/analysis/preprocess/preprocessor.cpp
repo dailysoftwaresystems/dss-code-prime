@@ -2230,24 +2230,37 @@ struct ExpToken {
     // dropped before the result leaves `substitute`). The default `false` makes
     // every existing ExpToken construction a non-placemarker -- zero regression.
     bool placemarker = false;
-    // FC18a (D-PP-VA-OPT): "this token was separated from the previous one by
-    // white space IN THE CONSTRUCT IT CAME FROM". Written ONLY while substituting
-    // a va-opt-replacement's content, and read ONLY by `stringizeTokens` (the
-    // `#__VA_OPT__(...)` spelling builder).
+    // ★★ "White space separated this token from the previous one IN THE CONSTRUCT
+    // IT CAME FROM" -- the ONE owner of pp-token adjacency, and the ONLY thing
+    // C23 6.10.5.2p3 (`#`) is allowed to consult. ALWAYS maintained.
     //
-    // ★ WHY A CAPTURED BIT AND NOT A SPAN COMPARISON AT STRINGIZE TIME. C23
-    // 6.10.5.2p3 says each occurrence of white space BETWEEN the stringizing
-    // argument's tokens becomes one space -- so where the source had none, none
-    // is inserted. ✔MEASURED (clang-18/clang-19/gcc-13 agreeing): with X=p,
+    // ★★ WHY A CARRIED BIT AND NEVER A SPAN COMPARISON. 6.10.5.2p3 turns each
+    // occurrence of white space BETWEEN the stringizing argument's tokens into one
+    // space and inserts NONE where the source had none. ✔MEASURED
+    // (clang-18/clang-19/gcc-13/cl 19.51 unanimous): with X=p,
     //   `#define SZ(X, ...) #__VA_OPT__(X+X)`   -> "p+p"
     //   `#define SZ(...)    #__VA_OPT__(a + b)` -> "a + b"
     //   `#define SZ(...)    #__VA_OPT__(a+b)`   -> "a+b"
-    // Adjacency is a property of the REPLACEMENT LIST, and after substitution it
-    // is no longer recoverable from spans: in `X+X` the substituted `p` comes from
-    // the CALL SITE while the `+` comes from the `#define` line, so the two are
-    // never byte-adjacent in any buffer and a span comparison would wrongly emit
-    // "p + p". The bit records the answer while the replacement list is still in
-    // hand. Defaults to `false`, so no existing construction changes behavior.
+    // Adjacency belongs to the CONSTRUCT, and once tokens have been substituted it
+    // is no longer recoverable from their spans: in `X+X` the substituted `p` comes
+    // from the CALL SITE while the `+` comes from the `#define` line, so the two are
+    // never byte-adjacent in ANY buffer and a span comparison wrongly says "p + p".
+    // D-PP-STRINGIZE-EXPANDED-ARG-SLICES-WRONG-BYTES is what happens when a span is
+    // trusted anyway: the slice ran off the argument entirely and shipped the
+    // `#define` line -- or the rest of the file -- inside the string literal, with
+    // no diagnostic.
+    //
+    // ★ WRITTEN AT EXACTLY TWO PLACES, WHERE ADJACENCY IS GENUINELY KNOWN, AND
+    // ONLY EVER COPIED THEREAFTER:
+    //   (1) `liftRun` -- an ORIGINAL source run, whose own TRIVIA tokens are still
+    //       interleaved, so the answer is read off the white space itself (exact,
+    //       and it needs no contiguity assumption at all). A comment is trivia, so
+    //       it correctly counts as one space (✔MEASURED `S(a/*x*/b)` -> "a b").
+    //   (2) `substituteRange`'s `spacedHere` -- a REPLACEMENT-LIST token, where
+    //       trivia was dropped at `#define` time but the list IS one contiguous run
+    //       of the define line, so the span gap is exact.
+    // Everything downstream (`stampArg`, `collapsePastes`, the splice sites)
+    // PROPAGATES the bit; nothing recomputes it. Defaults to `false`.
     bool spacedBefore = false;
 };
 
@@ -2257,6 +2270,52 @@ struct ExpToken {
 // its real position; macro splices later inherit the invoking token's anchor.
 inline ExpToken fromToken(Token const& t) {
     return ExpToken{t, nullptr, t.span.start()};
+}
+
+// Lift a whole ORIGINAL source run into the expansion working set, stamping each
+// significant token's `spacedBefore` (site (1) of the two writers named on that
+// field). This is THE production point for source-origin adjacency: the run still
+// carries its own TRIVIA tokens, so "was there white space before this token" is
+// read off the white space itself rather than inferred from byte positions -- exact,
+// and correct for a comment too (phase 3 makes a comment one space).
+//
+// ★ TRIVIA IS KEPT IN THE RUN, not filtered: `trimArgTrivia`, `nextSignificant` and
+// `hasSignificantToken` all read it, and 6.10.5.1p7's emptiness question is asked of
+// PREPROCESSING tokens, which white space is not. Only significant tokens get a bit;
+// a trivia token's own bit is never read.
+//
+// The leading token of a run has no predecessor, so its bit stays `false` -- which is
+// also 6.10.5.2p3's answer (leading white space of a stringizing argument is deleted).
+[[nodiscard]] inline std::vector<ExpToken> liftRun(std::vector<Token> const& toks) {
+    std::vector<ExpToken> work;
+    work.reserve(toks.size());
+    bool pendingSpace = false;
+    for (Token const& t : toks) {
+        ExpToken e = fromToken(t);
+        if (isTrivia(t) || isNewline(t)) {
+            pendingSpace = true;
+        } else {
+            e.spacedBefore = pendingSpace;
+            pendingSpace   = false;
+        }
+        work.push_back(e);
+    }
+    return work;
+}
+
+// A macro's replacement run REPLACES the invoking NAME token, so the run's first
+// significant token inherits that name's own `spacedBefore` -- otherwise the
+// spacing that separated the invocation from its predecessor is lost.
+// ✔MEASURED (all four oracles): `#define PLAIN(a,b) g(a, b)` under a two-level
+// stringize gives "a g(1, 2)" for `a PLAIN(1,2)` and "a+g(1, 2)" for `a+PLAIN(1,2)`
+// -- the `g` carries the spacing of the `PLAIN` it replaced, not the define line's.
+inline void inheritLeadingSpacing(std::vector<ExpToken>& run, bool spaced) {
+    for (ExpToken& e : run) {
+        if (e.placemarker) continue;
+        if (isTrivia(e.tok) || isNewline(e.tok)) continue;
+        e.spacedBefore = spaced;
+        return;
+    }
 }
 
 // M is hidden for this token iff M is a member of its hide set.
@@ -2655,9 +2714,9 @@ public:
         // construct; a function-like call spanning it fails loud -- in collectArgs
         // when the name+`(` are in this flush, else at the parser when only the
         // name precedes the directive -- never a silent mis-expansion).
-        std::vector<ExpToken> work;
-        work.reserve(pending.size());
-        for (Token const& t : pending) work.push_back(fromToken(t));
+        // `liftRun` also stamps each token's `spacedBefore` from the trivia this run
+        // still carries -- the ONE production point for source-origin adjacency.
+        std::vector<ExpToken> work = liftRun(pending);
         // TF-C82: THIS is the expansion whose output reaches the parser, so it is
         // the one whose tokens carry a `#pragma pack` cap. The `#if`-operand
         // expansions (`expandTokens`) run with the flag clear — their tokens are
@@ -3705,12 +3764,11 @@ private:
     // expand, drop the hide sets. Used by the `#if` evaluator's callback so the
     // controlling expression's macros expand identically to the body's.
     std::vector<Token> expandTokens(std::vector<Token> const& toks) {
-        std::vector<ExpToken> work;
-        work.reserve(toks.size());
         // FC15b: seed each token's own offset as its invocation anchor (a
         // `__LINE__` in a `#if` operand resolves against that operand's line).
-        for (Token const& t : toks) work.push_back(fromToken(t));
-        std::vector<ExpToken> expanded = expand(std::move(work), 0);
+        // `liftRun` additionally stamps `spacedBefore` from this run's trivia, so a
+        // `#`-stringize reached from a `#if` operand spells the same as in the body.
+        std::vector<ExpToken> expanded = expand(liftRun(toks), 0);
         std::vector<Token> out;
         out.reserve(expanded.size());
         // FC15 paste residuals: backstop drop of any stray placemarker (see
@@ -4593,7 +4651,7 @@ private:
     //   PHASE A -- substitution. A normal parameter substitutes its PRE-EXPANDED
     //   argument (`expandedArgs[k]` / `vaArgs`, C 6.10.3.1). A `#` immediately
     //   followed by a parameter is replaced by ONE string-literal product
-    //   (`stringizeArg`, F2) built from that parameter's RAW argument
+    //   (`stringizeTokens`, F2) built from that parameter's RAW argument
     //   (`rawArgs[k]` / `rawVaArgs`). A parameter that is an OPERAND of a `##`
     //   (its adjacent significant replacement token is a `##`) substitutes its RAW
     //   argument (C 6.10.3.1: `#`/`##` operands are NOT pre-expanded). `##` tokens
@@ -4620,8 +4678,7 @@ private:
         HideSet const& hs, ByteOffset invOffset) {
         std::vector<ExpToken> items;
         substituteRange(def, 0, def.replacement.size(), expandedArgs, vaArgs,
-                        rawArgs, rawVaArgs, hs, invOffset,
-                        /*trackSpacing=*/false, items);
+                        rawArgs, rawVaArgs, hs, invOffset, items);
         // ── PHASE B: collapse every `##` marker LEFT-TO-RIGHT. ──
         return collapsePastes(std::move(items), hs, invOffset,
                               /*sweepPlacemarkers=*/true);
@@ -4643,28 +4700,38 @@ private:
     // gcc-13 all answer `a b` for `H4(, 1)` -- which only comes out right when
     // the interior paste is evaluated and the exterior one is not.
     //
-    // `trackSpacing` records, on each appended token, whether white space
-    // preceded it (see `ExpToken::spacedBefore`). It is set ONLY for a va-opt
-    // content walk feeding `#__VA_OPT__(...)`, where C23 6.10.5.2p3 needs it; the
-    // ordinary path leaves every bit `false` and never reads it.
+    // Each appended token's `spacedBefore` is maintained UNCONDITIONALLY -- this walk
+    // is writer (2) of that field for replacement-list tokens, and the propagator for
+    // argument tokens. There is no opt-in flag: a bit that is only sometimes true is
+    // a bit no reader can trust, and the one that used to gate this (`trackSpacing`,
+    // set solely for the `#__VA_OPT__(...)` content walk) is exactly why `#param`
+    // could not share the va-opt spelling builder and kept its own broken one.
     void substituteRange(
         MacroDef const& def, std::size_t begin, std::size_t end,
         std::vector<std::vector<ExpToken>> const& expandedArgs,
         std::vector<ExpToken> const& vaArgs,
         std::vector<std::vector<ExpToken>> const& rawArgs,
         std::vector<ExpToken> const& rawVaArgs,
-        HideSet const& hs, ByteOffset invOffset,
-        bool trackSpacing, std::vector<ExpToken>& items) {
+        HideSet const& hs, ByteOffset invOffset, std::vector<ExpToken>& items) {
         // FC15b: a REPLACEMENT-origin token (a plain replacement token, a `##`
         // marker/product, a stringize product) inherits the INVOCATION offset
         // `invOffset` (so a `__LINE__` in the replacement resolves to the
         // invocation line). An ARGUMENT token keeps its OWN `invOffset` (it came
         // from the call site -- its real position).
+        //
+        // ★ COPY-THEN-ADJUST, never field-by-field reconstruction
+        // (D-PP-SPACING-BIT-NOT-ACTUALLY-CARRIED). An argument token
+        // arrives carrying `spacedBefore` (its adjacency, settled where it was
+        // produced); rebuilding the ExpToken from three fields silently RESET that
+        // bit to `false`, so every argument token after the first stringized as
+        // though it had been jammed against its predecessor. The hide set is the only
+        // thing substitution changes here.
         auto stampArg = [&](std::vector<ExpToken> const& a,
                             std::vector<ExpToken>& outTokens) {
             for (ExpToken const& e : a) {
-                outTokens.push_back(
-                    ExpToken{e.tok, hideUnionAll(e.hide, hs), e.invOffset});
+                ExpToken stamped = e;
+                stamped.hide     = hideUnionAll(e.hide, hs);
+                outTokens.push_back(std::move(stamped));
             }
         };
         // FC15 paste residuals (D-PP-PASTE-PLACEMARKER, C 6.10.3.3p2): stamp a
@@ -4698,20 +4765,25 @@ private:
             return nullptr;
         };
 
-        // Record the white-space bits for the run of items an arm just appended
-        // (everything from index `mark` on). `sp` is the REPLACEMENT-LEVEL answer
-        // for the run's FIRST token -- was the replacement token that produced it
-        // separated from its predecessor by white space. Tokens 2..N of the run
-        // came from ONE argument's contiguous call-site text, so their own spans
-        // give the answer directly. A run that is a lone PLACEMARKER has size 1,
-        // so a real token is never measured against a placemarker's unset span.
+        // The run an arm just appended (everything from index `mark` on) begins where
+        // the REPLACEMENT token at `i` sat, so its first token takes the
+        // replacement-level answer `sp`. That is the ONLY bit this function owns.
+        //
+        // ★★ TOKENS 2..N ARE NOT THIS FUNCTION'S BUSINESS, AND PRETENDING OTHERWISE
+        // WAS A DEFECT (D-PP-SPACING-BIT-NOT-ACTUALLY-CARRIED). This used to
+        // recompute them as
+        // `items[k].span.start() != items[k-1].span.end()`, on the premise that a run
+        // came from ONE argument's contiguous call-site text. That premise is false
+        // the moment the argument itself arrived through an expansion: its tokens then
+        // come from the `#define` line, the call site and `productText_` interleaved,
+        // and the comparison is reading unrelated byte positions. ✔MEASURED at the
+        // one place it was already reachable (`#__VA_OPT__(X)` with X = `CAT2(z)`,
+        // `#define CAT2(a) a+b`): DSS said "z +b" where all three oracles say "z+b".
+        // Those tokens carry their OWN correct bit (`stampArg` propagates it, the
+        // recursive va-opt walk sets it) -- so leave them alone.
         auto applySpacing = [&](std::size_t mark, bool sp) {
-            if (!trackSpacing || items.size() <= mark) return;
+            if (items.size() <= mark) return;
             items[mark].spacedBefore = sp;
-            for (std::size_t k = mark + 1; k < items.size(); ++k) {
-                items[k].spacedBefore =
-                    items[k].tok.span.start() != items[k - 1].tok.span.end();
-            }
         };
 
         // ── PHASE A: substitution (keeping `##` markers verbatim). ──
@@ -4750,7 +4822,9 @@ private:
                         }
                     }
                     if (auto const* raw = rawArgAt(i + 1)) {
-                        stringizeArg(*raw, hs, invOffset, items);
+                        // THE SAME builder the `#__VA_OPT__(...)` arm above uses --
+                        // one mechanism for both `#` operands, so they cannot drift.
+                        stringizeTokens(*raw, hs, invOffset, items);
                         applySpacing(mark, spacedHere);
                         ++i;   // consume the parameter operand
                         continue;
@@ -4819,8 +4893,7 @@ private:
                     // keep in agreement.
                     const std::size_t before = items.size();
                     substituteRange(def, open + 1, close, expandedArgs, vaArgs,
-                                    rawArgs, rawVaArgs, hs, invOffset,
-                                    trackSpacing, items);
+                                    rawArgs, rawVaArgs, hs, invOffset, items);
                     // Significance, not size: a parameter inside the content
                     // whose argument expanded away can leave interior white space
                     // behind, and white space is not a preprocessing token. The
@@ -4853,13 +4926,13 @@ private:
                         items.push_back(pm);
                     }
                 }
-                // Only the run's FIRST token takes the va-opt's own replacement-
-                // level spacing; the recursive call already set the interior bits
-                // from the content's own layout, so a blanket `applySpacing` here
-                // would overwrite them.
-                if (trackSpacing && items.size() > mark) {
-                    items[mark].spacedBefore = spacedHere;
-                }
+                // The run's FIRST token takes the va-opt's own replacement-level
+                // spacing; the recursive call already settled the interior bits from
+                // the content's own layout. (This arm used to open-code the
+                // assignment precisely BECAUSE `applySpacing` would have clobbered
+                // those interior bits with span arithmetic. Now that it does not,
+                // the two are the same operation and share the one owner.)
+                applySpacing(mark, spacedHere);
                 i = close;   // consume through the closing `)`
                 continue;
             }
@@ -4996,6 +5069,9 @@ private:
                     keep = items[i - 1];                // X ## pm -> X
                     keep.hide = hideUnionAll(keep.hide, hs);
                 }
+                // Whatever survives now occupies the LEFT operand's position, so it
+                // takes that position's leading spacing (see the concat arm below).
+                keep.spacedBefore = items[i - 1].spacedBefore;
                 items.erase(items.begin() + static_cast<std::ptrdiff_t>(lo),
                             items.begin() + static_cast<std::ptrdiff_t>(i + 2));
                 items.insert(items.begin() + static_cast<std::ptrdiff_t>(lo), keep);
@@ -5017,11 +5093,20 @@ private:
             // Replace [i-1, i, i+1) with the single product token (hide set hs --
             // a fresh replacement-origin token), then rescan from i-1 so a
             // chained `##` to its right pastes against this product.
+            //
+            // The product stands where the LEFT operand stood, so it inherits the LEFT
+            // operand's `spacedBefore`: the paste consumed the boundary BETWEEN the
+            // operands, not the one before them. ✔MEASURED (all three oracles) with
+            // `#define P(a,b) a##b`: a two-level stringize of `x P(1,2)` is "x 12" and
+            // of `x+P(1,2)` is "x+12" -- the product carries the spacing that preceded
+            // the invocation, and the operands' own gap has vanished with the `##`.
             const std::size_t lo = i - 1;
+            ExpToken pasted{*product, hs, invOffset};
+            pasted.spacedBefore = items[lo].spacedBefore;
             items.erase(items.begin() + static_cast<std::ptrdiff_t>(lo),
                         items.begin() + static_cast<std::ptrdiff_t>(i + 2));
             items.insert(items.begin() + static_cast<std::ptrdiff_t>(lo),
-                         ExpToken{*product, hs, invOffset});
+                         std::move(pasted));
             i = lo;   // rescan from the product
         }
         // FC15 paste residuals (MUST-FIX-2): drop any PLACEMARKER that survived
@@ -5064,8 +5149,7 @@ private:
         // ✔MEASURED `""` for `#define SZ(...) #__VA_OPT__(a)` called `SZ()`.
         if (hasSignificantToken(vaArgs)) {
             substituteRange(def, contentBegin, contentEnd, expandedArgs, vaArgs,
-                            rawArgs, rawVaArgs, hs, invOffset,
-                            /*trackSpacing=*/true, content);
+                            rawArgs, rawVaArgs, hs, invOffset, content);
             content = collapsePastes(std::move(content), hs, invOffset,
                                      /*sweepPlacemarkers=*/false);
             content.erase(
@@ -5076,26 +5160,64 @@ private:
         stringizeTokens(content, hs, invOffset, out);
     }
 
-    // Build a string-literal product from an already-substituted TOKEN SEQUENCE
-    // (rather than from a contiguous source slice, which is what `stringizeArg`
-    // does for an ordinary parameter and which cannot work here -- a va-opt's
-    // tokens come from the `#define` line and the call site interleaved, so they
-    // occupy no single contiguous run of any buffer).
+    // ── THE stringize spelling builder (C 6.10.3.2 / C23 6.10.5.2). ONE OWNER. ──
     //
-    // Spelling follows C23 6.10.5.2p3: each token's own spelling verbatim, one
-    // space wherever white space separated it from its predecessor and NONE where
-    // white space did not (`spacedBefore`, captured during substitution), `"` and
-    // `\` escaped. The product is appended to `productText_` and re-tokenized by
-    // the same `materializeSignificant` path `stringizeArg` uses, so the result is
-    // a real opener + body + closer run rather than one fabricated token.
+    // Serves BOTH `#param` (a raw argument run) and `#__VA_OPT__(...)` (a substituted
+    // content run). There is deliberately no second mechanism: the two used to differ
+    // -- `#param` sliced a contiguous byte range -- and the difference WAS
+    // D-PP-STRINGIZE-EXPANDED-ARG-SLICES-WRONG-BYTES.
+    //
+    // ★★ A TOKEN SEQUENCE, NEVER A SOURCE SLICE. A stringizing argument's tokens
+    // occupy no single contiguous run of any buffer as soon as one of them came from
+    // an expansion -- `XSTR(PLAIN(1,2))` hands `STR` a run whose `g`/`(`/`,`/`)` are
+    // from PLAIN's `#define` line and whose `1`/`2` are from the call site. Slicing
+    // `front().span.start() .. back().span.end()` across that shipped the define
+    // line, a comment, or the remainder of the file, silently.
+    //
+    // Spelling, per 6.10.5.2p2-p4:
+    //  * each preprocessing token's OWN spelling, VERBATIM (see below);
+    //  * exactly one space where white space separated it from its predecessor and
+    //    NONE where none did -- read from `spacedBefore`, never from spans;
+    //  * leading/trailing white space of the argument deleted, which falls out of
+    //    skipping trivia and never spacing the first emitted token;
+    //  * `\` inserted before each `"` and `\` (`appendEscapedSpelling`).
+    //
+    // ★ WHITE SPACE INSIDE A TOKEN'S SPELLING SURVIVES VERBATIM
+    // (D-PP-STRINGIZE-COLLAPSES-WHITESPACE-INSIDE-A-TOKEN). 6.10.5.2p2 collapses
+    // white space BETWEEN the argument's preprocessing tokens; two spaces inside a
+    // string or character literal are part of THAT TOKEN'S spelling and are not
+    // between anything. ✔MEASURED, clang-18/clang-19/gcc-13/cl 19.51 unanimous:
+    // `#define S(x) #x` gives `S("a  b")` -> "\"a  b\"" (both spaces), an interior TAB
+    // verbatim, `S('a  b')` -> "'a  b'", and -- the case that pins both rules at once
+    // -- `S(f("a  b" ,   "c  d"))` -> "f(\"a  b\" , \"c  d\")", collapsing between
+    // tokens while preserving inside them. That is only expressible per-token, which
+    // is a second reason the slice had to go: a byte-range walk cannot tell which of
+    // its spaces are inside a token.
+    //
+    // TRIVIA AND PLACEMARKERS ARE SKIPPED, NOT SPELLED. A raw argument run still
+    // carries its own white-space tokens (`collectArgs` keeps them) and a va-opt
+    // content run can hold placemarkers; neither is a preprocessing token, and their
+    // adjacency contribution is already recorded in the next real token's bit.
+    //
+    // The product is appended to `productText_` and RE-TOKENIZED via
+    // `materializeSignificant`, so it reaches the parser as a real opener + body +
+    // closer run rather than one fabricated token (a single token would not satisfy
+    // the grammar's `stringLiteralExpr`, which since
+    // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN names all three slots). Each product token
+    // is stamped with `hs`, and with `invOffset` because a `#` product is
+    // replacement-origin (FC15b).
     void stringizeTokens(std::vector<ExpToken> const& seq, HideSet const& hs,
                          ByteOffset invOffset, std::vector<ExpToken>& out) {
         std::string inner = "\"";
-        for (std::size_t k = 0; k < seq.size(); ++k) {
-            if (k > 0 && seq[k].spacedBefore) {
+        bool emittedAny = false;
+        for (ExpToken const& e : seq) {
+            if (e.placemarker) continue;
+            if (isTrivia(e.tok) || isNewline(e.tok)) continue;
+            if (emittedAny && e.spacedBefore) {
                 inner.push_back(static_cast<char>(0x20));
             }
-            appendStringized(text(seq[k].tok), inner);
+            appendEscapedSpelling(text(e.tok), inner);
+            emittedAny = true;
         }
         inner.push_back('"');
         for (Token const& t : materializeSignificant(inner)) {
@@ -5103,64 +5225,21 @@ private:
         }
     }
 
-    // FC15a (F2, C 6.10.3.2): STRINGIZE the RAW argument token run `raw` into a
-    // string-literal product, appending the resulting token(s) to `out`. Per
-    // C 6.10.3.2p2 the spelling is the argument's SOURCE text with: every run of
-    // white space (incl. between tokens) collapsed to a single space and
-    // leading/trailing space deleted; and a `\` inserted before each `"` and `\`
-    // (the chars of a string/char literal -- in valid C those characters appear
-    // ONLY inside such a literal, so escaping every occurrence is exact). The
-    // result is wrapped in `"..."`, appended to `productText_` (A2), and
-    // RE-TOKENIZED so the product is a real opener + body + CLOSER token run (a
-    // single fabricated token would not satisfy the grammar's `stringLiteralExpr`,
-    // which since D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN names all three slots)
-    // whose spans point at the appended region. `materializeSignificant` filters
-    // only trivia/newline/Eof, so the closer survives into the product. Each
-    // product token is stamped with `hs`.
-    void stringizeArg(std::vector<ExpToken> const& raw, HideSet const& hs,
-                      ByteOffset invOffset, std::vector<ExpToken>& out) {
-        std::string inner = "\"";
-        if (!raw.empty()) {
-            // The raw operand's tokens are un-pre-expanded args from the CALL
-            // site, so they are contiguous in the prefix buffer: one slice
-            // recovers the exact source spelling (incl. interior string quotes
-            // and whitespace).
-            //
-            // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN (CLOSED): the one-byte `"`/`'`
-            // re-consume that used to sit here is DELETED. A literal's close
-            // delimiter is its own token now, so when the argument ENDS in a
-            // literal `raw.back()` IS that closer and the slice already covers it.
-            // Keeping the byte probe would DOUBLE-count the delimiter and stringize
-            // `F("a")` as `"\"a\"\""`.
-            const ByteOffset s = raw.front().tok.span.start();
-            const ByteOffset e = raw.back().tok.span.end();
-            appendStringized(synth_->slice(s, e), inner);
-        }
-        inner.push_back('"');
-        // FC15b: a stringize product is a replacement-origin token -> inherit
-        // the invocation offset (kept consistent with the other product paths).
-        for (Token const& t : materializeSignificant(inner)) {
-            out.push_back(ExpToken{t, hs, invOffset});
-        }
-    }
-
-    // Append `src` to `out` realizing C 6.10.3.2's stringize transform: collapse
-    // each run of source white space to a single space and drop leading/trailing
-    // space; insert a `\` before each `"` and `\`.
-    static void appendStringized(std::string_view src, std::string& out) {
-        std::size_t i = 0;
-        const std::size_t nbytes = src.size();
-        // Skip leading white space.
-        auto isWs = [](char c) {
-            return c == ' ' || c == '\t' || c == '\n' || c == '\r'
-                || c == '\f' || c == '\v';
-        };
-        while (i < nbytes && isWs(src[i])) ++i;
-        bool pendingSpace = false;
-        for (; i < nbytes; ++i) {
-            char const c = src[i];
-            if (isWs(c)) { pendingSpace = true; continue; }
-            if (pendingSpace) { out.push_back(' '); pendingSpace = false; }
+    // Append ONE preprocessing token's spelling `src` to `out`, escaping it for life
+    // inside a string literal: a `\` before each `"` and `\` (C 6.10.3.2p2). In valid
+    // C those two characters occur only inside a string/character literal, so
+    // escaping every occurrence is exact.
+    //
+    // ★ IT DOES NOT TOUCH WHITE SPACE, AND MUST NOT. It used to also collapse every
+    // run of white space to one space and drop leading/trailing space -- correct for
+    // the whole-argument SOURCE SLICE it was written for, and wrong now that it is
+    // handed one token at a time: the two spaces in `S("a  b")` are INSIDE the token
+    // and must survive verbatim (✔MEASURED on all four oracles). Between-token
+    // spacing is `stringizeTokens`' job, from `spacedBefore`; leading/trailing
+    // deletion falls out of skipping trivia there. Two owners of "where do spaces go"
+    // is what let the collapse eat bytes it did not own.
+    static void appendEscapedSpelling(std::string_view src, std::string& out) {
+        for (char const c : src) {
             if (c == '"' || c == '\\') out.push_back('\\');
             out.push_back(c);
         }
@@ -5504,6 +5583,10 @@ private:
                         for (Token const& v : value) {
                             repl.push_back(ExpToken{v, t.hide, t.invOffset});
                         }
+                        // The value stands where the macro NAME stood -> it keeps that
+                        // name's leading spacing (a `__LINE__` reached through a
+                        // stringized argument must not lose the space before it).
+                        inheritLeadingSpacing(repl, t.spacedBefore);
                         spliceOver(work, 0, 1, repl);
                         continue;   // rescan from the materialized value
                     }
@@ -5525,8 +5608,19 @@ private:
                 // invocation offset, so a `__LINE__` reached via an object-like
                 // macro (`#define WARN __LINE__`) resolves to the INVOCATION line,
                 // not the `#define` line.
-                for (Token const& r : def.replacement) {
-                    repl.push_back(ExpToken{r, hs, t.invOffset});
+                // Adjacency INSIDE the replacement list comes from the `#define`
+                // line's own spans (writer (2) of `spacedBefore`): trivia was dropped
+                // at definition time, but the list is one contiguous run of that line,
+                // so a gap between consecutive tokens is exact. ✔MEASURED: with
+                // `#define OBJ p+q` / `#define OBJS p + q`, a two-level stringize
+                // yields "p+q" and "p + q" respectively on all three oracles.
+                for (std::size_t k = 0; k < def.replacement.size(); ++k) {
+                    Token const& r = def.replacement[k];
+                    ExpToken e{r, hs, t.invOffset};
+                    e.spacedBefore =
+                        k > 0
+                        && def.replacement[k - 1].span.end() != r.span.start();
+                    repl.push_back(e);
                 }
                 // FC15 paste residuals (D-PP-PASTE-OBJECT-LIKE, C 6.10.3.3): `##`
                 // applies to OBJECT-like macros too. Route the replacement through
@@ -5538,6 +5632,10 @@ private:
                 // macros (C 6.10.3.2) and there is none to handle here.
                 repl = collapsePastes(std::move(repl), hs, t.invOffset,
                                       /*sweepPlacemarkers=*/true);
+                // The replacement stands where the NAME stood -> its first token keeps
+                // the name's leading spacing, not the define line's (whose first token
+                // has no predecessor and is therefore always `false`).
+                inheritLeadingSpacing(repl, t.spacedBefore);
                 spliceOver(work, 0, 1, repl);
                 continue;          // rescan from i (the first replacement token)
             }
@@ -5673,6 +5771,11 @@ private:
             std::vector<ExpToken> substituted =
                 substitute(def, expandedArgs, vaArgs, rawArgs, rawVaArgs, hs,
                            callInvOffset);
+            // The whole call `[i, past)` is replaced by this run, so the run's first
+            // token keeps the spacing that preceded the macro NAME. ✔MEASURED: a
+            // two-level stringize of `a PLAIN(1,2)` is "a g(1, 2)" and of
+            // `a+PLAIN(1,2)` is "a+g(1, 2)" on all four oracles.
+            inheritLeadingSpacing(substituted, t.spacedBefore);
             // Splice the substituted result over the WHOLE call `[i, past)` and
             // RESCAN from i: the invoked macro M is in every substituted token's
             // hide set, so a self-reference is frozen; a function-like name newly
