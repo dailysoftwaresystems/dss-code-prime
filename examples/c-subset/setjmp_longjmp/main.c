@@ -4,8 +4,10 @@
  *
  * On elf (x86_64 + arm64) setjmp/longjmp are DIRECT libc FFI (glibc libc.so.6
  * exports them); on pe64 the source `setjmp(env)` expands via a pe-only descriptor
- * MACRO to MSVC's 2-arg `_setjmp(env, 0)` (msvcrt export, frame=0 = the plain non-SEH
- * restore); on macho (arm64) they are DIRECT libSystem FFI. The `jmp_buf` typedef is a
+ * MACRO to MSVC's 2-arg `_setjmp(env, 0)` — bound to the ucrtbase export
+ * `__intrinsic_setjmp` through the descriptor's `linkName` (UCRT-P5; frame=0 = the
+ * plain non-SEH restore), which is the same name MSVC's own vcruntime.lib resolves
+ * `_setjmp` to; on macho (arm64) they are DIRECT libSystem FFI. The `jmp_buf` typedef is a
  * per-(arch,format) opaque buffer sized from each platform's setjmp.h (elf-x86_64 200B,
  * elf-arm64 312B, pe-x86_64 256B/16-aligned so `_setjmp`'s `movaps` xmm saves don't
  * #GP, macho-arm64 over-sized to 224B).

@@ -145,8 +145,12 @@ struct DSS_EXPORT ExternImport {
     // ⇒ WHAT REMAINS REACHABLE, and why the wide key still earns its keep: two
     // CONFIG-DECLARED images can still legitimately own one name — a per-SYMBOL
     // `library` override routes a single name off its header's default image (pe
-    // `strftime`→ucrtbase while the rest of <time.h> stays elsewhere), and
-    // `setjmp.json` deliberately still names msvcrt.dll. Those are DECLARED
+    // `strftime`→ucrtbase while the rest of <time.h> stays elsewhere). Both of the
+    // examples that used to stand here have since been retired — UCRT-P5 moved the
+    // last one, `setjmp.json`, off msvcrt — but the KEY is not thereby redundant:
+    // the mechanism stays reachable by config, and a corpus that happens to name
+    // one image today is not the same fact as a key that can only ever express
+    // one. Those are DECLARED
     // divergences, and the (mangledName, libraryPath, version) key keeps them two
     // distinct dynamic symbols instead of silently folding them — which is the
     // misbind D-LK11-EXTERN-IMPORT-DEDUP exists to prevent. What is gone is the

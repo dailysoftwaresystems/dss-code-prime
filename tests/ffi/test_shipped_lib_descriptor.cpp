@@ -3210,8 +3210,11 @@ TEST(ShippedLibDescriptor, ShippedStdioLibraryMapRoutesPerObjectFormat) {
     // errno, stdlib, malloc, string, direct, process, sys/stat) because they share
     // CRT co-state — FILE buffers, `errno`, the heap, the fd table — and a split
     // bind would silently read one runtime's state through the other's API.
-    // setjmp.json deliberately stays on msvcrt (ucrtbase exports no `_setjmp`, and
-    // `jmp_buf` is caller-owned, so it carries no cross-runtime state). The
+    // setjmp.json was the LAST holdout and is no longer one: UCRT-P5 moved it to
+    // ucrtbase too. The sentence that stood here ("ucrtbase exports no `_setjmp`")
+    // measured a SPELLING and concluded a FUNCTION was missing — ucrtbase exports
+    // the facility as `__intrinsic_setjmp`, byte-identical code to msvcrt's
+    // `_setjmp`, and the descriptor now reaches it through `linkName`. The
     // GROUP-WIDE atomicity is pinned in tests/ffi/test_pe_crt_costate_binding.cpp;
     // this test keeps its original single-descriptor scope.
     EXPECT_EQ(desc->library.at("pe"),    "ucrtbase.dll");
