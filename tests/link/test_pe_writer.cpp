@@ -1409,8 +1409,10 @@ TEST(PeExecFormatJson, ShippedPeExecDeclaresGotIndirectDataImportBinding) {
            "(D-LK-EXTERN-DATA-IMPORT, c149)";
     EXPECT_TRUE(*loaded.format->dataImportBinding()
                 == DataImportBinding::GotIndirect)
-        << "PE data imports bind IAT-slot-indirect (__imp_ semantics) -- "
-           "the got-indirect model, not copy-relocation";
+        << "PE data imports bind IAT-slot-indirect (__imp_ semantics) -- the "
+           "got-indirect model, which is now the ONLY member: ELF's "
+           "copy-relocation alternative was deleted from the vocabulary "
+           "(D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET)";
 }
 
 TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
@@ -1706,14 +1708,23 @@ TEST(PeExecWriter, MixedFunctionAndDataExternsThunkForFunctionSlotForData) {
     EXPECT_NE(hay.find("msvcrt.dll"), std::string_view::npos);
 }
 
-TEST(PeExecWriter, DataExternUnderForeignDataImportBindingFailsLoud) {
-    // c149 walker-side binding assertion (mirrors elf.cpp's
-    // copy-relocation check and macho.cpp's got-indirect check): the
-    // PE exec walker implements exactly `got-indirect`. A pe-exec
-    // schema declaring a FOREIGN model (copy-relocation — valid enum,
-    // wrong walker) passes the linker's schema-declared pre-walker
-    // gate, so the WALKER must reject loud rather than silently hand
-    // the data extern an IAT-slot binding it did not declare.
+TEST(PeExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
+    // c149 walker-side binding assertion (the SAME assertion elf.cpp and
+    // macho.cpp carry): the PE exec walker implements exactly
+    // `got-indirect`, so a pe-exec schema that does NOT declare that
+    // model must be rejected LOUD rather than silently handed an
+    // IAT-slot binding it never declared.
+    //
+    // ⓘ THE FIXTURE USED TO DECLARE A FOREIGN MODEL — `"copy-relocation"`,
+    // a valid enum value with the wrong walker. That value no longer
+    // EXISTS (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET deleted
+    // it), and a fixture spelling it would now be refused AT LOAD, which
+    // would test the loader instead of this walker. So the fixture omits
+    // the key entirely: that is the only remaining way to reach this
+    // walker without the model it implements, and it is reachable because
+    // this test drives the walker DIRECTLY — the linker's pre-walker gate,
+    // which would also refuse a nullopt binding, is bypassed here on
+    // purpose so the walker's own belt is what gets measured.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
@@ -1721,9 +1732,8 @@ TEST(PeExecWriter, DataExternUnderForeignDataImportBindingFailsLoud) {
       "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
-      "format": {"name":"pe-exec-foreign-data-binding","kind":"pe"},
+      "format": {"name":"pe-exec-undeclared-data-binding","kind":"pe"},
       "externCallDispatch": "direct-plt",
-      "dataImportBinding": "copy-relocation",
       "$entryClusterComment": "D-LK10-ENTRY: validate() now REJECTS an exec-flavored format that declares no processExit, so a synthetic pe-exec schema must carry the pair. Values copied verbatim from the shipped pe64-x86_64-windows-exec.format.json; inert here (the walker is driven directly, no trampoline) but required to load.",
       "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
       "entryVerbs": ["none","argc-argv"],

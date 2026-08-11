@@ -777,10 +777,11 @@ struct Lowerer {
     // linker binds `symbolVa[dataExtern]` to the __got slot VA, and dyld
     // fills the slot with the library object's address), NOT a bare lea
     // (whose result would be the slot's address, off by one indirection —
-    // the silent-miscompile class the fold-suppression below closes). Under
-    // CopyRelocation (ELF) the object has a DIRECT exec-local .bss address,
-    // so its data externs are NOT in this set (the normal single-lea path).
-    // Empty for every non-got-indirect module ⇒ lowering byte-identical.
+    // the silent-miscompile class the fold-suppression below closes).
+    // Every IMAGE format declares GotIndirect, so this is the ONE data-
+    // import lowering; a module under a nullopt-binding (relocatable)
+    // format has no bound data imports at all and the set stays empty ⇒
+    // lowering byte-identical there.
     std::optional<DataImportBinding> dataImportBinding_;
     std::unordered_set<std::uint32_t> externDataGotSymbols_;
 
@@ -963,9 +964,10 @@ struct Lowerer {
         // (Mach-O __got), an extern-DATA object's address is not a direct
         // symbol VA — it is LOADED from the object's __got slot. Collect
         // those symbols so `lowerGlobalAddr` emits the extra deref (and the
-        // riprel fold is suppressed for them). Populated ONLY under
-        // GotIndirect: CopyRelocation (ELF) data externs have a direct
-        // exec-local .bss address (normal lea), so they stay out of the set.
+        // riprel fold is suppressed for them). Populated ONLY under an
+        // explicitly declared GotIndirect binding — a nullopt binding (a
+        // relocatable format, which binds no imports) leaves the set empty
+        // rather than guessing an indirection level.
         if (dataImportBinding_ == DataImportBinding::GotIndirect) {
             for (auto const& e : externImports) {
                 if (e.isData) externDataGotSymbols_.insert(e.symbol.v);
@@ -4721,8 +4723,9 @@ struct Lowerer {
         // instruction variants; the riprel fold is suppressed for `sym`
         // (globalAddrRiprelFoldsIntoLoad returns false) so a C-level Load
         // stays a distinct SECOND indirection (object address → object
-        // value). CopyRelocation (ELF) never reaches here — its data externs
-        // have a DIRECT exec-local .bss address (the plain lea path below).
+        // value). This is the path EVERY image format's data imports take:
+        // ELF's `.got` + R_*_GLOB_DAT, Mach-O's `__got`, PE's IAT slot all
+        // present the same shape to the lowering.
         if (externDataGotSymbols_.contains(sym.v)) {
             auto const loadOp = classOp(cls, RegClassOp::Load);
             if (!loadOp.has_value()) {

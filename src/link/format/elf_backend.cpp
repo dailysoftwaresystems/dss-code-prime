@@ -313,7 +313,6 @@ public:
         auto const& processExit            = d.processExit;
         auto const& entryCallingConvention = d.entryCallingConvention;
         auto const& processArgs            = d.processArgs;
-        auto const& dataImportBinding      = d.dataImportBinding;
 
     // ELF identity: when format kind is Elf, the identity block must
     // be populated. `fileClass=0` means "no class declared" which
@@ -520,21 +519,16 @@ public:
                                  "D-LK1-4.",
                                  elf.soname));
             }
-            // A `.so` cannot host copy relocations — R_*_COPY is the
-            // EXECUTABLE's mechanism (the exec owns the one canonical
-            // copy every image binds to; a library declaring it would
-            // invert the interposition contract). The dyn data-import
-            // model is got-indirect (a GOT slot ld.so fills with the
-            // object's address — the c117/c149 GotIndirect lowering).
-            if (dataImportBinding.has_value()
-                && *dataImportBinding == DataImportBinding::CopyRelocation) {
-                fail("/dataImportBinding",
-                     "ELF ET_DYN format must not declare "
-                     "'dataImportBinding': \"copy-relocation\" -- copy "
-                     "relocations are exec-only (the executable owns "
-                     "the canonical copy). Declare \"got-indirect\" "
-                     "for extern data in a shared library. D-LK1-4.");
-            }
+            // (There USED to be a rule here rejecting
+            // `dataImportBinding: "copy-relocation"` on an ET_DYN
+            // schema — copy relocations were exec-only, so a `.so`
+            // declaring one was invalid ELF. That rule is GONE with its
+            // SUBJECT: the enum value was deleted outright
+            // (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET), so
+            // no schema of ANY flavour can spell it and the closed-enum
+            // reject in the loader refuses the file first. A property
+            // whose subject no longer exists asserts nothing; keeping it
+            // would just be an unreachable branch pretending to guard.)
         }
         // `soname` is an ET_DYN-only field (DT_SONAME names a shared
         // library; a `.o` / executable carrying one is dead config —

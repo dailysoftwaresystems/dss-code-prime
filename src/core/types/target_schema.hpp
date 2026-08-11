@@ -1906,8 +1906,8 @@ enum class RelocFormulaKind : std::uint8_t {
     // symbol is rejected "when making a shared object"). Emitted ONLY into
     // an ELF relocatable `.o` / static-archive member, which is linked by
     // a FOREIGN toolchain (gcc/clang) — DSS itself NEVER applies this
-    // reloc (no DSS-apply consumer: the exec path uses copy-relocation,
-    // the PIE path the c117 DSS-local slot). So the `applyExecRelocations`
+    // reloc (no DSS-apply consumer: every DSS-linked image reaches an
+    // imported object through the c117 DSS-local got-indirect slot). So the `applyExecRelocations`
     // kernel arm is an EXPLICIT FAIL-LOUD REFUSAL, not an S/A/P formula.
     // Declaring it a real (non-Linear) kind is what keeps the ET_DYN
     // slide-safe classifier from mis-treating it as a Linear-absolute-in-

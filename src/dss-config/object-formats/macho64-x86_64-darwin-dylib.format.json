@@ -35,7 +35,7 @@
   "$externCallDispatchComment": "The walker synthesizes a `__stubs` entry per extern FUNCTION (x86_64 = 6-byte FF 25 disp32 through the `__got` slot, lazy/eager per bindNow) and the call site is a plain direct `call rel32` to the stub -- pc-relative, slide-safe under the dyld base slide. D-FFI-EXTERN-CALL-DISPATCH.",
   "externCallDispatch": "direct-plt",
 
-  "$dataImportBindingComment": "extern library DATA objects bind GOT-INDIRECT -- the walker reserves a `__got` slot per imported object; dyld's bind opcodes write the object's address into the slot and the GotIndirect lowering reads it. Copy relocations are not a Mach-O mechanism.",
+  "$dataImportBindingComment": "extern library DATA objects bind GOT-INDIRECT -- the walker reserves a `__got` slot per imported object; dyld's bind opcodes write the object's address into the slot and the GotIndirect lowering reads it. Copy relocations are not a Mach-O mechanism, and are no longer a DSS one either: the value was deleted from `DataImportBinding` (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET).",
   "dataImportBinding": "got-indirect",
 
   "$supportedDataSectionsComment": "rodata (__TEXT,__const -- read-only), data (__DATA,__data), bss (__DATA,__bss zero-fill), relro (reloc-bearing const, __DATA,__const -- merged so its rebase slots land in writable pages). NO tdata/tbss: thread_local in a dylib needs the TLV descriptor model (D-LK3-DYLIB-TLS-MODEL); fails loud by this set's absence.",

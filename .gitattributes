@@ -147,3 +147,18 @@ CMakeLists.txt text eol=lf
 # OPPOSITE treatment — a pin's blast radius is exactly what it names, and what it omits is
 # invisible (D-REPO-GITATTRIBUTES-DOES-NOT-COVER-BINARY-TEST-FIXTURES).
 tests/**/data/** binary
+
+# Binary EXAMPLE fixtures: prebuilt shared libraries a runnable example loads.
+# `examples/c-subset/environ_alias_object_identity/` ships two gcc-built `.so`s
+# (x86_64 + aarch64) because an OBJECT-IDENTITY property cannot be witnessed by
+# ONE image — the example needs a second image DSS did not build, and shipping
+# it prebuilt means the corpus needs no host cross-compiler at test time
+# (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET).
+# ★ WITHOUT THIS LINE THE BYTES ARE CORRUPTED, not merely unpinned: the
+# `examples/** text eol=lf` rule near the top of this file applies the text
+# clean/smudge filter to EVERY path under examples/, so an ELF whose bytes
+# happen to contain 0x0D would be rewritten on checkout and the `.so` would
+# fail to load — the same defect the `examples/**/*.bin binary` rule exists to
+# prevent, and the same category the note above says is the one most likely to
+# be forgotten. Placed LAST so last-match precedence beats every text rule.
+examples/**/*.so binary

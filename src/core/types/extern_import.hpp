@@ -48,8 +48,9 @@ struct DSS_EXPORT ExternImport {
     // `extern const char sqlite3_version[];`), false for a function.
     // A data import that survives to the link tier (the LK11 merge
     // resolves sibling-CU-defined ones away first) binds per the
-    // format's declared `dataImportBinding` model (c84: the ELF
-    // ET_EXEC R_*_COPY copy-relocation); a format that declares no
+    // format's declared `dataImportBinding` model (every image
+    // format declares "got-indirect" — a loader-bound pointer slot
+    // holding the library object's ADDRESS); a format that declares no
     // model FAILS LOUD at the linker's pre-walker gate — a PLT
     // stub bound to a data symbol would be a silent miscompile.
     bool        isData = false;
@@ -65,20 +66,26 @@ struct DSS_EXPORT ExternImport {
     // walker tier rejects it loud (slice C). Meaningless (false) for
     // function imports (S_ThreadLocalOnFunction rejects those upstream).
     bool        isThreadLocal = false;
-    // c84 (D-LK-EXTERN-DATA-IMPORT): the imported DATA object's byte
-    // size + alignment, DERIVED from the declared type's layout at
-    // HIR→MIR (`computeLayout` under the active target's aggregate-
-    // layout params + the format's DataModel — never hardcoded; a
-    // `FILE*` object is the data model's pointer width). Consumed by
-    // the ELF copy-relocation emitter: the exec reserves a `.bss`
-    // slot of exactly this shape, exports the symbol with this
-    // `st_size`, and the loader memcpy's `st_size` bytes from the
-    // library's object. BOTH stay 0 when the declared type is
-    // INCOMPLETE (`extern const char v[];`) — legal C for a cross-TU
-    // extern the LK11 merge resolves against its defining sibling
-    // CU; a TRUE library import that survives to the walker with
-    // size 0 fails loud there (an unsized copy slot cannot be
-    // reserved). Meaningless (0) for function imports.
+    // D-LK-EXTERN-DATA-IMPORT: the imported DATA object's byte size +
+    // alignment, DERIVED from the declared type's layout at HIR→MIR
+    // (`computeLayout` under the active target's aggregate-layout
+    // params + the format's DataModel — never hardcoded; a `FILE*`
+    // object is the data model's pointer width). BOTH stay 0 when the
+    // declared type is INCOMPLETE (`extern const char v[];`) — legal C
+    // for a cross-TU extern the LK11 merge resolves against its
+    // defining sibling CU. Meaningless (0) for function imports.
+    // ★ NO EMITTER CONSUMES THESE, and that is a deliberate END STATE,
+    // not an oversight. They sized the ELF copy-relocation `.bss` slot
+    // (the exec reserved storage of exactly this shape and exported the
+    // symbol with this `st_size`); that mechanism is DELETED
+    // (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET) because
+    // claiming a name of an ALIASED libc object split the object
+    // silently. A got-indirect slot holds an ADDRESS, so the object's
+    // own size is irrelevant to it — an incomplete `extern char v[];`
+    // binds fine, and the walker no longer rejects a surviving size-0
+    // import. What the fields still DO is witness the DECLARED shape,
+    // so the two merge tiers can fail loud when two CUs declare
+    // DIFFERENT objects under one external name.
     std::uint64_t dataSizeBytes  = 0;
     std::uint64_t dataAlignBytes = 0;
     // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED symbol version this

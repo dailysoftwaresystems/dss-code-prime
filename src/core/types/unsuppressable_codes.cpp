@@ -389,8 +389,8 @@ constexpr std::array<DiagnosticCode, 139> kUnsuppressableCodes{{
     // tiers — linker.cpp `mergeModules` and mir_merge.cpp — collapses N CUs'
     // imports of one dynamic symbol into one row. Four fields cannot be folded
     // and must be a hard stop: `isData` and `isThreadLocal` SELECT THE BINDING
-    // MODEL, and two differing non-zero `dataSizeBytes`/`dataAlignBytes` size
-    // one copy-relocation `.bss` slot two ways.
+    // MODEL, and two differing non-zero `dataSizeBytes`/`dataAlignBytes` are
+    // two CUs declaring DIFFERENT objects under one external name.
     // Suppressing this restores first-wins EXACTLY — the merge proceeds with
     // one CU's answer and the other CU's calls bind through the wrong model
     // (a PLT stub standing in for a data object: D-LK-EXTERN-DATA-IMPORT).

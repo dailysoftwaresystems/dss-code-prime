@@ -754,20 +754,27 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     }
 
     // D-LK-EXTERN-DATA-IMPORT: `dataImportBinding` — the format's
-    // extern-DATA import binding model ("copy-relocation"). Optional in
-    // the JSON (a format whose data-import model has not landed — PE /
-    // Mach-O / every relocatable flavor — omits it; the linker's pre-
-    // walker gate then fails loud on any surviving data import instead
-    // of binding a data symbol through the function-import machinery).
+    // extern-DATA import binding model ("got-indirect"). Optional in
+    // the JSON (a format whose data-import model has not landed — every
+    // relocatable flavor — omits it; the linker's pre-walker gate then
+    // fails loud on any surviving data import instead of binding a data
+    // symbol through the function-import machinery).
     // Present-but-unknown IS a fail-loud HERE at load (a typo must NOT
     // silently degrade to "no data imports supported" — the
-    // externCallDispatch discipline).
+    // externCallDispatch discipline). ★ That closed-enum reject is now
+    // ALSO what keeps `"copy-relocation"` from coming back: the value
+    // was DELETED from `DataImportBinding`
+    // (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET — it split
+    // an aliased libc object silently), so a format file spelling it
+    // is REFUSED AT LOAD naming the file, exactly as any other unknown
+    // value is. Leaving the value accepted-but-unused would have left a
+    // future format one JSON edit away from the whole defect class.
     if (doc.contains("dataImportBinding")) {
         if (!doc.at("dataImportBinding").is_string()) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       "/dataImportBinding",
                       "'dataImportBinding' must be a string "
-                      "(\"copy-relocation\")");
+                      "(\"got-indirect\")");
         } else {
             auto const s =
                 doc.at("dataImportBinding").get<std::string>();
@@ -776,9 +783,15 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 coll.emit(DiagnosticCode::C_MalformedJson,
                           "/dataImportBinding",
                           std::format("unknown dataImportBinding '{}' "
-                                      "— accepted: \"copy-relocation\" "
-                                      "(ELF ET_EXEC R_*_COPY exec-local "
-                                      ".bss copy)",
+                                      "— accepted: \"got-indirect\" "
+                                      "(a loader-bound pointer slot "
+                                      "holding the library object's "
+                                      "ADDRESS: ELF .got + R_*_GLOB_DAT, "
+                                      "Mach-O __got, PE IAT). "
+                                      "\"copy-relocation\" was REMOVED: "
+                                      "it claimed one name of an alias "
+                                      "set and split the object. See "
+                                      "D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET.",
                                       s));
             } else {
                 data.dataImportBinding = *b;

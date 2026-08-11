@@ -2437,14 +2437,14 @@ enum class DiagnosticCode : std::uint16_t {
     //   (mangledName, libraryPath, version), the triple that IDENTIFIES an
     //   import -- with CONTRADICTORY per-row ATTRIBUTES, so the merge that
     //   folds them into one row has two answers and no basis to choose.
-    //   `isData` selects the BINDING MODEL (the ELF copy-relocation data slot
+    //   `isData` selects the BINDING MODEL (a got-indirect data pointer slot
     //   vs the function-import path), `isThreadLocal` selects the
     //   (unimplemented, walker-rejected) initial-exec TLS model, and two
-    //   DIFFERING NON-ZERO `dataSizeBytes`/`dataAlignBytes` size ONE
-    //   copy-relocation `.bss` slot two ways (the loader memcpy's `st_size`
-    //   bytes -- picking either silently truncates or over-copies). A zero
-    //   size/align is an INCOMPLETE type ("unknown in this TU", legal C), not
-    //   a disagreement: the non-zero shape wins and no diagnostic fires.
+    //   DIFFERING NON-ZERO `dataSizeBytes`/`dataAlignBytes` are two CUs
+    //   declaring DIFFERENT objects under ONE external name -- picking either
+    //   silently picks a winner. A zero size/align is an INCOMPLETE type
+    //   ("unknown in this TU", legal C), not a disagreement: the non-zero
+    //   shape wins and no diagnostic fires.
     //   DISTINCT FROM `K_SymbolRedefinedAcrossUnits` (0x8011): that code is
     //   the DEFINITION-tier fault -- one name with multiple strong bodies.
     //   This is a DECLARATION-tier fault about ONE imported symbol nobody

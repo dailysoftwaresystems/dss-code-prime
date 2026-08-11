@@ -3,30 +3,49 @@
 //
 // WHY THIS TEST EXISTS
 //
-// ★★ THE SHAPE IS `environ` -> MACRO -> `__environ` -> DATA OBJECT, AND THE
-// OBVIOUS SHAPE (an `environ` data row) IS SILENTLY WRONG. That is not a
-// hypothesis; it was SHIPPED in the first cut of this row and MEASURED wrong:
-// the binary looked perfect (`readelf -r` showed `R_X86_64_COPY … environ + 0`,
-// the dynsym showed `environ` as an 8-byte OBJECT) and `environ` READ NULL at
-// runtime on all four legs (x86_64/arm64 × debug/release). A matched
-// `gcc -std=gnu17 -no-pie` control of the same program RUNS, and its copy
-// relocation is against **`__environ@GLIBC_2.2.5`** — the STRONG alias — with
-// BOTH `__environ` (GLOBAL) and `environ` (WEAK) defined at one exec address.
+// ★★ THE SHAPE IS `environ` -> MACRO -> `__environ` -> DATA OBJECT.
 //
-// THE MECHANISM: glibc's startup writes the environment pointer through its
-// INTERNAL name `__environ`, and an ELF copy relocation only redirects libc's
-// own references for the symbol THE EXEC CLAIMS. Claim the weak `environ` alone
-// and libc keeps writing its own .bss slot while the exec reads a copy ld.so
-// filled from that slot BEFORE `__libc_start_main` ran — i.e. 0. Claim
-// `__environ` and libc's write lands in the exec's slot. Same class as TF-C121's
-// `_realpath$DARWIN_EXTSN`: the declared name links clean, loads clean, and
-// binds the wrong thing.
+// ⓘ READ THIS FIRST, BECAUSE THE ORIGINAL REASON FOR IT IS NOW HISTORY, AND A
+// TEST DOCBLOCK THAT KEEPS ASSERTING A DEAD MECHANISM IS THE EXACT FAILURE MODE
+// D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET IS ABOUT. When this file
+// was written, ELF exec data imports bound by COPY RELOCATION, and under that
+// mechanism the spelling was load-bearing for CORRECTNESS: a copy relocation
+// redirects libc's references only for the name THE EXEC CLAIMS, so an `environ`
+// row left glibc's startup writing its own slot while the exec read a copy
+// filled before `__libc_start_main` ran — i.e. 0. That was SHIPPED and MEASURED
+// (`readelf -r` showed `R_X86_64_COPY … environ + 0`, the dynsym showed
+// `environ` as an 8-byte OBJECT, and the value read NULL on all four legs).
+//
+// ★ THAT MECHANISM IS GONE. Copy relocation was DELETED outright — claiming ONE
+// name of glibc's `{environ, _environ, __environ}` alias set SPLIT the object in
+// two, which broke any third-party `.so` reading the un-prefixed name and
+// violated C23 6.2.2. Every ELF format now declares
+// `dataImportBinding: "got-indirect"`: the exec DEFINES NOTHING and binds the
+// library object's ADDRESS through a GOT slot, so ld.so resolves whichever
+// spelling the descriptor names to the SAME one object. Under got-indirect
+// EITHER spelling would therefore WORK.
+//
+// ★★ SO WHY DOES THIS FILE STILL PIN `__environ`? Two reasons that outlive the
+// deleted mechanism, and NEITHER is "it would read NULL":
+//   * `__environ` is glibc's UNCONDITIONALLY declared spelling
+//     (/usr/include/unistd.h; plain `environ` sits behind `#ifdef __USE_GNU`)
+//     and the STRONG (GLOBAL) export, while `environ`/`_environ` are WEAK. DSS
+//     EAGER-IMPORTS every name a descriptor declares, so the safest choice is
+//     the strong, always-present one.
+//   * Declaring BOTH would emit TWO eager imports for ONE object, and an
+//     `environ` SYMBOL row would collide with the `environ` MACRO this design
+//     depends on (the macro wins at every call site, leaving the row
+//     unreachable while still costing a load-time binding).
+// The RUNTIME object-identity property itself is witnessed where it can only be
+// witnessed — across an image boundary, by
+// `examples/c-subset/environ_alias_object_identity`, which loads a gcc-built
+// `.so` that reads the UN-PREFIXED name. A descriptor-shape test like this one
+// cannot see identity at all, and must not claim to.
 //
 // So this file pins THREE properties, each of which fails silently if edited:
 //
-//   (1) THE SYMBOL IS `__environ`, NOT `environ`. Reverting the row to the
-//       un-prefixed spelling reproduces the NULL read above with no diagnostic
-//       anywhere in the pipeline.
+//   (1) THE SYMBOL IS `__environ`, NOT `environ` — the strong, unconditionally
+//       declared spelling, declared ALONE.
 //
 //   (2) AVAILABILITY IS elf ONLY. DSS EAGER-IMPORTS every symbol a descriptor
 //       DECLARES, not merely the ones a program calls
@@ -181,8 +200,9 @@ resolvedAvailability(json const& doc, json const& row) {
     return true;
 }
 
-// (2) The environment data object must be bound under the STRONG glibc alias.
-//     The weak spellings are the silent-NULL shapes measured above.
+// (2) The environment data object must be bound under the STRONG glibc alias,
+//     and under it ALONE (see the header: the strong+unconditional export, one
+//     eager import, no collision with the `environ` macro).
 [[nodiscard]] bool bindsStrongEnvironAlias(json const& doc) {
     if (findNamed(doc, "symbols", "__environ") == nullptr) return false;
     return findNamed(doc, "symbols", "environ") == nullptr
@@ -215,13 +235,15 @@ TEST(EnvironDataObjectBinding, RealUnistdJsonEnvironElfOnlyDataObject) {
     ASSERT_NE(row, nullptr)
         << "unistd.json must declare `__environ` — glibc's UNCONDITIONALLY "
            "declared spelling (/usr/include/unistd.h; plain `environ` is behind "
-           "#ifdef __USE_GNU) and the STRONG alias libc's own startup writes "
-           "through. It is what a real `gcc -no-pie` copy-relocates.";
+           "#ifdef __USE_GNU) and the STRONG (GLOBAL) export, while "
+           "`environ`/`_environ` are WEAK. DSS eager-imports every declared "
+           "name, so the always-present one is the safe choice.";
     EXPECT_TRUE(bindsStrongEnvironAlias(doc))
-        << "the environment object must be bound under `__environ` ONLY: an "
-           "`environ`/`_environ` row copy-relocates a WEAK alias, which links "
-           "clean, loads clean, and READS NULL at runtime because libc writes "
-           "its own slot instead of the exec's";
+        << "the environment object must be bound under `__environ` ONLY. "
+           "Declaring a second spelling emits TWO eager imports for ONE object, "
+           "and an `environ` SYMBOL row collides with the `environ` MACRO this "
+           "design depends on — the macro wins at every call site, so the row "
+           "is unreachable while still costing a load-time binding.";
 
     ASSERT_TRUE(row->contains("kind"));
     EXPECT_EQ(row->at("kind").get<std::string>(), "object")
@@ -270,8 +292,9 @@ TEST(EnvironDataObjectBinding, RealUnistdJsonEnvironElfOnlyDataObject) {
     EXPECT_EQ(arm.at("when").at("format").get<std::string>(), "elf");
     ASSERT_TRUE(arm.contains("replacement"));
     EXPECT_EQ(arm.at("replacement").get<std::string>(), "__environ")
-        << "the macro must expand to the STRONG alias -- expanding it to "
-           "`environ` or `_environ` reinstates the measured silent-NULL read";
+        << "the macro must expand to the name the SYMBOL row declares -- "
+           "expanding it to `environ` or `_environ` names a symbol no "
+           "descriptor ships, so every use becomes an honest S0001";
     EXPECT_FALSE(arm.contains("params"))
         << "object-like: `environ` is an LVALUE, not a call";
 
@@ -374,7 +397,10 @@ TEST(EnvironDataObjectBinding, WidenedAvailabilityIsCaught) {
 }
 
 TEST(EnvironDataObjectBinding, WeakAliasSpellingIsCaught) {
-    // THE MEASURED SILENT-NULL SHAPE: the un-prefixed weak alias as the row.
+    // The un-prefixed WEAK alias as the row. (Historically this was the MEASURED
+    // silent-NULL shape under copy relocation; since that mechanism was deleted
+    // it is no longer a correctness fault, but it is still the wrong choice —
+    // a weak export where a strong, unconditionally declared one exists.)
     json const weak = json::parse(R"JSON({
       "header": "unistd.h",
       "availableObjectFormats": ["elf", "macho"],
@@ -387,7 +413,7 @@ TEST(EnvironDataObjectBinding, WeakAliasSpellingIsCaught) {
         << "the synthetic really does declare the weak spelling";
     EXPECT_FALSE(bindsStrongEnvironAlias(weak))
         << "the guard must REJECT a row bound to the weak `environ` alias -- "
-           "the shape that links clean and reads NULL";
+           "and doubly so because that name is macro-realized on elf";
 
     // The other weak alias, same address in glibc, same failure.
     json const weak2 = json::parse(R"JSON({

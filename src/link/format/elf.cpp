@@ -64,7 +64,7 @@ constexpr std::uint8_t STB_LOCAL  = 0;
 constexpr std::uint8_t STB_GLOBAL = 1;
 constexpr std::uint8_t STB_WEAK   = 2;  // ET_DYN weak exports (c150)
 constexpr std::uint8_t STT_NOTYPE = 0;
-constexpr std::uint8_t STT_OBJECT = 1;  // data object (copy-reloc dynsym)
+constexpr std::uint8_t STT_OBJECT = 1;  // data object (vs a function)
 constexpr std::uint8_t STT_FUNC   = 2;
 constexpr std::uint8_t STT_SECTION = 3;
 constexpr std::uint16_t SHN_UNDEF = 0;
@@ -205,19 +205,29 @@ constexpr std::uint16_t kFirstVersionIndex = 2; // first assignable vna_other
 constexpr std::uint32_t R_X86_64_GLOB_DAT   = 6;
 constexpr std::uint32_t R_AARCH64_GLOB_DAT  = 1025;
 
-// Per-machine ELF reloc type for "memcpy the shared library's DATA
-// object into the executable's local `.bss` copy at load time" —
-// the ET_EXEC extern-data import binding (D-LK-EXTERN-DATA-IMPORT,
-// `dataImportBinding: "copy-relocation"` on the format schema).
-// x86_64 psABI §4.4.1 — R_X86_64_COPY = 5.
-// AArch64 ELF psABI §4.6.3 — R_AARCH64_COPY = 1024 (0x400).
-// The loader resolves the symbol NAME in the needed libraries
-// (skipping the executable's own definition — ELF_RTYPE_CLASS_COPY
-// lookup semantics) and copies min(st_size) bytes to r_offset; every
-// other image binds the SAME name to the executable's DEFINED OBJECT
-// symbol (interposition), so all references converge on the copy.
-constexpr std::uint32_t R_X86_64_COPY   = 5;
-constexpr std::uint32_t R_AARCH64_COPY  = 1024;
+// ── WHY THERE IS NO `R_*_COPY` HERE ────────────────────────────────
+// D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET: DSS used to
+// bind an ET_EXEC's extern DATA imports by COPY RELOCATION (reserve a
+// `.bss` slot of the object's exact size, export the symbol as a
+// DEFINED OBJECT there, emit one R_X86_64_COPY / R_AARCH64_COPY and
+// let ld.so memcpy the library's object in). That mechanism is
+// NAME-SCOPED and therefore UNSOUND whenever the imported object has
+// ALIASES: a copy relocation redirects the library's references for
+// exactly the name the exec CLAIMS, so claiming glibc's `__environ`
+// left its WEAK aliases `environ` / `_environ` still pointing at
+// libc's own (never-written) storage — C23 6.2.2's "one identifier,
+// one object" split in two, SILENTLY (a third-party `.so` reading
+// `environ` saw NULL, not a link error).
+// The whole mechanism is GONE, not merely unused: every ELF format now
+// declares `dataImportBinding: "got-indirect"`, which binds the
+// ADDRESS of the library's ONE object and so cannot split it.
+// ★ GOT-INDIRECT IS LEGAL IN A NON-PIE ET_EXEC — do not "correct" this
+// back: a non-PIE executable has a `.got` like any other image, and
+// `R_*_GLOB_DAT` rows in `.rela.dyn` are processed by ld.so at load
+// with no PIE requirement whatsoever. Copy relocation exists ONLY to
+// hand non-PIC code a link-time-CONSTANT address for an object the
+// image does not define; got-indirect needs no such constant, so the
+// mechanism's entire reason to exist evaporates with it.
 
 // Closed-enum machine codes the dynamic walker dispatches on.
 // EM_X86_64 = 62 (gABI fig 4-2); EM_AARCH64 = 183 (AArch64 ELF psABI).
@@ -247,19 +257,6 @@ globDatTypeFor(std::uint16_t machine) noexcept {
     switch (machine) {
         case kEmX86_64:  return R_X86_64_GLOB_DAT;
         case kEmAArch64: return R_AARCH64_GLOB_DAT;
-    }
-    return 0u;
-}
-
-// Per-machine copy-relocation type (extern DATA imports — c84,
-// D-LK-EXTERN-DATA-IMPORT). Same closed-enum dispatch shape as
-// `globDatTypeFor`; a 3rd ISA adds its `R_*_COPY` constant + an arm
-// here (see the `kEmX86_64` comment block above).
-[[nodiscard]] constexpr std::uint32_t
-copyRelocTypeFor(std::uint16_t machine) noexcept {
-    switch (machine) {
-        case kEmX86_64:  return R_X86_64_COPY;
-        case kEmAArch64: return R_AARCH64_COPY;
     }
     return 0u;
 }
@@ -563,8 +560,11 @@ encodeElfExecDynamic(
     //   (e) internal absolute data slots emit R_*_RELATIVE entries
     //       (base-relative addend) instead of link-final in-place
     //       VAs;
-    //   (f) extern DATA imports bind got-indirect (a GOT slot +
-    //       GLOB_DAT; copy-relocation is exec-only);
+    //   (f) — WAS a divergence, now shared: extern DATA imports bind
+    //       got-indirect on EVERY ELF flavour (a GOT slot +
+    //       GLOB_DAT). The exec arm used to bind them by copy
+    //       relocation; that mechanism is deleted
+    //       (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET);
     //   (g) zero externs is LEGAL (a self-contained `.so` still
     //       needs `.dynamic`/`.dynsym`/`.hash` for its exports) and
     //       an extern with an EMPTY libraryPath is LEGAL (undefined,
@@ -955,18 +955,13 @@ encodeElfExecDynamic(
 
     // ── (b.5) Partition externs: FUNCTION vs DATA imports ──────────
     //
-    // c84 (D-LK-EXTERN-DATA-IMPORT): a FUNCTION import binds through
-    // the PLT/GOT machinery below (a PLT stub + GOT slot + GLOB_DAT);
-    // a DATA import (libc `stdout` — `ExternImport.isData`) binds via
-    // an ELF COPY RELOCATION: the exec reserves a `.bss` slot of the
-    // object's exact size+alignment, exports the symbol as a DEFINED
-    // OBJECT at that slot, and emits one R_*_COPY in `.rela.dyn`; the
-    // loader memcpy's the library's object into the slot at startup
-    // and ALL references (this exec's code via the normal GlobalAddr
-    // path; other images via interposition) converge on the copy —
-    // gcc's non-PIE ET_EXEC mechanism, zero new instruction
-    // encodings. `externSlot[i]` is the extern's ordinal within its
-    // OWN class (PLT/GOT slot for functions; copy-slot for data).
+    // D-LK-EXTERN-DATA-IMPORT: a FUNCTION import binds through the
+    // PLT/GOT machinery below (a PLT stub + GOT slot + GLOB_DAT); a
+    // DATA import (libc `stdout` / `__environ` — `ExternImport.isData`)
+    // gets a GOT slot of its own, placed AFTER the function slots, that
+    // ld.so fills with the library object's ADDRESS (GLOB_DAT) and the
+    // shared GotIndirect lowering derefs.
+    // `externSlot[i]` is the extern's ordinal within its OWN class.
     std::vector<std::size_t> externSlot(numExterns, 0);
     std::size_t numFuncExterns = 0;
     std::size_t numDataExterns = 0;
@@ -975,86 +970,59 @@ encodeElfExecDynamic(
                             ? numDataExterns++
                             : numFuncExterns++;
     }
-    // c150 (D-LK1-4): the data-import binding is FLAVOR-keyed.
-    //   * ET_EXEC → copy-relocation (c84): a `.bss` copy slot + one
-    //     R_*_COPY; the exec owns the canonical copy.
-    //   * ET_DYN → got-indirect (the c117/c149 model): a GOT slot +
-    //     one R_*_GLOB_DAT; ld.so writes the object's address into
-    //     the slot and the GotIndirect lowering derefs it. A copy
-    //     relocation inside a `.so` is INVALID ELF (copy relocs are
-    //     the executable's mechanism; validate() rejects the config).
-    bool const hasCopySlots    = !isDyn && numDataExterns > 0;
-    bool const hasGotDataSlots =  isDyn && numDataExterns > 0;
-    if (numDataExterns > 0) {
+    // The extern's GOT slot index — the SINGLE definition of the slot
+    // layout (`[functions][data]`), so the three consumers below (the
+    // `.rela.dyn` r_offset, a data extern's symbolVa, the slot-count)
+    // cannot drift apart.
+    auto const gotSlotIndexFor = [&](std::size_t i) -> std::size_t {
+        return module.externImports[i].isData
+                   ? numFuncExterns + externSlot[i]
+                   : externSlot[i];
+    };
+    // The data-import binding is what the FORMAT DECLARES — this
+    // walker OBEYS `dataImportBinding`, it does not re-derive the
+    // model from the image flavour. (It used to: `required = isDyn ?
+    // GotIndirect : CopyRelocation`, with the declaration merely
+    // cross-checked. That made the schema key a redundant restatement
+    // the engine validated instead of a decision it read, and put the
+    // choice in an `isDyn` identity branch.)
+    //   * got-indirect: a GOT slot + one R_*_GLOB_DAT; ld.so writes
+    //     the object's ADDRESS into the slot and the shared
+    //     GotIndirect lowering derefs it.
+    std::optional<DataImportBinding> const declaredBinding =
+        fmt.dataImportBinding();
+    bool const hasGotDataSlots =
+        numDataExterns > 0
+        && declaredBinding == DataImportBinding::GotIndirect;
+    if (numDataExterns > 0 && !hasGotDataSlots) {
         // The linker's pre-walker gate admits data imports only when
-        // the schema DECLARES a binding model; each flavor arm here
-        // implements exactly one. A mismatched declaration must fail
-        // loud, not silently get a slot kind it did not declare.
-        auto const binding = fmt.dataImportBinding();
-        DataImportBinding const required = isDyn
-            ? DataImportBinding::GotIndirect
-            : DataImportBinding::CopyRelocation;
-        if (!binding.has_value() || *binding != required) {
-            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                 std::string{"elf::encodeElfExecDynamic: module carries "}
-                     + std::to_string(numDataExterns)
-                     + " extern DATA import(s) but format '"
-                     + std::string{fmt.name()}
-                     + "' does not declare 'dataImportBinding': \""
-                     + std::string{dataImportBindingName(required)}
-                     + "\" -- the data-import mechanism the "
-                     + (isDyn ? "ET_DYN" : "ET_EXEC")
-                     + " arm implements (D-LK-EXTERN-DATA-IMPORT / "
-                       "D-LK1-4).");
-            return {};
-        }
+        // the schema DECLARES a binding model; this walker implements
+        // exactly `got-indirect`. A format that declares nothing (or a
+        // future member this walker has no arm for) must fail loud,
+        // not silently get a slot kind it did not declare.
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             std::string{"elf::encodeElfExecDynamic: module carries "}
+                 + std::to_string(numDataExterns)
+                 + " extern DATA import(s) but format '"
+                 + std::string{fmt.name()}
+                 + "' does not declare 'dataImportBinding': \""
+                 + std::string{dataImportBindingName(
+                       DataImportBinding::GotIndirect)}
+                 + "\" -- the only data-import mechanism this walker "
+                   "implements (D-LK-EXTERN-DATA-IMPORT / D-LK1-4).");
+        return {};
     }
-    // Validate each data import's shape — EXEC (copy-slot) arm only:
-    // the copy slot needs a real size (an INCOMPLETE declared type —
-    // `extern const char v[];` — carries 0/0: legal ONLY when a
-    // sibling CU defines it, in which case the LK11 merge strips the
-    // row before this walker runs; one SURVIVING here means a true
-    // library import of an unsizeable object — fail loud, an unsized
-    // copy slot cannot be reserved) and a power-of-two alignment
-    // (layout-derived upstream; re-check so a hand-built module
-    // cannot corrupt the slot packing). The ET_DYN got-indirect slot
-    // is a pointer — the object's size is irrelevant (an incomplete
-    // `extern char v[];` binds fine through the GOT), so the check
-    // is skipped there.
-    for (std::size_t i = 0; hasCopySlots && i < numExterns; ++i) {
-        auto const& ext = module.externImports[i];
-        if (!ext.isData) continue;
-        if (ext.dataSizeBytes == 0 || ext.dataAlignBytes == 0) {
-            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                 std::string{"elf::encodeElfExecDynamic: extern DATA "
-                             "import '"} + ext.mangledName
-                     + "' carries no computable object size/alignment "
-                       "(declared with an INCOMPLETE type and no "
-                       "defining sibling CU resolved it). A copy-"
-                       "relocation slot needs the object's exact size "
-                       "— complete the extern's declared type or "
-                       "compile it with its defining translation "
-                       "unit. D-LK-EXTERN-DATA-IMPORT.");
-            return {};
-        }
-        if ((ext.dataAlignBytes & (ext.dataAlignBytes - 1)) != 0) {
-            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                 std::string{"elf::encodeElfExecDynamic: extern DATA "
-                             "import '"} + ext.mangledName
-                     + "' carries a non-power-of-two alignment ("
-                     + std::to_string(ext.dataAlignBytes)
-                     + ") — the copy-slot packing below would place "
-                       "it at a wrong offset. Layout-derived "
-                       "alignments are powers of two; this module "
-                       "row is corrupt.");
-            return {};
-        }
-    }
+    // NOTE (deliberately no per-import size/alignment validation here):
+    // the got-indirect slot is a POINTER, so the imported object's own
+    // size and alignment are irrelevant to it — an incomplete `extern
+    // char v[];` binds fine through the GOT. The deleted copy-slot arm
+    // needed both (it reserved storage of the object's exact size) and
+    // validated them; nothing in this walker consumes them now.
 
-    // c84: `.bss` exists for module zero-init globals AND/OR extern-
-    // data copy slots (exec arm; the dyn arm's data externs live in
-    // the GOT, so only module globals count there).
-    bool const hasBssSection = hasBssDyn || hasCopySlots;
+    // `.bss` exists for the module's own zero-init globals. Extern data
+    // imports never contribute: their storage is the LIBRARY's object,
+    // reached through a GOT slot.
+    bool const hasBssSection = hasBssDyn;
 
     // ── (b.6) Symbol-version REQUIREMENTS (D-LK-ELF-SYMBOL-VERSIONING) ──
     // An import whose `ExternImport.version` is non-empty (config-driven,
@@ -1116,11 +1084,11 @@ encodeElfExecDynamic(
     // removing an optional section ([.interp]/[.rodata]/[.data]/
     // [.bss]) keeps every cross-reference (.link/.info/e_shstrndx)
     // coherent with the actual header table. Hoisted ABOVE the
-    // symbol-table builds because (1) the dynsym data-extern patch
-    // needs IDX_BSS, (2) the `.symtab` STT_SECTION + function entries
-    // need IDX_TEXT (c150 — no longer a hardcoded 2: the dyn image
-    // has no `.interp`, shifting `.text` to index 1), and (3) the
-    // ET_DYN export patch needs IDX_TEXT/IDX_RODATA/IDX_DATA/IDX_BSS.
+    // symbol-table builds because (1) the `.symtab` STT_SECTION +
+    // function entries need IDX_TEXT (c150 — no longer a hardcoded 2:
+    // the dyn image has no `.interp`, shifting `.text` to index 1), and
+    // (2) the ET_DYN export patch needs
+    // IDX_TEXT/IDX_RODATA/IDX_DATA/IDX_BSS.
     // Emit order:
     //   0 NULL, [.interp — exec only], .text, [.rodata], .plt,
     //   .dynsym, .dynstr, .hash, .rela.dyn, [.tdata], [.tbss],
@@ -1317,25 +1285,24 @@ encodeElfExecDynamic(
     for (std::size_t i = 0; i < numExterns; ++i) {
         dynsymIdx[i] =
             static_cast<std::uint32_t>(dynsym.size() / 24);
-        // A FUNCTION import is UNDEF (the loader resolves it into the
-        // GOT via GLOB_DAT). A DATA import (c84 copy-relocation) is a
-        // DEFINED OBJECT in THIS executable: st_size is the object's
-        // layout-derived size (the loader copies min(st_size) bytes;
-        // other images bind to this definition by interposition);
-        // st_value (the `.bss` slot VA) + st_shndx (the `.bss` section
-        // index) are patched after layout, once both exist.
+        // EVERY import — function AND data — is a plain UNDEF reference
+        // the loader resolves into a GOT slot via GLOB_DAT. st_size
+        // stays 0 and st_value/st_shndx stay UNDEF: nothing is copied,
+        // so this image DEFINES none of these names.
+        // ★ THIS IS THE FIX for
+        // D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET. The
+        // deleted copy-relocation arm made a data import a DEFINED
+        // OBJECT here (sized, placed in `.bss`), which is precisely
+        // what SPLIT an aliased libc object: the exec claimed the ONE
+        // spelling it was told about, so the library's references
+        // through that name were redirected to the exec's copy while
+        // its other names for the SAME object were not. An UNDEF
+        // reference claims nothing and therefore cannot split anything.
         bool const isData = module.externImports[i].isData;
-        // st_size: the copy-relocation arm (exec) needs the object's
-        // size (the loader copies min(st_size) bytes); the dyn
-        // got-indirect arm's import stays a plain UNDEF reference
-        // (size 0 — no copy happens, the slot holds a pointer).
         appendDynsymEntry(externNameOff[i],
                           makeStInfo(STB_GLOBAL,
                                      isData ? STT_OBJECT : STT_NOTYPE),
-                          SHN_UNDEF, 0,
-                          (isData && !isDyn)
-                              ? module.externImports[i].dataSizeBytes
-                              : 0);
+                          SHN_UNDEF, 0, 0);
     }
     // ET_DYN exports (c150): appended AFTER the imports so import
     // dynsym indices (and the exec image) are unchanged. st_shndx /
@@ -1546,8 +1513,48 @@ encodeElfExecDynamic(
                     .relocations.size();
         }
     }
+    // ★ D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET, the cost the
+    // copy-relocation deletion actually carried, MEASURED not assumed:
+    //   `static char ***g = &environ;`
+    // is a legal ADDRESS CONSTANT, and under copy relocation the exec HAD a
+    // link-time-constant address for the object (its own `.bss` copy), so the
+    // apply below could bake it into the slot. Under got-indirect there is NO
+    // link-time address: `symbolVa[dataExtern]` is the GOT SLOT, so baking it
+    // stores a pointer ONE INDIRECTION OFF — ✔MEASURED as a SILENT
+    // miscompile (`static = 0x403240` = the slot; `runtime = 0x7f..d58` = the
+    // object) before this counter existed.
+    // The ET_DYN arm already solved it (its `externAddrBySlotVa` fold below
+    // emits a SYMBOL-BASED absolute reloc and ZEROES the slot, letting ld.so
+    // write the real address — gcc's own PIE shape, `R_X86_64_64 environ`).
+    // The exec arm gets the SAME rows; the PREDICATE is stated as a reason, not
+    // a flavour: a slot naming an extern needs a symbol-based row whenever the
+    // extern's address is not a link-time constant in THIS image — always for a
+    // DATA import (got-indirect binds at load), and for any extern in a SLID
+    // image (a base-relative stub VA cannot be baked absolutely). On the dyn
+    // arm those rows are ALREADY counted by `numRelativeRelocs` (one row per
+    // data-item relocation either way), so this counter is the exec arm's share.
+    std::size_t numExecExternAddrRelocs = 0;
+    std::unordered_map<SymbolId, std::size_t> externIdxBySym;
+    externIdxBySym.reserve(numExterns);
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        externIdxBySym.emplace(module.externImports[i].symbol, i);
+    }
+    auto const dataItemRelocNeedsSymbolRow =
+        [&](Relocation const& rel) -> bool {
+        auto const it = externIdxBySym.find(rel.target);
+        if (it == externIdxBySym.end()) return false;        // internal target
+        return isDyn || module.externImports[it->second].isData;
+    };
+    if (!isDyn) {
+        for (std::size_t j = 0; j < dataDynLayout.itemIndices.size(); ++j) {
+            for (auto const& rel :
+                 module.dataItems[dataDynLayout.itemIndices[j]].relocations) {
+                if (dataItemRelocNeedsSymbolRow(rel)) ++numExecExternAddrRelocs;
+            }
+        }
+    }
     std::uint64_t const relaDynSz  =
-        (numExterns + numRelativeRelocs) * 24;
+        (numExterns + numRelativeRelocs + numExecExternAddrRelocs) * 24;
 
     std::uint64_t const ptLoad1End = relaDynOff + relaDynSz;
 
@@ -1653,14 +1660,12 @@ encodeElfExecDynamic(
         }
     }
 
-    // (k) `.rela.dyn` content is built AFTER the `.bss` layout below
-    // (c84): a COPY relocation's r_offset is the data extern's `.bss`
-    // copy-slot VA, which does not exist until `.dynamic`'s size (and
-    // thus `.bss`'s VA) is known. The SIZE (`relaDynSz` — one 24-byte
-    // Elf64_Rela per extern, GLOB_DAT or COPY) was already fixed at
-    // layout time above; only the byte CONTENT moves down.
+    // (k) `.rela.dyn` content is built AFTER the layout below: a row's
+    // r_offset is a GOT-slot VA, which does not exist until the section
+    // VAs are known. The SIZE (`relaDynSz` — one 24-byte Elf64_Rela per
+    // extern, all GLOB_DAT) was already fixed at layout time above;
+    // only the byte CONTENT moves down.
     std::uint32_t const globDatType = globDatTypeFor(machine);
-    std::uint32_t const copyType    = copyRelocTypeFor(machine);
 
     // ── (l) Build .dynamic
     std::vector<std::uint8_t> dynamicSec;
@@ -1721,36 +1726,21 @@ encodeElfExecDynamic(
     // .dynamic, aligned to the bss section alignment, and extends p_memsz
     // beyond p_filesz. No file bytes are emitted for it. D-LK4-DATA-PRODUCER.
     //
-    // c84 (D-LK-EXTERN-DATA-IMPORT): the section is the module's own
-    // zero-init globals FIRST (the existing bssDynLayout — item offsets
-    // unchanged), then one COPY-RELOCATION SLOT per extern DATA import,
-    // each at the object's layout-derived alignment. The section exists
-    // when EITHER part is non-empty; its alignment is the max of both
-    // parts (bssDynLayout.maxAlign already folds the schema floor, even
-    // when the module part is empty).
+    // The section is EXACTLY the module's own zero-init globals
+    // (`bssDynLayout`). Extern DATA imports contribute nothing: the
+    // deleted copy-relocation arm appended one exec-local slot per
+    // imported object here; got-indirect leaves the object where the
+    // library put it and stores only its ADDRESS, in the GOT.
     if (hasBssSection && secBssDyn == nullptr) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              "elf::encodeElfExecDynamic: module needs a `.bss` section "
-             "(zero-init globals and/or extern-data copy-relocation "
-             "slots) but the format declares no 'bss' section row.");
+             "(zero-init globals) but the format declares no 'bss' "
+             "section row.");
         return {};
     }
-    // Copy slots are EXEC-only (c84); the dyn arm's data externs live
-    // in the GOT (hasCopySlots is false there), so `bssSpan` stays the
-    // module's own zero-init span.
-    std::vector<std::uint64_t> copySlotOffset(numExterns, 0);
-    std::uint64_t bssSpan = bssDynLayout.spanSize;
-    std::uint64_t copyMaxAlign = 1;
-    for (std::size_t i = 0; hasCopySlots && i < numExterns; ++i) {
-        auto const& ext = module.externImports[i];
-        if (!ext.isData) continue;
-        bssSpan = alignUp(bssSpan, ext.dataAlignBytes);
-        copySlotOffset[i] = bssSpan;
-        bssSpan += ext.dataSizeBytes;
-        copyMaxAlign = std::max(copyMaxAlign, ext.dataAlignBytes);
-    }
+    std::uint64_t const bssSpan = bssDynLayout.spanSize;
     std::uint64_t const bssAlignDyn =
-        hasBssSection ? std::max(bssDynLayout.maxAlign, copyMaxAlign) : 1;
+        hasBssSection ? bssDynLayout.maxAlign : 1;
     std::uint64_t const bssVa =
         hasBssSection ? alignUp(dynamicVa + dynamicSz, bssAlignDyn) : 0;
     std::uint64_t const bssSz = bssSpan;
@@ -1760,11 +1750,13 @@ encodeElfExecDynamic(
                       : ptLoad2FileSize;
 
     // ── (k, moved) Build the EXTERN half of `.rela.dyn` — one
-    // Elf64_Rela per extern:
-    //   * function → GLOB_DAT against its GOT slot (both arms);
-    //   * data, exec arm → COPY against its `.bss` copy slot (c84);
-    //   * data, dyn arm  → GLOB_DAT against its GOT slot (c150
-    //     got-indirect — ld.so writes the object's address there).
+    // Elf64_Rela per extern, ALL of type GLOB_DAT against the extern's
+    // own GOT slot: a FUNCTION's slot is the PLT stub's jump target; a
+    // DATA import's slot receives the library object's ADDRESS, which
+    // the shared GotIndirect lowering derefs. IDENTICAL on every ELF
+    // image flavour — this loop has no `isDyn` arm and no per-kind
+    // relocation type, which is exactly what deleting copy-relocation
+    // bought.
     // The dyn arm's RELATIVE half is assembled AFTER
     // applyDataItemRelocations (its addends are the base-relative
     // slot values that apply writes); the two halves concatenate —
@@ -1773,16 +1765,11 @@ encodeElfExecDynamic(
     std::vector<std::uint8_t> relaExtern;
     relaExtern.reserve(numExterns * 24);
     for (std::size_t i = 0; i < numExterns; ++i) {
-        bool const isData = module.externImports[i].isData;
         std::uint64_t const rOffset =
-            isData ? (isDyn ? gotVa + (numFuncExterns + externSlot[i]) * 8
-                            : bssVa + copySlotOffset[i])
-                   : gotVa + externSlot[i] * 8;
-        std::uint32_t const rType =
-            (isData && !isDyn) ? copyType : globDatType;
+            gotVa + gotSlotIndexFor(i) * 8;
         std::uint64_t const rInfo =
             (static_cast<std::uint64_t>(dynsymIdx[i]) << 32)
-            | static_cast<std::uint64_t>(rType);
+            | static_cast<std::uint64_t>(globDatType);
         appendU64LE(relaExtern, rOffset);
         appendU64LE(relaExtern, rInfo);
         appendI64LE(relaExtern, 0);
@@ -1997,19 +1984,16 @@ encodeElfExecDynamic(
     }
     for (std::size_t i = 0; i < numExterns; ++i) {
         // D-LK6-8: a FUNCTION extern's VA points at its PLT stub (per-
-        // machine stub size: 6 bytes x86_64 / 16 bytes ARM64). c84: an
-        // EXEC data extern's VA is its `.bss` COPY SLOT — module code
-        // references the LOCAL copy through the normal GlobalAddr
-        // reloc path; the loader fills the slot from the library's
-        // object before entry (R_*_COPY, eager DF_1_NOW binding).
-        // c150: a DYN data extern's VA is its GOT SLOT (got-indirect —
-        // the lowering lea's the slot and derefs; ld.so fills it via
-        // GLOB_DAT), NEVER a thunk/stub VA (a data object is not
-        // callable — the PE/Mach-O c117/c149 model).
+        // machine stub size: 6 bytes x86_64 / 16 bytes ARM64).
+        // A DATA extern's VA is its GOT SLOT (got-indirect — the shared
+        // lowering lea's the slot and derefs it; ld.so fills the slot
+        // via GLOB_DAT), NEVER a thunk/stub VA (a data object is not
+        // callable — the PE/Mach-O c117/c149 model) and, since the
+        // copy-relocation deletion, never an image-local `.bss` slot
+        // either. IDENTICAL on every ELF image flavour.
         bool const isData = module.externImports[i].isData;
         std::uint64_t const va =
-            isData ? (isDyn ? gotVa + (numFuncExterns + externSlot[i]) * 8
-                            : bssVa + copySlotOffset[i])
+            isData ? gotVa + gotSlotIndexFor(i) * 8
                    : pltVa + externSlot[i] * pltStubSize;
         auto const [it, inserted] = symbolVa.emplace(
             module.externImports[i].symbol, va);
@@ -2165,38 +2149,83 @@ encodeElfExecDynamic(
         std::uint32_t nativeId  = 0;
         std::int64_t  addend    = 0;
     };
+    // Collected on EVERY flavour now (the predicate
+    // `dataItemRelocNeedsSymbolRow` above states WHY a site qualifies), because
+    // the exec arm needs exactly these rows for its extern-DATA sites since the
+    // copy-relocation deletion — see the sizing comment at `relaDynSz`.
     std::unordered_map<std::uint64_t, ExternAddrSite> externAddrBySlotVa;
-    if (isDyn && hasDataDyn) {
-        std::unordered_map<SymbolId, std::size_t> externIdxBySym;
-        externIdxBySym.reserve(numExterns);
-        for (std::size_t i = 0; i < numExterns; ++i) {
-            externIdxBySym.emplace(module.externImports[i].symbol, i);
-        }
+    // ★ AND THE SAME SITES IN LAYOUT ORDER. The dyn arm emits by walking
+    // `relativeSiteVas` (a vector) and LOOKING UP the map, so its row order is
+    // deterministic; the exec arm has no such vector and must not iterate the
+    // unordered_map — that would make `.rela.dyn`'s BYTE ORDER vary between
+    // runs of the same input, i.e. a non-reproducible image. This vector is
+    // filled in data-item/relocation order, the same walk the layout-time
+    // counter above uses, so sizing and emission agree by construction.
+    std::vector<std::pair<std::uint64_t, ExternAddrSite>> externAddrSitesInOrder;
+    if (hasDataDyn) {
         for (std::size_t j = 0; j < dataDynLayout.itemIndices.size(); ++j) {
             AssembledData const& di =
                 module.dataItems[dataDynLayout.itemIndices[j]];
             for (auto const& rel : di.relocations) {
-                auto const extIt = externIdxBySym.find(rel.target);
-                if (extIt == externIdxBySym.end()) continue;   // internal
+                if (!dataItemRelocNeedsSymbolRow(rel)) continue;
+                std::size_t const extIdx = externIdxBySym.at(rel.target);
                 auto const* fmtReloc = fmt.relocationByKind(rel.kind);
                 if (fmtReloc == nullptr) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          std::format(
-                             "elf::encodeElfExecDynamic (ET_DYN): data-item "
+                             "elf::encodeElfExecDynamic: data-item "
                              "relocation kind {} targeting extern '{}' is not "
                              "declared by object format '{}' - cannot emit "
                              "the symbol-based absolute reloc.",
                              rel.kind.v,
-                             module.externImports[extIt->second].mangledName,
+                             module.externImports[extIdx].mangledName,
                              fmt.name()));
                     return {};
                 }
                 std::uint64_t const slotVa = dataVa
                     + dataDynLayout.itemOffsets[j]
                     + static_cast<std::uint64_t>(rel.offset);
-                externAddrBySlotVa.insert_or_assign(
-                    slotVa, ExternAddrSite{dynsymIdx[extIt->second],
-                                           fmtReloc->nativeId, rel.addend});
+                ExternAddrSite const site{dynsymIdx[extIdx],
+                                          fmtReloc->nativeId, rel.addend};
+                auto const [it, inserted] =
+                    externAddrBySlotVa.insert_or_assign(slotVa, site);
+                (void)it;
+                // Two relocations naming the SAME slot would otherwise emit two
+                // rows for one 8 bytes while the map kept one — the count
+                // cross-check below would catch it, but say why here.
+                if (inserted) externAddrSitesInOrder.emplace_back(slotVa, site);
+            }
+        }
+    }
+    // ★ FAIL LOUD, never a silent wrong pointer: a READ-ONLY (`.rodata`) item
+    // whose relocation names an extern needing a load-time address CANNOT be
+    // fixed up — ld.so would have to write into a read-only page. The dyn arm
+    // rejects every reloc-bearing `.rodata` item outright
+    // (D-LK-DYN-RODATA-ITEM-RELOC); the exec arm allows them because their
+    // targets are normally link-time constants, so it must reject exactly this
+    // subset rather than bake the GOT-slot address the apply would write.
+    if (!isDyn && hasRodataDyn) {
+        for (std::size_t j = 0; j < rodataDynLayout.itemIndices.size(); ++j) {
+            for (auto const& rel :
+                 module.dataItems[rodataDynLayout.itemIndices[j]].relocations) {
+                if (!dataItemRelocNeedsSymbolRow(rel)) continue;
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format(
+                         "elf::encodeElfExecDynamic: a READ-ONLY (`.rodata`) "
+                         "data item holds the ADDRESS of extern DATA import "
+                         "'{}', whose address is only known at LOAD time "
+                         "(dataImportBinding \"got-indirect\" binds the "
+                         "library object's address into a GOT slot). A "
+                         "load-time relocation cannot write into a read-only "
+                         "page, and baking the link-time value would store "
+                         "the GOT SLOT's address instead of the object's -- "
+                         "one indirection off, silently. Give the item "
+                         "WRITABLE storage (drop a `const`, or let it be "
+                         "relro) so the loader can fix it up. "
+                         "D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET.",
+                         module.externImports[externIdxBySym.at(rel.target)]
+                             .mangledName));
+                return {};
             }
         }
     }
@@ -2239,6 +2268,39 @@ encodeElfExecDynamic(
             appendU64LE(relaDyn, makeRelaInfo(0, relativeType));
             appendI64LE(relaDyn, static_cast<std::int64_t>(addend));
         }
+    } else {
+        // ★ EXEC arm: the same symbol-based rows, for the sites the predicate
+        // selected (extern DATA imports). `applyDataItemRelocations` has
+        // already baked `symbolVa[extern]` — the GOT SLOT VA — into each slot,
+        // which is ONE INDIRECTION OFF; UNDO it by zeroing the slot and let
+        // ld.so write the object's real address through this row. The exec has
+        // no RELATIVE half, so these are the only data-item rows it emits.
+        // Iteration is over the ORDERED vector (never the unordered_map — that
+        // would make `.rela.dyn`'s byte order vary run to run), and the count is
+        // cross-checked against the layout-time counter below, so a slot that
+        // was counted but not emitted (or vice versa) cannot slip through as a
+        // wrong DT_RELASZ.
+        std::size_t emitted = 0;
+        for (auto const& [siteVa, site] : externAddrSitesInOrder) {
+            std::uint64_t const slotOff = siteVa - dataVa;
+            for (int b = 0; b < 8; ++b) {
+                dataDynLayout.bytes[static_cast<std::size_t>(
+                    slotOff + static_cast<std::uint64_t>(b))] = 0;
+            }
+            appendU64LE(relaDyn, siteVa);
+            appendU64LE(relaDyn, makeRelaInfo(site.dynsymIdx, site.nativeId));
+            appendI64LE(relaDyn, site.addend);
+            ++emitted;
+        }
+        if (emitted != numExecExternAddrRelocs) {
+            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                 std::format("elf::encodeElfExecDynamic: emitted {} "
+                             "symbol-based extern-address row(s) but the "
+                             "layout counted {} -- DT_RELASZ would disagree "
+                             "with the emitted rows.",
+                             emitted, numExecExternAddrRelocs));
+            return {};
+        }
     }
     appendBytes(relaDyn, relaExtern);
     if (relaDyn.size() != relaDynSz) {
@@ -2270,28 +2332,12 @@ encodeElfExecDynamic(
         return {};
     }
 
-    // ── Patch the data externs' dynsym entries (c84, EXEC arm) ──
-    // st_value = the `.bss` copy-slot VA; st_shndx = the `.bss`
-    // section index — both unknowable at build time (step e). The
-    // symbol is thereby a DEFINED OBJECT in this executable: the
-    // loader's COPY-reloc lookup skips the exec's own definition to
-    // find the library's object (ELF_RTYPE_CLASS_COPY semantics),
-    // while every OTHER image binds this name to the exec's copy
-    // (interposition) — all references converge on one storage.
-    // The ET_DYN arm skips this (hasCopySlots false): its data
-    // externs stay plain UNDEF references bound got-indirect.
-    for (std::size_t i = 0; hasCopySlots && i < numExterns; ++i) {
-        if (!module.externImports[i].isData) continue;
-        std::size_t const off =
-            static_cast<std::size_t>(dynsymIdx[i]) * 24;
-        std::uint64_t const slotVa = bssVa + copySlotOffset[i];
-        dynsym[off + 6] = static_cast<std::uint8_t>(IDX_BSS & 0xFF);
-        dynsym[off + 7] = static_cast<std::uint8_t>((IDX_BSS >> 8) & 0xFF);
-        for (int b = 0; b < 8; ++b) {
-            dynsym[off + 8 + b] =
-                static_cast<std::uint8_t>((slotVa >> (8 * b)) & 0xFF);
-        }
-    }
+    // (No post-layout patch of a data IMPORT's dynsym entry any more.
+    // The deleted copy-relocation arm wrote st_value = the `.bss`
+    // copy-slot VA and st_shndx = `.bss` here, turning the import into
+    // a DEFINED OBJECT of this image — the object-identity split
+    // D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET names. An
+    // import now stays UNDEF/0 exactly as step (e) wrote it.)
 
     // ── Patch the ET_DYN exports' dynsym entries (c150) ─────────
     // st_value = the symbol's base-relative VA (baseImageVa == 0, so
@@ -2454,10 +2500,10 @@ encodeElfExecDynamic(
     // D-LK1-ELF-EXEC-DATA-SECTIONS (dynamic arm): `.rodata`, WHEN present,
     // occupies index 3 (after `.text`@2, before `.plt`) — mirroring the
     // static ET_EXEC arm's `.rodata`@idx2 insertion. The incremental
-    // IDX_* computation (hoisted ABOVE the emit step — c84, so the
-    // dynsym data-extern patch can stamp st_shndx=IDX_BSS before the
-    // body is appended) keeps every cross-reference coherent; the
-    // header-table writes below follow the SAME emit order.
+    // IDX_* computation (hoisted ABOVE the emit step so the ET_DYN
+    // export patch can stamp each export's st_shndx before the body is
+    // appended) keeps every cross-reference coherent; the header-table
+    // writes below follow the SAME emit order.
 
     // Designated initializers per `SectionHeader` field — type-design
     // #1 + simplifier #3 fold: 10-arg positional pushShdr lambda
@@ -2778,9 +2824,13 @@ encode(AssembledModule const&    module,
             // pltNativeId/PLT32 — a data symbol bound through a PLT stub would
             // read jump-stub bytes as the object's value). This is EXACTLY what
             // gcc emits for `extern FILE *stdout` in a `.o`: a NOTYPE UND
-            // symbol + R_X86_64_PC32, even under default-PIE — the FINAL linker
-            // binds it by copy-relocation when the `.o` links into an
-            // EXECUTABLE (the DSS `.o` consumer today: sqlite's testfixture).
+            // symbol + R_X86_64_PC32, even under default-PIE — and the FINAL
+            // (foreign) linker binds it by a copy relocation IT synthesizes
+            // when the `.o` links into a non-PIE EXECUTABLE (the DSS `.o`
+            // consumer today: sqlite's testfixture). That is ld's contract for
+            // a faithful relocatable object; DSS's OWN images emit no copy
+            // relocation at all
+            // (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET).
             // The one case a data extern would instead need a GOT-indirect
             // binding (R_X86_64_GOTPCREL) — the `.o` linked into a SHARED
             // LIBRARY — is NOT a silent miscompile: ld itself fails loud
@@ -3441,8 +3491,8 @@ encode(AssembledModule const&    module,
         // reloc variant so a foreign PIE link resolves it through a
         // linker-built PLT. D-LK-OBJECT-DATA-EXTERN-RELOCATABLE (c144): DATA
         // externs are EXCLUDED — a data reference is not a call and must emit
-        // plain PC32 (the copy-relocation shape gcc emits for `extern FILE
-        // *stdout`), never PLT32; PLT32 would bind the data symbol to a
+        // plain PC32 (the shape gcc emits for `extern FILE *stdout` in a `.o`,
+        // which its own linker then resolves), never PLT32; PLT32 would bind the data symbol to a
         // linker-built PLT stub and the code would read jump-stub bytes as
         // the object's value (the silent miscompile the image-path
         // K_FormatLacksImportSupport reject guards against, here prevented in

@@ -79,7 +79,7 @@ char const* const kRejectedRootFields[] = {
             // would be dead data.
             "externCallDispatch",
             // D-LK-EXTERN-DATA-IMPORT: the extern-DATA import binding
-            // model (copy relocations) is likewise an ELF/PE/Mach-O
+            // model (a loader-bound pointer slot) is likewise an ELF/PE/Mach-O
             // dynamic-import notion — dead data on WASM/SPIR-V.
             "dataImportBinding",
             // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the extern-

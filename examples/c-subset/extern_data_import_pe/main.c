@@ -119,7 +119,9 @@
    red asserts nothing. Bind data externs to thunk VAs or drop the deref ->
    exit 4, or 0xC0000005 on the store. pe64-ONLY: `_mbcasemap` is a Windows CRT
    name; the elf/macho extern-DATA run witnesses are stdio_stream_objects (libc
-   stdout/stderr/stdin via copy-relocation / Mach-O __got) and shipped_environ.
+   stdout/stderr/stdin — got-indirect on every format now, ELF included) and
+   environ_alias_object_identity (the OBJECT-IDENTITY witness, which needs a
+   second image; shipped_environ is its single-image smoke-test sibling).
    The optimized arms prove the slot-deref address materialization survives the
    release pipelines. */
 extern unsigned char *_mbcasemap;

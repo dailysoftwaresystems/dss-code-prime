@@ -2441,9 +2441,9 @@ encodeExecDynamic(AssembledModule const&    module,
     // __got SLOT (loaded as a non-lazy pointer, dyld-bound at load). The
     // linker's pre-walker gate admits data imports only when the format
     // DECLARES a binding model; this walker implements exactly `got-indirect`
-    // (the Mach-O __got non-lazy pointer) — a foreign model fails loud, never
-    // silently gets a got slot it did not declare (mirrors elf.cpp's
-    // copy-relocation assertion). Function symbolVa is bound here; DATA
+    // (the Mach-O __got non-lazy pointer) — a format that declares nothing
+    // fails loud, never silently gets a got slot it did not declare (mirrors
+    // the SAME assertion in elf.cpp and pe.cpp). Function symbolVa is bound here; DATA
     // symbolVa is bound below once the __got VA is known.
     std::size_t numDataExterns = 0;
     for (auto const& ext : module.externImports) {

@@ -46,8 +46,10 @@
    rather than silently losing a layer. pe64-ONLY: these are Microsoft spellings
    with no glibc or libSystem export, which is also why both the symbol rows and
    the macro variants are `availableObjectFormats: [pe]` / `when.format: pe`; the
-   POSIX `environ` spelling is a DIFFERENT row (unistd.json, elf-only,
-   copy-relocation) witnessed by shipped_environ. */
+   POSIX `environ` spelling is a DIFFERENT row (unistd.json, elf-only, bound
+   got-indirect onto the strong `__environ`) witnessed by shipped_environ and,
+   for object identity across an image boundary,
+   environ_alias_object_identity. */
 #include <stdio.h>
 #include <stdlib.h>
 

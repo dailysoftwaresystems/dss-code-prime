@@ -1,69 +1,76 @@
-/* LANE-F (D-LK-EXTERN-DATA-IMPORT, a second elf copy-relocation consumer):
-   POSIX's `environ` — the environment vector itself. It ships from unistd.json
-   as the MACRO/SYMBOL SPLIT `environ` -> `__environ`: an elf-gated macro onto a
-   `kind: object` DATA row typed `ptr<ptr<char>>`, availableObjectFormats:[elf].
+/* POSIX `environ` — the SMOKE TEST: does reading the environment through the
+   shipped `environ` -> `__environ` macro/symbol split actually WORK in a
+   DSS-built ELF exec, on both arches, debug and release.
+
+   ★★ READ THIS BEFORE TRUSTING WHAT THIS EXAMPLE PROVES, BECAUSE IT ONCE
+   PROVED LESS THAN IT CLAIMED. This program is a SELF-LOOP and cannot witness
+   an OBJECT-IDENTITY property: it reads `environ` through the DSS macro and
+   cross-checks the value against libc's own `getenv`, but under the ELF COPY
+   RELOCATION binding that shipped at the time, BOTH of those reads went through
+   the very name the exec CLAIMED, so it compared the exec's copy WITH ITSELF.
+   It therefore stayed GREEN on all four legs across the whole window in which a
+   third-party `libtcl8.6.so` reading the UN-PREFIXED `environ` got NULL and
+   SIGSEGV'd in `TclSetupEnv+0xe8` (`09e1608a` green -> `6f4aab73` rc=139).
+   THE GENERAL RULE that came out of it, now recorded in the anchor: AN
+   OBJECT-IDENTITY PROPERTY CANNOT BE WITNESSED BY ONE IMAGE — a test asserting
+   that a symbol denotes the SAME OBJECT must involve a SECOND image DSS did not
+   build. That witness is `examples/c-subset/environ_alias_object_identity`,
+   which loads a gcc-built `.so` reading the un-prefixed name and asserts the
+   VALUE it sees, plus `dlsym` SAME_OBJECT=YES on both spellings.
+   ⇒ This example is kept for what it DOES witness — a live, well-formed
+   environment vector reachable through the shipped descriptor on both ELF
+   arches — and NOT for object identity.
+   (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET.)
 
    WHY `environ` AND NOT main's third parameter: POSIX.1 does not specify a
    third parameter to main AT ALL. `environ` is the blessed, portable spelling,
-   so it is what real code reaches for — which is exactly why it has to bind
-   correctly.
+   so it is what real code reaches for.
 
-   ★★ WHY THE SYMBOL IS `__environ` AND NOT `environ` — the whole point of this
-   witness, and NOT a stylistic choice. The obvious shape (an `environ` data
-   row) WAS built first and was SILENTLY WRONG: the binary looked perfect
-   (`readelf -r` showed `R_X86_64_COPY … environ + 0`, the dynsym showed
-   `environ` as an 8-byte OBJECT) and `environ` READ NULL at runtime on all four
-   legs — this program returned 1 from its very first guard. A matched
-   `gcc -std=gnu17 -no-pie` control of the same source RUNS, and ITS copy
-   relocation is against `__environ@GLIBC_2.2.5` — the STRONG alias — with both
-   `__environ` (GLOBAL) and `environ` (WEAK) defined at ONE exec address.
-   MECHANISM: glibc's startup writes the environment pointer through its
-   INTERNAL name `__environ`, and an ELF copy relocation only redirects libc's
-   own references for the symbol THE EXEC CLAIMS. Claim the weak `environ`
-   alone and libc keeps writing its own .bss slot while the exec reads a copy
-   ld.so filled from that slot BEFORE `__libc_start_main` ran — i.e. 0. This is
-   the TF-C121 `_realpath$DARWIN_EXTSN` class: the declared name links clean,
-   loads clean, and binds the wrong thing.
-   ⓘ It also mirrors the real header: glibc declares `__environ`
-   UNCONDITIONALLY and `environ` only under `#ifdef __USE_GNU` — which is why
-   the gcc cross-check needs `-D_GNU_SOURCE` (or its own extern) and a plain
-   `-std=c17` compile of `environ` fails `'environ' undeclared`.
+   WHY THE SYMBOL IS `__environ`: glibc declares `__environ`
+   UNCONDITIONALLY (/usr/include/unistd.h) and exports it STRONG, while
+   `environ` sits behind `#ifdef __USE_GNU` and is exported WEAK. DSS
+   EAGER-IMPORTS every name a descriptor declares, so the strong,
+   always-present spelling is the safe one — and the POSIX spelling reaches it
+   through an elf-gated macro. ⓘ It is no longer a CORRECTNESS requirement:
+   under the got-indirect binding this example now uses, ld.so resolves either
+   spelling to glibc's ONE object. It WAS one under copy relocation, and that is
+   history worth keeping rather than a live claim.
 
-   Binding model: the ELF exec formats declare
-   `dataImportBinding: "copy-relocation"`, so the exec reserves a .bss slot,
-   exports it as a DEFINED OBJECT dynsym (st_size = the layout-derived pointer
-   width, never hardcoded), and ld-linux copies libc's object in before entry.
+   Binding model: every ELF format declares `dataImportBinding: "got-indirect"`
+   — the exec reserves a GOT slot, emits one R_*_GLOB_DAT against it, ld.so
+   writes the LIBRARY object's address in, and the shared GotIndirect lowering
+   derefs it. The exec DEFINES NOTHING.
    EAGER-IMPORT SAFE, measured before the row shipped: glibc exports all three
    spellings at ONE address on BOTH run legs — `__environ` STRONG (`B`/`g`),
    `environ`/`_environ` WEAK (`V`/`w`) — 0x20ad58 @GLIBC_2.2.5 (x86_64) /
-   0x1b7288 @GLIBC_2.17 (aarch64), `nm -D` and `objdump -T` concurring,
-   `DO .bss` size 8.
+   0x1b7288 @GLIBC_2.17 (aarch64), `nm -D` and `objdump -T` concurring.
+   ⚠ the `@@GLIBC_x.y` suffix `readelf` prints makes a grep anchored on `$`
+   report a FALSE ABSENT.
 
-   The assertion ladder discriminates every wrong-binding class, and the CONTENT
-   of the environment is never asserted (it is host-dependent), only its
-   STRUCTURE plus an agreement check:
-   - `environ == 0` -> exit 1: the .bss slot was never filled (a dead slot, or
-     `dataImportBinding` dropped so nothing copies).
+   The assertion ladder never asserts the environment's CONTENT (it is
+   host-dependent), only its STRUCTURE plus an agreement check:
+   - `environ == 0` -> exit 1: nothing bound the object at all.
    - every entry must be `NAME=VALUE` with a NON-EMPTY name -> exit 2 / 3. Bound
-     one indirection off (the slot's ADDRESS read as the vector, the classic
+     one indirection off (the slot's ADDRESS read as the vector — the
      got-indirect-without-deref error), the walk sees garbage pointers and the
      '=' scan fails here rather than silently "passing".
    - the vector must hold at least one entry -> exit 4.
-   - ★ THE AGREEMENT CHECK, which is what proves the copied slot is libc's LIVE
-     object and not a stale duplicate: take environ[0]'s NAME and look it up
-     with libc's OWN `getenv`, then require the returned VALUE to be
-     byte-identical to the text after environ[0]'s '=' (exit 7 = getenv cannot
-     see a variable environ claims exists; exit 8 = the two disagree). A slot
-     copied from the wrong object, or copied too early/late, fails this while
-     passing every purely structural test above.
+   - the AGREEMENT CHECK: take environ[0]'s NAME, look it up with libc's OWN
+     `getenv`, and require the returned VALUE to be byte-identical to the text
+     after environ[0]'s '=' (exit 7 = getenv cannot see a variable environ
+     claims exists; exit 8 = the two disagree). ⚠ This is the SELF-LOOP half:
+     `getenv` reads libc's internal `__environ`, i.e. the same object this
+     program reads, so it cannot detect a SPLIT — only a garbage or stale
+     pointer.
 
-   RED-ON-DISABLE, and note the FIRST of these is the one that would otherwise
-   have shipped silently: repoint the row (or the macro) at the weak `environ`
-   spelling -> this program returns 1 on every elf leg, NOT a diagnostic, which
-   is exactly why the run witness exists and a compile-only pin would not have
-   caught it. Un-ship the row -> honest S0001; un-ship the macro -> honest
-   S0001 `got environ`; drop `dataImportBinding` from the elf exec format ->
-   the linker's loud data-import reject (K_FormatLacksImportSupport).
+   RED-ON-DISABLE: un-ship the row -> honest S0001; un-ship the macro -> honest
+   S0001 `got environ`; drop `dataImportBinding` from the elf exec format -> the
+   linker's loud data-import reject (K_FormatLacksImportSupport); neuter the
+   got-indirect deref (a bare lea) -> the vector walk reads the slot's own
+   address as `environ[0]` and fails the '=' scan at exit 2.
+   ⓘ NOT red-on-disable here any more, and that is the whole point of the sibling
+   example: repointing the row at the WEAK `environ` spelling now WORKS (ld.so
+   resolves it to the same object), where under copy relocation it returned 1.
    elf-ONLY on purpose: no Windows CRT exports a spelling ucrtbase can bind
    (measured — ucrtbase has none at all, msvcrt only the underscored
    `_environ`), and the macho export could not be measured this cycle, so both

@@ -62,6 +62,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace dss;
@@ -172,13 +173,14 @@ readDynSyms(std::vector<std::uint8_t> const& b, std::vector<Shdr> const& secs) {
     return out;
 }
 
-// `.dynsym` rows with the two fields a COPY-RELOCATION slot's shape is readable
-// from. Elf64_Sym: name u32 @0, info u8 @4, other u8 @5, shndx u16 @6,
-// st_value u64 @8, st_size u64 @16 (24 bytes). For a data import on the ET_EXEC
-// arm the linker exports a DEFINED OBJECT whose `st_size` IS the folded
-// `dataSizeBytes` (elf.cpp:1332-1337) and whose `st_value` is its `.bss` copy-slot
-// VA (patched post-layout) — which is how the merged row's numbers can be read
-// back out of the emitted image rather than inferred from whether it linked.
+// `.dynsym` rows. Elf64_Sym: name u32 @0, info u8 @4, other u8 @5, shndx u16 @6,
+// st_value u64 @8, st_size u64 @16 (24 bytes).
+// ⓘ These fields USED to carry a data import's copy-slot shape — st_size was the
+// folded `dataSizeBytes` and st_value the `.bss` slot VA. Since the
+// copy-relocation deletion (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET)
+// a data import is a plain UNDEF reference with st_size 0 and st_value 0 — the
+// exec DEFINES NOTHING, which is the whole point of the fix — so what these
+// fields are read for now is exactly that: proof of the absence of a claim.
 struct DynSymRow {
     std::string   name;
     std::uint64_t value = 0;
@@ -977,11 +979,12 @@ TEST(CrossCuLinkFormats, EagerImportBitOrCombinesAcrossTheFoldInBothOrders) {
 }
 
 // A cross-CU disagreement about ONE dynamic symbol is a REAL conflict, never a
-// pick-one. `isData` selects the binding MODEL (the ELF copy-relocation data
-// slot vs the function-import path), so silently keeping either row would bind
-// the loser CU's references through the wrong one — the D-LK-EXTERN-DATA-IMPORT
+// pick-one. `isData` selects the binding MODEL (a got-indirect data pointer slot
+// vs the function-import path), so silently keeping either row would bind the
+// loser CU's references through the wrong one — the D-LK-EXTERN-DATA-IMPORT
 // silent-miscompile shape. Same for `isThreadLocal`, and for two DIFFERING
-// non-zero `dataSizeBytes` (they size the copy-relocation `.bss` slot).
+// non-zero `dataSizeBytes` — two CUs declaring DIFFERENT objects under one
+// external name.
 TEST(CrossCuLinkFormats, ConflictingExternImportAttributesFailLoud) {
     auto loaded = loadShippedPair("x86_64", "elf64-x86_64-linux-exec");
     ASSERT_TRUE(loaded.target && loaded.format);
@@ -1030,7 +1033,7 @@ TEST(CrossCuLinkFormats, ConflictingExternImportAttributesFailLoud) {
             << (rep.all().empty() ? "" : rep.all().front().actual);
         EXPECT_TRUE(image.bytes.empty());
     }
-    {   // Two DIFFERING non-zero sizes for one copy-relocation slot.
+    {   // Two DIFFERING non-zero sizes for one external name.
         SCOPED_TRACE("dataSizeBytes");
         ExternImport small = libImport("gvar", "libc.so.6");
         small.isData         = true;
@@ -1042,39 +1045,44 @@ TEST(CrossCuLinkFormats, ConflictingExternImportAttributesFailLoud) {
         auto image = linkPair(small, big, rep);
         EXPECT_EQ(countCode(rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u);
         EXPECT_TRUE(anyDiagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
-                                    "conflicting `dataSizeBytes` (copy-relocation "
-                                    "slot size) across CompilationUnits (4 vs 8)"))
+                                    "conflicting `dataSizeBytes` (declared "
+                                    "object size) across CompilationUnits (4 vs 8)"))
             << (rep.all().empty() ? "" : rep.all().front().actual);
         EXPECT_TRUE(image.bytes.empty());
     }
 }
 
-// ── CONTROL + FOLD: a ZERO size/align is an INCOMPLETE TYPE, not a conflict ─────
+// ── CONTROL: a ZERO size/align is an INCOMPLETE TYPE, not a conflict — and the
+//    folded shape reaches the IMAGE as a CLAIM OF NOTHING ────────────────────
 //
 // `extern const char v[];` in one TU beside a sized declaration in another is legal
 // C (extern_import.hpp — both fields stay 0 for an incomplete type), so the merge
 // takes the NON-ZERO shape per field and reports nothing.
 //
-// ★ WHAT THIS TEST REPLACED, and why the replacement is not gold-plating. The
-// previous form of this control lived inline in the conflict test above and asserted
-// exactly two things: zero conflict diagnostics, and one surviving row. It never read
-// the FOLDED NUMBERS back, so it discriminated only INDIRECTLY — via elf.cpp:1023-1037
-// refusing a zero-size / zero-align copy slot — and it ran ONE order. Three real gaps
-// followed: the SIZED-FIRST order was untested, a `dataAlignBytes`-ONLY fold was
-// untested (nothing forced the align field to fold INDEPENDENTLY of the size field),
-// and a fold that produced a WRONG NON-ZERO number would have passed it. The MIR tier's
-// twin (`MirMerge.IncompleteExternDataTypeFoldsToTheSizedShapeNotAConflict`) already
-// checks both orders and asserts the pair `{8, 8}`; this brings the link tier to the
-// same standard by reading the numbers out of the EMITTED IMAGE:
-//   * `dataSizeBytes` → the copy slot's `.dynsym` `st_size` (elf.cpp:1332-1337);
-//   * `dataAlignBytes` → the DISTANCE from a deliberately 1-byte-and-1-aligned PAD
-//     import's slot to the subject's, which is `alignUp(1, foldedAlign)` == the folded
-//     alignment itself (elf.cpp:1743-1749). Hence the pad: without something ahead of
-//     it the subject's slot sits at offset 0 and the alignment is unobservable.
+// ★★ WHAT THIS TEST LOST AND WHAT REPLACED IT — stated rather than quietly
+// dropped, because the loss is real. It used to read the FOLDED NUMBERS back out
+// of the emitted image: `dataSizeBytes` from the copy slot's `.dynsym` st_size,
+// and `dataAlignBytes` from the DISTANCE between a 1-aligned pad import's `.bss`
+// slot and the subject's. Both observations are GONE with the copy-relocation
+// mechanism (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET): a data import
+// now takes a GOT slot holding the library object's ADDRESS, so its declared size
+// and alignment reach NO emitter at all and cannot be recovered from the image by
+// any means. The link tier therefore cannot witness the fold's OUTPUT any more.
+//   * WHERE THE FOLD IS STILL WITNESSED, both orders and the align-only case:
+//     `MirMerge.IncompleteExternDataTypeFoldsToTheSizedShapeNotAConflict` in
+//     tests/mir/test_mir_merge.cpp, which reads the MERGED ROW directly instead of
+//     an image. That is the honest home for it now.
+//   * WHAT THIS TEST ASSERTS INSTEAD is the property the deletion BOUGHT, which is
+//     strictly stronger for the defect that motivated it: the folded row reaches
+//     the image as a data import that CLAIMS NOTHING — `.dynsym` UNDEF, st_size 0,
+//     st_value 0 — and binds through exactly one GLOB_DAT against a GOT slot. A
+//     copy-relocation-shaped regression (the exec DEFINING an imported name at its
+//     own `.bss`) reds here even if the folded numbers were perfect, and it is
+//     precisely that shape which SPLIT an aliased libc object silently.
 // Every row is EAGER and UNREFERENCED — a data object is not called, so the fixture
 // does not aim a `call rel32` at one, and the eager bit is what keeps the reference
 // gate from dropping the rows.
-TEST(CrossCuLinkFormats, IncompleteExternDataFoldsToTheSizedShapeInEitherOrder) {
+TEST(CrossCuLinkFormats, IncompleteExternDataFoldsAndClaimsNothingInEitherOrder) {
     auto loaded = loadShippedPair("x86_64", "elf64-x86_64-linux-exec");
     ASSERT_TRUE(loaded.target && loaded.format);
 
@@ -1084,9 +1092,10 @@ TEST(CrossCuLinkFormats, IncompleteExternDataFoldsToTheSizedShapeInEitherOrder) 
     pad.dataAlignBytes = 1;
     pad.isEagerImport  = true;
 
-    // Reads back (st_size, slotDistanceFromPad) for the subject "gvar2".
-    auto const foldedShape = [&](ExternImport const& first, ExternImport const& second)
-        -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
+    // Reads back the subject "gvar2"'s image-level CLAIM: (st_size, st_value,
+    // GLOB_DAT-row count against its GOT slot).
+    auto const claimShape = [&](ExternImport const& first, ExternImport const& second)
+        -> std::optional<std::tuple<std::uint64_t, std::uint64_t, std::size_t>> {
         auto mods = makeImportCus({{pad, /*referenced=*/false},
                                    {first, /*referenced=*/false},
                                    {second, /*referenced=*/false}},
@@ -1099,8 +1108,9 @@ TEST(CrossCuLinkFormats, IncompleteExternDataFoldsToTheSizedShapeInEitherOrder) 
             << "a zero size/align is an incomplete type, not a disagreement; got: "
             << (rep.all().empty() ? "" : rep.all().front().actual);
         EXPECT_EQ(countCode(rep, DiagnosticCode::K_FormatLacksImportSupport), 0u)
-            << "★ a copy slot that folded to 0 is REJECTED by the ELF writer — this "
-               "count firing means the fold kept the incomplete shape; got: "
+            << "the walker must ADMIT an incomplete-typed data import: a "
+               "got-indirect slot holds an ADDRESS, so the object's own size is "
+               "irrelevant to it; got: "
             << (rep.all().empty() ? "" : rep.all().front().actual);
         EXPECT_EQ(countName(image.externImportNames, "gvar2"), 1u)
             << "one (name, library, version) is ONE import row";
@@ -1108,15 +1118,42 @@ TEST(CrossCuLinkFormats, IncompleteExternDataFoldsToTheSizedShapeInEitherOrder) 
             ADD_FAILURE() << "no image emitted — the walker refused the folded shape";
             return std::nullopt;
         }
-        auto const rows    = readDynSymRows(image.bytes, readSections(image.bytes));
+        auto const secs    = readSections(image.bytes);
+        auto const rows    = readDynSymRows(image.bytes, secs);
         auto const subject = findDynSym(rows, "gvar2");
         auto const padRow  = findDynSym(rows, "padvar");
         if (!subject.has_value() || !padRow.has_value()) {
-            ADD_FAILURE() << "the copy-relocation slots must export through .dynsym";
+            ADD_FAILURE() << "both data imports must appear in .dynsym as "
+                             "references — an import that is not even referenced "
+                             "makes every assertion below vacuous";
             return std::nullopt;
         }
-        EXPECT_EQ(padRow->size, 1u) << "the pad's own shape must be untouched";
-        return std::pair{subject->size, subject->value - padRow->value};
+        EXPECT_EQ(padRow->size, 0u)
+            << "the PAD is an import too: it must claim nothing either";
+        // Which .dynsym index is the subject? Needed to attribute its reloc.
+        std::size_t subjectIdx = 0;
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i].name == "gvar2") subjectIdx = i;
+        }
+        // R_X86_64_GLOB_DAT == 6, and the r_offset must land inside `.got`.
+        Shdr const* got = findSection(secs, ".got");
+        if (got == nullptr) {
+            ADD_FAILURE() << "no `.got` section — a got-indirect data import has "
+                             "nowhere to bind";
+            return std::nullopt;
+        }
+        std::size_t globDats = 0;
+        for (auto const& r : readRelaDyn(image.bytes, secs)) {
+            if (r.sym != subjectIdx) continue;
+            EXPECT_EQ(r.type, 6u)
+                << "a data import's ONLY dynamic reloc must be GLOB_DAT (6); a "
+                   "COPY (5) here is the object-identity defect returning";
+            EXPECT_GE(r.offset, got->addr);
+            EXPECT_LT(r.offset, got->addr + got->size)
+                << "the slot must live in `.got`, never in `.bss`";
+            ++globDats;
+        }
+        return std::tuple{subject->size, subject->value, globDats};
     };
 
     // Each order gets its OWN verdict: the check body is a void lambda, so a failing
@@ -1124,18 +1161,22 @@ TEST(CrossCuLinkFormats, IncompleteExternDataFoldsToTheSizedShapeInEitherOrder) 
     // a bare `ASSERT_TRUE` in the TEST body returns from the WHOLE test, which would let
     // the first failing order hide whether the others fold correctly, and the whole
     // point of this fixture is that the orders are independent observations.)
-    auto const expectFoldsToSizedShape =
+    auto const expectClaimsNothing =
         [&](char const* trace, ExternImport const& first, ExternImport const& second) {
         SCOPED_TRACE(trace);
-        auto const shape = foldedShape(first, second);
-        if (!shape.has_value()) return;   // `foldedShape` already reported why
-        EXPECT_EQ(shape->first, 8u)
-            << "the COMPLETE type SIZES the copy-relocation slot; the loader memcpy's "
-               "st_size bytes, so a 0 is an unsized slot and any other number "
-               "truncates or over-copies";
-        EXPECT_EQ(shape->second, 32u)
-            << "…and ALIGNS it: the subject's slot must sit at alignUp(1, 32) past the "
-               "pad's, so this number IS the folded `dataAlignBytes`";
+        auto const shape = claimShape(first, second);
+        if (!shape.has_value()) return;   // `claimShape` already reported why
+        EXPECT_EQ(std::get<0>(*shape), 0u)
+            << "★ st_size must be 0: a NON-ZERO size here means the exec is "
+               "exporting the imported name as a DEFINED, SIZED OBJECT — the "
+               "copy-relocation shape that claimed ONE name of glibc's "
+               "{environ,_environ,__environ} alias set and split the object";
+        EXPECT_EQ(std::get<1>(*shape), 0u)
+            << "★ st_value must be 0 (SHN_UNDEF): a real address here means this "
+               "image DEFINES a name the library owns";
+        EXPECT_EQ(std::get<2>(*shape), 1u)
+            << "exactly ONE GLOB_DAT binds the import — zero means nothing "
+               "resolves the object, two means duplicate slots";
     };
 
     ExternImport sized = libImport("gvar2", "libc.so.6");
@@ -1148,21 +1189,44 @@ TEST(CrossCuLinkFormats, IncompleteExternDataFoldsToTheSizedShapeInEitherOrder) 
     incomplete.isData = true;          // 0 / 0 — the shape is unknown in THIS unit
     incomplete.isEagerImport = true;
 
-    // ★ THE DISCRIMINATING ORDER: the incomplete declaration comes FIRST, so a
-    // first-wins merge keeps 0/0 and ships an unsized, unaligned copy slot…
-    expectFoldsToSizedShape("incomplete first", incomplete, sized);
-    // …and the other order must agree — the fold is order-INDEPENDENT.
-    expectFoldsToSizedShape("sized first", sized, incomplete);
+    // Both orders: the fold is order-INDEPENDENT, and either way the image must
+    // claim nothing.
+    expectClaimsNothing("incomplete first", incomplete, sized);
+    expectClaimsNothing("sized first", sized, incomplete);
 
-    // ★ THE ALIGN FIELD FOLDS ON ITS OWN. Both rows carry the SAME non-zero size, so
-    // `dataSizeBytes` never moves at all here and ONLY the alignment can — a merge that
-    // folds size but first-wins alignment (they are two independent `foldNonZero`
-    // calls) passes every other case in this file and reds only on these two rows.
+    // The align-only case still LINKS cleanly (it is legal C), even though its
+    // fold is no longer observable here — the MIR-tier twin asserts the folded
+    // pair. Kept so a regression that REJECTED this shape still reds somewhere.
     ExternImport alignUnknown = libImport("gvar2", "libc.so.6");
     alignUnknown.isData = true;
     alignUnknown.dataSizeBytes  = 8;   // size AGREES
     alignUnknown.dataAlignBytes = 0;   // only the ALIGNMENT is unknown here
     alignUnknown.isEagerImport  = true;
-    expectFoldsToSizedShape("alignment alone unknown, unknown first", alignUnknown, sized);
-    expectFoldsToSizedShape("alignment alone unknown, sized first", sized, alignUnknown);
+    expectClaimsNothing("alignment alone unknown, unknown first", alignUnknown, sized);
+    expectClaimsNothing("alignment alone unknown, sized first", sized, alignUnknown);
+
+    // ★ FAIL-CLOSED, and it is the assertion that keeps every EXPECT_EQ(…, 0u)
+    // above from being satisfiable by an image that imports nothing at all: a
+    // FUNCTION import through the same fixture must carry a NON-ZERO st_value
+    // (its PLT stub VA). If the reader were broken, or the reference gate had
+    // dropped every row, this reads 0 too and the whole test reds.
+    ExternImport fnControl = libImport("fnctl", "libc.so.6");
+    fnControl.isEagerImport = true;
+    {
+        SCOPED_TRACE("positive control: a FUNCTION import still claims a stub VA");
+        auto mods = makeImportCus({{fnControl, /*referenced=*/false},
+                                   {sized, /*referenced=*/false}},
+                                  /*withEntry=*/true);
+        DiagnosticReporter rep;
+        auto image = linker::link(
+            std::span<AssembledModule const>{mods.data(), mods.size()},
+            *loaded.target, *loaded.format, rep);
+        ASSERT_FALSE(image.bytes.empty());
+        auto const rows = readDynSymRows(image.bytes, readSections(image.bytes));
+        auto const fnRow = findDynSym(rows, "fnctl");
+        ASSERT_TRUE(fnRow.has_value())
+            << "the reader must find a function import — otherwise the zeroes "
+               "asserted above prove only that it finds nothing";
+        EXPECT_EQ(fnRow->size, 0u) << "a function import claims no size either";
+    }
 }

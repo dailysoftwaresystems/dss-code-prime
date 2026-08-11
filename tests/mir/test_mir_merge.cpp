@@ -885,7 +885,11 @@ TEST(MirMerge, TwoConfigDeclaredImagesOwningOneNameStayTwoImports) {
 // the (unimplemented) initial-exec TLS model, so silently keeping either row
 // binds the loser CU's references through the WRONG model — the
 // D-LK-EXTERN-DATA-IMPORT silent-miscompile shape. Two DIFFERING non-zero
-// `dataSizeBytes`/`dataAlignBytes` size ONE copy-relocation `.bss` slot two ways.
+// `dataSizeBytes`/`dataAlignBytes` are two CUs declaring DIFFERENT objects under
+// ONE external name. (No emitter consumes those two fields any more — they sized
+// the ELF copy-relocation `.bss` slot, and that mechanism is deleted:
+// D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET. The CHECK keeps its own
+// subject, the cross-CU declaration disagreement, so it stays.)
 //
 // The code is K_ExternImportAttributeConflict (0x801B), NOT
 // K_SymbolRedefinedAcrossUnits: nobody DEFINES this symbol — two `extern`
@@ -938,7 +942,7 @@ TEST(MirMerge, ConflictingExternImportAttributesFailLoudAtTheMirTier) {
                                  "duration) across compilation units (false vs true)"))
             << allDiagText(rep);
     }
-    {   // Two DIFFERING non-zero sizes for ONE copy-relocation slot.
+    {   // Two DIFFERING non-zero sizes for ONE external name.
         SCOPED_TRACE("dataSizeBytes");
         ExternImport small = libImport("gvar", "libc.so.6");
         small.isData         = true;
@@ -953,7 +957,7 @@ TEST(MirMerge, ConflictingExternImportAttributesFailLoudAtTheMirTier) {
                       rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u)
             << allDiagText(rep);
         EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
-                                 "conflicting `dataSizeBytes` (copy-relocation slot "
+                                 "conflicting `dataSizeBytes` (declared object "
                                  "size) across compilation units (4 vs 8)"))
             << allDiagText(rep);
     }
@@ -972,7 +976,7 @@ TEST(MirMerge, ConflictingExternImportAttributesFailLoudAtTheMirTier) {
                       rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u)
             << allDiagText(rep);
         EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
-                                 "conflicting `dataAlignBytes` (copy-relocation slot "
+                                 "conflicting `dataAlignBytes` (declared object "
                                  "alignment) across compilation units (8 vs 16)"))
             << allDiagText(rep);
     }
@@ -983,8 +987,11 @@ TEST(MirMerge, ConflictingExternImportAttributesFailLoudAtTheMirTier) {
 // legal C (extern_import.hpp:76-81 — both fields stay 0 for an incomplete type),
 // so the merge takes the NON-ZERO shape and reports nothing. Both orders are
 // checked: the INCOMPLETE-FIRST order is the discriminating one — the pre-fix
-// first-wins merge kept CU0's 0/0 and shipped a copy-relocation `.bss` slot of
-// size ZERO, which the walker then rejects (or, worse, sizes wrong).
+// first-wins merge kept CU0's 0/0, which the walker then rejected as an unsized
+// copy slot (or, worse, sized wrong). ⓘ Since the copy-relocation deletion the
+// SIZE reaches no emitter at all, so THIS test — which reads the merged ROW
+// directly — is where the fold is still observable; its link-tier sibling in
+// test_crosscu_link_formats.cpp can no longer see it in the image.
 TEST(MirMerge, IncompleteExternDataTypeFoldsToTheSizedShapeNotAConflict) {
     ExternImport sized = libImport("gvar2", "libc.so.6");
     sized.isData         = true;
@@ -1016,8 +1023,8 @@ TEST(MirMerge, IncompleteExternDataTypeFoldsToTheSizedShapeNotAConflict) {
             << "a zero size is an incomplete type, not a disagreement: "
             << allDiagText(rep);
         EXPECT_EQ(shape->first, 8u)
-            << "the COMPLETE type sizes the copy-relocation slot (pre-fix "
-               "first-wins kept CU0's 0 and shipped an unsized slot)";
+            << "the COMPLETE type's size must survive the fold (pre-fix "
+               "first-wins kept CU0's 0)";
         EXPECT_EQ(shape->second, 8u);
     }
     {   // The other order agrees (the fold is order-independent).

@@ -244,15 +244,16 @@ lowerToLir(Mir const&          mir,
            // extern-DATA binding model, read from `ObjectFormatSchema::
            // dataImportBinding()`. Selects how a GlobalAddr of an extern
            // DATA object (libc `stdout`) materializes its address:
-           // `got-indirect` (Mach-O __got non-lazy pointer) → the address
-           // is LOADED from the __got slot (`lowerGlobalAddr` emits the
+           // `got-indirect` (ELF `.got`, Mach-O __got, PE IAT — the only
+           // member, and what every IMAGE format declares) → the address
+           // is LOADED from the slot (`lowerGlobalAddr` emits the
            // lea-of-slot + a deref Load, and the GlobalAddr+Load riprel
            // fold is SUPPRESSED so the C-level load stays a distinct
-           // second indirection); `copy-relocation` (ELF) or nullopt →
-           // the object has a direct exec-local address, the normal
-           // single-lea path. Only extern-DATA symbols under a
-           // `got-indirect` format consume it; every other module is
-           // byte-identical. Defaults to nullopt.
+           // second indirection); nullopt (a relocatable format, which
+           // binds no imports) → the normal single-lea path. Only
+           // extern-DATA symbols under a `got-indirect` format consume
+           // it; every other module is byte-identical. Defaults to
+           // nullopt.
            std::optional<DataImportBinding> dataImportBinding =
                std::nullopt,
            // TLS C1 (D-CSUBSET-THREAD-LOCAL): the ACTIVE OBJECT FORMAT's

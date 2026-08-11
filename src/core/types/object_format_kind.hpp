@@ -331,39 +331,54 @@ externCallDispatchFromName(std::string_view s) noexcept {
 // would make code read jump-stub BYTES as the object's value — the
 // silent-miscompile class the linker's pre-walker reject exists for.
 //
-//   * `copy-relocation` (ELF ET_EXEC R_X86_64_COPY / R_AARCH64_COPY):
-//     the executable reserves a correctly-sized `.bss` slot per
-//     imported object, exports the symbol as a DEFINED OBJECT at that
-//     slot, and emits one COPY relocation; the dynamic loader memcpy's
-//     the library's object into the slot at startup and every image
-//     (including the library itself, by symbol interposition) then
-//     references the executable's copy. The standard glibc non-PIE
-//     ET_EXEC mechanism — zero new instruction encodings.
+//   * `got-indirect` (ELF `.got` + R_*_GLOB_DAT; Mach-O `__got`
+//     S_NON_LAZY_SYMBOL_POINTERS; PE the IAT slot itself — c117/c149):
+//     the ADDRESS of the imported object is LOADED at run time from a
+//     per-object pointer slot the dynamic loader binds to the library's
+//     object. Code that needs the object's address loads the slot
+//     (x86_64 `mov r,[rip+disp]`; arm64 `adrp+ldr`) — one extra
+//     indirection vs a direct address, zero copies, and it works in a
+//     non-PIE image exactly as in a PIE one.
 //
-//   * `got-indirect` (Mach-O `__got` S_NON_LAZY_SYMBOL_POINTERS; c117):
-//     the address of the imported object is LOADED at run time from a
-//     per-object non-lazy pointer slot (`__DATA_CONST,__got`) that the
-//     dynamic loader (dyld) binds to the library's object. Code that
-//     needs the object's ADDRESS loads the slot (x86_64 `mov r,[rip+
-//     GOTPCREL]`; arm64 `adrp+ldr`) — one extra indirection vs a direct
-//     address, but ZERO copy + PIE-compatible (macOS arm64 images are
-//     always PIE). This is the model the PE `__imp_` data thunk will
-//     also take when it lands; the __got slot infrastructure already
-//     exists for the function-import stubs (they jump THROUGH it).
+// ── WHY `copy-relocation` IS NOT A MEMBER, AND MUST NOT COME BACK ───
+// D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET (born CLOSED).
+// There USED to be a second member, `copy-relocation`: the ELF non-PIE
+// ET_EXEC mechanism — the exec reserves a correctly-sized `.bss` slot
+// per imported object, exports the symbol as a DEFINED OBJECT at that
+// slot, emits one R_X86_64_COPY / R_AARCH64_COPY, and ld.so memcpy's
+// the library's object in at startup so that every image referencing
+// THAT NAME converges on the exec's copy.
+// It is UNSOUND, and not merely inelegant: the convergence is
+// NAME-SCOPED. glibc exports ONE `environ` object under THREE names
+// (`__environ` GLOBAL, `environ` / `_environ` WEAK, all at one
+// address), and an exec that claims only the spelling its descriptor
+// happened to name splits that object in two — `__libc_start_main`
+// writes envp into the exec's copy while libc's own `environ` slot is
+// never written, so any OTHER image reading `environ` sees an EMPTY
+// object with no diagnostic anywhere. That violates C23 6.2.2's
+// guarantee that an identifier with external linkage denotes the SAME
+// object throughout the program.
+// The member is therefore DELETED, not left inert: an enum value no
+// shipped format declares is a loaded gun — a future format file could
+// declare it and silently reintroduce the whole class. Every ELF
+// format now declares `got-indirect`, which binds the ADDRESS of the
+// library's ONE object and so cannot split it. Reintroducing the
+// mechanism would need a way to prove the alias set complete AT LINK
+// TIME WITHOUT reading the target's libc (which would break "build ANY
+// target inside ANY host"), and nobody has one.
 //
-// The PE `__imp_` data-thunk model would be a further NEW member; the
-// linker gate + walkers dispatch on the declared member, never on a
-// format-name branch. Consumed by the linker's pre-walker data-import
-// gate (linker.cpp) + the per-format walker that implements the
-// declared mechanism (elf.cpp copy-relocation / macho.cpp __got).
+// A genuinely new mechanism would be a NEW member; the linker gate +
+// walkers dispatch on the declared member, never on a format-name
+// branch — and never (since the deletion above) on the image flavour
+// either. Consumed by the linker's pre-walker data-import gate
+// (linker.cpp) + the per-format walker that implements the declared
+// mechanism (elf.cpp `.got`/GLOB_DAT, macho.cpp __got, pe.cpp IAT).
 enum class DataImportBinding : std::uint8_t {
-    CopyRelocation = 1,  // ELF ET_EXEC R_*_COPY exec-local .bss copy
-    GotIndirect    = 2,  // Mach-O __got non-lazy pointer (dyld-bound)
+    GotIndirect = 1,  // loader-bound pointer slot holding the address
 };
 
-inline constexpr EnumNameTable<DataImportBinding, 2> kDataImportBindingTable{{{
-    { DataImportBinding::CopyRelocation, "copy-relocation" },
-    { DataImportBinding::GotIndirect,    "got-indirect" },
+inline constexpr EnumNameTable<DataImportBinding, 1> kDataImportBindingTable{{{
+    { DataImportBinding::GotIndirect, "got-indirect" },
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -404,9 +419,10 @@ dataImportBindingFromName(std::string_view s) noexcept {
 // A format that declares NO `externAddrBinding` materializes an
 // `&extern` value via the ordinary lea (an absolute page-pair on arm64;
 // a PC-relative rel32 on x86_64 — already foreign-PIE-safe there). The
-// DSS-linked EXEC formats never declare it (they use
-// `dataImportBinding: "copy-relocation"` for data + a direct address for
-// functions); the PIE/dyn formats use the c117 DSS-local-slot path. Only
+// DSS-linked EXEC formats never declare it (their data imports take the
+// `dataImportBinding: "got-indirect"` slot path and their functions a
+// direct address); the PIE/dyn formats use the c117 DSS-local-slot
+// path. Only
 // the arm64 relocatable + static-archive formats declare `got`. Consumed
 // by MIR→LIR `lowerGlobalAddr` (the value-form arm, keyed on the
 // derived symbol set — never a format/arch identity branch). An unknown

@@ -18,7 +18,11 @@
 //   * undefined-extern policy: dyn KEEPS referenced no-library
 //     externs (ld.so global scope); exec still REJECTS.
 //   * validate() shape rules: no interpreter / no entryPoint / text
-//     VA == pageAlign / no copy-relocation binding / soname dyn-only.
+//     VA == pageAlign / soname dyn-only. (There was a fourth rule —
+//     "no copy-relocation binding" — until the enum value it policed
+//     was deleted; see
+//     `DeletedCopyRelocationBindingRefusedAtLoadOnEveryFlavour`
+//     below, which replaces a flavour rule with a flavour-BLIND one.)
 //   * fail-loud belts: TLS-in-.so (D-LK-DYN-TLS-MODEL), absolute
 //     reloc in `.text` (D-LK-DYN-TEXT-ABS-RELOC), reloc-bearing
 //     rodata (D-LK-DYN-RODATA-ITEM-RELOC).
@@ -455,8 +459,27 @@ TEST(ElfDynFormatJson, TextVaNotEqualPageAlignRejectedAtLoad) {
     EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
-TEST(ElfDynFormatJson, CopyRelocationBindingOnDynRejectedAtLoad) {
-    auto r = ObjectFormatSchema::loadFromText(R"({
+// ★ THE VOCABULARY DELETION, pinned — D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-
+// AN-ALIAS-SET. `"copy-relocation"` was a real `DataImportBinding` member: the
+// ELF non-PIE ET_EXEC mechanism (a `.bss` slot + a DEFINED OBJECT dynsym + one
+// R_*_COPY). It is UNSOUND because its convergence-on-one-storage is
+// NAME-SCOPED: glibc exports ONE environment object under THREE names, and an
+// exec claiming only the spelling its descriptor named left the others pointing
+// at never-written storage — a third-party `.so` reading `environ` got NULL with
+// no diagnostic anywhere.
+//
+// WHAT THIS TEST USED TO BE, AND WHY THE CHANGE IS NOT COSMETIC: it was
+// `CopyRelocationBindingOnDynRejectedAtLoad`, pinning a FLAVOUR rule — copy
+// relocations are the executable's mechanism, so a `.so` declaring one was
+// invalid ELF. That rule is gone WITH ITS SUBJECT: the enum member was deleted,
+// so no schema of ANY flavour can spell it. The reject that replaces it is
+// STRONGER and flavour-blind — the loader's closed-enum check — and this test
+// asserts it on BOTH an ET_DYN and an ET_EXEC schema, because "available just in
+// case" is exactly the state that would let one JSON edit reintroduce the whole
+// defect class.
+TEST(ElfDynFormatJson, DeletedCopyRelocationBindingRefusedAtLoadOnEveryFlavour) {
+    // (a) ET_DYN — the shape the OLD flavour rule policed.
+    auto dyn = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LP64",
@@ -466,9 +489,51 @@ TEST(ElfDynFormatJson, CopyRelocationBindingOnDynRejectedAtLoad) {
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
     })");
-    ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(countAtPath(r, "/dataImportBinding"), 1u) << rejectSummary(r);
-    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    ASSERT_FALSE(dyn.has_value())
+        << "a deleted vocabulary value must be REFUSED AT LOAD, not stored";
+    EXPECT_EQ(countAtPath(dyn, "/dataImportBinding"), 1u) << rejectSummary(dyn);
+    EXPECT_EQ(errorCount(dyn), 1u) << rejectSummary(dyn);
+
+    // (b) ★ ET_EXEC — the shape the old rule did NOT police, and the one the
+    //     defect actually shipped in. The two shipped ELF exec formats DID
+    //     declare "copy-relocation"; if the value merely stopped being used,
+    //     re-adding it here would load clean and bind data imports the unsound
+    //     way again.
+    auto exec = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"exec-copy-reloc","kind":"elf"},
+      "dataImportBinding": "copy-relocation",
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
+    })");
+    ASSERT_FALSE(exec.has_value())
+        << "the ET_EXEC arm is the one the defect shipped in; it must be "
+           "refused too, and by the SAME flavour-blind check";
+    EXPECT_EQ(countAtPath(exec, "/dataImportBinding"), 1u) << rejectSummary(exec);
+
+    // (c) POSITIVE CONTROL: the surviving member still LOADS on the same
+    //     schema, so (a)/(b) are the closed-enum check firing and not the
+    //     fixture being rejected for some unrelated reason.
+    auto good = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"dyn-got-indirect","kind":"elf"},
+      "dataImportBinding": "got-indirect",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    EXPECT_TRUE(good.has_value())
+        << "positive control: \"got-indirect\" must still load — otherwise the "
+           "rejects above prove nothing about the VALUE";
 }
 
 TEST(ElfDynFormatJson, SonameOnNonDynRejectedAtLoad) {
