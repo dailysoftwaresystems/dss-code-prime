@@ -554,14 +554,26 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   a gate item with a number, checked exactly like ctest. Count before and after and report both:
 
   ```bash
-  git show HEAD:.plans/_deferred-anchor-registry.md \
-    | grep -cE '\| `D-[A-Z0-9-]+` \| (🔴|🟠|⚠)'        # OPEN at cycle start
-  grep -cE '\| `D-[A-Z0-9-]+` \| (🔴|🟠|⚠)' \
-    .plans/_deferred-anchor-registry.md                 # OPEN now
+  python tools/check-anchor-balance.py
   ```
+
+  It prints OPEN-at-base, OPEN-now, and **the name of every row that opened or closed** — the count
+  alone cannot tell you which, and "which" is the question. Exit 1 when the cycle leaves more open
+  than it found.
 
   `after > before` ⇒ **the gate FAILS.** Close the difference, or escalate the one you cannot close
   as a **§B decision** — the user chooses to carry it; the cycle does not decide that for itself.
+
+  ⚠ **DO NOT go back to an inline `grep -c` over a list of status glyphs.** That was the first
+  version of this gate and it was wrong in the direction that flatters the cycle: it enumerated
+  `🔴|🟠|⚠` and was blind to `⏳`, so it reported **269** open rows where there were **579**, and a
+  cycle that closed one 🟠 row while opening one ⏳ row would have been congratulated for an
+  improvement. ✔MEASURED 2026-08-11, on the very cycle that introduced the gate — the row it could
+  not see was `D-OPT6-LICM-SPECULATIVE-LOAD-HOIST`, a HIGH miscompile. The tool inverts the rule:
+  **a row is OPEN unless its status cell carries an explicit `✅`**, so a glyph nobody has thought of
+  yet counts as open, which is the safe direction. `--self-test` pins that inversion (including a
+  deliberately novel glyph); run it if you touch the script. Enumerating the open glyphs is the same
+  mistake as enumerating build-directory layouts — define the complement, not the variants.
   Opening rows is fine and often right; ENDING ON A HIGHER NUMBER is what is forbidden, because that
   is the arithmetic by which a 3,000-row audit trail became a 350-row backlog nobody reads.
 

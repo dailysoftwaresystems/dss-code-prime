@@ -125,7 +125,7 @@ fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
 # a pass over work it did not do.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN,
 # by design. One line to update, against an instrument that would otherwise lie.
-TOTAL_ASSERTIONS=136     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+TOTAL_ASSERTIONS=138     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
                          # + 28 loadext staging + 6 staged sqlite_cfg.h (this driver)
                          # + 4 launcher argv form (this driver, 2 of them behavioural)
                          # + 40 driver-pairing (.ps1-gated): 12 original + 28 for
@@ -939,6 +939,20 @@ else
     [elf64-x86_64]="'^walsetlk-' '^busy2-' '^zipfile-25\\.0\$'"
     [pe64-x86_64]=""
     [elf64-arm64]="'^busy2-' 'emulated:^writecrash-'"
+    [unprobedleg]="'^busy2-'"
+  )
+  # ★ THE GATING STAMP. The supply now REFUSES a plan whose confound gating was
+  # not MEASURED: a conditional row (`requires: [<environment probe>]`) is honoured
+  # only where the probe found its defect on this machine, and an `unprobed` plan is
+  # safe (conditional rows dropped) but not usable — its withheld excusals would
+  # surface as GENUINE reds and read as compiler regressions. Declared for every
+  # fixture leg, plus ONE leg left `unprobed` so the refusal itself is exercised.
+  # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  declare -A LEG_CONFOUND_GATING=(
+    [elf64-x86_64]="probed"
+    [pe64-x86_64]="probed"
+    [elf64-arm64]="probed"
+    [unprobedleg]="unprobed"
   )
   DSS_CONFOUNDS=""
   # `die` stubbed so the shipped refusal is a CATCHABLE outcome: the last two
@@ -987,6 +1001,23 @@ else
   SUPOUT="$(leg_confound_patterns macho64-arm64 2>&1)"; SUPRC=$?
   check_eq "an UNDECLARED leg REFUSES rather than answering []" "97" "$SUPRC"
   check "...naming the reason"  "transport" "$SUPOUT"
+  # ★★ AND THE MEASUREMENT GATE ITSELF. Two assertions, because the failure this
+  # closes is silent in one direction only: an unmeasured run that serves its
+  # ungated list looks exactly like a measured one, and the reds it produces read
+  # as compiler regressions rather than as a missing measurement.
+  # ⚠ WHAT THIS ASSERTS, AND WHAT IT DOES *NOT*.
+  # [D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL.] `SUPRC=$?` reads the
+  # SUBSTITUTION's status directly — a shape the production call site does not have,
+  # because it ran the substitution inside `eval "CONFOUND_PATTERNS=(…)"` where bash
+  # discards it. So these two lines prove the FUNCTION refuses and prove NOTHING
+  # about whether the DRIVER STOPS; ✔MEASURED, it did not, and the whole corpus would
+  # have run with an empty confound list. The driver-level property is pinned by
+  # test-driver-contracts.sh's I2 case (and its .ps1 twin G2), which extracts the
+  # real call site and runs it in a child shell. Both are kept: the function's
+  # contract and the driver's behaviour are different claims.
+  SUPOUT="$(leg_confound_patterns unprobedleg 2>&1)"; SUPRC=$?
+  check_eq "an UNPROBED plan REFUSES rather than serving its ungated list" "97" "$SUPRC"
+  check "...naming the gating it actually got" "confoundGating='unprobed'" "$SUPOUT"
   unset -f die
 fi
 

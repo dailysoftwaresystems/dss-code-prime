@@ -570,6 +570,15 @@ RUN_FILESYSTEMS = {
         # be a round-trip whose answer could differ from the caller's own view.
         "probeArgv": {},
         "validHostOs": "",
+        # ★ DOES THE LAUNCHED PROCESS SHARE THIS DRIVER'S KERNEL?
+        # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+        # D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE
+        # `driver` is one machine, one kernel, one clock — Wine,
+        # qemu-user and `arch -x86_64` are all in-process translation, so an
+        # environment probe run by this driver is measuring the very environment
+        # the fixture will get. Declared as a FIELD, not decided by looking at the
+        # verb's NAME, so a new launcher has to state it.
+        "sharesDriverKernel": True,
     },
     "wsl-linux": {
         # /tmp, not $HOME: ✔MEASURED ext4 with 749 G free, and it is the one
@@ -607,6 +616,16 @@ RUN_FILESYSTEMS = {
                           'command -v "$1" >/dev/null', "--", "{path}"],
         },
         "validHostOs": "windows",
+        # ⚠ FALSE, AND IT IS THE ONE THAT MATTERS FOR THE CLOCK PROBE. This launcher
+        # crosses into a DIFFERENT KERNEL — and the measured clock defect
+        # (D-ENV-WSL2-CLOCK-REALTIME-STEPS-34S) is that kernel's, not Windows'. So a
+        # Windows-driven run of this leg samples a HEALTHY Windows clock and gets
+        # ABSENT, while the fixture executes against the WSL2 clock that steps.
+        # ⇒ THE ERROR IS A FALSE NEGATIVE, WHICH IS THE SAFE DIRECTION: the clock
+        # rows go INACTIVE, an environment-caused walsetlk failure is reported as
+        # GENUINE, and somebody investigates. It is NOT silently excused. The
+        # report SAYS SO per leg rather than leaving a reader to notice.
+        "sharesDriverKernel": False,
     },
 }
 
@@ -1025,15 +1044,62 @@ def resolve_launcher_requirements(entry, where=""):
 # nothing has ever been earned there and that every failure counts. The key is
 # REQUIRED on every leg so that silence cannot mean "nobody filled this in".
 #
-# `scope` reproduces the `native:`/`emulated:` prefix vocabulary the drivers have
-# always used, as a FIELD rather than a string prefix an operator has to spell:
-#   any        excused however this leg runs.
+# ── `scope` IS LEGACY: A RUN MODE IS NOT A HOST ─────────────────────────────
+#
+# [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.]
+#
+# `scope` matched a pattern against the leg's RUN MODE — `any` / `native` /
+# `emulated`. It is the wrong axis for any row whose mechanism is a property of
+# the MACHINE, and the catalogue could not say so, so it said nothing:
+#
+#   · `^walsetlk-`, `^walsetlk_recover-` and `^busy2-` are excused because THIS
+#     BOX'S CLOCK_REALTIME steps ~34.47 s every ~5 s. There is no `scope` that
+#     spells "on a host whose clock does that", so all three sat at `scope: any`
+#     — which excuses the family on EVERY machine, including the arm64 VPS where
+#     the clock has never been shown to step. A GENUINE walsetlk regression there
+#     would have been swallowed in silence.
+#   · The condition was ALREADY WRITTEN DOWN. legs[1]'s `$confoundsComment` says
+#     the clock rows are declared because the mechanism is "a property of the
+#     HOST'S CLOCK, which both Linux legs share WHEN THIS HARNESS IS DRIVEN FROM
+#     THIS BOX". A load-bearing condition, recorded in prose, where nothing reads
+#     it — the same failure as `earnedOn`, one field along.
+#
+# ⇒ THE CONDITION BECOMES A MEASUREMENT. A row may declare
+# `requires: [<probe name>]`, and it is honoured only when every named probe
+# MEASURES its defect as PRESENT on the machine this run is happening on. `[]` is
+# the unconditional claim and is the common answer.
+#
+# ★ WHY THIS IS NOT HOST-KEYING (and legs.json's `$noHostKeyingComment` now says
+# it positively): A MEASURED PROPERTY OF THE RUNNING ENVIRONMENT IS ADMISSIBLE; A
+# NAME FOR THE ENVIRONMENT NEVER IS. `if host == 'wsl'` is forbidden because a
+# name is not evidence and it cannot be wrong out loud. "This clock steps 34.5 s,
+# here are the 4 steps I watched it take" is evidence, it is checkable, and it is
+# false on a healthy box — which is the entire point.
+#
+# ⛔ WHY `scope: emulated` WAS REJECTED AS THE FIX FOR THE CLOCK ROWS. It is a
+# PROXY, and this project already owns the receipts:
+# D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT records this same pin
+# being re-cut TWICE, each time by the case it was meant to judge. It is also
+# provably wrong in BOTH directions: `emulated` would excuse walsetlk under Wine
+# on a healthy-clock box (false excusal), and the `^writecrash-` row below already
+# documents the proxy breaking the other way on an arm64 Windows host. A proxy
+# with two recorded failures is not a candidate.
+#
+# `scope` is therefore LEGACY, not an alternative: it survives ONLY on rows whose
+# real mechanism has no probe yet, each of which must NAME ITS BLOCKER
+# (`scopeLegacyBlocker`). `scope: any` is REFUSED outright — that claim is now
+# spelled `requires: []`. The axis retires when the last row leaves it, the way
+# `copy-relocation` was retired: deleted, not left inert.
 #   native     excused only when THIS HOST executes the artefact directly.
 #   emulated   excused only when it goes through a declared launcher. The name is
 #              the operator-facing DSS_CONFOUNDS vocabulary and is deliberately
 #              NOT renamed to `launched`: renaming it would silently un-excuse
 #              every `emulated:` pattern an operator has ever typed.
-CONFOUND_SCOPES = ("any", "native", "emulated")
+CONFOUND_SCOPES = ("native", "emulated")
+
+# Retired from CONFOUND_SCOPES, and NAMED so the refusal can explain itself
+# instead of reporting "unknown scope" for a value that used to be the default.
+RETIRED_CONFOUND_SCOPES = ("any",)
 
 # Required on EVERY declared pattern, all non-empty. These are the four questions
 # a reader must be able to answer without leaving the file: what does it match,
@@ -1046,23 +1112,735 @@ CONFOUND_PROVENANCE_KEYS = ("earnedOn", "earnedAt", "mechanism", "anchor")
 def confound_scope_prefix(scope):
     """The `native:`/`emulated:` prefix a scope becomes on the wire, so the two
     drivers' long-standing pattern grammar is produced in ONE place instead of
-    being re-spelled in each of them."""
+    being re-spelled in each of them.
+
+    `scope` is LEGACY (see the block above). This function is what a row still on
+    the axis passes through; a row that has migrated never reaches it."""
+    if scope in RETIRED_CONFOUND_SCOPES:
+        raise LegError(
+            "confound scope %r is RETIRED. It meant 'excused however this leg "
+            "runs', which is now spelled `requires: []` — an explicit claim that "
+            "the excusal depends on nothing measurable. The `scope` axis survives "
+            "only for rows whose real mechanism has no probe yet, and each of "
+            "those must name its blocker. "
+            "[D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]" % (scope,))
     if scope not in CONFOUND_SCOPES:
         raise LegError(
             "unknown confound scope %r (known: %s). A scope decides whether a "
             "pattern excuses a failure at all; an unrecognised one cannot be "
-            "treated as 'any', because 'any' is the widest possible excusal."
-            % (scope, ", ".join(CONFOUND_SCOPES)))
-    return "" if scope == "any" else scope + ":"
+            "treated as unconditional, because unconditional is the widest "
+            "possible excusal." % (scope, ", ".join(CONFOUND_SCOPES)))
+    return scope + ":"
 
 
-def leg_confounds(leg):
-    """This leg's DECLARED confound patterns, in wire form (`emulated:^re`).
+# ── WHICH RUN MODES A `scope`d PATTERN CAN EVER MATCH ───────────────────────
+#
+# [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.]
+#
+# `scope` is LEGACY, but while it survives the harness has to be able to SAY —
+# per leg, per run — whether a scoped row can match anything here at all. It
+# could not, and the report said the opposite: ✔MEASURED at 0ecec160 with
+# `--host-os linux --host-arch arm64 --launchers-none` (run mode `native`),
+# `confound rows ACTIVE (4 of 7): ... emulated:^writecrash- ...` with the reason
+# "unconditional (`requires: []`) ... nothing this harness measures per run".
+# Two claims, both false: on a native run the matcher never applies an
+# `emulated:` pattern, so the row is neither unconditional nor in force. The
+# direction was safe; the ACCOUNT — whose entire job is to say why a failure was
+# excused — overstated the excusal set.
+#
+# ⚠ THE MATCHING ITSELF STAYS IN THE DRIVERS' MATCHER, ITS ONE OWNER. This table
+# is NOT a second implementation of it: the wire pattern keeps its prefix and is
+# still supplied verbatim, because a planner that ALSO decided scope matches
+# would make two places answer one question — the defect
+# D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG already cost this project
+# once, one axis along. What this table buys is HONEST REPORTING: the account
+# says a scoped row is SUPPLIED but not in force here, and names the run mode
+# that would put it in force.
+RUN_MODES = ("native", "launched", "skip")
+CONFOUND_SCOPE_RUN_MODES = {
+    "native": ("native",),
+    # `emulated` is the operator-facing DSS_CONFOUNDS spelling and is
+    # deliberately NOT renamed to `launched` (see CONFOUND_SCOPES); the mapping
+    # to the run mode it means lives here, declared, rather than in a reader's
+    # head.
+    "emulated": ("launched",),
+}
 
-    A leg with no `confounds` key RAISES rather than returning []: an empty list
-    is a claim a catalogue must make out loud, and a missing key would make
-    "nothing was ever earned here" indistinguishable from "this leg predates the
-    declaration" — which is the ambiguity the old per-driver lists lived in."""
+
+def confound_scope_run_modes(scope):
+    """The run modes in which a `scope`d pattern can match at all, or a
+    LegError. Never a permissive default: an unknown scope answered with "every
+    mode" would report a dead row as in force, which is the direction that
+    overstates what was excused."""
+    modes = CONFOUND_SCOPE_RUN_MODES.get(scope)
+    if modes is None:
+        raise LegError(
+            "confound scope %r declares no run modes it can match (known: %s). "
+            "A scope is a claim about HOW the leg runs; one whose modes nobody "
+            "declared cannot be reported as in force, and cannot be reported as "
+            "dead either." % (scope, ", ".join(sorted(CONFOUND_SCOPE_RUN_MODES))))
+    return modes
+
+
+# ── THE ENVIRONMENT-DEFECT PROBE REGISTRY ───────────────────────────────────
+#
+# [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.]
+#
+# A confound row's `requires` names PROBES, and a probe is a MEASURED PROCEDURE
+# that answers one question about the machine this run is happening on:
+#
+#   present         the defect is HERE — I watched it happen, and here is what I saw
+#   absent          I looked and it did not happen
+#   indeterminate   I could not look (no instrument, the measurement was cut short)
+#
+# ★★ THE ERRORS ARE NOT SYMMETRIC, AND THE WHOLE DESIGN FOLLOWS FROM THAT.
+#
+#   FALSE NEGATIVE — `absent` on a box that HAS the defect: the confound rows go
+#   INACTIVE, environment failures are reported as genuine reds, somebody
+#   investigates and finds the clock. NOISY BUT SAFE.
+#
+#   FALSE POSITIVE — `present` on a HEALTHY box: a real DSS miscompile is
+#   SILENTLY EXCUSED. SILENT AND DANGEROUS — it is the exact failure this whole
+#   mechanism exists to remove, so a mechanism that can commit it is worse than
+#   none.
+#
+# ⇒ EVERY PROBE IS BIASED TOWARD `absent`. `indeterminate` is honoured as
+# `absent` (never as `present`), the thresholds must be CLEARED rather than
+# approached, and a probe that raises is `indeterminate` and says so.
+#
+# ★ THE ENGINE HAS NO PROBE-NAME BRANCH. A registry entry names a VERB; the
+# engine looks the verb up in this closed table and calls its `measure`. Adding
+# `clock-realtime-steps-on-the-vps` needs NO code. Adding a new KIND of
+# measurement adds a verb here — a vocabulary extension, exactly like
+# RUN_FILESYSTEMS / PATH_TRANSLATIONS / ENV_TRANSFERS — and the lint then refuses
+# any registry entry naming a verb this table does not have.
+PROBE_VERDICTS = ("present", "absent", "indeterminate")
+
+
+def probe_verdict_honours(verdict):
+    """Does this verdict permit a row that REQUIRES the probe to be honoured?
+
+    ONLY `present`. `indeterminate` is deliberately NOT a maybe: a row honoured
+    on "I could not measure" is a row honoured on nothing, which is the state
+    `scope: any` was already in."""
+    if verdict not in PROBE_VERDICTS:
+        raise LegError(
+            "unknown probe verdict %r (known: %s). A verdict decides whether a "
+            "failure is excused; an unrecognised one cannot be read as "
+            "'present', because 'present' is the direction that hides a real "
+            "compiler defect." % (verdict, ", ".join(PROBE_VERDICTS)))
+    return verdict == "present"
+
+
+# The "nothing was injected" sentinel. `None` cannot do this job: `monotonic=None`
+# is a REAL fixture — "this interpreter has no monotonic clock" — and the arm it
+# selects (INDETERMINATE) is one the self-test has to be able to drive. Reusing
+# None for both would make that arm permanently unreachable from a test, which is
+# how a defensive branch comes to be shipped unexercised.
+_PROBE_DEFAULT = object()
+
+
+def _measure_wall_clock_step(config, clock=None, monotonic=_PROBE_DEFAULT,
+                             sleeper=None):
+    """Does this machine's WALL CLOCK step, relative to its MONOTONIC clock?
+
+    THE INSTRUMENT IS THE DIFFERENCE OF TWO CLOCKS, and that choice is the
+    noise immunity. Sampling CLOCK_REALTIME alone would have to assume the sleep
+    interval was honoured, so a descheduled process, a loaded box or a slow
+    filesystem would all read as "the clock jumped". Subtracting the monotonic
+    delta cancels every one of those: a scheduling delay inflates BOTH deltas
+    equally and the difference stays ~0. What survives is a wall clock that
+    moved when monotonic time did not — which is the defect, and nothing else.
+
+    ✔THE SIGNATURE THIS IS CALIBRATED AGAINST (D-ENV-WSL2-CLOCK-REALTIME-STEPS-
+    34S, MEASURED 2026-08-01, two independent instruments): CLOCK_REALTIME
+    oscillates between two values ~34.47 s apart, flipping every ~5 s; 49 and 48
+    steps observed; total spread 35.164 s. So a 20 s sample at 250 ms sees ~4
+    flips, and `minStepSeconds: 5` sits ~7x below the real magnitude and ~4
+    orders of magnitude above scheduler noise.
+
+    The clocks are INJECTED so the self-test drives every arm — present, absent,
+    indeterminate, and the boundary either side of each threshold — on any host,
+    in milliseconds, with no dependence on the machine running the test."""
+    import time as _time
+    clock = clock or _time.time
+    if monotonic is _PROBE_DEFAULT:
+        monotonic = getattr(_time, "monotonic", None)
+    sleeper = sleeper or _time.sleep
+    if monotonic is None:
+        # NOT a failure of the box: a failure of the INSTRUMENT. Reported as
+        # indeterminate (⇒ honoured as absent) rather than guessed either way.
+        return "indeterminate", ("no monotonic clock on this interpreter, so a "
+                                 "wall-clock step cannot be told from a "
+                                 "scheduling delay"), {}
+    window = float(config["sampleSeconds"])
+    interval = float(config["sampleIntervalMs"]) / 1000.0
+    min_step = float(config["minStepSeconds"])
+    min_steps = int(config["minStepsRequired"])
+    steps, worst, samples = 0, 0.0, 0
+    lo = hi = None
+    m0 = monotonic()
+    prev_w, prev_m = clock(), m0
+    try:
+        while monotonic() - m0 < window:
+            sleeper(interval)
+            w, m = clock(), monotonic()
+            samples += 1
+            # The wall clock's own drift over this tick, with real elapsed time
+            # taken out. |.| because the measured defect steps BOTH ways.
+            drift = abs((w - prev_w) - (m - prev_m))
+            if drift > worst:
+                worst = drift
+            if drift >= min_step:
+                steps += 1
+            # The oscillation AMPLITUDE, monotonic time removed, so a clock that
+            # merely runs fast is not mistaken for one that jumps.
+            offset = w - m
+            lo = offset if lo is None else min(lo, offset)
+            hi = offset if hi is None else max(hi, offset)
+            prev_w, prev_m = w, m
+    except Exception as exc:                                # noqa: BLE001
+        # A clock that cannot be read is an unmeasured machine, not a healthy one
+        # and not a broken one. Said out loud, honoured as absent.
+        return "indeterminate", ("the sample was cut short by %s: %s"
+                                 % (type(exc).__name__, exc)), {
+            "samples": samples, "steps": steps}
+    spread = 0.0 if lo is None else hi - lo
+    evidence = {"samples": samples, "steps": steps,
+                "worstDriftSeconds": round(worst, 4),
+                "spreadSeconds": round(spread, 4),
+                "windowSeconds": round(monotonic() - m0, 3)}
+    if samples < 2:
+        return "indeterminate", ("only %d sample(s) in %.1f s — a step needs at "
+                                 "least two intervals to be visible at all"
+                                 % (samples, window)), evidence
+    # BOTH thresholds, and both must be CLEARED. Either alone is weaker than the
+    # measured signature: a single big drift could be one suspend/resume, and a
+    # spread with no per-tick step is a clock that drifts rather than jumps.
+    if steps >= min_steps and spread >= min_step:
+        return "present", (
+            "%d step(s) >= %d required; worst per-tick wall-vs-monotonic drift "
+            "%.3f s and total offset spread %.3f s, both >= %.3f s, over %.1f s "
+            "/ %d samples" % (steps, min_steps, worst, spread, min_step,
+                              evidence["windowSeconds"], samples)), evidence
+    return "absent", (
+        "%d step(s) (need %d) with worst per-tick drift %.4f s and offset spread "
+        "%.4f s (need %.3f s) over %.1f s / %d samples: this machine's wall clock "
+        "tracked its monotonic clock"
+        % (steps, min_steps, worst, spread, min_step, evidence["windowSeconds"],
+           samples)), evidence
+
+
+# THE CLOSED VERB TABLE. `configKeys` closes the config so a typo'd threshold is
+# a LOUD refusal and not a silently-ignored key; `floors` is the one thing config
+# may NOT weaken.
+#
+# ★★ WHY THE FLOORS ARE IN CODE AND THE THRESHOLDS ARE IN CONFIG. The operator's
+# rule is that tightening a threshold must be an edit, not a code change — so
+# `sampleSeconds`, `minStepSeconds` and friends live in legs.json. But a
+# threshold that config can LOOSEN without limit is a guard that gets re-cut to
+# fit whatever case is in front of it, which this project has already paid for
+# twice (D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT). So config may
+# only move a threshold in the SAFE direction: the floors below are the weakest
+# configuration that can still support a `present`, and the lint refuses anything
+# looser, naming the asymmetry. `sampleSeconds >= 15` and `minStepsRequired >= 2`
+# are the operator's stated floor — never a single pair of readings.
+ENVIRONMENT_PROBE_VERBS = {
+    "wall-clock-step": {
+        "measure": _measure_wall_clock_step,
+        "asks": "does this machine's CLOCK_REALTIME jump relative to its "
+                "monotonic clock?",
+        "configKeys": ("sampleSeconds", "sampleIntervalMs", "minStepSeconds",
+                       "minStepsRequired"),
+        "floors": {"sampleSeconds": 15.0, "minStepsRequired": 2,
+                   "minStepSeconds": 1.0},
+        # Config may only ever RAISE these. `sampleIntervalMs` has no floor: a
+        # shorter interval takes MORE samples in the same window, which can only
+        # make the measurement finer.
+        "raiseOnly": ("sampleSeconds", "minStepsRequired", "minStepSeconds"),
+    },
+}
+
+# Required on every registry entry, all non-empty — the same discipline
+# CONFOUND_PROVENANCE_KEYS imposes on a confound row, for the same reason. A
+# probe decides whether a failure is excused; it has to say what it measures,
+# what a `present` would mean, and which anchor holds the long form.
+PROBE_DECLARATION_KEYS = ("verb", "measures", "presentMeans", "anchor")
+
+
+def environment_probes(catalogue_doc):
+    """The declared registry, or {} — and `{}` is legal: a catalogue in which no
+    row is conditional needs no probes. A row that NAMES a probe the registry
+    does not declare is refused by the lint, so an empty registry cannot silently
+    disable a gate."""
+    probes = catalogue_doc.get("environmentProbes", {})
+    if not isinstance(probes, dict):
+        raise LegError("`environmentProbes` must be an object, got %r"
+                       % type(probes).__name__)
+    return probes
+
+
+def probe_verb(name):
+    """The declared verb's spec, or a LegError — never a permissive default, for
+    the same reason run_filesystem() has none: an unknown verb treated as
+    anything at all is a probe whose answer nobody chose."""
+    spec = ENVIRONMENT_PROBE_VERBS.get(name)
+    if spec is None:
+        raise LegError(
+            "unknown environment-probe verb %r (known: %s). A probe's verb IS "
+            "its measured procedure; there is no default, because the only two "
+            "candidates for one are 'assume the defect is here' (which hides "
+            "compiler bugs) and 'assume it is not' (which is what an ABSENT "
+            "verdict already says out loud)."
+            % (name, ", ".join(sorted(ENVIRONMENT_PROBE_VERBS))))
+    return spec
+
+
+# ── WHERE A VERDICT CAME FROM ───────────────────────────────────────────────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT
+#
+# ★★★ THE NEW DOOR WAS QUIETER THAN THE OLD ONE, IN THE DANGEROUS DIRECTION.
+# `--probe-verdicts FILE` accepted any JSON object, checked only that it was a
+# dict, stamped the plan `confoundGating: probed` and honoured whatever it said.
+# ✔MEASURED at 0ecec160: a hand-written
+# `{"clock-realtime-steps": {"verdict": "present", "why": "I said so", ...}}`
+# produced `gating=probed`, all 7 rows ACTIVE, and a report line reading
+# `clock-realtime-steps = PRESENT   [wall-clock-step: I said so]` — nothing in
+# the plan or the log distinguished it from a measurement. Contrast the OPERATOR
+# override DSS_CONFOUNDS, which both drivers announce per leg as
+# `[operator DSS_CONFOUNDS - applied to EVERY leg]`.
+#
+# ⇒ TWO THINGS, AND NEITHER ALONE IS ENOUGH.
+#   1. EVERY INJECTED ENTRY IS VALIDATED against the declared registry (the probe
+#      NAME must be declared, the `verb` must match ITS declaration, the verdict
+#      must be in the closed set, the evidence must be a map) with a named
+#      LegError instead of a python traceback from three frames deeper.
+#      ✔MEASURED before this: `{"clock-realtime-steps": "present"}` raised
+#      `ValueError: dictionary update sequence element #0 has length 1` and
+#      `{"clock-realtime-steps": {"why": "..."}}` raised `KeyError: 'verdict'`.
+#   2. IT IS HONOURED, AND IT IS LOUD, AND IT CANNOT RUN A CORPUS. An injected
+#      verdict still decides rows — the flag exists so a caller and the pins can
+#      drive the honouring path without sampling a clock for 20 s — but the plan
+#      is stamped `confoundGating: injected`, which is NOT the one gating both
+#      drivers accept, so a verdict file captured on the WSL2 box and replayed on
+#      the arm64 VPS STOPS THE DRIVER instead of silently restoring the blind
+#      spot this gate closed. Every report line derived from one says INJECTED in
+#      words, so a log reader can never mistake it for a measurement.
+PROBE_SOURCE_MEASURED = "measured"
+PROBE_SOURCE_INJECTED = "injected"
+PROBE_SOURCES = (PROBE_SOURCE_MEASURED, PROBE_SOURCE_INJECTED)
+
+# Required on every INJECTED entry, all present. `evidence` is required too: a
+# verdict with no evidence beside it is the `earnedOn` defect wearing a JSON key,
+# and `{}` is a legal answer for the indeterminate arms that have none.
+INJECTED_VERDICT_KEYS = ("verdict", "why", "verb", "evidence")
+
+
+def validate_probe_verdicts(verdicts, catalogue_doc, source_label):
+    """Injected verdicts, VALIDATED against the declared registry and stamped
+    `source: injected` — or a named LegError.
+
+    Returns a NEW map; the caller's object is never mutated, so a caller that
+    also wants the raw file contents still has them.
+
+    ★ WHY EVERY CLAUSE IS HERE RATHER THAN "trust the caller, it is a test flag":
+    the flag is reachable from any shell, its effect is to EXCUSE FAILING TESTS,
+    and the failure mode is silent. A validated refusal costs a line; an
+    unvalidated `present` costs a real compiler defect."""
+    probes = environment_probes(catalogue_doc)
+    if not isinstance(verdicts, dict):
+        raise LegError(
+            "%s is not the JSON object --probe-environment prints (got %s). "
+            "A verdict map decides which failing tests are excused; a value of "
+            "another shape cannot be read as one."
+            % (source_label, type(verdicts).__name__))
+    out = {}
+    for name in sorted(verdicts):
+        got = verdicts[name]
+        if name not in probes:
+            raise LegError(
+                "%s carries a verdict for '%s', which the catalogue's "
+                "`environmentProbes` registry does not declare (declared: %s). "
+                "A verdict for an undeclared probe can gate nothing, and "
+                "accepting it silently would let a typo'd name look like a "
+                "measurement that happened. See anchor, ONE LINE, DO NOT WRAP: "
+                "D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT"
+                % (source_label, name, ", ".join(sorted(probes)) or "<none>"))
+        if not isinstance(got, dict):
+            raise LegError(
+                "%s: the verdict for '%s' is %s, not the object "
+                "--probe-environment prints ({verdict, why, verb, evidence}). "
+                "A bare string cannot say WHAT was measured or HOW."
+                % (source_label, name, type(got).__name__))
+        missing = [k for k in INJECTED_VERDICT_KEYS if k not in got]
+        if missing:
+            raise LegError(
+                "%s: the verdict for '%s' omits %s. Every key is required: a "
+                "verdict decides whether a failing test is excused, so it states "
+                "the answer, the evidence for it, and the verb that produced it. "
+                "[D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT]"
+                % (source_label, name, ", ".join("`%s`" % k for k in missing)))
+        # The verdict word itself, through the same closed check the measuring
+        # path uses — so an invented verdict cannot arrive by flag either.
+        probe_verdict_honours(got["verdict"])
+        if not str(got["why"]).strip():
+            raise LegError(
+                "%s: the verdict for '%s' carries an EMPTY `why`. A verdict with "
+                "no stated evidence is the `earnedOn` defect wearing a JSON key."
+                % (source_label, name))
+        declared_verb = probes[name].get("verb", "")
+        if got["verb"] != declared_verb:
+            raise LegError(
+                "%s: the verdict for '%s' says verb %r, but the registry declares "
+                "that probe's verb as %r. A verdict is the answer of ONE measured "
+                "procedure; one carrying another procedure's name is either a "
+                "replay of a different probe or a hand-edit, and neither may "
+                "decide an excusal."
+                % (source_label, name, got["verb"], declared_verb))
+        if not isinstance(got["evidence"], dict):
+            raise LegError(
+                "%s: the verdict for '%s' carries `evidence` of type %s rather "
+                "than an object. `{}` is the legal answer when there is none."
+                % (source_label, name, type(got["evidence"]).__name__))
+        entry = dict(got)
+        # ★ STAMPED HERE, AND NOT TAKEN FROM THE FILE. A file that said
+        # `"source": "measured"` would otherwise be able to launder itself into
+        # looking like this process's own measurement, which is the whole hazard.
+        entry["source"] = PROBE_SOURCE_INJECTED
+        out[name] = entry
+    return out
+
+
+def probe_verdict_source(entry):
+    """The declared source of one verdict, or a LegError — never a default.
+
+    An entry with no source is a producer this function has not been taught
+    about; reading it as `measured` would be the permissive answer, and reading
+    it as `injected` would slander a real measurement. Both doors stamp it."""
+    src = entry.get("source")
+    if src not in PROBE_SOURCES:
+        raise LegError(
+            "a probe verdict carries source %r (known: %s). Every producer of a "
+            "verdict stamps where it came from — run_environment_probes measures, "
+            "validate_probe_verdicts injects — because the report must never read "
+            "the same for a measurement and for a file. "
+            "[D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT]"
+            % (src, ", ".join(PROBE_SOURCES)))
+    return src
+
+
+# ── HOW A PLAN'S GATING WAS ARRIVED AT, AND WHETHER IT MAY RUN A CORPUS ─────
+#
+# Closed, and each entry says whether a DRIVER may run on it. Exactly one may.
+# ⚠ THE DRIVERS SPELL THE TEST AS `== 'probed'` — i.e. "the only usable one" —
+# and --self-test asserts that exactly one gating is usable and that it is
+# spelled `probed`, so adding a usable gating here without touching both drivers
+# reds instead of silently letting a corpus run on it.
+CONFOUND_GATINGS = {
+    "probed": {
+        "usable": True,
+        "means": "this process MEASURED the declared probes on this machine",
+    },
+    "unprobed": {
+        "usable": False,
+        "means": "nothing was measured; every conditional row is INACTIVE. "
+                 "Fail-safe, but the excusals it withholds would surface as "
+                 "GENUINE reds and read as compiler regressions",
+    },
+    "injected": {
+        "usable": False,
+        "means": "the verdicts were READ FROM A FILE (--probe-verdicts), not "
+                 "measured here. Validated and honoured for resolution, so a "
+                 "caller and the pins can drive the honouring path, but never "
+                 "fit to excuse a failure on THIS machine: the file may have "
+                 "been captured on another one",
+    },
+}
+
+
+def confound_gating(probe_verdicts):
+    """The one word a driver checks. `None` -> unprobed; otherwise the gating
+    named by the SOURCE the verdicts carry.
+
+    ★ DERIVED FROM THE VERDICTS THEMSELVES rather than from which CLI flag ran,
+    so a second injection door cannot arrive later and be stamped `probed` by
+    forgetting a line at the call site."""
+    if probe_verdicts is None:
+        return "unprobed"
+    if not isinstance(probe_verdicts, dict):
+        raise LegError(
+            "probe verdicts of type %s cannot be gated on; an unprobed "
+            "resolution is spelled `None`." % type(probe_verdicts).__name__)
+    sources = {probe_verdict_source(v) for v in probe_verdicts.values()}
+    if PROBE_SOURCE_INJECTED in sources:
+        # ANY injected verdict taints the whole plan's gating. A plan that mixed
+        # one measured and one injected verdict and called itself `probed` would
+        # be the quiet door again, wearing a majority vote.
+        return "injected"
+    return "probed"
+
+
+def run_environment_probes(catalogue_doc, only=None, **instruments):
+    """{name: {verdict, why, verb, evidence}} — the machine ANSWERING.
+
+    Deliberately a separate act from `plan_leg`, which stays PURE: the same split
+    as `check_launcher` (a plan is the same on every host; a probe is the host
+    speaking). Verdicts are then INJECTED back into the plan, exactly as launcher
+    availability is.
+
+    `only` restricts the run to the probe names actually required by some row, so
+    a catalogue whose rows are all unconditional pays nothing. `instruments` are
+    forwarded to the verb's `measure` so the self-test can drive every arm."""
+    probes = environment_probes(catalogue_doc)
+    out = {}
+    for name in sorted(probes):
+        if only is not None and name not in only:
+            continue
+        spec = probes[name]
+        verb = spec.get("verb", "")
+        impl = probe_verb(verb)
+        config = spec.get("config", {})
+        try:
+            verdict, why, evidence = impl["measure"](config, **instruments)
+        except LegError:
+            raise
+        except Exception as exc:                             # noqa: BLE001
+            # The verb itself misbehaved. INDETERMINATE (⇒ absent), named, never
+            # swallowed into a green.
+            verdict, why, evidence = ("indeterminate",
+                                      "probe verb '%s' raised %s: %s"
+                                      % (verb, type(exc).__name__, exc), {})
+        if verdict not in PROBE_VERDICTS:
+            raise LegError(
+                "environment probe '%s' (verb '%s') answered %r, which is not "
+                "one of %s. A probe that invents a verdict cannot be gated on."
+                % (name, verb, verdict, ", ".join(PROBE_VERDICTS)))
+        out[name] = {"verdict": verdict, "why": why, "verb": verb,
+                     "evidence": evidence,
+                     "anchor": spec.get("anchor", ""),
+                     "config": dict(config),
+                     # ★ WHERE THIS ANSWER CAME FROM, ON THE RECORD.
+                     # [D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT]
+                     # A verdict this process MEASURED and a verdict handed to it
+                     # in a file are not the same evidence, and the report must
+                     # never read the same for both. Stamped at BOTH doors — see
+                     # validate_probe_verdicts for the other one — because a
+                     # field that only one producer sets is a field a reader
+                     # cannot trust the absence of.
+                     "source": PROBE_SOURCE_MEASURED}
+    return out
+
+
+def required_probe_names(legs):
+    """Every probe name any row on any leg requires — the `only` set above."""
+    names = set()
+    for leg in legs:
+        for row in leg.get("confounds", []):
+            for nm in row.get("requires", []):
+                names.add(nm)
+    return names
+
+
+# ── WHOSE KERNEL DID THE PROBE MEASURE? THE *DECISION*, NOT THE PRINTOUT ────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE
+#
+# ★★★ IT WAS PROSE THAT CHANGED NOTHING — THE `earnedOn` DEFECT, ONE FIELD ALONG.
+# The caveat confound_report_lines prints says, in words, "rows go INACTIVE and
+# such a failure is reported as GENUINE". The DECISION function had never heard of
+# `run`, `runFilesystem` or `sharesDriverKernel`. ✔MEASURED at 0ecec160 with
+# `--host-os windows --host-arch x86_64 --launchers-available wsl.exe` and a
+# `present` verdict: the caveat printed, and THE NEXT LINE printed `confound rows
+# ACTIVE (7 of 7)`. The caveat fired on `sharesDriverKernel == False` alone,
+# unconditional on the verdict, so it was false whenever it mattered.
+#
+# ⛔ THE FAILURE IT LEAVES OPEN, WHICH IS NOT HYPOTHETICAL: a Windows host whose
+# OWN CLOCK_REALTIME steps (VM checkpoint/migration, a time-sync storm, chrony
+# `makestep`) driving the ELF legs through `wsl.exe`. The probe samples the
+# WINDOWS clock, answers `present`, and every ^walsetlk-/^busy2- failure produced
+# inside the WSL2 kernel is silently excused — including a genuine WAL
+# blocking-lock miscompile, which the ^walsetlk- row's own mechanism text says
+# must stay red.
+#
+# ⇒ THE VERDICTS ARE FILTERED BEFORE ANY ROW IS DECIDED, ONCE, HERE. A leg whose
+# resolved launcher does not share this driver's kernel has every verdict forced
+# to `indeterminate` — which probe_verdict_honours already treats as `absent` —
+# so its conditional rows go INACTIVE in BOTH directions and the caveat becomes a
+# description of what happened instead of a promise about it.
+#
+# ★ READ FROM THE DECLARED TABLE VIA THE LEG'S RESOLVED LAUNCHER, NEVER FROM THE
+# VERB'S NAME. `sharesDriverKernel` is a field on RUN_FILESYSTEMS because Wine,
+# qemu-user and `arch -x86_64` are in-process translation on ONE kernel while
+# `wsl.exe` crosses into another, and no spelling of a verb tells you which.
+#
+# ★ THE MEASUREMENT IS RECORDED AND NOT APPLIED, never discarded
+# (`measuredVerdict`): "PRESENT on this driver's clock, NOT APPLIED to this leg"
+# is the fact a reader needs. Reporting a bare INDETERMINATE about a probe that
+# answered would be a second lie in the place built to stop the first one.
+
+
+def run_shares_driver_kernel(run):
+    """Does this leg's fixture execute against THIS driver's kernel?
+
+    ★ NO PERMISSIVE DEFAULT ON EITHER LOOKUP, and that stopped being cosmetic the
+    moment this value began DECIDING whether a measurement applies.
+    `run.get("runFilesystem", "driver")` and `fs.get("sharesDriverKernel", True)`
+    both defaulted to "shares the kernel, apply the verdict, print no caveat" —
+    the direction that excuses a real miscompile. `runFilesystem` is seeded on
+    EVERY resolved run by plan_leg, so an absent key is a transport defect and not
+    a native run; `sharesDriverKernel` is required on every RUN_FILESYSTEMS entry,
+    which --self-test asserts."""
+    if not isinstance(run, dict):
+        raise LegError(
+            "the run handed to the confound gate is %r rather than a resolved "
+            "run plan. WHICH KERNEL the fixture executes in decides whether an "
+            "environment measurement applies to this leg at all, so there is "
+            "nothing to default it to."
+            % type(run).__name__)
+    if "runFilesystem" not in run:
+        raise LegError(
+            "the resolved run plan carries no `runFilesystem`. plan_leg seeds it "
+            "on every run ('driver' for a native one), so its absence is a "
+            "transport defect between the resolver and this gate — and reading it "
+            "as 'driver' would apply a measurement of THIS machine to a leg that "
+            "may execute in another kernel. "
+            "[D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-"
+            "LAUNCHED-ONE]")
+    fs = run_filesystem(run["runFilesystem"])
+    if "sharesDriverKernel" not in fs:
+        raise LegError(
+            "runFilesystem %r declares no `sharesDriverKernel`. Every verb states "
+            "it — `True` is itself the CLAIM, and it was the unexamined one — so a "
+            "missing field is a new launcher nobody answered the question for, "
+            "never a yes." % run["runFilesystem"])
+    return fs["sharesDriverKernel"]
+
+
+def run_mode(run):
+    """The resolved run's mode, checked against the closed vocabulary. Required
+    for the same reason `runFilesystem` is: the mode decides whether a `scope`d
+    row can match here, and an unknown mode reported as matching would overstate
+    what was excused."""
+    if not isinstance(run, dict) or "mode" not in run:
+        raise LegError(
+            "the resolved run plan carries no `mode`. plan_leg sets it on every "
+            "path (native / launched / skip), so its absence is a transport "
+            "defect.")
+    mode = run["mode"]
+    if mode not in RUN_MODES:
+        raise LegError("unknown run mode %r (known: %s)"
+                       % (mode, ", ".join(RUN_MODES)))
+    return mode
+
+
+# The fields of the object below. Consumers CHECK for them, so handing the raw
+# verdict map to `leg_confound_decisions` or `confound_report_lines` is a loud
+# refusal rather than a silent return to the unfiltered behaviour — which is
+# exactly how V1 shipped: one function knew about the launcher and the other did
+# not, and nothing said so.
+PROBE_GATE_KEYS = ("verdicts", "appliesToThisLeg", "why", "runFilesystem",
+                   "runMode", "gating")
+
+
+def probe_gate(probe_verdicts, run):
+    """THE MEASUREMENT IN FORCE FOR ONE LEG, and the run it was judged against.
+
+    Built ONCE per leg and handed to every consumer, so "which verdicts decide
+    this leg's rows" has exactly one owner. `verdicts` is None for an unprobed
+    resolution and otherwise a map whose entries carry `measuredVerdict` (what
+    the probe answered) beside `verdict` (what is allowed to decide here)."""
+    shares = run_shares_driver_kernel(run)
+    mode = run_mode(run)
+    verb = run["runFilesystem"]
+    why = ""
+    if not shares:
+        why = ("this leg runs through a launcher whose runFilesystem '%s' does "
+               "NOT share this driver's kernel, so a probe run here measured "
+               "THIS driver's environment and not the one the fixture executes "
+               "in" % verb)
+    gate = {"verdicts": None, "appliesToThisLeg": shares, "why": why,
+            "runFilesystem": verb, "runMode": mode,
+            "gating": confound_gating(probe_verdicts)}
+    if probe_verdicts is None:
+        return gate
+    if not isinstance(probe_verdicts, dict):
+        raise LegError(
+            "probe verdicts of type %s cannot gate a leg's confounds. An "
+            "unprobed resolution is legal and is spelled `None`."
+            % type(probe_verdicts).__name__)
+    out = {}
+    for name, got in probe_verdicts.items():
+        if not isinstance(got, dict) or "verdict" not in got:
+            raise LegError(
+                "the verdict for probe '%s' is %r and carries no `verdict`. "
+                "Every producer of a verdict map emits the full entry "
+                "({verdict, why, verb, evidence, source}); a partial one here is "
+                "a transport defect, and a missing verdict cannot be read as "
+                "either answer. See anchor, ONE LINE, DO NOT WRAP: "
+                "D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT"
+                % (name, got if not isinstance(got, dict) else sorted(got)))
+        probe_verdict_source(got)
+        entry = dict(got)
+        entry["measuredVerdict"] = got["verdict"]
+        if shares:
+            entry["appliedToThisLeg"] = True
+        else:
+            # ⇒ INDETERMINATE, honoured as ABSENT. The `why` keeps the measured
+            # answer AND says it was not applied, because a reader who is told
+            # only "indeterminate" about a probe that answered has been misled
+            # a second time.
+            entry["appliedToThisLeg"] = False
+            entry["verdict"] = "indeterminate"
+            # ⓘ SHORT ON PURPOSE: this string is repeated once per conditional row
+            # in the report, and the CAVEAT line states the mechanism in full
+            # exactly once. Every fact a single line needs is still here — what was
+            # measured, that it was not applied, and which launcher made it so.
+            entry["why"] = ("MEASURED %s on this driver's own environment (%s), "
+                            "NOT APPLIED to this leg - its launcher's "
+                            "runFilesystem '%s' is another kernel"
+                            % (got["verdict"].upper(), got.get("why", ""), verb))
+        out[name] = entry
+    gate["verdicts"] = out
+    return gate
+
+
+def _checked_probe_gate(gate, who):
+    """The one place a consumer asserts it was handed a GATE and not a raw
+    verdict map. Named `who` so the refusal says which consumer was miscalled."""
+    if not isinstance(gate, dict) or any(k not in gate for k in PROBE_GATE_KEYS):
+        raise LegError(
+            "%s was handed %r instead of the object probe_gate() returns "
+            "(fields: %s). The gate is what filters a verdict measured in THIS "
+            "kernel out of a leg that executes in another one, so a consumer "
+            "reading a raw verdict map would silently honour a cross-kernel "
+            "`present` — which is the defect this object exists to make "
+            "impossible. [D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-"
+            "KERNEL-NOT-THE-LAUNCHED-ONE]"
+            % (who, sorted(gate) if isinstance(gate, dict) else type(gate).__name__,
+               ", ".join(PROBE_GATE_KEYS)))
+    return gate
+
+
+def leg_confound_decisions(leg, gate):
+    """[{pattern, wire, active, reason, requires, scope}] — every declared row,
+    WITH ITS VERDICT, in declaration order.
+
+    ★ EVERY ROW APPEARS, active or not. An inactive row that vanished from this
+    list would be indistinguishable from a row nobody declared, and "which rows
+    were INACTIVE" is precisely what a reader needs to understand a red.
+
+    `gate` is what probe_gate() returned for THIS LEG — never a raw verdict map.
+    A gate whose `verdicts` is None means NO PROBE WAS RUN for this plan; every
+    conditional row is then INACTIVE — the fail-safe direction — and the plan says
+    `confoundGating: unprobed` so a driver refuses to use it rather than quietly
+    under-excusing. A gate whose `appliesToThisLeg` is False has already forced
+    every verdict to `indeterminate`, so a cross-kernel `present` reaches this
+    function unable to honour anything."""
+    gate = _checked_probe_gate(gate, "leg_confound_decisions")
+    probe_verdicts = gate["verdicts"]
     label = leg.get("label", "<unlabelled>")
     if "confounds" not in leg:
         raise LegError(
@@ -1073,8 +1851,229 @@ def leg_confounds(leg):
             "decides whether a failure is reported as a compiler defect." % label)
     out = []
     for row in leg["confounds"]:
-        out.append(confound_scope_prefix(row.get("scope", "any")) + row["pattern"])
+        pattern = row["pattern"]
+        scope = row.get("scope", "")
+        wire = (confound_scope_prefix(scope) if scope else "") + pattern
+        # ── CAN A `scope`d PATTERN MATCH ANYTHING ON THIS RUN AT ALL? ────────
+        # The matcher (both drivers) is still the only thing that APPLIES the
+        # prefix; this only decides what the account is allowed to SAY. A row
+        # whose scope excludes this run's mode is SUPPLIED and NOT IN FORCE, and
+        # calling that "unconditional" overstated the excusal set.
+        # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+        scope_modes = confound_scope_run_modes(scope) if scope else ()
+        scoped_out = bool(scope) and gate["runMode"] not in scope_modes
+        scope_clause = ""
+        if scope:
+            scope_clause = (
+                ". SCOPED `%s:`, and this leg's run mode is `%s`: the matcher "
+                "applies a pattern prefixed `%s:` only on a run in mode %s, so "
+                "this row is supplied and %s"
+                % (scope, gate["runMode"], scope, "/".join(scope_modes),
+                   "NOT IN FORCE HERE" if scoped_out else "IN FORCE here"))
+
+        def _decision(active, reason, _requires=(), _pattern=pattern, _wire=wire,
+                      _scope=scope, _scoped_out=scoped_out,
+                      _clause=scope_clause):
+            """One row's verdict. `active` stays the SUPPLY question — is this
+            pattern handed to the matcher — and `scopedOut` is the separate,
+            separately-reported question of whether the matcher can apply it on
+            this run. Two questions, two fields; collapsing them is what produced
+            a row reported ACTIVE with the reason "unconditional"."""
+            return {"pattern": _pattern, "wire": _wire, "scope": _scope,
+                    "requires": list(_requires), "active": active,
+                    "scopedOut": _scoped_out, "reason": reason + _clause}
+
+        requires = list(row.get("requires", []))
+        if "requires" not in row:
+            raise LegError(
+                "leg '%s': confound %r declares no `requires`. It is REQUIRED on "
+                "every row and `[]` is the ordinary answer — 'this excusal "
+                "depends on nothing this harness can measure'. It is not "
+                "defaulted, because a missing key could not be told from an "
+                "empty one, and the difference is whether a family is excused on "
+                "a machine that has never been shown to have the defect. "
+                "[D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
+                % (label, pattern))
+        if not requires:
+            # ⚠ THE WORD "unconditional" IS RESERVED FOR A ROW THAT REALLY IS ONE.
+            # A row carrying a `scope` is conditional on the RUN MODE, so saying
+            # "unconditional ... nothing this harness measures per run" about it
+            # was two false claims in the sentence a reader uses to judge an
+            # excusal. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+            out.append(_decision(
+                True,
+                ("requires no environment probe (`requires: []`): this excusal "
+                 "rests on its own earned control"
+                 if scope else
+                 "unconditional (`requires: []`): this excusal rests on its own "
+                 "earned control and on nothing this harness measures per run")))
+            continue
+        if probe_verdicts is None:
+            out.append(_decision(
+                False,
+                "requires %s, and NO environment probe was run for this plan; a "
+                "conditional row is never honoured on an unmeasured machine"
+                % ", ".join(requires), requires))
+            continue
+        blocking, holding = [], []
+        # ⚠ DEFENDED RATHER THAN ASSUMED, and red-on-disable is what asked for it.
+        # The `probe_verdicts is None` branch above is the only thing that keeps this
+        # loop from dereferencing None, and when that branch was removed to prove the
+        # guard bites, the answer was `AttributeError: 'NoneType' object has no
+        # attribute 'get'` — a python message about a python rule, in the one place
+        # whose whole job is to say what this harness believes about a machine. A
+        # None deref must never be a diagnostic.
+        if not isinstance(probe_verdicts, dict):
+            raise LegError(
+                "leg '%s': confound %r requires environment probe(s) %s, and the "
+                "probe verdicts handed to this resolution are %r rather than a "
+                "map. An unprobed resolution is legal — it drops every conditional "
+                "row — but it is handled by declaring `probe_verdicts=None`, not "
+                "by arriving here. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-"
+                "HOST]" % (label, pattern, ", ".join(requires),
+                           type(probe_verdicts).__name__))
+        for nm in requires:
+            got = probe_verdicts.get(nm)
+            if got is None:
+                raise LegError(
+                    "leg '%s': confound %r requires environment probe '%s', and "
+                    "this run carries NO verdict for it. That is a transport "
+                    "defect between the probe run and the plan, not a machine "
+                    "without the defect — and guessing either way is the whole "
+                    "hazard: guess 'present' and a real miscompile is excused in "
+                    "silence." % (label, pattern, nm))
+            if probe_verdict_honours(got["verdict"]):
+                holding.append("%s: %s" % (nm, got["verdict"]))
+            else:
+                blocking.append("%s: %s (%s)"
+                                % (nm, got["verdict"], got.get("why", "")))
+        if blocking:
+            out.append(_decision(
+                False,
+                "NOT honoured here: %s. A failure matching this pattern will be "
+                "reported as GENUINE." % "; ".join(blocking), requires))
+        else:
+            out.append(_decision(True, "honoured: %s" % "; ".join(holding),
+                                 requires))
     return out
+
+
+def leg_confounds(leg, gate):
+    """This leg's HONOURED confound patterns, in wire form (`emulated:^re`).
+
+    The gate is applied HERE, once, in the one place both drivers read from — so
+    a probe cannot be honoured by one driver and not the other, which is the same
+    per-driver asymmetry D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG was
+    about, one axis along."""
+    return [d["wire"] for d in leg_confound_decisions(leg, gate)
+            if d["active"]]
+
+
+def confound_report_lines(label, decisions, gate):
+    """THE LINES BOTH DRIVERS PRINT, generated ONCE here.
+
+    ★★ `earnedOn` FAILED BECAUSE IT IS PROSE NOTHING READS. A probe result
+    nobody SEES is the same failure with extra steps, so this is not optional
+    output: every run states, per leg, which probes ran, each verdict WITH ITS
+    MEASURED EVIDENCE, and which rows are consequently ACTIVE vs INACTIVE. A run
+    whose report cannot say why a failure was excused has not earned the
+    exclusion.
+
+    Generated here rather than in each driver so the two cannot drift into
+    printing different accounts of the same decision — and so the differential
+    battery has one answer to compare.
+
+    ★★ AND IT REPORTS WHAT HAPPENED, NOT WHAT WOULD BE SAFE. Every line here is
+    derived from the SAME gate that decided the rows, so the account cannot
+    contradict the decision the way the old caveat did (it announced rows INACTIVE
+    on the line before `ACTIVE (7 of 7)`). Three facts each get their own words:
+    what the probe MEASURED, whether that measurement was APPLIED to this leg, and
+    whether it was MEASURED HERE at all or read from a file."""
+    gate = _checked_probe_gate(gate, "confound_report_lines")
+    probe_verdicts = gate["verdicts"]
+    lines = []
+    used = sorted({nm for d in decisions for nm in d["requires"]})
+    if not used:
+        lines.append("[%s] environment probes: NONE REQUIRED - every declared "
+                     "confound row is unconditional (`requires: []`)" % label)
+    elif probe_verdicts is None:
+        lines.append("[%s] environment probes: NOT RUN for this plan, so all %d "
+                     "conditional row(s) are INACTIVE" % (label, len(used)))
+    else:
+        for nm in used:
+            got = probe_verdicts.get(nm, {})
+            # ★ THE VERDICT AS MEASURED, ALWAYS — even when the gate has forced it
+            # to indeterminate for this leg. What was measured and what was allowed
+            # to decide are two facts, and the caveat below is where the second one
+            # is stated. Printing only the forced value would hide a probe that
+            # answered.
+            # ★★ AND WHERE THE ANSWER CAME FROM, IN WORDS, ON EVERY DERIVED LINE.
+            # An injected verdict that read like a measurement is
+            # D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT.
+            injected = probe_verdict_source(got) == PROBE_SOURCE_INJECTED
+            lines.append(
+                "[%s] environment probe %s = %s%s   [%s: %s]"
+                % (label, nm, got.get("measuredVerdict", "?").upper(),
+                   ("   [INJECTED by --probe-verdicts, NOT MEASURED ON THIS "
+                    "MACHINE - this plan is confoundGating '%s' and NO driver "
+                    "will run a corpus on it]" % gate["gating"]) if injected
+                   else "",
+                   got.get("verb", "?"), got.get("why", "")))
+        # ★★ THE PROBE MEASURED *THIS DRIVER'S* ENVIRONMENT, AND FOR A LAUNCHER IN
+        # ANOTHER KERNEL THAT IS NOT THE ONE THE FIXTURE GETS. Stated out loud, per
+        # leg, because the alternative is a reader trusting a verdict about the wrong
+        # machine — and this is the same class of gap `pathTranslation`,
+        # `envTransfer` and `runFilesystem` each closed one namespace at a time.
+        # ⚠ IT IS NOW A REPORT OF THE DECISION AND NOT A PROMISE ABOUT IT: probe_gate
+        # has already forced every verdict on such a leg to `indeterminate`, so
+        # "rows go INACTIVE" is a thing that HAS HAPPENED by the time this prints.
+        # It used to fire on `sharesDriverKernel == False` alone while the decision
+        # honoured the `present` regardless — ✔MEASURED, and the very next line said
+        # `ACTIVE (7 of 7)`.
+        # ANCHOR, ONE LINE, DO NOT WRAP:
+        # D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE
+        if not gate["appliesToThisLeg"]:
+            lines.append(
+                "[%s] CAVEAT: %s. Each verdict above is therefore recorded AS "
+                "MEASURED and was NOT APPLIED to this leg - it was forced to "
+                "INDETERMINATE, which is honoured as ABSENT, so every conditional "
+                "row below is INACTIVE and such a failure is reported as GENUINE. "
+                "That is the safe direction and not a clean bill."
+                % (label, gate["why"]))
+    active = [d for d in decisions if d["active"]]
+    inactive = [d for d in decisions if not d["active"]]
+    lines.append("[%s] confound rows ACTIVE (%d of %d): %s"
+                 % (label, len(active), len(decisions),
+                    " ".join(d["wire"] for d in active) or "<none>"))
+    # ★ A SUPPLIED ROW THE MATCHER CANNOT APPLY ON THIS RUN GETS ITS OWN LINE.
+    # It is in the ACTIVE list because it IS handed to the matcher, and the matcher
+    # is the one owner of scope matching — but a reader counting the excusal set
+    # from the line above would over-count it, and the row's reason used to say
+    # "unconditional". [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+    for d in active:
+        if d.get("scopedOut"):
+            lines.append("[%s] confound row SCOPED OUT: %s - %s"
+                         % (label, d["wire"], d["reason"]))
+    for d in inactive:
+        lines.append("[%s] confound row INACTIVE: %s - %s"
+                     % (label, d["wire"], d["reason"]))
+    # ⚠ ASCII ONLY, ASSERTED RATHER THAN INTENDED. These lines cross into a bash
+    # variable and a PowerShell string through two different file readers, and the
+    # differential battery compares them BYTE FOR BYTE — so one em-dash would put
+    # an encoding question inside the one value the twin-parity proof rests on
+    # (the same reason the zero-progress sentinel is ASCII). Caught HERE, at the
+    # generator, because the alternative is finding it as a mysterious mirror
+    # failure on whichever host has the other default codepage.
+    for line in lines:
+        bad = [c for c in line if ord(c) > 126]
+        if bad:
+            raise LegError(
+                "the confound report for leg '%s' contains non-ASCII character(s) "
+                "%r. This text is compared byte-for-byte between a bash arm and a "
+                "PowerShell arm; a non-ASCII character makes the twin-parity proof "
+                "a test of two codepages instead of two implementations. Line: %s"
+                % (label, sorted(set(bad)), line))
+    return lines
 
 # The zconf.h guards `./configure` may have baked into the DERIVING host's zlib
 # header, and which each leg therefore has to declare for ITS OWN target. Closed,
@@ -3005,6 +4004,16 @@ def load_catalogue(path=CATALOGUE):
     return legs
 
 
+def load_catalogue_doc(path=CATALOGUE):
+    """The WHOLE catalogue document, for the run-wide blocks that are not legs
+    (`stageBuild`, `environmentProbes`). Version-checked through load_catalogue
+    first so a run-wide block can never be read out of a catalogue this resolver
+    does not understand."""
+    load_catalogue(path)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 # ── THE STAGE BUILD CONFIGURATION — one declaration, both drivers ────────────
 # WHICH sqlite the corpus tests is a property of the RUN, not of a leg: one
 # staged tree feeds all five legs, so the capability set cannot live per-leg and
@@ -4230,13 +5239,19 @@ def assert_translated(verb, args):
 
 # ── The one decision ────────────────────────────────────────────────────────
 
-def plan_leg(leg, host_os, host_arch, available):
+def plan_leg(leg, host_os, host_arch, available, probe_verdicts=None):
     """Resolve ONE leg against ONE host.
 
     Build is unconditional. Run is answered from the leg's declaration.
     Returns a dict; `run.verdict` is populated ONLY for a non-run (it is one of
     the skip names) — a planned run has verdict None because the verdict is the
     OUTCOME (`ran` / `poisoned`) and only the driver can know it.
+
+    `probe_verdicts` is an INJECTED MEASUREMENT, exactly as `available` is: this
+    function stays pure, and a plan is therefore the same on every machine given
+    the same measurements. `None` means nothing was measured, which makes every
+    conditional confound row INACTIVE and stamps the leg `confoundGating:
+    unprobed` — see leg_confound_decisions.
     """
     spec = leg["spec"]
     arch = spec_target_arch(spec)
@@ -4362,6 +5377,19 @@ def plan_leg(leg, host_os, host_arch, available):
     libs["zImportName"] = z_import
     build["libraries"] = libs
 
+    # ── THE MEASUREMENT IN FORCE FOR *THIS LEG*, AND THE ROWS IT DECIDES ─────
+    # ★ ONCE. `leg_confound_decisions` was called three times here (for
+    # `confounds`, for `confoundDecisions` and again for `confoundReport`) — pure
+    # and deterministic, so never divergent, but "one fact, one owner" cannot be
+    # read off three call sites, and the third call is the one that took the RAW
+    # verdicts and a `run` the other two did not have.
+    # ★★ AND IT IS BUILT AFTER `run` DELIBERATELY: the gate needs the leg's
+    # RESOLVED launcher to know whose kernel the probe measured, which is precisely
+    # what the decision function used not to have.
+    # [D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE]
+    gate = probe_gate(probe_verdicts, run)
+    decisions = leg_confound_decisions(leg, gate)
+
     return {
         "label": leg["label"],
         "spec": spec,
@@ -4385,17 +5413,43 @@ def plan_leg(leg, host_os, host_arch, available):
         # instead of only that it did. Host-free: a confound is a property of the
         # LEG (its target, its libraries, its upstream), which is exactly the
         # claim the old per-driver lists could not make.
-        "confounds": leg_confounds(leg),
+        # ★ THE GATED ANSWER, THE ROWS BEHIND IT, THE PER-ROW DECISION AND THE
+        # REPORT — four fields because they answer four different questions and
+        # collapsing any two of them is how this defect happened in the first
+        # place. `confounds` is what the classifier matches against; `confoundRows`
+        # is the catalogue's own text (provenance included); `confoundDecisions`
+        # says which rows are ACTIVE and WHY; `confoundReport` is the human account
+        # both drivers print verbatim. `confoundGating` is the one a driver must
+        # CHECK: only `probed` is usable, and `unprobed`/`injected` each mean no
+        # measurement of THIS machine backs the gating, so the list is fail-safe
+        # (conditional rows dropped, or honoured on a file) but not fit to run on.
+        # ⓘ `confoundDecisions` IS READ, and by the one reader that can hold this
+        # mechanism to account without parsing prose:
+        # tests/harness/test_sqlite_harness_legs.cpp asserts the per-row ACTIVE /
+        # INACTIVE / SCOPED-OUT decision structurally, including both directions of
+        # the cross-kernel rule. It was inert for one cycle — emitted and read by
+        # nothing — and an inert field is a claim nobody can be wrong about.
+        "confounds": [d["wire"] for d in decisions if d["active"]],
         "confoundRows": [dict(r) for r in leg.get("confounds", [])],
+        "confoundDecisions": decisions,
+        "confoundGating": gate["gating"],
+        "confoundReport": confound_report_lines(leg["label"], decisions, gate),
         "run": run,
     }
 
 
-def plan(host_os, host_arch, available, path=CATALOGUE):
+def plan(host_os, host_arch, available, path=CATALOGUE, probe_verdicts=None):
     legs = load_catalogue(path)
     return {
         "host": {"os": host_os, "arch": host_arch},
-        "legs": [plan_leg(leg, host_os, host_arch, available) for leg in legs],
+        # THE PROBES THIS PLAN WAS GATED BY, verbatim, at the TOP of the plan —
+        # so a reader (and a diff of two runs) sees the measurement that decided
+        # every leg's excusals, once, rather than reconstructing it per leg.
+        "environmentProbes": ({} if probe_verdicts is None
+                              else {k: dict(v) for k, v in probe_verdicts.items()}),
+        "environmentProbesRun": probe_verdicts is not None,
+        "legs": [plan_leg(leg, host_os, host_arch, available, probe_verdicts)
+                 for leg in legs],
     }
 
 
@@ -4670,6 +5724,26 @@ def emit_sh(resolved):
         # provenance behind each pattern stays in legs.json, where the lint can
         # require it — a driver needs the pattern, a reader needs the evidence.
         put("LEG_CONFOUNDS", " ".join(q(x) for x in leg["confounds"]))
+        # ★ AND WHETHER A MACHINE MEASUREMENT BACKS THAT LIST. `unprobed` is
+        # fail-safe (every conditional row was dropped) but it is NOT fit to run
+        # on, and the driver refuses it — a run that silently under-excuses reads
+        # as a compiler regression, which is the mirror of the defect this gate
+        # exists to remove. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+        put("LEG_CONFOUND_GATING", leg.get("confoundGating", ""))
+        # ★ HOW MANY ROWS THE CATALOGUE DECLARED FOR THIS LEG, so an EMPTY supply
+        # can be told from a catalogue that declares nothing. Both drivers used to
+        # infer the second from the first: "this leg's catalogue entry declares
+        # `confounds: []`, i.e. nothing has ever been measured as a non-DSS
+        # confound HERE" — a claim about the CATALOGUE derived from an empty array,
+        # which is ALSO what you get when every declared row is gated off by a
+        # probe (and, before this cycle, when the transport failed).
+        # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+        put("LEG_CONFOUND_DECLARED", str(len(leg.get("confoundRows", []))))
+        # THE VISIBLE ACCOUNT, generated once in the resolver and printed verbatim
+        # by both drivers (dss:confound-report). NEWLINE-separated inside one
+        # variable: the report is a block, and splitting it per line would make
+        # the two drivers each decide how to reassemble it.
+        put("LEG_CONFOUND_REPORT", "\n".join(leg.get("confoundReport", [])))
         put("LEG_RECIPE_TRANSFORM", b.get("recipeTransform", "none"))
         # The leg's OWN staged-header directory name + the guards that made it.
         # The driver joins the key onto its zinc/ root; it never decides the
@@ -4997,6 +6071,81 @@ def lint(path=CATALOGUE):
     except (OSError, ValueError) as exc:
         findings.append("stageBuild could not be read from %s: %s" % (path, exc))
     legs = load_catalogue(path)
+    # ── THE ENVIRONMENT-PROBE REGISTRY ──────────────────────────────────────
+    # Linted BEFORE the legs, because every conditional confound row names an
+    # entry here and a broken registry would report as N broken rows.
+    # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+    registry = {}
+    try:
+        registry = environment_probes(load_catalogue_doc(path))
+    except LegError as exc:
+        findings.append("environmentProbes: %s" % exc)
+    except (OSError, ValueError) as exc:
+        findings.append("environmentProbes could not be read from %s: %s"
+                        % (path, exc))
+    for pname in sorted(registry):
+        entry = registry[pname] if isinstance(registry[pname], dict) else {}
+        if not isinstance(registry[pname], dict):
+            findings.append("environmentProbes['%s'] must be an object, got %r"
+                            % (pname, type(registry[pname]).__name__))
+            continue
+        for k in PROBE_DECLARATION_KEYS:
+            v = entry.get(k, "")
+            if not isinstance(v, str) or not v.strip():
+                findings.append(
+                    "environmentProbes['%s'] declares no '%s'. A probe decides "
+                    "whether a failing test is excused, so it states what it "
+                    "MEASURES, what a PRESENT verdict would mean, and which "
+                    "anchor holds the long form (required: %s)."
+                    % (pname, k, ", ".join(PROBE_DECLARATION_KEYS)))
+        verb = entry.get("verb", "")
+        try:
+            spec = probe_verb(verb)
+        except LegError as exc:
+            findings.append("environmentProbes['%s']: %s" % (pname, exc))
+            continue
+        config = entry.get("config", {})
+        if not isinstance(config, dict):
+            findings.append("environmentProbes['%s'].config must be an object, "
+                            "got %r" % (pname, type(config).__name__))
+            continue
+        want = set(spec["configKeys"])
+        missing = sorted(want - set(config))
+        extra = sorted(set(config) - want)
+        if missing:
+            findings.append(
+                "environmentProbes['%s'] (verb '%s') omits config key(s) %s. "
+                "Every threshold is DECLARED, never defaulted in code: a probe "
+                "whose sensitivity a reader has to find in python is one nobody "
+                "can tighten by editing this file."
+                % (pname, verb, ", ".join(missing)))
+        if extra:
+            findings.append(
+                "environmentProbes['%s'] (verb '%s') declares unknown config "
+                "key(s) %s (known: %s). The set is closed because a typo'd "
+                "threshold would be SILENTLY IGNORED and the probe would run at "
+                "a sensitivity nobody chose."
+                % (pname, verb, ", ".join(extra), ", ".join(spec["configKeys"])))
+        # ★★ THE FAIL-SAFE FLOOR. Config may TIGHTEN a threshold and may not
+        # loosen it below what can still support a `present`. A guard config can
+        # weaken without limit is one that gets re-cut to fit each new case
+        # (D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT, twice).
+        for key in spec.get("raiseOnly", ()):
+            floor = spec["floors"][key]
+            got = config.get(key)
+            try:
+                bad = got is None or float(got) < float(floor)
+            except (TypeError, ValueError):
+                bad = True
+            if bad:
+                findings.append(
+                    "environmentProbes['%s'] (verb '%s') sets %s=%r, below the "
+                    "floor %r. This threshold may only be RAISED. The errors are "
+                    "not symmetric: a probe that says PRESENT on a healthy "
+                    "machine SILENTLY EXCUSES a real compiler defect, while one "
+                    "that says ABSENT on a defective machine merely produces "
+                    "noisy reds somebody then investigates."
+                    % (pname, verb, key, got, floor))
     seen_labels, seen_specs = {}, {}
     # (targetArch, hostOs, hostArch) -> set of launcher spellings. One triple
     # must have ONE vocabulary, for the same reason lintDeclaredEmulators gives:
@@ -5218,13 +6367,71 @@ def lint(path=CATALOGUE):
                         "regex (%s) — it would silently match NOTHING and every "
                         "failure it names would be reported as a DSS defect"
                         % (label, pat, exc))
-                scope = row.get("scope", "")
-                if scope not in CONFOUND_SCOPES:
+                # ── `requires`: THE CONDITION, MACHINE-READABLE ─────────────
+                # REQUIRED on every row; `[]` is the ordinary answer. See
+                # leg_confound_decisions for why it is not defaulted.
+                # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+                reqs = row.get("requires")
+                if "requires" not in row:
+                    # Told apart from a WRONG-TYPE `requires` on purpose: "you
+                    # forgot the key" and "the key is the wrong shape" send a
+                    # reader to two different places, and the first is the one
+                    # that used to be spelled `scope: any`.
                     findings.append(
-                        "leg '%s': confound %r declares scope %r (known: %s). "
-                        "The scope is REQUIRED and never defaulted: 'any' is the "
-                        "widest possible excusal and must be chosen, not fallen "
-                        "into." % (label, pat, scope, ", ".join(CONFOUND_SCOPES)))
+                        "leg '%s': confound %r declares no `requires`. It is "
+                        "REQUIRED on every row and `[]` is the ordinary answer — "
+                        "'this excusal depends on nothing this harness can "
+                        "measure'. A missing key cannot be told from an empty "
+                        "one, and the difference is whether a family is excused "
+                        "on a machine never shown to have the defect."
+                        % (label, pat))
+                elif not isinstance(reqs, list):
+                    findings.append(
+                        "leg '%s': confound %r declares `requires` %r — it must "
+                        "be a LIST of environment-probe names, `[]` when the "
+                        "excusal depends on nothing this harness measures."
+                        % (label, pat, reqs))
+                else:
+                    for nm in reqs:
+                        if nm not in registry:
+                            findings.append(
+                                "leg '%s': confound %r requires environment probe "
+                                "%r, which `environmentProbes` does not declare "
+                                "(declared: %s). An undeclared probe cannot be "
+                                "measured, so the row would be honoured on "
+                                "nothing — the exact state `scope: any` was in."
+                                % (label, pat, nm,
+                                   ", ".join(sorted(registry)) or "<none>"))
+                # ── `scope`: LEGACY, and it must name its blocker ───────────
+                if "scope" in row:
+                    scope = row.get("scope", "")
+                    if scope in RETIRED_CONFOUND_SCOPES:
+                        findings.append(
+                            "leg '%s': confound %r declares scope %r, which is "
+                            "RETIRED. That claim is now `requires: []`. The "
+                            "`scope` axis survives only where a row's real "
+                            "mechanism has no probe yet."
+                            % (label, pat, scope))
+                    elif scope not in CONFOUND_SCOPES:
+                        findings.append(
+                            "leg '%s': confound %r declares scope %r (known: %s). "
+                            "An unrecognised scope cannot be read as "
+                            "unconditional, because unconditional is the widest "
+                            "possible excusal."
+                            % (label, pat, scope, ", ".join(CONFOUND_SCOPES)))
+                    blocker = row.get("scopeLegacyBlocker", "")
+                    if not isinstance(blocker, str) or not blocker.strip():
+                        findings.append(
+                            "leg '%s': confound %r still uses the LEGACY `scope` "
+                            "axis and declares no `scopeLegacyBlocker`. A row may "
+                            "stay on `scope` only while it NAMES what stops it "
+                            "migrating to a measured `requires` probe — otherwise "
+                            "the axis becomes an inert alternative that the next "
+                            "row reaches for, and a run mode is not a host. "
+                            "[D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
+                            % (label, pat))
+                else:
+                    scope = ""
                 for k in CONFOUND_PROVENANCE_KEYS:
                     v = row.get(k, "")
                     if not isinstance(v, str) or not v.strip():
@@ -5536,8 +6743,34 @@ DSS_REGIONS = {
                   "verifiers": ["test-confound-scope.sh"]},
     "src-gate": {"drivers": ["build-and-test.sh"],
                  "verifiers": ["test-confound-scope.sh"]},
-    "confound-supply": {"drivers": ["build-and-test.sh"],
-                        "verifiers": ["test-confound-scope.sh"]},
+    # BOTH DRIVERS, and `mirror` is deliberately NOT claimed — for a reason that is
+    # the design and not an omission.
+    # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+    # D-HARNESS-CONFOUND-SUPPLY-PS1-HALF-IS-IN-NO-REGION
+    # The two halves answer the same question from GENUINELY DIFFERENT
+    # TRANSPORTS: `leg_confound_patterns` reads emit_sh's flattened
+    # `LEG_CONFOUNDS[leg]` / `LEG_CONFOUND_GATING[leg]` associative arrays, while
+    # `Get-LegConfounds` reads the resolved leg OBJECT out of the JSON plan. A
+    # differential case would therefore have to re-type one side's data in a shape
+    # it never receives, which is the pin defect the bar names outright — and it is
+    # how the .sh's refusal came to be proven by a pin that captured a rc the
+    # production call site discards. So the pairing is what is enforced here (the
+    # region must exist in BOTH drivers), and each half is driven THROUGH ITS OWN
+    # REAL INPUT PATH by its own verifier.
+    "confound-supply": {"drivers": ["build-and-test.sh", "build-and-test.ps1"],
+                        "verifiers": ["test-confound-scope.sh",
+                                      "test-driver-contracts.ps1"]},
+    # TF: D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST. `mirror` IS claimed
+    # here — unlike launcher-prereq/smoke-targets, this pair really is the same
+    # PURE FUNCTION in two languages (take the resolver's report text, print one
+    # tagged line per non-empty line, refuse an empty report), so the differential
+    # battery can drive it on identical input and compare byte for byte. That is
+    # the twin-parity proof for the visibility half of the gate: a driver that
+    # silently stopped printing WHY a failure was excused would otherwise look
+    # exactly like a driver with nothing to excuse.
+    "confound-report": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["harness_legs.py"], "mirror": True},
     "loadext-stage": {"drivers": ["build-and-test.sh"],
                       "verifiers": ["test-confound-scope.sh",
                                     "test-confound-scope.ps1"]},
@@ -5626,6 +6859,8 @@ MIRROR_PAIRS = [
     {"sh": "tier_permutations", "ps1": "Get-TierPermutations",
      "differential": "tier-permutations"},
     {"sh": "parse_segment", "ps1": "Read-CorpusSegment", "differential": "parse-segment"},
+    {"sh": "zero_progress_signature", "ps1": "Get-ZeroProgressSignature",
+     "differential": "zero-progress-signature"},
     {"sh": "resolve_abort_file", "ps1": "Resolve-AbortFile",
      "differential": "resolve-abort-file"},
     {"sh": "files_after", "ps1": "Get-FilesAfter", "differential": "files-after"},
@@ -5679,6 +6914,9 @@ MIRROR_PAIRS = [
     {"sh": None, "ps1": "Stop-FixtureProcesses", "differential": "",
      "why": "the shared tail of Stop-OurFixtures / Stop-OurFixturesUnder; the "
             ".sh has one caller and needs no split."},
+    # ── dss:confound-report ─────────────────────────────────────────────────
+    {"sh": "print_confound_report", "ps1": "Write-ConfoundReport",
+     "differential": "confound-report"},
 ]
 
 # The symbol-definition grammar of each driver language, used to enumerate what
@@ -5782,18 +7020,22 @@ function Die($m)  { Write-Error $m; exit 9 }
 
 MIRROR_CASES = {
     "corpus-files": {
+        "region": "corpus-engine",
         "sh": 'corpus_files "$CORPUSDIR"',
         "ps1": "foreach ($f in (Get-CorpusFiles $CORPUSDIR)) { $f }",
     },
     "tier-permutations": {
+        "region": "corpus-engine",
         "sh": 'tier_permutations "$TIERFILE"',
         "ps1": "foreach ($p in (Get-TierPermutations $TIERFILE)) { $p }",
     },
     "tier-prefixes": {
+        "region": "corpus-engine",
         "sh": 'tier_prefixes "$PERMSFILE"',
         "ps1": "foreach ($p in (Get-TierPrefixes $PERMSFILE)) { $p }",
     },
     "resolve-abort-file": {
+        "region": "corpus-engine",
         "sh": ('while IFS= read -r nm; do\n'
                '  printf "%s\\t%s\\n" "$nm" "$(resolve_abort_file "$nm" "$LISTFILE")"\n'
                'done < "$NAMESFILE"'),
@@ -5816,6 +7058,7 @@ MIRROR_CASES = {
     # both answer "" agree perfectly — which is precisely the state this case was
     # written to end.
     "abort-file-from-traceback": {
+        "region": "corpus-engine",
         "sh": ('parse_segment "$ABORTLOG" "$ABORTFACTS"\n'
                'facts B "$ABORTFACTS" | sed "s/^/B /"\n'
                'printf "T %s\\n" "$(fact T "$ABORTFACTS")"\n'
@@ -5842,7 +7085,55 @@ MIRROR_CASES = {
             "FILE symlink2.test",
         ],
     },
+    # ── THE ZERO-PROGRESS SIGNATURE, WITH THE RIGHT ANSWER STATED ───────────
+    #
+    # D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH. This decides
+    # whether a leg spends ONE resume on a fixture that never started or all ten,
+    # so the two copies agreeing is not enough — row 2 is the whole defect and
+    # rows 3-5 are the resilience rule, and both are asserted by `expect` rather
+    # than by the two drivers agreeing with each other.
+    #
+    # ⚠ THE SENTINEL IS ASCII ON PURPOSE. It is compared BYTE-FOR-BYTE between a
+    # bash string and a PowerShell string that reach this battery through two
+    # different file readers; a non-ASCII character would put an encoding question
+    # inside the one value the discriminator rests on.
+    #
+    # ⓘ The arguments are LITERALS rather than a fixture file: this pair is a pure
+    # function of four scalars, and a table file would add a TSV-parsing step to
+    # each arm whose divergence this case would then be measuring instead.
+    "zero-progress-signature": {
+        "region": "corpus-engine",
+        "sh": ('printf "1 %s\\n" "$(zero_progress_signature "boom: cannot open libtcl" 0 0 "")"\n'
+               'printf "2 %s\\n" "$(zero_progress_signature "" 0 0 "")"\n'
+               'printf "3 %s\\n" "$(zero_progress_signature "" 5 0 "")"\n'
+               'printf "4 %s\\n" "$(zero_progress_signature "" 0 2 "")"\n'
+               'printf "5 %s\\n" "$(zero_progress_signature "" 0 0 "select1-1.1")"\n'
+               'printf "6 %s\\n" "$(zero_progress_signature "boom" 9 9 "x")"'),
+        "ps1": ('"1 $(Get-ZeroProgressSignature \'boom: cannot open libtcl\' 0 0 \'\')"\n'
+                '"2 $(Get-ZeroProgressSignature \'\' 0 0 \'\')"\n'
+                '"3 $(Get-ZeroProgressSignature \'\' 5 0 \'\')"\n'
+                '"4 $(Get-ZeroProgressSignature \'\' 0 2 \'\')"\n'
+                '"5 $(Get-ZeroProgressSignature \'\' 0 0 \'select1-1.1\')"\n'
+                '"6 $(Get-ZeroProgressSignature \'boom\' 9 9 \'x\')"'),
+        # 1 — a diagnostic is returned verbatim (the case that already worked).
+        # 2 — SILENCE gets the sentinel. This is the defect: it used to be empty,
+        #     so two consecutive silent segments never compared equal and the leg
+        #     burned all ten resumes on a fixture that had never started.
+        # 3/4/5 — no diagnostic BUT the segment produced test-level output: the
+        #     answer is EMPTY, i.e. keep resuming. These three are the resilience
+        #     rule, and they are why the sentinel is not simply `${diag:-…}`.
+        # 6 — a diagnostic wins over every counter.
+        "expect": [
+            "1 boom: cannot open libtcl",
+            "2 <SILENT: the fixture produced no diagnostic, no test result and no test name>",
+            "3",
+            "4",
+            "5",
+            "6 boom",
+        ],
+    },
     "files-after": {
+        "region": "corpus-engine",
         "sh": 'files_after "$BOUNDARY" "$LISTFILE"',
         "ps1": ("$corpus = @(Get-Content -LiteralPath $LISTFILE)\n"
                 "foreach ($f in (Get-FilesAfter $corpus $BOUNDARY)) { $f }"),
@@ -5850,6 +7141,7 @@ MIRROR_CASES = {
     # THE ONE THAT CARRIES THE PARSING SEMANTICS. Both sides project into the
     # .sh region's own fact alphabet; see the normalisation note above.
     "parse-segment": {
+        "region": "corpus-engine",
         # ★ `I` AND `M` ARE PROJECTED HERE OR THEY ARE NOT COMPARED AT ALL. This
         #   projection is a FIXED alphabet, so a fact the two engines both
         #   compute but neither side lists is silently outside the differential —
@@ -5885,6 +7177,54 @@ MIRROR_CASES = {
                 "\"Q $($r.FailMarkers)\"\n"
                 "\"A $($r.Diagnostic)\""),
     },
+    # ── THE VISIBILITY HALF OF THE CONFOUND GATE ────────────────────────────
+    #
+    # D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.
+    #
+    # A confound row may be honoured only where a named environment probe MEASURED
+    # its defect. `earnedOn` failed because it is prose nothing reads, so a probe
+    # verdict nobody SEES would be the same failure with extra steps — which makes
+    # the printing a load-bearing capability and not decoration. A driver that
+    # silently stopped printing the account would look exactly like a driver with
+    # nothing to excuse.
+    #
+    # ★ THE INPUT IS THE RESOLVER'S OWN TEXT, PASSED THROUGH — the report is
+    # generated ONCE in harness_legs.py precisely so the two drivers cannot compose
+    # different accounts of the same decision. So what this case proves is the part
+    # that IS duplicated: line splitting, blank-line handling, CR tolerance, the
+    # `Info` tagging, and the refusal of an empty report.
+    #
+    # ⚠ EVERY LINE HERE IS ASCII, and confound_report_lines ASSERTS that at the
+    # generator: this text is compared byte-for-byte between a bash string and a
+    # PowerShell string that reach the battery through two different file readers,
+    # so a non-ASCII character would make this a test of two codepages. The `\r` in
+    # row 3 is deliberate — the .ps1 reads CRLF natively and the .sh does not, and a
+    # trailing CR left on a line would show up in a log as a mangled tag.
+    # ⓘ The empty-report REFUSAL is exercised by its own case below rather than
+    # here: a `Die` arm cannot share a capture with a success arm.
+    # ⓘ `info`/`Info` are NO-OPS in the shared prelude, because every corpus-engine
+    # case needs the drivers silent. So this case OVERRIDES them per arm to echo
+    # with a marker: the emission is the answer here, and a battery that compared
+    # two silences would pass over a driver that had stopped reporting.
+    "confound-report": {
+        "region": "confound-report",
+        # ★ THE CR CLAIM, MADE REAL. [D-HARNESS-MIRROR-CR-CLAIM-IS-VACUOUS.] Row 3
+        # of the fixture carries a TRAILING CR, and this flag is what makes that
+        # fixture prove something: each arm's RAW output is checked for a CR beyond
+        # its own line terminator, BEFORE _mirror_normalise strips CR from both.
+        # Without it the row proved nothing at all — ✔MEASURED, and it was hiding a
+        # real asymmetry (the .ps1 trimmed, the .sh did not).
+        "crClean": True,
+        "sh": ('info() { printf "REPORT> %s\\n" "$*"; }\n'
+               'print_confound_report "elf64-x86_64" "$REPORT"'),
+        "ps1": ('function Info($m) { "REPORT> $m" }\n'
+                'Write-ConfoundReport "elf64-x86_64" $REPORT'),
+        "expect": [
+            "REPORT> [elf64-x86_64] environment probe clock-realtime-steps = ABSENT   [wall-clock-step: 0 step(s)]",
+            "REPORT> [elf64-x86_64] confound rows ACTIVE (1 of 2): ^zipfile-25.0$",
+            "REPORT> [elf64-x86_64] confound row INACTIVE: ^walsetlk- - NOT honoured here: clock-realtime-steps: absent",
+        ],
+    },
 }
 
 
@@ -5901,6 +7241,36 @@ def _mirror_normalise(raw):
     while lines and lines[-1] == "":
         lines.pop()
     return lines
+
+
+# ── THE ONE PROPERTY THE NORMALISER ERASES, CHECKED BEFORE IT RUNS ──────────
+#
+# [D-HARNESS-MIRROR-CR-CLAIM-IS-VACUOUS.]
+#
+# ★★★ A COMMENT CLAIMING A PROOF THAT DOES NOT EXIST. The confound-report fixture
+# carries a TRAILING CR on row 3 and its comment said that row proves the two
+# copies handle CR alike. It cannot: `_mirror_normalise` strips every `\r` and
+# then rstrips, from BOTH arms, BEFORE the comparison. ✔MEASURED: with the .sh
+# NOT trimming and the .ps1 trimming (`$line.TrimEnd("`r")`), the raw bytes
+# differed and the normalised lines were IDENTICAL — so the differential passed
+# over a real asymmetry while a comment credited it with catching one.
+#
+# ⇒ THE CLAIM IS MADE REAL HERE, ON THE RAW BYTES, BEFORE NORMALISATION. The
+# instrument is per-INTERPRETER because the thing being distinguished is each
+# interpreter's OWN line terminator: bash's `printf '\n'` emits LF, pwsh emits
+# CRLF, so "a CR that is not the terminator" is `\r` surviving a split on that
+# arm's own EOL. Declared as a table for the same reason MIRROR_SYMBOL_RE is —
+# the languages really do differ here, and stating it beats inferring it.
+MIRROR_RAW_EOL = {"sh": "\n", "ps1": "\r\n"}
+
+
+def mirror_stray_cr_lines(raw, lang):
+    """The lines of one arm's RAW output that carry a CR beyond this
+    interpreter's own line terminator. `[]` is the pass."""
+    if lang not in MIRROR_RAW_EOL:
+        raise LegError("no line terminator declared for arm %r (known: %s)"
+                       % (lang, ", ".join(sorted(MIRROR_RAW_EOL))))
+    return [ln for ln in raw.split(MIRROR_RAW_EOL[lang]) if "\r" in ln]
 
 
 # ── A REAL SEGMENT LOG, VERBATIM ────────────────────────────────────────────
@@ -6095,15 +7465,46 @@ def _mirror_write_fixtures(work):
     # claim this battery has no business making — the two arms only have to
     # agree with EACH OTHER, and a bare relative name means the same thing to
     # both interpreters on every host.
+    # ── THE CONFOUND REPORT, AS A MULTI-LINE SCALAR ─────────────────────────
+    # Passed as a VALUE rather than a file, because that is how the drivers really
+    # receive it (one newline-joined variable out of the resolver: LEG_CONFOUND_
+    # REPORT / $leg.confoundReport), and a file would add a reader whose divergence
+    # this case would then be measuring instead.
+    #
+    # ★ THE THREE THINGS IT MAKES THE ARMS PROVE, none of which is free:
+    #   · row 3 carries a TRAILING CR, which each arm must strip BEFORE printing.
+    #     ⚠ THAT CLAIM STOOD HERE FOR A CYCLE AND WAS VACUOUS: _mirror_normalise
+    #     strips every CR from BOTH arms before comparing, so a surviving CR was
+    #     indistinguishable from pwsh's own CRLF — ✔MEASURED, raw bytes differed and
+    #     the normalised lines were identical, while the .sh did not trim at all.
+    #     It is real now because the case declares `crClean` and the battery checks
+    #     each arm's RAW output. [D-HARNESS-MIRROR-CR-CLAIM-IS-VACUOUS]
+    #   · there is a BLANK line, which both must skip rather than print as a tag
+    #     with nothing after it.
+    #   · a line contains `%s` and one contains a `$`, so an arm that pushed the
+    #     text through a FORMAT string or a second expansion diverges loudly.
+    # ⚠ ASCII only, deliberately: see confound_report_lines, which asserts it at the
+    # generator. This is compared byte-for-byte across two file readers.
+    report = ("[elf64-x86_64] environment probe clock-realtime-steps = ABSENT   "
+              "[wall-clock-step: 0 step(s)]\n"
+              "\n"
+              "[elf64-x86_64] confound rows ACTIVE (1 of 2): ^zipfile-25.0$\r\n"
+              "[elf64-x86_64] confound row INACTIVE: ^walsetlk- - NOT honoured "
+              "here: clock-realtime-steps: absent")
     return {"CORPUSDIR": "corpus", "PERMSFILE": "corpus/permutations.test",
             "TIERFILE": "tier.test", "LISTFILE": "corpus.lst",
             "NAMESFILE": "names.lst", "LOGFILE": "segment.log",
             "FACTFILE": "facts.tsv", "BOUNDARY": "swarmvtab.test",
-            "ABORTLOG": "abort-segment.log", "ABORTFACTS": "abort-facts.tsv"}
+            "ABORTLOG": "abort-segment.log", "ABORTFACTS": "abort-facts.tsv",
+            "REPORT": report}
 
 
 def _mirror_run(lang, region, case, work, env):
-    """(ok, lines, detail) — one copy's answer, or why it could not be had."""
+    """(ok, lines, detail, raw) — one copy's answer, or why it could not be had.
+
+    `raw` is the UNNORMALISED stdout, carried out so a case can assert a property
+    the normaliser erases — see mirror_stray_cr_lines and, anchor on ONE LINE,
+    D-HARNESS-MIRROR-CR-CLAIM-IS-VACUOUS."""
     import subprocess  # local, matching the rest of this module's spawn sites
     body = MIRROR_CASES[case][lang]
     # The script is named RELATIVELY and the child's cwd is `work`, for the same
@@ -6135,13 +7536,13 @@ def _mirror_run(lang, region, case, work, env):
         out, err = proc.communicate()
         rc = proc.returncode
     except OSError as exc:
-        return False, [], "could not run %s: %s" % (argv[0], exc)
+        return False, [], "could not run %s: %s" % (argv[0], exc), ""
     out = out.decode("utf-8", "replace")
     err = err.decode("utf-8", "replace")
     if rc != 0:
         return False, [], ("%s arm exited %s: %s"
-                           % (lang, rc, (err.strip() or out.strip())[:400]))
-    return True, _mirror_normalise(out), ""
+                           % (lang, rc, (err.strip() or out.strip())[:400])), out
+    return True, _mirror_normalise(out), "", out
 
 
 def check_dss_regions(harness_dir, out=None):
@@ -6248,6 +7649,9 @@ def check_dss_regions(harness_dir, out=None):
                              "reader's suspicion." % (vf, name)))
 
     # 4. THE MIRROR CONTRACT — pairing, then differential execution.
+    # {region: (sh symbols, ps1 symbols)}, accumulated so the cross-region
+    # staleness check below can see the UNION rather than one region at a time.
+    all_syms = {}
     for name in sorted(n for n in DSS_REGIONS if DSS_REGIONS[n].get("mirror")):
         out.write("--- dss:%s — the MIRROR contract ---\n" % name)
         sh_text = dss_region_text(texts.get("build-and-test.sh", ""), name)
@@ -6274,18 +7678,35 @@ def check_dss_regions(harness_dir, out=None):
                   "whether the .sh needs it")
         for pair in MIRROR_PAIRS:
             if pair.get("sh") and pair.get("ps1"):
-                check("pair %s <-> %s: both still defined"
-                      % (pair["sh"], pair["ps1"]),
-                      pair["sh"] in sh_syms and pair["ps1"] in ps_syms,
-                      "sh=%s ps1=%s" % (pair["sh"] in sh_syms,
-                                        pair["ps1"] in ps_syms))
-            else:
-                only = "sh" if pair.get("sh") else "ps1"
-                check("single-driver %s `%s` states WHY"
-                      % (only, pair.get("sh") or pair.get("ps1")),
-                      bool(pair.get("why")),
-                      "a capability present in one driver only must say why, or "
-                      "it is indistinguishable from one that was forgotten")
+                # ★ "IF EITHER IS HERE, BOTH MUST BE" — and NOT "both are in this
+                #   region", which is what this asserted while there was exactly
+                #   one mirrored region. With two, the unconditional form reds
+                #   every OTHER region's pairs against a body that never defined
+                #   them. The conditional form keeps the whole anti-drift property
+                #   (a pair whose halves drifted into different regions is still
+                #   LOUD here, and a pair defined nowhere is caught by the
+                #   cross-region check below) without asserting a co-location that
+                #   was never the contract.
+                here = pair["sh"] in sh_syms or pair["ps1"] in ps_syms
+                if here:
+                    check("pair %s <-> %s: both still defined in dss:%s"
+                          % (pair["sh"], pair["ps1"], name),
+                          pair["sh"] in sh_syms and pair["ps1"] in ps_syms,
+                          "sh=%s ps1=%s" % (pair["sh"] in sh_syms,
+                                            pair["ps1"] in ps_syms))
+                continue
+            only = "sh" if pair.get("sh") else "ps1"
+            check("single-driver %s `%s` states WHY"
+                  % (only, pair.get("sh") or pair.get("ps1")),
+                  bool(pair.get("why")),
+                  "a capability present in one driver only must say why, or "
+                  "it is indistinguishable from one that was forgotten")
+        # ★ AND THE OTHER HALF OF THE CONDITIONAL PAIRING ABOVE: a row naming a
+        #   symbol that exists in NO mirrored region at all. That is a stale claim
+        #   about code that has been deleted, and without this it would now pass
+        #   silently — the exact failure mode the conditional form could introduce,
+        #   closed in the same edit rather than left for a reader to spot.
+        all_syms[name] = (sh_syms, ps_syms)
 
         # ── DIFFERENTIAL EXECUTION ──────────────────────────────────────────
         # EVERY case in MIRROR_CASES runs, not only those a MIRROR_PAIRS row
@@ -6303,12 +7724,38 @@ def check_dss_regions(harness_dir, out=None):
         # Keys are closed: a typo turns an `expect` into a silently-absent
         # assertion, which is the vacuity class this battery exists to refuse.
         for c in sorted(MIRROR_CASES):
-            unknown = sorted(set(MIRROR_CASES[c]) - {"sh", "ps1", "expect"})
+            unknown = sorted(set(MIRROR_CASES[c])
+                             - {"sh", "ps1", "expect", "region", "crClean"})
             check("MIRROR_CASES `%s` declares only known keys" % c, not unknown,
                   "unknown key(s): %s" % ", ".join(unknown))
+            # ★ `region` IS REQUIRED, AND THAT REQUIREMENT IS THE FIX FOR A LATENT
+            #   TRAP THIS LOOP HAD WHILE THERE WAS EXACTLY ONE MIRRORED REGION:
+            #   every case ran against EVERY mirrored region's extracted text, so
+            #   the day a second region was declared, every corpus-engine case
+            #   would have been executed against a body that does not define its
+            #   helpers — a wall of failures naming the wrong thing. Defaulting to
+            #   `corpus-engine` would have hidden it again, so it is declared.
+            check("MIRROR_CASES `%s` names the region it drives" % c,
+                  MIRROR_CASES[c].get("region") in DSS_REGIONS
+                  and DSS_REGIONS[MIRROR_CASES[c]["region"]].get("mirror"),
+                  "region=%r — a case must name a DSS_REGIONS entry declared "
+                  "`mirror: True`, because the region's text is what its two arms "
+                  "are executed against"
+                  % MIRROR_CASES[c].get("region"))
+        # ★ AND THE CR PROPERTY CANNOT QUIETLY LEAVE. Dropping `crClean` from every
+        # case would take the only assertion about raw CR handling with it and leave
+        # the fixture's trailing CR proving nothing again — which is exactly the
+        # state this cycle found it in. [D-HARNESS-MIRROR-CR-CLAIM-IS-VACUOUS]
+        check("some MIRROR_CASES entry still declares `crClean`",
+              any(MIRROR_CASES[c].get("crClean") for c in MIRROR_CASES),
+              "the trailing CR in a fixture is only a proof while some case asks "
+              "for the RAW check; without it the normaliser erases the property "
+              "and the comparison passes over a real asymmetry")
         named = [p["differential"] for p in MIRROR_PAIRS
                  if p.get("differential") and p["differential"] in MIRROR_CASES]
-        cases = named + [c for c in sorted(MIRROR_CASES) if c not in named]
+        cases = [c for c in (named + [c for c in sorted(MIRROR_CASES)
+                                      if c not in named])
+                 if MIRROR_CASES[c].get("region") == name]
         have_pwsh = _sh.which("pwsh")
         have_bash = _sh.which(os.environ.get("BASH", "bash")) or _sh.which("bash")
         if not (have_pwsh and have_bash):
@@ -6323,12 +7770,29 @@ def check_dss_regions(harness_dir, out=None):
             try:
                 env = _mirror_write_fixtures(work)
                 for case in cases:
-                    ok_sh, sh_out, d_sh = _mirror_run("sh", sh_text, case, work, env)
-                    ok_ps, ps_out, d_ps = _mirror_run("ps1", ps_text, case, work, env)
+                    ok_sh, sh_out, d_sh, raw_sh = _mirror_run("sh", sh_text, case,
+                                                              work, env)
+                    ok_ps, ps_out, d_ps, raw_ps = _mirror_run("ps1", ps_text, case,
+                                                              work, env)
                     if not (ok_sh and ok_ps):
                         check("differential %s: both copies RAN" % case, False,
                               "; ".join(x for x in (d_sh, d_ps) if x))
                         continue
+                    # ★ THE PROPERTY THE NORMALISER ERASES, ASSERTED ON RAW BYTES
+                    # AND PER ARM. [D-HARNESS-MIRROR-CR-CLAIM-IS-VACUOUS.] A case
+                    # whose fixture carries a trailing CR declares `crClean`, and
+                    # each arm must have removed it BEFORE printing — which the
+                    # line-for-line comparison below cannot see, because
+                    # _mirror_normalise strips CR from both arms first.
+                    if MIRROR_CASES[case].get("crClean"):
+                        for lang, raw in (("sh", raw_sh), ("ps1", raw_ps)):
+                            stray = mirror_stray_cr_lines(raw, lang)
+                            check("differential %s: the .%s arm leaves NO stray CR "
+                                  "in its output" % (case, lang), not stray,
+                                  "a CR that is not this interpreter's own line "
+                                  "terminator survived into the output, where it "
+                                  "mangles a log line - and the normalised "
+                                  "comparison below cannot see it: %r" % stray[:3])
                     same = sh_out == ps_out
                     detail = ""
                     if not same:
@@ -6357,6 +7821,53 @@ def check_dss_regions(harness_dir, out=None):
                                  " | ".join(got) or "<empty>"))
             finally:
                 _sh.rmtree(work, ignore_errors=True)
+
+    # 4b. A MIRROR_PAIRS ROW WHOSE CODE IS GONE.
+    # The per-region pairing above became CONDITIONAL when a second mirrored region
+    # appeared ("if either half is here, both must be"), and that alone would let a
+    # row survive whose code has been deleted outright. Checked here against the
+    # UNION, so the two halves of the property are complete together.
+    #
+    # ★ TWO KINDS OF ROW, TWO PROPERTIES, AND THE STRICT ONE IS NOT WEAKENED.
+    # [D-HARNESS-MIRROR-PAIRS-4B-OVER-STRICT-FOR-A-SINGLE-DRIVER-HELPER.]
+    #   · A PAIR row (both `sh` and `ps1`) is a claim that these two are twins, and
+    #     the differential battery only reaches a symbol INSIDE a mirrored region.
+    #     So both halves must still live in one — that catches deletion AND the
+    #     quieter regression of a twin MOVED OUT of the mirror, where its
+    #     differential coverage would vanish silently. Unchanged.
+    #   · A SINGLE-DRIVER row (one side plus a stated reason) has no twin to compare
+    #     and therefore contributes NO differential coverage wherever it lives; the
+    #     only thing that can go stale about it is the code disappearing. So it is
+    #     checked against every top-level definition in ITS OWN driver. That admits
+    #     a future single-driver helper in a non-mirrored region — which used to red
+    #     for a reason that had nothing to do with the property — while still
+    #     failing the moment the symbol is gone.
+    if all_syms:
+        union_sh = set().union(*[s for s, _ in all_syms.values()])
+        union_ps = set().union(*[p for _, p in all_syms.values()])
+        whole_sh = set(dss_region_symbols(texts.get("build-and-test.sh", ""), "sh"))
+        whole_ps = set(dss_region_symbols(texts.get("build-and-test.ps1", ""),
+                                         "ps1"))
+        for pair in MIRROR_PAIRS:
+            paired = bool(pair.get("sh")) and bool(pair.get("ps1"))
+            for lang, sym, mirrored, whole in (
+                    ("sh", pair.get("sh"), union_sh, whole_sh),
+                    ("ps1", pair.get("ps1"), union_ps, whole_ps)):
+                if not sym:
+                    continue
+                if paired:
+                    check("MIRROR_PAIRS %s `%s` (a declared TWIN) exists in some "
+                          "mirrored region" % (lang, sym), sym in mirrored,
+                          "no dss: region declared `mirror: True` defines it — "
+                          "either the code is gone, or it has moved OUT of the "
+                          "mirror and the differential battery no longer reaches "
+                          "it. Both are claims about code that is not there.")
+                else:
+                    check("MIRROR_PAIRS %s `%s` (declared SINGLE-DRIVER) still "
+                          "exists in its driver" % (lang, sym), sym in whole,
+                          "nothing in build-and-test.%s defines it at top level — "
+                          "a stale row is the same shape of defect as an "
+                          "unverified region" % lang)
 
     out.write("passed=%d failed=%d skipped=%d\n"
               % (counts["passed"], counts["failed"], counts["skipped"]))
@@ -6623,11 +8134,35 @@ RUN_ORACLE = {
 
 def _raises(thunk):
     """Did `thunk` refuse LOUDLY? Only a LegError counts — an AttributeError or a
-    TypeError is a bug in the resolver, not the refusal under test."""
+    TypeError is a bug in the resolver, not the refusal under test.
+
+    ⚠ ANY OTHER EXCEPTION PROPAGATES and takes the runner down with it, which
+    prints NO `FAIL` line at all. That is fine where the surrounding code cannot
+    raise anything else, and it is exactly wrong where the property under test is
+    "this is a NAMED refusal and not a python traceback" — use
+    `_refuses_namedly` there. ✔MEASURED while red-on-disabling the injected-verdict
+    validation: removing the key check made `_inject({"why": "x"})` raise KeyError,
+    which aborted the whole self-test with a traceback instead of failing one
+    assertion."""
     try:
         thunk()
     except LegError:
         return True
+    return False
+
+
+def _refuses_namedly(thunk):
+    """True only if `thunk` raised a LegError. A python-level exception is caught
+    and reported as a FAILURE OF THIS PROPERTY rather than allowed to kill the
+    runner — the distinction between a named diagnostic and a traceback IS the
+    property here. See anchor, ONE LINE, DO NOT WRAP:
+    D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT"""
+    try:
+        thunk()
+    except LegError:
+        return True
+    except BaseException:                                       # noqa: BLE001
+        return False
     return False
 
 
@@ -7424,20 +8959,84 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG. The catalogue is the
     # ledger and the lint is what keeps it honest; these assert the RESOLUTION,
     # i.e. that both drivers are handed the same rows in the grammar they speak.
+    # ⓘ WRAPPED, so a raise here REPORTS instead of taking the runner down. This is
+    # the FIRST call in the file that resolves confounds with no probe verdicts, so
+    # it is the first casualty of any defect on the unprobed path — and an
+    # uncaught raise made the whole self-test exit with a traceback and NO `FAIL`
+    # line, i.e. a red that named nothing. ✔MEASURED while red-on-disabling the
+    # unprobed guard.
+    # ── THE RUNS THESE FIXTURES ARE JUDGED AGAINST ──────────────────────────
+    # ★ EVERY confound resolution now STATES WHICH KERNEL the leg's fixture runs
+    # in, because that is what decides whether a measurement of this machine
+    # applies to it at all. Two runs, and both are used below in both directions.
+    # [D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE]
+    _same_kernel = {"mode": "native", "runFilesystem": "driver"}
+    _cross_kernel = {"mode": "launched", "runFilesystem": "wsl-linux"}
+    _launched_same = {"mode": "launched", "runFilesystem": "driver"}
+
+    def _resolves(leg):
+        try:
+            return isinstance(leg_confounds(leg, probe_gate(None, _same_kernel)),
+                              list)
+        except BaseException:                                   # noqa: BLE001
+            return False
     check("every leg's confounds resolve (a missing key is FATAL, never empty)",
-          all(isinstance(leg_confounds(l), list) for l in legs))
+          all(_resolves(l) for l in legs),
+          "an unprobed resolution must still ANSWER — with every conditional row "
+          "dropped — rather than raise: %r"
+          % [l["label"] for l in legs if not _resolves(l)])
     check("a leg with no `confounds` key RAISES rather than defaulting to []",
-          _raises(lambda: leg_confounds({"label": "x"})))
-    check("an unknown confound scope raises rather than meaning 'any'",
+          _raises(lambda: leg_confounds({"label": "x"},
+                                        probe_gate(None, _same_kernel))))
+    # ★★ AND A CONSUMER HANDED THE RAW VERDICT MAP REFUSES. This is the shape V1
+    # shipped in: one function knew about the launcher and the other did not, and
+    # nothing said so. A gate is a distinct object precisely so that mistake is a
+    # LegError and not a silently-unfiltered `present`.
+    check("a raw verdict map handed where a GATE belongs RAISES (both consumers)",
+          _raises(lambda: leg_confound_decisions(
+              legs[0], {"clock-realtime-steps": {"verdict": "present"}}))
+          and _raises(lambda: confound_report_lines("x", [], {"a": 1})),
+          "a consumer reading a raw map would honour a cross-kernel `present`, "
+          "which is the exact defect the gate object exists to make impossible")
+    check("an unknown confound scope raises rather than meaning unconditional",
           _raises(lambda: confound_scope_prefix("sometimes")))
-    check("scope 'any' carries NO prefix (the drivers' bare-pattern grammar)",
-          confound_scope_prefix("any") == "")
+    # ★★ THE MESSAGE IS ASSERTED, NOT JUST THE REFUSAL, and red-on-disable is what
+    # forced that. `any` is refused TWICE over — by the RETIRED branch and, if that
+    # goes, by the generic "unknown scope" branch below it — so deleting the RETIRED
+    # branch left `_raises` perfectly satisfied and the mutation read as VACUOUS.
+    # ✔MEASURED. The generic refusal is still SAFE (the value never becomes an
+    # excusal), but its diagnostic sends the reader hunting for a scope that was
+    # never a scope instead of telling them the claim is now `requires: []`. That is
+    # a real property and it needs a real assertion.
+    _any_why = ""
+    try:
+        confound_scope_prefix("any")
+    except LegError as _exc:
+        _any_why = str(_exc)
+    check("scope 'any' is refused AS RETIRED, naming its replacement",
+          "RETIRED" in _any_why and "requires: []" in _any_why,
+          "'any' meant 'excused however this leg runs', which is now the explicit "
+          "`requires: []`. It must be refused, and the refusal must say WHICH "
+          "spelling replaced it — 'unknown confound scope' is true and useless. "
+          "got: %r [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]" % _any_why)
     check("scope 'emulated' becomes the drivers' `emulated:` prefix",
           confound_scope_prefix("emulated") == "emulated:")
     # ★ THE ASYMMETRY IS THE POINT, AND IT IS ASSERTED RATHER THAN DESCRIBED.
     # A catalogue in which every leg carried the same list would be the global
     # list again, wearing a per-leg shape — so the self-test refuses that.
-    _sets = {l["label"]: set(leg_confounds(l)) for l in legs}
+    # ⓘ RESOLVED WITH EVERY PROBE PRESENT, so these checks keep asking what they
+    # have always asked — "which patterns does this leg DECLARE" — rather than
+    # silently becoming "which survive on the machine running the test". The
+    # GATING is asserted separately, immediately below, on its own fixtures.
+    _probes_present = {nm: {"verdict": "present", "why": "self-test fixture",
+                            "verb": "wall-clock-step", "evidence": {},
+                            "source": PROBE_SOURCE_MEASURED}
+                       for nm in environment_probes(load_catalogue_doc(path))}
+    # ⓘ ON A LAUNCHED, SAME-KERNEL RUN (wine/qemu/`arch`), so an `emulated:` row is
+    # in force and a measured verdict applies — i.e. these keep asking what the
+    # catalogue DECLARES, which is what they have always asked.
+    _sets = {l["label"]: set(leg_confounds(
+        l, probe_gate(_probes_present, _launched_same))) for l in legs}
     check("the legs do NOT all carry the same confound set",
           len({frozenset(v) for v in _sets.values()}) > 1,
           "identical sets on every leg would be the old global list in a per-leg "
@@ -7495,13 +9094,21 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           "a pe64 row earned on a sibling leg is the TF-C123 defect returning, and "
           "this leg admits no transfers at all; got %r"
           % [(r["pattern"], r["earnedOn"][:60]) for r in _pe_rows])
-    check("an `any`-scoped pe64 confound declares it was earned NATIVELY",
-          all(r["scope"] != "any" or "NATIVE" in r["earnedOn"].upper()
-              for r in _pe_rows),
-          "scope `any` excuses a failure on real Windows, which is the platform that "
-          "proves this leg — a wine-only observation may not be widened to cover it; "
-          "got %r" % [(r["pattern"], r["scope"], r["earnedOn"][:60])
-                      for r in _pe_rows])
+    # ⓘ RE-EXPRESSED FOR THE POST-`scope` VOCABULARY, and it is the SAME RULE, not a
+    # weakening: a row with no `scope` and no `requires` excuses a failure however
+    # this leg runs — which on pe64 includes REAL WINDOWS, the platform that proves
+    # it — so such a row must say it was earned natively. Previously the trigger was
+    # spelled `scope == "any"`; it is now "unconditional", which is what `any`
+    # always meant. The one row that is NOT unconditional (win32longpath, wine) is
+    # still exempt, exactly as before.
+    check("an UNCONDITIONAL pe64 confound declares it was earned NATIVELY",
+          all(r.get("scope") or r.get("requires")
+              or "NATIVE" in r["earnedOn"].upper() for r in _pe_rows),
+          "an unconditional row excuses a failure on real Windows, which is the "
+          "platform that proves this leg — a wine-only observation may not be "
+          "widened to cover it; got %r"
+          % [(r["pattern"], r.get("scope", ""), r.get("requires"),
+              r["earnedOn"][:60]) for r in _pe_rows])
     # The six that shipped on this leg in the old global list, by name. `_pe` holds
     # WIRE strings, so drop the scope prefix first — and drop it as a KNOWN prefix
     # from the scope vocabulary, not with lstrip() (a character SET, correct here
@@ -7531,6 +9138,502 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           "macho64-x86_64 runs through `arch -x86_64`, so its run mode is "
           "`launched` and an `emulated:` pattern WOULD match there — the per-leg "
           "ledger is what stops the scope name carrying it across; got %r" % _sets)
+
+    # ── THE ENVIRONMENT-PROBE GATE ───────────────────────────────────────────
+    #
+    # D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.
+    #
+    # ★★ EVERY ARM IS DRIVEN WITH INJECTED CLOCKS, so the whole verb is asserted on
+    # any host, in milliseconds, and — the part that matters — the PRESENT arm is
+    # EXERCISED rather than described. A probe that can only be seen to say ABSENT
+    # (which is what this project's boxes mostly are) is a probe whose detecting
+    # half has never run.
+    _doc = load_catalogue_doc(path)
+    _reg = environment_probes(_doc)
+    check("the catalogue declares an environment-probe registry", bool(_reg),
+          "the clock rows require one; an empty registry means the lint is "
+          "refusing every `requires` name and nothing is gated")
+    check("`clock-realtime-steps` is declared and names a known verb",
+          _reg.get("clock-realtime-steps", {}).get("verb") in
+          ENVIRONMENT_PROBE_VERBS, "got %r" % _reg.get("clock-realtime-steps"))
+
+    def _fake_clocks(step_at, step_by, interval):
+        """A monotonic clock that always advances by `interval`, and a wall clock
+        that advances with it EXCEPT on the ticks in `step_at`, where it jumps by
+        `step_by`. The two are handed to the verb separately, so the instrument
+        under test really is the DIFFERENCE of two clocks."""
+        state = {"n": 0, "mono": 0.0, "wall": 1_000_000.0}
+
+        def sleeper(_secs):
+            state["n"] += 1
+            state["mono"] += interval
+            state["wall"] += interval
+            if state["n"] in step_at:
+                state["wall"] += step_by
+        return (lambda: state["wall"], lambda: state["mono"], sleeper)
+
+    _cfg = dict(_reg["clock-realtime-steps"]["config"])
+    _iv = float(_cfg["sampleIntervalMs"]) / 1000.0
+
+    def _measure(step_at, step_by, config=None, interval=None):
+        w, m, s = _fake_clocks(step_at, step_by, interval or _iv)
+        return _measure_wall_clock_step(config or _cfg, clock=w, monotonic=m,
+                                        sleeper=s)
+    # A HEALTHY clock: the wall clock tracks monotonic exactly.
+    _v, _why, _ev = _measure(set(), 0.0)
+    check("a clock that tracks monotonic time measures ABSENT",
+          _v == "absent" and _ev["steps"] == 0, "%s / %r" % (_v, _ev))
+    # ★ THE MEASURED SIGNATURE: ±34.47 s flipping every ~5 s. At 250 ms that is a
+    # step every 20 ticks, in ALTERNATING directions — so this fixture also proves
+    # the |.| is real and a negative step is not read as no step.
+    _flips = {20: 1, 40: -1, 60: 1, 80: -1}
+    _w, _m, _s = _fake_clocks(set(), 0.0, _iv)
+    _st = {"n": 0, "mono": 0.0, "wall": 1_000_000.0}
+
+    def _osc_sleep(_secs):
+        _st["n"] += 1
+        _st["mono"] += _iv
+        _st["wall"] += _iv + (34.47 * _flips.get(_st["n"], 0))
+    _v, _why, _ev = _measure_wall_clock_step(
+        _cfg, clock=lambda: _st["wall"], monotonic=lambda: _st["mono"],
+        sleeper=_osc_sleep)
+    check("the MEASURED 34.47 s oscillation measures PRESENT",
+          _v == "present" and _ev["steps"] == 4, "%s / %r / %s" % (_v, _ev, _why))
+    check("...and the PRESENT verdict quotes its own evidence",
+          "34.4" in _why and "step(s)" in _why, _why)
+    # ★★ THE FAIL-SAFE BOUNDARY, BOTH SIDES OF `minStepsRequired`. ONE step is not
+    # enough — a single jump is a suspend/resume, not a stepping clock, and the
+    # floor exists so a probe can never be satisfied by one pair of readings.
+    _v, _, _ev = _measure({20}, 34.47)
+    check("a SINGLE 34.47 s jump measures ABSENT (one step < the floor of 2)",
+          _v == "absent" and _ev["steps"] == 1, "%s / %r" % (_v, _ev))
+    _v, _, _ev = _measure({20, 40}, 34.47)
+    check("...and TWO jumps measure PRESENT", _v == "present" and _ev["steps"] == 2,
+          "%s / %r" % (_v, _ev))
+    # THE OTHER THRESHOLD: many small jumps, well under minStepSeconds, are
+    # scheduler noise. A probe that fired on those would excuse the clock family on
+    # every loaded machine in the world.
+    _v, _, _ev = _measure({10, 20, 30, 40, 50, 60}, 0.05)
+    check("six 50 ms jumps measure ABSENT (below minStepSeconds)",
+          _v == "absent" and _ev["steps"] == 0, "%s / %r" % (_v, _ev))
+    # AN UNREADABLE CLOCK is an UNMEASURED machine: indeterminate, never present.
+    def _boom(_secs):
+        raise OSError("clock_gettime: EINVAL")
+    _v, _why, _ = _measure_wall_clock_step(_cfg, clock=lambda: 0.0,
+                                           monotonic=lambda: 0.0,
+                                           sleeper=_boom)
+    check("a clock that cannot be sampled measures INDETERMINATE",
+          _v == "indeterminate" and "cut short" in _why, "%s / %s" % (_v, _why))
+    check("an interpreter with NO monotonic clock measures INDETERMINATE",
+          _measure_wall_clock_step(_cfg, clock=lambda: 0.0, monotonic=None,
+                                   sleeper=lambda _s: None)[0]
+          == "indeterminate")
+    # ★★★ THE ASYMMETRY, ASSERTED. `indeterminate` must NOT honour a row.
+    # ★★ EVERY ARM'S `why` IS ASCII, ASSERTED AT THE SOURCE. It is published into
+    # the confound report, which the differential battery compares BYTE FOR BYTE
+    # across two shells — and this is not hypothetical: confound_report_lines
+    # REFUSED an em-dash that the ABSENT arm was emitting, which is the guard
+    # firing one level below where it was written. Caught here too, so the next one
+    # reds in the self-test rather than in a `--plan` on whichever host.
+    _whys = [_measure(set(), 0.0)[1], _measure({20, 40}, 34.47)[1],
+             _measure({20}, 34.47)[1],
+             _measure_wall_clock_step(_cfg, clock=lambda: 0.0, monotonic=None,
+                                      sleeper=lambda _s: None)[1],
+             _measure_wall_clock_step(_cfg, clock=lambda: 0.0,
+                                      monotonic=lambda: 0.0, sleeper=_boom)[1]]
+    # ── WHOSE KERNEL DID THE PROBE MEASURE? ─────────────────────────────────
+    # D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE.
+    # A launcher that crosses into another kernel gets a probe verdict about the
+    # WRONG machine. Declared per runFilesystem verb — never derived from the verb's
+    # NAME — and REQUIRED, for the same reason `runFilesystem` itself is: `True` is
+    # the CLAIM, and it was the unexamined one.
+    check("every runFilesystem verb declares whether it shares this kernel",
+          all("sharesDriverKernel" in RUN_FILESYSTEMS[v]
+              for v in RUN_FILESYSTEMS),
+          "missing on: %r" % [v for v in sorted(RUN_FILESYSTEMS)
+                              if "sharesDriverKernel" not in RUN_FILESYSTEMS[v]])
+    check("`driver` shares this kernel; `wsl-linux` does NOT",
+          RUN_FILESYSTEMS["driver"]["sharesDriverKernel"] is True
+          and RUN_FILESYSTEMS["wsl-linux"]["sharesDriverKernel"] is False,
+          "Wine/qemu/`arch` are in-process translation on one kernel; wsl.exe "
+          "crosses into the very kernel whose clock defect this probe looks for")
+    check("EVERY probe arm's evidence string is ASCII",
+          all(ord(c) < 127 for w in _whys for c in w),
+          "these strings land in the confound report, which is compared byte-for-"
+          "byte between a bash arm and a PowerShell arm; got %r"
+          % [w for w in _whys if any(ord(c) > 126 for c in w)])
+    check("only PRESENT honours a conditional row", probe_verdict_honours("present"))
+    check("ABSENT does not honour it", not probe_verdict_honours("absent"))
+    check("INDETERMINATE does not honour it — it is not a maybe",
+          not probe_verdict_honours("indeterminate"),
+          "a row honoured on 'I could not measure' is honoured on nothing, which "
+          "is the state `scope: any` was already in")
+    check("an invented verdict RAISES rather than being read as present",
+          _raises(lambda: probe_verdict_honours("probably")))
+    # ── THE GATE, END TO END, ON THE REAL CATALOGUE ──────────────────────────
+    _elf = [l for l in legs if l["label"] == "elf64-x86_64"][0]
+    _absent = {nm: {"verdict": "absent", "why": "self-test fixture: healthy clock",
+                    "verb": "wall-clock-step", "evidence": {},
+                    "source": PROBE_SOURCE_MEASURED} for nm in _reg}
+    _ind = {nm: {"verdict": "indeterminate", "why": "self-test fixture",
+                 "verb": "wall-clock-step", "evidence": {},
+                 "source": PROBE_SOURCE_MEASURED} for nm in _reg}
+    _on = set(leg_confounds(_elf, probe_gate(_probes_present, _same_kernel)))
+    _off = set(leg_confounds(_elf, probe_gate(_absent, _same_kernel)))
+    check("with the clock defect PRESENT, the clock families are honoured",
+          {"^walsetlk-", "^walsetlk_recover-", "^busy2-"} <= _on, "got %r" % _on)
+    # ★★★ THE WHOLE POINT OF THIS CHANGE, IN ONE ASSERTION. On a healthy-clock box
+    # — the arm64 VPS is the real one — those three patterns are NOT in force, so a
+    # genuine walsetlk failure there is reported as GENUINE for the first time.
+    check("with the clock HEALTHY, the clock families are NOT honoured",
+          not ({"^walsetlk-", "^walsetlk_recover-", "^busy2-"} & _off),
+          "this is the blind spot closing: at `scope: any` these excused a "
+          "walsetlk failure on the arm64 VPS, where the clock has never been shown "
+          "to step; got %r" % _off)
+    check("...and INDETERMINATE behaves exactly like ABSENT here",
+          set(leg_confounds(_elf, probe_gate(_ind, _same_kernel))) == _off)
+    check("the UNCONDITIONAL rows survive a healthy clock",
+          {"^zipfile-25\\.0$", "^date-2\\.4c$", "^recoverfault"} <= _off,
+          "a row with `requires: []` rests on its own control and must not be "
+          "gated on anything; got %r" % _off)
+    # ★★★ V1, BOTH DIRECTIONS, AS A DECISION AND NOT A PRINTOUT.
+    # [D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE]
+    # ✔MEASURED at 0ecec160: `--host-os windows --host-arch x86_64
+    # --launchers-available wsl.exe` with a `present` verdict printed the caveat
+    # saying "rows go INACTIVE" and then `confound rows ACTIVE (7 of 7)`. The
+    # scenario that made it dangerous: a Windows host whose OWN clock steps (VM
+    # checkpoint, chrony `makestep`) driving the ELF legs through wsl.exe would
+    # excuse every ^walsetlk-/^busy2- failure produced inside the WSL2 kernel,
+    # including a genuine WAL blocking-lock miscompile.
+    _cross = set(leg_confounds(_elf, probe_gate(_probes_present, _cross_kernel)))
+    check("a CROSS-KERNEL leg does NOT honour a `present` measured by this driver",
+          not ({"^walsetlk-", "^walsetlk_recover-", "^busy2-"} & _cross),
+          "the probe measured THIS driver's kernel and the fixture executes in "
+          "another one, so the verdict must be forced to indeterminate BEFORE any "
+          "row is decided — printing a caveat beside an honoured row is what "
+          "shipped, and the caveat was false; got %r" % _cross)
+    check("...and the same verdict on a SAME-KERNEL leg IS honoured (not a blanket off)",
+          {"^walsetlk-", "^walsetlk_recover-", "^busy2-"} <= _on,
+          "a fix that turned the rows off everywhere would pass the direction above "
+          "while removing the mechanism; got %r" % _on)
+    check("...and a cross-kernel leg's UNCONDITIONAL rows are untouched",
+          {"^zipfile-25\\.0$", "^date-2\\.4c$", "^recoverfault"} <= _cross,
+          "the kernel question is about MEASURED verdicts; a row that rests on its "
+          "own earned control is not gated on any probe at all; got %r" % _cross)
+    _cross_gate = probe_gate(_probes_present, _cross_kernel)
+    check("the gate RECORDS the measurement it did not apply",
+          (_cross_gate["verdicts"]["clock-realtime-steps"]["measuredVerdict"]
+           == "present"
+           and _cross_gate["verdicts"]["clock-realtime-steps"]["verdict"]
+           == "indeterminate"
+           and _cross_gate["verdicts"]["clock-realtime-steps"]["appliedToThisLeg"]
+           is False),
+          "discarding the measured answer would leave the report saying "
+          "INDETERMINATE about a probe that answered; got %r"
+          % _cross_gate["verdicts"])
+    check("`sharesDriverKernel` is read from the DECLARED table, and RAISES rather "
+          "than defaulting to True",
+          run_shares_driver_kernel(_same_kernel) is True
+          and run_shares_driver_kernel(_cross_kernel) is False
+          and _raises(lambda: run_shares_driver_kernel({"mode": "native"}))
+          and _raises(lambda: run_shares_driver_kernel(
+              {"mode": "native", "runFilesystem": "somewhere-else"})),
+          "both lookups used to default to 'shares the kernel, apply the verdict, "
+          "print no caveat' — the permissive direction, and a correctness bug now "
+          "that this value decides whether a measurement applies")
+    # ── M1: A `scope`d ROW IS SUPPLIED, AND THE ACCOUNT SAYS WHETHER IT CAN FIRE ─
+    # ✔MEASURED at 0ecec160 (`--host-os linux --host-arch arm64 --launchers-none`,
+    # run mode `native`): `emulated:^writecrash-` was reported ACTIVE with the
+    # reason "unconditional (`requires: []`) ... nothing this harness measures per
+    # run". Safe, and wrong twice: the matcher never applies an `emulated:` pattern
+    # on a native run, so the row is neither unconditional nor in force.
+    _arm = [l for l in legs if l["label"] == "elf64-arm64"][0]
+    _arm_native = leg_confound_decisions(_arm, probe_gate(_absent, _same_kernel))
+    _wc = [d for d in _arm_native if d["pattern"] == "^writecrash-"][0]
+    check("a scope'd row on a NATIVE run is reported SCOPED OUT, never 'unconditional'",
+          _wc["scopedOut"] is True and "unconditional" not in _wc["reason"]
+          and "NOT IN FORCE HERE" in _wc["reason"],
+          "the report is the account of why a failure was excused; a row the "
+          "matcher cannot apply must not read as the widest kind of excusal. "
+          "got %r" % _wc["reason"])
+    check("...and it is STILL SUPPLIED to the matcher, which owns scope matching",
+          _wc["active"] is True and _wc["wire"] == "emulated:^writecrash-",
+          "dropping the pattern here would make the planner a second owner of "
+          "scope matching — the D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-"
+          "LEG defect, one axis along; got %r" % _wc)
+    _arm_launched = leg_confound_decisions(_arm,
+                                          probe_gate(_absent, _launched_same))
+    _wcl = [d for d in _arm_launched if d["pattern"] == "^writecrash-"][0]
+    check("...and on a LAUNCHED run the same row reports IN FORCE",
+          _wcl["scopedOut"] is False and "IN FORCE here" in _wcl["reason"],
+          "a pin that only ever saw one direction would pass over a scope note "
+          "that was hard-wired; got %r" % _wcl["reason"])
+    check("an unscoped row carries NO scope clause either way",
+          all("SCOPED" not in d["reason"] and d["scopedOut"] is False
+              for d in _arm_native if not d["scope"]),
+          "a note printed where it does not apply teaches a reader to skip it")
+    check("a scope with no declared run modes RAISES rather than matching everything",
+          _raises(lambda: confound_scope_run_modes("sometimes"))
+          and confound_scope_run_modes("emulated") == ("launched",),
+          "an unknown scope answered with 'every mode' would report a dead row as "
+          "in force")
+    check("every declared confound scope declares the run modes it can match",
+          all(s in CONFOUND_SCOPE_RUN_MODES for s in CONFOUND_SCOPES)
+          and all(m in RUN_MODES for ms in CONFOUND_SCOPE_RUN_MODES.values()
+                  for m in ms),
+          "a scope whose modes nobody declared cannot be reported either way: "
+          "scopes=%r modes=%r" % (CONFOUND_SCOPES, CONFOUND_SCOPE_RUN_MODES))
+    # ★★ ROBUST TO *HOW* THE GUARD IS REMOVED, and red-on-disable is what forced
+    # that too. Deleting the `probe_verdicts is None` branch does not make this
+    # answer WRONG — it makes the function CRASH (`'NoneType' has no attribute
+    # 'get'`, ✔MEASURED), which took the whole self-test down and printed no FAIL
+    # line at all. A pin that can only red by crashing its own runner reports
+    # nothing about which property broke, so the raise is CAUGHT and turned into a
+    # visibly wrong answer.
+    def _gated(leg, verdicts):
+        try:
+            return set(leg_confounds(leg, probe_gate(verdicts, _same_kernel)))
+        except BaseException as exc:                            # noqa: BLE001
+            return {"<RAISED %s: %s>" % (type(exc).__name__, exc)}
+    check("an UNPROBED plan honours no conditional row (the fail-safe direction)",
+          _gated(_elf, None) == _off,
+          "unprobed must behave as absent, never as present: the noisy direction "
+          "gets investigated, the silent one hides a miscompile. got: %r"
+          % sorted(_gated(_elf, None)))
+    # A verdict that never arrived is a TRANSPORT defect, not a healthy machine.
+    check("a MISSING verdict for a required probe RAISES",
+          _raises(lambda: leg_confounds(_elf, probe_gate({}, _same_kernel))),
+          "guessing 'present' would excuse a real miscompile in silence; guessing "
+          "'absent' would hide a broken probe run behind plausible reds")
+    check("a row with no `requires` key RAISES rather than defaulting",
+          _raises(lambda: leg_confound_decisions(
+              {"label": "x", "confounds": [{"pattern": "^a"}]},
+              probe_gate(_absent, _same_kernel))))
+    # ── THE VISIBLE ACCOUNT ─────────────────────────────────────────────────
+    _dec = leg_confound_decisions(_elf, probe_gate(_absent, _same_kernel))
+    check("EVERY declared row appears in the decision ledger, active or not",
+          len(_dec) == len(_elf["confounds"]),
+          "an inactive row that vanished would be indistinguishable from a row "
+          "nobody declared")
+    _rep = confound_report_lines("elf64-x86_64", _dec,
+                                 probe_gate(_absent, _same_kernel))
+    # ★★ AND THE CAVEAT IS PRINTED *AND TRUE*. It used to be emitted on
+    # `sharesDriverKernel == False` alone, unconditional on the verdict, so it
+    # announced rows INACTIVE one line above `ACTIVE (7 of 7)`. Both halves are
+    # asserted here: the words, and the decision they describe.
+    _cross_dec = leg_confound_decisions(_elf, _cross_gate)
+    _cross_rep = confound_report_lines("elf64-x86_64", _cross_dec, _cross_gate)
+    check("a cross-kernel launcher's report CARRIES the caveat",
+          any("does NOT share this driver's kernel" in l for l in _cross_rep),
+          "the probe measured this driver's environment, not the launched one")
+    check("...and the caveat is TRUE: the line beside it says those rows are INACTIVE",
+          any("confound rows ACTIVE (4 of 7)" in l for l in _cross_rep)
+          and sum(1 for l in _cross_rep if "INACTIVE" in l
+                  and "confound row" in l) == 3,
+          "a caveat that contradicts the decision beside it is worse than none; "
+          "got %r" % _cross_rep)
+    check("...and the report still states the verdict AS MEASURED, plus that it was "
+          "NOT APPLIED",
+          any("clock-realtime-steps = PRESENT" in l for l in _cross_rep)
+          and any("NOT APPLIED to this leg" in l for l in _cross_rep),
+          "reporting a bare INDETERMINATE about a probe that answered would be a "
+          "second false statement in the place built to stop the first; got %r"
+          % _cross_rep)
+    check("...and a same-kernel launcher's report does NOT carry it",
+          not any("does NOT share" in l
+                  for l in confound_report_lines(
+                      "elf64-x86_64",
+                      leg_confound_decisions(
+                          _elf, probe_gate(_absent, _launched_same)),
+                      probe_gate(_absent, _launched_same))),
+          "a caveat printed where it does not apply teaches a reader to skip it")
+    check("the report names the probe, its VERDICT and its measured evidence",
+          any("clock-realtime-steps = ABSENT" in l and "healthy clock" in l
+              for l in _rep), "got %r" % _rep)
+    check("the report names every INACTIVE row and says a match will be GENUINE",
+          sum(1 for l in _rep if "INACTIVE" in l) == 3
+          and all("GENUINE" in l for l in _rep if "INACTIVE" in l),
+          "a run whose report cannot say why a failure was excused has not earned "
+          "the exclusion; got %r" % _rep)
+    check("the report is ASCII, and non-ASCII RAISES at the generator",
+          all(ord(c) < 127 for l in _rep for c in l)
+          and _raises(lambda: confound_report_lines(
+              "x", [{"pattern": "^a", "wire": "^a", "scope": "", "requires": [],
+                     "active": False, "scopedOut": False,
+                     "reason": "an em dash — here"}],
+              probe_gate(None, _same_kernel))),
+          "this text is compared byte-for-byte between a bash arm and a PowerShell "
+          "arm; a non-ASCII character makes the twin-parity proof a test of two "
+          "codepages")
+    # ── H1/M3: THE INJECTION DOOR IS VALIDATED, AND IT IS LOUD ──────────────
+    # [D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT]
+    # ✔MEASURED at 0ecec160: a hand-written `{"verdict":"present","why":"I said
+    # so","evidence":{}}` yielded gating=probed, 7 of 7 rows ACTIVE and a report
+    # line indistinguishable from a measurement; and two malformed shapes raised
+    # python's own ValueError / KeyError from three frames deeper.
+    def _inject(obj):
+        return validate_probe_verdicts(obj, _doc, "<self-test>")
+    _good = {"clock-realtime-steps": {"verdict": "present", "why": "captured "
+                                      "elsewhere", "verb": "wall-clock-step",
+                                      "evidence": {}}}
+    check("a well-formed injected map is ACCEPTED and stamped `injected`",
+          _inject(_good)["clock-realtime-steps"]["source"]
+          == PROBE_SOURCE_INJECTED)
+    check("...and a file claiming `source: measured` cannot launder itself",
+          _inject({"clock-realtime-steps":
+                   dict(_good["clock-realtime-steps"],
+                        source=PROBE_SOURCE_MEASURED)})
+          ["clock-realtime-steps"]["source"] == PROBE_SOURCE_INJECTED,
+          "the stamp is applied by the door, never read from the file")
+    check("a BARE STRING verdict is a named refusal, not a ValueError",
+          _refuses_namedly(lambda: _inject({"clock-realtime-steps": "present"})))
+    check("a verdict object with no `verdict` key is a named refusal, not a KeyError",
+          _refuses_namedly(lambda: _inject({"clock-realtime-steps": {"why": "x"}})))
+    check("an UNDECLARED probe name is refused",
+          _raises(lambda: _inject({"clock-goes-backwards":
+                                   _good["clock-realtime-steps"]})))
+    check("an invented verdict word is refused",
+          _raises(lambda: _inject({"clock-realtime-steps":
+                                   dict(_good["clock-realtime-steps"],
+                                        verdict="probably")})))
+    check("a verdict naming ANOTHER probe's verb is refused",
+          _raises(lambda: _inject({"clock-realtime-steps":
+                                   dict(_good["clock-realtime-steps"],
+                                        verb="guess-the-clock")})),
+          "a replayed verdict from a different procedure may not decide an excusal")
+    check("an EMPTY `why` is refused (a verdict with no evidence is `earnedOn`)",
+          _raises(lambda: _inject({"clock-realtime-steps":
+                                   dict(_good["clock-realtime-steps"],
+                                        why="   ")})))
+    check("non-object `evidence` is refused",
+          _raises(lambda: _inject({"clock-realtime-steps":
+                                   dict(_good["clock-realtime-steps"],
+                                        evidence="lots")})))
+    check("a verdict with NO `source` RAISES rather than being read as measured",
+          _raises(lambda: probe_verdict_source({"verdict": "present"})),
+          "reading it as measured is the permissive direction; reading it as "
+          "injected would slander a real measurement")
+    # ★★ AND THE INJECTION IS VISIBLE, AND CANNOT RUN A CORPUS.
+    _inj_gate = probe_gate(_inject(_good), _same_kernel)
+    _inj_rep = confound_report_lines(
+        "elf64-x86_64", leg_confound_decisions(_elf, _inj_gate), _inj_gate)
+    check("an injected verdict is HONOURED for resolution",
+          {"^walsetlk-", "^busy2-"}
+          <= set(leg_confounds(_elf, _inj_gate)),
+          "the flag exists so a caller and the pins can drive the honouring path "
+          "without sampling a clock for 20 s")
+    check("...and EVERY report line derived from it says INJECTED, in words",
+          all("INJECTED by --probe-verdicts" in l for l in _inj_rep
+              if "environment probe clock-realtime-steps" in l),
+          "nothing distinguished an injected verdict from a measurement; got %r"
+          % _inj_rep)
+    check("...and the plan's gating is `injected`, which NO driver accepts",
+          _inj_gate["gating"] == "injected"
+          and CONFOUND_GATINGS["injected"]["usable"] is False,
+          "a verdict file captured on the WSL2 box and replayed on the arm64 VPS "
+          "must STOP the driver, not silently restore the blind spot this gate "
+          "closed")
+    check("exactly ONE gating is usable, and it is spelled `probed`",
+          [g for g in sorted(CONFOUND_GATINGS)
+           if CONFOUND_GATINGS[g]["usable"]] == ["probed"],
+          "both drivers spell the test as `== 'probed'`, so a second usable gating "
+          "added here would let a corpus run on gating neither driver checked")
+    check("gating is derived from the verdicts' own SOURCE, not from which flag ran",
+          confound_gating(None) == "unprobed"
+          and confound_gating(_absent) == "probed"
+          and confound_gating(_inject(_good)) == "injected"
+          # ONE injected verdict taints the whole plan: a majority vote would be
+          # the quiet door again.
+          and confound_gating(dict(_absent, **_inject(_good))) == "injected")
+    # ── THE CONFIG FLOORS ───────────────────────────────────────────────────
+    # A config that could be loosened without limit is a guard that gets re-cut to
+    # fit each new case. The lint refuses it; asserted here on a real catalogue
+    # copy so the refusal is exercised and not merely present.
+    def _lint_with_probe_config(**over):
+        import tempfile as _t
+        d = json.loads(json.dumps(_doc))
+        d["environmentProbes"]["clock-realtime-steps"]["config"].update(over)
+        fd, p2 = _t.mkstemp(suffix=".json"); os.close(fd)
+        try:
+            with open(p2, "w", encoding="utf-8") as fh:
+                json.dump(d, fh)
+            return [f for f in lint(p2) if "environmentProbes" in f]
+        finally:
+            os.unlink(p2)
+    check("the shipped probe config clears every floor",
+          not _lint_with_probe_config(), "%r" % _lint_with_probe_config())
+    check("a 5 s sample window is REFUSED (the floor is 15 s)",
+          any("sampleSeconds" in f for f in _lint_with_probe_config(sampleSeconds=5)))
+    check("requiring only ONE step is REFUSED (never a single pair of readings)",
+          any("minStepsRequired" in f
+              for f in _lint_with_probe_config(minStepsRequired=1)))
+    check("a 10 ms step threshold is REFUSED (scheduler noise would fire it)",
+          any("minStepSeconds" in f
+              for f in _lint_with_probe_config(minStepSeconds=0.01)))
+    check("a TIGHTER config is accepted — config may raise, never lower",
+          not _lint_with_probe_config(sampleSeconds=60, minStepsRequired=4,
+                                      minStepSeconds=10))
+    check("an unknown config key is REFUSED, not silently ignored",
+          any("unknown config key" in f
+              for f in _lint_with_probe_config(minStepSecs=5)))
+    check("an unknown probe VERB raises rather than defaulting",
+          _raises(lambda: probe_verb("guess-the-clock")))
+    def _lint_with_mutated_catalogue(mutate, needle):
+        """Lint a COPY of the shipped catalogue with one thing changed. The copy is
+        the real file, so a finding here is the real refusal firing on real data —
+        not a hand-built fixture that only resembles it."""
+        import tempfile as _t
+        d = json.loads(json.dumps(_doc))
+        mutate(d)
+        fd, p2 = _t.mkstemp(suffix=".json"); os.close(fd)
+        try:
+            with open(p2, "w", encoding="utf-8") as fh:
+                json.dump(d, fh)
+            return [f for f in lint(p2) if needle in f]
+        finally:
+            os.unlink(p2)
+
+    def _bogus_requires(d):
+        d["legs"][0]["confounds"][0]["requires"] = ["clock-goes-backwards"]
+    check("a `requires` naming an undeclared probe is a lint finding",
+          _lint_with_mutated_catalogue(_bogus_requires, "clock-goes-backwards"),
+          "an undeclared probe cannot be measured, so the row would be honoured "
+          "on nothing — the exact state `scope: any` was in")
+
+    def _drop_requires(d):
+        del d["legs"][0]["confounds"][0]["requires"]
+    check("a row with NO `requires` key is a lint finding, not a default",
+          _lint_with_mutated_catalogue(_drop_requires, "declares no `requires`"))
+
+    def _readd_any(d):
+        d["legs"][0]["confounds"][0]["scope"] = "any"
+    check("re-adding `scope: any` is a lint finding",
+          _lint_with_mutated_catalogue(_readd_any, "RETIRED"))
+
+    def _scope_without_blocker(d):
+        for r in d["legs"][1]["confounds"]:
+            if r["pattern"] == "^writecrash-":
+                del r["scopeLegacyBlocker"]
+    check("a legacy `scope` row that names no blocker is a lint finding",
+          _lint_with_mutated_catalogue(_scope_without_blocker,
+                                       "scopeLegacyBlocker"),
+          "without this the axis becomes an inert alternative the next row reaches "
+          "for, which is how a proxy gets re-cut to fit each new case")
+    # ── THE MIGRATION OFF `scope`, ASSERTED SO IT CANNOT SILENTLY REGROW ─────
+    _scoped = [(l["label"], r["pattern"]) for l in legs for r in l["confounds"]
+               if "scope" in r]
+    check("only the two rows with a NAMED blocker remain on the legacy `scope` axis",
+          sorted(_scoped) == [("elf64-arm64", "^writecrash-"),
+                              ("pe64-x86_64", "^win32longpath-1\\.3$")],
+          "the axis retires when the last row leaves it. A NEW row on `scope` is "
+          "either a migration that was not done or a proxy being reached for; got %r"
+          % sorted(_scoped))
+    check("every surviving `scope` row NAMES what blocks its migration",
+          all(r.get("scopeLegacyBlocker", "").strip()
+              for l in legs for r in l["confounds"] if "scope" in r))
+    check("no row anywhere still spells the retired `scope: any`",
+          not any(r.get("scope") == "any"
+                  for l in legs for r in l["confounds"]))
 
     # ── the staged-header plan ───────────────────────────────────────────────
     # HOST-INVARIANT for exactly the reason the build set is: which zlib header a
@@ -7648,7 +9751,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 31,
+          len(statements) == 1 + len(labels) * 34,
           "got %d statements for %d legs" % (len(statements), len(labels)))
     check("the sh emitter carries the launcher's run FILESYSTEM",
           "LEG_RUN_FILESYSTEM[" in sh,
@@ -9180,6 +11283,24 @@ def main(argv=None):
                    help="a leg and the libtcl it resolved. Repeatable — pass "
                         "every leg that resolved one, so a run whose legs "
                         "disagree WITH EACH OTHER is caught as well.")
+    p.add_argument("--probe-environment", action="store_true",
+                   help="RUN the declared environment-defect probes on THIS "
+                        "machine and print the verdicts as JSON. The measurement "
+                        "half of the confound gate: a probe answers "
+                        "present/absent/indeterminate, and only `present` lets a "
+                        "row that requires it be honoured. "
+                        "[D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]")
+    p.add_argument("--probe-verdicts", default=None, metavar="FILE",
+                   help="read probe verdicts from FILE (the JSON "
+                        "--probe-environment prints) instead of measuring. For a "
+                        "caller that already probed, and for tests. Without it "
+                        "--plan MEASURES.")
+    p.add_argument("--environment-probes", default="measure",
+                   choices=("measure", "skip"), metavar="measure|skip",
+                   help="`skip` resolves a plan WITHOUT measuring, which marks "
+                        "it `confoundGating: unprobed`; every conditional "
+                        "confound row is then INACTIVE and both drivers REFUSE "
+                        "to run a corpus on it. For structural callers only.")
     p.add_argument("--lint", action="store_true")
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--host-os", default=None)
@@ -9250,8 +11371,10 @@ def main(argv=None):
             or args.run_filesystems or args.run_dir_plan
             or args.stage_build or args.check_launcher or args.identify_binary
             or args.launcher_for_target
-            or args.registry_controls or args.check_regions):
-        p.error("one of --verdict-vocabulary / --plan / --header-stages / "
+            or args.registry_controls or args.check_regions
+            or args.probe_environment):
+        p.error("one of --verdict-vocabulary / --plan / --probe-environment / "
+                "--header-stages / "
                 "--config-stages / --stage-build / --lint "
                 "/ --self-test / --path-translations / --translate-path / "
                 "--assert-translated / --env-transfers / --env-transfer / "
@@ -9566,7 +11689,54 @@ def main(argv=None):
             if argv_:
                 sys.stdout.write(" ".join(shlex.quote(x) for x in argv_) + "\n")
             return 0
-        resolved = plan(host_os, host_arch, available, args.catalogue)
+        # ── THE MEASUREMENT HALF ────────────────────────────────────────────
+        # Probing is an IMPURE act and it lives out here at the CLI boundary,
+        # exactly where launcher availability is resolved before being injected
+        # into the pure planner. Run ONCE per invocation, and only for the probes
+        # some row actually requires — a catalogue whose rows are all
+        # unconditional pays nothing at all.
+        # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+        verdicts = None
+        if args.probe_verdicts:
+            try:
+                with open(args.probe_verdicts, "r", encoding="utf-8") as fh:
+                    verdicts = json.load(fh)
+            except (OSError, ValueError) as exc:
+                raise LegError(
+                    "--probe-verdicts %s could not be read (%s). A caller that "
+                    "asked for measured gating and got an unreadable file must "
+                    "stop: falling back to 'measure it again' would answer a "
+                    "different question than the one asked, and falling back to "
+                    "'no probes' would silently drop every conditional excusal."
+                    % (_fwd(args.probe_verdicts), exc))
+            # ★★ VALIDATED, AND STAMPED AS INJECTED. An unvalidated map reached
+            # three frames deeper and raised python's own `ValueError`/`KeyError`
+            # in the one place whose job is to say what this harness believes
+            # about a machine; and nothing distinguished a verdict this process
+            # measured from one somebody typed. Both fixed at the door.
+            # [D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT]
+            verdicts = validate_probe_verdicts(
+                verdicts, load_catalogue_doc(args.catalogue),
+                "--probe-verdicts %s" % _fwd(args.probe_verdicts))
+        elif args.environment_probes == "measure":
+            doc = load_catalogue_doc(args.catalogue)
+            verdicts = run_environment_probes(
+                doc, only=required_probe_names(load_catalogue(args.catalogue)))
+        if args.probe_environment:
+            if verdicts is None:
+                # --environment-probes skip + --probe-environment is a caller
+                # asking to measure and not to measure. Refused rather than
+                # silently answered one way.
+                raise LegError(
+                    "--probe-environment with --environment-probes skip asks for "
+                    "a measurement and forbids measuring. Drop one of them.")
+            json.dump(verdicts, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+            # rc 0 whatever the verdicts are: ABSENT is a successful measurement,
+            # not a failure. A non-zero rc for "your clock is fine" would teach a
+            # driver to treat a healthy machine as a broken run.
+            return 0
+        resolved = plan(host_os, host_arch, available, args.catalogue, verdicts)
         if args.format == "sh":
             sys.stdout.write(emit_sh(resolved))
         else:

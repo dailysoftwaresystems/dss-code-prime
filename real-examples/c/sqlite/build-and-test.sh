@@ -383,6 +383,8 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
            LEG_LAUNCH=() LEG_LAUNCH_ENV=() \
            LEG_PATH_TRANSLATION=() LEG_PATH_TRANSLATOR=() LEG_ENV_TRANSFER=() \
            LEG_RUN_FILESYSTEM=() LEG_CONFOUNDS=() LEG_RUN_LAUNCH=() \
+           LEG_CONFOUND_GATING=() LEG_CONFOUND_REPORT=() \
+           LEG_CONFOUND_DECLARED=() \
            LEG_RECIPE_TRANSFORM=() LEG_HEADER_STAGE_KEY=() LEG_ZCONF_GUARDS=() \
            LEG_CONFIG_STAGE_KEY=() LEG_CONFIGURE_ANSWERS=() \
            LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() LEG_LOADEXT_NAME=() \
@@ -768,9 +770,13 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
 #   test-confound-scope.sh    the end-of-run confound classifier + the Step-2 gate
 #   test-driver-contracts.sh  the LEG CONTRACTS — the not-run recorder, the shared
 #                             run decision, the Step-8 gate sequence, parse_segment,
-#                             the precondition discriminator, acq_field and the
-#                             target-keyed loader variable, each with its
-#                             red-on-disable mutation asserted to have LANDED.
+#                             the precondition discriminator (driven over real
+#                             ZERO-BYTE segment logs, so "one resume, not ten" is
+#                             asserted rather than described — D-HARNESS-
+#                             PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH),
+#                             acq_field and the target-keyed loader variable, each
+#                             with its red-on-disable mutation asserted to have
+#                             LANDED.
 #   test-mirror-regions.sh    the `dss:` REGIONS — every region declared with who
 #                             verifies it (a claimed verifier that does not read
 #                             the region is a LOUD failure), and for a region
@@ -3753,6 +3759,43 @@ parse_segment() {              # parse_segment <log> <out-facts>
 }
 fact() { LC_ALL=C awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v}' "$2"; }
 facts() { LC_ALL=C awk -F'\t' -v k="$1" '$1==k{print $2}' "$2"; }
+# ── THE ZERO-PROGRESS SIGNATURE ─────────────────────────────────────────────
+# [D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH.]
+#
+# What must CHANGE between two consecutive segments for another resume to be
+# worth attempting. The PRECONDITION FAILURE branch below compares this answer
+# against the previous zero-file segment's; empty means "keep resuming".
+#
+# ✔MEASURED 2026-08-10, one Windows run, two legs, same commit, same root cause —
+# and this is the A/B that motivated the helper:
+#   · elf64-arm64 ran under qemu, which PRINTS `qemu: uncaught target signal 11
+#     (Segmentation fault) - core dumped`. The discriminator fired on the second
+#     segment and the remaining resume budget was NOT spent.
+#   · elf64-x86_64 ran natively and died SILENTLY: every corpus*.log was 0 bytes
+#     and every facts file held only N/D/M/K/Q — no `A` fact at all. The old
+#     condition also required `-n "$s_diag"`, so it could never be satisfied: the
+#     leg burned all 10 resumes and reported `11 fixture ABORT(s)` with every
+#     abort unnameable and 12 unit groups NOT REACHED.
+# THE LEG WHOSE CRASH TALKS WAS HANDLED; THE LEG WHOSE CRASH IS SILENT WAS NOT.
+# A silent crash is strictly worse than a talking one, and the `-n` conjunct had
+# quietly assumed its own best case (a fixture whose first line says what is
+# wrong). So a segment that produced NOTHING gets a SENTINEL, which compares
+# equal to the next such segment exactly as two identical diagnostics do.
+#
+# ★ "NOTHING" IS THE PARSE FINDING NOTHING, NOT MERELY THE DIAGNOSTIC BEING
+# EMPTY, and the distinction is what keeps the resilience rule intact. `A` is
+# also empty for a segment that ran TESTS without completing a FILE (its ` Ok`
+# lines and `name...` lines are fixture output, which the A rule excludes by
+# design) — that segment made progress, its resume boundary advances off the T
+# fact, and it must stay on the ordinary resume path. So the sentinel is returned
+# only when the diagnostic, the ` Ok` tally, the failure tally and the last test
+# name are ALL empty: the fixture said nothing whatsoever.
+zero_progress_signature() { # zero_progress_signature <diag> <ok-lines> <fail-markers> <last-test>
+  if [[ -n "${1:-}" ]]; then printf '%s' "$1"; return 0; fi
+  if [[ "${2:-0}" -eq 0 && "${3:-0}" -eq 0 && -z "${4:-}" ]]; then
+    printf '%s' '<SILENT: the fixture produced no diagnostic, no test result and no test name>'
+  fi
+}
 # Which corpus FILE was the fixture inside when it died? Two things can name it,
 # and this resolver takes EITHER: a qualified test NAME (the T fact) or the SOURCE
 # PATH a Tcl traceback blames (the B fact). Pick the corpus stem occurring
@@ -5126,6 +5169,20 @@ TESTDIR_SRC="$(cd "$(dirname "$TEST_FILE")" && pwd)"
 # ⚠ `eval` INTO AN ARRAY, exactly like LEG_LAUNCH: the resolver emits
 # shlex-quoted words so that a pattern containing a space, a `$` or a backslash
 # survives. `for p in ${LEG_CONFOUNDS[...]}` would shred it.
+#
+# ★★★ AND THE CALL SITE MUST BE A PLAIN ASSIGNMENT FIRST, NEVER A SUBSTITUTION
+# INSIDE `eval`. [D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL.]
+# `die` is `exit 1`, which exits the SUBSHELL a command substitution runs in, and
+# under `set -Eeuo pipefail` bash does NOT propagate a failed substitution inside
+# a NON-ASSIGNMENT command. ✔MEASURED end to end with this shipped region and the
+# production call site `eval "CONFOUND_PATTERNS=($(leg_confound_patterns "$leg"))"`:
+# the refusal printed, then `REACHED THE NEXT STATEMENT. CONFOUND_PATTERNS size=0`,
+# then the script COMPLETED with rc=0 — i.e. the whole corpus would have run with
+# an EMPTY confound list instead of stopping. A simple `v="$(…)"` DOES propagate
+# the status (measured: rc 1, nothing after it runs), which is the same rule this
+# driver already records at the SEGQ site for the same reason. The pin that holds
+# it is test-driver-contracts.sh's "the refusal STOPS THE DRIVER" case, which
+# drives the real call-site shape rather than capturing the substitution's rc.
 # ⚠ AND AN UNSET ENTRY IS FATAL, NOT EMPTY: harness_legs.py REFUSES to plan a leg
 # that does not declare `confounds`, so the array being absent here means the
 # plan this driver eval'd is not the plan that file produces. Substituting an
@@ -5147,9 +5204,77 @@ leg_confound_patterns() {   # leg_confound_patterns <leg>  -> shlex-quoted words
       defect between the resolver and this driver — NOT a leg with nothing earned. Treating it as an
       empty list would silently report every failure on this leg as a DSS defect.
       [D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG]"
+  # ★★ AND WHETHER A MACHINE MEASUREMENT BACKS THAT LIST. A row whose mechanism is
+  # a property of THIS MACHINE (the stepping CLOCK_REALTIME) declares
+  # `requires: [<probe>]` and is honoured only where the probe MEASURES the defect
+  # as PRESENT. An `unprobed` plan is FAIL-SAFE — every conditional row was
+  # dropped, so nothing is excused on evidence nobody gathered — but it is NOT fit
+  # to run a corpus on: the excusals it withholds would read as compiler
+  # regressions, which is the mirror of the defect the gate exists to remove. So
+  # the refusal is LOUD and names the flag that produced it.
+  # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  # ⚠ THE TWO UNUSABLE GATINGS FAIL FOR OPPOSITE REASONS, so the refusal names
+  # both rather than asserting one. Saying "so every conditional row is INACTIVE"
+  # is TRUE of `unprobed` and FALSE of `injected` — where the rows ARE honoured,
+  # from a file that may describe another machine — and a refusal that misstates
+  # what happened is the same defect as a caveat that contradicts the decision
+  # beside it. See anchor, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT
+  [[ "${LEG_CONFOUND_GATING[$leg]:-}" == 'probed' ]] || die "[$leg] the resolved leg plan says confoundGating='${LEG_CONFOUND_GATING[$leg]:-<unset>}', not 'probed'.
+      A conditional confound row (\`requires: [<environment probe>]\`) is honoured ONLY where the named
+      probe MEASURED its defect as PRESENT on THIS machine, and this plan carries no such measurement.
+      'unprobed' — nothing was measured, so every conditional row is INACTIVE. Safe, and not usable:
+        the withheld excusals surface as GENUINE reds and read as compiler regressions.
+        Resolve the plan WITHOUT \`--environment-probes skip\` so harness_legs.py measures.
+      'injected' — the verdicts were READ FROM A FILE (\`--probe-verdicts\`), so conditional rows ARE
+        honoured, on evidence gathered somewhere this driver cannot vouch for. A verdict captured on
+        another box would excuse a real miscompile HERE, in silence. Drop the flag and let it measure.
+      [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
   printf '%s' "${LEG_CONFOUNDS[$leg]}"
 }
 # <<< dss:confound-supply <<<
+
+# >>> dss:confound-report >>>
+# WHY A FAILURE WAS EXCUSED, PRINTED — NOT MERELY DECIDED.
+# [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.]
+#
+# ★★ `earnedOn` FAILED BECAUSE IT IS PROSE NOTHING READS, AND A PROBE RESULT
+# NOBODY SEES IS THE SAME FAILURE WITH EXTRA STEPS. So every run states, per leg:
+# which environment probes ran, each verdict WITH ITS MEASURED EVIDENCE, and which
+# confound rows are consequently ACTIVE vs INACTIVE. A run whose report cannot say
+# why a failure was excused has not earned the exclusion.
+#
+# ⚠ THE LINES ARE GENERATED BY harness_legs.py AND PRINTED VERBATIM HERE. Neither
+# driver composes them: two drivers each writing their own account of the same
+# decision is how the ledger came to have two answers in the first place, and it is
+# what the differential battery's `confound-report` case exists to keep true. This
+# function's whole job is transport + the LOUD refusal of an empty report, which is
+# the one thing a caller could otherwise not tell from "nothing to say".
+print_confound_report() {   # print_confound_report <leg> <report-text>
+  local _leg="$1" _report="$2" _line
+  if [[ -z "${_report//[[:space:]]/}" ]]; then
+    die "[$_leg] the resolved leg plan carries an EMPTY confound report.
+      harness_legs.py emits at least one line for every leg — the rows that are ACTIVE, and one line
+      per INACTIVE row saying which probe withheld it. An empty report means the account of WHY a
+      failure was excused did not arrive, and an unexplained exclusion is not an earned one.
+      [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
+  fi
+  while IFS= read -r _line; do
+    # ⚠ TRAILING CR STRIPPED, AND THE TWIN DOES THE SAME. The report arrives as one
+    # newline-joined scalar, and on a host where it was assembled with CRLF every
+    # line would otherwise carry a CR into the log and mangle the tag.
+    # [D-HARNESS-MIRROR-CR-CLAIM-IS-VACUOUS.] `Write-ConfoundReport` has always done
+    # `$line.TrimEnd("`r")`; this half did NOT, and the differential battery could
+    # not see it because its normaliser strips CR from BOTH arms BEFORE comparing.
+    # ✔MEASURED: the raw bytes differed, the post-normalise lines were identical.
+    # The battery now checks each arm's RAW output for a CR that is not its own line
+    # terminator, so this line is load-bearing and its removal reds.
+    _line="${_line%$'\r'}"
+    [[ -z "$_line" ]] && continue
+    info "$_line"
+  done <<< "$_report"
+}
+# <<< dss:confound-report <<<
 # Tier exclusions (see DSS_TIER_EXCLUDES above) — announced BEFORE the run so the
 # reduction is on the record even if a leg never reaches a summary line, and
 # carried into every leg's Step-9 verdict via $EXCL_NOTE.
@@ -5675,12 +5800,36 @@ for leg in "${LEG_ORDER[@]}"; do
   # build-and-test.ps1 reads. ONE ledger, both drivers.
   # [D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG]
   declare -a CONFOUND_PATTERNS=()
-  eval "CONFOUND_PATTERNS=($(leg_confound_patterns "$leg"))"
+  # ★★★ TWO STATEMENTS, AND THE FIRST ONE IS WHY THE REFUSAL WORKS.
+  # [D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL.] A plain assignment
+  # takes the substitution's exit status as its own, so `die` inside
+  # leg_confound_patterns stops this driver. Fused into the `eval` below —
+  # `eval "CONFOUND_PATTERNS=($(leg_confound_patterns "$leg"))"` — the refusal
+  # printed and the run CONTINUED with an empty list (✔MEASURED, rc 0). Do not
+  # re-fuse them, and do not make this `local`: `local v="$(…)"` takes `local`'s
+  # own status, which is always 0 (✔MEASURED too).
+  CONFOUND_SUPPLY="$(leg_confound_patterns "$leg")"
+  eval "CONFOUND_PATTERNS=($CONFOUND_SUPPLY)"
   if [[ ${#CONFOUND_PATTERNS[@]} -gt 0 ]]; then
     info "[$leg] confound patterns in force (${#CONFOUND_PATTERNS[@]}): ${CONFOUND_PATTERNS[*]}$( [[ -n "$DSS_CONFOUNDS" ]] && printf '   [operator DSS_CONFOUNDS — applied to EVERY leg]' || printf '   [EARNED on this leg — legs.json `confounds`, provenance per pattern]' )"
+  elif [[ "${LEG_CONFOUND_DECLARED[$leg]:-0}" -gt 0 ]]; then
+    # ★★ AN EMPTY SUPPLY IS NOT A CLAIM ABOUT THE CATALOGUE. Three different facts
+    # produce an empty array and they must read differently: the catalogue declares
+    # none, every declared row was GATED OFF by an environment probe, or the
+    # transport failed. The third is now impossible here — leg_confound_patterns
+    # `die`s and the plain assignment above propagates it — and the first two are
+    # told apart by the resolver's own declared-row count, never inferred from the
+    # empty array. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+    info "[$leg] NO confound patterns IN FORCE, and this is NOT a catalogue that declares none: ${LEG_CONFOUND_DECLARED[$leg]} row(s) ARE declared for this leg and every one of them was gated OFF for this run — see the per-row account immediately below. Every failure here counts, and a clock-family failure here reads as GENUINE."
   else
-    info "[$leg] NO confound patterns: this leg's catalogue entry declares \`confounds: []\`, i.e. nothing has ever been measured as a non-DSS confound HERE, and a confound must be EARNED per platform, never copied from a sibling leg. Every failure here counts."
+    info "[$leg] NO confound patterns: this leg's catalogue entry declares \`confounds: []\` (0 rows declared), i.e. nothing has ever been measured as a non-DSS confound HERE, and a confound must be EARNED per platform, never copied from a sibling leg. Every failure here counts."
   fi
+  # ★ AND THE ACCOUNT OF WHY — every probe verdict with its evidence, every row's
+  # ACTIVE/INACTIVE decision. Printed on the OPERATOR override path too: an
+  # operator's list replaces the earned one, and which earned rows it displaced is
+  # exactly what a reader of that run needs to know.
+  # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  print_confound_report "$leg" "${LEG_CONFOUND_REPORT[$leg]:-}"
   runlog="$OUT_DIR/$leg/corpus.log"
   ledger="$OUT_DIR/$leg/corpus-units.txt"
   # scratch lives in the leg's OUT dir — NEVER in the sqlite clone (the .sh runs the
@@ -5732,13 +5881,15 @@ for leg in "${LEG_ORDER[@]}"; do
   ps_enum_available || HYGIENE+=("leftover-fixture detection UNAVAILABLE on this host (ps(1) cannot enumerate) — a stray fixture would go unnoticed")
   seg_i=0; resumes=0; last_boundary=""; total_tests=0; total_errors=0; files_done=0; files_inert=0
   seg_summary=""; all_fails=""
-  # The previous segment's first diagnostic, but ONLY when that segment completed
-  # zero files. Empty means "the last segment made progress", which is what keeps a
-  # genuine mid-corpus crash on the ordinary resume path. See the PRECONDITION
-  # FAILURE branch for why one repetition, and not the first occurrence, is the
-  # discriminator. PRECONDITION_FAIL is the diagnostic itself once detected — the
-  # classifier below reads it, so the verdict is decided in one place.
-  prev_zero_diag=""; PRECONDITION_FAIL=""
+  # The previous segment's ZERO-PROGRESS SIGNATURE (zero_progress_signature: its
+  # first diagnostic, or a SENTINEL when it said nothing at all), but ONLY when
+  # that segment completed zero files. Empty means "the last segment made
+  # progress", which is what keeps a genuine mid-corpus crash on the ordinary
+  # resume path. See the PRECONDITION FAILURE branch for why one repetition, and
+  # not the first occurrence, is the discriminator. PRECONDITION_FAIL is that
+  # signature once detected — the classifier below reads it, so the verdict is
+  # decided in one place.
+  prev_zero_sig=""; PRECONDITION_FAIL=""
   while [[ $seg_i -lt ${#SEGQ[@]} ]]; do
     IFS="$US" read -r s_kind s_perm s_label s_patfile s_arg1 s_arg2 <<< "${SEGQ[$seg_i]}"
     if [[ $seg_i -eq 0 ]]; then
@@ -5875,30 +6026,48 @@ for leg in "${LEG_ORDER[@]}"; do
     # What is added is a DISTINCT case with two conjuncts that a genuine mid-corpus
     # crash cannot satisfy together:
     #   (1) the segment completed ZERO files, and
-    #   (2) its first diagnostic is IDENTICAL to the previous segment's, which also
-    #       completed zero files.
+    #   (2) its ZERO-PROGRESS SIGNATURE is IDENTICAL to the previous segment's,
+    #       which also completed zero files.
     # A real crash on the corpus's next file also completes zero files — but the
     # resume boundary STRICTLY ADVANCES every time, so it dies in a different file
     # with a different diagnostic, and (2) fails. Two identical zero-progress
     # segments in a row mean the fixture never started, which is not something
     # resuming can fix. The FIRST such abort is still resumed exactly as today: one
     # attempt is what distinguishes "could not start" from "crashed at the start".
-    if [[ "$s_nf" -eq 0 && -n "$s_diag" && "$s_diag" == "${prev_zero_diag:-}" ]]; then
-      PRECONDITION_FAIL="$s_diag"
-      warn "[$leg] PRECONDITION FAILURE — the fixture completed ZERO test files in TWO consecutive segments with the IDENTICAL first diagnostic."
+    #
+    # ★★ THE SIGNATURE, NOT THE DIAGNOSTIC — see zero_progress_signature() for the
+    # measured A/B. This condition used to read `-n "$s_diag" && "$s_diag" ==
+    # "${prev_zero_diag:-}"`, which is unsatisfiable for a fixture that dies
+    # WITHOUT WRITING A BYTE: there is no `A` fact, so the `-n` conjunct is false
+    # forever and the whole resume budget burns on a startup crash. The helper
+    # answers a SENTINEL for a segment that said nothing at all, so silence
+    # compares equal to silence — and answers empty for a segment that ran tests
+    # without completing a file, which is what keeps that case resumable.
+    s_zero_sig="$(zero_progress_signature "$s_diag" "$s_ok" "$s_fx" "$s_last")"
+    if [[ "$s_nf" -eq 0 && -n "$s_zero_sig" && "$s_zero_sig" == "${prev_zero_sig:-}" ]]; then
+      PRECONDITION_FAIL="$s_zero_sig"
+      # The log's SIZE is stated because it is the measured evidence for the
+      # silent case, and `head` prints nothing at all for a 0-byte log — a report
+      # that goes quiet exactly where the fixture did would look like a reporting
+      # bug. `if _sz_raw=…` guards the assignment: under `set -e` a failed command
+      # substitution in a BARE assignment kills the run, and this one is on the
+      # failure path, where dying would cost the leg the diagnosis it just earned.
+      _sz="size unknown"
+      if _sz_raw="$(LC_ALL=C wc -c < "$seglog" 2>/dev/null)"; then _sz="${_sz_raw//[[:space:]]/} byte(s)"; fi
+      warn "[$leg] PRECONDITION FAILURE — the fixture completed ZERO test files in TWO consecutive segments, both ending IDENTICALLY."
       warn "      This is NOT a resumable fixture crash: nothing the resume engine can do changes it,"
       warn "      so the remaining $((DSS_MAX_RESUMES - resumes)) resume(s) are NOT spent on it."
-      warn "      the diagnostic, verbatim, from $seglog:"
-      warn "        $s_diag"
-      info "      first lines of that log:"
+      warn "      what both segments ended with, verbatim, from $seglog:"
+      warn "        $s_zero_sig"
+      info "      first lines of that log ($_sz):"
       head -6 "$seglog" 2>/dev/null | sed 's/^/        /'
-      NOT_REACHED+=("EVERY unit of the '${s_perm:-$DSS_TIER}' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $s_diag")
+      NOT_REACHED+=("EVERY unit of the '${s_perm:-$DSS_TIER}' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $s_zero_sig")
       break
     fi
     # Carried to the NEXT segment so the comparison above has something to compare
     # against. Cleared by any segment that made progress, which is what keeps a
     # genuine crash on the resilience path.
-    if [[ "$s_nf" -eq 0 ]]; then prev_zero_diag="$s_diag"; else prev_zero_diag=""; fi
+    if [[ "$s_nf" -eq 0 ]]; then prev_zero_sig="$s_zero_sig"; else prev_zero_sig=""; fi
     # An aborted segment is NOT an empty segment. It printed no summary, so its work
     # is counted from its per-test lines (see the derivation note at the union) —
     # otherwise the totals silently omit everything it did, and a regression inside
@@ -6228,7 +6397,12 @@ for leg in "${LEG_ORDER[@]}"; do
     # holding "Can't find a usable init.tcl" is withholding the diagnosis, and
     # THAT, not the retrying, was the expensive half.
     # [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
-    UNIT_VERDICT["$leg"]="FAIL:PRECONDITION FAILURE — the fixture completed ZERO test files in $nseg consecutive segment(s), each dying with the same first diagnostic: $PRECONDITION_FAIL  (this is not a resumable crash; the remaining resume budget was NOT spent on it — see $runlog)"
+    # ★ "each ENDING THE SAME WAY", not "each dying with the same first
+    # diagnostic": PRECONDITION_FAIL now carries a zero_progress_signature, which
+    # is the `<SILENT: …>` sentinel for a fixture that wrote nothing at all. A
+    # verdict that called that sentinel a "diagnostic" would be describing a line
+    # the fixture never printed.
+    UNIT_VERDICT["$leg"]="FAIL:PRECONDITION FAILURE — THE FIXTURE NEVER STARTED: it completed ZERO test files in $nseg consecutive segment(s), each ending the same way: $PRECONDITION_FAIL  (this is not a resumable crash; the remaining resume budget was NOT spent on it — see $runlog)"
     UNIT_FAILS=$((UNIT_FAILS + 1))
     warn "[$leg] corpus FAIL — PRECONDITION FAILURE, no unit of this leg's corpus ever ran."
     warn "      $PRECONDITION_FAIL"

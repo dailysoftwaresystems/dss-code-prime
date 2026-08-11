@@ -25,17 +25,62 @@ namespace {
 using dss::opt::analysis::StrictTbaa;
 using dss::opt::analysis::MirMemoryClobbers;
 
-// Trap-eligible opcodes: divisions and modulo may raise at runtime
-// (#DE on x86 for IDIV with divisor=0 / quotient overflow; similar
-// on ARM under specific cores). Hoisting these out of a loop whose
-// trip count could be zero would execute the trap-eligible op
-// UNCONDITIONALLY, changing observable program behavior. Until
-// interval / value-range analysis proves the divisor is non-zero,
-// these stay in the loop body (D-OPT6-LICM-TRAP-SAFE-HOIST).
-[[nodiscard]] bool isTrapEligible(MirOpcode op) noexcept {
+// ── Speculation safety: ONE fact, ONE owner ───────────────────────────
+// The fact: "executing this opcode can FAULT."
+//   * SDiv / UDiv / SMod / UMod raise at runtime — #DE on x86 IDIV for
+//     divisor 0 or INT_MIN/-1 quotient overflow; similar on ARM cores
+//     that trap.
+//   * Load faults on a null / unmapped / misaligned pointer.
+// Considered and deliberately NOT in the set: FDiv (IEEE division by
+// zero yields inf/NaN in the default masked FP environment — no trap);
+// Gep / Bitcast / PtrToInt / ExtractValue (address or register
+// arithmetic, never a memory access); Alloca, Store, Call,
+// IntrinsicCall, AtomicLoad (all carry `hasSideEffects` in the
+// opcodeInfo table, so `isLicmCandidateOpcode` refuses them before this
+// predicate is ever consulted — read off the table, not assumed).
+//
+// The CONSEQUENCE is identical for every member, so it is stated ONCE
+// rather than growing one gate per opcode family: a may-fault candidate
+// may be hoisted into the preheader ONLY out of a block that is
+// GUARANTEED TO EXECUTE when the loop is entered
+// (`blockRunsOnEveryLoopEntry`, built per loop in analyze()). Where that
+// holds, the fault was going to happen on the first iteration anyway,
+// and C makes both faults undefined behaviour — so relocating it
+// preserves behaviour in the only sense the standard defines. Where it
+// does NOT hold, hoisting INJECTS a fault into a program that had none:
+//
+//     for (i = 0; i < n; i++) { if (q) x = *p; }   /* q == 0, p == NULL */
+//
+// which is a MISCOMPILE, not a missed-precision matter
+// (D-OPT6-LICM-SPECULATIVE-LOAD-HOIST — witnessed live at
+// `--config=release` as an 0xC0000005 access violation while this gate
+// covered division only).
+//
+// ⚠ THE EXACT BOUNDARY OF THE SOUNDNESS ARGUMENT, stated rather than
+// left for someone to rediscover. "B dominates every exiting block"
+// proves "if control LEAVES the loop, B ran". It does not prove B ran in
+// an execution that never leaves — and one can be built: an inner
+// non-terminating region sitting between the header and B (`for (;;) {
+// for (;;) {} … x = *p; }`) reaches neither the exit nor B, so the
+// original program hangs where the hoisted one faults. Closing that would
+// mean proving termination. C23 6.8.5p6 instead lets an implementation
+// ASSUME an iteration statement terminates unless its controlling
+// expression is a constant expression, which is exactly the assumption
+// LLVM's `isGuaranteedToExecute` + `mustprogress` rest on, so this gate
+// matches the reference compilers. The `exits.empty()` refusal below
+// covers the one shape the assumption does NOT cover and which is cheap
+// to detect: a loop with no exiting block at all.
+//
+// The division arm keeps a refinement of its OWN beyond this gate:
+// proving the divisor non-zero would admit hoists out of blocks that are
+// NOT guaranteed to execute, which needs interval / value-range analysis
+// (D-OPT6-LICM-TRAP-SAFE-HOIST). That is a strictly additional
+// permission, not a different rule.
+[[nodiscard]] bool mayFaultWhenSpeculated(MirOpcode op) noexcept {
     switch (op) {
         case MirOpcode::SDiv: case MirOpcode::UDiv:
         case MirOpcode::SMod: case MirOpcode::UMod:
+        case MirOpcode::Load:
             return true;
         default:
             return false;
@@ -52,7 +97,14 @@ using dss::opt::analysis::MirMemoryClobbers;
     // identical to the reference `mirAnyMayAliasingStoreInLoop` scan) — if
     // no may-aliasing Store sits in the loop body, the Load is
     // loop-invariant in the alias sense.
-    if (isTrapEligible(op)) return false;     // D-OPT6-LICM-TRAP-SAFE-HOIST
+    //
+    // NOTE what is NOT decided here: the may-fault opcodes (Load and the
+    // divisions) stay CANDIDATES. Whether they may actually move is a
+    // property of the candidate's BLOCK, not of its opcode, so it cannot
+    // be answered from an opcode alone — `mayFaultWhenSpeculated` +
+    // `blockRunsOnEveryLoopEntry` decide it together in analyze(). A
+    // blanket opcode-level refusal here is what made the division arm
+    // pass while the Load arm miscompiled.
     // Leaf opcodes (zero-operand value origins) have dedicated
     // builders on MirBuilder + carry no runtime computation worth
     // hoisting. Excluding them keeps the hoist emit-loop generic
@@ -268,6 +320,122 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
             continue;
         }
 
+        // ── Speculation-safety facts for THIS loop ───────────────────
+        // (D-OPT6-LICM-SPECULATIVE-LOAD-HOIST; see
+        // `mayFaultWhenSpeculated` for the rule these three facts serve.)
+        // Computed ONCE per loop in a single O(|body|) scan, and only
+        // CONSULTED when a may-fault candidate actually turns up — a loop
+        // containing none pays nothing beyond this scan.
+        //
+        // (1) `entryIsUnconditional` — the hoist lands in the preheader
+        //     BEFORE its terminator. `preheader` above is only "the
+        //     header's unique predecessor outside the loop"; it may still
+        //     branch SOMEWHERE ELSE. Then executing the preheader does
+        //     NOT imply entering the loop — `if (c) for (…) x = *p;`,
+        //     where the `if` block IS the preheader — and a may-fault op
+        //     hoisted into it runs on a path the loop never ran on.
+        // (2) `exits` — every loop block with a successor OUTSIDE the
+        //     body, i.e. every block through which control can LEAVE the
+        //     loop. Cross-edges are the COMPLETE enumeration, and the
+        //     reason deserves stating because a zero-successor block
+        //     (Return / Unreachable) looks like a missing case: such a
+        //     block can never BE in `loop.body`. `mirNaturalLoops` builds
+        //     the body by walking PREDECESSORS back from the back-edge
+        //     sources, and a block that reaches nothing is a predecessor
+        //     of nothing on that walk. MEASURED, not reasoned: a fixture
+        //     with a Return inside the loop region behaves identically
+        //     with and without a zero-successor arm here. The source
+        //     shape `for (…) { if (r) return 0; … x = *p; }` is still
+        //     covered — by the cross-edge from the BRANCHING block to the
+        //     out-of-body return block, which makes the branching block
+        //     an exit that the dereference does not dominate.
+        //     An EMPTY set means control can never leave the loop, so no
+        //     block below the header is guaranteed to run at all.
+        // (3) `bodyHasCall` — a Call may never return (exit / abort /
+        //     longjmp / a nested infinite loop). Control then never
+        //     reaches any exit, and (2)'s dominance argument — "control
+        //     left through E, and B dominates E, therefore B ran" —
+        //     proves nothing. This condition is NECESSARILY whole-body
+        //     rather than "the blocks that dominate the candidate": a
+        //     call in a SIBLING arm, `for (…) { if (c) exit(0); … x =
+        //     *p; }`, stops the candidate from executing just as
+        //     effectively as one that precedes it. Load hoists were
+        //     already refused in such loops (Call is in
+        //     `opcodeClobbersMemory`, so the clobber gate catches them);
+        //     this condition is what makes the DIVISION arm sound too.
+        auto const preheaderSucc = src_.blockSuccessors(preheader);
+        bool const entryIsUnconditional =
+            preheaderSucc.size() == 1
+            && preheaderSucc[0].v == loop.header.v;
+        std::vector<MirBlockId> exits;
+        bool bodyHasCall = false;
+        for (MirBlockId const b : loop.body) {
+            for (MirBlockId const s : src_.blockSuccessors(b)) {
+                if (bodySet.count(s.v)) continue;
+                exits.push_back(b);
+                break;
+            }
+            // Written only ever to `true`, never assigned the test's
+            // result: a plain `bodyHasCall = (o == Call || …)` would be
+            // correct ONLY because the loop condition below stops the
+            // scan, and would silently RESET the flag the moment someone
+            // widened that condition. Monotone by construction instead.
+            std::uint32_t const nb = src_.blockInstCount(b);
+            for (std::uint32_t i = 0; i < nb && !bodyHasCall; ++i) {
+                MirOpcode const o = src_.instOpcode(src_.blockInstAt(b, i));
+                if (o == MirOpcode::Call || o == MirOpcode::IntrinsicCall) {
+                    bodyHasCall = true;
+                }
+            }
+        }
+
+        // Is block `b` guaranteed to execute whenever this loop is
+        // entered? Memoized per block: the dominance walk is O(idom
+        // chain) per exit and the chained-invariant fixed point below
+        // re-visits every block on every round.
+        //
+        // Every uncertain answer resolves to `false` — including the
+        // dominator walk's `GaveUp`, which is reported once per loop as
+        // Info rather than silently mistaken for "not dominated"
+        // (mir_dom.hpp's tri-state contract). Refusing to hoist is
+        // always behaviour-preserving, so `false` is the fail-safe pole.
+        std::unordered_map<std::uint32_t, bool> runsOnEntry;
+        bool domGaveUpReported = false;
+        auto blockRunsOnEveryLoopEntry = [&](MirBlockId b) -> bool {
+            if (auto const it = runsOnEntry.find(b.v); it != runsOnEntry.end()) {
+                return it->second;
+            }
+            bool ok = entryIsUnconditional && !bodyHasCall;
+            // Entering the loop IS executing the header, so the header
+            // needs no dominance proof. Any other block must lie on
+            // EVERY path by which control leaves the loop.
+            if (ok && b.v != loop.header.v) {
+                ok = !exits.empty();
+                for (MirBlockId const e : exits) {
+                    if (!ok) break;
+                    MirDomResult const dr = mirDominatesBlock(b, e, dom);
+                    if (dr == MirDomResult::Dominates) continue;
+                    ok = false;
+                    if (dr != MirDomResult::GaveUp || domGaveUpReported) break;
+                    domGaveUpReported = true;
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::X_OptPassSkipped;
+                    d.severity = DiagnosticSeverity::Info;
+                    d.actual   = std::format(
+                        "opt::Licm: refused may-fault hoists out of block "
+                        "v={} in the loop with header v={} — the dominator "
+                        "walk to loop exit v={} hit its step cap, so "
+                        "guaranteed-to-execute could not be decided; "
+                        "refusing to hoist is the behaviour-preserving "
+                        "answer (D-OPT6-LICM-SPECULATIVE-LOAD-HOIST).",
+                        b.v, loop.header.v, e.v);
+                    reporter.report(std::move(d));
+                }
+            }
+            runsOnEntry.emplace(b.v, ok);
+            return ok;
+        };
+
         // For each inst in the loop body (skip the header's Phis
         // implicitly since Phi isn't a candidate opcode):
         //   - Eligibility: opcode + flags.
@@ -343,23 +511,15 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
                         }
                     }
                     if (!allOutside) continue;
-                    // Load admission gate (unchanged): a Load is
-                    // hoist-eligible only when no Store in the loop
-                    // body may alias its pointer.
-                    //
-                    // ★ KNOWN GAP — `D-OPT6-LICM-SPECULATIVE-LOAD-HOIST`:
-                    // this gate proves the loaded VALUE is invariant, NOT
-                    // that the load is SAFE to execute speculatively. There
-                    // is no guaranteed-to-execute test and no
-                    // dereferenceability test, so a conditionally-executed
-                    // dereference — `for (…) if (q) x = *p;` — is hoisted
-                    // into the preheader and runs even when the guard is
-                    // false or the loop body never executes. `isTrapEligible`
-                    // covers only division (`D-OPT6-LICM-TRAP-SAFE-HOIST`).
-                    // Generalize it before trusting this pass on pointers
-                    // that may be null. (TF-C58's own soundness argument
-                    // cites the whole-body clobber scan below, which IS
-                    // sufficient for that purpose and is unaffected.)
+                    // Load admission gate: a Load is hoist-eligible only
+                    // when no Store in the loop body may alias its
+                    // pointer. This answers "is the loaded VALUE
+                    // invariant?" — and ONLY that. Whether the load is
+                    // SAFE TO EXECUTE speculatively is a separate
+                    // question, answered by the may-fault gate below.
+                    // (TF-C58's soundness argument cites this whole-body
+                    // clobber scan, which IS sufficient for that purpose
+                    // and is unaffected by the gate below.)
                     if (op == MirOpcode::Load) {
                         auto const lops = src_.instOperands(id);
                         if (lops.empty()) {
@@ -374,6 +534,23 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
                                 strictTbaa_, charTypesAliasAll_)) {
                             continue;  // clobbered in body
                         }
+                    }
+                    // ── The may-fault gate: the ONE consequence of the
+                    // ONE fact `mayFaultWhenSpeculated` records. A Load
+                    // or a division may only leave a block that runs on
+                    // every entry into this loop; anywhere else, hoisting
+                    // would execute a fault the source never reached
+                    // (D-OPT6-LICM-SPECULATIVE-LOAD-HOIST). Deliberately
+                    // NOT paired with a diagnostic: unlike the
+                    // ambiguous-preheader skip above this is the CORRECT
+                    // and permanent answer for the shape, not a deferred
+                    // capability, and the shape (`if (p) …` inside a
+                    // loop) is pervasive in ordinary C — an Info per
+                    // occurrence would bury the diagnostics that mean
+                    // something.
+                    if (mayFaultWhenSpeculated(op)
+                        && !blockRunsOnEveryLoopEntry(b)) {
+                        continue;
                     }
                     // Nested-loop dedup (CRITICAL fix): an inst that's
                     // invariant in BOTH an inner and an outer enclosing

@@ -4,10 +4,17 @@
 // division codegen (idiv raises #DE = STATUS_INTEGER_DIVIDE_BY_ZERO at
 // runtime).
 //
-// `num / d` inside loop_div's body is LOOP-INVARIANT and unconditionally
-// dominates the loop body. The ONLY reason a correct LICM must NOT hoist it
-// to the preheader is that SDiv is TRAP-ELIGIBLE. isTrapEligible() in
-// src/opt/passes/licm.cpp gates exactly this case.
+// `num / d` inside loop_div's body is LOOP-INVARIANT. The ONLY reason a
+// correct LICM must NOT hoist it to the preheader is that SDiv MAY FAULT and
+// the `while (i < n)` body is NOT GUARANTEED TO EXECUTE — at n == 0 the
+// header branches straight out and the body never runs. `mayFaultWhenSpeculated`
+// + `blockRunsOnEveryLoopEntry` in src/opt/passes/licm.cpp gate exactly this
+// case. ⓘ Those two replaced the older blanket `isTrapEligible()` opcode veto,
+// which refused division hoists from EVERY block; the gate is now shared with
+// Load (D-OPT6-LICM-SPECULATIVE-LOAD-HOIST) and keyed on the candidate's
+// BLOCK, so a division in a guaranteed-to-execute block does hoist. This
+// fixture is unaffected: its body block is conditionally executed, which is
+// the whole point of the 0-trip-count shape below.
 //
 // `num` is a NAMED LOCAL assigned in the entry block (num = 100), NOT an
 // inline literal: that is load-bearing. An inline `100 / d` would leave the

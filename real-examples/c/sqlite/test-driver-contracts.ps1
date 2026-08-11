@@ -446,7 +446,12 @@ $script:python3   = Get-Command python3 -ErrorAction SilentlyContinue
 $script:XlateVerb = 'windows-to-wsl'   # the verb the measured defects were found under
 $script:XlateOk   = $false
 if ((Get-Command python3 -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath $LegsPy) -and (Test-Path -LiteralPath $Cat)) {
-  & python3 $LegsPy '--catalogue' $Cat '--plan' '--host-os' 'darwin' '--host-arch' 'arm64' 2>$null |
+  # `--environment-probes skip` DELIBERATELY: these pins are about the plan's
+  # SHAPE, and measuring a clock for 20 s per invocation would put a wall-clock
+  # sample inside a self-test the drivers run at STARTUP. It also exercises the
+  # skip path, whose plan both drivers must REFUSE to run a corpus on.
+  # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  & python3 $LegsPy '--catalogue' $Cat '--plan' '--environment-probes' 'skip' '--host-os' 'darwin' '--host-arch' 'arm64' 2>$null |
     Set-Content -LiteralPath (Join-Path $Work 'plan.json')
   if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath (Join-Path $Work 'plan.json') -ErrorAction SilentlyContinue }
   # ★ THE WINDOWS-HOST PLAN, and it is a SECOND file rather than a reuse: the two
@@ -454,7 +459,7 @@ if ((Get-Command python3 -ErrorAction SilentlyContinue) -and (Test-Path -Literal
   # another namespace, and on a darwin host every elf leg resolves to `skip` with no
   # launcher, no envTransfer and no declared launcher variable at all. Resolved by
   # the shipped resolver from the shipped catalogue — never a leg typed out here.
-  & python3 $LegsPy '--catalogue' $Cat '--plan' '--host-os' 'windows' '--host-arch' 'x86_64' 2>$null |
+  & python3 $LegsPy '--catalogue' $Cat '--plan' '--environment-probes' 'skip' '--host-os' 'windows' '--host-arch' 'x86_64' 2>$null |
     Set-Content -LiteralPath (Join-Path $Work 'plan-windows.json')
   if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath (Join-Path $Work 'plan-windows.json') -ErrorAction SilentlyContinue }
   # CAN THIS HOST TRANSLATE AT ALL? The launcher-namespace half of pin I drives the
@@ -504,8 +509,28 @@ if ($VocabSource -eq 'unavailable') {
 # supply and not about the matcher its sibling file already covers.
 function Pin-ConfoundSupply($driver) {
   $script:ConfoundsOverride = $null
+  # ⚠ THE REGION IS A CONTRACT WITH harness_legs.py's DSS_REGIONS, WHICH NAMES THIS
+  # FILE AS THE .ps1 HALF'S VERIFIER.
+  # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+  # D-HARNESS-CONFOUND-SUPPLY-PS1-HALF-IS-IN-NO-REGION
+  # `Get-LegConfounds` used to live in NO dss: region at all while its .sh
+  # twin sat inside `dss:confound-supply`, so the region machinery — whose whole job
+  # is to red when a capability exists in one driver only - could not see this pair.
+  # It reads the sentinels here so the claim in DSS_REGIONS is true rather than
+  # credited: a comment naming an instrument that does not read the region is worse
+  # than no comment, because it retires the reader's suspicion.
+  $driverText = (Get-Content -LiteralPath $driver) -join "`n"
+  $supplyRegion = if ($driverText -match '(?s)>>> dss:confound-supply >>>(.*?)<<< dss:confound-supply <<<') { $Matches[1] } else { '' }
+  Ck 'the dss:confound-supply region is marked in this driver' $true ($supplyRegion.Length -gt 0)
+  CkHas '...and the SUPPLY function is inside it' $supplyRegion 'function Get-LegConfounds'
   Invoke-Expression (Get-Fn $driver 'Get-LegConfounds')
-  $mk = { param($label, $c) [pscustomobject]@{ label = $label; confounds = $c } }
+  # + `confoundGating`, which the supply now REFUSES to proceed without: a
+  # conditional row (`requires: [<environment probe>]`) is honoured only where
+  # the named probe found its defect on THIS machine. 'probed' by default so
+  # every assertion below keeps asking what it asked; the refusal gets its own
+  # case. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  $mk = { param($label, $c, $g = 'probed') [pscustomobject]@{ label = $label;
+            confounds = $c; confoundGating = $g } }
   Ck 'a leg gets ITS OWN declared patterns' '^walsetlk- ^busy2-' `
      ((@(Get-LegConfounds (& $mk 'elf64-x86_64' @('^walsetlk-','^busy2-')))) -join ' ')
   # THE ONE THAT WOULD HAVE CAUGHT IT: same declaration, DIFFERENT label. A
@@ -522,6 +547,109 @@ function Pin-ConfoundSupply($driver) {
   try { [void](Get-LegConfounds ([pscustomobject]@{ label = 'nodecl' })) }
   catch { $refused = "$($_.Exception.Message)" }
   Ck 'an UNDECLARED leg REFUSES, never answers @()' $true ($refused -match 'transport defect')
+  # ★★ AND AN UNPROBED PLAN. The plan is already fail-SAFE without this (every
+  # conditional row dropped, nothing excused on evidence nobody gathered) - which
+  # is why the guard is easy to lose and why losing it is silent in the WRONG
+  # place: a corpus run on an unprobed plan reports a broken host clock as a
+  # compiler regression. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  $ungated = ''
+  try { [void](Get-LegConfounds (& $mk 'elf64-x86_64' @('^busy2-') 'unprobed')) }
+  catch { $ungated = "$($_.Exception.Message)" }
+  Ck 'an UNPROBED plan REFUSES rather than serving its ungated list' $true ($ungated -match "confoundGating='unprobed'")
+  CkHas '...and says how to resolve a measured plan' "$ungated" '--environment-probes skip'
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# G2 - THE REFUSAL MUST STOP *THE DRIVER*, NOT JUST THROW
+# ═══════════════════════════════════════════════════════════════════════════
+# D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL.
+#
+# ★★ THE TWIN OF test-driver-contracts.sh's I2, AND IT EXISTS BECAUSE THE .sh HALF
+# FAILED THIS. There, `die` is `exit 1` inside a COMMAND SUBSTITUTION, so the
+# refusal killed a subshell and the driver ran the whole corpus with an empty
+# confound list (✔MEASURED, rc 0). Every pin above captured the refusal's own
+# status — a shape the production call site did not have — so none of them could
+# see it. This driver's `Die` is a plain `exit 1` on a DIRECT call and therefore
+# stops, but "therefore" is an inference, and an inference about whether a corpus
+# runs unexcused is exactly what the .sh's cycle-long silence was made of.
+#
+# ⚠ THE CALL SITE IS EXTRACTED FROM THE SHIPPED DRIVER, never re-typed, and run in
+# a CHILD pwsh - the property under test is "the process exits", which cannot be
+# asserted from inside the process that exits.
+function Pin-ConfoundSupplyStopsTheDriver($driver) {
+  $pwshCmd = Get-Command pwsh -ErrorAction SilentlyContinue
+  if (-not $pwshCmd) {
+    Skipped 'G2: pwsh is not on PATH, so a child-process refusal cannot be observed'
+    return
+  }
+  $text = (Get-Content -LiteralPath $driver) -join "`n"
+  $region = if ($text -match '(?s)>>> dss:confound-supply >>>(.*?)<<< dss:confound-supply <<<') { $Matches[1] } else { '' }
+  $callsite = @(Get-Content -LiteralPath $driver | Where-Object { $_ -match '^\$Confounds\s*=\s*@\(Get-LegConfounds \$leg\)' })
+  if (-not $region -or $callsite.Count -ne 1) {
+    $script:PinFails++
+    if (-not $script:Quiet) { Bad "could not extract the region ($($region.Length) chars) and the single call site ($($callsite.Count) found) from $(Split-Path -Leaf $driver) - this pin would assert over nothing" }
+    return
+  }
+  CkHas 'the extracted call site is the real supply call' $callsite[0] 'Get-LegConfounds $leg'
+  $script = Join-Path ([IO.Path]::GetTempPath()) ("dss-confound-callsite-" + [Guid]::NewGuid().ToString('N') + ".ps1")
+  $body = @(
+    'param($Gating)',
+    "`$ErrorActionPreference = 'Stop'",
+    'function Info($m) { }',
+    'function Step($m) { }',
+    'function Die($m) { Write-Host "DIE: $m"; exit 1 }',
+    '$ConfoundsOverride = $null',
+    $region,
+    '$leg = [pscustomobject]@{ label = "someleg"; confounds = @("^busy2-"); confoundGating = $Gating; confoundRows = @(1) }',
+    '$LegTag = "someleg"',
+    $callsite[0],
+    'Write-Host "REACHED-NEXT-STATEMENT size=$($Confounds.Count)"'
+  ) -join "`n"
+  Set-Content -LiteralPath $script -Value $body -Encoding utf8
+  # ── THE REFUSAL ARM ──────────────────────────────────────────────────────
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'unprobed' 2>&1 | Out-String
+  $rc = $LASTEXITCODE
+  Ck 'an UNPROBED plan STOPS THE DRIVER at the real call site (rc)' 1 $rc
+  CkHas '...having said why' $out "confoundGating='unprobed'"
+  Ck '...and the statement AFTER the call site never ran' 'no' `
+     $(if ($out -match 'REACHED-NEXT-STATEMENT') { 'yes' } else { 'no' })
+  # ── THE NEGATIVE CONTROL: without it the arm above could pass for any
+  #    reason at all, including a script that never ran ──────────────────────
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'probed' 2>&1 | Out-String
+  $rc = $LASTEXITCODE
+  Ck 'a PROBED plan runs on through the call site (rc)' 0 $rc
+  CkHas '...and reaches the next statement with the leg pattern' $out 'REACHED-NEXT-STATEMENT size=1'
+  Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# N - WHY A FAILURE WAS EXCUSED IS PRINTED, NOT MERELY DECIDED
+# ═══════════════════════════════════════════════════════════════════════════
+# D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.
+#
+# `earnedOn` failed because it is prose nothing reads, so a probe verdict nobody
+# SEES is the same failure with extra steps. The report TEXT is generated once by
+# harness_legs.py and its two-driver agreement is proven by DIFFERENTIAL EXECUTION
+# (--check-regions, case `confound-report`); what is pinned HERE is the shipped
+# .ps1's transport of it, and the refusal that stops an empty report reading as
+# "this leg had nothing to excuse".
+function Pin-ConfoundReport($driver) {
+  Invoke-Expression (Get-Fn $driver 'Write-ConfoundReport')
+  # This runner's `Info` is a no-op, so the emission would be invisible and two
+  # silences would compare equal - the vacuity shape this whole file refuses.
+  # PowerShell scopes functions DYNAMICALLY, so this shadows it for the callee.
+  function Info($m) { "REPORT> $m" }
+  $out = @(Write-ConfoundReport 'elf64-x86_64' "probe clock-realtime-steps = ABSENT`n`nrow INACTIVE: ^walsetlk-")
+  # `Info` is this runner's stub, so the ANSWER is the set of lines the function
+  # decided to hand it - which is exactly the capability under test.
+  Ck 'a report is printed line by line, blanks skipped' 2 $out.Count
+  CkHas '...the probe verdict line' ($out -join '|') 'clock-realtime-steps = ABSENT'
+  CkHas '...the INACTIVE row line' ($out -join '|') 'row INACTIVE: ^walsetlk-'
+  # ★ THE REFUSAL: an unexplained exclusion is not an earned one.
+  $empty = ''
+  try { [void](Write-ConfoundReport 'elf64-x86_64' '   ') }
+  catch { $empty = "$($_.Exception.Message)" }
+  Ck 'an EMPTY report REFUSES rather than printing nothing' $true ($empty -match 'EMPTY confound report')
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1025,6 +1153,144 @@ function Pin-SmokeArgv($driver) {
   Ck 'the host-identity flag appears NOWHERE in the smoke block' $false ($full.Contains('HostNeedsWsl'))
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# M - the precondition discriminator, INCLUDING THE SILENT CRASH
+# ═══════════════════════════════════════════════════════════════════════════
+# [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY,
+#  D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH]
+#
+# ★★ THIS PIN HAD NO PowerShell SIDE AT ALL until now, and that absence is itself
+# an instance of the defect class this suite exists for: the .sh twin has pinned
+# the discriminator (its section E) since the branch was written, so on a
+# Windows-only host the decision that chooses between spending ONE resume and
+# spending ten was covered by no test the driver in use ever runs.
+#
+# ★★ THE RESILIENCE RULE IS WHAT IT PROTECTS. A fixture abort stays RECOVERABLE -
+# named, resumed past, reported in the union. Only ONE shape is diverted: zero
+# files completed AND the same zero-progress signature as the previous zero-file
+# segment. The RESUME assertions outnumber the PRECONDITION ones, so a
+# discriminator that grew greedier goes red first.
+function Pin-Precondition($driver) {
+  $text = @(Get-Content -LiteralPath $driver)
+  # BY PREFIX, and the FIRST match: the carry line below the condition opens with
+  # the same test, and the condition is first in file order. A tighter prefix
+  # naming the signature conjunct would make a mutation that DELETES that conjunct
+  # read as "the discriminator is missing" instead of being judged behaviourally.
+  # ⚠ THE PREFIX STOPS BEFORE `-and`. ✔MEASURED while writing this: with `-and` in
+  # it, the F17 mutant (which deletes the conjuncts) matched NOTHING, the pin took
+  # its "would assert over nothing" exit, and the red-on-disable demonstration
+  # reported ONE red from the missing-line path instead of the NINE behavioural
+  # reds the mutation actually causes. The .sh twin's header records the same rule;
+  # this file had to learn it by getting it wrong.
+  # `StartsWith` after TrimStart, so the CARRY line - which contains the same test
+  # but as the right-hand side of an assignment - cannot be picked up instead.
+  $condLine = @($text | Where-Object { $_.TrimStart().StartsWith('if ($res.Completed.Count -eq 0') })
+  $carryLine = @($text | Where-Object { $_.TrimStart().StartsWith('$prevZeroSig = if (') })
+  $budgetLine = @($text | Where-Object { $_.TrimStart().StartsWith('$MaxResumes') })
+  if ($condLine.Count -lt 1 -or $carryLine.Count -lt 1 -or $budgetLine.Count -lt 1) {
+    $script:PinFails++
+    if (-not $script:Quiet) { Bad "the precondition discriminator, its carry or the resume budget is not in $(Split-Path -Leaf $driver) (cond=$($condLine.Count) carry=$($carryLine.Count) budget=$($budgetLine.Count)) - this pin would assert over nothing" }
+    return
+  }
+  # `if (…) {` -> the boolean expression alone. From the FIRST '(' to the LAST
+  # ')', so the nested [string]::Equals(...) parens survive intact.
+  $e = $condLine[0].Trim()
+  $expr = $e.Substring($e.IndexOf('(') + 1)
+  $expr = $expr.Substring(0, $expr.LastIndexOf(')'))
+  $carry = $carryLine[0].Trim()
+  # The DRIVER'S OWN budget, so "rather than ten" is its number, not this file's.
+  $mb = [regex]::Match($budgetLine[0], 'else \{ (\d+) \}')
+  if (-not $mb.Success) {
+    $script:PinFails++
+    if (-not $script:Quiet) { Bad "the resume budget default could not be read from $(Split-Path -Leaf $driver) - this pin would assert over a default it invented" }
+    return
+  }
+  $budget = [int]$mb.Groups[1].Value
+  $fns = Get-Fns $driver @('Read-CorpusSegment','Get-ZeroProgressSignature')
+  if (-not $fns) { return }
+  . ([scriptblock]::Create($fns))
+  # DOT-SOURCED, never `&`: `&` runs a scriptblock in a CHILD scope, where the
+  # carry's assignment to $prevZeroSig would vanish on return and the comparison
+  # would be against a stale value forever. Same scope-fidelity rule the extractor
+  # header records. [scriptblock]::Create is the PowerShell twin of the .sh pin's
+  # `eval "$cond"`, and both evaluate the DRIVER'S OWN line.
+  $sbCond = [scriptblock]::Create($expr)
+  $sbCarry = [scriptblock]::Create($carry)
+  function Takes($filesDone, $diagnostic, $prevSig, $okLines, $failMarkers, $lastTest) {
+    # A STUB SHAPED LIKE Read-CorpusSegment's answer: the condition reads
+    # $res.Completed.Count, so what it is handed has to have that shape.
+    $res = @{ Completed = New-Object 'System.Collections.Generic.List[string]' }
+    for ($i = 0; $i -lt $filesDone; $i++) { [void]$res.Completed.Add("f$i.test") }
+    # THE SHIPPED DERIVATION, not a hand-set signature: the sentinel is the whole
+    # fix, so a pin that supplied it itself would pass over a driver that never
+    # produced one.
+    $zeroSig = Get-ZeroProgressSignature $diagnostic $okLines $failMarkers $lastTest
+    $prevZeroSig = $prevSig
+    if (. $sbCond) { return 'PRECONDITION' } else { return 'RESUME' }
+  }
+  $D1 = "Can't find a usable init.tcl in the following directories: /opt/local/lib/tcl8.6 ..."
+  $D2 = 'child process exited abnormally'
+  $SILENT = Get-ZeroProgressSignature '' 0 0 ''
+  Ck 'zero progress twice, IDENTICAL diagnostic -> PRECONDITION' 'PRECONDITION' (Takes 0 $D1 $D1 0 0 '')
+  Ck 'the FIRST such abort                      -> RESUME'       'RESUME' (Takes 0 $D1 '' 0 0 '')
+  Ck 'zero progress, DIFFERENT diagnostic       -> RESUME'       'RESUME' (Takes 0 $D2 $D1 0 0 '')
+  Ck 'a crash AFTER completing files            -> RESUME'       'RESUME' (Takes 7 $D1 $D1 0 0 '')
+  Ck 'one file completed, same diagnostic       -> RESUME'       'RESUME' (Takes 1 $D1 $D1 0 0 '')
+  Ck 'zero progress, NO OUTPUT, first time      -> RESUME'       'RESUME' (Takes 0 '' '' 0 0 '')
+  Ck 'SILENCE TWICE                             -> PRECONDITION' 'PRECONDITION' (Takes 0 '' $SILENT 0 0 '')
+  Ck "no diagnostic but ' Ok' lines             -> RESUME"       'RESUME' (Takes 0 '' $SILENT 5 0 '')
+  Ck 'no diagnostic but a FAILURE marker        -> RESUME'       'RESUME' (Takes 0 '' $SILENT 0 2 '')
+  Ck 'no diagnostic but a test NAME             -> RESUME'       'RESUME' (Takes 0 '' $SILENT 0 0 'select1-1.1')
+  # ── CASE SENSITIVITY, WHICH IS A TWIN PROPERTY AND NOT A DETAIL ──────────
+  # PowerShell's `-eq` on strings is CASE-INSENSITIVE while the .sh twin's
+  # `[[ a == b ]]` is byte-wise, so a condition written with `-eq` would answer
+  # PRECONDITION here and RESUME on Linux for the same two logs.
+  Ck 'two diagnostics differing only in CASE    -> RESUME' 'RESUME' (Takes 0 'Cannot Open Libtcl' 'cannot open libtcl' 0 0 '')
+
+  # ── THE STOPPING DECISION, DRIVEN OVER REAL LOGS ─────────────────────────
+  # Every moving part is the driver's: Read-CorpusSegment and
+  # Get-ZeroProgressSignature are LOADED from it, the condition and the carry are
+  # EXTRACTED from it, the budget is READ from it. What this contributes is the
+  # loop, and the loop is what makes "stops after ONE resume" sayable at all.
+  $segDir = Join-Path $Work 'seg'
+  New-Item -ItemType Directory -Force -Path $segDir | Out-Null
+  $silent = @(); $same = @(); $diff = @()
+  foreach ($i in 1..12) {
+    $s = Join-Path $segDir "silent.$i.log"
+    [System.IO.File]::WriteAllBytes($s, @())            # ZERO BYTES, the measured case
+    $silent += $s
+    $p = Join-Path $segDir "same.$i.log"
+    Set-Content -LiteralPath $p -Value $D1; $same += $p
+    $q = Join-Path $segDir "diff.$i.log"
+    Set-Content -LiteralPath $q -Value "child process exited abnormally in file $i"; $diff += $q
+  }
+  # ✔THE INPUT IS ASSERTED, NOT ASSUMED: a write that failed would make the whole
+  # demonstration a statement about a file that was not there.
+  Ck "the silent fixture's log really is ZERO BYTES" 0 (Get-Item -LiteralPath $silent[0]).Length
+  function Drive($logs) {
+    $prevZeroSig = ''; $n = 0; $r = 0; $stop = 'BUDGET-EXHAUSTED'
+    foreach ($lg in $logs) {
+      $n++
+      $res = Read-CorpusSegment $lg
+      $zeroSig = Get-ZeroProgressSignature $res.Diagnostic $res.OkLines $res.FailMarkers $res.LastTest
+      if (. $sbCond) { $stop = 'PRECONDITION'; break }
+      . $sbCarry
+      if ($r -ge $budget) { $stop = 'BUDGET-EXHAUSTED'; break }
+      $r++
+    }
+    return "segments=$n resumes=$r stop=$stop"
+  }
+  Ck "TWO SILENT SEGMENTS: the engine stops after ONE resume, not $budget" `
+     'segments=2 resumes=1 stop=PRECONDITION' (Drive $silent)
+  Ck 'two segments with the SAME diagnostic: same answer' `
+     'segments=2 resumes=1 stop=PRECONDITION' (Drive $same)
+  # THE NEGATIVE CONTROL. A genuine crash that MOVES must still spend the whole
+  # budget - if this ever reads PRECONDITION the discriminator has become greedy
+  # and the resilience rule is gone.
+  Ck 'DIFFERENT diagnostics every time: the whole budget IS spent' `
+     "segments=$($budget + 1) resumes=$budget stop=BUDGET-EXHAUSTED" (Drive $diff)
+}
+
 Green 'A+B  the verdict recorders + the shared run decision' 'Pin-Verdicts'
 Green 'C    Read-CorpusSegment keeps the first diagnostic'   'Pin-ReadSegment'
 # ★★ THE PARITY PIN, RUN FROM THE PowerShell SIDE TOO. Its twin lives in
@@ -1036,11 +1302,14 @@ Say '-- C2   the declared capability set reaches every build site, BOTH drivers'
 Pin-StageCapabilities @($PS1, (Join-Path $Here 'build-and-test.sh'))
 Green 'D+E  the loader variable + the acquisition field'     'Pin-LoaderVar'
 Green 'G    the confound supply follows the DECLARATION'     'Pin-ConfoundSupply'
+Green "G2   the supply's REFUSAL stops the DRIVER"           'Pin-ConfoundSupplyStopsTheDriver'
 Green 'H    a failed run-dir operation is a VERDICT'         'Pin-RunDirArgv'
 Green "I    a launched leg's run environment ARRIVES"        'Pin-LaunchEnv'
 Green 'J    the CLI smoke gate applies it too'               'Pin-SmokeSite'
 Green 'K    the launcher-prerequisite gate'                  'Pin-LauncherPrereq'
 Green 'L    the smoke argv: MEASURED targets, DECLARED launcher' 'Pin-SmokeArgv'
+Green 'M    the precondition discriminator, silent crash included' 'Pin-Precondition'
+Green 'N    the confound report is PRINTED, per leg'          'Pin-ConfoundReport'
 
 # ═══════════════════════════════════════════════════════════════════════════
 # F - RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.
@@ -1137,11 +1406,28 @@ function Pin-HygieneLauncher($driver) {
   # A path that does not exist on disk: the sweep must key on the ARGUMENT TEXT,
   # never on resolving the file. It is under $Work so it can collide with nothing.
   $marker = Join-Path $Work 'legdir\testfixture'
+  # ⚠ `ping -n`, NOT `timeout /t` — AND THE REASON IS MEASURED, NOT STYLISTIC.
+  # [D-TEST-HYGIENE-PIN-DECOY-DIES-WHEN-STDIN-IS-REDIRECTED.]
+  # `timeout` reads the console to honour a keypress, so with stdin redirected it
+  # exits IMMEDIATELY ("Input redirection is not supported"). This runner is
+  # spawned with redirected stdin by both drivers' start-up self-test and by CI,
+  # so the decoy was already dead 800 ms later and the sweep correctly found
+  # NOTHING — reporting a blind sweep when the only thing that had gone was the
+  # pin's OWN fixture. ✔MEASURED: `HasExited = True` under a redirected stdin and
+  # `False` from an interactive console, which is why it looked intermittent.
+  # `ping -n 26 127.0.0.1` needs no console input and is on every Windows box.
   $decoy  = Start-Process -FilePath 'cmd.exe' `
-              -ArgumentList @('/c', "timeout /t 25 /nobreak >nul & rem $marker") `
+              -ArgumentList @('/c', "ping -n 26 127.0.0.1 >nul & rem $marker") `
               -PassThru -WindowStyle Hidden
   try {
     Start-Sleep -Milliseconds 800
+    # ★★ THE FIXTURE IS ASSERTED ALIVE BEFORE THE SUBJECT IS ASKED ANYTHING. This
+    # is the structural half of the fix and it outlives the `ping`/`timeout`
+    # detail: a decoy that dies makes the two assertions below fail for a reason
+    # that has nothing to do with the sweep, i.e. the pin accuses its subject of
+    # its own defect. Named separately so the next such death is one line of
+    # triage instead of a hunt through the sweep.
+    Ck "the pin's own decoy is still ALIVE when the sweep runs" $false $decoy.HasExited
     $hits = @(Get-OurFixtureProcesses $marker)
     # CONTENT, not just count: a sweep that returned some unrelated process would
     # satisfy "found >= 1" and then kill the wrong thing.
@@ -1331,6 +1617,58 @@ if (Invoke-Mutation 'F16 pick the reference launcher from the host identity' $m1
       })
     }) {
   Red 'F16 the reference launcher comes from the catalogue, not the host' 'Pin-SmokeArgv' $m16
+}
+
+# F17 - drop the "same signature" conjunct. The discriminator becomes greedy and
+# the RESILIENCE cases must go red: a genuine crash would stop being resumed.
+$m17 = Join-Path $Work 'm17.ps1'
+if (Invoke-Mutation 'F17 weaken the precondition discriminator' $m17 '[string]::Equals($zeroSig, $prevZeroSig, [System.StringComparison]::Ordinal)' {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_.TrimStart().StartsWith('if ($res.Completed.Count -eq 0 -and')) {
+          '  if ($res.Completed.Count -eq 0) {'
+        } else { $_ }
+      })
+    }) {
+  Red 'F17 a genuine crash is still RESUMED' 'Pin-Precondition' $m17
+}
+
+# F18 - THE SILENT-CRASH DEFECT ITSELF, RESTORED. Get-ZeroProgressSignature stops
+# answering for a segment that produced NOTHING, which is exactly the state the
+# discriminator was in when elf64-x86_64 burned all ten resumes on a fixture that
+# had never started. The TALKING cases must stay green and only the SILENT ones go
+# red - a mutation that reddened everything would prove far less.
+# ⚠ THE WITNESS IS THE SENTINEL STRING ITSELF, unique in the driver: the
+#   surrounding if/return and the comment above it survive, so "something changed"
+#   cannot stand in for "the sentinel is gone".
+$m18 = Join-Path $Work 'm18.ps1'
+if (Invoke-Mutation 'F18 make a SILENT crash unsignable again' $m18 "return '<SILENT: the fixture produced no diagnostic, no test result and no test name>'" {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_.Contains("return '<SILENT: the fixture produced no diagnostic")) { "    return ''" } else { $_ }
+      })
+    }) {
+  Red 'F18 a fixture that dies SILENTLY is still diagnosed' 'Pin-Precondition' $m18
+}
+
+# F19 - DOWNGRADE THE GATING REFUSAL TO A NOTE, so the supply hands back its
+# UNGATED list and the driver carries on.
+# ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+# D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL
+# This is what "the refusal does not stop the driver" looks like
+# from the outside, and it is the .ps1's own version of the .sh defect that shipped:
+# there the refusal printed and the corpus ran anyway. G2 must notice, in the child
+# process, which is the only place "the driver stopped" is observable at all.
+$m19 = Join-Path $Work 'm19.ps1'
+if (Invoke-Mutation 'F19 downgrade the gating refusal to a note' $m19 "not 'probed'. A conditional confound row" {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_.Contains("not 'probed'. A conditional confound row")) {
+          '    Info "[$($leg.label)] gating $gating"'
+        } else { $_ }
+      })
+    }) {
+  Red "F19 the supply's refusal STOPS THE DRIVER" 'Pin-ConfoundSupplyStopsTheDriver' $m19
 }
 
 Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue

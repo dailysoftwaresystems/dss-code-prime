@@ -14,20 +14,37 @@
 //   - NOT a Phi (loop-header phis are inherently loop-bound; their
 //     incomings are by definition not invariant).
 //   - NOT Volatile (observable memory semantics).
-//   - NOT a Load (alias-unsafe defer — no alias-analysis substrate;
-//     anchor `D-OPT-LOAD-ALIAS-ANALYSIS` follows CSE's parallel exclusion).
-//   - NOT trap-eligible (SDiv / UDiv / SMod / UMod — division by zero
-//     would happen unconditionally in the preheader; in a loop that
-//     might never execute, this changes observable behavior). Anchor
-//     `D-OPT6-LICM-TRAP-SAFE-HOIST` for a future cycle that proves
-//     non-zero divisor via interval / value-range analysis.
+//   - A Load IS a candidate (cycle 10b, once the alias substrate
+//     landed) but carries TWO extra gates, and they answer different
+//     questions — conflating them is what produced a miscompile:
+//       (a) VALUE invariance: no may-aliasing Store in the loop body
+//           (`MirMemoryClobbers::anyClobberInBlocks`).
+//       (b) SAFETY to execute speculatively: see the may-fault rule
+//           below. (a) does NOT imply (b).
+//   - MAY-FAULT candidates — `Load` plus the divisions SDiv / UDiv /
+//     SMod / UMod — are hoisted ONLY out of a block that is
+//     GUARANTEED TO EXECUTE when the loop is entered. One predicate
+//     (`mayFaultWhenSpeculated`) and one gate
+//     (`blockRunsOnEveryLoopEntry`) own both families, because the
+//     consequence is the same: relocating a fault into the preheader
+//     turns a program with no undefined behaviour into one that
+//     faults — `for (…) { if (q) x = *p; }` with a false guard and a
+//     null `p`, or `x = n / d` in a loop that runs zero times.
+//     Anchors `D-OPT6-LICM-SPECULATIVE-LOAD-HOIST` (closed by that
+//     gate) and `D-OPT6-LICM-TRAP-SAFE-HOIST` (still open for the
+//     ADDITIONAL permission a value-range proof of a non-zero divisor
+//     would grant: hoisting out of a block that is NOT guaranteed to
+//     execute). See licm.cpp for the gate's exact conditions and the
+//     stated boundary of its soundness argument.
 //   - ALL operands defined OUTSIDE the loop body OR already
 //     hoisted earlier this loop (chained-invariant resolution,
 //     D-OPT6-LICM-CHAINED-INVARIANTS, cycle 10j closure
 //     2026-06-04). Termination: a per-loop monotone-growing
 //     `hoistedInThisLoop` set; the iterator breaks on a no-
-//     progress round. Defensive step cap at 64 (bounded above by
-//     `|loop.body inst count|`).
+//     progress round. Defensive step cap DERIVED from the structural
+//     bound `sum of blockInstCount over loop.body + 1` — deliberately
+//     not a literal, so a legitimately long invariant chain cannot
+//     trip it.
 //
 // **Preheader requirement (c1)**: the pass hoists ONLY when the
 // loop header has EXACTLY ONE non-back-edge predecessor — that
