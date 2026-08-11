@@ -80,6 +80,16 @@
 // every enumeration dimension carries a floor, so a collapsed corpus scan or a
 // silent driver failure cannot come back green.
 //
+// ── ...AND NEITHER MUST A PRESENT ONE DECIDE THE VERDICT ───────────────────
+//
+// The harder half, learned the expensive way: it is not enough for an ABSENT
+// oracle to be loud. A PRESENT one must not be allowed to change what the test
+// asserts. This file shipped a census whose pass/fail depended on which compilers
+// the machine happened to hold — green on the author's box, six failures on the CI
+// arm64 leg, and no DSS defect anywhere in it. The cure is the two-decision split
+// at `pin()` / `corroborate()` below; read that block before touching anything
+// here, because it is the reason those two functions have the signatures they do.
+//
 // ── WHY DSS IS RUN FOR TWO FIXED TARGETS ───────────────────────────────────
 //
 // Not the host-native target. DSS builds any target on any host, and a
@@ -947,13 +957,68 @@ struct DssVerdict {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  THE DECISION FUNCTION — the whole point, kept pure so it can be exercised
+//  THE TWO DECISIONS, AND WHY THERE HAD TO BE TWO
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// ★★★ A GATE THAT ONLY GATES ON THE MACHINE WITH THE RIGHT COMPILERS IS NOT A
+// GATE. The first version of this file asked ONE question — "what did the
+// compilers on THIS host say, and does DSS agree?" — and pinned the answer. That
+// makes the verdict a function of `apt list --installed`. It passed on the
+// author's box and went red on the CI arm64 leg, and neither run was wrong about
+// what it measured: they measured different rosters.
+//
+// ✔MEASURED, and this is the whole reason for the split. clang-18 reports
+// `__STDC_VERSION__ == 202311L` under `-std=c23`, so it is ENTITLED to judge every
+// `@min-stdc 202311` probe — and it then refuses three of them, in its own words:
+//     a_constexpr_object_c23   error: unknown type name 'constexpr'
+//     a_binary_literal_c23     error: binary integer literals are a GNU extension
+//     a_va_opt_c23             error: must specify at least one argument for '...'
+// clang-19 accepts all three (`a_bitint_c23` is the positive control: both accept
+// it, so the instrument can tell accept from reject). A host holding clang-19 thus
+// reads "a reference compiler accepts this"; a host holding only clang-18 reads
+// "NO reference compiler accepts this" — which is the literal definition of a
+// direction-B defect. Same corpus, same DSS, opposite verdict, and the only
+// difference is a package version. The family gate (`@families`) cannot see this:
+// both compilers ARE the gnu family at the declared level.
+//
+// ★ THE ASYMMETRY THAT FIXES IT. Adding an oracle to a roster can only ever turn
+// "nobody accepted" into "somebody accepted"; it can never do the reverse.
+//   * POSITIVE evidence — "this named compiler ACCEPTED it" — is sound on every
+//     host. A host without that compiler simply does not observe it.
+//   * NEGATIVE evidence — "nothing here accepted it" — is a fact about the ROSTER,
+//     not about C. No finite roster can establish it.
+// Every host-dependent verdict this file ever produced was a negative used as if
+// it were a fact.
+//
+// So the census answers two questions and pins only the first:
+//
+//   1. THE PIN — does DSS agree with the reference behaviour the CORPUS DECLARES
+//      (`@expect-ref`)? Its inputs are that declaration and DSS's verdict for two
+//      FIXED targets. `pin()` takes NO roster argument at all, so host-
+//      independence is a property of the signature rather than a promise in a
+//      comment. This is the half that reds on a conformance gap, and it reds
+//      identically on every machine.
+//
+//   2. CORROBORATION — what was THIS host's roster able to say about that
+//      declaration? Reported for every probe, and it reds in exactly one bucket:
+//      a `@expect-ref reject` row that some compiler ACCEPTED. That is a
+//      universally-quantified claim met by a witness — positive evidence, sound
+//      anywhere. An `@expect-ref accept` row that nothing here accepted is the
+//      un-refutable negative: printed as NOT-WITNESSED with the full roster, and
+//      never a red, because the honest reading is "this host lacks the compiler",
+//      not "the corpus is wrong".
+//
+// ★ AND IT IS A RATCHET, NOT A LOOSENING. The pin now covers EVERY probe on EVERY
+// host. The three `@families msvc` rows used to be UNORACLED — i.e. silent — on
+// every POSIX leg, so a DSS regression on `__declspec` could not be caught
+// anywhere but Windows; `a_seh_try_except_msvc` losing its gap would likewise red
+// only there. They are pinned everywhere now, and the stale-acknowledgement
+// ratchet turns on every leg instead of on whichever one happened to hold the
+// deciding compiler.
 enum class Outcome : std::uint8_t {
-    Agreement,          // DSS and the references say the same thing
-    DirectionADefect,   // >=1 judging oracle ACCEPTS, DSS REJECTS everywhere
-    DirectionBDefect,   // NO judging oracle accepts, DSS ACCEPTS somewhere
-    Unoracled,          // no available oracle was entitled to judge this probe
+    Agreement,          // DSS does what the corpus says reference compilers do
+    DirectionADefect,   // the corpus declares ACCEPT, DSS rejects everywhere
+    DirectionBDefect,   // the corpus declares REJECT, DSS accepts somewhere
     NotPinned,          // `@expect-ref varies` — censused, deliberately not pinned
 };
 
@@ -962,34 +1027,104 @@ enum class Outcome : std::uint8_t {
         case Outcome::Agreement:        return "AGREE";
         case Outcome::DirectionADefect: return "DIR-A";
         case Outcome::DirectionBDefect: return "DIR-B";
-        case Outcome::Unoracled:        return "UNORACLED";
         case Outcome::NotPinned:        return "NOT-PINNED";
     }
     return "?";
 }
 
-// PURE. Given how many oracles judged the probe, whether any of them accepted,
-// whether DSS accepted for any target, and whether the corpus declared the
-// reference verdict host-dependent — what is this row?
+// PURE, and look at the SIGNATURE: no roster, no oracle count, no host. Given what
+// the corpus declares reference compilers do with this construct, and what DSS did
+// for the two fixed targets, what is this row? Two machines with different
+// toolchains cannot disagree about this function's output.
 //
 // `varies` is NOT PINNED IN EITHER DIRECTION, and that is a measured necessity
 // rather than a convenience. ✔MEASURED: cl 19.51 ACCEPTS `enum E { };` while
-// gcc 13.x and clang 18/19 refuse it. On a Windows host a reference compiler
-// accepts it, so DSS accepting it is agreement; on a Linux host the same probe
-// would look invented purely because no MSVC exists there. A pin whose verdict
-// depends on which machine ran it is not a pin, so those rows are censused,
-// printed with their note, and counted — never turned into a red.
-[[nodiscard]] Outcome classify(std::size_t judgingOracles, bool anyOracleAccepted,
-                               bool dssAcceptedSomewhere, ExpectRef expectRef) {
-    if (judgingOracles == 0)              return Outcome::Unoracled;
-    if (expectRef == ExpectRef::Varies)   return Outcome::NotPinned;
-    if (anyOracleAccepted && !dssAcceptedSomewhere) return Outcome::DirectionADefect;
-    if (!anyOracleAccepted && dssAcceptedSomewhere) return Outcome::DirectionBDefect;
+// gcc 13.x and clang 18/19 refuse it. The corpus cannot state one reference
+// behaviour for that construct because there is not one, so it states that, and
+// the row is censused with its note instead of pinned.
+[[nodiscard]] Outcome pin(ExpectRef expectRef, bool dssAcceptedSomewhere) {
+    if (expectRef == ExpectRef::Varies) return Outcome::NotPinned;
+    bool const referencesAccept = (expectRef == ExpectRef::Accept);
+    if (referencesAccept && !dssAcceptedSomewhere) return Outcome::DirectionADefect;
+    if (!referencesAccept && dssAcceptedSomewhere) return Outcome::DirectionBDefect;
     return Outcome::Agreement;
 }
 
 [[nodiscard]] bool isDefect(Outcome o) {
     return o == Outcome::DirectionADefect || o == Outcome::DirectionBDefect;
+}
+
+// What THIS host's roster was able to say about the corpus's declaration. Five
+// buckets, total and disjoint, because "every unit gets a verdict; silence about a
+// unit is a harness bug" — a probe that fell out of the reporting entirely is the
+// failure this file exists to prevent.
+enum class Corroboration : std::uint8_t {
+    Confirmed,      // a compiler HERE accepted a row the corpus declares ACCEPT
+    Consistent,     // every entitled compiler rejected a row declared REJECT
+    NotWitnessed,   // every entitled compiler rejected a row declared ACCEPT. The
+                    // UN-REFUTABLE negative: reported in full, never a red.
+    Refuted,        // a compiler HERE accepted a row declared REJECT — a WITNESS
+                    // against a universal claim. The one sound measurement red.
+    NoJudge,        // no oracle here was entitled (family and/or measured level)
+    Waived,         // `@expect-ref varies` — the corpus declined to claim anything.
+                    // Kept APART from NoJudge on purpose: a waiver is a corpus
+                    // decision and reads the same on every machine, while NoJudge is
+                    // a fact about this host. Summing them into one number would
+                    // re-blend exactly the two things this file now separates.
+};
+
+[[nodiscard]] char const* corroborationName(Corroboration c) {
+    switch (c) {
+        case Corroboration::Confirmed:    return "confirmed";
+        case Corroboration::Consistent:   return "consistent";
+        case Corroboration::NotWitnessed: return "not-witnessed";
+        case Corroboration::Refuted:      return "REFUTED";
+        case Corroboration::NoJudge:      return "no-judge";
+        case Corroboration::Waived:       return "waived";
+    }
+    return "?";
+}
+
+[[nodiscard]] Corroboration corroborate(std::size_t judgingOracles,
+                                        bool anyOracleAccepted, ExpectRef expectRef) {
+    // Checked FIRST, and that ordering is the property: a waived row is waived on
+    // every host, whatever the roster did or did not manage to say about it.
+    if (expectRef == ExpectRef::Varies) return Corroboration::Waived;
+    if (judgingOracles == 0)            return Corroboration::NoJudge;
+    if (expectRef == ExpectRef::Reject)
+        return anyOracleAccepted ? Corroboration::Refuted : Corroboration::Consistent;
+    return anyOracleAccepted ? Corroboration::Confirmed : Corroboration::NotWitnessed;
+}
+
+// Everything this file can conclude about ONE probe on ONE host, produced by ONE
+// pure function. The census below and the host-independence property test both go
+// through it, so the thing under test and the thing that ships cannot drift apart
+// — a property test that re-implements the decision proves only that the author
+// can write the same bug twice.
+struct RowVerdict {
+    Outcome       outcome          = Outcome::Agreement;
+    Corroboration corroboration    = Corroboration::NoJudge;
+    bool          redsAsNewDefect  = false;   // a pinned divergence, unacknowledged
+    bool          redsAsStaleAck   = false;   // an acknowledgement that no longer holds
+    bool          redsAsRefutation = false;   // a `reject` declaration met a witness
+};
+
+[[nodiscard]] RowVerdict judgeRow(ExpectRef expectRef, bool acknowledged,
+                                  bool dssAcceptedSomewhere,
+                                  std::size_t judgingOracles, bool anyOracleAccepted) {
+    RowVerdict v;
+    v.outcome         = pin(expectRef, dssAcceptedSomewhere);
+    v.corroboration   = corroborate(judgingOracles, anyOracleAccepted, expectRef);
+    v.redsAsNewDefect = isDefect(v.outcome) && !acknowledged;
+    // ★ THE RATCHET, AND IT ONLY TURNS ONE WAY. An acknowledgement that no longer
+    // describes a divergence is a guard weakened until it asserts nothing — this
+    // repo has that on record twice. Closing a gap therefore reds HERE, with the
+    // exact edit named, rather than leaving a row that still reads as "known" a
+    // year from now. A waived row is exempt because it never claimed a direction.
+    v.redsAsStaleAck  = !isDefect(v.outcome) && acknowledged
+                     && v.outcome != Outcome::NotPinned;
+    v.redsAsRefutation = (v.corroboration == Corroboration::Refuted);
+    return v;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1207,6 +1342,17 @@ TEST(ReferenceConformance, CorpusIsWellFormedAndComplete) {
                 << p.id << ": a direction-B probe must name EVERY family (`gnu,msvc`) — "
                            "\"no reference compiler accepts it\" is a union over all of "
                            "them, and narrowing turns an unmeasured family into evidence.";
+            // ★ `@expect-ref` IS THE PIN. Since the pinned verdict is a function of
+            // that declaration and DSS alone, a direction-B probe that declares
+            // `accept` would be censused as direction A — the corpus would be
+            // arguing with itself and the census would report the argument as fact.
+            // Checked in the exception-free direction only: `sanity_reject` is a
+            // direction-A row declaring `reject`, and it is legitimately so.
+            EXPECT_NE(p.expectRef, ExpectRef::Accept)
+                << p.id << ": `@direction B` says \"no reference compiler accepts this\" "
+                           "but `@expect-ref accept` says they all do. The pinned census "
+                           "reads @expect-ref, so this probe would be censused as the "
+                           "OPPOSITE direction from the one it declares.";
         } else {
             ++nA;
         }
@@ -1346,40 +1492,155 @@ TEST(ReferenceConformance, OracleStandardLevelsAreMeasuredNotAssumed) {
 TEST(ReferenceConformance, ClassifierTruthTableIsExhaustive) {
     using E = ExpectRef;
 
-    // No judging oracle → UNORACLED, whatever DSS said. A row with no reference
-    // verdict must never be scored as agreement: that is the inert-oracle defect
-    // in its purest form.
-    for (bool dss : {false, true})
-        for (E e : {E::Accept, E::Reject, E::Varies})
-            EXPECT_EQ(classify(0, /*anyOracleAccepted=*/false, dss, e), Outcome::Unoracled)
-                << "judgingOracles=0 must be UNORACLED";
-
-    // `varies` → NOT PINNED in both directions, for every verdict combination.
-    for (bool refAcc : {false, true})
-        for (bool dss : {false, true})
-            EXPECT_EQ(classify(3, refAcc, dss, E::Varies), Outcome::NotPinned);
-
-    // The four pinned combinations, at every oracle count that means "someone
-    // judged it".
-    for (std::size_t n : {std::size_t{1}, std::size_t{5}}) {
-        for (E e : {E::Accept, E::Reject}) {
-            EXPECT_EQ(classify(n, /*refAcc=*/true,  /*dss=*/false, e),
-                      Outcome::DirectionADefect)
-                << "reference accepts + DSS rejects is direction A";
-            EXPECT_EQ(classify(n, /*refAcc=*/false, /*dss=*/true,  e),
-                      Outcome::DirectionBDefect)
-                << "no reference accepts + DSS accepts is direction B — the invented-"
-                   "extension case this whole file exists to detect";
-            EXPECT_EQ(classify(n, /*refAcc=*/true,  /*dss=*/true,  e), Outcome::Agreement);
-            EXPECT_EQ(classify(n, /*refAcc=*/false, /*dss=*/false, e), Outcome::Agreement);
-        }
+    // ── THE PIN. `varies` is not pinned in either direction; the other two
+    // declarations pin all four combinations against DSS's verdict.
+    for (bool dss : {false, true}) {
+        EXPECT_EQ(pin(E::Varies, dss), Outcome::NotPinned);
+        EXPECT_EQ(pin(E::Accept, /*dss=*/false), Outcome::DirectionADefect)
+            << "the corpus declares reference compilers ACCEPT it and DSS rejects — "
+               "direction A, real C that fails to build with DSS";
+        EXPECT_EQ(pin(E::Reject, /*dss=*/true), Outcome::DirectionBDefect)
+            << "the corpus declares NO reference compiler accepts it and DSS does — "
+               "direction B, the invented-extension case this file exists to detect";
+        EXPECT_EQ(pin(E::Accept, /*dss=*/true), Outcome::Agreement);
+        EXPECT_EQ(pin(E::Reject, /*dss=*/false), Outcome::Agreement);
     }
 
     EXPECT_TRUE(isDefect(Outcome::DirectionADefect));
     EXPECT_TRUE(isDefect(Outcome::DirectionBDefect));
     EXPECT_FALSE(isDefect(Outcome::Agreement));
-    EXPECT_FALSE(isDefect(Outcome::Unoracled));
     EXPECT_FALSE(isDefect(Outcome::NotPinned));
+
+    // ── CORROBORATION, exhaustively over the roster observations a host can make.
+    for (bool acc : {false, true})
+        for (std::size_t n : {std::size_t{0}, std::size_t{3}})
+            EXPECT_EQ(corroborate(n, acc, E::Varies), Corroboration::Waived)
+                << "a waived row makes no claim, so there is nothing to corroborate — "
+                   "and it reads WAIVED at every roster size, never as a host fact";
+    for (E e : {E::Accept, E::Reject})
+        EXPECT_EQ(corroborate(0, /*anyOracleAccepted=*/false, e), Corroboration::NoJudge)
+            << "no entitled oracle means no evidence — never agreement";
+    for (std::size_t n : {std::size_t{1}, std::size_t{5}}) {
+        EXPECT_EQ(corroborate(n, true,  E::Accept), Corroboration::Confirmed);
+        EXPECT_EQ(corroborate(n, false, E::Accept), Corroboration::NotWitnessed);
+        EXPECT_EQ(corroborate(n, true,  E::Reject), Corroboration::Refuted);
+        EXPECT_EQ(corroborate(n, false, E::Reject), Corroboration::Consistent);
+    }
+
+    // Every enumerator prints as itself. A bucket that rendered as "?" would make
+    // the census log — the actual deliverable — unreadable at exactly the rows
+    // that matter.
+    std::set<std::string> names;
+    for (auto c : {Corroboration::Confirmed, Corroboration::Consistent,
+                   Corroboration::NotWitnessed, Corroboration::Refuted,
+                   Corroboration::NoJudge, Corroboration::Waived}) {
+        std::string const n = corroborationName(c);
+        EXPECT_NE(n, "?");
+        EXPECT_TRUE(names.insert(n).second) << "duplicate corroboration name " << n;
+    }
+    for (auto o : {Outcome::Agreement, Outcome::DirectionADefect,
+                   Outcome::DirectionBDefect, Outcome::NotPinned})
+        EXPECT_NE(std::string{outcomeName(o)}, "?");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  3b. THE REGRESSION TEST FOR THE DEFECT THIS FILE SHIPPED WITH.
+//
+//  `ReferenceConformance.DifferentialAcceptRejectCensus` passed on a Windows box
+//  holding MSVC 19.51 + clang-19 + clang-18 + gcc-13 and FAILED on the CI
+//  `linux-arm64-gcc-release` leg holding gcc-13 + clang-18. Six failures, none of
+//  them about DSS: three probes changed classification because clang-19 — which
+//  accepts `constexpr` objects, `0b` literals and a zero-argument `__VA_OPT__`
+//  call — was not installed there, while clang-18 reports the same
+//  `__STDC_VERSION__` and refuses all three.
+//
+//  The property below is the one that was missing. It consults no compiler VERDICT
+//  — it simulates the roster instead — so it is live on every host, including one
+//  with no toolchain at all: for a fixed corpus declaration, a fixed
+//  acknowledgement state and a fixed DSS verdict, everything that can RED must be
+//  invariant under every roster a host can present.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(ReferenceConformance, PinnedVerdictCannotDependOnWhichCompilersTheHostHas) {
+    // Every roster OBSERVATION a host can produce, which is the complete domain of
+    // roster-derived input into the decision: how many oracles were entitled, and
+    // whether any of them accepted. `{0, true}` is excluded because it cannot
+    // happen — nobody judged, so nobody accepted.
+    std::vector<std::pair<std::size_t, bool>> const rosters{
+        {0, false},               // no compiler here was entitled to judge
+        {1, false}, {1, true},    // one entitled oracle, either way
+        {2, false}, {2, true},    // gcc-13 + clang-18, the CI arm64 shape
+        {5, false}, {5, true},    // MSVC + Strawberry gcc + three WSL compilers
+    };
+
+    std::size_t checked = 0;
+    for (ExpectRef e : {ExpectRef::Accept, ExpectRef::Reject, ExpectRef::Varies})
+        for (bool ack : {false, true})
+            for (bool dss : {false, true}) {
+                auto const ref = judgeRow(e, ack, dss, rosters.front().first,
+                                          rosters.front().second);
+                for (auto const& [n, acc] : rosters) {
+                    auto const v = judgeRow(e, ack, dss, n, acc);
+                    EXPECT_EQ(v.outcome, ref.outcome)
+                        << "THE PIN MOVED WITH THE ROSTER. expect-ref="
+                        << static_cast<int>(e) << " ack=" << ack << " dss=" << dss
+                        << " judging=" << n << " anyAccepted=" << acc << ": pinned "
+                        << outcomeName(v.outcome) << " here and "
+                        << outcomeName(ref.outcome) << " with no oracles. A verdict that "
+                           "flips with which machine ran it must not be pinned in either "
+                           "direction.";
+                    EXPECT_EQ(v.redsAsNewDefect, ref.redsAsNewDefect)
+                        << "the UNACKNOWLEDGED-DIVERGENCE red moved with the roster";
+                    EXPECT_EQ(v.redsAsStaleAck, ref.redsAsStaleAck)
+                        << "the STALE-ACKNOWLEDGEMENT red moved with the roster — this is "
+                           "the exact shape of the `a_va_opt_c23` false red: an "
+                           "acknowledgement is stale when the GAP closes, never when the "
+                           "host cannot oracle it";
+                    // The one measurement-driven red is SOUND because it requires a
+                    // WITNESS. Negative evidence must never produce it.
+                    if (v.redsAsRefutation)
+                        EXPECT_TRUE(acc)
+                            << "a refutation fired with NO compiler having accepted "
+                               "anything. \"Nothing here accepted it\" is a fact about the "
+                               "roster, not about C, and no finite roster can refute an "
+                               "existential claim.";
+                    ++checked;
+                }
+            }
+    EXPECT_EQ(checked, 3u * 2u * 2u * rosters.size())
+        << "the invariance sweep did not cover its own domain";
+
+    // ★ NEGATIVE CONTROL, and without it the sweep above is satisfiable by a
+    // decision function that reads nothing at all — i.e. by a harness that has
+    // stopped measuring. Corroboration MUST move with the roster; that is its job,
+    // and it is the half deliberately left free to differ per host.
+    EXPECT_NE(judgeRow(ExpectRef::Accept, false, true, 0, false).corroboration,
+              judgeRow(ExpectRef::Accept, false, true, 3, true).corroboration)
+        << "corroboration did not move between an empty roster and one that accepted";
+    EXPECT_NE(judgeRow(ExpectRef::Reject, false, true, 3, false).corroboration,
+              judgeRow(ExpectRef::Reject, false, true, 3, true).corroboration)
+        << "corroboration did not move between a rejecting roster and an accepting one";
+    EXPECT_TRUE(judgeRow(ExpectRef::Reject, false, true, 3, true).redsAsRefutation)
+        << "a witness against a `reject` declaration must still RED — the sound "
+           "measurement red is not allowed to be optimised away with the unsound one";
+
+    // ── And the same property over the corpus that actually SHIPS, so a probe
+    // added tomorrow is covered by construction rather than by remembering to.
+    auto const& h = harness();
+    ASSERT_TRUE(h.corpus.error.empty()) << h.corpus.error;
+    ASSERT_FALSE(h.corpus.probes.empty()) << "no probes parsed";
+    std::size_t rows = 0;
+    for (auto const& p : h.corpus.probes)
+        for (bool dss : {false, true}) {
+            auto const ref = judgeRow(p.expectRef, p.acknowledged(), dss, 0, false);
+            for (auto const& [n, acc] : rosters) {
+                auto const v = judgeRow(p.expectRef, p.acknowledged(), dss, n, acc);
+                EXPECT_EQ(v.outcome, ref.outcome) << p.id << ": pinned verdict moved";
+                EXPECT_EQ(v.redsAsNewDefect, ref.redsAsNewDefect) << p.id;
+                EXPECT_EQ(v.redsAsStaleAck, ref.redsAsStaleAck) << p.id;
+                ++rows;
+            }
+        }
+    EXPECT_EQ(rows, h.corpus.probes.size() * 2u * rosters.size());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1393,13 +1654,26 @@ TEST(ReferenceConformance, DifferentialAcceptRejectCensus) {
     auto const& set    = h.oracles;
 
     for (auto const& b : set.broken) ADD_FAILURE() << b;
-    if (set.found.empty()) {
-        // Same fail-closed condition as the roster test: see the note there.
+
+    // ★ NO SKIP HERE, AND THAT IS THE LAST PIECE OF THE HOST-INDEPENDENCE FIX.
+    // The census used to GTEST_SKIP on a host with no reference compiler — and
+    // ctest scores a skip as a pass, so on such a host this file asserted NOTHING
+    // about DSS. But only the CORROBORATION half needs a compiler; the PIN needs
+    // the corpus and the DSS CLI, both of which are always here. So the pin is
+    // taken unconditionally and the roster-dependent work is gated instead. A
+    // toolchain-less host now reports every probe as `no-judge` and still gates
+    // DSS, which is what "the pinned numbers are the same on every host" has to
+    // mean if it is to mean anything.
+    bool const haveOracles = !set.found.empty();
+    if (!haveOracles) {
+        // Same fail-closed condition as the roster test: see the note there. An
+        // empty absent list means nothing was even LOOKED for, which is a harness
+        // defect wearing a missing-toolchain's clothes.
         EXPECT_FALSE(set.absent.empty())
-            << "DECORATIVE SKIP: nothing was found and nothing was looked for.";
-        GTEST_SKIP() << "NO usable reference C compiler on this host — the census cannot "
-                        "be taken. Reported as a SKIP with every candidate named, never "
-                        "as a pass:" << describeOracles(set);
+            << "DECORATIVE ROSTER: nothing was found and nothing was looked for.";
+        std::cout << "[census] NO usable reference C compiler on this host. The "
+                     "CORROBORATION half cannot be taken and every probe will read "
+                     "`no-judge`; the PINNED half needs no compiler and is taken anyway.";
     }
     std::cout << "[census]" << describeOracles(set) << "\n";
 
@@ -1486,18 +1760,30 @@ TEST(ReferenceConformance, DifferentialAcceptRejectCensus) {
     }
 
     // ── DIFF ──
-    native_probe::ExecutedRows judgedRows{"probes compared against >=1 oracle", 1};
+    // The INERT-ORACLE floor guards "this host HAD oracles and rows went missing
+    // between the driver and the diff". On a host with none there is nothing for it
+    // to guard, and a floor that reds because a machine has no compilers punishes
+    // the host rather than the code — the pinned floor below is the unconditional
+    // one, because it needs no compiler.
+    std::optional<native_probe::ExecutedRows> judgedRows;
+    if (haveOracles) judgedRows.emplace("probes an oracle was entitled to judge", 1);
+    // ★ EVERY probe gets a PINNED verdict on EVERY host — that is the property the
+    // whole split exists to deliver, so it carries the strongest floor in the file:
+    // the corpus's own size. A probe that fell out of the pinned census would be a
+    // silent hole exactly where the previous design had one.
+    native_probe::ExecutedRows pinnedRows{"probes given a pinned verdict", probes.size()};
     // ⚠ DELIBERATELY PLAIN COUNTERS, NOT `ExecutedRows`. A ledger with a floor on
     // the DEFECT counts would go red precisely when every gap has been closed —
     // i.e. it would punish the outcome this file exists to produce. The floors
     // belong on the ENUMERATION (probes found, probes compared, DSS verdicts
     // produced), never on the findings.
-    std::size_t dirACount = 0, dirBCount = 0;
+    std::size_t dirACount = 0, dirBCount = 0, notPinnedCount = 0;
 
     std::ostringstream table;
-    table << "\n[census] probe                                            | outcome    | DSS"
-             "                | reference verdicts";
-    std::vector<std::string> newDefects, staleAcks, expectRefWrong, unoracled, censusA, censusB;
+    table << "\n[census] probe                                            | pinned     | "
+             "corroborated  | DSS                | reference verdicts";
+    std::vector<std::string> newDefects, staleAcks, refutations, censusA, censusB;
+    std::map<Corroboration, std::vector<std::string>> corroborated;
 
     for (auto const& p : probes) {
         std::vector<std::string> judged, accepting;
@@ -1520,8 +1806,9 @@ TEST(ReferenceConformance, DifferentialAcceptRejectCensus) {
         }
 
         bool const dssAccepts = dss[p.id].acceptedAnywhere();
-        auto const outcome = classify(judged.size(), !accepting.empty(), dssAccepts,
-                                      p.expectRef);
+        auto const verdict = judgeRow(p.expectRef, p.acknowledged(), dssAccepts,
+                                      judged.size(), !accepting.empty());
+        auto const outcome = verdict.outcome;
 
         std::string refCell;
         for (auto const& o : set.found) {
@@ -1531,72 +1818,83 @@ TEST(ReferenceConformance, DifferentialAcceptRejectCensus) {
                              : (it->second.accepted ? "ACCEPT" : "reject");
             refCell += " " + o.id + "=" + cell;
         }
-        table << "\n[census] " << p.id << std::string(p.id.size() < 48 ? 48 - p.id.size() : 1, ' ')
-              << "| " << outcomeName(outcome)
-              << std::string(std::max<std::size_t>(
-                     1, 11 - std::min<std::size_t>(
-                            10, std::string_view{outcomeName(outcome)}.size())), ' ')
+        auto const pad = [](std::string_view s, std::size_t w) {
+            return std::string(s.size() < w ? w - s.size() : 1, ' ');
+        };
+        char const* const corrName = corroborationName(verdict.corroboration);
+        table << "\n[census] " << p.id << pad(p.id, 48)
+              << "| " << outcomeName(outcome) << pad(outcomeName(outcome), 11)
+              << "| " << corrName << pad(corrName, 14)
               << "| " << dss[p.id].perTarget() << " |" << refCell;
 
-        if (!judged.empty()) judgedRows.record();
-        if (outcome == Outcome::Unoracled) {
-            unoracled.push_back(p.id);
-            continue;
-        }
-        if (outcome == Outcome::NotPinned) continue;
-
-        // The corpus's own understanding, cross-checked against the measurement.
-        if (p.expectRef == ExpectRef::Accept && accepting.empty()) {
-            std::string j;
-            for (auto const& x : judged) j += (j.empty() ? "" : ",") + x;
-            expectRefWrong.push_back(p.id + ": declares `@expect-ref accept` but NONE of {"
-                                     + j + "} accepted it");
-        }
-        if (p.expectRef == ExpectRef::Reject && !accepting.empty()) {
-            std::string a;
-            for (auto const& x : accepting) a += (a.empty() ? "" : ",") + x;
-            expectRefWrong.push_back(p.id + ": declares `@expect-ref reject` but it was "
-                                     "ACCEPTED by {" + a + "} — the corpus is wrong about "
-                                     "reference compilers, which is worse than a gap");
-        }
-
-        if (outcome == Outcome::DirectionADefect) ++dirACount;
-        if (outcome == Outcome::DirectionBDefect) ++dirBCount;
+        // ★ THE PIN IS TOTAL. Every probe is counted here, including the ones no
+        // oracle on this host was entitled to judge — that is precisely the set the
+        // previous design left silent.
+        pinnedRows.record();
+        if (!judged.empty() && judgedRows) judgedRows->record();
+        corroborated[verdict.corroboration].push_back(p.id);
 
         std::string const row =
             p.id + "  [DSS " + dss[p.id].perTarget() + "]  [refs:" + refCell + "]";
-        if (outcome == Outcome::DirectionADefect) censusA.push_back(row);
-        if (outcome == Outcome::DirectionBDefect) censusB.push_back(row);
 
-        if (isDefect(outcome) && !p.acknowledged()) {
+        // The one measurement-driven red, and it needs a WITNESS. A `@expect-ref
+        // reject` row is a claim about EVERY reference compiler; one that accepts
+        // refutes it, on any host, with no appeal to what is not installed.
+        if (verdict.redsAsRefutation) {
+            std::string a;
+            for (auto const& x : accepting) a += (a.empty() ? "" : ",") + x;
+            refutations.push_back(p.id + ": declares `@expect-ref reject` but it was "
+                                  "ACCEPTED by {" + a + "} — the corpus is wrong about "
+                                  "reference compilers, which is worse than a gap");
+        }
+
+        if (outcome == Outcome::NotPinned) { ++notPinnedCount; continue; }
+        if (outcome == Outcome::DirectionADefect) { ++dirACount; censusA.push_back(row); }
+        if (outcome == Outcome::DirectionBDefect) { ++dirBCount; censusB.push_back(row); }
+
+        if (verdict.redsAsNewDefect)
             newDefects.push_back(
                 std::string{outcomeName(outcome)} + " on `" + p.id + "`: " + row
                 + "\n      why: " + p.why);
-        }
-        // ★ THE RATCHET, AND IT ONLY TURNS ONE WAY. An acknowledgement that no
-        // longer describes a divergence is a guard that has been weakened until
-        // it asserts nothing — this repo has that on record twice. Closing a gap
-        // therefore reds HERE, with the exact edit named, rather than leaving a
-        // row that will still read as "known" a year from now.
-        if (!isDefect(outcome) && p.acknowledged() && p.id != "sanity_reject") {
-            staleAcks.push_back(p.id);
-        }
+        if (verdict.redsAsStaleAck) staleAcks.push_back(p.id);
     }
     std::cout << table.str() << "\n";
 
     // ── The censuses, always printed: this is the deliverable, not the failure. ──
-    std::cout << "\n[census] DIRECTION-B (DSS accepts, NO reference compiler does) — "
+    std::cout << "\n[census] DIRECTION-B (the corpus declares REJECT, DSS accepts) — "
               << censusB.size() << " row(s):\n";
     for (auto const& r : censusB) std::cout << "  " << r << "\n";
-    std::cout << "[census] DIRECTION-A (a reference compiler accepts, DSS rejects) — "
+    std::cout << "[census] DIRECTION-A (the corpus declares ACCEPT, DSS rejects) — "
               << censusA.size() << " row(s):\n";
     for (auto const& r : censusA) std::cout << "  " << r << "\n";
-    std::cout << "[census] UNORACLED on this host (" << unoracled.size()
-              << ") — no available compiler was entitled to judge these:\n";
-    for (auto const& u : unoracled) std::cout << "  " << u << "\n";
+
+    // ── CORROBORATION, per bucket and BY NAME. This is the half that is allowed to
+    // move between hosts, so it is the half that must be legible: a reader has to
+    // be able to see which declarations this roster could stand behind and which it
+    // simply could not reach.
+    for (auto const c : {Corroboration::Confirmed, Corroboration::Consistent,
+                         Corroboration::NotWitnessed, Corroboration::Refuted,
+                         Corroboration::NoJudge, Corroboration::Waived}) {
+        auto const& ids = corroborated[c];
+        std::cout << "[census] corroboration=" << corroborationName(c) << " (" << ids.size()
+                  << ")";
+        if (c == Corroboration::NotWitnessed)
+            std::cout << " — declared ACCEPT, nothing HERE accepted it. This is NOT a "
+                         "finding: no finite roster can refute an existential claim, and "
+                         "the honest reading is that this host lacks the compiler. They "
+                         "are still PINNED";
+        if (c == Corroboration::NoJudge)
+            std::cout << " — no oracle here was entitled (family/measured level). They "
+                         "are still PINNED";
+        if (c == Corroboration::Waived)
+            std::cout << " — `@expect-ref varies`: the corpus declines to state one "
+                         "reference behaviour, so there is none to pin";
+        std::cout << ":\n";
+        for (auto const& id : ids) std::cout << "  " << id << "\n";
+    }
 
     // ── Verdicts ──
-    for (auto const& e : expectRefWrong)
+    for (auto const& e : refutations)
         ADD_FAILURE() << "CORPUS DISAGREES WITH MEASUREMENT — " << e;
 
     for (auto const& d : newDefects)
@@ -1611,30 +1909,64 @@ TEST(ReferenceConformance, DifferentialAcceptRejectCensus) {
     for (auto const& s : staleAcks)
         ADD_FAILURE()
             << "STALE ACKNOWLEDGEMENT on probe `" << s << "`: it carries an "
-               "`@acknowledged-gap` line but DSS and the reference compilers now AGREE. "
-               "That is good news and it requires one edit: DELETE the `@acknowledged-gap` "
-               "line from that probe in "
+               "`@acknowledged-gap` line but DSS now does what the corpus says reference "
+               "compilers do. That is good news and it requires one edit: DELETE the "
+               "`@acknowledged-gap` line from that probe in "
                "tests/conformance/corpus/reference_conformance.probes. This reds on "
                "purpose — an acknowledgement list that keeps rows after they are fixed "
-               "stops meaning anything, and then a genuinely new gap hides among them.";
+               "stops meaning anything, and then a genuinely new gap hides among them. "
+               "⚠ It is keyed on the corpus DECLARATION and DSS, never on which "
+               "compilers this host happens to hold: an acknowledgement that looked "
+               "stale only because the deciding compiler was not installed is the "
+               "false red this arm was rebuilt to stop producing.";
 
     // ── FAIL-CLOSED enumeration, per dimension. Floors DERIVED from the corpus
     // and the roster, never typed in: a hand-written floor drifts away from what
     // it guards and quietly stops being one.
+    std::size_t const judgedCount = judgedRows ? judgedRows->count() : 0;
     std::size_t universalProbes = 0;
     for (auto const& p : probes)
         if (p.minStdc == 0 && p.families.size() == 2) ++universalProbes;
-    EXPECT_GE(judgedRows.count(), universalProbes)
-        << "INERT ORACLE: " << judgedRows.count() << " probes were compared, but "
-        << universalProbes << " of them name every family and demand no standard level, so "
-           "ANY located oracle is entitled to judge them. A shortfall means rows were "
-           "dropped between the driver and the diff.";
-    EXPECT_LT(unoracled.size(), probes.size())
-        << "EVERY probe was unoracled — the roster is non-empty yet judged nothing.";
+    if (haveOracles) {
+        EXPECT_GE(judgedCount, universalProbes)
+            << "INERT ORACLE: " << judgedCount << " probes were compared, but "
+            << universalProbes << " of them name every family and demand no standard "
+               "level, so ANY located oracle is entitled to judge them. A shortfall means "
+               "rows were dropped between the driver and the diff.";
+        EXPECT_LT(corroborated[Corroboration::NoJudge].size(), probes.size())
+            << "NOTHING was corroborated — the roster is non-empty yet judged nothing.";
+    }
+    // ★ UNCONDITIONAL, and deliberately so: this is the floor that does not care
+    // what the host has installed.
+    EXPECT_EQ(pinnedRows.count(), probes.size())
+        << "THE PIN IS NOT TOTAL: " << pinnedRows.count() << " of " << probes.size()
+        << " probes reached a pinned verdict. Every probe is pinned on every host, or "
+           "the guarantee this file now makes is not one.";
+    // Total and disjoint, checked rather than asserted in prose: a probe that
+    // vanished from the buckets would be a unit with no verdict, which is the
+    // harness defect this file is built to make impossible.
+    std::size_t bucketed = 0;
+    for (auto const& [c, ids] : corroborated) bucketed += ids.size();
+    EXPECT_EQ(bucketed, probes.size())
+        << "CORROBORATION IS NOT TOTAL: " << bucketed << " of " << probes.size()
+        << " probes landed in a bucket. Silence about a probe is a harness bug.";
 
-    std::cout << "[census] compared=" << judgedRows.count() << "/" << probes.size()
-              << " dss-verdicts=" << dssRows.count()
+    // ★ TWO LINES, AND THE SPLIT BETWEEN THEM IS THE POINT. The PINNED line must
+    // read identically on every host; the CORROBORATION line is expected to move
+    // with the roster and says so. Diffing two legs' logs is how a regression in
+    // host-independence gets caught by eye as well as by the property test.
+    std::cout << "[census] PINNED (host-independent): pinned=" << pinnedRows.count() << "/"
+              << probes.size() << " dss-verdicts=" << dssRows.count()
               << " direction-A=" << dirACount
               << " direction-B=" << dirBCount
-              << " unoracled=" << unoracled.size() << "\n";
+              << " not-pinned=" << notPinnedCount << "\n";
+    std::cout << "[census] CORROBORATION (this host's roster, may differ per machine): "
+              << "oracles=" << set.found.size()
+              << " judged=" << judgedCount << "/" << probes.size()
+              << " confirmed=" << corroborated[Corroboration::Confirmed].size()
+              << " consistent=" << corroborated[Corroboration::Consistent].size()
+              << " not-witnessed=" << corroborated[Corroboration::NotWitnessed].size()
+              << " refuted=" << corroborated[Corroboration::Refuted].size()
+              << " no-judge=" << corroborated[Corroboration::NoJudge].size()
+              << " waived=" << corroborated[Corroboration::Waived].size() << "\n";
 }

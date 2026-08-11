@@ -101,8 +101,7 @@ int dss_sanity_accept_object;
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@acknowledged-gap HARNESS SANITY — this probe is REJECTED BY DESIGN on every oracle AND on DSS, so it is an agreement row, not a gap. The acknowledgement is unused; it is present only so a reader does not have to work out why a deliberately-invalid probe is here.
-@why HARNESS SANITY: illegal characters no C compiler accepts. Proves a nonzero verdict is reachable through the driver.
+@why HARNESS SANITY: illegal characters no C compiler accepts. Proves a nonzero verdict is reachable through the driver. It carries NO @acknowledged-gap: it is REJECTED BY DESIGN on every oracle AND on DSS, so it is an agreement row rather than a gap, and an acknowledgement here would have to be excused BY NAME in the stale-acknowledgement ratchet. A guard with a named exception is one edit away from having two.
 @code
 int @@@ dss_sanity_reject $$$ ;
 @end
