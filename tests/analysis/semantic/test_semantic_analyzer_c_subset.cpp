@@ -1950,6 +1950,46 @@ TEST(SemanticAnalyzerCSubset, StaticAssertAlignofCharSpellingFoldsTrue) {
         << "alignof(char)==1 must fold true (the C23 spelling)";
 }
 
+// D-CSUBSET-ALIGNOF-GNU-SPELLING: `__alignof__` and `__alignof` are keyword-table
+// ALIASES onto the SAME AlignofKeyword `_Alignof` uses, so they must reach this
+// identical const-eval path — not merely parse. Both GNU spellings in one unit;
+// `_Alignof` is present too as the matched control, so a run in which the whole
+// static-assert machinery silently stopped evaluating cannot look like a pass.
+TEST(SemanticAnalyzerCSubset, GnuAlignofSpellingsFoldLikeIsoSpelling) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(__alignof__(double) == 8, \"gnu double aligns 8\");\n"
+        "_Static_assert(__alignof(int) == 4, \"gnu int aligns 4\");\n"
+        "_Static_assert(__alignof__(char) == _Alignof(char), \"alias == iso\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "both GNU alignof spellings must fold through the SAME alignofType "
+           "rule as _Alignof";
+}
+
+// FAIL-CLOSED twin of the above, and it is not decoration: a `_Static_assert`
+// whose operand never got evaluated raises NOTHING, which is indistinguishable
+// from a passing assertion. This arm proves the alias's VALUE is really read —
+// `__alignof__(double)` is 8, so `== 4` must fail LOUD.
+TEST(SemanticAnalyzerCSubset, GnuAlignofSpellingFoldsFalseFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(__alignof__(double) == 4, \"wrong on purpose\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "__alignof__(double)==4 must FOLD FALSE and fail loud — otherwise the "
+           "true-arm above would pass on an alias that parses and evaluates to "
+           "nothing";
+}
+
 // _Alignof of a STRUCT = the MAX member alignment (not the size): {char; double}
 // is 16 bytes but aligns to 8 (the double). Exercises the aggregateLayout path
 // and proves alignof reads ALIGNMENT, never size.
@@ -2720,6 +2760,63 @@ TEST(SemanticAnalyzerCSubset, SizeofTypeofFoldsInArrayDim) {
     ASSERT_EQ(ti.scalars(a->type).size(), 1u);
     EXPECT_EQ(ti.scalars(a->type)[0], 2)
         << "sizeof(typeof(unsigned short)) folds to 2";
+}
+
+// ── D-CSUBSET-TYPEOF-GNU-SPELLING: `__typeof__` / `__typeof` ────────────────
+//
+// The aliases route to TypeofKeyword, so they must resolve EXACTLY as `typeof`
+// does — both operand forms, from the same `typeofSpecifier`.
+TEST(SemanticAnalyzerCSubset, GnuTypeofSpellingsResolveLikeIsoSpelling) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int x;\n"
+        "__typeof__(x) a;\n"        // EXPRESSION operand, long spelling
+        "__typeof(x) b;\n"          // EXPRESSION operand, short spelling
+        "__typeof__(int*) p;\n",    // TYPE-NAME operand
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    for (char const* name : {"a", "b"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        ASSERT_TRUE(s->type.valid()) << name;
+        EXPECT_EQ(ti.kind(s->type), TypeKind::I32)
+            << name << ": a GNU typeof spelling over an int operand is int";
+    }
+    SymbolRecord const* p = findSym(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->type.valid());
+    ASSERT_EQ(ti.kind(p->type), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(p->type)[0]), TypeKind::I32)
+        << "__typeof__(int*) resolves through the SAME castTypeRef the ISO "
+           "spelling uses";
+}
+
+// ★ THE assertion that makes the alias correct rather than merely accepted.
+// `typeof` and `typeof_unqual` differ in EXACTLY ONE observable: the top-level
+// qualifier strip. GNU `__typeof__` means the PRESERVING one, so a keyword row
+// that mapped it to TypeofUnqualKeyword would still parse, still resolve to a
+// plain int, and still pass every test above — and would silently drop a
+// `volatile` the program wrote. Only this pin separates the two mappings, and
+// it is the exact mirror of TypeofUnqualStripsVolatile one section up.
+TEST(SemanticAnalyzerCSubset, GnuTypeofSpellingPreservesVolatile) {
+    auto cu = buildShippedUnit("c-subset", {
+        "__typeof__(volatile int) v;\n"
+        "__typeof(volatile int) w;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    for (char const* name : {"v", "w"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        ASSERT_TRUE(s->type.valid()) << name;
+        EXPECT_TRUE(ti.isVolatileQualified(s->type))
+            << name << ": GNU __typeof__ is the QUALIFIER-PRESERVING typeof, "
+                       "never typeof_unqual — a row mapped to "
+                       "TypeofUnqualKeyword would strip this and pass "
+                       "everything else";
+    }
 }
 
 // Bit-field operand → S_TypeofBitfieldOperand (C 6.7.2.5 constraint): a bit-field

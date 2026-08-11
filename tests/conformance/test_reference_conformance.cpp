@@ -1045,6 +1045,18 @@ constexpr std::size_t kMinDirectionBProbes = 15;
         "a_builtin_choose_expr_gnu", "a_builtin_offsetof_gnu", "a_real_imag_gnu",
         "a_alignof_gnu_spelling", "a_attribute_constructor_gnu",
         "a_attribute_alias_gnu",
+        // ★ A row is listed here whether it is an OPEN gap or a CLOSED one. Once
+        // `a_typeof_gnu_spelling` and `a_alignof_gnu_spelling` were fixed
+        // (D-CSUBSET-TYPEOF-GNU-SPELLING / D-CSUBSET-ALIGNOF-GNU-SPELLING,
+        // 2026-08-11) they stopped being gap records and became FEATURE guards —
+        // deleting either now would retire the only cross-compiler evidence that
+        // the alias still resolves, which is exactly what this list exists to
+        // prevent. `a_alignof_expression_operand_gnu` is the gap that closing
+        // them EXPOSED: the sibling probe only ever exercised the TYPE-NAME
+        // operand, so the operand axis had never been oracled at all, on any
+        // spelling. Named the day it was found so it cannot be trimmed before it
+        // is fixed.
+        "a_alignof_expression_operand_gnu",
     };
 }
 

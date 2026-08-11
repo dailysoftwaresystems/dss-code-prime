@@ -768,11 +768,11 @@ unsigned __int128 dss_uint128_probe;
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: DSS has the C23 `typeof` keyword (a_typeof_c23 passes) but not the GNU `__typeof__` spelling, which is the one that works at every -std level and is therefore the one real headers use. All four gnu oracles accept it.
-@why GNU __typeof__ — available at every -std level, unlike the C23 `typeof` keyword.
+@why GNU __typeof__ — available at every -std level, unlike the C23 `typeof` keyword. CLOSED 2026-08-11 (D-CSUBSET-TYPEOF-GNU-SPELLING): `__typeof__` and `__typeof` are now keyword-table aliases onto the EXISTING TypeofKeyword, so they reach the same qualifier-PRESERVING semantic arm the C23 spelling does — no new semantics, no C++ change. The second spelling is exercised below on purpose: it also proves the lexer takes the LONGEST match rather than reading `__typeof__` as `__typeof` plus a stray identifier.
 @code
 int dss_typeof_gnu_src;
 __typeof__(dss_typeof_gnu_src) dss_typeof_gnu_probe;
+__typeof(dss_typeof_gnu_src) dss_typeof_gnu_probe2;
 @end
 
 @probe a_statement_expression_gnu
@@ -1075,10 +1075,23 @@ double dss_real_imag_probe(void) { return __real__ dss_real_imag_src + __imag__ 
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: `__alignof__` is rejected by DSS while `_Alignof` is accepted (a_alignas_alignof_c11 passes) and gcc 13.3.0 / clang 19.1.1 accept both. The same shape as a_typeof_gnu_spelling: the ISO keyword is implemented and the GNU spelling — the one that works at every -std level, and therefore the one real headers use — is not.
-@why GNU `__alignof__`.
+@why GNU `__alignof__`. CLOSED 2026-08-11 (D-CSUBSET-ALIGNOF-GNU-SPELLING): `__alignof__` and `__alignof` are now keyword-table aliases onto the EXISTING AlignofKeyword, so both reach the same `alignofType` rule `_Alignof` does. TYPE-NAME operand only — the VALUE operand every oracle also accepts is a separate, PRE-EXISTING gap that hits `_Alignof` identically and is censused by a_alignof_expression_operand_gnu below.
 @code
 int dss_alignof_gnu_probe(void) { return (int)__alignof__(double); }
+int dss_alignof_gnu_probe2(void) { return (int)__alignof(double); }
+@end
+
+@probe a_alignof_expression_operand_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap, found 2026-08-11 while closing a_alignof_gnu_spelling and NOT previously censused — the sibling probe only ever exercised the TYPE-NAME operand, so the operand axis was invisible to the whole corpus. gcc 13.3.0, clang 18.1.3 and clang 19.1.1 all accept an EXPRESSION operand (measured with matched positive+negative controls, at -std=gnu17 and at each oracle's newest -std), and they accept it for EVERY spelling — `__alignof__(d)`, `__alignof(d)`, `_Alignof(d)`, `alignof(d)` via <stdalign.h>, and even the paren-free `_Alignof d`. DSS accepts NONE of them. This is therefore NOT a GNU-spelling gap: it hits the already-shipped `_Alignof` exactly as hard, and the new aliases neither caused it nor widened it. `alignofType` is type-name-only by construction (a keyword row cannot reach the value form), so closing it means an `alignofValue` rule plus an `alignofExpr` wrapper — the sizeofExpr/sizeofType/sizeofValue triple, verbatim — and a `valueRule` arm in the alignof semantics block. Tracked at D-CSUBSET-ALIGNOF-VALUE-OPERAND. Today it fails LOUD at parse; there is no wrong-alignment path.
+@why GNU/ISO alignof applied to an EXPRESSION rather than a type-name — the operand axis, not the spelling axis.
+@code
+double dss_alignof_expr_src;
+int dss_alignof_expr_probe(void) { return (int)__alignof__(dss_alignof_expr_src); }
 @end
 
 @probe a_attribute_constructor_gnu
