@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // Canonical object-format taxonomy — the closed-enum vocabulary the
 // substrate engine speaks for the OUTPUT image kind (ELF / PE/COFF /
@@ -587,6 +588,127 @@ librarySynthVehicleFromName(std::string_view s) noexcept {
     return kLibrarySynthVehicleTable.fromName(s);
 }
 
+// ── UCRT-P4 (D-FFI-PE-CRT-UCRT-MIGRATION): the per-format RUNTIME
+//    LIBRARY ROLE table ─────────────────────────────────────────────
+//
+// WHICH IMAGE plays WHICH RUNTIME ROLE for this object format. A format file
+// declares ONE `runtimeLibraries` block mapping each role it uses to an image
+// identity; every spine block then NAMES A ROLE instead of carrying a path.
+//
+// ★★ WHY A TABLE AND NOT ONE `crt` STRING. A single per-format CRT string
+// would model an ACCIDENT of one DLL configuration, and it is already wrong in
+// two configurations this repo ships:
+//   * MEASURED (`nm -D`, 2026-08-10): the ELF unwinder personality lives in
+//     `libgcc_s.so.1`; `libc.so.6` exports NO `_Unwind_*` symbol at all. (Do
+//     not be fooled by `personality@@GLIBC_2.2.5` in libc — that is the
+//     `personality(2)` SYSCALL wrapper, unrelated to unwinding.) On ELF, one
+//     image demonstrably cannot serve both `cLibrary` and `unwindPersonality`.
+//   * Microsoft names the C library and the VC runtime SEPARATELY in BOTH
+//     configurations (`/MD` ⇒ `ucrt.lib` + `vcruntime.lib`; `/MT` ⇒
+//     `libucrt.lib` + `libvcruntime.lib`), and DSS already ships static linking
+//     for all formats (#47), so the split configuration is live in-tree.
+//   * ucrtbase ALSO exporting `__C_specific_handler` (MEASURED ord 30; msvcrt
+//     106, ntdll 2332, vcruntime140 8) is a CONVENIENCE of the pe DLL config,
+//     not Microsoft's model.
+// ★ The pe table pointing `cLibrary` and `unwindPersonality` at the SAME image
+// is therefore FINE: the table PERMITS sameness without ASSERTING it. That is
+// the whole difference from a single string, and it is what stops the value
+// from having to be re-cut every time a new configuration arrives
+// (`D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT`).
+//
+// ROLE IS A CLOSED ENUM, deliberately: every per-format BEHAVIORAL rule in this
+// schema family already is one, and free-form strings stay reserved for names
+// and paths. A typo'd role must fail loud at LOAD, never resolve to "some
+// image".
+//
+// ★ C23 POSITION, stated so the scope is honest: SEH (`__try`/`__except`) is
+// NOT C23 — it is a Microsoft extension. That is PRECISELY why its personality
+// must be a per-format CONFIG DECLARATION and never a literal in shared
+// substrate: a non-standard, platform-specific mechanism is the last thing that
+// should be spelled inside `src/mir`. (`setjmp`/`longjmp` ARE C23 7.13, but they
+// ride `setjmp.json` — a DESCRIPTOR with its own per-format library map — so
+// they do not gate this table.)
+enum class RuntimeLibraryRole : std::uint8_t {
+    None              = 0,  // default-constructed sentinel; loader rejects "none"
+    // The C library the program is bound to: the image that owns `exit`, the
+    // stdio family, and the CRT program-entry argument machinery.
+    CLibrary          = 1,
+    // The image that owns the UNWINDER PERSONALITY routine an exception /
+    // structured-exception region names in its unwind info (pe
+    // `__C_specific_handler`; the ELF `_Unwind_*` family in `libgcc_s.so.1`
+    // when ELF unwind lands; gcc/mingw-w64 on Windows uses libgcc rather than
+    // vcruntime, and a role table accommodates that future target without a
+    // schema change).
+    UnwindPersonality = 2,
+    // The OS PRIMITIVE image a compiler-synthesized shim emits over
+    // (`kernel32.dll` on Windows: CRITICAL_SECTION / CONDITION_VARIABLE /
+    // Fls*). Distinct from `cLibrary` on pe; on Mach-O the same image serves
+    // both, which the table expresses by pointing both roles at it.
+    SystemPrimitives  = 3,
+};
+
+inline constexpr EnumNameTable<RuntimeLibraryRole, 4> kRuntimeLibraryRoleTable{{{
+    { RuntimeLibraryRole::None,              "none"              },
+    { RuntimeLibraryRole::CLibrary,          "cLibrary"          },
+    { RuntimeLibraryRole::UnwindPersonality, "unwindPersonality" },
+    { RuntimeLibraryRole::SystemPrimitives,  "systemPrimitives"  },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+runtimeLibraryRoleName(RuntimeLibraryRole r) noexcept {
+    return kRuntimeLibraryRoleTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<RuntimeLibraryRole>
+runtimeLibraryRoleFromName(std::string_view s) noexcept {
+    return kRuntimeLibraryRoleTable.fromName(s);
+}
+
+// One `runtimeLibraries` row: a role and the image identity that plays it.
+struct DSS_EXPORT RuntimeLibraryBinding {
+    RuntimeLibraryRole role = RuntimeLibraryRole::None;
+    std::string        image;   // "ucrtbase.dll" / "libgcc_s.so.1" / a dylib path
+};
+
+// The format's whole role table. A VECTOR of rows rather than a fixed struct of
+// three optional strings, so adding a fourth role is an enum slot + a JSON row
+// and touches no reader. Roles are unique cross-row (loader-enforced).
+struct DSS_EXPORT RuntimeLibraryTable {
+    std::vector<RuntimeLibraryBinding> bindings;
+
+    // The image playing `role`, or nullopt if this format declares no such row.
+    // ★ NULLOPT IS THE FAIL-LOUD SIGNAL, never a fallback: the loader refuses a
+    // format whose spine block names a role this table does not declare, so no
+    // consumer ever has to invent an image.
+    [[nodiscard]] std::optional<std::string_view>
+    imageForRole(RuntimeLibraryRole role) const noexcept {
+        for (auto const& b : bindings) {
+            if (b.role == role) return std::string_view{b.image};
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] bool empty() const noexcept { return bindings.empty(); }
+};
+
+// ── UCRT-P4: the unwinder-personality declaration ──────────────────
+//
+// The routine an emitted unwind record names as its handler, and the image it
+// is imported from. Populated from the format JSON's `sehPersonality` block,
+// whose `role` is resolved against `runtimeLibraries` AT LOAD — so `libraryPath`
+// here is a DERIVED copy of a fact the role table owns, exactly as
+// `sectionKindIndex` is a derived copy of `sections`.
+//
+// ★★ WHAT THIS REPLACES, AND WHY IT IS NOT A REFACTOR: `src/mir/merge/
+// synth_seh_funclets.cpp` hardcoded BOTH `pers.mangledName =
+// "__C_specific_handler"` and `pers.libraryPath = "msvcrt.dll"` — two platform
+// literals in shared MIR substrate, on a pass that runs for EVERY format. A
+// format that declares no personality now fails LOUD when a SEH region
+// resolves, instead of silently emitting an msvcrt import into an ELF image.
+struct DSS_EXPORT SehPersonality {
+    RuntimeLibraryRole role = RuntimeLibraryRole::None;  // declared in JSON
+    std::string libraryPath;   // DERIVED: resolved from `role` at load
+    std::string mangledName;   // "__C_specific_handler"
+};
+
 // The format's shipped-library synthesis block (`"librarySynthesis"` in
 // `.format.json`). `vehicle` selects the primitive family the synth pass
 // emits over; `libraryPath` is the native library its on-demand helper
@@ -595,6 +717,12 @@ librarySynthVehicleFromName(std::string_view s) noexcept {
 // FFI) and wasm/spirv (no native shim).
 struct DSS_EXPORT LibrarySynthesis {
     LibrarySynthVehicle vehicle = LibrarySynthVehicle::Win32;
+    // UCRT-P4: the ROLE this block names in the format's `runtimeLibraries`
+    // table, and the image the loader RESOLVED it to. The JSON declares only the
+    // role; `libraryPath` is the derived copy, kept so `synthesizeThreadsShim`
+    // reads exactly what it read before. `validate()` re-checks the pair against
+    // the table, so a hand-built schema cannot set one without the other.
+    RuntimeLibraryRole  role = RuntimeLibraryRole::None;
     std::string         libraryPath;
 };
 

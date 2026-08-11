@@ -1,0 +1,42 @@
+{
+  "$comment": "LANE-F (D-LK-EXTERN-DATA-IMPORT, a second elf copy-relocation consumer): POSIX `environ` ships from unistd.json as the MACRO/SYMBOL SPLIT `environ` -> `__environ` (an elf-gated macro onto a kind:object DATA row, ptr<ptr<char>>, availableObjectFormats:[elf]) and binds through the elf exec formats' declared dataImportBinding:copy-relocation — the exec reserves a .bss slot, exports it as a DEFINED OBJECT dynsym (st_size = the layout-derived pointer width, never hardcoded), and ld-linux copies libc's `environ` in before entry. `environ` rather than main's third parameter because POSIX.1 does not specify that parameter at all, so `extern char **environ;` (glibc /usr/include/unistd.h:566) is the interface portable code actually uses. ★★ WHY `__environ` AND NOT `environ`, WHICH IS THE WHOLE POINT OF THIS WITNESS: the obvious shape (an `environ` data row) WAS BUILT FIRST AND WAS SILENTLY WRONG. The binary looked perfect — `readelf -r` showed `R_X86_64_COPY … environ + 0` and the dynsym showed `environ` as an 8-byte OBJECT — and `environ` READ NULL at runtime on ALL FOUR legs (x86_64/arm64 × debug/release), i.e. this program returned 1 from its first guard. ✔ROOT-CAUSED BY A MATCHED CONTROL, not by theory: the same source built `gcc -std=gnu17 -no-pie` RUNS (rc=42) and ITS copy relocation is against `__environ@GLIBC_2.2.5` — the STRONG alias — with BOTH `__environ` (GLOBAL) and `environ` (WEAK) defined at ONE exec address. MECHANISM: glibc's startup writes the environment pointer through its INTERNAL name `__environ`, and an ELF copy relocation only redirects libc's own references for the symbol THE EXEC CLAIMS; claim the weak alias alone and libc keeps writing its own .bss slot while the exec reads a copy ld.so filled from that slot BEFORE `__libc_start_main` ran — 0. Same class as TF-C121's `_realpath$DARWIN_EXTSN`: links clean, loads clean, binds the wrong thing. It also mirrors the real header — glibc declares `__environ` UNCONDITIONALLY and `environ` only under `#ifdef __USE_GNU`. EAGER-IMPORT SAFE, MEASURED BEFORE THE ROW SHIPPED on both run legs and two concurring instruments: glibc exports all three spellings at ONE address — `__environ` STRONG (`B`/`g`), `environ`/`_environ` WEAK (`V`/`w`) — 0x20ad58 @GLIBC_2.2.5 (x86_64) and 0x1b7288 @GLIBC_2.17 (aarch64), `nm -D` and `objdump -T` concurring with `DO .bss` SIZE 8. ⚠ the `@@GLIBC_x.y` suffix makes a grep anchored on `$` report a FALSE ABSENT. THE ENVIRONMENT'S CONTENT IS NEVER ASSERTED (it is host-dependent) — only its STRUCTURE plus an agreement check, so the stdout pin is host-independent: every entry must be NAME=VALUE with a non-empty NAME (exit 2/3 — a binding one indirection off, the got-indirect-without-deref class, fails the '=' scan on garbage rather than appearing to pass), the vector must be non-empty (exit 4), and ★ THE AGREEMENT CHECK proves the copied slot is libc's LIVE object rather than a stale duplicate: environ[0]'s NAME is looked up through libc's OWN getenv and the value must be BYTE-IDENTICAL to the text after environ[0]'s '=' (exit 7 = getenv cannot see a variable environ claims exists; exit 8 = they disagree). A slot copied from the wrong object, or copied at the wrong time, fails that while passing every purely structural test. ELF-ONLY, both exclusions deliberate: ✔MEASURED, NEITHER Windows CRT exports `environ` — `objdump -p` plus a direct PE export-directory parse find no `environ`/`_environ`/`__environ` in ucrtbase.dll (2,484 exports) and only the UNDERSCORED `_environ` data export (ordinal 270) in msvcrt.dll (1,330), so a pe arm would have to be a MACRO onto UCRT's `__p__environ` accessor (ordinal 87) and cannot live in unistd.json at all (that descriptor is [elf,macho] — there is no <unistd.h> on pe); macho is DEFERRED because its export could not be measured this cycle and this directory's rule is need-driven + measured, never inferred (the fileno/popen-pclose staging precedent) — an inferred row risks EVERY macho binary's LOAD. Both stay honest S0001. exec-only, not pie: the elf pie formats declare dataImportBinding:got-indirect, a DIFFERENT mechanism, and the canonical elf data-object witness (stdio_stream_objects) is likewise exec-only. RED-ON-DISABLE witnessed, and the FIRST of these is the one that would otherwise have shipped silently: repoint the row or the macro at the weak `environ` spelling -> this program returns 1 on every elf leg, NOT a diagnostic — which is precisely why a RUN witness exists here and a compile-only pin would have waved it through. Un-ship the row -> S0001; un-ship the macro -> S0001 `got environ`; drop dataImportBinding from the elf exec format -> K_FormatLacksImportSupport at link. Cross-checked in WSL against `gcc -std=gnu17 -no-pie` (exit 42, identical stdout) — gnu17 rather than c17 because glibc gates the `environ` spelling behind __USE_GNU.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "environ:live\n",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ]
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

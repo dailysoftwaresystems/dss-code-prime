@@ -43,6 +43,32 @@ examples/**/*.bin binary
 # already strips trailing CR, but pin LF so the goldens are platform-stable.
 tests/lsp/sessions/** text eol=lf
 
+# `.probes` reference-conformance corpora — one probe per line, read line-wise by
+# the differential accept/reject oracle (tests/conformance/). Pinned because the
+# extension arrived WITHOUT a pin and immediately landed CRLF on disk: with
+# core.autocrlf=false and no rule here, `git add` does NOT normalise, so the CR
+# bytes would have entered the commit. ★ AND A CRLF PROBE FILE FAILS IN THE WORST
+# WAY — not loudly. A reader that strips `\n` and keeps `\r` compares `token\r`
+# against `token`, so EVERY probe silently mismatches and the oracle reports a
+# clean run over a corpus it never parsed. That exact `ran\r` defect has already
+# been measured in this repo, which is why this is a pin and not a convention.
+*.probes text eol=lf
+
+# The REPO GUARD DRIVERS in tools/ — the twin `.sh`/`.ps1` pairs that ctest runs
+# as `anchor_registry_guard`, `line_endings_guard` and `orphan_tests_guard`.
+# Pinned for the same reason `real-examples/**` is: these run on Windows, WSL,
+# macOS and arm64, and a CRLF `.sh` fails on a POSIX leg at the shebang with a
+# useless error. ★ THE SHARPER REASON IS SELF-REFERENCE: `check-line-endings.sh`
+# is itself one of these files, so an unpinned CRLF rewrite can break the very
+# guard that would have reported it — a guard that cannot run reads exactly like
+# a guard that found nothing. Left unpinned until now, so both orphan-guard
+# twins were LF by an author's care rather than by mechanism, which is the
+# distinction this repo's own wiring comment draws: "an invariant nothing
+# executes is a convention."
+tools/**/*.sh  text eol=lf
+tools/**/*.ps1 text eol=lf
+tools/**/*.py  text eol=lf
+
 # The real-example HARNESS DRIVERS (real-examples/c/sqlite/). Their whole promise
 # is "clone the repo and run ONE command", on ANY host — so a fresh clone must
 # not be able to break them before they start. `core.autocrlf=true` is the

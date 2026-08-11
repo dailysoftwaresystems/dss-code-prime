@@ -722,7 +722,8 @@ TEST(LibrarySynthesis, UnknownVehicleRejected) {
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "relocations": [],
-      "librarySynthesis": { "vehicle": "bogus", "libraryPath": "libc.so.6" }
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "librarySynthesis": { "vehicle": "bogus", "role": "cLibrary" }
     })");
     ASSERT_FALSE(r.has_value())
         << "an unknown librarySynthesis vehicle must fail loud at load";
@@ -730,7 +731,13 @@ TEST(LibrarySynthesis, UnknownVehicleRejected) {
     EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
-TEST(LibrarySynthesis, MissingLibraryPathRejected) {
+TEST(LibrarySynthesis, MissingRoleRejected) {
+    // UCRT-P4: the block names a ROLE in the format's `runtimeLibraries` table
+    // instead of spelling an image path, so the field whose omission must fail
+    // loud is `role`. RENAMED rather than silently re-pointed — the subject of
+    // the test genuinely changed, and a test whose name still said
+    // `libraryPath` would send the next reader looking for a key that no longer
+    // exists.
     // MEASURED: same dataModel/headerNameMatching gap as UnknownVehicleRejected.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
@@ -740,11 +747,14 @@ TEST(LibrarySynthesis, MissingLibraryPathRejected) {
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
       "relocations": [],
+      "$runtimeLibrariesComment": "DELIBERATELY ABSENT. Declaring a row here would add a SECOND error -- the loader also rejects a role-table row NO block names -- and both would trace to this fixture's ONE property (the missing role), so the test would stop pinning a single defect. Absent, the only complaint is the omitted `role`, which is exactly what this test is for.",
       "librarySynthesis": { "vehicle": "pthread" }
     })");
     ASSERT_FALSE(r.has_value())
-        << "a librarySynthesis block without libraryPath must fail loud";
-    EXPECT_EQ(countAtPath(r, "/librarySynthesis/libraryPath"), 1u) << rejectSummary(r);
+        << "a librarySynthesis block that names no role must fail loud — a "
+           "silently-unresolved image is how the pass's old hardcoded literal "
+           "survived unnoticed";
+    EXPECT_EQ(countAtPath(r, "/librarySynthesis/role"), 1u) << rejectSummary(r);
     EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
@@ -861,7 +871,12 @@ TEST(LK10EntrySliceB, SyscallArmMissingNumberRejected) {
         "syscall arm requires syscallNumber", 3u);
 }
 
-TEST(LK10EntrySliceB, ByNameImportArmMissingLibraryRejected) {
+TEST(LK10EntrySliceB, ByNameImportArmMissingRoleRejected) {
+    // UCRT-P4 replaced this arm's literal `importLibraryPath` with a `role`
+    // naming the format's `runtimeLibraries` table, so the field whose OMISSION
+    // must fail loud moved key. RENAMED rather than silently re-pointed: a test
+    // still called `...MissingLibrary...` would send the next reader hunting for
+    // a key that no longer exists.
     // Same knock-on shape, on the PE side: pe.objectType defaults to Obj
     // (not exec), so the pairing + exec-flavor rules fire alongside the
     // missing-field rejection this test pins.
@@ -877,8 +892,10 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingLibraryRejected) {
         "mechanism": "by-name-import",
         "importMangledName": "ExitProcess"
       }
-    })", "/processExit/importLibraryPath",
-        "by-name-import arm requires importLibraryPath", 3u);
+    })", "/processExit/role",
+        "by-name-import arm requires a `role` naming a runtimeLibraries row — a "
+        "literal image path here would be a second owner of a fact the role "
+        "table owns", 3u);
 }
 
 TEST(LK10EntrySliceB, OpcodeByteOutOfRangeRejected) {
@@ -988,7 +1005,7 @@ TEST(LK10EntrySliceB, SyscallOpcodeBytesEmptyArrayRejected) {
 // test-analyzer M1 (7425905 audit fold): pin the ByNameImport
 // missing-mangled-name arm.
 TEST(LK10EntrySliceB, ByNameImportArmMissingMangledNameRejected) {
-    // Same knock-on shape as ByNameImportArmMissingLibraryRejected.
+    // Same knock-on shape as ByNameImportArmMissingRoleRejected.
     expectRejectedAtPath(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
@@ -997,10 +1014,8 @@ TEST(LK10EntrySliceB, ByNameImportArmMissingMangledNameRejected) {
       "format": { "name": "synth", "version": "0.1", "kind": "pe" },
       "pe": { "machine": 34404, "characteristics": 34 },
       "entryCallingConvention": "ms_x64",
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importLibraryPath": "kernel32.dll"
-      }
+      "runtimeLibraries": [{"role":"cLibrary","image":"kernel32.dll"}],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary" }
     })", "/processExit/importMangledName",
         "by-name-import arm without importMangledName must reject", 3u);
 }
@@ -1165,7 +1180,7 @@ TEST(ProcessArgsSubstrate, ShippedElfExecsDeclareStackVector) {
     }
 }
 
-TEST(ProcessArgsSubstrate, ShippedMachoExecsDeclareNoneAndPeDeclaresCrtOutParam) {
+TEST(ProcessArgsSubstrate, ShippedMachoExecsDeclareNoneAndPeDeclaresUcrtAccessors) {
     // Mach-O: the LC_MAIN entry is CALLED by dyld with argc/argv already in the
     // argument registers — pass-through (no block) IS the correct mechanism. Pin
     // the deliberate absence so an accidental stack-vector block (reading a stack
@@ -1178,21 +1193,49 @@ TEST(ProcessArgsSubstrate, ShippedMachoExecsDeclareNoneAndPeDeclaresCrtOutParam)
             << name << " must NOT declare processArgs — dyld already places "
             "argc/argv in the argument registers at the Mach-O entry.";
     }
-    // PE (c111, D-RUNTIME-PE-MAIN-ARGS): unlike ELF/Mach-O, the Windows OS entry
-    // receives NO C argument vector, so pe64 DOES declare processArgs — the CRT
-    // out-parameter mechanism whose synthesized pre-main init fetches argc/argv via
-    // an msvcrt export. Pin the declared shape (mechanism + the wide/narrow export
-    // names + the import library) so a descriptor edit that drops or mistypes it
-    // fails here before it ships an entry that reads register garbage for argv.
+    // PE (UCRT-P4, D-FFI-PE-CRT-UCRT-MIGRATION — was c111's msvcrt arm): unlike
+    // ELF/Mach-O, the Windows OS entry receives NO C argument vector, so pe64 DOES
+    // declare processArgs. It now declares the UCRT ACCESSOR mechanism, because
+    // `__getmainargs`/`__wgetmainargs` are msvcrt-ONLY exports (MEASURED 2026-08-10,
+    // `objdump -p`: msvcrt ord 138 / 167, ucrtbase exports NEITHER) — the mechanism
+    // had to CHANGE, not merely be repointed. Every value below was read off
+    // ucrtbase.dll's export table on that date: `_configure_narrow_argv` 190,
+    // `_configure_wide_argv` 191, `__p___argc` 81, `__p___argv` 82, `__p___wargv` 83.
+    //
+    // Pin ALL of it — mechanism, five names, both integers, and the role-resolved
+    // library — so a descriptor edit that drops or mistypes any one fails HERE
+    // instead of shipping an entry that reads register garbage for argv, or (worse)
+    // one whose LOAD fails at 0xC0000139 because it asked ucrtbase for a name only
+    // msvcrt exports.
     auto pe = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
     ASSERT_TRUE(pe.has_value());
     auto const& pa = (*pe)->processArgs();
     ASSERT_TRUE(pa.has_value())
-        << "pe64 must declare processArgs (the CRT out-parameter args mechanism)";
-    EXPECT_EQ(pa->mechanism, ArgsMechanism::CrtOutParam);
-    EXPECT_EQ(pa->crtWideArgvFn, "__wgetmainargs");
-    EXPECT_EQ(pa->crtNarrowArgvFn, "__getmainargs");
-    EXPECT_EQ(pa->crtLibraryPath, "msvcrt.dll");
+        << "pe64 must declare processArgs (the UCRT argv-accessor mechanism)";
+    EXPECT_EQ(pa->mechanism, ArgsMechanism::CrtArgvAccessors);
+    EXPECT_EQ(pa->configureNarrowArgvFn, "_configure_narrow_argv");
+    EXPECT_EQ(pa->configureWideArgvFn,   "_configure_wide_argv");
+    EXPECT_EQ(pa->argcAccessorFn,        "__p___argc");
+    EXPECT_EQ(pa->narrowArgvAccessorFn,  "__p___argv");
+    EXPECT_EQ(pa->wideArgvAccessorFn,    "__p___wargv");
+    // mode 1 = argv present, wildcards NOT expanded. MEASURED with a literal `*.c`
+    // argument and two `.c` files present: mode 0 -> argc 0 / argv NULL; mode 1 ->
+    // argc 4 with argv[3] the LITERAL "*.c"; mode 2 -> argc 5, EXPANDED. c111 passed
+    // `_dowildcard = 0`, so 1 is the behaviour-preserving value and 2 would silently
+    // change what every pe program sees in argv.
+    EXPECT_EQ(pa->argvMode, 1u)
+        << "mode 2 would glob-expand argv (a BEHAVIOUR change, not a config detail); "
+           "mode 0 yields argv == NULL while still returning errno_t 0";
+    // Non-zero, because 0 is C's success status: a zero here would make the
+    // "CRT produced no argv" path indistinguishable from a successful run.
+    EXPECT_NE(pa->argvUnavailableExitStatus, 0);
+    // The library is ROLE-resolved, and it is NOT the legacy CRT.
+    EXPECT_EQ(pa->role, RuntimeLibraryRole::CLibrary);
+    EXPECT_EQ(pa->crtLibraryPath, "ucrtbase.dll");
+    EXPECT_NE(pa->crtLibraryPath, "msvcrt.dll")
+        << "D-FFI-PE-CRT-UCRT-MIGRATION: the pe argv spine must not name the legacy "
+           "CRT. Stated as its own assertion because the equality above would still "
+           "pass if BOTH values were edited together.";
 }
 
 TEST(ProcessArgsSubstrate, UnknownMechanismRejected) {
@@ -1349,7 +1392,14 @@ TEST(ProcessArgsSubstrate, ProcessArgsWithoutProcessExitRejected) {
     })", "/processArgs",
         "processArgs without processExit must reject — the argument "
         "materialization is emitted by the entry trampoline "
-        "(D-RUNTIME-MAIN-ARGC-ARGV pairing rule)", 2u);
+        "(D-RUNTIME-MAIN-ARGC-ARGV pairing rule)",
+        // 3, not 2: this fixture is EXEC-FLAVORED and declares neither
+        // `processExit` nor `entryVerbs`, so UCRT-P4's paired
+        // "exec-flavored ⇒ must declare entryVerbs" rule fires alongside the
+        // pre-existing "exec-flavored ⇒ must declare processExit" one. Both are
+        // MEASURED knock-ons of the same single fixture property, named here
+        // rather than absorbed into a looser bound.
+        3u);
 }
 
 TEST(ProcessArgsSubstrate, ProcessArgsOnRelocatableFormatRejected) {
@@ -1415,12 +1465,23 @@ TEST(ProcessArgsSubstrate, ArgsMechanismEnumRoundTrip) {
     EXPECT_EQ(argsMechanismName(ArgsMechanism::StackVector),
               "stack-vector");
     EXPECT_EQ(argsMechanismName(ArgsMechanism::None), "none");
-    EXPECT_EQ(argsMechanismName(ArgsMechanism::CrtOutParam), "crt-out-param");
+    EXPECT_EQ(argsMechanismName(ArgsMechanism::CrtArgvAccessors),
+              "crt-argv-accessors");
     EXPECT_EQ(argsMechanismFromName("stack-vector"),
               std::optional{ArgsMechanism::StackVector});
-    EXPECT_EQ(argsMechanismFromName("crt-out-param"),
-              std::optional{ArgsMechanism::CrtOutParam});
+    EXPECT_EQ(argsMechanismFromName("crt-argv-accessors"),
+              std::optional{ArgsMechanism::CrtArgvAccessors});
     EXPECT_FALSE(argsMechanismFromName("bogus").has_value());
+    // UCRT-P4 RETIRED the msvcrt out-parameter mechanism outright rather than
+    // leaving it as an undeclared vocabulary member: it was the only remaining way
+    // to point the pe program-entry spine back at msvcrt, and a declarable-but-
+    // undeclared mechanism is a second owner of "how pe gets argv" waiting to be
+    // re-selected. This assertion is what makes the retirement REAL — a stale
+    // on-disk spelling now fails at the name table instead of resolving to
+    // something.
+    EXPECT_FALSE(argsMechanismFromName("crt-out-param").has_value())
+        << "the msvcrt __getmainargs mechanism is retired; `crt-out-param` must no "
+           "longer resolve to anything";
 }
 
 // ── AP3: object-format `artifactProfiles[]` (which profiles a format SERVES) ──
@@ -2120,8 +2181,18 @@ TEST(FormatRootKeyVocabulary, DollarPrefixedRootKeysStillAccepted) {
 
 // EVERY shipped format must load clean under the closed vocabulary — all 24,
 // not a sample. This is exactly the multi-site class where a green subset hides
-// the miss: the regression it catches is adding a root key to a `.format.json`
-// without adding it to `kFormatDocumentKeys`, or vice versa.
+// the miss.
+//
+// ⚠ WHAT IT CATCHES, PRECISELY — the prose here used to say "…without adding it to
+// `kFormatDocumentKeys`, OR VICE VERSA", and the second half was an over-claim.
+// The assertion is `load-clean`, which is ONE-DIRECTIONAL: a root key present in a
+// `.format.json` but MISSING from `kFormatDocumentKeys` makes that format REFUSED
+// at load and reds here; a vocabulary entry that NO file declares leaves load
+// completely untouched and this sweep stays green. That asymmetry is not a defect
+// in the guard — it is the ORDERING LAW the loader's own comment states, and it is
+// why a new key's vocabulary row always lands BEFORE the descriptors that declare
+// it. The unused-entry direction has no load-time symptom to assert; it is caught
+// by review, not by this test.
 TEST(FormatRootKeyVocabulary, AllShippedFormatsLoadCleanUnderClosedVocabulary) {
     constexpr std::string_view kAll[] = {
         "elf64-aarch64-linux-dyn",      "elf64-aarch64-linux-exec",

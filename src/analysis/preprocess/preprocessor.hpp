@@ -80,6 +80,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>   // UserDefineSplit (c105 — the `--define` split's ONE owner)
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -339,6 +340,61 @@ struct DSS_EXPORT MergedPredefinedMacros {
     std::span<PredefinedMacroDef const> targetMacros,
     std::span<PredefinedMacroDef const> formatMacros,
     std::optional<ObjectFormatKind>     activeFormat);
+
+// ── c105 (D-PP-USER-DEFINE): the ONE owner of `--define NAME[=VALUE]` ─────
+//
+// Split ONE command-line `--define` entry into the NAME and the VALUE the
+// preprocessor will actually seed. An entry with NO `=` takes the value `1`
+// (the gcc `-DNAME` rule); an entry with a `=` takes everything after the
+// FIRST `=` verbatim, EMPTY INCLUDED (`--define NAME=` defines NAME as empty,
+// which is a real and different thing from defining it as `1`).
+//
+// ★ WHY THIS IS A FUNCTION AND NOT THREE COPIES OF FOUR LINES. The
+// "defaults to 1" rule had TWO independent implementations inside
+// `preprocessRun` — the `<command-line>` PROLOGUE and the include-gating
+// PRE-SCAN prefix — held in agreement only by a comment on the second one
+// saying it parses "EXACTLY like the prologue above". A drift between them is
+// not a cosmetic bug: the pre-scan decides whether a `#if NAME`-gated
+// quote-`#include` resolves, so a pre-scan that read a different value than
+// the authoritative pass would silently include (or silently skip) a header.
+// `--dump-predefined-macros` needed the same rule a THIRD time — to report
+// what a `--define` actually contributes — and a third copy is how a
+// verification instrument ends up disagreeing with the thing it verifies. One
+// function, three callers, no convention to keep.
+//
+// `name` and (when stated) `value` are views INTO `entry` — the caller keeps
+// `entry` alive. The DEFAULT value is a view of a string literal with static
+// storage, so it outlives any caller.
+struct DSS_EXPORT UserDefineSplit {
+    std::string_view name;
+    std::string_view value;
+    // false ⇒ the entry carried no `=` and `value` is the DEFAULT. Reported by
+    // `--dump-predefined-macros` so the operator can tell "you asked for 1"
+    // apart from "nothing was stated and 1 is what the rule supplies".
+    bool             valueWasStated = false;
+};
+[[nodiscard]] DSS_EXPORT UserDefineSplit
+splitUserDefine(std::string_view entry) noexcept;
+
+// FC15b (C 6.10.8.1): the translation DATE and TIME spellings, from ONE read of
+// the wall clock. Returned WITHOUT the surrounding quotes (`__DATE__`'s
+// materializer wraps them) — `date` is the C-mandated `"Mmm dd yyyy"` with a
+// SPACE-padded day (`Jun  4 2026`), `time` is `hh:mm:ss` zero-padded.
+//
+// ★ ONE CLOCK READ, BOTH FIELDS. `__DATE__` and `__TIME__` must describe the
+// SAME instant — two independent reads can straddle a second (or midnight) and
+// ship a TU whose two timestamps disagree. Returning both from one call makes
+// that impossible for every caller, rather than being a rule each caller has to
+// know.
+//
+// Defensive: a null `std::localtime` (impossible in practice) leaves BOTH
+// strings empty — the materializer then produces `""`, never a crash and never
+// a fabricated date.
+struct DSS_EXPORT TranslationTimestamp {
+    std::string date;   // "Mmm dd yyyy", unquoted; empty iff the clock failed
+    std::string time;   // "hh:mm:ss",    unquoted; empty iff the clock failed
+};
+[[nodiscard]] DSS_EXPORT TranslationTimestamp translationTimestamp();
 
 // Run the preprocessor over `mainSource` under `schema`. Precondition:
 // `schema->preprocess().enabled` is true (the caller gates on it; calling

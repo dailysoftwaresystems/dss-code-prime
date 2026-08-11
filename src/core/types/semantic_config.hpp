@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"
+#include "core/types/entry_shape.hpp"     // EntryFunctionShape (program-entry vocabulary)
 #include "core/types/enum_name_table.hpp"  // EnumNameTable (kDeclarationKindTable)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"
@@ -758,16 +759,51 @@ struct DSS_EXPORT DeclarationRule {
     // "garbage-rax-at-exit" downstream of the runnable-binary
     // trampoline (D-LK10-ENTRY).
     std::vector<std::string> implicitReturnZeroForFunctionNames;
-    // FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN): the program ENTRY-point function
-    // name(s) — the symbol(s) the driver resolves as the executable's entry. This
-    // is SEPARATE from `implicitReturnZeroForFunctionNames` (the C `main`-style
-    // reach-`}`-⇒-`return 0` set): a language could declare an entry whose
-    // fall-through is NOT a return-0 (e.g. a `void`-returning runtime entry), or a
-    // return-0 function that is not the entry. For c-subset both are `["main"]`,
-    // but the driver's entry-symbol resolution reads THIS field so the two
-    // concepts can diverge without one silently dragging the other. Absent/empty →
-    // the driver falls back to its format-declared entry default.
-    std::vector<std::string> entryFunctionNames;
+    // FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN) + D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE:
+    // the program ENTRY declarations — for each name this language spells a
+    // program entry with, the SIGNATURES that spelling may have and the
+    // materialization VERB each signature needs. This is SEPARATE from
+    // `implicitReturnZeroForFunctionNames` (the C `main`-style reach-`}`-⇒-
+    // `return 0` set): a language could declare an entry whose fall-through is
+    // NOT a return-0 (e.g. a `void`-returning runtime entry), or a return-0
+    // function that is not the entry. Absent/empty → this declaration form
+    // declares no program entry, and the driver falls back to its format-declared
+    // entry default.
+    //
+    // ★★★ THIS FIELD USED TO BE A BARE `std::vector<std::string>` OF NAMES, AND
+    // THAT IS THE DEFECT THIS SHAPE CLOSES. A name list is FORMAT-BLIND: it made
+    // `wmain` an entry candidate on every format, so (MEASURED 2026-08-10, HEAD
+    // `3e86a187`) `int wmain(int, unsigned short**)` with NO `main`, built for
+    // `elf64-x86_64-linux-exec`, was selected AS THE LINUX PROGRAM ENTRY by the
+    // name scan — and the downstream shape gate then emitted a message that
+    // asserted `wmain` WAS the Linux entry and prescribed adding an ELF config row
+    // to make it one. gcc's answer to the same source is `undefined reference to
+    // 'main'`. Carrying the VERB on the row is what lets candidate selection
+    // INTERSECT this declared set with the active format's declared
+    // `entryVerbs`, so `wmain` is a candidate exactly where a wide argument
+    // vector can actually be produced — with no format-identity branch anywhere.
+    //
+    // ★ ONE OWNER FOR THE SIGNATURE. These rows are the ONLY place a program
+    // entry's accepted signatures are declared. The FORMAT side declares verbs
+    // ONLY (`ObjectFormatData::entryVerbs`), never signatures, so there is no
+    // second table to keep in sync — the two halves answer two different
+    // questions and neither can answer the other's. `entry_shape.hpp`'s docblock
+    // has the standards argument (C23 5.1.2.2.1 + 3.4.1) for why the pair of
+    // config declarations IS the conformance documentation artifact.
+    //
+    // ★ THE PER-DEFINITION CHECK AGAINST THESE ROWS IS A SINGLE-TU FACT WITH A
+    // SPAN and the semantic tier owns it (`S_EntryShapeNotDeclared`): "a function
+    // named `main` is defined here with a signature no declared row for `main`
+    // has". Whole-program facts — "this program defines no entry at all",
+    // "two rival entries are realizable" — are NOT per-definition and live at
+    // entry resolution instead, where every CU is in hand.
+    //
+    // A name legitimately appears on SEVERAL rows: C's `main` is both
+    // `fn() -> i32` (verb `none`) and `fn(i32, ptr-ptr-char) -> i32` (verb
+    // `argc-argv`). The JSON spells the mapping as an object keyed by name whose
+    // value is that name's array of shapes; the loader flattens it to this row
+    // list, so config reads as a mapping and the engine scans a flat vector.
+    std::vector<EntryFunctionShape> entryFunctions;
     // Optional kind-discriminator. When set, the engine evaluates it at
     // pass 1 and uses the resulting effective kind / params / body
     // instead of the static fields above.
@@ -2200,40 +2236,28 @@ struct DSS_EXPORT SemanticConfig {
     // Absent (nullopt) ⇒ the language has no `_Atomic` qualifier. Source-agnostic: the
     // engine reads THIS, never a hardcoded token name.
     std::optional<SchemaTokenId>    atomicMarker;
-    // FF6 Slice 2 + audit fold (2026-06-02): per-object-format
-    // runtime library identity for SOURCE-DECLARED externs. The
-    // source language's grammar emits a complete `extern int
-    // puts(const char*);`-shape signature; the synthesizeFfi
-    // path trusts that signature as authoritative and binds the
-    // resulting FfiMetadata to this map's per-format entry.
+    // ── RETIRED: `externLibraryByFormat` (UCRT-P4, Decision 1) ──────────────
+    // A per-LANGUAGE map "object-format kind -> runtime library identity" that
+    // supplied the import library for any source-declared extern carrying none of
+    // its own. BOTH the field and the `.lang.json` key are GONE — a config that
+    // still declares the key is REFUSED AT LOAD (the closed `semantics` key set in
+    // grammar_schema_json.cpp), which is deliberately how it stays gone.
     //
-    // Key: `ObjectFormatKind` name as a string ("pe", "elf",
-    // "macho", "wasm", "spirv" — matches `objectFormatKindName`).
-    // Value: runtime library identity the linker writes into the
-    // .idata / .dynamic / etc. import descriptor (e.g.
-    // "msvcrt.dll", "libc.so.6", "/usr/lib/libSystem.B.dylib").
+    // WHY IT COULD NOT SURVIVE: it was never a fact about a LANGUAGE. "Which image
+    // owns this symbol" is a fact about a PLATFORM, and the shipped-descriptor
+    // corpus already owns it PER SYMBOL — pe stdio is the modern CRT while
+    // setjmp deliberately is not, elf math is `libm.so.6` while the rest of libc is
+    // `libc.so.6`. One string per language cannot express that, so this field was a
+    // GUESS and a SECOND OWNER of a fact the corpus owns (the same defect class as
+    // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN). C23 6.2.2p5 makes
+    // `extern int printf(...);` and `int printf(...);` the SAME declaration, and the
+    // guess is what made them realize DIFFERENTLY.
     //
-    // Empty map ⇒ the language declares no source-side externs
-    // OR the active CU has none. When the source DOES declare an
-    // extern AND the active object format has no entry in this
-    // map, the FFI synthesis call fails loud with
-    // `F_FfiNoImportLibraryForFormat` (unsuppressable).
-    //
-    // Per-LANGUAGE field (NOT per-declaration-rule). The pre-fold
-    // 2026-06-02 placement on `DeclarationRule` was fragile: the
-    // pipeline iterated declarations and took the first-match
-    // result, leaving multi-extern-decl-rule grammars with non-
-    // obvious lookup order. Per-language placement matches the
-    // semantic invariant — "when compiling THIS LANGUAGE for THIS
-    // FORMAT, source-declared externs live in THIS LIBRARY" —
-    // and lets the c-subset config retain a single declaration
-    // entry without spurious rule-level coupling.
-    //
-    // The "extern <lib> int foo(...);" per-declaration override
-    // is anchored `D-CSUBSET-EXTERN-LIBRARY-SYNTAX` for a future
-    // grammar extension that would layer per-symbol overrides on
-    // top of this language-level default.
-    std::unordered_map<std::string, std::string> externLibraryByFormat;
+    // Every extern now takes its library from the ROW: the platform realization the
+    // semantic phase reads off the corpus, or a source `extern "lib" ...` override.
+    // A row with neither is UNBOUND and resolves at LINK (C23 5.1.1.2 phase 8).
+    // `F_FfiNoImportLibraryForFormat`, which this field's absence used to raise, is
+    // retired with it (kept in the enum for diagnostic-name stability).
 
     // FF11 (2026-06-05): SYSTEM include search path — the per-language
     // analogue of C's /usr/include. Each entry is a subdirectory under

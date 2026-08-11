@@ -122,6 +122,10 @@ add_subdirectory(program)
 add_subdirectory(lsp)
 add_subdirectory(examples)
 add_subdirectory(harness)
+# The DIFFERENTIAL accept/reject oracle (D-CONF-REFERENCE-DIFFERENTIAL-ORACLE):
+# diffs DSS's accept/reject verdicts against every reference C compiler on the
+# host, in BOTH directions — they-accept-we-reject AND we-accept-nobody-accepts.
+add_subdirectory(conformance)
 
 # ── TF-C91 (D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE) — the ORDER arm ──
 #

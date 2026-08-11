@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"
 #include "core/types/aggregate_layout.hpp"  // FC6: AggregateLayoutParams
+#include "core/types/entry_shape.hpp"     // program-entry vocabulary (extracted; see its docblock)
 #include "core/types/enum_name_table.hpp"  // EnumNameTable (extracted; breaks the leaf-enum cycle)
 #include "core/types/grammar_schema.hpp"   // ConfigDiagnostic + LoadResult
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind (charIsUnsigned's per-format axis)
@@ -2019,12 +2020,18 @@ exitMechanismFromName(std::string_view s) noexcept {
 //                            LIR opcode.
 //
 // For ByNameImport (Windows / macOS-libSystem):
-//   * `importLibraryPath`  — DLL/dylib path ("kernel32.dll" on
-//                            Windows; future "/usr/lib/libSystem.B
-//                            .dylib" on macOS).
-//   * `importMangledName`  — on-binary symbol name ("ExitProcess"
-//                            on Windows; "_exit" with leading
-//                            underscore via D-FF4 on macOS).
+//   * `role`               — UCRT-P4: WHICH RUNTIME ROLE owns the exit
+//                            primitive, named against the format's
+//                            `runtimeLibraries` table. The JSON declares
+//                            this and NOT a path.
+//   * `importLibraryPath`  — DERIVED at load from `role` (ucrtbase.dll on
+//                            Windows; "/usr/lib/libSystem.B.dylib" on
+//                            macOS). Kept as a resolved copy so the entry
+//                            trampoline reads exactly what it read before;
+//                            `validate()` re-checks it against the table.
+//   * `importMangledName`  — on-binary symbol name ("exit" on Windows and
+//                            Linux; "_exit" with leading underscore via
+//                            D-FF4 on macOS).
 //
 // The `statusArgGpr` is intentionally NOT a field — it's read from
 // the format's `entryCallingConvention.argGprs[0]` (preserves
@@ -2039,7 +2046,8 @@ struct DSS_EXPORT ProcessExit {
     std::vector<std::uint8_t> syscallOpcodeBytes;
 
     // ByNameImport arm
-    std::string importLibraryPath;
+    RuntimeLibraryRole role = RuntimeLibraryRole::None;  // declared in JSON
+    std::string importLibraryPath;   // DERIVED: resolved from `role` at load
     std::string importMangledName;
 };
 
@@ -2083,20 +2091,46 @@ struct DSS_EXPORT ProcessExit {
 enum class ArgsMechanism : std::uint8_t {
     None        = 0,  // default-constructed zero; loader rejects "none"
     StackVector = 1,  // argc + in-place argv vector on the entry stack
-    // c111 (D-RUNTIME-PE-MAIN-ARGS): the Windows CRT out-parameter route. The PE
-    // OS entry receives NO C argument vector — argc/argv are ASKED for via an
-    // msvcrt call `__wgetmainargs(&argc,&argv,&env,0,&startinfo)` (wide) /
-    // `__getmainargs` (narrow). This needs stack locals + a 5-arg call, so
-    // (USER §B decision) the pipeline SYNTHESIZES a pre-main init function in
-    // ordinary MIR that makes the call and forwards (argc, argv) to the user
-    // entry; the trampoline's own arg-setup is a NO-OP for this mechanism.
-    CrtOutParam = 2,  // msvcrt __wgetmainargs/__getmainargs, via a synth init fn
+    // ⚠ SLOT 2 WAS `CrtOutParam` — c111's msvcrt `__getmainargs` /
+    // `__wgetmainargs` out-parameter route — and UCRT-P4 REMOVED IT rather than
+    // leaving it as an unused vocabulary member. It was the ONLY thing in the
+    // tree that could still point the pe program-entry spine at msvcrt, and a
+    // declarable-but-undeclared mechanism is a second owner of "how pe gets
+    // argv" waiting to be re-selected. The value is left UNUSED rather than
+    // renumbered so a stale on-disk `crt-out-param` spelling fails loud at the
+    // name table instead of silently resolving to the accessor arm.
+    //
+    // UCRT-P4 (D-FFI-PE-CRT-UCRT-MIGRATION): the UCRT ACCESSOR route, which is
+    // the mechanism the Universal CRT actually offers — `__getmainargs` /
+    // `__wgetmainargs` are msvcrt-ONLY exports (MEASURED 2026-08-10,
+    // `objdump -p C:/Windows/System32/ucrtbase.dll`: ucrtbase exports NEITHER,
+    // while msvcrt exports them at ordinals 138 / 167). UCRT instead publishes
+    //   * `_configure_narrow_argv(int mode)` (ord 190) /
+    //     `_configure_wide_argv(int mode)` (ord 191) — populate the CRT's
+    //     internal argv state;
+    //   * `__p___argc()` -> `int*`   (ord 81),
+    //     `__p___argv()` -> `char***` (ord 82),
+    //     `__p___wargv()` -> `wchar_t***` (ord 83) — accessors returning the
+    //     ADDRESS of the state, so each needs EXACTLY ONE dereference
+    //     (`ucrt/stdlib.h:1144-1145`, macros `:1153-1154`).
+    // Like CrtOutParam this needs a real call sequence, so it rides the SAME
+    // MIR-tier synth-init seam (the trampoline's own arg-setup stays a no-op)
+    // — the difference is entirely in the emitted body, which is why it is a
+    // sibling MECHANISM rather than a re-spelling of the msvcrt one.
+    //
+    // ★ MEASURED, and it is why this mechanism is viable at all (PROBE-0,
+    // 2026-08-10): the accessor triple returns the REAL command line in a
+    // STARTUP-LESS DSS pe64 binary, byte-identical to the `__getmainargs`
+    // control, at debug AND release. No `_initterm` prologue and no
+    // `__acrt_initialize` are needed. `_configure_narrow_argv` IS load-bearing
+    // — without it `*__p___argc() == 0` and `*__p___argv() == NULL`.
+    CrtArgvAccessors = 3,
 };
 
 inline constexpr EnumNameTable<ArgsMechanism, 3> kArgsMechanismTable{{{
-    { ArgsMechanism::None,        "none"          },
-    { ArgsMechanism::StackVector, "stack-vector"  },
-    { ArgsMechanism::CrtOutParam, "crt-out-param" },
+    { ArgsMechanism::None,             "none"                },
+    { ArgsMechanism::StackVector,      "stack-vector"        },
+    { ArgsMechanism::CrtArgvAccessors, "crt-argv-accessors"  },
 }}};
 
 [[nodiscard]] constexpr std::string_view argsMechanismName(ArgsMechanism m) noexcept {
@@ -2137,17 +2171,73 @@ struct DSS_EXPORT ProcessArgs {
     std::uint32_t argcStackOffset = 0;
     std::uint32_t argvStackOffset = 0;
 
-    // CrtOutParam arm (c111, D-RUNTIME-PE-MAIN-ARGS). The msvcrt exports the
-    // synthesized pre-main init function calls to obtain (argc, argv). Both the
-    // WIDE (`wchar_t** argv`, for a `wmain` entry) and NARROW (`char** argv`,
-    // for a `main` entry) forms are declared; the synthesizer picks by the
-    // resolved entry's second-parameter pointee width (u16 ⇒ wide, i8 ⇒ narrow)
-    // — never a format-level flag, which would mis-call a narrow entry. The
-    // library is the import library the two symbols resolve from.
-    std::string crtWideArgvFn;    // "__wgetmainargs"
-    std::string crtNarrowArgvFn;  // "__getmainargs"
-    std::string crtLibraryPath;   // "msvcrt.dll"
+    // ── CrtArgvAccessors arm (UCRT-P4) ────────────────────────────────────
+    //
+    // The UCRT spelling of the same job. Five export NAMES + two integers, all
+    // per-format config, none of them derivable from anything the engine knows:
+    //   * `configureNarrowArgvFn` / `configureWideArgvFn` — the one-shot
+    //     populate call. WIDE vs NARROW is selected by the verb of the SOURCE
+    //     LANGUAGE's entry row that the resolved entry matched (`argc-argv`
+    //     ⇒ narrow, `argc-wargv` ⇒ wide), i.e. still by the RESOLVED ENTRY'S
+    //     SIGNATURE and never by a format-level flag — the c111 rule, generalized
+    //     from an ad-hoc TypeKind inspection to a declared table lookup. The
+    //     signature→verb mapping lives in `DeclarationRule::entryFunctions`; this
+    //     format's `entryVerbs` says only WHICH verbs it can realize, and
+    //     `argc-wargv` appearing there is what makes a wide entry possible at all.
+    //   * `argcAccessorFn` / `narrowArgvAccessorFn` / `wideArgvAccessorFn` —
+    //     the address-returning accessors. EXACTLY ONE dereference each.
+    //     ★ argc is SHARED between the narrow and wide worlds (MEASURED,
+    //     PROBE-0): one accessor serves both, so there is no
+    //     `wideArgcAccessorFn`.
+    //   * `argvMode` — the `_crt_argv_mode` value handed to the configure call.
+    //     The enum is `…/VC/Tools/MSVC/<ver>/include/vcruntime_startup.h:19-24`
+    //     (the MSVC TOOLSET header — NOT in the Windows SDK; a grep of the SDK
+    //     include tree for the enumerator names returns zero hits), so the
+    //     value is declared here rather than derived. MEASURED 2026-08-10 with a
+    //     literal `*.c` argument and two `.c` files present: mode 0 ⇒ argc 0 /
+    //     argv NULL; mode 1 ⇒ argc 4 with `argv[3] == "*.c"` LITERAL; mode 2 ⇒
+    //     argc 5, glob EXPANDED. c111's `_dowildcard` was the literal 0
+    //     (unexpanded), so **mode 1 is the behaviour-preserving choice**. The
+    //     loader constrains the value to 0..2 — mode 7 does not return an error
+    //     at all, the process dies at `0xC0000409` printing nothing.
+    //   * `argvUnavailableExitStatus` — the status the synthesized init RETURNS
+    //     when the populate call produced nothing.
+    //     ★★ THIS FIELD EXISTS BECAUSE THE RETURN VALUE CANNOT BE TRUSTED
+    //     (MEASURED): all three valid modes return `errno_t` **0**, and mode 0
+    //     returns 0 *while yielding `argv == NULL`*. So the emitted gate tests
+    //     `*__p___argv() != NULL` — never the `errno_t`, which would be a guard
+    //     that asserts nothing. On failure the init RETURNS this status rather
+    //     than calling the user entry, so the value flows out through the
+    //     format's already-wired `processExit` path (no second exit import, no
+    //     `Unreachable` in a reachable position) and the program terminates with
+    //     a distinctive code instead of running `main` on a NULL argv.
+    std::string   configureNarrowArgvFn;   // "_configure_narrow_argv"
+    std::string   configureWideArgvFn;     // "_configure_wide_argv"
+    std::string   argcAccessorFn;          // "__p___argc"
+    std::string   narrowArgvAccessorFn;    // "__p___argv"
+    std::string   wideArgvAccessorFn;      // "__p___wargv"
+    std::uint32_t argvMode = 0;            // `_crt_argv_mode`, 0..2
+    std::int32_t  argvUnavailableExitStatus = 0;
+
+    // The import library the CRT entry-point names resolve from. The JSON
+    // declares `role`; `crtLibraryPath` is the DERIVED copy the loader resolved
+    // against the format's `runtimeLibraries` table (see `RuntimeLibraryRole`).
+    RuntimeLibraryRole role = RuntimeLibraryRole::None;
+    std::string crtLibraryPath;   // "ucrtbase.dll"
 };
+
+// ── UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the program-entry
+//    vocabulary MOVED OUT of this header ───────────────────────────
+//
+// `EntryParamShape` / `EntryReturnShape` / `EntryMaterialization` /
+// `EntryFunctionShape` now live in `core/types/entry_shape.hpp`, included
+// above. They had to be EXTRACTED, not merely shared: the SOURCE-LANGUAGE
+// half of the entry declaration (`DeclarationRule::entryFunctions`) reads
+// them, `grammar_schema.hpp` includes `semantic_config.hpp`, and THIS header
+// includes `grammar_schema.hpp` — so `semantic_config.hpp` including this
+// header would close a cycle. Same resolution `enum_name_table.hpp` already
+// used. Read that file's docblock for WHY the signature and the realized verb
+// set have two DIFFERENT single owners rather than one shared table.
 
 // ── TLS identity (D-CSUBSET-THREAD-LOCAL, TLS C1) ──────────────────
 //

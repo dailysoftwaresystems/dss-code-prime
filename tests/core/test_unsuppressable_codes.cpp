@@ -2,9 +2,19 @@
 #include "core/types/source_buffer.hpp"
 #include "core/types/unsuppressable_codes.hpp"
 
+#include "repo_root.hpp"
+
 #include <gtest/gtest.h>
 
+#include <cctype>
+#include <cstddef>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <set>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
 // D-FF2-UNSUPP closed-table pins.
@@ -185,18 +195,24 @@ TEST(UnsuppressableCodes, ThreadLocalRejectsAreUnsuppressable) {
         DiagnosticCode::S_ThreadLocalAddressNotConstant));
     EXPECT_TRUE(isUnsuppressable(
         DiagnosticCode::S_ThreadLocalInvalidCombination));
-    // VLA C1a (D-CSUBSET-VLA): the two VLA constraint/boundary codes + the MIR
-    // verifier invariant + the C1a→C1b LIR fail-loud. Suppressing the static-storage
-    // form would carry a runtime-sized vlaArray into the static→global lowering; the
-    // multi-dim form would build a nested array-of-VLA no tier handles; and the LIR
-    // boundary, suppressed, would silently lower a runtime alloca as a 1-slot scalar
-    // (MINOR-3). Named per-code pins.
+    // VLA C1a (D-CSUBSET-VLA): the VLA constraint codes + the MIR verifier
+    // invariant + the C1a→C1b LIR fail-loud. Suppressing the static-storage form
+    // would carry a runtime-sized vlaArray into the static→global lowering; and the
+    // LIR boundary, suppressed, would silently lower a runtime alloca as a 1-slot
+    // scalar (MINOR-3). Named per-code pins.
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_VlaWithStaticStorage));
-    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_VlaMultiDimUnsupported));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_VlaSizeNotInteger));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::I_VlaAllocaOperandInvalid));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::L_VlaDynamicAllocaUnsupported));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::L_VlaNonLeafFrameUnsupported));
+    // S_VlaMultiDimUnsupported (0xE052) is deliberately NOT here: VLA C3 lifted all
+    // four of its reject sites, so it has no emit site and an unemittable code
+    // cannot be suppressed. Pinned as a NEGATIVE below rather than merely dropped,
+    // so re-adding the dead row reds a test instead of passing unnoticed.
+    EXPECT_FALSE(isUnsuppressable(DiagnosticCode::S_VlaMultiDimUnsupported))
+        << "0xE052 was RETIRED at VLA C3 (`int a[n][m]` / `int a[5][n]` / "
+           "`int a[n][5]` all compile rc=0). A retired code must LEAVE the closed "
+           "table — membership is what made it read as load-bearing.";
 }
 
 TEST(UnsuppressableCodes, ListSelfConsistent) {
@@ -461,4 +477,290 @@ TEST(Reporter, NormalCodeSuppressedAlongsideUnsuppressableInSameReporter) {
     r.report(makeDiag(DiagnosticCode::H_ExternHasInitializer));
     ASSERT_EQ(r.all().size(), 1u);
     EXPECT_EQ(r.all()[0].code, DiagnosticCode::H_ExternHasInitializer);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE CLASS PROPERTY: no DEAD code may sit in the closed table.
+//
+// WHY A PROPERTY AND NOT MORE PINS. Every `EXPECT_TRUE(isUnsuppressable(X))`
+// above is an INSTANCE, and an instance list cannot fail — it only ever asserts
+// about names someone thought to type. The table had accumulated FIVE members
+// whose emit sites were deleted cycles earlier (`F_FfiNoImportLibraryForFormat`,
+// `F_FfiResolveLibrarySymbolAbsent`, `S_BitIntWidthAboveC1Limit`,
+// `S_BitIntWideMulDivUnsupported`, `S_VlaMultiDimUnsupported`), and no instance
+// pin could have found them because each one's pin said TRUE and stayed true.
+// Two of the five ALSO carried doc comments still describing the retired surface
+// as live, and one of those stale comments produced a wrong C23 conformance
+// claim that only a probe caught. Membership in a closed table of
+// silent-miscompile guards is precisely what makes a dead name read as
+// load-bearing to the next reader, so the table is where the property belongs.
+//
+// THE PROPERTY, in three directions that together admit no silent absence:
+//   A. a member that is NOT marked RETIRED must have a real emit site in `src/`
+//   B. a code marked RETIRED must NOT be a member (an unemittable code cannot be
+//      suppressed — the `S_VolatilePointeeNotSupported` 0xE025 precedent)
+//   C. a code marked RETIRED must have NO emit site
+// C is what makes A un-defeatable: without it, the cheapest way to green a
+// failing A is to staple a RETIRED marker onto a LIVE code, and the marker would
+// then be the lie instead of the row. The escape hatch is explicit, sits AT the
+// declaration, and is itself checked.
+//
+// ★ THE SCAN IS WHOLE-FILE, NOT LINE-BY-LINE, AND THAT IS LOAD-BEARING.
+// clang-format wraps long emit sites after the `::` —
+//     d.code = DiagnosticCode::
+//         S_EntryShapeNotDeclared;
+// — so a per-line matcher reported FIVE genuinely-live codes as dead (MEASURED
+// 2026-08-10: S_EntryShapeNotDeclared, S_TypeNameDeclaratorNotAbstract,
+// S_InvalidEnumUnderlyingType, S_EnumeratorValueOutOfRange,
+// L_IndirectCalleeClobberedByArgSetup). Whitespace after `::` must be skipped.
+//
+// Comments are BLANKED before matching, because a code named in prose is not an
+// emit site — `hir_to_mir.cpp` and `semantic_analyzer.cpp` both discuss retired
+// codes by name. String literals are deliberately NOT stripped: MEASURED, doing
+// so changes neither the reference count (735) nor the outcome, so the extra
+// machinery would be untested weight.
+//
+// ⚠ KNOWN LIMIT, STATED SO A FUTURE FALSE RED IS DIAGNOSED AND NOT PAPERED OVER
+// [[D-TEST-UNSUPPRESSABLE-EMIT-SITE-SCAN-BLIND-TO-CONFIG-DECLARED-CODES]].
+// A diagnostic can also be emitted WITHOUT any `DiagnosticCode::` reference, by
+// naming the code as a STRING in language config and letting the name→code
+// resolver in `grammar_schema_json.cpp` bind it (MEASURED: `S_StaticStorageInForInit`
+// is declared that way in two `src/dss-config/` rows). This scan cannot see that
+// path. Today it costs nothing — MEASURED 2026-08-10, all 139 members have a
+// direct `DiagnosticCode::` site, so no member relies on it — but the day a
+// config-only-emitted code JOINS this table, direction A will red on a code that
+// is genuinely live. ★ THE FIX IS TO TEACH THE SCANNER THE CONFIG PATH (also walk
+// `src/dss-config/**.json` for the code name as a VALUE, never inside a
+// `$comment`), NOT to mark a live code RETIRED — direction C exists precisely to
+// make that shortcut fail. Widening the matcher was not done pre-emptively
+// because an unreachable arm is an untested arm; the anchor carries the trigger.
+namespace {
+
+namespace fs = std::filesystem;
+
+// The three files that MENTION every code by construction (the enum, the
+// name-mapping switch, the closed table). Scanning them would make every code
+// look emitted, which is the one way this property could silently pass.
+bool isDeclarationFile(fs::path const& p) {
+    auto const name = p.filename().string();
+    if (name == "parse_diagnostic.hpp" || name == "parse_diagnostic.cpp"
+        || name == "unsuppressable_codes.cpp")
+        return p.parent_path().filename().string() == "types";
+    return false;
+}
+
+// Replace every comment body with spaces, preserving newlines and total length.
+std::string blankComments(std::string_view src) {
+    std::string out;
+    out.reserve(src.size());
+    bool inBlock = false;
+    bool inLine  = false;
+    for (std::size_t i = 0; i < src.size();) {
+        char const c   = src[i];
+        auto const two = src.substr(i, 2);
+        if (inBlock) {
+            if (two == "*/") { inBlock = false; out += "  "; i += 2; continue; }
+            out += (c == '\n') ? '\n' : ' ';
+            ++i;
+            continue;
+        }
+        if (inLine) {
+            if (c == '\n') { inLine = false; out += '\n'; ++i; continue; }
+            out += ' ';
+            ++i;
+            continue;
+        }
+        if (two == "/*") { inBlock = true; out += "  "; i += 2; continue; }
+        if (two == "//") { inLine = true; out += "  "; i += 2; continue; }
+        out += c;
+        ++i;
+    }
+    return out;
+}
+
+struct EmitScan {
+    std::size_t filesScanned = 0;
+    std::size_t totalRefs    = 0;
+    // name -> first file that emits it (CONTENT, so a failure names the site)
+    std::map<std::string, std::string> siteOf;
+};
+
+// One pass per file: find each `DiagnosticCode::`, skip whitespace, read the
+// identifier. No regex — this runs over ~400 files in a Debug build.
+EmitScan scanForEmitSites(fs::path const& srcRoot) {
+    EmitScan scan;
+    std::string const kQual = "DiagnosticCode::";
+    for (auto const& entry : fs::recursive_directory_iterator(srcRoot)) {
+        if (!entry.is_regular_file()) continue;
+        auto const ext = entry.path().extension().string();
+        if (ext != ".cpp" && ext != ".hpp" && ext != ".h" && ext != ".cc") continue;
+        if (isDeclarationFile(entry.path())) continue;
+        ++scan.filesScanned;
+        std::ifstream in{entry.path(), std::ios::binary};
+        if (!in) continue;
+        std::string const raw{std::istreambuf_iterator<char>{in},
+                              std::istreambuf_iterator<char>{}};
+        if (raw.find(kQual) == std::string::npos) continue;
+        std::string const text = blankComments(raw);
+        for (std::size_t pos = text.find(kQual); pos != std::string::npos;
+             pos             = text.find(kQual, pos + 1)) {
+            std::size_t j = pos + kQual.size();
+            while (j < text.size()
+                   && (text[j] == ' ' || text[j] == '\t' || text[j] == '\r'
+                       || text[j] == '\n'))
+                ++j;
+            std::size_t e = j;
+            while (e < text.size()
+                   && (std::isalnum(static_cast<unsigned char>(text[e])) != 0
+                       || text[e] == '_'))
+                ++e;
+            if (e == j) continue;
+            ++scan.totalRefs;
+            scan.siteOf.emplace(
+                text.substr(j, e - j),
+                fs::relative(entry.path(), srcRoot.parent_path()).string());
+        }
+    }
+    return scan;
+}
+
+struct MarkerScan {
+    std::size_t declLines = 0;
+    std::set<std::string> retired;
+};
+
+// Parse `parse_diagnostic.hpp` for `<Name> = 0xNNN,` declaration lines and pick
+// out those whose TRAILING comment carries the RETIRED marker. The marker lives
+// at the declaration — "justified at the site" — not in a list a reader of the
+// enum would never find.
+MarkerScan scanForRetiredMarkers(fs::path const& hpp) {
+    MarkerScan out;
+    std::ifstream in{hpp};
+    std::string line;
+    while (std::getline(in, line)) {
+        std::size_t i = 0;
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+        std::size_t const nameStart = i;
+        while (i < line.size()
+               && (std::isalnum(static_cast<unsigned char>(line[i])) != 0
+                   || line[i] == '_'))
+            ++i;
+        if (i == nameStart) continue;
+        std::string const name = line.substr(nameStart, i - nameStart);
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+        if (i >= line.size() || line[i] != '=') continue;
+        ++i;
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+        if (line.compare(i, 2, "0x") != 0 && line.compare(i, 2, "0X") != 0) continue;
+        i += 2;
+        std::size_t const digits = i;
+        while (i < line.size()
+               && std::isxdigit(static_cast<unsigned char>(line[i])) != 0)
+            ++i;
+        if (i == digits) continue;
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+        if (i >= line.size() || line[i] != ',') continue;
+        ++out.declLines;
+        std::size_t const slashes = line.find("//", i);
+        if (slashes != std::string::npos
+            && line.find("RETIRED", slashes) != std::string::npos)
+            out.retired.insert(name);
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(UnsuppressableCodes, EveryMemberHasAnEmitSiteOrIsMarkedRetired) {
+    auto const root = dss::test::repoRoot();
+    auto const src  = root / "src";
+    ASSERT_TRUE(fs::is_directory(src)) << src.string();
+
+    auto const scan  = scanForEmitSites(src);
+    auto const marks = scanForRetiredMarkers(src / "core" / "types"
+                                            / "parse_diagnostic.hpp");
+    auto const codes = unsuppressableCodes();
+
+    // ── PER-DIMENSION FLOORS ────────────────────────────────────────────────
+    // Every dimension this property enumerates gets its own floor, because a
+    // scan that collapses to zero on ONE axis otherwise reports a serene pass:
+    // no files walked, no declaration lines parsed, no markers found, and no
+    // references matched each look identical to "everything is fine". This repo
+    // has shipped exactly that bug — a guard that passed while scanning
+    // nothing. Floors sit below the 2026-08-10 measurements with headroom, so
+    // ordinary growth never reds them; they catch a COLLAPSE, not a delta.
+    EXPECT_GE(scan.filesScanned, 300u)          // MEASURED 393
+        << "the src/ walk collapsed — an empty scan would pass every "
+           "emit-site check below vacuously";
+    EXPECT_GE(scan.totalRefs, 500u)             // MEASURED 735
+        << "the DiagnosticCode:: matcher collapsed — files were opened but "
+           "nothing matched, so no code could be proven emitted";
+    EXPECT_GE(marks.declLines, 300u)            // MEASURED 345
+        << "the parse_diagnostic.hpp enumerator parse collapsed — with no "
+           "declaration lines nothing can be classified RETIRED, and "
+           "directions B and C assert nothing";
+    EXPECT_GE(marks.retired.size(), 5u)         // MEASURED 8
+        << "the RETIRED-marker parse collapsed — direction C would then be "
+           "vacuous and A's escape hatch unchecked";
+    ASSERT_GE(codes.size(), 120u)               // MEASURED 139
+        << "the closed table collapsed — nothing left to assert about";
+
+    // ── CONTENT ANCHORS ─────────────────────────────────────────────────────
+    // Content, not count: name codes on BOTH sides, so a matcher that silently
+    // stops recognising real sites — or starts recognising prose — is caught by
+    // identity rather than by an arithmetic total many wrong scans reproduce.
+    EXPECT_TRUE(scan.siteOf.contains("S_VlaWithStaticStorage"))
+        << "a known-LIVE emit site went unseen — the scanner is broken, not "
+           "the table";
+    EXPECT_TRUE(scan.siteOf.contains("K_SymbolUndefined"));
+    EXPECT_TRUE(scan.siteOf.contains("S_EntryShapeNotDeclared"))
+        << "this site is clang-format-wrapped after `DiagnosticCode::`; if it "
+           "is missing, the whitespace skip regressed to a line-local match";
+    EXPECT_TRUE(marks.retired.contains("S_VlaMultiDimUnsupported"))
+        << "0xE052's RETIRED marker vanished from its declaration line";
+    EXPECT_FALSE(scan.siteOf.contains("S_VlaMultiDimUnsupported"))
+        << "0xE052 acquired an emit site — if a multi-dim VLA shape genuinely "
+           "needs refusing again, un-retire the code deliberately (marker off, "
+           "table row back, doc comment describing ONLY the refused shape)";
+
+    // ── A: a live member must be emittable ──────────────────────────────────
+    for (auto const c : codes) {
+        std::string const name{diagnosticCodeName(c)};
+        if (marks.retired.contains(name)) continue;   // direction B reports it
+        EXPECT_TRUE(scan.siteOf.contains(name))
+            << "unsuppressable code " << name << " (0x" << std::hex
+            << static_cast<unsigned>(c) << std::dec << ") has NO emit site in "
+               "src/. A closed-table member that nothing emits asserts nothing, "
+               "and its membership makes a dead code read as load-bearing. "
+               "Either restore the emit site, or RETIRE it: mark the "
+               "declaration in parse_diagnostic.hpp with a trailing RETIRED "
+               "comment, correct the doc comment to describe only what is "
+               "ACTUALLY refused, and drop this row (keep the enum value — "
+               "never renumber).";
+    }
+
+    // ── B: a retired code must not be a member ──────────────────────────────
+    for (auto const c : codes) {
+        std::string const name{diagnosticCodeName(c)};
+        EXPECT_FALSE(marks.retired.contains(name))
+            << name << " is marked RETIRED at its declaration yet is still a "
+               "member of the closed unsuppressable table. An unemittable code "
+               "cannot be suppressed, so the row asserts nothing while making "
+               "the code read as load-bearing — remove the row and leave the "
+               "rationale in its place (S_VolatilePointeeNotSupported 0xE025 "
+               "precedent).";
+    }
+
+    // ── C: a retired marker must be TRUE ────────────────────────────────────
+    // Without this, direction A is defeatable by stapling a RETIRED marker onto
+    // a live code.
+    for (auto const& name : marks.retired) {
+        auto const it = scan.siteOf.find(name);
+        EXPECT_EQ(it, scan.siteOf.end())
+            << name << " is marked RETIRED but IS emitted, at "
+            << (it == scan.siteOf.end() ? std::string{} : it->second)
+            << ". A RETIRED marker is a claim about the code, not a way to "
+               "quiet this test — remove the marker and restore the row if the "
+               "code is live.";
+    }
 }

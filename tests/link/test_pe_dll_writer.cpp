@@ -691,7 +691,8 @@ TEST(PeDllFormatJsonValidate, EntryClusterRejected) {
     // (D-LK2-DLL-DLLMAIN-ENTRY is the pinned follow-up).
     auto r = ObjectFormatSchema::loadFromText(dllJsonWith(R"(
       "entryCallingConvention": "ms_x64",
-      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "kernel32.dll", "importMangledName": "ExitProcess" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"kernel32.dll"}],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "ExitProcess" },
     )"));
     ASSERT_FALSE(r.has_value());
 }
@@ -719,7 +720,9 @@ TEST(PeDllFormatJsonValidate, ExecWithImageFileDllBitRejected) {
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-exe","kind":"pe"},
       "$entryClusterComment": "D-LK10-ENTRY 2.13: validate() REJECTS an exec-flavored format declaring no processExit, and this fixture is pe.type=exec -- without the pair it would be rejected for a reason unrelated to the IMAGE_FILE_DLL bit it exists to pin. Verbatim from the shipped pe64-x86_64-windows-exec.format.json; inert here (a load test builds no trampoline).",
-      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 8226, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },

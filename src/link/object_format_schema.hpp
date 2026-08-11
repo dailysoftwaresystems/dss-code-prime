@@ -978,13 +978,95 @@ struct DSS_EXPORT ObjectFormatData {
     // any ABI-prologue SP adjustment — the stack offsets are
     // defined against the untouched process-entry SP).
     // nullopt = the format declared no argument mechanism: the
-    // trampoline passes whatever the registers hold (correct for
-    // Mach-O LC_MAIN, where dyld already delivers argc/argv in the
-    // argument registers; the pre-c88 status quo for PE until
-    // D-RUNTIME-PE-MAIN-ARGS lands its __getmainargs arm).
+    // trampoline passes whatever the registers hold. That is CORRECT on
+    // Mach-O, where dyld already delivers argc/argv in the argument
+    // registers before any DSS code runs — an ANSWER, not an omission.
+    // PE declares the `crt-argv-accessors` mechanism (UCRT-P4); the
+    // c111 msvcrt out-parameter mechanism it replaced is retired.
     // Vocabulary types (`ArgsMechanism` + `ProcessArgs`) live in
     // `core/types/target_schema.hpp` beside ProcessExit.
     std::optional<ProcessArgs> processArgs;
+
+    // ── UCRT-P4 (D-FFI-PE-CRT-UCRT-MIGRATION): the RUNTIME LIBRARY
+    //    ROLE table ─────────────────────────────────────────────────
+    //
+    // OPTIONAL top-level `"runtimeLibraries"` — the SINGLE OWNER of "which
+    // image plays which runtime role" for this format. Every spine block that
+    // needs an image NAMES A ROLE (`processExit.role`, `processArgs.role`,
+    // `sehPersonality.role`, `librarySynthesis.role`) and the loader RESOLVES
+    // that role here, copying the image into the block's own path field. Those
+    // copies are DERIVED-AT-LOAD, not a second owner — the same relationship
+    // `sectionKindIndex` has to `sections`.
+    //
+    // ★★ FAIL LOUD, BOTH DIRECTIONS, AT LOAD (`RuntimeLibraryRole`'s docblock
+    // has the measured reasoning): a block naming a role this table does not
+    // declare is REFUSED, and a table row no block names is REFUSED too. The
+    // first direction stops a silent "some image" resolution; the second stops
+    // inert config accumulating — the `charSignedness` rule in this same file,
+    // which rejects a second-owner key by name rather than letting it sit.
+    //
+    // ★ THE MECHANICAL EXIT CRITERION for the pe CRT migration is stated
+    // against THIS field: "no pe format file's `runtimeLibraries` table has ANY
+    // value naming `msvcrt.dll`", checked across all four pe flavours. That is
+    // strictly stronger than a single-CRT-string criterion, because it also
+    // catches a future edit that repoints ONE role at the wrong image.
+    //
+    // Absent ⇒ empty ⇒ this format names no roles anywhere (every relocatable /
+    // staticlib / dyn / dll / wasm / spirv format today). Emptiness is not a
+    // default; it is what "declares no spine blocks" looks like.
+    RuntimeLibraryTable runtimeLibraries;
+
+    // ── UCRT-P4: the unwinder-personality declaration ─────────────
+    //
+    // OPTIONAL top-level `"sehPersonality"` block (`{"role": …,
+    // "mangledName": …}`). The routine an emitted unwind record names as its
+    // handler. `std::nullopt` = this format declares NO personality — NOT a
+    // silent default: the SEH funclet synthesis pass fails loud the moment a
+    // guarded region resolves under a nullopt-personality format, which is
+    // exactly what an ELF/Mach-O build carrying `__try` should get. See
+    // `SehPersonality` for what two literals in `src/mir` this deletes.
+    std::optional<SehPersonality> sehPersonality;
+
+    // ── UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the REALIZED
+    //    ENTRY-VERB set ─────────────────────────────────────────────
+    //
+    // Top-level `"entryVerbs"` — the program-entry materialization verbs THIS
+    // FORMAT CAN ACTUALLY REALIZE. REQUIRED (non-empty) on every exec-flavored
+    // format and REJECTED on every other, by the same paired-cluster discipline
+    // `processExit` / `entryCallingConvention` already follow: a format that
+    // starts a program must say what it can hand the entry, and a format that
+    // starts nothing must not carry dead rows.
+    //
+    // ★★★ THIS FIELD DELIBERATELY CARRIES NO SIGNATURES, and that is the change
+    // this cycle made. It used to be `std::vector<EntryShape> entryShapes` —
+    // full `(returns, params, verb)` rows — which made the accepted signature
+    // set a FORMAT fact. It is not one. `int wmain(int, wchar_t**)` is a
+    // SOURCE-LANGUAGE spelling; a linker format has no opinion on how C spells
+    // an entry, only on whether it can produce a wide argument vector at all.
+    // So the signature moved to its one owner — the language's
+    // `DeclarationRule::entryFunctions` mapping — and what stays here is the
+    // one question only a format can answer.
+    //
+    // ⇒ THE ACCEPTED ENTRY SET IS THE INTERSECTION, computed by the engine:
+    // a defined function is a program-entry candidate iff its name matches a
+    // declared language row, its signature matches that row, and that row's
+    // verb is in THIS set. `argc-wargv` appears here only on
+    // `pe64-x86_64-windows-exec`, which is the entire reason `wmain` is a
+    // candidate on Windows and nowhere else — with no format-identity branch in
+    // shared substrate. Before the verb was the intersection key, candidate
+    // selection matched NAMES alone and was format-blind (MEASURED: a
+    // `wmain`-only source was selected as the ELF entry).
+    //
+    // EMPTY IS A DECLARED ANSWER, NOT A MISSING DECLARATION: it says "this
+    // format starts no program", which is exactly the relocatable / staticlib /
+    // library case, and the engine's "does this build need an entry" predicate
+    // reads THIS EMPTINESS — never `isExecFlavor()` and never a format name.
+    //
+    // See `entry_shape.hpp` for the MEASURED defect the pair closes (a 3-param
+    // `main` compiling rc=0 with zero diagnostics on pe64 AND elf64 and
+    // faulting at run) and for the C23 5.1.2.2.1 + 3.4.1 argument that makes
+    // the two config declarations the conformance documentation artifact.
+    std::vector<EntryMaterialization> entryVerbs;
 
     // `entryCallingConvention`: name of the calling convention the
     // trampoline emitter resolves via
@@ -1546,6 +1628,38 @@ public:
     // call — the Mach-O LC_MAIN-correct / pre-c88 PE behavior).
     [[nodiscard]] std::optional<ProcessArgs> const& processArgs() const noexcept {
         return d_.processArgs;
+    }
+
+    // ── UCRT-P4 accessors ─────────────────────────────────────────
+    // The format's ROLE → IMAGE table. Read by the migration's mechanical exit
+    // criterion and by tests; the spine blocks themselves already carry their
+    // role's resolved image (the loader resolved it), so no engine consumer has
+    // to walk this at emit time.
+    [[nodiscard]] RuntimeLibraryTable const& runtimeLibraries() const noexcept {
+        return d_.runtimeLibraries;
+    }
+    // The format's unwinder-personality declaration, or nullopt if it declares
+    // none. `synthesizeSehFunclets` fails loud on a resolved SEH region under a
+    // nullopt personality — never a silently-assumed handler/image pair.
+    [[nodiscard]] std::optional<SehPersonality> const&
+    sehPersonality() const noexcept { return d_.sehPersonality; }
+    // The program-entry materialization VERBS this format realizes. Non-empty on
+    // every exec-flavored format, empty on every other (both directions
+    // load-enforced), so EMPTY is the engine's "this build needs no program
+    // entry" predicate. Candidate selection intersects this set with the source
+    // language's declared entry rows; see the field's docblock for why no
+    // signature appears here.
+    [[nodiscard]] std::span<EntryMaterialization const>
+    entryVerbs() const noexcept {
+        return d_.entryVerbs;
+    }
+    // Convenience for the one question every consumer actually asks of the set.
+    // A membership helper rather than open-coded `std::find` at each call site:
+    // the set is DATA, and the engine must never grow a second way to ask.
+    [[nodiscard]] bool realizesEntryVerb(EntryMaterialization v) const noexcept {
+        for (auto const d : d_.entryVerbs)
+            if (d == v) return true;
+        return false;
     }
 
     // ── D-FFI-EXTERN-CALL-DISPATCH accessor ──────────────────────

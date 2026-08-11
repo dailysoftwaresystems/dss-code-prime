@@ -946,9 +946,12 @@ enum class DiagnosticCode : std::uint16_t {
     // D-CSUBSET-BITINT — the C1 cycle boundary: `_BitInt(N)` with N > 64. RETIRED in
     // C2 (N>64 is now a runnable multi-limb type — the semantic gate no longer emits
     // this). The code + its span slot are KEPT (never renumber — the append-only
-    // discipline; still on the unsuppressable list) so every historical 0xE04E golden
-    // stays stable; no live site references it after the C2 gate relaxation.
-    S_BitIntWidthAboveC1Limit = 0xE04E,
+    // discipline) so every historical 0xE04E golden stays stable; no live site
+    // references it after the C2 gate relaxation. De-listed from
+    // `kUnsuppressableCodes` 2026-08-10 (it had stayed a member for a month after
+    // retirement, which is what made a dead code read as load-bearing): an
+    // unemittable code cannot be suppressed — 0xE025 precedent.
+    S_BitIntWidthAboveC1Limit = 0xE04E,  // RETIRED — see comment
     // D-CSUBSET-BITINT-C2-WIDE — the C3 cycle boundary: `* / %` on a WIDE `_BitInt(N>64)`.
     // C2 ships the multi-limb storage + the EASY ops (+ - & | ^ ~ << >> compare convert);
     // wide MULTIPLY / DIVIDE / MODULO (schoolbook UMulH / long-division) land in C3. A
@@ -958,8 +961,11 @@ enum class DiagnosticCode : std::uint16_t {
     // with no multi-limb lowering and silently miscompile. ★ RETIRED C3 (2026-07-12): wide
     // `* / %` now LOWER (multi-limb schoolbook mul + long-division) — this code is no longer
     // emitted; kept append-only (stable-id), pinned unreachable by the flipped
-    // WideBitIntMulDivModLowersAtC3 unit test (asserts nDiag(0xE04F)==0).
-    S_BitIntWideMulDivUnsupported = 0xE04F,
+    // WideBitIntMulDivModLowersAtC3 unit test (asserts nDiag(0xE04F)==0). De-listed
+    // from `kUnsuppressableCodes` 2026-08-10: an unemittable code cannot be
+    // suppressed, so the row asserted nothing while making a dead code read as
+    // load-bearing — 0xE025 precedent.
+    S_BitIntWideMulDivUnsupported = 0xE04F,  // RETIRED — see comment
     // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV — conversion between a FLOATING type and a
     // WIDE `_BitInt(N>64)` (`(_BitInt(128))1.5`, `(double)wide`). C2 ships integer<->wide
     // and wide<->wide; a correct multi-limb float<->wide conversion (the full FP
@@ -981,15 +987,27 @@ enum class DiagnosticCode : std::uint16_t {
     // size (a wrong-storage miscompile). (File-scope `int g[n]` never becomes a VLA
     // — the scope gate leaves it S_NonConstantArrayLength.)
     S_VlaWithStaticStorage = 0xE051,
-    // VLA C1a (D-CSUBSET-VLA) — the C3 multi-dimensional boundary: a VLA whose
-    // ELEMENT is itself an array or a VLA (`int a[n][m]`, `int a[5][n]`,
-    // `int a[n][5]`). C1a ships 1-D VLAs only; a runtime STRIDE through index/GEP
-    // for a multi-dimensional VLA lands in C3. Rejected on BOTH the VLA arm (any
-    // array/VLA element) AND the constant arms (a VLA element — `typeContains-
-    // FlexibleArray`/`isIncompleteArray` check -1, so they would silently build
-    // `array(vlaArray)`). UNSUPPRESSABLE — a suppressed multi-dim VLA would build a
-    // nested array-of-VLA / VLA-of-array type that no lowering tier handles.
-    S_VlaMultiDimUnsupported = 0xE052,
+    // S_VlaMultiDimUnsupported: RETIRED at VLA C3 (2026-07-13), doc corrected +
+    // de-tabled 2026-08-10. It was the C1a multi-DIMENSIONAL boundary, and C3
+    // lifted all four of its reject sites: `int a[n][m]`, `int a[5][n]` and
+    // `int a[n][5]` now LOWER with a runtime inner stride and RUN on every leg.
+    // MEASURED 2026-08-10 (build-dbg at 3e86a187, elf64-x86_64-linux, debug AND
+    // release, plus pe64): each of those three forms compiles rc=0 — so the
+    // pre-C3 claim this comment used to carry ("C1a ships 1-D VLAs only", those
+    // three forms refused) was FALSE for over a year of cycles and had already
+    // produced one wrong C23 conformance claim before a probe caught it. The
+    // number is kept reserved (NOT renumbered) so historical 0xE052 diagnostics
+    // remain decodeable — 0xC034 / 0xE015 precedent.
+    // ★ WHAT IS STILL REFUSED, AND BY WHOM: the multi-LEVEL shape whose array
+    // levels outnumber its declarator dimension bounds (a VLA whose element comes
+    // from an array typedef — `typedef int R[5]; R a[n];`). That refusal has its
+    // OWN live emit site at the MIR tier (`hir_to_mir.cpp`, the
+    // `dims->size() != depth` gate) under the generic H0009, positioned at the
+    // declarator and naming the shape — MEASURED to fire. Nothing routes here.
+    // Also de-listed from `kUnsuppressableCodes`: an unemittable code cannot be
+    // suppressed, and leaving the row made a dead code read as load-bearing
+    // (`S_VolatilePointeeNotSupported` 0xE025 precedent).
+    S_VlaMultiDimUnsupported = 0xE052,  // RETIRED — see comment
     // VLA C1a (D-CSUBSET-VLA, C11 §6.7.6.2p1): a variable-length array whose size
     // expression does NOT have integer type (`int a[1.5]` — float; `int a[nullptr]` —
     // nullptr_t; a pointer; etc.). C requires the VLA size to have integer type.
@@ -1241,6 +1259,57 @@ enum class DiagnosticCode : std::uint16_t {
     // that depends on this conversion is ABI-correct by construction, unlike the
     // layout constraints that block belongs to.
     S_IncompatiblePointerIntegerPointee = 0xE060,
+    // S_EntryShapeNotDeclared (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): a function whose
+    //   name the SOURCE LANGUAGE declares as a program-entry spelling is defined
+    //   with a signature no declared row for that name has.
+    //   ★ THIS IS THE SEMANTIC-TIER OWNER OF THE ENTRY SIGNATURE, and it is a
+    //   SINGLE-TU fact: "the definition in front of me has the wrong shape for its
+    //   name". It therefore carries a REAL SOURCE SPAN, at the declarator. Its
+    //   predecessor (`K_EntryShapeNotDeclared`, now retired to a narrow MIR-tier
+    //   backstop) fired from the MIR tier where `Mir` carries no `BufferId` or
+    //   `SourceSpan` for a function, so it could only name the entry by symbol
+    //   name — the weakest possible report of what is a plain declaration
+    //   mistake with an obvious location.
+    //   ★ WHAT IT REFUSES, MEASURED 2026-08-10 on HEAD `3e86a187` (`build-dbg`):
+    //   `int main(int argc, char **argv, char **envp)` compiled **rc=0 with ZERO
+    //   diagnostics** on BOTH `pe64-x86_64-windows-exec` and
+    //   `elf64-x86_64-linux-exec`, and both images FAULT — observed `argc=3
+    //   argv=0x…7D10 envp=0x0000000000000004`, dereferencing envp gives
+    //   `0xC0000005` on pe and SIGSEGV (rc=139) on elf. gcc compiles the identical
+    //   source and it works. (The ORIGIN of the `0x4` is UNDETERMINED. An earlier
+    //   probe explained it as "the integer argc left in a leftover register"; that
+    //   is REFUTED — the measured run had argc=3 with envp still 0x4. Do NOT put a
+    //   mechanism claim into this diagnostic's text.)
+    //   ★ IT IS FORMAT-INDEPENDENT, DELIBERATELY. A 3-parameter `main` is refused
+    //   on a relocatable `.o` too, because no format realizes it and no
+    //   translation unit can make it legal later — the check needs no target and
+    //   so runs wherever the declaration is seen. What IS format-dependent is
+    //   CANDIDACY ("does this format realize the verb this row needs"), and that
+    //   deliberately lives at entry resolution instead: on ELF, `wmain` is not a
+    //   candidate but it is NOT an error either — a program defining `main` and
+    //   `wmain` must BUILD there and take `main`. Making "unrealized verb" a
+    //   per-definition error would make that program impossible.
+    //   ★ ALSO REFUSES `void main()` — through the SAME check with no second
+    //   mechanism: no declared row spells a `void` return (C23 5.1.2.2.1: the
+    //   return type shall be int), so it simply fails to match.
+    //   ★ C23 IS WHAT MAKES THIS A DEFECT RATHER THAN A PREFERENCE. 5.1.2.2.1
+    //   permits `main` "in some other IMPLEMENTATION-DEFINED MANNER", so
+    //   SUPPORTING 3-param main is conforming and REFUSING it is conforming —
+    //   accepting it and faulting is the one outcome C23 rules out, and that was
+    //   the shipped behaviour. 3.4.1 then defines implementation-defined behavior
+    //   as behavior each implementation DOCUMENTS, which is why the accepted set
+    //   is declared in config — the language file's `entryFunctions` mapping —
+    //   and why this message ENUMERATES it and says where it lives.
+    //   ★ THE MESSAGE MUST NAME THREE THINGS and the third is the easy one to
+    //   drop: (i) the entry and its OBSERVED signature; (ii) the ENUMERATED
+    //   declared rows for that NAME; (iii) that the set is CONFIG-DECLARED, so the
+    //   reader knows the remedy is a config row and not a compiler patch. With
+    //   (i) and (ii) but not (iii) it reads as "the compiler does not support
+    //   this", which is the wrong conclusion.
+    //   ★ MEMBERSHIP IN `kUnsuppressableCodes` IS PART OF THIS CODE. A silently
+    //   miscompiled program ENTRY is the worst class there is, and `--suppress`
+    //   must not be able to restore an accepted-then-faulting binary.
+    S_EntryShapeNotDeclared = 0xE061,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -2504,7 +2573,76 @@ enum class DiagnosticCode : std::uint16_t {
     //   entry ships. See the rationale block in
     //   `core/types/unsuppressable_codes.cpp`.
     K_ExecEntryNotTrampolined      = 0x801D,
-    // K-NEXT-SLOT: 0x801E — grep this marker before adding a K_* code.
+    // K_EntryVerbUnmaterializable (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the verb
+    //   entry resolution decided for the program entry materializes arguments the
+    //   entry's signature IN THE MERGED MODULE cannot receive.
+    //   ★ THIS CODE WAS `K_EntryShapeNotDeclared` AND ITS JOB CHANGED, so read
+    //   what it is NOT. It used to be the whole entry-shape gate: it classified
+    //   the resolved entry's MIR signature and refused any signature the FORMAT
+    //   did not declare. That was the wrong tier and the wrong party — no source
+    //   span was reachable from `Mir`, and "is this a legal entry signature" is a
+    //   SOURCE-LANGUAGE question, not a loader's. The signature check is now
+    //   `S_EntryShapeNotDeclared` at the semantic tier, against the language's
+    //   declared entry rows, WITH a span.
+    //   ★ WHAT REMAINS HERE IS A DIFFERENT FACT and not a second owner of the
+    //   first: "can the arguments I am about to materialize physically land in
+    //   this function". That is about the MIR in hand, not about anything
+    //   declared, and without it the materializer reads `params[0]`/`params[1]`
+    //   out of bounds — silently, on the program entry.
+    //   ⚠ NO SOURCE SPAN, AND THAT IS NOW CORRECT RATHER THAN A LIMITATION. It
+    //   fires only for a signature that never passed the semantic tier: a
+    //   hand-built module, or an entry from a pre-built object. There IS no
+    //   declaration site to point at, so omitting the span states the truth.
+    //   ★ MEMBERSHIP IN `kUnsuppressableCodes` IS PART OF THIS CODE: a silently
+    //   miscompiled program ENTRY is the worst class there is.
+    K_EntryVerbUnmaterializable    = 0x801E,
+    // K_ProgramEntryUndefined (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): this build
+    //   targets a format that STARTS A PROGRAM, and no function it compiled is a
+    //   program-entry candidate for that format.
+    //   ★ IT IS A WHOLE-PROGRAM FACT AND THAT DICTATES ITS TIER. In a multi-CU
+    //   build, CU A's declaration pass cannot know whether CU B defines `main`, so
+    //   this cannot be a per-declaration diagnostic and deliberately carries NO
+    //   span — there is no single declaration at fault. It is emitted at entry
+    //   resolution, once every CU is in hand.
+    //   ★★ THE MESSAGE MUST NAME THE NEAR-MISSES, and that is the whole reason
+    //   this code exists rather than leaning on the link tier's
+    //   `K_SymbolUndefined`. MEASURED 2026-08-10 on HEAD `3e86a187`: `int
+    //   wmain(int, unsigned short**)` with no `main`, built for
+    //   `elf64-x86_64-linux-exec`, was SELECTED as the Linux entry by a
+    //   name-only scan and then refused by a message asserting `wmain` WAS the
+    //   entry and prescribing an ELF config row to make it so — three wrong
+    //   claims in one message. The honest report is "this program defines no
+    //   entry this format can start; you defined `wmain`, whose `argc-wargv`
+    //   verb this format does not realize". gcc's answer to the same source is
+    //   `undefined reference to 'main'`, which is the same fact with less detail.
+    //   ⓘ The link tier's existence checks (`K_SymbolUndefined` /
+    //   `K_EntryPointResolvesToExtern`) are NOT superseded and are not a second
+    //   owner: they answer "the image names an entry symbol that is not defined
+    //   anywhere in the link", which covers entries arriving from objects DSS
+    //   never compiled. This code answers "the sources I compiled declared no
+    //   candidate", which is the only one that can explain WHY.
+    K_ProgramEntryUndefined        = 0x801F,
+    // K_ProgramEntryAmbiguous (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): more than one
+    //   function is a realizable program-entry candidate for the active format.
+    //   ★ WHAT IT REPLACES, AND WHY THE REPLACEMENT IS NOT COSMETIC. The
+    //   ambiguity refusal previously emitted `K_SymbolUndefined` — a code about a
+    //   symbol that does not exist, for a condition where TWO exist — and cited
+    //   `D-CSUBSET-MULTI-FN-WIN64-CC`, an anchor about calling conventions with
+    //   nothing to do with entry selection. A diagnostic whose code and anchor
+    //   both point somewhere else sends the reader to the wrong place with full
+    //   confidence, which is worse than a vague message.
+    //   ★ IT IS FORMAT-DEPENDENT BY CONSTRUCTION, and that is the design working
+    //   rather than an inconsistency: `main` + `wmain` in one program is ambiguous
+    //   on `pe64-x86_64-windows-exec`, which realizes BOTH verbs, and resolves
+    //   cleanly to `main` on every ELF and Mach-O format, where `argc-wargv` is
+    //   not realized and `wmain` is therefore an ordinary function. Refusing to
+    //   pick one silently is the point — first-match-wins on a program ENTRY is a
+    //   silent wrong-entry.
+    //   ⓘ Spans: each candidate's declaration IS locatable, so the message names
+    //   every candidate and attaches the declaration sites as related locations
+    //   where the resolving path has them.
+    K_ProgramEntryAmbiguous        = 0x8020,
+    // K-NEXT-SLOT: 0x8021 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
@@ -2687,22 +2825,28 @@ enum class DiagnosticCode : std::uint16_t {
     //   2026-06-01): Mach-O reader emits the same counter+Warning
     //   contract; see src/ffi/binary_readers/macho_reader.cpp.
     F_BinaryReaderPartialCorruption = 0x5018,
-    // F_FfiNoImportLibraryForFormat: FF5 `synthesizeFfiFromSourceDecls`
-    //   (the source-declared sibling of `ingest`, used when the
-    //   language's extern declarations ARE their own authority — no
-    //   header / binary surface read) was invoked with an empty
-    //   `importLibrary` for the active `ObjectFormatKind`. Means the
-    //   language's `DeclarationRule.externLibraryByFormat` map has no
-    //   entry for this format. Remediation: extend the language's
-    //   semantics JSON (e.g. c-subset.lang.json) with an
-    //   `externLibraryByFormat: { "pe": "msvcrt.dll", ... }` entry
-    //   for the missing format. Distinct from
-    //   `F_HeaderEmptyImportLibrary` (which means "a HEADER-source
-    //   caller forgot the library identity at FF2 read time") — this
-    //   code means "the LANGUAGE CONFIG has no per-format library
-    //   declaration for source-declared externs". (FF6 Slice 2,
-    //   2026-06-02.)
-    F_FfiNoImportLibraryForFormat  = 0x5019,
+    // F_FfiNoImportLibraryForFormat: RETIRED at UCRT-P4 Decision 1, doc corrected
+    //   + de-tabled 2026-08-10. It fired (FF6 Slice 2, 2026-06-02) when FF5
+    //   `synthesizeFfiFromSourceDecls` found no `DeclarationRule.
+    //   externLibraryByFormat` entry for the active `ObjectFormatKind`, and its
+    //   remediation advice told the operator to add one. BOTH the field and the
+    //   gate were deleted: "which image owns this symbol" is a fact about a
+    //   PLATFORM, owned PER SYMBOL by the shipped-descriptor corpus, so one
+    //   string per language was a guess AND a second owner — see the retirement
+    //   rationale at `src/ffi/ingest.cpp` and `src/core/types/semantic_config.hpp`.
+    //   A row with no library is now UNBOUND on purpose (`noLibraryBinding`) and
+    //   resolves at LINK per C23 5.1.1.2 phase 8 — a sibling TU's definition, a
+    //   `--resolve-library` export, or a loud `K_SymbolUndefined`. "No library for
+    //   this extern" is a routing outcome, not an error condition, so nothing
+    //   emits this.
+    //   ⚠ The paragraph above REPLACES advice that survived the deletion and kept
+    //   prescribing the removed `externLibraryByFormat` field — the same stale-doc
+    //   failure mode as 0xE052. The number is kept reserved (NOT renumbered) so
+    //   historical 0x5019 diagnostics remain decodeable, and de-listed from
+    //   `kUnsuppressableCodes`: an unemittable code cannot be suppressed (0xE025
+    //   precedent). Its `EXPECT_EQ(countCode(...), 0u)` pin in
+    //   `tests/ffi/test_ingest.cpp` is what keeps the retirement observable.
+    F_FfiNoImportLibraryForFormat  = 0x5019,  // RETIRED — see comment
     // F_ShippedHeaderNotFound: FF11 angle-include resolution. A
     //   `#include <h.h>` (the SYSTEM/angle form) named a header that
     //   was NOT found on any of the language's `shippedLibDirs` (the
@@ -2813,8 +2957,10 @@ enum class DiagnosticCode : std::uint16_t {
     //   K_SymbolUndefined on any exec-flavor image -- the same tier every C
     //   toolchain reports undefined symbols from. The typo protection is
     //   preserved, one tier later and false-positive-free.
-    //   (D-FF1-READER-CONSUMER c162; retired by TF-C66.)
-    F_FfiResolveLibrarySymbolAbsent = 0x5022,
+    //   (D-FF1-READER-CONSUMER c162; retired by TF-C66.) De-listed from
+    //   `kUnsuppressableCodes` 2026-08-10: an unemittable code cannot be
+    //   suppressed — 0xE025 precedent.
+    F_FfiResolveLibrarySymbolAbsent = 0x5022,  // RETIRED — see comment
     // F_ShippedTypeIdentityConflict: two shipped descriptors resolved for the
     //   SAME compile target declare the same struct/union TAG NAME (or the same
     //   typedef NAME) as DIFFERENT types — OR a descriptor spells a vocabulary

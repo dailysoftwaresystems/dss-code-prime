@@ -1,0 +1,49 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: `main` + `wmain` in one program BUILDS and RUNS `main` on every format that does not realize the `argc-wargv` verb. Before candidate selection became format-aware this source was REFUSED on every target as an ambiguous entry (MEASURED 2026-08-10 on HEAD 3e86a187: K_SymbolUndefined 'ambiguous user-entry', citing D-CSUBSET-MULTI-FN-WIN64-CC -- a code about a symbol that does not exist and an anchor about calling conventions, for a condition where two entries do exist). Selection now intersects the LANGUAGE's declared entry rows with the FORMAT's declared `entryVerbs`, so `wmain` is a candidate only where a wide argument vector can actually be produced. * THE EXIT CODE IS THE WITNESS: main returns 4, wmain returns 7, so a wrong selection is a DISTINCT observable (exit 7) rather than a crash. * THE pe64 HALF IS A SEPARATE EXAMPLE ON PURPOSE: pe64 realizes both verbs, so the identical source is REFUSED there as ambiguous -- see entry_main_and_wmain_ambiguous_pe. Neither example alone states the claim; the claim is that candidacy is per-format DATA. * RED-ON-DISABLE: add \"argc-wargv\" to elf64-x86_64-linux-exec.format.json's `entryVerbs` and this example stops building, because two candidates then survive on ELF too.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 4,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ]
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

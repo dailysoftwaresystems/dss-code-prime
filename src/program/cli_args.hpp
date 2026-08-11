@@ -77,6 +77,28 @@ struct DSS_EXPORT CliArgs {
     // ── Mode flags (mutually exclusive at dispatch time) ────────
     bool                     lspMode     = false;
     bool                     helpMode    = false;
+    // FC18 companion (`--dump-predefined-macros`): print the EFFECTIVE
+    // predefined-macro set for the resolved (language × target × object-format)
+    // triple, then exit 0 having compiled nothing. DSS's answer to `gcc -dM -E`.
+    //
+    // ★ WHY IT IS A MODE AND NOT AN OPTION. The question it answers is about an
+    // EMPTY translation unit — no source file participates, so there is nothing
+    // for it to decorate a compile with, and letting it ride alongside
+    // `--compile` would leave "does the compile still happen?" ambiguous. Being
+    // a mode also means it inherits the tail validation that DEMANDS
+    // `--language` and at least one `--target`: without a resolved triple there
+    // is no effective set, only a language-only approximation that an operator
+    // could mistake for a per-target answer.
+    //
+    // Repeatable `--target` prints ONE SECTION PER TARGET, because the whole
+    // point of the instrument is that the answer DIFFERS per target — an
+    // instrument that silently answered for only the first of three legs would
+    // be the exact silent-partial it exists to rule out.
+    //
+    // NO `-dM` ALIAS, and none should be added: `-dM` is one letter-cluster of
+    // gcc's `-d<CHARS>` dump family, and claiming that spelling would promise a
+    // family DSS does not implement. (`--define` likewise has no `-D` alias.)
+    bool                     dumpPredefinedMacros = false;
     std::vector<std::string> sourceFiles; // populated by --compile <files>...
     std::vector<std::string> transpileFiles; // populated by --transpile <files>...
     std::optional<std::string> directoryPath; // populated by --directory <path>

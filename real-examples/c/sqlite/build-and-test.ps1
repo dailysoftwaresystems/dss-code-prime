@@ -146,8 +146,26 @@
 #       per-cycle OS-symbol additions (isnan/pread64/…). The worklist:
 #         · kernel32 (test1.c Win section): CreateEvent OpenEvent SetEvent
 #           LockFile UnlockFile + EVENT_MODIFY_STATE
-#         · msvcrt CRT (test1.c/test_quota.c): _set_abort_behavior _CALL_REPORTFAULT
-#           _commit _chsize_s _stati64
+#         · UCRT/ucrtbase.dll (test1.c/test_quota.c): _set_abort_behavior
+#           _CALL_REPORTFAULT _commit _chsize_s _stat64i32
+#           ⓘ ucrtbase, NOT msvcrt, and that is measured rather than assumed:
+#           ✔MEASURED, msvcrt.dll exports no `_set_abort_behavior` at all, so
+#           this row can only ever bind against UCRT.
+#           ⚠ THE STAT SPELLING IS `_stat64i32`, NOT `_stati64`, AND THE WRONG ONE
+#           IS A LOAD-BREAKER RATHER THAN A TYPO. ✔MEASURED on two independent
+#           instruments (`objdump -p` + a direct PE export-directory parse, both
+#           reading OrdinalBase=1): `_stati64` is msvcrt.dll ORDINAL 766 and is
+#           ABSENT FROM ucrtbase.dll; UCRT spells the same 64-bit-size/32-bit-time
+#           stat `_stat64i32` (ucrtbase.dll ORDINAL 1807, itself absent from
+#           msvcrt.dll). Since TF-C111 flipped `library.pe` to ucrtbase.dll, a
+#           descriptor row naming `_stati64` would be EAGER-IMPORTED
+#           ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]: DSS imports every symbol a
+#           descriptor DECLARES, not merely the ones called), so EVERY binary that
+#           so much as `#include`s that header would die at LOAD with 0xC0000139
+#           STATUS_ENTRYPOINT_NOT_FOUND — never a link error, and never a
+#           diagnostic pointing at this line. `_commit` and `_chsize_s` above are
+#           real exports of BOTH images (ucrtbase 189/186, msvcrt 220/215), so they
+#           stay exactly as spelled.
 #         · CRT low-level I/O by POSIX name (test_fs.c): open close read fstat —
 #           test_fs.c:72 gates <unistd.h> on `!_WIN32 || __MSVCRT__`; DSS defines
 #           _WIN32 but not __MSVCRT__, so they need <io.h>/<sys/stat.h> pe mappings

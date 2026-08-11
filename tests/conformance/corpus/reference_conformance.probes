@@ -1,0 +1,1107 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  THE DIFFERENTIAL ACCEPT/REJECT PROBE CORPUS
+#  (subject: tests/conformance/test_reference_conformance.cpp)
+#  D-CONF-REFERENCE-DIFFERENTIAL-ORACLE
+# ════════════════════════════════════════════════════════════════════════════
+#
+# The operator's standing rule, which this corpus exists to MEASURE rather than
+# assert: "WE MUST SUPPORT WHAT REFERENCE COMPILERS DO SUPPORT FOR C Language,
+# that's it." It is BIDIRECTIONAL, and both directions are defects:
+#
+#   Direction A — a reference compiler ACCEPTS and DSS REJECTS.
+#                 A conformance gap; real corpora fail to build.
+#   Direction B — DSS ACCEPTS and NO reference compiler accepts.
+#                 An INVENTED extension; code written for DSS builds nowhere else.
+#
+# Direction B had never been checked before this corpus existed, and the operator
+# caught an instance BY EYE (`extern int _fmode "msvcrt.dll";`, probe
+# `b_extern_library_realization_string` below). A fix to that one instance is
+# worthless; the mechanism is the deliverable.
+#
+# ── WHAT IS DECLARED HERE AND WHAT IS MEASURED ─────────────────────────────
+#
+# ★ REFERENCE VERDICTS ARE MEASURED, NEVER TAKEN FROM THIS FILE. Every verdict
+#   in the census comes from a compiler this harness located on THIS host and ran
+#   on THIS probe, and is reported with that compiler's identity and the exact
+#   `-std=` / `/std:` flag that produced it. `expect-ref` below is a CROSS-CHECK
+#   of the author's understanding against that measurement, not an input to it —
+#   so this file can never make the harness believe something false about gcc.
+#
+# ★ AND DSS'S EXPECTED VERDICT IS NOT DECLARED AT ALL. It IS the measured
+#   reference consensus — that is precisely the operator's rule, encoded. There is
+#   deliberately no `expect-dss` key for a future edit to quietly relax.
+#
+# ── KEYS (an unknown key FAILS LOUD; a missing required key FAILS LOUD) ────
+#
+#   @probe <id>        unique; the census row name. Required.
+#   @direction A|B     which direction this probe hunts. Required.
+#   @mode strict|extended
+#                      strict   → the ISO arm: gnu oracles add `-pedantic-errors`.
+#                      extended → the permissive arm: gnu oracles use `-std=gnu*`
+#                                 and NO -pedantic. ⚠ MSVC has no ISO-strict mode
+#                                 at all, so for the msvc family the two modes are
+#                                 the SAME command line — said out loud here rather
+#                                 than papered over.
+#   @min-stdc <n>      the probe is judged ONLY by oracles whose MEASURED
+#                      `__STDC_VERSION__` is >= n. 0 = any. This is the mechanism
+#                      that stops a C2x-DRAFT oracle from certifying C23: gcc 13.3
+#                      measures 202000L, so `@min-stdc 202311` excludes it BY
+#                      MEASUREMENT, with no per-compiler special case anywhere.
+#   @families gnu|msvc|gnu,msvc
+#                      which reference families are RELEVANT. MSVC having no
+#                      `__attribute__` is not evidence that `__attribute__` is
+#                      invented, so an `@direction A` probe may narrow. An
+#                      `@direction B` probe may NOT narrow — "no reference compiler
+#                      accepts it" is a union over ALL of them, and the harness
+#                      rejects a narrowed B probe.
+#   @expect-ref accept|reject|varies
+#                      accept → at least one judging oracle must accept, else RED.
+#                      reject → NO judging oracle may accept, else RED.
+#                      varies → host/toolchain-dependent; NO assertion, and it must
+#                               carry `@varies-note`. Every `varies` probe is PRINTED
+#                               in the summary so this escape hatch cannot grow
+#                               quietly.
+#   @varies-note <text>   required iff `@expect-ref varies`; must be non-empty.
+#   @acknowledged-gap <text>
+#                      OPTIONAL. Presence means: a divergence on this probe is a
+#                      KNOWN, RECORDED gap — census it, do not red. Absence means a
+#                      divergence is a NEW defect and reds. ⚠ The ratchet only turns
+#                      one way: when a gap is CLOSED the harness reds and names the
+#                      exact line to delete, because an acknowledgement list that
+#                      keeps stale rows is a guard that has been weakened until it
+#                      asserts nothing.
+#   @why <text>        required, non-empty; the citation or reason.
+#   @code ... @end     the probe body. DECLARATIONS ONLY — no `#include`, no
+#                      `main`, and every oracle compiles to a RELOCATABLE object
+#                      (`-c` / `/c` / a bare DSS object format). System headers are
+#                      the single largest confound available and are excluded by
+#                      construction rather than by care.
+#
+# ════════════════════════════════════════════════════════════════════════════
+#  HARNESS SANITY PAIR — the two probes that prove the harness can tell accept
+#  from reject AT ALL, on EVERY oracle, on EVERY run. An oracle that fails either
+#  one is reported BROKEN (red), never skipped: a driver whose quoting silently
+#  collapsed would otherwise report "everything agrees" while compiling nothing.
+# ════════════════════════════════════════════════════════════════════════════
+
+@probe sanity_accept
+@direction A
+@mode strict
+@min-stdc 0
+@families gnu,msvc
+@expect-ref accept
+@why HARNESS SANITY: the most boring valid C declaration there is. Any oracle that rejects this is broken, not strict.
+@code
+int dss_sanity_accept_object;
+@end
+
+@probe sanity_reject
+@direction A
+@mode strict
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap HARNESS SANITY — this probe is REJECTED BY DESIGN on every oracle AND on DSS, so it is an agreement row, not a gap. The acknowledgement is unused; it is present only so a reader does not have to work out why a deliberately-invalid probe is here.
+@why HARNESS SANITY: illegal characters no C compiler accepts. Proves a nonzero verdict is reachable through the driver.
+@code
+int @@@ dss_sanity_reject $$$ ;
+@end
+
+# ════════════════════════════════════════════════════════════════════════════
+#  DIRECTION B — DSS ACCEPTS, NO REFERENCE COMPILER DOES.
+#  The novel half, and the reason this corpus exists.
+# ════════════════════════════════════════════════════════════════════════════
+
+@probe b_extern_library_realization_string
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap THE KNOWN INSTANCE, caught BY EYE by the operator and seeded here so the mechanism demonstrably catches it. DSS accepts a string literal as a declaration suffix meaning "this symbol is realized in that library" — self-described in the shipped examples as "DSS's own vocabulary for STATING a realization". It also contradicts the invariant recorded in src/hir/lowering/cst_to_hir.cpp (~line 2176): "a user declaration has authority over the SIGNATURE — never over the platform's REALIZATION." Removal is NOT this lane's work; the detector is.
+@why ISO/IEC 9899:2024 §6.7.1 gives the COMPLETE production as `init-declarator: declarator | declarator = initializer` — nothing may follow a declarator but `=`, `,` or `;`. ⚠ Cite the grammar, NOT the diagnostic: gcc's message lists `asm` and `__attribute__` too, and both of those are gcc EXTENSIONS rather than part of the standard production, so the error text is a WIDER list than ISO C allows. The nearest reference-compiler spelling of this construct's intent is a GNU asm label (see a_asm_label_gnu), which every gnu oracle accepts — and which is an extension too, in scope here because the rule is what reference compilers support, not ISO only.
+@code
+extern int dss_realization_probe "msvcrt.dll";
+@end
+
+@probe b_extern_library_realization_string_function
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap Same construct as b_extern_library_realization_string in FUNCTION position. Kept as its own row because a fix that only closed the object-declaration path would leave this one open and the object-only probe would go green — a one-probe pin on a two-position grammar rule is a pin that can be half-satisfied.
+@why Same rejection shape on every reference compiler; a string literal cannot follow a function declarator (an asm label needs the `__asm__`/`asm` keyword).
+@code
+extern int dss_realization_fn_probe(int) "msvcrt.dll";
+@end
+
+@probe b_extern_library_realization_string_decl_list
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap STRICTLY WIDER than b_extern_library_realization_string: the optional string sits AFTER the whole initDeclaratorList (/shapes/externDecl in c-subset.lang.json), so per that rule's own $comment it applies to EVERY declarator in the declaration. No corpus file uses this form — it is pure grammar over-admission on top of an already-invented construct.
+@why A declaration-level realization suffix has no counterpart in C, GNU C or MSVC C.
+@code
+extern int dss_rl_a, *dss_rl_b, dss_rl_c[4] "msvcrt.dll";
+@end
+
+@probe b_extern_library_realization_wide_string
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap An accidental sub-case: the optional child is the full `stringLiteralExpr` shape, whose opener alt admits WideStringStart / Utf16 / Utf32 / Utf8 and a concatenation run. A library NAME is a byte string by nature, so admitting L"..." here is over-admission inside over-admission.
+@why The position itself does not exist in any reference compiler, so no encoding prefix can make it legal.
+@code
+extern int dss_rl_wide "msv" L"crt.dll";
+@end
+
+@probe b_va_start_keywords_without_stdarg
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap DSS reserves va_start / va_arg / va_end as GRAMMAR KEYWORDS (/keywords VaStartKeyword, VaArgKeyword, VaEndKeyword; /shapes vaStartExpr, vaArgExpr, vaEndExpr) and injects __builtin_va_list unconditionally, so this compiles with NO <stdarg.h> at all. gcc/clang spell the primitives __builtin_va_start/__builtin_va_arg/__builtin_va_end; the unprefixed names are <stdarg.h> MACROS in every reference implementation. Note vaArgExpr also puts a TYPE-NAME in an expression argument position, which no reference grammar has outside a macro expansion.
+@why Header-less: `va_start` is undeclared and `va_arg(ap, int)` is `expected expression before 'int'` on gcc/clang; MSVC likewise.
+@code
+int dss_va_probe(int n, ...) { __builtin_va_list ap; int v; va_start(ap, n); v = va_arg(ap, int); va_end(ap); return v; }
+@end
+
+@probe b_asm_label_after_attribute_and_duplicated
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@why /shapes/initDeclarator admits `{repeat: {alt: [attrSpec, stdAttr, asmLabel]}}`, i.e. EVERY interleaving and any number of asm labels. gcc and clang both fix the order as `declarator asm-label attributes` and reject a second label; MSVC has no asm label at all.
+@code
+extern int dss_asm_order_probe(void) __asm__("dss_first") __attribute__((weak)) __asm__("dss_second");
+@end
+
+@probe b_comma_operator_in_array_size
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@why /shapes/arrayDeclSuffix takes the full `expression` (comma at operator precedence 10) where ISO C 6.7.6.2 requires a constant-expression, which excludes the comma operator. DSS has a comma-free `assignmentExpr` shape and deliberately does not use it here.
+@code
+int dss_comma_array_probe[1, 2];
+@end
+
+@probe b_comma_operator_in_block_array_size
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap The BLOCK-SCOPE twin of b_comma_operator_in_array_size, and the sharper of the two. At file scope DSS rejects for an incidental reason ("a file-scope array requires a constant length"), which hides whether the COMMA was ever refused; inside a function there is no constant-length requirement to hide behind, so this row measures the grammar over-admission itself. Every reference compiler stops at the `,` with a pure SYNTAX error, at every -std level, because C 6.7.6.2 admits an assignment-expression there and not an expression.
+@why gcc/clang: `expected ']' before ',' token`; MSVC: `syntax error: missing ']' before ','`.
+@code
+int dss_comma_block_array_probe(int n) { int a[1, 2]; a[0] = n; return a[0]; }
+@end
+
+@probe b_comma_operator_in_case_label
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap MEASURED: DSS ACCEPTS `case 1, 2:` while all five oracles refuse it with a pure SYNTAX error (gcc `expected ':' or '...' before ','`, clang `expected ':' after 'case'`, cl `C2051 case expression not constant`). /shapes/caseLabel takes the full `expression`, so the comma operator is admitted where C 6.8.4.2 requires a constant-expression -- and the shape it most resembles is the multi-value case label that no C compiler has, so a reader could reasonably believe `case 1, 2:` matches both values.
+@why /shapes/caseLabel takes the full `expression`; C 6.8.4.2 requires a constant-expression. `case 1, 2:` reads to a reference compiler as an attempt at the (non-existent) multi-value case label.
+@code
+int dss_comma_case_probe(int x) { switch (x) { case 1, 2: return 7; } return 0; }
+@end
+
+@probe b_comma_operator_in_designated_index
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@why /shapes/designatedIndex is `[ expression ]` where C 6.7.9 requires a constant-expression.
+@code
+int dss_comma_designator_probe[3] = {[0, 1] = 5};
+@end
+
+@probe b_empty_enumerator_list
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref varies
+@varies-note ✔MEASURED and it is the reason this row is not a direction-B claim: cl 19.51 /std:clatest ACCEPTS `enum E { };` while gcc 13.2/13.3 say `empty enum is invalid` and clang 18/19 say `use of empty enum`. So a reference compiler DOES accept it — and on a host with no MSVC the same probe would look invented. A verdict that flips with which machine ran it must not be pinned in either direction.
+@why /shapes/enumBody makes the enumerator list `{optional}`, which C 6.7.2.2 does not. Kept as a censused row precisely because the reference family SPLITS on it.
+@code
+enum DssEmptyEnum { };
+@end
+
+@probe b_elided_enumerator
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap MEASURED: DSS ACCEPTS `enum F { A, , B };`. The `{optional: enumerator}` after Comma in /shapes/enumBody exists for the C99 TRAILING comma and also admits an INTERIOR hole. Note the contrast with b_empty_enumerator_list, where MSVC agrees with DSS -- here nothing does.
+@why /shapes/enumBody spells the tail as `{repeat: {sequence: [Comma, {optional: enumerator}]}}`. The `{optional}` exists for the C99 TRAILING comma but also admits INTERIOR elision, which nothing accepts.
+@code
+enum DssElidedEnum { DSS_EE_A, , DSS_EE_B };
+@end
+
+@probe b_elided_initializer_element
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap MEASURED: DSS ACCEPTS `{ 1, , 3 }`. Same `{optional}`-after-Comma shape as the enumerator list, in /shapes/braceInitList. This is the most dangerous of the elision family: the hole is SILENT, so the reader's third element lands at index 2 in DSS and the file does not compile anywhere else.
+@why /shapes/braceInitList has the same `{optional}`-after-Comma shape as enumBody, so an interior hole in an initializer list is admitted.
+@code
+static int dss_elided_init_probe[3] = { 1, , 3 };
+@end
+
+@probe b_elided_struct_member_declarator
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap MEASURED: DSS ACCEPTS `struct T { int a, , b; };`. /shapes/structMemberDeclarator is fully nullable. The FULLY empty member `struct T { int; };` IS caught (S_DeclarationDeclaresNothing) -- it is the populated-list-with-a-hole case that slips past, which is exactly the shape a guard written against the empty case never sees.
+@why /shapes/structMemberDeclarator is fully nullable (optional declarator + optional bit-field suffix), so a mid-list hole is admitted. The FULLY empty case `struct T { int; };` IS caught (S_DeclarationDeclaresNothing) — a populated list with a hole in it is the case that slips past.
+@code
+struct DssElidedMember { int a, , b; };
+@end
+
+@probe b_ellipsis_not_last_parameter
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap MEASURED: DSS ACCEPTS `int f(int a, ..., int b);`. /shapes/paramList repeats `{Comma, paramOrEllipsis}` with no rule that the ellipsis terminates the list (C 6.7.6.3), and no semantic check supplies one.
+@why /shapes/paramList repeats `{Comma, paramOrEllipsis}` with no "the ellipsis terminates the list" rule. C 6.7.6.3 puts `...` last, full stop.
+@code
+int dss_ellipsis_mid_probe(int a, ..., int b);
+@end
+
+@probe b_duplicate_array_param_qualifiers
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap MEASURED: DSS ACCEPTS `int a[static static const restrict const 3]`. /shapes/arrayDeclSuffix repeats `{alt: [static, const, volatile, restrict]}` unbounded with no duplicate check. gcc/clang report `duplicate 'static'`/`duplicate 'const'`; the NON-parameter use of the same form IS caught (S_ArrayParamQualifierNonParameter), so the guard exists one axis over.
+@why /shapes/arrayDeclSuffix repeats `{alt: [static, const, volatile, restrict]}` with no duplicate check. gcc/clang report `duplicate 'static'` / `duplicate 'const'`; MSVC rejects the whole C99 array-parameter form.
+@code
+int dss_dup_arrayqual_probe(int a[static static const restrict const 3]);
+@end
+
+@probe b_assignment_inside_attribute_argument
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@why /shapes/attrArgItem admits `attrArgAtom {optional {AssignOp, attrArgAtom}}` for EVERY attribute. Its own $comment scopes the intent to clang's `__availability__(..., message=_msg)`; the slot is generic. gcc accepts no `=` in any attribute argument, and clang accepts it only inside `availability`.
+@code
+int dss_attr_assign_probe __attribute__((aligned=8));
+@end
+
+@probe b_msvc_calling_convention_macro_without_windows_h
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@acknowledged-gap MEASURED: `int WINAPI f(void);` is ACCEPTED by DSS for the pe64 target and REJECTED by all seven oracles — cl 19.51 included, because MSVC itself needs <windows.h> for WINAPI. This is the row that justifies the two-fixed-target design: DSS rejects it for elf64 and accepts it for pe64, so "accepted under ANY target" is what identifies it as an invented construct rather than a per-target detail. A source file written against these predefines compiles only with DSS, and only for pe.
+@why /preprocess/predefinedMacros predefines WINAPI, __stdcall, __cdecl, __fastcall and __forceinline to the EMPTY STRING, gated availableObjectFormats ["pe"]. So a pe translation unit sees them with NO <windows.h>. MSVC needs <windows.h>/<minwindef.h> for WINAPI; gcc/clang have no such macro at any -std level. (This probe is why DSS's verdict is measured for TWO fixed object formats: it is admitted for pe and rejected for elf, and "accepted under any target" is what makes a construct invented.)
+@code
+int WINAPI dss_winapi_probe(void);
+@end
+
+# ════════════════════════════════════════════════════════════════════════════
+#  DIRECTION A — a reference compiler ACCEPTS, DSS may REJECT.
+#  ISO surface first, then the extensions reference compilers ship. The rule is
+#  NOT ISO-only, so `__attribute__` / asm labels / __int128 / __try / typeof are
+#  IN SCOPE here exactly as much as `_Generic` is.
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── C11 surface (every oracle here measures >= 201112L) ────────────────────
+
+@probe a_generic_c11
+@direction A
+@mode strict
+@min-stdc 201112
+@families gnu,msvc
+@expect-ref accept
+@why C11 6.5.1.1 _Generic primary expression.
+@code
+int dss_generic_probe(void) { double d = 0.0; return _Generic(d, double: 1, default: 0); }
+@end
+
+@probe a_static_assert_c11
+@direction A
+@mode strict
+@min-stdc 201112
+@families gnu,msvc
+@expect-ref accept
+@why C11 6.7.10 _Static_assert with a message.
+@code
+_Static_assert(sizeof(int) >= 2, "int is at least 16 bits");
+@end
+
+@probe a_alignas_alignof_c11
+@direction A
+@mode strict
+@min-stdc 201112
+@families gnu,msvc
+@expect-ref accept
+@why C11 6.7.5 _Alignas and 6.5.3.4 _Alignof.
+@code
+_Alignas(16) int dss_alignas_probe;
+int dss_alignof_probe = (int)_Alignof(double);
+@end
+
+@probe a_anonymous_struct_member_c11
+@direction A
+@mode strict
+@min-stdc 201112
+@families gnu,msvc
+@expect-ref accept
+@why C11 6.7.2.1p13 anonymous structure/union members.
+@code
+struct DssAnon { int tag; union { int i; float f; }; };
+int dss_anon_probe(struct DssAnon *p) { return p->i; }
+@end
+
+@probe a_atomic_qualifier_c11
+@direction A
+@mode strict
+@min-stdc 201112
+@families gnu
+@expect-ref accept
+@why C11 6.7.3 _Atomic type qualifier. Narrowed to gnu: MSVC gates C11 atomics behind /experimental:c11atomics, which is a compiler-configuration fact rather than evidence about the construct.
+@code
+_Atomic int dss_atomic_probe;
+@end
+
+@probe a_noreturn_c11
+@direction A
+@mode strict
+@min-stdc 201112
+@families gnu,msvc
+@expect-ref accept
+@why C11 7.23 _Noreturn function specifier.
+@code
+_Noreturn void dss_noreturn_probe(void);
+@end
+
+# ── C99 surface ────────────────────────────────────────────────────────────
+
+@probe a_compound_literal_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C99 6.5.2.5 compound literals.
+@code
+struct DssPoint { int x, y; };
+int dss_compound_probe(void) { struct DssPoint p = (struct DssPoint){1, 2}; return p.x + p.y; }
+@end
+
+@probe a_designated_initializers_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C99 6.7.9 designated initializers, both member and array-index forms.
+@code
+struct DssD { int a, b; };
+struct DssD dss_desig_probe = {.b = 2, .a = 1};
+int dss_desig_arr[4] = {[2] = 7, [0] = 1};
+@end
+
+@probe a_flexible_array_member_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C99 6.7.2.1p18 flexible array member.
+@code
+struct DssFam { int n; char data[]; };
+int dss_fam_probe(struct DssFam *p) { return p->n; }
+@end
+
+@probe a_restrict_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C99 6.7.3 restrict qualifier.
+@code
+void dss_restrict_probe(int *restrict a, int *restrict b) { *a = *b; }
+@end
+
+@probe a_vla_parameter_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu
+@expect-ref accept
+@why C99 6.7.6.2 variable-length array. Narrowed to gnu: MSVC has never implemented VLAs, and C11 6.10.8.3 makes them optional (__STDC_NO_VLA__), so an MSVC rejection is not evidence about the construct.
+@code
+int dss_vla_probe(int n) { int a[n]; a[0] = n; return a[0]; }
+@end
+
+@probe a_complex_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu
+@expect-ref accept
+@why C99 6.2.5 _Complex. Narrowed to gnu: C11 makes complex optional (__STDC_NO_COMPLEX__) and MSVC implements the _Dcomplex struct family instead of the _Complex keyword.
+@code
+_Complex double dss_complex_probe;
+@end
+
+@probe a_mixed_declarations_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C99 6.8.2 declarations may follow statements inside a block, and 6.8.5.3 a for-loop may declare its counter.
+@code
+int dss_mixed_probe(int n) { int t = n; t = t + 1; int u = t; for (int i = 0; i < 2; ++i) u += i; return u; }
+@end
+
+@probe a_func_predefined_ident_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C99 6.4.2.2 the predefined identifier __func__.
+@code
+char const *dss_func_probe(void) { return __func__; }
+@end
+
+@probe a_variadic_macro_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C99 6.10.3 variadic function-like macros with __VA_ARGS__.
+@code
+#define DSS_SUM(...) dss_variadic_sink(__VA_ARGS__)
+int dss_variadic_sink(int, int);
+int dss_variadic_probe(void) { return DSS_SUM(1, 2); }
+@end
+
+# ── C23 surface. `@min-stdc 202311` is what keeps a C2x-DRAFT oracle out. ──
+
+@probe a_nullptr_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.4.4.6 nullptr / 7.21 nullptr_t.
+@code
+void *dss_nullptr_probe = nullptr;
+@end
+
+@probe a_bool_true_false_keywords_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.4.1 bool/true/false are keywords; no <stdbool.h> required.
+@code
+bool dss_bool_probe = true;
+bool dss_bool_probe2 = false;
+@end
+
+@probe a_static_assert_no_message_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.7.11 static_assert spelling with the message omitted.
+@code
+static_assert(sizeof(int) >= 2);
+@end
+
+@probe a_typeof_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.7.2.5 typeof and typeof_unqual.
+@code
+int dss_typeof_src;
+typeof(dss_typeof_src) dss_typeof_probe;
+typeof_unqual(int const) dss_typeof_unqual_probe;
+@end
+
+@probe a_bitint_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu
+@expect-ref accept
+@why C23 6.2.5p5 _BitInt(N). Narrowed to gnu: MSVC has no _BitInt as of cl 19.5x, and that is a compiler-coverage fact, not evidence about the construct.
+@code
+_BitInt(37) dss_bitint_probe;
+unsigned _BitInt(3) dss_bitint_probe2;
+@end
+
+@probe a_binary_literal_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.4.4.1 binary integer constants (0b/0B).
+@code
+int dss_binary_literal_probe = 0b1011;
+@end
+
+@probe a_enum_fixed_underlying_type_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.7.2.2 enum with a fixed underlying type. ⚠ NO enum-typed GLOBAL here on purpose: the first draft of this probe declared one and DSS rejected it at `lowerMirGlobalsToDataItems` (K_NoMatchingObjectFormat, D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL) — a BACK-END limitation on non-primitive global types that has nothing to do with the C23 syntax under test. A probe that reports a real rejection for the wrong reason is a false census row, so the enumerator is consumed inside a function instead.
+@code
+enum DssFixed : unsigned char { DSS_FIXED_A = 1, DSS_FIXED_B = 2 };
+int dss_enum_fixed_probe(void) { return (int)DSS_FIXED_B; }
+@end
+
+@probe a_standard_attribute_leading_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.7.12.1 [[deprecated]] in the LEADING declaration position. Split from the parameter form below: the first draft carried both in one probe, so a single rejection could not say WHICH position DSS lacks — and "one construct per probe" is what makes a census row actionable.
+@code
+[[deprecated]] int dss_attr_deprecated_probe(void);
+@end
+
+@probe a_standard_attribute_parameter_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: `[[maybe_unused]] int p` in a PARAMETER declaration is rejected by DSS while clang 18/19 (C23) and cl /std:clatest accept it. Its LEADING-position twin (a_standard_attribute_leading_c23) is accepted, so this is a position-specific hole, not absent C23 attribute support. RECORDED, not fixed -- this lane builds the detector.
+@why C23 6.7.12.1 [[maybe_unused]] on a PARAMETER declaration.
+@code
+int dss_attr_param_probe([[maybe_unused]] int unused_param);
+@end
+
+@probe a_empty_initializer_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.7.10 the empty initializer `= {}`.
+@code
+struct DssEmptyInit { int a; int b; };
+struct DssEmptyInit dss_empty_init_probe = {};
+@end
+
+@probe a_va_opt_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: DSS answers `P0002: expected 'ParenClose' -- got '__VA_OPT__'`. C23 6.10.5. clang-19 accepts; clang-18 rejects the probe for a different, measured reason (-Wgnu-zero-variadic-macro-arguments promoted by -pedantic-errors), which is why the direction rule is `any judging oracle accepts` rather than `all`.
+@why C23 6.10.5 __VA_OPT__.
+@code
+int dss_vaopt_sink(int);
+#define DSS_CALL(a, ...) dss_vaopt_sink(a __VA_OPT__(+) __VA_ARGS__)
+int dss_vaopt_probe(void) { return DSS_CALL(1) + DSS_CALL(1, 2); }
+@end
+
+@probe a_elifdef_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.10.1 #elifdef / #elifndef.
+@code
+#define DSS_ELIFDEF_ON 1
+#ifdef DSS_NOT_DEFINED_AT_ALL
+int dss_elifdef_probe = 1;
+#elifdef DSS_ELIFDEF_ON
+int dss_elifdef_probe = 2;
+#else
+int dss_elifdef_probe = 3;
+#endif
+@end
+
+@probe a_unnamed_parameter_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.7.6.3 a parameter may be unnamed in a function DEFINITION.
+@code
+int dss_unnamed_param_probe(int, double) { return 0; }
+@end
+
+@probe a_label_at_block_end_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.8.1 a label may appear at the end of a compound statement, and before a declaration. ⚠ Declared `void`, deliberately: the first draft returned `int` and fell off the end after the trailing label, so DSS answered H0003 "non-void function may fall through without returning a value" — a true diagnostic about a DIFFERENT defect in the probe, which would have censused as a C23-label gap.
+@code
+void dss_label_probe(int n) { if (n) goto done; int t = n + 1; (void)t; done: ; }
+@end
+
+@probe a_constexpr_object_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.7.1 the constexpr storage-class specifier on an object definition.
+@code
+constexpr int dss_constexpr_probe = 42;
+@end
+
+@probe a_u8_char_literal_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.4.4.4 u8 character constants.
+@code
+unsigned char dss_u8_char_probe = u8'A';
+@end
+
+# ── Extensions the reference compilers ship. IN SCOPE: the rule is not ISO-only.
+
+@probe a_attribute_packed_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU __attribute__((packed)) on a struct. Narrowed to gnu: MSVC spells this #pragma pack (probe a_pragma_pack).
+@code
+struct DssPacked { char c; int i; } __attribute__((packed));
+int dss_packed_probe(void) { return (int)sizeof(struct DssPacked); }
+@end
+
+@probe a_attribute_aligned_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU __attribute__((aligned(N))) on an object.
+@code
+int dss_aligned_probe __attribute__((aligned(16)));
+@end
+
+@probe a_attribute_noreturn_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU __attribute__((noreturn)) on a function declaration.
+@code
+void dss_attr_noreturn_probe(void) __attribute__((noreturn));
+@end
+
+@probe a_asm_label_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU asm label — the reference-compiler spelling of "this declaration is realized under that external name". It is the construct probe b_extern_library_realization_string should have been.
+@code
+extern int dss_asm_label_probe __asm__("dss_external_name");
+@end
+
+@probe a_int128_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU __int128 on a 64-bit target.
+@code
+__int128 dss_int128_probe;
+unsigned __int128 dss_uint128_probe;
+@end
+
+@probe a_typeof_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: DSS has the C23 `typeof` keyword (a_typeof_c23 passes) but not the GNU `__typeof__` spelling, which is the one that works at every -std level and is therefore the one real headers use. All four gnu oracles accept it.
+@why GNU __typeof__ — available at every -std level, unlike the C23 `typeof` keyword.
+@code
+int dss_typeof_gnu_src;
+__typeof__(dss_typeof_gnu_src) dss_typeof_gnu_probe;
+@end
+
+@probe a_statement_expression_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: GNU statement expressions `({ ... })` are rejected by DSS and accepted by all four gnu oracles. Pervasive in glibc/kernel-style headers and in macro-heavy corpora.
+@why GNU statement expressions `({ ... })`.
+@code
+int dss_stmt_expr_probe(int n) { return ({ int t = n; t + 1; }); }
+@end
+
+@probe a_builtin_expect_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: `__builtin_expect` is an unknown identifier to DSS (S0001) and accepted by all four gnu oracles. It appears throughout real C corpora, sqlite included.
+@why GNU __builtin_expect — pervasive in real C corpora (sqlite, glibc headers).
+@code
+int dss_builtin_expect_probe(int n) { return __builtin_expect(n != 0, 1) ? 1 : 0; }
+@end
+
+@probe a_zero_length_array_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU zero-length arrays as struct members — the pre-C99 spelling of a flexible array member, still in wide use.
+@code
+struct DssZeroLen { int n; char data[0]; };
+int dss_zero_len_probe(struct DssZeroLen *p) { return p->n; }
+@end
+
+@probe a_case_range_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: GNU case ranges `case 1 ... 5:` are rejected by DSS (`expected 'Colon' -- got '...'`) and accepted by all four gnu oracles.
+@why GNU case ranges `case 1 ... 5:`.
+@code
+int dss_case_range_probe(int n) { switch (n) { case 1 ... 5: return 1; default: return 0; } }
+@end
+
+@probe a_label_as_value_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU labels as values (`&&label` and a `void *` computed goto) — the classic threaded-interpreter dispatch idiom.
+@code
+int dss_label_value_probe(int n) { void *p = &&target; if (n) goto *p; return 0; target: return 1; }
+@end
+
+@probe a_nested_function_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref varies
+@varies-note A gcc-only extension: gcc accepts a nested function definition, clang has never implemented it and rejects. Both are the `gnu` family, so the family-level verdict genuinely differs BY COMPILER and any single declared expectation would be false on some host.
+@why GNU nested functions.
+@code
+int dss_nested_fn_probe(int n) { int inner(int x) { return x + 1; } return inner(n); }
+@end
+
+@probe a_pragma_pack
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref accept
+@why #pragma pack(N) / pop — the one packed-struct spelling BOTH families implement.
+@code
+#pragma pack(push, 1)
+struct DssPragmaPacked { char c; int i; };
+#pragma pack(pop)
+int dss_pragma_pack_probe(void) { return (int)sizeof(struct DssPragmaPacked); }
+@end
+
+@probe a_pragma_operator_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C99 6.10.9 the _Pragma operator.
+@code
+_Pragma("pack(push, 1)")
+struct DssPragmaOp { char c; int i; };
+_Pragma("pack(pop)")
+int dss_pragma_op_probe(void) { return (int)sizeof(struct DssPragmaOp); }
+@end
+
+@probe a_declspec_msvc
+@direction A
+@mode extended
+@min-stdc 0
+@families msvc
+@expect-ref accept
+@why MSVC __declspec(dllimport). Narrowed to msvc as the family that DEFINES it; a mingw gcc accepts it too and that shows up in the measured per-oracle rows.
+@code
+__declspec(dllimport) int dss_declspec_probe;
+@end
+
+@probe a_seh_try_except_msvc
+@direction A
+@mode extended
+@min-stdc 0
+@families msvc
+@expect-ref accept
+@acknowledged-gap NOT a front-end gap, and the distinction is the whole value of this row. DSS PARSES `__try`/`__except` (it reaches lowering) and then refuses at `synthesizeSehFunclets` because neither fixed probe target declares a `sehPersonality` block: the pe64 RELOCATABLE-OBJECT arm emits no unwind info, so accepting would be a silent miscompile in which `__except` can never run (D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO, D-WIN64-SEH-FUNCLETS). It is a LOUD, CORRECT format-capability refusal. It is censused rather than dropped because the user-visible fact is real — you cannot compile `__try` into a pe64 .obj with DSS while cl.exe can — and because this harness compiles to relocatable objects on purpose (the exact `-c` / `/c` stage the reference compilers are held to). ⚠ Do NOT "close" this by adding a personality block to an object format; that is the refusal's own documented trap.
+@why MSVC structured exception handling __try / __except. DSS implements SEH .pdata/.xdata for the pe64 exec and dll formats, so this is squarely in scope.
+@code
+int dss_seh_probe(int n) { int r = 0; __try { r = 1 / n; } __except (1) { r = -1; } return r; }
+@end
+
+@probe a_forceinline_msvc
+@direction A
+@mode extended
+@min-stdc 0
+@families msvc
+@expect-ref accept
+@why MSVC __forceinline function specifier.
+@code
+__forceinline int dss_forceinline_probe(int n) { return n + 1; }
+@end
+
+@probe a_counter_macro
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: `__COUNTER__` is undefined in DSS (S0001) and predefined by ALL FIVE oracles -- the only probe in this corpus that every located reference compiler accepts and DSS refuses.
+@why __COUNTER__ — a gcc/clang/MSVC-common predefined macro used for unique-name generation.
+@code
+int dss_counter_probe_a = __COUNTER__;
+int dss_counter_probe_b = __COUNTER__;
+@end
+
+@probe a_inline_asm_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: DSS's /shapes/asmStmt admits an asm TEMPLATE only, so the operand-constraint form `__asm__ volatile("" : "=r"(r) : "r"(n))` stops at the first `:`. All four gnu oracles accept it. The template-only subset is what real corpora almost never use.
+@why GNU extended inline asm with operand constraints — the form real corpora use.
+@code
+int dss_inline_asm_probe(int n) { int r; __asm__ volatile("" : "=r"(r) : "r"(n)); return r; }
+@end
+
+@probe a_stray_toplevel_semicolon
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref accept
+@why A stray file-scope `;` is accepted by gcc/clang/MSVC outside -pedantic-errors. `@mode extended` is load-bearing here rather than decorative: under the strict arm the same probe is a pedantic ERROR, so judging it strictly would manufacture a false direction-A row.
+@code
+int dss_stray_semi_probe;
+;
+;;
+@end
+
+@probe a_empty_struct_body_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref accept
+@why An empty struct body is a GNU extension (and an MSVC one); it is a pedantic error under ISO C, hence the extended arm.
+@code
+struct DssEmptyBody { };
+int dss_empty_body_probe(void) { return (int)sizeof(struct DssEmptyBody); }
+@end
+
+@probe a_enum_underlying_typeof_c23
+@direction A
+@mode extended
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23's fixed enum underlying type composed with C23 `typeof` — the two features meeting, which is where a grammar that bolted them on separately shows the seam.
+@code
+enum DssUnderTypeof : typeof(1) { DSS_UT_A = 1 };
+@end
+
+@probe a_designated_initializer_nested_c99
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C99 6.7.9 nested designators (`.outer.inner =` and `[i].member =`), the form real corpora use for tables of structs.
+@code
+struct DssInner { int a, b; };
+struct DssOuter { struct DssInner in; int tail; };
+struct DssOuter dss_nested_desig_probe = {.in.b = 2, .tail = 3};
+struct DssInner dss_nested_arr_probe[2] = {[1].a = 5};
+@end
+
+@probe a_string_literal_concatenation
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C 6.4.5 adjacent string literal concatenation, including across a macro boundary — pervasive in real corpora.
+@code
+#define DSS_SUFFIX "world"
+char const dss_concat_probe[] = "hello " DSS_SUFFIX "!";
+@end
+
+@probe a_bitfield_declarations
+@direction A
+@mode strict
+@min-stdc 199901
+@families gnu,msvc
+@expect-ref accept
+@why C 6.7.2.1 bit-fields, including a zero-width unnamed one (the forced-alignment idiom) and an unnamed padding field.
+@code
+struct DssBits { unsigned a : 3; unsigned : 0; unsigned b : 5; signed c : 2; };
+int dss_bits_probe(struct DssBits *p) { return (int)p->a + (int)p->b; }
+@end
+
+@probe a_local_label_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: GNU local labels (`__label__ L;` inside a block) are rejected by DSS and accepted by gcc 13.3.0 and clang 19.1.1. The companion of the computed-goto machinery DSS already has, and the form macro-heavy corpora use to keep a label private to a macro expansion.
+@why GNU C `__label__` declares a label local to the enclosing block.
+@code
+int dss_local_label_probe(void) { __label__ done; goto done; done: return 0; }
+@end
+
+@probe a_builtin_types_compatible_p_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. It is the primitive every pre-C11 type-generic macro is written on, and it takes TYPE NAMES in an expression argument position — the same grammatical shape as `_Generic`, which DSS does support (a_generic_c11 passes).
+@why GNU `__builtin_types_compatible_p(T1, T2)`.
+@code
+int dss_types_compatible_probe(void) { return __builtin_types_compatible_p(int, long); }
+@end
+
+@probe a_builtin_choose_expr_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. Paired with __builtin_types_compatible_p above, this is how type-generic macros SELECT a branch without evaluating the other one.
+@why GNU `__builtin_choose_expr(const, a, b)`.
+@code
+int dss_choose_expr_probe(int n) { return __builtin_choose_expr(1, n, 0); }
+@end
+
+@probe a_builtin_offsetof_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. This is what <stddef.h>'s `offsetof` EXPANDS TO on both of them, so a translation unit reaching it through the standard header hits this gap without ever writing `__builtin_offsetof`.
+@why GNU `__builtin_offsetof(type, member)`.
+@code
+struct DssOffs { int a, b; };
+unsigned long dss_builtin_offsetof_probe(void) { return __builtin_offsetof(struct DssOffs, b); }
+@end
+
+@probe a_real_imag_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. Note DSS DOES accept the `_Complex` type itself (a_complex_c99 passes) — so complex values can be declared and not decomposed, which is the shape of a half-implemented feature rather than an absent one.
+@why GNU `__real__` / `__imag__` operators on a complex value.
+@code
+_Complex double dss_real_imag_src;
+double dss_real_imag_probe(void) { return __real__ dss_real_imag_src + __imag__ dss_real_imag_src; }
+@end
+
+@probe a_alignof_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: `__alignof__` is rejected by DSS while `_Alignof` is accepted (a_alignas_alignof_c11 passes) and gcc 13.3.0 / clang 19.1.1 accept both. The same shape as a_typeof_gnu_spelling: the ISO keyword is implemented and the GNU spelling — the one that works at every -std level, and therefore the one real headers use — is not.
+@why GNU `__alignof__`.
+@code
+int dss_alignof_gnu_probe(void) { return (int)__alignof__(double); }
+@end
+
+@probe a_attribute_constructor_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. DSS accepts other GNU attributes (packed / aligned / noreturn all pass), so this is a per-ATTRIBUTE hole rather than absent attribute support — which is why it is its own row.
+@why GNU `__attribute__((constructor))`.
+@code
+int dss_attr_constructor_probe(void) __attribute__((constructor));
+@end
+
+@probe a_attribute_alias_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. Worth noting next to the direction-B extern-realization family: `alias` is one of the reference-compiler mechanisms for STATING that a name resolves to another symbol, i.e. part of the vocabulary DSS invented its own syntax for instead of adopting.
+@why GNU `__attribute__((alias("target")))`.
+@code
+int dss_alias_target_probe(void) { return 1; }
+int dss_alias_probe(void) __attribute__((alias("dss_alias_target_probe")));
+@end

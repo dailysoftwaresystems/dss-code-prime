@@ -199,3 +199,15 @@ dss_add_test(NAME link/test_object_format_backend_registry
              SOURCES test_object_format_backend_registry.cpp)
 target_link_libraries(dss_link_test_object_format_backend_registry
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# UCRT-P4 (D-FFI-PE-CRT-UCRT-MIGRATION): the `runtimeLibraries` ROLE TABLE's
+# red-on-disable levers + the migration's mechanical exit criterion. Both levers are
+# the C4 shape -- change CONFIG, recompile no C++, observe different EMITTED BYTES.
+# The json link is for the `$`-prefixed OMISSION RATIONALE key: `ObjectFormatSchema`
+# drops documentation keys on load, so the parsed schema cannot answer whether an
+# EXCLUDED pe flavour still carries the written reason for its exclusion. Same
+# precedent as test_object_format_family_symmetry / test_c_symbol_decoration.
+dss_add_test(NAME link/test_runtime_library_roles
+             SOURCES test_runtime_library_roles.cpp)
+target_link_libraries(dss_link_test_runtime_library_roles
+                      PRIVATE nlohmann_json::nlohmann_json)

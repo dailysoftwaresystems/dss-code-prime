@@ -4696,46 +4696,19 @@ private:
     }
 
     // FC15b (predefined macros; C 6.10.8.1): compute the once-per-TU translation
-    // DATE / TIME spellings from the wall clock. `__DATE__` is the C-mandated
-    // `"Mmm dd yyyy"` with a SPACE-padded day of month (`"Jun  4 2026"`, two
-    // leading spaces for a single-digit day); `__TIME__` is `"hh:mm:ss"`
-    // (zero-padded). Stored WITHOUT the surrounding quotes (the materializer
-    // wraps them). Uses `std::localtime` (the translation's local date, matching
-    // a hosted C implementation). Defensive: a null `localtime` (impossible in
-    // practice) leaves the strings empty -> a synth `""` literal, never a crash.
+    // DATE / TIME spellings. The SPELLINGS themselves live in the exported
+    // `translationTimestamp()` (bottom of this file) — the ONE owner, shared with
+    // `--dump-predefined-macros`, which has to report the very values this TU will
+    // see and would otherwise have re-derived the C-mandated formats itself.
+    //
+    // `needDate`/`needTime` still gate the STORE, so a TU that predefines neither
+    // reads no clock at all. Storing only what was asked for keeps the observable
+    // state identical to the pre-extraction shape.
     void computeDateTime(bool needDate, bool needTime) {
-        const std::time_t now = std::time(nullptr);
-        const std::tm* lt = std::localtime(&now);
-        if (lt == nullptr) return;
-        if (needDate) {
-            static char const* const kMon[12] = {
-                "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-            const int mon = (lt->tm_mon >= 0 && lt->tm_mon < 12) ? lt->tm_mon : 0;
-            // Sized for the format's WORST CASE over arbitrary `int`, not for a
-            // well-formed date: `%s`(3) + ' ' + `%2d`(<=11, "-2147483648") + ' '
-            // + `%04d`(<=11) + NUL = 28. Truncation is therefore structurally
-            // impossible rather than merely improbable, which is the stronger
-            // property — `tm_mon` is range-checked just above, but `tm_mday` and
-            // `tm_year` are not, so a hostile/broken `localtime` could otherwise
-            // silently truncate `__DATE__` to a wrong spelling (snprintf would
-            // not overflow, so this is a correctness bug, never a memory one).
-            // ★ Surfaced by gcc-13 -Wformat-truncation on an aarch64 host, which
-            // inlines this far enough to see the bound; the x86_64 legs do not
-            // report it. D-PP-DATETIME-BUF-SIZED-FOR-VALID-TM-ONLY.
-            char buf[32];
-            // SPACE-padded day (`%e` is not portable on MSVC), 4-digit year.
-            std::snprintf(buf, sizeof(buf), "%s %2d %04d", kMon[mon],
-                          lt->tm_mday, lt->tm_year + 1900);
-            dateString_ = buf;
-        }
-        if (needTime) {
-            // Same worst-case sizing: three `%02d` at <=11 each + 2 ':' + NUL = 36.
-            char buf[40];
-            std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", lt->tm_hour,
-                          lt->tm_min, lt->tm_sec);
-            timeString_ = buf;
-        }
+        if (!needDate && !needTime) return;
+        TranslationTimestamp const ts = translationTimestamp();
+        if (needDate) dateString_ = ts.date;
+        if (needTime) timeString_ = ts.time;
     }
 
     // FC15b (predefined macros; C 6.10.8.1): MATERIALIZE the replacement token(s)
@@ -5506,6 +5479,81 @@ MergedPredefinedMacros mergePredefinedMacros(
     return out;
 }
 
+// c105 (D-PP-USER-DEFINE): the ONE owner of the `--define NAME[=VALUE]` split
+// and of its `VALUE defaults to 1` rule. See the header for why the three
+// callers (the `<command-line>` prologue, the include-gating pre-scan prefix,
+// and `--dump-predefined-macros`) must not each carry their own copy.
+//
+// FIRST `=`, deliberately: a macro VALUE may legitimately contain `=`
+// (`--define EQ_OP="a == b"`), while a NAME may not — so the first separator is
+// the only split that cannot truncate a value. (`--resolve-library` splits on
+// the LAST `=` for the mirror-image reason; see `CliArgs::resolveLibraries`.)
+//
+// Agnosticism: compares `entry` against exactly one character and one string
+// literal, the latter being the DEFAULT VALUE the C/gcc `-D` rule specifies.
+// Nothing here knows a macro name, a language, an architecture or a format.
+UserDefineSplit splitUserDefine(std::string_view entry) noexcept {
+    auto const eq = entry.find('=');
+    if (eq == std::string_view::npos) {
+        // No `=` at all. `1` is the value gcc's `-DNAME` supplies and the value
+        // this project documents on `CliArgs::defines`.
+        return UserDefineSplit{entry, std::string_view{"1"},
+                               /*valueWasStated*/ false};
+    }
+    // Everything after the first `=`, EMPTY INCLUDED: `--define NAME=` states an
+    // EMPTY value, which is a different macro from `--define NAME`. Folding the
+    // empty case back onto the default would silently rewrite the user's request.
+    return UserDefineSplit{entry.substr(0, eq), entry.substr(eq + 1),
+                           /*valueWasStated*/ true};
+}
+
+// FC15b (C 6.10.8.1): the translation DATE + TIME spellings, from ONE read of the
+// wall clock. Extracted from the `MacroExpander`'s private `computeDateTime` so
+// `--dump-predefined-macros` can report the SAME spellings a real TU gets instead
+// of re-deriving the C-mandated formats — a second derivation of a format is how a
+// dump ends up disagreeing with the compile it claims to describe.
+//
+// Agnosticism: no language / architecture / object-format appears; the only
+// literals are the C standard's own month abbreviations and field layouts.
+TranslationTimestamp translationTimestamp() {
+    TranslationTimestamp out;
+    const std::time_t now = std::time(nullptr);
+    const std::tm*    lt  = std::localtime(&now);
+    // Defensive: a null `localtime` leaves BOTH strings empty -> a synth `""`
+    // literal and a dump that says the value is empty, never a fabricated date.
+    if (lt == nullptr) return out;
+    {
+        static char const* const kMon[12] = {
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        const int mon = (lt->tm_mon >= 0 && lt->tm_mon < 12) ? lt->tm_mon : 0;
+        // Sized for the format's WORST CASE over arbitrary `int`, not for a
+        // well-formed date: `%s`(3) + ' ' + `%2d`(<=11, "-2147483648") + ' '
+        // + `%04d`(<=11) + NUL = 28. Truncation is therefore structurally
+        // impossible rather than merely improbable — `tm_mon` is range-checked
+        // just above, but `tm_mday` and `tm_year` are not, so a hostile/broken
+        // `localtime` could otherwise silently truncate `__DATE__` to a wrong
+        // spelling (snprintf would not overflow, so this is a correctness bug,
+        // never a memory one).
+        // ★ Surfaced by gcc-13 -Wformat-truncation on an aarch64 host, which
+        // inlines this far enough to see the bound; the x86_64 legs do not
+        // report it. D-PP-DATETIME-BUF-SIZED-FOR-VALID-TM-ONLY.
+        char buf[32];
+        // SPACE-padded day (`%e` is not portable on MSVC), 4-digit year.
+        std::snprintf(buf, sizeof(buf), "%s %2d %04d", kMon[mon],
+                      lt->tm_mday, lt->tm_year + 1900);
+        out.date = buf;
+    }
+    {
+        // Same worst-case sizing: three `%02d` at <=11 each + 2 ':' + NUL = 36.
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", lt->tm_hour,
+                      lt->tm_min, lt->tm_sec);
+        out.time = buf;
+    }
+    return out;
+}
+
 namespace {
 
 // The preprocess RUN — the whole pass, MINUS the result-shape guarantee.
@@ -5620,15 +5668,14 @@ PreprocessResult preprocessRun(
         }
         std::string cliText;
         for (std::string const& d : userDefines) {
-            auto const eq = d.find('=');
-            std::string const name =
-                (eq == std::string::npos) ? d : d.substr(0, eq);
-            std::string const val =
-                (eq == std::string::npos) ? std::string{"1"} : d.substr(eq + 1);
+            // `splitUserDefine` is the ONE owner of the NAME/VALUE split and of
+            // the `VALUE defaults to 1` rule — shared with the pre-scan prefix
+            // below and with `--dump-predefined-macros`.
+            UserDefineSplit const s = splitUserDefine(d);
             cliText += "#define ";
-            cliText += name;
+            cliText += s.name;
             cliText += ' ';
-            cliText += val;
+            cliText += s.value;
             cliText += '\n';
         }
         if (!cliText.empty()) {
@@ -5650,10 +5697,14 @@ PreprocessResult preprocessRun(
     // `#if __STDC_VERSION__ >= 201112L`) gating a quote-`#include` evaluates
     // correctly, the pre-scan must see the macro's VALUE -- not just its
     // definedness. Built from:
-    //   (a) every command-line `--define`, parsed EXACTLY like the `<command-line>`
-    //       prologue above (VALUE defaults to 1) -- so the pre-scan is more-live
-    //       only IN LOCKSTEP with the authoritative pass (the one-directional-
-    //       divergence invariant that keeps P0016 closed); PLUS
+    //   (a) every command-line `--define`, parsed by the SAME `splitUserDefine`
+    //       the `<command-line>` prologue above uses (VALUE defaults to 1) -- so
+    //       the pre-scan is more-live only IN LOCKSTEP with the authoritative
+    //       pass (the one-directional-divergence invariant that keeps P0016
+    //       closed). ★ Sharing the FUNCTION, not merely the intent: these two
+    //       sites previously each carried their own copy of the split, held in
+    //       agreement by this comment alone, and a divergence here silently
+    //       changes whether a `#if NAME`-gated quote-`#include` resolves; PLUS
     //   (b) every OBJECT-like predefined macro available on the active format, via
     //       the SHARED filter (FINDING-B) the authoritative `predefined_` seed +
     //       `sbNameDefined` use -- so the sets cannot drift. FINDING-A: FUNCTION-
@@ -5666,15 +5717,11 @@ PreprocessResult preprocessRun(
     // const-ref + threaded into children.
     std::string preScanDefinePrefix;
     for (std::string const& d : userDefines) {
-        auto const eq = d.find('=');
-        std::string const name =
-            (eq == std::string::npos) ? d : d.substr(0, eq);
-        std::string const val =
-            (eq == std::string::npos) ? std::string{"1"} : d.substr(eq + 1);
+        UserDefineSplit const s = splitUserDefine(d);
         preScanDefinePrefix += "#define ";
-        preScanDefinePrefix += name;
+        preScanDefinePrefix += s.name;
         preScanDefinePrefix += ' ';
-        preScanDefinePrefix += val;
+        preScanDefinePrefix += s.value;
         preScanDefinePrefix += '\n';
     }
     // TF-C74: the EFFECTIVE list (seed site #4 of four) — already

@@ -119,35 +119,41 @@ struct DSS_EXPORT ExternImport {
     // `linker.cpp`'s `dedupKey`). Two rows that share a NAME but disagree on the
     // owning library are two DIFFERENT dynamic symbols by construction, so they
     // do not fold, and nothing about them is OR-combined. The contract above
-    // therefore holds only where the two PRODUCERS spell the same library:
-    //   * the shipped descriptor's `library` map, e.g. src/dss-config/
-    //     shippedLibs/stdio.json:5 → {"pe":"ucrtbase.dll", "elf":"libc.so.6",
-    //     "macho":"/usr/lib/libSystem.B.dylib"};
-    //   * the source-declared-extern default, src/dss-config/sources/
-    //     c-subset.lang.json:1531 `externLibraryByFormat` →
-    //     {"pe":"msvcrt.dll", "elf":"libc.so.6",
-    //      "macho":"/usr/lib/libSystem.B.dylib"}.
-    // On elf and macho those AGREE, so the fold happens and the contract reads
-    // exactly as written. ⚠ ON pe THEY DIVERGE — `ucrtbase.dll` vs `msvcrt.dll`
-    // — so on pe the two rows are, correctly per the key, two imports: a CU that
-    // `#include <stdio.h>`s (⇒ the descriptor row, ucrtbase.dll) beside a sibling
-    // CU that hand-declares `extern int puts(const char*);` without the header
-    // (⇒ the source-extern default, msvcrt.dll) yields TWO surviving rows, TWO
-    // IMAGE_IMPORT_DESCRIPTORs, and the hand-declaring CU's call bound into
-    // msvcrt's copy — the split CRT the UCRT migration retired. Reachable
-    // CROSS-CU only: same-TU the semantic tier SUPPRESSES the shipped row when the
-    // user declares the name (semantic_analyzer.cpp:13324,13354) and forwards the
-    // descriptor's library with it, so one TU yields one row.
-    // ★ THIS DIVERGENCE IS A PRE-EXISTING UCRT-MIGRATION RESIDUAL, NOT SOMETHING
-    // THE FOLD INTRODUCED: the two config values were already what they are, and
-    // widening the key merely stopped a name-only key from HIDING the mismatch
-    // behind a silent cross-library fold (which is itself the misbind
-    // D-LK11-EXTERN-IMPORT-DEDUP exists to prevent). Reconciling the two pe
-    // defaults belongs to D-FFI-PE-CRT-UCRT-MIGRATION, not to the dedup key.
-    // The CURRENT behaviour is pinned by
-    // `MirMerge.PeUcrtbaseAndMsvcrtRowsOfOneNameStayTwoImports` in
-    // tests/mir/test_mir_merge.cpp so that changing either config value MOVES a
-    // test rather than silently changing what a pe binary imports.
+    // therefore holds only where the two PRODUCERS spell the same library.
+    //
+    // ★★ UCRT-P4 (Decision 1) REDUCED THAT TO ONE PRODUCER, AND THAT IS THE POINT.
+    // There used to be two independent owners of "which image owns this name":
+    //   * the shipped descriptor's per-format `library` map (e.g.
+    //     src/dss-config/shippedLibs/stdio.json → {"pe":"ucrtbase.dll",
+    //     "elf":"libc.so.6", "macho":"/usr/lib/libSystem.B.dylib"}), and
+    //   * a per-LANGUAGE `externLibraryByFormat` default in the `.lang.json`,
+    //     whose pe entry named the LEGACY `msvcrt.dll`.
+    // On elf and macho those agreed; ON pe THEY DIVERGED, so a CU that
+    // `#include <stdio.h>`d (⇒ ucrtbase.dll) beside a sibling CU that hand-declared
+    // `extern int puts(const char*);` without the header (⇒ the language default,
+    // msvcrt.dll) produced TWO surviving rows, TWO IMAGE_IMPORT_DESCRIPTORs, and the
+    // hand-declaring CU's call bound into msvcrt's copy — a SPLIT CRT in one image.
+    // ⇒ THE LANGUAGE DEFAULT HAS BEEN REMOVED, not repointed. A user declaration
+    // carries the SIGNATURE; the PLATFORM (the descriptor corpus, per format) carries
+    // the REALIZATION, so a hand-written prototype and an `#include`d one now resolve
+    // through the SAME descriptor row and produce a BYTE-IDENTICAL import. Repointing
+    // the default at ucrtbase would have been the workaround, and a lethal one:
+    // ucrtbase exports no bare `printf`, so the flip would have turned a
+    // wrong-but-loadable msvcrt import into an unresolvable one — 0xC0000139 at the
+    // LOAD of every such binary. Removing the field's authority is the fix.
+    //
+    // ⇒ WHAT REMAINS REACHABLE, and why the wide key still earns its keep: two
+    // CONFIG-DECLARED images can still legitimately own one name — a per-SYMBOL
+    // `library` override routes a single name off its header's default image (pe
+    // `strftime`→ucrtbase while the rest of <time.h> stays elsewhere), and
+    // `setjmp.json` deliberately still names msvcrt.dll. Those are DECLARED
+    // divergences, and the (mangledName, libraryPath, version) key keeps them two
+    // distinct dynamic symbols instead of silently folding them — which is the
+    // misbind D-LK11-EXTERN-IMPORT-DEDUP exists to prevent. What is gone is the
+    // UNDECLARED divergence that came from a second owner guessing.
+    // Pinned by `MirMerge.TwoConfigDeclaredImagesOwningOneNameStayTwoImports` in
+    // tests/mir/test_mir_merge.cpp, so changing a declared image MOVES a test rather
+    // than silently changing what a pe binary imports.
     //
     // INVARIANT:
     // isEagerImport ⟹ non-empty `libraryPath` (a descriptor always ships a

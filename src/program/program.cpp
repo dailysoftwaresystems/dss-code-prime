@@ -17,7 +17,7 @@
 #include "ffi/shipped_lib_descriptor.hpp"  // isKnownSynthesizeRecipe (FC17.9a threads-shim vocab)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
-#include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
+#include "mir/merge/synth_pe_startup.hpp"  // realizeEntryShape (the argv spine)
 #include "mir/merge/synth_stdio_shim.hpp"  // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "lsp/lsp_server.hpp"
@@ -688,6 +688,9 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         memberNames.reserve(cuMirs.size());
         for (std::size_t i = 0; i < cuMirs.size(); ++i) {
             auto mod = lowerCuMirToAssembly(cuMirs[i], (*formatR)->processArgs(),
+                                            (*formatR)->entryVerbs(),
+                                            (*formatR)->sehPersonality(),
+                                            (*formatR)->name(),
                                             (*formatR)->kind(), reporter);
             if (!mod) return false;  // back-half tier failure already reported
             members.push_back(std::move(*mod));
@@ -735,6 +738,9 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // work + a different code path); keep the proven single-CU lowering for byte-identity.
     if (cuMirs.size() == 1) {
         auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(),
+                                        (*formatR)->entryVerbs(),
+                                        (*formatR)->sehPersonality(),
+                                        (*formatR)->name(),
                                         (*formatR)->kind(), reporter);
         if (!mod) {              // back-half tier failure already reported via `reporter`
             emitNullNoDiagnostic("back-half lower (lowerCuMirToAssembly)");
@@ -830,24 +836,66 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     TypeLattice host{cuMirs[0].cuId,
                      std::string{cuMirs[0].model.lattice().registry().sourceLanguage()}};
 
-    // entryNames: the grammar's entry-function name list (the same list the single-CU
-    // user-entry scan reads). The merge uses it to compute the merged `userEntrySymbol`.
-    // FC5: read the de-conflated `entryFunctionNames` (the program-entry concept),
-    // falling back to `implicitReturnZeroForFunctionNames` (the C return-0 set) when a
-    // declaration doesn't separately declare its entry names — so the two concepts can
-    // diverge without one silently dragging the other (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN).
+    // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: resolve the program entry BEFORE the
+    //    merge, across EVERY CU, through the SAME single owner the single-CU path
+    //    uses ──────────────────────────────────────────────────────────────────────
+    //
+    // ★★★ THIS REPLACED A NAME LIST HANDED TO `mergeCuMirs`, AND THE NAME LIST WAS
+    // TWO DEFECTS AT ONCE.
+    //
+    //   (1) IT WAS FORMAT-BLIND. Every name the language declared was passed in, so
+    //       `wmain` was an entry candidate on ELF and Mach-O. MEASURED 2026-08-10
+    //       on HEAD `3e86a187`: `int wmain(int, unsigned short**)` with no `main`,
+    //       built for `elf64-x86_64-linux-exec`, was SELECTED as the Linux program
+    //       entry. Candidacy now requires the format to realize the verb the
+    //       matched language row needs.
+    //   (2) THE MERGE'S OWN SCAN HAS NO AMBIGUITY CHECK. `mergeCuMirs` walks CUs
+    //       and functions and takes the FIRST name in the set it is given, so
+    //       `main` in a.c and `wmain` in b.c silently picked one — while the
+    //       single-CU path refused the same program. Two paths, two answers, and
+    //       the merged one was the silent wrong-entry.
+    //
+    // Resolving HERE fixes both without touching the merge's contract: the scan runs
+    // over each CU's SemanticModel (which has the signatures the merge cannot
+    // express), and only the ONE winning name is handed to `mergeCuMirs` — so its
+    // first-match-wins walk is now provably unambiguous rather than accidentally so.
+    std::vector<EntryCandidate> cands;
+    std::vector<std::uint32_t>  candSym;   // per-model record indices; unused here
+    for (auto& cu : cuMirs) collectEntryCandidates(cu.model, cands, candSym);
+    bool entryOk = true;
+    auto const resolvedEntry = resolveProgramEntry(
+        cands, (*formatR)->entryVerbs(), (*formatR)->name(), reporter, entryOk);
+    if (!entryOk) return false;   // undefined / ambiguous entry — already reported.
+
+    // The winning name, MANGLED to the merge's DEFINITION-KEY convention.
+    //
+    // ★★ THE MANGLING MUST GO THROUGH THE SAME FUNCTION `nameOf` USES, NOT MERELY
+    // THE SAME IDEA. `MergeCuInput::nameOf` calls `dss::ffi::linkNameFor(name,
+    // asmName, scheme, linkName)`, which honours a per-symbol `asm` label and a
+    // descriptor `linkName` OVERRIDE; `applyCMangling` applies only the format's
+    // C decoration and knows nothing about either. For a plain `main` the two agree,
+    // which is exactly why using the wrong one is a latent trap rather than an
+    // immediate failure — it would diverge only for an entry carrying an asm label.
+    // Feed the SymbolRecord through `linkNameFor` so the key is the same string by
+    // CONSTRUCTION (D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY, c118: macho keys `_main`,
+    // identity on elf/pe).
     std::vector<std::string> entryNames;
-    for (auto const& decl : grammar.semantics().declarations) {
-        auto const& names = decl.entryFunctionNames.empty()
-                                ? decl.implicitReturnZeroForFunctionNames
-                                : decl.entryFunctionNames;
-        for (auto const& n : names) {
-            // D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY (c118): mangle the entry name to the same
-            // convention as the merge's DEFINITION keys (nameOf mangles too), so the merged
-            // `userEntrySymbol` scan — `entrySet.count(nameOf(func))` in mergeCuMirs — still
-            // finds `main` on macho (both keyed `_main`). Identity on elf/pe.
-            entryNames.push_back(dss::ffi::applyCMangling(n, cSymDecor));
+    EntryMaterialization entryVerb = EntryMaterialization::None;
+    if (resolvedEntry.has_value()) {
+        std::string_view const winner = cands[resolvedEntry->index].name;
+        for (auto& cu : cuMirs) {
+            bool done = false;
+            for (auto const& rec : cu.model.symbols()) {
+                if (rec.kind != DeclarationKind::Function) continue;
+                if (!rec.entryVerb.has_value() || rec.name != winner) continue;
+                entryNames.push_back(dss::ffi::linkNameFor(
+                    rec.name, rec.asmName, cSymDecor, rec.linkName));
+                done = true;
+                break;
+            }
+            if (done) break;
         }
+        entryVerb = resolvedEntry->verb;
     }
 
     auto merged = mergeCuMirs(
@@ -857,19 +905,31 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         reporter);
     if (!merged) return false;  // merge failure (conflict / verify) already reported.
 
-    // c111 (D-RUNTIME-PE-MAIN-ARGS): when the target format fetches argc/argv via a
-    // CRT out-parameter call (Windows __wgetmainargs/__getmainargs — the PE OS entry
-    // carries no C argument vector), synthesize the pre-main init that makes that call
-    // and forwards (argc, argv) to the user entry, retargeting `userEntrySymbol` to it.
-    // Runs BEFORE optimize so the synth function is DCE-rooted (Global) + optimized +
-    // lowered like any other. A no-op for every other mechanism / a no-arg entry. The
-    // interner is the merged host's (the type space the merged TypeIds index into).
-    if (auto const& pa = (*formatR)->processArgs(); pa.has_value()) {
-        if (!synthesizePeStartup(merged->mir, merged->host.interner(),
-                                 merged->userEntrySymbol, merged->externImports,
-                                 *pa, reporter)) {
-            return false;  // malformed argv parameter type — fail-loud already reported.
-        }
+    // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
+    // MATERIALIZE the resolved entry's arguments per its verb × the format's declared
+    // mechanism. On the CRT-accessor route (Windows: the PE OS entry carries no C
+    // argument vector) this appends the pre-main init that calls the UCRT populate +
+    // accessor exports and forwards (argc, argv) to the user entry, retargeting
+    // `userEntrySymbol` to it. Runs BEFORE optimize so an appended init is DCE-rooted
+    // (Global) + optimized + lowered like any other. The interner is the merged host's
+    // (the type space the merged TypeIds index into).
+    //
+    // ⚠ CALLED UNCONDITIONALLY — deliberately, and this is a CHANGE from c111, which
+    // guarded the call with `if (processArgs.has_value())`. That guard was harmless
+    // while the pass only synthesized, but it would SILENTLY SKIP the pass on Mach-O,
+    // whose exec formats declare NO `processArgs` (dyld delivers argc/argv in the
+    // argument registers before any DSS code runs). A pass must not be keyed on a
+    // field that is legitimately absent on a whole platform.
+    //
+    // ⓘ THE VERB IS AN INPUT, and there is no gate here any more. The signature check
+    // ran at the SEMANTIC tier, per definition, with a source span
+    // (`S_EntryShapeNotDeclared`); candidacy was decided by `resolveProgramEntry`
+    // above. This call does exactly one job.
+    if (!realizeEntryShape(merged->mir, merged->host.interner(),
+                           merged->userEntrySymbol, merged->externImports,
+                           entryVerb, (*formatR)->processArgs(), cSymDecor,
+                           (*formatR)->name(), reporter)) {
+        return false;  // unusable mechanism — fail-loud already reported.
     }
 
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): whole-program
@@ -999,7 +1059,9 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // Appends the __C_specific_handler personality import on demand.
     std::vector<MirSehScope> sehScopes;
     if (!synthesizeSehFunclets(merged->mir, merged->host.interner(),
-                               merged->externImports, sehScopes, reporter)) {
+                               merged->externImports,
+                               (*formatR)->sehPersonality(), cSymDecor,
+                               (*formatR)->name(), sehScopes, reporter)) {
         return false;  // unsupported SEH shape (c116b frontier) — fail-loud reported.
     }
 

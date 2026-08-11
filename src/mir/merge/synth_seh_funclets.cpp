@@ -4,6 +4,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/core_type.hpp"       // TypeKind, CallConv
 #include "core/types/type_lattice/type_interner.hpp"
+#include "ffi/mangling/c_mangle.hpp"   // applyCMangling (per-format personality name)
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
@@ -11,6 +12,7 @@
 #include <algorithm>   // std::max
 #include <array>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -437,11 +439,14 @@ parentAllocaSlotIds(Mir const& mir, MirFuncId fn) {
 
 } // namespace
 
-bool synthesizeSehFunclets(Mir&                        mir,
-                           TypeInterner&               interner,
-                           std::vector<ExternImport>&  externImports,
-                           std::vector<MirSehScope>&   outScopes,
-                           DiagnosticReporter&         reporter) {
+bool synthesizeSehFunclets(Mir&                                  mir,
+                           TypeInterner&                         interner,
+                           std::vector<ExternImport>&            externImports,
+                           std::optional<SehPersonality> const&  sehPersonality,
+                           CSymbolDecorationScheme               scheme,
+                           std::string_view                      formatName,
+                           std::vector<MirSehScope>&             outScopes,
+                           DiagnosticReporter&                   reporter) {
     // (0) Fast presence scan — no SehTryBegin anywhere ⇒ clean no-op.
     bool anySeh = false;
     std::size_t const nf0 = mir.moduleFuncCount();
@@ -543,13 +548,57 @@ bool synthesizeSehFunclets(Mir&                        mir,
     }
     if (regions.empty()) return true;  // scan said yes but none resolved — no-op
 
-    // Register the __C_specific_handler personality import (SEH-gated, on demand —
-    // the c101 loader law; NEVER in windows.json symbols).
+    // ── Register the FORMAT-DECLARED personality import ────────────────────
+    //
+    // SEH-gated + on demand (the c101 loader law; NEVER in windows.json symbols).
+    //
+    // ★★ UCRT-P4: THE TWO LITERALS THAT USED TO BE HERE ARE GONE. This block read
+    // `pers.mangledName = "__C_specific_handler"` and `pers.libraryPath =
+    // "msvcrt.dll"` — a Microsoft-extension routine name and a legacy CRT image
+    // spelled inside `src/mir`, on a pass that runs for EVERY format. Nothing
+    // could override them and no test could see them, which is exactly how the
+    // second one survived the whole pe CRT migration unnoticed.
+    //
+    // The REFUSAL below is placed HERE and not at the top of the function on
+    // purpose: the fast presence scan has already returned for every module
+    // without a `__try`, so a format that declares no personality stays fully
+    // usable for every program that does not use SEH. The gate fires only when a
+    // guarded region actually resolved and therefore actually needs a handler.
+    if (!sehPersonality.has_value()) {
+        emitErr(reporter, std::format(
+                    "synthesizeSehFunclets: {} SEH region(s) resolved but object "
+                    "format '{}' declares NO `sehPersonality` block, so there is "
+                    "no unwinder-personality routine to name in the emitted "
+                    "unwind info and no image to import it from. `__try`/"
+                    "`__except` is a Microsoft extension, not C23 — a format "
+                    "realizes it only by DECLARING its personality (routine + "
+                    "runtimeLibraries role). Build this translation unit for a "
+                    "format that declares one. ⚠ DO NOT reflexively 'just add "
+                    "the block' to silence this: on a format whose writer emits "
+                    "no unwind info, declaring a personality turns this LOUD, "
+                    "CORRECT refusal into a SILENT MISCOMPILE. ✔MEASURED on the "
+                    "pe64 relocatable-obj and staticlib arms — with the block "
+                    "declared they compile rc=0 and the artifact carries `.text` "
+                    "ONLY: no `.pdata`, no `.xdata`, filter funclets and scope "
+                    "table dropped, so `__except` can never run. Add the block "
+                    "ONLY to a format whose writer actually emits unwind info "
+                    "(the pe64 exec and dll arms do; both were witnessed by "
+                    "RUNNING a guarded division-by-zero through to its "
+                    "`__except`). See D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO. "
+                    "(D-WIN64-SEH-FUNCLETS + D-FFI-PE-CRT-UCRT-MIGRATION.)",
+                    regions.size(), formatName));
+        return false;
+    }
     {
         ExternImport pers;
         pers.symbol      = personalitySym;
-        pers.mangledName = "__C_specific_handler";
-        pers.libraryPath = "msvcrt.dll";
+        // C-mangled for the active format through the SAME `applyCMangling` the
+        // FFI ingest uses. The old literal was undecorated — correct on pe
+        // (`scheme: none`) and silently wrong the instant a `leading-underscore`
+        // format declared a personality.
+        pers.mangledName =
+            dss::ffi::applyCMangling(sehPersonality->mangledName, scheme);
+        pers.libraryPath = sehPersonality->libraryPath;
         pers.isData      = false;
         // D-LINK-EXTERN-IMPORT-REFERENCE-GATE (TF-C44): this personality import is
         // referenced by the pe UNWIND_INFO's EHANDLER handler-RVA field (the SEH scope

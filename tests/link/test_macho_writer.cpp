@@ -1426,11 +1426,10 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
       "bitFieldStrategy": "gnu_packed",
       "entryPoint": "",
       "externCallDispatch": "direct-plt",
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -2048,11 +2047,10 @@ TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-dylibs","kind":"macho"},
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld" },
@@ -2122,11 +2120,10 @@ TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"underflow","kind":"macho"},
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
@@ -2161,11 +2158,10 @@ TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-dyld","kind":"macho"},
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
@@ -2640,11 +2636,10 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-lazy-pending","kind":"macho"},
       "entryPoint": "",
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -2701,11 +2696,10 @@ TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-default","kind":"macho"},
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -2730,11 +2724,10 @@ TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-on","kind":"macho"},
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -2764,11 +2757,10 @@ TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-bad","kind":"macho"},
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -2824,11 +2816,10 @@ loadChainedFixupsExecFormat() {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-integration","kind":"macho"},
       "entryPoint": "",
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -3207,11 +3198,10 @@ TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-legacy-for-delta","kind":"macho"},
       "entryPoint": "",
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -3437,11 +3427,10 @@ TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bindnow-default","kind":"macho"},
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -3475,11 +3464,10 @@ TEST(MachOExecFormatJson, PageZeroSizeMustBePowerOfTwo) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bad-pagezero","kind":"macho"},
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -3623,11 +3611,10 @@ TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bindnow-wrong","kind":"macho"},
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -3665,11 +3652,10 @@ TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-two-libs","kind":"macho"},
       "entryPoint": "",
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {

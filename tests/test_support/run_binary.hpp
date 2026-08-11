@@ -219,6 +219,16 @@ namespace detail {
 // `D-RUN-HARNESS-STDIO-SPLIT` if a future case needs separate
 // stdout/stderr streams).
 //
+// `programArgs` (UCRT-P4): arguments appended AFTER `binaryPath`, i.e. the
+// program's own `argv[1..]`. EMPTY by default, which is byte-identical to every
+// pre-UCRT-P4 spawn (the child saw argc == 1). It exists because the pe
+// program-entry argv spine's REAL INPUT PATH is the OS command line: a test that
+// hands the program a re-typed vector is not testing the mechanism at all, and the
+// examples runner has no argv knob, so `argc == 1` was the only observable any
+// harness could produce. DISTINCT FROM `launcherPrefix`, which goes BEFORE the
+// binary and belongs to the EMULATOR, not the program; the two compose (an
+// emulated run still passes the program its own arguments).
+//
 // `launcherPrefix` (D-LK10-ENTRY-ARM64, v0.0.2 V2-1): an optional
 // argv prefix prepended ahead of `binaryPath`. EMPTY by default —
 // the binary is exec'd directly (byte-identical to the pre-V2-1
@@ -233,7 +243,8 @@ namespace detail {
 spawnAndWait(std::filesystem::path const&     binaryPath,
              std::chrono::milliseconds        timeout,
              ChildStdio                       stdio,
-             std::vector<std::string> const&  launcherPrefix) {
+             std::vector<std::string> const&  launcherPrefix,
+             std::vector<std::string> const&  programArgs) {
     RunResult out;
     // The pipe plumbing below is written in terms of this predicate; the
     // Inherit and Discard modes differ only in how the child's handles are
@@ -328,6 +339,16 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
         cmdline += "\"" + pathStr + "\"";
     } else {
         cmdline = "\"" + pathStr + "\"";
+    }
+    // The program's own arguments. Each is QUOTED so an argument containing a
+    // SPACE arrives as ONE element -- which is exactly the case a test of the argv
+    // mechanism has to be able to pose. Embedded double quotes and trailing
+    // backslashes are NOT escaped here: no caller needs them, and a half-correct
+    // escaper is worse than an absent one, since it would silently mangle the
+    // input a test believes it sent. Add the full MSVCRT quoting algorithm the
+    // first time a caller genuinely needs it, with its own pin.
+    for (auto const& a : programArgs) {
+        cmdline += " \"" + a + "\"";
     }
 
     BOOL const ok = ::CreateProcessA(
@@ -543,9 +564,13 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     // The program exec'd is argv[0] — the emulator's full path when a
     // prefix is present (caller-resolved on PATH), else the binary.
     std::vector<std::string> argStrings;
-    argStrings.reserve(launcherPrefix.size() + 1);
+    argStrings.reserve(launcherPrefix.size() + 1 + programArgs.size());
     for (auto const& p : launcherPrefix) argStrings.push_back(p);
     argStrings.push_back(pathStr);
+    // The program's own arguments. No quoting on this arm: `posix_spawn` takes an
+    // argv ARRAY, so each element crosses the exec boundary intact by construction
+    // -- there is no command-line string for a space to be re-split inside.
+    for (auto const& a : programArgs) argStrings.push_back(a);
     std::vector<char const*> argvVec;
     argvVec.reserve(argStrings.size() + 1);
     for (auto const& a : argStrings) argvVec.push_back(a.c_str());
@@ -737,7 +762,10 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
 runBinary(std::filesystem::path const&     binaryPath,
           std::chrono::milliseconds        timeout        = kRunBudget,
           bool                             captureStdout  = false,
-          std::vector<std::string> const&  launcherPrefix = {}) {
+          std::vector<std::string> const&  launcherPrefix = {},
+          // UCRT-P4: the program's own `argv[1..]`. Empty = the pre-UCRT-P4
+          // behaviour (argc == 1) for every existing caller.
+          std::vector<std::string> const&  programArgs    = {}) {
     // Skipped under an emulator: there the program the kernel actually
     // exec's is `launcherPrefix[0]` — a long-lived system binary that was
     // admitted once, long ago — while the freshly written image is merely
@@ -745,13 +773,18 @@ runBinary(std::filesystem::path const&     binaryPath,
     // admission cost to absorb, and warming up would only double the
     // runtime of the slowest arm in the matrix.
     if (launcherPrefix.empty()) {
+        // The warm-up passes the SAME arguments as the timed run. It must: a
+        // program given different input can take a different path, and the point of
+        // phase 1 is to pay the OS's one-time admission cost for the code the timed
+        // run will execute -- not for a different execution of it.
         (void)detail::spawnAndWait(binaryPath, kAdmissionBudget,
-                                   ChildStdio::Discard, launcherPrefix);
+                                   ChildStdio::Discard, launcherPrefix,
+                                   programArgs);
     }
     return detail::spawnAndWait(
         binaryPath, timeout,
         captureStdout ? ChildStdio::CapturePipe : ChildStdio::Inherit,
-        launcherPrefix);
+        launcherPrefix, programArgs);
 }
 
 }  // namespace dss::test_support

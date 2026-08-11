@@ -1,9 +1,11 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header)
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -26,6 +28,38 @@ namespace dss {
 //               once at construction (C 6.10.8.1).
 //   Time     -- the translation TIME, a string literal `"hh:mm:ss"` computed once.
 enum class PredefinedMacroKind { Line, File, Constant, Date, Time };
+
+// The kind's CONFIG SPELLING — the same verb `parsePredefinedMacroArray`
+// (`predefined_macro_json.cpp`) accepts for the `"kind"` key, in ONE table so the
+// read side and the report side cannot drift. `--dump-predefined-macros` prints
+// these, so an operator auditing the effective set sees the very word they would
+// write in a `.lang.json` / `.target.json` / `.format.json` to declare it.
+//
+// ★ NOT A COMPLETE LIST OF ACCEPTED VERBS, and that is deliberate: the loader
+// also accepts `"version"`, which is not a kind at all — it LOWERS to `Constant`
+// at load time (see the long note at its arm in `predefined_macro_json.cpp`). A
+// table row for it would claim a runtime kind that does not exist. So the
+// invariant is one-directional and is pinned by a test: every row here is a verb
+// the loader accepts, not every verb the loader accepts is a row here.
+//
+// No fall-back row is reachable: `PredefinedMacroKind` has no invalid sentinel,
+// so every value the engine can hold is enumerated below.
+inline constexpr EnumNameTable<PredefinedMacroKind, 5> kPredefinedMacroKindTable{{{
+    { PredefinedMacroKind::Line,     "line"     },
+    { PredefinedMacroKind::File,     "file"     },
+    { PredefinedMacroKind::Constant, "constant" },
+    { PredefinedMacroKind::Date,     "date"     },
+    { PredefinedMacroKind::Time,     "time"     },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+predefinedMacroKindName(PredefinedMacroKind k) noexcept {
+    return kPredefinedMacroKindTable.name(k);
+}
+[[nodiscard]] constexpr std::optional<PredefinedMacroKind>
+predefinedMacroKindFromName(std::string_view s) noexcept {
+    return kPredefinedMacroKindTable.fromName(s);
+}
 
 // TF-C83 (D-CSUBSET-TOOLCHAIN-IDENTITY-PREDEFINES). Pack a dot-separated version ("0.0.2")
 // into ONE integer using `weights` (most-significant first, last entry 1):

@@ -30,7 +30,8 @@
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
-#include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
+#include "mir/mir_verifier.hpp"           // MirVerifier (UCRT-P4: verify the POST-SYNTHESIS module)
+#include "mir/merge/synth_pe_startup.hpp"  // realizeEntryShape (UCRT-P4: the argv spine)
 #include "mir/merge/synth_stdio_shim.hpp"  // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "opt/optimizer.hpp"
@@ -344,9 +345,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
     }
 
     // 2.5. FFI metadata synthesis for source-declared externs
-    //      (FF6 Slice 2, 2026-06-02). When the language schema's
-    //      `externDecl` rule declares an `externLibraryByFormat`
-    //      entry for the active object format, every extern the
+    //      (FF6 Slice 2, 2026-06-02). Every extern the
     //      HIR lowerer collected gets a FfiMetadata row written to
     //      the per-CU `HirFfiMap`. HIR→MIR (step 3) consumes the
     //      map to materialize each `ExternFunction` /
@@ -361,32 +360,26 @@ static std::optional<CuMirModule> buildCuMirImpl(
     //      with no `set()` calls is observationally identical to
     //      passing `nullptr` for callers of empty-extern modules.
     //
-    //      Agnostic over CPU + format: the per-format library
-    //      identity comes from `grammar.semantics().declarations`'s
-    //      `externLibraryByFormat` map keyed on
-    //      `objectFormatKindName(format.kind())`. ELF / Mach-O
-    //      hosts thread through the same call with their own
-    //      library identities; a future grammar extension to allow
-    //      `extern "otherlib.dll" int foo();` (anchored
-    //      D-CSUBSET-EXTERN-LIBRARY-SYNTAX) layers a per-extern
-    //      override on top of this map without touching the
-    //      synthesis kernel.
+    //      ★★ UCRT-P4 (Decision 1): THERE IS NO PER-LANGUAGE
+    //      FORMAT-DEFAULT LIBRARY ANY MORE. Every row's import
+    //      library comes from the ROW — the PLATFORM's
+    //      shipped-descriptor realization, or a source
+    //      `extern "otherlib.dll" int foo();`
+    //      (D-CSUBSET-EXTERN-LIBRARY-SYNTAX) — and a row with
+    //      neither is UNBOUND, resolved at the LINK tier per C23
+    //      5.1.1.2 phase 8. The former `externLibraryByFormat` map
+    //      was a per-LANGUAGE GUESS standing in for the corpus and a
+    //      SECOND OWNER of a fact the corpus owns per SYMBOL, and it
+    //      is what made a hand-written
+    //      `extern int printf(const char*, ...);` bind a different C
+    //      runtime than the same program's `#include`d stdio surface.
+    //      Agnostic over CPU + format: the only format-keyed step
+    //      left is the FOLD below, which selects the active format's
+    //      entry out of each row's own per-format map.
     HirFfiMap ffiMap{hir->hir};
     if (!hir->externDecls.empty()) {
-        // Find the active language's `externLibraryByFormat`
-        // entry for this object format. Lives at SemanticConfig
-        // scope (post-fold #1 2026-06-02): one map per language,
-        // keyed on `objectFormatKindName(format.kind())`. Empty
-        // string ⇒ no entry; synthesize() fails loud with
-        // F_FfiNoImportLibraryForFormat upstream of the linker.
-        auto const& libMap =
-            grammar.semantics().externLibraryByFormat;
         std::string const formatKey{
             objectFormatKindName(format.kind())};
-        std::string importLibrary;
-        if (auto it = libMap.find(formatKey); it != libMap.end()) {
-            importLibrary = it->second;
-        }
 
         // Build the temporary ExternDeclRef span from the lowerer's
         // owning records. The views are valid for the duration of
@@ -401,9 +394,9 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // single string `ExternDeclRef.libraryOverride` carries. The fold keys
         // on `formatKey` (= objectFormatKindName(format.kind())) — no
         // `if(format)`. A key present ⇒ that image; a key ABSENT ⇒ empty
-        // override, which (per the existing ExternDeclRef contract) makes the
-        // FFI synthesize stage fall back to the format-level default
-        // `importLibrary` (externLibraryByFormat[format]).
+        // override, which (UCRT-P4, Decision 1) now means UNBOUND — there is no
+        // format-level default left to fall back to, so the reference resolves
+        // at the LINK tier (C23 5.1.1.2 phase 8).
         std::vector<std::string> resolvedLibs;
         resolvedLibs.reserve(hir->externDecls.size());
         for (auto const& r : hir->externDecls) {
@@ -464,9 +457,14 @@ static std::optional<CuMirModule> buildCuMirImpl(
         //   4. a governed extern ABSENT from every named binary:
         //      * KNOWN system symbol AND declared for the ACTIVE OBJECT FORMAT
         //        (in some shipped descriptor, e.g. a bare `extern int puts;`
-        //        the user did not #include) → fall through to the format-default
-        //        library (`externLibraryByFormat`), the gcc implicit-libc
-        //        semantics -- NOT a fail-loud;
+        //        the user did not #include) → fall through, the gcc implicit-libc
+        //        semantics -- NOT a fail-loud. ⓘ UCRT-P4 (Decision 1): such a row
+        //        now already CARRIES the platform's realization (the semantic
+        //        realization pass gave it the descriptor's own per-format library
+        //        before this stage ran), so "fall through" no longer means
+        //        "inherit a language-level default" — that default is gone. The
+        //        partition below sees it as explicitly bound, which is the honest
+        //        classification: it IS bound, by the corpus.
         //      * KNOWN system symbol but declared ONLY FOR OTHER FORMATS (the
         //        elf-only `fdatasync` referenced by a macho build) → FAIL LOUD
         //        F_ShippedSymbolUnavailableForTarget. Falling through here would
@@ -504,21 +502,41 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // over ALL externs -- byte-identical output.
         if (opts.resolveLibraries.empty()) {
             auto const ffiResult = ffi::synthesizeFfiFromSourceDecls(
-                refs, importLibrary, target, format, ffiMap, reporter);
+                refs, target, format, ffiMap, reporter);
             (void)ffiResult;  // shape inspected via reporter.errorCount()
         } else {
-            // PARTITION: an extern with NEITHER an explicit per-symbol
-            // override NOR the no-library marker is "binary-governed" -- it
-            // would otherwise take the format-default (precedence 4), so it
-            // is exactly the class `--resolve-library` governs. `refs` and
-            // `binaryGoverned` are parallel-indexed to `hir->externDecls` so
-            // an unmatched governed extern can be recovered post-ingest.
+            // PARTITION: an extern that already CARRIES A LIBRARY is explicitly
+            // bound and the binary read never overrides it (precedence 2); every
+            // other extern is "binary-governed" -- exactly the class
+            // `--resolve-library` exists to resolve. `refs` and `binaryGoverned`
+            // are parallel-indexed to `hir->externDecls` so an unmatched governed
+            // extern can be recovered post-ingest.
+            //
+            // ★★ UCRT-P4 (Decision 1) — THE TEST IS "HAS A LIBRARY", NOT "CARRIES
+            // THE no-library FLAG", AND THE DIFFERENCE IS LOAD-BEARING.
+            // It used to be `!library.empty() || noLibraryBinding`. That worked only
+            // while `noLibraryBinding` meant "a BARE PROTOTYPE deliberately opted
+            // out"; it now also means "the platform realizes nothing for this name",
+            // which is the state of EVERY extern to a user's own library. Keeping the
+            // flag in this test therefore routed `extern int dss_lib_answer(void);`
+            // into `explicitlyBound`, hid it from the reader, and made
+            // `--resolve-library` unable to bind the very symbols it was pointed at
+            // (MEASURED: K_SymbolUndefined on every round-trip test).
+            //
+            // ⇒ It also CLOSES A PRE-EXISTING ASYMMETRY, which is why this is a fix
+            // and not a patch: the bare-prototype producer has always set
+            // `noLibraryBinding=true` for an unknown name, so a bare
+            // `int dss_lib_answer(void);` was ALREADY invisible to the reader while
+            // the `extern`-keyword spelling of the same declaration was governed by
+            // it. C23 6.2.2p5 makes those the same declaration. Keying on the LIBRARY
+            // makes both governed, and an unmatched governed extern still routes
+            // unbound below — so the deliberate opt-out loses nothing it actually
+            // protected: it protected the ABSENCE of a guessed library, and the guess
+            // is gone.
             std::vector<ffi::ExternDeclRef> binaryGoverned;
             std::vector<ffi::ExternDeclRef> explicitlyBound;
             for (std::size_t i = 0; i < refs.size(); ++i) {
-                bool const hasExplicit =
-                    !resolvedLibs[i].empty()
-                    || hir->externDecls[i].noLibraryBinding;
+                bool const hasExplicit = !resolvedLibs[i].empty();
                 (hasExplicit ? explicitlyBound : binaryGoverned)
                     .push_back(refs[i]);
             }
@@ -659,7 +677,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // diagnostic set focused).
             if (tierClean(reporter, ffiEntry) && !fallThrough.empty()) {
                 auto const r = ffi::synthesizeFfiFromSourceDecls(
-                    fallThrough, importLibrary, target, format, ffiMap,
+                    fallThrough, target, format, ffiMap,
                     reporter);
                 (void)r;
             }
@@ -1342,80 +1360,158 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     return assembled;
 }
 
-namespace {
-
-// Resolve the user-entry symbol for a SINGLE CU by scanning its SemanticModel's
-// symbol records for a function symbol whose declared name appears in ANY decl
-// rule's entry-name list (D-CSUBSET-MULTI-FN-WIN64-CC). Returns the matched
-// SymbolId, or nullopt when no function matches. Fail-loud on MULTIPLE matches
-// (sets `*ok=false` + reports K_SymbolUndefined) — the trampoline injector cannot
-// silently pick one.
+// ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: program-entry resolution ──────────────
 //
-// This is the entry-name SCAN that used to live inline in the LOWER half (pre-
-// Cycle-25); it stays CU-specific because it ENUMERATES the model's symbol records
-// (which the merged path's symbol→name `nameOf` cannot express). The merged path's
-// equivalent runs inside `mergeCuMirs` against the merged functions. Source-agnostic:
-// the trigger is the grammar's `entryFunctionNames` (FC5 — falling back to the
-// `implicitReturnZeroForFunctionNames` return-0 set when absent), never a hardcoded "main".
-[[nodiscard]] std::optional<SymbolId>
-resolveSingleCuUserEntry(SemanticModel const& model, GrammarSchema const& grammar,
-                         DiagnosticReporter& reporter, bool& ok) {
-    ok = true;
-    std::vector<std::string_view> entryNames;
-    for (auto const& decl : grammar.semantics().declarations) {
-        auto const& names = decl.entryFunctionNames.empty()
-                                ? decl.implicitReturnZeroForFunctionNames
-                                : decl.entryFunctionNames;
-        for (auto const& n : names) {
-            entryNames.push_back(n);
-        }
-    }
-    if (entryNames.empty()) return std::nullopt;
+// See `resolveProgramEntry`'s docblock in the header for the contract and for why
+// ONE owner replaced the two disagreeing scans that were here before.
 
-    // Silent-failure HIGH #1 (2026-06-03): walk EVERY function symbol matching the
-    // entry-name list; fail-loud on multiple matches rather than silently
-    // first-match-wins (a future `["main", "_start"]` both-defined, or a duplicate-
-    // name config, would otherwise re-introduce the silent wrong-entry bug class).
-    std::vector<SymbolId> matches;
-    std::vector<std::string_view> matchNames;
-    for (auto const& rec : model.symbols()) {
+void collectEntryCandidates(SemanticModel const& model,
+                            std::vector<EntryCandidate>& out,
+                            std::vector<std::uint32_t>& outSymbolIndex) {
+    // ★ BY REFERENCE. `symbols()` returns `std::vector<SymbolRecord> const&`, so
+    // `auto const` (no `&`) silently COPIES every record — the measured dangling-view
+    // defect described on `EntryCandidate::name`. The copy is also pure waste on a
+    // hot path.
+    auto const& recs = model.symbols();
+    for (std::size_t i = 0; i < recs.size(); ++i) {
+        auto const& rec = recs[i];
         if (rec.kind != DeclarationKind::Function) continue;
-        bool const isEntry = std::any_of(
-            entryNames.begin(), entryNames.end(),
-            [&](std::string_view n){ return n == rec.name; });
-        if (isEntry) {
-            SymbolId const sym{static_cast<std::uint32_t>(
-                &rec - model.symbols().data())};
-            matches.push_back(sym);
-            matchNames.push_back(rec.name);
-        }
+        // The semantic tier stamps `entryVerb` ONLY on a function DEFINITION whose
+        // name the language declares as an entry spelling AND whose signature
+        // matched one of that name's declared rows. So this one test replaces the
+        // old name-list scan entirely — and it is strictly narrower in two ways
+        // that both matter: a PROTOTYPE `int main(int, char**);` no longer makes a
+        // TU look like it has an entry (gcc: `undefined reference to 'main'`), and
+        // a definition with a bad signature was already refused at its declarator
+        // instead of arriving here to be mis-selected.
+        if (!rec.entryVerb.has_value()) continue;
+        out.push_back(EntryCandidate{std::string{rec.name}, rec.entryVerb});
+        outSymbolIndex.push_back(static_cast<std::uint32_t>(i));
     }
-    if (matches.size() > 1) {
-        std::string list;
-        for (std::size_t i = 0; i < matchNames.size(); ++i) {
-            if (i) list += ", ";
-            list += matchNames[i];
+}
+
+std::optional<ResolvedEntry>
+resolveProgramEntry(std::span<EntryCandidate const>       candidates,
+                    std::span<EntryMaterialization const> formatVerbs,
+                    std::string_view                      formatName,
+                    DiagnosticReporter&                   reporter,
+                    bool&                                 ok) {
+    ok = true;
+
+    // ── THE "THIS FORMAT STARTS NO PROGRAM" ARM ────────────────────────────
+    //
+    // An EMPTY declared verb set is a DECLARED ANSWER, not a missing declaration:
+    // `ObjectFormatData::validate()` pins `entryVerbs` non-empty ⟺ exec-flavored
+    // in BOTH directions, so empty is exactly the relocatable / staticlib /
+    // entry-less-library case. Such a build resolves its entry by NAME with no
+    // verb requirement and demands nothing — `main` in a `.o` is resolved if
+    // present (a later linker decides what starts) and is otherwise an ordinary
+    // global function.
+    //
+    // ⚠ THIS IS NOT A FORMAT CHECK, and the distinction is load-bearing. The
+    // predicate is the DECLARED SET being empty — never `isExecFlavor()`, never a
+    // format name. MEASURED when the predecessor gate was built: without this
+    // arm, `dss --target x86_64:elf64-x86_64-linux` (the RELOCATABLE format)
+    // refused `int main(void){return 0;}`, i.e. every object-file build in the
+    // tree.
+    if (formatVerbs.empty()) {
+        if (candidates.empty()) return std::nullopt;
+        return ResolvedEntry{0, EntryMaterialization::None};
+    }
+
+    std::vector<std::size_t> realizable;
+    std::vector<std::size_t> nearMiss;   // an entry name whose verb this format cannot realize
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        if (!candidates[i].verb.has_value()) continue;
+        bool found = false;
+        for (auto const v : formatVerbs) {
+            if (v == *candidates[i].verb) { found = true; break; }
+        }
+        (found ? realizable : nearMiss).push_back(i);
+    }
+
+    // ── EXACTLY ONE: the normal path ───────────────────────────────────────
+    if (realizable.size() == 1) {
+        auto const i = realizable[0];
+        return ResolvedEntry{i, *candidates[i].verb};
+    }
+
+    // ── ZERO: no entry this format can start ───────────────────────────────
+    if (realizable.empty()) {
+        // ★ NAME THE NEAR-MISSES. This is the entire reason this diagnostic
+        // exists rather than letting the link tier's `K_SymbolUndefined` speak.
+        // MEASURED 2026-08-10 on HEAD `3e86a187`: a `wmain`-only source built for
+        // `elf64-x86_64-linux-exec` was told that `wmain` WAS the Linux entry and
+        // that the remedy was an ELF config row to make it one. The honest report
+        // is that the program defines no entry this format can start, and WHY.
+        std::string detail;
+        for (auto const i : nearMiss) {
+            if (!detail.empty()) detail += "; ";
+            detail += std::format("'{}' is defined here but needs the '{}' "
+                                  "materialization verb, which this format does "
+                                  "not realize",
+                                  candidates[i].name,
+                                  entryMaterializationName(*candidates[i].verb));
+        }
+        std::string declared;
+        for (auto const v : formatVerbs) {
+            if (!declared.empty()) declared += ", ";
+            declared += entryMaterializationName(v);
         }
         ParseDiagnostic d;
-        d.code     = DiagnosticCode::K_SymbolUndefined;
+        d.code     = DiagnosticCode::K_ProgramEntryUndefined;
         d.severity = DiagnosticSeverity::Error;
-        d.actual   = std::format(
-            "compile_pipeline: ambiguous user-entry — {} "
-            "function symbol(s) match the language's entry-"
-            "name list (matched: {}). The trampoline injector "
-            "cannot silently pick one. Declare distinct entry "
-            "names per decl rule OR restrict the source to "
-            "exactly one of these (D-CSUBSET-MULTI-FN-WIN64-CC "
-            "ambiguity gate).", matches.size(), list);
+        d.actual = std::format(
+            "no program entry is defined. Object format '{}' STARTS A PROGRAM, so "
+            "the build needs exactly one function that is both an entry spelling "
+            "the source language declares and realizable by this format; it found "
+            "none. This format realizes these materialization verbs: {}. {} The "
+            "accepted entry set is the INTERSECTION of the language's "
+            "`entryFunctions` mapping and this format's `entryVerbs`, so a "
+            "definition can be a valid entry on one target and an ordinary "
+            "function on another — that is by design, not a bug. "
+            "(D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)",
+            formatName, declared,
+            detail.empty()
+                ? std::string{"No entry-named function is DEFINED in this build "
+                              "at all (a prototype without a body defines "
+                              "nothing to run)."}
+                : std::format("Near miss: {}.", detail));
         reporter.report(std::move(d));
         ok = false;
         return std::nullopt;
     }
-    if (matches.size() == 1) return matches[0];
+
+    // ── MORE THAN ONE: refuse, never pick ──────────────────────────────────
+    //
+    // ★ THE PREDECESSORS OF THIS BRANCH WERE BOTH WRONG, IN DIFFERENT WAYS. The
+    // single-CU scan refused with `K_SymbolUndefined` — a code about a symbol that
+    // does not exist, for a condition where two do — citing
+    // `D-CSUBSET-MULTI-FN-WIN64-CC`, an anchor about calling conventions. The
+    // merged scan did not refuse at all: it took the first matching name it walked
+    // past, so `main` in a.c and `wmain` in b.c silently picked one.
+    std::string list;
+    for (auto const i : realizable) {
+        if (!list.empty()) list += ", ";
+        list += std::format("'{}' [{}]", candidates[i].name,
+                            entryMaterializationName(*candidates[i].verb));
+    }
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::K_ProgramEntryAmbiguous;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual = std::format(
+        "ambiguous program entry: {} functions are BOTH entry spellings this "
+        "source language declares AND realizable by object format '{}' ({}). A "
+        "program has exactly one entry and this compiler will not choose for you "
+        "— picking one silently is how a build runs the wrong code while "
+        "reporting success. Define one, or build for a target that realizes only "
+        "one of their verbs (the same source resolves cleanly wherever only one "
+        "of these verbs is realized). (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)",
+        realizable.size(), formatName, list);
+    reporter.report(std::move(d));
+    ok = false;
     return std::nullopt;
 }
-
-} // namespace
 
 // LOWER half (single-CU): thin wrapper over the shared `lowerMirModuleToAssembly`.
 // Binds the seam state from the `CuMirModule`: the per-CU type interner, a
@@ -1425,32 +1521,52 @@ resolveSingleCuUserEntry(SemanticModel const& model, GrammarSchema const& gramma
 std::optional<AssembledModule>
 lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<ProcessArgs> const& processArgs,
+                     std::span<EntryMaterialization const> entryVerbs,
+                     std::optional<SehPersonality> const& sehPersonality,
+                     std::string_view                  formatName,
                      ObjectFormatKind                  fmtKind,
                      DiagnosticReporter&               reporter) {
     SemanticModel&       model   = cuMir.model;
     GrammarSchema const& grammar = *cuMir.grammar;
 
-    // Resolve the user-entry FIRST (fail-loud on ambiguity, exactly as the inline
-    // scan did) so a multi-entry source halts before lowering — same observable
-    // failure point as pre-Cycle-25. Non-const: `synthesizePeStartup` may retarget it.
+    // Resolve the program entry FIRST so a multi-entry or entry-less source halts
+    // before lowering — same observable failure point as pre-Cycle-25. Non-const:
+    // `realizeEntryShape` may retarget it.
+    //
+    // Both driver paths call the SAME `resolveProgramEntry`; see its docblock for
+    // why that had to become single-owner.
+    std::vector<EntryCandidate> cands;
+    std::vector<std::uint32_t>  candSym;
+    collectEntryCandidates(model, cands, candSym);
     bool entryOk = true;
-    std::optional<SymbolId> userEntry =
-        resolveSingleCuUserEntry(model, grammar, reporter, entryOk);
+    auto const resolved = resolveProgramEntry(cands, entryVerbs, formatName,
+                                              reporter, entryOk);
     if (!entryOk) return std::nullopt;
 
-    // c111 (D-RUNTIME-PE-MAIN-ARGS): single-CU counterpart of the merge-path synth
-    // (program.cpp). When the target format fetches argc/argv via a CRT out-parameter
-    // call (Windows), append the pre-main init that makes that call + forwards
-    // (argc, argv) to the user entry, retargeting `userEntry` to it. A no-op for every
-    // other mechanism / a no-arg entry. The CU is already per-CU-optimized here, so the
-    // appended init skips the optimizer but is lowered like any other function; the
-    // interner is the CU model's (the type space this CU's TypeIds index into).
-    if (processArgs.has_value()) {
-        if (!synthesizePeStartup(cuMir.mir, model.lattice().interner(),
-                                 userEntry, cuMir.externImports,
-                                 *processArgs, reporter)) {
-            return std::nullopt;  // malformed argv parameter type — fail-loud reported.
-        }
+    std::optional<SymbolId> userEntry;
+    EntryMaterialization    entryVerb = EntryMaterialization::None;
+    if (resolved.has_value()) {
+        // `collectEntryCandidates` records each candidate's index in
+        // `model.symbols()`, which IS its SymbolId on this path (the same identity
+        // the pre-existing scan minted).
+        userEntry = SymbolId{candSym[resolved->index]};
+        entryVerb = resolved->verb;
+    }
+
+    // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
+    // single-CU counterpart of the merge-path call (program.cpp). MATERIALIZE the
+    // resolved entry's arguments per its verb × the format's declared mechanism (on
+    // the CRT-accessor route this appends the pre-main init and retargets
+    // `userEntry` to it). The signature GATE is no longer here or anywhere in the
+    // back half: the semantic tier owns it, with a source span. The CU is already
+    // per-CU-optimized here, so an appended init skips the optimizer but is lowered
+    // like any other function; the interner is the CU model's (the type space this
+    // CU's TypeIds index into).
+    if (!realizeEntryShape(cuMir.mir, model.lattice().interner(),
+                           userEntry, cuMir.externImports,
+                           entryVerb, processArgs, cuMir.cSymbolDecoration,
+                           formatName, reporter)) {
+        return std::nullopt;  // unusable mechanism — fail-loud already reported.
     }
 
     // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): PARTITION `cuMir.libraryShimRecipes` (the
@@ -1517,14 +1633,70 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         return std::nullopt;  // recipe/helper-import/va-strategy mismatch — reported.
     }
 
+    // ══ VERIFY THE POST-SYNTHESIS MODULE (UCRT-P4) ═══════════════════════════
+    //
+    // ★ THE HOLE THIS CLOSES, AND HOW IT WAS FOUND. TF-C112 advertised MIR
+    // call-site signature checking as covering "wrong arity at every hand-built
+    // call in every synthesis pass". MEASURED that it did not: a 3-parameter
+    // `int main(int, char**, char**)` compiled rc=0 while the synthesized startup
+    // called it with TWO arguments. The verifier's arity rule
+    // (`I_CallSignatureMismatch`) is fully CAPABLE of catching that — it reads the
+    // callee's FnSig straight off the `GlobalAddr`'s own type, needs no definition
+    // and no symbol table — so the defect was pure COVERAGE: on the single-CU path
+    // the LAST verify happens inside `optimizeModule` during the BUILD half, and
+    // every synthesis pass runs afterwards in this LOWER half, unverified.
+    //
+    // ★ POSITION IS THE WHOLE DESIGN, and it MIRRORS THE MERGED PATH EXACTLY.
+    // On the N>1 path `program.cpp` runs `realizeEntryShape` → threads → stdio and
+    // THEN `optimizeModule`, whose verify covers all three; `synthesizeSehFunclets`
+    // runs after it and is uncovered there too. Placing this verify at the same
+    // point makes the two seams AGREE on what is verified instead of one silently
+    // checking less than the other (`D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-
+    // ASYMMETRY`).
+    //
+    // ⚠ IT DELIBERATELY PRECEDES `synthesizeSehFunclets`, AND THAT RESIDUE IS
+    // STATED, NOT HIDDEN. That pass RELAYOUTS parent blocks to make each `__try`
+    // body PC-contiguous and does not re-derive the StructCf markers the verifier
+    // compares (its three siblings all do, at their own sites). Verifying after it
+    // would therefore red on the marker equality and the layout-position rules for
+    // reasons that are the PASS's to fix, inside `src/mir/merge/`. Extending
+    // coverage over the SEH pass is its own change; what must not happen is this
+    // verify being dropped because that one is harder.
+    {
+        MirVerifier verifier{cuMir.mir, &model.lattice().interner()};
+        if (!verifier.verify(reporter)) {
+            // The verifier already reported the specific broken invariant (with the
+            // offending instruction); this names the TIER so the reader knows a
+            // SYNTHESIS pass produced it rather than the optimizer or the front end.
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::I_VerifierFailure;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = "the module failed MIR verification AFTER the synthesis "
+                         "passes (entry realization / threads shim / stdio shim) — "
+                         "a synthesized body broke a structural, SSA or call-"
+                         "signature invariant. This is a compiler defect, never a "
+                         "program error.";
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+    }
+
     // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
     // scope ranges (post-optimize; the CU is already optimized here). Trigger =
     // presence of SehTryBegin — a no-op fast-return for the overwhelming majority
     // of TUs. Appends the __C_specific_handler personality import on demand.
+    // UCRT-P4: the personality routine + its image are now the FORMAT's declared
+    // `sehPersonality` block instead of two literals inside the pass. A format that
+    // declares none fails loud HERE (only when a region actually resolved), which is
+    // what an ELF/Mach-O build carrying `__try` should get instead of an msvcrt
+    // import planted in a non-Windows image.
     std::vector<MirSehScope> sehScopes;
     if (!synthesizeSehFunclets(cuMir.mir, model.lattice().interner(),
-                               cuMir.externImports, sehScopes, reporter)) {
-        return std::nullopt;  // unsupported SEH shape (c116b frontier) — fail-loud.
+                               cuMir.externImports, sehPersonality,
+                               cuMir.cSymbolDecoration, formatName,
+                               sehScopes, reporter)) {
+        return std::nullopt;  // unsupported SEH shape (c116b frontier) / no declared
+                              // personality — fail-loud.
     }
 
     // `nameOf`: SymbolId → the on-binary symbol name = the declared name run
@@ -2027,7 +2199,8 @@ assembleUnit(CompilationUnit const&        cu,
                             callingConventionIndex, reporter, opts);
     if (!cuMir) return std::nullopt;
     return lowerCuMirToAssembly(*cuMir, format.processArgs(),
-                                format.kind(), reporter);
+                                format.entryVerbs(), format.sehPersonality(),
+                                format.name(), format.kind(), reporter);
 }
 
 bool compileSingleUnit(CompilationUnit const&        cu,

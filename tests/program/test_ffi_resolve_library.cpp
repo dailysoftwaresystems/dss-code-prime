@@ -400,9 +400,34 @@ TEST(FfiResolveLibraryRoundTrip, PerFormatRowsUnionKeepsSymbolKnownEverywhere) {
                   0u)
             << "mtx_lock is declared by THREE per-format rows; the UNION makes "
                "it known on every format. A per-row predicate fails here.";
-        EXPECT_EQ(rc, 0)
-            << "the union-declared symbol must still fall through to the "
-               "format default and link";
+        // ⓘ UCRT-P4 (Decision 1): this used to assert `rc == 0` on every leg, on
+        // the grounds that the union-declared symbol "falls through to the format
+        // default". That per-language default is RETIRED — a hand-written
+        // `extern int mtx_lock(void*);` now gets the SAME realization the
+        // `#include <threads.h>` spelling gets, which is the whole invariant. On
+        // macho that realization is a SYNTHESIZED pthread shim whose vehicle the
+        // macho format file does not yet declare, so the build is REFUSED LOUD by
+        // an ALREADY-ANCHORED gap (D-CSUBSET-C11-THREADS-MACHO) — a pre-existing
+        // hole this test newly reaches, not a regression it introduced. Silently
+        // binding libSystem instead was only ever possible because the bare path
+        // consulted no descriptor at all.
+        //
+        // Kept STRICT: the build must either SUCCEED or fail with exactly that one
+        // anchored refusal. Any other diagnostic — and in particular any
+        // availability verdict, which is this test's actual subject — is red.
+        if (rc != 0) {
+            EXPECT_GT(::dss::test_support::countCode(
+                          rep, DiagnosticCode::L_UnsupportedLoweringForOpcode),
+                      0u)
+                << "the only tolerated failure here is the anchored "
+                   "no-synthesis-vehicle refusal (D-CSUBSET-C11-THREADS-MACHO); "
+                   "anything else means the union predicate or the realization is "
+                   "wrong";
+            EXPECT_EQ(::dss::test_support::countCode(
+                          rep, DiagnosticCode::K_SymbolUndefined), 0u)
+                << "a union-declared platform symbol must never reach the link "
+                   "tier UNBOUND — that would mean no row realized it";
+        }
     }
 }
 
@@ -947,13 +972,30 @@ TEST(FfiResolveLibraryRoundTrip, PeDynamicRoundTripExitsFortyTwo) {
            "through the dsslib.dll import bound by the reader-consumer.";
 }
 
-// Red-on-disable (b): WITHOUT --resolve-library, dss_lib_answer has no
-// binding source, falls through to the format-default library (msvcrt.dll),
-// and the loader cannot find it there -> the process fails to start / exits
-// non-42. The ONLY thing that makes main run is the binding discovered by
-// READING dsslib.dll -- so this proves the library binding comes from the
-// read, not from anywhere else.
-TEST(FfiResolveLibraryRoundTrip, PeWithoutResolveLibraryMisbindsAtRuntime) {
+// ★★ Red-on-disable (b), AND THE FAILURE MOVED FROM LOAD TIME TO BUILD TIME
+// (UCRT-P4, Decision 1) — WHICH IS THE POINT.
+//
+// WITHOUT `--resolve-library`, nothing binds `dss_lib_answer`: it is not in any
+// shipped descriptor and no linked CU defines it. So the ONLY thing that can make
+// this program link is the binding discovered by READING dsslib.dll — which is what
+// this test proves, from the negative side.
+//
+// ⓘ WHAT THIS TEST USED TO ASSERT, AND WHY IT CHANGED. It used to assert that the
+// build SUCCEEDED (`ASSERT_EQ(buildOne(...), 0)`) and that the resulting binary then
+// failed to run. That was only true because the retired per-language
+// `externLibraryByFormat` default handed every unbound extern an INVENTED import
+// library: `dss_lib_answer` was bound to the legacy pe C runtime, which does not
+// export it, so the image linked CLEAN and died at LOAD with no diagnostic from any
+// compile stage. That is precisely the silent-misbind class this cycle deleted.
+//
+// Now the reference is UNBOUND and C23 5.1.1.2 phase 8 resolves external references
+// at LINK, so the LINKER rejects it LOUD with K_SymbolUndefined — the same tier and
+// the same verdict every other C toolchain gives. A loud build failure strictly
+// dominates a binary that dies on startup.
+//
+// RED-ON-DISABLE: reinstate any format-level library fallback and the build starts
+// succeeding again, producing exactly the load-time misbind this now prevents.
+TEST(FfiResolveLibraryRoundTrip, PeWithoutResolveLibraryFailsLoudAtLink) {
     ScratchDir scratch{Location::InsideRepo, "ffi-resolve-lib"};
     auto const dir = scratch.path();
     auto const libSrc  = writeSrc(dir, "dsslib.c", kLibSrc);
@@ -963,22 +1005,18 @@ TEST(FfiResolveLibraryRoundTrip, PeWithoutResolveLibraryMisbindsAtRuntime) {
     ASSERT_EQ(buildOne(dir, {}, libSrc.string(),
                        "x86_64:pe64-x86_64-windows-dll", libRep), 0);
 
-    // Build main WITHOUT resolveLibraries -> binds to the msvcrt default.
+    // Build main WITHOUT resolveLibraries -> nothing binds dss_lib_answer.
     DiagnosticReporter mainRep;
-    ASSERT_EQ(buildOne(dir, {}, mainSrc.string(),
+    EXPECT_NE(buildOne(dir, {}, mainSrc.string(),
                        "x86_64:pe64-x86_64-windows-exec", mainRep), 0)
-        << "main.exe still BUILDS (dss_lib_answer binds to the format "
-           "default) -- the misbinding surfaces only at load/run.";
-    auto const exePath = dir / "main.exe";
-    ASSERT_TRUE(fs::exists(exePath));
-
-    auto const r = runBinary(exePath, std::chrono::milliseconds{5000});
-    // Mis-bound to msvcrt.dll (which does not export dss_lib_answer) -> the
-    // loader fails to resolve the import; the process never returns 42.
-    EXPECT_TRUE(!r.spawned || r.exitCode != 42u)
-        << "WITHOUT the binary read, main must NOT exit 42 -- the binding "
-           "that makes it run comes ONLY from reading dsslib.dll. "
-           "spawned=" << r.spawned << " exit=" << r.exitCode;
+        << "without the binary read there is no binding for dss_lib_answer, so the "
+           "build must FAIL — never emit an image bound to a library that has no "
+           "such export";
+    EXPECT_EQ(::dss::test_support::countCode(
+                  mainRep, DiagnosticCode::K_SymbolUndefined), 1u)
+        << "and it must fail by NAMING the unresolved symbol at the LINK tier";
+    EXPECT_FALSE(fs::exists(dir / "main.exe"))
+        << "no image may be emitted for a program with an unresolved reference";
 }
 
 // silent-failure HIGH fold (b): the MIXED program -- a bare `extern puts;`
@@ -1016,8 +1054,180 @@ TEST(FfiResolveLibraryRoundTrip, PeMixedBareSystemExternAndOwnLibraryExitFortyTw
     EXPECT_EQ(r.exitCode, 42u)
         << "exit 42 = puts->msvcrt + dss_lib_answer->dsslib.dll both bound.";
     EXPECT_NE(r.capturedStdout.find("hi"), std::string::npos)
-        << "puts must print 'hi' (it resolved to msvcrt); got: ["
+        << "puts must print 'hi' (it resolved through the platform's own "
+           "realization of that name); got: ["
         << r.capturedStdout << "]";
+    // ★ UCRT-P4 (Decision 1) — WHAT THIS TEST USED TO PASS STRAIGHT THROUGH.
+    // Until this cycle the assertions here stopped at the exit code, and this
+    // program's bare `extern int puts(const char*);` was bound to the LEGACY pe C
+    // runtime by a per-language default library while the rest of any `#include`ing
+    // TU was realized as UCRT — two C runtimes, invisible to an exit-code check
+    // because msvcrt DOES export `puts`, so the program ran and returned 42 anyway.
+    // The exit code was never the observable; the IMPORT TABLE was.
+    auto const bytes = readWholeBinary(exePath);
+    auto const libs  = peImportedLibraries(bytes);
+    EXPECT_EQ(dependencyOccurrences(libs, "msvcrt.dll"), 0u)
+        << "a bare `extern int puts(const char*);` must be realized by the "
+           "PLATFORM (the shipped descriptor's per-format image), never by a "
+           "language-level default naming the legacy CRT. Imported libraries: ["
+        << joinDependencies(libs) << "]";
+    EXPECT_EQ(dependencyOccurrences(libs, "ucrtbase.dll"), 1u)
+        << "exactly one row for the modern CRT; got [" << joinDependencies(libs)
+        << "]";
+    EXPECT_EQ(dependencyOccurrences(libs, "dsslib.dll"), 1u)
+        << "and the own-library binding is unaffected; got ["
+        << joinDependencies(libs) << "]";
+    auto const syms = peImportedSymbols(bytes);
+    EXPECT_EQ(dependencyOccurrences(syms, "puts"), 1u)
+        << "one `puts` import, not two (one per owning image). Symbols: ["
+        << joinDependencies(syms) << "]";
+}
+
+// ══ THE 4-SHAPE ACCEPT-SET — THE HEADLINE PIN (UCRT-P4, Decision 1) ══════════
+//
+// ★★★ THE DECLARATION SYNTAX HAS NO AUTHORITY OVER REALIZATION, EVER.
+//
+// C23 6.2.2p5 makes a file-scope function declaration with no storage-class
+// specifier have its linkage determined EXACTLY AS IF declared `extern` — so
+// `extern int printf(const char*, ...);` and `int printf(const char*, ...);` are THE
+// SAME DECLARATION. 7.1.4p2 entitles a program to declare a library function without
+// including its header. All four spellings below are legal C23 and accepted by gcc
+// and clang, so all four must realize `printf` IDENTICALLY.
+//
+// MEASURED AT HEAD 3e86a187, i.e. what this pin exists to prevent returning:
+//   1 `extern int printf(…);`                     rc 0 — msvcrt.dll: printf (!)
+//   2 `int printf(…);`                            rc 1 — K_SymbolUndefined (!)
+//   3 `#include <stdio.h>` + `extern int printf(…);` rc 0 — msvcrt.dll: printf
+//        ALONGSIDE ucrtbase's `__stdio_common_v*` shim cores ⇒ TWO C RUNTIMES in a
+//        three-line program, with NO diagnostic at any stage (!)
+//   4 `#include <stdio.h>` + `int printf(…);`      rc 0 — ucrtbase only (correct)
+// Four spellings, three different realizations, one of them a hard reject.
+//
+// ⚠ ASSERTED ON THE IMPORT TABLE, NEVER ON AN EXIT CODE. Every one of those broken
+// shapes RAN and printed correctly on this host, because the legacy CRT really does
+// export `printf`. An exit-code assertion cannot see a split runtime at all — that
+// is exactly how the sibling test above passed through the hazard for months.
+//
+// ⚠ AND NEVER ON A COUNT. Aggregate counts go inert as the shipped surface grows;
+// these assert SPECIFIC names PRESENT and SPECIFIC names ABSENT.
+//
+// THE INVARIANT PINNED: in all four shapes `printf` is realized as the compiler
+// SYNTHESIZED shim — so it is ABSENT from the import table entirely, its UCRT cores
+// ARE present, and msvcrt.dll appears nowhere. Shapes that differ only by the
+// storage-class keyword must be BYTE-IDENTICAL to each other.
+//
+// RED-ON-DISABLE: revert the extern-keyword producer's realization lookup in
+// `cst_to_hir.cpp` (drop the `suppressedShippedSymbolFor` consult in `recordExtern`
+// / the shim claim in the prototype arm) and shapes 1 and 3 regain a `printf` import
+// — from the retired language default if that is also restored, or unbound if not.
+// Either way the `printf`-absent and msvcrt-absent assertions below fail by NAME.
+TEST(FfiPlatformRealization, PeFourDeclarationShapesRealizePrintfIdentically) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-accept-set"};
+    auto const dir = scratch.path();
+
+    // The four legal-C23 spellings of the same declaration. Deliberately built from
+    // two independent axes (`extern` or not × `#include` or not) so a future change
+    // cannot "fix" one axis while leaving the other.
+    struct Shape {
+        char const* name;
+        char const* src;
+        bool        includesHeader;
+    };
+    Shape const shapes[] = {
+        {"bare_extern_keyword",
+         "extern int printf(const char*, ...);\n"
+         "int main(void){ printf(\"hi\\n\"); return 0; }\n", false},
+        {"bare_no_keyword",
+         "int printf(const char*, ...);\n"
+         "int main(void){ printf(\"hi\\n\"); return 0; }\n", false},
+        {"include_plus_extern_keyword",
+         "#include <stdio.h>\n"
+         "extern int printf(const char*, ...);\n"
+         "int main(void){ printf(\"hi\\n\"); return 0; }\n", true},
+        {"include_plus_no_keyword",
+         "#include <stdio.h>\n"
+         "int printf(const char*, ...);\n"
+         "int main(void){ printf(\"hi\\n\"); return 0; }\n", true},
+    };
+
+    std::vector<std::string> firstBareSymbols;
+    std::vector<std::string> firstIncludeSymbols;
+    for (auto const& shape : shapes) {
+        SCOPED_TRACE(shape.name);
+        ScratchDir shapeDir{Location::InsideRepo, "ffi-accept-set-one"};
+        auto const src = writeSrc(shapeDir.path(),
+                                  std::string{shape.name} + ".c", shape.src);
+        DiagnosticReporter rep;
+        ASSERT_EQ(buildOne(shapeDir.path(), {}, src.string(),
+                           "x86_64:pe64-x86_64-windows-exec", rep), 0)
+            << "all four spellings are legal C23 (6.2.2p5 + 7.1.4p2) and accepted "
+               "by gcc and clang — a refusal here is a conformance defect, and "
+               "shape 2 was MEASURED as exactly that at HEAD 3e86a187";
+        auto const exePath = shapeDir.path()
+                           / (std::string{shape.name} + ".exe");
+        ASSERT_TRUE(fs::exists(exePath)) << exePath.string();
+
+        auto const bytes = readWholeBinary(exePath);
+        auto const libs  = peImportedLibraries(bytes);
+        auto const syms  = peImportedSymbols(bytes);
+
+        // (a) ONE C RUNTIME. The legacy image must not appear at all.
+        EXPECT_EQ(dependencyOccurrences(libs, "msvcrt.dll"), 0u)
+            << "the LEGACY pe C runtime must not be imported — the platform "
+               "realizes this name through the modern one. Libraries: ["
+            << joinDependencies(libs) << "]";
+        EXPECT_EQ(dependencyOccurrences(libs, "ucrtbase.dll"), 1u)
+            << "exactly one modern-CRT row; got [" << joinDependencies(libs) << "]";
+
+        // (b) `printf` IS A SYNTHESIZED SHIM, SO IT IS NOT AN IMPORT AT ALL.
+        // This is the single strongest observable: the modern CRT exports no bare
+        // `printf`, so ANY `printf` import row means the declaration reached the
+        // link as a plain import — either bound to the legacy CRT (the measured
+        // defect) or bound to an image that cannot resolve it (0xC0000139 at LOAD).
+        EXPECT_EQ(dependencyOccurrences(syms, "printf"), 0u)
+            << "'printf' must NOT be imported — the platform realizes it as a "
+               "compiler-synthesized shim. Symbols: [" << joinDependencies(syms)
+            << "]";
+
+        // (c) AND THE SHIM'S CORES ARE PRESENT. Without this, (b) would also pass
+        // for a program where printf was silently dropped altogether.
+        EXPECT_EQ(dependencyOccurrences(syms, "__stdio_common_vfprintf"), 1u)
+            << "the shim's UCRT core must be imported. Symbols: ["
+            << joinDependencies(syms) << "]";
+        EXPECT_EQ(dependencyOccurrences(syms, "__acrt_iob_func"), 1u)
+            << "and the stdout accessor the shim passes to it. Symbols: ["
+            << joinDependencies(syms) << "]";
+
+        // (d) IT RUNS, AND PRINTS. The realization has to be correct, not just
+        // well-shaped — a shim wired to the wrong core would satisfy (a)-(c).
+        auto const r = runBinary(exePath, std::chrono::milliseconds{5000},
+                                 /*captureStdout=*/true);
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_FALSE(r.timedOut);
+        EXPECT_EQ(r.exitCode, 0u);
+        EXPECT_NE(r.capturedStdout.find("hi"), std::string::npos)
+            << "got: [" << r.capturedStdout << "]";
+
+        // (e) THE TWO SPELLINGS THAT DIFFER ONLY BY THE STORAGE-CLASS KEYWORD MUST
+        // PRODUCE THE IDENTICAL IMPORT TABLE. C23 6.2.2p5 says they are the same
+        // declaration, so anything less than equality is a divergence. Compared
+        // WITHIN each `#include` group: the extra rows shapes 3 and 4 carry come
+        // from the HEADER's eager surface, which is what an `#include` is for — the
+        // declaration is not what differs there.
+        auto& first = shape.includesHeader ? firstIncludeSymbols
+                                           : firstBareSymbols;
+        if (first.empty()) {
+            first = syms;
+        } else {
+            EXPECT_EQ(first, syms)
+                << "adding or removing the `extern` keyword changed the import "
+                   "table — C23 6.2.2p5 makes those the SAME declaration. ["
+                << joinDependencies(first) << "] vs [" << joinDependencies(syms)
+                << "]";
+        }
+    }
+    ASSERT_FALSE(firstBareSymbols.empty());
+    ASSERT_FALSE(firstIncludeSymbols.empty());
 }
 #endif  // _WIN32
 

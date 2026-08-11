@@ -21,11 +21,32 @@ namespace {
 // SIGILL at user runtime), I_* verifier invariants (SSA / CFG
 // violations sailing through), K_ImageWrite* (silently truncated
 // on-disk image), F_FfiIngest* architectural exclusions (silent
-// wrong-shape FfiMetadata for the wrong abiModel). Table size
-// grows monotonically as new architectural surfaces close; each
-// addition includes a one-line rationale block alongside the
-// entry.
-constexpr std::array<DiagnosticCode, 140> kUnsuppressableCodes{{
+// wrong-shape FfiMetadata for the wrong abiModel). The table grows
+// as new architectural surfaces close and SHRINKS when one is
+// retired (see the 144 → 139 note below — it does NOT grow
+// monotonically); each addition includes a one-line rationale
+// block alongside the entry, and each removal leaves that block
+// rewritten in place rather than deleted.
+// 141 → 144: the program-entry resolution family replaced one member
+// (`K_EntryShapeNotDeclared`) with four (`S_EntryShapeNotDeclared`,
+// `K_ProgramEntryUndefined`, `K_ProgramEntryAmbiguous`,
+// `K_EntryVerbUnmaterializable`) — the one gate split into the four distinct ways
+// a build can end up running the wrong entry, or none, while reporting success.
+//
+// ★ 144 → 139 (2026-08-10): the table does NOT grow monotonically after all — a
+// RETIRED code must LEAVE it. Five members had outlived their emit sites
+// (`F_FfiNoImportLibraryForFormat`, `F_FfiResolveLibrarySymbolAbsent`,
+// `S_BitIntWidthAboveC1Limit`, `S_BitIntWideMulDivUnsupported`,
+// `S_VlaMultiDimUnsupported`), two of them still carrying doc comments that
+// described the retired surface as live — and one of those stale comments had
+// already produced a wrong C23 conformance claim. Membership was the thing that
+// made them read as load-bearing to a reader, because a closed table of
+// silent-miscompile guards is exactly where a name looks load-bearing. An
+// unemittable code cannot be suppressed, so those rows asserted NOTHING.
+// `EveryMemberHasAnEmitSiteOrIsMarkedRetired` in
+// `tests/core/test_unsuppressable_codes.cpp` now enforces the property that
+// found them, so the next retirement cannot leave its row behind silently.
+constexpr std::array<DiagnosticCode, 139> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -55,28 +76,18 @@ constexpr std::array<DiagnosticCode, 140> kUnsuppressableCodes{{
     // names would silently shadow `bySymbol[""]` rows).
     DiagnosticCode::F_FfiIngestAbiModelUnsupported,
     DiagnosticCode::F_FfiIngestEmptyCanonical,
-    // F_FfiNoImportLibraryForFormat (FF6 Slice 2, 2026-06-02): the
-    // source-declared FFI synthesis path fails loud when the active
-    // language's `DeclarationRule.externLibraryByFormat` map has no
-    // entry for the target's ObjectFormatKind. Suppressing this
-    // would let externs land with `importLibrary=""` → downstream
-    // K_FormatLacksImportSupport or K_SymbolUndefined diagnostics
-    // would fire instead, masking the upstream config gap and
-    // forcing operators to debug from the wrong end of the
-    // pipeline. The closed-table membership pins the upstream
-    // surface.
-    DiagnosticCode::F_FfiNoImportLibraryForFormat,
-    // F_FfiResolveLibrarySymbolAbsent (c162, D-FF1-READER-CONSUMER):
-    // the live `ingest()` consumer matched a declared extern against
-    // the named `--resolve-library` binary's export surface and found
-    // NO row. Suppressing this would let the reference silently sail
-    // on to the format-default binding (a DANGLING import against the
-    // wrong library) or a downstream K_SymbolUndefined -- masking the
-    // real cause (the library does not export the symbol) at the wrong
-    // end of the pipeline. The whole VALUE of reading a real export
-    // table is compile-time proof the symbol exists; a suppressible
-    // validation is no validation. Membership pins the surface.
-    DiagnosticCode::F_FfiResolveLibrarySymbolAbsent,
+    // UCRT-P4 Decision 1 RETIRED F_FfiNoImportLibraryForFormat, and TF-C66
+    // RETIRED F_FfiResolveLibrarySymbolAbsent; both were DE-LISTED here
+    // 2026-08-10 by the EveryMemberHasAnEmitSite property below, which is what
+    // found them still listed. The first gated a per-language
+    // `DeclarationRule.externLibraryByFormat` map that no longer exists (a
+    // per-symbol platform fact cannot be one string per language); the second
+    // was an UNSOUND per-CU verdict (it could not see a sibling TU's definition
+    // — sqlite false-positived 2770 times). Both surfaces now resolve at LINK
+    // per C23 5.1.1.2 phase 8, where a genuine typo still rejects loud with
+    // K_SymbolUndefined — a member below. Neither code has an emit site, and an
+    // unemittable code cannot be suppressed, so membership asserted nothing
+    // while making dead codes read as load-bearing (0xE025 precedent).
     // F_BinaryReaderPartialCorruption (silent-failure-hunter
     // 2nd-order audit on 9dbdc8e): the Warning's stated intent is
     // "operators must see this signal". Without unsuppressable
@@ -344,6 +355,35 @@ constexpr std::array<DiagnosticCode, 140> kUnsuppressableCodes{{
     // code, not a follow-up.
     DiagnosticCode::K_FormatLacksProcessExit,
     DiagnosticCode::K_ExecEntryNotTrampolined,
+    // The PROGRAM-ENTRY RESOLUTION family (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE,
+    // 2026-08-10) — four codes, one rule, and the rule is that EVERY outcome of
+    // entry resolution other than "exactly one candidate" must be undroppable.
+    // Suppression here restores a MEASURED fault rather than a hypothetical one:
+    // before these codes existed, `int main(int, char**, char**)` compiled rc=0
+    // with ZERO diagnostics on pe64 AND elf64 and the emitted binary faulted on
+    // its first envp dereference (`0xC0000005` / SIGSEGV rc=139), while gcc built
+    // the identical source correctly. C23 5.1.2.2.1 permits supporting that shape
+    // OR refusing it — accepting-then-faulting is the one outcome it does not
+    // allow, and suppression would hand exactly that binary back. A silently
+    // miscompiled entry has NO other trace: the build reports success.
+    //
+    // ★ WHY ALL FOUR AND NOT JUST THE SHAPE CHECK. Each is a distinct way to end
+    // up running the wrong code, or none, with a successful-looking build:
+    //   * S_EntryShapeNotDeclared — the definition has the wrong signature for its
+    //     name (the measured 3-param-main fault above).
+    //   * K_ProgramEntryUndefined — an exec build with NO candidate. Suppressed,
+    //     the build proceeds to a link-tier "symbol not found" at best, and the
+    //     explanation of WHY (the verb this format cannot realize) is lost.
+    //   * K_ProgramEntryAmbiguous — two rival candidates. Suppressed, resolution
+    //     falls back to first-match-wins on a program ENTRY, which is the silent
+    //     wrong-entry class in its purest form.
+    //   * K_EntryVerbUnmaterializable — the decided verb and the MIR signature
+    //     disagree. Suppressed, the materializer reads past the end of the
+    //     parameter list.
+    DiagnosticCode::S_EntryShapeNotDeclared,
+    DiagnosticCode::K_ProgramEntryUndefined,
+    DiagnosticCode::K_ProgramEntryAmbiguous,
+    DiagnosticCode::K_EntryVerbUnmaterializable,
 
     // The extern-import dedup fold (D-LK11-EXTERN-IMPORT-DEDUP) at BOTH merge
     // tiers — linker.cpp `mergeModules` and mir_merge.cpp — collapses N CUs'
@@ -601,27 +641,34 @@ constexpr std::array<DiagnosticCode, 140> kUnsuppressableCodes{{
     DiagnosticCode::S_BitIntWidthNotPositive,
     DiagnosticCode::S_BitIntSignedWidthTooSmall,
     DiagnosticCode::S_BitIntWidthExceedsMax,
-    DiagnosticCode::S_BitIntWidthAboveC1Limit,
-    // D-CSUBSET-BITINT-C2-WIDE (C3 boundary): `* / %` on a wide `_BitInt(N>64)` — the
-    // still-unimplemented multi-limb op. UNSUPPRESSABLE: suppressed, a wide multiply/
-    // divide would reach codegen with no lowering and silently miscompile.
-    DiagnosticCode::S_BitIntWideMulDivUnsupported,
+    // S_BitIntWidthAboveC1Limit (the C1 N>64 gate, RETIRED in C2) and
+    // S_BitIntWideMulDivUnsupported (the C2 `* / %` boundary, RETIRED in C3
+    // 2026-07-12) were DE-LISTED here 2026-08-10. Both surfaces LOWER now —
+    // N>64 is a runnable multi-limb type and wide `* / %` lower to schoolbook
+    // mul + long-division — so neither code has an emit site, and an unemittable
+    // code cannot be suppressed. What still guards the wide-op family is the
+    // member below (float<->wide conversion, genuinely unimplemented) plus the
+    // WideBitIntMulDivModLowersAtC3 pin asserting nDiag(0xE04F)==0. 0xE025
+    // precedent; found by the EveryMemberHasAnEmitSite property below.
     // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV: float<->wide `_BitInt(N>64)` conversion —
     // deferred (a correct multi-limb FP<->limbs path is a later cycle). UNSUPPRESSABLE:
     // suppressed, the naive scalar path emits the wrong sign + drops the upper limbs
     // (a wide `(_BitInt(128))1.5` / `(double)wide`) and silently miscompiles.
     DiagnosticCode::S_BitIntWideFloatConvUnsupported,
-    // S_Vla* (VLA C1a, D-CSUBSET-VLA, C99/C11 §6.7.6.2): the two variable-length-array
-    // constraint/boundary violations — a block-scope static/extern VLA (a VLA needs
-    // automatic storage) and a multi-dimensional VLA (the C3 boundary). Both ship a
-    // WRONG type if suppressed: the static form would carry a runtime-sized `vlaArray`
-    // into the static-local→hidden-global lowering (whose layout has no static size),
-    // and the multi-dim form would build a nested array-of-VLA / VLA-of-array type no
-    // lowering tier handles. Same silent-miscompile-guard class as the S_BitInt* /
-    // S_Alignas* constraint entries above. Closed here so an invalid VLA never
-    // compiles quietly.
+    // S_VlaWithStaticStorage (VLA C1a, D-CSUBSET-VLA, C99/C11 §6.7.6.2): a
+    // block-scope static/extern VLA (a VLA needs automatic storage). Suppressed it
+    // ships a WRONG type — a runtime-sized `vlaArray` carried into the
+    // static-local→hidden-global lowering, whose layout has no static size. Same
+    // silent-miscompile-guard class as the S_BitInt* / S_Alignas* constraint
+    // entries above. Closed here so an invalid VLA never compiles quietly.
+    // ⓘ Its former neighbour S_VlaMultiDimUnsupported (the C1a multi-DIMENSIONAL
+    // boundary) was DE-LISTED 2026-08-10: C3 lifted all four of its reject sites,
+    // so `int a[n][m]` / `int a[5][n]` / `int a[n][5]` LOWER and RUN (MEASURED
+    // rc=0, debug + release + pe64) and the code has no emit site. The multi-LEVEL
+    // shape that IS still refused (`typedef int R[5]; R a[n];`) is owned at the MIR
+    // tier under H0009, positioned and named. 0xE025 precedent; found by the
+    // EveryMemberHasAnEmitSite property below.
     DiagnosticCode::S_VlaWithStaticStorage,
-    DiagnosticCode::S_VlaMultiDimUnsupported,
     // S_VlaSizeNotInteger (C11 §6.7.6.2p1): a non-integer VLA size (float / nullptr /
     // pointer). Suppressed, it ships a bogus VLA — a float bound FPToSI-truncates to
     // a garbage element count, a nullptr bound is a silent 0-byte array. Same

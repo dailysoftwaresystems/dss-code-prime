@@ -572,6 +572,177 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "(D-RUNTIME-MAIN-ARGC-ARGV.)");
     }
 
+    // ── UCRT-P4 (D-FFI-PE-CRT-UCRT-MIGRATION): the ROLE TABLE
+    //    BICONDITIONAL, enforced at THIS tier as well as at load ────────────
+    //
+    // The loader already refuses a block naming a role the table does not
+    // declare. This arm is the OTHER tier — the one a hand-built
+    // `ObjectFormatData` reaches, since `ObjectFormatSchema{ObjectFormatData}`
+    // is a public constructor that runs no validation — and it enforces BOTH
+    // directions:
+    //   (a) every block that names a role must resolve to the table's image for
+    //       that role, byte for byte. A hand-built schema that set a block's
+    //       resolved `…LibraryPath` WITHOUT the table (or against a different
+    //       image) is exactly the two-owners-that-nothing-forces-to-agree defect
+    //       this table exists to delete, so it fails here rather than emitting
+    //       an import nobody declared.
+    //   (b) every table row must be NAMED by some block. An unnamed row is inert
+    //       config, and this file already rejects inert config by name (see the
+    //       `charSignedness` note in the header). It is also how a stale row
+    //       would survive a migration — the very thing the mechanical
+    //       "no pe table names msvcrt.dll" exit criterion is checked against.
+    {
+        // (role → image) pairs each spine block CLAIMS, gathered generically:
+        // nothing here knows which block owns which role.
+        struct RoleClaim { RuntimeLibraryRole role; std::string_view image;
+                           char const* where; };
+        std::vector<RoleClaim> claims;
+        if (processExit.has_value()
+            && processExit->role != RuntimeLibraryRole::None) {
+            claims.push_back({processExit->role, processExit->importLibraryPath,
+                              "/processExit"});
+        }
+        if (processArgs.has_value()
+            && processArgs->role != RuntimeLibraryRole::None) {
+            claims.push_back({processArgs->role, processArgs->crtLibraryPath,
+                              "/processArgs"});
+        }
+        if (sehPersonality.has_value()
+            && sehPersonality->role != RuntimeLibraryRole::None) {
+            claims.push_back({sehPersonality->role,
+                              sehPersonality->libraryPath, "/sehPersonality"});
+        }
+        if (librarySynthesis.has_value()
+            && librarySynthesis->role != RuntimeLibraryRole::None) {
+            claims.push_back({librarySynthesis->role,
+                              librarySynthesis->libraryPath,
+                              "/librarySynthesis"});
+        }
+        for (auto const& c : claims) {
+            auto const image = runtimeLibraries.imageForRole(c.role);
+            if (!image.has_value()) {
+                fail(c.where,
+                     std::format(
+                         "names runtime-library role '{}' but this format's "
+                         "`runtimeLibraries` table does not declare it — the "
+                         "block's import would be bound to no image. "
+                         "(D-FFI-PE-CRT-UCRT-MIGRATION.)",
+                         runtimeLibraryRoleName(c.role)));
+            } else if (*image != c.image) {
+                fail(c.where,
+                     std::format(
+                         "resolved image '{}' disagrees with the "
+                         "`runtimeLibraries` row for role '{}', which declares "
+                         "'{}'. The role table is the SINGLE OWNER of this "
+                         "fact; the block's path is a derived copy, and two "
+                         "copies that disagree is the defect the table "
+                         "removes. (D-FFI-PE-CRT-UCRT-MIGRATION.)",
+                         std::string{c.image},
+                         runtimeLibraryRoleName(c.role),
+                         std::string{*image}));
+            }
+        }
+        // ⚠ THE OTHER DIRECTION — "a table row NO block names is inert config" —
+        // is enforced in the JSON LOADER, not here, and the reason is a MEASURED
+        // cascade rather than convenience. This tier sees only what LOADED: when a
+        // block is rejected for an unrelated defect (say `processExit` omitting
+        // `importMangledName`), `data.processExit` is never populated, so its role
+        // CLAIM disappears and the row it named looks unnamed — producing a second,
+        // misleading diagnostic about the table on top of the real one. MEASURED
+        // while building this cycle: `LK10EntrySliceB.ByNameImportArmMissing-
+        // MangledNameRejected` gained exactly that spurious `/runtimeLibraries`
+        // error. The LOADER reads each block's `role` key straight out of the JSON,
+        // so it knows the DECLARED intent whether or not the block validated, and
+        // its answer cannot cascade. The cost is that a hand-built
+        // `ObjectFormatData` carrying an inert row is not caught — accepted,
+        // because an inert row is a config-AUTHORING fault and the JSON tier is
+        // where config is authored (contrast direction (a) above, which guards a
+        // real MISCOMPILE and therefore must hold on both paths).
+    }
+
+    // ── UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): `entryVerbs` ⟺
+    //    exec-flavored ─────────────────────────────────────────────
+    //
+    // The SAME paired-cluster discipline `processExit` / `entryCallingConvention`
+    // follow, and for the same reason in both directions. A format that STARTS a
+    // program must declare what it can hand an entry: with an empty set NOTHING
+    // the source language declares can survive the intersection, so every program
+    // would be refused as entry-less; with no set at all, "realizes anything"
+    // restores the MEASURED defect (a `wmain`-only source selected as the ELF
+    // entry, and a 3-param `main` accepted rc=0 on pe64 AND elf64, faulting at
+    // run). A format that starts NOTHING must not carry verbs: they would be
+    // unreachable config nothing ever consults.
+    //
+    // ⚠ THE ELF ET_DYN CAVEAT THAT MAKES `processExit`'s OWN RULE A TAUTOLOGY
+    // DOES NOT APPLY HERE. `elfDynPieShape` counts `processExit.has_value()` as
+    // one of its cluster members, which is why "exec-flavored ⇒ declares
+    // processExit" enforces nothing on the dyn arm. `entryVerbs` is NOT a
+    // cluster member of any `isExecFlavor()` arm, so this rule has real teeth on
+    // all four arms. Do NOT add `entryVerbs` to `elfDynPieShape` — that would
+    // silently hollow this rule out exactly as the other one was hollowed.
+    //
+    // ★ AND THIS RULE IS WHAT LETS THE ENGINE USE EMPTINESS AS ITS PREDICATE.
+    // "Does this build need a program entry" is answered by `entryVerbs.empty()`
+    // rather than by `isExecFlavor()` or a format name, which is only sound
+    // because this rule pins the two equivalent in BOTH directions. Weakening
+    // either direction turns that predicate into a silent lie — the exec arm
+    // would stop requiring an entry, or a relocatable `.o` would start demanding
+    // one.
+    if (isExecFlavor && entryVerbs.empty()) {
+        fail("/entryVerbs",
+             "exec-flavored format declares NO `entryVerbs` — every format that "
+             "starts a program must declare which program-entry materialization "
+             "verbs it can realize. That set is intersected with the source "
+             "language's declared entry signatures to select the program entry, "
+             "so an absent set leaves NO candidate and an unchecked one restores "
+             "the MEASURED defect: a 3-parameter `main` that compiles rc=0 with "
+             "zero diagnostics and faults on its first envp dereference, and a "
+             "`wmain`-only source selected as the ELF entry. C23 5.1.2.2.1 "
+             "permits an implementation-defined entry set and C23 3.4.1 requires "
+             "the implementation to DOCUMENT it; this key and the language's "
+             "`entryFunctions` mapping are jointly that documentation. "
+             "(D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)");
+    }
+    if (!entryVerbs.empty() && !isExecFlavor) {
+        fail("/entryVerbs",
+             "entryVerbs is only legal on exec-flavored formats (ELF ET_EXEC / "
+             "ELF ET_DYN PIE with the full entry cluster / PE PE32+ Exec / "
+             "Mach-O MH_EXECUTE). A relocatable artifact and an entry-less "
+             "library image both resolve NO program entry, so the verbs would "
+             "never be consulted — and the engine reads this emptiness as "
+             "\"needs no entry\", which a stray verb would falsify. "
+             "(D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)");
+    }
+
+    // A materialization verb that needs argument setup is only realizable if the
+    // format actually declares HOW it obtains arguments — the two axes are
+    // independent (verb = WHICH arguments, `processArgs.mechanism` = HOW), but
+    // "which" without any "how" on a format whose loader delivers nothing would
+    // call the entry on uninitialized registers. Mach-O legitimately declares NO
+    // `processArgs` because dyld puts argc/argv in the argument registers BEFORE
+    // any DSS code runs, so absence is a real answer there and this rule cannot
+    // simply require the block — it requires the pairing to be COHERENT, which
+    // for the shipped mechanisms means: a CRT-accessor mechanism must be paired
+    // with at least one verb that consumes it, or the accessor names are dead.
+    if (processArgs.has_value()
+        && processArgs->mechanism == ArgsMechanism::CrtArgvAccessors) {
+        bool anyMaterializing = false;
+        for (auto const v : entryVerbs) {
+            if (v != EntryMaterialization::None) {
+                anyMaterializing = true;
+                break;
+            }
+        }
+        if (!anyMaterializing) {
+            fail("/processArgs",
+                 "declares the `crt-argv-accessors` mechanism but `entryVerbs` "
+                 "names no verb that consumes it — the five declared CRT export "
+                 "names would never be emitted. Declare the argc/argv verb(s) "
+                 "this format realizes, or drop the mechanism. "
+                 "(D-FFI-PE-CRT-UCRT-MIGRATION.)");
+        }
+    }
+
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: `supportedDataSections` is NO
     // longer restricted to exec-flavored formats. A RELOCATABLE object DOES
     // carry data — a global lands in `.data`/`.rodata`/`.bss` with `sh_addr=0`

@@ -40,6 +40,12 @@ std::string acceptedRelocFormulaList() {
     return out;
 }
 
+// UCRT-P4: the ONE entry-signature renderer moved to `core/types/entry_shape.hpp`
+// as `entrySignatureSpelling` (inline) when the vocabulary was extracted there —
+// the semantic tier now renders the same string, and that tier must not link
+// against the target schema to do it. Still exactly one renderer, so no
+// diagnostic can compare a C++-spelled signature against a JSON-spelled one.
+
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromFile(
     std::filesystem::path const& path) {
     std::ifstream in(path, std::ios::binary);

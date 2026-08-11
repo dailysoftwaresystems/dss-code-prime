@@ -1,0 +1,21 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the MACH-O counterpart of entry_wmain_only_refused_elf -- a `wmain`-only program targeting Darwin has NO program entry and is REFUSED. * WHY IT IS A SEPARATE EXAMPLE RATHER THAN INFERRED FROM THE ELF ONE: the sibling wmain_argc example used to carry two Mach-O run arms and they PASSED VACUOUSLY. dyld hands an LC_MAIN entry a NARROW char** argv; read through an `unsigned short**` parameter, argv[0][0] picks up the first TWO ASCII bytes of the program path as one non-zero u16, so the 'argv[0] is non-empty' layer was satisfied by a coincidence of endianness and path spelling rather than by a wide vector -- which Darwin does not produce at all. Those arms were removed for that reason, which took Darwin from FALSELY-GREEN to NO COVERAGE; this example closes that hole. * THE INFERENCE WOULD HAVE BEEN UNSOUND: ELF declares a `processArgs` stack-vector mechanism while both Darwin execs declare NO `processArgs` at all (dyld fills the argument registers before any DSS code runs), so a refusal that happened to depend on the mechanism being PRESENT would pass on ELF and silently ACCEPT here. MEASURED 2026-08-10 on both Darwin execs: rc=1, K_ProgramEntryUndefined, naming the near miss ('wmain' is defined here but needs the 'argc-wargv' materialization verb, which this format does not realize) -- so candidacy is decided by the declared VERB SET and not by the mechanism, proven on a format where the two differ. * `positioned: false` is honest, not a shortcut: this is a WHOLE-PROGRAM fact with no single declaration at fault, and a fabricated span would be trusted while a missing one is not. * NO `runOn`: the example compiles and never runs, so the refusal is a cross-compile fact observable from any host -- which is what makes it a legitimate Darwin pin from a Windows host, unlike the run-witness arms it replaces. * RED-ON-DISABLE: add \"argc-wargv\" to macho64-arm64-darwin-exec.format.json's `entryVerbs` and this stops erroring, because `wmain` would survive the intersection and be selected as the Darwin entry -- whose wide argv dyld never supplies.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "K_ProgramEntryUndefined",
+      "line": 1,
+      "col": 1,
+      "positioned": false
+    }
+  ]
+}

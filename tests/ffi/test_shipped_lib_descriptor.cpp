@@ -361,6 +361,149 @@ TEST(ShippedLibDescriptor, SymbolLibraryOverrideSentinelFormatFailsLoud) {
            "the table";
 }
 
+// ══ A MACRO THAT SHADOWS A SYMBOL WITHOUT REFERENCING IT (UCRT-P4) ═══════════
+//
+// Before this guard the shape below compiled rc=0 with NO diagnostic: the macro
+// silently won at preprocess time, nothing could ever call the symbol, and the
+// symbol was STILL eagerly imported (D-FFI-DESCRIPTOR-EAGER-IMPORT) — a dead import
+// in every binary that included the header.
+//
+// ★ THE THREE TESTS BELOW ARE ONE ARGUMENT AND MUST BE READ TOGETHER. The naive
+// rule "same name + overlapping format = error" is FALSE and would red 17 in-tree,
+// standard-mandated rows; the two BENIGN pins are what stop this guard from being
+// re-cut into that false rule the first time someone "simplifies" it.
+//
+// RED-ON-DISABLE (for the defect pin): delete the `checkMacroSymbolShadowing` call
+// at step (7.5) of `readShippedLibDescriptor` and the read SUCCEEDS. Neither benign
+// pin changes, so removing the guard is distinguishable from loosening it.
+TEST(ShippedLibDescriptor, MacroShadowingSymbolWithoutReferenceFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // `g` is declared as a symbol AND defined as a macro expanding to something
+    // ELSE, on the same (unrestricted) formats. Nothing can ever reach the symbol.
+    auto const path = writeTemp(dir, "shadow_defect.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "g", "signature": "fn(i32) -> i32" },
+            { "name": "h", "signature": "fn(i32) -> i32" }
+        ],
+        "macros": [
+            { "name": "g", "params": ["x"], "replacement": "h((x))" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+    EXPECT_TRUE(anyDiagMentions(rep, "SHADOWS"))
+        << "the diagnostic must name the SHADOWING as the fault — a generic "
+           "'malformed macro' would send the author looking at the macro's shape";
+    EXPECT_TRUE(anyDiagMentions(rep, "does not reference"))
+        << "and it must state the DISCRIMINATOR, or the reader will conclude that "
+           "a same-name macro is itself illegal (it is not — see the tgmath pin)";
+}
+
+TEST(ShippedLibDescriptor, MacroShadowingSymbolItReferencesIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // ★ THE C 7.25 <tgmath.h> PATTERN, WHICH THE REAL CORPUS USES 17 TIMES. The
+    // replacement REFERENCES the shadowed name, so by C 6.10.3.4p2 (a replacement
+    // list is not re-scanned for the macro being replaced) the symbol is the
+    // macro's OWN CALLEE and the eager import is exactly right.
+    // RED-ON-DISABLE for the false rule: implement "same name + overlapping format
+    // = error" and this test fails, naming tgmath.
+    auto const path = writeTemp(dir, "shadow_benign_ref.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libm.so.6" },
+        "symbols": [
+            { "name": "acos",  "signature": "fn(f64) -> f64" },
+            { "name": "acosf", "signature": "fn(f32) -> f32" }
+        ],
+        "macros": [
+            { "name": "acos", "params": ["x"],
+              "replacement": "_Generic((x), float: acosf((float)(x)), default: acos((x)))" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_TRUE(desc.has_value())
+        << "the standard-mandated type-generic-macro shape must LOAD — this is the "
+           "shape 17 rows of the shipped corpus use";
+    EXPECT_FALSE(rep.hasErrors());
+}
+
+TEST(ShippedLibDescriptor, MacroShadowingSymbolOnDisjointFormatsIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // ★ THE pe `time`->`_time64` PATTERN, which the real corpus uses 11 times
+    // (setjmp, stdin/stdout/stderr, atexit, strtoll, time/localtime/gmtime/mktime,
+    // fstat). The macro does NOT reference the shadowed name — and must not have to:
+    // it exists on pe precisely BECAUSE the symbol is absent there. Disjoint formats
+    // mean no leg ever sees both, so nothing is shadowed and nothing is wasted.
+    // RED-ON-DISABLE for the format half: drop the `overlaps` test and this fails.
+    auto const path = writeTemp(dir, "shadow_benign_disjoint.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "t", "signature": "fn(ptr<i64>) -> i64",
+              "availableObjectFormats": ["elf", "macho"] },
+            { "name": "_t64", "signature": "fn(ptr<i64>) -> i64",
+              "availableObjectFormats": ["pe"] }
+        ],
+        "macros": [
+            { "name": "t",
+              "variants": [ { "when": { "format": "pe" },
+                              "params": ["a"], "replacement": "_t64((a))" } ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // activeFormat deliberately NOT supplied — the nullopt path the corpus-wide
+    // decode test uses, where `out.macros` is EMPTY for a variants-only macro. The
+    // guard must still see the variant (it reads the raw JSON), and must still
+    // ACCEPT it.
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_TRUE(desc.has_value())
+        << "a per-format macro whose symbol lives on the OTHER formats is the "
+           "intended design, not a defect";
+    EXPECT_FALSE(rep.hasErrors());
+}
+
+TEST(ShippedLibDescriptor, MacroVariantWhoseOtherFormatBodyDropsTheNameFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // ★ EVERY VARIANT BODY IS CHECKED INDEPENDENTLY, NOT "ANY BODY REFERENCES IT".
+    // The pe body REFERENCES `q` (legitimate — the tgmath `fabs`/`ldexp` shape), the
+    // elf body does NOT, and the symbol is available on BOTH formats. So this is a
+    // real defect ON ELF that its own pe sibling must not excuse.
+    // RED-ON-DISABLE: change the predicate to "any body references the name" and
+    // this read starts succeeding, while all three pins above stay green — so the
+    // weakening is distinguishable from removing the guard outright.
+    auto const path = writeTemp(dir, "shadow_variant_mixed.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "q", "signature": "fn(i32) -> i32" },
+            { "name": "r", "signature": "fn(i32) -> i32" }
+        ],
+        "macros": [
+            { "name": "q",
+              "variants": [
+                { "when": { "format": "pe" },  "params": ["x"], "replacement": "q((x))" },
+                { "when": { "format": "elf" }, "params": ["x"], "replacement": "r((x))" }
+              ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(anyDiagMentions(rep, "SHADOWS"));
+}
+
 // A per-symbol `library` VALUE that is not a string fails loud (mirrors the
 // descriptor-level map's non-string-value rejection via `decodeLibraryMap`).
 TEST(ShippedLibDescriptor, SymbolLibraryOverrideNonStringValueFailsLoud) {
@@ -5787,6 +5930,117 @@ TEST(ShippedLibDescriptor, RealStdlibJsonMallocZoneMachoOnly) {
     ASSERT_NE(malloc_, nullptr) << "positive control: malloc must be present";
     EXPECT_TRUE(malloc_->availableObjectFormats.empty())
         << "positive control: malloc ships ungated (every format)";
+}
+
+// ── UCRT-P4: `setlocale` MUST BE A UNGATED SHIPPED ROW ON ALL THREE FORMATS ──────
+// The language schema no longer guesses a per-name import library
+// (`externLibraryByFormat` is gone), so the shipped-descriptor corpus is the SINGLE
+// owner of realization and a bare `extern char *setlocale(int, const char *)` binds
+// ONLY through a row like this one. examples/c-subset/setlocale_c is the consumer and
+// it spans pe AND elf AND macho across five targets, which is exactly why a SOURCE-side
+// per-symbol library override cannot serve it: that syntax carries ONE library string
+// and would project one image under every format key.
+//
+// The row lives in stdlib.json rather than a locale.json ON PURPOSE and at a stated
+// cost — a descriptor SHADOWS its header TOTALLY, so a partial locale.json would delete
+// a future `#include <locale.h>`'s access to the REAL header and REGRESS
+// D-INCLUDE-ANGLE-SOURCE-FALLBACK, while a complete one would need a per-format
+// `struct lconv` + a DIVERGING LC_* domain (msvcrt LC_ALL=0 vs glibc LC_CTYPE=0) with no
+// consumer to witness it. That is the identical trade the malloc_zone cluster above
+// records, and the identical accepted cost: <stdlib.h>'s surface now declares a name the
+// real <stdlib.h> does not. Placement is organizational — the consuming oracle scans
+// `symbols[].name` across ALL descriptors.
+//
+// FOUR things are asserted and each is load-bearing on its own:
+//   (1) the ROW EXISTS (delete it and every leg is K_SymbolUndefined again);
+//   (2) the SIGNATURE is `fn(i32, ptr<char>) -> ptr<char>` — all three platform headers
+//       agree, and `int` needs no dataModel arm (i32 under LP64 AND LLP64);
+//   (3) it is UNGATED — narrowing it to any single format silently returns the other
+//       legs to unbound, which is the precise regression this row exists to close, so
+//       the emptiness of the availability set is asserted AND the injector gate is
+//       probed on all three formats;
+//   (4) the LIBRARY comes from the DESCRIPTOR map with pe on `ucrtbase.dll`, and the row
+//       carries NO per-symbol override — the eager-import law means a declared
+//       non-export breaks the LOAD of every binary including <stdlib.h>, and a per-symbol
+//       override would mint a SECOND owner of a fact declared once and let the two drift.
+//
+// RED-on-disable: delete the row (1 fails), re-sign it `fn(i32, ptr<char>) -> i32`
+// (2 fails), add `availableObjectFormats: ["pe"]` (3 fails), or point pe back at
+// msvcrt.dll (4 fails). Each is a HASH change to the descriptor, none a line-count
+// change, and each leaves the JSON parseable — so the read below still succeeds and the
+// assertion, not the loader, is what reds.
+TEST(ShippedLibDescriptor, RealStdlibJsonSetlocaleUngatedAllFormats) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "stdlib.json";
+
+    // The three (format, expected image) pairs the descriptor map must resolve.
+    struct Leg { ObjectFormatKind fmt; char const* image; char const* arch; };
+    std::array<Leg, 3> const legs{{
+        {ObjectFormatKind::Pe,    "ucrtbase.dll",                 "x86_64"},
+        {ObjectFormatKind::Elf,   "libc.so.6",                    "x86_64"},
+        {ObjectFormatKind::MachO, "/usr/lib/libSystem.B.dylib",   "arm64"},
+    }};
+
+    for (auto const& leg : legs) {
+        DarwinBsdClusterRead r;
+        ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, leg.arch, leg.fmt, r));
+
+        // (1) THE ROW EXISTS. This is the delete-the-row red.
+        auto const* sym = findDarwinBsdSymbol(r, "setlocale");
+        ASSERT_NE(sym, nullptr)
+            << "setlocale must ship as a stdlib.json symbol row — without it a bare "
+               "extern is UNBOUND now that the language schema guesses no import library";
+
+        // (2) THE SIGNATURE, structurally: char *setlocale(int, const char *).
+        ASSERT_EQ(r.interner.kind(sym->signature), TypeKind::FnSig);
+        TypeId const ret = r.interner.fnResult(sym->signature);
+        EXPECT_EQ(r.interner.kind(ret), TypeKind::Ptr) << "setlocale returns char *";
+        {
+            auto const rp = r.interner.operands(ret);
+            ASSERT_EQ(rp.size(), 1u);
+            EXPECT_EQ(r.interner.kind(rp[0]), TypeKind::Char)
+                << "the RESULT pointee is char — the witness prints the returned string, "
+                   "so a ptr<void> here would lose the only thing it asserts";
+        }
+        auto const ps = r.interner.fnParams(sym->signature);
+        ASSERT_EQ(ps.size(), 2u) << "setlocale(category, locale)";
+        EXPECT_EQ(r.interner.kind(ps[0]), TypeKind::I32)
+            << "the category is a plain C int — i32 under LP64 AND LLP64, hence no "
+               "signatureByDataModel arm";
+        ASSERT_EQ(r.interner.kind(ps[1]), TypeKind::Ptr);
+        {
+            auto const pp = r.interner.operands(ps[1]);
+            ASSERT_EQ(pp.size(), 1u);
+            EXPECT_EQ(r.interner.kind(pp[0]), TypeKind::Char)
+                << "the locale name is a const char * (ptr<char> by this file's "
+                   "realpath/getenv/system convention)";
+        }
+
+        // (3) UNGATED. Empty availability set == every format; and the gate itself must
+        // admit THIS leg's format, so a narrowing that keeps the set non-empty but drops
+        // one format cannot slip past the emptiness check alone.
+        EXPECT_TRUE(sym->availableObjectFormats.empty())
+            << "setlocale is ungated: its consumer spans pe + elf + macho, so ANY "
+               "availableObjectFormats narrowing returns the excluded legs to "
+               "K_SymbolUndefined";
+        EXPECT_TRUE(objectFormatInAvailabilitySet(sym->availableObjectFormats, leg.fmt))
+            << "the injector gate must admit setlocale on this format";
+
+        // (4) THE IMAGE comes from the DESCRIPTOR map, and pe is UCRT.
+        auto const it =
+            r.desc->library.find(std::string{objectFormatKindName(leg.fmt)});
+        ASSERT_NE(it, r.desc->library.end())
+            << "stdlib.json must declare a runtime image for this format";
+        EXPECT_EQ(it->second, leg.image)
+            << "setlocale is eager-imported from this image by EVERY program that "
+               "includes <stdlib.h>; pe in particular must be ucrtbase.dll (measured "
+               "export) and not the legacy msvcrt.dll this arc is retiring";
+        EXPECT_TRUE(sym->library.empty())
+            << "NO per-symbol library override: the descriptor map already names exactly "
+               "the three images setlocale lives in, and a second owner of that fact "
+               "would drift from the first";
+    }
 }
 
 TEST(ShippedLibDescriptor, RealSysTimeJsonFutimesMachoOnly) {

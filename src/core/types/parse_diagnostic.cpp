@@ -69,6 +69,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_AttributeIgnoredForDeclarationKind";
         case DiagnosticCode::S_IncompatiblePointerIntegerPointee:
             return "S_IncompatiblePointerIntegerPointee";
+        case DiagnosticCode::S_EntryShapeNotDeclared:
+            return "S_EntryShapeNotDeclared";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -441,6 +443,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_FormatLacksProcessExit";
         case DiagnosticCode::K_ExecEntryNotTrampolined:
             return "K_ExecEntryNotTrampolined";
+        case DiagnosticCode::K_EntryVerbUnmaterializable:
+            return "K_EntryVerbUnmaterializable";
+        case DiagnosticCode::K_ProgramEntryUndefined:
+            return "K_ProgramEntryUndefined";
+        case DiagnosticCode::K_ProgramEntryAmbiguous:
+            return "K_ProgramEntryAmbiguous";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

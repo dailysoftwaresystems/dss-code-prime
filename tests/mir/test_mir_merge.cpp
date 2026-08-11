@@ -36,7 +36,9 @@
 #include "core/types/type_lattice/type_lattice.hpp"
 #include "core/types/target_schema.hpp"        // ProcessArgs / ArgsMechanism (c111)
 #include "mir/merge/mir_merge.hpp"
-#include "mir/merge/synth_pe_startup.hpp"       // synthesizePeStartup (c111)
+#include "core/types/unsuppressable_codes.hpp"  // isUnsuppressable (UCRT-P4 gate)
+#include "link/object_format_schema.hpp"        // the shipped runtimeLibraries table
+#include "mir/merge/synth_pe_startup.hpp"       // realizeEntryShape (UCRT-P4)
 #include "mir/merge/synth_seh_funclets.hpp"     // synthesizeSehFunclets (c116)
 #include "mir/merge/synth_stdio_shim.hpp"       // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION P3)
 #include "mir/merge/synth_threads_shim.hpp"      // synthesizeThreadsShim (FC17.9a)
@@ -187,14 +189,108 @@ Mir buildEntryOnly(TypeInterner& in, TypeId sig) {
     return std::move(mb).finish();
 }
 
-// The Windows CRT out-parameter mechanism, wired with the real msvcrt export names.
-ProcessArgs crtOutParamPa() {
+// The `void main()` twin — a ZERO-PARAMETER, void-returning entry.
+//
+// ⓘ ITS ROLE CHANGED WITH THE TIER. It was built to be refused by this pass's
+// declared-SHAPE lookup (C23 5.1.2.2.1 requires `int`, so no format declared a
+// `void` return row). That signature check moved to the semantic tier
+// (`S_EntryShapeNotDeclared`, which has the declarator and a real source span), so
+// what this builder supplies NOW is the only thing at the MIR tier that still cares
+// about this module: a signature with FEWER THAN TWO PARAMETERS, which an
+// argc/argv verb has nowhere to materialize into (`K_EntryVerbUnmaterializable`).
+//
+// A separate builder because the body cannot `return 0;` from a void function --
+// the MirVerifier would reject that before the pass under test ever ran, which
+// would make the refusal test pass for the wrong reason.
+Mir buildVoidEntryOnly(TypeInterner& in, TypeId sig) {
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    mb.addReturn();
+    return std::move(mb).finish();
+}
+
+// The UCRT accessor mechanism, wired with the REAL ucrtbase export names + the
+// MEASURED argv mode. Values, not placeholders: `_configure_narrow_argv` (ord 190),
+// `_configure_wide_argv` (191), `__p___argc` (81), `__p___argv` (82), `__p___wargv`
+// (83) were all read off `objdump -p C:/Windows/System32/ucrtbase.dll` on 2026-08-10,
+// and mode 1 is the behaviour-preserving `_crt_argv_mode` (argv present, wildcards
+// NOT expanded) that matches c111's `_dowildcard = 0`.
+ProcessArgs ucrtAccessorPa() {
     ProcessArgs pa;
-    pa.mechanism       = ArgsMechanism::CrtOutParam;
-    pa.crtWideArgvFn   = "__wgetmainargs";
-    pa.crtNarrowArgvFn = "__getmainargs";
-    pa.crtLibraryPath  = "msvcrt.dll";
+    pa.mechanism             = ArgsMechanism::CrtArgvAccessors;
+    pa.configureNarrowArgvFn = "_configure_narrow_argv";
+    pa.configureWideArgvFn   = "_configure_wide_argv";
+    pa.argcAccessorFn        = "__p___argc";
+    pa.narrowArgvAccessorFn  = "__p___argv";
+    pa.wideArgvAccessorFn    = "__p___wargv";
+    pa.argvMode              = 1;
+    pa.argvUnavailableExitStatus = 127;
+    pa.role                  = RuntimeLibraryRole::CLibrary;
+    pa.crtLibraryPath        = "ucrtbase.dll";
     return pa;
+}
+
+// The pe64 exec format's declared program-entry VERB SET — `entryVerbs`, which is
+// the whole of what a FORMAT declares about program entry now.
+//
+// ⓘ WHAT THIS USED TO BE, because the shrink is the design change. It was a list of
+// whole SHAPES (`EntryShape{returns, params, verb}`) and a format owned all three
+// parts. The SIGNATURE half moved to the SOURCE LANGUAGE — `EntryFunctionShape`
+// (which also carries the entry's NAME) under `DeclarationRule::entryFunctions` —
+// because how an entry is SPELLED is C's fact, not a loader's. What a format still
+// owns, and solely owns, is which materialization VERBS its loader/CRT can
+// actually realize. `wmain` is a program-entry candidate on Windows because
+// `argc-wargv` is in THIS set and in no other shipped format's, with no
+// format-identity branch anywhere.
+//
+// Spelled here rather than loaded so these MIR-tier pins stay host-independent;
+// the SHIPPED values are pinned separately in
+// tests/link/test_object_format_schema.cpp.
+std::vector<EntryMaterialization> peEntryVerbs() {
+    return {
+        EntryMaterialization::None,        // `int main(void)` — nothing to fetch
+        EntryMaterialization::ArgcArgv,    // `int main(int, char**)`
+        EntryMaterialization::ArgcWargv,   // `int wmain(int, wchar_t**)` — pe only
+    };
+}
+
+// `ObjectFormatSchema::realizesEntryVerb` spelled at the test tier: pick the verb
+// under test OUT of the stated format's declared set, failing loud when that set
+// does not declare it.
+//
+// WHY THE INDIRECTION IS WORTH ITS LINES. `realizeEntryShape` is handed ONE verb,
+// already decided; the FORMAT owns a SET, and entry resolution picks between them
+// with exactly this predicate. Routing every pin's verb through here keeps the
+// "this is what format F does" claim in each pin's name honest — a pin that passed
+// `ArgcWargv` while naming an ELF format would be describing a combination no
+// shipped build can produce, and would therefore be pinning nothing.
+[[nodiscard]] EntryMaterialization
+verbRealizedBy(std::vector<EntryMaterialization> const& declared,
+               EntryMaterialization                     want) {
+    bool found = false;
+    for (auto const v : declared) {
+        if (v == want) found = true;
+    }
+    EXPECT_TRUE(found)
+        << "the stated format's declared entryVerbs set does NOT realize '"
+        << entryMaterializationName(want)
+        << "' — entry resolution could never hand this pass that verb for this "
+           "format, so the pin below would assert on an unreachable combination";
+    return want;
+}
+
+// The pe64 exec format's declared SEH personality: the routine + the image its
+// `unwindPersonality` role resolves to. MEASURED 2026-08-10: `__C_specific_handler`
+// is exported by ucrtbase (ord 30), msvcrt (106), ntdll (2332) AND vcruntime140 (8),
+// so pointing it at ucrtbase is link-safe.
+SehPersonality peSehPersonality() {
+    SehPersonality p;
+    p.role        = RuntimeLibraryRole::UnwindPersonality;
+    p.libraryPath = "ucrtbase.dll";
+    p.mangledName = "__C_specific_handler";
+    return p;
 }
 
 } // namespace
@@ -679,81 +775,104 @@ TEST(MirMerge, LengthPrefixedKeyKeepsAColludingNameLibraryPairApart) {
     EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
 }
 
-// ── THE pe CRT DIVERGENCE THIS KEY MAKES VISIBLE — PINNED AS-IS, NOT AS-WISHED ──
+// == TWO IMAGES OWNING ONE NAME STAY TWO IMPORTS -- and the libraries are now
+//    READ FROM CONFIG, not hardcoded ========================================
 //
-// extern_import.hpp's `isEagerImport` contract says an eager `#include`d symbol
-// and a hand-written non-eager `extern` of the same name fold to one EAGER row.
-// That is true only where BOTH PRODUCERS SPELL THE SAME LIBRARY, and on pe they
-// do not — MEASURED, from the two config values themselves:
-//   * src/dss-config/shippedLibs/stdio.json:5  `library.pe`            = ucrtbase.dll
-//   * src/dss-config/sources/c-subset.lang.json:1531
-//                                         `externLibraryByFormat.pe`   = msvcrt.dll
-// (elf and macho each spell ONE library across both, so the contract holds there
-// unchanged — which is why this test is pe-shaped and pe-named.)
+// ** WHY THIS TEST WAS REWRITTEN, stated plainly because the old version is the
+// exact failure mode this project has a name for. It was called
+// `PeUcrtbaseAndMsvcrtRowsOfOneNameStayTwoImports`, its comment promised that
+// "changing either config value MOVES A TEST instead of silently changing what a pe
+// binary imports", and `src/core/types/extern_import.hpp` CITED it as the pin for
+// that property. MEASURED 2026-08-10: it hardcoded `libImport("puts",
+// "ucrtbase.dll")` and `libImport("puts", "msvcrt.dll")` and read NEITHER config
+// value, so changing either moved nothing. It was a guard that asserted nothing,
+// carrying a comment claiming the opposite -- and it would have stayed green while
+// pinning a shape that no longer exists, since UCRT-P4 removes the last mechanism
+// that could point the pe spine at msvcrt.
 //
-// So on pe, CU A `#include <stdio.h>` + CU B `extern int puts(const char*);`
-// produce TWO rows, TWO IMAGE_IMPORT_DESCRIPTORs, and CU B's call bound into
-// msvcrt's copy of `puts` — the split CRT the UCRT migration retired. NOT
-// reachable same-TU: the semantic tier suppresses the shipped row when the user
-// declares the name (semantic_analyzer.cpp:13324,13354), so one TU yields one row.
+// WHAT IT PINS NOW, and the claim is exactly as strong as the assertions:
+//   1. THE MERGE PROPERTY (unchanged, and always the real subject): two extern
+//      imports that share a `mangledName` but name DIFFERENT libraries are TWO
+//      dynamic symbols. They do NOT fold, so the eagerness OR-combine never runs,
+//      and each CU's call binds into ITS OWN image. Folding across `libraryPath` is
+//      the misbind D-LK11-EXTERN-IMPORT-DEDUP exists to prevent.
+//   2. THE CONFIG READ (new): the two libraries come from the SHIPPED pe64 exec
+//      format's `runtimeLibraries` table -- `cLibrary` and `systemPrimitives`. That
+//      makes the claim honest AND makes it move: point those two roles at the same
+//      image and this test reds, which is precisely the "changing a config value
+//      moves a test" property the old comment promised and did not deliver.
 //
-// ★ WHAT THIS TEST IS FOR, stated plainly so nobody "fixes" it by editing the
-// expectation. It does NOT bless the divergence and it does NOT claim the wider
-// key caused it: both config values predate this fold, and a name-only key did not
-// RECONCILE them — it HID them, folding across libraryPath, which is the very
-// misbind D-LK11-EXTERN-IMPORT-DEDUP exists to prevent. Reconciling the two pe
-// defaults is D-FFI-PE-CRT-UCRT-MIGRATION's job. Until then this pins the ACTUAL
-// behaviour so that changing either config value MOVES A TEST instead of silently
-// changing what a pe binary imports. When the reconciliation lands, this test's
-// expectation becomes 1 row and its eagerness becomes OR-combined true — and the
-// person doing it will be told so by this failure.
-TEST(MirMerge, PeUcrtbaseAndMsvcrtRowsOfOneNameStayTwoImports) {
-    ExternImport shipped = libImport("puts", "ucrtbase.dll");  // <stdio.h>
-    shipped.isEagerImport = true;                              // descriptor ⇒ eager
-    ExternImport handDeclared = libImport("puts", "msvcrt.dll");  // source `extern`
+// The pe64 table is the right source because it is the one shipped format that
+// declares MORE THAN ONE role, i.e. the only place in the tree where "two images,
+// one program" is a real configuration rather than a hypothetical.
+TEST(MirMerge, TwoConfigDeclaredImagesOwningOneNameStayTwoImports) {
+    auto fmtR = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(fmtR.has_value());
+    auto const& table = (*fmtR)->runtimeLibraries();
+    auto const cLib = table.imageForRole(RuntimeLibraryRole::CLibrary);
+    auto const sysLib = table.imageForRole(RuntimeLibraryRole::SystemPrimitives);
+    ASSERT_TRUE(cLib.has_value())
+        << "the pe64 exec format must declare a cLibrary role for this test to read";
+    ASSERT_TRUE(sysLib.has_value())
+        << "and a systemPrimitives role -- the two-image configuration is what is "
+           "under test";
+    // FAIL-CLOSED, and this is the assertion that keeps the test honest: if the two
+    // roles ever pointed at the SAME image, the rows below would FOLD and the
+    // "stay two imports" claim would be false rather than untested. Reds here with
+    // a message naming the cause, instead of silently asserting a different thing.
+    ASSERT_NE(std::string{*cLib}, std::string{*sysLib})
+        << "the two roles must resolve to DIFFERENT images (" << *cLib << " vs "
+        << *sysLib << ") -- with one image the merge SHOULD fold them and this "
+           "test's subject disappears";
+
+    ExternImport shipped = libImport("puts", std::string{*cLib});
+    shipped.isEagerImport = true;                    // a descriptor row => eager
+    ExternImport handDeclared = libImport("puts", std::string{*sysLib});
     handDeclared.isEagerImport = false;
 
     DiagnosticReporter rep;
     auto merged = mergeTwoImportCus(shipped, handDeclared, rep);
     ASSERT_TRUE(merged.has_value()) << allDiagText(rep);
     EXPECT_EQ(rep.errorCount(), 0u)
-        << "two libraries owning one name is not a conflict — it is two imports: "
+        << "two libraries owning one name is not a conflict -- it is two imports: "
         << allDiagText(rep);
 
     ASSERT_EQ(merged->externImports.size(), 2u)
-        << "★ pe's shipped-descriptor library (ucrtbase.dll) and its source-extern "
-           "default (msvcrt.dll) DIFFER, so these are two dynamic symbols and the "
-           "eagerness OR-combine never runs. If this now reads 1, the two config "
-           "values were reconciled — update extern_import.hpp's pe paragraph and "
-           "this test together";
+        << "two DIFFERENT libraries owning one name are two dynamic symbols, so the "
+           "eagerness OR-combine never runs. If this reads 1, the merge started "
+           "folding across libraryPath -- the exact misbind "
+           "D-LK11-EXTERN-IMPORT-DEDUP exists to prevent";
 
     std::unordered_map<std::string, ExternImport const*> byLib;
     for (ExternImport const& e : merged->externImports) {
         EXPECT_EQ(e.mangledName, "puts");
         byLib.emplace(e.libraryPath, &e);
     }
-    ASSERT_TRUE(byLib.count("ucrtbase.dll") == 1 && byLib.count("msvcrt.dll") == 1)
-        << "both CRT images must keep their own import row";
-    EXPECT_TRUE(byLib["ucrtbase.dll"]->isEagerImport)
+    ASSERT_TRUE(byLib.count(std::string{*cLib}) == 1
+                && byLib.count(std::string{*sysLib}) == 1)
+        << "both images must keep their own import row";
+    EXPECT_TRUE(byLib[std::string{*cLib}]->isEagerImport)
         << "the descriptor row stays EAGER (D-FFI-DESCRIPTOR-EAGER-IMPORT)";
-    EXPECT_FALSE(byLib["msvcrt.dll"]->isEagerImport)
-        << "★ and the hand-declared row stays NON-eager: it did NOT fold, so it "
+    EXPECT_FALSE(byLib[std::string{*sysLib}]->isEagerImport)
+        << "* and the hand-declared row stays NON-eager: it did NOT fold, so it "
            "never received the descriptor row's eagerness. This is the observable "
-           "half of the divergence — the linker's reference gate treats the two "
-           "rows by different rules";
-    EXPECT_NE(byLib["ucrtbase.dll"]->symbol.v, byLib["msvcrt.dll"]->symbol.v);
+           "half -- the linker's reference gate treats the two rows by different "
+           "rules";
+    EXPECT_NE(byLib[std::string{*cLib}]->symbol.v,
+              byLib[std::string{*sysLib}]->symbol.v);
 
-    // …and CU B's call really does bind the msvcrt row. That is the miscompile-
-    // shaped consequence, and it is what makes this a behaviour pin rather than a
-    // row count.
+    // ...and each CU's call really does bind ITS OWN row. That is the
+    // miscompile-shaped consequence, and it is what makes this a behaviour pin
+    // rather than a row count.
     auto const mainCallee =
         calleeSymbolOf(merged->mir, merged->symbolNames, "main");
     auto const helperCallee =
         calleeSymbolOf(merged->mir, merged->symbolNames, "helper");
     ASSERT_TRUE(mainCallee.has_value() && helperCallee.has_value());
-    EXPECT_EQ(*mainCallee, byLib["ucrtbase.dll"]->symbol.v);
-    EXPECT_EQ(*helperCallee, byLib["msvcrt.dll"]->symbol.v)
-        << "the hand-declaring CU calls MSVCRT's puts — one program, two CRTs";
+    EXPECT_EQ(*mainCallee, byLib[std::string{*cLib}]->symbol.v);
+    EXPECT_EQ(*helperCallee, byLib[std::string{*sysLib}]->symbol.v)
+        << "the hand-declaring CU calls the OTHER image's `puts` -- one program, "
+           "two images";
 
     MirVerifier verifier{merged->mir, &merged->host.interner()};
     EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
@@ -1756,21 +1875,327 @@ TEST(MirMerge, MergeReportsTwoStrongConflict) {
         << "exactly one two-strong conflict must be reported";
 }
 
-// ── c111 (D-RUNTIME-PE-MAIN-ARGS): synthesizePeStartup structural pins ─────────
-// The Windows CRT out-parameter args mechanism synthesizes a pre-main init that
-// fetches argc/argv via an msvcrt export and forwards them to the user entry,
-// RETARGETING the program entry to the synth fn. These pins assert that shape
-// HOST-INDEPENDENTLY — they run on EVERY leg, unlike the Windows-only runtime
-// witness in examples/c-subset/main_argc_argv (whose pe64 arm this cycle turns on):
-//   * NarrowMain — a main(int,char**) entry appends a synth fn (entry retargeted),
-//     adds the NARROW __getmainargs FUNCTION import, and the module verifies;
-//   * WideWmain — a wmain(int,wchar_t**) entry (argv element = pe wide-char u16)
-//     binds the WIDE __wgetmainargs export instead — arm chosen by the argv ELEMENT
-//     width, never a format flag (RED-on-swap if narrow/wide invert);
-//   * VoidMain — a main(void) entry needs no arg setup → NO synth;
-//   * NonCrtMechanism — a non-CrtOutParam (ELF stack-vector) mechanism → NO synth.
+// == UCRT-P4: realizeEntryShape structural pins ==============================
+//
+// ★★★ THE PASS NOW HAS ONE JOB, NOT TWO, AND THIS SECTION SHRANK TO MATCH. It used
+// to GATE (classify the resolved entry's signature out of the merged MIR and refuse
+// any shape the FORMAT had not declared, `K_EntryShapeNotDeclared`) and then
+// MATERIALIZE. The gate is GONE FROM THIS TIER — deliberately, not by oversight —
+// and the retired code split into four:
+//
+//   * `S_EntryShapeNotDeclared` (0xE061, SEMANTIC tier, per-definition, with a real
+//     source span) — "a function whose name the language declares as an entry
+//     spelling has a signature no declared row for that name has". THAT is where a
+//     3-param `main` and a `void main()` are refused now. Emitted from
+//     src/analysis/semantic/semantic_analyzer.cpp.
+//   * `K_ProgramEntryUndefined` (0x801F) / `K_ProgramEntryAmbiguous` (0x8020) —
+//     entry RESOLUTION, which intersects the language's declared entry rows with
+//     the format's declared `entryVerbs` and so decides the verb before this pass
+//     is called.
+//   * `K_EntryVerbUnmaterializable` (0x801E) — the ONE refusal for a shape problem
+//     this pass still owns, and it is a MIR-tier ARITY BACKSTOP rather than a
+//     signature gate: "the verb I was told to materialize needs two parameters and
+//     this module's entry has fewer, so the arguments have nowhere to land."
+//
+// Two MIR-tier assertions were therefore DELETED rather than reworded — each is
+// marked at its old position with what it asserted and which code owns it now. A
+// test kept alive by relaxing it until the new code happens to satisfy it would
+// claim coverage this tier does not have; see the note above
+// `EveryEntryRefusalCodeIsUnsuppressable`.
+//
+// What is pinned here is HOST-INDEPENDENT (it runs on EVERY leg, unlike the
+// Windows-only runtime witnesses in examples/ and
+// tests/program/test_entry_argv_run.cpp):
+//
+//   THE ONE SURVIVING REFUSAL (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE)
+//     * ArgcArgvVerbOnAZeroParamEntryHitsTheArityBackstop -- verb `argc-argv` with a
+//       0-parameter entry signature => K_EntryVerbUnmaterializable, asserted by CODE
+//       and by MESSAGE CONTENT (the defect this family replaces WAS a silent
+//       accept-then-fault, so a bare `EXPECT_FALSE` would repeat the mistake), plus
+//       "a refused entry emits nothing".
+//     * EveryEntryRefusalCodeIsUnsuppressable -- all four replacement codes, so
+//       `--suppress` cannot hand back the accepted-then-faulting binary.
+//
+//   MATERIALIZE (D-FFI-PE-CRT-UCRT-MIGRATION)
+//     * EveryDeclaredVerbHasAMaterializationArm -- the verb-SET pin, and the
+//       red-on-disable that replaces the deleted config-lever refusal: every verb
+//       the pe64 format declares must have an arm here, and FILTERING `argc-argv`
+//       out of the declared set must remove the narrow argv spine from what the
+//       format can realize (its own matcher, the `__p___argv` import name);
+//     * NarrowMainBindsUcrtNarrowAccessors -- a main(int,char**) entry appends a synth
+//       fn (entry retargeted) and imports EXACTLY the narrow triple from the
+//       role-resolved image;
+//     * WideWmainBindsUcrtWideAccessors -- a wmain(int,wchar_t**) entry binds the WIDE
+//       configure + wargv accessor and the SHARED argc accessor. The arm is chosen by
+//       the DECIDED VERB -- which came from the LANGUAGE row that matched the entry's
+//       own signature -- never a format flag;
+//     * VoidMainNeedsNoSynth -- the `none` verb is a clean no-op -> NO synth;
+//     * StackVectorMechanismIsANoOp -- the ELF route materializes in the trampoline;
+//     * NoMechanismIsANoOp -- Mach-O's real answer (dyld already did it).
 
-TEST(SynthPeStartup, NarrowMainAppendsGetmainargsAndRetargets) {
+// Assert a substring is present, with the whole message on failure -- the refusal's
+// CONTENT is the contract here, so a bare `hasErrors()` would not pin it.
+inline void expectDiagContains(DiagnosticReporter const& rep, std::string_view needle) {
+    std::string const all = allDiagText(rep);
+    EXPECT_NE(all.find(needle), std::string::npos)
+        << "diagnostic must contain \"" << needle << "\"; full text was:\n" << all;
+}
+
+// ── ⓧ REMOVED: RealizeEntryShape.ThreeParamMainRefusedNamingTheDeclaredSet ────
+//
+// WHAT IT ASSERTED: that `realizeEntryShape` refused an `int main(int, char**,
+// char**)` entry with `K_EntryShapeNotDeclared` and a message naming the entry, the
+// ENUMERATED declared shape set, and that the set was FORMAT-declared. It was the
+// pin on the MEASURED defect (2026-08-10, HEAD 3e86a187): that exact signature
+// compiled rc=0 with ZERO diagnostics on pe64 AND elf64 and produced a binary that
+// faulted on the first envp dereference (0xC0000005 / SIGSEGV rc=139).
+//
+// WHY IT IS GONE RATHER THAN REWRITTEN: this tier no longer decides it, and there
+// is no honest MIR-tier restatement of it. `K_EntryShapeNotDeclared` is RETIRED; a
+// signature is now checked against the SOURCE LANGUAGE's declared rows at the
+// SEMANTIC tier, by `S_EntryShapeNotDeclared` (0xE061), which has the declarator and
+// therefore a real source span — and which asks the one party that can answer "how
+// does C spell an entry", instead of asking a linker format. The MIR-tier arity
+// backstop below does NOT cover this case and must not be read as covering it: a
+// 3-parameter entry has MORE than the two parameters an argc/argv verb needs, so
+// everything this pass looks at is satisfied. The refusal genuinely lives one tier
+// up now.
+//
+// OWNER OF THE COVERAGE, VERIFIED PRESENT RATHER THAN ASSUMED:
+// `S_EntryShapeNotDeclared`, emitted from src/analysis/semantic/semantic_analyzer.cpp
+// and pinned END-TO-END by examples/c-subset/entry_main_envp_refused_positioned --
+// this same 3-parameter source, expecting that code with `positioned: true` at an
+// EXACT line:col. That example asserts strictly MORE than the test deleted here
+// could: the span it demands is exactly what the MIR tier cannot supply, so if the
+// check ever regresses back to a span-less tier the example goes RED even though the
+// same diagnostic code is still emitted. Its siblings cover the other two halves of
+// the split -- entry_wmain_only_refused_elf (`K_ProgramEntryUndefined`, a wmain-only
+// ELF build: `argc-wargv` is not in any ELF format's `entryVerbs`, so `wmain` does
+// not survive candidate selection) and entry_main_and_wmain_ambiguous_pe
+// (`K_ProgramEntryAmbiguous`).
+
+// ── ⓧ REMOVED: RealizeEntryShape.VoidReturnMainRefusedByTheSameCheck ──────────
+//
+// WHAT IT ASSERTED: that `void main()` was refused by the SAME declared-set lookup
+// as the 3-param case (C23 5.1.2.2.1 — main's return type "shall be int"), with no
+// second mechanism to keep in sync.
+//
+// WHY IT MOVED, AND WHAT REPLACED IT HERE: the RETURN-TYPE half of that claim is
+// now `S_EntryShapeNotDeclared`'s, same as above — nothing at the MIR tier looks at
+// an entry's return type. What survives at this tier from that module is its ARITY,
+// and that is a different, real assertion, so the test immediately below is not this
+// one reworded: it drives the same 0-parameter module through the
+// `K_EntryVerbUnmaterializable` backstop and asserts the backstop's own message.
+
+TEST(RealizeEntryShape, ArgcArgvVerbOnAZeroParamEntryHitsTheArityBackstop) {
+    // THE ONE SHAPE REFUSAL THIS TIER STILL OWNS. Every argc/argv verb materializes
+    // into the entry's FIRST TWO parameters, so a decided verb of `argc-argv` against
+    // a signature with fewer than two is an internal inconsistency between what entry
+    // resolution decided and what is actually in the merged MIR — and `params[0]` /
+    // `params[1]` would be an out-of-bounds read on the program entry if it were not
+    // caught.
+    //
+    // ★ WHY THIS IS NOT THE RETIRED GATE WEARING A NEW CODE, which is the thing to
+    // check before trusting this pin. It does not ask "is this a legal entry
+    // signature" — the language owns that, with a span. It asks "can the arguments I
+    // am about to materialize physically land in this function", which is a fact
+    // about the MIR in hand and about nothing declared anywhere.
+    //
+    // ⓘ AND IT IS REACHABLE HONESTLY, which is why a hand-built `Mir` is the right
+    // fixture rather than a cheat: on any source DSS compiled this combination CANNOT
+    // occur, because the semantic tier already matched the definition against the very
+    // language row the verb came from. The paths that reach it are exactly a
+    // hand-built module (this test) and an entry arriving from a pre-built object.
+    //
+    // CONTROL: the same verb with a TWO-parameter entry succeeds and emits the whole
+    // argv spine — NarrowMainBindsUcrtNarrowAccessors below. So this refusal cannot be
+    // satisfied by a pass that simply refuses everything.
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const sig    = in.fnSig({}, voidTy, CallConv::CcMS64);
+    Mir mir = buildVoidEntryOnly(in, sig);
+
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    DiagnosticReporter        rep;
+    EXPECT_FALSE(realizeEntryShape(
+        mir, in, entry, ext,
+        verbRealizedBy(peEntryVerbs(), EntryMaterialization::ArgcArgv),
+        ucrtAccessorPa(), CSymbolDecorationScheme::None,
+        "pe64-x86_64-windows-exec", rep));
+    EXPECT_EQ(test_support::countCode(
+                  rep, DiagnosticCode::K_EntryVerbUnmaterializable), 1u)
+        << allDiagText(rep);
+    // The MESSAGE, not just the code. The behaviour this family replaces WAS a silent
+    // accept, so a bare `EXPECT_FALSE` would repeat the original mistake in a new
+    // place. It must name (i) the VERB it was asked to materialize, (ii) the arity it
+    // actually found — a message that says only "unmaterializable" sends the reader
+    // looking for a config row when the two inputs simply disagree — and (iii) the
+    // anchor, so the reader lands on the recorded long-term closure.
+    expectDiagContains(rep, "argc-argv");
+    expectDiagContains(rep, "declares 0 parameter(s)");
+    expectDiagContains(rep, "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE");
+    // Nothing was emitted for a refused entry (carried over from the deleted 3-param
+    // pin, whose tail was about the FAILURE PATH's cleanliness rather than about
+    // signature classification — that part never belonged to the moved gate).
+    EXPECT_TRUE(ext.empty())             << "a refused entry must import nothing";
+    EXPECT_EQ(mir.moduleFuncCount(), 1u) << "and synthesize nothing";
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_EQ(entry->v, 100u)            << "and leave the entry symbol alone";
+}
+
+TEST(RealizeEntryShape, EveryEntryRefusalCodeIsUnsuppressable) {
+    // The retired `K_EntryShapeNotDeclared` was unsuppressable, and its
+    // unsuppressability assertion lived inside the deleted 3-param pin. The code
+    // split into four, so the assertion follows the split — ALL FOUR, because
+    // `--suppress` reaching any ONE of them hands back a member of the same family
+    // of accepted-then-faulting binaries the whole split exists to refuse:
+    //   * S_EntryShapeNotDeclared     — the definition's signature is not a declared
+    //                                   entry spelling (3-param main, `void main()`);
+    //   * K_ProgramEntryUndefined     — an exec-flavored format with NO realizable
+    //                                   entry candidate;
+    //   * K_ProgramEntryAmbiguous     — more than one realizable candidate;
+    //   * K_EntryVerbUnmaterializable — the decided verb and the MIR signature
+    //                                   disagree (the pin above).
+    // Asserted individually rather than as a count, so a code dropped from
+    // `kUnsuppressableCodes` names itself here.
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_EntryShapeNotDeclared));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::K_ProgramEntryUndefined));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::K_ProgramEntryAmbiguous));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::K_EntryVerbUnmaterializable));
+}
+
+TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
+    // ⓘ WHAT THIS PIN USED TO BE — `UndeclaredShapeRefusalIsRedOnDisable` — AND WHY
+    // ITS CLAIM CHANGED SHAPE. It drove a declared SHAPE SET through this pass twice
+    // and pinned the config lever "delete the argc/argv row → the SAME program is
+    // REFUSED". Both ends of that moved: a format's declared set is now a set of
+    // VERBS (`entryVerbs`, no signatures in it), and the verdict it drives — which
+    // verb, if any, the resolved entry gets — is reached at ENTRY RESOLUTION, one
+    // tier above this pass, which is simply HANDED a verb.
+    //
+    // ★ THE SET-DRIVEN CLAIM THAT SURVIVES AT THIS TIER IS COMPLETENESS, and it is
+    // worth as much as the one it replaces: for EVERY verb the pe64 exec format
+    // declares it realizes, this pass must ACTUALLY HAVE a materialization arm. A
+    // declared verb with no arm here is a format promising a program shape the
+    // compiler cannot build — and it would surface as a refusal on a perfectly legal
+    // program, at link time, on whichever platform declared it. Driven off the
+    // declared LIST rather than three hand-written calls, so adding a verb to
+    // `entryVerbs` without an arm here is RED by construction.
+    //
+    // ★★ MUTANT HALF — the red-on-disable that replaces the deleted refusal pin, and
+    // it is NOT the tautology it can look like. Filtering `argc-argv` out of the
+    // declared set must remove the NARROW argv spine from what the format can
+    // realize, asserted with the pin's own matcher (the `__p___argv` import NAME),
+    // while the WIDE spine stays. What that catches is a pass that bound the narrow
+    // accessors regardless of the verb — i.e. keyed on the format instead of on the
+    // entry, which is precisely the c111 defect class this whole arc removed. Under
+    // such a regression `__p___argv` survives the mutation and this reds. The mutant
+    // is also still a WELL-FORMED verb set (non-empty, no duplicates), so the
+    // mutation cannot be passing merely by making its input invalid.
+    //
+    // ★ DEMONSTRATED RED, not reasoned about (the file's rule for every pin below the
+    // stdio banner, applied here). Filtering the WRONG verb out — `argc-wargv` in
+    // place of `argc-argv` — was applied, built and run: it reds BOTH halves of the
+    // mutant assertion (`__p___argv` still present, `__p___wargv` now absent) and
+    // NOTHING else in this suite, so the pin distinguishes WHICH verb produced WHICH
+    // accessor rather than merely counting imports. Likewise `verbRealizedBy` was
+    // asked for `argc-wargv` against the elf set below: it reds with its own message.
+    // Both mutations were then reverted (the suite is back to 61/61).
+
+    // Materialize ONE verb against a signature that matches it, and report what the
+    // pass produced. The signature is chosen per verb because that is what entry
+    // resolution guarantees this pass — a verb never arrives against a signature the
+    // language did not match it to.
+    auto const runVerb = [](EntryMaterialization verb, bool& ok,
+                            std::string& diagText) {
+        TypeInterner in{CompilationUnitId{1}};
+        TypeId const i32    = in.primitive(TypeKind::I32);
+        TypeId const charPP = in.pointer(in.pointer(in.primitive(TypeKind::Char)));
+        TypeId const u16PP  = in.pointer(in.pointer(in.primitive(TypeKind::U16)));
+        TypeId const sig =
+            verb == EntryMaterialization::None
+                ? in.fnSig({}, i32, CallConv::CcMS64)
+                : in.fnSig(std::array<TypeId, 2>{
+                               i32, verb == EntryMaterialization::ArgcWargv ? u16PP
+                                                                           : charPP},
+                           i32, CallConv::CcMS64);
+        Mir mir = buildEntryOnly(in, sig);
+        std::optional<SymbolId>   entry = SymbolId{100};
+        std::vector<ExternImport> ext;
+        DiagnosticReporter        rep;
+        ok = realizeEntryShape(mir, in, entry, ext, verb, ucrtAccessorPa(),
+                               CSymbolDecorationScheme::None,
+                               "pe64-x86_64-windows-exec", rep);
+        diagText = allDiagText(rep);
+        std::vector<std::string> names;
+        for (auto const& e : ext) names.push_back(e.mangledName);
+        return names;
+    };
+
+    // The union of every import name the format's DECLARED set can realize.
+    auto const realizableImports =
+        [&](std::vector<EntryMaterialization> const& declared) {
+            std::vector<std::string> all;
+            for (auto const verb : declared) {
+                bool        ok = false;
+                std::string diagText;
+                auto const  names = runVerb(verb, ok, diagText);
+                EXPECT_TRUE(ok)
+                    << "the format declares it realizes the '"
+                    << entryMaterializationName(verb)
+                    << "' verb, but this pass has no materialization arm for it: "
+                    << diagText;
+                all.insert(all.end(), names.begin(), names.end());
+            }
+            return all;
+        };
+    auto const has = [](std::vector<std::string> const& v, char const* want) {
+        for (auto const& s : v) {
+            if (s == want) return true;
+        }
+        return false;
+    };
+
+    // ── THE WITNESS: the declared set realizes BOTH spines. ──
+    auto const declared = realizableImports(peEntryVerbs());
+    EXPECT_TRUE(has(declared, "__p___argv"))
+        << "the declared set includes `argc-argv`, so the NARROW argv accessor must "
+           "be realizable";
+    EXPECT_TRUE(has(declared, "__p___wargv"))
+        << "and `argc-wargv`, so the WIDE one must be too";
+
+    // ── THE MUTANT: the declared set MINUS the verb under test. Built by FILTERING
+    // rather than by re-typing the list, so the two sets cannot drift apart. ──
+    std::vector<EntryMaterialization> mutant;
+    for (auto const v : peEntryVerbs()) {
+        if (v != EntryMaterialization::ArgcArgv) mutant.push_back(v);
+    }
+    ASSERT_EQ(mutant.size(), peEntryVerbs().size() - 1u)
+        << "the mutation must remove EXACTLY the verb under test";
+    ASSERT_FALSE(mutant.empty())
+        << "the mutant must still be a WELL-FORMED (non-empty) declared set — an "
+           "exec format declaring no verb at all is rejected by the schema loader, "
+           "so a mutation that produced one would prove nothing about this pass";
+    for (std::size_t i = 0; i < mutant.size(); ++i) {
+        for (std::size_t j = i + 1; j < mutant.size(); ++j) {
+            EXPECT_NE(static_cast<int>(mutant[i]), static_cast<int>(mutant[j]))
+                << "and must still be duplicate-free, as the loader requires";
+        }
+    }
+
+    auto const mutated = realizableImports(mutant);
+    EXPECT_FALSE(has(mutated, "__p___argv"))
+        << "with `argc-argv` removed from the declared set, NOTHING the format can "
+           "realize may bind the narrow argv accessor — if it still does, the arm is "
+           "being chosen by something other than the verb";
+    EXPECT_TRUE(has(mutated, "__p___wargv"))
+        << "while the untouched `argc-wargv` verb must be unaffected — this is what "
+           "keeps the assertion above from being satisfiable by a pass that stopped "
+           "importing anything at all";
+}
+
+TEST(RealizeEntryShape, NarrowMainBindsUcrtNarrowAccessors) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32    = in.primitive(TypeKind::I32);
     TypeId const charPP = in.pointer(in.pointer(in.primitive(TypeKind::Char)));
@@ -1780,7 +2205,12 @@ TEST(SynthPeStartup, NarrowMainAppendsGetmainargsAndRetargets) {
     std::optional<SymbolId>   entry = SymbolId{100};
     std::vector<ExternImport> ext;
     DiagnosticReporter        rep;
-    ASSERT_TRUE(synthesizePeStartup(mir, in, entry, ext, crtOutParamPa(), rep));
+    ASSERT_TRUE(realizeEntryShape(
+        mir, in, entry, ext,
+        verbRealizedBy(peEntryVerbs(), EntryMaterialization::ArgcArgv),
+        ucrtAccessorPa(), CSymbolDecorationScheme::None,
+        "pe64-x86_64-windows-exec", rep))
+        << allDiagText(rep);
     EXPECT_EQ(rep.errorCount(), 0u);
 
     // The synth init was appended alongside the original main.
@@ -1788,29 +2218,51 @@ TEST(SynthPeStartup, NarrowMainAppendsGetmainargsAndRetargets) {
     // The program entry is retargeted AWAY from main(100) to the synth fn.
     ASSERT_TRUE(entry.has_value());
     EXPECT_NE(entry->v, 100u) << "the entry must be retargeted to the synth init";
-    // Exactly the NARROW msvcrt arg-fetch export was added, as a FUNCTION import.
-    ASSERT_EQ(ext.size(), 1u);
-    EXPECT_EQ(ext[0].mangledName, "__getmainargs");
-    EXPECT_EQ(ext[0].libraryPath, "msvcrt.dll");
-    EXPECT_FALSE(ext[0].isData) << "the CRT arg-fetch is a function, not data";
+
+    // Assert NAMES PRESENT and NAMES ABSENT -- never a count alone, which goes inert
+    // the moment the mechanism grows or shrinks an import.
+    std::unordered_map<std::string, ExternImport const*> byName;
+    for (auto const& e : ext) byName.emplace(e.mangledName, &e);
+    for (char const* want : {"_configure_narrow_argv", "__p___argc", "__p___argv"}) {
+        ASSERT_EQ(byName.count(want), 1u) << "missing UCRT import " << want;
+        EXPECT_EQ(byName[want]->libraryPath, "ucrtbase.dll")
+            << want << " must come from the role-resolved image";
+        EXPECT_FALSE(byName[want]->isData) << want << " is a function, not data";
+    }
+    for (char const* forbidden : {"_configure_wide_argv", "__p___wargv",
+                                  "__getmainargs", "__wgetmainargs"}) {
+        EXPECT_EQ(byName.count(forbidden), 0u)
+            << forbidden << " must NOT be imported by a narrow `main` entry -- the "
+               "wide twin would populate the wrong argv, and the msvcrt names are "
+               "retired outright";
+    }
+    for (auto const& e : ext) {
+        EXPECT_NE(e.libraryPath, "msvcrt.dll")
+            << "the pe entry spine must import NOTHING from the legacy CRT "
+               "(D-FFI-PE-CRT-UCRT-MIGRATION exit criterion)";
+    }
+
     // The retargeted entry names a REAL defined function whose BODY fetches args and
-    // forwards to the original entry — not merely an extern row + an empty shell.
+    // forwards to the original entry -- not merely extern rows + an empty shell.
     auto const synthFn = findFuncBySymbol(mir, *entry);
     ASSERT_TRUE(synthFn.has_value())
         << "the new entry symbol must resolve to the appended synth function";
     auto const body = scanBody(mir, *synthFn);
-    EXPECT_EQ(body.allocaCount, 4u)
-        << "synth locals: argc + argv + env + startupinfo";
-    EXPECT_TRUE(body.calls(ext[0].symbol.v))
-        << "the synth body must CALL the CRT arg-fetch export it registered";
+    EXPECT_EQ(body.allocaCount, 0u)
+        << "the UCRT accessor route needs NO stack out-parameters (that was the "
+           "msvcrt __getmainargs shape) -- the accessors RETURN the addresses";
+    for (char const* want : {"_configure_narrow_argv", "__p___argc", "__p___argv"}) {
+        EXPECT_TRUE(body.calls(byName[want]->symbol.v))
+            << "the synth body must CALL " << want;
+    }
     EXPECT_TRUE(body.calls(100u))
         << "the synth body must forward to the ORIGINAL user entry (symbol 100)";
-    // The rebuilt module is well-formed.
+    // The rebuilt module is well-formed (the body is MULTI-block now -- the argv gate).
     MirVerifier verifier{mir, &in};
     EXPECT_TRUE(verifier.verify(rep)) << "the synthesized module must verify";
 }
 
-TEST(SynthPeStartup, WideWmainPicksWgetmainargs) {
+TEST(RealizeEntryShape, WideWmainBindsUcrtWideAccessors) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32     = in.primitive(TypeKind::I32);
     TypeId const wcharPP = in.pointer(in.pointer(in.primitive(TypeKind::U16)));
@@ -1820,16 +2272,32 @@ TEST(SynthPeStartup, WideWmainPicksWgetmainargs) {
     std::optional<SymbolId>   entry = SymbolId{100};
     std::vector<ExternImport> ext;
     DiagnosticReporter        rep;
-    ASSERT_TRUE(synthesizePeStartup(mir, in, entry, ext, crtOutParamPa(), rep));
-    EXPECT_EQ(rep.errorCount(), 0u);
-    ASSERT_EQ(ext.size(), 1u);
-    EXPECT_EQ(ext[0].mangledName, "__wgetmainargs")
-        << "a wchar_t** argv entry must bind the WIDE arg-fetch export (not narrow)";
+    ASSERT_TRUE(realizeEntryShape(
+        mir, in, entry, ext,
+        verbRealizedBy(peEntryVerbs(), EntryMaterialization::ArgcWargv),
+        ucrtAccessorPa(), CSymbolDecorationScheme::None,
+        "pe64-x86_64-windows-exec", rep))
+        << allDiagText(rep);
+    std::unordered_map<std::string, ExternImport const*> byName;
+    for (auto const& e : ext) byName.emplace(e.mangledName, &e);
+    // WIDE configure + WIDE argv accessor, and the SHARED argc accessor (MEASURED,
+    // PROBE-0: argc is common to the narrow and wide worlds, so there is no wide argc
+    // name to get wrong).
+    for (char const* want : {"_configure_wide_argv", "__p___wargv", "__p___argc"}) {
+        EXPECT_EQ(byName.count(want), 1u) << "missing UCRT wide import " << want;
+    }
+    for (char const* forbidden : {"_configure_narrow_argv", "__p___argv"}) {
+        EXPECT_EQ(byName.count(forbidden), 0u)
+            << forbidden << " must NOT be bound by a wchar_t** argv entry -- the arm "
+               "is selected by the DECIDED VERB, which came from the LANGUAGE row "
+               "that matched this entry's own signature, and never from a format "
+               "flag (the format only declares that it CAN realize the verb)";
+    }
     MirVerifier verifier{mir, &in};
     EXPECT_TRUE(verifier.verify(rep)) << "the synthesized module must verify";
 }
 
-TEST(SynthPeStartup, VoidMainNeedsNoSynth) {
+TEST(RealizeEntryShape, VoidMainNeedsNoSynth) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);
     TypeId const sig = in.fnSig({}, i32, CallConv::CcMS64);
@@ -1838,14 +2306,27 @@ TEST(SynthPeStartup, VoidMainNeedsNoSynth) {
     std::optional<SymbolId>   entry = SymbolId{100};
     std::vector<ExternImport> ext;
     DiagnosticReporter        rep;
-    ASSERT_TRUE(synthesizePeStartup(mir, in, entry, ext, crtOutParamPa(), rep));
-    EXPECT_EQ(mir.moduleFuncCount(), 1u) << "main(void) has no argc/argv to fetch";
+    // The `none` verb is a REAL declared answer on this enum, not a sentinel: C23's
+    // `()`≡`(void)` makes `fn() -> i32` the resolution of `int main()`, which needs
+    // no materialization. So this asserts a clean NO-OP -- true, and NOT the same as
+    // "the pass declined to run", which is why the three untouched-state assertions
+    // below are all present.
+    ASSERT_TRUE(realizeEntryShape(
+        mir, in, entry, ext,
+        verbRealizedBy(peEntryVerbs(), EntryMaterialization::None),
+        ucrtAccessorPa(), CSymbolDecorationScheme::None,
+        "pe64-x86_64-windows-exec", rep))
+        << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "a no-op must be SILENT, not merely non-fatal: " << allDiagText(rep);
+    EXPECT_EQ(mir.moduleFuncCount(), 1u)
+        << "main(void) carries the `none` verb -- nothing to fetch";
     EXPECT_TRUE(ext.empty())             << "no CRT import when there is no setup";
     ASSERT_TRUE(entry.has_value());
     EXPECT_EQ(entry->v, 100u)            << "the entry is left unchanged";
 }
 
-TEST(SynthPeStartup, NonCrtMechanismIsANoOp) {
+TEST(RealizeEntryShape, StackVectorMechanismIsANoOp) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32    = in.primitive(TypeKind::I32);
     TypeId const charPP = in.pointer(in.pointer(in.primitive(TypeKind::Char)));
@@ -1855,12 +2336,102 @@ TEST(SynthPeStartup, NonCrtMechanismIsANoOp) {
     std::optional<SymbolId>   entry = SymbolId{100};
     std::vector<ExternImport> ext;
     ProcessArgs               pa;
-    pa.mechanism = ArgsMechanism::StackVector;  // the ELF route — NOT the pe CRT one
+    pa.mechanism = ArgsMechanism::StackVector;  // the ELF route -- the trampoline owns it
     DiagnosticReporter        rep;
-    ASSERT_TRUE(synthesizePeStartup(mir, in, entry, ext, pa, rep));
-    EXPECT_EQ(mir.moduleFuncCount(), 1u) << "a non-CRT mechanism synthesizes nothing";
+    // The elf64 exec format's declared VERB SET. It realizes `argc-argv` and `none`
+    // and NOT `argc-wargv` -- there is no ELF CRT publishing a wide argument vector --
+    // which is the whole reason `wmain` is a program-entry candidate on pe64 and on no
+    // ELF target, with no format-identity branch anywhere. Kept as the SET rather than
+    // collapsed to the one verb below so that fact stays stated where it is used.
+    std::vector<EntryMaterialization> const elfVerbs{EntryMaterialization::None,
+                                                    EntryMaterialization::ArgcArgv};
+    ASSERT_TRUE(realizeEntryShape(
+        mir, in, entry, ext,
+        verbRealizedBy(elfVerbs, EntryMaterialization::ArgcArgv), pa,
+        CSymbolDecorationScheme::None, "elf64-x86_64-linux-exec", rep))
+        << allDiagText(rep);
+    EXPECT_EQ(mir.moduleFuncCount(), 1u)
+        << "the stack-vector mechanism materializes in the entry trampoline";
     EXPECT_TRUE(ext.empty());
     EXPECT_EQ(entry->v, 100u);
+}
+
+TEST(RealizeEntryShape, NoMechanismIsANoOp) {
+    // Mach-O's real answer: dyld CALLS an LC_MAIN entry with argc/argv already in the
+    // argument registers, so declaring NO `processArgs` is an ANSWER and not an
+    // omission -- an `argc-argv` verb is fully realized with nothing synthesized here.
+    //
+    // ⓧ RENAMED FROM `NoMechanismIsANoOpButStillGates`, AND ITS SECOND HALF IS
+    // DELETED. That half built a 3-parameter entry and asserted that
+    // `K_EntryShapeNotDeclared` still fired with no mechanism declared -- i.e. that
+    // the c111 bug of wrapping the whole pass in `if (processArgs.has_value())` could
+    // not silently disable the ENTRY-SHAPE GATE on every Mach-O build. There is no
+    // gate here to disable any more: the signature check is `S_EntryShapeNotDeclared`
+    // at the SEMANTIC tier, which runs off the parse tree and so cannot be reached or
+    // skipped by anything about a format's `processArgs`. The concern the half
+    // existed for is structurally gone rather than merely untested, and it is NOT
+    // restated as an arity assertion, because on the no-mechanism path this pass
+    // returns before the arity backstop -- correctly, since nothing is being
+    // materialized into the entry at all.
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const charPP = in.pointer(in.pointer(in.primitive(TypeKind::Char)));
+    // The macho64 exec format's declared VERB SET -- `argc-argv` and `none`, and no
+    // wide arm (Darwin publishes no wide argument vector).
+    std::vector<EntryMaterialization> const machoVerbs{EntryMaterialization::None,
+                                                      EntryMaterialization::ArgcArgv};
+    TypeId const sig = in.fnSig(std::array<TypeId, 2>{i32, charPP}, i32,
+                                CallConv::CcApple);
+    Mir mir = buildEntryOnly(in, sig);
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(realizeEntryShape(
+        mir, in, entry, ext,
+        verbRealizedBy(machoVerbs, EntryMaterialization::ArgcArgv), std::nullopt,
+        CSymbolDecorationScheme::LeadingUnderscore, "macho64-arm64-darwin-exec", rep))
+        << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "\"no mechanism\" is an ANSWER, so this must be SILENT rather than merely "
+           "non-fatal: " << allDiagText(rep);
+    EXPECT_EQ(mir.moduleFuncCount(), 1u) << "dyld already materialized the args";
+    EXPECT_TRUE(ext.empty());
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_EQ(entry->v, 100u);
+}
+
+TEST(RealizeEntryShape, CrtImportNamesAreCMangledForTheFormat) {
+    // c111 wrote the CRT export name into the import VERBATIM, which was harmless
+    // only because the one format using the mechanism declares
+    // `cSymbolDecoration: {"scheme": "none"}` -- an assumption invisible in the code.
+    // Routing through `applyCMangling` makes a decorating format request the DECORATED
+    // name. MEASURED 2026-08-06 that this class of error is a MIS-BIND rather than a
+    // link failure: ucrtbase exports `exit`, `_exit` AND `_Exit` as three DISTINCT
+    // functions, so an off-by-one-underscore request finds a different function.
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const charPP = in.pointer(in.pointer(in.primitive(TypeKind::Char)));
+    TypeId const sig    = in.fnSig(std::array<TypeId, 2>{i32, charPP}, i32, CallConv::CcMS64);
+    Mir mir = buildEntryOnly(in, sig);
+
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    DiagnosticReporter        rep;
+    // The verb is passed DIRECTLY here rather than through `verbRealizedBy`: the
+    // format named below is deliberately hypothetical (no shipped format pairs
+    // `crt-argv-accessors` with a decorating C scheme), so there is no declared verb
+    // set to pick it out of and pretending there was one would be fiction.
+    ASSERT_TRUE(realizeEntryShape(mir, in, entry, ext,
+                                  EntryMaterialization::ArgcArgv, ucrtAccessorPa(),
+                                  CSymbolDecorationScheme::LeadingUnderscore,
+                                  "<hypothetical-decorating-format>", rep))
+        << allDiagText(rep);
+    std::unordered_map<std::string, ExternImport const*> byName;
+    for (auto const& e : ext) byName.emplace(e.mangledName, &e);
+    EXPECT_EQ(byName.count("___p___argc"), 1u)
+        << "a leading-underscore format must request the DECORATED accessor name";
+    EXPECT_EQ(byName.count("__p___argc"), 0u)
+        << "and must NOT request the undecorated one";
 }
 
 // ── c116 (D-WIN64-SEH-FUNCLETS): synthesizeSehFunclets structural pins ─────────
@@ -1931,16 +2502,31 @@ TEST(SynthSehFunclets, ExtractsFilterFuncletAndStubsParent) {
     std::vector<ExternImport> ext;
     std::vector<MirSehScope>  scopes;
     DiagnosticReporter        rep;
-    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, scopes, rep));
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                      CSymbolDecorationScheme::None,
+                                      "pe64-x86_64-windows-exec", scopes, rep));
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     EXPECT_EQ(rep.errorCount(), 0u);
 
     // One funclet was appended alongside the parent.
     EXPECT_EQ(mir.moduleFuncCount(), 2u) << "the filter funclet must be appended";
-    // Exactly the __C_specific_handler personality import was added (SEH-gated).
+    // Exactly the personality import was added (SEH-gated) — and BOTH halves of it
+    // now come from the format's DECLARED `sehPersonality` block. Before UCRT-P4
+    // this pass hardcoded `"__C_specific_handler"` AND `"msvcrt.dll"`; the library
+    // literal is the one that survived the whole pe CRT migration unnoticed,
+    // because nothing read config and no test could see it.
     ASSERT_EQ(ext.size(), 1u);
-    EXPECT_EQ(ext[0].mangledName, "__C_specific_handler");
-    EXPECT_EQ(ext[0].libraryPath, "msvcrt.dll");
+    EXPECT_EQ(ext[0].mangledName, peSehPersonality().mangledName)
+        << "the routine name must come from the declared block, not a literal";
+    EXPECT_EQ(ext[0].libraryPath, peSehPersonality().libraryPath)
+        << "the image must come from the declared block's role resolution";
+    EXPECT_EQ(ext[0].libraryPath, "ucrtbase.dll")
+        << "spelled out as well as compared, so a config edit that changed BOTH "
+           "sides together still moves this test";
+    EXPECT_NE(ext[0].libraryPath, "msvcrt.dll")
+        << "D-FFI-PE-CRT-UCRT-MIGRATION: the SEH personality must no longer be "
+           "imported from the legacy CRT (MEASURED: `__C_specific_handler` is "
+           "exported by ucrtbase ord 30, so the move is link-safe)";
     EXPECT_FALSE(ext[0].isData);
     // One scope record, naming the funclet + the personality.
     ASSERT_EQ(scopes.size(), 1u);
@@ -1992,10 +2578,69 @@ TEST(SynthSehFunclets, NoSehIsANoOp) {
     std::vector<ExternImport> ext;
     std::vector<MirSehScope>  scopes;
     DiagnosticReporter        rep;
-    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, scopes, rep));
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                      CSymbolDecorationScheme::None,
+                                      "pe64-x86_64-windows-exec", scopes, rep));
     EXPECT_EQ(mir.moduleFuncCount(), 1u) << "no __try → no funclet appended";
     EXPECT_TRUE(ext.empty())             << "no __try → no personality import";
     EXPECT_TRUE(scopes.empty())          << "no __try → no scope records";
+}
+
+// UCRT-P4 red-on-disable, BOTH directions, and both are needed.
+//
+// THE WITNESS half re-runs the very same SEH module with the personality DELETED
+// from the declared config and nothing else changed. The refusal proves the two
+// literals this pass used to carry are genuinely GONE: if either survived, the pass
+// would still have a routine name and an image and would happily synthesize.
+//
+// THE NO-OP half is the fail-closed check that makes the first half mean something:
+// a module WITHOUT `__try` must still compile clean under the same nullopt config.
+// Without it, "declares no personality" could be satisfied by refusing every
+// program on the format, and the pin would be green for the wrong reason. This is
+// also the shape a real ELF/Mach-O build has: those formats declare no personality
+// and must stay fully usable for every program that does not use SEH.
+TEST(SynthSehFunclets, NoDeclaredPersonalityRefusesOnlyWhenARegionResolves) {
+    {   // WITNESS: a real `__try` region + NO declared personality ⇒ REFUSED.
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = buildSehParent(in, SymbolId{100});
+        std::vector<ExternImport> ext;
+        std::vector<MirSehScope>  scopes;
+        DiagnosticReporter        rep;
+        EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, std::nullopt,
+                                           CSymbolDecorationScheme::None,
+                                           "elf64-x86_64-linux-exec", scopes, rep))
+            << "a resolved SEH region under a format declaring NO sehPersonality "
+               "must FAIL LOUD — the pre-UCRT-P4 pass silently planted an "
+               "`msvcrt.dll` import, which on an ELF image is an undefined symbol "
+               "at best";
+        EXPECT_TRUE(rep.hasErrors());
+        std::string const text = allDiagText(rep);
+        EXPECT_NE(text.find("sehPersonality"), std::string::npos)
+            << "the diagnostic must name the CONFIG BLOCK to add; full text:\n"
+            << text;
+        EXPECT_NE(text.find("elf64-x86_64-linux-exec"), std::string::npos)
+            << "and the format whose config is missing it; full text:\n" << text;
+        EXPECT_TRUE(ext.empty())
+            << "and it must import NOTHING — least of all a fallback";
+    }
+    {   // FAIL-CLOSED: no `__try` + NO declared personality ⇒ clean no-op.
+        TypeInterner in{CompilationUnitId{1}};
+        TypeId const i32 = in.primitive(TypeKind::I32);
+        TypeId const sig = in.fnSig({}, i32, CallConv::CcMS64);
+        Mir mir = buildEntryOnly(in, sig);
+        std::vector<ExternImport> ext;
+        std::vector<MirSehScope>  scopes;
+        DiagnosticReporter        rep;
+        ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, std::nullopt,
+                                          CSymbolDecorationScheme::None,
+                                          "elf64-x86_64-linux-exec", scopes, rep))
+            << allDiagText(rep);
+        EXPECT_FALSE(rep.hasErrors())
+            << "a format that declares no personality must stay usable for every "
+               "program that does not use SEH";
+        EXPECT_TRUE(ext.empty());
+        EXPECT_TRUE(scopes.empty());
+    }
 }
 
 // c116b (D-WIN64-SEH-FUNCLETS): a MULTI-BLOCK guarded body. The try body is a small
@@ -2065,7 +2710,9 @@ TEST(SynthSehFunclets, MultiBlockGuardedBodyIsContiguousAndBounded) {
     std::vector<ExternImport> ext;
     std::vector<MirSehScope>  scopes;
     DiagnosticReporter        rep;
-    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, scopes, rep));
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                      CSymbolDecorationScheme::None,
+                                      "pe64-x86_64-windows-exec", scopes, rep));
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     EXPECT_EQ(rep.errorCount(), 0u);
     ASSERT_EQ(scopes.size(), 1u);
@@ -2178,7 +2825,9 @@ TEST(SynthSehFunclets, FilterReadingParentLocalEmitsRecoverParentFrameSlot) {
     std::vector<ExternImport> ext;
     std::vector<MirSehScope>  scopes;
     DiagnosticReporter        rep;
-    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, scopes, rep));
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                      CSymbolDecorationScheme::None,
+                                      "pe64-x86_64-windows-exec", scopes, rep));
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     EXPECT_EQ(rep.errorCount(), 0u);
     ASSERT_EQ(scopes.size(), 1u);
@@ -2240,7 +2889,7 @@ TEST(SynthThreadsShim, SynthesizesDefinitionAndHelperImportNotTheShimName) {
     std::unordered_map<std::uint32_t, std::string> recipes{{10u, "mtx_lock"}};
     std::vector<ExternImport> externs;   // a threads.h-only TU imports no cond-var/CS yet
     DiagnosticReporter rep;
-    LibrarySynthesis const win32{LibrarySynthVehicle::Win32, "kernel32.dll"};
+    LibrarySynthesis const win32{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"};
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, win32, CSymbolDecorationScheme::None,
                                       externs, rep));
     EXPECT_FALSE(rep.hasErrors());
@@ -2324,7 +2973,7 @@ TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
-                                      LibrarySynthesis{LibrarySynthVehicle::Win32, "kernel32.dll"},
+                                      LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"},
                                       CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
@@ -2387,6 +3036,156 @@ TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
     EXPECT_TRUE(verifier.verify(rep)) << "the thrd_create-synthesized module must verify";
 }
 
+// ── UCRT-P4: A SYNTHESIZED CROSS-ABI CALL NEVER PUNS ITS OPERAND'S TYPE ──────────
+// C11 declares `_Noreturn void thrd_exit(int res)` — SIGNED — while NEITHER vehicle's
+// exit primitive takes that: Win32's `VOID ExitThread(DWORD)` is UNSIGNED (windows.json
+// states it `fn(u32) -> void`, faithful to the real prototype) and pthread's
+// `void pthread_exit(void *)` is a POINTER. Both declarations are correct, so the
+// conversion belongs to the SHIM — and this pin holds the CLASS rather than one line:
+// on EITHER arm the operand handed to the primitive must NOT be the raw `Arg`, and its
+// type must be the PRIMITIVE's declared parameter type.
+//
+// The win32 arm was the broken one, and it stayed broken precisely as long as the
+// single-CU synth seam ran unverified: the raw `i32` Arg went straight into the `u32`
+// parameter. On x64 that emitted the very `mov ecx, <arg>` a correct compile emits, so
+// no black-box test could see it — only the MIR type invariant was violated. The CLASS
+// is what earns the pin: the identical shape with a WIDTH difference (an i32 into a u64
+// parameter) leaves the upper half undefined, and with an aggregate it mis-wires the ABI
+// outright.
+//
+// STRICTNESS: asserting the conversion's RESULT type alone would still pass if someone
+// "fixed" it by declaring the shim's own `Arg` as u32 — a lie about `thrd_exit`'s
+// signature rather than a conversion. So the producing opcode AND its operand's type are
+// both asserted: the value must be a conversion OF an `Arg` that is still I32.
+//
+// RED-on-disable: retype the win32 conversion's result to its operand's own type and the
+// U32 assertion below fails AND MirVerifier reports I_CallSignatureMismatch; drop the
+// pthread widening and the Ptr assertion fails the same way. Neither mutation changes the
+// subject's line count.
+TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType) {
+    // Locate the Call to `helperName` inside the synthesized shim body for SymbolId{10},
+    // and return its single argument operand. Shared by both vehicle legs so the two can
+    // never drift into asking different questions of the same invariant.
+    auto exitArgOperandOf = [](Mir const& mir, std::vector<ExternImport> const& externs,
+                               char const* helperName) -> MirInstId {
+        std::optional<std::uint32_t> helperSym;
+        for (auto const& imp : externs)
+            if (imp.mangledName == helperName) helperSym = imp.symbol.v;
+        if (!helperSym.has_value()) return MirInstId{};
+        MirFuncId shimFn{};
+        for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i)
+            if (mir.funcSymbol(mir.funcAt(i)).v == 10u) shimFn = mir.funcAt(i);
+        if (!shimFn.valid()) return MirInstId{};
+        for (std::uint32_t bi = 0; bi < mir.funcBlockCount(shimFn); ++bi) {
+            MirBlockId const b = mir.funcBlockAt(shimFn, bi);
+            for (std::uint32_t j = 0; j < mir.blockInstCount(b); ++j) {
+                MirInstId const id = mir.blockInstAt(b, j);
+                if (mir.instOpcode(id) != MirOpcode::Call) continue;
+                auto const ops = mir.instOperands(id);
+                if (ops.size() != 2u) continue;   // exactly one argument
+                if (mir.instOpcode(ops[0]) != MirOpcode::GlobalAddr) continue;
+                if (mir.globalAddrSymbol(ops[0]).v == *helperSym) return ops[1];
+            }
+        }
+        return MirInstId{};
+    };
+    // A caller that merely REFERENCES thrd_exit (SymbolId{10}); the shim pass supplies the
+    // definition. `fn(i32) -> void` is threads.json's declared shape on every format.
+    auto buildReferencingModule = [](TypeInterner& in) -> Mir {
+        TypeId const i32    = in.primitive(TypeKind::I32);
+        TypeId const voidTy = in.primitive(TypeKind::Void);
+        std::array<TypeId, 1> const ep{i32};
+        TypeId const exitSig = in.fnSig(ep, voidTy, CallConv::CcMS64);
+        MirBuilder mb;
+        mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirInstId const ga   = mb.addGlobalAddr(SymbolId{10}, in.pointer(exitSig));
+        MirInstId const zero = mb.addConst(i32Lit(0), i32);
+        MirInstId const co[] = {ga, zero};
+        mb.addInst(MirOpcode::Call, co, InvalidType);   // thrd_exit returns void
+        mb.addReturn(mb.addConst(i32Lit(0), i32));
+        return std::move(mb).finish();
+    };
+
+    // ── win32 vehicle: ExitThread(DWORD) — the operand must be an explicit U32 ──
+    {
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = buildReferencingModule(in);
+        std::unordered_map<std::uint32_t, std::string> recipes{{10u, "thrd_exit"}};
+        std::vector<ExternImport> externs;
+        DiagnosticReporter rep;
+        ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
+                                          LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"},
+                                          CSymbolDecorationScheme::None, externs, rep));
+        EXPECT_FALSE(rep.hasErrors());
+
+        MirInstId const code = exitArgOperandOf(mir, externs, "ExitThread");
+        ASSERT_TRUE(code.valid())
+            << "the synthesized thrd_exit body must call the kernel32 ExitThread import";
+        // (1) THE PARAMETER TYPE. windows.json declares ExitThread `fn(u32) -> void`, so a
+        // conforming operand is U32 — an I32 here is the silent pun this pin exists for.
+        ASSERT_TRUE(mir.instType(code).valid());
+        EXPECT_EQ(in.kind(mir.instType(code)), TypeKind::U32)
+            << "ExitThread's dwExitCode operand must be U32 (the declared DWORD), never "
+               "the shim's raw signed i32 Arg";
+        // (2) IT IS A CONVERSION, NOT A RETYPED Arg. Same-width int->int is a pure retag,
+        // which is exactly the opcode hir_to_mir's own mapCast picks for `tw == fw`.
+        EXPECT_EQ(mir.instOpcode(code), MirOpcode::Bitcast)
+            << "the i32->u32 narrowing-free retag must be an EXPLICIT conversion node";
+        // (3) AND ITS SOURCE IS STILL THE SIGNED Arg — so the conversion was added rather
+        // than the shim's own C11 signature being quietly rewritten to unsigned.
+        auto const conv = mir.instOperands(code);
+        ASSERT_EQ(conv.size(), 1u);
+        EXPECT_EQ(mir.instOpcode(conv[0]), MirOpcode::Arg)
+            << "the converted value is thrd_exit's own parameter";
+        EXPECT_EQ(mir.argIndex(conv[0]), 0u);
+        EXPECT_EQ(in.kind(mir.instType(conv[0])), TypeKind::I32)
+            << "thrd_exit's declared parameter stays SIGNED int (C11 7.26.5.5) — the fix is "
+               "a conversion at the call, never a re-signed Arg";
+
+        DiagnosticReporter vrep;
+        MirVerifier verifier{mir, &in};
+        EXPECT_TRUE(verifier.verify(vrep))
+            << "the win32 thrd_exit shim must clear MirVerifier's call-signature rule";
+        EXPECT_FALSE(vrep.hasErrors());
+    }
+
+    // ── pthread vehicle: pthread_exit(void *) — the SIBLING that was already right ──
+    {
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = buildReferencingModule(in);
+        std::unordered_map<std::uint32_t, std::string> recipes{{10u, "thrd_exit"}};
+        std::vector<ExternImport> externs;
+        DiagnosticReporter rep;
+        ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
+                                          LibrarySynthesis{LibrarySynthVehicle::Pthread, RuntimeLibraryRole::CLibrary, "/usr/lib/libSystem.B.dylib"},
+                                          CSymbolDecorationScheme::LeadingUnderscore, externs, rep));
+        EXPECT_FALSE(rep.hasErrors());
+
+        // LeadingUnderscore mangling — libSystem exports `_pthread_exit`.
+        MirInstId const val = exitArgOperandOf(mir, externs, "_pthread_exit");
+        ASSERT_TRUE(val.valid())
+            << "the synthesized thrd_exit body must call the libSystem pthread_exit import";
+        ASSERT_TRUE(mir.instType(val).valid());
+        EXPECT_EQ(in.kind(mir.instType(val)), TypeKind::Ptr)
+            << "pthread_exit takes a void* — the i32 res must arrive widened and re-kinded, "
+               "never punned";
+        EXPECT_EQ(mir.instOpcode(val), MirOpcode::IntToPtr)
+            << "the C idiom pthread_exit((void*)(intptr_t)res) ends in an explicit IntToPtr";
+        auto const itp = mir.instOperands(val);
+        ASSERT_EQ(itp.size(), 1u);
+        EXPECT_EQ(mir.instOpcode(itp[0]), MirOpcode::SExt)
+            << "the i32->i64 step is a SIGN-preserving widening (C11 res is signed)";
+
+        DiagnosticReporter vrep;
+        MirVerifier verifier{mir, &in};
+        EXPECT_TRUE(verifier.verify(vrep))
+            << "the pthread thrd_exit shim must clear MirVerifier's call-signature rule";
+        EXPECT_FALSE(vrep.hasErrors());
+    }
+}
+
 // call_once synthesizes ONE module-scoped __dss_once_tramp, address-takes it, and the
 // adapter invokes the C11 void(*)(void) INDIRECTLY. RED-on-disable: dropping the adapter
 // (passing the bare fn as PINIT_ONCE_FN) removes the 3rd function + the indirect call.
@@ -2414,7 +3213,7 @@ TEST(SynthThreadsShim, CallOnceSynthesizesAddressTakenTrampolineWithIndirectCall
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
-                                      LibrarySynthesis{LibrarySynthVehicle::Win32, "kernel32.dll"},
+                                      LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"},
                                       CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
@@ -2529,7 +3328,7 @@ TEST(SynthThreadsShim, ThrdJoinIsMultiBlockAndVerifies) {
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
-                                      LibrarySynthesis{LibrarySynthVehicle::Win32, "kernel32.dll"},
+                                      LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"},
                                       CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
@@ -2626,7 +3425,7 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
 
     std::unordered_map<std::uint32_t, std::string> mergedRecipes{{*shimV, "mtx_lock"}};
     std::vector<ExternImport> externs = merged->externImports;
-    LibrarySynthesis const win32{LibrarySynthVehicle::Win32, "kernel32.dll"};
+    LibrarySynthesis const win32{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"};
     ASSERT_TRUE(synthesizeThreadsShim(merged->mir, merged->host.interner(),
                                       mergedRecipes, win32, CSymbolDecorationScheme::None, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
@@ -2668,7 +3467,7 @@ TEST(SynthThreadsShim, PthreadVehicleSynthesizesDefinitionAndPthreadHelperImport
     std::unordered_map<std::uint32_t, std::string> recipes{{10u, "mtx_lock"}};
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
-    LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, "/usr/lib/libSystem.B.dylib"};
+    LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, RuntimeLibraryRole::CLibrary, "/usr/lib/libSystem.B.dylib"};
     ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthread, CSymbolDecorationScheme::LeadingUnderscore,
                                       externs, rep));
     EXPECT_FALSE(rep.hasErrors());
@@ -2755,7 +3554,7 @@ TEST(SynthThreadsShim, PthreadAllTwentyOneRecipesEmitAndVerify) {
         std::unordered_map<std::uint32_t, std::string> recipes{{10u, c.recipe}};
         std::vector<ExternImport> externs;
         DiagnosticReporter rep;
-        LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, "/usr/lib/libSystem.B.dylib"};
+        LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, RuntimeLibraryRole::CLibrary, "/usr/lib/libSystem.B.dylib"};
         ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthread, CSymbolDecorationScheme::LeadingUnderscore,
                                           externs, rep))
             << "recipe '" << c.recipe << "' must synthesize";
@@ -2841,7 +3640,7 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
 
     std::unordered_map<std::uint32_t, std::string> mergedRecipes{{*shimV, "mtx_lock"}};
     std::vector<ExternImport> externs = merged->externImports;
-    LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, "/usr/lib/libSystem.B.dylib"};
+    LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, RuntimeLibraryRole::CLibrary, "/usr/lib/libSystem.B.dylib"};
     ASSERT_TRUE(synthesizeThreadsShim(merged->mir, merged->host.interner(),
                                       mergedRecipes, pthread, CSymbolDecorationScheme::LeadingUnderscore,
                                       externs, rep));

@@ -153,6 +153,8 @@ std::string cliHelpText() {
         "  dss-code-prime --directory <path> --language <name> "
             "--target <spec> [options]\n"
         "  dss-code-prime --project <file.dss-project.json>\n"
+        "  dss-code-prime --dump-predefined-macros --language <name> "
+            "--target <spec>\n"
         "  dss-code-prime --lsp [--schema-dir=<path>]\n"
         "  dss-code-prime --help\n"
         "\n"
@@ -165,6 +167,21 @@ std::string cliHelpText() {
         "  --project <file>       load a project config "
             "(.dss-project.json: language/artifactProfile/targets/"
             "sources — plan 06)\n"
+        // FC18 companion: the ONLY way to see the effective predefined-macro
+        // set by inspection. Discoverability matters more here than for most
+        // flags — the claim "DSS defines none of the C23 __STDC_NO_* macros"
+        // was previously verifiable only by reading three config files.
+        "  --dump-predefined-macros  print the EFFECTIVE predefined-macro "
+            "set for the resolved (language x target x object-format) triple "
+            "and exit without compiling — DSS's `gcc -dM -E`. Requires "
+            "--language and at least one --target (repeatable: one section "
+            "per target). Each line carries the macro's ORIGIN "
+            "(language/target/format/command-line) and KIND; `--define` "
+            "entries are included, so the output is what a translation unit "
+            "actually SEES, not merely what the configs declare. An "
+            "offset-derived kind (line/file) and a function-like macro have "
+            "no single value and say so rather than print a fabricated one. "
+            "There is no `-dM` alias.\n"
         "\n"
         "Common compile / transpile options:\n"
         "  --language <name>      source-language schema name "
@@ -184,6 +201,15 @@ std::string cliHelpText() {
             "(default: auto = min(cores, TUs, 16); --jobs 1 = serial). "
             "Only the multi-source build parallelizes; the `=`-form is "
             "also accepted.\n"
+        // D-CLI-HELP-OMITS-DEFINE-FLAG: `--define` has been parsed since c105
+        // but was absent here, so the only discoverable spelling was the
+        // source. There is no `-D` alias, and reaching for one is the mistake
+        // this entry exists to prevent.
+        "  --define NAME[=VALUE]  predefine an object-like macro "
+            "(repeatable; VALUE defaults to `1`). NAME must be a single "
+            "identifier; a function-like `--define` is unsupported — declare "
+            "a config predefinedMacros entry for that. There is no `-D` "
+            "alias. The `=`-form is also accepted (--define=NAME[=VALUE]).\n"
         "  --resolve-library <path>[=<import-name>]  read a binary's "
             "(.so/.dll/.dylib) export table to resolve + validate this "
             "build's externs against it (repeatable; typically a DSS-built "
@@ -218,7 +244,9 @@ std::string cliHelpText() {
         "  dss-code-prime --compile hello.c --language c-subset "
             "--target x86_64:elf64-x86_64-linux\n"
         "  dss-code-prime --directory src/ --language c-subset "
-            "--target x86_64:elf64-x86_64-linux --config=release\n";
+            "--target x86_64:elf64-x86_64-linux --config=release\n"
+        "  dss-code-prime --dump-predefined-macros --language c-subset "
+            "--target x86_64:pe64-x86_64-windows-exec --define SQLITE_TEST\n";
     return text;
 }
 
@@ -233,7 +261,8 @@ parseCliArgs(int argc, char* argv[]) {
     // error message). Repeating the SAME mode flag is rejected as
     // a DuplicateModeFlag too (e.g. `--compile a.c --compile b.c`
     // — the user should write `--compile a.c b.c`).
-    enum class Mode : std::uint8_t { None, Compile, Transpile, Directory, Project, Lsp };
+    enum class Mode : std::uint8_t { None, Compile, Transpile, Directory, Project, Lsp,
+                                     DumpPredefinedMacros };
     Mode mode = Mode::None;
     auto const setMode = [&](Mode m, std::string_view flag)
             -> std::expected<void, CliArgsErrorInfo> {
@@ -246,7 +275,8 @@ parseCliArgs(int argc, char* argv[]) {
                       "arguments under a single mode flag"
                     : " conflicts with an earlier mode flag — "
                       "exactly one of --compile / --transpile / "
-                      "--directory / --project / --lsp may be "
+                      "--directory / --project / --lsp / "
+                      "--dump-predefined-macros may be "
                       "specified")));
         }
         mode = m;
@@ -353,6 +383,17 @@ parseCliArgs(int argc, char* argv[]) {
         // ── Help ────────────────────────────────────────────────
         if (a == "--help" || a == "-h") {
             out.helpMode = true;
+            continue;
+        }
+
+        // ── Predefined-macro dump (a MODE: prints, compiles nothing) ──
+        if (a == "--dump-predefined-macros") {
+            if (auto e = setMode(Mode::DumpPredefinedMacros,
+                                 "--dump-predefined-macros");
+                !e) {
+                return std::unexpected(e.error());
+            }
+            out.dumpPredefinedMacros = true;
             continue;
         }
 
@@ -798,8 +839,8 @@ parseCliArgs(int argc, char* argv[]) {
                 CliArgsError::NoModeSelected,
                 "mode-specific options were supplied but no mode flag "
                 "was selected — pick exactly one of --compile / "
-                "--transpile / --directory / --project / --lsp, or "
-                "pass --help for usage"));
+                "--transpile / --directory / --project / --lsp / "
+                "--dump-predefined-macros, or pass --help for usage"));
         }
         // No-arg invocation is allowed — falls back to the "ready"
         // message at the dispatch level.
@@ -813,20 +854,26 @@ parseCliArgs(int argc, char* argv[]) {
         // structural / profile error. No further CLI validation needed.
         return out;
     }
-    // Compile / Transpile / Directory modes require language + at
-    // least one target.
+    // Compile / Transpile / Directory / DumpPredefinedMacros modes require
+    // language + at least one target. `--dump-predefined-macros` joins the list
+    // for the same reason the other three are on it — the effective
+    // predefined-macro set is a property of a (language x target x
+    // object-format) TRIPLE, so without both halves there is nothing to answer.
+    // ★ The message NAMES every mode it can be reached from: a mode-list that
+    // omits the mode the operator actually typed reads as "this flag is not
+    // supported", which is the opposite of what happened.
     if (out.languageName.empty()) {
         return std::unexpected(make_error(
             CliArgsError::MissingLanguage,
             "--language <name> is required for compile / transpile / "
-            "directory mode"));
+            "directory / dump-predefined-macros mode"));
     }
     if (out.targets.empty()) {
         return std::unexpected(make_error(
             CliArgsError::EmptyTargetList,
             "at least one --target <spec> is required for compile / "
-            "transpile / directory mode (e.g. --target "
-            "x86_64:elf64-x86_64-linux)"));
+            "transpile / directory / dump-predefined-macros mode (e.g. "
+            "--target x86_64:elf64-x86_64-linux)"));
     }
     if (mode == Mode::Compile && out.sourceFiles.empty()) {
         return std::unexpected(make_error(
