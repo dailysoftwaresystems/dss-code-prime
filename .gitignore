@@ -43,6 +43,14 @@
 # Build directory
 .temp/
 .cache/
+# Compiler cache. The CI `ccache-action` materialises `.ccache/<hex>/CACHEDIR.TAG`
+# INSIDE the workspace, and on a Windows runner ccache writes those tags with CRLF.
+# They are untracked and were therefore NOT ignored, so `line_endings_guard` (which
+# scans `git ls-files --others --exclude-standard`) convicted 16 of them and failed
+# the windows-msvc-release leg — on bytes no human wrote and nothing would ever
+# commit. Ignoring is the correct classification, not a silencer: a content-addressed
+# compiler cache is build output, never source.
+.ccache/
 build/
 build-wsl/
 # Ad-hoc out-of-source build dirs (e.g. build-rel / build-dbg used for
