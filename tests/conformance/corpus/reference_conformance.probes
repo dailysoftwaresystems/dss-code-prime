@@ -633,12 +633,38 @@ struct DssEmptyInit dss_empty_init_probe = {};
 @min-stdc 202311
 @families gnu,msvc
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: DSS answers `P0002: expected 'ParenClose' -- got '__VA_OPT__'`. C23 6.10.5. clang-19 accepts; clang-18 rejects the probe for a different, measured reason (-Wgnu-zero-variadic-macro-arguments promoted by -pedantic-errors), which is why the direction rule is `any judging oracle accepts` rather than `all`.
-@why C23 6.10.5 __VA_OPT__.
+@why C23 6.10.5.1 __VA_OPT__ (IMPLEMENTED, FC18a / D-PP-VA-OPT). The `@acknowledged-gap` line that stood here is DELETED: DSS now expands the construct and agrees with the oracles. Semantics + fail-loud arms are pinned by the `PreprocessorVaOpt.*` unit suite; the runtime witness is examples/c-subset/preprocessor_va_opt. clang-18 rejects THIS probe for a different, measured reason (-Wgnu-zero-variadic-macro-arguments promoted by -pedantic-errors on `DSS_CALL(1)`), which is why the direction rule is `any judging oracle accepts` rather than `all`.
 @code
 int dss_vaopt_sink(int);
 #define DSS_CALL(a, ...) dss_vaopt_sink(a __VA_OPT__(+) __VA_ARGS__)
 int dss_vaopt_probe(void) { return DSS_CALL(1) + DSS_CALL(1, 2); }
+@end
+
+@probe a_va_opt_paste_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.10.5.1p7 + 6.10.5.3p3 -- a `__VA_OPT__` that is an operand of an OUTSIDE `##`. With no variable arguments the va-opt is a PLACEMARKER, so the paste yields the other operand instead of violating the no-dangling-`##` constraint. Split from a_va_opt_c23 because it exercises the placemarker interaction rather than plain presence/absence, and one construct per probe is what makes a census row actionable.
+@code
+int dss_vaopt_base;
+int dss_vaopt_base_x;
+#define DSS_PICK(...) dss_vaopt_base ## __VA_OPT__(_x)
+int dss_vaopt_paste_probe(void) { return DSS_PICK(1) + DSS_PICK(0); }
+@end
+
+@probe a_va_opt_stringize_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why C23 6.10.5.1p4 + 6.10.5.2 -- `#__VA_OPT__( ... )`. A va-opt-replacement is "treated as if it were a parameter", so it is a valid `#` operand; the spelling keeps the content's ORIGINAL adjacency (white space between tokens becomes one space, and none is inserted where there was none).
+@code
+extern int dss_vaopt_str_sink(const char*);
+#define DSS_STR(X, ...) #__VA_OPT__(X+X)
+int dss_vaopt_str_probe(void) { return dss_vaopt_str_sink(DSS_STR(p, 1)); }
 @end
 
 @probe a_elifdef_c23

@@ -45,6 +45,8 @@
     "functionLikeArgSeparatorToken": "Comma",
     "variadicMarkerToken": "EllipsisOp",
     "variadicArgsName": "__VA_ARGS__",
+    "$vaOptNameComment": "FC18a (D-PP-VA-OPT, C23 6.10.5.1): the va-opt-replacement introducer. `__VA_OPT__( content )` in a VARIADIC macro's replacement list yields `content` when the variable arguments' SUBSTITUTION is non-empty, and a placemarker otherwise. Matched by TEXT like `variadicArgsName` (it lexes as an ordinary identifier, so there is no token kind to resolve). NOT a spelling of `variadicCommaElision`: ✔MEASURED on clang-18/clang-19/gcc-13, with `#define EMP` the GNU idiom `g(f , ## __VA_ARGS__)` keeps the comma for `GNU(1, EMP)` (the argument is PRESENT) while `g(f __VA_OPT__(,) __VA_ARGS__)` drops it (the argument's SUBSTITUTION is empty) -- two predicates, two keys.",
+    "vaOptName": "__VA_OPT__",
     "stringizeToken": "HashOp",
     "pasteToken": "HashHashOp",
     "$variadicCommaElisionComment": "FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): opt into the GNU `,##__VA_ARGS__` extension. `sep ## __VA_ARGS__` with an EMPTY variadic part drops the preceding separator (`LOG(\"x\")` -> `f(\"x\")`); non-empty keeps it. Without this flag, standard C placemarker behavior leaves the separator. The separator/__VA_ARGS__ are matched by the config KIND/name above, never hardcoded.",

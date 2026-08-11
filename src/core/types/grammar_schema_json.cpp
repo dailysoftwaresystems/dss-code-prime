@@ -4149,6 +4149,30 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                 }
             }
+            // `vaOptName` (C23's `__VA_OPT__`, 6.10.5.1) is OPTIONAL and only
+            // meaningful alongside `variadicMarkerToken`: it is the IDENTIFIER
+            // that introduces a va-opt-replacement in a variadic macro's
+            // replacement list. Like `variadicArgsName` it is matched by LEXEME
+            // TEXT (an ordinary identifier, NOT a token kind), so it is
+            // validated only as a NON-EMPTY string when present -- no
+            // `checkToken`, there is no token kind to resolve. Absent -> the
+            // language declares no va-opt construct. (FC18a -- D-PP-VA-OPT.)
+            if (pp.contains("vaOptName")) {
+                if (!pp.at("vaOptName").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/vaOptName",
+                              "'preprocess.vaOptName' must be a string");
+                } else {
+                    cfg.vaOptName = pp.at("vaOptName").get<std::string>();
+                    if (cfg.vaOptName.empty()) {
+                        coll.emit(
+                            DiagnosticCode::C_InvalidPreprocess,
+                            "/preprocess/vaOptName",
+                            "'preprocess.vaOptName' must be a non-empty "
+                            "string when present");
+                    }
+                }
+            }
             // `stringizeToken` (C's `#` -> "HashOp", C 6.10.3.2) is OPTIONAL:
             // empty means the language declares NO stringize operator. The macro
             // engine reads it to RECOGNISE a `#param` stringize in a replacement

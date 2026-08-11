@@ -2230,6 +2230,25 @@ struct ExpToken {
     // dropped before the result leaves `substitute`). The default `false` makes
     // every existing ExpToken construction a non-placemarker -- zero regression.
     bool placemarker = false;
+    // FC18a (D-PP-VA-OPT): "this token was separated from the previous one by
+    // white space IN THE CONSTRUCT IT CAME FROM". Written ONLY while substituting
+    // a va-opt-replacement's content, and read ONLY by `stringizeTokens` (the
+    // `#__VA_OPT__(...)` spelling builder).
+    //
+    // ★ WHY A CAPTURED BIT AND NOT A SPAN COMPARISON AT STRINGIZE TIME. C23
+    // 6.10.5.2p3 says each occurrence of white space BETWEEN the stringizing
+    // argument's tokens becomes one space -- so where the source had none, none
+    // is inserted. ✔MEASURED (clang-18/clang-19/gcc-13 agreeing): with X=p,
+    //   `#define SZ(X, ...) #__VA_OPT__(X+X)`   -> "p+p"
+    //   `#define SZ(...)    #__VA_OPT__(a + b)` -> "a + b"
+    //   `#define SZ(...)    #__VA_OPT__(a+b)`   -> "a+b"
+    // Adjacency is a property of the REPLACEMENT LIST, and after substitution it
+    // is no longer recoverable from spans: in `X+X` the substituted `p` comes from
+    // the CALL SITE while the `+` comes from the `#define` line, so the two are
+    // never byte-adjacent in any buffer and a span comparison would wrongly emit
+    // "p + p". The bit records the answer while the replacement list is still in
+    // hand. Defaults to `false`, so no existing construction changes behavior.
+    bool spacedBefore = false;
 };
 
 // Lift a plain (directive-stripped, original) body token into the expansion
@@ -3936,6 +3955,25 @@ private:
             return;
         }
 
+        // FC18a (D-PP-VA-OPT, C23 6.10.5p5): `__VA_OPT__` is not an ordinary
+        // identifier -- it may occur ONLY as the introducer of a
+        // va-opt-replacement inside a variadic macro's replacement list, so it can
+        // never be a macro NAME. Same posture as the two guards above and the same
+        // reason: honoring the `#define` would shadow a construct the engine
+        // implements, leaving one spelling with two meanings. ✔MEASURED: cl 19.51
+        // answers C4117 ("reserved, '#define' ignored") and clang-18/clang-19/
+        // gcc-13 all reject it under -pedantic-errors. Config-driven name, no
+        // hard-coded spelling.
+        if (!cfg().vaOptName.empty() && name == cfg().vaOptName) {
+            emitPP(rep_,
+                   DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
+                   synth_->id(), in[nameIdx].span,
+                   std::string{"'"} + name
+                       + "' is a variadic-macro operator this implementation "
+                         "provides and may not be #defined");
+            return;
+        }
+
         MacroDef def;
         // FUNCTION-like iff the configured open-paren is IMMEDIATELY ADJACENT
         // to the macro name (C 6.10.3p3: no white space between the name and
@@ -3984,6 +4022,11 @@ private:
             }
         }
 
+        // FC18a (D-PP-VA-OPT): every va-opt-replacement constraint, checked HERE
+        // at definition time -- where the construct is WRITTEN, rather than at a
+        // possibly-absent invocation. `validateVaOpt` emits its own diagnostic.
+        if (!validateVaOpt(def, name)) return;
+
         auto it = table_.find(name);
         if (it != table_.end() && !sameDefinition(it->second, def)) {
             emitPP(rep_, DiagnosticCode::P_PreprocessorMacroRedefinition,
@@ -3992,6 +4035,93 @@ private:
             return;
         }
         table_[name] = std::move(def);
+    }
+
+    // FC18a (D-PP-VA-OPT): enforce every C23 va-opt-replacement constraint on a
+    // freshly parsed `#define`. Returns false (having emitted ONE diagnostic)
+    // when the definition must be rejected; true when it is well formed or the
+    // language declares no va-opt construct at all.
+    //
+    // The constraints, each named where it is checked below:
+    //   6.10.5p5     -- may occur ONLY in a variadic function-like macro's
+    //                   replacement list (so: not object-like, not non-variadic).
+    //   6.10.5.1p3   -- must occur as `__VA_OPT__ ( pp-tokens_opt )`: a `(` must
+    //                   follow, and its matching `)` must exist.
+    //   6.10.5.1p3   -- the content shall NOT contain another `__VA_OPT__`.
+    //   6.10.5.1p3   -- the content "shall form a valid replacement list", which
+    //                   via 6.10.5.3p1 forbids a `##` at either END of it. This is
+    //                   the standard's own H1 example.
+    //
+    // ★ THIS IS THE DIAGNOSIS FIX, NOT JUST A FEATURE GATE. Before FC18a a
+    // `__VA_OPT__` reached the PARSER as an unknown identifier and the user was
+    // told `expected 'ParenClose'` -- a true statement about the parser's stack
+    // that named neither the construct nor the reason. Every arm below names
+    // `__VA_OPT__` and the rule it broke.
+    [[nodiscard]] bool validateVaOpt(MacroDef const& def,
+                                     std::string const& macroName) {
+        if (cfg().vaOptName.empty()) return true;   // language has no va-opt
+        const std::size_t n = def.replacement.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            Token const& r = def.replacement[i];
+            if (!isVaOptWord(r)) continue;
+            // 6.10.5p5: only inside a VARIADIC function-like macro.
+            if (!def.isVariadic) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), r.span,
+                       std::string{"'"} + cfg().vaOptName
+                           + "' may appear only in a variadic macro's "
+                             "replacement: " + macroName);
+                return false;
+            }
+            std::size_t open = 0;
+            const std::size_t close = findVaOptClose(def.replacement, i, open);
+            if (close == vaOptNpos()) {
+                // Distinguish "no `(` at all" from "`(` never closed" -- they are
+                // different mistakes and the user fixes them differently.
+                const bool hasOpen =
+                    i + 1 < n && isParenOpen(def.replacement[i + 1]);
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), r.span,
+                       std::string{"'"} + cfg().vaOptName
+                           + (hasOpen
+                                  ? "' is missing the ')' that closes its "
+                                    "replacement content"
+                                  : "' must be followed by '(' -- it is only "
+                                    "valid as the form '"
+                                        + cfg().vaOptName + "( content )'"));
+                return false;
+            }
+            // 6.10.5.1p3: the content shall not contain another va-opt.
+            for (std::size_t j = open + 1; j < close; ++j) {
+                if (isVaOptWord(def.replacement[j])) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                           synth_->id(), def.replacement[j].span,
+                           std::string{"'"} + cfg().vaOptName
+                               + "' must not be nested inside another '"
+                               + cfg().vaOptName + "'");
+                    return false;
+                }
+            }
+            // 6.10.5.1p3 + 6.10.5.3p1: the content must be a valid replacement
+            // list, so no `##` at either end of it. (An EMPTY content is fine --
+            // `__VA_OPT__()` is a well-formed no-op.)
+            if (close > open + 1) {
+                const bool pasteAtStart = isPaste(def.replacement[open + 1]);
+                const bool pasteAtEnd   = isPaste(def.replacement[close - 1]);
+                if (pasteAtStart || pasteAtEnd) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorPaste,
+                           synth_->id(),
+                           (pasteAtStart ? def.replacement[open + 1].span
+                                         : def.replacement[close - 1].span),
+                           std::string{"'##' must not appear at the "}
+                               + (pasteAtStart ? "start" : "end") + " of a '"
+                               + cfg().vaOptName + "' replacement content");
+                    return false;
+                }
+            }
+            i = close;   // skip the whole construct; nesting was rejected above
+        }
+        return true;
     }
 
     // Two `#define`s of the same name are COMPATIBLE (C 6.10.3p1/p2) only when
@@ -4255,6 +4385,21 @@ private:
                          "implementation provides and may not be #undef'd");
             return;
         }
+        // FC18a (D-PP-VA-OPT): the `#undef` half of the `__VA_OPT__` name guard.
+        // An `#undef __VA_OPT__` that SUCCEEDED would claim to remove something
+        // that was never in the macro table, and would read as license to then
+        // `#define` it -- the same one-spelling-two-meanings hazard the `#define`
+        // arm refuses. ✔MEASURED: cl 19.51 answers C4117 ("reserved, '#undef'
+        // ignored"); clang/gcc reject under -pedantic-errors.
+        if (!cfg().vaOptName.empty() && name == cfg().vaOptName) {
+            emitPP(rep_,
+                   DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
+                   synth_->id(), in[p].span,
+                   std::string{"'"} + name
+                       + "' is a variadic-macro operator this implementation "
+                         "provides and may not be #undef'd");
+            return;
+        }
         table_.erase(name);
     }
 
@@ -4369,6 +4514,77 @@ private:
             && text(r) == cfg().variadicArgsName;
     }
 
+    // ── FC18a (D-PP-VA-OPT, C23 6.10.5.1) ────────────────────────────────────
+    //
+    // The va-opt-replacement INTRODUCER, matched by config TEXT (`vaOptName`).
+    // This form takes no `MacroDef`: it answers "is this token the introducer
+    // identifier", which is what the DEFINITION-time constraint checks need
+    // (they must fire precisely in the macros where the construct is NOT
+    // allowed). An empty config spelling means the language declares no va-opt
+    // construct, so nothing is ever recognized.
+    [[nodiscard]] bool isVaOptWord(Token const& r) const {
+        return isWord(r) && !cfg().vaOptName.empty()
+            && text(r) == cfg().vaOptName;
+    }
+    // The SUBSTITUTION-time form: a va-opt is only ever acted on inside a
+    // variadic macro, which `handleDefine` has already guaranteed.
+    [[nodiscard]] bool isVaOptName(Token const& r, MacroDef const& def) const {
+        return def.isVariadic && isVaOptWord(r);
+    }
+
+    // Locate the `)` that closes the va-opt whose introducer sits at `introIdx`
+    // in `repl`, "determined by skipping intervening pairs of matching left and
+    // right parentheses in its pp-tokens" (C23 6.10.5.1p3).
+    //
+    // Returns the index of the CLOSING paren. `openOut` receives the index of the
+    // opening paren. Returns `npos` when the construct is malformed -- either the
+    // introducer is not followed by `(`, or the `(` is never closed. The caller
+    // decides which diagnostic that is (it has the context to name it), which is
+    // why this reports a plain failure and emits nothing itself.
+    [[nodiscard]] static constexpr std::size_t vaOptNpos() {
+        return static_cast<std::size_t>(-1);
+    }
+
+    // "Does this run contain at least one PREPROCESSING TOKEN?" -- the emptiness
+    // question C23 6.10.5.1p7 actually asks of a va-opt's controlling
+    // substitution ("consists of no preprocessing tokens").
+    //
+    // ★ WHITESPACE IS NOT A PREPROCESSING TOKEN, AND A PLAIN `.empty()` GETS THIS
+    // WRONG. `collectArgs`/`trimArgTrivia` strip only the LEADING and TRAILING
+    // trivia of an argument, so an argument whose every macro expanded away can
+    // still leave INTERIOR white space behind. ✔MEASURED, this is observable:
+    // with `#define EMP`, `F(EMP)` has nothing left and `F(EMP EMP)` is left
+    // holding one whitespace token — yet clang-18, clang-19 and gcc-13 all answer
+    // `f(0 )` for BOTH, because neither has any preprocessing token left. A
+    // `.empty()` test passes the first and fails the second, which is exactly the
+    // split this project's own oracle differential caught.
+    [[nodiscard]] static bool hasSignificantToken(
+        std::vector<ExpToken> const& run) {
+        for (ExpToken const& e : run) {
+            if (e.placemarker) continue;             // not a real token either
+            if (isTrivia(e.tok) || isNewline(e.tok)) continue;
+            return true;
+        }
+        return false;
+    }
+    [[nodiscard]] std::size_t findVaOptClose(std::vector<Token> const& repl,
+                                             std::size_t introIdx,
+                                             std::size_t& openOut) const {
+        const std::size_t n = repl.size();
+        const std::size_t open = introIdx + 1;
+        if (open >= n || !isParenOpen(repl[open])) return vaOptNpos();
+        openOut = open;
+        std::size_t depth = 0;
+        for (std::size_t j = open; j < n; ++j) {
+            if (isParenOpen(repl[j])) {
+                ++depth;
+            } else if (isParenClose(repl[j])) {
+                if (--depth == 0) return j;
+            }
+        }
+        return vaOptNpos();
+    }
+
     // Build the substituted replacement list for a function-like call (C 6.10.3).
     // A replacement token that names a parameter (or `__VA_ARGS__`) is replaced by
     // that argument's tokens; every other token passes through stamped with `hs`.
@@ -4402,6 +4618,43 @@ private:
         std::vector<std::vector<ExpToken>> const& rawArgs,
         std::vector<ExpToken> const& rawVaArgs,
         HideSet const& hs, ByteOffset invOffset) {
+        std::vector<ExpToken> items;
+        substituteRange(def, 0, def.replacement.size(), expandedArgs, vaArgs,
+                        rawArgs, rawVaArgs, hs, invOffset,
+                        /*trackSpacing=*/false, items);
+        // ── PHASE B: collapse every `##` marker LEFT-TO-RIGHT. ──
+        return collapsePastes(std::move(items), hs, invOffset,
+                              /*sweepPlacemarkers=*/true);
+    }
+
+    // PHASE A over the HALF-OPEN replacement-list range `[begin, end)`, appending
+    // to `items`. The whole-list call (`begin=0, end=size()`) is the ordinary
+    // macro path and behaves exactly as before this function was made
+    // range-scoped; the RESTRICTED call is FC18a's va-opt-replacement content
+    // (C23 6.10.5.1p7: the content is expanded "as the replacement list of the
+    // current function-like macro"), which is why one walk serves both.
+    //
+    // ★ ADJACENCY IS RANGE-LOCAL, AND THAT IS THE SEMANTICS, NOT AN ARTIFACT.
+    // The `#`/`##`-operand tests below look at `i > begin` / `i + 1 < end`, not at
+    // the whole list. In `__VA_OPT__(a X) ## b` the `##` binds to the va-opt's
+    // RESULT, not to `X`, so `X` inside the content is not a paste operand; in
+    // `__VA_OPT__(a X ## X) ## b` the interior `##` IS in range and does bind.
+    // ✔MEASURED: the second is the standard's own H4, and clang-18/clang-19/
+    // gcc-13 all answer `a b` for `H4(, 1)` -- which only comes out right when
+    // the interior paste is evaluated and the exterior one is not.
+    //
+    // `trackSpacing` records, on each appended token, whether white space
+    // preceded it (see `ExpToken::spacedBefore`). It is set ONLY for a va-opt
+    // content walk feeding `#__VA_OPT__(...)`, where C23 6.10.5.2p3 needs it; the
+    // ordinary path leaves every bit `false` and never reads it.
+    void substituteRange(
+        MacroDef const& def, std::size_t begin, std::size_t end,
+        std::vector<std::vector<ExpToken>> const& expandedArgs,
+        std::vector<ExpToken> const& vaArgs,
+        std::vector<std::vector<ExpToken>> const& rawArgs,
+        std::vector<ExpToken> const& rawVaArgs,
+        HideSet const& hs, ByteOffset invOffset,
+        bool trackSpacing, std::vector<ExpToken>& items) {
         // FC15b: a REPLACEMENT-origin token (a plain replacement token, a `##`
         // marker/product, a stringize product) inherits the INVOCATION offset
         // `invOffset` (so a `__LINE__` in the replacement resolves to the
@@ -4445,17 +4698,60 @@ private:
             return nullptr;
         };
 
+        // Record the white-space bits for the run of items an arm just appended
+        // (everything from index `mark` on). `sp` is the REPLACEMENT-LEVEL answer
+        // for the run's FIRST token -- was the replacement token that produced it
+        // separated from its predecessor by white space. Tokens 2..N of the run
+        // came from ONE argument's contiguous call-site text, so their own spans
+        // give the answer directly. A run that is a lone PLACEMARKER has size 1,
+        // so a real token is never measured against a placemarker's unset span.
+        auto applySpacing = [&](std::size_t mark, bool sp) {
+            if (!trackSpacing || items.size() <= mark) return;
+            items[mark].spacedBefore = sp;
+            for (std::size_t k = mark + 1; k < items.size(); ++k) {
+                items[k].spacedBefore =
+                    items[k].tok.span.start() != items[k - 1].tok.span.end();
+            }
+        };
+
         // ── PHASE A: substitution (keeping `##` markers verbatim). ──
-        std::vector<ExpToken> items;
-        const std::size_t n = def.replacement.size();
-        for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t n = end;
+        for (std::size_t i = begin; i < n; ++i) {
             Token const& r = def.replacement[i];
+            // White space preceded `r` iff it does not start exactly where its
+            // predecessor ended. (`def.replacement` holds only SIGNIFICANT tokens
+            // -- trivia was dropped at `#define` time -- so the gap is the only
+            // remaining evidence, and it is exact.)
+            const bool spacedHere =
+                i > begin
+                && def.replacement[i - 1].span.end() != r.span.start();
+            const std::size_t mark = items.size();
             if (isStringize(r)) {
                 // `#` operand is the NEXT significant token, which MUST be a
-                // parameter (or `__VA_ARGS__`).
+                // parameter (or `__VA_ARGS__`), or -- FC18a, C23 6.10.5.1p4,
+                // "a va-opt-replacement is treated as if it were a parameter" --
+                // a whole `__VA_OPT__( ... )`.
                 if (i + 1 < n) {
+                    if (isVaOptName(def.replacement[i + 1], def)) {
+                        std::size_t open = 0;
+                        const std::size_t close =
+                            findVaOptClose(def.replacement, i + 1, open);
+                        // `handleDefine` rejects a malformed va-opt, so a
+                        // well-formed table entry always resolves. The guard is
+                        // defense-in-depth: a `npos` here would otherwise index
+                        // out of bounds.
+                        if (close != vaOptNpos() && close < n) {
+                            stringizeVaOpt(def, open + 1, close, expandedArgs,
+                                           vaArgs, rawArgs, rawVaArgs, hs,
+                                           invOffset, items);
+                            applySpacing(mark, spacedHere);
+                            i = close;   // consume `__VA_OPT__ ( ... )`
+                            continue;
+                        }
+                    }
                     if (auto const* raw = rawArgAt(i + 1)) {
                         stringizeArg(*raw, hs, invOffset, items);
+                        applySpacing(mark, spacedHere);
                         ++i;   // consume the parameter operand
                         continue;
                     }
@@ -4465,16 +4761,112 @@ private:
                        "'#' in a macro replacement must be followed by a "
                        "parameter");
                 items.push_back(ExpToken{r, hs, invOffset});  // recovery: `#` verbatim
+                applySpacing(mark, spacedHere);
                 continue;
             }
             if (isPaste(r)) {
                 items.push_back(ExpToken{r, hs, invOffset});  // marker for phase B
+                applySpacing(mark, spacedHere);
+                continue;
+            }
+            // ── FC18a (D-PP-VA-OPT, C23 6.10.5.1p7): a va-opt-replacement. ──
+            //
+            // The construct spans `__VA_OPT__ ( content )` -- several replacement
+            // tokens -- so it is recognized here and CONSUMED whole.
+            //
+            // ★★ THE EMPTINESS PREDICATE IS `vaArgs`, NOT `rawVaArgs`, AND THE
+            // DIFFERENCE IS OBSERVABLE. 6.10.5.1p7 keys the choice on "a
+            // (hypothetical) substitution of __VA_ARGS__ as neither an operand of
+            // # nor ##" -- i.e. the MACRO-EXPANDED variable arguments. The
+            // standard's own EXAMPLE 2 is the witness: with `#define EMP` and
+            // `#define F(...) f(0 __VA_OPT__(,) __VA_ARGS__)`, `F(EMP)` is
+            // "replaced by f(0)" -- one RAW argument token is present, yet its
+            // SUBSTITUTION is empty, so the comma goes. ✔MEASURED on clang-18,
+            // clang-19 and gcc-13, which also answer `f(0)` for `F(EMP EMP)` (two
+            // raw tokens, still an empty substitution). The GNU comma-elision arm
+            // above deliberately keeps testing `rawVaArgs` -- ✔MEASURED, those
+            // same three compilers answer `g(1 , )` for the GNU spelling of the
+            // identical call. Two constructs, two predicates, both correct.
+            if (isVaOptName(r, def)) {
+                std::size_t open = 0;
+                const std::size_t close = findVaOptClose(def.replacement, i, open);
+                if (close == vaOptNpos() || close >= n) {
+                    // `handleDefine` rejects this at DEFINITION time, so reaching
+                    // here means the table holds a malformed entry. Fail loud
+                    // rather than index past the range.
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                           synth_->id(), r.span,
+                           std::string{"'"} + cfg().vaOptName
+                               + "' is missing its closing parenthesis");
+                    continue;
+                }
+                if (!hasSignificantToken(vaArgs)) {
+                    // Empty substitution -> a single PLACEMARKER (6.10.5.1p7).
+                    // A placemarker, not "nothing": it is what lets an adjacent
+                    // `##` still find an operand, so `z ## __VA_OPT__(w)` with no
+                    // variable arguments collapses to `z` instead of tripping the
+                    // dangling-`##` constraint check. ✔MEASURED `z` on all three.
+                    ExpToken pm{};
+                    pm.hide      = hs;
+                    pm.invOffset = invOffset;
+                    pm.placemarker = true;
+                    items.push_back(pm);
+                } else {
+                    // Non-empty substitution -> the content, expanded as this
+                    // macro's replacement list. Recursion reuses THIS walk, so
+                    // parameters, `__VA_ARGS__`, `#` and `##` all behave inside a
+                    // va-opt exactly as they do outside it -- no second engine to
+                    // keep in agreement.
+                    const std::size_t before = items.size();
+                    substituteRange(def, open + 1, close, expandedArgs, vaArgs,
+                                    rawArgs, rawVaArgs, hs, invOffset,
+                                    trackSpacing, items);
+                    // Significance, not size: a parameter inside the content
+                    // whose argument expanded away can leave interior white space
+                    // behind, and white space is not a preprocessing token. The
+                    // same distinction `hasSignificantToken` exists for.
+                    bool appendedSomething = false;
+                    for (std::size_t k = before; k < items.size(); ++k) {
+                        if (items[k].placemarker) continue;
+                        if (isTrivia(items[k].tok) || isNewline(items[k].tok)) {
+                            continue;
+                        }
+                        appendedSomething = true;
+                        break;
+                    }
+                    if (!appendedSomething) {
+                        // The content substituted to NOTHING (it was empty, or it
+                        // was a parameter with an empty argument). Same reasoning
+                        // as the empty-substitution arm: emit a placemarker so an
+                        // adjacent `##` still has an operand. ✔MEASURED: for
+                        // `#define PZ(...) z ## __VA_OPT__()`, `PZ(1)` is `z` on
+                        // all three oracles -- not a dangling-`##` error.
+                        //
+                        // REPLACE, don't append: any white space the content did
+                        // leave behind must go, or an adjacent `##` would bind to
+                        // a whitespace token instead of to the placemarker.
+                        items.resize(before);
+                        ExpToken pm{};
+                        pm.hide      = hs;
+                        pm.invOffset = invOffset;
+                        pm.placemarker = true;
+                        items.push_back(pm);
+                    }
+                }
+                // Only the run's FIRST token takes the va-opt's own replacement-
+                // level spacing; the recursive call already set the interior bits
+                // from the content's own layout, so a blanket `applySpacing` here
+                // would overwrite them.
+                if (trackSpacing && items.size() > mark) {
+                    items[mark].spacedBefore = spacedHere;
+                }
+                i = close;   // consume through the closing `)`
                 continue;
             }
             if (isVaArgsName(r, def)) {
                 // RAW iff this `__VA_ARGS__` is a `##` operand (adjacent `##`).
                 bool const pasteOperand =
-                    (i > 0 && isPaste(def.replacement[i - 1]))
+                    (i > begin && isPaste(def.replacement[i - 1]))
                     || (i + 1 < n && isPaste(def.replacement[i + 1]));
                 // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): the GNU
                 // `sep ## __VA_ARGS__` idiom, CONFIG-gated by `variadicCommaElision`
@@ -4489,7 +4881,7 @@ private:
                 // `p ## __VA_ARGS__` where the left neighbor is a value not a separator)
                 // falls through to the standard path below.
                 if (cfg().variadicCommaElision
-                    && i > 0 && isPaste(def.replacement[i - 1])
+                    && i > begin && isPaste(def.replacement[i - 1])
                     && items.size() >= 2
                     && !items.back().placemarker
                     && isPaste(items.back().tok)
@@ -4501,6 +4893,10 @@ private:
                         items.pop_back();          // drop only the `##` (no paste)
                         stampArg(vaArgs, items);   // pre-expanded __VA_ARGS__
                     }
+                    // The elision arm POPS items, so `mark` may now be past the
+                    // end; `applySpacing` is a no-op in that case, which is right
+                    // -- nothing new was appended to attribute spacing to.
+                    applySpacing(mark, spacedHere);
                     continue;
                 }
                 // Standard path. A `##`-operand EMPTY `__VA_ARGS__` becomes a
@@ -4514,12 +4910,13 @@ private:
                 } else {
                     stampArg(vaArgs, items);
                 }
+                applySpacing(mark, spacedHere);
                 continue;
             }
             int const pi = paramIndexOf(r, def);
             if (pi >= 0) {
                 bool const pasteOperand =
-                    (i > 0 && isPaste(def.replacement[i - 1]))
+                    (i > begin && isPaste(def.replacement[i - 1]))
                     || (i + 1 < n && isPaste(def.replacement[i + 1]));
                 // FC15 paste residuals: a `##`-operand parameter with an EMPTY
                 // argument becomes a PLACEMARKER (C 6.10.3.3p2) via stampArgOrPM;
@@ -4529,16 +4926,15 @@ private:
                 } else {
                     stampArg(expandedArgs[static_cast<std::size_t>(pi)], items);
                 }
+                applySpacing(mark, spacedHere);
                 continue;
             }
             // A plain replacement token gets EXACTLY hs (no prior hide set) and
             // the INVOCATION offset (FC15b: a `__LINE__` in a function-like
             // replacement resolves to the invocation line).
             items.push_back(ExpToken{r, hs, invOffset});
+            applySpacing(mark, spacedHere);
         }
-
-        // ── PHASE B: collapse every `##` marker LEFT-TO-RIGHT. ──
-        return collapsePastes(std::move(items), hs, invOffset);
     }
 
     // Phase B of `substitute`: walk `items`, and at each `##` MARKER concatenate
@@ -4549,9 +4945,17 @@ private:
     // constraint violation (C 6.10.3.3p1) -> P_PreprocessorPaste, recovery: drop
     // the dangling `##` and keep the lone operand. A product that is not exactly
     // one token (F1) -> P_PreprocessorPaste, recovery: emit both operands verbatim.
+    //
+    // FC18a: `sweepPlacemarkers` is false ONLY for the `#__VA_OPT__(...)` content
+    // collapse. C23 6.10.5.1p7 defines a va-opt's argument as the expansion of its
+    // content "BEFORE removal of placemarker tokens", and 6.10.5.2p3 then defines
+    // the stringizing argument as that sequence WITH placemarkers removed -- two
+    // steps that only compose correctly if the collapse can be asked not to sweep.
+    // The ordinary path passes true and is unchanged.
     std::vector<ExpToken> collapsePastes(std::vector<ExpToken> items,
                                          HideSet const& hs,
-                                         ByteOffset invOffset) {
+                                         ByteOffset invOffset,
+                                         bool sweepPlacemarkers) {
         std::size_t i = 0;
         while (i < items.size()) {
             if (!isPaste(items[i].tok)) { ++i; continue; }
@@ -4626,10 +5030,77 @@ private:
         // so a surviving placemarker is dead -- removing it HERE guarantees a
         // placemarker never re-enters `expand`'s rescan (the `run()`/`expandTokens()`
         // drop is a defensive backstop only).
-        items.erase(std::remove_if(items.begin(), items.end(),
-                                   [](ExpToken const& e) { return e.placemarker; }),
-                    items.end());
+        if (sweepPlacemarkers) {
+            items.erase(
+                std::remove_if(items.begin(), items.end(),
+                               [](ExpToken const& e) { return e.placemarker; }),
+                items.end());
+        }
         return items;
+    }
+
+    // FC18a (C23 6.10.5.2 applied to a va-opt operand): STRINGIZE the va-opt whose
+    // content occupies `[contentBegin, contentEnd)` of `def.replacement`, appending
+    // the string-literal product to `out`.
+    //
+    // The sequence being stringized is NOT the raw source text of the content: per
+    // 6.10.5.1p7 the content is first substituted and `##`-collapsed (placemarkers
+    // surviving), and 6.10.5.2p2 then stringizes THAT with placemarkers removed.
+    // ✔MEASURED, this is exactly what the standard's H3 needs:
+    // `#define H3(X, ...) #__VA_OPT__(X##X X##X)` with `H3(, 0)` is `""` on
+    // clang-18/clang-19/gcc-13 -- the two pastes must actually run and yield
+    // placemarkers, because spelling the content literally would give "####".
+    void stringizeVaOpt(
+        MacroDef const& def, std::size_t contentBegin, std::size_t contentEnd,
+        std::vector<std::vector<ExpToken>> const& expandedArgs,
+        std::vector<ExpToken> const& vaArgs,
+        std::vector<std::vector<ExpToken>> const& rawArgs,
+        std::vector<ExpToken> const& rawVaArgs,
+        HideSet const& hs, ByteOffset invOffset, std::vector<ExpToken>& out) {
+        std::vector<ExpToken> content;
+        // An EMPTY variable-argument substitution makes the whole va-opt a single
+        // placemarker (6.10.5.1p7), which 6.10.5.2p3 then removes -- leaving the
+        // empty stringizing argument, whose literal is `""` (6.10.5.2p4).
+        // ✔MEASURED `""` for `#define SZ(...) #__VA_OPT__(a)` called `SZ()`.
+        if (hasSignificantToken(vaArgs)) {
+            substituteRange(def, contentBegin, contentEnd, expandedArgs, vaArgs,
+                            rawArgs, rawVaArgs, hs, invOffset,
+                            /*trackSpacing=*/true, content);
+            content = collapsePastes(std::move(content), hs, invOffset,
+                                     /*sweepPlacemarkers=*/false);
+            content.erase(
+                std::remove_if(content.begin(), content.end(),
+                               [](ExpToken const& e) { return e.placemarker; }),
+                content.end());
+        }
+        stringizeTokens(content, hs, invOffset, out);
+    }
+
+    // Build a string-literal product from an already-substituted TOKEN SEQUENCE
+    // (rather than from a contiguous source slice, which is what `stringizeArg`
+    // does for an ordinary parameter and which cannot work here -- a va-opt's
+    // tokens come from the `#define` line and the call site interleaved, so they
+    // occupy no single contiguous run of any buffer).
+    //
+    // Spelling follows C23 6.10.5.2p3: each token's own spelling verbatim, one
+    // space wherever white space separated it from its predecessor and NONE where
+    // white space did not (`spacedBefore`, captured during substitution), `"` and
+    // `\` escaped. The product is appended to `productText_` and re-tokenized by
+    // the same `materializeSignificant` path `stringizeArg` uses, so the result is
+    // a real opener + body + closer run rather than one fabricated token.
+    void stringizeTokens(std::vector<ExpToken> const& seq, HideSet const& hs,
+                         ByteOffset invOffset, std::vector<ExpToken>& out) {
+        std::string inner = "\"";
+        for (std::size_t k = 0; k < seq.size(); ++k) {
+            if (k > 0 && seq[k].spacedBefore) {
+                inner.push_back(static_cast<char>(0x20));
+            }
+            appendStringized(text(seq[k].tok), inner);
+        }
+        inner.push_back('"');
+        for (Token const& t : materializeSignificant(inner)) {
+            out.push_back(ExpToken{t, hs, invOffset});
+        }
     }
 
     // FC15a (F2, C 6.10.3.2): STRINGIZE the RAW argument token run `raw` into a
@@ -5065,7 +5536,8 @@ private:
                 // literal `##` operators and still fail-louds a genuine dangling `##`
                 // (`#define OBJ a ##`). `#` (stringize) does NOT apply to object-like
                 // macros (C 6.10.3.2) and there is none to handle here.
-                repl = collapsePastes(std::move(repl), hs, t.invOffset);
+                repl = collapsePastes(std::move(repl), hs, t.invOffset,
+                                      /*sweepPlacemarkers=*/true);
                 spliceOver(work, 0, 1, repl);
                 continue;          // rescan from i (the first replacement token)
             }

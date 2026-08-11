@@ -9521,3 +9521,555 @@ TEST(Preprocessor, HeaderCaseEmbedResourceCollisionIsReported) {
     std::error_code ec;
     fs::remove_all(inc, ec);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FC18a (D-PP-VA-OPT) -- C23 6.10.5.1 `__VA_OPT__`.
+//
+// EVERY expectation below is ✔MEASURED, not derived: the same construct was run
+// through clang-18 `-std=c23`, clang-19 `-std=c23` and gcc-13 `-std=c2x`, which
+// agreed on all of them, and through cl 19.51.36252 `/std:clatest
+// /Zc:preprocessor` as a fourth oracle for the expansion cases. Where the
+// standard states an answer itself (its EXAMPLE 2: F/G/SDEF/H2..H5) the measured
+// answer matched the standard, so the two are not independent votes -- they are
+// a cross-check that the probe was written correctly.
+//
+// The assertions run over the TOKEN stream (`ppLexemes`) rather than over
+// stringized text, deliberately: `#` applied to an already-expanded argument has
+// its own pre-existing defect (D-PP-STRINGIZE-EXPANDED-ARG-SLICES-WRONG-BYTES),
+// and an instrument that shares a defect with its subject cannot detect it.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+// The token sequence, one space between lexemes -- a canonical form directly
+// comparable with a reference preprocessor's `-E` output after whitespace
+// normalization.
+[[nodiscard]] std::string ppJoin(std::vector<std::string> const& lexs) {
+    std::string out;
+    for (std::size_t i = 0; i < lexs.size(); ++i) {
+        if (i != 0) out.push_back(' ');
+        out += lexs[i];
+    }
+    return out;
+}
+// Lexemes with NO separator. Used for the stringize assertions so they do not
+// depend on how many tokens a string literal is split into (opener/body/closer).
+[[nodiscard]] std::string ppConcat(std::vector<std::string> const& lexs) {
+    std::string out;
+    for (auto const& s : lexs) out += s;
+    return out;
+}
+
+} // namespace
+
+// ── The standard's own EXAMPLE 2, clause by clause. ──────────────────────────
+
+TEST(PreprocessorVaOpt, PresenceAndAbsenceOfTheOptionalTokens) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define F(...) f(0 __VA_OPT__(,) __VA_ARGS__)\n"
+                          "F(a, b, c)\n",
+                          r);
+    EXPECT_FALSE(r.diagnostics->hasErrors()) << "a well-formed __VA_OPT__ must not error";
+    EXPECT_EQ(ppJoin(lexs), "f ( 0 , a , b , c )");
+
+    PreprocessResult r2;
+    auto lexs2 = ppLexemes("#define F(...) f(0 __VA_OPT__(,) __VA_ARGS__)\n"
+                           "F()\n",
+                           r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs2), "f ( 0 )")
+        << "with no variable arguments the va-opt contributes NOTHING";
+}
+
+// ★★ THE LOAD-BEARING TEST OF THIS WHOLE FEATURE.
+//
+// C23 6.10.5.1p7 keys the emptiness choice on "a (hypothetical) substitution of
+// __VA_ARGS__ as neither an operand of # nor ##" -- the MACRO-EXPANDED variable
+// arguments. `F(EMP)` passes one RAW argument token, so an implementation that
+// tested the raw run would keep the comma and emit `f(0 , )`. The standard says
+// `F(EMP)` is "replaced by f(0)", and clang-18/clang-19/gcc-13/cl all agree.
+//
+// RED-ON-DISABLE: change the predicate in `substituteRange`'s va-opt arm from
+// `vaArgs.empty()` to `rawVaArgs.empty()` -- the one-token edit that "looks
+// equivalent" and is the same predicate the GNU comma-elision arm four lines
+// away legitimately uses -- and all three cases below flip to `f ( 0 , )`.
+TEST(PreprocessorVaOpt, EmptinessIsTestedOnTheExpandedArgumentsNotTheRawOnes) {
+    // One raw token that expands to nothing.
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define EMP\n"
+                          "#define F(...) f(0 __VA_OPT__(,) __VA_ARGS__)\n"
+                          "F(EMP)\n",
+                          r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs), "f ( 0 )")
+        << "an argument that is PRESENT but expands to NOTHING is empty";
+
+    // A CHAIN of empty macros -- still empty after full expansion.
+    PreprocessResult r2;
+    auto lexs2 = ppLexemes("#define EMP\n"
+                           "#define EMP2 EMP\n"
+                           "#define F(...) f(0 __VA_OPT__(,) __VA_ARGS__)\n"
+                           "F(EMP2)\n",
+                           r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs2), "f ( 0 )");
+
+    // TWO raw tokens, both expanding to nothing.
+    PreprocessResult r3;
+    auto lexs3 = ppLexemes("#define EMP\n"
+                           "#define F(...) f(0 __VA_OPT__(,) __VA_ARGS__)\n"
+                           "F(EMP EMP)\n",
+                           r3);
+    EXPECT_FALSE(r3.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs3), "f ( 0 )");
+}
+
+// ★ WHITE SPACE IS NOT A PREPROCESSING TOKEN — the sibling of the test above,
+// and the case that actually caught the bug. `collectArgs` trims only an
+// argument's LEADING and TRAILING trivia, so `EMP EMP` leaves one INTERIOR
+// whitespace token after both macros expand away. A `vaArgs.empty()` test then
+// reports "non-empty" and the va-opt fires. ✔MEASURED on clang-18/clang-19/
+// gcc-13: all three treat it as empty in all three positions below.
+//
+// RED-ON-DISABLE: revert `hasSignificantToken(vaArgs)` to `!vaArgs.empty()` and
+// all three assertions flip (`z1`/`v ( 0 , )`/`" "`).
+TEST(PreprocessorVaOpt, WhitespaceLeftByAnExpandedAwayArgumentIsStillEmpty) {
+    PreprocessResult r;
+    auto paste = ppLexemes("#define EMP\n"
+                           "#define PQ(X, ...) z ## __VA_OPT__(X)\n"
+                           "PQ(EMP EMP, 1)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(paste), "z")
+        << "the content left only white space, so the va-opt is a placemarker";
+
+    PreprocessResult r2;
+    auto comma = ppLexemes("#define EMP\n"
+                           "#define VV(...) v(0 __VA_OPT__(,) __VA_ARGS__)\n"
+                           "VV(EMP EMP)\n", r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(comma), "v ( 0 )");
+
+    PreprocessResult r3;
+    auto str = ppLexemes("#define EMP\n"
+                         "#define SZW(X, ...) #__VA_OPT__(X)\n"
+                         "SZW(EMP EMP, 1)\n", r3);
+    EXPECT_FALSE(r3.diagnostics->hasErrors());
+    EXPECT_EQ(ppConcat(str), "\"\"")
+        << "and the stringized form is empty, not a lone space";
+}
+
+// ★★ THE GNU IDIOM AND `__VA_OPT__` DISAGREE ON EXACTLY THIS INPUT, AND BOTH
+// ANSWERS ARE CORRECT. `,##__VA_ARGS__` asks "was a trailing argument WRITTEN"
+// (raw); `__VA_OPT__` asks "does it SUBSTITUTE to anything" (expanded).
+// ✔MEASURED on clang-18/clang-19/gcc-13: `g(1 , )` vs `g(1 )`.
+//
+// This test is the guard against "simplifying" the two onto one predicate. If a
+// later cycle routes `__VA_OPT__` through the comma-elision path (or vice
+// versa), one of the two lines below goes red.
+TEST(PreprocessorVaOpt, GnuCommaElisionAndVaOptDisagreeOnAnEmptyExpandingArg) {
+    PreprocessResult rGnu;
+    auto gnu = ppLexemes("#define EMP\n"
+                         "#define GNU(f, ...) g(f , ## __VA_ARGS__)\n"
+                         "GNU(1, EMP)\n",
+                         rGnu);
+    EXPECT_FALSE(rGnu.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(gnu), "g ( 1 , )")
+        << "GNU comma-elision keys off the RAW argument, which is PRESENT";
+
+    PreprocessResult rStd;
+    auto std_ = ppLexemes("#define EMP\n"
+                          "#define STD(f, ...) g(f __VA_OPT__(,) __VA_ARGS__)\n"
+                          "STD(1, EMP)\n",
+                          rStd);
+    EXPECT_FALSE(rStd.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(std_), "g ( 1 )")
+        << "__VA_OPT__ keys off the EXPANDED argument, which is EMPTY";
+}
+
+TEST(PreprocessorVaOpt, NamedParameterThenOptionalComma) {
+    PreprocessResult r;
+    auto a = ppLexemes("#define G(X, ...) f(0, X __VA_OPT__(,) __VA_ARGS__)\n"
+                       "G(a, b, c)\n", r);
+    EXPECT_EQ(ppJoin(a), "f ( 0 , a , b , c )");
+    PreprocessResult r2;
+    auto b = ppLexemes("#define G(X, ...) f(0, X __VA_OPT__(,) __VA_ARGS__)\n"
+                       "G(a, )\n", r2);
+    EXPECT_EQ(ppJoin(b), "f ( 0 , a )")
+        << "an explicitly EMPTY trailing argument is still empty";
+    PreprocessResult r3;
+    auto c = ppLexemes("#define G(X, ...) f(0, X __VA_OPT__(,) __VA_ARGS__)\n"
+                       "G(a)\n", r3);
+    EXPECT_EQ(ppJoin(c), "f ( 0 , a )");
+}
+
+// The standard's SDEF -- the motivating real-world shape (an optional
+// initializer). Also pins that `{`/`}` inside the content are ordinary tokens:
+// only PARENTHESES participate in finding the closing `)` (6.10.5.1p3).
+TEST(PreprocessorVaOpt, OptionalInitializerShape) {
+    PreprocessResult r;
+    auto a = ppLexemes("#define SDEF(sname, ...) S sname __VA_OPT__(= { __VA_ARGS__ })\n"
+                       "SDEF(foo);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(a), "S foo ;");
+    PreprocessResult r2;
+    auto b = ppLexemes("#define SDEF(sname, ...) S sname __VA_OPT__(= { __VA_ARGS__ })\n"
+                       "SDEF(bar, 1, 2);\n", r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(b), "S bar = { 1 , 2 } ;");
+}
+
+// H2: `##` INSIDE the content pastes normally.
+TEST(PreprocessorVaOpt, PasteInsideTheContent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define H2(X, Y, ...) __VA_OPT__(X ## Y,) __VA_ARGS__\n"
+                          "H2(a, b, c, d)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs), "ab , c , d");
+}
+
+// ★ H4: the va-opt RESULT is an operand of an OUTSIDE `##`, and an interior
+// `##` produced a placemarker. Both must be handled, and in the right order.
+// `H4(, 1)` = `a b`: inside, `X ## X` with X empty is placemarker##placemarker
+// = placemarker; outside, `<pm> ## b` = `b`.
+TEST(PreprocessorVaOpt, PlacemarkerFromInteriorPasteThenExteriorPaste) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define H4(X, ...) __VA_OPT__(a X ## X) ## b\n"
+                          "H4(, 1)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs), "a b");
+}
+
+// H5: an EMPTY va-opt content is a placemarker, and a placemarker survives long
+// enough to satisfy the `##` operands around it, then disappears.
+TEST(PreprocessorVaOpt, EmptyContentIsAPlacemarkerNotADanglingPaste) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define H5A(...) __VA_OPT__()/**/__VA_OPT__()\n"
+                          "#define H5B(X) a ## X ## b\n"
+                          "#define H5C(X) H5B(X)\n"
+                          "H5C(H5A())\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs), "ab");
+}
+
+// EXAMPLE 1: the closing `)` is found by paren MATCHING, so a `(` that arrives
+// from a nested macro invocation does not confuse the scan.
+TEST(PreprocessorVaOpt, StandardExampleOneWithLparenMacro) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define LPAREN() (\n"
+                          "#define G(Q) 42\n"
+                          "#define F(R, X, ...) __VA_OPT__(G R X) )\n"
+                          "int x = F(LPAREN(), 0, ~);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs), "int x = 42 ;");
+}
+
+// ── Structural cases beyond the standard's examples. ─────────────────────────
+
+// ✔MEASURED: white space between `__VA_OPT__` and its `(` is allowed. This is
+// the OPPOSITE of the `#define F (x)` rule, where a space makes the macro
+// object-like -- there the adjacency is what distinguishes two forms, here the
+// grammar is just `__VA_OPT__ ( pp-tokens )` over preprocessing tokens.
+TEST(PreprocessorVaOpt, SpaceBetweenIntroducerAndParenIsAllowed) {
+    PreprocessResult r;
+    auto a = ppLexemes("#define SP(...) s(0 __VA_OPT__ (,) __VA_ARGS__)\nSP()\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(a), "s ( 0 )");
+    PreprocessResult r2;
+    auto b = ppLexemes("#define SP(...) s(0 __VA_OPT__ (,) __VA_ARGS__)\nSP(9)\n", r2);
+    EXPECT_EQ(ppJoin(b), "s ( 0 , 9 )");
+}
+
+TEST(PreprocessorVaOpt, EmptyContentWithNonEmptyArgumentsYieldsNothing) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define EC(...) e( __VA_OPT__() __VA_ARGS__ )\nEC(7)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs), "e ( 7 )");
+}
+
+TEST(PreprocessorVaOpt, TwoVaOptsInOneReplacementList) {
+    PreprocessResult r;
+    auto a = ppLexemes("#define TW(...) t( __VA_OPT__([) __VA_ARGS__ __VA_OPT__(]) )\nTW()\n", r);
+    EXPECT_EQ(ppJoin(a), "t ( )");
+    PreprocessResult r2;
+    auto b = ppLexemes("#define TW(...) t( __VA_OPT__([) __VA_ARGS__ __VA_OPT__(]) )\nTW(3)\n", r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(b), "t ( [ 3 ] )");
+}
+
+// Nested parentheses inside the content must not terminate the scan early
+// (6.10.5.1p3: "skipping intervening pairs of matching left and right
+// parentheses"). The content also carries a COMMA at depth > 0.
+TEST(PreprocessorVaOpt, NestedParensInsideTheContent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define NP(...) n( __VA_OPT__( (a,(b)) ) __VA_ARGS__ )\nNP(4)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs), "n ( ( a , ( b ) ) 4 )");
+}
+
+TEST(PreprocessorVaOpt, NamedParameterInsideTheContentSubstitutes) {
+    PreprocessResult r;
+    auto a = ppLexemes("#define PN(X, ...) p( X __VA_OPT__(X X) )\nPN(q)\n", r);
+    EXPECT_EQ(ppJoin(a), "p ( q )");
+    PreprocessResult r2;
+    auto b = ppLexemes("#define PN(X, ...) p( X __VA_OPT__(X X) )\nPN(q, r)\n", r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(b), "p ( q q q )");
+}
+
+// ★ The va-opt as a `##` operand. Empty -> placemarker -> the paste yields the
+// other operand (NOT a dangling-`##` constraint error). ✔MEASURED `z` / `zw`.
+TEST(PreprocessorVaOpt, VaOptAsAPasteOperand) {
+    PreprocessResult r;
+    auto a = ppLexemes("#define PL(...) z ## __VA_OPT__(w)\nPL()\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "an empty va-opt is a PLACEMARKER, so the `##` has an operand";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    EXPECT_EQ(ppJoin(a), "z");
+
+    PreprocessResult r2;
+    auto b = ppLexemes("#define PL(...) z ## __VA_OPT__(w)\nPL(1)\n", r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(b), "zw");
+}
+
+// The same, but the content itself substitutes to nothing (an empty parameter),
+// and separately an entirely EMPTY content -- both must become placemarkers.
+TEST(PreprocessorVaOpt, PasteOperandWhoseContentSubstitutesToNothing) {
+    PreprocessResult r;
+    auto a = ppLexemes("#define PZ(...) z ## __VA_OPT__()\nPZ(1)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    EXPECT_EQ(ppJoin(a), "z");
+
+    PreprocessResult r2;
+    auto b = ppLexemes("#define PQ(X, ...) z ## __VA_OPT__(X)\nPQ(,1)\n", r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(b), "z");
+
+    PreprocessResult r3;
+    auto c = ppLexemes("#define PQ(X, ...) z ## __VA_OPT__(X)\nPQ(w,1)\n", r3);
+    EXPECT_EQ(ppJoin(c), "zw");
+}
+
+TEST(PreprocessorVaOpt, VaOptBetweenTwoPastes) {
+    PreprocessResult r;
+    auto a = ppLexemes("#define BB(...) a ## __VA_OPT__(m) ## b\nBB()\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(a), "ab");
+    PreprocessResult r2;
+    auto b = ppLexemes("#define BB(...) a ## __VA_OPT__(m) ## b\nBB(1)\n", r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(b), "amb");
+}
+
+TEST(PreprocessorVaOpt, VaArgsAsAPasteOperandInsideTheContent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define VP(...) v( __VA_OPT__(q ## __VA_ARGS__) )\nVP(1)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs), "v ( q1 )");
+}
+
+// The content is NOT rescanned in place; the OUTER rescan expands what it
+// produced (6.10.5.1p7: the argument is the expansion "before ... rescanning").
+// Observationally: `INNER(__VA_ARGS__)` inside the content still ends up
+// expanded, but by the ordinary post-substitution rescan.
+TEST(PreprocessorVaOpt, ContentIsRescannedByTheOuterPass) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define INNER(x) [x]\n"
+                          "#define RS(...) r( __VA_OPT__(INNER(__VA_ARGS__)) )\n"
+                          "RS(5)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppJoin(lexs), "r ( [ 5 ] )");
+}
+
+// ── Stringizing a va-opt (6.10.5.1p4 + 6.10.5.2). ───────────────────────────
+//
+// ★ THE SPELLING IS NOT A BLIND SPACE-JOIN. 6.10.5.2p3: white space BETWEEN the
+// stringizing argument's tokens becomes one space, and where there was none,
+// none is inserted. ✔MEASURED `"a+b"` vs `"a + b"`, and `"p+p"` for a
+// SUBSTITUTED parameter -- adjacency comes from the replacement list.
+TEST(PreprocessorVaOpt, StringizePreservesOriginalAdjacency) {
+    PreprocessResult r;
+    auto tight = ppLexemes("#define SZ3(...) #__VA_OPT__(a+b)\nSZ3(1)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppConcat(tight), "\"a+b\"");
+
+    PreprocessResult r2;
+    auto spaced = ppLexemes("#define SZ4(...) #__VA_OPT__(a + b)\nSZ4(1)\n", r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppConcat(spaced), "\"a + b\"");
+
+    PreprocessResult r3;
+    auto param = ppLexemes("#define SZ5(X, ...) #__VA_OPT__(X+X)\nSZ5(p, 1)\n", r3);
+    EXPECT_FALSE(r3.diagnostics->hasErrors());
+    EXPECT_EQ(ppConcat(param), "\"p+p\"")
+        << "a substituted parameter keeps the replacement list's adjacency";
+
+    PreprocessResult r4;
+    auto runs = ppLexemes("#define SZ(...) #__VA_OPT__(a b   c)\nSZ(1)\n", r4);
+    EXPECT_FALSE(r4.diagnostics->hasErrors());
+    EXPECT_EQ(ppConcat(runs), "\"a b c\"")
+        << "a RUN of white space collapses to exactly one space";
+}
+
+// An empty variable-argument substitution makes the whole va-opt a placemarker,
+// which stringization removes -- leaving `""` (6.10.5.2p4). And H3: interior
+// pastes must actually RUN, because spelling the content literally would give
+// "####" instead of "".
+TEST(PreprocessorVaOpt, StringizeOfAnEmptyOrPlacemarkerOnlyVaOptIsEmptyString) {
+    PreprocessResult r;
+    auto empty = ppLexemes("#define SZ(...) #__VA_OPT__(a b c)\nSZ()\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppConcat(empty), "\"\"");
+
+    PreprocessResult r2;
+    auto h3 = ppLexemes("#define H3(X, ...) #__VA_OPT__(X##X X##X)\nH3(, 0)\n", r2);
+    EXPECT_FALSE(r2.diagnostics->hasErrors());
+    EXPECT_EQ(ppConcat(h3), "\"\"")
+        << "the interior pastes yield placemarkers, which stringization removes";
+}
+
+TEST(PreprocessorVaOpt, StringizeOfVaArgsInsideTheContent) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define SZ7(...) #__VA_OPT__(__VA_ARGS__)\nSZ7(a , b)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppConcat(lexs), "\"a , b\"");
+}
+
+// ── Constraint violations: every one must FAIL LOUD AND BY NAME. ─────────────
+//
+// ★ THE POINT OF THESE IS THE MESSAGE, NOT MERELY THE REJECTION. Before FC18a a
+// `__VA_OPT__` reached the PARSER as an unknown identifier and the user was told
+// `expected 'ParenClose'` -- true about the parser's stack, silent about the
+// construct. Each case below asserts the diagnostic NAMES `__VA_OPT__`.
+namespace {
+// Every diagnostic's text, joined. Code-agnostic on purpose: these tests assert
+// on WHAT THE USER IS TOLD, and pinning the code as well would make the test
+// re-cut itself every time a message legitimately moves between codes.
+[[nodiscard]] std::string ppAllMessages(PreprocessResult const& r) {
+    std::string out;
+    for (auto const& d : r.diagnostics->all()) {
+        out += d.actual;
+        out.push_back('\n');
+    }
+    return out;
+}
+} // namespace
+
+TEST(PreprocessorVaOpt, InANonVariadicFunctionLikeMacroFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define NV(X) v( X __VA_OPT__(,) )\nNV(1)\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+    std::string const m = ppAllMessages(r);
+    EXPECT_NE(m.find("__VA_OPT__"), std::string::npos)
+        << "the diagnostic must NAME the construct, not say \"expected ')'\": " << m;
+    EXPECT_NE(m.find("variadic"), std::string::npos) << m;
+}
+
+TEST(PreprocessorVaOpt, InAnObjectLikeMacroFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define OL __VA_OPT__(x)\nOL\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+    EXPECT_NE(ppAllMessages(r).find("__VA_OPT__"), std::string::npos);
+}
+
+TEST(PreprocessorVaOpt, WithoutAnOpeningParenFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define NP(...) q( __VA_OPT__ )\nNP(1)\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+    std::string const m = ppAllMessages(r);
+    EXPECT_NE(m.find("__VA_OPT__"), std::string::npos) << m;
+    EXPECT_NE(m.find("("), std::string::npos)
+        << "must say a '(' is required: " << m;
+}
+
+TEST(PreprocessorVaOpt, UnterminatedContentFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define UT(...) q __VA_OPT__( a b\nUT(1)\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+    std::string const m = ppAllMessages(r);
+    EXPECT_NE(m.find("__VA_OPT__"), std::string::npos) << m;
+    EXPECT_NE(m.find(")"), std::string::npos)
+        << "must say the closing ')' is missing: " << m;
+}
+
+TEST(PreprocessorVaOpt, NestedVaOptFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define N(...) n( __VA_OPT__( a __VA_OPT__(b) ) )\nN(1)\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+    std::string const m = ppAllMessages(r);
+    EXPECT_NE(m.find("__VA_OPT__"), std::string::npos) << m;
+    EXPECT_NE(m.find("nested"), std::string::npos) << m;
+}
+
+// The standard's H1: `##` may not sit at either end of the content, because the
+// content "shall form a valid replacement list" (6.10.5.1p3 -> 6.10.5.3p1).
+TEST(PreprocessorVaOpt, PasteAtEitherEndOfTheContentFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define H1(X, ...) X __VA_OPT__(##) __VA_ARGS__\nH1(1,2)\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPaste));
+    EXPECT_NE(ppAllMessages(r).find("__VA_OPT__"), std::string::npos);
+
+    PreprocessResult r2;
+    (void)ppLexemes("#define PE(X, ...) __VA_OPT__(X ##) __VA_ARGS__\nPE(1,2)\n", r2);
+    EXPECT_TRUE(r2.diagnostics->hasErrors());
+    EXPECT_TRUE(hasPPCode(r2, DiagnosticCode::P_PreprocessorPaste));
+}
+
+TEST(PreprocessorVaOpt, DefineOrUndefOfTheReservedNameFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#define __VA_OPT__ 1\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable));
+
+    PreprocessResult r2;
+    (void)ppLexemes("#undef __VA_OPT__\n", r2);
+    EXPECT_TRUE(r2.diagnostics->hasErrors());
+    EXPECT_TRUE(hasPPCode(r2, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable));
+}
+
+// ── Agnosticism: the spelling comes from CONFIG, never from the C source. ────
+//
+// RED-ON-DISABLE: replace `cfg().vaOptName` with a literal "__VA_OPT__" anywhere
+// in the engine and this test fails -- under the rebound config the engine would
+// still recognise the C spelling (so `DSS_OPT` would pass through verbatim and
+// the joined output would not contain `w`), while `__VA_OPT__` would be treated
+// as a construct in a config that never declared one.
+TEST(PreprocessorVaOpt, VaOptNameIsConfigDrivenNotHardcoded) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
+    const std::string from = "\"vaOptName\": \"__VA_OPT__\"";
+    const std::string to   = "\"vaOptName\": \"DSS_OPT\"";
+    auto const pos = text.find(from);
+    ASSERT_NE(pos, std::string::npos)
+        << "shipped c-subset config no longer carries vaOptName=__VA_OPT__";
+    text.replace(pos, from.size(), to);
+
+    auto loaded = GrammarSchema::loadFromText(text, "<rebound-vaopt-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << "rebound schema should still load: "
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    ASSERT_EQ(schema->preprocess().vaOptName, "DSS_OPT");
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+
+    // The REBOUND spelling now behaves as the construct.
+    auto buf = SourceBuffer::fromString(
+        std::string{"#define PL(...) z ## DSS_OPT(w)\nPL(1)\n"}, "main.c");
+    PreprocessResult r =
+        preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the CONFIG-declared spelling must be the one the engine acts on";
+    std::string joined;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        joined += std::string{r.synthBuffer->slice(t.span)};
+    }
+    EXPECT_EQ(joined, "zw")
+        << "under the rebound config `DSS_OPT(w)` must expand, proving the "
+           "spelling is read from config rather than hard-coded";
+}
