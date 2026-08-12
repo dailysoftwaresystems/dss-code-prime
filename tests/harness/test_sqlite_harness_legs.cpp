@@ -1750,42 +1750,87 @@ TEST_F(HarnessLegs, AnUnprobedPlanHonoursNoConditionalConfound) {
 // the WSL2 kernel is silently excused, including a genuine WAL blocking-lock
 // miscompile that the ^walsetlk- row's own mechanism text says must stay red.
 //
-// ★ BOTH DIRECTIONS ARE PINNED, because a fix that turned the clock rows off
-// everywhere would satisfy the first half while deleting the mechanism.
+// ★ EVERY DIRECTION IS PINNED, because a fix that turned the clock rows off
+// everywhere would satisfy the dangerous one while deleting the mechanism.
 //
 // ⓘ AND THIS IS THE READER `confoundDecisions` DID NOT HAVE. That field was emitted
 // and consumed by nothing for a cycle; the per-row ACTIVE/INACTIVE decision is what
 // this test needs, and reading it beats grepping the prose report for a substring.
 //
-// RED-ON-DISABLE (measured, numbers in the cycle report): make probe_gate() return
-// the verdicts unchanged when `sharesDriverKernel` is false and the cross-kernel
-// case below goes green with 7 of 7 rows active.
+// ★★★ V2 (2026-08-12) REMOVES THE FILTER BY REMOVING ITS SUBJECT. Verdicts are
+// measured PER KERNEL and filed under that kernel's name, so a leg reads only the
+// drawer for the kernel IT executes in. The dangerous direction is no longer
+// filtered out — it cannot be expressed. What replaces the old force-to-
+// indeterminate is the case where the RIGHT kernel could not be measured, which is
+// `outcome: unreachable`, INDETERMINATE verdicts, and a caveat that says so.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): make probe_gate() read
+// the driver's drawer when the leg's own kernel is absent from the map, and the
+// first case below goes green with 7 of 7 rows active on a verdict about Windows.
 TEST_F(HarnessLegs, ACrossKernelLegDoesNotHonourAVerdictMeasuredByThisDriver) {
-    // The verdict is INJECTED so the case is deterministic on every host: what is
+    // The verdicts are INJECTED so the case is deterministic on every host: what is
     // under test is the DECISION, not this machine's clock. An injected plan is
     // stamped `confoundGating: injected` on purpose — see the gating test below.
-    auto const vfile = scratch_->path() / "present-verdicts.json";
-    {
-        std::ofstream out(vfile, std::ios::binary);
-        out << R"({"clock-realtime-steps": {"verdict": "present",)"
-               R"( "why": "pinned fixture: a stepping clock",)"
-               R"( "verb": "wall-clock-step", "evidence": {"steps": 4}}})";
-    }
+    // ★ THE FILE NAMES THE KERNEL. That is the whole subject: a verdict with no
+    // machine attached is what let a Windows measurement decide a WSL2 fixture.
+    auto const write = [&](char const* name, std::string const& body) {
+        auto const p = scratch_->path() / name;
+        std::ofstream out(p, std::ios::binary);
+        out << body;
+        return p;
+    };
+    std::string const entry =
+        R"({"verdict": "present", "why": "pinned fixture: a stepping clock",)"
+        R"( "verb": "wall-clock-step", "evidence": {"steps": 4}})";
+    auto const driverFile = write(
+        "present-in-driver.json",
+        R"({"driver": {"clock-realtime-steps": )" + entry + "}}");
+    auto const wslFile = write(
+        "present-in-wsl.json",
+        R"({"wsl-linux": {"clock-realtime-steps": )" + entry + "}}");
     auto const clockRows = std::set<std::string>{"^walsetlk-",
                                                  "^walsetlk_recover-", "^busy2-"};
 
-    auto planWith = [&](std::vector<std::string> args) {
+    auto planWith = [&](std::filesystem::path const& vfile,
+                        std::vector<std::string> args) {
         args.emplace_back("--probe-verdicts");
         args.emplace_back(vfile.string());
         return run(args);
     };
 
-    {   // ★ CROSS-KERNEL: a Windows host driving the ELF leg through wsl.exe.
-        auto const r = planWith({"--plan", "--host-os", "windows", "--host-arch",
+    {   // ★ THE DANGEROUS DIRECTION: a Windows host whose OWN clock steps, driving
+        // the ELF leg through wsl.exe. The `present` describes the DRIVER's kernel;
+        // the fixture executes in WSL2. It must not reach that leg — and because
+        // the leg's own drawer is then empty of a probe its rows require, the
+        // resolution REFUSES rather than guessing either way.
+        auto const r = planWith(driverFile,
+                                {"--plan", "--host-os", "windows", "--host-arch",
+                                 "x86_64", "--launchers-available", "wsl.exe"});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "a verdict measured in the DRIVER's kernel was accepted for a leg"
+               " whose fixture executes in WSL2. Guessing 'present' silently"
+               " excuses a real WAL blocking-lock miscompile; guessing 'absent'"
+               " hides a broken probe run behind plausible reds:\n" << r.output;
+        EXPECT_EQ(r.output.find("Traceback"), std::string::npos)
+            << "the refusal must be a named diagnostic, not a python traceback:\n"
+            << r.output;
+        EXPECT_NE(r.output.find("clock-realtime-steps"), std::string::npos)
+            << "the refusal must name the probe whose verdict is missing:\n"
+            << r.output;
+    }
+    {   // ★ THE CAPABILITY THIS CYCLE ADDS: the SAME verdict, filed under the
+        // kernel the fixture actually runs in, IS honoured there. This is the
+        // withheld-excusal recovery — 4 walsetlk reds on elf64-x86_64 and 3 on
+        // elf64-arm64 at 52cf784d that the arm64 VPS ran green from the same
+        // commit against the same upstream tree.
+        auto const r = planWith(wslFile,
+                                {"--plan", "--host-os", "windows", "--host-arch",
                                  "x86_64", "--launchers-available", "wsl.exe"});
         ASSERT_TRUE(r.spawned) << r.diagnostic;
         ASSERT_EQ(r.exitCode, 0u) << r.output;
-        auto const leg = legFrom(json::parse(r.output), "elf64-x86_64");
+        auto const plan = json::parse(r.output);
+        auto const leg = legFrom(plan, "elf64-x86_64");
         ASSERT_FALSE(leg.empty());
         ASSERT_EQ(leg.at("run").at("runFilesystem").get<std::string>(),
                   "wsl-linux")
@@ -1793,49 +1838,43 @@ TEST_F(HarnessLegs, ACrossKernelLegDoesNotHonourAVerdictMeasuredByThisDriver) {
                " stopped resolving one, it proves nothing.";
         auto const wire = leg.at("confounds").get<std::set<std::string>>();
         for (auto const& pat : clockRows) {
-            EXPECT_EQ(wire.count(pat), 0u)
-                << pat << " was honoured on a leg whose fixture executes in the"
-                          " WSL2 kernel, from a verdict measured on the Windows"
-                          " host. That silently excuses a real WAL miscompile.";
+            EXPECT_EQ(wire.count(pat), 1u)
+                << pat << " was NOT honoured on a leg whose OWN kernel measured"
+                          " the defect. Those excusals are real and were being"
+                          " withheld only because the probe looked at the wrong"
+                          " machine.";
         }
-        // AND THE STRUCTURED DECISION SAYS SO, per row, with a reason.
-        std::size_t inactive = 0;
-        for (auto const& d : leg.at("confoundDecisions")) {
-            if (clockRows.count(d.at("pattern").get<std::string>()) == 0u)
-                continue;
-            ++inactive;
-            EXPECT_FALSE(d.at("active").get<bool>());
-            EXPECT_NE(d.at("reason").get<std::string>().find("NOT APPLIED"),
-                      std::string::npos)
-                << "the row's reason must say the measurement was not applied and"
-                   " why: " << d.at("reason").get<std::string>();
-        }
-        EXPECT_EQ(inactive, clockRows.size())
-            << "the decision ledger did not carry all three clock rows, so this"
-               " assertion checked fewer rows than it claims.";
-        // AND THE ACCOUNT AGREES WITH THE DECISION — the exact pairing that was
-        // false: a caveat announcing INACTIVE beside a line saying ACTIVE (7 of 7).
-        bool caveat = false, activeLine = false, asMeasured = false;
+        // ★★ AND THE ACCOUNT NO LONGER CARRIES THE NOT-APPLIED CAVEAT. Its old
+        // condition was "this leg runs somewhere else", which was the right thing
+        // to say only while the probe could not GO there. Printing it now would be
+        // a fresh instance of the claim-rot this anchor exists to remove.
+        bool namesKernel = false, caveat = false, allActive = false;
         for (auto const& l : leg.at("confoundReport")) {
             auto const t = l.get<std::string>();
-            if (t.find("does NOT share this driver's kernel") != std::string::npos)
-                caveat = true;
-            if (t.find("confound rows ACTIVE (4 of 7)") != std::string::npos)
-                activeLine = true;
-            if (t.find("clock-realtime-steps = PRESENT") != std::string::npos)
-                asMeasured = true;
+            if (t.find("executes in kernel 'wsl-linux'") != std::string::npos)
+                namesKernel = true;
+            if (t.find("CAVEAT") != std::string::npos) caveat = true;
+            if (t.find("confound rows ACTIVE (7 of 7)") != std::string::npos)
+                allActive = true;
         }
-        EXPECT_TRUE(caveat) << "the report must state whose kernel was measured.";
-        EXPECT_TRUE(activeLine)
-            << "the caveat must be TRUE: the rows it says are INACTIVE must be"
-               " inactive on the line beside it.";
-        EXPECT_TRUE(asMeasured)
-            << "the verdict must still be reported AS MEASURED; a bare"
-               " INDETERMINATE about a probe that answered is a second false"
-               " statement in the place built to stop the first.";
+        EXPECT_TRUE(namesKernel)
+            << "the report must say WHICH KERNEL the verdicts below it describe;"
+               " a verdict with no machine attached is this anchor's subject.";
+        EXPECT_FALSE(caveat)
+            << "the measurement came from the right kernel, so a 'NOT APPLIED'"
+               " caveat would be false — and it would sit one line above ACTIVE"
+               " (7 of 7), which is exactly the pairing V1 shipped.";
+        EXPECT_TRUE(allActive)
+            << "the caveat's absence must be TRUE: the rows must be in force.";
+        // AND THE PER-KERNEL RECORD IS AT THE TOP OF THE PLAN, keyed on the kernel.
+        ASSERT_TRUE(plan.at("environmentProbes").contains("wsl-linux"))
+            << "the plan must file the measurement under the kernel it describes.";
+        EXPECT_EQ(plan.at("environmentProbes").at("wsl-linux")
+                      .at("kernel").get<std::string>(), "wsl-linux");
     }
-    {   // ★ SAME KERNEL, SAME VERDICT: the mechanism must still work.
-        auto const r = planWith({"--plan", "--host-os", "linux", "--host-arch",
+    {   // ★ SAME KERNEL, SAME VERDICT: the mechanism must still work natively.
+        auto const r = planWith(driverFile,
+                                {"--plan", "--host-os", "linux", "--host-arch",
                                  "x86_64", "--launchers-none"});
         ASSERT_TRUE(r.spawned) << r.diagnostic;
         ASSERT_EQ(r.exitCode, 0u) << r.output;
@@ -1850,6 +1889,21 @@ TEST_F(HarnessLegs, ACrossKernelLegDoesNotHonourAVerdictMeasuredByThisDriver) {
                           " would pass the cross-kernel case above while deleting"
                           " the mechanism it protects.";
         }
+    }
+    {   // ★ AND A FILE WITH NO KERNEL ON IT — the shape this harness used before it
+        // could measure more than one — is REFUSED, not read as the driver's.
+        auto const flat = write(
+            "present-flat.json",
+            R"({"clock-realtime-steps": )" + entry + "}");
+        auto const r = planWith(flat, {"--plan", "--host-os", "linux",
+                                       "--host-arch", "x86_64",
+                                       "--launchers-none"});
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u)
+            << "a verdict about an unnamed machine was accepted:\n" << r.output;
+        EXPECT_NE(r.output.find("keyed on PROBE NAMES"), std::string::npos)
+            << "the refusal must say what is wrong and how to spell it:\n"
+            << r.output;
     }
 }
 
@@ -1874,8 +1928,8 @@ TEST_F(HarnessLegs, AnInjectedProbeVerdictIsAnnouncedAndCannotRunACorpus) {
     };
     auto const good = write(
         "inject-good.json",
-        R"({"clock-realtime-steps": {"verdict": "present", "why": "captured )"
-        R"(elsewhere", "verb": "wall-clock-step", "evidence": {}}})");
+        R"({"driver": {"clock-realtime-steps": {"verdict": "present", "why": )"
+        R"("captured elsewhere", "verb": "wall-clock-step", "evidence": {}}}})");
     {
         auto const r = run({"--plan", "--host-os", "linux", "--host-arch",
                             "x86_64", "--launchers-none", "--probe-verdicts",
@@ -1924,26 +1978,35 @@ TEST_F(HarnessLegs, AnInjectedProbeVerdictIsAnnouncedAndCannotRunACorpus) {
         char const* why;
     };
     Bad const bad[] = {
-        {"inject-bare.json", R"({"clock-realtime-steps": "present"})",
+        {"inject-bare.json", R"({"driver": {"clock-realtime-steps": "present"}})",
          "a bare string cannot say what was measured or how"},
-        {"inject-noverdict.json", R"({"clock-realtime-steps": {"why": "x"}})",
+        {"inject-noverdict.json",
+         R"({"driver": {"clock-realtime-steps": {"why": "x"}}})",
          "a verdict object with no verdict"},
         {"inject-unknown.json",
-         R"({"clock-goes-backwards": {"verdict": "absent", "why": "x", )"
-         R"("verb": "wall-clock-step", "evidence": {}}})",
+         R"({"driver": {"clock-goes-backwards": {"verdict": "absent", )"
+         R"("why": "x", "verb": "wall-clock-step", "evidence": {}}}})",
          "a probe the registry does not declare can gate nothing"},
         {"inject-invented.json",
-         R"({"clock-realtime-steps": {"verdict": "probably", "why": "x", )"
-         R"("verb": "wall-clock-step", "evidence": {}}})",
+         R"({"driver": {"clock-realtime-steps": {"verdict": "probably", )"
+         R"("why": "x", "verb": "wall-clock-step", "evidence": {}}}})",
          "an invented verdict word"},
         {"inject-wrongverb.json",
-         R"({"clock-realtime-steps": {"verdict": "present", "why": "x", )"
-         R"("verb": "guess-the-clock", "evidence": {}}})",
+         R"({"driver": {"clock-realtime-steps": {"verdict": "present", )"
+         R"("why": "x", "verb": "guess-the-clock", "evidence": {}}}})",
          "a verdict naming another procedure's verb"},
         {"inject-nowhy.json",
-         R"({"clock-realtime-steps": {"verdict": "present", "why": "  ", )"
-         R"("verb": "wall-clock-step", "evidence": {}}})",
+         R"({"driver": {"clock-realtime-steps": {"verdict": "present", )"
+         R"("why": "  ", "verb": "wall-clock-step", "evidence": {}}}})",
          "a verdict with no stated evidence is the `earnedOn` defect"},
+        // ★ THE KERNEL NAME IS VALIDATED TOO: a drawer nobody opens would let a
+        // typo'd kernel decide nothing, silently — the direction that hides an
+        // unapplied measurement.
+        // [D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE]
+        {"inject-unknownkernel.json",
+         R"({"some-other-box": {"clock-realtime-steps": {"verdict": "present", )"
+         R"("why": "x", "verb": "wall-clock-step", "evidence": {}}}})",
+         "a kernel no declared runFilesystem resolves to"},
     };
     for (auto const& b : bad) {
         auto const p = write(b.name, b.body);
@@ -1992,6 +2055,62 @@ TEST_F(HarnessLegs, TheEnvironmentProbeReportsAVerdictWithItsEvidence) {
         // but useless, and it must be visible rather than inferred.
         EXPECT_GE(got.at("evidence").at("samples").get<int>(), 2)
             << "a decisive verdict from fewer than two samples: " << r.output;
+    }
+}
+
+// ── THE DOORS AROUND THAT INSTRUMENT ARE FAIL-CLOSED ────────────────────────
+//
+// D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE.
+//
+// `--probe-environment` is what `--plan` re-enters this script with INSIDE each
+// kernel a leg executes in, so its contract is now load-bearing in a second place:
+// it measures where it IS, it measures exactly what it was ASKED for, and it never
+// prints anything it did not measure. Each case below is refused BEFORE any clock
+// is sampled, so this whole test costs nothing.
+//
+// RED-ON-DISABLE (measured, numbers in the cycle report): drop the `--probe-only`
+// membership check and the undeclared-name case goes green with an empty
+// measurement — a map that looks successful and measured nothing.
+TEST_F(HarnessLegs, TheProbeMeasurementFlagsRefuseWhatTheyCannotAnswer) {
+    struct Case {
+        char const* why;
+        std::vector<std::string> args;
+        char const* says;
+    };
+    auto const vfile = scratch_->path() / "probe-doors.json";
+    {
+        std::ofstream out(vfile, std::ios::binary);
+        out << R"({"driver": {"clock-realtime-steps": {"verdict": "present",)"
+               R"( "why": "x", "verb": "wall-clock-step", "evidence": {}}}})";
+    }
+    Case const cases[] = {
+        {"an UNDECLARED probe name would silently narrow the measurement to"
+         " nothing while still printing a successful-looking map",
+         {"--probe-environment", "--probe-only", "clock-goes-backwards"},
+         "environmentProbes"},
+        {"--probe-only outside --probe-environment would look like it had"
+         " narrowed something and do nothing at all",
+         {"--plan", "--host-os", "linux", "--host-arch", "x86_64",
+          "--launchers-none", "--probe-only", "clock-realtime-steps"},
+         "--probe-only"},
+        {"measuring and reading a file at once would print somebody else's answer"
+         " under the name of a measurement",
+         {"--probe-environment", "--probe-verdicts", vfile.string()},
+         "MEASURES"},
+        {"measuring and forbidding measurement at once",
+         {"--probe-environment", "--environment-probes", "skip"},
+         "forbids measuring"},
+    };
+    for (auto const& c : cases) {
+        auto const r = run(c.args);
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        EXPECT_NE(r.exitCode, 0u) << "ACCEPTED, and " << c.why << ":\n"
+                                  << r.output;
+        EXPECT_EQ(r.output.find("Traceback"), std::string::npos)
+            << "the refusal must be a named diagnostic:\n" << r.output;
+        EXPECT_NE(r.output.find(c.says), std::string::npos)
+            << "the refusal must name what is wrong (looking for '" << c.says
+            << "'):\n" << r.output;
     }
 }
 
