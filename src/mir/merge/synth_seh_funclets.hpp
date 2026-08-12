@@ -36,10 +36,25 @@
 // and attaches a `SehScopeEntry` to the parent's `FrameUnwindInfo.sehScopes`, and
 // the pe writer emits the `__C_specific_handler` scope table + UNW_FLAG_EHANDLER.
 //
-// The `__C_specific_handler` personality is imported ON DEMAND here (its
-// `ExternImport` is appended to `externImports`) — NEVER eager-imported via
-// windows.json `symbols` (the c101 0xC0000139 loader law); the c111
-// `synthesizePeStartup` `__wgetmainargs` synthesis is the precedent.
+// The personality routine is imported ON DEMAND here (its `ExternImport` is
+// appended to `externImports`) — NEVER eager-imported via windows.json `symbols`
+// (the c101 0xC0000139 loader law); the c111 `__getmainargs` synthesis, now the
+// UCRT accessor synthesis in `synth_pe_startup.cpp`, is the precedent.
+//
+// ★★ UCRT-P4: WHICH routine and WHICH image are now CONFIG, not literals. This
+// pass used to hardcode BOTH `pers.mangledName = "__C_specific_handler"` and
+// `pers.libraryPath = "msvcrt.dll"` — two platform facts spelled in shared MIR
+// substrate, on a pass that runs for EVERY format, which no format could override
+// and no test could see. They come from the format's `sehPersonality` block now
+// (whose `role` the loader resolved against the format's `runtimeLibraries`
+// table), and a format that declares NO personality FAILS LOUD the moment a
+// guarded region resolves — which is what an ELF or Mach-O build carrying `__try`
+// should get, instead of an msvcrt import planted in an ELF image.
+//
+// ★ SEH (`__try`/`__except`) IS NOT C23; it is a Microsoft extension. That is
+// precisely why its personality must be a per-format CONFIG DECLARATION: a
+// non-standard, platform-specific mechanism is the last thing that should be
+// spelled inside `src/mir`.
 //
 // This pass mirrors the `synthesizePeStartup` structure (MirBuilder rebuild of a
 // frozen module + appended synth functions + `cloneGlobalsVerbatim`). It is a
@@ -47,10 +62,13 @@
 
 #include "core/export.hpp"
 #include "core/types/extern_import.hpp"       // ExternImport
+#include "core/types/object_format_kind.hpp"  // SehPersonality (the declared handler)
 #include "core/types/strong_ids.hpp"          // SymbolId, MirBlockId
 #include "mir/mir_node.hpp"                    // MirBlockId
 
 #include <cstdint>
+#include <optional>
+#include <string_view>
 #include <vector>
 
 namespace dss {
@@ -83,18 +101,29 @@ struct DSS_EXPORT MirSehScope {
 //   * `mir` is REBUILT with each parent's filterBB reduced to a stub + one appended
 //     funclet function per `__try` region (Mir is frozen — the shared
 //     MirFunctionRebuilder substrate does the clone);
-//   * the `__C_specific_handler` personality import is appended to `externImports`;
+//   * the FORMAT-DECLARED personality import is appended to `externImports`;
 //   * the returned vector carries one `MirSehScope` per region.
 // A module with no `__try` is a clean no-op (returns empty; `mir`/`externImports`
-// untouched). Returns false (fail-loud, reported) on an unsupported SEH shape a
-// c116a scaffold cannot lower (e.g. a multi-basic-block filter or guarded body —
-// D-WIN64-SEH-FUNCLETS; those are the c116b frontier). On the no-op / success path
-// returns true and fills `outScopes`.
+// untouched) — and the no-op runs BEFORE `sehPersonality` is consulted, so a
+// format that declares none stays perfectly usable for every program that does not
+// use SEH. Returns false (fail-loud, reported) on an unsupported SEH shape a c116a
+// scaffold cannot lower (e.g. a multi-basic-block filter — D-WIN64-SEH-FUNCLETS;
+// the c116b frontier) AND when a region resolved under a format declaring NO
+// `sehPersonality`. On the no-op / success path returns true and fills `outScopes`.
+//
+// `sehPersonality` is the format's declared handler routine + the image its `role`
+// resolved to. `scheme` C-mangles the routine's canonical name for the active
+// format, through the SAME `applyCMangling` the FFI ingest uses — the old literal
+// was undecorated, which is correct on pe and would be wrong the instant a
+// decorating format declared a personality.
 [[nodiscard]] DSS_EXPORT bool
-synthesizeSehFunclets(Mir&                        mir,
-                      TypeInterner&               interner,
-                      std::vector<ExternImport>&  externImports,
-                      std::vector<MirSehScope>&   outScopes,
-                      DiagnosticReporter&         reporter);
+synthesizeSehFunclets(Mir&                                  mir,
+                      TypeInterner&                         interner,
+                      std::vector<ExternImport>&            externImports,
+                      std::optional<SehPersonality> const&  sehPersonality,
+                      CSymbolDecorationScheme               scheme,
+                      std::string_view                      formatName,
+                      std::vector<MirSehScope>&             outScopes,
+                      DiagnosticReporter&                   reporter);
 
 } // namespace dss

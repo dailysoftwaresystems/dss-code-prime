@@ -340,13 +340,26 @@ TEST(StaticLink, PullResolvesReferenceAndMergeStripsImport) {
     EXPECT_EQ(image.resolvedCrossCuRefs.size(), 1u)
         << "the reference->definition binding must be recorded";
 
-    // RED-ON-DISABLE: WITHOUT the pulled member, dss_lib_answer stays an
-    // unresolved import (the exact state the static pull removes).
+    // RED-ON-DISABLE: WITHOUT the pulled member, dss_lib_answer is UNRESOLVED --
+    // the exact state the static pull removes.
+    //
+    // ⓘ UCRT-P4 (Decision 1) CHANGED HOW "UNRESOLVED" LOOKS, AND FOR THE BETTER.
+    // This used to assert the name appeared in `externImportNames`: the retired
+    // per-language `externLibraryByFormat` default gave every unbound extern an
+    // invented import library, so a missing definition silently became a DYNAMIC
+    // IMPORT of a library that does not export it -- a clean link and a failure at
+    // LOAD. With the guess gone the row carries no library, so it is not an import
+    // at all; it is an unresolved reference, and an exec-flavour link REJECTS it
+    // LOUD. Assert THAT, which is the property the pull actually removes.
     DiagnosticReporter aloneRep;
     auto imageAlone = linker::link(
         std::span<AssembledModule const>{&*mainMod, 1}, *s.target, *s.exec, aloneRep);
-    EXPECT_TRUE(importsContain(imageAlone.externImportNames, "dss_lib_answer"))
-        << "without the static pull, dss_lib_answer is an unresolved import";
+    EXPECT_TRUE(aloneRep.hasErrors())
+        << "without the static pull, the reference to dss_lib_answer must be "
+           "rejected LOUD at link -- never quietly turned into an import of a "
+           "library that has no such export";
+    EXPECT_EQ(imageAlone.resolvedCrossCuRefs.size(), 0u)
+        << "and nothing may claim to have resolved it";
 }
 
 // -- Two-pass lazy-pull: only REFERENCED members are pulled (W2) -----------------
@@ -434,22 +447,47 @@ TEST(StaticLink, DriverStaticLinkBuildsSelfContainedExec) {
         << "THE acceptance criterion: exit 42 = dss_lib_answer() pulled from "
            "libdsslib.a, merged into main, and called.";
 
-    // RED-ON-DISABLE: WITHOUT --resolve-library, dss_lib_answer is left an
-    // undefined dynamic symbol -> the build still succeeds (elf-exec defers
-    // undefined symbols to ld.so) but the RUN fails (symbol lookup error). The
-    // ONLY thing that makes main exit 42 is the static pull+merge.
+    // RED-ON-DISABLE: WITHOUT --resolve-library, `dss_lib_answer` is an
+    // UNRESOLVED REFERENCE, and an exec-flavour link now REJECTS it LOUD — so
+    // the BUILD FAILS. Assert that, which is the property the static pull
+    // actually removes — the same migration `PullResolvesReferenceAndMergeStripsImport`
+    // above already made. (Cited BY TEST NAME, not by line: an earlier draft of
+    // this comment said "352-362 and ~620" and the second number had already
+    // drifted to 636 before it was ever committed. D-PLANS-LINE-CITATION-ROT.)
+    //
+    // ★ THE OLD EXPECTATION WAS STRICTLY WEAKER AND IS WHY THIS CHANGED: it
+    // asserted the build SUCCEEDED and merely that the RUN did not reach 42 —
+    // i.e. it accepted a clean link that died at LOAD with a symbol-lookup
+    // error. Retiring the per-language `externLibraryByFormat` default turned
+    // that into a compile-time refusal, which is the better outcome.
+    //
+    // ★★ WHY IT WAS MISSED, RECORDED BECAUSE THE SHAPE RECURS: that retirement
+    // changed this property at THREE sites in this file — the two
+    // `*PullResolvesReferenceAndMergeStripsImport` tests were migrated with the
+    // change; this one was not. The Windows leg reported 816/816 while WSL was
+    // red, because this arm lives inside the
+    // `#if defined(__linux__) && (__x86_64__ || __amd64__)` guard and Windows
+    // CANNOT COMPILE IT AT ALL. A green suite over a SUBSET of a multi-site
+    // contract is not proof of the contract.
+    // ⚠ AND THE SAME BLIND SPOT IS STILL OPEN ONE TEST BELOW:
+    // `MachODriverStaticLinkBuildsSelfContainedExec` is guarded by
+    // `#if defined(__APPLE__) && defined(__aarch64__)`, which NEITHER gate leg
+    // compiles — so it could be arbitrarily stale and no leg would say so.
+    // Tracked as D-TEST-PLATFORM-GUARDED-ARM-COMPILES-ON-NO-GATE-LEG.
     ScratchDir scratchNo{Location::InsideRepo, "static-link"};
     auto const dirNo = scratchNo.path();
     auto const mainNo = writeSrc(dirNo, "main.c", kMainSrc);
     Program pNo;
     pNo.setOutputDir(dirNo);
     DiagnosticReporter repNo;
-    ASSERT_EQ(pNo.compileFiles(std::vector<std::string>{mainNo.string()}, "c-subset",
-                  std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, repNo), 0);
-    auto const r2 = runBinary(dirNo / "main", std::chrono::milliseconds{5000});
-    EXPECT_TRUE(!r2.spawned || r2.exitCode != 42u)
-        << "WITHOUT the static pull, main must NOT exit 42 (undefined symbol at "
-           "load). spawned=" << r2.spawned << " exit=" << r2.exitCode;
+    EXPECT_NE(pNo.compileFiles(std::vector<std::string>{mainNo.string()}, "c-subset",
+                  std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, repNo), 0)
+        << "without the static pull, the unresolved reference to dss_lib_answer "
+           "must FAIL THE BUILD -- never quietly become a dynamic import of a "
+           "library that has no such export";
+    EXPECT_TRUE(repNo.hasErrors())
+        << "and that failure must be a REPORTED diagnostic, not a bare nonzero "
+           "status with nothing said";
 #endif  // __linux__
 }
 
@@ -596,14 +634,19 @@ TEST(StaticLink, MachOPullResolvesReferenceAndMergeStripsImport) {
     EXPECT_EQ(image.resolvedCrossCuRefs.size(), 1u)
         << "the reference->definition binding must be recorded";
 
-    // RED-ON-DISABLE: main ALONE (no pulled member) keeps dss_lib_answer an
-    // unresolved import -- the exact state the static pull removes.
+    // RED-ON-DISABLE: main ALONE (no pulled member) leaves dss_lib_answer
+    // UNRESOLVED -- the exact state the static pull removes. See the elf sibling
+    // above for why this asserts a LOUD REJECTION rather than an import row: with
+    // the retired per-language library default gone, an unbound extern no longer
+    // gets an invented import library to hide in.
     DiagnosticReporter aloneRep;
     auto imageAlone = linker::link(
         std::span<AssembledModule const>{&*mainMod, 1}, *s.target, *s.exec, aloneRep);
-    EXPECT_TRUE(std::any_of(imageAlone.externImportNames.begin(),
-                            imageAlone.externImportNames.end(), refsAnswer))
-        << "without the static pull, dss_lib_answer stays an unresolved import";
+    EXPECT_TRUE(aloneRep.hasErrors())
+        << "without the static pull, the reference to dss_lib_answer must be "
+           "rejected LOUD at link";
+    EXPECT_EQ(imageAlone.resolvedCrossCuRefs.size(), 0u)
+        << "and nothing may claim to have resolved it";
 }
 
 // -- c168: Mach-O static-link through the PRODUCTION driver ----------------------

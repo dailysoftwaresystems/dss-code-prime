@@ -1109,7 +1109,8 @@ TEST(MachoDylibFormatJsonValidate, MinimalDylibShapeAccepted) {
 TEST(MachoDylibFormatJsonValidate, EntryClusterRejected) {
     auto r = ObjectFormatSchema::loadFromText(dylibJsonWith(R"(
       "entryCallingConvention": "apple_arm64",
-      "processExit": { "mechanism": "by-name-import", "importMangledName": "_exit", "importLibraryPath": "/usr/lib/libSystem.B.dylib" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
     )"));
     ASSERT_FALSE(r.has_value());
 }
@@ -1168,10 +1169,15 @@ TEST(MachoDylibFormatJsonValidate, InstallNameOnExecRejected) {
     // declares neither `processExit` nor `entryCallingConvention`, so
     // D-LK10-ENTRY 2.13's entry-cluster requirement fires ALONGSIDE the
     // installName-on-exec rule this test pins -- two independent
-    // defects, not a knock-on of one.
-    EXPECT_EQ(errorCount(r), 2u) << rejectSummary(r);
+    // defects, not a knock-on of one. UCRT-P4 adds a THIRD, for the same
+    // single fixture property: an exec-flavored format must also declare
+    // `entryVerbs` (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE), the paired twin of the
+    // processExit requirement. Each firing is named below rather than absorbed
+    // into a looser bound, so a FOURTH unrelated rule still reds this line.
+    EXPECT_EQ(errorCount(r), 3u) << rejectSummary(r);
     EXPECT_EQ(countAtPath(r, "/image/installName"), 1u) << rejectSummary(r);
     EXPECT_EQ(countAtPath(r, "/processExit"), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/entryVerbs"), 1u) << rejectSummary(r);
 }
 
 TEST(MachoDylibFormatJsonValidate, MissingInstallNameRejected) {

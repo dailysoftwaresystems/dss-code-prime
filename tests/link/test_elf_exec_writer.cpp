@@ -218,7 +218,9 @@ TEST(ElfExecFormatJson, InterpreterTypeCheckRejectsNonString) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-interp","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": 42 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -247,7 +249,9 @@ TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"empty-interp","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -328,7 +332,9 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-interp","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -549,7 +555,9 @@ TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingFutureWork) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"riscv-exec","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": {
         "class":"elf64", "data":"lsb", "machine": 243, "type":"exec",
@@ -1109,7 +1117,9 @@ TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-entry-named","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "entryPoint": "sym_42",
@@ -1150,7 +1160,9 @@ TEST(ElfExecWriter, UnknownEntryPointOnDynamicPathFailsLoud) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-bad-entry","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "entryPoint": "sym_99",
@@ -1222,7 +1234,9 @@ TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bindnow-wrong-type","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": "true" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1249,10 +1263,13 @@ TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bindnow-default","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
-      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
+      "relocations":[{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE((*r)->elf().bindNow);
@@ -1272,7 +1289,9 @@ TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"elf-lazy-pending","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "entryPoint": "",
       "elf": {
@@ -1827,7 +1846,9 @@ TEST(ElfExecFormatJson, ExecWithZeroVirtualAddressRejected) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-exec","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
@@ -1863,7 +1884,9 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-page-align","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1887,7 +1910,9 @@ TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"odd-page-align","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 3000 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -1976,7 +2001,9 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"forge-exec","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_42",
@@ -2023,7 +2050,9 @@ TEST(ElfExecWriter, UnknownEntryPointFailsLoud) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-entry","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "entryPoint": "sym_99",
@@ -2134,7 +2163,9 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-interp","kind":"elf"},
-      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096 },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}]
@@ -2164,6 +2195,150 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
         if (d.code == DiagnosticCode::K_FormatLacksImportSupport) sawCode = true;
     }
     EXPECT_TRUE(sawCode);
+}
+
+// ★ RED-ON-DISABLE for the ELF walker's OWN data-import binding belt, and for
+//   the ownership change that put it there.
+//   D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET.
+//
+// The walker USED to DERIVE the binding model from the image flavour —
+// `required = isDyn ? GotIndirect : CopyRelocation` — and then merely ERROR if
+// the schema's `dataImportBinding` disagreed. That made the schema key a
+// redundant restatement the engine validated instead of a decision it read, and
+// it put the choice in an `isDyn` identity branch. The walker now READS the
+// declared value and implements exactly `got-indirect`.
+//
+// So the belt this pins is: a schema that declares NO model reaching the walker
+// must FAIL LOUD, never silently receive a GOT slot it did not declare. It is
+// reachable only by driving the walker DIRECTLY — the linker's pre-walker gate
+// refuses a nullopt binding first — which is exactly what this test does, and is
+// why the belt is not dead code. The PE and Mach-O walkers carry the identical
+// assertion (test_pe_writer.cpp's
+// `DataExternUnderUndeclaredDataImportBindingFailsLoud`).
+//
+// ⓘ There is deliberately no "declares a FOREIGN model" arm any more: the second
+// enum member was DELETED, so a foreign spelling is refused AT LOAD (pinned by
+// test_elf_dyn_writer.cpp's
+// `DeletedCopyRelocationBindingRefusedAtLoadOnEveryFlavour`) and can never
+// reach a walker.
+TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    // A complete exec schema EXCEPT that `dataImportBinding` is absent.
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"exec-no-data-binding","kind":"elf"},
+      "externCallDispatch": "direct-plt",
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
+      "relocations":[{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
+    })");
+    ASSERT_TRUE(fmt.has_value())
+        << "the fixture must LOAD — otherwise this measures the loader, not "
+           "the walker's belt";
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3};   // mov rax,[rip+disp]
+    Relocation rel;
+    rel.offset = 3;
+    rel.target = SymbolId{99};
+    rel.kind   = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport dataExt;
+    dataExt.symbol         = SymbolId{99};
+    dataExt.mangledName    = "__environ";
+    dataExt.libraryPath    = "libc.so.6";
+    dataExt.isData         = true;
+    dataExt.dataSizeBytes  = 8;
+    dataExt.dataAlignBytes = 8;
+    mod.externImports.push_back(std::move(dataExt));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "no image may be produced under an undeclared binding model";
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksImportSupport) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode)
+        << "the walker must name the missing 'dataImportBinding' declaration — "
+           "silently binding the data extern is the miscompile class this belt "
+           "exists for";
+
+    // POSITIVE CONTROL, ONE VARIABLE: the SAME module under the SAME synthetic
+    // schema with `dataImportBinding` ADDED, and nothing else changed. Without
+    // it the reject above could be the module being malformed rather than the
+    // schema being silent; with a *different* schema as the control it could be
+    // any of a dozen other keys.
+    auto declared = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"exec-with-data-binding","kind":"elf"},
+      "externCallDispatch": "direct-plt",
+      "dataImportBinding": "got-indirect",
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism":"by-name-import", "role": "cLibrary","importMangledName":"exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
+      "relocations":[{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
+    })");
+    ASSERT_TRUE(declared.has_value());
+    // …and the SHIPPED formats really do declare it, so the control is the
+    // shipped configuration and not a fixture-only shape.
+    auto shipped = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(shipped.has_value());
+    ASSERT_TRUE((*shipped)->dataImportBinding().has_value());
+    EXPECT_TRUE(*(*shipped)->dataImportBinding()
+                == DataImportBinding::GotIndirect)
+        << "the shipped ELF exec format must declare got-indirect: a copy "
+           "relocation claims ONE name of an alias set and splits the object";
+    AssembledModule ok;
+    ok.expectedFuncCount = 1;
+    // D-LK10-ENTRY 2.13: an exec schema declaring `processExit` CONTRACTS that
+    // the image entry is the injected `_start` trampoline. This test drives the
+    // walker directly (no `linker::link`, hence no injection), so the override
+    // must name the entry explicitly — the walker refuses to default it rather
+    // than silently make functions[0] the process entry.
+    ok.imageEntryOverride = 0u;
+    AssembledFunction fn2;
+    fn2.symbol = SymbolId{1};
+    fn2.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3};
+    Relocation rel2;
+    rel2.offset = 3;
+    rel2.target = SymbolId{99};
+    rel2.kind   = RelocationKind{1};
+    fn2.relocations.push_back(rel2);
+    ok.functions.push_back(std::move(fn2));
+    ExternImport dataOk;
+    dataOk.symbol         = SymbolId{99};
+    dataOk.mangledName    = "__environ";
+    dataOk.libraryPath    = "libc.so.6";
+    dataOk.isData         = true;
+    dataOk.dataSizeBytes  = 8;
+    dataOk.dataAlignBytes = 8;
+    ok.externImports.push_back(std::move(dataOk));
+    DiagnosticReporter rep2;
+    auto okBytes = elf::encode(ok, **target, **declared, rep2);
+    std::ostringstream why;
+    for (auto const& d : rep2.all()) why << " | " << d.actual;
+    EXPECT_EQ(rep2.errorCount(), 0u)
+        << "positive control: adding ONLY `dataImportBinding` must make the "
+           "SAME module encode:" << why.str();
+    EXPECT_FALSE(okBytes.empty());
 }
 
 TEST(ElfRelWriter, ExternDataImportNoLongerFailsLoudOnEtRel) {
@@ -2258,6 +2433,98 @@ constexpr std::size_t kShdrSize = 64;
 }
 
 } // namespace
+
+// ★ THE BELT, EXERCISED RATHER THAN ASSERTED — and it exists because the
+// copy-relocation deletion took away a link-time constant.
+// D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET.
+//
+// `FILE **pp = &stdout;` needs the ADDRESS of an imported object. Under copy
+// relocation the exec owned a `.bss` copy that WAS the object, so the address
+// was a link-time constant and the data-item apply could bake it in. Under
+// got-indirect there is no link-time address (the object lives in libc; the
+// exec holds a GOT slot ld.so fills), so the slot gets a SYMBOL-BASED absolute
+// dynamic relocation and ld.so writes the real address at load. ✔MEASURED: the
+// first cut of the deletion baked `symbolVa[extern]` — the GOT SLOT — and
+// `examples/c-subset/extern_data_addr_static_init` went red at exit 1, a
+// pointer one indirection off with no diagnostic.
+//
+// A load-time write cannot reach a READ-ONLY page. The normal C shapes never
+// get there — a reloc-bearing `const` global is classified RELRO and folded
+// into writable `.data` (measured: `FILE **const pp = &stdout;` lands in
+// `.data` WA with the symbol-based row and runs) — so this is a BELT for a
+// HAND-BUILT module, exactly like the alignment re-check in the same walker.
+// A belt nobody ever fires asserts nothing, hence this test: it builds that
+// module directly and requires the loud refusal, because the alternative the
+// walker would otherwise take is baking the wrong pointer SILENTLY.
+TEST(ElfExecWriter, RodataItemHoldingImportedObjectAddressFailsLoud) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;   // READ-ONLY on purpose
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};  // an 8-byte pointer slot
+    d.alignment = Alignment::of<8>();
+    Relocation rel;
+    rel.offset = 0;
+    rel.target = SymbolId{99};               // the extern DATA import
+    rel.kind   = RelocationKind{2};          // abs64 (R_X86_64_64)
+    d.relocations.push_back(rel);
+    mod.dataItems.push_back(std::move(d));
+    ExternImport dataExt;
+    dataExt.symbol         = SymbolId{99};
+    dataExt.mangledName    = "stdout";
+    dataExt.libraryPath    = "libc.so.6";
+    dataExt.isData         = true;
+    dataExt.dataSizeBytes  = 8;
+    dataExt.dataAlignBytes = 8;
+    mod.externImports.push_back(std::move(dataExt));
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "no image may ship with an unfixable read-only address slot";
+    std::ostringstream why;
+    bool sawCode = false;
+    for (auto const& d2 : rep.all()) {
+        why << " | " << d2.actual;
+        if (d2.code == DiagnosticCode::K_RelocationKindMismatch) sawCode = true;
+    }
+    EXPECT_TRUE(sawCode)
+        << "the walker must name the read-only slot and the import whose "
+           "address it cannot fix up:" << why.str();
+
+    // POSITIVE CONTROL, ONE VARIABLE: the SAME item in a WRITABLE section
+    // encodes cleanly. Without it the refusal above could be the extern, the
+    // reloc kind, or the fixture — rather than the section's writability.
+    AssembledModule ok = makeTrivialModule({0xC3}, 1);
+    AssembledData dw;
+    dw.symbol    = SymbolId{42};
+    dw.section   = DataSectionKind::Data;    // the ONLY difference
+    dw.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};
+    dw.alignment = Alignment::of<8>();
+    Relocation relw;
+    relw.offset = 0;
+    relw.target = SymbolId{99};
+    relw.kind   = RelocationKind{2};
+    dw.relocations.push_back(relw);
+    ok.dataItems.push_back(std::move(dw));
+    ExternImport dataOk;
+    dataOk.symbol         = SymbolId{99};
+    dataOk.mangledName    = "stdout";
+    dataOk.libraryPath    = "libc.so.6";
+    dataOk.isData         = true;
+    dataOk.dataSizeBytes  = 8;
+    dataOk.dataAlignBytes = 8;
+    ok.externImports.push_back(std::move(dataOk));
+    DiagnosticReporter rep2;
+    auto okBytes = encodeUntrampolined(ok, *loaded.target, *loaded.format, rep2);
+    std::ostringstream why2;
+    for (auto const& d2 : rep2.all()) why2 << " | " << d2.actual;
+    EXPECT_EQ(rep2.errorCount(), 0u)
+        << "positive control: the same slot in `.data` must encode:"
+        << why2.str();
+    EXPECT_FALSE(okBytes.empty());
+}
 
 TEST(ElfExecWriter, RodataSectionHeaderPinnedFromDataItems) {
     auto loaded = loadShipped();

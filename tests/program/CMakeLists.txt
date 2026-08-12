@@ -22,3 +22,17 @@ dss_add_test(NAME program/test_cross_validate_target_format
              SOURCES test_cross_validate_target_format.cpp)
 dss_add_test(NAME program/test_project_config
              SOURCES test_project_config.cpp)
+
+# `--dump-predefined-macros` (FC18 companion): the effective predefined-macro set
+# as an INSPECTABLE artifact, plus the sweep asserting no shipped object format
+# defines a C23 `__STDC_NO_*` non-support macro.
+dss_add_test(NAME program/test_dump_predefined_macros
+             SOURCES test_dump_predefined_macros.cpp)
+
+# UCRT-P4 (D-FFI-PE-CRT-UCRT-MIGRATION + D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the pe
+# program-entry argv spine's REAL-INPUT-PATH witnesses. This tier, not
+# tests/examples/, because the subject's real input is the OS COMMAND LINE and the
+# examples runner has no argv-passing knob (every example is spawned with no
+# arguments, so `argc == 1` is the only observable it can produce).
+dss_add_test(NAME program/test_entry_argv_run
+             SOURCES test_entry_argv_run.cpp)

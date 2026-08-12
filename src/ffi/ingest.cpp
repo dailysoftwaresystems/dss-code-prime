@@ -499,7 +499,6 @@ ingest(std::span<IngestionSource const> sources,
 HirIngestResult
 synthesizeFfiFromSourceDecls(
     std::span<ExternDeclRef const> externs,
-    std::string_view               importLibrary,
     TargetSchema const&            target,
     ObjectFormatSchema const&      format,
     HirFfiMap&                     ffiMap,
@@ -534,29 +533,31 @@ synthesizeFfiFromSourceDecls(
         }
     }
 
-    // (2) Per-format library identity must be configured. An empty
-    // string means the active language's
-    // `DeclarationRule.externLibraryByFormat` map has no entry for
-    // `format.kind()`. Fail loud upstream so the operator fixes
-    // the language config rather than chasing a downstream
-    // K_FormatLacksImportSupport.
-    if (importLibrary.empty()) {
-        dss::report(reporter,
-                    DiagnosticCode::F_FfiNoImportLibraryForFormat,
-                    DiagnosticSeverity::Error,
-                    std::format("FF5 synthesizeFfiFromSourceDecls: the "
-                                "active language declared no "
-                                "`externLibraryByFormat` entry for "
-                                "object format '{}'. Add a per-format "
-                                "library name (e.g. \"pe\": "
-                                "\"msvcrt.dll\") to the language's "
-                                "semantics JSON so source-declared "
-                                "externs can resolve to a runtime "
-                                "library.",
-                                objectFormatKindName(format.kind())));
-        return returnWithSnapshot();
-    }
-
+    // (2) ── RETIRED: THE FORMAT-LEVEL LIBRARY-IDENTITY GATE ──────────────
+    //
+    // This step used to REJECT the whole module when the active language
+    // declared no `externLibraryByFormat` entry for `format.kind()`, and its
+    // advice text told the operator to add one (naming a specific legacy pe
+    // CRT). Both the field and the gate are gone (UCRT-P4, Decision 1).
+    //
+    // WHY THE GATE CANNOT SURVIVE THE FIELD: it asserted "a language MUST name
+    // one runtime image per object format". That is not a fact about a
+    // LANGUAGE — it is a fact about a PLATFORM, and the shipped-descriptor
+    // corpus already owns it PER SYMBOL (`stdio.json` is UCRT while
+    // `setjmp.json` is deliberately not; `math.json` is `libm.so.6` on elf
+    // while the rest of libc is `libc.so.6`). A single per-language string
+    // could not express that, so it was a GUESS, and the guess is what bound a
+    // hand-written `extern int printf(const char*, ...);` to the wrong C
+    // runtime while the `#include`d siblings were realized correctly.
+    //
+    // WHAT REPLACED IT: a row with no library is UNBOUND on purpose
+    // (`noLibraryBinding`), and C23 5.1.1.2 phase 8 resolves it at LINK — a
+    // sibling TU's definition, a `--resolve-library` export, or a LOUD
+    // K_SymbolUndefined. So "no library for this extern" is no longer an error
+    // condition at all; it is a routing outcome. `F_FfiNoImportLibraryForFormat`
+    // is retained in the diagnostic enum for name stability (the
+    // `F_FfiResolveLibrarySymbolAbsent` precedent) and is no longer emitted.
+    //
     // (3) Per-extern: validate non-empty canonical, apply FF4
     // C-mangling, write FfiMetadata. No surface match required —
     // the source's `extern` declaration IS the authoritative
@@ -564,9 +565,7 @@ synthesizeFfiFromSourceDecls(
     // node). The linker will fail loud at the loader stage with
     // K_SymbolUndefined if the runtime library doesn't actually
     // export the symbol; that's the correct surface for "library
-    // missing the symbol" (different audience from "language
-    // config missing the library").
-    std::string const libCopy{importLibrary};
+    // missing the symbol".
     for (auto const& ext : externs) {
         if (ext.canonicalName.empty()) {
             dss::report(reporter,
@@ -598,26 +597,29 @@ synthesizeFfiFromSourceDecls(
                                          ext.linkName);
         meta.linkage       = FfiLinkage::Strong;
         meta.visibility    = FfiVisibility::Default;
-        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3): a
-        // per-symbol library override on the ExternDeclRef wins over
-        // the format-level default. Empty override = use the
-        // format-level fallback. Source-language agnostic — any
-        // language whose lowerer populates the override gets
-        // per-symbol routing without further substrate change.
+        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3) + UCRT-P4
+        // (Decision 1): the ROW's per-symbol library is now the ONLY
+        // source of an import library. It arrives from the PLATFORM's
+        // shipped-descriptor realization (already folded to this
+        // format's image upstream) or from a source `extern "lib" …`.
+        // There is no format-level fallback left to fall back TO —
+        // deleting it is what made a hand-written prototype and an
+        // `#include`d one realize IDENTICALLY. Source-language
+        // agnostic: any language whose lowerer populates the field
+        // gets per-symbol routing with no substrate change.
         //
         // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): a
-        // `noLibraryBinding` extern OPTS OUT of the format-default
-        // fallback entirely — its importLibrary stays EMPTY on
-        // purpose (a bare-prototype cross-TU reference resolves at
-        // the link tier: a sibling-TU definition, or a LOUD
+        // `noLibraryBinding` extern is UNBOUND on purpose — its
+        // importLibrary stays EMPTY and the reference resolves at the
+        // link tier (a sibling-TU definition, or a LOUD
         // undefined-symbol reject). The flag is stamped through so
-        // the HIR→MIR extern pre-pass admits the empty library.
+        // the HIR→MIR extern pre-pass admits the empty library. The
+        // two spellings of "nothing to bind" now agree by
+        // construction: an empty override yields an empty library
+        // either way, and the flag is what says it was DELIBERATE.
         meta.noLibraryBinding = ext.noLibraryBinding;
-        if (!ext.noLibraryBinding) {
-            meta.importLibrary = ext.libraryOverride.empty()
-                                     ? libCopy
-                                     : std::string{ext.libraryOverride};
-        }
+        if (!ext.noLibraryBinding)
+            meta.importLibrary = std::string{ext.libraryOverride};
         // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED ELF symbol version,
         // already resolved for the active (arch, format) by the descriptor
         // reader. Rides to the MIR ExternImport → the ELF writer's

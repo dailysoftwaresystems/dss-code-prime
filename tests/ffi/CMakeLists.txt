@@ -21,3 +21,24 @@ target_link_libraries(dss_ffi_test_shipped_type_consistency
 dss_add_test(NAME ffi/test_pe_crt_costate_binding SOURCES test_pe_crt_costate_binding.cpp)
 target_link_libraries(dss_ffi_test_pe_crt_costate_binding
                       PRIVATE nlohmann_json::nlohmann_json)
+# D-FFI-PE-ABORT-BEHAVIOR-NOOP-MACRO-STALE-AFTER-UCRT-FLIP (UCRT-P4):
+# `_set_abort_behavior` must be a REAL ucrtbase.dll binding, not the pe-gated
+# no-op `(0u)` macro it shipped as under msvcrt. Two axes — the EMITTED pe64
+# import table (host-independent: nothing is run, so every leg checks it) and
+# the descriptor itself (the partial-revert axis the image cannot see, since a
+# restored macro leaves the eager import in place). Reads the shipped
+# descriptor's JSON directly, hence the same json link as its two siblings.
+dss_add_test(NAME ffi/test_pe_abort_behavior_binding
+             SOURCES test_pe_abort_behavior_binding.cpp)
+target_link_libraries(dss_ffi_test_pe_abort_behavior_binding
+                      PRIVATE nlohmann_json::nlohmann_json)
+# POSIX `environ` — the extern DATA-OBJECT row's two load-bearing properties:
+# its availability set (eager-import law — widening it to a format whose CRT
+# has no such export breaks every including binary's LOAD, silently at build
+# time) and the absence of any macro that would shadow an LVALUE data object.
+# Reads the shipped descriptors' JSON directly, hence the same json link as its
+# three siblings above.
+dss_add_test(NAME ffi/test_environ_data_object_binding
+             SOURCES test_environ_data_object_binding.cpp)
+target_link_libraries(dss_ffi_test_environ_data_object_binding
+                      PRIVATE nlohmann_json::nlohmann_json)

@@ -11294,21 +11294,25 @@ struct Lowerer {
                         threadLocalTargetSymbols.insert(sym.v);
                     }
                 }
-                // c84 (D-LK-EXTERN-DATA-IMPORT): derive the imported
+                // D-LK-EXTERN-DATA-IMPORT: derive the imported
                 // OBJECT's byte size + alignment from the declared
                 // type's LAYOUT (the same computeLayout every sizeof /
                 // global-emission consumer uses — a `FILE*` object is
                 // the DataModel's pointer width, never a hardcoded 8).
-                // The ELF copy-relocation emitter reserves a `.bss`
-                // slot of exactly this shape and stamps `st_size`.
-                // An INCOMPLETE declared type (`extern const char
-                // v[];` — no computable layout) legitimately leaves
-                // both 0: legal C for a cross-TU extern the LK11
-                // merge resolves against its defining sibling CU;
-                // a TRUE library import surviving to the walker with
-                // size 0 fails loud THERE (an unsized copy slot
-                // cannot be reserved), keeping the incomplete-array
-                // cross-TU case working.
+                // NO emitter consumes these (a got-indirect slot holds
+                // an ADDRESS, so the object's size is irrelevant to it;
+                // the copy-relocation arm that DID size storage from
+                // them is deleted —
+                // D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET),
+                // but the two merge tiers compare them to fail loud
+                // when two CUs declare DIFFERENT objects under one
+                // external name — so they must be DERIVED here, never
+                // guessed. An INCOMPLETE declared type (`extern const
+                // char v[];` — no computable layout) legitimately
+                // leaves both 0: legal C for a cross-TU extern the LK11
+                // merge resolves against its defining sibling CU, and a
+                // TRUE library import that survives with size 0 now
+                // binds fine through the GOT.
                 if (config.aggregateLayoutLoaded) {
                     auto const layout = computeLayout(
                         ty, interner, config.aggregateLayout,

@@ -1799,8 +1799,8 @@ encodeExec(AssembledModule const&    module,
         // exactly `got-indirect` (the IAT-slot pointer). A future
         // second member reaching here without a walker arm must fail
         // loud, not silently get an IAT-slot binding it did not
-        // declare (mirrors elf.cpp's copy-relocation assertion and
-        // macho.cpp's got-indirect assertion).
+        // declare (mirrors the SAME assertion in elf.cpp and
+        // macho.cpp).
         auto const binding = fmt.dataImportBinding();
         if (!binding.has_value()
             || *binding != DataImportBinding::GotIndirect) {

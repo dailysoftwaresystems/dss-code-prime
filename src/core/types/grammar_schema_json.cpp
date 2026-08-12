@@ -2232,14 +2232,30 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     // `contextual: true` per entry marks soft keywords (await/yield etc.).
     // The top-level `reservedWordPolicy: "contextual"` flag forces every
     // keyword soft regardless of the per-entry setting.
+    //
+    // ★ A PRESENT-BUT-WRONG-TYPE `keywords` USED TO BE SILENT, and that was the
+    // SECOND defect in this statement. Every other top-level block ENTERS its
+    // branch and then diagnoses a bad type (`tokens` → "'tokens' must be an
+    // object"; same for `lexerModes`, `operators`, `syncTokens`, `shapes`,
+    // `semantics`). `keywords` folded the type test into the `if` CONDITION, so
+    // `"keywords": { "if": "IfKw" }` fell out of the dispatch entirely and the
+    // document loaded PERFECTLY CLEAN with the ENTIRE keyword table dropped —
+    // every keyword in the language silently demoted to a plain `Identifier`.
+    // The two conditions below are complementary and exhaustive over
+    // `contains("keywords")`, so exactly one of them runs; they are written as
+    // two `if`s rather than an if/else purely to keep the 120-line body's
+    // indentation — and therefore the reviewable diff — unchanged.
+    if (doc.contains("keywords") && !doc.at("keywords").is_array()) {
+        coll.emit(DiagnosticCode::C_ConflictingField, "/keywords",
+                  "'keywords' must be an array of entry objects");
+    }
     if (doc.contains("keywords") && doc.at("keywords").is_array()) {
         const bool forceContextual =
             (data.reservedWordPolicy == ReservedWordPolicy::Contextual);
         for (std::size_t i = 0; i < doc.at("keywords").size(); ++i) {
             json const& kw = doc.at("keywords").at(i);
             const auto kwPath = std::format("/keywords/{}", i);
-            if (!kw.is_object() || !kw.contains("word") || !kw.contains("kind") ||
-                !kw.at("word").is_string() || !kw.at("kind").is_string()) {
+            if (!kw.is_object()) {
                 coll.emit(DiagnosticCode::C_MissingField, kwPath,
                           "keyword entry needs string 'word' and string 'kind'");
                 continue;
@@ -2248,6 +2264,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // `tokens` entries; keywords resolve contextually (soft-
             // keyword demotion), a distinct mechanism from mode
             // switching or delimited-string opening. Reject loudly.
+            //
+            // ★ THESE RUN BEFORE THE CLOSED-KEY VOCABULARY BELOW, AND THE ORDER
+            // IS THE DESIGN. `modeOp` / `modeArg` / `stringStyle` are keys this
+            // loader KNOWS — it knows exactly what they mean and which block
+            // they belong on — so reporting them as "unknown" would be a false
+            // statement in a diagnostic, and the redirect ("move the entry to
+            // 'tokens'") is the sentence the author can act on. Excluding them
+            // by CONTROL FLOW rather than by a second parallel list is what
+            // makes that safe in both drift directions: add a redirect above
+            // and it is honoured automatically; delete one and the key falls
+            // through to the vocabulary and is still REJECTED, just with the
+            // generic message. A parallel "misplaced keys" table could instead
+            // go stale in the one direction that is silent — a name listed
+            // there whose redirect no longer exists would be skipped by the
+            // vocabulary AND matched by nothing, i.e. silently accepted, which
+            // is the very defect this block is closing.
             if (kw.contains("modeOp") || kw.contains("modeArg")) {
                 coll.emit(DiagnosticCode::C_ConflictingField, kwPath,
                           "mode operations belong on 'tokens' entries; keywords "
@@ -2259,6 +2291,52 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 coll.emit(DiagnosticCode::C_ConflictingField, kwPath,
                           "'stringStyle' belongs on 'tokens' entries; keywords "
                           "are word-shaped and cannot open delimited strings");
+                continue;
+            }
+            // CLOSED KEY VOCABULARY (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD) —
+            // the ONE per-entry table in this loader that never had one.
+            //
+            // ★ WHY IT MATTERS HERE SPECIFICALLY, and it is not "a typo is
+            // untidy": `contextual` is an OPT-IN whose absence is meaningful and
+            // whose default is the DANGEROUS value. A near-miss spelling
+            // (`contextul`, `Contextual`, `contextual_`) used to load perfectly
+            // clean, leave `lm.contextual` false, and install the keyword as a
+            // HARD RESERVED WORD — so a soft keyword the author declared to be
+            // identifier-compatible silently starts breaking user code that uses
+            // the word as an identifier, with no diagnostic anywhere. The
+            // authored intent and the shipped behaviour are opposites and
+            // nothing says so.
+            //
+            // ★ AND IT RUNS BEFORE THE REQUIRED-`word`/`kind` CHECK, for the
+            // reason the `defaultToken` sibling records: a misspelled `word`
+            // ("wrd") would otherwise be reported ONLY as a MISSING 'word' — a
+            // field the author demonstrably did write — sending them hunting in
+            // the wrong place. Both diagnostics fire now, typo named first.
+            // `$`-prefixed keys are the codebase-wide documentation convention,
+            // never a knob, so they are exempt.
+            {
+                static constexpr std::array<std::string_view, 3>
+                    kKeywordKeys{"word", "kind", "contextual"};
+                DSS_CHECK_KEY_VOCABULARY(kKeywordKeys);
+                for (auto it = kw.begin(); it != kw.end(); ++it) {
+                    if (isDocumentationKey(it.key())) continue;
+                    bool known = false;
+                    for (auto const& k : kKeywordKeys) {
+                        if (it.key() == k) { known = true; break; }
+                    }
+                    if (known) continue;
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/{}", kwPath, it.key()),
+                              std::format("unknown key '{}' in a 'keywords' entry "
+                                          "— allowed keys are 'word', 'kind', "
+                                          "'contextual' (typo discriminator)",
+                                          it.key()));
+                }
+            }
+            if (!kw.contains("word") || !kw.contains("kind") ||
+                !kw.at("word").is_string() || !kw.at("kind").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField, kwPath,
+                          "keyword entry needs string 'word' and string 'kind'");
                 continue;
             }
             LexemeMeaning lm{};
@@ -2918,8 +2996,29 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     }
 
     // scopes.validity ──
+    //
+    // ★ THE `keywords` TWIN, closed in the same pass and for the same reason: a
+    // present-but-wrong-type value used to fall out of the `if` CONDITION and
+    // silently disable EVERY scope-validity rule the author wrote. ⚠ Note the
+    // trap that makes the wrong type plausible enough to write by accident:
+    // `semantics.scopes` IS an array (every shipped config declares one), while
+    // this TOP-LEVEL `scopes` is an OBJECT whose one member is `validity`. Two
+    // different keys, one spelling. Each pair of conditions below is
+    // complementary and exhaustive over its own `contains`, so exactly one arm
+    // of each runs; two `if`s rather than if/else keeps the body's indentation
+    // and the reviewable diff intact.
+    if (doc.contains("scopes") && !doc.at("scopes").is_object()) {
+        coll.emit(DiagnosticCode::C_ConflictingField, "/scopes",
+                  "'scopes' must be an object; its one recognized member is "
+                  "'validity' (note 'semantics.scopes' is a DIFFERENT key and "
+                  "IS an array)");
+    }
     if (doc.contains("scopes") && doc.at("scopes").is_object()) {
         auto const& sv = doc.at("scopes");
+        if (sv.contains("validity") && !sv.at("validity").is_array()) {
+            coll.emit(DiagnosticCode::C_ConflictingField, "/scopes/validity",
+                      "'validity' must be an array of scope-rule objects");
+        }
         if (sv.contains("validity") && sv.at("validity").is_array()) {
             for (std::size_t i = 0; i < sv.at("validity").size(); ++i) {
                 json const& v = sv.at("validity").at(i);
@@ -4149,6 +4248,30 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                 }
             }
+            // `vaOptName` (C23's `__VA_OPT__`, 6.10.5.1) is OPTIONAL and only
+            // meaningful alongside `variadicMarkerToken`: it is the IDENTIFIER
+            // that introduces a va-opt-replacement in a variadic macro's
+            // replacement list. Like `variadicArgsName` it is matched by LEXEME
+            // TEXT (an ordinary identifier, NOT a token kind), so it is
+            // validated only as a NON-EMPTY string when present -- no
+            // `checkToken`, there is no token kind to resolve. Absent -> the
+            // language declares no va-opt construct. (FC18a -- D-PP-VA-OPT.)
+            if (pp.contains("vaOptName")) {
+                if (!pp.at("vaOptName").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/vaOptName",
+                              "'preprocess.vaOptName' must be a string");
+                } else {
+                    cfg.vaOptName = pp.at("vaOptName").get<std::string>();
+                    if (cfg.vaOptName.empty()) {
+                        coll.emit(
+                            DiagnosticCode::C_InvalidPreprocess,
+                            "/preprocess/vaOptName",
+                            "'preprocess.vaOptName' must be a non-empty "
+                            "string when present");
+                    }
+                }
+            }
             // `stringizeToken` (C's `#` -> "HashOp", C 6.10.3.2) is OPTIONAL:
             // empty means the language declares NO stringize operator. The macro
             // engine reads it to RECOGNISE a `#param` stringize in a replacement
@@ -4588,7 +4711,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // silently unhonored: the knob-that-lies class this discipline
             // exists to prevent. Listed in loader-read order so a new facet's
             // key lands next to the reader that consumes it.
-            static constexpr std::array<std::string_view, 57> kSemanticsKeys{
+            // 56 after UCRT-P4 (Decision 1) removed `externLibraryByFormat`; the
+            // DSS_CHECK_KEY_VOCABULARY assertion below is what caught the stale 57.
+            static constexpr std::array<std::string_view, 56> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
                 "scopes",
@@ -4612,8 +4737,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // single-token roles
                 "identifierToken", "bracketIdentifierToken", "pointerToken",
                 "volatileMarker", "atomicMarker",
-                // link / FFI surface
-                "externLibraryByFormat", "shippedLibDirs",
+                // link / FFI surface. ⛔ `externLibraryByFormat` is DELIBERATELY
+                // ABSENT (UCRT-P4, Decision 1): a per-LANGUAGE "which image owns a
+                // symbol" default was a guess standing in for the shipped-descriptor
+                // corpus, and the corpus owns that fact PER SYMBOL. Re-adding the key
+                // here is how the guess comes back — a `.lang.json` declaring it is
+                // now refused at load, and that refusal is the guard.
+                "shippedLibDirs",
                 // the conversion lattice
                 "pointerConversions", "charConvertsToArith",
                 "bitIntConversions", "enumConvertsToArith",
@@ -5269,7 +5399,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 "declarationAttrSlotRules",
                                 "unknownStrictAttributeIsError",
                                 // driver-facing name sets + lint switches
-                                "entryFunctionNames",
+                                "entryFunctions",
                                 "implicitReturnZeroForFunctionNames",
                                 "prototypeSynthesizesExtern", "warnIfUnused"};
                         // The declared SIZE is load-bearing and the compiler
@@ -6454,47 +6584,273 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
-                        // FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN): the optional
-                        // `entryFunctionNames` string-array — the de-conflated
-                        // entry-point name set (SEPARATE from the return-0 set
-                        // above; the driver's entry-symbol resolution reads this,
-                        // falling back to the return-0 set when absent). Same
-                        // array-of-non-empty-strings shape + load-time dup check.
-                        if (entry.contains("entryFunctionNames")) {
-                            auto const& arr = entry.at("entryFunctionNames");
-                            if (!arr.is_array()) {
+                        // FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN) +
+                        // D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the optional
+                        // `entryFunctions` MAPPING — for each name this language
+                        // spells a program entry with, that name's array of
+                        // { returns, params, verb } shapes.
+                        //
+                        // ★ THIS REPLACED A BARE `entryFunctionNames` STRING
+                        // ARRAY, and the old key is NOT accepted: it is absent
+                        // from `kDeclarationRowKeys` above, so a stale config
+                        // carrying it fails loud as an unknown declaration key
+                        // rather than loading with an empty entry set and
+                        // silently reverting the format-blindness this shape
+                        // exists to close. Rejecting a retired owner BY NAME is
+                        // the `charSignedness` discipline.
+                        if (entry.contains("entryFunctions")) {
+                            auto const& obj = entry.at("entryFunctions");
+                            if (!obj.is_object()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                          path + "/entryFunctionNames",
-                                          "'entryFunctionNames' must be an "
-                                          "array of strings");
+                                          path + "/entryFunctions",
+                                          "'entryFunctions' must be an OBJECT "
+                                          "mapping each entry NAME to the array "
+                                          "of { \"returns\", \"params\", \"verb\" } "
+                                          "shapes that name may have");
                             } else {
-                                rule.entryFunctionNames.reserve(arr.size());
-                                for (std::size_t ni = 0; ni < arr.size(); ++ni) {
-                                    if (!arr[ni].is_string()
-                                        || arr[ni].get<std::string>().empty()) {
+                                for (auto nit = obj.begin(); nit != obj.end(); ++nit) {
+                                    std::string const fnName = nit.key();
+                                    auto const nPath =
+                                        std::format("{}/entryFunctions/{}", path, fnName);
+                                    if (fnName.empty()) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  std::format("{}/entryFunctionNames/{}",
-                                                              path, ni),
-                                                  "each entry must be a non-empty "
-                                                  "string");
+                                                  nPath,
+                                                  "entry name must be non-empty");
                                         continue;
                                     }
-                                    rule.entryFunctionNames.push_back(
-                                        arr[ni].get<std::string>());
-                                }
-                                std::size_t const n = rule.entryFunctionNames.size();
-                                for (std::size_t a = 0; a < n; ++a)
-                                    for (std::size_t b = a + 1; b < n; ++b)
-                                        if (rule.entryFunctionNames[a]
-                                         == rule.entryFunctionNames[b])
+                                    if (!nit.value().is_array()
+                                        || nit.value().empty()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  nPath,
+                                                  "each entry name must map to a "
+                                                  "NON-EMPTY array of shapes — a "
+                                                  "name with no declared signature "
+                                                  "could never match a definition");
+                                        continue;
+                                    }
+                                    // Rows for THIS name, so the duplicate-
+                                    // signature check below is per-name (two
+                                    // names may legitimately share a signature).
+                                    std::vector<EntryFunctionShape> rows;
+                                    auto const& arr = nit.value();
+                                    for (std::size_t si = 0; si < arr.size(); ++si) {
+                                        auto const sPath =
+                                            std::format("{}/{}", nPath, si);
+                                        if (!arr[si].is_object()) {
                                             coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                      std::format("{}/entryFunctionNames/{}",
-                                                                  path, b),
-                                                      std::format("duplicate function "
-                                                                  "name '{}' (already "
-                                                                  "declared at index {})",
-                                                                  rule.entryFunctionNames[a],
-                                                                  a));
+                                                      sPath,
+                                                      "each shape must be an object");
+                                            continue;
+                                        }
+                                        auto const& sh = arr[si];
+                                        static constexpr std::array<
+                                            std::string_view, 3> kShapeKeys{
+                                            "returns", "params", "verb"};
+                                        bool badKey = false;
+                                        for (auto kit = sh.begin(); kit != sh.end();
+                                             ++kit) {
+                                            if (isDocumentationKey(kit.key())) continue;
+                                            if (std::find(kShapeKeys.begin(),
+                                                          kShapeKeys.end(),
+                                                          std::string_view{kit.key()})
+                                                == kShapeKeys.end()) {
+                                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                          std::format("{}/{}", sPath,
+                                                                      kit.key()),
+                                                          "unknown entry-shape key "
+                                                          "(accepted: 'returns', "
+                                                          "'params', 'verb')");
+                                                badKey = true;
+                                            }
+                                        }
+                                        if (badKey) continue;
+                                        EntryFunctionShape row;
+                                        row.name = fnName;
+                                        // `returns` — REQUIRED, and "none" is the
+                                        // struct's sentinel rather than a legal
+                                        // spelling (C23 5.1.2.2.1: the entry's
+                                        // return type shall be int; a language that
+                                        // wants otherwise adds an enumerator and a
+                                        // materialization arm, not a "none" row).
+                                        if (!sh.contains("returns")
+                                            || !sh.at("returns").is_string()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      sPath + "/returns",
+                                                      "'returns' is REQUIRED and "
+                                                      "must be a string");
+                                            continue;
+                                        }
+                                        auto const rs = entryReturnShapeFromName(
+                                            sh.at("returns").get<std::string>());
+                                        if (!rs.has_value()
+                                            || *rs == EntryReturnShape::None) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      sPath + "/returns",
+                                                      std::format(
+                                                          "unknown return shape '{}' "
+                                                          "(accepted: 'i32')",
+                                                          sh.at("returns")
+                                                              .get<std::string>()));
+                                            continue;
+                                        }
+                                        row.returns = *rs;
+                                        // `params` — REQUIRED (an empty ARRAY is how
+                                        // `int main(void)` is spelled; an ABSENT key
+                                        // would make "no parameters" and "forgot to
+                                        // declare them" the same config).
+                                        if (!sh.contains("params")
+                                            || !sh.at("params").is_array()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      sPath + "/params",
+                                                      "'params' is REQUIRED and must "
+                                                      "be an array (use [] for a "
+                                                      "no-parameter entry)");
+                                            continue;
+                                        }
+                                        bool badParam = false;
+                                        auto const& ps = sh.at("params");
+                                        for (std::size_t pi = 0; pi < ps.size(); ++pi) {
+                                            if (!ps[pi].is_string()) {
+                                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                          std::format("{}/params/{}",
+                                                                      sPath, pi),
+                                                          "each parameter shape must "
+                                                          "be a string");
+                                                badParam = true;
+                                                continue;
+                                            }
+                                            auto const p = entryParamShapeFromName(
+                                                ps[pi].get<std::string>());
+                                            if (!p.has_value()
+                                                || *p == EntryParamShape::None) {
+                                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                          std::format("{}/params/{}",
+                                                                      sPath, pi),
+                                                          std::format(
+                                                              "unknown parameter shape "
+                                                              "'{}' (accepted: 'i32', "
+                                                              "'ptr-ptr-char', "
+                                                              "'ptr-ptr-u16')",
+                                                              ps[pi].get<std::string>()));
+                                                badParam = true;
+                                                continue;
+                                            }
+                                            row.params.push_back(*p);
+                                        }
+                                        if (badParam) continue;
+                                        // `verb` — REQUIRED, and "none" IS legal here
+                                        // (a no-argument entry needs no setup; that is
+                                        // an ANSWER, not an omission).
+                                        if (!sh.contains("verb")
+                                            || !sh.at("verb").is_string()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      sPath + "/verb",
+                                                      "'verb' is REQUIRED and must be "
+                                                      "a string");
+                                            continue;
+                                        }
+                                        auto const vb = entryMaterializationFromName(
+                                            sh.at("verb").get<std::string>());
+                                        if (!vb.has_value()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      sPath + "/verb",
+                                                      std::format(
+                                                          "unknown materialization verb "
+                                                          "'{}' (accepted: 'none', "
+                                                          "'argc-argv', 'argc-wargv')",
+                                                          sh.at("verb")
+                                                              .get<std::string>()));
+                                            continue;
+                                        }
+                                        row.verb = *vb;
+                                        // ★★ VERB ⟺ SIGNATURE COHERENCE. Stated as a
+                                        // table of the (verb → the param shapes that
+                                        // verb's emitter actually materializes) pairs,
+                                        // so a NEW verb has to add a row here instead
+                                        // of inheriting a permissive default.
+                                        //
+                                        // ⓘ THIS RULE MIGRATED HERE FROM THE FORMAT
+                                        // LOADER, where it could not survive: the
+                                        // format side no longer declares signatures,
+                                        // so it can no longer compare one against a
+                                        // verb. Dropping the rule in the move would
+                                        // have been a silent weakening, which is why
+                                        // it is reproduced in full rather than
+                                        // replaced by the weaker empty-⟺-none test.
+                                        //
+                                        // BOTH DIRECTIONS ARE REAL DEFECTS. A verb
+                                        // that materializes arguments the signature
+                                        // does not have writes registers the entry
+                                        // never reads; a signature with arguments the
+                                        // verb does not materialize calls the entry on
+                                        // UNINITIALIZED registers — the measured
+                                        // `argc=846361312` class. Neither is the
+                                        // "harmless" one.
+                                        std::vector<EntryParamShape> want;
+                                        switch (row.verb) {
+                                        case EntryMaterialization::None:      break;
+                                        case EntryMaterialization::ArgcArgv:
+                                            want = {EntryParamShape::I32,
+                                                    EntryParamShape::PtrPtrChar};
+                                            break;
+                                        case EntryMaterialization::ArgcWargv:
+                                            want = {EntryParamShape::I32,
+                                                    EntryParamShape::PtrPtrU16};
+                                            break;
+                                        }
+                                        if (row.params != want) {
+                                            std::string wantText;
+                                            for (auto const w : want) {
+                                                if (!wantText.empty()) wantText += ", ";
+                                                wantText += entryParamShapeName(w);
+                                            }
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      sPath,
+                                                      std::format(
+                                                          "entry '{}' declares signature "
+                                                          "{} with verb '{}', whose "
+                                                          "emitter materializes exactly "
+                                                          "({}) — the two disagree. A "
+                                                          "verb that materializes "
+                                                          "arguments the signature does "
+                                                          "not have writes registers the "
+                                                          "entry never reads; a "
+                                                          "signature with arguments the "
+                                                          "verb does not materialize "
+                                                          "calls the entry on "
+                                                          "UNINITIALIZED registers",
+                                                          fnName,
+                                                          entrySignatureSpelling(row),
+                                                          entryMaterializationName(
+                                                              row.verb),
+                                                          wantText));
+                                            continue;
+                                        }
+                                        // Two rows for one name with the SAME
+                                        // signature would make verb selection
+                                        // ambiguous at the only place that resolves
+                                        // it — a silent wrong-verb, so it is a load
+                                        // error.
+                                        bool dupe = false;
+                                        for (std::size_t a = 0; a < rows.size(); ++a) {
+                                            if (!rows[a].sameSignatureAs(row)) continue;
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      sPath,
+                                                      std::format(
+                                                          "duplicate signature {} for "
+                                                          "entry '{}' (already declared "
+                                                          "at index {}) — one signature "
+                                                          "cannot need two verbs",
+                                                          entrySignatureSpelling(row),
+                                                          fnName, a));
+                                            dupe = true;
+                                            break;
+                                        }
+                                        if (!dupe) rows.push_back(std::move(row));
+                                    }
+                                    for (auto& r : rows)
+                                        rule.entryFunctions.push_back(std::move(r));
+                                }
                             }
                         }
 
@@ -10414,89 +10770,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
-            // FF6 Slice 2 + audit fold (2026-06-02): per-language
-            // `externLibraryByFormat` — runtime library identity
-            // per ObjectFormatKind for source-declared externs.
-            // Object: keys are ObjectFormatKind names ("pe", "elf",
-            // "macho", "wasm", "spirv" — validated via
-            // `objectFormatKindFromName`); values are runtime
-            // library identities. Lives at the LANGUAGE level
-            // (not per-declaration-rule — the pre-fold #1 placement
-            // on `DeclarationRule` was fragile: the pipeline
-            // first-match loop gave non-obvious behavior on
-            // grammars with multiple extern-shaped declaration
-            // rules). c-subset's `externDecl` is the only shipped
-            // declaration that needs it; per-symbol overrides
-            // (`extern "otherlib.dll" int foo();`) are anchored
-            // D-CSUBSET-EXTERN-LIBRARY-SYNTAX.
-            if (sem.contains("externLibraryByFormat")) {
-                auto const& obj = sem.at("externLibraryByFormat");
-                if (!obj.is_object()) {
-                    coll.emit(DiagnosticCode::C_InvalidSemantics,
-                              "/semantics/externLibraryByFormat",
-                              "'externLibraryByFormat' must be an object "
-                              "mapping format-kind names to library "
-                              "identities");
-                } else {
-                    for (auto it = obj.begin(); it != obj.end(); ++it) {
-                        if (isDocumentationKey(it.key())) continue;
-                        auto const& formatName = it.key();
-                        auto const& val = it.value();
-                        auto const kindPath = std::format(
-                            "/semantics/externLibraryByFormat/{}",
-                            formatName);
-                        auto const fmtKind =
-                            objectFormatKindFromName(formatName);
-                        if (!fmtKind.has_value()) {
-                            coll.emit(
-                                DiagnosticCode::C_InvalidSemantics,
-                                kindPath,
-                                std::format(
-                                    "'{}' is not a recognized "
-                                    "object-format kind "
-                                    "(expected one of 'elf', "
-                                    "'pe', 'macho', 'wasm', "
-                                    "'spirv')",
-                                    formatName));
-                            continue;
-                        }
-                        // The `unknown` sentinel SPELLS correctly, so the
-                        // lookup above accepts it. An entry stored under it
-                        // would be keyed to a format no image can ever have,
-                        // so the extern would fall through to the
-                        // "no externLibraryByFormat entry for this format"
-                        // diagnostic — a config that declares the library and
-                        // is told the library is undeclared.
-                        if (!isSelectableObjectFormatKind(*fmtKind)) {
-                            coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                      kindPath,
-                                      std::string{
-                                          kObjectFormatKindSentinelRejection});
-                            continue;
-                        }
-                        if (!val.is_string()) {
-                            coll.emit(
-                                DiagnosticCode::C_InvalidSemantics,
-                                kindPath,
-                                "library identity must be a "
-                                "string (e.g. \"msvcrt.dll\", "
-                                "\"libc.so.6\")");
-                            continue;
-                        }
-                        auto const libName = val.get<std::string>();
-                        if (libName.empty()) {
-                            coll.emit(
-                                DiagnosticCode::C_InvalidSemantics,
-                                kindPath,
-                                "library identity must be a "
-                                "non-empty string");
-                            continue;
-                        }
-                        cfg.externLibraryByFormat
-                            .emplace(formatName, libName);
-                    }
-                }
-            }
+            // ── RETIRED: `externLibraryByFormat` (UCRT-P4, Decision 1) ──────
+            // A per-LANGUAGE map "object-format kind -> runtime library" used to
+            // supply the import library for every source-declared extern that
+            // carried none of its own. It is GONE, key and all: a `.lang.json`
+            // that still declares it is now REFUSED AT LOAD by the closed
+            // `semantics` key set above, which is the point — it must not be
+            // possible to reintroduce the guess by config.
+            //
+            // WHY REMOVED RATHER THAN REPOINTED: it was never a fact about a
+            // LANGUAGE. Which image owns a symbol is a fact about a PLATFORM, and
+            // the shipped-descriptor corpus already owns it PER SYMBOL — stdio is
+            // the modern pe CRT while setjmp deliberately is not, and math is
+            // `libm.so.6` on elf while the rest of libc is `libc.so.6`. One
+            // string per language could not express that, so it was a GUESS and a
+            // SECOND OWNER of a fact the corpus owns. MEASURED consequences of the
+            // guess: on pe a hand-written `extern int printf(const char*, ...);`
+            // imported the LEGACY CRT beside the modern one (two C runtimes, no
+            // diagnostic); on elf a hand-written `extern double sin(double);` bound
+            // `libc.so.6` and the binary died at LOAD with "undefined symbol: sin"
+            // because glibc ships `sin` in `libm.so.6`.
+            //
+            // ⛔ AND WHY NOT JUST FLIP THE pe VALUE: the modern pe CRT exports no
+            // bare `printf`, so repointing would have turned a wrong-but-loadable
+            // import into an unresolvable one — 0xC0000139 at the LOAD of every
+            // such binary. Removing the authority is the fix; flipping the value
+            // was the workaround.
 
             // `shippedLibDirs` (FF11) — SYSTEM include search path: an
             // array of subdirectory strings under `src/dss-config/`

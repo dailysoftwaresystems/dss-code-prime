@@ -154,6 +154,21 @@ _check_set() {
 _check_set "committed (HEAD)" "${_offenders_head}"
 _check_set "staged (index)"   "${_offenders_index}"
 
+# ── ONE `git ls-files --eol` read, shared by checks C/D/E, WITH A FLOOR ───────
+# Checks D and E both answer from this table, and a table that comes back EMPTY
+# would make both of them report nothing — the "guard that passes over what it
+# never read" shape this file already fails closed against on the history side.
+# So the row count carries the same floor as the positive control above.
+# ✔MEASURED 2026-08-10: 2,265 tracked paths.
+_eol_rows="$(git ls-files --eol 2>/dev/null)"
+_eol_row_count="$(printf '%s' "${_eol_rows}" | grep -c . || true)"
+if [[ "${_eol_row_count}" -lt "${SCAN_FLOOR}" ]]; then
+    echo "line-endings: FAIL — \`git ls-files --eol\` returned only ${_eol_row_count} rows, below its floor of ${SCAN_FLOOR}." >&2
+    echo "  Checks D and E answer from that table, so an empty one makes BOTH report a clean" >&2
+    echo "  worktree over files they never looked at. Refusing to pass; fix the scan." >&2
+    exit 2
+fi
+
 # ── Check C: the pin's own glob set must contain no binary-detected blob ──
 # Without this, a source file git mis-detects as binary is skipped by `-I` above
 # and this guard would report a clean tree over a file it never opened.
@@ -166,7 +181,7 @@ _binary_in_pinned="$(git ls-files --eol -- '*.c' '*.h' '*.cpp' '*.hpp' '*.cmake'
 if [[ -n "${_binary_in_pinned}" ]]; then
     while IFS= read -r _f; do
         [[ -z "${_f}" ]] && continue
-        _report+="  binary-detected inside the eol=lf pin (invisible to the scan above): ${_f}"$'\n'
+        _report+="  staged (index): binary-detected inside the eol=lf pin, so the blob scan above never opened it: ${_f}"$'\n'
     done <<< "${_binary_in_pinned}"
 fi
 
@@ -197,7 +212,7 @@ fi
 # file not materialised — must not be guessed at and turned into a red.
 # MEASURED when this landed: 2166 tracked files declare `eol=lf`, and ZERO have
 # a non-LF worktree form.
-_worktree_rewritten="$(git ls-files --eol 2>/dev/null | awk -F'\t' '
+_worktree_rewritten="$(printf '%s\n' "${_eol_rows}" | awk -F'\t' '
     NF >= 2 && index($1, "eol=lf") > 0 {
         split($1, f, /[ \t]+/)
         if (f[2] == "w/crlf" || f[2] == "w/mixed") print $2
@@ -205,8 +220,78 @@ _worktree_rewritten="$(git ls-files --eol 2>/dev/null | awk -F'\t' '
 if [[ -n "${_worktree_rewritten}" ]]; then
     while IFS= read -r _f; do
         [[ -z "${_f}" ]] && continue
-        _report+="  worktree rewritten to CRLF under an eol=lf pin (git diff shows NOTHING to review): ${_f}"$'\n'
+        _report+="  working (tracked, eol=lf pinned): rewritten to CRLF on disk — git diff shows NOTHING to review: ${_f}"$'\n'
     done <<< "${_worktree_rewritten}"
+fi
+
+# ── Check E: THE UNSTAGED WORKING TREE — the tier the other checks cannot see ──
+# ★★ THE BLIND SPOT, ✔MEASURED 2026-08-10 on this tree. Checks A and B read
+# BLOBS (HEAD and the index); check C is an index fact; check D reads the disk but
+# ONLY for files that DECLARE `eol=lf`. So a CRLF introduced into a working file
+# that is neither staged nor covered by the pin was invisible to every tier — and
+# "before commit" is exactly when a line-ending mistake is cheap to fix and the
+# only moment this guard can prevent rather than diagnose.
+# The gap is not theoretical arithmetic: of 2,265 tracked paths, 2,186 declare
+# `eol=lf` and 55 are tracked TEXT with NO such declaration (the rest are empty or
+# binary). `.gitattributes` carries no `* text=auto`, and this workstation reports
+# `core.autocrlf=false`, so for those 55 git performs NO normalisation on `git add`
+# — a CRLF rewrite of any one of them LANDS CRLF IN THE COMMIT. Same for a NEW
+# untracked file outside the pin.
+# ⚠ `core.autocrlf=true` (the Git-for-Windows INSTALLER DEFAULT) makes a CRLF
+# WORKING COPY of an unpinned text file the LEGITIMATE result of checkout, not a
+# rewrite. Convicting there would be a false red on a correctly-configured host,
+# so E1 states the situation instead of convicting — and E2 (untracked files,
+# which were never checked out) keeps convicting either way.
+_autocrlf="$(git config core.autocrlf 2>/dev/null || true)"
+[[ -n "${_autocrlf}" ]] || _autocrlf='<unset>'
+# E1 — TRACKED, text, NOT covered by an `eol=lf` pin, CRLF/mixed on disk.
+# `i/-text` is binary (its 0x0D is legitimate) and `i/none` is empty; both are
+# excluded by NAME rather than by "anything else", for the same reason check D
+# uses a closed `w/` set: an unmeasured state must not be guessed into a red.
+_worktree_unpinned="$(printf '%s\n' "${_eol_rows}" | awk -F'\t' '
+    NF >= 2 && index($1, "eol=lf") == 0 {
+        split($1, f, /[ \t]+/)
+        if (f[1] == "i/-text" || f[1] == "i/none") next
+        if (f[2] == "w/crlf" || f[2] == "w/mixed") print $2
+    }')"
+if [[ -n "${_worktree_unpinned}" ]]; then
+    while IFS= read -r _f; do
+        [[ -z "${_f}" ]] && continue
+        if [[ "${_autocrlf}" == "true" ]]; then
+            echo "line-endings: NOTE — '${_f}' is CRLF on disk and carries NO eol=lf pin, but core.autocrlf=true," >&2
+            echo "    so a CRLF checkout is the expected result here and this is NOT convicted. Add an eol=lf pin" >&2
+            echo "    for its extension if this repo should own its bytes regardless of a host's git config." >&2
+        else
+            _report+="  working (tracked, NOT covered by an eol=lf pin): CRLF on disk and core.autocrlf=${_autocrlf}, so \`git add\` will NOT normalise it — this WILL land CRLF in the commit: ${_f}"$'\n'
+        fi
+    done <<< "${_worktree_unpinned}"
+fi
+# E2 — UNTRACKED (not ignored), text, NOT covered by an `eol=lf` pin, has a CR.
+# A pinned untracked file is deliberately NOT reported: its clean filter
+# normalises it on `git add`, so it cannot land CRLF, and a guard that reds on a
+# state git is about to fix teaches people to ignore it.
+# ⚠ `tr -dc '\r' | wc -c`, never `grep -c $'\r'` — the latter matches the LETTER
+# `r` in some shells (instrument note at the top of this file).
+_worktree_untracked=""
+while IFS= read -r _f; do
+    [[ -z "${_f}" ]] && continue
+    [[ -f "${_f}" ]] || continue
+    # BINARY skip, using grep's own detection (the same family as `git grep -I`)
+    # rather than a hand-rolled NUL scan.
+    grep -qI . -- "${_f}" 2>/dev/null || continue
+    # An explicit `binary` / `-text` declaration is an exemption, exactly as `-I`
+    # honours it for the blob tiers.
+    case "$(git check-attr text -- "${_f}" 2>/dev/null)" in *": text: unset") continue;; esac
+    case "$(git check-attr eol  -- "${_f}" 2>/dev/null)" in *": eol: lf")     continue;; esac
+    if [[ "$(tr -dc '\r' < "${_f}" | wc -c | tr -d ' ')" -ne 0 ]]; then
+        _worktree_untracked+="${_f}"$'\n'
+    fi
+done <<< "$(git ls-files --others --exclude-standard 2>/dev/null)"
+if [[ -n "${_worktree_untracked}" ]]; then
+    while IFS= read -r _f; do
+        [[ -z "${_f}" ]] && continue
+        _report+="  working (untracked, not yet added): carries CR and NO eol=lf pin covers it, so \`git add\` will NOT normalise it — this WILL land CRLF in the commit: ${_f}"$'\n'
+    done <<< "${_worktree_untracked}"
 fi
 
 if [[ -z "${_report}" ]]; then
@@ -214,18 +299,26 @@ if [[ -z "${_report}" ]]; then
         # Say plainly what was NOT checked. A guard reporting "OK" while having
         # silently skipped half its checks is the self-blind-instrument shape
         # this repo keeps finding — the message must not outrun the evidence.
-        echo "line-endings: OK (WORKTREE ONLY — the history scan was SKIPPED, see above; the ${_control_head} HEAD / ${_control_index} index blobs were NOT judged)"
+        echo "line-endings: OK (WORKTREE ONLY — the history scan was SKIPPED, see above; the ${_control_head} HEAD / ${_control_index} index blobs were NOT judged; ${_eol_row_count} working-tree paths were)"
     else
-        echo "line-endings: OK (${_control_head} committed + ${_control_index} staged text blobs, none carries CR)"
+        # ★ The summary NAMES EVERY TIER it judged. A guard that says "OK" without
+        # saying over what invites the reader to assume it covered the tier they
+        # care about — and for four tiers of this guard's life, one of them
+        # (the unstaged working tree) was the tier it did NOT cover.
+        echo "line-endings: OK (committed ${_control_head} + staged ${_control_index} text blobs, working tree ${_eol_row_count} tracked paths + untracked, core.autocrlf=${_autocrlf}; none carries CR)"
     fi
     exit 0
 fi
 
-echo "line-endings: FAIL — tracked blobs violate the LF contract:"
+echo "line-endings: FAIL — the LF contract is violated (tier named per line):"
 echo ""
 printf '%s' "${_report}"
 echo ""
 echo "Fix:"
+echo "  ★ A \`working (...)\` line is the CHEAP one: the bytes are only on your disk,"
+echo "    nothing is committed yet, and converting the file to LF right now costs a"
+echo "    single command. A \`committed (HEAD)\` line is the same defect after it"
+echo "    became history. Fix the working tier BEFORE you stage."
 echo "  (a) convert the file to LF — \`sed 's/\\r\$//' f > f.tmp && mv f.tmp f\` —"
 echo "      and commit that rewrite ON ITS OWN, never beside real changes; a"
 echo "      whole-file EOL diff sitting next to logic is unreviewable, which is"

@@ -746,5 +746,172 @@ DSS_EXPORT void forEachDescriptorInClosure(
 std::optional<std::unordered_map<std::string, std::vector<std::string>>>
 collectShippedExternSymbolFormats();
 
+// ── THE PLATFORM REALIZATION ORACLE ──────────────────────────────────────────
+//
+// ★★★ THE DECLARATION SYNTAX HAS NO AUTHORITY OVER REALIZATION, EVER.
+//
+// A user declaration carries the SIGNATURE. The PLATFORM — this shipped-descriptor
+// corpus, per object format — carries the REALIZATION: `library`,
+// `availableObjectFormats`, the `synthesize` recipe, `linkName`, `version`,
+// `signatureByDataModel`. `#include <stdio.h>` and a hand-written
+// `extern int printf(const char *, ...);` are two ways to obtain a TYPE; NEITHER
+// is a way to obtain a different PLATFORM.
+//
+// C23 makes this a CONFORMANCE requirement, not a preference:
+//   * 6.2.2p5 — a file-scope function declaration with no storage-class specifier
+//     has its linkage determined EXACTLY AS IF declared `extern`. So
+//     `extern int printf(const char*, ...);` and `int printf(const char*, ...);`
+//     are THE SAME DECLARATION. Two spellings C says declare the same thing MUST
+//     realize the same thing.
+//   * 7.1.4p2 — a library function needing no header-defined type MAY be declared
+//     and used WITHOUT including its header. The program is ENTITLED to write the
+//     prototype by hand and still get the real printf.
+//   * 5.1.1.2 phase 8 — external references are resolved AT LINK. An "I don't know
+//     that name" verdict therefore belongs to the LINK tier, never to a per-CU
+//     compile error: another CU, or a library supplied later, may legitimately
+//     provide the symbol.
+//
+// ★ WHY THIS ORACLE EXISTS AT ALL. Before it, a shipped descriptor was consulted
+// ONLY when the source `#include`d its header (the semantic injector) or under
+// `--resolve-library` (`collectShippedExternSymbolFormats`, which answers
+// AVAILABILITY only — not library, not recipe, not link name). On an ordinary
+// build a hand-written prototype consulted NO descriptor at all and fell through
+// to a per-LANGUAGE default library guess. That guess was a SECOND OWNER of a fact
+// the corpus already owns, and it was WRONG in the ways only a guess can be: it
+// named one image for every symbol of every header, so `extern int printf(const
+// char*, ...);` imported a bare `printf` from the LEGACY pe C runtime while the
+// rest of the same program's stdio surface was correctly realized as UCRT shims —
+// TWO C RUNTIMES in one three-line program, with no diagnostic at any stage. The
+// guess is gone; this is what replaced it.
+//
+// ★ AGNOSTIC BY CONSTRUCTION. Every answer is DATA read off a descriptor row and
+// selected by the ONE shared availability predicate `objectFormatInAvailabilitySet`
+// — the SAME predicate the `#include` gate, `__has_include`, the macro splice and
+// the semantic injector use, so this oracle cannot drift from them. There is no
+// `if (format == …)`, no `if (arch == …)`, and no symbol name is special-cased.
+
+// WHY a name has (or has not) a realization on the active object format. A CLOSED
+// enum: every outcome is ENUMERATED and STATED, so none is an unenumerated
+// fallthrough. Only `Realized` carries realization data.
+enum class ShippedRealizationStatus : std::uint8_t {
+    // No descriptor in the corpus declares this name. An ordinary program symbol,
+    // a sibling-TU definition, or a typo — the LINK tier is the only tier that can
+    // tell those apart, so the reference routes UNBOUND and link judges it
+    // (K_SymbolUndefined when it is genuinely undefined AND referenced).
+    Unknown = 0,
+    // Declared by the corpus, but NOT on the active object format (the elf-only
+    // `fdatasync` in a macho build). Routes UNBOUND for the same reason: binding it
+    // to any image would link clean and die at LOAD. Never a compile error here.
+    UnavailableForFormat,
+    // ★ THE ARM THAT USED TO BE A FALLTHROUGH. Declared AND available on this
+    // format, yet the row's `library` map names no image FOR this format —
+    // `decodeLibraryMap` simply omits an absent key, so this outcome previously
+    // existed only as "the map lookup missed". It is now a STATED arm: the platform
+    // declares the symbol exists here but not where it lives, so there is nothing
+    // to bind and the reference routes UNBOUND to the link tier. There is no
+    // in-tree instance today; the arm is about the DESIGN being total, not about a
+    // live bug (the eight POSIX descriptors once cited as evidence are top-level
+    // gated ["elf","macho"] with zero pe-gated symbol rows, which makes their
+    // absent `pe` key CORRECT and puts them in `UnavailableForFormat` above).
+    NoLibraryForFormat,
+    // Fully realized: bind exactly as the `#include` path would have.
+    Realized,
+};
+
+// The PLATFORM's realization of one extern name, already resolved for the ACTIVE
+// (arch, object format, data model). Field-for-field the same realization the
+// `#include` path carries on a `SuppressedShippedSymbol` — deliberately, so a
+// hand-written declaration and an `#include`d one produce a BYTE-IDENTICAL import.
+struct DSS_EXPORT ShippedSymbolRealization {
+    ShippedRealizationStatus status = ShippedRealizationStatus::Unknown;
+    // The row's per-object-format `library` map with the per-SYMBOL override
+    // MERGED OVER it (symbol keys win; an omitted format inherits the
+    // descriptor's) — the identical merge the semantic injector performs.
+    std::unordered_map<std::string, std::string> library;
+    std::string version;    // required ELF symbol version; EMPTY ⇒ unversioned
+    std::string recipeId;   // `synthesize`; EMPTY ⇒ an ordinary library import
+    std::string linkName;   // per-target link BASE name; EMPTY ⇒ the identifier
+    // The row's DECLARED signature, interned in the CALLER's interner (the
+    // `signatureByDataModel` override for the active model already applied).
+    // InvalidType unless `status == Realized`.
+    TypeId      signature;
+    bool        isFunction = true;   // ExternFunction vs ExternGlobal
+};
+
+// Resolve the platform realization of each requested NAME for the active target.
+//
+// Returns a map holding one entry per requested name whose status is anything
+// other than `Unknown`; a name with NO corpus row is simply ABSENT (the caller
+// treats absence as `Unknown` — unbound, link tier). Returns std::nullopt IFF the
+// shippedLibs directory cannot be located (DSS_CONFIG_ROOT unset and no ancestor
+// hit): the caller must then behave exactly as it did before this oracle existed
+// and route unbound, never fail loud — a config-discovery miss is not a statement
+// about the user's program.
+//
+// `activeFormat` nullopt (a direct-API / LSP / unit caller with no target) ⇒ EVERY
+// name answers `Unknown`. Availability and the library map are BOTH per-format
+// facts, so without a format there is no realization to state, and inventing one
+// would be exactly the guess this oracle removes. (Same posture the macro-variant
+// selection already takes under nullopt.)
+//
+// COST: the corpus INDEX (name → the descriptors declaring it) is built once and
+// memoized; only the descriptors that actually declare a requested name are read,
+// so a TU that hand-declares nothing reads NOTHING and a TU that hand-declares
+// `popen`/`pclose` reads ONE descriptor. Descriptors are read through the SAME
+// `readShippedLibDescriptor` the `#include` path uses — there is no second
+// resolution grammar, so `variants` / `signatureByDataModel` / per-symbol
+// `library` overrides cannot be resolved one way here and another way there.
+//
+// A descriptor that FAILS to read is SKIPPED (its names stay `Unknown` and route
+// unbound → the link tier judges the reference LOUD). Deliberate: this oracle is
+// consulted for names the user never `#include`d, so an unrelated descriptor's
+// malformedness must not become this program's build failure. Descriptor health is
+// owned by the tier that reads it for real (the `#include` path) plus the
+// corpus-wide decode test — the `shippedHeaderAvailableForFormat` precedent.
+[[nodiscard]] DSS_EXPORT
+std::optional<std::unordered_map<std::string, ShippedSymbolRealization>>
+realizeShippedExternSymbols(std::span<std::string const>      names,
+                            TypeInterner&                     interner,
+                            TypeRegistry&                     typeReg,
+                            DataModel                         dataModel,
+                            std::optional<std::string_view>   activeTarget,
+                            std::optional<ObjectFormatKind>   activeFormat,
+                            std::span<NamedTypeBinding const> namedTypes = {});
+
+// EVERY symbol row of the descriptor that declares `name`, realized for the active
+// target — i.e. the whole import surface that descriptor would contribute.
+//
+// ★ WHAT IT IS FOR, AND IT IS NOT A CONVENIENCE. A `synthesize` row is realized as
+// a COMPILER-EMITTED BODY, and that body CALLS other rows of the SAME descriptor
+// (the pe printf shim calls `__stdio_common_vfprintf` and `__acrt_iob_func`). On the
+// `#include` path those cores arrive for free — the header's whole surface is
+// injected. On the HAND-DECLARED path (C23 7.1.4p2) nothing else in the TU declares
+// them, and the synth pass then correctly FAIL-LOUDS ("the UCRT core
+// '__acrt_iob_func' is not imported by this module" — MEASURED). So realizing a
+// recipe row means realizing the surface its recipe can reach into.
+//
+// ★ WHY THE WHOLE SURFACE AND NOT "THE CORES". The recipe→core mapping lives in the
+// synth pass's per-recipe switch arms. Restating those core NAMES here would plant
+// platform symbol literals in shared substrate — the agnosticism break this codebase
+// keeps deleting — and would need editing every time a recipe lands. Instead the
+// caller records the whole surface as NON-EAGER imports and the LINKER's existing
+// reference gate prunes it to exactly the rows the emitted body referenced. The
+// precision comes from a mechanism already in the tree, not from a list.
+//
+// Returns nullopt on config-discovery failure (same contract as
+// `realizeShippedExternSymbols`); an EMPTY map when nothing declares `name`. Rows
+// that are not `Realized` on this format are OMITTED — a companion that does not
+// exist here must never become an import (the eager-import law's whole point).
+// `name` ITSELF is included; the caller already has its realization and can skip it.
+[[nodiscard]] DSS_EXPORT
+std::optional<std::unordered_map<std::string, ShippedSymbolRealization>>
+realizeShippedDescriptorSurfaceFor(std::string_view                  name,
+                                   TypeInterner&                     interner,
+                                   TypeRegistry&                     typeReg,
+                                   DataModel                         dataModel,
+                                   std::optional<std::string_view>   activeTarget,
+                                   std::optional<ObjectFormatKind>   activeFormat,
+                                   std::span<NamedTypeBinding const> namedTypes = {});
+
 } // namespace ffi
 } // namespace dss

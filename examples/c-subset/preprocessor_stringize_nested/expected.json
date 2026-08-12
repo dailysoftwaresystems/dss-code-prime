@@ -1,0 +1,36 @@
+{
+  "$comment": "D-PP-STRINGIZE-EXPANDED-ARG-SLICES-WRONG-BYTES witness. `#` (C 6.10.3.2 / C23 6.10.5.2) must spell its operand's PREPROCESSING TOKENS, not a contiguous source byte range: once the operand arrived through a macro expansion its tokens come from the `#define` line, the call site and the product buffer interleaved, and slicing across them silently shipped the define line's own text, a comment, or the rest of the file. Eighteen runtime checks plus four printed lines; every expectation MEASURED on clang-18, clang-19, gcc-13 `-std=c2x` and cl 19.51.36252 `/Zc:preprocessor`, all four agreeing. The load-bearing pair is `XSTR(PLAIN(1,2))` -> `g(1, 2)` against its single-level control `STR(PLAIN(1,2))` -> `PLAIN(1,2)`, and `S(f(\"a  b\" ,   \"c  d\"))`, which collapses white space BETWEEN tokens while preserving it INSIDE one in the same product. The `release` arm re-runs the whole thing through the shipped optimizer. Exit 42; each check has a distinct failure code.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "[g(1, 2)]\r\n[k(1, 2,3)]\r\n[f(\"a  b\" , \"c  d\")]\r\n[x 12]\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "[g(1, 2)]\n[k(1, 2,3)]\n[f(\"a  b\" , \"c  d\")]\n[x 12]\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "[g(1, 2)]\n[k(1, 2,3)]\n[f(\"a  b\" , \"c  d\")]\n[x 12]\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "expectedStdout": "[g(1, 2)]\n[k(1, 2,3)]\n[f(\"a  b\" , \"c  d\")]\n[x 12]\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

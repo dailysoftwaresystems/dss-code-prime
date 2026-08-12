@@ -172,6 +172,79 @@ peImportedLibraries(std::vector<std::uint8_t> const& b) {
     return out;
 }
 
+// ── PE: the imported SYMBOL NAMES, across every descriptor ────────
+//
+// UCRT-P4. `peImportedLibraries` above answers "which images does this binary
+// need"; this answers "which NAMES does it ask them for", which is the question a
+// CRT migration turns on — the pe entry spine's whole defect class is asking the
+// RIGHT image for a name only the WRONG one exports (the eager-import
+// `0xC0000139` law). A library-level check cannot see that.
+//
+// Follows the real chain, like its sibling: data directory #1 → each 20-byte
+// IMAGE_IMPORT_DESCRIPTOR → its import LOOKUP table (OriginalFirstThunk at +0,
+// falling back to FirstThunk at +16 when the lookup table was not emitted) → each
+// 64-bit entry. An entry with the high bit set is an ORDINAL import and carries no
+// name (skipped); otherwise the low 31 bits are an RVA to an IMAGE_IMPORT_BY_NAME
+// whose `Name` starts at +2, past the u16 Hint.
+//
+// Names are returned in emission order and NOT de-duplicated, so a caller can tell
+// one row from two. Deliberately NOT a substring scan of `.idata`: a scan cannot
+// distinguish a real import row from an incidental string in a neighbouring blob,
+// which is precisely the defect an "absent" assertion has to be able to see.
+[[nodiscard]] inline std::vector<std::string>
+peImportedSymbols(std::vector<std::uint8_t> const& b) {
+    using namespace image_deps_detail;
+    std::vector<std::string> out;
+    if (b.size() < 0x40) return out;
+    std::size_t const peOff = rdU32(b, 0x3C);
+    if (peOff + 24 > b.size() || rdU32(b, peOff) != 0x00004550u) return out;
+    std::size_t   const coffOff = peOff + 4;
+    std::uint16_t const numSecs = rdU16(b, coffOff + 2);
+    std::uint16_t const optSize = rdU16(b, coffOff + 16);
+    std::size_t   const optOff  = coffOff + 20;
+    if (rdU16(b, optOff) != 0x020Bu) return out;   // PE32+ magic
+    std::uint32_t const importRva = rdU32(b, optOff + 112 + 1 * 8);
+    if (importRva == 0) return out;
+
+    std::size_t const secTabOff = optOff + optSize;
+    auto rvaToFile = [&](std::uint32_t rva) -> std::size_t {
+        for (std::size_t i = 0; i < numSecs; ++i) {
+            std::size_t   const s    = secTabOff + i * 40;
+            std::uint32_t const va   = rdU32(b, s + 12);
+            std::uint32_t const vsz  = rdU32(b, s + 8);
+            std::uint32_t const rsz  = rdU32(b, s + 16);
+            std::uint32_t const raw  = rdU32(b, s + 20);
+            std::uint32_t const span = std::max(vsz, rsz);
+            if (span != 0 && rva >= va && rva < va + span)
+                return static_cast<std::size_t>(raw) + (rva - va);
+        }
+        return 0;
+    };
+
+    std::size_t desc = rvaToFile(importRva);
+    if (desc == 0) return out;
+    for (; desc + 20 <= b.size(); desc += 20) {
+        std::uint32_t const lookupRva = rdU32(b, desc + 0);
+        std::uint32_t const nameRva   = rdU32(b, desc + 12);
+        std::uint32_t const iatRva    = rdU32(b, desc + 16);
+        if (lookupRva == 0 && nameRva == 0 && iatRva == 0) break;  // terminator
+        std::uint32_t const thunkRva = lookupRva != 0 ? lookupRva : iatRva;
+        if (thunkRva == 0) continue;
+        std::size_t thunk = rvaToFile(thunkRva);
+        if (thunk == 0) continue;
+        for (; thunk + 8 <= b.size(); thunk += 8) {
+            std::uint64_t const entry = rdU64(b, thunk);
+            if (entry == 0) break;                       // end of this image's list
+            if ((entry >> 63) != 0) continue;            // ORDINAL import: no name
+            std::size_t const hintOff =
+                rvaToFile(static_cast<std::uint32_t>(entry & 0x7FFFFFFFull));
+            if (hintOff == 0) continue;
+            out.push_back(rdCStr(b, hintOff + 2));       // past the u16 Hint
+        }
+    }
+    return out;
+}
+
 // ── Mach-O: the LC_LOAD_DYLIB path list ──────────────────────────
 [[nodiscard]] inline std::vector<std::string>
 machoLoadedDylibs(std::vector<std::uint8_t> const& b) {

@@ -130,16 +130,37 @@ function Add-Offenders([string]$What, $Files) {
 Add-Offenders 'committed (HEAD)' $OffendersHead
 Add-Offenders 'staged (index)'   $OffendersIndex
 
+# ── ONE `git ls-files --eol` read, shared by checks C/D/E, WITH A FLOOR ───────
+# Checks D and E both answer from this table, and a table that comes back EMPTY
+# would make both report nothing — the "guard that passes over what it never
+# read" shape this file already fails closed against on the history side. So the
+# row count carries the same floor as the positive control above.
+# MEASURED 2026-08-10: 2,265 tracked paths.
+# ⚠ NAMED `$AllTrackedEolRows`, NOT `$EolRows`. PowerShell variable names are
+# CASE-INSENSITIVE, so a `$EolRows` here IS the same variable as check C's
+# `$eolRows` — which holds only the PINNED-GLOB subset. ✔MEASURED 2026-08-10: with
+# the colliding name, check C's assignment overwrote this table and checks D and
+# E1 silently walked 1,418 rows instead of 2,265 while the summary still claimed
+# to have judged the working tree. Found by RUNNING both twins and comparing
+# their counts (2,265 vs 1,418), not by reading the code.
+$AllTrackedEolRows = Get-GitLines @('ls-files','--eol')
+if ($AllTrackedEolRows.Count -lt $ScanFloor) {
+    Write-Host "line-endings: FAIL - ``git ls-files --eol`` returned only $($AllTrackedEolRows.Count) rows, below its floor of $ScanFloor."
+    Write-Host "  Checks D and E answer from that table, so an empty one makes BOTH report a clean"
+    Write-Host "  worktree over files they never looked at. Refusing to pass; fix the scan."
+    exit 2
+}
+
 # ── Check C: the pin's own glob set must contain no binary-detected blob ──
 # Suspended with checks A/C on a stale checkout: `i/-text` is an INDEX fact.
-$eolRows = if ($SkipHistoryScan) { @() } else {
+$PinnedGlobEolRows = if ($SkipHistoryScan) { @() } else {
     Get-GitLines @('ls-files','--eol','--','*.c','*.h','*.cpp','*.hpp',
                    '*.cmake','CMakeLists.txt','*/CMakeLists.txt','*.md','VERSION')
 }
-foreach ($row in $eolRows) {
+foreach ($row in $PinnedGlobEolRows) {
     if ($row -match '^i/-text') {
         $path = ($row -split "`t", 2)[-1]
-        $report.Add("  binary-detected inside the eol=lf pin (invisible to the scan above): $path")
+        $report.Add("  staged (index): binary-detected inside the eol=lf pin, so the blob scan above never opened it: $path")
     }
 }
 
@@ -154,31 +175,109 @@ foreach ($row in $eolRows) {
 # Checks A-C cannot see it BY CONSTRUCTION: the blob is fine; the tree is not.
 # Closed set (`w/crlf`, `w/mixed`) on purpose — an unmeasured `w/` state must
 # not be guessed at. Kept identical to the .sh sibling.
-foreach ($row in (Get-GitLines @('ls-files','--eol'))) {
+foreach ($row in $AllTrackedEolRows) {
     $parts = $row -split "`t", 2
     if ($parts.Count -lt 2) { continue }
     $attrs = $parts[0]
     if ($attrs -notmatch 'eol=lf') { continue }
     if ($attrs -match '(^|\s)w/(crlf|mixed)(\s|$)') {
-        $report.Add("  worktree rewritten to CRLF under an eol=lf pin (git diff shows NOTHING to review): $($parts[1])")
+        $report.Add("  working (tracked, eol=lf pinned): rewritten to CRLF on disk - git diff shows NOTHING to review: $($parts[1])")
+    }
+}
+
+# ── Check E: THE UNSTAGED WORKING TREE — the tier the other checks cannot see ──
+# ★★ THE BLIND SPOT, MEASURED 2026-08-10 on this tree. Checks A and B read BLOBS
+# (HEAD and the index); check C is an index fact; check D reads the disk but ONLY
+# for files that DECLARE `eol=lf`. So a CRLF introduced into a working file that
+# is neither staged nor covered by the pin was invisible to every tier - and
+# "before commit" is exactly when a line-ending mistake is cheap to fix and the
+# only moment this guard can prevent rather than diagnose.
+# Not theoretical arithmetic: of 2,265 tracked paths, 2,186 declare `eol=lf` and
+# 55 are tracked TEXT with NO such declaration. `.gitattributes` carries no
+# `* text=auto` and this workstation reports `core.autocrlf=false`, so for those
+# 55 git performs NO normalisation on `git add` - a CRLF rewrite of any one of
+# them LANDS CRLF IN THE COMMIT. Same for a NEW untracked file outside the pin.
+# ⚠ `core.autocrlf=true` (the Git-for-Windows INSTALLER DEFAULT, so the likeliest
+# config for a reader of THIS twin) makes a CRLF WORKING COPY of an unpinned text
+# file the LEGITIMATE result of checkout. Convicting there would be a false red on
+# a correctly-configured host, so E1 states the situation instead of convicting -
+# and E2 (untracked files, never checked out) keeps convicting either way.
+# Kept behaviourally identical to the .sh sibling, measured by the same `git`
+# subcommands with the same arguments.
+$AutoCrlf = (& git config core.autocrlf 2>$null)
+if ([string]::IsNullOrEmpty($AutoCrlf)) { $AutoCrlf = '<unset>' }
+# E1 - TRACKED, text, NOT covered by an `eol=lf` pin, CRLF/mixed on disk.
+# `i/-text` is binary (its 0x0D is legitimate) and `i/none` is empty; both are
+# excluded by NAME rather than by "anything else", for the same reason check D
+# uses a closed `w/` set: an unmeasured state must not be guessed into a red.
+foreach ($row in $AllTrackedEolRows) {
+    $parts = $row -split "`t", 2
+    if ($parts.Count -lt 2) { continue }
+    $attrs = $parts[0]
+    if ($attrs -match 'eol=lf') { continue }
+    # Matched by REGEX, not by splitting and indexing: `Set-StrictMode -Version
+    # Latest` turns an out-of-bounds array index into a THROW, so a single
+    # malformed row would kill the guard with a PowerShell stack trace instead of
+    # a diagnostic. Check D above already reads this field with a regex; E1 uses
+    # the same shape so the two cannot diverge in robustness either.
+    if ($attrs -match '(^|\s)i/(-text|none)(\s|$)') { continue }
+    if ($attrs -notmatch '(^|\s)w/(crlf|mixed)(\s|$)') { continue }
+    if ($AutoCrlf -eq 'true') {
+        Write-Host "line-endings: NOTE - '$($parts[1])' is CRLF on disk and carries NO eol=lf pin, but core.autocrlf=true,"
+        Write-Host "    so a CRLF checkout is the expected result here and this is NOT convicted. Add an eol=lf pin"
+        Write-Host "    for its extension if this repo should own its bytes regardless of a host's git config."
+    } else {
+        $report.Add("  working (tracked, NOT covered by an eol=lf pin): CRLF on disk and core.autocrlf=$AutoCrlf, so ``git add`` will NOT normalise it - this WILL land CRLF in the commit: $($parts[1])")
+    }
+}
+# E2 - UNTRACKED (not ignored), text, NOT covered by an `eol=lf` pin, has a CR.
+# A pinned untracked file is deliberately NOT reported: its clean filter
+# normalises it on `git add`, so it cannot land CRLF, and a guard that reds on a
+# state git is about to fix teaches people to ignore it.
+foreach ($f in (Get-GitLines @('ls-files','--others','--exclude-standard'))) {
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
+    $bytes = [IO.File]::ReadAllBytes($f)
+    if ($bytes.Length -eq 0) { continue }
+    # BINARY skip via git's own heuristic (a NUL in the first 8000 bytes), so the
+    # answer matches what `git grep -I` would have decided for a tracked blob.
+    $probe = [Math]::Min($bytes.Length, 8000)
+    $isBinary = $false
+    for ($i = 0; $i -lt $probe; $i++) { if ($bytes[$i] -eq 0) { $isBinary = $true; break } }
+    if ($isBinary) { continue }
+    # An explicit `binary` / `-text` declaration is an exemption, exactly as `-I`
+    # honours it for the blob tiers.
+    if ((& git check-attr text -- $f 2>$null) -match ': text: unset$') { continue }
+    if ((& git check-attr eol  -- $f 2>$null) -match ': eol: lf$')     { continue }
+    $hasCr = $false
+    foreach ($b in $bytes) { if ($b -eq 13) { $hasCr = $true; break } }
+    if ($hasCr) {
+        $report.Add("  working (untracked, not yet added): carries CR and NO eol=lf pin covers it, so ``git add`` will NOT normalise it - this WILL land CRLF in the commit: $f")
     }
 }
 
 if ($report.Count -eq 0) {
     if ($SkipHistoryScan) {
         # Never let the summary outrun the evidence: say what was NOT judged.
-        Write-Host "line-endings: OK (WORKTREE ONLY - the history scan was SKIPPED, see above; the $ControlHead HEAD / $ControlIndex index blobs were NOT judged)"
+        Write-Host "line-endings: OK (WORKTREE ONLY - the history scan was SKIPPED, see above; the $ControlHead HEAD / $ControlIndex index blobs were NOT judged; $($AllTrackedEolRows.Count) working-tree paths were)"
     } else {
-        Write-Host "line-endings: OK ($ControlHead committed + $ControlIndex staged text blobs, none carries CR)"
+        # ★ The summary NAMES EVERY TIER it judged. A guard that says "OK" without
+        # saying over what invites the reader to assume it covered the tier they
+        # care about - and for four tiers of this guard's life, one of them (the
+        # unstaged working tree) was the tier it did NOT cover.
+        Write-Host "line-endings: OK (committed $ControlHead + staged $ControlIndex text blobs, working tree $($AllTrackedEolRows.Count) tracked paths + untracked, core.autocrlf=$AutoCrlf; none carries CR)"
     }
     exit 0
 }
 
-Write-Host "line-endings: FAIL - tracked blobs violate the LF contract:"
+Write-Host "line-endings: FAIL - the LF contract is violated (tier named per line):"
 Write-Host ""
 foreach ($line in $report) { Write-Host $line }
 Write-Host ""
 Write-Host "Fix:"
+Write-Host "  * A ``working (...)`` line is the CHEAP one: the bytes are only on your disk,"
+Write-Host "    nothing is committed yet, and converting the file to LF right now costs a"
+Write-Host "    single command. A ``committed (HEAD)`` line is the same defect after it"
+Write-Host "    became history. Fix the working tier BEFORE you stage."
 Write-Host "  (a) convert the file to LF and commit that rewrite ON ITS OWN, never"
 Write-Host "      beside real changes; a whole-file EOL diff sitting next to logic is"
 Write-Host "      unreviewable, which is how the original six got in unnoticed; OR"

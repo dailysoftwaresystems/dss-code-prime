@@ -140,6 +140,7 @@ makeSyscallElfExecFormat() {
         "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": true
       },
       "entryCallingConvention": "sysv_amd64",
+      "entryVerbs": ["none","argc-argv"],
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 231,
@@ -172,6 +173,7 @@ makeSyscallElfExecFormatArm64() {
         "interpreter": "/lib/ld-linux-aarch64.so.1", "bindNow": true
       },
       "entryCallingConvention": "aapcs64",
+      "entryVerbs": ["none","argc-argv"],
       "processExit": {
         "mechanism": "syscall",
         "syscallNumber": 94,
@@ -1175,6 +1177,18 @@ makeElfExecFormatData(bool withProcessExit) {
     data.relocations.push_back(std::move(pc32));
     data.relocationKindIndex[RelocationKind{1}] = 0;
     data.relocationNameIndex["R_X86_64_PC32"]   = 0;
+
+    // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): an exec-flavored format must
+    // declare which entry signatures it realizes. Set on BOTH variants —
+    // DELIBERATELY OUTSIDE the `withProcessExit` branch — because the two fixtures
+    // must differ in EXACTLY ONE capability for the matched-pair proof below to
+    // mean anything. Putting it inside would make the WITHOUT variant fail for two
+    // reasons and the "its ONLY complaint is /processExit" assertion would be
+    // pinning fixture drift instead of the gate.
+    // The format declares VERBS, never signatures: the accepted entry SIGNATURES
+    // are a source-language fact (`DeclarationRule::entryFunctions`) and this
+    // fixture is a FORMAT. These are the two verbs every shipped ELF exec realizes.
+    data.entryVerbs = {EntryMaterialization::None, EntryMaterialization::ArgcArgv};
 
     if (withProcessExit) {
         // x86_64 Linux exit_group(231) via SYSCALL (0F 05), number in rax.

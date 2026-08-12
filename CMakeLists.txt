@@ -285,6 +285,34 @@ if(DSS_BUILD_TESTS)
     # ever named. The pin is the mechanism; THIS is the invariant, and
     # an invariant nothing executes is a convention.
     #
+    # Orphan-test-source guard (2026-08-10 —
+    # D-TEST-UNIT-TIER-HAS-NO-ORPHAN-SOURCE-GUARD).
+    # Every `tests/**/*.cpp` must be registered by a STRUCTURAL
+    # `dss_add_test(... SOURCES ...)` call or be on the guard's
+    # machine-checked allowlist. An unregistered test source compiles
+    # NOWHERE and no ctest entry runs it — absent coverage that looks
+    # exactly like coverage from every direction (the file is there, it
+    # reads like a test, the diff adding it looked like added coverage,
+    # and the suite is green because it never had anything to say about
+    # it). ✔MEASURED 2026-08-10: nothing in this repository checked for
+    # it, and no CI job asserts an expected ctest entry count.
+    #
+    # ★ RIDES CTEST rather than being a CI step, which is why it is here
+    # and not in a workflow: every leg then runs it for free, on the
+    # host it is about, and the invariant is EXECUTED rather than
+    # documented — the same reasoning the line-endings comment above
+    # states in its last sentence.
+    #
+    # ★★ IT SELF-TESTS ON EVERY RUN. Given no argument (the form used
+    # here) each twin mirrors tests/ into a per-run temp tree, mutates
+    # it 12 ways, and asserts it reds with the right exit code and the
+    # right message each time — so this entry cannot pass without also
+    # proving the guard can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-
+    # VACUOUS-PASS, D-CENSUS-INSTRUMENT-UNGUARDED-BY-CTEST). Cost,
+    # MEASURED on this Windows workstation: ~18 s (.sh) / ~11 s (.ps1),
+    # which ctest -j overlaps with the other ~810 entries and is in
+    # family with the anchor guard's own 9.6–14.7 s.
+    #
     # Same WIN32 dispatch, same contract, same exit codes as the
     # anchor guard above; both scripts drive identical `git`
     # subcommands so the two shells only marshal arguments.
@@ -302,6 +330,12 @@ if(DSS_BUILD_TESTS)
                     -NoProfile -ExecutionPolicy Bypass
                     -File "${CMAKE_SOURCE_DIR}/tools/check-line-endings.ps1"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        add_test(
+            NAME orphan_tests_guard
+            COMMAND ${POWERSHELL_EXE}
+                    -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_SOURCE_DIR}/tools/check-orphan-tests.ps1"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     else()
         add_test(
             NAME anchor_registry_guard
@@ -310,6 +344,10 @@ if(DSS_BUILD_TESTS)
         add_test(
             NAME line_endings_guard
             COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-line-endings.sh"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        add_test(
+            NAME orphan_tests_guard
+            COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-orphan-tests.sh"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     endif()
 endif()

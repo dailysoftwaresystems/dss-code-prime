@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // Canonical object-format taxonomy — the closed-enum vocabulary the
 // substrate engine speaks for the OUTPUT image kind (ELF / PE/COFF /
@@ -330,39 +331,54 @@ externCallDispatchFromName(std::string_view s) noexcept {
 // would make code read jump-stub BYTES as the object's value — the
 // silent-miscompile class the linker's pre-walker reject exists for.
 //
-//   * `copy-relocation` (ELF ET_EXEC R_X86_64_COPY / R_AARCH64_COPY):
-//     the executable reserves a correctly-sized `.bss` slot per
-//     imported object, exports the symbol as a DEFINED OBJECT at that
-//     slot, and emits one COPY relocation; the dynamic loader memcpy's
-//     the library's object into the slot at startup and every image
-//     (including the library itself, by symbol interposition) then
-//     references the executable's copy. The standard glibc non-PIE
-//     ET_EXEC mechanism — zero new instruction encodings.
+//   * `got-indirect` (ELF `.got` + R_*_GLOB_DAT; Mach-O `__got`
+//     S_NON_LAZY_SYMBOL_POINTERS; PE the IAT slot itself — c117/c149):
+//     the ADDRESS of the imported object is LOADED at run time from a
+//     per-object pointer slot the dynamic loader binds to the library's
+//     object. Code that needs the object's address loads the slot
+//     (x86_64 `mov r,[rip+disp]`; arm64 `adrp+ldr`) — one extra
+//     indirection vs a direct address, zero copies, and it works in a
+//     non-PIE image exactly as in a PIE one.
 //
-//   * `got-indirect` (Mach-O `__got` S_NON_LAZY_SYMBOL_POINTERS; c117):
-//     the address of the imported object is LOADED at run time from a
-//     per-object non-lazy pointer slot (`__DATA_CONST,__got`) that the
-//     dynamic loader (dyld) binds to the library's object. Code that
-//     needs the object's ADDRESS loads the slot (x86_64 `mov r,[rip+
-//     GOTPCREL]`; arm64 `adrp+ldr`) — one extra indirection vs a direct
-//     address, but ZERO copy + PIE-compatible (macOS arm64 images are
-//     always PIE). This is the model the PE `__imp_` data thunk will
-//     also take when it lands; the __got slot infrastructure already
-//     exists for the function-import stubs (they jump THROUGH it).
+// ── WHY `copy-relocation` IS NOT A MEMBER, AND MUST NOT COME BACK ───
+// D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET (born CLOSED).
+// There USED to be a second member, `copy-relocation`: the ELF non-PIE
+// ET_EXEC mechanism — the exec reserves a correctly-sized `.bss` slot
+// per imported object, exports the symbol as a DEFINED OBJECT at that
+// slot, emits one R_X86_64_COPY / R_AARCH64_COPY, and ld.so memcpy's
+// the library's object in at startup so that every image referencing
+// THAT NAME converges on the exec's copy.
+// It is UNSOUND, and not merely inelegant: the convergence is
+// NAME-SCOPED. glibc exports ONE `environ` object under THREE names
+// (`__environ` GLOBAL, `environ` / `_environ` WEAK, all at one
+// address), and an exec that claims only the spelling its descriptor
+// happened to name splits that object in two — `__libc_start_main`
+// writes envp into the exec's copy while libc's own `environ` slot is
+// never written, so any OTHER image reading `environ` sees an EMPTY
+// object with no diagnostic anywhere. That violates C23 6.2.2's
+// guarantee that an identifier with external linkage denotes the SAME
+// object throughout the program.
+// The member is therefore DELETED, not left inert: an enum value no
+// shipped format declares is a loaded gun — a future format file could
+// declare it and silently reintroduce the whole class. Every ELF
+// format now declares `got-indirect`, which binds the ADDRESS of the
+// library's ONE object and so cannot split it. Reintroducing the
+// mechanism would need a way to prove the alias set complete AT LINK
+// TIME WITHOUT reading the target's libc (which would break "build ANY
+// target inside ANY host"), and nobody has one.
 //
-// The PE `__imp_` data-thunk model would be a further NEW member; the
-// linker gate + walkers dispatch on the declared member, never on a
-// format-name branch. Consumed by the linker's pre-walker data-import
-// gate (linker.cpp) + the per-format walker that implements the
-// declared mechanism (elf.cpp copy-relocation / macho.cpp __got).
+// A genuinely new mechanism would be a NEW member; the linker gate +
+// walkers dispatch on the declared member, never on a format-name
+// branch — and never (since the deletion above) on the image flavour
+// either. Consumed by the linker's pre-walker data-import gate
+// (linker.cpp) + the per-format walker that implements the declared
+// mechanism (elf.cpp `.got`/GLOB_DAT, macho.cpp __got, pe.cpp IAT).
 enum class DataImportBinding : std::uint8_t {
-    CopyRelocation = 1,  // ELF ET_EXEC R_*_COPY exec-local .bss copy
-    GotIndirect    = 2,  // Mach-O __got non-lazy pointer (dyld-bound)
+    GotIndirect = 1,  // loader-bound pointer slot holding the address
 };
 
-inline constexpr EnumNameTable<DataImportBinding, 2> kDataImportBindingTable{{{
-    { DataImportBinding::CopyRelocation, "copy-relocation" },
-    { DataImportBinding::GotIndirect,    "got-indirect" },
+inline constexpr EnumNameTable<DataImportBinding, 1> kDataImportBindingTable{{{
+    { DataImportBinding::GotIndirect, "got-indirect" },
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -403,9 +419,10 @@ dataImportBindingFromName(std::string_view s) noexcept {
 // A format that declares NO `externAddrBinding` materializes an
 // `&extern` value via the ordinary lea (an absolute page-pair on arm64;
 // a PC-relative rel32 on x86_64 — already foreign-PIE-safe there). The
-// DSS-linked EXEC formats never declare it (they use
-// `dataImportBinding: "copy-relocation"` for data + a direct address for
-// functions); the PIE/dyn formats use the c117 DSS-local-slot path. Only
+// DSS-linked EXEC formats never declare it (their data imports take the
+// `dataImportBinding: "got-indirect"` slot path and their functions a
+// direct address); the PIE/dyn formats use the c117 DSS-local-slot
+// path. Only
 // the arm64 relocatable + static-archive formats declare `got`. Consumed
 // by MIR→LIR `lowerGlobalAddr` (the value-form arm, keyed on the
 // derived symbol set — never a format/arch identity branch). An unknown
@@ -587,6 +604,127 @@ librarySynthVehicleFromName(std::string_view s) noexcept {
     return kLibrarySynthVehicleTable.fromName(s);
 }
 
+// ── UCRT-P4 (D-FFI-PE-CRT-UCRT-MIGRATION): the per-format RUNTIME
+//    LIBRARY ROLE table ─────────────────────────────────────────────
+//
+// WHICH IMAGE plays WHICH RUNTIME ROLE for this object format. A format file
+// declares ONE `runtimeLibraries` block mapping each role it uses to an image
+// identity; every spine block then NAMES A ROLE instead of carrying a path.
+//
+// ★★ WHY A TABLE AND NOT ONE `crt` STRING. A single per-format CRT string
+// would model an ACCIDENT of one DLL configuration, and it is already wrong in
+// two configurations this repo ships:
+//   * MEASURED (`nm -D`, 2026-08-10): the ELF unwinder personality lives in
+//     `libgcc_s.so.1`; `libc.so.6` exports NO `_Unwind_*` symbol at all. (Do
+//     not be fooled by `personality@@GLIBC_2.2.5` in libc — that is the
+//     `personality(2)` SYSCALL wrapper, unrelated to unwinding.) On ELF, one
+//     image demonstrably cannot serve both `cLibrary` and `unwindPersonality`.
+//   * Microsoft names the C library and the VC runtime SEPARATELY in BOTH
+//     configurations (`/MD` ⇒ `ucrt.lib` + `vcruntime.lib`; `/MT` ⇒
+//     `libucrt.lib` + `libvcruntime.lib`), and DSS already ships static linking
+//     for all formats (#47), so the split configuration is live in-tree.
+//   * ucrtbase ALSO exporting `__C_specific_handler` (MEASURED ord 30; msvcrt
+//     106, ntdll 2332, vcruntime140 8) is a CONVENIENCE of the pe DLL config,
+//     not Microsoft's model.
+// ★ The pe table pointing `cLibrary` and `unwindPersonality` at the SAME image
+// is therefore FINE: the table PERMITS sameness without ASSERTING it. That is
+// the whole difference from a single string, and it is what stops the value
+// from having to be re-cut every time a new configuration arrives
+// (`D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT`).
+//
+// ROLE IS A CLOSED ENUM, deliberately: every per-format BEHAVIORAL rule in this
+// schema family already is one, and free-form strings stay reserved for names
+// and paths. A typo'd role must fail loud at LOAD, never resolve to "some
+// image".
+//
+// ★ C23 POSITION, stated so the scope is honest: SEH (`__try`/`__except`) is
+// NOT C23 — it is a Microsoft extension. That is PRECISELY why its personality
+// must be a per-format CONFIG DECLARATION and never a literal in shared
+// substrate: a non-standard, platform-specific mechanism is the last thing that
+// should be spelled inside `src/mir`. (`setjmp`/`longjmp` ARE C23 7.13, but they
+// ride `setjmp.json` — a DESCRIPTOR with its own per-format library map — so
+// they do not gate this table.)
+enum class RuntimeLibraryRole : std::uint8_t {
+    None              = 0,  // default-constructed sentinel; loader rejects "none"
+    // The C library the program is bound to: the image that owns `exit`, the
+    // stdio family, and the CRT program-entry argument machinery.
+    CLibrary          = 1,
+    // The image that owns the UNWINDER PERSONALITY routine an exception /
+    // structured-exception region names in its unwind info (pe
+    // `__C_specific_handler`; the ELF `_Unwind_*` family in `libgcc_s.so.1`
+    // when ELF unwind lands; gcc/mingw-w64 on Windows uses libgcc rather than
+    // vcruntime, and a role table accommodates that future target without a
+    // schema change).
+    UnwindPersonality = 2,
+    // The OS PRIMITIVE image a compiler-synthesized shim emits over
+    // (`kernel32.dll` on Windows: CRITICAL_SECTION / CONDITION_VARIABLE /
+    // Fls*). Distinct from `cLibrary` on pe; on Mach-O the same image serves
+    // both, which the table expresses by pointing both roles at it.
+    SystemPrimitives  = 3,
+};
+
+inline constexpr EnumNameTable<RuntimeLibraryRole, 4> kRuntimeLibraryRoleTable{{{
+    { RuntimeLibraryRole::None,              "none"              },
+    { RuntimeLibraryRole::CLibrary,          "cLibrary"          },
+    { RuntimeLibraryRole::UnwindPersonality, "unwindPersonality" },
+    { RuntimeLibraryRole::SystemPrimitives,  "systemPrimitives"  },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+runtimeLibraryRoleName(RuntimeLibraryRole r) noexcept {
+    return kRuntimeLibraryRoleTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<RuntimeLibraryRole>
+runtimeLibraryRoleFromName(std::string_view s) noexcept {
+    return kRuntimeLibraryRoleTable.fromName(s);
+}
+
+// One `runtimeLibraries` row: a role and the image identity that plays it.
+struct DSS_EXPORT RuntimeLibraryBinding {
+    RuntimeLibraryRole role = RuntimeLibraryRole::None;
+    std::string        image;   // "ucrtbase.dll" / "libgcc_s.so.1" / a dylib path
+};
+
+// The format's whole role table. A VECTOR of rows rather than a fixed struct of
+// three optional strings, so adding a fourth role is an enum slot + a JSON row
+// and touches no reader. Roles are unique cross-row (loader-enforced).
+struct DSS_EXPORT RuntimeLibraryTable {
+    std::vector<RuntimeLibraryBinding> bindings;
+
+    // The image playing `role`, or nullopt if this format declares no such row.
+    // ★ NULLOPT IS THE FAIL-LOUD SIGNAL, never a fallback: the loader refuses a
+    // format whose spine block names a role this table does not declare, so no
+    // consumer ever has to invent an image.
+    [[nodiscard]] std::optional<std::string_view>
+    imageForRole(RuntimeLibraryRole role) const noexcept {
+        for (auto const& b : bindings) {
+            if (b.role == role) return std::string_view{b.image};
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] bool empty() const noexcept { return bindings.empty(); }
+};
+
+// ── UCRT-P4: the unwinder-personality declaration ──────────────────
+//
+// The routine an emitted unwind record names as its handler, and the image it
+// is imported from. Populated from the format JSON's `sehPersonality` block,
+// whose `role` is resolved against `runtimeLibraries` AT LOAD — so `libraryPath`
+// here is a DERIVED copy of a fact the role table owns, exactly as
+// `sectionKindIndex` is a derived copy of `sections`.
+//
+// ★★ WHAT THIS REPLACES, AND WHY IT IS NOT A REFACTOR: `src/mir/merge/
+// synth_seh_funclets.cpp` hardcoded BOTH `pers.mangledName =
+// "__C_specific_handler"` and `pers.libraryPath = "msvcrt.dll"` — two platform
+// literals in shared MIR substrate, on a pass that runs for EVERY format. A
+// format that declares no personality now fails LOUD when a SEH region
+// resolves, instead of silently emitting an msvcrt import into an ELF image.
+struct DSS_EXPORT SehPersonality {
+    RuntimeLibraryRole role = RuntimeLibraryRole::None;  // declared in JSON
+    std::string libraryPath;   // DERIVED: resolved from `role` at load
+    std::string mangledName;   // "__C_specific_handler"
+};
+
 // The format's shipped-library synthesis block (`"librarySynthesis"` in
 // `.format.json`). `vehicle` selects the primitive family the synth pass
 // emits over; `libraryPath` is the native library its on-demand helper
@@ -595,6 +733,12 @@ librarySynthVehicleFromName(std::string_view s) noexcept {
 // FFI) and wasm/spirv (no native shim).
 struct DSS_EXPORT LibrarySynthesis {
     LibrarySynthVehicle vehicle = LibrarySynthVehicle::Win32;
+    // UCRT-P4: the ROLE this block names in the format's `runtimeLibraries`
+    // table, and the image the loader RESOLVED it to. The JSON declares only the
+    // role; `libraryPath` is the derived copy, kept so `synthesizeThreadsShim`
+    // reads exactly what it read before. `validate()` re-checks the pair against
+    // the table, so a hand-built schema cannot set one without the other.
+    RuntimeLibraryRole  role = RuntimeLibraryRole::None;
     std::string         libraryPath;
 };
 

@@ -577,13 +577,18 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                    ") — one dynamic symbol cannot be imported two ways "
                    "(D-LK11-EXTERN-IMPORT-DEDUP).");
         };
-        // `dataSizeBytes` / `dataAlignBytes` SIZE the ELF copy-relocation `.bss`
-        // slot (c84 D-LK-EXTERN-DATA-IMPORT). One CU legitimately holds an
-        // INCOMPLETE type (`extern const char v[];` ⇒ 0/0 — extern_import.hpp
-        // :76-81), so a zero is "unknown here", not a disagreement: take the
-        // non-zero. Two DIFFERING non-zero values would reserve the SAME slot two
-        // ways — the loader memcpy's `st_size` bytes, so picking either silently
-        // truncates or over-copies. Fail loud.
+        // `dataSizeBytes` / `dataAlignBytes` are the DECLARED size/alignment of
+        // the imported object (D-LK-EXTERN-DATA-IMPORT). One CU legitimately
+        // holds an INCOMPLETE type (`extern const char v[];` ⇒ 0/0 —
+        // extern_import.hpp), so a zero is "unknown here", not a disagreement:
+        // take the non-zero. Two DIFFERING non-zero values are two CUs declaring
+        // DIFFERENT objects under one external name — a real source-level
+        // conflict; picking either would silently pick a winner. Fail loud.
+        // ⓘ No emitter consumes these values any more: they SIZED the ELF
+        // copy-relocation `.bss` slot, and that mechanism is deleted
+        // (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET). The CHECK keeps
+        // its own subject — the cross-CU declaration disagreement — which is
+        // why it stays rather than going with the mechanism.
         auto const foldNonZero = [&](std::uint64_t& kept, std::uint64_t incoming,
                                      char const* field, ExternImport const& e) {
             if (incoming == 0 || kept == incoming) return;  // incomplete / agrees
@@ -637,11 +642,11 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 // `isData` / `isThreadLocal` — a disagreement is a REAL conflict, and
                 // silently picking either row is the D-LK-EXTERN-DATA-IMPORT
                 // silent-miscompile shape: `isData` decides whether the walker binds
-                // the name through the DATA-slot model (the ELF copy-relocation) or
-                // the function-import path, so the loser's CU would have every
-                // reference bound through the WRONG model — a PLT stub standing in
-                // for a data object, or a copy-reloc `.bss` slot standing in for a
-                // function. `isThreadLocal` likewise selects the (unimplemented,
+                // the name through the DATA-slot model (a got-indirect pointer slot
+                // ld.so fills with the object's address) or the function-import
+                // path, so the loser's CU would have every reference bound through
+                // the WRONG model — a PLT stub standing in for a data object, or a
+                // pointer slot standing in for a function. `isThreadLocal` likewise selects the (unimplemented,
                 // walker-rejected) initial-exec TLS model — D-CSUBSET-THREAD-LOCAL.
                 if (kept.isData != ext.isData) {
                     conflict(ext, "`isData` (data object vs function import)",
@@ -652,9 +657,9 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                              boolStr(kept.isThreadLocal), boolStr(ext.isThreadLocal));
                 }
                 foldNonZero(kept.dataSizeBytes,  ext.dataSizeBytes,
-                            "`dataSizeBytes` (copy-relocation slot size)", ext);
+                            "`dataSizeBytes` (declared object size)", ext);
                 foldNonZero(kept.dataAlignBytes, ext.dataAlignBytes,
-                            "`dataAlignBytes` (copy-relocation slot alignment)", ext);
+                            "`dataAlignBytes` (declared object alignment)", ext);
                 // Every remaining ExternImport field is accounted for: `symbol` IS the
                 // dedup output (replaced by the canonical merged id above), and
                 // `mangledName` / `libraryPath` / `version` are the KEY, hence equal
@@ -871,12 +876,11 @@ LinkedImage link(std::span<AssembledModule const> modules,
 
     // c82+c84 (D-LK-EXTERN-DATA-IMPORT): a DATA import that SURVIVED — no
     // sibling-CU definition resolved it away at the merge — binds per the
-    // format's SCHEMA-DECLARED `dataImportBinding` model (c84: the ELF
-    // exec formats declare "copy-relocation" and their walker reserves an
-    // exec-local `.bss` copy slot + emits the R_*_COPY dynamic reloc). A
-    // format that declares NO model (PE / Mach-O until their `__imp_`
-    // data-thunk / non-lazy-pointer models land; every relocatable
-    // flavor) REJECTS LOUD here, the one chokepoint all format walkers
+    // format's SCHEMA-DECLARED `dataImportBinding` model (every image
+    // format declares "got-indirect": a loader-bound pointer slot holding
+    // the library object's ADDRESS — ELF `.got` + R_*_GLOB_DAT, Mach-O
+    // `__got`, the PE IAT slot). A format that declares NO model (every
+    // relocatable flavor) REJECTS LOUD here, the one chokepoint all format walkers
     // share: its import walker binds imports as CODE (PLT-style stubs /
     // IAT thunks) — a data symbol bound that way "links" and then reads
     // jump-stub BYTES as the object's value at run time, the exact
@@ -889,10 +893,13 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // rule is IMAGE-scoped. A relocatable object does NOT bind imports — it
     // has no import walker; a surviving data extern is emitted as an
     // SHN_UNDEF symbol (the reloc-driven symtab loop in elf.cpp) and the
-    // FINAL (foreign) linker resolves it — for an executable link via a
-    // copy-relocation, exactly what gcc does for `extern FILE *stdout` in a
-    // `.o` (empirically R_X86_64_PC32 + a NOTYPE UND symbol, even under
-    // default-PIE). The data-bound-as-code miscompile this reject guards
+    // FINAL (foreign) linker resolves it however IT chooses — which for a
+    // non-PIE executable link is a copy relocation IT synthesizes, exactly
+    // what gcc does for `extern FILE *stdout` in a `.o` (empirically
+    // R_X86_64_PC32 + a NOTYPE UND symbol, even under default-PIE). DSS's
+    // OWN images never emit one (the mechanism is deleted —
+    // D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET); what a foreign
+    // linker does with a faithful relocatable object is its own contract. The data-bound-as-code miscompile this reject guards
     // against lives in the IMAGE import walker; the relocatable writer's own
     // guard is that a data-extern reference emits PC32, never the PLT32 call
     // variant (elf.cpp restricts pltNativeId to FUNCTION externs). So only an
@@ -900,12 +907,13 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // declared binding rejects. Mirrors D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE
     // (c143), which kept referenced no-library FUNCTION externs as SHN_UNDEF.
     //
-    // c150 (D-LK1-4): ELF ET_DYN is now image-flavored, so a `.so` with a
+    // c150 (D-LK1-4): ELF ET_DYN is image-flavored, so a `.so` with a
     // surviving data extern takes THIS gate — its schema declares
     // `dataImportBinding: "got-indirect"` (the c117/c149 GotIndirect model:
     // ld.so fills a GOT slot with the object's address; the lowering derefs
-    // it), so it passes by config. Copy-relocation stays exec-only
-    // (validate() rejects it on a dyn schema).
+    // it), so it passes by config. Every ELF flavour — exec, pie, dyn —
+    // declares that one value now, so this gate sees no flavour split at
+    // all (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET).
     //
     // This gate is format-AGNOSTIC (isImageFlavor() is false for every
     // relocatable flavor), so it lifts the reject for the Mach-O `object` and
@@ -929,8 +937,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
                        + std::string{objectFormatSchema.name()}
                        + "' declares no 'dataImportBinding' model "
                          "(D-LK-EXTERN-DATA-IMPORT). Library data objects "
-                         "bind via the format's declared mechanism (ELF exec: "
-                         "\"copy-relocation\"); binding one through the "
+                         "bind via the format's declared mechanism (every "
+                         "image format: \"got-indirect\"); binding one through the "
                          "function-import machinery would read jump-stub "
                          "bytes as the object's value. A cross-TU extern "
                          "object resolves by compiling it WITH its defining "
@@ -946,8 +954,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // local extern import — an `extern thread_local` whose definition no
     // sibling CU supplied, i.e. a TRUE LIBRARY thread-local (glibc
     // `errno`-class objects). NO shipped binding model can carry it:
-    //   * copy-relocation copies into ONE process-shared exec slot — the
-    //     antithesis of thread storage (every thread would alias one copy);
+    //   * got-indirect binds ONE process-shared address per object — the
+    //     antithesis of thread storage (every thread would alias one datum);
     //   * the local-exec model this arc ships computes LINK-TIME tpoffs
     //     against the exec's OWN PT_TLS block — a library's TLS block has
     //     a loader-assigned module offset, unknowable at link time.
@@ -969,9 +977,9 @@ LinkedImage link(std::span<AssembledModule const> modules,
                      "GOT slot), which is not implemented "
                      "(D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC). The shipped "
                      "local-exec model covers only THIS executable's own "
-                     "thread-locals; copy-relocation cannot apply (one "
-                     "process-shared copy slot would defeat the declared "
-                     "thread storage duration). An intra-program `extern "
+                     "thread-locals; the got-indirect data binding cannot "
+                     "apply (one process-shared object address would defeat "
+                     "the declared thread storage duration). An intra-program `extern "
                      "thread_local` resolves by compiling it with its "
                      "defining translation unit.");
         image.resolvedFuncCount = 0;

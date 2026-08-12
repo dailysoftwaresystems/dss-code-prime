@@ -22,6 +22,21 @@
 *.dylib
 *.dll
 
+# ...EXCEPT the runnable corpus's PREBUILT SECOND IMAGES, which are SOURCE, not
+# build output. `examples/c-subset/environ_alias_object_identity/` ships two
+# gcc-built `.so`s (x86_64 + aarch64, from `env_probe_so.c` in the same
+# directory, build command recorded there) because an OBJECT-IDENTITY property
+# cannot be witnessed by ONE image — the example needs a second image DSS did
+# not build, and shipping it prebuilt means the corpus needs no host
+# cross-compiler at test time (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET).
+# ★ WITHOUT THIS NEGATION the `.so`s are silently un-committable and the example
+# fails on every fresh clone. It fails LOUD there (exit 10, the fail-closed
+# witness check refuses to skip), but loud-on-every-clone is not shipped
+# coverage. Scoped to this one directory on purpose: `*.so` must keep ignoring
+# real build output everywhere else. `.gitattributes` declares these paths
+# `binary` so the `examples/** text eol=lf` rule cannot rewrite their bytes.
+!examples/**/*.so
+
 # Fortran module files
 *.mod
 *.smod
@@ -43,6 +58,14 @@
 # Build directory
 .temp/
 .cache/
+# Compiler cache. The CI `ccache-action` materialises `.ccache/<hex>/CACHEDIR.TAG`
+# INSIDE the workspace, and on a Windows runner ccache writes those tags with CRLF.
+# They are untracked and were therefore NOT ignored, so `line_endings_guard` (which
+# scans `git ls-files --others --exclude-standard`) convicted 16 of them and failed
+# the windows-msvc-release leg — on bytes no human wrote and nothing would ever
+# commit. Ignoring is the correct classification, not a silencer: a content-addressed
+# compiler cache is build output, never source.
+.ccache/
 build/
 build-wsl/
 # Ad-hoc out-of-source build dirs (e.g. build-rel / build-dbg used for

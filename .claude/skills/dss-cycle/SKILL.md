@@ -189,12 +189,22 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      explicit trigger + closing-work (§F/§D) — a later cycle is legitimate ONLY behind a named
      blocker or an unfired trigger. Either way it is *handled*: NEVER a silent skip, a masked
      test exclusion, a swallowed error, or a "temporarily disabled" that no anchor tracks.
-   - **★★ (c) THE QUICK-FIX RULE — AN ANCHOR IS NOT A PLACE TO PUT WORK YOU COULD HAVE DONE.**
+   - **★★★ (c) THE QUICK-FIX RULE — AN ANCHOR IS NOT A PLACE TO PUT WORK YOU COULD HAVE DONE.**
+     ★★★ **THE DEFAULT IS FIX. DEFERRAL IS A §B DECISION THE USER MAKES, NOT ONE THE CYCLE MAKES.**
+     A cycle may not, on its own authority, decide that something it found is somebody's problem
+     later. Either it closes, or it goes to the user as a named choice. This is enforced by the
+     **anchor balance gate** in Step 6: end with more OPEN rows than you started and the gate FAILS,
+     exactly like a red test.
      The registry is an **audit trail**, not a backlog, and it is measurably drifting into one: it
-     passed **885 rows** on 2026-08-07, and rows are still being opened for defects that were then
-     fixed minutes later in the same cycle. A row that describes a defect nobody is going to fix
-     this year is not "handled" — it is the deferral §F.0 forbids, wearing a registry row as a
-     disguise. So:
+     passed **885 rows** on 2026-08-07 and **350 OPEN** on 2026-08-11 — 22 of them opened by a single
+     five-commit branch — while rows are still being opened for defects that were then fixed minutes
+     later in the same cycle. A row that describes a defect nobody is going to fix this year is not
+     "handled" — it is the deferral §F.0 forbids, wearing a registry row as a disguise.
+     ★★ **AND THE OPERATOR IS THE ONE WHO PAYS.** ✔MEASURED 2026-08-11, the user, twice, unprompted:
+     *"I HATE YOUR WAY TO CLOSE AN ANCHOR WHILE OPEN ANOTHER 534354 anchors… CAN'T YOU PLEASE START
+     AND FINISH A JOB WITHOUT LEAVING ANYTHING BEHIND?"* Every open row is a decision billed to a
+     human on every future sweep. A cycle that closes 5 and opens 9 did not make progress; it moved
+     work from a place where it was being done to a place where it is being counted. So:
      - **THE COST TEST, and it is a hard rule: if writing an honest anchor row costs more than
        fixing the thing, FIXING IS MANDATORY.** An honest row carries what/why/trigger/closing
        work/cross-refs — for most small defects that is more thought and more keystrokes than the
@@ -404,6 +414,22 @@ fail-loud, strict tests), the house comment style, the specific traps already kn
 eager-import law, closed descriptor key sets, `--define` not `-D`, capture rc directly), and
 what to REPORT BACK. Tell it what NOT to do as explicitly as what to do.
 
+★★★ **AND EVERY BRIEF MUST SAY "ANCHOR *AND CLOSE*" — "anchor every issue you find", written
+alone, is an instruction to generate OPEN ROWS.** ✔MEASURED 2026-08-11: that exact sentence went
+into four consecutive lane briefs; the lanes obeyed it perfectly and the branch ended with 22 open
+rows, nine of them from a lane whose assignment WAS the thing it was documenting. The lanes were
+not at fault — the brief asked for anchors and got anchors. Put this in every brief, verbatim:
+
+> Anchor every issue you come across — and **close it in this cycle**. A row you hand me OPEN is
+> work you are asking someone else to do; hand me rows **born ✅ CLOSED**, with the fix and its
+> verification in them. If something is genuinely out of reach it needs a **NAMED blocker** — a
+> specific missing prerequisite, an unfired trigger, or a decision only the operator can make.
+> "Out of scope", "bigger than this cycle", "a follow-up" and "the natural next step" are not
+> blockers. Bring me the decision; do not park it in the registry.
+
+Then CHECK the returned rows before you write them. An agent reporting "anchored 6 findings" is
+reporting six unfinished jobs unless every one says CLOSED.
+
 ### Step 0 — Orient
 - Check `git status` + current branch + the last commit subject. A `… WIP` cycle in flight
   means **this cycle finishes it** (it is the priority).
@@ -523,6 +549,46 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   now, or pinned as a deferred anchor with a trigger). If you excluded, disabled, skipped, or
   "green-modulo"-ed ANYTHING to reach green, it MUST carry an anchor + a proper fix-or-defer decision;
   a silent workaround is a gate failure, not a pass.
+- **★★★ THE ANCHOR BALANCE GATE — COUNTABLE, AND IT FAILS THE CYCLE.**
+  **A cycle MUST NOT end with more OPEN rows than it started.** Not a target, not a trend to watch:
+  a gate item with a number, checked exactly like ctest. Count before and after and report both:
+
+  ```bash
+  python tools/check-anchor-balance.py
+  ```
+
+  It prints OPEN-at-base, OPEN-now, and **the name of every row that opened or closed** — the count
+  alone cannot tell you which, and "which" is the question. Exit 1 when the cycle leaves more open
+  than it found.
+
+  `after > before` ⇒ **the gate FAILS.** Close the difference, or escalate the one you cannot close
+  as a **§B decision** — the user chooses to carry it; the cycle does not decide that for itself.
+
+  ⚠ **DO NOT go back to an inline `grep -c` over a list of status glyphs.** That was the first
+  version of this gate and it was wrong in the direction that flatters the cycle: it enumerated
+  `🔴|🟠|⚠` and was blind to `⏳`, so it reported **269** open rows where there were **579**, and a
+  cycle that closed one 🟠 row while opening one ⏳ row would have been congratulated for an
+  improvement. ✔MEASURED 2026-08-11, on the very cycle that introduced the gate — the row it could
+  not see was `D-OPT6-LICM-SPECULATIVE-LOAD-HOIST`, a HIGH miscompile. The tool inverts the rule:
+  **a row is OPEN unless its status cell carries an explicit `✅`**, so a glyph nobody has thought of
+  yet counts as open, which is the safe direction. `--self-test` pins that inversion (including a
+  deliberately novel glyph); run it if you touch the script. Enumerating the open glyphs is the same
+  mistake as enumerating build-directory layouts — define the complement, not the variants.
+  Opening rows is fine and often right; ENDING ON A HIGHER NUMBER is what is forbidden, because that
+  is the arithmetic by which a 3,000-row audit trail became a 350-row backlog nobody reads.
+
+  ★★ **THE FAILURE MODE THIS EXISTS TO KILL, ✔MEASURED 2026-08-11 and it is not subtle:** a lane was
+  dispatched to FIX the predefined-macro set. When it was stopped it had written **nine new OPEN rows
+  describing predefined-macro gaps** — `D-PP-COMPILER-IDENTITY-INCOHERENT`,
+  `D-PP-IMPL-DETAIL-PREDEFINES-ABSENT`, `D-PP-CODE-MODEL-PREDEFINES` and six more — i.e. it had
+  converted its own assignment into nine reasons to do it later, each one honestly written and
+  correctly cross-referenced. **A row that restates the task you were given is not documentation, it
+  is the task not being done.** Before writing ANY row, answer in one sentence: *is this the work I
+  was sent to do?* If yes, the row is forbidden and the work is mandatory. That cycle's 22 committed
+  rows over five commits are the same arithmetic at a slower rate.
+- **★ FOUR ROWS THAT LOOK DIFFERENT AND ARE THE SAME ROW.** Before appending, grep the registry for
+  the SYMPTOM, the ARTEFACT and the FILE NAMES in your evidence — not the title you have in mind
+  (§C.-1 1b). Nine rows about one absent macro family is one row, or better, one fix.
 
 **Any red the cycle cannot self-repair → STOP and report the blocker. Do not push broken.**
 Better to wake the user to "stopped at step N, here is the blocker" than to push something
@@ -580,6 +646,12 @@ independent audit.) Running it here catches such a thing **before** anything is 
 
 ### Step 10 — Report & end
 Emit a one-line cycle summary: priority closed, anchors touched, test delta, commit hash.
+
+**★ The anchor line is MANDATORY and it carries the numbers, not an adjective:**
+`anchors: opened N, closed M, net ±K — OPEN was <before>, now <after>`. The Step 6 balance gate
+already refuses `after > before`, so this line is the receipt, not the check. "Anchored a few
+follow-ups" is not a report; it is the thing the gate exists to make impossible to say.
+
 **The invocation ends here.** Under `/loop`, the next invocation begins the next cycle with
 fresh context.
 

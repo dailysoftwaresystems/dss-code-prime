@@ -552,13 +552,32 @@ pin_stage_capabilities() { # pin_stage_capabilities <driver...>
 # ═══════════════════════════════════════════════════════════════════════════
 # ★★ THE RESILIENCE RULE IS WHAT THIS PIN PROTECTS. A fixture abort stays a
 # RECOVERABLE outcome — named, resumed past, reported in the union. Only ONE
-# shape is diverted: zero files completed AND the same first diagnostic as the
-# previous zero-progress segment. FIVE of these six assertions are the resilience
-# cases; if a future change makes the discriminator greedier they go red first.
+# shape is diverted: zero files completed AND the same ZERO-PROGRESS SIGNATURE as
+# the previous zero-progress segment. MOST of the 14 assertions below are the
+# resilience cases — NINE demand RESUME-or-spend-the-budget (8 verdicts + the
+# whole-budget drive) against FOUR that demand a PRECONDITION stop (2 verdicts + 2
+# drives), plus one input control — so if a future change makes the discriminator
+# greedier they go red first and they go red in numbers. (✔That ratio is what H4
+# measures: dropping the sameness conjunct reds NINE checks.)
+# ★★ AND THE SILENT CRASH IS THE OTHER HALF
+# [D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH]. The
+# discriminator used to require a NON-EMPTY diagnostic, so a fixture that died
+# writing ZERO BYTES could never satisfy it. ✔MEASURED 2026-08-10, one Windows
+# run, two legs, same commit, same root cause: elf64-arm64 under qemu (whose
+# crash PRINTS `qemu: uncaught target signal 11`) stopped after one resume, while
+# elf64-x86_64 native (whose crash is SILENT) burned all ten and reported eleven
+# unnameable aborts. So this pin now drives the WHOLE STOPPING DECISION over real
+# segment logs, not only the condition in isolation — because "stops after ONE
+# resume rather than ten" is the property, and a per-call verdict cannot state it.
 pin_precondition() { # pin_precondition <driver>
-  local drv="$1" cond line
+  local drv="$1" cond carry line budget
   # BY PREFIX, so a WEAKENED discriminator is still LOADED and judged
   # BEHAVIOURALLY rather than the pin going red merely because it went missing.
+  # ⚠ THE LOOSE PREFIX IS DELIBERATE AND `head -1` IS LOAD-BEARING: the carry line
+  # two lines below the condition opens with the same test, and the CONDITION is
+  # first in file order. A tighter prefix naming the `-n` conjunct would make a
+  # mutation that DELETES that conjunct read as "the discriminator is missing"
+  # instead of being judged behaviourally, which is the whole point of section H.
   line="$(LC_ALL=C grep -n 'if \[\[ "\$s_nf" -eq 0' "$drv" | head -1)"
   if [ -z "$line" ]; then
     PIN_FAILS=$((PIN_FAILS + 1))
@@ -566,18 +585,95 @@ pin_precondition() { # pin_precondition <driver>
     return 0
   fi
   cond="${line#*:}"; cond="${cond%; then}"; cond="${cond#*if }"
-  takes() { # takes <files-done> <this-diag> <prev-zero-diag>
-    local s_nf="$1" s_diag="$2" prev_zero_diag="$3"
+  # THE CARRY IS THE SECOND HALF OF THE DECISION and is extracted too: a condition
+  # that is right about one segment decides nothing if what the next segment
+  # compares against is wrong. ✔The old carry stored `$s_diag`, i.e. EMPTY for a
+  # silent segment, which is indistinguishable from "the last segment made
+  # progress" — the same defect a second time, one line down.
+  carry="$(LC_ALL=C grep -h 'prev_zero_sig="\$s_zero_sig"' "$drv" | head -1)"
+  # The DRIVER'S OWN budget, so "rather than ten" is its number and not this
+  # file's opinion of it.
+  budget="$(LC_ALL=C awk '/^DSS_MAX_RESUMES=/ { if (match($0, /:-[0-9]+/)) print substr($0, RSTART + 2, RLENGTH - 2); exit }' "$drv")"
+  if [ -z "$carry" ] || [ -z "$budget" ]; then
+    PIN_FAILS=$((PIN_FAILS + 1))
+    [ "$QUIET" -eq 1 ] || bad "the carry line and/or DSS_MAX_RESUMES could not be read from ${drv##*/} (carry=[$carry] budget=[$budget]) — this pin would assert over a default it invented"
+    return 0
+  fi
+  load_fns "$drv" parse_segment fact zero_progress_signature || return 0
+  takes() { # takes <files-done> <this-diag> <prev-sig> [ok-lines] [fail-markers] [last-test]
+    local s_nf="$1" prev_zero_sig="$3" s_zero_sig
+    # THE SHIPPED DERIVATION, not a hand-set signature: the sentinel is the whole
+    # fix, so a pin that supplied it itself would pass over a driver that never
+    # produced one.
+    s_zero_sig="$(zero_progress_signature "$2" "${4:-0}" "${5:-0}" "${6:-}")"
     if eval "$cond"; then printf 'PRECONDITION'; else printf 'RESUME'; fi
   }
   local D1="Can't find a usable init.tcl in the following directories: /opt/local/lib/tcl8.6 ..."
   local D2="child process exited abnormally"
+  local SILENT
+  SILENT="$(zero_progress_signature "" 0 0 "")"
   ck "zero progress twice, IDENTICAL diagnostic -> PRECONDITION" PRECONDITION "$(takes 0 "$D1" "$D1")"
   ck "the FIRST such abort                      -> RESUME"       RESUME "$(takes 0 "$D1" "")"
   ck "zero progress, DIFFERENT diagnostic       -> RESUME"       RESUME "$(takes 0 "$D2" "$D1")"
   ck "a crash AFTER completing files            -> RESUME"       RESUME "$(takes 7 "$D1" "$D1")"
   ck "one file completed, same diagnostic       -> RESUME"       RESUME "$(takes 1 "$D1" "$D1")"
-  ck "zero progress, NO diagnostic at all       -> RESUME"       RESUME "$(takes 0 "" "")"
+  ck "zero progress, NO OUTPUT, first time      -> RESUME"       RESUME "$(takes 0 "" "")"
+  # ── THE SILENT CASE, WHICH IS THE DEFECT ─────────────────────────────────
+  ck "SILENCE TWICE                             -> PRECONDITION" PRECONDITION "$(takes 0 "" "$SILENT")"
+  # ── AND THE RESILIENCE RULE UNDER SILENCE: no diagnostic is NOT the same as
+  #    no output. A segment that ran TESTS without completing a FILE has an empty
+  #    `A` fact too, and it must stay on the resume path.
+  ck "no diagnostic but ' Ok' lines             -> RESUME"       RESUME "$(takes 0 "" "$SILENT" 5 0 "")"
+  ck "no diagnostic but a FAILURE marker        -> RESUME"       RESUME "$(takes 0 "" "$SILENT" 0 2 "")"
+  ck "no diagnostic but a test NAME             -> RESUME"       RESUME "$(takes 0 "" "$SILENT" 0 0 "select1-1.1")"
+
+  # ── THE STOPPING DECISION, DRIVEN OVER REAL LOGS ─────────────────────────
+  # Every moving part is the driver's: parse_segment and zero_progress_signature
+  # are LOADED from it, the condition and the carry are EXTRACTED from it, and the
+  # budget is READ from it. What this function contributes is the loop, and the
+  # loop is what makes "stops after ONE resume" sayable at all.
+  drive() { # drive <log>... -> "segments=N resumes=R stop=WHY"
+    local prev_zero_sig="" n=0 r=0 stop="BUDGET-EXHAUSTED" lg
+    local s_nf s_diag s_ok s_fx s_last s_zero_sig f="$WORK/drive.facts"
+    for lg in "$@"; do
+      n=$((n + 1))
+      parse_segment "$lg" "$f"
+      s_nf="$(fact N "$f")"; s_diag="$(fact A "$f")"
+      s_ok="$(fact K "$f")"; s_fx="$(fact Q "$f")"; s_last="$(fact T "$f")"
+      s_zero_sig="$(zero_progress_signature "$s_diag" "$s_ok" "$s_fx" "$s_last")"
+      if eval "$cond"; then stop="PRECONDITION"; break; fi
+      eval "$carry"
+      if [ "$r" -ge "$budget" ]; then stop="BUDGET-EXHAUSTED"; break; fi
+      r=$((r + 1))
+    done
+    printf 'segments=%s resumes=%s stop=%s' "$n" "$r" "$stop"
+  }
+  # 12 logs, i.e. more than the budget, so "it stopped early" is a real finding
+  # and not the list running out.
+  local i
+  # `mkdir -p` and NO `rm -rf`: every one of these files is rewritten below on
+  # every call, so there is nothing stale to clear — and `rm -rf "$WORK/seg"`
+  # with an empty $WORK would spell `rm -rf /seg`. A destructive command whose
+  # safety depends on a variable being non-empty is not worth the tidiness.
+  mkdir -p "$WORK/seg"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    : > "$WORK/seg/silent.$i.log"                       # ZERO BYTES, the measured case
+    printf '%s\n' "$D1" > "$WORK/seg/same.$i.log"       # the talking case that already worked
+    printf 'child process exited abnormally in file %s\n' "$i" > "$WORK/seg/diff.$i.log"
+  done
+  # ✔THE INPUT IS ASSERTED, NOT ASSUMED: a `: >` that failed would make the whole
+  # demonstration a statement about a file that was not there.
+  ck "the silent fixture's log really is ZERO BYTES" "0" \
+     "$(LC_ALL=C wc -c < "$WORK/seg/silent.1.log" | tr -d '[:space:]')"
+  ck "TWO SILENT SEGMENTS: the engine stops after ONE resume, not $budget" \
+     "segments=2 resumes=1 stop=PRECONDITION" "$(drive "$WORK"/seg/silent.*.log)"
+  ck "two segments with the SAME diagnostic: same answer" \
+     "segments=2 resumes=1 stop=PRECONDITION" "$(drive "$WORK"/seg/same.*.log)"
+  # THE NEGATIVE CONTROL. A genuine crash that moves must still spend the whole
+  # budget — if this ever reads PRECONDITION the discriminator has become greedy
+  # and the resilience rule is gone.
+  ck "DIFFERENT diagnostics every time: the whole budget IS spent" \
+     "segments=$((budget + 1)) resumes=$budget stop=BUDGET-EXHAUSTED" "$(drive "$WORK"/seg/diff.*.log)"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -641,7 +737,13 @@ pin_loader_var() { # pin_loader_var <driver>
 # a silent pass: a pin that quietly asserts nothing is the defect this file exists
 # to prevent.
 if command -v python3 >/dev/null 2>&1 && [ -f "$LEGS_PY" ] && [ -f "$CATALOGUE" ]; then
-  python3 "$LEGS_PY" --catalogue "$CATALOGUE" --plan --host-os darwin --host-arch arm64 --format sh \
+  # `--environment-probes skip` DELIBERATELY: these pins are about the plan's
+  # SHAPE, and measuring a clock for 20 s per invocation would put a wall-clock
+  # sample inside a self-test the drivers run at STARTUP. It also exercises the
+  # skip path, whose plan both drivers must REFUSE to run a corpus on.
+  # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  python3 "$LEGS_PY" --catalogue "$CATALOGUE" --plan --environment-probes skip \
+    --host-os darwin --host-arch arm64 --format sh \
     > "$WORK/plan.sh" 2>/dev/null || rm -f "$WORK/plan.sh"
   python3 - "$LEGS_PY" > "$WORK/acq.json" 2>/dev/null <<'PY' || rm -f "$WORK/acq.json"
 import importlib.util, json, sys
@@ -679,6 +781,17 @@ pin_confound_supply() { # pin_confound_supply <driver>
   LEG_CONFOUNDS[elf64-x86_64]="'^walsetlk-' '^busy2-'"
   LEG_CONFOUNDS[pe64-x86_64]=""
   LEG_CONFOUNDS[elf64-arm64]="'^busy2-' 'emulated:^writecrash-'"
+  # ★ THE GATING STAMP, WHICH THE SUPPLY NOW REFUSES TO PROCEED WITHOUT. A
+  # conditional confound row (`requires: [<environment probe>]`) is honoured only
+  # where the probe MEASURED its defect as PRESENT, and an `unprobed` plan is safe
+  # but not usable — its withheld excusals would read as compiler regressions.
+  # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  LEG_CONFOUND_GATING=()
+  LEG_CONFOUND_GATING[elf64-x86_64]="probed"
+  LEG_CONFOUND_GATING[pe64-x86_64]="probed"
+  LEG_CONFOUND_GATING[elf64-arm64]="probed"
+  LEG_CONFOUND_GATING[unprobedleg]="unprobed"
+  LEG_CONFOUNDS[unprobedleg]="'^busy2-'"
   load_fns "$drv" leg_confound_patterns || return 0
   local -a got=()
   eval "got=($(leg_confound_patterns elf64-x86_64))"
@@ -702,6 +815,135 @@ pin_confound_supply() { # pin_confound_supply <driver>
   out="$(leg_confound_patterns nodecl 2>&1)"; rc=$?
   ck "an UNDECLARED leg REFUSES rather than answering []" "97" "$rc"
   ck_has "...naming the reason" "$out" "transport"
+  # ★★ AN UNPROBED PLAN IS REFUSED. This is the direction that matters: the plan is
+  # already fail-SAFE (every conditional row dropped), so nothing is excused on
+  # evidence nobody gathered — but running a corpus on it would surface those
+  # withheld excusals as GENUINE reds, i.e. report a broken clock as a compiler
+  # regression. Silence here would make an unmeasured run indistinguishable from a
+  # measured one. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  out="$(leg_confound_patterns unprobedleg 2>&1)"; rc=$?
+  ck "an UNPROBED plan REFUSES rather than serving its ungated list" "97" "$rc"
+  ck_has "...naming the gating it got" "$out" "confoundGating='unprobed'"
+  ck_has "...and how to resolve a measured plan" "$out" "--environment-probes skip"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# I2 — THE REFUSAL MUST STOP *THE DRIVER*, NOT JUST RETURN NON-ZERO
+# ═══════════════════════════════════════════════════════════════════════════
+# D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL.
+#
+# ★★★ WHAT THE PINS ABOVE COULD NOT SEE, AND WHY. Every one of them captures the
+# substitution's status DIRECTLY (`out="$(leg_confound_patterns …)"; rc=$?`) — a
+# shape the PRODUCTION call site did not have. The driver ran
+# `eval "CONFOUND_PATTERNS=($(leg_confound_patterns "$leg"))"`, and `die` is
+# `exit 1`, which exits the SUBSHELL a command substitution runs in; under
+# `set -Eeuo pipefail` bash does NOT propagate a failed substitution inside a
+# NON-ASSIGNMENT command. ✔MEASURED end to end with the shipped region: the
+# refusal printed, then `REACHED THE NEXT STATEMENT. CONFOUND_PATTERNS size=0`,
+# then the script COMPLETED with rc 0. So the pins proved the FUNCTION refuses
+# while nothing proved THE DRIVER STOPS — and the whole corpus would have run with
+# an empty confound list, charging every clock failure to the compiler.
+#
+# ⚠ SO THIS PIN EXTRACTS THE PRODUCTION CALL SITE FROM THE SHIPPED DRIVER rather
+# than re-typing a shape of its own. Re-fuse the two statements back into one and
+# this pin runs THAT code and reds. It runs in a CHILD bash because the property
+# under test is "the shell exits", which cannot be asserted from inside the shell
+# that exits.
+pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver <driver>
+  local drv="$1" region callsite script out rc
+  region="$(LC_ALL=C sed -n -e '/^# >>> dss:confound-supply >>>$/,/^# <<< dss:confound-supply <<</p' "$drv")"
+  if [ -z "$region" ]; then
+    PIN_FAILS=$((PIN_FAILS + 1))
+    [ "$QUIET" -eq 1 ] || bad "could not extract the dss:confound-supply region from ${drv##*/} — this pin would assert over nothing"
+    return 0
+  fi
+  # THE REAL CALL SITE: from the array declaration through the `eval`, verbatim —
+  # STATEMENTS ONLY. ⚠ COMMENT LINES ARE DROPPED, and that is not tidiness: the
+  # driver's own comment there QUOTES the fused form it warns against, so an
+  # extraction that stopped at the first line MENTIONING the eval captured four
+  # comment lines and no code — and the "contains the eval" assertion below passed
+  # on the comment. ✔MEASURED while writing this pin: both arms answered
+  # `REACHED-NEXT-STATEMENT size=0` because nothing executable had been extracted.
+  callsite="$(LC_ALL=C awk '/declare -a CONFOUND_PATTERNS=\(\)/ { p = 1 }
+                            p && /^[[:space:]]*#/ { next }
+                            p { print; if ($0 ~ /eval "CONFOUND_PATTERNS=\(/) exit }' "$drv")"
+  if [ -z "$callsite" ]; then
+    PIN_FAILS=$((PIN_FAILS + 1))
+    [ "$QUIET" -eq 1 ] || bad "could not extract the CONFOUND_PATTERNS call site from ${drv##*/} — this pin would assert over nothing"
+    return 0
+  fi
+  # THE SUBJECT FIRST, and on its LAST line: the extraction must END at the eval
+  # STATEMENT, so a mutation that removes it cannot leave this pin asserting over a
+  # prefix of the call site.
+  ck "the extracted call site ENDS at the eval statement" "yes" \
+     "$(case "$(printf '%s\n' "$callsite" | tail -1)" in *'eval "CONFOUND_PATTERNS=('*) echo yes ;; *) echo no ;; esac)"
+  ck_has "...and it carries the supply call itself" "$callsite" 'leg_confound_patterns "$leg"'
+  script="$(mktemp "${TMPDIR:-/tmp}/dss-confound-callsite-XXXXXX.sh")"
+  # `$LEG_STATE` / `$AFTER` are written by THIS file; everything between them is
+  # the shipped driver's own text.
+  {
+    printf '%s\n' 'set -Eeuo pipefail'
+    printf '%s\n' 'declare -A LEG_CONFOUNDS=() LEG_CONFOUND_GATING=() LEG_CONFOUND_DECLARED=()'
+    printf '%s\n' 'DSS_CONFOUNDS=""'
+    printf '%s\n' 'die() { printf "DIE: %s\n" "$*" >&2; exit 1; }'
+    printf '%s\n' 'info() { :; }'
+    printf '%s\n' "$region"
+    printf '%s\n' 'leg="${1:?leg}"'
+    printf '%s\n' 'LEG_CONFOUNDS[$leg]="'"'"'^busy2-'"'"'"'
+    printf '%s\n' 'LEG_CONFOUND_GATING[$leg]="${2:?gating}"'
+    printf '%s\n' 'LEG_CONFOUND_DECLARED[$leg]=1'
+    printf '%s\n' "$callsite"
+    printf '%s\n' 'printf "REACHED-NEXT-STATEMENT size=%d\n" "${#CONFOUND_PATTERNS[@]}"'
+  } > "$script"
+  # ── THE REFUSAL ARM: an unprobed plan must STOP the shell ────────────────
+  out="$(bash "$script" someleg unprobed 2>&1)"; rc=$?
+  ck "an UNPROBED plan STOPS THE DRIVER at the real call site (rc)" "1" "$rc"
+  ck_has "...having said why" "$out" "confoundGating='unprobed'"
+  # ⚠ THROUGH `ck`, not a bare `bad`: `bad` bumps the GLOBAL failure count, which
+  # under red()'s QUIET=1 would turn an EXPECTED mutant failure into a run-level
+  # red. Every pin assertion goes through ck/ck_has for exactly that reason.
+  ck "...and the statement AFTER the call site never ran" "no" \
+     "$(printf '%s' "$out" | grep -q 'REACHED-NEXT-STATEMENT' && echo yes || echo no)"
+  # ── THE NEGATIVE CONTROL: the same script must reach the marker on a
+  #    `probed` plan, or the arm above would pass for the wrong reason ──────
+  out="$(bash "$script" someleg probed 2>&1)"; rc=$?
+  ck "a PROBED plan runs on through the call site (rc)" "0" "$rc"
+  ck_has "...and reaches the next statement with the leg's pattern" "$out" "REACHED-NEXT-STATEMENT size=1"
+  rm -f "$script"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# N — WHY A FAILURE WAS EXCUSED IS PRINTED, NOT MERELY DECIDED
+# ═══════════════════════════════════════════════════════════════════════════
+# D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.
+#
+# `earnedOn` failed because it is prose nothing reads. A probe verdict nobody SEES
+# is the same failure with extra steps, so the printing is a load-bearing capability
+# and this pin treats it as one. The report TEXT is generated once by
+# harness_legs.py (and its two-driver agreement is proven by DIFFERENTIAL EXECUTION
+# in --check-regions, case `confound-report`); what is pinned HERE is the shipped
+# .sh's transport of it, and the refusal that stops an empty report reading as
+# "nothing to excuse".
+pin_confound_report() { # pin_confound_report <driver>
+  local drv="$1" out rc
+  load_fns "$drv" print_confound_report || return 0
+  # info() is stubbed by this runner, so drive the emission through a local echo:
+  # what is under test is WHICH lines survive, not how they are decorated.
+  info() { printf 'I %s\n' "$*"; }
+  out="$(print_confound_report elf64-x86_64 'probe clock-realtime-steps = ABSENT
+
+row INACTIVE: ^walsetlk-' 2>&1)"; rc=$?
+  ck "a report is printed line by line" "0" "$rc"
+  ck_has "...the probe verdict line" "$out" "I probe clock-realtime-steps = ABSENT"
+  ck_has "...the INACTIVE row line" "$out" "I row INACTIVE: ^walsetlk-"
+  ck "...and the BLANK line is skipped, never printed as an empty tag" "2" \
+     "$(printf '%s\n' "$out" | grep -c '^I ')"
+  # ★ THE REFUSAL: an empty report means the account of WHY a failure was excused
+  # did not arrive. An unexplained exclusion is not an earned one, so this must die
+  # rather than print nothing and continue.
+  out="$(print_confound_report elf64-x86_64 '   ' 2>&1)"; rc=$?
+  ck "an EMPTY report REFUSES rather than printing nothing" "97" "$rc"
+  ck_has "...naming what is missing" "$out" "EMPTY confound report"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1128,10 +1370,12 @@ green "E    the precondition discriminator"                 pin_precondition
 green "F    acq_field over a REAL acquisition record"       pin_acq_field
 green "G    the loader variable is TARGET-keyed"            pin_loader_var
 green "I    the confound supply is PER LEG"                 pin_confound_supply
+green "I2   the supply's REFUSAL stops the DRIVER"          pin_confound_supply_stops_the_driver
 green "J    a failed run-dir operation is a VERDICT"        pin_run_dir_argv
 green "K    a forwarded PATH crosses through its declared group" pin_env_forward
 green "L    the launcher-prerequisite gate"                 pin_launcher_prereq
 green "M    the smoke argv: MEASURED targets, DECLARED launcher" pin_smoke_argv
+green "N    the confound report is PRINTED, per leg"        pin_confound_report
 
 # ═══════════════════════════════════════════════════════════════════════════
 # H — RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.
@@ -1161,13 +1405,28 @@ if mutate "H3 remove the first-diagnostic capture" "$WORK/m3.sh" 'diag = $0' '
   red "H3 the captured log's first error line is surfaced" pin_parse_segment "$WORK/m3.sh"
 fi
 
-# H4 — drop the "same diagnostic" conjunct. The discriminator becomes greedy and
+# H4 — drop the "same signature" conjunct. The discriminator becomes greedy and
 # the RESILIENCE cases must go red: a genuine crash would stop being resumed.
-if mutate "H4 weaken the precondition discriminator" "$WORK/m4.sh" '"$s_diag" == "${prev_zero_diag:-}"' '
-    /^    if \[\[ "\$s_nf" -eq 0 && -n "\$s_diag" && "\$s_diag" == "\$\{prev_zero_diag:-\}" \]\]; then$/ {
+if mutate "H4 weaken the precondition discriminator" "$WORK/m4.sh" '"$s_zero_sig" == "${prev_zero_sig:-}"' '
+    /^    if \[\[ "\$s_nf" -eq 0 && -n "\$s_zero_sig" && "\$s_zero_sig" == "\$\{prev_zero_sig:-\}" \]\]; then$/ {
       print "    if [[ \"$s_nf\" -eq 0 ]]; then"; next }
     { print }'; then
   red "H4 a genuine crash is still RESUMED" pin_precondition "$WORK/m4.sh"
+fi
+
+# H4b — THE SILENT-CRASH DEFECT ITSELF, RESTORED. The signature helper stops
+# answering for a segment that produced NOTHING, which is exactly the state the
+# discriminator was in when elf64-x86_64 burned all ten resumes on a fixture that
+# had never started. The talking cases must stay green and the SILENT ones must go
+# red — a mutation that reddened everything would prove far less.
+# ⚠ THE WITNESS IS THE SENTINEL STRING ITSELF, which appears exactly once in the
+#   driver: the surrounding `if`/`fi` and the comment above it survive, so
+#   "something changed" cannot stand in for "the sentinel is gone".
+if mutate "H4b make a SILENT crash unsignable again" "$WORK/m4b.sh" \
+    '<SILENT: the fixture produced no diagnostic, no test result and no test name>' '
+    /<SILENT: the fixture produced no diagnostic/ { print "    return 0"; next }
+    { print }'; then
+  red "H4b a fixture that dies SILENTLY is still diagnosed" pin_precondition "$WORK/m4b.sh"
 fi
 
 # H5 — the target-OS cross-check in leg_loader_path_var: make it always answer the
@@ -1302,6 +1561,46 @@ if mutate "H16 resolve no launcher for the reference" "$WORK/m16.sh" 'launcher_a
       print "    _lrc=0; LAUNCHER_FOR_ARGV=\"\"; LAUNCHER_FOR_WHY=\"\""; next }
     { print }'; then
   red "H16 the reference launcher comes from the catalogue" pin_smoke_argv "$WORK/m16.sh"
+fi
+
+# H17 — remove the CONFOUND GATING REFUSAL. The plan is already fail-SAFE without
+# it (every conditional row was dropped), so nothing is excused on evidence nobody
+# gathered — which is exactly why this guard is easy to lose and why losing it is
+# not silent in the right direction: a corpus run on an unprobed plan reports a
+# broken host clock as a compiler regression. The pin must notice.
+if mutate "H17 remove the confound gating refusal" "$WORK/m17.sh" "LEG_CONFOUND_GATING[\$leg]:-}\" == 'probed'" '
+    /== .probed. \]\] \|\| die/ { skip = 1 }
+    skip && /A-RUN-MODE-NOT-A-HOST\]"$/ { skip = 0; next }
+    !skip { print }'; then
+  red "H17 an UNPROBED plan is REFUSED, never served ungated" pin_confound_supply "$WORK/m17.sh"
+fi
+
+# H18 — remove the EMPTY-REPORT REFUSAL. Without it a driver whose report never
+# arrived prints nothing and carries on, which on a log reads exactly like a leg
+# with nothing to excuse. That equivalence is the whole defect this gate exists to
+# end one level up (`earnedOn` is prose nothing reads), so an unexplained exclusion
+# must not be reachable.
+if mutate "H18 remove the empty-report refusal" "$WORK/m18.sh" 'EMPTY confound report' '
+    /^  if \[\[ -z "\$\{_report\/\/\[\[:space:\]\]\/\}" \]\]; then$/ { skip = 1 }
+    skip && /^  fi$/ { skip = 0; next }
+    !skip { print }'; then
+  red "H18 an EMPTY confound report is REFUSED, never printed as silence" pin_confound_report "$WORK/m18.sh"
+fi
+
+# H19 — RE-FUSE THE CALL SITE. [D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL.]
+# This is the defect itself, restored: the supply called from inside a COMMAND
+# SUBSTITUTION in a non-assignment command, where `die`'s `exit 1` kills only the
+# subshell and `set -Eeuo pipefail` does not propagate the failure. The refusal
+# still PRINTS, and every earlier pin in this file still passes, because they
+# capture the substitution's rc directly — a shape production never had. Only the
+# I2 pin, which drives the real call site in a child shell, can see it.
+if mutate "H19 re-fuse the supply call into the eval" "$WORK/m19.sh" \
+    'CONFOUND_SUPPLY="$(leg_confound_patterns "$leg")"' '
+    /^  CONFOUND_SUPPLY="\$\(leg_confound_patterns "\$leg"\)"$/ { next }
+    /^  eval "CONFOUND_PATTERNS=\(\$CONFOUND_SUPPLY\)"$/ {
+        print "  eval \"CONFOUND_PATTERNS=($(leg_confound_patterns \"$leg\"))\""; next }
+    { print }'; then
+  red "H19 the supply's refusal STOPS THE DRIVER" pin_confound_supply_stops_the_driver "$WORK/m19.sh"
 fi
 
 printf '\n'

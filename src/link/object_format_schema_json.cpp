@@ -137,7 +137,21 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // (`elf` / `pe` / `optionalHeader` / `macho` / `image`) LEFT this array —
     // they are now contributed by the backends that own them, so 29 - 5 = 24.
     // See the note under the array.
-    static constexpr std::array<std::string_view, 24> kFormatDocumentKeys{
+    // RE-DERIVED a fifth time in UCRT-P4: three new root keys —
+    // `runtimeLibraries` (the ROLE → IMAGE table that becomes the single owner
+    // of "which image plays which runtime role"), `sehPersonality` (the
+    // unwinder-personality declaration that deletes two platform literals from
+    // `src/mir/merge/synth_seh_funclets.cpp`), and `entryVerbs` (the set of
+    // program-entry materialization verbs this format realizes) — so 24 + 3 = 27.
+    // ★ THE ORDERING IS LOAD-BEARING AND IT IS ASYMMETRIC (MEASURED, both
+    // directions): a key present in a `.format.json` but absent HERE makes that
+    // format REFUSED AT LOAD, reddening every test and example on it; a key
+    // present here that no file declares leaves LOAD untouched. So the
+    // vocabulary row always lands BEFORE the descriptors that declare it, and
+    // never after. `DSS_CHECK_KEY_VOCABULARY` below is a static_assert on
+    // size-equals-initializer-count plus uniqueness, so the `27` is ENFORCED at
+    // compile time rather than maintained by discipline.
+    static constexpr std::array<std::string_view, 27> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -155,9 +169,21 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         "container", "artifactProfiles",
         // program-entry cluster
         "entryPoint", "entryCallingConvention", "processExit", "processArgs",
+        // the set of program-entry materialization VERBS this format realizes
+        // (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE — a typo here means a verb the format
+        // really does realize drops out of the intersection, so every entry that
+        // needs it becomes unresolvable, and the reverse). ★ THE RETIRED
+        // `entryShapes` SPELLING IS DELIBERATELY ABSENT: this vocabulary is
+        // strict, so a stale file carrying the old key is REFUSED AT LOAD rather
+        // than loading with an empty verb set.
+        "entryVerbs",
         // import / link contract
         "externCallDispatch", "dataImportBinding", "externAddrBinding",
         "tlsAccess", "librarySynthesis",
+        // ROLE → IMAGE table + the roles that name it. A typo in either is a
+        // wrong-IMAGE bind, i.e. the eager-import 0xC0000139 class on pe and an
+        // undefined symbol elsewhere — never a silent fallback.
+        "runtimeLibraries", "sehPersonality",
         // stack-reserve capability + its remedy axis
         "stackReserveControl", "stackReserveUnsupportedReason",
         // section / relocation description
@@ -728,20 +754,27 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     }
 
     // D-LK-EXTERN-DATA-IMPORT: `dataImportBinding` — the format's
-    // extern-DATA import binding model ("copy-relocation"). Optional in
-    // the JSON (a format whose data-import model has not landed — PE /
-    // Mach-O / every relocatable flavor — omits it; the linker's pre-
-    // walker gate then fails loud on any surviving data import instead
-    // of binding a data symbol through the function-import machinery).
+    // extern-DATA import binding model ("got-indirect"). Optional in
+    // the JSON (a format whose data-import model has not landed — every
+    // relocatable flavor — omits it; the linker's pre-walker gate then
+    // fails loud on any surviving data import instead of binding a data
+    // symbol through the function-import machinery).
     // Present-but-unknown IS a fail-loud HERE at load (a typo must NOT
     // silently degrade to "no data imports supported" — the
-    // externCallDispatch discipline).
+    // externCallDispatch discipline). ★ That closed-enum reject is now
+    // ALSO what keeps `"copy-relocation"` from coming back: the value
+    // was DELETED from `DataImportBinding`
+    // (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET — it split
+    // an aliased libc object silently), so a format file spelling it
+    // is REFUSED AT LOAD naming the file, exactly as any other unknown
+    // value is. Leaving the value accepted-but-unused would have left a
+    // future format one JSON edit away from the whole defect class.
     if (doc.contains("dataImportBinding")) {
         if (!doc.at("dataImportBinding").is_string()) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       "/dataImportBinding",
                       "'dataImportBinding' must be a string "
-                      "(\"copy-relocation\")");
+                      "(\"got-indirect\")");
         } else {
             auto const s =
                 doc.at("dataImportBinding").get<std::string>();
@@ -750,9 +783,15 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 coll.emit(DiagnosticCode::C_MalformedJson,
                           "/dataImportBinding",
                           std::format("unknown dataImportBinding '{}' "
-                                      "— accepted: \"copy-relocation\" "
-                                      "(ELF ET_EXEC R_*_COPY exec-local "
-                                      ".bss copy)",
+                                      "— accepted: \"got-indirect\" "
+                                      "(a loader-bound pointer slot "
+                                      "holding the library object's "
+                                      "ADDRESS: ELF .got + R_*_GLOB_DAT, "
+                                      "Mach-O __got, PE IAT). "
+                                      "\"copy-relocation\" was REMOVED: "
+                                      "it claimed one name of an alias "
+                                      "set and split the object. See "
+                                      "D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET.",
                                       s));
             } else {
                 data.dataImportBinding = *b;
@@ -915,6 +954,246 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // ── UCRT-P4: `runtimeLibraries` — the ROLE → IMAGE table ─────────────
+    //
+    // Parsed FIRST among the role-consuming blocks (`processExit`,
+    // `processArgs`, `sehPersonality`, `librarySynthesis` all resolve against
+    // it), so `resolveRuntimeRole` below is available to every one of them.
+    // Each row is `{"role": <closed enum>, "image": <non-empty string>}`; roles
+    // are unique cross-row. An unknown role spelling, the `none` sentinel, a
+    // missing/empty image, or a duplicate role all REFUSE the document — the
+    // whole point of the table is that a wrong image binds to a symbol that
+    // either does not exist (a pe LOAD failure at 0xC0000139) or is a DIFFERENT
+    // function, and neither is detectable downstream.
+    if (doc.contains("runtimeLibraries")) {
+        if (!doc.at("runtimeLibraries").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/runtimeLibraries",
+                      "'runtimeLibraries' must be an ARRAY of "
+                      "{ \"role\": ..., \"image\": ... } rows — the role "
+                      "vocabulary is closed ('cLibrary', "
+                      "'unwindPersonality', 'systemPrimitives')");
+        } else {
+            auto const& arr = doc.at("runtimeLibraries");
+            std::size_t i = 0;
+            for (auto const& row : arr) {
+                auto const path = std::format("/runtimeLibraries/{}", i);
+                ++i;
+                if (!row.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "each runtimeLibraries entry must be an object "
+                              "{ \"role\": ..., \"image\": ... }");
+                    continue;
+                }
+                if (!row.contains("role") || !row.at("role").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path + "/role",
+                              "missing or non-string 'role'");
+                    continue;
+                }
+                auto const roleText = row.at("role").get<std::string>();
+                auto const role = runtimeLibraryRoleFromName(roleText);
+                if (!role.has_value() || *role == RuntimeLibraryRole::None) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path + "/role",
+                              std::format(
+                                  "unknown runtimeLibraries role '{}' — "
+                                  "accepted: \"cLibrary\", "
+                                  "\"unwindPersonality\", "
+                                  "\"systemPrimitives\"", roleText));
+                    continue;
+                }
+                if (!row.contains("image") || !row.at("image").is_string()
+                 || row.at("image").get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path + "/image",
+                              "requires a non-empty 'image' (the DLL / "
+                              "shared-object / dylib identity that plays this "
+                              "role)");
+                    continue;
+                }
+                if (data.runtimeLibraries.imageForRole(*role).has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path + "/role",
+                              std::format(
+                                  "duplicate runtimeLibraries role '{}' — one "
+                                  "role names exactly one image; two rows "
+                                  "would make the resolution order the answer",
+                                  roleText));
+                    continue;
+                }
+                data.runtimeLibraries.bindings.push_back(
+                    RuntimeLibraryBinding{*role,
+                                          row.at("image").get<std::string>()});
+            }
+        }
+    }
+
+    // Resolve a block's declared `role` against the table above. Fails LOUD
+    // (and returns false) on a missing/non-string/unknown role AND on a role
+    // the table does not declare. The `at` path is the BLOCK's own JSON path so
+    // the diagnostic points at the naming site, not at the table.
+    //
+    // ★ THE SECOND FAILURE MODE IS THE INTERESTING ONE and it is why this is a
+    // shared helper rather than four copies: a block that names a role the
+    // format never declared must NOT resolve to "some image". Before this
+    // table, the equivalent fact was a literal spelled per consumer, and
+    // `src/mir/merge/synth_seh_funclets.cpp` proved what that costs — an
+    // `msvcrt.dll` string in shared MIR substrate that no format could
+    // override and no test could see.
+    auto resolveRuntimeRole =
+        [&](nlohmann::json const& block, std::string const& blockPath,
+            std::string& outImage) -> bool {
+            std::string const rolePath = blockPath + "/role";
+            if (!block.contains("role") || !block.at("role").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField, rolePath,
+                          "requires a non-empty string 'role' naming a row of "
+                          "this format's top-level 'runtimeLibraries' table "
+                          "(\"cLibrary\" / \"unwindPersonality\" / "
+                          "\"systemPrimitives\") — a literal image path here "
+                          "would be a second owner of a fact the role table "
+                          "owns");
+                return false;
+            }
+            auto const roleText = block.at("role").get<std::string>();
+            auto const role = runtimeLibraryRoleFromName(roleText);
+            if (!role.has_value() || *role == RuntimeLibraryRole::None) {
+                coll.emit(DiagnosticCode::C_MalformedJson, rolePath,
+                          std::format("unknown runtime-library role '{}' — "
+                                      "accepted: \"cLibrary\", "
+                                      "\"unwindPersonality\", "
+                                      "\"systemPrimitives\"", roleText));
+                return false;
+            }
+            auto const image = data.runtimeLibraries.imageForRole(*role);
+            if (!image.has_value()) {
+                std::string declared;
+                for (auto const& b : data.runtimeLibraries.bindings) {
+                    if (!declared.empty()) declared += ", ";
+                    declared += runtimeLibraryRoleName(b.role);
+                    declared += " -> ";
+                    declared += b.image;
+                }
+                if (declared.empty()) declared = "<none>";
+                coll.emit(DiagnosticCode::C_MissingField, rolePath,
+                          std::format(
+                              "names runtime-library role '{}', but this "
+                              "format's 'runtimeLibraries' table does not "
+                              "declare it (declared: {}). Add the row — a "
+                              "role that resolves to nothing would leave this "
+                              "block's import bound to no image.",
+                              roleText, declared));
+                return false;
+            }
+            outImage = std::string{*image};
+            return true;
+        };
+
+    // ── UCRT-P4: `sehPersonality` — the unwinder-personality declaration ──
+    //
+    // `{"role": <runtimeLibraries role>, "mangledName": <non-empty>}`. Both
+    // halves REQUIRED when the block is present: a personality with no name has
+    // no handler to point unwind info at, and one with no role has no image to
+    // import it from. OPTIONAL as a block — a format that declares none FAILS
+    // LOUD only when a guarded region actually resolves, which is what an
+    // ELF/Mach-O build carrying `__try` should get instead of an msvcrt import.
+    if (doc.contains("sehPersonality")) {
+        if (!doc.at("sehPersonality").is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/sehPersonality",
+                      "'sehPersonality' must be an object { \"role\": ..., "
+                      "\"mangledName\": ... }");
+        } else {
+            auto const& sp = doc.at("sehPersonality");
+            SehPersonality out;
+            bool ok = resolveRuntimeRole(sp, "/sehPersonality",
+                                         out.libraryPath);
+            if (ok) {
+                out.role = *runtimeLibraryRoleFromName(
+                    sp.at("role").get<std::string>());
+            }
+            if (!sp.contains("mangledName")
+             || !sp.at("mangledName").is_string()
+             || sp.at("mangledName").get<std::string>().empty()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/sehPersonality/mangledName",
+                          "requires a non-empty 'mangledName' — the routine an "
+                          "emitted unwind record names as its handler "
+                          "(pe: \"__C_specific_handler\")");
+                ok = false;
+            } else {
+                out.mangledName = sp.at("mangledName").get<std::string>();
+            }
+            if (ok) data.sehPersonality = std::move(out);
+        }
+    }
+
+    // ── UCRT-P4: `entryVerbs` — the REALIZED materialization-verb set ────
+    //
+    // An ARRAY of closed-vocabulary verb names: `["none", "argc-argv"]`.
+    //
+    // ★★★ THIS KEY USED TO BE `entryShapes`, AN ARRAY OF FULL
+    // `{returns, params, materialization}` ROWS, and shrinking it to verbs is the
+    // point rather than a simplification. The accepted entry SIGNATURES are a
+    // SOURCE-LANGUAGE fact — `int wmain(int, wchar_t**)` is C's spelling, not the
+    // loader's — so they now live in their one owner, the language's
+    // `DeclarationRule::entryFunctions` mapping, which also carries each
+    // signature's verb. What a FORMAT alone can answer is what it can actually
+    // hand an entry, and that is exactly this set. Candidate selection
+    // INTERSECTS the two, which is why `argc-wargv` appearing here only on
+    // pe64-x86_64-windows-exec is the whole mechanism by which `wmain` is a
+    // program entry on Windows and nowhere else.
+    //
+    // ⚠ THE OLD KEY IS REJECTED BY NAME (see the strict top-level key
+    // vocabulary): a format file still carrying `entryShapes` fails loud instead
+    // of loading with an EMPTY verb set — which would silently make every program
+    // entry-less on that format, or, on a non-exec format, silently pass the
+    // exec-flavor pairing rule. A retired owner must never be merely ignored.
+    //
+    // Duplicate verbs are refused rather than deduped silently: a set with a
+    // repeated member is an authoring mistake, and this loader has no reason to
+    // guess which of two identical declarations was meant.
+    if (doc.contains("entryVerbs")) {
+        if (!doc.at("entryVerbs").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/entryVerbs",
+                      "'entryVerbs' must be an ARRAY of materialization verb "
+                      "names (accepted: \"none\", \"argc-argv\", \"argc-wargv\")");
+        } else {
+            auto const& arr = doc.at("entryVerbs");
+            std::size_t i = 0;
+            for (auto const& row : arr) {
+                auto const path = std::format("/entryVerbs/{}", i);
+                ++i;
+                if (!row.is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "each entryVerbs entry must be a verb NAME string "
+                              "(accepted: \"none\", \"argc-argv\", "
+                              "\"argc-wargv\"). Full { returns, params, ... } "
+                              "rows belong to the source language's "
+                              "`entryFunctions` mapping, which is the single "
+                              "owner of an entry SIGNATURE.");
+                    continue;
+                }
+                auto const spelling = row.get<std::string>();
+                auto const v = entryMaterializationFromName(spelling);
+                if (!v.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "unknown entry materialization verb '{}' — "
+                                  "accepted: \"none\", \"argc-argv\", "
+                                  "\"argc-wargv\"", spelling));
+                    continue;
+                }
+                bool dupe = false;
+                for (auto const prior : data.entryVerbs) {
+                    if (prior != *v) continue;
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "duplicate entry verb '{}' — this is a SET, and "
+                                  "a repeated member is an authoring mistake this "
+                                  "loader will not silently absorb.", spelling));
+                    dupe = true;
+                    break;
+                }
+                if (!dupe) data.entryVerbs.push_back(*v);
+            }
+        }
+    }
+
     // D-CSUBSET-C11-THREADS-MACHO: `librarySynthesis` block — the format's
     // compiler-synthesized-shim vehicle (the kernel32 vs pthread primitive
     // family a synthesized shipped-library shim, today C11 <threads.h>,
@@ -957,24 +1236,20 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     info.vehicle = *v;
                 }
             }
-            if (!ls.contains("libraryPath")
-                || !ls.at("libraryPath").is_string()) {
-                coll.emit(DiagnosticCode::C_MissingField,
-                          "/librarySynthesis/libraryPath",
-                          "'librarySynthesis.libraryPath' is required and must "
-                          "be a string (the native library the synthesized "
-                          "shim's helpers import from — e.g. \"kernel32.dll\" "
-                          "or \"/usr/lib/libSystem.B.dylib\")");
+            // UCRT-P4: the native library the synthesized shim's helpers import
+            // from is named by ROLE, not spelled as a path here. On pe that role
+            // is `systemPrimitives` (kernel32.dll — OS primitives, NOT the C
+            // library); on Mach-O the same image serves both roles, so the
+            // format points `cLibrary` at it and names that. THAT ASYMMETRY IS
+            // THE ARGUMENT FOR A ROLE TABLE: a single per-format CRT string
+            // could not express "the synth vehicle's image is the C library
+            // here and is not the C library there".
+            if (!resolveRuntimeRole(ls, "/librarySynthesis",
+                                    info.libraryPath)) {
                 ok = false;
             } else {
-                info.libraryPath = ls.at("libraryPath").get<std::string>();
-                if (info.libraryPath.empty()) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              "/librarySynthesis/libraryPath",
-                              "'librarySynthesis.libraryPath' must be "
-                              "non-empty");
-                    ok = false;
-                }
+                info.role = *runtimeLibraryRoleFromName(
+                    ls.at("role").get<std::string>());
             }
             if (ok) data.librarySynthesis = info;
         }
@@ -1311,9 +1586,16 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             }
                         }
                     } else {  // ByNameImport
-                        if (!requireNonEmptyString("importLibraryPath",
-                                                    out.importLibraryPath)) {
+                        // UCRT-P4: the image comes from the ROLE table, never a
+                        // path spelled here. `role` is recorded alongside the
+                        // resolved path so `validate()` can re-check the pair —
+                        // the loader is not the only tier that enforces it.
+                        if (!resolveRuntimeRole(pe, "/processExit",
+                                                out.importLibraryPath)) {
                             armOk = false;
+                        } else {
+                            out.role = *runtimeLibraryRoleFromName(
+                                pe.at("role").get<std::string>());
                         }
                         if (!requireNonEmptyString("importMangledName",
                                                     out.importMangledName)) {
@@ -1362,7 +1644,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                               std::format("unknown processArgs.mechanism"
                                           " '{}' — accepted: "
                                           "\"stack-vector\", "
-                                          "\"crt-out-param\"", mechName));
+                                          "\"crt-argv-accessors\"", mechName));
                     armOk = false;
                 } else if (*m == ArgsMechanism::StackVector) {
                     out.mechanism = *m;
@@ -1408,11 +1690,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                         armOk = false;
                     }
                 } else {
-                    // CrtOutParam arm (c111): three non-empty string fields —
-                    // the wide + narrow msvcrt arg-fetch export names and the
-                    // import library they resolve from. The synthesizer picks
-                    // wide vs narrow by the resolved entry's signature.
                     out.mechanism = *m;
+                    // Shared by both CRT arms: a per-field non-empty-string
+                    // requirement whose diagnostic names the ARM, so a config
+                    // author who mixed two arms' field sets is told which one
+                    // they are in.
                     auto requireStr =
                         [&](char const* field, std::string& dst) -> bool {
                             std::string const path =
@@ -1423,20 +1705,133 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                 coll.emit(DiagnosticCode::C_MalformedJson,
                                           path,
                                           std::format(
-                                              "crt-out-param arm requires a "
-                                              "non-empty string '{}'", field));
+                                              "{} arm requires a non-empty "
+                                              "string '{}'",
+                                              argsMechanismName(*m), field));
                                 return false;
                             }
                             dst = pa.at(field).get<std::string>();
                             return true;
                         };
-                    if (!requireStr("crtWideArgvFn", out.crtWideArgvFn)) {
-                        armOk = false;
-                    }
-                    if (!requireStr("crtNarrowArgvFn", out.crtNarrowArgvFn)) {
-                        armOk = false;
-                    }
-                    if (!requireStr("crtLibraryPath", out.crtLibraryPath)) {
+                    if (*m == ArgsMechanism::CrtArgvAccessors) {
+                        // CrtArgvAccessors arm (UCRT-P4): the UCRT populate
+                        // call + the three address-returning accessors, plus
+                        // the two integers. The library comes from the ROLE
+                        // table, never a path here.
+                        if (!resolveRuntimeRole(pa, "/processArgs",
+                                                out.crtLibraryPath)) {
+                            armOk = false;
+                        } else {
+                            out.role = *runtimeLibraryRoleFromName(
+                                pa.at("role").get<std::string>());
+                        }
+                        if (!requireStr("configureNarrowArgvFn",
+                                        out.configureNarrowArgvFn)) {
+                            armOk = false;
+                        }
+                        if (!requireStr("configureWideArgvFn",
+                                        out.configureWideArgvFn)) {
+                            armOk = false;
+                        }
+                        if (!requireStr("argcAccessorFn",
+                                        out.argcAccessorFn)) {
+                            armOk = false;
+                        }
+                        if (!requireStr("narrowArgvAccessorFn",
+                                        out.narrowArgvAccessorFn)) {
+                            armOk = false;
+                        }
+                        if (!requireStr("wideArgvAccessorFn",
+                                        out.wideArgvAccessorFn)) {
+                            armOk = false;
+                        }
+                        // `argvMode` — CONSTRAINED to a declared member of the
+                        // `_crt_argv_mode` enum (0..2). ★ MEASURED 2026-08-10:
+                        // mode 7 does NOT return an error — the process dies at
+                        // 0xC0000409 printing nothing. So the only tier that can
+                        // catch a fat-fingered mode is THIS one, and it must
+                        // refuse rather than clamp.
+                        if (!pa.contains("argvMode")
+                         || !pa.at("argvMode").is_number_unsigned()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      "/processArgs/argvMode",
+                                      "crt-argv-accessors arm requires "
+                                      "'argvMode' (the `_crt_argv_mode` value "
+                                      "handed to the configure call: 0 = no "
+                                      "argv, 1 = argv unexpanded, 2 = argv with "
+                                      "wildcard expansion)");
+                            armOk = false;
+                        } else {
+                            auto const v =
+                                pa.at("argvMode").get<std::uint64_t>();
+                            if (v > 2u) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          "/processArgs/argvMode",
+                                          std::format(
+                                              "'argvMode' = {} is outside the "
+                                              "declared `_crt_argv_mode` enum "
+                                              "(0..2). MEASURED: a value "
+                                              "outside the enum does not return "
+                                              "an error — the process dies at "
+                                              "0xC0000409 printing nothing, so "
+                                              "load time is the only tier that "
+                                              "can refuse it.", v));
+                                armOk = false;
+                            } else {
+                                out.argvMode =
+                                    static_cast<std::uint32_t>(v);
+                            }
+                        }
+                        // `argvUnavailableExitStatus` — REQUIRED and must be
+                        // NON-ZERO. Zero is the C success status, so a zero here
+                        // would make the "argv came back NULL" path
+                        // indistinguishable from a program that ran and
+                        // succeeded — a guard that reports nothing.
+                        if (!pa.contains("argvUnavailableExitStatus")
+                         || !pa.at("argvUnavailableExitStatus")
+                                 .is_number_integer()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      "/processArgs/argvUnavailableExitStatus",
+                                      "crt-argv-accessors arm requires "
+                                      "'argvUnavailableExitStatus' (the status "
+                                      "the synthesized init RETURNS when the "
+                                      "CRT populate call produced no argv — the "
+                                      "errno_t the configure call returns "
+                                      "CANNOT distinguish that case, MEASURED)");
+                            armOk = false;
+                        } else {
+                            auto const v = pa.at("argvUnavailableExitStatus")
+                                               .get<std::int64_t>();
+                            if (v == 0 || v < -2147483648LL
+                             || v > 2147483647LL) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          "/processArgs/"
+                                          "argvUnavailableExitStatus",
+                                          std::format(
+                                              "'argvUnavailableExitStatus' = {} "
+                                              "must be a NON-ZERO i32 — zero is "
+                                              "C's success status, so a zero "
+                                              "here makes the no-argv failure "
+                                              "indistinguishable from a "
+                                              "successful run", v));
+                                armOk = false;
+                            } else {
+                                out.argvUnavailableExitStatus =
+                                    static_cast<std::int32_t>(v);
+                            }
+                        }
+                    } else {
+                        // Closed-enum discipline: a new ArgsMechanism member
+                        // must add its own field-set arm HERE. Falling through
+                        // would accept the block and leave every field empty.
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/processArgs/mechanism",
+                                  std::format(
+                                      "processArgs.mechanism '{}' is a declared "
+                                      "vocabulary member but this loader has no "
+                                      "field-set arm for it — the block would "
+                                      "load with every field EMPTY",
+                                      argsMechanismName(*m)));
                         armOk = false;
                     }
                 }
@@ -1444,6 +1839,59 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             if (armOk) {
                 data.processArgs = out;
             }
+        }
+    }
+
+    // ── UCRT-P4: NO `runtimeLibraries` ROW MAY SIT UNNAMED ────────────────
+    //
+    // The reverse half of the role-table biconditional. `ObjectFormatData::
+    // validate()` enforces that every block's role RESOLVES and matches; this
+    // enforces that every declared row is actually NAMED by some block.
+    //
+    // ★ IT LIVES HERE, NOT IN validate(), FOR A MEASURED REASON. validate() sees
+    // only blocks that LOADED, so a block rejected for an unrelated defect loses
+    // its role claim and makes the row it named look inert — a second, misleading
+    // diagnostic stacked on the real one (MEASURED: `LK10EntrySliceB.ByName-
+    // ImportArmMissingMangledNameRejected` gained exactly that). Reading the
+    // `role` keys straight out of the JSON captures the DECLARED intent whether or
+    // not the block validated, so this answer cannot cascade.
+    //
+    // WHY REJECT AT ALL, rather than shrug at a spare row: an unnamed row is
+    // exactly how a stale image survives a CRT migration unnoticed — nothing reads
+    // it, so nothing contradicts it, and the mechanical "no pe table names
+    // msvcrt.dll" exit criterion would be checking a value with no consumer. This
+    // file already rejects inert config by name (see the `charSignedness` note at
+    // the top); this is the same rule for the same reason.
+    if (!data.runtimeLibraries.empty()) {
+        // Which roles does ANY block name? Gathered from the document, generically
+        // — the list of role-NAMING block keys is the only thing enumerated, and it
+        // is the same four the parsers above read.
+        std::vector<RuntimeLibraryRole> named;
+        for (char const* blockKey : {"processExit", "processArgs",
+                                     "sehPersonality", "librarySynthesis"}) {
+            if (!doc.contains(blockKey) || !doc.at(blockKey).is_object()) continue;
+            auto const& blk = doc.at(blockKey);
+            if (!blk.contains("role") || !blk.at("role").is_string()) continue;
+            if (auto const r =
+                    runtimeLibraryRoleFromName(blk.at("role").get<std::string>())) {
+                named.push_back(*r);
+            }
+        }
+        for (auto const& b : data.runtimeLibraries.bindings) {
+            if (std::find(named.begin(), named.end(), b.role) != named.end()) {
+                continue;
+            }
+            coll.emit(DiagnosticCode::C_MalformedJson, "/runtimeLibraries",
+                      std::format(
+                          "declares runtime-library role '{}' -> '{}' that NO "
+                          "block in this format names — inert config. A role-table "
+                          "row is only meaningful because some spine block "
+                          "resolves against it; an unnamed row is how a stale "
+                          "image survives a CRT migration unnoticed, with nothing "
+                          "reading it and therefore nothing contradicting it. "
+                          "Remove the row, or name it from the block that needs "
+                          "it. (D-FFI-PE-CRT-UCRT-MIGRATION.)",
+                          runtimeLibraryRoleName(b.role), b.image));
         }
     }
 

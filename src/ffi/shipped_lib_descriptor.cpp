@@ -22,6 +22,7 @@
 #include <fstream>
 #include <functional>    // std::function (forEachDescriptorInClosure callbacks)
 #include <initializer_list>
+#include <mutex>         // std::mutex/lock_guard (the corpus-index memo)
 #include <optional>
 #include <span>
 #include <filesystem>
@@ -738,8 +739,11 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                                     std::unordered_map<std::string, std::string>& out) {
     if (!node.is_object()) {
         emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+            // The example names the MODERN pe C runtime deliberately: this text is
+            // what an author copies, and `msvcrt.dll` is the legacy CRT the UCRT
+            // migration moved off (only `setjmp.json` still names it, on purpose).
             + "' must be a per-object-format object, e.g. "
-              "{\"pe\":\"msvcrt.dll\",\"elf\":\"libc.so.6\"}");
+              "{\"pe\":\"ucrtbase.dll\",\"elf\":\"libc.so.6\"}");
         return false;
     }
     for (auto const& kv : node.items()) {
@@ -769,6 +773,173 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         out.emplace(kv.key(), kv.value().get<std::string>());
     }
     return true;
+}
+
+// True iff `text` contains `name` as a whole PREPROCESSING TOKEN — i.e. not as a
+// substring of a longer identifier. `acos` occurs inside `acosf` and inside
+// `_Generic`; only a match with a non-identifier character (or nothing) on both
+// sides is the shadowed name being CALLED. Identifier characters are C's:
+// [A-Za-z0-9_]. Content-blind — no name is special-cased.
+[[nodiscard]] bool referencesIdentifierToken(std::string_view text,
+                                             std::string_view name) {
+    if (name.empty()) return false;
+    auto isIdent = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '_';
+    };
+    for (std::size_t at = text.find(name); at != std::string_view::npos;
+         at = text.find(name, at + 1)) {
+        bool const leftOk  = at == 0 || !isIdent(text[at - 1]);
+        std::size_t const end = at + name.size();
+        bool const rightOk = end >= text.size() || !isIdent(text[end]);
+        if (leftOk && rightOk) return true;
+    }
+    return false;
+}
+
+// ── A MACRO THAT SHADOWS A SYMBOL WITHOUT REFERENCING IT IS A DEFECT ─────────
+//
+// MEASURED behaviour before this guard: such a descriptor compiled rc=0, emitted no
+// diagnostic, the macro silently SHADOWED the symbol at preprocess time, and the
+// symbol was STILL eagerly imported (D-FFI-DESCRIPTOR-EAGER-IMPORT) — a wasted
+// import of a name nothing could ever call. Loud at LOAD is the only place this can
+// be caught: by the time a TU is compiled the macro has already won.
+//
+// ★★ "SAME NAME + OVERLAPPING FORMAT = ERROR" IS A FALSE RULE. DO NOT SHIP IT.
+// It would red 17 in-tree rows that are STANDARD-MANDATED and BENIGN: C 7.25
+// <tgmath.h> defines `acos` (and 16 siblings) as a type-generic MACRO over the very
+// `acos` symbol <math.h> declares, and the replacement
+// `_Generic((x), float: acosf(...), default: acos((x)))` REFERENCES the shadowed
+// name — so by C 6.10.3.4p2 (a replacement list is not re-scanned for the macro
+// being replaced) the symbol IS the macro's own callee and the import is correct.
+//
+// ⇒ THE DISCRIMINATOR IS THE REFERENCE, NOT THE NAME. A defect is:
+//      formats overlap  AND  NO body of the macro references the shadowed name.
+// MEASURED clean tree-wide at the time this landed: 28 same-name macro/symbol
+// pairs, 17 overlapping-and-referencing (the tgmath family) and 11 that do NOT
+// reference but live on DISJOINT formats — pe `time`→`_time64` while the `time`
+// SYMBOL is gated ["elf","macho"], pe `setjmp`→`_setjmp`, `stdin`/`stdout`/`stderr`,
+// `atexit`, `strtoll`, `fstat`, … Those 11 are the DESIGN: the macro exists on the
+// format precisely BECAUSE the symbol is absent there. Zero defects; this guard is a
+// LOCK on a clean corpus, not a repair of a broken one.
+//
+// ⚠ NOTE THE DIVERGENCE FROM THE PREDEFINED-MACRO COLLISION SCAN
+// (`preprocessor.cpp`), which deliberately checks collisions BEFORE the format
+// filter because "two configs claim one NAME" is itself the fault there. That
+// reasoning does NOT transfer: here per-format divergence is the intended design,
+// and following that precedent literally would red the 11 rows above. Stated so the
+// inconsistency is not "tidied up" into a build break.
+//
+// ⚠ READS THE RAW JSON, NOT `out.macros`. `decodeShippedMacros` collapses per-format
+// `variants` down to the ONE matching the active format, and under a nullopt
+// activeFormat (unit tests, the LSP, and the corpus-wide decode test) it emits NONE
+// of them. A guard reading the decoded surface would therefore be blind to exactly
+// the per-format cases, and inert in the very test that sweeps all 51 descriptors.
+// The raw `doc` gives every body on every format regardless of the active target.
+//
+// ⚠ EVERY VARIANT BODY IS CHECKED, not the first or the active one: a macro whose pe
+// body references the name while its elf body does not is a REAL defect on elf, and
+// checking one body would hide it.
+//
+// AGNOSTIC: availability is compared through the shared `objectFormatInAvailabilitySet`
+// contract's own encoding (an EMPTY set means EVERY format), never against a
+// hardcoded {pe,elf,macho} universe — the vocabulary has five selectable kinds today
+// and this must not need editing when a sixth lands.
+void checkMacroSymbolShadowing(json const& doc, ShippedLibDescriptor const& out,
+                               std::string const& pathStr,
+                               DiagnosticReporter& reporter) {
+    auto const mIt = doc.find("macros");
+    if (mIt == doc.end() || !mIt->is_array() || out.symbols.empty()) return;
+
+    // "Do these two availability sets share a format?" EMPTY means EVERY format on
+    // both sides, so an empty set overlaps everything (including another empty one).
+    auto overlaps = [](std::vector<std::string> const& a,
+                       std::vector<std::string> const& b) {
+        if (a.empty() || b.empty()) return true;
+        for (auto const& f : a)
+            if (std::find(b.begin(), b.end(), f) != b.end()) return true;
+        return false;
+    };
+    // ONE macro entry decomposes into one BODY PER FORMAT ARM: a flat macro is a
+    // single unrestricted body, a `variants` macro is one body per variant (a
+    // variant whose `when` names no format is unrestricted). Checking per BODY
+    // rather than per ENTRY is what makes a MIXED macro — pe arm references the
+    // name, elf arm does not — a defect ON ELF instead of being excused by its pe
+    // sibling. An "any body references it" test would hide exactly that.
+    struct MacroBody {
+        std::vector<std::string> formats;   // EMPTY ⇒ every format
+        std::string              replacement;
+    };
+    auto bodiesOf = [](json const& m) {
+        std::vector<MacroBody> bodies;
+        auto const vIt = m.find("variants");
+        if (vIt == m.end() || !vIt->is_array()) {
+            auto const rIt = m.find("replacement");
+            bodies.push_back(MacroBody{{}, rIt != m.end() && rIt->is_string()
+                                               ? rIt->get<std::string>()
+                                               : std::string{}});
+            return bodies;
+        }
+        for (auto const& v : *vIt) {
+            if (!v.is_object()) continue;
+            MacroBody b;
+            auto const rIt = v.find("replacement");
+            if (rIt != v.end() && rIt->is_string())
+                b.replacement = rIt->get<std::string>();
+            auto const wIt = v.find("when");
+            if (wIt != v.end() && wIt->is_object()) {
+                auto const fIt = wIt->find("format");
+                if (fIt != wIt->end() && fIt->is_string())
+                    b.formats.push_back(fIt->get<std::string>());
+            }
+            bodies.push_back(std::move(b));
+        }
+        return bodies;
+    };
+
+    for (std::size_t mi = 0; mi < mIt->size(); ++mi) {
+        json const& m = mIt->at(mi);
+        if (!m.is_object()) continue;
+        auto const nIt = m.find("name");
+        if (nIt == m.end() || !nIt->is_string()) continue;   // shape: owned upstream
+        auto const name = nIt->get<std::string>();
+        bool reported = false;
+        for (auto const& body : bodiesOf(m)) {
+            // C 6.10.3.4p2 — a replacement list is not re-scanned for the macro
+            // being replaced, so a body that NAMES the symbol calls it.
+            if (referencesIdentifierToken(body.replacement, name)) continue;
+            for (auto const& sym : out.symbols) {
+                if (sym.name != name) continue;
+                // TIER 1 the symbol's own gate, TIER 2 the document's — the same
+                // two-level fallback the injector applies.
+                std::vector<std::string> const& symFormats =
+                    sym.availableObjectFormats.empty() ? out.availableObjectFormats
+                                                       : sym.availableObjectFormats;
+                if (!overlaps(body.formats, symFormats)) continue;  // by design
+                reported = true;
+                break;
+            }
+            if (reported) break;
+        }
+        if (reported) {
+            emitMalformed(reporter,
+                std::string{"shipped-lib descriptor '"} + pathStr + "' macros["
+                + std::to_string(mi) + "]: the macro '" + name
+                + "' SHADOWS this descriptor's symbol row of the same name on a "
+                  "format they SHARE, and its replacement does not reference '"
+                + name
+                + "' — so the macro wins at preprocess time, nothing can ever call "
+                  "the symbol, and the symbol is still eagerly imported (a dead "
+                  "import in every binary). Either reference the name in the "
+                  "replacement (the C 7.25 <tgmath.h> pattern, which is why a "
+                  "same-name macro is NOT itself an error), or restrict the two to "
+                  "DISJOINT 'availableObjectFormats' (the pe 'time'->'_time64' "
+                  "pattern, where the macro exists because the symbol does not)");
+            // COLLECT-ALL across macro entries (the house style for per-entry
+            // descriptor validation): a corpus with three such macros should name
+            // all three, not make the author re-run the build twice.
+        }
+    }
 }
 
 // Decode the optional `includes` array (the transitive sibling-header NAMES, plan
@@ -2215,6 +2386,14 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // macro selector).
     decodeShippedMacros(doc, path.generic_string(), reporter, out.macros, activeFormat);
 
+    // (7.5) A macro that SHADOWS one of this descriptor's own symbol rows on a
+    // format they share, WITHOUT referencing it, is a defect — see
+    // `checkMacroSymbolShadowing` for why "same name" alone is a false rule and why
+    // this reads the raw JSON instead of the decoded `out.macros`. Runs here, after
+    // both surfaces exist, and its diagnostics fail the read through the errBefore
+    // delta below (never a partial surface).
+    checkMacroSymbolShadowing(doc, out, path.generic_string(), reporter);
+
     // (8) A descriptor must declare SOMETHING — a file with no symbols, no
     // constants, no typedefs, AND no macros is a no-op artifact that should not
     // ship silently (mirrors the old non-empty-`symbols` rule, now spanning all
@@ -2422,66 +2601,72 @@ bool shippedHeaderAvailableForFormat(std::filesystem::path const& descriptorPath
     return objectFormatInAvailabilitySet(*avail, fmt);
 }
 
-std::optional<std::unordered_map<std::string, std::vector<std::string>>>
-collectShippedExternSymbolFormats() {
+namespace {
+
+// ── THE SHIPPED-CORPUS SYMBOL INDEX ──────────────────────────────────────────
+// ONE walk of the corpus, TWO public views: `collectShippedExternSymbolFormats`
+// (availability only, the `--resolve-library` oracle) and
+// `realizeShippedExternSymbols` (the full platform REALIZATION). They were two
+// walks; sharing the index is what makes "is X a known system symbol here" and
+// "how does the platform realize X here" structurally incapable of disagreeing.
+struct CorpusSymbolRow {
+    // The declaring descriptor, RELATIVE to the corpus root and in generic form
+    // — the sort key, so candidate order is identical on every host (a
+    // `recursive_directory_iterator` order is filesystem-dependent).
+    std::string relPath;
+    // The row's resolved availability: TIER 1 the symbol's own
+    // `availableObjectFormats`, else TIER 2 the document's, else unrestricted.
+    // EMPTY ⇒ available on EVERY format (the `objectFormatInAvailabilitySet`
+    // encoding, verbatim).
+    std::vector<std::string> formats;
+    bool                     isObject = false;   // `kind: "object"` (vs function)
+};
+
+struct CorpusIndex {
+    std::filesystem::path                                          root;
+    std::unordered_map<std::string, std::vector<CorpusSymbolRow>>  byName;
+};
+
+// Decode ONE `availableObjectFormats` array into `out`, generically: every entry
+// must name a real format in the `objectFormatKindFromName` vocabulary AND must
+// not be the `unknown` sentinel (which spells correctly but selects nothing). A
+// bad entry is SKIPPED rather than errored — this scan is lenient by contract
+// (the strict validation lives in the semantic read on the same descriptor), and
+// skipping can only WIDEN a row's set, never narrow it into a false fail-loud.
+// Returns false iff the key is absent / not an array, so the caller can apply the
+// next fallback tier.
+[[nodiscard]] bool scanAvailability(json const& obj,
+                                    std::vector<std::string>& out) {
+    auto const it = obj.find("availableObjectFormats");
+    if (it == obj.end() || !it->is_array()) return false;
+    for (auto const& v : *it) {
+        if (!v.is_string()) continue;
+        auto const name = v.get<std::string>();
+        auto const kind = objectFormatKindFromName(name);
+        if (!kind || !isSelectableObjectFormatKind(*kind)) continue;
+        out.push_back(name);
+    }
+    return true;
+}
+
+// Build the index by walking `root`. Names + availability only (no signature
+// decode, no interner) — a lightweight scan distinct from the full
+// `readShippedLibDescriptor`. Lenient per-file: an unreadable / malformed
+// descriptor is SKIPPED (its symbols are simply not "known"; the malformedness is
+// caught for real by the semantic reader on `#include` plus the corpus-wide
+// AllShippedDescriptorsDecode test).
+[[nodiscard]] CorpusIndex buildCorpusIndex(std::filesystem::path root) {
     namespace fs = std::filesystem;
-    // Locate src/dss-config/shippedLibs through the SHARED directory resolver
-    // (DSS_CONFIG_ROOT override first, then a cwd-walk up to 8 ancestors). This
-    // was a hand-rolled copy of that precedence; `findShippedConfigDir` is now
-    // the one implementation, so this site cannot drift from the file form the
-    // way `program.cpp::applySystemDirs` silently had. nullopt on no hit.
-    auto const rootOpt = findShippedConfigDir("shippedLibs");
-    if (!rootOpt) return std::nullopt;  // discovery failed -> caller falls through
-    fs::path const& root = *rootOpt;
-
-    // ── D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS ────────────────────
-    // name -> the UNION of the object-format names every declaring row makes it
-    // available on. EMPTY vector ⇒ available on EVERY format (the
-    // `objectFormatInAvailabilitySet` encoding, verbatim), so the union
-    // SATURATES: once any row is unrestricted the name is unrestricted and no
-    // later restricted row may narrow it back.
-    std::unordered_map<std::string, std::vector<std::string>> byName;
-    // Names whose union has saturated to "every format". Tracked explicitly
-    // because the saturated state and the "nothing accumulated yet" state share
-    // the same empty-vector spelling in the result map.
-    std::unordered_set<std::string> unrestricted;
-
-    // Decode ONE `availableObjectFormats` array into `out`, generically: every
-    // entry must name a real format in the `objectFormatKindFromName` vocabulary
-    // AND must not be the `unknown` sentinel (which spells correctly but selects
-    // nothing). A bad entry is SKIPPED here rather than errored -- this scan is
-    // lenient by contract (the strict validation lives in the semantic read on
-    // the same descriptor), and skipping can only WIDEN a row's set, never
-    // narrow it into a false fail-loud. Returns false iff the key is absent /
-    // not an array, so the caller can apply the next fallback tier.
-    auto decodeFormats = [](nlohmann::json const& obj,
-                            std::vector<std::string>& out) -> bool {
-        auto const it = obj.find("availableObjectFormats");
-        if (it == obj.end() || !it->is_array()) return false;
-        for (auto const& v : *it) {
-            if (!v.is_string()) continue;
-            auto const name = v.get<std::string>();
-            auto const kind = objectFormatKindFromName(name);
-            if (!kind || !isSelectableObjectFormatKind(*kind)) continue;
-            out.push_back(name);
-        }
-        return true;
-    };
-
+    CorpusIndex idx;
+    idx.root = std::move(root);
     std::error_code ec;
-    for (auto const& entry : fs::recursive_directory_iterator(root, ec)) {
+    for (auto const& entry : fs::recursive_directory_iterator(idx.root, ec)) {
         if (ec) break;
-        if (!entry.is_regular_file()
-            || entry.path().extension() != ".json") {
+        if (!entry.is_regular_file() || entry.path().extension() != ".json")
             continue;
-        }
         std::ifstream in(entry.path(), std::ios::binary);
         if (!in) continue;  // lenient: unreadable descriptor skipped
-        nlohmann::json j;
-        // Names + availability scan: no signature decode, no interner. A
-        // malformed descriptor is skipped (its symbols simply are not "known" --
-        // caught for real by the semantic reader on #include +
-        // AllShippedDescriptorsDecode).
+        json j;
         try {
             in >> j;
         } catch (...) {
@@ -2491,47 +2676,303 @@ collectShippedExternSymbolFormats() {
             || !j.at("symbols").is_array()) {
             continue;
         }
+        std::error_code relEc;
+        auto rel = fs::relative(entry.path(), idx.root, relEc);
+        std::string const relPath =
+            relEc ? entry.path().generic_string() : rel.generic_string();
         // DOCUMENT-level availability — the fallback a symbol row with no
         // `availableObjectFormats` key of its own inherits (mirrors the semantic
         // injector's two-level gate). `hasDoc == false` ⇒ the document itself is
         // unrestricted, so such a row is available on every format.
         std::vector<std::string> docFormats;
-        bool const hasDoc = decodeFormats(j, docFormats);
-
+        bool const hasDoc = scanAvailability(j, docFormats);
         for (auto const& sym : j.at("symbols")) {
             if (!sym.is_object() || !sym.contains("name")
                 || !sym.at("name").is_string()) {
                 continue;
             }
-            auto name = sym.at("name").get<std::string>();
-            if (unrestricted.count(name) != 0) continue;  // already saturated
-
-            // TIER 1 per-symbol gate, TIER 2 the document gate, else everywhere.
-            std::vector<std::string> rowFormats;
-            bool const rowRestricted =
-                decodeFormats(sym, rowFormats)
-                    ? true
-                    : (hasDoc ? (rowFormats = docFormats, true) : false);
-
-            if (!rowRestricted || rowFormats.empty()) {
-                // Unrestricted row (no gate at either tier) — or a gate that
-                // decoded to nothing usable, which the empty-set contract also
-                // reads as "every format". SATURATE: drop any accumulated
-                // restriction so a later restricted row cannot narrow it.
-                unrestricted.insert(name);
-                byName[std::move(name)].clear();
-                continue;
-            }
-            // UNION this row's formats into the name's accumulated set.
-            auto& acc = byName[std::move(name)];
-            for (auto& f : rowFormats) {
-                if (std::find(acc.begin(), acc.end(), f) == acc.end()) {
-                    acc.push_back(std::move(f));
-                }
-            }
+            CorpusSymbolRow row;
+            row.relPath = relPath;
+            // TIER 1 per-symbol gate, TIER 2 the document gate, else everywhere
+            // (an unrestricted row leaves `formats` EMPTY, which every consumer
+            // reads through `objectFormatInAvailabilitySet` as "every format").
+            if (!scanAvailability(sym, row.formats) && hasDoc)
+                row.formats = docFormats;
+            auto const kindIt = sym.find("kind");
+            row.isObject = kindIt != sym.end() && kindIt->is_string()
+                        && kindIt->get<std::string>() == "object";
+            idx.byName[sym.at("name").get<std::string>()]
+                .push_back(std::move(row));
         }
     }
+    // DETERMINISTIC candidate order, independent of directory-iteration order.
+    for (auto& [name, rows] : idx.byName) {
+        std::stable_sort(rows.begin(), rows.end(),
+                         [](CorpusSymbolRow const& a, CorpusSymbolRow const& b) {
+                             return a.relPath < b.relPath;
+                         });
+    }
+    return idx;
+}
+
+// The memoized index for the CURRENTLY-RESOLVED corpus root.
+//
+// ⚠ THE MEMO KEY IS THE RESOLVED CONFIG-DIR PATH, AND THAT IS LOAD-BEARING, NOT
+// tidiness. `DSS_CONFIG_ROOT` is mutated IN-PROCESS by tests (the config-path-walk
+// and system-dirs suites each re-point it at a scratch tree several times in one
+// process, one of them literally named `stale`), and the examples runner is
+// in-process too. A memo keyed on anything else — or a process-wide one-shot —
+// would answer the FIRST tree's corpus for every later invocation and make the
+// answers invocation-ORDER dependent (D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE).
+//
+// ⚠ A DISCOVERY FAILURE IS NEVER MEMOIZED. `findShippedConfigDir` returning
+// nullopt means "we could not locate the corpus RIGHT NOW" — a statement about the
+// environment, not about the corpus. Caching it as a positive ("there are no
+// shipped symbols") would poison every later lookup in the same process once one
+// invocation ran with the env unset.
+//
+// Realize ONE decoded symbol row of `desc` for the active format. The SINGLE
+// kernel both public entry points use, so a name's realization cannot differ
+// between "I asked about this name" and "I asked about its descriptor's surface".
+// Availability is tested with the ONE shared predicate — never an `if (format ==)`.
+[[nodiscard]] ShippedSymbolRealization
+realizeRow(ShippedLibDescriptor const& desc, ShippedSymbol const& sym,
+           ObjectFormatKind activeFormat, std::string const& formatKey,
+           bool docAvailableHere) {
+    ShippedSymbolRealization real;
+    if (!docAvailableHere
+        || !objectFormatInAvailabilitySet(sym.availableObjectFormats,
+                                         activeFormat)) {
+        real.status = ShippedRealizationStatus::UnavailableForFormat;
+        return real;
+    }
+    // Per-SYMBOL `library` override MERGED OVER the descriptor map (symbol keys
+    // win; an omitted format inherits) — the identical merge the semantic injector
+    // performs, so the two produce the same image for the same row.
+    real.library = desc.library;
+    for (auto const& [ovFmt, ovImage] : sym.library)
+        real.library.insert_or_assign(ovFmt, ovImage);
+    real.version    = sym.version;
+    real.recipeId   = sym.synthesize;
+    real.linkName   = sym.linkName;
+    real.signature  = sym.signature;
+    real.isFunction = sym.kind == ShippedSymbolKind::Function;
+    // ★ THE ENUMERATED NO-LIBRARY ARM. Available here, yet the row names no image
+    // FOR this format: the platform says the symbol exists but not where it lives,
+    // so there is nothing to bind. A synthesized shim needs no image at all, so a
+    // `synthesize` row is REALIZED regardless of the library map.
+    real.status = (real.recipeId.empty() && !real.library.contains(formatKey))
+                      ? ShippedRealizationStatus::NoLibraryForFormat
+                      : ShippedRealizationStatus::Realized;
+    return real;
+}
+
+// Returns nullptr iff discovery failed. The pointer stays valid for the process:
+// the map is node-based and entries are never erased, so an insertion for another
+// root cannot move an already-returned index, and the index is IMMUTABLE once
+// published (built to completion, then moved in under the lock).
+[[nodiscard]] CorpusIndex const* corpusIndex() {
+    auto const rootOpt = findShippedConfigDir("shippedLibs");
+    if (!rootOpt) return nullptr;   // discovery failed — NOT memoized
+    std::string key = rootOpt->generic_string();
+    static std::mutex                              mu;
+    static std::unordered_map<std::string, CorpusIndex> cache;
+    std::lock_guard<std::mutex> const lock{mu};
+    if (auto const it = cache.find(key); it != cache.end()) return &it->second;
+    CorpusIndex built = buildCorpusIndex(*rootOpt);
+    return &cache.emplace(std::move(key), std::move(built)).first->second;
+}
+
+} // namespace
+
+std::optional<std::unordered_map<std::string, std::vector<std::string>>>
+collectShippedExternSymbolFormats() {
+    // ── D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS ────────────────────
+    // name -> the UNION of the object-format names every declaring row makes it
+    // available on. EMPTY vector ⇒ available on EVERY format (the
+    // `objectFormatInAvailabilitySet` encoding, verbatim), so the union
+    // SATURATES: once any row is unrestricted the name is unrestricted and no
+    // later restricted row may narrow it back.
+    //
+    // Derived from the SHARED corpus index rather than from its own walk, so this
+    // availability view and the REALIZATION view below read the identical rows.
+    CorpusIndex const* const idx = corpusIndex();
+    if (idx == nullptr) return std::nullopt;  // discovery failed -> caller falls through
+    std::unordered_map<std::string, std::vector<std::string>> byName;
+    byName.reserve(idx->byName.size());
+    for (auto const& [name, rows] : idx->byName) {
+        std::vector<std::string> acc;
+        bool unrestricted = false;
+        for (auto const& row : rows) {
+            if (row.formats.empty()) {   // this row is available everywhere
+                unrestricted = true;     // SATURATE — no later row may narrow it
+                break;
+            }
+            for (auto const& f : row.formats) {
+                if (std::find(acc.begin(), acc.end(), f) == acc.end())
+                    acc.push_back(f);
+            }
+        }
+        byName.emplace(name, unrestricted ? std::vector<std::string>{}
+                                          : std::move(acc));
+    }
     return byName;
+}
+
+std::optional<std::unordered_map<std::string, ShippedSymbolRealization>>
+realizeShippedExternSymbols(std::span<std::string const>      names,
+                            TypeInterner&                     interner,
+                            TypeRegistry&                     typeReg,
+                            DataModel                         dataModel,
+                            std::optional<std::string_view>   activeTarget,
+                            std::optional<ObjectFormatKind>   activeFormat,
+                            std::span<NamedTypeBinding const> namedTypes) {
+    CorpusIndex const* const idx = corpusIndex();
+    if (idx == nullptr) return std::nullopt;   // discovery failed — route unbound
+    std::unordered_map<std::string, ShippedSymbolRealization> out;
+    if (names.empty()) return out;
+    // No active format ⇒ no realization to state. Availability AND the library map
+    // are both per-format facts; answering without a format would be exactly the
+    // per-name guess this oracle exists to delete.
+    if (!activeFormat.has_value()) return out;
+    std::string const formatKey{objectFormatKindName(*activeFormat)};
+
+    // (1) Which descriptors do the requested names live in? Only those are read —
+    // a TU that hand-declares nothing reads nothing. Candidate order is the
+    // index's deterministic relPath order, and the FIRST row available on this
+    // format wins (the same first-wins rule cross-descriptor duplicate rows
+    // already carry; the corpus ships byte-identical duplicates by convention).
+    std::vector<std::string> wantedDescriptors;
+    std::unordered_map<std::string, std::vector<CorpusSymbolRow> const*> wantedRows;
+    for (auto const& n : names) {
+        auto const it = idx->byName.find(n);
+        if (it == idx->byName.end()) continue;   // Unknown — absent from `out`
+        wantedRows.emplace(n, &it->second);
+        for (auto const& row : it->second) {
+            if (std::find(wantedDescriptors.begin(), wantedDescriptors.end(),
+                          row.relPath) == wantedDescriptors.end())
+                wantedDescriptors.push_back(row.relPath);
+        }
+    }
+    if (wantedRows.empty()) return out;
+
+    // (2) Read each candidate descriptor ONCE, through the SAME reader the
+    // `#include` path uses — so `variants`, `signatureByDataModel` and per-symbol
+    // `library` overrides cannot resolve one way here and another way there.
+    //
+    // THROWAWAY reporter, and a failed read is SKIPPED: this oracle is consulted
+    // for names the user never `#include`d, so an unrelated descriptor's
+    // malformedness must not become this program's build failure. Its names then
+    // stay `Unknown` and route unbound, where the link tier judges the reference
+    // LOUD. (The `shippedHeaderAvailableForFormat` precedent.)
+    std::unordered_map<std::string, ShippedLibDescriptor> decoded;
+    for (auto const& rel : wantedDescriptors) {
+        DiagnosticReporter throwaway;
+        auto desc = readShippedLibDescriptor(idx->root / rel, interner, typeReg,
+                                             throwaway, dataModel, activeTarget,
+                                             activeFormat, namedTypes);
+        if (!desc) continue;
+        decoded.emplace(rel, std::move(*desc));
+    }
+
+    // (3) Per requested name: walk its candidate rows in order and take the first
+    // that is AVAILABLE here, then state its outcome. Availability is tested with
+    // the ONE shared predicate — never an `if (format == …)`.
+    for (auto const& [name, rows] : wantedRows) {
+        ShippedSymbolRealization real;
+        bool sawRow = false;
+        for (auto const& row : *rows) {
+            auto const dIt = decoded.find(row.relPath);
+            if (dIt == decoded.end()) continue;   // unreadable descriptor
+            ShippedLibDescriptor const& desc = dIt->second;
+            // The DOCUMENT gate first (a header that does not exist here declares
+            // nothing here), then the SYMBOL gate inside `realizeRow` — the same
+            // two gates, in the same order, the semantic injector applies.
+            bool const docHere = objectFormatInAvailabilitySet(
+                desc.availableObjectFormats, *activeFormat);
+            // ★ SCAN EVERY ROW OF THIS NAME, NOT JUST THE FIRST. One descriptor
+            // routinely declares the SAME name several times with DIFFERENT
+            // availability gates — `printf` has an ["elf","macho"] IMPORT row AND a
+            // ["pe"] `synthesize` row in stdio.json, and the C11 threads surface
+            // carries three rows per name. Stopping at the first match makes the
+            // answer depend on DECLARATION ORDER inside the file: MEASURED, it made
+            // pe `printf` resolve `UnavailableForFormat` off the elf row and the
+            // shim was never claimed, so a hand-declared printf reached the linker
+            // as an undefined symbol. A non-realized row is only ever a FALLBACK
+            // status — it must never shadow a realizable sibling.
+            for (auto const& sym : desc.symbols) {
+                if (sym.name != name) continue;
+                sawRow = true;
+                auto candidate =
+                    realizeRow(desc, sym, *activeFormat, formatKey, docHere);
+                bool const usable =
+                    candidate.status == ShippedRealizationStatus::Realized
+                    || candidate.status == ShippedRealizationStatus::NoLibraryForFormat;
+                if (usable) { real = std::move(candidate); break; }
+                if (real.status == ShippedRealizationStatus::Unknown)
+                    real = std::move(candidate);   // remember "declared, not here"
+            }
+            if (real.status == ShippedRealizationStatus::Realized
+                || real.status == ShippedRealizationStatus::NoLibraryForFormat)
+                break;   // first descriptor that realizes the name wins
+        }
+        if (sawRow) out.emplace(name, std::move(real));
+    }
+    return out;
+}
+
+std::optional<std::unordered_map<std::string, ShippedSymbolRealization>>
+realizeShippedDescriptorSurfaceFor(std::string_view                  name,
+                                   TypeInterner&                     interner,
+                                   TypeRegistry&                     typeReg,
+                                   DataModel                         dataModel,
+                                   std::optional<std::string_view>   activeTarget,
+                                   std::optional<ObjectFormatKind>   activeFormat,
+                                   std::span<NamedTypeBinding const> namedTypes) {
+    CorpusIndex const* const idx = corpusIndex();
+    if (idx == nullptr) return std::nullopt;
+    std::unordered_map<std::string, ShippedSymbolRealization> out;
+    if (!activeFormat.has_value()) return out;   // no format ⇒ no realization
+    auto const nameIt = idx->byName.find(std::string{name});
+    if (nameIt == idx->byName.end()) return out;
+    std::string const formatKey{objectFormatKindName(*activeFormat)};
+
+    // Walk the SAME deterministic candidate order and take the FIRST descriptor
+    // that realizes `name` here — so the surface returned belongs to exactly the
+    // descriptor `realizeShippedExternSymbols` chose for that name, never a
+    // different one that happens to declare the name too.
+    for (auto const& row : nameIt->second) {
+        DiagnosticReporter throwaway;   // see the skip rationale in the header
+        auto desc = readShippedLibDescriptor(idx->root / row.relPath, interner,
+                                            typeReg, throwaway, dataModel,
+                                            activeTarget, activeFormat, namedTypes);
+        if (!desc) continue;
+        bool const docHere = objectFormatInAvailabilitySet(
+            desc->availableObjectFormats, *activeFormat);
+        // Does THIS descriptor realize `name` here? If not, keep looking — the
+        // surface of a descriptor that cannot realize the name is not the surface
+        // whose cores that name's recipe would call.
+        // EVERY row of the name, for the same reason the sibling entry point scans
+        // them all: one descriptor declares `printf` twice with different gates,
+        // and the elf row must not answer for the pe one.
+        bool realizesName = false;
+        for (auto const& sym : desc->symbols) {
+            if (sym.name != name) continue;
+            if (realizeRow(*desc, sym, *activeFormat, formatKey, docHere).status
+                == ShippedRealizationStatus::Realized) {
+                realizesName = true;
+                break;
+            }
+        }
+        if (!realizesName) continue;
+        for (auto const& sym : desc->symbols) {
+            auto real = realizeRow(*desc, sym, *activeFormat, formatKey, docHere);
+            if (real.status != ShippedRealizationStatus::Realized) continue;
+            out.emplace(sym.name, std::move(real));   // first row of a name wins
+        }
+        return out;
+    }
+    return out;
 }
 
 } // namespace dss::ffi

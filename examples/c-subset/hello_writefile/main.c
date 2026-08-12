@@ -52,9 +52,27 @@
 // STD_OUTPUT_HANDLE = -11 (DWORD). Sign-extending int -11 in RCX
 // low-32 bits matches the constant: 0xFFFFFFF5 = (DWORD)-11.
 
-extern void* GetStdHandle(int nStdHandle) "kernel32.dll";
+// STANDARD C DECLARATIONS, and the trailing library string is GONE ON PURPOSE.
+// These two once carried an image name as a string literal after the declarator —
+// a form NO C compiler accepts. ✔MEASURED, gcc 13.3.0 `-std=c2x
+// -pedantic-errors`: that shape is rc=1 `error: expected '=', ',', ';', 'asm' or
+// '__attribute__' before string constant`, while the bare form below is rc=0.
+// ★ CITE THE GRAMMAR, NOT THAT ERROR TEXT — gcc's list is WIDER than C's, because
+// `asm` and `__attribute__` after a declarator are gcc EXTENSIONS. The standard
+// itself is narrower: C23 §6.7.1 gives the complete production as
+// `init-declarator: declarator | declarator = initializer`, so an INITIALIZER is
+// the only thing that may follow a declarator (read from ISO/IEC 9899:2024).
+// (The rejected shape is deliberately NOT spelled out here: a grep-based guard
+// looking for it must not match this explanation.)
+// A declaration therefore carries the SIGNATURE only; WHERE a symbol resolves is
+// owned by the shipped-descriptor corpus — both names below are declared in
+// `src/dss-config/shippedLibs/windows.json`, which is what binds them to
+// kernel32. That is the same invariant `cst_to_hir.cpp` already records: a user
+// declaration has authority over the signature, never over the platform's
+// realization.
+extern void* GetStdHandle(int nStdHandle);
 extern int   WriteFile(void* hFile, char* lpBuffer, int n,
-                       int* lpWritten, void* lpOverlapped) "kernel32.dll";
+                       int* lpWritten, void* lpOverlapped);
 
 int main() {
     void* h = GetStdHandle(-11);

@@ -48,8 +48,9 @@ struct DSS_EXPORT ExternImport {
     // `extern const char sqlite3_version[];`), false for a function.
     // A data import that survives to the link tier (the LK11 merge
     // resolves sibling-CU-defined ones away first) binds per the
-    // format's declared `dataImportBinding` model (c84: the ELF
-    // ET_EXEC R_*_COPY copy-relocation); a format that declares no
+    // format's declared `dataImportBinding` model (every image
+    // format declares "got-indirect" — a loader-bound pointer slot
+    // holding the library object's ADDRESS); a format that declares no
     // model FAILS LOUD at the linker's pre-walker gate — a PLT
     // stub bound to a data symbol would be a silent miscompile.
     bool        isData = false;
@@ -65,20 +66,26 @@ struct DSS_EXPORT ExternImport {
     // walker tier rejects it loud (slice C). Meaningless (false) for
     // function imports (S_ThreadLocalOnFunction rejects those upstream).
     bool        isThreadLocal = false;
-    // c84 (D-LK-EXTERN-DATA-IMPORT): the imported DATA object's byte
-    // size + alignment, DERIVED from the declared type's layout at
-    // HIR→MIR (`computeLayout` under the active target's aggregate-
-    // layout params + the format's DataModel — never hardcoded; a
-    // `FILE*` object is the data model's pointer width). Consumed by
-    // the ELF copy-relocation emitter: the exec reserves a `.bss`
-    // slot of exactly this shape, exports the symbol with this
-    // `st_size`, and the loader memcpy's `st_size` bytes from the
-    // library's object. BOTH stay 0 when the declared type is
-    // INCOMPLETE (`extern const char v[];`) — legal C for a cross-TU
-    // extern the LK11 merge resolves against its defining sibling
-    // CU; a TRUE library import that survives to the walker with
-    // size 0 fails loud there (an unsized copy slot cannot be
-    // reserved). Meaningless (0) for function imports.
+    // D-LK-EXTERN-DATA-IMPORT: the imported DATA object's byte size +
+    // alignment, DERIVED from the declared type's layout at HIR→MIR
+    // (`computeLayout` under the active target's aggregate-layout
+    // params + the format's DataModel — never hardcoded; a `FILE*`
+    // object is the data model's pointer width). BOTH stay 0 when the
+    // declared type is INCOMPLETE (`extern const char v[];`) — legal C
+    // for a cross-TU extern the LK11 merge resolves against its
+    // defining sibling CU. Meaningless (0) for function imports.
+    // ★ NO EMITTER CONSUMES THESE, and that is a deliberate END STATE,
+    // not an oversight. They sized the ELF copy-relocation `.bss` slot
+    // (the exec reserved storage of exactly this shape and exported the
+    // symbol with this `st_size`); that mechanism is DELETED
+    // (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET) because
+    // claiming a name of an ALIASED libc object split the object
+    // silently. A got-indirect slot holds an ADDRESS, so the object's
+    // own size is irrelevant to it — an incomplete `extern char v[];`
+    // binds fine, and the walker no longer rejects a surviving size-0
+    // import. What the fields still DO is witness the DECLARED shape,
+    // so the two merge tiers can fail loud when two CUs declare
+    // DIFFERENT objects under one external name.
     std::uint64_t dataSizeBytes  = 0;
     std::uint64_t dataAlignBytes = 0;
     // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED symbol version this
@@ -119,35 +126,45 @@ struct DSS_EXPORT ExternImport {
     // `linker.cpp`'s `dedupKey`). Two rows that share a NAME but disagree on the
     // owning library are two DIFFERENT dynamic symbols by construction, so they
     // do not fold, and nothing about them is OR-combined. The contract above
-    // therefore holds only where the two PRODUCERS spell the same library:
-    //   * the shipped descriptor's `library` map, e.g. src/dss-config/
-    //     shippedLibs/stdio.json:5 → {"pe":"ucrtbase.dll", "elf":"libc.so.6",
-    //     "macho":"/usr/lib/libSystem.B.dylib"};
-    //   * the source-declared-extern default, src/dss-config/sources/
-    //     c-subset.lang.json:1531 `externLibraryByFormat` →
-    //     {"pe":"msvcrt.dll", "elf":"libc.so.6",
-    //      "macho":"/usr/lib/libSystem.B.dylib"}.
-    // On elf and macho those AGREE, so the fold happens and the contract reads
-    // exactly as written. ⚠ ON pe THEY DIVERGE — `ucrtbase.dll` vs `msvcrt.dll`
-    // — so on pe the two rows are, correctly per the key, two imports: a CU that
-    // `#include <stdio.h>`s (⇒ the descriptor row, ucrtbase.dll) beside a sibling
-    // CU that hand-declares `extern int puts(const char*);` without the header
-    // (⇒ the source-extern default, msvcrt.dll) yields TWO surviving rows, TWO
-    // IMAGE_IMPORT_DESCRIPTORs, and the hand-declaring CU's call bound into
-    // msvcrt's copy — the split CRT the UCRT migration retired. Reachable
-    // CROSS-CU only: same-TU the semantic tier SUPPRESSES the shipped row when the
-    // user declares the name (semantic_analyzer.cpp:13324,13354) and forwards the
-    // descriptor's library with it, so one TU yields one row.
-    // ★ THIS DIVERGENCE IS A PRE-EXISTING UCRT-MIGRATION RESIDUAL, NOT SOMETHING
-    // THE FOLD INTRODUCED: the two config values were already what they are, and
-    // widening the key merely stopped a name-only key from HIDING the mismatch
-    // behind a silent cross-library fold (which is itself the misbind
-    // D-LK11-EXTERN-IMPORT-DEDUP exists to prevent). Reconciling the two pe
-    // defaults belongs to D-FFI-PE-CRT-UCRT-MIGRATION, not to the dedup key.
-    // The CURRENT behaviour is pinned by
-    // `MirMerge.PeUcrtbaseAndMsvcrtRowsOfOneNameStayTwoImports` in
-    // tests/mir/test_mir_merge.cpp so that changing either config value MOVES a
-    // test rather than silently changing what a pe binary imports.
+    // therefore holds only where the two PRODUCERS spell the same library.
+    //
+    // ★★ UCRT-P4 (Decision 1) REDUCED THAT TO ONE PRODUCER, AND THAT IS THE POINT.
+    // There used to be two independent owners of "which image owns this name":
+    //   * the shipped descriptor's per-format `library` map (e.g.
+    //     src/dss-config/shippedLibs/stdio.json → {"pe":"ucrtbase.dll",
+    //     "elf":"libc.so.6", "macho":"/usr/lib/libSystem.B.dylib"}), and
+    //   * a per-LANGUAGE `externLibraryByFormat` default in the `.lang.json`,
+    //     whose pe entry named the LEGACY `msvcrt.dll`.
+    // On elf and macho those agreed; ON pe THEY DIVERGED, so a CU that
+    // `#include <stdio.h>`d (⇒ ucrtbase.dll) beside a sibling CU that hand-declared
+    // `extern int puts(const char*);` without the header (⇒ the language default,
+    // msvcrt.dll) produced TWO surviving rows, TWO IMAGE_IMPORT_DESCRIPTORs, and the
+    // hand-declaring CU's call bound into msvcrt's copy — a SPLIT CRT in one image.
+    // ⇒ THE LANGUAGE DEFAULT HAS BEEN REMOVED, not repointed. A user declaration
+    // carries the SIGNATURE; the PLATFORM (the descriptor corpus, per format) carries
+    // the REALIZATION, so a hand-written prototype and an `#include`d one now resolve
+    // through the SAME descriptor row and produce a BYTE-IDENTICAL import. Repointing
+    // the default at ucrtbase would have been the workaround, and a lethal one:
+    // ucrtbase exports no bare `printf`, so the flip would have turned a
+    // wrong-but-loadable msvcrt import into an unresolvable one — 0xC0000139 at the
+    // LOAD of every such binary. Removing the field's authority is the fix.
+    //
+    // ⇒ WHAT REMAINS REACHABLE, and why the wide key still earns its keep: two
+    // CONFIG-DECLARED images can still legitimately own one name — a per-SYMBOL
+    // `library` override routes a single name off its header's default image (pe
+    // `strftime`→ucrtbase while the rest of <time.h> stays elsewhere). Both of the
+    // examples that used to stand here have since been retired — UCRT-P5 moved the
+    // last one, `setjmp.json`, off msvcrt — but the KEY is not thereby redundant:
+    // the mechanism stays reachable by config, and a corpus that happens to name
+    // one image today is not the same fact as a key that can only ever express
+    // one. Those are DECLARED
+    // divergences, and the (mangledName, libraryPath, version) key keeps them two
+    // distinct dynamic symbols instead of silently folding them — which is the
+    // misbind D-LK11-EXTERN-IMPORT-DEDUP exists to prevent. What is gone is the
+    // UNDECLARED divergence that came from a second owner guessing.
+    // Pinned by `MirMerge.TwoConfigDeclaredImagesOwningOneNameStayTwoImports` in
+    // tests/mir/test_mir_merge.cpp, so changing a declared image MOVES a test rather
+    // than silently changing what a pe binary imports.
     //
     // INVARIANT:
     // isEagerImport ⟹ non-empty `libraryPath` (a descriptor always ships a

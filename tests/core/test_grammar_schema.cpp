@@ -3442,6 +3442,282 @@ TEST(GrammarSchema, DeclarationRowDollarPrefixedKeyIsExempt) {
     EXPECT_EQ((*r)->semantics().declarations.size(), 1u);
 }
 
+// ── `keywords[]` ENTRY closed key vocabulary (typo discriminator) ─────────
+//
+// The last per-entry table in this loader that had none: the block type-checked
+// `word`/`kind`/`contextual` and rejected misplaced `modeOp`/`stringStyle`, but
+// ran no vocabulary check, so any OTHER key was silently ignored.
+//
+// ★ WHY THIS ENTRY IS THE SHARP ONE. `contextual` is an opt-in whose absence is
+// meaningful and whose DEFAULT IS THE DANGEROUS VALUE. A near-miss spelling
+// loaded clean, left the flag false, and installed the keyword as a HARD
+// RESERVED WORD — the exact opposite of the authored intent — so user code that
+// legally uses the word as an identifier starts failing with no diagnostic
+// anywhere. Every pin below therefore checks the DIAGNOSTIC, not merely that the
+// load failed: "it failed" is equally true of a config that failed for an
+// unrelated reason.
+
+namespace {
+// The minimal loadable document from §keywords, with one keyword ENTRY body
+// spliced at %X%. `Identifier` is the root shape so no entry's `kind` has to be
+// referenced by a shape — the pins are about KEYS, and a shape reference would
+// add a second reason for the load to fail.
+[[nodiscard]] std::string keywordEntrySchemaWith(std::string_view entryBody) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "KwKeys", "version": "0.1.0" },
+      "keywords": [ %X% ],
+      "shapes": { "root": { "sequence": [ "Identifier" ] } }
+    })JSON";
+    auto const pos = cfg.find("%X%");
+    cfg.replace(pos, 3, entryBody);
+    return cfg;
+}
+
+// The same minimal document with a whole top-level BLOCK spliced RAW at %X%.
+// The entry-level helper above cannot express a `keywords` whose value is not
+// an array, which is exactly what the type pins below need.
+[[nodiscard]] std::string keywordBlockSchemaWith(std::string_view rawBlock) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "KwKeys", "version": "0.1.0" },
+      %X%
+      "shapes": { "root": { "sequence": [ "Identifier" ] } }
+    })JSON";
+    auto const pos = cfg.find("%X%");
+    cfg.replace(pos, 3, rawBlock);
+    return cfg;
+}
+
+// Does ANY diagnostic carry this substring? Used to pin the MESSAGE, because a
+// code alone cannot distinguish "rejected the typo'd key" from "rejected for
+// some other reason that happens to share the code".
+[[nodiscard]] bool hasDiagMessage(std::vector<ConfigDiagnostic> const& diags,
+                                  std::string_view needle) {
+    return std::ranges::any_of(diags, [needle](auto const& d) {
+        return d.message.find(needle) != std::string::npos;
+    });
+}
+} // namespace
+
+// BASELINE, and it carries the "not too tight" half of the pin: ALL THREE legal
+// keys load, and `contextual` still reaches `LexemeMeaning`. A vocabulary that
+// omitted one of these would break every shipped language at LOAD, so this is
+// not a courtesy test — it is the guard against over-tightening.
+TEST(GrammarSchema, KeywordEntryClosedKeyBaselineLoadsAllThreeLegalKeys) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "if", "kind": "IfKw" },
+            { "word": "await", "kind": "AwaitKw", "contextual": true })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    auto const ifKw = (*r)->lookupLexeme("if");
+    ASSERT_EQ(ifKw.size(), 1u);
+    EXPECT_FALSE(ifKw[0].contextual);
+    auto const awaitKw = (*r)->lookupLexeme("await");
+    ASSERT_EQ(awaitKw.size(), 1u);
+    EXPECT_TRUE(awaitKw[0].contextual)
+        << "the baseline must prove `contextual` is READ, not merely tolerated — "
+           "otherwise a vocabulary that accepted the key while the loader ignored "
+           "it would pass this test";
+}
+
+// ★ THE DEFECT THIS CLOSES, in its most damaging spelling. `contextul` used to
+// load clean and turn a soft keyword into a hard reserved word.
+TEST(GrammarSchema, KeywordEntryMisspelledContextualReportsConflict) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "await", "kind": "AwaitKw", "contextul": true })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a typo'd `contextual` must fail the load — silently shipping the "
+           "keyword as HARD when the author declared it SOFT is the "
+           "knob-that-lies, and it breaks user code that uses the word as an "
+           "identifier";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_ConflictingField));
+    EXPECT_TRUE(hasDiagMessage(r.error(), "unknown key 'contextul' in a "
+                                          "'keywords' entry"))
+        << "the pin is on the DIAGNOSTIC, not on the failure: the message must "
+           "name the offending key. Got:" << errorDiags(r.error());
+}
+
+// Case is part of the spelling — `Contextual` is a different key, and JSON has
+// no case-folding rule that would make it the same one.
+TEST(GrammarSchema, KeywordEntryCasedContextualReportsConflict) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "await", "kind": "AwaitKw", "Contextual": true })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "unknown key 'Contextual'"))
+        << errorDiags(r.error());
+}
+
+// A second axis: the vocabulary is a VOCABULARY, not one special-cased name. A
+// trailing-underscore near-miss on `contextual` and a misspelling of the
+// REQUIRED `word` are both caught.
+TEST(GrammarSchema, KeywordEntryTrailingUnderscoreKeyReportsConflict) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "await", "kind": "AwaitKw", "contextual_": true })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "unknown key 'contextual_'"))
+        << errorDiags(r.error());
+}
+
+// ★ WHY THE VOCABULARY RUNS BEFORE THE REQUIRED-FIELD CHECK. With only the
+// required-field rule, `wrd` was reported as a MISSING 'word' — a field the
+// author demonstrably DID write — which sends them hunting in the wrong place.
+// Both diagnostics must now fire, and the typo must be NAMED.
+TEST(GrammarSchema, KeywordEntryMisspelledWordNamesTheTypoNotJustTheAbsence) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "wrd": "await", "kind": "AwaitKw" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "unknown key 'wrd'"))
+        << "the required-'word' diagnostic alone names a field the author DID "
+           "write; the vocabulary must run first and name the key. Got:"
+        << errorDiags(r.error());
+    EXPECT_TRUE(hasDiagMessage(r.error(),
+                               "keyword entry needs string 'word' and string 'kind'"))
+        << "and the required-field rule must still fire — the vocabulary check "
+           "reports, it does not swallow. Got:" << errorDiags(r.error());
+}
+
+// The two MISPLACED keys keep their own, more specific redirect and must NOT be
+// reported as "unknown": this loader knows exactly what `modeOp` and
+// `stringStyle` are and which block they belong on, so calling them unknown
+// would be a false statement in a diagnostic. This pins the ORDER of the two
+// checks, which is the only thing that makes that true.
+TEST(GrammarSchema, KeywordEntryMisplacedModeOpKeepsItsRedirectDiagnostic) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "if", "kind": "IfKw", "modeOp": "pushMode", "modeArg": "main" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "keywords cannot switch lexer modes"))
+        << errorDiags(r.error());
+    EXPECT_FALSE(hasDiagMessage(r.error(), "unknown key 'modeOp'"))
+        << "`modeOp` is a key this loader KNOWS — reporting it as unknown would "
+           "be false, and it would bury the redirect that says where the entry "
+           "belongs. Got:" << errorDiags(r.error());
+}
+
+TEST(GrammarSchema, KeywordEntryMisplacedStringStyleKeepsItsRedirectDiagnostic) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "string", "kind": "StringKw",
+             "stringStyle": { "escapeKind": "none", "endsAt": "'" } })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "keywords are word-shaped"))
+        << errorDiags(r.error());
+    EXPECT_FALSE(hasDiagMessage(r.error(), "unknown key 'stringStyle'"))
+        << errorDiags(r.error());
+}
+
+// `$`-prefixed documentation keys stay EXEMPT on a keyword entry too — the same
+// carve-out every sibling vocabulary applies.
+TEST(GrammarSchema, KeywordEntryDollarPrefixedKeyIsExempt) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "await", "kind": "AwaitKw", "contextual": true,
+             "$contextualComment": "soft: `await` is a valid identifier here" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key must not trip the typo "
+           "discriminator: " << errorDiags(r.error());
+    auto const awaitKw = (*r)->lookupLexeme("await");
+    ASSERT_EQ(awaitKw.size(), 1u);
+    EXPECT_TRUE(awaitKw[0].contextual);
+}
+
+// ── the top-level blocks that were SILENTLY SKIPPED on a WRONG TYPE ───────
+//
+// A SECOND defect found in the same `if` statement while closing the vocabulary
+// above, and measured rather than assumed. Every OTHER top-level block ENTERS
+// its branch and then DIAGNOSES a wrong type — `tokens` emits "'tokens' must be
+// an object", and `lexerModes` / `operators` / `syncTokens` / `shapes` /
+// `semantics` all do the same. `keywords` and `scopes` alone folded the type
+// test INTO the `if` CONDITION:
+//
+//     if (doc.contains("keywords") && doc.at("keywords").is_array()) { … }
+//
+// so a present-but-wrong-type value fell out of the dispatch entirely and the
+// document loaded PERFECTLY CLEAN with the whole table dropped — every keyword
+// silently demoted to a plain `Identifier`, or every scope-validity rule gone.
+// Same shape as the vocabulary gap: the authored intent and the shipped
+// behaviour are opposites and nothing says so.
+//
+// ⚠ THE COUNTERPART FORM IS PINNED TOO. Both blocks are OPTIONAL, so ABSENT
+// must stay silent, and `scopes` without `validity` must stay silent. A check
+// that also reds on absence is a different bug wearing this fix's clothes, and
+// only the positive pins can tell the two apart.
+
+TEST(GrammarSchema, KeywordsBlockNonArrayFailsLoud) {
+    auto const cfg = keywordBlockSchemaWith(R"("keywords": { "if": "IfKw" },)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a `keywords` that is not an array must FAIL, not vanish: dropping "
+           "the whole keyword table turns every keyword in the language into a "
+           "plain Identifier with no diagnostic";
+    EXPECT_TRUE(hasDiagMessage(r.error(), "'keywords' must be an array"))
+        << errorDiags(r.error());
+}
+
+// A second wrong type, so the check is about the TYPE and not about objects.
+TEST(GrammarSchema, KeywordsBlockStringValueFailsLoud) {
+    auto const cfg = keywordBlockSchemaWith(R"("keywords": "if",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "'keywords' must be an array"))
+        << errorDiags(r.error());
+}
+
+// ABSENT `keywords` is legal — a language may have none.
+TEST(GrammarSchema, KeywordsBlockAbsentStaysSilent) {
+    auto r = GrammarSchema::loadFromText(keywordBlockSchemaWith(""));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+}
+
+// An EMPTY array is also legal, and it is the case a naive "is it there and
+// non-trivial" check would wrongly reject.
+TEST(GrammarSchema, KeywordsBlockEmptyArrayStaysSilent) {
+    auto r = GrammarSchema::loadFromText(keywordBlockSchemaWith(R"("keywords": [],)"));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+}
+
+// ★ The `scopes` twin. ⚠ `semantics.scopes` IS an array (every shipped config
+// declares one) — this is the TOP-LEVEL `scopes`, whose one member is
+// `validity`. Confusing the two is the reason the wrong-type value looks
+// plausible enough to write by accident.
+TEST(GrammarSchema, ScopesBlockNonObjectFailsLoud) {
+    auto const cfg = keywordBlockSchemaWith(R"("scopes": [ "block" ],)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a top-level `scopes` that is not an object must FAIL: silently "
+           "dropping it disables every scope-validity rule the author wrote";
+    EXPECT_TRUE(hasDiagMessage(r.error(), "'scopes' must be an object"))
+        << errorDiags(r.error());
+}
+
+TEST(GrammarSchema, ScopesValidityNonArrayFailsLoud) {
+    auto const cfg =
+        keywordBlockSchemaWith(R"("scopes": { "validity": { "scope": "B" } },)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "`validity` is the ONLY member `scopes` has — a wrong type there "
+           "empties the block just as completely as a wrong-typed `scopes`";
+    EXPECT_TRUE(hasDiagMessage(r.error(), "'validity' must be an array"))
+        << errorDiags(r.error());
+}
+
+// `scopes` present with NO `validity`, and `scopes` absent: both legal.
+TEST(GrammarSchema, ScopesBlockWithoutValidityStaysSilent) {
+    auto r = GrammarSchema::loadFromText(keywordBlockSchemaWith(R"("scopes": {},)"));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+}
+
+TEST(GrammarSchema, ScopesBlockEmptyValidityStaysSilent) {
+    auto r = GrammarSchema::loadFromText(
+        keywordBlockSchemaWith(R"("scopes": { "validity": [] },)"));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+}
+
 // ── TOP-LEVEL document closed key vocabulary (typo discriminator) ────────
 //
 // The widest-blast-radius instance: every block is optional and absence is
@@ -3610,25 +3886,33 @@ TEST(GrammarSchema, LexerModesMapDollarPrefixedKeyIsExempt) {
         << "the documentation key must not be REGISTERED as a lexer mode";
 }
 
-// (3) `semantics.externLibraryByFormat` — an identifier-valued map, but a
-// CLOSED one: its keys must name an ObjectFormatKind, so a `$comment` can
-// never be a legal key and skipping it forecloses nothing.
-TEST(GrammarSchema, ExternLibraryByFormatDollarPrefixedKeyIsExempt) {
+// (3) `semantics.pointerAliasing` — a CLOSED-key map: every key must be one of
+// its declared fields, and an unrecognized one is C_InvalidSemantics. A
+// `$comment` can therefore never be a legal key, so skipping it forecloses
+// nothing — and the closed-key rejection must not fire ON the documentation key.
+//
+// ⓘ This case previously used `semantics.externLibraryByFormat`, retired in
+// UCRT-P4 (Decision 1) along with the per-language library default it carried.
+// The PROPERTY under test is the `$`-key exemption on a closed-key semantics map,
+// not that field — so it is retargeted at a surviving one rather than deleted,
+// keeping the enumeration's case (3) covered.
+TEST(GrammarSchema, ClosedKeySemanticsMapDollarPrefixedKeyIsExempt) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 4,
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { ";": [{ "kind": "Semi" }] },
       "shapes": { "root": { "sequence": [ "Semi" ] } },
       "semantics": {
-        "externLibraryByFormat": { "$comment": "the CRT, per format",
-                                   "pe": "msvcrt.dll" }
+        "pointerAliasing": { "$comment": "the aliasing lattice",
+                             "charTypesAliasAll": true }
       }
     })JSON";
     auto r = GrammarSchema::loadFromText(kCfg);
     ASSERT_TRUE(r.has_value())
-        << "a '$'-prefixed documentation key must not be read as an "
-           "object-format name: " << errorDiags(r.error());
-    EXPECT_EQ((*r)->semantics().externLibraryByFormat.size(), 1u);
+        << "a '$'-prefixed documentation key must not be judged against the "
+           "closed field set: " << errorDiags(r.error());
+    EXPECT_TRUE((*r)->semantics().pointerAliasing.charTypesAliasAll)
+        << "and the real field beside it must still be read";
 }
 
 // (4) `declarations[].gatedMarkers[]` — a closed-key vocabulary that rejected
@@ -4138,15 +4422,15 @@ TEST(GrammarSchema, SemanticsImplicitReturnZeroDuplicateElementReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
-// FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN) — the de-conflation pin. The new
-// `entryFunctionNames` (the program-entry set, read by the driver's entry-symbol
+// FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN) + D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE — the
+// de-conflation pin. `entryFunctions` (the program-entry MAPPING, read by entry
 // resolution) and `implicitReturnZeroForFunctionNames` (the C main-style return-0
-// set) load INDEPENDENTLY. No shipped language declares them DIFFERENTLY (c-subset
-// sets both to `["main"]`), so this synthetic config builds the consuming shape
-// itself: the two lists differ, and each field must hold its own value. A loader
-// that aliased them (or dropped entryFunctionNames) would fail this — the
-// red-on-disable lever for the split.
-TEST(GrammarSchema, SemanticsEntryFunctionNamesLoadIndependentlyFromReturnZeroSet) {
+// NAME set) load INDEPENDENTLY. They are now different SHAPES as well as different
+// concepts, which makes aliasing them impossible by construction — but the pin is
+// kept, and strengthened, because it now also proves the mapping's per-name shape
+// list survives the load with its VERB intact. A loader that dropped the verb, or
+// flattened the mapping back to a name list, fails this.
+TEST(GrammarSchema, SemanticsEntryFunctionsLoadIndependentlyFromReturnZeroSet) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 4,
       "language": { "name": "X", "version": "0.1.0" },
@@ -4155,7 +4439,12 @@ TEST(GrammarSchema, SemanticsEntryFunctionNamesLoadIndependentlyFromReturnZeroSe
       "semantics": {
         "declarations": [ { "rule": "root", "name": 0, "kind": "function",
                             "implicitReturnZeroForFunctionNames": ["main"],
-                            "entryFunctionNames": ["custom_entry", "_start"] } ]
+                            "entryFunctions": {
+                              "custom_entry": [ { "returns": "i32", "params": [],
+                                                  "verb": "none" } ],
+                              "_start": [ { "returns": "i32",
+                                            "params": ["i32", "ptr-ptr-char"],
+                                            "verb": "argc-argv" } ] } } ]
       }
     })JSON";
     auto r = GrammarSchema::loadFromText(kCfg);
@@ -4166,13 +4455,33 @@ TEST(GrammarSchema, SemanticsEntryFunctionNamesLoadIndependentlyFromReturnZeroSe
     // The two fields are SEPARATE — neither aliases the other.
     EXPECT_EQ(decls[0].implicitReturnZeroForFunctionNames,
               (std::vector<std::string>{"main"}));
-    EXPECT_EQ(decls[0].entryFunctionNames,
-              (std::vector<std::string>{"custom_entry", "_start"}));
+    // The mapping flattens to a row list. JSON object keys iterate in sorted order
+    // (nlohmann's default `json` is an ordered map), so `_start` precedes
+    // `custom_entry` — asserted explicitly rather than sorted-for-convenience, so a
+    // future change in iteration order is a VISIBLE failure and not a silent
+    // reordering of program-entry candidates.
+    ASSERT_EQ(decls[0].entryFunctions.size(), 2u);
+    EXPECT_EQ(decls[0].entryFunctions[0].name, "_start");
+    EXPECT_EQ(decls[0].entryFunctions[0].returns, EntryReturnShape::I32);
+    EXPECT_EQ(decls[0].entryFunctions[0].params,
+              (std::vector<EntryParamShape>{EntryParamShape::I32,
+                                            EntryParamShape::PtrPtrChar}));
+    // The VERB is the field the whole format-intersection turns on; a loader that
+    // parsed the signature but dropped the verb would leave every entry
+    // unrealizable, so it is asserted per row rather than assumed.
+    EXPECT_EQ(decls[0].entryFunctions[0].verb, EntryMaterialization::ArgcArgv);
+    EXPECT_EQ(decls[0].entryFunctions[1].name, "custom_entry");
+    EXPECT_TRUE(decls[0].entryFunctions[1].params.empty());
+    EXPECT_EQ(decls[0].entryFunctions[1].verb, EntryMaterialization::None);
 }
 
-// FC5 — entryFunctionNames carries the same load-time duplicate check as the
-// return-0 set (a paste-error in a language config is caught at load).
-TEST(GrammarSchema, SemanticsEntryFunctionNamesDuplicateElementReportsInvalid) {
+// FC5 + D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE — `entryFunctions` carries a load-time
+// duplicate check, and the mapping makes it a STRONGER claim than the retired name
+// list's. A duplicate NAME is now impossible (JSON object keys are unique), so the
+// check that matters is a duplicate SIGNATURE under one name: two rows with the same
+// shape and different verbs would make declaration ORDER decide which verb an entry
+// materializes — a silent wrong-verb on the program entry. Refused at load.
+TEST(GrammarSchema, SemanticsEntryFunctionsDuplicateSignatureReportsInvalid) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 4,
       "language": { "name": "X", "version": "0.1.0" },
@@ -4180,7 +4489,14 @@ TEST(GrammarSchema, SemanticsEntryFunctionNamesDuplicateElementReportsInvalid) {
       "shapes": { "root": { "sequence": [ "Semi" ] } },
       "semantics": {
         "declarations": [ { "rule": "root", "name": 0, "kind": "function",
-                            "entryFunctionNames": ["main", "main"] } ]
+                            "entryFunctions": {
+                              "main": [
+                                { "returns": "i32",
+                                  "params": ["i32", "ptr-ptr-char"],
+                                  "verb": "argc-argv" },
+                                { "returns": "i32",
+                                  "params": ["i32", "ptr-ptr-char"],
+                                  "verb": "argc-argv" } ] } } ]
       }
     })JSON";
     auto r = GrammarSchema::loadFromText(kCfg);
@@ -4188,131 +4504,45 @@ TEST(GrammarSchema, SemanticsEntryFunctionNamesDuplicateElementReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
-// FF6 Slice 2 + audit fold (2026-06-02 post-fold #1): per-language
-// `externLibraryByFormat` JSON loader. Closes test-analyzer G3 —
-// the 80+ LOC of new validation shipped without direct tests.
-// Validates: shape (object), key (closed-enum ObjectFormatKind
-// name), value (non-empty string). Each failure surface emits
-// C_InvalidSemantics so a typo in a language config can't silently
-// produce an empty map (which would then fire F_FfiNoImportLibraryForFormat
-// at compile time with no anchor at the upstream config gap).
-
-TEST(GrammarSchema, SemanticsExternLibraryByFormatHappyPath) {
-    constexpr std::string_view kCfg = R"JSON({
-      "dssSchemaVersion": 4,
-      "language": { "name": "X", "version": "0.1.0" },
-      "tokens": { ";": [{ "kind": "Semi" }] },
-      "shapes": { "root": { "sequence": [ "Semi" ] } },
-      "semantics": {
-        "externLibraryByFormat": {
-          "pe":    "msvcrt.dll",
-          "elf":   "libc.so.6",
-          "macho": "/usr/lib/libSystem.B.dylib"
-        }
-      }
-    })JSON";
-    auto r = GrammarSchema::loadFromText(kCfg);
-    ASSERT_TRUE(r.has_value()) << "expected clean load";
-    auto const& m = (*r)->semantics().externLibraryByFormat;
-    EXPECT_EQ(m.size(), 3u);
-    EXPECT_EQ(m.at("pe"),    "msvcrt.dll");
-    EXPECT_EQ(m.at("elf"),   "libc.so.6");
-    EXPECT_EQ(m.at("macho"), "/usr/lib/libSystem.B.dylib");
-}
-
-TEST(GrammarSchema, SemanticsExternLibraryByFormatNonObjectReportsInvalid) {
-    constexpr std::string_view kCfg = R"JSON({
-      "dssSchemaVersion": 4,
-      "language": { "name": "X", "version": "0.1.0" },
-      "tokens": { ";": [{ "kind": "Semi" }] },
-      "shapes": { "root": { "sequence": [ "Semi" ] } },
-      "semantics": {
-        "externLibraryByFormat": ["pe", "msvcrt.dll"]
-      }
-    })JSON";
-    auto r = GrammarSchema::loadFromText(kCfg);
-    ASSERT_FALSE(r.has_value());
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
-}
-
-TEST(GrammarSchema, SemanticsExternLibraryByFormatUnknownKeyReportsInvalid) {
-    // Typo: "pee" (instead of "pe"). Catches the trap at config
-    // load — without this validation, the typo would land silently
-    // and `F_FfiNoImportLibraryForFormat` would fire at compile
-    // time with no breadcrumb pointing at the language JSON.
-    constexpr std::string_view kCfg = R"JSON({
-      "dssSchemaVersion": 4,
-      "language": { "name": "X", "version": "0.1.0" },
-      "tokens": { ";": [{ "kind": "Semi" }] },
-      "shapes": { "root": { "sequence": [ "Semi" ] } },
-      "semantics": {
-        "externLibraryByFormat": { "pee": "msvcrt.dll" }
-      }
-    })JSON";
-    auto r = GrammarSchema::loadFromText(kCfg);
-    ASSERT_FALSE(r.has_value());
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
-}
-
-// ★ A DIFFERENT SPECIES FROM THE "pee" TYPO ABOVE. `unknown` is a real row in
-// `kObjectFormatKindTable`, so `objectFormatKindFromName("unknown")` SUCCEEDS
-// and the name check one test up waves it straight through. The entry then sits
-// in the map keyed to a format no emitted image can ever have — so every extern
-// falls through to `F_FfiNoImportLibraryForFormat`, i.e. a config that DOES
-// declare the library is told the library is undeclared.
+// ── `externLibraryByFormat` IS RETIRED — THE KEY ITSELF IS NOW THE ERROR ─────
 //
-// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in
-// `grammar_schema_json.cpp`'s externLibraryByFormat loop and this load succeeds.
-TEST(GrammarSchema, SemanticsExternLibraryByFormatSentinelKeyReportsInvalid) {
+// This replaces the six tests that pinned the per-language `externLibraryByFormat`
+// LOADER (happy path, non-object, unknown key, sentinel key, non-string value,
+// empty-string value). That loader is gone: the field was never a fact about a
+// LANGUAGE. "Which runtime image owns this symbol" is a fact about a PLATFORM, and
+// the shipped-descriptor corpus owns it PER SYMBOL — so one string per language was
+// a GUESS and a SECOND OWNER of a fact the corpus already owned. MEASURED
+// consequences of the guess: on pe a hand-written
+// `extern int printf(const char*, ...);` imported the LEGACY C runtime beside the
+// modern one (two C runtimes in one image, no diagnostic at any stage); on elf a
+// hand-written `extern double sin(double);` bound `libc.so.6` and the binary died
+// at LOAD with "undefined symbol: sin", because glibc ships `sin` in `libm.so.6`.
+//
+// ★ WHAT THIS ONE TEST PINS THAT SIX PASSING LOADER TESTS COULD NOT: that the key
+// cannot COME BACK. Deleting a loader while leaving its key in the closed
+// `semantics` vocabulary would leave a silently-ignored config knob — an author
+// would write it, see a clean load, and get none of the behaviour. Refusal at LOAD
+// is the only outcome that tells them.
+//
+// RED-ON-DISABLE: re-add "externLibraryByFormat" to the allowed `semantics` key
+// list in `grammar_schema_json.cpp` and this load starts succeeding.
+TEST(GrammarSchema, SemanticsExternLibraryByFormatKeyIsRefusedAtLoad) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 4,
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { ";": [{ "kind": "Semi" }] },
       "shapes": { "root": { "sequence": [ "Semi" ] } },
       "semantics": {
-        "externLibraryByFormat": { "unknown": "msvcrt.dll" }
+        "externLibraryByFormat": { "pe": "ucrtbase.dll", "elf": "libc.so.6" }
       }
     })JSON";
     auto r = GrammarSchema::loadFromText(kCfg);
     ASSERT_FALSE(r.has_value())
-        << "'unknown' is the invalid sentinel — it SPELLS correctly, so only an "
-           "explicit selectability check can stop it";
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
-    EXPECT_TRUE(std::ranges::any_of(r.error(), [](auto const& d) {
-        return d.message.find("sentinel") != std::string::npos;
-    })) << "the diagnostic must say WHY 'unknown' is refused — 'unrecognized "
-           "name' would be a confusing lie for a correctly-spelled row:\n"
+        << "a language config declaring the retired per-format library default "
+           "must be REFUSED, not silently ignored — a silently-ignored config "
+           "knob is worse than a missing one";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics))
         << errorDiags(r.error());
-}
-
-TEST(GrammarSchema, SemanticsExternLibraryByFormatNonStringValueReportsInvalid) {
-    constexpr std::string_view kCfg = R"JSON({
-      "dssSchemaVersion": 4,
-      "language": { "name": "X", "version": "0.1.0" },
-      "tokens": { ";": [{ "kind": "Semi" }] },
-      "shapes": { "root": { "sequence": [ "Semi" ] } },
-      "semantics": {
-        "externLibraryByFormat": { "pe": 42 }
-      }
-    })JSON";
-    auto r = GrammarSchema::loadFromText(kCfg);
-    ASSERT_FALSE(r.has_value());
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
-}
-
-TEST(GrammarSchema, SemanticsExternLibraryByFormatEmptyStringValueReportsInvalid) {
-    constexpr std::string_view kCfg = R"JSON({
-      "dssSchemaVersion": 4,
-      "language": { "name": "X", "version": "0.1.0" },
-      "tokens": { ";": [{ "kind": "Semi" }] },
-      "shapes": { "root": { "sequence": [ "Semi" ] } },
-      "semantics": {
-        "externLibraryByFormat": { "pe": "" }
-      }
-    })JSON";
-    auto r = GrammarSchema::loadFromText(kCfg);
-    ASSERT_FALSE(r.has_value());
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
 // `literalTypes[i].literal` that names no declared token → C_UnknownToken.

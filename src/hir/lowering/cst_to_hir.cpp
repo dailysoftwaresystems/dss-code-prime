@@ -9830,12 +9830,64 @@ struct Lowerer {
             uniformLibraryMap(externLibraryOverride(node, decl));
         // FF6 Slice 2: record one FFI-synthesis import row per emitted extern node.
         // The canonical name is the SymbolRecord's unmangled identifier.
+        // ★★★ UCRT-P4 (Decision 1) — THE DECLARATION SYNTAX HAS NO AUTHORITY OVER
+        // REALIZATION, EVER.
+        //
+        // THIS producer — the `extern`-KEYWORD one — was the ONLY one of the four
+        // extern producers that did not inherit the platform's realization. It
+        // recorded an empty `libraryOverride` and left `noLibraryBinding` FALSE, so
+        // every hand-written `extern int printf(const char*, ...);` fell through to
+        // a per-LANGUAGE default library GUESS. MEASURED on pe64-exec at HEAD
+        // 3e86a187: that guess imported a bare `printf` from the LEGACY C runtime —
+        // and with `#include <stdio.h>` present it did so ALONGSIDE the UCRT
+        // `__stdio_common_v*` shims the descriptor path correctly produced, i.e.
+        // TWO C RUNTIMES in a three-line program, rc=0, no diagnostic at any stage.
+        //
+        // C23 6.2.2p5 makes `extern int printf(…);` and `int printf(…);` THE SAME
+        // DECLARATION (the file-scope no-storage-class form has its linkage
+        // determined exactly as if `extern`), so the bare-prototype producer's
+        // realization and this one's are not allowed to differ. Both now read the
+        // SAME seam — `suppressedShippedSymbolFor`, filled by BOTH the goal-2 skip
+        // and the corpus realization oracle — and both route a `synthesize` row
+        // through the SAME `claimSuppressedShimSymbol`. Zero new downstream code:
+        // `libraryOverride` is the per-format map `compile_pipeline`'s existing fold
+        // already selects the active format's entry from.
+        //
+        // PRECEDENCE, and why a source override still outranks the platform:
+        //   1. a SOURCE `extern "kernel32.dll" …` library override. That is not
+        //      declaration SYNTAX — it is DSS's own vocabulary for STATING a
+        //      realization, so it legitimately wins over the corpus.
+        //   2. the platform's realization for this name on this format.
+        //   3. neither ⇒ UNBOUND (`noLibraryBinding`), resolved at the LINK tier per
+        //      C23 5.1.1.2 phase 8 — a sibling TU may define it, a
+        //      `--resolve-library` binary may export it, or it is genuinely
+        //      undefined and rejected LOUD (K_SymbolUndefined). This is the SAME
+        //      unbound channel the bare-prototype producer has always used; there is
+        //      deliberately NO per-CU availability error here, because a per-CU
+        //      verdict can be wrong (D-FFI-FORMAT-ORACLE-BYPASSED-WITHOUT-RESOLVE-
+        //      LIBRARY, whose named prerequisite is
+        //      D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD).
+        //
+        // AGNOSTIC: every input is DATA on a descriptor row, already per-format
+        // selected by the shared availability predicate. No format / arch / language
+        // identity test, and no symbol name is special-cased.
         auto recordExtern = [&](HirNodeId h, SymbolId sym, NodeId fromDeclarator) {
             recordLinkage(h,
                           declaratorLinkage(externPrefixLink, decl, fromDeclarator));
             auto const* rec = model.recordFor(sym);
-            HirExternRecord row{h, rec ? rec->name : std::string{},
-                                libraryOverride};
+            // A SOURCE override present ⇒ the user STATED the image; the platform
+            // row is not consulted at all (precedence 1 above).
+            auto const* shipped =
+                (rec != nullptr && libraryOverride.empty())
+                    ? model.suppressedShippedSymbolFor(rec->name)
+                    : nullptr;
+            HirExternRecord row{
+                h, rec ? rec->name : std::string{},
+                shipped != nullptr ? shipped->library : libraryOverride,
+                // Nothing to bind ⇒ UNBOUND, and say so explicitly rather than
+                // leaving an empty library to be interpreted downstream.
+                /*noLibraryBinding=*/shipped == nullptr && libraryOverride.empty(),
+                shipped != nullptr ? shipped->version : std::string{}};
             // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the label was read PER
             // DECLARATOR by
             // Pass-1 and lives on the SymbolRecord, so this producer just carries
@@ -9851,6 +9903,16 @@ struct Lowerer {
             // the SymbolRecord — rather than deciding here that it cannot exist —
             // is what keeps this producer honest if a future path stamps one.
             if (rec != nullptr) row.linkName = rec->linkName;
+            // UCRT-P4: and the PLATFORM's per-target link base name outranks the
+            // (normally empty) record copy — the descriptor is the authority on
+            // which name the library exports for this C identifier on this target.
+            // Without this an `extern int fstat(int, struct stat*);` written by hand
+            // re-imports Darwin-x86_64's LEGACY 32-bit-inode `_fstat` instead of
+            // `_fstat$INODE64`, which is a SILENT wrong-ABI bind, not a link error.
+            // The user's own `__asm` label (`asmName`, above) still outranks both
+            // inside `ffi::linkNameFor`.
+            if (shipped != nullptr && !shipped->linkName.empty())
+                row.linkName = shipped->linkName;
             externDecls.push_back(std::move(row));
         };
         for (NodeId d : declarators) {
@@ -9875,6 +9937,23 @@ struct Lowerer {
             // declarator to each `param` (VarDecl) leaf — to keep the ExternFunction
             // node byte-identical to the pre-c23 single-declarator lowering.
             if (rec->isProtoDeclaration) {
+                // ★ UCRT-P4: THE SUPPRESSED-SHIM ARM — the THIRD call site of the
+                // shared helper, and it MUST precede the import synthesis for the
+                // same reason the other two do (see `claimSuppressedShimSymbol`): on
+                // a `synthesize` row an import is not a degradation, it is a binary
+                // that will not LOAD. `ucrtbase.dll` exports none of
+                // printf/fprintf/sprintf/vfprintf/sscanf — only the
+                // `__stdio_common_v*` cores they are shimmed over — and DSS
+                // eager-imports every declared shipped extern, so
+                // `extern int printf(const char *, ...);` used to plant an
+                // unresolvable import and die at PROCESS START with 0xC0000139.
+                // A SOURCE library override means the user STATED the image, so the
+                // platform's shim is deliberately not claimed there (precedence 1).
+                if (libraryOverride.empty()
+                    && claimSuppressedShimSymbol(
+                           model.suppressedShippedSymbolFor(rec->name), d, sym,
+                           rec->name, type))
+                    continue;   // shim (or refusal) — never an import row.
                 std::vector<HirNodeId> params;
                 collectParams(d, params);
                 HirNodeId const ef =
@@ -10277,7 +10356,13 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         externDecls.push_back(HirExternRecord{
             node, ext.name, ext.library, /*noLibraryBinding=*/false,
             ext.version,          // D-LK-ELF-SYMBOL-VERSIONING (c156)
-            /*isEagerImport=*/true,
+            // UCRT-P4 (Decision 1): almost always TRUE — a `#include`d descriptor
+            // symbol is imported whether or not the TU calls it. It is FALSE only
+            // for a SHIM-CORE COMPANION row, which exists so a hand-declared
+            // `synthesize` symbol's synthesized body can reach its cores; those are
+            // deliberately left to the linker's reference gate, which keeps exactly
+            // the ones the emitted body calls. See `ShippedExternSymbol::eagerImport`.
+            /*isEagerImport=*/ext.eagerImport,
             // A descriptor row has no DECLARATOR, so there is no user `__asm`
             // label to read — the empty string here is the correct value, not a
             // gap. The per-target LINK BASE NAME is the descriptor's channel and

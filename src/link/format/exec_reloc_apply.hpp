@@ -402,11 +402,11 @@ namespace dss::link::format {
                     // relocatable `.o` / static-archive member — an
                     // artifact linked by a FOREIGN toolchain (gcc/clang),
                     // which synthesizes the GOT slot and applies them.
-                    // DSS itself has NO apply consumer: the DSS-linked
-                    // EXEC path materializes an extern's address via
-                    // copy-relocation (data) / a direct address (fn); the
-                    // PIE/dyn path via the c117 DSS-local __got slot (the
-                    // Linear/AddAbsLo12 kernels). So reaching THIS kernel
+                    // DSS itself has NO apply consumer: every DSS-linked
+                    // image — exec, pie and dyn alike — materializes an
+                    // extern DATA object's address through the c117
+                    // DSS-local got-indirect slot and a FUNCTION's through
+                    // its stub (the Linear/AddAbsLo12 kernels). So reaching THIS kernel
                     // with a GOT-address reloc means a DSS exec/dyn image
                     // is somehow carrying a foreign-link-only reloc — a
                     // bug. Fail LOUD; a silent S/A/P fabrication here would

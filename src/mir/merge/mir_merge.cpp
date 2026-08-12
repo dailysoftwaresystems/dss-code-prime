@@ -994,9 +994,9 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                                    boolStr(kept.isThreadLocal), boolStr(e.isThreadLocal));
             }
             foldNonZero(kept.dataSizeBytes,  e.dataSizeBytes,
-                        "`dataSizeBytes` (copy-relocation slot size)", e);
+                        "`dataSizeBytes` (declared object size)", e);
             foldNonZero(kept.dataAlignBytes, e.dataAlignBytes,
-                        "`dataAlignBytes` (copy-relocation slot alignment)", e);
+                        "`dataAlignBytes` (declared object alignment)", e);
             // Every remaining ExternImport field is accounted for: `symbol` IS the
             // dedup output (the canonical merged id, checked equal above), and
             // `mangledName` / `libraryPath` / `version` are the KEY, hence equal

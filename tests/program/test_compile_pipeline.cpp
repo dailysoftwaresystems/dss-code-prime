@@ -1858,6 +1858,35 @@ namespace {
     }
     return {};
 }
+
+// The same build, but reporting only WHETHER it was refused — for the case where
+// the interesting answer is "no image, loudly" rather than "which library".
+// Deliberately EXPECT-free so a refusal is data here, not a failure.
+[[nodiscard]] bool putsBuildIsRefusedFor(
+        std::string const& descJson, char const* targetName, char const* formatName) {
+    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    auto targetR  = TargetSchema::loadShipped(targetName);
+    auto formatR  = ObjectFormatSchema::loadShipped(formatName);
+    if (!grammarR || !targetR || !formatR) return false;
+    auto grammar = *grammarR;
+    DiagnosticReporter rep;
+    auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, rep);
+    if (!abi) return false;
+    auto const ccSpan  = (*targetR)->callingConventions();
+    auto const ccIndex = static_cast<std::uint16_t>(
+        std::distance(ccSpan.data(), abi->cc));
+    ScratchDir sysDir{Location::InsideRepo, "model3-libresolve"};
+    std::ofstream(sysDir.path() / "stdio.json", std::ios::binary) << descJson;
+    UnitBuilder builder{grammar};
+    builder.addSystemDir(sysDir.path());
+    builder.addInMemory(R"(#include <stdio.h>
+int main() { puts("hi"); return 0; }
+)",
+                        "main.c");
+    CompilationUnit cu = std::move(builder).finish();
+    auto cuMir = buildCuMir(cu, *grammar, **targetR, **formatR, ccIndex, rep);
+    return !cuMir.has_value() && rep.errorCount() > 0;
+}
 } // namespace
 
 TEST(Program_ShippedLibModel3, PerFormatLibraryResolvesFromNeutralDescriptor) {
@@ -1880,18 +1909,45 @@ TEST(Program_ShippedLibModel3, PerFormatLibraryResolvesFromNeutralDescriptor) {
               "/usr/lib/libSystem.B.dylib");
 }
 
-// A descriptor whose `library` map OMITS the active format's key falls back to
-// the language's `externLibraryByFormat[format]` default (the pre-Model-3
-// "empty library inherits default" contract, preserved per format). Here the map
-// has only "pe", so an ELF build inherits the c-subset ELF default (libc.so.6).
-TEST(Program_ShippedLibModel3, MissingFormatKeyInheritsLanguageDefault) {
+// ★★ A DESCRIPTOR WHOSE `library` MAP OMITS THE ACTIVE FORMAT'S KEY BINDS
+// NOTHING — IT DOES NOT INHERIT A LANGUAGE DEFAULT (UCRT-P4, Decision 1).
+//
+// This test previously asserted the opposite: that an ELF build of a pe-only map
+// inherited `externLibraryByFormat.elf` ("libc.so.6"). That per-LANGUAGE default is
+// GONE, because it was never a fact about a language — "which image owns this
+// symbol" is a fact about a PLATFORM, and the descriptor corpus owns it PER SYMBOL.
+// Inheriting it made a descriptor that says NOTHING about elf look like it had said
+// "libc.so.6", which is how a hand-written `extern double sin(double);` came to bind
+// libc while glibc ships `sin` in libm — that binary died at LOAD with
+// "undefined symbol: sin" (MEASURED; it now links libm and runs).
+//
+// THE INVARIANT NOW: no library for this format => EMPTY, i.e. UNBOUND, and C23
+// 5.1.1.2 phase 8 resolves the reference at LINK (a sibling TU, a
+// `--resolve-library` export, or a LOUD K_SymbolUndefined). "The platform declares
+// this symbol but not where it lives" is an ENUMERATED outcome, not a fallthrough.
+//
+// RED-ON-DISABLE: reinstate any format-level fallback and the elf assertion returns
+// the invented image instead of "", failing with the name it invented.
+TEST(Program_ShippedLibModel3, MissingFormatKeyBindsNothingRatherThanADefault) {
     std::string const descPeOnly = R"({
-        "header": "stdio.h", "library": { "pe": "msvcrt.dll" },
+        "header": "stdio.h", "library": { "pe": "ucrtbase.dll" },
         "symbols": [ { "name": "puts", "signature": "fn(ptr<char>) -> i32" } ]
     })";
-    // ELF build, map has no "elf" key → inherit c-subset externLibraryByFormat.elf.
-    EXPECT_EQ(resolvedPutsLibraryFor(descPeOnly, "x86_64", "elf64-x86_64-linux-exec"),
-              "libc.so.6");
+    // On ELF the descriptor is silent, so there is NOTHING to bind. It is an EAGER
+    // shipped row (a `#include`d descriptor symbol is imported whether referenced or
+    // not), and `isEagerImport ⟹ library-bound` is a standing invariant — so the
+    // build is REFUSED LOUD rather than handed an invented image. Either loud
+    // outcome is acceptable and both are strictly better than the silent guess; what
+    // is asserted is that NO IMAGE IS INVENTED.
+    EXPECT_TRUE(putsBuildIsRefusedFor(descPeOnly, "x86_64",
+                                      "elf64-x86_64-linux-exec"))
+        << "a descriptor that declares `puts` available on elf while naming no elf "
+           "library must be REFUSED — never silently inherit a language-level guess";
+    // The CONTROL half: the same descriptor DOES speak for pe, and that value is
+    // still read. Without it, an implementation that refused everything would also
+    // pass this test.
+    EXPECT_EQ(resolvedPutsLibraryFor(descPeOnly, "x86_64", "pe64-x86_64-windows-exec"),
+              "ucrtbase.dll");
 }
 
 // RED-on-disable for the knob-that-lies: the descriptor's `library.elf` value is
@@ -3170,10 +3226,21 @@ TEST(Program_CompileFiles, TFC74InvalidTargetFormatPairDiagnosedWithoutCascade) 
                        "#endif\n");
     // `PAIR_GATE_OK` is load-bearing, not decoration: the body does not PARSE
     // unless the header was really included AND really took the x86_64 arm.
+    // ⓘ THE `main` IS REQUIRED, AND IT IS NOT SCAFFOLDING FOR THIS TEST'S CLAIM.
+    // CONTROL 1 below compiles this source to an EXEC-flavored format and asserts an
+    // EMPTY diagnostic set. Without a `main` that is now a legitimate refusal
+    // (`K_ProgramEntryUndefined`, D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): a format that
+    // starts a program needs exactly one realizable entry, and gcc's answer to the
+    // same input is `undefined reference to 'main'`. The control previously passed
+    // only because that hole was open, i.e. it was encoding a MISSING CHECK as
+    // expected behaviour. The `#include` + arch-ladder proof this test actually makes
+    // is untouched — `forty_two` still carries `PAIR_GATE_OK`, so the body still does
+    // not parse unless the header was really included and really took the x86_64 arm.
     auto const src =
         writeCSubsetSource(scratch.path(), "paircascade.c",
                            "#include \"pairgate.h\"\n"
-                           "int forty_two(void) { return PAIR_GATE_OK + 41; }\n");
+                           "int forty_two(void) { return PAIR_GATE_OK + 41; }\n"
+                           "int main(void) { return forty_two() - 42; }\n");
     scratch.useAsCwd();
 
     // ── CONTROL 1: the ladder is SATISFIABLE, under a GOOD pair ───────────

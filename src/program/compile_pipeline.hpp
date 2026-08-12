@@ -427,16 +427,120 @@ optimizeModule(Mir&                  mir,
 // (its `externImports` are MOVED into MIR→LIR; its `mir` + `model` are read). Returns
 // nullopt on any back-half tier failure (diagnostics emitted via `reporter`).
 //
-// c111 (D-RUNTIME-PE-MAIN-ARGS): `processArgs` is the target format's declared
-// program-entry argument mechanism (nullopt when the format declares none). After the
-// user entry is resolved, this drives `synthesizePeStartup` — the single-CU counterpart
-// of the merge-path synth in `program.cpp` — which, for the CRT out-parameter mechanism,
-// appends the pre-main init that fetches argc/argv and retargets the entry to it.
+// UCRT-P4 (was c111): the four format-declared blocks the entry spine reads, passed
+// as values rather than as an `ObjectFormatSchema&` so this driver half keeps its
+// existing dependency shape (the same reason `librarySynthesis` /
+// `cSymbolDecoration` / `vaListLayout` already arrive through `CuMirModule`):
+//   * `processArgs`    — the program-entry argument MECHANISM (nullopt when the
+//                        format declares none, which is correct on Mach-O: dyld
+//                        delivers argc/argv in the argument registers).
+//   * `entryVerbs`     — the program-entry materialization VERBS this format
+//                        realizes. Intersected with the language's declared entry
+//                        rows to SELECT the program entry; non-empty on every exec
+//                        format and empty on every other (both load-enforced), so
+//                        emptiness is also the "this build needs no entry"
+//                        predicate.
+//   * `sehPersonality` — the declared unwinder-personality routine + its image;
+//                        `synthesizeSehFunclets` fails loud on a resolved SEH region
+//                        when this is nullopt.
+//   * `formatName`     — names the format in those two diagnostics, so the reader
+//                        knows WHICH `.format.json` to open.
+// After the user entry is resolved this drives `realizeEntryShape` — the single-CU
+// counterpart of the merge-path pass in `program.cpp` — which materializes the
+// entry's arguments per the resolved verb × the format's declared mechanism.
 [[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
 lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<ProcessArgs> const& processArgs,
+                     std::span<EntryMaterialization const> entryVerbs,
+                     std::optional<SehPersonality> const& sehPersonality,
+                     std::string_view                  formatName,
                      ObjectFormatKind                  fmtKind,
                      DiagnosticReporter&               reporter);
+
+// ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: PROGRAM-ENTRY RESOLUTION ───────────────
+//
+// ★★★ THE SINGLE OWNER of "which function is this program's entry". Both driver
+// paths call it — the single-CU/archive path from `lowerCuMirToAssembly` and the
+// N>1 merged path from `Program::compileOneTarget` — because a program has ONE
+// entry and the rule for picking it must not exist twice. Before this existed the
+// two paths disagreed in a way nothing caught: the single-CU scan refused
+// ambiguity while the merge's scan took the FIRST name it happened to walk past,
+// so `main` in a.c and `wmain` in b.c silently picked one.
+//
+// A candidate is a function DEFINITION whose name the language declares as a
+// program-entry spelling and whose signature matched one of that name's declared
+// rows — the semantic tier already decided that and recorded the row's VERB, so
+// this function classifies nothing. What it adds is the FORMAT half: a candidate
+// is REALIZABLE only if `formatVerbs` contains its verb. That intersection is the
+// whole mechanism by which `wmain` is a program entry on Windows and an ordinary
+// function everywhere else, with no format-identity branch.
+//
+// Outcomes, all fail-loud except the first:
+//   * exactly one realizable candidate → returned.
+//   * `formatVerbs` EMPTY → this format starts no program (a relocatable `.o` /
+//     staticlib / library image). Entry selection is then by NAME only, with no
+//     verb and no requirement, preserving the behaviour object-file builds have
+//     always had: `main` is resolved if present and is otherwise just a function.
+//   * zero realizable candidates on an exec format → `K_ProgramEntryUndefined`,
+//     naming the NEAR-MISSES (a defined entry name whose verb this format cannot
+//     realize) because that is the only thing that explains WHY.
+//   * more than one → `K_ProgramEntryAmbiguous`. Never first-match-wins: a
+//     silently chosen program entry is the worst outcome available here.
+struct DSS_EXPORT EntryCandidate {
+    // ★★ OWNING, NOT A `string_view` INTO THE MODEL, AND THIS COST IS BOUGHT
+    // DELIBERATELY. It was a `string_view` aliasing `SymbolRecord::name`, and that
+    // ALREADY caused a MEASURED silent wrong-answer: `collectEntryCandidates` wrote
+    // `auto const recs = model.symbols();`, and because that accessor returns
+    // `std::vector<SymbolRecord> const&` while `auto const` deduces a VALUE, the
+    // records were COPIED and every view dangled the moment the function returned.
+    // The single-CU path never noticed — it identifies its winner by record INDEX and
+    // never reads `.name` — while the merged path, which needs the NAME to key the
+    // merge, read freed memory and got `__fu`. 9 cross-CU examples and the link-writer
+    // suites went red for a lifetime bug that no amount of reasoning about mangling
+    // could have found, because the two strings were never the same string.
+    //
+    // Fixing only the `auto const` would restore correctness and leave the TRAP: the
+    // next caller to obtain records any other way re-arms it, and the failure mode is
+    // silent garbage in a program-ENTRY decision. An owning string makes the type
+    // incapable of dangling regardless of how a caller sourced the record. There are
+    // 0-2 candidates in a program, so the allocation is not a cost worth reasoning
+    // about.
+    std::string                         name;
+    std::optional<EntryMaterialization> verb;   // as stamped by the semantic tier
+    // ⚠ DELIBERATELY NO SPAN. Both diagnostics this feeds report WHOLE-PROGRAM
+    // facts — "this program defines no entry", "two rival entries are realizable" —
+    // so there is no single declaration at fault to point at, and `SemanticModel`
+    // exposes no TreeId->Tree resolver from which one could be recovered anyway.
+    // Carrying an unset span field would be dead config, and filling it with the
+    // first candidate's location would be a FABRICATION: a wrong location is
+    // trusted, a missing one is not. The per-definition entry check that DOES have
+    // a declaration site is `S_EntryShapeNotDeclared` at the semantic tier, which
+    // carries a real span at the declarator.
+};
+
+struct DSS_EXPORT ResolvedEntry {
+    std::size_t          index = 0;   // index into the candidate span
+    EntryMaterialization verb  = EntryMaterialization::None;
+};
+
+// Returns the resolved entry, or nullopt. `nullopt` with `ok == true` means "no
+// entry, and that is legitimate" (a library/object build); `nullopt` with
+// `ok == false` means a diagnostic was reported and the build must stop.
+[[nodiscard]] DSS_EXPORT std::optional<ResolvedEntry>
+resolveProgramEntry(std::span<EntryCandidate const>      candidates,
+                    std::span<EntryMaterialization const> formatVerbs,
+                    std::string_view                     formatName,
+                    DiagnosticReporter&                  reporter,
+                    bool&                                ok);
+
+// Collect this model's program-entry candidates in symbol-record order. Shared by
+// both driver paths so "what counts as a candidate" is also single-owner; the
+// returned `EntryCandidate::index` position corresponds to `outSymbolIndex[i]`,
+// the record's index in `model.symbols()` (which IS its SymbolId on the single-CU
+// path).
+DSS_EXPORT void collectEntryCandidates(
+    SemanticModel const& model, std::vector<EntryCandidate>& out,
+    std::vector<std::uint32_t>& outSymbolIndex);
 
 // LOWER half for the MERGED whole-program module (Cycle 25 Stage C). Drives the
 // single module `mergeCuMirs` produced (N CUs unified, cross-CU calls already DIRECT,

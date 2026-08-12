@@ -1409,8 +1409,10 @@ TEST(PeExecFormatJson, ShippedPeExecDeclaresGotIndirectDataImportBinding) {
            "(D-LK-EXTERN-DATA-IMPORT, c149)";
     EXPECT_TRUE(*loaded.format->dataImportBinding()
                 == DataImportBinding::GotIndirect)
-        << "PE data imports bind IAT-slot-indirect (__imp_ semantics) -- "
-           "the got-indirect model, not copy-relocation";
+        << "PE data imports bind IAT-slot-indirect (__imp_ semantics) -- the "
+           "got-indirect model, which is now the ONLY member: ELF's "
+           "copy-relocation alternative was deleted from the vocabulary "
+           "(D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET)";
 }
 
 TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
@@ -1706,14 +1708,23 @@ TEST(PeExecWriter, MixedFunctionAndDataExternsThunkForFunctionSlotForData) {
     EXPECT_NE(hay.find("msvcrt.dll"), std::string_view::npos);
 }
 
-TEST(PeExecWriter, DataExternUnderForeignDataImportBindingFailsLoud) {
-    // c149 walker-side binding assertion (mirrors elf.cpp's
-    // copy-relocation check and macho.cpp's got-indirect check): the
-    // PE exec walker implements exactly `got-indirect`. A pe-exec
-    // schema declaring a FOREIGN model (copy-relocation — valid enum,
-    // wrong walker) passes the linker's schema-declared pre-walker
-    // gate, so the WALKER must reject loud rather than silently hand
-    // the data extern an IAT-slot binding it did not declare.
+TEST(PeExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
+    // c149 walker-side binding assertion (the SAME assertion elf.cpp and
+    // macho.cpp carry): the PE exec walker implements exactly
+    // `got-indirect`, so a pe-exec schema that does NOT declare that
+    // model must be rejected LOUD rather than silently handed an
+    // IAT-slot binding it never declared.
+    //
+    // ⓘ THE FIXTURE USED TO DECLARE A FOREIGN MODEL — `"copy-relocation"`,
+    // a valid enum value with the wrong walker. That value no longer
+    // EXISTS (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET deleted
+    // it), and a fixture spelling it would now be refused AT LOAD, which
+    // would test the loader instead of this walker. So the fixture omits
+    // the key entirely: that is the only remaining way to reach this
+    // walker without the model it implements, and it is reachable because
+    // this test drives the walker DIRECTLY — the linker's pre-walker gate,
+    // which would also refuse a nullopt binding, is bypassed here on
+    // purpose so the walker's own belt is what gets measured.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(R"({
@@ -1721,11 +1732,12 @@ TEST(PeExecWriter, DataExternUnderForeignDataImportBindingFailsLoud) {
       "cSymbolDecoration": { "scheme": "none" },
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
-      "format": {"name":"pe-exec-foreign-data-binding","kind":"pe"},
+      "format": {"name":"pe-exec-undeclared-data-binding","kind":"pe"},
       "externCallDispatch": "direct-plt",
-      "dataImportBinding": "copy-relocation",
       "$entryClusterComment": "D-LK10-ENTRY: validate() now REJECTS an exec-flavored format that declares no processExit, so a synthetic pe-exec schema must carry the pair. Values copied verbatim from the shipped pe64-x86_64-windows-exec.format.json; inert here (the walker is driven directly, no trampoline) but required to load.",
-      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2665,7 +2677,9 @@ TEST(PeExecFormatJsonValidate, MissingImageBaseRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-pe-exec","kind":"pe"},
       "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
-      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2708,7 +2722,9 @@ TEST(PeExecFormatJsonValidate, NonPow2SectionAlignmentRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"odd-align","kind":"pe"},
       "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
-      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 3000, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2746,7 +2762,9 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentBelowPageSizeRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"sub-page","kind":"pe"},
       "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
-      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 512, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2776,7 +2794,9 @@ TEST(PeExecFormatJsonValidate, MissingSubsystemRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-subsystem","kind":"pe"},
       "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
-      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2801,7 +2821,9 @@ TEST(PeExecFormatJsonValidate, MissingStackHeapSizesRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-stack","kind":"pe"},
       "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
-      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3 },
@@ -2831,7 +2853,9 @@ TEST(PeExecFormatJsonValidate, SectionAlignmentLessThanFileAlignmentRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"sect-lt-file","kind":"pe"},
       "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
-      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 8192, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -2862,7 +2886,9 @@ TEST(PeExecFormatJsonValidate, VirtualAddressNotMultipleOfSectionAlignmentReject
   "headerNameMatching": "case-sensitive",
       "format": {"name":"misaligned-va","kind":"pe"},
       "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
-      "processExit": { "mechanism": "by-name-import", "importLibraryPath": "ucrtbase.dll", "importMangledName": "exit" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
@@ -3469,7 +3495,9 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
       "format": {"name":"elf-lazy-gate","kind":"elf"},
       "entryPoint": "",
       "$entryClusterComment": "D-LK10-ENTRY: an ELF ET_EXEC schema is exec-flavored, and validate() now REJECTS an exec-flavored format declaring no processExit -- without this pair the schema no longer LOADS and this test dies at its ASSERT_TRUE(fmt.has_value()) before it can exercise the bindNow=false walker gate at all. Values copied verbatim from the shipped elf64-x86_64-linux-exec.format.json. The link path DOES build a trampoline from them; the walker still fails loud on bindNow=false, which is what this test pins.",
-      "processExit": { "mechanism": "by-name-import", "importMangledName": "exit", "importLibraryPath": "libc.so.6" },
+      "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "sysv_amd64",
       "elf": {
         "class":"elf64","data":"lsb","machine":62,"type":"exec",
@@ -3868,7 +3896,9 @@ TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
   "headerNameMatching": "case-sensitive",
       "format": {"name": "pe-exec-rodata-no-row", "version": "1.0", "kind": "pe"},
       "entryPoint": "",
-      "processExit": {"mechanism": "by-name-import", "importLibraryPath": "kernel32.dll", "importMangledName": "ExitProcess"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"kernel32.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "ExitProcess" },
       "entryCallingConvention": "ms_x64",
       "supportedDataSections": ["rodata"],
       "pe": {"machine": 34404, "characteristics": 34, "type": "exec"},
@@ -3956,7 +3986,9 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
   "headerNameMatching": "case-sensitive",
       "format": {"name": "pe-exec-cert-shift", "version": "1.0", "kind": "pe"},
       "entryPoint": "",
-      "processExit": {"mechanism": "by-name-import", "importLibraryPath": "kernel32.dll", "importMangledName": "ExitProcess"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"kernel32.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "ExitProcess" },
       "entryCallingConvention": "ms_x64",
       "supportedDataSections": ["rodata"],
       "pe": {"machine": 34404, "characteristics": 34, "type": "exec"},

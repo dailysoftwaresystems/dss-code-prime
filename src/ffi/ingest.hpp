@@ -355,22 +355,32 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
 // HIR FnSig was minted from it upstream by the CST→HIR lowerer),
 // so all that remains is to (a) apply per-format FF4 C-mangling to
 // produce the linker-visible decorated name and (b) bind every
-// extern to the caller-supplied per-format `importLibrary`. No
-// header / binary read is required.
+// extern to the per-symbol library the ROW carries. No header /
+// binary read is required.
 //
-// Used by `compileSingleUnit` when the active language declares
-// `DeclarationRule.externLibraryByFormat` for the target's
-// `ObjectFormatKind` — the canonical c-subset path for the FF6
-// hello-world milestone (puts in msvcrt.dll on PE-x86_64). A
+// ★★ UCRT-P4 (Decision 1): THERE IS NO LONGER A FORMAT-LEVEL DEFAULT
+// LIBRARY, AND THE `importLibrary` PARAMETER IS GONE WITH IT.
+// A row's import library now comes from exactly one place — the row
+// itself (`ExternDeclRef::libraryOverride`, which upstream fills from
+// the PLATFORM's shipped-descriptor realization or from a source
+// `extern "lib" …`). The former per-LANGUAGE `externLibraryByFormat`
+// default was a GUESS standing in for the descriptor corpus and a
+// SECOND OWNER of a fact the corpus already owns: it named ONE image
+// for every symbol of every header, so a hand-written
+// `extern int printf(const char*, ...);` bound the LEGACY pe CRT while
+// the same program's `#include`d stdio surface was correctly realized
+// as UCRT shims — two C runtimes, no diagnostic (MEASURED). A row with
+// nothing to bind is now UNBOUND on purpose and resolves at the LINK
+// tier (C23 5.1.1.2 phase 8), which is where every C toolchain reports
+// an unresolved external.
+//
+// Used by `compileSingleUnit` for every source-declared extern. A
 // future cycle layers header-driven validation back in via
 // `ingest()` for languages that want compile-time signature
 // validation against shipped headers (anchored
 // `D-FFI-HEADER-VALIDATION-OPTIONAL`).
 //
 // Failure modes:
-//   * Empty `importLibrary` → `F_FfiNoImportLibraryForFormat`
-//     (unsuppressable). Means the language's `externLibraryByFormat`
-//     map has no entry for `format.kind()`.
 //   * Empty `ExternDeclRef::canonicalName` → `F_FfiIngestEmptyCanonical`
 //     (shared with `ingest()`; same trap — would silently shadow
 //     legitimately-distinct symbols in any downstream by-name
@@ -386,7 +396,6 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
 [[nodiscard]] DSS_EXPORT HirIngestResult
 synthesizeFfiFromSourceDecls(
     std::span<ExternDeclRef const> externs,
-    std::string_view               importLibrary,
     TargetSchema const&            target,
     ObjectFormatSchema const&      format,
     HirFfiMap&                     ffiMap,

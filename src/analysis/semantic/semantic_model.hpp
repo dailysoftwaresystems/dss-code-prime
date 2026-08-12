@@ -145,6 +145,28 @@ struct DSS_EXPORT SymbolRecord {
     // The DeclarationRule's `kind` — Variable/Function/Table/Type. Read by
     // type-resolution (a Function symbol carries a FnSig type, etc.).
     DeclarationKind kind = DeclarationKind::Variable;
+    // D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the materialization VERB of the language
+    // entry row this DEFINITION matched — set only when this symbol is a function
+    // DEFINITION whose name the language declares as a program-entry spelling AND
+    // whose signature matches one of that name's declared shapes. `nullopt` on
+    // everything else, which is the overwhelming majority of symbols.
+    //
+    // ★★ THIS FIELD EXISTS SO THE SIGNATURE IS CLASSIFIED EXACTLY ONCE. The
+    // semantic tier is the only place that has the declarator, the resolved
+    // signature and a real source span together, so it is where the per-definition
+    // check belongs (`S_EntryShapeNotDeclared`). Entry resolution then needs only
+    // the ANSWER — this verb — to intersect against the active format's declared
+    // `entryVerbs`. Re-deriving the verb downstream would put a second classifier
+    // in the tree, and the two would drift with nothing to catch it: the previous
+    // arrangement had the MIR tier re-classifying out of `Mir` TypeIds, which is
+    // exactly the duplication this replaces.
+    //
+    // ⚠ SET ON DEFINITIONS ONLY, and that is load-bearing rather than incidental.
+    // A PROTOTYPE `int main(int, char**);` with no body declares nothing to run,
+    // so it must not make a translation unit look like it has a program entry —
+    // gcc's answer to a declared-but-undefined `main` is `undefined reference to
+    // 'main'`, and leaving this nullopt on protos is what reproduces that.
+    std::optional<EntryMaterialization> entryVerb;
     // SE4 const-correctness: set when the decl's `constMarker` token was
     // found in the type subtree. A reassignment of a const symbol emits
     // S_ConstViolation.
@@ -623,6 +645,34 @@ struct DSS_EXPORT ShippedExternSymbol {
     // definition rail and the import rail feed `linkNameFor` identical inputs
     // (the byte-for-byte agreement its header documents).
     std::string linkName;
+    // UCRT-P4 (Decision 1): FALSE ⇒ this row is a SHIM-CORE COMPANION, not a
+    // symbol this TU declared. See the realization pass in semantic_analyzer.cpp.
+    //
+    // ★ WHY IT EXISTS. A `synthesize` row is realized as a COMPILER-EMITTED body,
+    // and that body CALLS other rows of the same descriptor (the pe printf shim
+    // calls `__stdio_common_vfprintf` and `__acrt_iob_func`). On the `#include`
+    // path those cores arrive for free — the whole header's surface is injected. On
+    // the HAND-DECLARED path (`extern int printf(const char*, ...);` with no
+    // `#include`, which C23 7.1.4p2 entitles a program to write) nothing else in
+    // the TU declares them, so the synth pass FAIL-LOUDS: "the UCRT core
+    // '__acrt_iob_func' is not imported by this module" (MEASURED — the correct
+    // refusal, and the reason a recipe cannot be claimed without its cores).
+    //
+    // ★ WHY NON-EAGER RATHER THAN A CORE LIST. The recipe→core mapping lives in
+    // the synth pass's per-recipe switch arms; restating those core names here
+    // would put platform symbol literals in shared substrate — the exact
+    // agnosticism break this codebase keeps deleting. So the realization pass
+    // records the descriptor's WHOLE available surface and lets the LINKER's
+    // existing reference gate (`rejectOrDropUnreferencedExterns`) prune it: a
+    // NON-eager import survives only when REFERENCED, and after the synth pass
+    // emits the shim body exactly the cores it called are referenced. The result is
+    // precise WITHOUT anyone enumerating a core set — the mechanism already in the
+    // tree does it, which is also why this needs no update when a recipe is added.
+    //
+    // TRUE for every ordinary declared shipped extern (D-FFI-DESCRIPTOR-EAGER-
+    // IMPORT: a `#include`d descriptor's symbol is imported whether or not the TU
+    // calls it), so every pre-existing row is byte-identical.
+    bool eagerImport = true;
 };
 
 // c86 + c156: the link identity of a goal-2 SUPPRESSED shipped descriptor
@@ -840,6 +890,23 @@ public:
     // compiler-emitted shim must not be re-exported as a raw import merely
     // because the user re-declared its name (`ucrtbase.dll` exports no bare
     // `printf`, so that import fails the LOAD at 0xC0000139).
+    //
+    // ★★ UCRT-P4 (Decision 1) — TWO PRODUCERS NOW FILL THIS MAP, AND THEY PRODUCE
+    // THE IDENTICAL ROW ON PURPOSE:
+    //   ① the goal-2 skip, for a name whose descriptor the source `#include`d;
+    //   ② the corpus REALIZATION ORACLE (`ffi::realizeShippedExternSymbols`), for a
+    //      name the source declared BY HAND with no `#include` at all.
+    // C23 6.2.2p5 makes `extern int printf(…);` and `int printf(…);` THE SAME
+    // DECLARATION, and 7.1.4p2 entitles a program to declare a library function
+    // without its header — so a hand-written prototype and an `#include`d one MUST
+    // get the same realization. Before ② they did not: a hand-written one consulted
+    // no descriptor and fell through to a per-LANGUAGE default library GUESS, which
+    // on pe64 imported a bare `printf` from the LEGACY CRT alongside the UCRT shims
+    // the same program's `#include`d stdio produced — TWO C RUNTIMES, no diagnostic.
+    // ⇒ THE NAME STILL FITS: in both cases the USER's declaration displaces the
+    // platform's own, and this is the platform's realization of the displaced name.
+    // What must NEVER be inferred from a row's presence is that the source
+    // `#include`d anything.
     [[nodiscard]] SuppressedShippedSymbol const*
     suppressedShippedSymbolFor(std::string const& name) const noexcept {
         auto const it = suppressedShippedLibraries_.find(name);

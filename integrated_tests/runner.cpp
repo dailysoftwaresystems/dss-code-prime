@@ -569,6 +569,42 @@ struct CliArmOutcome {
         return {ArmVerdict::Poisoned, "output directory: " + made.why};
     }
 
+    // ── Mirror the example dir's FILE NEIGHBORHOOD into `outDir` ────────────
+    //
+    // ★ THIS CLOSES A REAL ASYMMETRY BETWEEN THE TWO RUNNERS, not a cosmetic
+    // one. The in-process sibling (tests/examples/examples_runner.cpp) already
+    // mirrors every regular file except the manifest into its scratch dir and
+    // then makes that dir the CWD; this runner did neither, so an example that
+    // needs a file AT RUN TIME passed in-process and failed here. Measured on
+    // exactly that: `examples/c-subset/environ_alias_object_identity` ships a
+    // prebuilt gcc-built `.so` it dlopens as `./libdss_env_probe_<arch>.so`
+    // (an OBJECT-IDENTITY property cannot be witnessed by one image, so the
+    // example needs a second image DSS did not build) — green in-process,
+    // exit 10 here, and exit 10 is that example's FAIL-CLOSED "the witness is
+    // absent" code, which is the only reason it did not pass for the wrong
+    // reason.
+    // [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]]: one runner enforcing while
+    // its sibling shrugs is a SILENT harness bug of the same shape as a
+    // `.ps1`/`.sh` pair where only one side is wrong.
+    // CONTRACT, deliberately identical to the sibling's: the IMMEDIATE
+    // directory only, no subdirectories, and the manifest excluded. An example
+    // whose data lives in a subdir needs BOTH loops made recursive in the same
+    // change.
+    for (auto const& entry : fs::directory_iterator(exampleDir)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().filename() == "expected.json") continue;
+        std::error_code copyEc;
+        fs::copy_file(entry.path(), outDir / entry.path().filename(),
+                      fs::copy_options::overwrite_existing, copyEc);
+        if (copyEc) {
+            check(exampleName + ": staged neighbor file "
+                  + entry.path().filename().generic_string(),
+                  false, copyEc.message());
+            return {ArmVerdict::Poisoned,
+                    "neighbor staging: " + copyEc.message()};
+        }
+    }
+
     // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): build each prerequisite LIBRARY
     // artifact FIRST (into the same out dir) via a separate CLI invocation,
     // then thread its path into the dependent build's `--resolve-library`.
@@ -679,8 +715,53 @@ struct CliArmOutcome {
         launcherPrefix.push_back(emuPath);
     }
 
-    auto const result = dss::test_support::runBinary(
-        artifactPath, std::chrono::milliseconds{5000}, false, launcherPrefix);
+    // ── Run WITH `outDir` AS THE WORKING DIRECTORY ──────────────────────────
+    //
+    // The staged neighbor files above are only reachable if the child's CWD is
+    // the directory they were staged into — a program that opens
+    // `./libfoo.so` resolves it against its CWD, not against its own path.
+    // The in-process sibling achieves this with `ScratchDir::useAsCwd()`; this
+    // is the same move, scoped and restored, because the runner also resolves
+    // RELATIVE paths of its own (the compiler path, the corpus root) between
+    // examples. SAFE HERE and stated so the next reader can check it: this
+    // runner walks examples SEQUENTIALLY in one thread — there is no concurrent
+    // arm whose relative-path resolution this could disturb.
+    struct CwdGuard {
+        fs::path saved;
+        bool     ok = false;
+        explicit CwdGuard(fs::path const& to) {
+            std::error_code ec;
+            saved = fs::current_path(ec);
+            if (ec) return;
+            fs::current_path(to, ec);
+            ok = !ec;
+        }
+        ~CwdGuard() {
+            if (!ok || saved.empty()) return;
+            std::error_code ec;
+            fs::current_path(saved, ec);
+        }
+        CwdGuard(CwdGuard const&) = delete;
+        CwdGuard& operator=(CwdGuard const&) = delete;
+    };
+    // FAIL-CLOSED: if the chdir did not take, an example that needs a staged
+    // file would fail for a reason that looks like a DSS defect. Say which.
+    auto const absArtifact = fs::absolute(artifactPath);
+    dss::test_support::RunResult result;
+    {
+        CwdGuard cwd{outDir};
+        check(exampleName + ": run cwd set to " + outDir.generic_string(),
+              cwd.ok,
+              cwd.ok ? "" : "chdir failed; a staged neighbor file would be "
+                            "unreachable and the example would fail as if DSS "
+                            "were at fault");
+        if (!cwd.ok) {
+            return {ArmVerdict::Poisoned, "could not chdir to the output dir"};
+        }
+        result = dss::test_support::runBinary(
+            absArtifact, std::chrono::milliseconds{5000}, false,
+            launcherPrefix);
+    }
     check(exampleName + ": spawn succeeded (diag='"
           + result.diagnostic + "')", result.spawned);
     if (!result.spawned) {

@@ -146,8 +146,26 @@
 #       per-cycle OS-symbol additions (isnan/pread64/…). The worklist:
 #         · kernel32 (test1.c Win section): CreateEvent OpenEvent SetEvent
 #           LockFile UnlockFile + EVENT_MODIFY_STATE
-#         · msvcrt CRT (test1.c/test_quota.c): _set_abort_behavior _CALL_REPORTFAULT
-#           _commit _chsize_s _stati64
+#         · UCRT/ucrtbase.dll (test1.c/test_quota.c): _set_abort_behavior
+#           _CALL_REPORTFAULT _commit _chsize_s _stat64i32
+#           ⓘ ucrtbase, NOT msvcrt, and that is measured rather than assumed:
+#           ✔MEASURED, msvcrt.dll exports no `_set_abort_behavior` at all, so
+#           this row can only ever bind against UCRT.
+#           ⚠ THE STAT SPELLING IS `_stat64i32`, NOT `_stati64`, AND THE WRONG ONE
+#           IS A LOAD-BREAKER RATHER THAN A TYPO. ✔MEASURED on two independent
+#           instruments (`objdump -p` + a direct PE export-directory parse, both
+#           reading OrdinalBase=1): `_stati64` is msvcrt.dll ORDINAL 766 and is
+#           ABSENT FROM ucrtbase.dll; UCRT spells the same 64-bit-size/32-bit-time
+#           stat `_stat64i32` (ucrtbase.dll ORDINAL 1807, itself absent from
+#           msvcrt.dll). Since TF-C111 flipped `library.pe` to ucrtbase.dll, a
+#           descriptor row naming `_stati64` would be EAGER-IMPORTED
+#           ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]: DSS imports every symbol a
+#           descriptor DECLARES, not merely the ones called), so EVERY binary that
+#           so much as `#include`s that header would die at LOAD with 0xC0000139
+#           STATUS_ENTRYPOINT_NOT_FOUND — never a link error, and never a
+#           diagnostic pointing at this line. `_commit` and `_chsize_s` above are
+#           real exports of BOTH images (ucrtbase 189/186, msvcrt 220/215), so they
+#           stay exactly as spelled.
 #         · CRT low-level I/O by POSIX name (test_fs.c): open close read fstat —
 #           test_fs.c:72 gates <unistd.h> on `!_WIN32 || __MSVCRT__`; DSS defines
 #           _WIN32 but not __MSVCRT__, so they need <io.h>/<sys/stat.h> pe mappings
@@ -289,6 +307,7 @@ $Config       = if ($env:DSS_CONFIG) { $env:DSS_CONFIG } else { 'release' }
 # for this run, not inheriting one — and which is announced as such per leg so a
 # reader of the log can never mistake it for the earned set.
 $ConfoundsOverride = if ($env:DSS_CONFOUNDS) { @($env:DSS_CONFOUNDS -split '\s+' | Where-Object { $_ }) } else { $null }
+# >>> dss:confound-supply >>>
 # THE SUPPLY, IN ONE PLACE, KEYED ON THE LEG'S OWN DECLARATION AND ON NOTHING
 # ELSE — no label, no host, no format. `$leg` is the RESOLVED leg from
 # harness_legs.py --plan, whose `confounds` field is the catalogue's rows already
@@ -303,8 +322,58 @@ function Get-LegConfounds($leg) {
   if ($null -eq $leg.PSObject.Properties['confounds']) {
     Die "[$($leg.label)] the resolved leg plan carries NO ``confounds`` field. harness_legs.py refuses to plan a leg that does not declare one, so this is a transport defect between the resolver and this driver — not a leg with nothing earned. Treating it as an empty list would silently report every failure on this leg as a DSS defect. [D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG]"
   }
+  # ★★ AND WHETHER A MACHINE MEASUREMENT BACKS THAT LIST — the .sh's twin refusal
+  # in leg_confound_patterns. A row whose mechanism is a property of THIS MACHINE
+  # (the stepping CLOCK_REALTIME) declares `requires: [<probe>]` and is honoured
+  # only where the probe MEASURED the defect as PRESENT. An `unprobed` plan is
+  # FAIL-SAFE — conditional rows dropped, nothing excused on evidence nobody
+  # gathered — but not fit to run a corpus on: the withheld excusals would surface
+  # as GENUINE reds and read as compiler regressions.
+  # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  # ⚠ THE TWO UNUSABLE GATINGS FAIL FOR OPPOSITE REASONS — the .sh's twin wording.
+  # "every conditional row is INACTIVE" is TRUE of `unprobed` and FALSE of
+  # `injected`, where the rows ARE honoured from a file that may describe another
+  # machine. A refusal that misstates what happened is the same defect as a caveat
+  # that contradicts the decision beside it. See anchor, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT
+  $gating = if ($null -ne $leg.PSObject.Properties['confoundGating']) { $leg.confoundGating } else { '<unset>' }
+  if ($gating -ne 'probed') {
+    Die "[$($leg.label)] the resolved leg plan says confoundGating='$gating', not 'probed'. A conditional confound row (``requires: [<environment probe>]``) is honoured ONLY where the named probe MEASURED its defect as PRESENT on THIS machine, and this plan carries no such measurement. 'unprobed' — nothing was measured, so every conditional row is INACTIVE: safe, and not usable, because the withheld excusals surface as GENUINE reds and read as compiler regressions; resolve the plan WITHOUT ``--environment-probes skip`` so harness_legs.py measures. 'injected' — the verdicts were READ FROM A FILE (``--probe-verdicts``), so conditional rows ARE honoured, on evidence this driver cannot vouch for: a verdict captured on another box would excuse a real miscompile HERE, in silence; drop the flag and let it measure. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
+  }
   return @($leg.confounds | Where-Object { $_ })
 }
+# <<< dss:confound-supply <<<
+
+# >>> dss:confound-report >>>
+# WHY A FAILURE WAS EXCUSED, PRINTED — NOT MERELY DECIDED.
+# [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.]
+#
+# ★★ `earnedOn` FAILED BECAUSE IT IS PROSE NOTHING READS, AND A PROBE RESULT
+# NOBODY SEES IS THE SAME FAILURE WITH EXTRA STEPS. So every run states, per leg:
+# which environment probes ran, each verdict WITH ITS MEASURED EVIDENCE, and which
+# confound rows are consequently ACTIVE vs INACTIVE. A run whose report cannot say
+# why a failure was excused has not earned the exclusion.
+#
+# ⚠ THE LINES ARE GENERATED BY harness_legs.py AND PRINTED VERBATIM HERE. Neither
+# driver composes them: two drivers each writing their own account of the same
+# decision is how the ledger came to have two answers in the first place, and it is
+# what the differential battery's `confound-report` case exists to keep true. This
+# function's whole job is transport + the LOUD refusal of an empty report, which is
+# the one thing a caller could otherwise not tell from "nothing to say".
+# ⚠ THE TWIN OF build-and-test.sh's print_confound_report, and the pair is proven
+# by DIFFERENTIAL EXECUTION (harness_legs.py --check-regions, case
+# `confound-report`) rather than by these two comments agreeing.
+function Write-ConfoundReport($legTag, $report) {
+  if ([string]::IsNullOrWhiteSpace($report)) {
+    Die "[$legTag] the resolved leg plan carries an EMPTY confound report. harness_legs.py emits at least one line for every leg — the rows that are ACTIVE, and one line per INACTIVE row saying which probe withheld it. An empty report means the account of WHY a failure was excused did not arrive, and an unexplained exclusion is not an earned one. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
+  }
+  foreach ($line in ($report -split "`n")) {
+    $line = $line.TrimEnd("`r")
+    if ($line.Length -eq 0) { continue }
+    Info $line
+  }
+}
+# <<< dss:confound-report <<<
 # DSS_TIER_EXCLUDES: space-separated regexes naming .test FILES to drop from the
 # tier. Delivered through SQLite's OWN upstream hook — the QUICKTEST_OMIT env var
 # read by test/permutations.test (~line 152): a COMMA-separated list of Tcl regexes
@@ -1007,9 +1076,13 @@ if (-not $python3) { Die "python3 not found on PATH — needed to resolve the le
 #                              ENVIRONMENT (the leg's declared variables, the loader
 #                              search path in the launcher's namespace with the
 #                              target's separator, the carrier that carries both,
-#                              and the CLI smoke gate applying them at all), each
-#                              with its red-on-disable mutation asserted to have
-#                              LANDED.
+#                              and the CLI smoke gate applying them at all), and —
+#                              since 2026-08-11 — the PRECONDITION DISCRIMINATOR,
+#                              driven over real zero-byte segment logs so that "one
+#                              resume, not ten" is asserted rather than described
+#                              [D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-
+#                              SILENT-CRASH]. Each pin carries its red-on-disable
+#                              mutation, asserted to have LANDED.
 #   test-mirror-regions.ps1    the `dss:` REGIONS — every region declared with who
 #                              verifies it (a claimed verifier that does not read
 #                              the region is a LOUD failure), and for a region
@@ -1055,7 +1128,23 @@ driver self-test exited 0 but printed no readable summary line.
   if ($nSkip -eq '0') {
     Info "driver self-test ${stName}: OK ($n assertions, 0 skipped)"
   } else {
-    Warn "driver self-test ${stName}: OK ($n assertions) — but $nSkip assertion(s) SKIPPED on this host (unmet prerequisite, normally 'no git on PATH'). That part of the late-stage logic is UNPROVEN for this run: $selfTest"
+    # ★★ PARITY with build-and-test.sh, and the same correction: the self-test's
+    # OWN words, never this driver's guess at them.
+    # ANCHOR, ONE LINE, DO NOT WRAP:
+    # D-HARNESS-SELFTEST-SKIP-REPORTED-UNDER-ANOTHER-SUITE-S-REASON
+    # "unmet prerequisite, normally 'no git on PATH'" is true of
+    # test-confound-scope.ps1 and FALSE of test-mirror-regions.ps1, whose skips
+    # mean the host cannot execute one of the two mirrored arms and twin parity
+    # is REDUCED. Each suite states its own reason; this driver RELAYS it.
+    Warn "driver self-test ${stName}: OK ($n assertions) — but $nSkip assertion(s) SKIPPED on this host."
+    $inBlock = $false
+    foreach ($line in $stOut) {
+      $t = "$line"
+      if ($t -match '^passed=') { $inBlock = $false; continue }
+      if ($t -match 'COVERAGE REDUCED') { $inBlock = $true }
+      if ($inBlock -or $t -match '^\s*[Ss][Kk][Ii][Pp]\s') { "      $t" | Write-Host }
+    }
+    Warn "      Those assertions are UNPROVEN for this run. Re-run the suite by hand on a host that has the missing prerequisite if you want the full battery: $selfTest"
   }
 }
 }
@@ -2545,29 +2634,64 @@ Pass "recipe: $nTus TUs, $nDefs defines, $nIncs include dirs (sqlite @ $sqliteHe
 # dss-code-prime emits every one of the five targets, selected from config. That
 # is why there is one Step 5 and not one per leg.
 Step '5/9  Locate / build dss-code-prime (newest existing, else build Release)'
+# ★★ DISCOVER THE LAYOUT UNDER A BUILD ROOT; DO NOT ENUMERATE IT.
+# [D-HARNESS-PS1-COMPILER-LOOKUP-BLIND-TO-A-MULTI-CONFIG-GENERATOR]
+#
+# What stood here was a hand-written (directory x name) cross-product. It listed
+# `build/bin/dss/Release` but had NO cell for `build-rel/bin/dss/<Config>/` — and
+# `build-rel` is the directory this very step BUILDS into, with `--config Release`,
+# a dozen lines below. A single-config generator (Ninja, Unix Makefiles) puts the
+# exe at `bin/dss/`; a MULTI-config one (Visual Studio, i.e. the default on a stock
+# Windows box) puts it at `bin/dss/<Config>/`. That is a property of the GENERATOR,
+# and restating it in a list here is how one cell came to be missing.
+#
+# ✔MEASURED 2026-08-11 in a fresh worktree, and the two lines were one second apart:
+#     dss-code-prime.vcxproj -> ...\build-rel\bin\dss\Release\dss-code-prime.exe
+#     [X] ERROR: dss-code-prime.exe not found.
+# The build SUCCEEDED and the driver died claiming its own output did not exist, so
+# no Windows corpus run could ever start in a checkout that had no pre-existing
+# Ninja build dir.
+#
+# ⓘ The `.sh` twin never had this defect because it already searched rather than
+# declared (`find "$SRC_DIR/build" -type f -name dss-code-prime`), which is exactly
+# why this was invisible on every POSIX leg. The ROOTS below remain a declared
+# POLICY list — which build directories are eligible, and their precedence is by
+# mtime, newest wins — while the layout BENEATH each root is discovered.
 function Find-Dss {
   # Both spellings on every host: the executable suffix is a fact about the
   # machine this compiler RUNS on, and probing for a name that cannot exist here
-  # costs one Test-Path.
+  # costs nothing.
   $names = @('dss-code-prime.exe', 'dss-code-prime')
-  $dirs  = @(
-    [System.IO.Path]::Combine($RepoRoot, 'build-rel', 'bin', 'dss'),
-    [System.IO.Path]::Combine($RepoRoot, 'build', 'bin', 'dss', 'Release'),
-    [System.IO.Path]::Combine($RepoRoot, 'build', 'bin', 'dss'),
-    [System.IO.Path]::Combine($RepoRoot, 'build-dbg', 'bin', 'dss')
-  )
+  $roots = @('build-rel', 'build', 'build-dbg')
+  $script:DssSearchedDirs = @()
   $cands = @()
-  foreach ($d in $dirs) { foreach ($n in $names) { $cands += (Join-Path $d $n) } }
-  $cands = $cands | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-             Sort-Object { (Get-Item -LiteralPath $_).LastWriteTime } -Descending
-  return ($cands | Select-Object -First 1)
+  foreach ($r in $roots) {
+    $binDir = [System.IO.Path]::Combine($RepoRoot, $r, 'bin', 'dss')
+    $script:DssSearchedDirs += $binDir
+    if (-not (Test-Path -LiteralPath $binDir -PathType Container)) { continue }
+    foreach ($n in $names) {
+      # -Recurse so a per-config subdirectory is found without being named.
+      $cands += @(Get-ChildItem -LiteralPath $binDir -Filter $n -File -Recurse -ErrorAction SilentlyContinue)
+    }
+  }
+  $best = $cands | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if ($best) { return $best.FullName }
+  return $null
+}
+# The searched set, spelled out, for the two `Die`s below: "not found" with no paths
+# is what turned this into a log dive instead of a one-line diagnosis.
+function Get-DssSearchNote {
+  $dirs = if ($script:DssSearchedDirs) { $script:DssSearchedDirs -join '; ' } else { '<Find-Dss not yet called>' }
+  return ("searched at any depth under: $dirs (for dss-code-prime.exe or dss-code-prime). " +
+          "A multi-config generator lands it in a per-config subdirectory (bin/dss/Release); " +
+          "a single-config one in bin/dss. Set `$env:DSS_BIN to name a binary outside these roots.")
 }
 if ($env:DSS_BIN -and (Test-Path $env:DSS_BIN)) {
   $DssBin = (Resolve-Path $env:DSS_BIN).Path
   Info "using `$env:DSS_BIN — $DssBin"
 } elseif ($env:SKIP_DSS_BUILD -eq '1') {
   $DssBin = Find-Dss
-  if (-not $DssBin) { Die "SKIP_DSS_BUILD=1 but no dss-code-prime.exe found under build-rel/build/build-dbg." }
+  if (-not $DssBin) { Die ("SKIP_DSS_BUILD=1 but no dss-code-prime binary exists: " + (Get-DssSearchNote)) }
   Info "SKIP_DSS_BUILD=1 — reusing $DssBin"
 } else {
   $DssBin = Find-Dss
@@ -2580,7 +2704,12 @@ if ($env:DSS_BIN -and (Test-Path $env:DSS_BIN)) {
     $DssBin = Find-Dss
   }
 }
-if (-not $DssBin -or -not (Test-Path $DssBin)) { Die "dss-code-prime.exe not found." }
+if (-not $DssBin -or -not (Test-Path $DssBin)) {
+  # ⚠ If the build above SUCCEEDED and you are reading this, the binary landed
+  # outside every eligible root — say WHERE in the report below rather than adding
+  # another cell to a list. [D-HARNESS-PS1-COMPILER-LOOKUP-BLIND-TO-A-MULTI-CONFIG-GENERATOR]
+  Die ("dss-code-prime binary not found after the build step: " + (Get-DssSearchNote))
+}
 $dssAge = (Get-Item $DssBin).LastWriteTime
 Info "compiler: $DssBin  (built $dssAge)"
 Warn "if the build below fails with a stale-manifest-field error (e.g. unknown 'artifactName'), this binary predates the project-config extensions — rebuild it (delete build-rel or set SKIP_DSS_BUILD off)."
@@ -3555,6 +3684,39 @@ function Read-CorpusSegment($logPath) {
   return $r
 }
 
+# ── THE ZERO-PROGRESS SIGNATURE ─────────────────────────────────────────────
+# [D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH.]
+#
+# What must CHANGE between two consecutive segments for another resume to be
+# worth attempting. The PRECONDITION FAILURE branch compares this answer against
+# the previous zero-file segment's; empty means "keep resuming".
+#
+# ✔MEASURED 2026-08-10, one Windows run, two legs, same commit, same root cause:
+# elf64-arm64 ran under qemu, which PRINTS `qemu: uncaught target signal 11`, and
+# the discriminator fired on the second segment with the resume budget intact.
+# elf64-x86_64 ran natively and died SILENTLY - every corpus*.log 0 bytes, no
+# diagnostic anywhere - so the old `-and $res.Diagnostic` conjunct could never be
+# satisfied: it burned all 10 resumes and reported 11 unnameable aborts. THE LEG
+# WHOSE CRASH TALKS WAS HANDLED; THE LEG WHOSE CRASH IS SILENT WAS NOT.
+#
+# ★ "NOTHING" IS THE PARSE FINDING NOTHING, not merely the diagnostic being
+# empty. Diagnostic is also empty for a segment that ran TESTS without completing
+# a FILE (` Ok` and `name...` lines are fixture output, excluded from Diagnostic
+# by design) - that segment made progress, its boundary advances off LastTest, and
+# it must stay resumable. So the sentinel is returned only when the diagnostic,
+# the ` Ok` tally, the failure tally and the last test name are ALL empty.
+#
+# ⚠ `-as [int]` rather than a cast: `[int]''` THROWS, and this runs on a failure
+# path where a throw would cost the run its report.
+function Get-ZeroProgressSignature($diagnostic, $okLines, $failMarkers, $lastTest) {
+  if ($diagnostic) { return "$diagnostic" }
+  $ok = ($okLines -as [int]); $fx = ($failMarkers -as [int])
+  if (-not $ok -and -not $fx -and -not $lastTest) {
+    return '<SILENT: the fixture produced no diagnostic, no test result and no test name>'
+  }
+  return ''
+}
+
 # Which corpus FILE was the fixture inside when it died? Two things can name it,
 # and this resolver takes EITHER: a qualified test NAME (LastTest) or the SOURCE
 # PATH a Tcl traceback blames (Blamed). Pick the corpus stem that occurs RIGHTMOST
@@ -3969,6 +4131,34 @@ foreach ($leg in $BuildableLegs) {
   if ((-not $legOut) -or (-not $lbl) -or ($legOut -eq $OutRoot)) { Die "internal: refusing to wipe '$legOut' for leg '$lbl' — it is not a per-leg directory under $OutRoot." }
   if (Test-Path $legOut) { Remove-Item -Recurse -Force $legOut }
   New-Item -ItemType Directory -Force -Path $legOut | Out-Null
+  # ── THE SAME-PLATFORM ATTRIBUTION ORACLE, FROM THE SAME MANIFEST ──────────
+  # ★ ONE DECLARATION, TWO COMPILERS — which is what an oracle IS. The manifest
+  # DSS is about to consume goes straight to this leg's VERIFIED target compiler
+  # (`--resolve-target-cc` proves the target with `-dumpmachine`; a name is not a
+  # declaration of target), so subject and control cannot drift apart. It is also
+  # the only shape that works cross-target: SQLite's autotools Makefile is
+  # configured for the DERIVING host and cannot emit a foreign-target fixture —
+  # which is why the pe64 leg had no oracle at all
+  # [D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE], while Step 9 printed it a line
+  # about a Linux ELF that reads as an available control and is not one.
+  # ★ NEVER FATAL, NEVER SILENT: rc 4 = no compiler here targets this leg, rc 3 =
+  # one does and the build failed. Both leave the leg with NO ORACLE, said in
+  # those terms at Step 9, and the corpus still runs.
+  $LegLedger[$lbl].Oracle = ''; $LegLedger[$lbl].OracleCc = ''; $LegLedger[$lbl].OracleTriple = ''
+  $oracleRun = Invoke-LegResolver @('--build-reference-oracle', $lbl,
+                                    '--manifest', $manifest,
+                                    '--oracle-dir', $legOut,
+                                    '--oracle-log', (Join-Path $legOut 'reference-oracle.log'))
+  if ($oracleRun.Rc -eq 0) {
+    $orep = ($oracleRun.Stdout | Select-Object -Last 1) | ConvertFrom-Json
+    $LegLedger[$lbl].Oracle       = "$($orep.path)"
+    $LegLedger[$lbl].OracleCc     = "$($orep.cc)"
+    $LegLedger[$lbl].OracleTriple = "$($orep.triple)"
+    Info "[$lbl] same-platform ORACLE built by $($orep.cc) ($($orep.triple)) -> $($orep.path)"
+  } else {
+    # The resolver's own words, never this driver's paraphrase of them.
+    foreach ($l in ($oracleRun.Text -split "`n")) { if ($l.Trim()) { Warn "[$lbl] oracle: $l" } }
+  }
   $clog = Join-Path $legOut 'compile.log'
   # A project build routes each target to <output>/<formatName>/, and NAMES the file
   # there itself. dss-code-prime returns exit 0 even on FATAL errors → judge from
@@ -4670,15 +4860,35 @@ $legLaunchFixture = Convert-LaunchPath $legXlate $fixture
 # THIS LEG'S OWN DECLARATION (legs.json `confounds`, resolved by harness_legs.py),
 # which is the same declaration build-and-test.sh reads. One ledger, both drivers.
 $Confounds   = @(Get-LegConfounds $leg)
+# The ABORT half of the SAME ledger, read from the same resolved plan. Kept as
+# its own list so a unit-name matcher can never see an `abort-file` pattern and
+# vice versa: one ledger, never one name space.
+# [D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY]
+$LegPlanAbortConfounds = @($leg.abortConfounds)
 Step "8/9  [$LegTag] $($leg.spec) — $Tier.test ($LegRunMode$(if ($legLauncher.Count) { ": $($legLauncher -join ' ')" })$(if ($legXlate -and $legXlate -ne 'none') { "; paths -> '$legXlate' via '$($leg.run.pathTranslator -join ' ')'" }))"
 if ($legXlate -and $legXlate -ne 'none') {
   Info "[$LegTag] the launcher addresses files in ANOTHER namespace — fixture $fixture -> $legLaunchFixture"
 }
+$LegConfoundsDeclared = @($leg.confoundRows).Count
 if ($Confounds.Count) {
   Info "[$LegTag] confound patterns in force ($($Confounds.Count)): $($Confounds -join ' ')$(if ($null -ne $ConfoundsOverride) { '   [operator DSS_CONFOUNDS — applied to EVERY leg]' } else { '   [EARNED on this leg — legs.json `confounds`, provenance per pattern]' })"
+} elseif ($LegConfoundsDeclared -gt 0) {
+  # ★★ AN EMPTY SUPPLY IS NOT A CLAIM ABOUT THE CATALOGUE — the .sh's twin
+  # announcement, and the same three facts. The catalogue declaring none, every
+  # declared row being GATED OFF by an environment probe, and a transport failure
+  # all produce an empty array; the third `Die`s in Get-LegConfounds, and the first
+  # two are told apart by the resolver's own declared-row count instead of being
+  # inferred from the emptiness. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  Info "[$LegTag] NO confound patterns IN FORCE, and this is NOT a catalogue that declares none: $LegConfoundsDeclared row(s) ARE declared for this leg and every one of them was gated OFF for this run — see the per-row account immediately below. Every failure here counts, and a clock-family failure here reads as GENUINE."
 } else {
-  Info "[$LegTag] NO confound patterns: this leg's catalogue entry declares ``confounds: []``, i.e. nothing has ever been measured as a non-DSS confound HERE, and a confound must be EARNED per platform, never copied from a sibling leg. Every failure here counts."
+  Info "[$LegTag] NO confound patterns: this leg's catalogue entry declares ``confounds: []`` (0 rows declared), i.e. nothing has ever been measured as a non-DSS confound HERE, and a confound must be EARNED per platform, never copied from a sibling leg. Every failure here counts."
 }
+# ★ AND THE ACCOUNT OF WHY — every probe verdict with its evidence, every row's
+# ACTIVE/INACTIVE decision. Printed on the OPERATOR override path too: an
+# operator's list replaces the earned one, and which earned rows it displaced is
+# exactly what a reader of that run needs to know.
+# [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+Write-ConfoundReport $LegTag ($leg.confoundReport -join "`n")
 # The leg's OWN library directories go on its TARGET's loader search variable so
 # its fixture can load them at run time; TCL_LIBRARY points the Tcl runtime at its
 # script library.
@@ -4868,12 +5078,15 @@ foreach ($n in $CloneLockNotes) { $hygiene += $n }
 # a sweep that could not run is not a clean bill, and that path warns.
 $resumes    = 0
 $lastBoundary = ''
-# The previous segment's first diagnostic, but ONLY when that segment completed
-# zero files. Empty means "the last segment made progress", which is what keeps a
-# genuine mid-corpus crash on the ordinary resume path. $preconditionFail is the
-# diagnostic itself once detected — the classifier below reads it, so the verdict
-# is decided in one place. [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
-$prevZeroDiag = ''
+# The previous segment's ZERO-PROGRESS SIGNATURE (Get-ZeroProgressSignature: its
+# first diagnostic, or a SENTINEL when it said nothing at all), but ONLY when that
+# segment completed zero files. Empty means "the last segment made progress",
+# which is what keeps a genuine mid-corpus crash on the ordinary resume path.
+# $preconditionFail is that signature once detected — the classifier below reads
+# it, so the verdict is decided in one place.
+# [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY,
+#  D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH]
+$prevZeroSig = ''
 $preconditionFail = ''
 $oldTclLib = $env:TCL_LIBRARY
 $oldOmit = $env:QUICKTEST_OMIT; $oldPatterns = $env:SQLITE_TEST_PATTERN_LIST
@@ -4994,28 +5207,53 @@ while ($si -lt $segments.Count) {
   # reported in the union - one bad unit must never cost us the other thousand.
   # What is added is a DISTINCT case with two conjuncts a genuine mid-corpus crash
   # cannot satisfy together: (1) the segment completed ZERO files, and (2) its
-  # first diagnostic is IDENTICAL to the previous segment's, which also completed
-  # zero files. A real crash on the corpus's next file also completes zero files -
-  # but the resume boundary STRICTLY ADVANCES every time, so it dies in a different
-  # file with a different diagnostic and (2) fails. The FIRST such abort is still
-  # resumed exactly as today: one attempt is what distinguishes "could not start"
-  # from "crashed at the start".
-  if ($res.Completed.Count -eq 0 -and $res.Diagnostic -and $res.Diagnostic -eq $prevZeroDiag) {
-    $preconditionFail = $res.Diagnostic
-    Warn "[$LegTag] PRECONDITION FAILURE — the fixture completed ZERO test files in TWO consecutive segments with the IDENTICAL first diagnostic."
+  # ZERO-PROGRESS SIGNATURE is IDENTICAL to the previous segment's, which also
+  # completed zero files. A real crash on the corpus's next file also completes
+  # zero files - but the resume boundary STRICTLY ADVANCES every time, so it dies
+  # in a different file with a different diagnostic and (2) fails. The FIRST such
+  # abort is still resumed exactly as today: one attempt is what distinguishes
+  # "could not start" from "crashed at the start".
+  #
+  # ★★ THE SIGNATURE, NOT THE DIAGNOSTIC - see Get-ZeroProgressSignature for the
+  # measured A/B. This condition used to require a non-empty $res.Diagnostic,
+  # which is unsatisfiable for a fixture that dies WITHOUT WRITING A BYTE, so the
+  # whole resume budget burned on a startup crash. The helper answers a SENTINEL
+  # for a segment that said nothing at all, so silence compares equal to silence.
+  #
+  # ⚠ [string]::Equals(..., Ordinal) AND NOT `-eq`: PowerShell's `-eq` on strings
+  # is CASE-INSENSITIVE, while the .sh twin's `[[ a == b ]]` is byte-wise. Two
+  # diagnostics differing only in case would have been "identical" on Windows and
+  # different on Linux - a twin divergence in the one comparison the whole
+  # discriminator rests on.
+  #
+  # ⓘ ON ONE LINE ON PURPOSE, long as it is: test-driver-contracts.ps1 EXTRACTS
+  # this condition and evaluates it, exactly as the .sh twin's pin does, so that
+  # the decision is judged BEHAVIOURALLY rather than by a text search. A wrapped
+  # condition would have to be reassembled by the pin, and a pin that rebuilds its
+  # subject is a pin that can rebuild it wrongly.
+  $zeroSig = Get-ZeroProgressSignature $res.Diagnostic $res.OkLines $res.FailMarkers $res.LastTest
+  if ($res.Completed.Count -eq 0 -and $zeroSig -and [string]::Equals($zeroSig, $prevZeroSig, [System.StringComparison]::Ordinal)) {
+    $preconditionFail = $zeroSig
+    # The log's SIZE is stated because it is the measured evidence for the silent
+    # case, and Get-Content prints nothing at all for a 0-byte log - a report that
+    # goes quiet exactly where the fixture did would read as a reporting bug.
+    $logSize = 'size unknown'
+    $logItem = Get-Item -LiteralPath $log -ErrorAction SilentlyContinue
+    if ($logItem) { $logSize = "$($logItem.Length) byte(s)" }
+    Warn "[$LegTag] PRECONDITION FAILURE — the fixture completed ZERO test files in TWO consecutive segments, both ending IDENTICALLY."
     Warn "      This is NOT a resumable fixture crash: nothing the resume engine can do changes it,"
     Warn "      so the remaining $($MaxResumes - $resumes) resume(s) are NOT spent on it."
-    Warn "      the diagnostic, verbatim, from $log :"
-    Warn "        $($res.Diagnostic)"
-    Info "      first lines of that log:"
+    Warn "      what both segments ended with, verbatim, from $log :"
+    Warn "        $zeroSig"
+    Info "      first lines of that log ($logSize):"
     Get-Content $log -TotalCount 6 | ForEach-Object { Info "        $_" }
-    $notReached += "EVERY unit of the '$(if ($seg.Perm) { $seg.Perm } else { $Tier })' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $($res.Diagnostic)"
+    $notReached += "EVERY unit of the '$(if ($seg.Perm) { $seg.Perm } else { $Tier })' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $zeroSig"
     break
   }
   # Carried to the NEXT segment so the comparison above has something to compare
   # against. Cleared by any segment that made progress, which is what keeps a
   # genuine crash on the resilience path.
-  $prevZeroDiag = if ($res.Completed.Count -eq 0) { $res.Diagnostic } else { '' }
+  $prevZeroSig = if ($res.Completed.Count -eq 0) { $zeroSig } else { '' }
   $lastDone = if ($res.Completed.Count) { $res.Completed[$res.Completed.Count - 1] } else { '' }
   $perm     = $res.Permutation
   if (-not $perm -and $seg.Perm) { $perm = $seg.Perm }
@@ -5291,6 +5529,49 @@ if ($StageBuild -and $StageBuild.capabilityWitnesses -and $results.Count) {
   }
 }
 
+# ── EARNED vs UNEARNED ABORTS — THE SAME LEDGER, THE OTHER NAME SPACE ───────
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY
+# A `confounds` row keys on a UNIT name; an abort kills the fixture mid-file, so
+# there IS no unit name and a PROVEN-upstream abort could not be recorded in any
+# form. The rule below ("a run with aborts is NEVER green") therefore charged an
+# environment fault to the compiler even after a matched-CRT control had shown
+# both fixtures failing identically and deterministically. ★ THE RULE IS NOT
+# REMOVED — it is made CONDITIONAL ON PROVENANCE: an `matches: abort-file` row
+# carries the same mandatory earnedOn/earnedAt/mechanism/anchor as any confound,
+# and an UNEARNED abort still fails the leg exactly as before. Twin of the block
+# in build-and-test.sh, and the CLASSIFIER is one implementation in the resolver.
+$abortsEarned = @(); $abortsUnearned = @()
+foreach ($a in $aborts) {
+  $name = "$(if ($a.Perm) { $a.Perm } else { '?' })/$(if ($a.File) { $a.File } else { '?' })"
+  if (-not $LegPlanAbortConfounds) {
+    # No abort row declared for this leg at all — do not pay for a resolve to be
+    # told what the plan already says.
+    $abortsUnearned += $name
+    continue
+  }
+  # ★ THE ABORT'S OWN SEGMENT LOG travels with its name: the row matches only
+  # when the file pattern AND the DIAGNOSTIC do. A name alone is a LOCATION, and
+  # a location-keyed excusal forgives every future failure in that file —
+  # including one this compiler caused.
+  # [D-HARNESS-ABORT-CONFOUND-KEYED-ON-LOCATION-NOT-IDENTITY]
+  $cls = Invoke-LegResolver @('--classify-abort', $LegTag, '--abort', $name,
+                              '--abort-log', "$(if ($a.Log) { $a.Log } else { '<none>' })",
+                              '--host-os', $HostOs, '--host-arch', $HostArch)
+  if ($cls.Rc -eq 0) {
+    $abortsEarned += $name
+    # ★ STATED, NEVER SILENCED. An earned abort stops COUNTING against DSS; it
+    # does not stop being reported. Its provenance and what it took down with it
+    # are printed, because "we proved it is not ours" is a different claim from
+    # "nothing happened".
+    Warn "[$LegTag] ABORT $name — PROVEN NOT DSS's, and it still cost the rest of that file:"
+    foreach ($l in ($cls.Text -split "`n")) { if ($l.Trim()) { Info "        $l" } }
+  } else {
+    $abortsUnearned += $name
+  }
+}
+$legRec.AbortsEarned = $abortsEarned
+
 $unitVerdict = ''; $unitFail = $false
 if ($preconditionFail) {
   # ★ FIRST ARM, AND IT CARRIES THE DIAGNOSIS. The old engine would have landed in
@@ -5299,22 +5580,27 @@ if ($preconditionFail) {
   # says "the log named no resolvable corpus file" while holding "Can't find a
   # usable init.tcl" is withholding the diagnosis, and THAT, not the retrying, was
   # the expensive half. [D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY]
-  $unitVerdict = "FAIL: PRECONDITION FAILURE — the fixture completed ZERO test files in $($results.Count) consecutive segment(s), each dying with the same first diagnostic: $preconditionFail  (this is not a resumable crash; the remaining resume budget was NOT spent on it — see $runlog)"
+  # ★ "each ENDING THE SAME WAY", not "each dying with the same first diagnostic":
+  # $preconditionFail now carries a Get-ZeroProgressSignature answer, which is the
+  # `<SILENT: …>` sentinel for a fixture that wrote nothing at all. A verdict that
+  # called that sentinel a "diagnostic" would be describing a line the fixture
+  # never printed. Mirrored word-for-word in build-and-test.sh.
+  $unitVerdict = "FAIL: PRECONDITION FAILURE — THE FIXTURE NEVER STARTED: it completed ZERO test files in $($results.Count) consecutive segment(s), each ending the same way: $preconditionFail  (this is not a resumable crash; the remaining resume budget was NOT spent on it — see $runlog)"
   $unitFail = $true
   Warn "[$LegTag] corpus FAIL — PRECONDITION FAILURE, no unit of this leg's corpus ever ran."
   Warn "      $preconditionFail"
   Info "      $($results.Count) segment(s), $filesDone test file(s) completed ($filesInert of them asserted NOTHING), $resumes of $MaxResumes resume(s) used."
   Info "      per-unit ledger: $Ledger"
-} elseif ($aborts.Count) {
+} elseif ($abortsUnearned.Count) {
   # An abort is itself a FAILURE. Resuming recovers the units behind it; it never
   # makes the abort disappear, and a run with aborts is NEVER green.
-  $where = @(); foreach ($a in $aborts) { $where += "$(if ($a.Perm) { $a.Perm } else { '?' })/$(if ($a.File) { $a.File } else { '?' })" }
-  $unitVerdict = "FAIL: $($aborts.Count) fixture ABORT(s) [$($where -join ' ')]; recovered by $resumes resume(s); union: $summaryText"
+  $where = $abortsUnearned
+  $unitVerdict = "FAIL: $($abortsUnearned.Count) fixture ABORT(s) [$($where -join ' ')]; recovered by $resumes resume(s); union: $summaryText"
   if ($derivationText) { $unitVerdict += " [$derivationText]" }
   if ($real.Count)      { $unitVerdict += "; $($real.Count) genuine unit failure(s): $($real -join ' ')" }
   if ($notReached.Count) { $unitVerdict += "; $($notReached.Count) unit group(s) NOT REACHED — see $Ledger" }
   $unitFail = $true
-  Warn "[$LegTag] corpus FAIL — $($aborts.Count) abort(s): $($where -join ' ')"
+  Warn "[$LegTag] corpus FAIL — $($abortsUnearned.Count) UNEARNED abort(s): $($where -join ' ')$(if ($abortsEarned.Count) { "   (plus $($abortsEarned.Count) PROVEN-not-DSS abort(s), reported above and NOT charged: $($abortsEarned -join ' '))" })"
   Info "      union across $($results.Count) segment(s): $summaryText; $filesDone test file(s) completed ($filesInert of them asserted NOTHING)"
   if ($derivationText) { Info "        derived from: $derivationText" }
   if ($real.Count) { Info "      $($real.Count) UNCLASSIFIED failure(s) — not matched by any earned confound, NOT yet attributed to DSS: $($real -join ' ')" }
@@ -5424,24 +5710,46 @@ Info "recipe   : $nTus TUs, $nDefs defines"
 #   ⚠ AND NOTE THE ASYMMETRY BETWEEN LEGS, which is new as of TF-C114: for an
 #   elf64 Linux leg this same binary is very nearly a MATCHED control (same OS,
 #   same object format, differing only in the compiler), i.e. a much stronger
-#   instrument than it is for pe64 or mach-o. Neither claim has been MEASURED on
-#   this driver, so the line below states what the oracle IS and leaves the
-#   strength of the inference to the leg being triaged.
+#   instrument than it is for pe64 or mach-o. ⓘ THE LAST SENTENCE OF THIS
+#   PARAGRAPH USED TO READ "so the line below states what the oracle IS and
+#   leaves the strength of the inference to the leg being triaged" — which was
+#   the whole defect in one clause: leaving the strength of the inference to the
+#   reader is precisely what a control must never do. The asymmetry is no longer
+#   described and then flattened into one line; it is DECIDED, per leg, below.
+# ★★★ ONE ORACLE LINE PER LEG, AND A LEG WITH NO ORACLE SAYS SO.
+# ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE
+# The paragraph above states the one-sidedness correctly and in detail — and the
+# CODE below it printed one unqualified `oracle : <path>` line for the whole run
+# anyway. That is the "comment records the full fact while the code uses half of
+# it" shape this project keeps finding. The verdict is now DERIVED per leg by the
+# shared resolver from two MEASURED inputs (the reference binary's own target,
+# read out of its header, against the leg's declared spec), so a leg whose
+# reference is another platform's binary is reported as having NO ORACLE, in
+# those terms, with the fallback control named — and both drivers say it in the
+# same words because there is one implementation of them.
+$RefOracleTarget = ''
 if ($RefOracle) {
-  Info "oracle   : $RefOracleWin"
-  Info "             LINUX/gcc reference testfixture (ELF, built by the deriving host). Run it on"
-  # `-e`, not `--`: this line is ADVICE AN OPERATOR PASTES, so it must be the
-  # shape that survives. MEASURED 2026-08-04 — `wsl.exe -- <argv>` still routes
-  # through the distro's default shell (`wsl.exe -- /nope` answers `/bin/bash:
-  # line 1: /nope: No such file`, `wsl.exe -e /nope` answers `execvpe(/nope)
-  # failed`), so a staged path with a glob character or a `$` would be rewritten
-  # under the operator mid-triage.
-  Info "             the same .test to EXONERATE dss:   $(if ($script:HostNeedsWsl) { "wsl.exe -e $RefOracle" } else { $RefOracle }) <staged .test>"
-  Info "             It fails too => upstream/test-suite. It passes => INCONCLUSIVE for a leg of a"
-  Info "             different platform (pe64 / mach-o); never proof of a dss bug on its own."
-} else {
-  Warn "oracle   : ABSENT — no reference fixture survived this run, so a corpus failure"
-  Warn "             cannot be attributed to DSS vs upstream. $RefOracleMiss"
+  # MEASURED, never assumed. Unidentifiable => every leg reports NO ORACLE,
+  # which is the honest reading of "we do not know what this binary is".
+  $refFixId = Get-BinaryTarget $RefOracleWin
+  if ($refFixId.Ok) { $RefOracleTarget = $refFixId.Target }
+  else { Warn "the reference testfixture could not be IDENTIFIED — $($refFixId.Why). Every leg therefore reports NO ORACLE: a control whose platform is unknown is not a control." }
+}
+foreach ($lbl in $LegOrder) {
+  $lr = $LegLedger[$lbl]
+  $orep = Invoke-LegResolver @('--oracle-report', $lbl,
+                               '--reference-target', $RefOracleTarget,
+                               '--reference-path', "$RefOracle",
+                               '--leg-oracle', "$(if ($lr) { $lr.Oracle })",
+                               '--leg-oracle-cc', "$(if ($lr) { $lr.OracleCc })",
+                               '--leg-oracle-triple', "$(if ($lr) { $lr.OracleTriple })")
+  foreach ($l in ($orep.Text -split "`n")) { if ($l.Trim()) { Info "oracle   : $l" } }
+}
+# The RUN reference's own absence, on its own line: the per-leg verdicts above
+# already say NO ORACLE where it matters, and this names the log that explains
+# why there was nothing to derive from in the first place.
+if (-not $RefOracle) {
+  Warn "oracle   : no run reference survived this run. $RefOracleMiss"
 }
 Info "tier     : $Tier.test   outputs: $Work"
 Info "excluded : $(if ($TierExcludes.Count) { "$($TierExcludes -join ' ')   (operator DSS_TIER_EXCLUDES -> QUICKTEST_OMIT; dropped from every `$allquicktests-derived permutation, still run under 'full')" } else { '(none — the full tier ran)' })"

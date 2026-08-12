@@ -399,11 +399,10 @@ TEST(MachOArm64Exit, IndirectSlotDispatchOnMachOFailsLoud) {
       "format": {"name":"macho-indirect-bad","kind":"macho"},
       "entryPoint": "",
       "externCallDispatch": "indirect-slot",
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -668,11 +667,10 @@ TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-badpage","kind":"macho"},
       "entryPoint": "",
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "apple_arm64",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -738,11 +736,10 @@ TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-badva","kind":"macho"},
       "entryPoint": "",
-      "processExit": {
-        "mechanism": "by-name-import",
-        "importMangledName": "_exit",
-        "importLibraryPath": "/usr/lib/libSystem.B.dylib"
-      },
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
       "entryCallingConvention": "apple_arm64",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
       "image": {

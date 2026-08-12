@@ -123,6 +123,15 @@ bool synthesizeThreadsShim(
     };
 
     // ── win32 (kernel32) helper signatures ──
+    // ⚠ SECOND OWNER, STATED NOT HIDDEN — the anchor name must stay on ONE line or the
+    // registry guard extracts a truncated identifier that resolves to nothing:
+    // D-MIR-SYNTH-SHIM-HELPER-SIGNATURES-DUPLICATE-THE-DESCRIPTOR.
+    // Every `hSig_*` / `phSig_*` below re-declares a shape that a shipped
+    // descriptor ALSO declares (e.g. `hSig_v_u32` here vs windows.json's
+    // `ExitThread: fn(u32) -> void`). They agree today and nothing enforces it — and the
+    // post-synthesis MirVerifier CANNOT enforce it, because it reads the callee FnSig off the
+    // GlobalAddr this pass itself minted, so the rule is self-consistent within the pass. It
+    // catches the INTRA-shim class only (the `thrd_exit` i32→u32 pun below was exactly that).
     TypeId const hSig_v_pV        = sig({pVoid}, voidTy);                 // Init/Enter/Leave/Delete CS; cond-var Init/Wake/WakeAll
     TypeId const hSig_i32_pV      = sig({pVoid}, i32Ty);                  // TryEnterCriticalSection / CloseHandle
     TypeId const hSig_i32_pVpVu32 = sig({pVoid, pVoid, u32Ty}, i32Ty);   // SleepConditionVariableCS
@@ -432,7 +441,25 @@ bool synthesizeThreadsShim(
                 builder.addReturn();
             } else if (recipe == "thrd_exit") {  // ExitThread((DWORD)res); (void, noreturn)
                 begin(sym, rSig_v_i32);
-                call1("ExitThread", hSig_v_u32, InvalidType, builder.addArg(0, i32Ty));
+                // ★ THE CAST IS LOAD-BEARING, not decoration (UCRT-P4, caught the moment a
+                // MirVerifier was wired into the single-CU synth seam). C11 declares
+                // `_Noreturn void thrd_exit(int res)` — SIGNED — and Win32 declares
+                // `VOID ExitThread(DWORD dwExitCode)` — UNSIGNED; windows.json states the
+                // latter faithfully (`fn(u32) -> void`). BOTH declarations are right, so the
+                // conversion between them belongs HERE, exactly as the pthread arm below
+                // spells its own `thrd_exit` widening with an EXPLICIT SExt+IntToPtr instead
+                // of punning an i32 into a `ptr<void>` parameter. Handing the raw `i32` Arg
+                // to a `u32` parameter was a silent type pun across a declared ABI boundary;
+                // a hand-built MIR call must carry every conversion its C equivalent
+                // (`ExitThread((DWORD)res)`) would.
+                // Same-width int→int is a pure RETAG — no bits move (C 6.3.1.3p2 is modulo
+                // 2^32, i.e. bit-identical two's complement) — so `Bitcast` is the opcode
+                // hir_to_mir's own `mapCast` picks for `tw == fw` on the int↔int arm, and the
+                // thrd_join arm below already uses it for its ptr retag. It lowers to one
+                // same-class register move that copy-propagation coalesces.
+                std::array<MirInstId, 1> dw{builder.addArg(0, i32Ty)};
+                MirInstId const code = builder.addInst(MirOpcode::Bitcast, dw, u32Ty);
+                call1("ExitThread", hSig_v_u32, InvalidType, code);
                 builder.addReturn();             // dead (ExitThread noreturn) — a terminator is required
             } else if (recipe == "thrd_detach") {// CloseHandle(t); ret success
                 begin(sym, rSig_i32_pV);

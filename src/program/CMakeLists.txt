@@ -6,6 +6,7 @@ add_library(program OBJECT
     input_resolver.cpp
     cross_validate_target_format.cpp
     project_config.cpp
+    dump_predefined_macros.cpp
 )
 
 target_include_directories(program PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

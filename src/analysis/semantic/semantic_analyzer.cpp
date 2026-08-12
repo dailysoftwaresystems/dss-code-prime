@@ -47,6 +47,7 @@
 #include <format>
 #include <functional>
 #include <limits>
+#include <map>          // std::map (the realization pass's ORDERED name set)
 #include <optional>
 #include <span>
 #include <string>
@@ -7844,6 +7845,186 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         s.lattice.interner().fnResult(declTy);
                                 }
                             }
+                            // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the
+                            //    PER-DEFINITION PROGRAM-ENTRY SHAPE CHECK ──
+                            //
+                            // This is the SEMANTIC-TIER OWNER of the entry
+                            // signature, and it is here because here is the only
+                            // place that has the declarator, the resolved
+                            // signature and a REAL SOURCE SPAN at once. Its
+                            // predecessor lived at the MIR tier, where `Mir`
+                            // carries no `BufferId`/`SourceSpan` for a function,
+                            // so it could only name the entry by symbol name.
+                            //
+                            // ★ IT IS FORMAT-INDEPENDENT, DELIBERATELY, and that
+                            // is not an oversight to be "improved" later. Two
+                            // separate reasons:
+                            //   * The question it asks — "does the definition in
+                            //     front of me have one of the signatures this
+                            //     LANGUAGE declares for this name" — needs no
+                            //     target at all. A 3-parameter `main` is refused
+                            //     on a relocatable `.o` too, because no format
+                            //     realizes it and no later translation unit can
+                            //     make it legal.
+                            //   * The format-dependent question ("does the active
+                            //     format realize this row's verb") MUST NOT be
+                            //     answered here even though `s.activeFormat`
+                            //     exists. On ELF, `wmain` is not a program-entry
+                            //     candidate — but it is NOT an error either: a
+                            //     program defining BOTH `main` and `wmain` has to
+                            //     BUILD on ELF and take `main`. A per-definition
+                            //     "unrealized verb" error would make that program
+                            //     impossible. Candidacy is a whole-program
+                            //     decision and lives at entry resolution.
+                            //
+                            // ★ SO WHAT THIS STAMPS IS THE ANSWER, NOT THE
+                            // QUESTION: on a match it records the row's VERB on
+                            // the symbol, and entry resolution intersects that
+                            // verb with the format's declared set. One
+                            // classification in the whole compiler.
+                            if (isFnSig && bodyNode.valid()
+                                && !decl.entryFunctions.empty()) {
+                                std::string_view const fnName =
+                                    s.symbols.at(sym).name;
+                                bool nameIsEntry = false;
+                                for (auto const& row : decl.entryFunctions) {
+                                    if (row.name == fnName) {
+                                        nameIsEntry = true;
+                                        break;
+                                    }
+                                }
+                                if (nameIsEntry) {
+                                    auto const& intern =
+                                        s.lattice.interner();
+                                    // Classify STRUCTURALLY. The vocabulary says
+                                    // "pointer to pointer to a 16-bit unsigned",
+                                    // never "the wide argv", so nothing here
+                                    // assumes which platform spells a wide
+                                    // character how — a 32-bit-wchar_t platform
+                                    // simply never matches the u16 shape.
+                                    auto classifyParam =
+                                        [&](TypeId ty)
+                                        -> std::optional<EntryParamShape> {
+                                        switch (intern.kind(ty)) {
+                                        case TypeKind::I32:
+                                            return EntryParamShape::I32;
+                                        case TypeKind::Ptr: break;
+                                        default: return std::nullopt;
+                                        }
+                                        TypeId const pointee =
+                                            intern.operands(ty)[0];
+                                        if (intern.kind(pointee) != TypeKind::Ptr)
+                                            return std::nullopt;
+                                        switch (intern.kind(
+                                            intern.operands(pointee)[0])) {
+                                        case TypeKind::Char:
+                                        case TypeKind::I8:
+                                            return EntryParamShape::PtrPtrChar;
+                                        case TypeKind::U16:
+                                            return EntryParamShape::PtrPtrU16;
+                                        default: return std::nullopt;
+                                        }
+                                    };
+                                    bool classified = true;
+                                    EntryReturnShape obsRet =
+                                        EntryReturnShape::None;
+                                    if (intern.kind(intern.fnResult(declTy))
+                                        == TypeKind::I32) {
+                                        obsRet = EntryReturnShape::I32;
+                                    } else {
+                                        classified = false;
+                                    }
+                                    std::vector<EntryParamShape> obsParams;
+                                    auto const ps = intern.fnParams(declTy);
+                                    for (std::size_t pi = 0;
+                                         classified && pi < ps.size(); ++pi) {
+                                        if (auto const c = classifyParam(ps[pi])) {
+                                            obsParams.push_back(*c);
+                                        } else {
+                                            classified = false;
+                                        }
+                                    }
+                                    EntryFunctionShape const* hit = nullptr;
+                                    if (classified) {
+                                        for (auto const& row :
+                                             decl.entryFunctions) {
+                                            if (row.name != fnName) continue;
+                                            if (row.returns == obsRet
+                                                && row.params == obsParams) {
+                                                hit = &row;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (hit != nullptr) {
+                                        s.symbols.at(sym).entryVerb = hit->verb;
+                                    } else {
+                                        // Enumerate the declared rows for THIS
+                                        // name, rendered through the SAME
+                                        // renderer as the observed side, so the
+                                        // reader compares like with like.
+                                        std::string declared;
+                                        for (auto const& row :
+                                             decl.entryFunctions) {
+                                            if (row.name != fnName) continue;
+                                            if (!declared.empty())
+                                                declared += "; ";
+                                            declared +=
+                                                entrySignatureSpelling(row);
+                                            declared += " [";
+                                            declared +=
+                                                entryMaterializationName(
+                                                    row.verb);
+                                            declared += "]";
+                                        }
+                                        // When a parameter fell OUTSIDE the
+                                        // vocabulary, a partial rendering would
+                                        // print a shape the entry does not have —
+                                        // say so explicitly instead.
+                                        std::string const observed =
+                                            classified
+                                                ? entrySignatureSpelling(
+                                                      obsRet, obsParams)
+                                                : std::format(
+                                                      "fn(<{} parameter(s), at "
+                                                      "least one of a type no "
+                                                      "declared entry shape can "
+                                                      "name>) -> <see source>",
+                                                      ps.size());
+                                        ParseDiagnostic d;
+                                        d.code = DiagnosticCode::
+                                            S_EntryShapeNotDeclared;
+                                        d.severity =
+                                            DiagnosticSeverity::Error;
+                                        d.buffer = tree.source().id();
+                                        d.span   = tree.span(
+                                            nameNode.valid() ? nameNode : node);
+                                        d.actual = std::format(
+                                            "'{}' is a PROGRAM ENTRY name for "
+                                            "this source language, and this "
+                                            "definition's signature {} is not "
+                                            "one the language declares for it. "
+                                            "Declared for '{}': {}. That set is "
+                                            "CONFIG-DECLARED — it is the "
+                                            "`entryFunctions` mapping on this "
+                                            "declaration form in the language's "
+                                            "`.lang.json`, so the remedy is a "
+                                            "config row (plus a materialization "
+                                            "arm for its verb), not a compiler "
+                                            "change. C23 5.1.2.2.1 permits an "
+                                            "implementation-defined entry set "
+                                            "and 3.4.1 requires the "
+                                            "implementation to DOCUMENT it; that "
+                                            "mapping is the documentation. "
+                                            "(D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)",
+                                            fnName, observed, fnName,
+                                            declared.empty()
+                                                ? std::string{"<none>"}
+                                                : declared);
+                                        s.reporter.report(std::move(d));
+                                    }
+                                }
+                            }
                         } else if (isFnSig
                                    && s.symbols.at(sym).kind
                                           == DeclarationKind::Variable) {
@@ -13052,6 +13233,14 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // surviving to the linker as an undefined symbol.
     std::unordered_map<std::string, SuppressedShippedSymbol>
         suppressedShippedLibraries;
+    // Names already MINTED from a descriptor (two descriptors both declaring `puts`
+    // → first wins), so a name is injected at most once.
+    // ★ FUNCTION SCOPE, not block scope (UCRT-P4): the `#include` injection block
+    // below is no longer the only minter. The PLATFORM REALIZATION PASS after Pass
+    // 1.5 also mints SHIM-CORE COMPANION imports, and it must observe the SAME
+    // first-wins set — otherwise a companion could re-mint a name the `#include`
+    // path already injected and the module would carry two rows for one symbol.
+    std::unordered_set<std::string> injectedNames;
     // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: one CANDIDATE per (descriptor
     // composite, SOURCE composite) pair whose tag BOTH origins declare at file
     // scope, carrying every descriptor SURFACE symbol typed by it (a composite
@@ -13194,7 +13383,6 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // minted (two descriptors both declaring `puts` → first wins) so a name
         // is injected at most once.
         std::unordered_set<std::string> readDescriptors;
-        std::unordered_set<std::string> injectedNames;
         // Struct/union/enum TAGS live in a SEPARATE namespace (C 6.2.3): a
         // descriptor `struct stat` does NOT collide with the ordinary `stat`
         // function, so tag first-wins dedup uses its own set.
@@ -14026,6 +14214,231 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             }
             s.reporter.report(std::move(d));
         }
+    }
+
+    // ══ THE PLATFORM REALIZATION PASS ════════════════════════════════════════
+    //
+    // ★★★ THE DECLARATION SYNTAX HAS NO AUTHORITY OVER REALIZATION, EVER.
+    //
+    // A user declaration carries the SIGNATURE. The PLATFORM — the shipped
+    // descriptor corpus, per object format — carries the REALIZATION (`library`,
+    // `availableObjectFormats`, the `synthesize` recipe, `linkName`, `version`).
+    // `#include <stdio.h>` and a hand-written `extern int printf(const char*,
+    // ...);` are two ways to obtain a TYPE; NEITHER is a way to obtain a
+    // different PLATFORM.
+    //
+    // WHY THIS PASS EXISTS. `suppressedShippedLibraries` was populated ONLY by the
+    // goal-2 skip above — i.e. only for a name whose descriptor the source actually
+    // `#include`d. A program that writes the prototype by hand instead (C23 7.1.4p2
+    // entitles it to) consulted NO descriptor at all and fell through to a
+    // per-LANGUAGE default library GUESS. C23 6.2.2p5 makes `extern int printf(…);`
+    // and `int printf(…);` THE SAME DECLARATION, so two spellings the standard says
+    // declare the same thing were realizing DIFFERENTLY — one of them against a
+    // guess. MEASURED consequence on pe64: a three-line program imported a bare
+    // `printf` from the LEGACY C runtime while its `#include`d stdio siblings were
+    // correctly realized as UCRT shims — TWO C RUNTIMES, no diagnostic at any
+    // stage. This pass deletes the guess by giving EVERY user-declared name the
+    // same corpus-sourced realization the `#include` path gets.
+    //
+    // ⚠ WHERE THE FAIL-LOUD GOES: THE LINK TIER, NOT HERE. A name the corpus does
+    // not declare — or declares but not on this object format — produces NO
+    // diagnostic and NO row: the declaration routes UNBOUND and C23 5.1.1.2 phase 8
+    // resolves it at LINK, where a sibling TU may define it, a `--resolve-library`
+    // binary may export it, or it is genuinely undefined and rejected LOUD
+    // (K_SymbolUndefined). A per-CU verdict here would be WRONG for exactly the
+    // shapes real multi-TU programs are made of (the 185-TU sqlite fixture declares
+    // 2770 such externs) — see `D-FFI-FORMAT-ORACLE-BYPASSED-WITHOUT-RESOLVE-LIBRARY`,
+    // whose named prerequisite is `D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD`.
+    //
+    // ⚠ DSS BECOMES MORE PERMISSIVE THAN MSVC HERE, AND THAT IS DELIBERATE. Under
+    // the UCRT, `printf` is a header inline over `__stdio_common_vfprintf` and
+    // ucrtbase exports no bare `printf`, so REAL MSVC FAILS TO LINK a hand-written
+    // `extern int printf(const char*, ...);` unless you add
+    // `legacy_stdio_definitions.lib`. Under this pass DSS inherits the descriptor's
+    // `synthesize` recipe and ACCEPTS the program, matching gcc and clang.
+    // ★ DO NOT "FIX" THIS INTO AN MSVC-MATCHING REFUSAL. The program is legal C23
+    // (6.2.2p5 + 7.1.4p2) and accepting legal C is never the wrong direction.
+    //
+    // POSITION: after Pass 1.5, because the C23 compatibility check below needs the
+    // user's RESOLVED FnSig — at the goal-2 skip above, user types are still Pass-1
+    // forward mints. Before Pass 2, because a call must resolve against whatever
+    // this pass decides.
+    {
+        // (a) Every FILE-SCOPE user declaration in the ORDINARY namespace that is
+        //     not a type name, WITH its SymbolId — the same walk the goal-2 skip
+        //     set performed, except it keeps the SymbolId that set threw away (the
+        //     compatibility check below needs the resolved type). A binding whose
+        //     symbol's `tree` is the root scope's own tree is a real user decl
+        //     (injected cross-tree bindings carry the DEFINING tree's id; builtins
+        //     carry InvalidTree) — the identical test the skip set uses.
+        std::map<std::string, SymbolId> userOrdinaryDecls;   // ORDERED: determinism
+        for (auto const& [treeV, scope] : treeRootScope) {
+            for (auto const& [name, ns, sym] : s.scopes.bindingsOf(scope)) {
+                if (!sym.valid() || ns != SymbolNamespace::Ordinary) continue;
+                auto const& rec = s.symbols.at(sym);
+                if (rec.tree.v != treeV) continue;
+                if (rec.kind == DeclarationKind::Type) continue;
+                userOrdinaryDecls.try_emplace(std::string{name}, sym);
+            }
+        }
+        // (b) Ask the corpus about the names the `#include` path did NOT already
+        //     answer for. A name already in `suppressedShippedLibraries` was
+        //     resolved from a descriptor the source really included — that row wins,
+        //     because it is the row whose OTHER symbols were injected into this TU
+        //     and the two must not come from two different descriptors.
+        std::vector<std::string> unrealized;
+        unrealized.reserve(userOrdinaryDecls.size());
+        for (auto const& [name, sym] : userOrdinaryDecls) {
+            (void)sym;
+            if (!suppressedShippedLibraries.contains(name))
+                unrealized.push_back(name);
+        }
+        if (!unrealized.empty()) {
+            // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): the SAME `va_list` binding the
+            // `#include` read threads, so a descriptor signature spelling the C
+            // alias lands the identical TypeId here. Rebuilt rather than hoisted so
+            // this pass reads exactly what that read read.
+            std::array<NamedTypeBinding, 1> namedTypeStorage{};
+            std::span<NamedTypeBinding const> namedTypes{};
+            if (vaListBuiltinType.has_value()) {
+                namedTypeStorage[0] =
+                    NamedTypeBinding{"va_list", *vaListBuiltinType};
+                namedTypes = std::span<NamedTypeBinding const>{
+                    namedTypeStorage.data(), 1};
+            }
+            std::optional<std::string_view> const activeTargetView =
+                s.activeTarget.has_value()
+                    ? std::optional<std::string_view>{*s.activeTarget}
+                    : std::nullopt;
+            auto realized = ffi::realizeShippedExternSymbols(
+                unrealized, s.lattice.interner(), s.lattice.registry(),
+                s.dataModel, activeTargetView, s.activeFormat, namedTypes);
+            // nullopt ⇒ the shippedLibs directory could not be located. That is a
+            // statement about the ENVIRONMENT, never about the user's program, so
+            // every name simply stays unrealized and routes unbound — the exact
+            // behavior that predates this pass.
+            if (realized.has_value()) {
+                for (auto& [name, real] : *realized) {
+                    // ONLY a fully realized row produces a binding. `Unknown`,
+                    // `UnavailableForFormat` and `NoLibraryForFormat` all mean
+                    // "the platform states no image for this name here" ⇒ leave it
+                    // unbound for the link tier. Enumerated, not fallen through.
+                    if (real.status != ffi::ShippedRealizationStatus::Realized)
+                        continue;
+                    bool const isShim = !real.recipeId.empty();
+                    suppressedShippedLibraries.emplace(
+                        name,
+                        SuppressedShippedSymbol{std::move(real.library),
+                                                real.version, real.recipeId,
+                                                real.signature,
+                                                real.linkName});
+                    if (!isShim) continue;
+                    // ★★ SHIM-CORE COMPANIONS — the one part of a `synthesize`
+                    // row's realization that is NOT on the row itself.
+                    //
+                    // A recipe row is realized as a COMPILER-EMITTED BODY, and that
+                    // body CALLS other rows of the same descriptor (the pe printf
+                    // shim calls `__stdio_common_vfprintf` + `__acrt_iob_func`). On
+                    // the `#include` path those arrive for free — the header's whole
+                    // surface is injected. HAND-DECLARED, nothing else in the TU
+                    // declares them, and the synth pass then correctly REFUSES:
+                    // MEASURED, `extern int printf(const char*, ...);` with no
+                    // `#include` produced "the UCRT core '__acrt_iob_func' is not
+                    // imported by this module". Claiming a recipe therefore means
+                    // realizing the surface its body can reach into.
+                    //
+                    // ⚠ IMPORT-ONLY: each companion is MINTED but NOT BOUND into
+                    // any scope. `#include` is what makes a header's names
+                    // NAMEABLE; this pass only makes the platform's realization
+                    // reachable by the code DSS itself emits. Binding them would let
+                    // `fopen` resolve in a TU that never included <stdio.h> — a
+                    // language change, and not one C23 authorizes.
+                    //
+                    // ⚠ NON-EAGER: the recipe→core mapping lives in the synth pass's
+                    // per-recipe switch arms, and restating those core NAMES here
+                    // would plant platform symbol literals in shared substrate. So
+                    // the WHOLE surface is recorded non-eagerly and the LINKER's
+                    // existing reference gate prunes it to exactly the rows the
+                    // emitted body referenced. Precision from a mechanism already in
+                    // the tree — and nothing here needs editing when a recipe lands.
+                    auto surface = ffi::realizeShippedDescriptorSurfaceFor(
+                        name, s.lattice.interner(), s.lattice.registry(),
+                        s.dataModel, activeTargetView, s.activeFormat, namedTypes);
+                    if (!surface.has_value()) continue;
+                    for (auto& [coreName, core] : *surface) {
+                        // The declared name itself is already handled above, and a
+                        // name the USER declared is theirs (goal-2) — never shadow
+                        // or double-import either.
+                        if (coreName == name) continue;
+                        if (userOrdinaryDecls.contains(coreName)) continue;
+                        // ⛔ A COMPANION THAT IS ITSELF A `synthesize` ROW IS NOT A
+                        // CORE, AND IMPORTING IT WOULD BE LETHAL. stdio.json's pe
+                        // arm realizes printf/fprintf/sprintf/vfprintf/sscanf as
+                        // SHIMS precisely because ucrtbase exports none of them, so
+                        // planting an import for one is a binary that fails to LOAD
+                        // (0xC0000139) — the exact defect this whole pass exists to
+                        // close. A shim is also never something another shim's body
+                        // calls: the bodies call the `__stdio_common_v*` CORES, which
+                        // are ordinary recipe-less rows. Skipping them also stops
+                        // synthesizing four unreachable shim bodies per printf.
+                        if (!core.recipeId.empty()) continue;
+                        // A name the `#include` path already injected owns the
+                        // import; first-wins, exactly as injection does.
+                        if (!injectedNames.insert(coreName).second) continue;
+                        SymbolRecord rec;
+                        rec.name     = coreName;
+                        rec.scope    = cuRoot;
+                        rec.tree     = InvalidTree;   // not a user decl
+                        rec.kind     = core.isFunction
+                                           ? DeclarationKind::Function
+                                           : DeclarationKind::Variable;
+                        rec.type     = core.signature;
+                        rec.linkName = core.linkName;
+                        SymbolId const id = s.symbols.mint(rec);
+                        shippedExterns.push_back(ShippedExternSymbol{
+                            id, coreName, core.signature, core.library,
+                            core.isFunction,
+                            /*recipeId=*/std::string{},   // gated above: never a shim
+                            core.version, core.linkName,
+                            /*eagerImport=*/false});
+                    }
+                }
+            }
+        }
+        // ⛔ NOT DONE HERE, AND DELIBERATELY SO — C23 REDECLARATION COMPATIBILITY.
+        //
+        // A user declaration that CONTRADICTS the platform's own (`extern int
+        // printf();` over `#include <stdio.h>` — C23 made `()` mean `(void)`, so
+        // that declares a NO-PARAMETER printf) is an incompatible redeclaration
+        // requiring a diagnostic AT THE DECLARATION (C23 6.7p4); gcc and clang both
+        // reject it. DSS accepts it, and the arity error surfaces later at the first
+        // CALL SITE, blaming the caller for the declaration's mistake.
+        //
+        // ★ THIS PASS FIXES THE REALIZATION SPLIT ONLY. It makes every spelling of
+        // one declaration resolve to the SAME platform realization; it does NOT make
+        // DSS judge whether that declaration AGREES with the platform's. Those are
+        // two different questions and only the first is Decision 1's.
+        //
+        // ⛔ AND `claimSuppressedShimSymbol` IS NOT THE PLACE TO ADD IT. That gate is
+        // a SHIM-SAFETY oracle: it asks "may this declaration inherit the recipe's
+        // one fixed body". It answers by interner TypeId identity, which is
+        // qualifier-BLIND (`const` is not a qualifier bit and is not recorded on the
+        // resolved type at all), so it reports a MATCH for
+        // `extern int printf(char*, ...);` over `#include <stdio.h>` and has nothing
+        // to diagnose. Widening it into a C23 compatibility oracle would conflate two
+        // rules and weaken the one it actually enforces.
+        //
+        // ⚠ MEASURED OBSTACLE for whoever does take this on: a TypeId comparison
+        // against the corpus is NOT a compatibility test. Descriptors spell integers
+        // in hir-text (`random: fn() -> i64`) while a C declaration carries the C
+        // spelling's TYPE IDENTITY (`long` interns distinctly from a bare `i64` —
+        // D-LANG-TYPE-IDENTITY-VOCABULARY), so the perfectly legal
+        // `extern long random(void);` compares UNEQUAL. Built and measured during
+        // this cycle: it rejected legal C in the existing
+        // `FormatUnavailableShippedSymbolFailsLoud` control program. A sound check
+        // needs either C-identity spelling in the corpus or a spelling-blind
+        // compatibility query on the interner — its own cycle, which is where it now
+        // lives.
     }
 
     // ── D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: license, then adopt ──

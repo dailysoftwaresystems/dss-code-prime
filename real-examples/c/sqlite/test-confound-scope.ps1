@@ -28,7 +28,7 @@ function Warn($m) { "      WARN: $m" }
 # host's "OK (N assertions)". This file now has a skippable block of its own, so it
 # inherits the same hazard and the same cure.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN.
-$TotalAssertions = 95     # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
+$TotalAssertions = 97     # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
                           # + 5 structural + 8 staged sqlite_cfg.h (5 this driver, 3 .sh pairing)
                           # + 6 launcher argv form (4 structural + 2 behavioural, python-gated)
                           # + 28 BOTH-DRIVERS pairing: the launcher-prerequisite
@@ -583,14 +583,22 @@ if (-not $supStart -or -not $supEnd) {
   $fail++
   # The 6 assertions below cannot run; count them so the accounting invariant
   # cannot be satisfied by silently losing them.
-  $skip += 6
+  $skip += 8
 } else {
   Invoke-Expression (($lines[($supStart-1)..($supEnd-1)]) -join "`n")
   "extracted $($supEnd - $supStart + 1) supply lines from the shipped script"
   # The resolved-leg shape harness_legs.py --plan produces, as ConvertFrom-Json
   # hands it to the driver: a PSCustomObject with a `confounds` array.
-  function New-PinLeg($label, $confounds) {
-    return [pscustomobject]@{ label = $label; confounds = $confounds }
+  # + `confoundGating`, which the supply now REFUSES to proceed without: a
+  # conditional row (`requires: [<environment probe>]`) is honoured only where the
+  # named probe found its defect on THIS machine, and an `unprobed` plan is safe
+  # (conditional rows dropped) but not usable - its withheld excusals would surface
+  # as GENUINE reds and read as compiler regressions. Defaulted to 'probed' here so
+  # every assertion above keeps asking what it asked; the refusal gets its own leg.
+  # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
+  function New-PinLeg($label, $confounds, $gating = 'probed') {
+    return [pscustomobject]@{ label = $label; confounds = $confounds;
+                              confoundGating = $gating }
   }
   $ConfoundsOverride = $null
   $earned = @(Get-LegConfounds (New-PinLeg 'elf64-x86_64' @('^walsetlk-','^busy2-','^zipfile-25\.0$')))
@@ -621,6 +629,14 @@ if (-not $supStart -or -not $supEnd) {
   try { [void](Get-LegConfounds ([pscustomobject]@{ label = 'macho64-arm64' })) }
   catch { $refused = "$($_.Exception.Message)" }
   Check "an UNDECLARED leg REFUSES rather than answering @()" ($refused -match 'transport defect')
+  # ★★ AND THE MEASUREMENT GATE ITSELF, the .sh's twin refusal. Silent in one
+  # direction only: an unmeasured run that serves its ungated list looks exactly
+  # like a measured one, and the reds it produces read as compiler regressions.
+  $ungated = ''
+  try { [void](Get-LegConfounds (New-PinLeg 'elf64-x86_64' @('^busy2-') 'unprobed')) }
+  catch { $ungated = "$($_.Exception.Message)" }
+  Check "an UNPROBED plan REFUSES rather than serving its ungated list" ($ungated -match "confoundGating='unprobed'")
+  Check "...and says how to resolve a measured plan" ($ungated -match '--environment-probes skip')
 }
 
 ""

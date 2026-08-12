@@ -1,9 +1,11 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header)
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -26,6 +28,38 @@ namespace dss {
 //               once at construction (C 6.10.8.1).
 //   Time     -- the translation TIME, a string literal `"hh:mm:ss"` computed once.
 enum class PredefinedMacroKind { Line, File, Constant, Date, Time };
+
+// The kind's CONFIG SPELLING — the same verb `parsePredefinedMacroArray`
+// (`predefined_macro_json.cpp`) accepts for the `"kind"` key, in ONE table so the
+// read side and the report side cannot drift. `--dump-predefined-macros` prints
+// these, so an operator auditing the effective set sees the very word they would
+// write in a `.lang.json` / `.target.json` / `.format.json` to declare it.
+//
+// ★ NOT A COMPLETE LIST OF ACCEPTED VERBS, and that is deliberate: the loader
+// also accepts `"version"`, which is not a kind at all — it LOWERS to `Constant`
+// at load time (see the long note at its arm in `predefined_macro_json.cpp`). A
+// table row for it would claim a runtime kind that does not exist. So the
+// invariant is one-directional and is pinned by a test: every row here is a verb
+// the loader accepts, not every verb the loader accepts is a row here.
+//
+// No fall-back row is reachable: `PredefinedMacroKind` has no invalid sentinel,
+// so every value the engine can hold is enumerated below.
+inline constexpr EnumNameTable<PredefinedMacroKind, 5> kPredefinedMacroKindTable{{{
+    { PredefinedMacroKind::Line,     "line"     },
+    { PredefinedMacroKind::File,     "file"     },
+    { PredefinedMacroKind::Constant, "constant" },
+    { PredefinedMacroKind::Date,     "date"     },
+    { PredefinedMacroKind::Time,     "time"     },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+predefinedMacroKindName(PredefinedMacroKind k) noexcept {
+    return kPredefinedMacroKindTable.name(k);
+}
+[[nodiscard]] constexpr std::optional<PredefinedMacroKind>
+predefinedMacroKindFromName(std::string_view s) noexcept {
+    return kPredefinedMacroKindTable.fromName(s);
+}
 
 // TF-C83 (D-CSUBSET-TOOLCHAIN-IDENTITY-PREDEFINES). Pack a dot-separated version ("0.0.2")
 // into ONE integer using `weights` (most-significant first, last entry 1):
@@ -348,6 +382,38 @@ struct DSS_EXPORT PreprocessConfig {
     // validated as a NON-EMPTY string at load (C_InvalidPreprocess). (FC13
     // cycle 3 -- D-PP-VARIADIC-MACRO.)
     std::string variadicArgsName;
+
+    // FC18a (D-PP-VA-OPT, C23 6.10.5.1): the IDENTIFIER that introduces a
+    // va-opt-replacement -- C23's `__VA_OPT__`. The grammar is
+    // `va-opt-replacement: __VA_OPT__ ( pp-tokens_opt )` (C23 A.4): inside a
+    // VARIADIC macro's replacement list it expands to its parenthesized content
+    // when the variable arguments have a NON-EMPTY substitution, and to a
+    // placemarker otherwise.
+    //
+    // ★ MATCHED BY TEXT, exactly like `variadicArgsName`, and for the same
+    // reason: `__VA_OPT__` lexes as an ordinary identifier (`Word`), not as a
+    // distinct token kind, so there is no kind to resolve and `checkToken` does
+    // not apply. Per-language CONFIG spelling, never a hard-coded `__VA_OPT__`:
+    // a second preprocess-opting language whose conditional-variadic construct
+    // is spelled differently is then handled correctly (agnosticism).
+    //
+    // ★★ WHY THIS IS A SEPARATE KEY FROM `variadicCommaElision` AND NOT A MODE
+    // OF IT. The GNU `,##__VA_ARGS__` idiom and C23 `__VA_OPT__(,)` look like
+    // two spellings of one feature, and they are NOT -- they test DIFFERENT
+    // predicates. ✔MEASURED (clang-18, clang-19, gcc-13, all agreeing):
+    // with `#define EMP` (an object-like macro expanding to nothing),
+    //   `#define GNU(f, ...) g(f , ## __VA_ARGS__)`  GNU(1, EMP) -> `g(1 , )`
+    //   `#define STD(f, ...) g(f __VA_OPT__(,) __VA_ARGS__)` STD(1, EMP) -> `g(1 )`
+    // GNU keys off whether a trailing argument is PRESENT (raw); C23 keys off
+    // whether its SUBSTITUTION is non-empty (macro-expanded). Collapsing them
+    // onto one predicate would silently change one of the two, so they are two
+    // independent config keys reading two independent argument runs.
+    //
+    // OPTIONAL and only meaningful alongside `variadicMarkerToken`; empty means
+    // the language declares no va-opt construct (the engine then never treats
+    // any identifier as one). When present it is validated as a NON-EMPTY string
+    // at load (C_InvalidPreprocess).
+    std::string vaOptName;
 
     // FC15a (`#`/`##` operators): the token KIND of the STRINGIZE operator (C's
     // `#` -> "HashOp", C 6.10.3.2). In a function-like macro's REPLACEMENT list,

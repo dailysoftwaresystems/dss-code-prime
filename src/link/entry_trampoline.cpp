@@ -403,20 +403,20 @@ bool injectEntryTrampoline(AssembledModule&          module,
     //     unaffected. A format WITHOUT `processArgs` emits nothing
     //     here — Mach-O's LC_MAIN entry already receives argc/argv in
     //     these registers from dyld (pass-through is the correct
-    //     mechanism there); PE's out-parameter CRT route
-    //     (__getmainargs) is anchored at D-RUNTIME-PE-MAIN-ARGS.
+    //     mechanism there); PE's CRT-accessor route is
+    //     D-FFI-PE-CRT-UCRT-MIGRATION's `crt-argv-accessors`.
     auto const& paOpt = format.processArgs();
-    // c111 (D-RUNTIME-PE-MAIN-ARGS): the CRT out-parameter mechanism (Windows
-    // __wgetmainargs / __getmainargs) performs its argc/argv setup in a MIR-tier
-    // SYNTHESIZED pre-main init (`synthesizePeStartup`) — the program entry was already
-    // retargeted to that synth function, which fetches the args via the CRT export and
-    // forwards (argc, argv) to the user entry through a normally-lowered call. So the
-    // trampoline emits NO argument materialization for it here; it just calls the
-    // (synth) entry below. Every OTHER declared mechanism still flows through the
-    // closed-enum block (the StackVector emitter + the fail-loud "no arm" reject),
-    // preserving the "a new ArgsMechanism member must add an emitter arm" discipline.
+    // UCRT-P4 (was c111): the CRT mechanisms perform their argc/argv setup in a
+    // MIR-tier SYNTHESIZED pre-main init (`realizeEntryShape`) — the program entry
+    // was already retargeted to that synth function, which fetches the args via the
+    // CRT exports and forwards (argc, argv) to the user entry through a
+    // normally-lowered call. So the trampoline emits NO argument materialization for
+    // it here; it just calls the (synth) entry below. Every OTHER declared mechanism
+    // still flows through the closed-enum block (the StackVector emitter + the
+    // fail-loud "no arm" reject), preserving the "a new ArgsMechanism member must add
+    // an emitter arm" discipline.
     bool const argsHandledBySynthInit =
-        paOpt.has_value() && paOpt->mechanism == ArgsMechanism::CrtOutParam;
+        paOpt.has_value() && paOpt->mechanism == ArgsMechanism::CrtArgvAccessors;
     if (paOpt.has_value() && !argsHandledBySynthInit) {
         auto const& pa = *paOpt;
         if (pa.mechanism != ArgsMechanism::StackVector) {

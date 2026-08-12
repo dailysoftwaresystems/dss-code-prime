@@ -898,9 +898,9 @@ TEST(FfiSynthesize, PEFormatProducesMangledNameAndImportLibrary) {
     ASSERT_TRUE(format.has_value());
 
     DiagnosticReporter rep;
-    std::array externs{ExternDeclRef{built.externNode, "puts"}};
+    std::array externs{ExternDeclRef{built.externNode, "puts", "msvcrt.dll"}};
     auto result = synthesizeFfiFromSourceDecls(
-        externs, "msvcrt.dll", **target, **format, ffi, rep);
+        externs, **target, **format, ffi, rep);
 
     EXPECT_TRUE(result.ok()) << "rep.errorCount=" << rep.errorCount();
     EXPECT_EQ(result.externsAnnotated, 1u);
@@ -933,10 +933,9 @@ TEST(FfiSynthesize, MachOFormatAppliesLeadingUnderscore) {
     ASSERT_TRUE(format.has_value());
 
     DiagnosticReporter rep;
-    std::array externs{ExternDeclRef{built.externNode, "puts"}};
+    std::array externs{ExternDeclRef{built.externNode, "puts", "/usr/lib/libSystem.B.dylib"}};
     auto result = synthesizeFfiFromSourceDecls(
-        externs, "/usr/lib/libSystem.B.dylib",
-        **target, **format, ffi, rep);
+        externs, **target, **format, ffi, rep);
 
     EXPECT_TRUE(result.ok());
     EXPECT_EQ(result.externsAnnotated, 1u);
@@ -973,8 +972,7 @@ TEST(FfiSynthesize, NoLibraryBindingLeavesImportLibraryEmpty) {
                                      /*libraryOverride=*/{},
                                      /*noLibraryBinding=*/true}};
     auto result = synthesizeFfiFromSourceDecls(
-        externs, "/usr/lib/libSystem.B.dylib",
-        **target, **format, ffi, rep);
+        externs, **target, **format, ffi, rep);
 
     EXPECT_TRUE(result.ok());
     EXPECT_EQ(result.externsAnnotated, 1u);
@@ -988,14 +986,36 @@ TEST(FfiSynthesize, NoLibraryBindingLeavesImportLibraryEmpty) {
     EXPECT_TRUE(meta->noLibraryBinding);
 }
 
-TEST(FfiSynthesize, EmptyImportLibraryFailsLoudWithDedicatedCode) {
-    // The language config's `externLibraryByFormat` map has no
-    // entry for the active object format ⇒ the synthesis call
-    // sees an empty importLibrary and rejects loud. Distinct
-    // F_FfiNoImportLibraryForFormat code so the diagnostic
-    // anchors at the upstream config gap rather than at the
-    // downstream linker (K_FormatLacksImportSupport /
-    // K_SymbolUndefined).
+TEST(FfiSynthesize, RowWithNoLibraryIsUnboundNotAnError) {
+    // ★★ UCRT-P4 (Decision 1) — THE RETIREMENT OF THE FORMAT-DEFAULT LIBRARY,
+    // PINNED FROM THE OTHER SIDE.
+    //
+    // This test replaces `EmptyImportLibraryFailsLoudWithDedicatedCode`, which
+    // asserted that a synthesis call with no format-level library REJECTED the
+    // whole module with `F_FfiNoImportLibraryForFormat`. That gate encoded "a
+    // LANGUAGE must name one runtime image per object format" — not a fact about a
+    // language, and a fact the shipped-descriptor corpus already owns PER SYMBOL
+    // (stdio is UCRT while setjmp deliberately is not; math is `libm.so.6` on elf
+    // while the rest of libc is `libc.so.6`). A single per-language string could
+    // not express that, so it was a guess — and the guess is what bound a
+    // hand-written `extern int printf(const char*, ...);` to a different C runtime
+    // than the same program's `#include`d stdio surface.
+    //
+    // THE INVARIANT NOW: a row with nothing to bind is UNBOUND, and that is a
+    // ROUTING OUTCOME, not an error. C23 5.1.1.2 phase 8 resolves external
+    // references at LINK, where a sibling TU may define the name, a
+    // `--resolve-library` binary may export it, or it is genuinely undefined and
+    // rejected LOUD (K_SymbolUndefined) — which is the tier every C toolchain
+    // reports unresolved externals from.
+    //
+    // ⚠ NOTE THE DIFFERENCE FROM ITS `noLibraryBinding` SIBLING ABOVE: that test
+    // pins the DELIBERATE opt-out flag. This one pins the row that says nothing at
+    // all. Both must yield an empty `importLibrary`, and asserting them separately
+    // is what stops a future "helpful" default from being reintroduced for only one
+    // of the two spellings.
+    //
+    // RED-ON-DISABLE: reinstating any format-level fallback makes `importLibrary`
+    // non-empty here and the EXPECT_TRUE below fails naming the image it invented.
     TypeInterner ti = makeInterner();
     auto built = buildModuleWithExtern(ti);
     HirFfiMap ffi{built.hir};
@@ -1006,22 +1026,28 @@ TEST(FfiSynthesize, EmptyImportLibraryFailsLoudWithDedicatedCode) {
     ASSERT_TRUE(format.has_value());
 
     DiagnosticReporter rep;
+    // No library override, and NOT flagged `noLibraryBinding`.
     std::array externs{ExternDeclRef{built.externNode, "puts"}};
     auto result = synthesizeFfiFromSourceDecls(
-        externs, /*importLibrary=*/"", **target, **format, ffi, rep);
+        externs, **target, **format, ffi, rep);
 
-    EXPECT_FALSE(result.ok());
-    EXPECT_EQ(result.externsAnnotated, 0u);
-    EXPECT_EQ(ffi.tryGet(built.externNode), nullptr);
-    // Pin EXACTLY one F_FfiNoImportLibraryForFormat (architectural
-    // gate at the head of synthesize — fires once per call, not
-    // per extern). A future refactor that moved the check into
-    // the per-extern loop would fire N times for N externs;
-    // EXPECT_EQ count=1 catches that regression.
+    EXPECT_TRUE(result.ok()) << "rep.errorCount=" << rep.errorCount();
+    EXPECT_EQ(result.externsAnnotated, 1u);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // The retired gate must not fire from anywhere: the code stays in the enum for
+    // name stability, but nothing emits it.
     EXPECT_EQ(::dss::test_support::countCode(
                   rep, DiagnosticCode::F_FfiNoImportLibraryForFormat),
-              1u);
-    EXPECT_EQ(rep.errorCount(), 1u);
+              0u);
+    auto const* meta = ffi.tryGet(built.externNode);
+    ASSERT_NE(meta, nullptr) << "the row must still be ANNOTATED — only its "
+                               "library is absent";
+    EXPECT_EQ(meta->mangledName, "puts")
+        << "C-mangling still applies — the merge/linker key on it";
+    EXPECT_TRUE(meta->importLibrary.empty())
+        << "a row with no library must stay UNBOUND for the link tier, never "
+           "inherit an invented format default; got '"
+        << meta->importLibrary << "'";
 }
 
 TEST(FfiSynthesize, EmptyCanonicalNameFailsLoudPerExtern) {
@@ -1042,7 +1068,7 @@ TEST(FfiSynthesize, EmptyCanonicalNameFailsLoudPerExtern) {
     DiagnosticReporter rep;
     std::array externs{ExternDeclRef{built.externNode, ""}};
     auto result = synthesizeFfiFromSourceDecls(
-        externs, "msvcrt.dll", **target, **format, ffi, rep);
+        externs, **target, **format, ffi, rep);
 
     EXPECT_FALSE(result.ok());
     EXPECT_EQ(result.externsAnnotated, 0u);
@@ -1073,9 +1099,9 @@ TEST(FfiSynthesize, OperandStackAbiModelShortCircuitsWithDedicatedCode) {
     ASSERT_TRUE(format.has_value());
 
     DiagnosticReporter rep;
-    std::array externs{ExternDeclRef{built.externNode, "puts"}};
+    std::array externs{ExternDeclRef{built.externNode, "puts", "msvcrt.dll"}};
     auto result = synthesizeFfiFromSourceDecls(
-        externs, "libc.so.6", **target, **format, ffi, rep);
+        externs, **target, **format, ffi, rep);
 
     EXPECT_FALSE(result.ok());
     EXPECT_EQ(result.externsAnnotated, 0u);
@@ -1112,11 +1138,11 @@ TEST(FfiSynthesize, MultipleExternsAllReceiveSameLibrary) {
 
     DiagnosticReporter rep;
     std::array externs{
-        ExternDeclRef{ef1, "puts"},
-        ExternDeclRef{ef2, "fprintf"},
+        ExternDeclRef{ef1, "puts", "msvcrt.dll"},
+        ExternDeclRef{ef2, "fprintf", "msvcrt.dll"},
     };
     auto result = synthesizeFfiFromSourceDecls(
-        externs, "msvcrt.dll", **target, **format, ffi, rep);
+        externs, **target, **format, ffi, rep);
 
     ASSERT_TRUE(result.ok());
     EXPECT_EQ(result.externsAnnotated, 2u);
@@ -1149,9 +1175,9 @@ TEST(FfiSynthesize, ELFFormatNoLeadingUnderscore) {
     ASSERT_TRUE(format.has_value());
 
     DiagnosticReporter rep;
-    std::array externs{ExternDeclRef{built.externNode, "puts"}};
+    std::array externs{ExternDeclRef{built.externNode, "puts", "libc.so.6"}};
     auto result = synthesizeFfiFromSourceDecls(
-        externs, "libc.so.6", **target, **format, ffi, rep);
+        externs, **target, **format, ffi, rep);
 
     EXPECT_TRUE(result.ok());
     EXPECT_EQ(rep.errorCount(), 0u);
@@ -1183,10 +1209,9 @@ TEST(FfiSynthesize, ExternGlobalAlsoReceivesMangling) {
     ASSERT_TRUE(format.has_value());
 
     DiagnosticReporter rep;
-    std::array externs{ExternDeclRef{eg, "errno"}};
+    std::array externs{ExternDeclRef{eg, "errno", "/usr/lib/libSystem.B.dylib"}};
     auto result = synthesizeFfiFromSourceDecls(
-        externs, "/usr/lib/libSystem.B.dylib",
-        **target, **format, ffi, rep);
+        externs, **target, **format, ffi, rep);
 
     EXPECT_TRUE(result.ok());
     EXPECT_EQ(result.externsAnnotated, 1u);
@@ -1223,10 +1248,10 @@ TEST(FfiSynthesize, MixedValidityPartialAnnotation) {
     DiagnosticReporter rep;
     std::array externs{
         ExternDeclRef{efBad,  ""},     // empty canonical → fails loud per-extern
-        ExternDeclRef{efGood, "puts"}, // proceeds despite predecessor's error
+        ExternDeclRef{efGood, "puts", "msvcrt.dll"}, // proceeds despite predecessor's error
     };
     auto result = synthesizeFfiFromSourceDecls(
-        externs, "msvcrt.dll", **target, **format, ffi, rep);
+        externs, **target, **format, ffi, rep);
 
     // !ok() (errorCount > 0) AND externsAnnotated == 1 (the
     // good one). Partial-annotation contract pinned.

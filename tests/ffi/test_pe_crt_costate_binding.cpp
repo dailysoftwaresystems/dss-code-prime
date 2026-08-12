@@ -270,11 +270,16 @@ struct PeBinding {
 // ── DECLARED CROSS-RUNTIME SYMBOLS ───────────────────────────────────────────
 //
 // A blanket "an override inside the group is always an error" rule would be
-// wrong, and this project has already decided the opposite twice: setjmp.json
-// stays on msvcrt because setjmp/longjmp carry ZERO CRT state (setjmp is not one
-// of the nine, but the reasoning is the same one), and the interim
+// wrong, and this project has already decided the opposite twice: setjmp.json sat
+// on msvcrt for two phases because setjmp/longjmp carry ZERO CRT state (setjmp is
+// not one of the nine, but the reasoning is the same one), and the interim
 // strftime->ucrtbase override rode inside time.json for a whole phase while the
-// rest of that header was still msvcrt. So the exception has to be EXPRESSIBLE —
+// rest of that header was still msvcrt. BOTH exceptions have since been retired —
+// UCRT-P5 moved setjmp.json to ucrtbase once the facility was found there under
+// the name `__intrinsic_setjmp` — and that is the point, not a counterexample: an
+// exception has to be expressible so the split can be JUSTIFIED AND DATED rather
+// than hidden, and then retired when the reason expires. So it has to be
+// EXPRESSIBLE —
 // but only as an explicit, justified, per-symbol declaration. An UNDECLARED
 // override inside the group fails loud.
 //
@@ -677,4 +682,173 @@ TEST(PeCrtCoStateBinding, EveryPeRuntimeImageNamedIsAKnownRuntime) {
         << "found only " << checked
         << " pe bindings across the shipped tree — the reader is almost "
            "certainly looking at the wrong key or the wrong directory.";
+}
+
+// ── THE setjmp FACILITY'S pe (IMAGE, EXTERNAL NAME) PAIR ─────────────────────
+//
+// UCRT-P5 moved setjmp.json from msvcrt.dll to ucrtbase.dll, and that move is
+// NOT the one-token edit every other descriptor's flip was: the two runtimes
+// export this facility under DIFFERENT NAMES. MEASURED 2026-08-11
+// (`objdump -p C:/Windows/System32/{msvcrt,ucrtbase}.dll`, GNU binutils 2.42):
+//
+//   msvcrt.dll    `_setjmp` (ordinal 722, RVA 0x7ab10) and `setjmp` (ord 1215)
+//   ucrtbase.dll  `__intrinsic_setjmp` (ord 75, RVA 0xed430) and `setjmp`
+//                 (ord 2371) — and NO `_setjmp` AT ALL
+//
+// So the descriptor carries TWO facts that have to agree: the image, and the
+// external name (`linkName`, defaulting to the C identifier `_setjmp` exactly as
+// ffi::linkNameFor resolves it). The dangerous states are the MIXTURES:
+//
+//   * ucrtbase.dll + no linkName ⇒ imports `_setjmp` from the one runtime that
+//     does not export it. This is the naive repoint — and believing it was the
+//     only available move is why this descriptor sat on the legacy CRT for two
+//     phases after every one of its siblings had left.
+//   * msvcrt.dll + `__intrinsic_setjmp` ⇒ a revert of the IMAGE that forgets the
+//     NAME, importing a UCRT-only name from the legacy CRT.
+//
+// NEITHER mixture fails the build. DSS eagerly imports every declared shipped
+// symbol (D-FFI-DESCRIPTOR-EAGER-IMPORT), so an absent name is rejected by the
+// LOADER at 0xC0000139: every pe binary that includes <setjmp.h> refuses to
+// start, with no diagnostic and no link error pointing at the JSON line.
+//
+// Following this file's standing rule (see the header: agreement, never a
+// literal runtime), the pin is NOT "the image is ucrtbase". It is "the (image,
+// name) pair is one that a real Windows actually exports" — true before the
+// migration, true after it, false only in the mixtures. Adding a row to this
+// table is a deliberate act and must cite an objdump.
+struct ExportedSetjmpPair {
+    char const* image;
+    char const* externalName;
+};
+
+constexpr ExportedSetjmpPair kExportedSetjmpPairs[] = {
+    {"msvcrt.dll",   "_setjmp"},              // ord 722  — the pre-UCRT-P5 bind
+    {"msvcrt.dll",   "setjmp"},               // ord 1215 — tail-thunk to _setjmp
+    {"ucrtbase.dll", "__intrinsic_setjmp"},   // ord 75   — what MSVC itself emits
+    {"ucrtbase.dll", "setjmp"},               // ord 2371 — tail-thunk to the above
+};
+
+[[nodiscard]] bool isExportedSetjmpPair(std::string_view image,
+                                        std::string_view externalName) {
+    for (auto const& p : kExportedSetjmpPairs)
+        if (image == p.image && externalName == p.externalName) return true;
+    return false;
+}
+
+// The pe (image, external name) a descriptor actually binds for one symbol, with
+// the same two defaulting rules the engine uses: a per-symbol `library` entry
+// wins over the root (semantic_analyzer.cpp), and an absent `linkName` means the
+// identifier itself (ffi::linkNameFor). nullopt = the symbol is not declared.
+struct PeSymbolBinding {
+    std::string image;
+    std::string externalName;
+};
+
+[[nodiscard]] std::optional<PeSymbolBinding>
+peBindingOfSymbol(nlohmann::json const& doc, std::string_view symbolName) {
+    if (!doc.is_object() || !doc.contains("symbols")) return std::nullopt;
+    for (auto const& sym : doc.at("symbols")) {
+        if (!sym.is_object() || !sym.contains("name")) continue;
+        if (sym.at("name").get<std::string>() != symbolName) continue;
+
+        PeSymbolBinding out;
+        if (doc.contains("library") && doc.at("library").is_object()
+            && doc.at("library").contains("pe"))
+            out.image = doc.at("library").at("pe").get<std::string>();
+        if (sym.contains("library") && sym.at("library").is_object()
+            && sym.at("library").contains("pe"))
+            out.image = sym.at("library").at("pe").get<std::string>();
+
+        out.externalName = std::string{symbolName};
+        if (sym.contains("linkName")) {
+            // Fail closed rather than wave through a shape this reader does not
+            // model: `linkName` may also be an object with per-target variants,
+            // and silently ignoring one would make this pin assert nothing.
+            EXPECT_TRUE(sym.at("linkName").is_string())
+                << "symbol '" << symbolName << "' carries a non-flat 'linkName'. "
+                   "This guard only models the flat-string form — teach it the "
+                   "variant form rather than letting the pair go unchecked.";
+            if (sym.at("linkName").is_string())
+                out.externalName = sym.at("linkName").get<std::string>();
+        }
+        return out;
+    }
+    return std::nullopt;
+}
+
+TEST(PeCrtCoStateBinding, SetjmpPeBindingNamesAPairWindowsExports) {
+    fs::path const root = configRoot();
+    ASSERT_FALSE(root.empty());
+    fs::path const path = root / "shippedLibs" / "setjmp.json";
+    ASSERT_TRUE(fs::exists(path)) << path.string();
+
+    std::ifstream in{path, std::ios::binary};
+    ASSERT_TRUE(in.is_open());
+    nlohmann::json const doc = nlohmann::json::parse(in, nullptr, false);
+    ASSERT_FALSE(doc.is_discarded()) << "setjmp.json does not parse";
+
+    auto const bind = peBindingOfSymbol(doc, "_setjmp");
+    // Guard the guard: if the pe row is ever renamed this reader would find
+    // nothing and the test would pass by sweeping an empty set.
+    ASSERT_TRUE(bind.has_value())
+        << "setjmp.json declares no `_setjmp` symbol — this guard just stopped "
+           "checking anything. If the pe row was renamed, re-aim the guard.";
+
+    EXPECT_TRUE(isExportedSetjmpPair(bind->image, bind->externalName))
+        << "setjmp.json binds pe `_setjmp` to image '" << bind->image
+        << "' under the external name '" << bind->externalName
+        << "', which that runtime does not export. This does NOT fail the build: "
+           "DSS eagerly imports every declared shipped symbol, so the LOADER "
+           "rejects every pe binary that includes <setjmp.h> at 0xC0000139. The "
+           "image and the name have to move together — ucrtbase.dll needs "
+           "`__intrinsic_setjmp`, msvcrt.dll needs `_setjmp`.";
+}
+
+// RED-ON-DISABLE for the decision above, run against the two shapes that would
+// otherwise reach a user as a binary that will not start. Without this the pin
+// would be a single assertion over a tree that is currently correct, and a
+// future edit that broke `peBindingOfSymbol` (say, dropping the per-symbol
+// library merge) would leave it green.
+TEST(PeCrtCoStateBinding, SetjmpPeBindingMixtureIsCaught) {
+    // The two known-good pairs are accepted...
+    EXPECT_TRUE(isExportedSetjmpPair("msvcrt.dll", "_setjmp"));
+    EXPECT_TRUE(isExportedSetjmpPair("ucrtbase.dll", "__intrinsic_setjmp"));
+
+    // ...and both mixtures are rejected.
+    EXPECT_FALSE(isExportedSetjmpPair("ucrtbase.dll", "_setjmp"))
+        << "the naive repoint (image moved, name left behind) must be caught";
+    EXPECT_FALSE(isExportedSetjmpPair("msvcrt.dll", "__intrinsic_setjmp"))
+        << "the half-revert (name moved, image left behind) must be caught";
+
+    // The reader's defaulting rules are what turn a JSON edit into a pair, so
+    // exercise them directly on synthetic documents rather than trusting them.
+    auto const parse = [](char const* text) {
+        return nlohmann::json::parse(text, nullptr, false);
+    };
+
+    // No `linkName` ⇒ the external name IS the identifier.
+    auto const bare = peBindingOfSymbol(parse(R"JSON({
+        "library": { "pe": "ucrtbase.dll" },
+        "symbols": [ { "name": "_setjmp" } ]
+    })JSON"), "_setjmp");
+    ASSERT_TRUE(bare.has_value());
+    EXPECT_EQ(bare->externalName, "_setjmp");
+    EXPECT_FALSE(isExportedSetjmpPair(bare->image, bare->externalName));
+
+    // A per-symbol `library` entry WINS over the root — the axis that was this
+    // file's original blind spot.
+    auto const overridden = peBindingOfSymbol(parse(R"JSON({
+        "library": { "pe": "ucrtbase.dll" },
+        "symbols": [ { "name": "_setjmp", "linkName": "__intrinsic_setjmp",
+                       "library": { "pe": "msvcrt.dll" } } ]
+    })JSON"), "_setjmp");
+    ASSERT_TRUE(overridden.has_value());
+    EXPECT_EQ(overridden->image, "msvcrt.dll");
+    EXPECT_FALSE(isExportedSetjmpPair(overridden->image,
+                                      overridden->externalName));
+
+    // An undeclared symbol reports nullopt rather than a default-constructed
+    // pair that would silently satisfy the table.
+    EXPECT_FALSE(peBindingOfSymbol(parse(R"JSON({"symbols":[]})JSON"), "_setjmp")
+                     .has_value());
 }
