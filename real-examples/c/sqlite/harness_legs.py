@@ -1108,6 +1108,49 @@ RETIRED_CONFOUND_SCOPES = ("any",)
 # its work.
 CONFOUND_PROVENANCE_KEYS = ("earnedOn", "earnedAt", "mechanism", "anchor")
 
+# ── WHAT A CONFOUND ROW MATCHES ─────────────────────────────────────────────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY
+#
+# ★★ ONE LEDGER, TWO MATCH KINDS — NOT TWO LEDGERS. Every row here answers one
+# question, "is this failure the compiler's?", and a second list answering it
+# would be a second thing to keep earned, lint and read. What differs is only
+# the NAME the failure arrives under: a unit failure arrives as a test name, and
+# an ABORT kills the fixture mid-file so there is no unit name at all — only
+# `permutation/file`. That was the gap: a proven-upstream abort could not be
+# recorded in ANY form, so the driver's "a run with aborts is NEVER green" rule
+# convicted the compiler of an environment fault it had measured to be innocent
+# of.
+#
+# ★ AND THE GUARD IS NOT REMOVED, IT IS MADE CONDITIONAL ON PROVENANCE. An
+# `abort-file` row carries the SAME mandatory earnedOn/earnedAt/mechanism/anchor
+# as any other, enforced by the same lint, and an UNEARNED abort still fails the
+# run exactly as before. "Proven" means earned; nothing else buys the exemption.
+CONFOUND_MATCH_KINDS = {
+    "unit": "the row's pattern is matched against a FAILING UNIT's test name "
+            "(the historical and default behaviour)",
+    "abort-file": "the row's pattern is matched against a fixture ABORT, spelled "
+                  "`permutation/file` (e.g. `^veryquick/nolock\\.test$`) — the "
+                  "only name an abort has, because it dies before the unit that "
+                  "killed it can be reported",
+}
+CONFOUND_MATCH_DEFAULT = "unit"
+
+
+def confound_match_kind(row):
+    """One row's match kind, defaulted and CHECKED. A typo must not silently
+    become the default: a row meant to excuse an abort that quietly became a
+    unit-name row would match nothing and the abort would still convict."""
+    kind = row.get("matches", CONFOUND_MATCH_DEFAULT)
+    if kind not in CONFOUND_MATCH_KINDS:
+        raise LegError(
+            "confound %r declares matches=%r (known: %s). An unrecognised match "
+            "kind cannot be defaulted to `unit`: a mistyped abort row would then "
+            "match no unit name, excuse nothing, and the abort it was written "
+            "for would still be charged to the compiler."
+            % (row.get("pattern"), kind, ", ".join(sorted(CONFOUND_MATCH_KINDS))))
+    return kind
+
 
 def confound_scope_prefix(scope):
     """The `native:`/`emulated:` prefix a scope becomes on the wire, so the two
@@ -1873,7 +1916,8 @@ def leg_confound_decisions(leg, gate):
 
         def _decision(active, reason, _requires=(), _pattern=pattern, _wire=wire,
                       _scope=scope, _scoped_out=scoped_out,
-                      _clause=scope_clause):
+                      _clause=scope_clause, _matches=confound_match_kind(row),
+                      _row=row):
             """One row's verdict. `active` stays the SUPPLY question — is this
             pattern handed to the matcher — and `scopedOut` is the separate,
             separately-reported question of whether the matcher can apply it on
@@ -1881,6 +1925,7 @@ def leg_confound_decisions(leg, gate):
             a row reported ACTIVE with the reason "unconditional"."""
             return {"pattern": _pattern, "wire": _wire, "scope": _scope,
                     "requires": list(_requires), "active": active,
+                    "matches": _matches, "row": _row,
                     "scopedOut": _scoped_out, "reason": reason + _clause}
 
         requires = list(row.get("requires", []))
@@ -1966,7 +2011,136 @@ def leg_confounds(leg, gate):
     per-driver asymmetry D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG was
     about, one axis along."""
     return [d["wire"] for d in leg_confound_decisions(leg, gate)
-            if d["active"]]
+            if d["active"] and d["matches"] == "unit"]
+
+
+def leg_abort_confounds(leg, gate):
+    """This leg's HONOURED ABORT patterns, in wire form — the same ledger, read
+    through the other match kind. Separate ACCESSOR, not a separate list: the
+    rows live beside every other confound and are earned by the same lint.
+
+    A UNIT matcher must never see these and an ABORT matcher must never see the
+    unit rows, or a row written for one name space would silently excuse a
+    failure in the other."""
+    return [d["wire"] for d in leg_confound_decisions(leg, gate)
+            if d["active"] and d["matches"] == "abort-file"]
+
+
+# ── WHAT AN ABORT'S DIAGNOSTIC *IS* ─────────────────────────────────────────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-ABORT-CONFOUND-KEYED-ON-LOCATION-NOT-IDENTITY
+#
+# ★★★ THE FIRST CUT OF THIS MECHANISM MATCHED ONLY `permutation/file`, AND THAT
+# EXCUSED A LOCATION RATHER THAN A FAILURE. Any abort anywhere inside
+# `nolock.test` — a codegen crash at nolock-3.2, a stack overflow, a wild store —
+# matched the row earned for a Windows lock-violation and was silently forgiven.
+# That is the exact class the confound ledger exists to prevent, wearing a new
+# costume [D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT].
+# ★★ AND THE INFORMATION WAS ALREADY IN THE ROW: its `mechanism` field records
+# the fingerprint (`error copying "test.db" to "sv_test.db": permission denied`,
+# gle=33) and the MATCHER USED NONE OF IT — this project's recurring failure mode
+# by name, "a comment that records the full fact while the code uses half of it"
+# (unistd.json's alias set; UCRT-P5's `_setjmp`). So the code now uses the whole
+# fact: a row must ALSO constrain the DIAGNOSTIC, and `abortDiagnostic` is
+# REQUIRED, not optional — an optional field is one the next row omits.
+#
+# ⓘ WHY THE LAST-EMITTED TEST IS *NOT* ALSO CONSTRAINED, stated rather than
+# dropped in silence. It was considered and REFUSED as brittle: this harness
+# pulls upstream sqlite on every run, so `nolock-5.1` is a COORDINATE, not an
+# identity — an upstream renumbering would stop the row matching and turn an
+# earned confound into a red that reads as a compiler regression, which is the
+# failure direction that costs a day. The DIAGNOSTIC is the identity; the test
+# number is where it happened to happen. If a future row genuinely needs the
+# test name to disambiguate two failures with the same text in one file, add it
+# THEN, with that case as the evidence.
+
+
+def abort_diagnostic_text(log_text):
+    """The fatal tail of an ABORTED segment's log — everything the fixture
+    printed AFTER it last did its job — or "" when there is none.
+
+    PURE: takes text, returns text, so the rule is unit-testable without a
+    corpus. This is deliberately NOT `Read-CorpusSegment`'s `Diagnostic`/`A`
+    fact, which is the FIRST non-fixture line and exists for the ZERO-PROGRESS
+    path. An abort like nolock's happens after 23 passing tests, so its fatal
+    text is at the END; keying on the first line would match a banner.
+
+    ★ "" IS A REAL ANSWER AND IT MEANS NO MATCH. A silent zero-byte crash yields
+    no diagnostic, and absence of evidence must never satisfy a matcher."""
+    fixture_noise = re.compile(
+        r"^\s*(Time:\s|Memory used:|Page-cache used:|Scratch used:|"
+        r"Malloc count:|SQLite \d|\d+ errors out of \d+ tests)"
+        r"|\.\.\.\s*Ok\s*$|^\S+\.test-\S*\.\.\.")
+    lines = (log_text or "").splitlines()
+    last_working = -1
+    for i, ln in enumerate(lines):
+        if fixture_noise.search(ln):
+            last_working = i
+    tail = [ln.rstrip() for ln in lines[last_working + 1:] if ln.strip()]
+    return "\n".join(tail)
+
+
+def classify_abort(leg, gate, abort_name, diagnostic):
+    """The leg-and-gate front door. The decision itself is
+    classify_abort_decisions, so the CLI can hand it the decisions the RESOLVED
+    PLAN already carries and the two can never be two matchers."""
+    return classify_abort_decisions(leg_confound_decisions(leg, gate),
+                                    leg.get("label"), abort_name, diagnostic)
+
+
+def classify_abort_decisions(decisions, label, abort_name, diagnostic):
+    """(row, why) for the FIRST active `abort-file` row whose file pattern AND
+    diagnostic pattern BOTH match, else (None, why-not).
+
+    ★ ONE MATCHER, BOTH DRIVERS. The unit matcher is per-driver because the two
+    receive their patterns through genuinely different transports; an abort
+    arrives as one short string in both, so there is no such excuse here and a
+    second regex implementation would be a second thing to get wrong.
+    A `scope`d row is applied only when the run mode allows it, exactly as the
+    unit matcher does — `scopedOut` is honoured, not just reported.
+
+    ★★ THE CONJUNCTION IS THE WHOLE POINT: location AND identity. See the
+    header above for why matching the file alone was a defect."""
+    if not (diagnostic or "").strip():
+        # FAIL TOWARD REPORTING. No extractable diagnostic (a silent, zero-byte
+        # crash is a real case this harness has already hit once) means the
+        # abort cannot be IDENTIFIED, and an unidentified abort is a compiler
+        # suspect. It is never excused for being unreadable.
+        return (None,
+                "abort %r on leg '%s' produced NO extractable diagnostic, so it "
+                "cannot be identified — it stays UNEARNED and fails the leg. "
+                "Absence of evidence never satisfies a matcher "
+                "[D-HARNESS-ABORT-CONFOUND-KEYED-ON-LOCATION-NOT-IDENTITY]"
+                % (abort_name, label))
+    file_hits = []
+    for d in decisions:
+        if not d["active"] or d["matches"] != "abort-file" or d["scopedOut"]:
+            continue
+        if not re.search(d["pattern"], abort_name or ""):
+            continue
+        want = d["row"].get("abortDiagnostic", "")
+        if want and re.search(want, diagnostic):
+            return (d, "matched the earned abort row %r AND its diagnostic %r"
+                       % (d["pattern"], want))
+        file_hits.append((d["pattern"], want))
+    if file_hits:
+        # ★ THE MESSAGE A TRIAGER NEEDS, and the one this defect would have
+        # denied them: the row for this FILE exists and this is NOT its failure.
+        return (None,
+                "abort %r on leg '%s' is in a file that HAS an earned row (%s), "
+                "but its diagnostic does NOT match that row's — this is a "
+                "DIFFERENT failure in the same file and it is charged to the "
+                "compiler. Earned diagnostic: %s. Observed: %r"
+                % (abort_name, label,
+                   ", ".join(p for p, _ in file_hits),
+                   "; ".join(w for _, w in file_hits),
+                   diagnostic.strip()[:400]))
+    return (None, "no ACTIVE `matches: abort-file` row on leg '%s' matches %r, "
+                  "so this abort is UNEARNED and still fails the leg — an "
+                  "unproven abort is a compiler suspect until a row shows its "
+                  "work [D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY]"
+                  % (label, abort_name))
 
 
 def confound_report_lines(label, decisions, gate):
@@ -2390,6 +2564,211 @@ def resolve_target_cc(leg, runner=None, which=None):
         return (cc, ((out or "").strip().splitlines() or [""])[0].strip(),
                 rejections)
     return ("", "", rejections)
+
+
+# ── THE ATTRIBUTION ORACLE, PER LEG ─────────────────────────────────────────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE
+#
+# ★★★ THE DEFECT THIS CLOSES WAS AN OUTPUT LINE, NOT A MISSING FEATURE. The
+# harness builds ONE reference testfixture per run — with the DERIVING host's
+# gcc, so on every host this project uses it is an ELF Linux binary — and then
+# Step 9 printed a single `oracle : <path>` line for the WHOLE run. For the
+# `elf64-x86_64` leg that line is very nearly a matched control. For `pe64` it
+# names a binary of a DIFFERENT PLATFORM that cannot be run against a pe64-only
+# failure at all. ⇒ THE LINE READ AS AN AVAILABLE CONTROL AND WAS NOT ONE, which
+# is strictly worse than printing nothing: an absent control is an honest gap, a
+# claimed-and-unheld one retires the reader's suspicion.
+#
+# ★ THE ORACLE IS THEREFORE A PER-LEG FACT AND IS DERIVED, NEVER ASSERTED. Its
+# two inputs are both MEASURED: the reference binary's own target (read out of
+# its header by `--identify-binary`) and the leg's DECLARED `spec`. No host is
+# consulted at any point — the same rule the loadext resolver above runs under.
+#
+# ★ AND A LEG CAN NOW HAVE ITS OWN. `--build-reference-oracle` compiles the
+# leg's OWN manifest — the same `.dss-project.json` DSS consumed, so the TU set,
+# the include roots, the defines and the libraries are one declaration read
+# twice — with the compiler `resolve_target_cc` already verifies against that
+# leg's target. That is what an oracle IS: one input, two compilers. It also
+# happens to be the only shape that CAN work cross-target, because upstream's
+# autotools Makefile is configured for the deriving host and cannot emit a
+# foreign-target fixture.
+
+# The verdict vocabulary. Closed, because "the oracle is sort of available" is
+# the state this whole anchor is about.
+ORACLE_CLASSES = {
+    "same-platform": "a reference binary built for THIS LEG'S OWN TARGET — run "
+                     "it on the same input to attribute a failure",
+    "cross-platform": "a reference binary exists, but for a DIFFERENT PLATFORM "
+                      "— it is NOT an oracle for this leg",
+    "absent": "no reference binary survived this run at all",
+}
+
+# The fallback control, named once. The row that opened this anchor insisted the
+# weaker form be STATED rather than left implicit: TF-C124 attributed
+# `win32longpath-1.3` on pe64 with no same-platform oracle, by holding the
+# COMPILER constant and varying only the RUNTIME (the same dss-built
+# testfixture.exe: `Ok` on real Windows, failing under wine). That is a
+# legitimate control and a report that omits it understates what the harness can
+# still do.
+ORACLE_FALLBACK_CONTROL = (
+    "FALLBACK CONTROL (weaker, but real): hold the COMPILER constant and vary "
+    "the RUNTIME — run this leg's OWN dss-built artefact under a second runtime "
+    "for the same target. A difference is then the runtime's, not the "
+    "compiler's. This is how win32longpath-1.3 was attributed on pe64 with no "
+    "same-platform oracle [D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE]."
+)
+
+
+def oracle_class_for_leg(leg, ref_target, ref_path):
+    """(class, why) — is the run's reference binary an oracle for THIS leg?
+
+    PURE: no filesystem, no process, no host. `ref_target` is the triple
+    `--identify-binary` MEASURED off the reference's own header; `ref_path` is
+    empty when no reference survived the run. The comparison is the same
+    arch+OS rule `machine_matches_spec` applies to a compiler's `-dumpmachine`,
+    because "does this binary belong to that target" and "does this compiler
+    produce that target" are one question asked of two artefacts."""
+    if not ref_path:
+        return ("absent", "no reference binary was produced or preserved")
+    if not ref_target:
+        return ("absent",
+                "a reference binary exists at %s but its target could not be "
+                "MEASURED, so whether it is an oracle for this leg is unknown — "
+                "and an unknown control is not a control" % ref_path)
+    # --identify-binary answers `arch<TAB>format`, joined with ':' by the
+    # drivers — the same `<arch>:<format>` shape a leg's `spec` is written in, so
+    # ONE pair of readers answers for both artefacts and neither side is parsed
+    # by a rule written for the other.
+    spec = leg.get("spec", "")
+    want = (canon_arch(spec_target_arch(spec)), canon_os(spec_target_os(spec)))
+    got = (canon_arch(spec_target_arch(ref_target)),
+           canon_os(spec_target_os(ref_target)))
+    if "" in (spec_target_os(spec), spec_target_os(ref_target)):
+        return ("absent",
+                "the reference (%s) or this leg (%s) does not name an OS in the "
+                "shape this catalogue reads, so whether they share a platform "
+                "cannot be DECIDED — and an undecided control is not a control"
+                % (ref_target, spec or "<undeclared>"))
+    if want == got:
+        return ("same-platform",
+                "the reference targets %s/%s, which is this leg's own target (%s)"
+                % (got[0], got[1], spec))
+    return ("cross-platform",
+            "the reference targets %s/%s (%s); this leg targets %s/%s (%s)"
+            % (got[0], got[1], ref_target, want[0], want[1], spec))
+
+
+def oracle_report_lines(leg, ref_target, ref_path, leg_oracle=None,
+                        resolver=None):
+    """The per-leg oracle verdict, as the lines a driver PRINTS verbatim.
+
+    ONE implementation of the prose, called by both drivers — the same argument
+    the confound report makes for living here. A leg with no oracle says so IN
+    THOSE TERMS and names the fallback; it never gets a line that could be read
+    as a held control.
+
+    `leg_oracle` is the leg's OWN same-platform reference when one was built:
+    {"path", "cc", "triple"}. `resolver` is resolve_target_cc's whole answer
+    (cc, machine, rejections), so a leg with no oracle also says WHY — and the
+    two whys are DIFFERENT facts that must not be collapsed: "this host owns no
+    compiler for this target" is the environment's limit, while "a qualifying
+    compiler is right here and the oracle still was not built" is OUR defect and
+    names a log to read. A report that printed one sentence for both would send
+    the reader to install a toolchain they already have."""
+    label = leg.get("label", "<unlabelled>")
+    spec = leg.get("spec", "<undeclared>")
+    lines = []
+    if leg_oracle and leg_oracle.get("path"):
+        lines.append("%s: SAME-PLATFORM — %s" % (label, leg_oracle["path"]))
+        lines.append("    built for this leg's own target %s by %s (%s), from "
+                     "this leg's OWN manifest — the same sources, includes and "
+                     "defines dss compiled. Run it on the failing input to "
+                     "ATTRIBUTE: it fails too => upstream; it passes => dss."
+                     % (spec, leg_oracle.get("cc", "<unnamed cc>"),
+                        leg_oracle.get("triple", "<unmeasured triple>")))
+        return lines
+    cls, why = oracle_class_for_leg(leg, ref_target, ref_path)
+    if cls == "same-platform":
+        lines.append("%s: SAME-PLATFORM (the run reference) — %s"
+                     % (label, ref_path))
+        lines.append("    %s. Run it on the failing input to ATTRIBUTE." % why)
+        return lines
+    # ── the two states that must NEVER read as an available control ──────────
+    lines.append("%s: NO ORACLE — %s" % (label, ORACLE_CLASSES[cls]))
+    lines.append("    %s." % why)
+    lines.append("    A %s-only failure CANNOT be attributed by this harness's "
+                 "documented method (run the reference on the same input), "
+                 "because there is nothing of this platform to run."
+                 % label)
+    if resolver is not None:
+        cc, machine, rejections = resolver
+        if cc:
+            lines.append(
+                "    ⚠ AND THAT IS THIS HARNESS'S GAP, NOT THIS HOST'S: `%s` "
+                "(%s) is on PATH and PROVES it targets %s, so a same-platform "
+                "oracle COULD have been built from this leg's own manifest and "
+                "was not. Read the leg's reference-oracle log."
+                % (cc, machine, spec))
+        else:
+            lines.append(
+                "    No declared compiler on this host targets %s, so none can "
+                "be built here: %s"
+                % (spec, "; ".join(rejections) or "no candidates declared"))
+    lines.append("    " + ORACLE_FALLBACK_CONTROL)
+    return lines
+
+
+# A binary's FILE NAME is a target fact, exactly as `loadExtHelperName` is — the
+# reason that key is declared per leg rather than spelled in a driver. Kept as a
+# target-keyed table here (rather than a sixth legs.json key to keep in step)
+# because unlike the loadext helper this name is never read by upstream's test
+# suite: it is ours, and only the suffix is the target's business.
+REFERENCE_ORACLE_NAME_BY_TARGET_OS = {
+    "windows": "reference-testfixture.exe",
+    "linux": "reference-testfixture",
+    "darwin": "reference-testfixture",
+}
+
+
+def reference_oracle_name(leg):
+    """This leg's same-platform oracle's file name, keyed on its TARGET's OS —
+    never on the host's. Raises rather than guessing: a leg whose spec names an
+    OS this table does not know would otherwise get a Windows binary with no
+    suffix, which is a file Windows will not exec."""
+    os_name = spec_target_os(leg.get("spec", ""))
+    if os_name not in REFERENCE_ORACLE_NAME_BY_TARGET_OS:
+        raise LegError(
+            "leg '%s' targets OS %r, which REFERENCE_ORACLE_NAME_BY_TARGET_OS "
+            "does not name (known: %s). The oracle's file name is a TARGET "
+            "fact and this catalogue will not guess one."
+            % (leg.get("label"), os_name,
+               ", ".join(sorted(REFERENCE_ORACLE_NAME_BY_TARGET_OS))))
+    return REFERENCE_ORACLE_NAME_BY_TARGET_OS[os_name]
+
+
+def reference_oracle_argv(cc, manifest, output, link_flags):
+    """The one command that builds a leg's same-platform reference, composed
+    from the leg's OWN manifest. PURE — returns argv, spawns nothing, so the
+    composition is unit-testable without a compiler on the host.
+
+    `link_flags` is the leg's DECLARED `build.referenceLinkFlags`: the TARGET's
+    system libraries (`-lm`, `-ldl`, `-lpthread` on a POSIX target; nothing on a
+    Windows one, where mingw links them itself). It is a property of the target,
+    declared per leg, never sniffed from the host."""
+    argv = [cc, "-o", output]
+    for d in manifest.get("defines", []):
+        argv.append("-D%s" % d)
+    for inc in manifest.get("includes", []):
+        argv.append("-I%s" % inc)
+    argv.extend(manifest.get("sources", []))
+    # A resolveLibraries entry is either a bare path or {"path", "importName"}.
+    # The reference links against the SAME binaries dss resolved against, which
+    # is what makes it a control rather than a differently-configured build.
+    for lib in manifest.get("resolveLibraries", []):
+        argv.append(lib["path"] if isinstance(lib, dict) else lib)
+    argv.extend(link_flags or [])
+    return argv
 
 
 # ── The helper extension the loadext corpus dlopen()s, PER TARGET ───────────
@@ -5429,7 +5808,14 @@ def plan_leg(leg, host_os, host_arch, available, probe_verdicts=None):
         # INACTIVE / SCOPED-OUT decision structurally, including both directions of
         # the cross-kernel rule. It was inert for one cycle — emitted and read by
         # nothing — and an inert field is a claim nobody can be wrong about.
-        "confounds": [d["wire"] for d in decisions if d["active"]],
+        # UNIT rows only. An `abort-file` row leaking into the unit matcher
+        # would let a pattern written for `perm/file` excuse a unit that
+        # happened to be spelled like one — one ledger, but never one
+        # name space. [D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY]
+        "confounds": [d["wire"] for d in decisions
+                      if d["active"] and d["matches"] == "unit"],
+        "abortConfounds": [d["wire"] for d in decisions
+                           if d["active"] and d["matches"] == "abort-file"],
         "confoundRows": [dict(r) for r in leg.get("confounds", [])],
         "confoundDecisions": decisions,
         "confoundGating": gate["gating"],
@@ -5724,6 +6110,8 @@ def emit_sh(resolved):
         # provenance behind each pattern stays in legs.json, where the lint can
         # require it — a driver needs the pattern, a reader needs the evidence.
         put("LEG_CONFOUNDS", " ".join(q(x) for x in leg["confounds"]))
+        put("LEG_ABORT_CONFOUNDS",
+            " ".join(q(x) for x in leg.get("abortConfounds", [])))
         # ★ AND WHETHER A MACHINE MEASUREMENT BACKS THAT LIST. `unprobed` is
         # fail-safe (every conditional row was dropped) but it is NOT fit to run
         # on, and the driver refuses it — a run that silently under-excuses reads
@@ -6432,6 +6820,45 @@ def lint(path=CATALOGUE):
                             % (label, pat))
                 else:
                     scope = ""
+                # ── `matches`: WHICH NAME SPACE THIS ROW IS WRITTEN FOR ─────
+                # [D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY]
+                kind = row.get("matches", CONFOUND_MATCH_DEFAULT)
+                if kind not in CONFOUND_MATCH_KINDS:
+                    findings.append(
+                        "leg '%s': confound %r declares matches=%r (known: %s). "
+                        "It is NOT defaulted: a mistyped abort row silently read "
+                        "as a unit row matches no unit name, excuses nothing, and "
+                        "the abort it was written for is still charged to the "
+                        "compiler."
+                        % (label, pat, kind, ", ".join(sorted(CONFOUND_MATCH_KINDS))))
+                elif kind == "abort-file" and not str(
+                        row.get("abortDiagnostic", "")).strip():
+                    # ★★ REQUIRED, EXACTLY LIKE `earnedOn`.
+                    # [D-HARNESS-ABORT-CONFOUND-KEYED-ON-LOCATION-NOT-IDENTITY]
+                    # A row constraining only the FILE excuses a LOCATION, so any
+                    # future abort in that file — a codegen crash, a stack
+                    # overflow — is silently forgiven by a row earned for
+                    # something else. Not optional: an optional field is one the
+                    # next row omits, and we are back here.
+                    findings.append(
+                        "leg '%s': confound %r declares matches='abort-file' but "
+                        "no 'abortDiagnostic'. An abort row must constrain the "
+                        "failure's IDENTITY (the text the fixture died with), "
+                        "not only WHERE it happened — otherwise a DIFFERENT "
+                        "abort in the same file inherits an excusal nobody "
+                        "earned for it." % (label, pat))
+                elif kind == "abort-file" and "/" not in pat:
+                    # An abort's only name is `permutation/file`. A pattern with
+                    # no separator was written against a unit name and would
+                    # match nothing here — dead config that reads as an earned
+                    # exemption, which is the worst of both.
+                    findings.append(
+                        "leg '%s': confound %r declares matches='abort-file' but "
+                        "its pattern contains no '/'. An abort is named "
+                        "`permutation/file` (e.g. `^veryquick/nolock\\.test$`); a "
+                        "pattern without the separator can never match one and "
+                        "would sit here reading as a proven exemption while "
+                        "excusing nothing." % (label, pat))
                 for k in CONFOUND_PROVENANCE_KEYS:
                     v = row.get(k, "")
                     if not isinstance(v, str) or not v.strip():
@@ -7499,6 +7926,52 @@ def _mirror_write_fixtures(work):
             "REPORT": report}
 
 
+# The two languages a mirrored region is written in, in the order every report
+# names them. Iterating this instead of spelling `("sh", "ps1")` at each site is
+# what lets the availability probe, the spawn and the skip accounting stay one
+# fact — see mirror_interpreter.
+MIRROR_LANGS = ("sh", "ps1")
+
+
+def mirror_case_inventory(case):
+    """The assertions one differential case OWNS, as (lang, kind) pairs — the
+    same list on every host, whatever that host can execute.
+
+    `lang is None` marks the one assertion that genuinely needs BOTH arms (the
+    comparison); every other entry is a PER-ARM correctness property that stands
+    on its own. This is the list the verifier reconciles its own counters
+    against, so "the inventory is host-independent" is CHECKED rather than
+    claimed — add an assertion to the battery without adding it here and the
+    reconciliation reds."""
+    spec = MIRROR_CASES[case]
+    inv = []
+    for lang in MIRROR_LANGS:
+        if spec.get("crClean"):
+            inv.append((lang, "crClean"))
+        if spec.get("expect") is not None:
+            inv.append((lang, "expect"))
+    inv.append((None, "identical"))
+    return inv
+
+
+def mirror_interpreter(lang):
+    """The interpreter argv PREFIX one arm is executed with.
+
+    ★ NAMED ONCE, because the AVAILABILITY PROBE and the SPAWN must be talking
+    about the same program. They were two literals — `_sh.which("pwsh")` in the
+    verifier and `["pwsh", …]` in the runner — and a pair like that fails in
+    both directions: probe a spelling the spawn does not use and a "present"
+    interpreter OSErrors into a FAIL; probe a spelling the spawn does not use
+    the other way and an available interpreter is skipped as absent. The probe
+    below takes argv[0] of THIS list, so neither can happen."""
+    if lang == "sh":
+        # `$BASH` first: on macOS a bare `bash` is /bin/bash 3.2, not the bash 4+
+        # the drivers re-exec themselves into — the same rule
+        # D-HARNESS-SELFTEST-BSD-SED-PORTABILITY made for the self-tests.
+        return [os.environ.get("BASH", "bash")]
+    return ["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+
+
 def _mirror_run(lang, region, case, work, env):
     """(ok, lines, detail, raw) — one copy's answer, or why it could not be had.
 
@@ -7520,13 +7993,12 @@ def _mirror_run(lang, region, case, work, env):
         rel = "arm_%s.sh" % case
         head = "".join("%s=%s\n" % (k, shlex.quote(v)) for k, v in sorted(env.items()))
         text = MIRROR_PRELUDE_SH + head + region + "\n" + body + "\n"
-        argv = [os.environ.get("BASH", "bash"), rel]
     else:
         rel = "arm_%s.ps1" % case
         head = "".join("$%s = %s\n" % (k, _ps1_single_quote(v))
                        for k, v in sorted(env.items()))
         text = MIRROR_PRELUDE_PS1 + head + region + "\n" + body + "\n"
-        argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", rel]
+    argv = mirror_interpreter(lang) + [rel]
     script = os.path.join(work, rel)
     with open(script, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
@@ -7652,6 +8124,10 @@ def check_dss_regions(harness_dir, out=None):
     # {region: (sh symbols, ps1 symbols)}, accumulated so the cross-region
     # staleness check below can see the UNION rather than one region at a time.
     all_syms = {}
+    # Every mirrored region whose differential battery ran with an arm missing,
+    # as (region, absent langs, absent interpreters, cases). Accumulated so the
+    # summary can NAME the reduction instead of leaving it as a bare count.
+    reduced = []
     for name in sorted(n for n in DSS_REGIONS if DSS_REGIONS[n].get("mirror")):
         out.write("--- dss:%s — the MIRROR contract ---\n" % name)
         sh_text = dss_region_text(texts.get("build-and-test.sh", ""), name)
@@ -7756,71 +8232,159 @@ def check_dss_regions(harness_dir, out=None):
         cases = [c for c in (named + [c for c in sorted(MIRROR_CASES)
                                       if c not in named])
                  if MIRROR_CASES[c].get("region") == name]
-        have_pwsh = _sh.which("pwsh")
-        have_bash = _sh.which(os.environ.get("BASH", "bash")) or _sh.which("bash")
-        if not (have_pwsh and have_bash):
-            missing = " and ".join(
-                [w for w, h in (("pwsh", have_pwsh), ("bash", have_bash)) if not h])
-            for case in cases:
-                skip("differential %s" % case,
-                     "%s is not on PATH, so the two copies cannot be executed "
-                     "on the same input from this host" % missing)
-        else:
-            work = _tf.mkdtemp(prefix="dss-mirror-")
-            try:
+        # ── WHICH INTERPRETERS THIS HOST CAN EXECUTE, AND WHAT ITS ABSENCE COSTS ─
+        # ★★ THE SKIP USED TO BE ALL-OR-NOTHING PER CASE, AND THAT WAS TWO
+        # DEFECTS AT ONCE. ANCHOR, ONE LINE, DO NOT WRAP:
+        # D-HARNESS-MIRROR-SKIP-MISCOUNTS-AND-DISCARDS-SINGLE-ARM-COVERAGE
+        # ✔MEASURED 2026-08-11 on macOS AND on the arm64 Linux VPS, identically —
+        # `OK (275 assertions) - but 9 assertion(s) SKIPPED on this host` — against
+        # `passed=292 failed=0 skipped=0` on Windows:
+        #   (1) THE COUNT WAS WRONG BY CONSTRUCTION. `skip()` fired ONCE PER CASE,
+        #       so the SEVENTEEN assertions those nine cases own were reported as
+        #       "9 assertion(s)". passed+skipped did not reconstruct the battery's
+        #       size (275+9=284, not 292), so the two hosts' numbers could not be
+        #       compared at all — and the number that WAS printed understated the
+        #       loss by nearly half.
+        #   (2) IT DISCARDED COVERAGE THAT NEEDS NO SECOND ARM. `expect` and
+        #       `crClean` are PER-ARM properties: they ask whether THIS copy is
+        #       RIGHT, not whether the two AGREE. Refusing to check the .sh arm
+        #       because pwsh is absent throws away four assertions the host could
+        #       have made. Only `identical answers` genuinely needs both arms.
+        # ⇒ THE INVENTORY IS NOW HOST-INDEPENDENT: every assertion this battery
+        # owns is either CHECKED or SKIPPED, never omitted, so passed+failed+
+        # skipped is the SAME total on every host and a reduced host announces the
+        # reduction in the same breath as the count. See mirror_case_inventory,
+        # which is what makes that claim checkable rather than asserted.
+        region_text = {"sh": sh_text, "ps1": ps_text}
+        interp = dict((lang, mirror_interpreter(lang)[0]) for lang in MIRROR_LANGS)
+        have = dict((lang, _sh.which(interp[lang])) for lang in MIRROR_LANGS)
+        absent = [lang for lang in MIRROR_LANGS if not have[lang]]
+        why_absent = ("%s is not on PATH, so this host cannot execute the .%s "
+                      "copy of a mirrored region"
+                      % (" and ".join(interp[l] for l in absent),
+                         "/.".join(absent)) if absent else "")
+        if absent:
+            reduced.append((name, list(absent),
+                            [interp[l] for l in absent], list(cases)))
+        work = None
+        # The reconciliation the inventory claim rests on. `ran_failures` is the
+        # ONE assertion class that is not in the inventory: it exists only when a
+        # PRESENT interpreter fails to execute its arm, which is a defect, not a
+        # host property.
+        inventory_size = sum(len(mirror_case_inventory(c)) for c in cases)
+        before = counts["passed"] + counts["failed"] + counts["skipped"]
+        ran_failures = 0
+        try:
+            env = None
+            if len(absent) < len(MIRROR_LANGS):
+                work = _tf.mkdtemp(prefix="dss-mirror-")
                 env = _mirror_write_fixtures(work)
-                for case in cases:
-                    ok_sh, sh_out, d_sh, raw_sh = _mirror_run("sh", sh_text, case,
-                                                              work, env)
-                    ok_ps, ps_out, d_ps, raw_ps = _mirror_run("ps1", ps_text, case,
-                                                              work, env)
-                    if not (ok_sh and ok_ps):
-                        check("differential %s: both copies RAN" % case, False,
-                              "; ".join(x for x in (d_sh, d_ps) if x))
+            for case in cases:
+                answer, raw_out = {}, {}
+                for lang in MIRROR_LANGS:
+                    if not have[lang]:
                         continue
-                    # ★ THE PROPERTY THE NORMALISER ERASES, ASSERTED ON RAW BYTES
-                    # AND PER ARM. [D-HARNESS-MIRROR-CR-CLAIM-IS-VACUOUS.] A case
-                    # whose fixture carries a trailing CR declares `crClean`, and
-                    # each arm must have removed it BEFORE printing — which the
-                    # line-for-line comparison below cannot see, because
-                    # _mirror_normalise strips CR from both arms first.
+                    ok, lines, detail, raw = _mirror_run(
+                        lang, region_text[lang], case, work, env)
+                    # A PRESENT interpreter that could not run its arm is a
+                    # FAILURE, never a skip — the host had the capability and the
+                    # code broke. Only an ABSENT interpreter skips.
+                    if not ok:
+                        ran_failures += 1
+                        check("differential %s: the .%s copy RAN" % (case, lang),
+                              False, detail)
+                        continue
+                    answer[lang], raw_out[lang] = lines, raw
+                # ── the PER-ARM assertions: one arm's own correctness ─────────
+                # ★ THE PROPERTY THE NORMALISER ERASES, ASSERTED ON RAW BYTES AND
+                # PER ARM. [D-HARNESS-MIRROR-CR-CLAIM-IS-VACUOUS.] A case whose
+                # fixture carries a trailing CR declares `crClean`, and each arm
+                # must have removed it BEFORE printing — which the line-for-line
+                # comparison below cannot see, because _mirror_normalise strips CR
+                # from both arms first.
+                # ★ AND, WHERE THE CASE DECLARES ONE, THE RIGHT ANSWER. Agreement
+                # is what a differential battery can offer on its own, and it is
+                # real — but two copies that both answer "" agree perfectly, and
+                # that was the exact state of the abort-file resolver before this
+                # case existed. `expect` is checked PER ARM so a wrong-but-
+                # identical pair reds, and it names which arm is wrong when only
+                # one is — which is also precisely why it survives a missing twin.
+                want = MIRROR_CASES[case].get("expect")
+                for lang in MIRROR_LANGS:
+                    labels = []
                     if MIRROR_CASES[case].get("crClean"):
-                        for lang, raw in (("sh", raw_sh), ("ps1", raw_ps)):
-                            stray = mirror_stray_cr_lines(raw, lang)
-                            check("differential %s: the .%s arm leaves NO stray CR "
-                                  "in its output" % (case, lang), not stray,
+                        labels.append(("cr", "differential %s: the .%s arm leaves "
+                                             "NO stray CR in its output"
+                                             % (case, lang)))
+                    if want is not None:
+                        labels.append(("expect", "differential %s: the .%s answer "
+                                                 "is CORRECT" % (case, lang)))
+                    if not have[lang]:
+                        for _kind, label in labels:
+                            skip(label, why_absent)
+                        continue
+                    if lang not in answer:
+                        for _kind, label in labels:
+                            check(label, False,
+                                  "the .%s arm did not run — see the RAN failure "
+                                  "above; its own correctness is unproven and that "
+                                  "is a RED, not a skip: this host HAS %s"
+                                  % (lang, interp[lang]))
+                        continue
+                    for kind, label in labels:
+                        if kind == "cr":
+                            stray = mirror_stray_cr_lines(raw_out[lang], lang)
+                            check(label, not stray,
                                   "a CR that is not this interpreter's own line "
                                   "terminator survived into the output, where it "
                                   "mangles a log line - and the normalised "
                                   "comparison below cannot see it: %r" % stray[:3])
-                    same = sh_out == ps_out
+                        else:
+                            got = answer[lang]
+                            check(label, got == want,
+                                  "expected: %s\n       got:      %s"
+                                  % (" | ".join(want) or "<empty>",
+                                     " | ".join(got) or "<empty>"))
+                # ── the DIFFERENTIAL itself: the one assertion needing BOTH ───
+                # A differential with one arm missing is not a differential, so
+                # this is the assertion an interpreter-less host genuinely loses —
+                # and it says so under its own name instead of under a count.
+                if absent:
+                    skip("differential %s: identical answers" % case, why_absent)
+                elif len(answer) < len(MIRROR_LANGS):
+                    check("differential %s: identical answers" % case, False,
+                          "an arm did not run, so the two copies were never "
+                          "compared — see the RAN failure above")
+                else:
+                    same = answer["sh"] == answer["ps1"]
                     detail = ""
                     if not same:
                         detail = ("the two drivers answer DIFFERENTLY on "
                                   "identical input:\n         .sh : %s\n"
                                   "         .ps1: %s"
-                                  % (" | ".join(sh_out) or "<empty>",
-                                     " | ".join(ps_out) or "<empty>"))
+                                  % (" | ".join(answer["sh"]) or "<empty>",
+                                     " | ".join(answer["ps1"]) or "<empty>"))
                     check("differential %s: identical answers (%d line(s))"
-                          % (case, len(sh_out)), same, detail)
-                    # ★ AND, WHERE THE CASE DECLARES ONE, THE RIGHT ANSWER.
-                    # Agreement is what a differential battery can offer on its
-                    # own, and it is real — but two copies that both answer ""
-                    # agree perfectly, and that was the exact state of the
-                    # abort-file resolver before this case existed. `expect` is
-                    # checked PER ARM so a wrong-but-identical pair reds, and it
-                    # names which arm is wrong when only one is.
-                    want = MIRROR_CASES[case].get("expect")
-                    if want is None:
-                        continue
-                    for lang, got in (("sh", sh_out), ("ps1", ps_out)):
-                        check("differential %s: the .%s answer is CORRECT"
-                              % (case, lang), got == want,
-                              "expected: %s\n       got:      %s"
-                              % (" | ".join(want) or "<empty>",
-                                 " | ".join(got) or "<empty>"))
-            finally:
+                          % (case, len(answer["sh"])), same, detail)
+        finally:
+            if work:
                 _sh.rmtree(work, ignore_errors=True)
+        # ★ THE HOST-INDEPENDENCE CLAIM, CHECKED. The battery must have ACCOUNTED
+        # for every assertion its inventory names — as a pass, a fail or a named
+        # skip — so `passed+failed+skipped` is the same total on a host with one
+        # interpreter as on a host with two. Without this, the next person to add
+        # a per-arm property can quietly reintroduce the shrink-in-silence this
+        # block was rewritten to end.
+        made = (counts["passed"] + counts["failed"] + counts["skipped"]) - before
+        check("dss:%s — the differential inventory is fully ACCOUNTED FOR "
+              "(%d case(s), %d assertion(s), host-independent)"
+              % (name, len(cases), inventory_size),
+              made == inventory_size + ran_failures,
+              "the battery emitted %d verdict(s) where the inventory names %d "
+              "(+%d arm-did-not-run failure(s)). An assertion that is neither "
+              "checked nor skipped VANISHES on the hosts that cannot make it, "
+              "which is how twin-parity coverage shrinks without anyone seeing "
+              "a number change" % (made, inventory_size, ran_failures))
 
     # 4b. A MIRROR_PAIRS ROW WHOSE CODE IS GONE.
     # The per-region pairing above became CONDITIONAL when a second mirrored region
@@ -7869,6 +8433,31 @@ def check_dss_regions(harness_dir, out=None):
                           "a stale row is the same shape of defect as an "
                           "unverified region" % lang)
 
+    # ── WHAT THIS HOST COULD NOT PROVE, IN WORDS, BESIDE THE COUNT ───────────
+    # ★ A BARE SKIP COUNT IS NOT A CLASSIFICATION. Both drivers used to render a
+    # nonzero skip as "an unmet prerequisite, normally 'no git on PATH'" — a
+    # sentence that is true of test-confound-scope.sh and simply WRONG here, so
+    # the one host-shaped hole in twin parity was reported under another
+    # self-test's reason. The reduction is named where it happens: which region,
+    # which interpreter, which cases, and what class of assertion was lost.
+    if reduced:
+        out.write("TWIN-PARITY COVERAGE REDUCED ON THIS HOST\n")
+        for name, langs, exes, region_cases in reduced:
+            lost = sum(1 for c in region_cases
+                       for lang, _kind in mirror_case_inventory(c)
+                       if lang is None or lang in langs)
+            out.write(
+                "  dss:%s — %s not on PATH, so the .%s copy could not be "
+                "EXECUTED. %d of this region's %d differential assertion(s) "
+                "were skipped across %d case(s): every `identical answers` "
+                "comparison (a differential with one arm missing is not a "
+                "differential) plus the .%s arm's own correctness checks. The "
+                "arms this host DOES have were still checked against their "
+                "declared `expect`/CR properties.\n"
+                % (name, " and ".join(exes), "/.".join(langs), lost,
+                   sum(len(mirror_case_inventory(c)) for c in region_cases),
+                   len(region_cases), "/.".join(langs)))
+            out.write("    cases: %s\n" % ", ".join(region_cases))
     out.write("passed=%d failed=%d skipped=%d\n"
               % (counts["passed"], counts["failed"], counts["skipped"]))
     return counts
@@ -9041,6 +9630,180 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           len({frozenset(v) for v in _sets.values()}) > 1,
           "identical sets on every leg would be the old global list in a per-leg "
           "costume; got %r" % _sets)
+    _pe_leg_for_oracle = leg_by_label(legs, "pe64-x86_64", path)
+    # ── THE PER-LEG ATTRIBUTION ORACLE ──────────────────────────────────────
+    # [D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE] The defect was an OUTPUT LINE:
+    # one `oracle : <path>` for the whole run, printed for legs whose platform
+    # that binary is not. These drive the real classifier and the real report over
+    # the SHIPPED catalogue, and they assert the WORDS, because the words are the
+    # thing that was wrong.
+    _elf_ref = "x86_64:elf64-x86_64-linux-exec"
+    for _l in legs:
+        _cls, _why = oracle_class_for_leg(_l, _elf_ref, "/out/reference-testfixture")
+        _same = _l["spec"] == _elf_ref
+        check("oracle class for %s against an ELF/Linux reference is %s"
+              % (_l["label"], "same-platform" if _same else "cross-platform"),
+              _cls == ("same-platform" if _same else "cross-platform"),
+              "got %r — %s" % (_cls, _why))
+        _lines = "\n".join(oracle_report_lines(
+            _l, _elf_ref, "/out/reference-testfixture", None,
+            ("", "", ["<fixture: nothing on PATH>"])))
+        if _same:
+            check("the %s report claims the oracle" % _l["label"],
+                  ": SAME-PLATFORM" in _lines, _lines)
+        else:
+            # ★★ THE ASSERTION THAT WOULD HAVE CAUGHT THE ORIGINAL DEFECT: a leg
+            # whose reference is another platform's binary must SAY it has none,
+            # and must name the fallback. "Prints something" is not the property;
+            # "cannot be read as an available control" is.
+            # ⚠ THE MATCHER IS `": SAME-PLATFORM"`, NOT `"SAME-PLATFORM"`. The
+            # bare substring also occurs inside the ANCHOR NAME the fallback
+            # paragraph cites, so the loose form failed on every cross-platform
+            # leg — a pin whose witness is not unique in its own subject, which
+            # is the discipline this file applies to red-on-disable and must
+            # apply to itself. Only the CLAIM (`<leg>: SAME-PLATFORM`) counts.
+            check("the %s report says NO ORACLE, in those terms" % _l["label"],
+                  ": NO ORACLE" in _lines and ": SAME-PLATFORM" not in _lines,
+                  _lines)
+            check("the %s report names the FALLBACK control" % _l["label"],
+                  "FALLBACK CONTROL" in _lines and "vary the RUNTIME" in _lines,
+                  _lines)
+    # An UNMEASURED reference is not a control, and neither is an absent one.
+    _cls, _ = oracle_class_for_leg(legs[0], "", "/out/reference-testfixture")
+    check("a reference whose target could not be MEASURED is not an oracle",
+          _cls == "absent")
+    check("no reference at all is not an oracle",
+          oracle_class_for_leg(legs[0], _elf_ref, "")[0] == "absent")
+    # A leg that DID get its own same-platform oracle claims it, and says by what.
+    _own = "\n".join(oracle_report_lines(
+        _pe_leg_for_oracle, _elf_ref, "/out/reference-testfixture",
+        {"path": "/out/pe64/reference-testfixture.exe",
+         "cc": "x86_64-w64-mingw32-gcc", "triple": "x86_64-w64-mingw32"}))
+    check("a leg with its OWN same-platform oracle reports it, naming the compiler",
+          ": SAME-PLATFORM" in _own and "x86_64-w64-mingw32-gcc" in _own
+          and ": NO ORACLE" not in _own, _own)
+    # The oracle's FILE NAME is a target fact, and an unknown target OS RAISES.
+    check("the oracle file name carries the TARGET's executable suffix",
+          reference_oracle_name(_pe_leg_for_oracle) == "reference-testfixture.exe"
+          and reference_oracle_name(legs[0]) == "reference-testfixture")
+    check("an unknown target OS is REFUSED an oracle name, never guessed",
+          _raises(lambda: reference_oracle_name({"label": "x",
+                                                 "spec": "x86_64:elf64-x86_64-plan9-exec"})))
+    # The build argv is composed from the leg's OWN manifest — one declaration,
+    # two compilers. Asserted on CONTENT, because a missing -D or -I is a
+    # different program compiled and would read as a codegen difference.
+    _argv = reference_oracle_argv(
+        "cc", {"defines": ["A=1"], "includes": ["/inc"], "sources": ["/a.c"],
+               "resolveLibraries": ["/lib/z.so", {"path": "/lib/tcl.so",
+                                                  "importName": "libtcl8.6.so"}]},
+        "/out/ref", ["-lm"])
+    check("the oracle build argv carries the manifest's defines, includes, "
+          "sources and resolved libraries",
+          _argv == ["cc", "-o", "/out/ref", "-DA=1", "-I/inc", "/a.c",
+                    "/lib/z.so", "/lib/tcl.so", "-lm"],
+          "got %r" % (_argv,))
+    # ── THE ABORT HALF OF THE SAME LEDGER ───────────────────────────────────
+    # [D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY] Driven through the
+    # SHIPPED catalogue's own rows, never a retyped fixture: these assert about
+    # the ledger this harness actually runs on.
+    _pe = leg_by_label(legs, "pe64-x86_64", path)
+    _pe_gate = probe_gate(_probes_present, _launched_same)
+    _pe_abort = leg_abort_confounds(_pe, _pe_gate)
+    check("pe64 declares its EARNED abort row in the abort name space",
+          "^veryquick/nolock\\.test$" in _pe_abort,
+          "abort rows = %r" % _pe_abort)
+    # ★★ THE SEPARATION IS THE POINT: one ledger, never one name space. An
+    # `abort-file` pattern reaching the UNIT matcher would excuse a unit that
+    # merely looked like a file path, and a unit pattern reaching the abort
+    # matcher would excuse an abort nobody earned.
+    check("an `abort-file` row is NOT handed to the unit matcher",
+          not (set(_pe_abort) & _sets["pe64-x86_64"]),
+          "overlap = %r" % sorted(set(_pe_abort) & _sets["pe64-x86_64"]))
+    check("a `unit` row is NOT handed to the abort matcher",
+          "^win32longpath-1\\.3$" not in [p.split(":", 1)[-1] for p in _pe_abort],
+          "abort rows = %r" % _pe_abort)
+    # ── THE DIAGNOSTIC IS THE IDENTITY; THE FILE IS ONLY THE LOCATION ───────
+    # [D-HARNESS-ABORT-CONFOUND-KEYED-ON-LOCATION-NOT-IDENTITY] Driven on the
+    # VERBATIM fixture text, laid out as a real aborted segment log is: passing
+    # tests first, the fatal tail last. A pin that handed the classifier a bare
+    # diagnostic string would never exercise abort_diagnostic_text, which is the
+    # half that decides WHAT the diagnostic even is.
+    _real_tail = 'error copying "test.db" to "sv_test.db": permission denied'
+    _abort_log = ("nolock-5.0... Ok\n"
+                  "nolock-5.1... Ok\n"
+                  "%s\n"
+                  "    while executing\n" % _real_tail)
+    _diag = abort_diagnostic_text(_abort_log)
+    check("the abort diagnostic is the log's FATAL TAIL, not its first line",
+          _real_tail in _diag and "nolock-5.1" not in _diag,
+          "got %r" % _diag)
+    # ★ EARNED vs UNEARNED, BOTH DIRECTIONS, through the real classifier.
+    _row, _why = classify_abort(_pe, _pe_gate, "veryquick/nolock.test", _diag)
+    check("a PROVEN abort is EARNED and arrives with its provenance",
+          _row is not None
+          and all(_row["row"].get(k, "").strip() for k in CONFOUND_PROVENANCE_KEYS),
+          "row=%r why=%s" % (_row and _row["pattern"], _why))
+    # ★★★ THE PIN THE OPERATOR ASKED FOR, AND THE WHOLE POINT OF THE FIELD: the
+    # SAME FILE with a DIFFERENT DIAGNOSTIC must NOT match. Without it, a codegen
+    # crash inside nolock.test inherits an excusal earned for a Windows lock
+    # violation — a silent acquittal of the compiler by the very ledger that
+    # exists to convict it.
+    _crash = abort_diagnostic_text(
+        "nolock-3.1... Ok\n"
+        "child process exited abnormally\n"
+        "    Segmentation fault (core dumped)\n")
+    _row_c, _why_c = classify_abort(_pe, _pe_gate, "veryquick/nolock.test",
+                                    _crash)
+    check("the SAME FILE with a DIFFERENT DIAGNOSTIC is NOT earned and still "
+          "fails the leg", _row_c is None,
+          "it matched %r — an abort row would then excuse a LOCATION rather "
+          "than a failure, and any crash in that file would be forgiven"
+          % (_row_c and _row_c["pattern"]))
+    check("...and the refusal SAYS the file has a row but this is not its failure",
+          "DIFFERENT failure in the same file" in _why_c, _why_c)
+    # ★ NO EXTRACTABLE DIAGNOSTIC — a silent, zero-byte crash — matches NOTHING.
+    # ⚠ AND THE PIN ASSERTS THE *REASON*, NOT ONLY THE `None`. Its first form
+    # checked `row is None` and survived deleting the guard it exists for: with
+    # `abortDiagnostic` required and non-empty, `re.search(want, "")` already
+    # answers no, so the None was over-determined and the pin was VACUOUS about
+    # the thing it names. ✔MEASURED by red-on-disable, which refused to certify
+    # it. What the guard uniquely buys is the DIAGNOSIS a triager gets — "this
+    # abort could not be identified" rather than "no row matched" — so that is
+    # what is asserted.
+    _row_e, _why_e = classify_abort(_pe, _pe_gate, "veryquick/nolock.test", "")
+    check("an abort with NO extractable diagnostic is NOT earned",
+          _row_e is None and "NO extractable diagnostic" in _why_e
+          and "Absence of evidence never satisfies a matcher" in _why_e,
+          "row=%r why=%s" % (_row_e and _row_e["pattern"], _why_e))
+    check("a zero-byte log yields no diagnostic at all",
+          abort_diagnostic_text("") == ""
+          and abort_diagnostic_text("nolock-5.1... Ok\n") == "")
+    _row2, _why2 = classify_abort(_pe, _pe_gate, "veryquick/symlink2.test",
+                                  _diag)
+    check("an UNEARNED abort is REFUSED, so it still fails the leg",
+          _row2 is None, "it matched %r, which would silence an unproven abort"
+                         % (_row2 and _row2["pattern"]))
+    # And the same file under a DIFFERENT permutation is a different abort: the
+    # pattern is anchored on the whole `perm/file` name, not on the file alone.
+    _row3, _ = classify_abort(_pe, _pe_gate, "full/nolock.test", _diag)
+    check("the abort pattern is matched against `perm/file`, not the file alone",
+          _row3 is None,
+          "a row earned under one permutation must not excuse another")
+    # Every abort row must CARRY the field the lint demands — asserted here too,
+    # because the lint proves the catalogue is well-formed and this proves the
+    # matcher is actually given something to conjoin with.
+    for _l in legs:
+        for _r in _l.get("confounds", []):
+            if confound_match_kind(_r) == "abort-file":
+                check("abort row %s on %s constrains a DIAGNOSTIC"
+                      % (_r["pattern"], _l["label"]),
+                      bool(str(_r.get("abortDiagnostic", "")).strip()))
+    # A mistyped match kind must be REFUSED, never defaulted — a row meant for an
+    # abort that quietly became a unit row excuses nothing and reads as coverage.
+    check("an unknown `matches` value RAISES rather than defaulting to `unit`",
+          _raises(lambda: confound_match_kind({"pattern": "^x", "matches": "abortfile"})))
+    check("`matches` defaults to `unit` when the key is absent",
+          confound_match_kind({"pattern": "^x"}) == "unit")
     # zipfile-25.0 turns on POSIX fopen() SUCCEEDING on a directory. It is
     # declared on every POSIX leg and MUST NOT be on the Windows one, where the
     # test passes — the single sharpest OS split in the ledger, and the one the
@@ -9751,7 +10514,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 34,
+          len(statements) == 1 + len(labels) * 35,
           "got %d statements for %d legs" % (len(statements), len(labels)))
     check("the sh emitter carries the launcher's run FILESYSTEM",
           "LEG_RUN_FILESYSTEM[" in sh,
@@ -9762,6 +10525,11 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           "LEG_CONFOUNDS[" in sh,
           "without it build-and-test.sh falls back to a global list applied to "
           "every leg, which is D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG")
+    check("the sh emitter carries THIS LEG'S earned ABORT confounds",
+          "LEG_ABORT_CONFOUNDS[" in sh,
+          "without it the .sh cannot tell a PROVEN-upstream abort from an "
+          "unproven one and convicts the compiler of both, which is "
+          "D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY")
     check("the sh emitter carries the leg's staged configure header",
           "LEG_CONFIG_STAGE_KEY[" in sh and "LEG_CONFIGURE_ANSWERS[" in sh,
           "without it build-and-test.sh has no way to give a leg the sqlite_cfg.h "
@@ -11187,6 +11955,66 @@ def main(argv=None):
                         "target is REFUSED, never assumed, because the compiler "
                         "builds this leg's dlopen()ed loadext helper and a "
                         "wrong-target one false-reds every loadext-* unit.")
+    # ── the ATTRIBUTION ORACLE, per leg ─────────────────────────────────────
+    p.add_argument("--oracle-report", default=None, metavar="LABEL",
+                   help="print LABEL's ORACLE VERDICT — the lines a driver's "
+                        "results section prints verbatim. A leg whose reference "
+                        "is a DIFFERENT platform's binary is reported as having "
+                        "NO ORACLE, in those terms, and the fallback control is "
+                        "named. Needs --reference-target (what --identify-binary "
+                        "MEASURED off the reference) and --reference-path.")
+    p.add_argument("--reference-target", default="", metavar="ARCH:FORMAT",
+                   help="the run reference's own MEASURED target, from "
+                        "--identify-binary. NEVER a guess: an unmeasured "
+                        "reference is reported as no oracle at all.")
+    p.add_argument("--reference-path", default="", metavar="PATH",
+                   help="the run reference binary, or empty when none survived")
+    p.add_argument("--leg-oracle", default="", metavar="PATH",
+                   help="this leg's OWN same-platform reference, when "
+                        "--build-reference-oracle produced one")
+    p.add_argument("--leg-oracle-cc", default="", metavar="CC")
+    p.add_argument("--leg-oracle-triple", default="", metavar="TRIPLE")
+    p.add_argument("--classify-abort", default=None, metavar="LABEL",
+                   help="decide whether a fixture ABORT on LABEL is an EARNED "
+                        "confound. Takes --abort '<permutation>/<file>'. rc 0 = "
+                        "earned (the row's provenance is printed on stdout, one "
+                        "`key: value` per line, for the driver to relay), rc 3 = "
+                        "UNEARNED, which still fails the leg. Uses the SAME "
+                        "`confounds` ledger as the unit matcher, through the "
+                        "`matches: abort-file` rows.")
+    p.add_argument("--abort", default="", metavar="PERM/FILE",
+                   help="the abort's LOCATION — permutation/file. NOT enough on "
+                        "its own: --abort-log supplies its IDENTITY.")
+    p.add_argument("--abort-log", default="", metavar="PATH",
+                   help="the ABORTED SEGMENT'S LOG. Its FATAL TAIL — everything "
+                        "printed after the fixture last did its job — is the "
+                        "abort's DIAGNOSTIC, and a row matches only when the "
+                        "file pattern AND its `abortDiagnostic` both do. A log "
+                        "yielding no diagnostic (a silent crash) or one that "
+                        "cannot be read matches NOTHING: absence of evidence "
+                        "never satisfies a matcher "
+                        "[D-HARNESS-ABORT-CONFOUND-KEYED-ON-LOCATION-NOT-IDENTITY].")
+    p.add_argument("--build-reference-oracle", default=None, metavar="LABEL",
+                   help="build LABEL's SAME-PLATFORM attribution oracle from "
+                        "the leg's OWN manifest, with the compiler "
+                        "--resolve-target-cc verifies against this leg's "
+                        "target. Prints a JSON report; rc 0 built, 3 the build "
+                        "failed, 4 no declared compiler on this host targets "
+                        "this leg (the leg then HAS NO ORACLE and says so).")
+    p.add_argument("--manifest", default="", metavar="PATH",
+                   help="the leg's .dss-project.json — the SAME file dss "
+                        "consumed, so the oracle compiles one declaration "
+                        "rather than a second, drifting copy of it")
+    p.add_argument("--oracle-output", default="", metavar="PATH",
+                   help="where to write the oracle binary. Prefer --oracle-dir: "
+                        "the FILE NAME carries the target's executable suffix "
+                        "and is this catalogue's business, not a driver's.")
+    p.add_argument("--oracle-dir", default="", metavar="DIR",
+                   help="write the oracle into DIR under the name this leg's "
+                        "TARGET requires (reference_oracle_name). A driver that "
+                        "spells the suffix itself has a `.exe` branch in it.")
+    p.add_argument("--oracle-log", default="", metavar="PATH",
+                   help="where to write the reference compiler's own output")
     # ── the loadext helper the corpus dlopen()s ─────────────────────────────
     # ONE implementation, called by BOTH drivers — the same argument this
     # module's header makes for putting the leg decision here, and the reason
@@ -11367,6 +12195,8 @@ def main(argv=None):
             or args.env_transfers or args.env_transfer
             or args.acquire or args.acquire_plan or args.resolve_library_argv
             or args.resolve_target_cc or args.build_loadext_helper
+            or args.oracle_report or args.build_reference_oracle
+            or args.classify_abort
             or args.loadext_builder or args.tcl_coherence
             or args.run_filesystems or args.run_dir_plan
             or args.stage_build or args.check_launcher or args.identify_binary
@@ -11380,7 +12210,8 @@ def main(argv=None):
                 "--assert-translated / --env-transfers / --env-transfer / "
                 "--registry-controls / --check-regions / "
                 "--acquire / --acquire-plan / --resolve-library-argv / "
-                "--resolve-target-cc / --build-loadext-helper / "
+                "--resolve-target-cc / --oracle-report / --classify-abort / "
+                "--build-reference-oracle / --build-loadext-helper / "
                 "--loadext-builder / --tcl-coherence / --run-filesystems / "
                 "--run-dir-plan / --check-launcher / --identify-binary / "
                 "--launcher-for-target is required")
@@ -11498,6 +12329,91 @@ def main(argv=None):
                        loadext_helper_name(leg) or "loadext helper"))
                 return 3
             sys.stdout.write("%s\t%s\n" % (cc, machine))
+            return 0
+        if args.oracle_report:
+            leg = leg_by_label(load_catalogue(args.catalogue),
+                               args.oracle_report, args.catalogue)
+            leg_oracle = None
+            if args.leg_oracle:
+                leg_oracle = {"path": args.leg_oracle, "cc": args.leg_oracle_cc,
+                              "triple": args.leg_oracle_triple}
+            # The resolver ladder is part of the ANSWER when there is no oracle:
+            # "no oracle" without "and here is every compiler this host was asked
+            # for" is a verdict a reader cannot act on. Only asked for when it is
+            # going to be printed, so a leg that HAS an oracle spawns nothing.
+            resolver = None
+            if not leg_oracle:
+                cls, _why = oracle_class_for_leg(leg, args.reference_target,
+                                                 args.reference_path)
+                if cls != "same-platform":
+                    resolver = resolve_target_cc(leg)
+            for line in oracle_report_lines(leg, args.reference_target,
+                                            args.reference_path, leg_oracle,
+                                            resolver):
+                sys.stdout.write("%s\n" % line)
+            return 0
+        if args.build_reference_oracle:
+            leg = leg_by_label(load_catalogue(args.catalogue),
+                               args.build_reference_oracle, args.catalogue)
+            if bool(args.oracle_output) == bool(args.oracle_dir):
+                p.error("--build-reference-oracle needs exactly one of "
+                        "--oracle-dir (preferred: the catalogue names the file) "
+                        "or --oracle-output (an explicit path)")
+            oracle_output = args.oracle_output or os.path.join(
+                args.oracle_dir, reference_oracle_name(leg))
+            for flag, value in (("--manifest", args.manifest),
+                                ("--oracle-log", args.oracle_log)):
+                if not value:
+                    p.error("--build-reference-oracle requires %s" % flag)
+            cc, machine, rejections = resolve_target_cc(leg)
+            for line in rejections:
+                sys.stderr.write("  rejected %s\n" % line)
+            if not cc:
+                # rc 4 is NOT a failure of this run — it is the honest statement
+                # that this host cannot produce a control for this leg. The leg
+                # then reports NO ORACLE, which is the whole point of the anchor.
+                sys.stderr.write(
+                    "no declared targetCc candidate for leg '%s' (%s) both "
+                    "exists on this host AND targets it, so NO same-platform "
+                    "attribution oracle can be built here. The leg reports that "
+                    "it HAS NO ORACLE rather than inheriting another platform's "
+                    "reference [D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE].\n"
+                    % (leg.get("label"), leg.get("spec")))
+                sys.stdout.write(json.dumps(
+                    {"status": "no-reference-compiler",
+                     "leg": leg.get("label"), "spec": leg.get("spec"),
+                     "rejections": rejections}) + "\n")
+                return 4
+            with open(args.manifest, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+            argv = reference_oracle_argv(
+                cc, manifest, oracle_output,
+                leg.get("build", {}).get("referenceLinkFlags", []))
+            import subprocess
+            with open(args.oracle_log, "w", encoding="utf-8") as log:
+                log.write("%s\n\n" % " ".join(argv))
+                log.flush()
+                # rc DIRECTLY off the process, never after a pipe.
+                proc = subprocess.run(argv, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT)
+                log.write(proc.stdout.decode("utf-8", "replace"))
+            built = proc.returncode == 0 and os.path.isfile(oracle_output)
+            report = {"status": "built" if built else "build-failed",
+                      "leg": leg.get("label"), "spec": leg.get("spec"),
+                      "cc": cc, "triple": machine, "rc": proc.returncode,
+                      "path": oracle_output if built else "",
+                      "log": args.oracle_log, "sources": len(manifest.get("sources", [])),
+                      "rejections": rejections}
+            sys.stdout.write(json.dumps(report) + "\n")
+            if not built:
+                # LOUD, and it does not degrade to the cross-platform reference:
+                # a control that failed to build is an absent control, and saying
+                # so is the entire discipline this anchor enforces.
+                sys.stderr.write(
+                    "the same-platform oracle for leg '%s' did NOT build (%s "
+                    "exited %d). The leg reports NO ORACLE; read %s.\n"
+                    % (leg.get("label"), cc, proc.returncode, args.oracle_log))
+                return 3
             return 0
         if args.loadext_builder:
             sys.stdout.write("%s\n"
@@ -11735,6 +12651,61 @@ def main(argv=None):
             # rc 0 whatever the verdicts are: ABSENT is a successful measurement,
             # not a failure. A non-zero rc for "your clock is fine" would teach a
             # driver to treat a healthy machine as a broken run.
+            return 0
+        if args.classify_abort:
+            if not args.abort:
+                p.error("--classify-abort requires --abort '<permutation>/<file>'")
+            if not args.abort_log:
+                p.error("--classify-abort requires --abort-log <segment log>. "
+                        "The abort's LOCATION alone cannot IDENTIFY it, and a "
+                        "row keyed on the file would excuse any failure in that "
+                        "file — the defect this flag closes "
+                        "[D-HARNESS-ABORT-CONFOUND-KEYED-ON-LOCATION-NOT-IDENTITY].")
+            try:
+                with open(args.abort_log, "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    _diag = abort_diagnostic_text(fh.read())
+            except OSError as exc:
+                # UNREADABLE IS NOT EXCUSED, same direction as an empty log.
+                sys.stderr.write(
+                    "the aborted segment's log %s could not be read (%s), so "
+                    "this abort cannot be identified and stays UNEARNED — it "
+                    "fails the leg.\n" % (args.abort_log, exc))
+                return 3
+            # ★ RESOLVED THROUGH `plan()`, NOT THROUGH A SECOND GATE. The rows
+            # this consults must be the SAME rows, decided by the SAME probe
+            # gate, that the driver was handed for its unit matcher — a private
+            # gate here is how one ledger becomes two that disagree.
+            _resolved = plan(host_os, host_arch, available, args.catalogue,
+                             verdicts)
+            _leg = None
+            for _l in _resolved["legs"]:
+                if _l["label"] == args.classify_abort:
+                    _leg = _l
+                    break
+            if _leg is None:
+                raise LegError(
+                    "--classify-abort names leg %r, which this host's plan does "
+                    "not contain (planned: %s)"
+                    % (args.classify_abort,
+                       ", ".join(l["label"] for l in _resolved["legs"])))
+            # ONE matcher — the same function the self-test drives — handed the
+            # decisions THIS host's plan resolved. A second inline loop here is
+            # how the CLI and the pinned rule come to disagree.
+            _row, _why = classify_abort_decisions(
+                _leg.get("confoundDecisions", []), args.classify_abort,
+                args.abort, _diag)
+            if _row is None:
+                sys.stderr.write("%s\n" % _why)
+                return 3
+            # The PROVENANCE is the answer, not a footnote: an abort that stops
+            # failing the leg must arrive with the work that earned it, or the
+            # exemption is indistinguishable from the silence it replaced.
+            sys.stdout.write("pattern: %s\n" % _row["pattern"])
+            sys.stdout.write("abortDiagnostic: %s\n"
+                             % _row["row"].get("abortDiagnostic", ""))
+            for k in CONFOUND_PROVENANCE_KEYS:
+                sys.stdout.write("%s: %s\n" % (k, _row["row"].get(k, "")))
             return 0
         resolved = plan(host_os, host_arch, available, args.catalogue, verdicts)
         if args.format == "sh":

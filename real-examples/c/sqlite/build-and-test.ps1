@@ -1128,7 +1128,23 @@ driver self-test exited 0 but printed no readable summary line.
   if ($nSkip -eq '0') {
     Info "driver self-test ${stName}: OK ($n assertions, 0 skipped)"
   } else {
-    Warn "driver self-test ${stName}: OK ($n assertions) — but $nSkip assertion(s) SKIPPED on this host (unmet prerequisite, normally 'no git on PATH'). That part of the late-stage logic is UNPROVEN for this run: $selfTest"
+    # ★★ PARITY with build-and-test.sh, and the same correction: the self-test's
+    # OWN words, never this driver's guess at them.
+    # ANCHOR, ONE LINE, DO NOT WRAP:
+    # D-HARNESS-SELFTEST-SKIP-REPORTED-UNDER-ANOTHER-SUITE-S-REASON
+    # "unmet prerequisite, normally 'no git on PATH'" is true of
+    # test-confound-scope.ps1 and FALSE of test-mirror-regions.ps1, whose skips
+    # mean the host cannot execute one of the two mirrored arms and twin parity
+    # is REDUCED. Each suite states its own reason; this driver RELAYS it.
+    Warn "driver self-test ${stName}: OK ($n assertions) — but $nSkip assertion(s) SKIPPED on this host."
+    $inBlock = $false
+    foreach ($line in $stOut) {
+      $t = "$line"
+      if ($t -match '^passed=') { $inBlock = $false; continue }
+      if ($t -match 'COVERAGE REDUCED') { $inBlock = $true }
+      if ($inBlock -or $t -match '^\s*[Ss][Kk][Ii][Pp]\s') { "      $t" | Write-Host }
+    }
+    Warn "      Those assertions are UNPROVEN for this run. Re-run the suite by hand on a host that has the missing prerequisite if you want the full battery: $selfTest"
   }
 }
 }
@@ -4115,6 +4131,34 @@ foreach ($leg in $BuildableLegs) {
   if ((-not $legOut) -or (-not $lbl) -or ($legOut -eq $OutRoot)) { Die "internal: refusing to wipe '$legOut' for leg '$lbl' — it is not a per-leg directory under $OutRoot." }
   if (Test-Path $legOut) { Remove-Item -Recurse -Force $legOut }
   New-Item -ItemType Directory -Force -Path $legOut | Out-Null
+  # ── THE SAME-PLATFORM ATTRIBUTION ORACLE, FROM THE SAME MANIFEST ──────────
+  # ★ ONE DECLARATION, TWO COMPILERS — which is what an oracle IS. The manifest
+  # DSS is about to consume goes straight to this leg's VERIFIED target compiler
+  # (`--resolve-target-cc` proves the target with `-dumpmachine`; a name is not a
+  # declaration of target), so subject and control cannot drift apart. It is also
+  # the only shape that works cross-target: SQLite's autotools Makefile is
+  # configured for the DERIVING host and cannot emit a foreign-target fixture —
+  # which is why the pe64 leg had no oracle at all
+  # [D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE], while Step 9 printed it a line
+  # about a Linux ELF that reads as an available control and is not one.
+  # ★ NEVER FATAL, NEVER SILENT: rc 4 = no compiler here targets this leg, rc 3 =
+  # one does and the build failed. Both leave the leg with NO ORACLE, said in
+  # those terms at Step 9, and the corpus still runs.
+  $LegLedger[$lbl].Oracle = ''; $LegLedger[$lbl].OracleCc = ''; $LegLedger[$lbl].OracleTriple = ''
+  $oracleRun = Invoke-LegResolver @('--build-reference-oracle', $lbl,
+                                    '--manifest', $manifest,
+                                    '--oracle-dir', $legOut,
+                                    '--oracle-log', (Join-Path $legOut 'reference-oracle.log'))
+  if ($oracleRun.Rc -eq 0) {
+    $orep = ($oracleRun.Stdout | Select-Object -Last 1) | ConvertFrom-Json
+    $LegLedger[$lbl].Oracle       = "$($orep.path)"
+    $LegLedger[$lbl].OracleCc     = "$($orep.cc)"
+    $LegLedger[$lbl].OracleTriple = "$($orep.triple)"
+    Info "[$lbl] same-platform ORACLE built by $($orep.cc) ($($orep.triple)) -> $($orep.path)"
+  } else {
+    # The resolver's own words, never this driver's paraphrase of them.
+    foreach ($l in ($oracleRun.Text -split "`n")) { if ($l.Trim()) { Warn "[$lbl] oracle: $l" } }
+  }
   $clog = Join-Path $legOut 'compile.log'
   # A project build routes each target to <output>/<formatName>/, and NAMES the file
   # there itself. dss-code-prime returns exit 0 even on FATAL errors → judge from
@@ -4816,6 +4860,11 @@ $legLaunchFixture = Convert-LaunchPath $legXlate $fixture
 # THIS LEG'S OWN DECLARATION (legs.json `confounds`, resolved by harness_legs.py),
 # which is the same declaration build-and-test.sh reads. One ledger, both drivers.
 $Confounds   = @(Get-LegConfounds $leg)
+# The ABORT half of the SAME ledger, read from the same resolved plan. Kept as
+# its own list so a unit-name matcher can never see an `abort-file` pattern and
+# vice versa: one ledger, never one name space.
+# [D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY]
+$LegPlanAbortConfounds = @($leg.abortConfounds)
 Step "8/9  [$LegTag] $($leg.spec) — $Tier.test ($LegRunMode$(if ($legLauncher.Count) { ": $($legLauncher -join ' ')" })$(if ($legXlate -and $legXlate -ne 'none') { "; paths -> '$legXlate' via '$($leg.run.pathTranslator -join ' ')'" }))"
 if ($legXlate -and $legXlate -ne 'none') {
   Info "[$LegTag] the launcher addresses files in ANOTHER namespace — fixture $fixture -> $legLaunchFixture"
@@ -5480,6 +5529,49 @@ if ($StageBuild -and $StageBuild.capabilityWitnesses -and $results.Count) {
   }
 }
 
+# ── EARNED vs UNEARNED ABORTS — THE SAME LEDGER, THE OTHER NAME SPACE ───────
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY
+# A `confounds` row keys on a UNIT name; an abort kills the fixture mid-file, so
+# there IS no unit name and a PROVEN-upstream abort could not be recorded in any
+# form. The rule below ("a run with aborts is NEVER green") therefore charged an
+# environment fault to the compiler even after a matched-CRT control had shown
+# both fixtures failing identically and deterministically. ★ THE RULE IS NOT
+# REMOVED — it is made CONDITIONAL ON PROVENANCE: an `matches: abort-file` row
+# carries the same mandatory earnedOn/earnedAt/mechanism/anchor as any confound,
+# and an UNEARNED abort still fails the leg exactly as before. Twin of the block
+# in build-and-test.sh, and the CLASSIFIER is one implementation in the resolver.
+$abortsEarned = @(); $abortsUnearned = @()
+foreach ($a in $aborts) {
+  $name = "$(if ($a.Perm) { $a.Perm } else { '?' })/$(if ($a.File) { $a.File } else { '?' })"
+  if (-not $LegPlanAbortConfounds) {
+    # No abort row declared for this leg at all — do not pay for a resolve to be
+    # told what the plan already says.
+    $abortsUnearned += $name
+    continue
+  }
+  # ★ THE ABORT'S OWN SEGMENT LOG travels with its name: the row matches only
+  # when the file pattern AND the DIAGNOSTIC do. A name alone is a LOCATION, and
+  # a location-keyed excusal forgives every future failure in that file —
+  # including one this compiler caused.
+  # [D-HARNESS-ABORT-CONFOUND-KEYED-ON-LOCATION-NOT-IDENTITY]
+  $cls = Invoke-LegResolver @('--classify-abort', $LegTag, '--abort', $name,
+                              '--abort-log', "$(if ($a.Log) { $a.Log } else { '<none>' })",
+                              '--host-os', $HostOs, '--host-arch', $HostArch)
+  if ($cls.Rc -eq 0) {
+    $abortsEarned += $name
+    # ★ STATED, NEVER SILENCED. An earned abort stops COUNTING against DSS; it
+    # does not stop being reported. Its provenance and what it took down with it
+    # are printed, because "we proved it is not ours" is a different claim from
+    # "nothing happened".
+    Warn "[$LegTag] ABORT $name — PROVEN NOT DSS's, and it still cost the rest of that file:"
+    foreach ($l in ($cls.Text -split "`n")) { if ($l.Trim()) { Info "        $l" } }
+  } else {
+    $abortsUnearned += $name
+  }
+}
+$legRec.AbortsEarned = $abortsEarned
+
 $unitVerdict = ''; $unitFail = $false
 if ($preconditionFail) {
   # ★ FIRST ARM, AND IT CARRIES THE DIAGNOSIS. The old engine would have landed in
@@ -5499,16 +5591,16 @@ if ($preconditionFail) {
   Warn "      $preconditionFail"
   Info "      $($results.Count) segment(s), $filesDone test file(s) completed ($filesInert of them asserted NOTHING), $resumes of $MaxResumes resume(s) used."
   Info "      per-unit ledger: $Ledger"
-} elseif ($aborts.Count) {
+} elseif ($abortsUnearned.Count) {
   # An abort is itself a FAILURE. Resuming recovers the units behind it; it never
   # makes the abort disappear, and a run with aborts is NEVER green.
-  $where = @(); foreach ($a in $aborts) { $where += "$(if ($a.Perm) { $a.Perm } else { '?' })/$(if ($a.File) { $a.File } else { '?' })" }
-  $unitVerdict = "FAIL: $($aborts.Count) fixture ABORT(s) [$($where -join ' ')]; recovered by $resumes resume(s); union: $summaryText"
+  $where = $abortsUnearned
+  $unitVerdict = "FAIL: $($abortsUnearned.Count) fixture ABORT(s) [$($where -join ' ')]; recovered by $resumes resume(s); union: $summaryText"
   if ($derivationText) { $unitVerdict += " [$derivationText]" }
   if ($real.Count)      { $unitVerdict += "; $($real.Count) genuine unit failure(s): $($real -join ' ')" }
   if ($notReached.Count) { $unitVerdict += "; $($notReached.Count) unit group(s) NOT REACHED — see $Ledger" }
   $unitFail = $true
-  Warn "[$LegTag] corpus FAIL — $($aborts.Count) abort(s): $($where -join ' ')"
+  Warn "[$LegTag] corpus FAIL — $($abortsUnearned.Count) UNEARNED abort(s): $($where -join ' ')$(if ($abortsEarned.Count) { "   (plus $($abortsEarned.Count) PROVEN-not-DSS abort(s), reported above and NOT charged: $($abortsEarned -join ' '))" })"
   Info "      union across $($results.Count) segment(s): $summaryText; $filesDone test file(s) completed ($filesInert of them asserted NOTHING)"
   if ($derivationText) { Info "        derived from: $derivationText" }
   if ($real.Count) { Info "      $($real.Count) UNCLASSIFIED failure(s) — not matched by any earned confound, NOT yet attributed to DSS: $($real -join ' ')" }
@@ -5618,24 +5710,46 @@ Info "recipe   : $nTus TUs, $nDefs defines"
 #   ⚠ AND NOTE THE ASYMMETRY BETWEEN LEGS, which is new as of TF-C114: for an
 #   elf64 Linux leg this same binary is very nearly a MATCHED control (same OS,
 #   same object format, differing only in the compiler), i.e. a much stronger
-#   instrument than it is for pe64 or mach-o. Neither claim has been MEASURED on
-#   this driver, so the line below states what the oracle IS and leaves the
-#   strength of the inference to the leg being triaged.
+#   instrument than it is for pe64 or mach-o. ⓘ THE LAST SENTENCE OF THIS
+#   PARAGRAPH USED TO READ "so the line below states what the oracle IS and
+#   leaves the strength of the inference to the leg being triaged" — which was
+#   the whole defect in one clause: leaving the strength of the inference to the
+#   reader is precisely what a control must never do. The asymmetry is no longer
+#   described and then flattened into one line; it is DECIDED, per leg, below.
+# ★★★ ONE ORACLE LINE PER LEG, AND A LEG WITH NO ORACLE SAYS SO.
+# ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE
+# The paragraph above states the one-sidedness correctly and in detail — and the
+# CODE below it printed one unqualified `oracle : <path>` line for the whole run
+# anyway. That is the "comment records the full fact while the code uses half of
+# it" shape this project keeps finding. The verdict is now DERIVED per leg by the
+# shared resolver from two MEASURED inputs (the reference binary's own target,
+# read out of its header, against the leg's declared spec), so a leg whose
+# reference is another platform's binary is reported as having NO ORACLE, in
+# those terms, with the fallback control named — and both drivers say it in the
+# same words because there is one implementation of them.
+$RefOracleTarget = ''
 if ($RefOracle) {
-  Info "oracle   : $RefOracleWin"
-  Info "             LINUX/gcc reference testfixture (ELF, built by the deriving host). Run it on"
-  # `-e`, not `--`: this line is ADVICE AN OPERATOR PASTES, so it must be the
-  # shape that survives. MEASURED 2026-08-04 — `wsl.exe -- <argv>` still routes
-  # through the distro's default shell (`wsl.exe -- /nope` answers `/bin/bash:
-  # line 1: /nope: No such file`, `wsl.exe -e /nope` answers `execvpe(/nope)
-  # failed`), so a staged path with a glob character or a `$` would be rewritten
-  # under the operator mid-triage.
-  Info "             the same .test to EXONERATE dss:   $(if ($script:HostNeedsWsl) { "wsl.exe -e $RefOracle" } else { $RefOracle }) <staged .test>"
-  Info "             It fails too => upstream/test-suite. It passes => INCONCLUSIVE for a leg of a"
-  Info "             different platform (pe64 / mach-o); never proof of a dss bug on its own."
-} else {
-  Warn "oracle   : ABSENT — no reference fixture survived this run, so a corpus failure"
-  Warn "             cannot be attributed to DSS vs upstream. $RefOracleMiss"
+  # MEASURED, never assumed. Unidentifiable => every leg reports NO ORACLE,
+  # which is the honest reading of "we do not know what this binary is".
+  $refFixId = Get-BinaryTarget $RefOracleWin
+  if ($refFixId.Ok) { $RefOracleTarget = $refFixId.Target }
+  else { Warn "the reference testfixture could not be IDENTIFIED — $($refFixId.Why). Every leg therefore reports NO ORACLE: a control whose platform is unknown is not a control." }
+}
+foreach ($lbl in $LegOrder) {
+  $lr = $LegLedger[$lbl]
+  $orep = Invoke-LegResolver @('--oracle-report', $lbl,
+                               '--reference-target', $RefOracleTarget,
+                               '--reference-path', "$RefOracle",
+                               '--leg-oracle', "$(if ($lr) { $lr.Oracle })",
+                               '--leg-oracle-cc', "$(if ($lr) { $lr.OracleCc })",
+                               '--leg-oracle-triple', "$(if ($lr) { $lr.OracleTriple })")
+  foreach ($l in ($orep.Text -split "`n")) { if ($l.Trim()) { Info "oracle   : $l" } }
+}
+# The RUN reference's own absence, on its own line: the per-leg verdicts above
+# already say NO ORACLE where it matters, and this names the log that explains
+# why there was nothing to derive from in the first place.
+if (-not $RefOracle) {
+  Warn "oracle   : no run reference survived this run. $RefOracleMiss"
 }
 Info "tier     : $Tier.test   outputs: $Work"
 Info "excluded : $(if ($TierExcludes.Count) { "$($TierExcludes -join ' ')   (operator DSS_TIER_EXCLUDES -> QUICKTEST_OMIT; dropped from every `$allquicktests-derived permutation, still run under 'full')" } else { '(none — the full tier ran)' })"
