@@ -301,9 +301,9 @@ void emitTargetSchemaLoadFailed(DiagnosticReporter&               rep,
     forwardConfigDiagnostics(why, rep);
     emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                "target schema '" + targetName
-               + "' could not be loaded — check that "
+               + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
                  "src/dss-config/targets/" + targetName
-               + ".target.json exists and parses cleanly.");
+               + ".target.json).");
 }
 
 void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
@@ -312,9 +312,9 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     forwardConfigDiagnostics(why, rep);
     emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                "object-format schema '" + formatName
-               + "' could not be loaded — check that "
+               + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
                  "src/dss-config/object-formats/" + formatName
-               + ".format.json exists and parses cleanly.");
+               + ".format.json).");
 }
 
 // D-PERF-4-CU-PARALLELISM: worker count for the INTERNAL per-CU build pool
@@ -1668,9 +1668,9 @@ int Program::compileProject(
         forwardConfigDiagnostics(grammarR.error(), rep);
         emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                    "language schema '" + pc.language
-                   + "' could not be loaded — check that "
+                   + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
                      "src/dss-config/sources/" + pc.language
-                   + ".lang.json exists and parses cleanly.");
+                   + ".lang.json).");
         drainDiagnosticsToStderr(rep);
         return 1;
     }
@@ -1993,9 +1993,9 @@ int Program::compileFiles(
         forwardConfigDiagnostics(grammarR.error(), rep);
         emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                    "language schema '" + languageName
-                   + "' could not be loaded — check that "
+                   + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
                      "src/dss-config/sources/" + languageName
-                   + ".lang.json exists and parses cleanly.");
+                   + ".lang.json).");
         drainDiagnosticsToStderr(rep);
         return 1;
     }
@@ -2098,9 +2098,9 @@ int Program::compileUnits(
         forwardConfigDiagnostics(grammarR.error(), rep);
         emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                    "language schema '" + languageName
-                   + "' could not be loaded — check that "
+                   + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
                      "src/dss-config/sources/" + languageName
-                   + ".lang.json exists and parses cleanly.");
+                   + ".lang.json).");
         drainDiagnosticsToStderr(rep);
         return 1;
     }

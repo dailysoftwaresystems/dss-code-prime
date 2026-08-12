@@ -1843,6 +1843,79 @@ struct DSS_EXPORT ParametersConfig {
     bool soleVoidMeansEmpty = false;
 };
 
+// ── inline-asm P1 (`semantics.inlineAsm`, D-CSUBSET-INLINE-ASM +
+//    D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED) ──
+//
+// The COMPLETE rule/token vocabulary of the language's inline-asm statement, so
+// the semantic tier can decide "which section is this, and what is in it" from
+// config-resolved `RuleId`s alone. NOTHING here may be inferred from a keyword
+// spelling, a rule NAME, or the language's identity — the whole facet exists so
+// that `if (language == …)` never appears in the analyzer.
+//
+// ★ THE GRAMMAR MODELS COLON *BOUNDARIES*, NOT SLOTS, and that is why the tail
+// vocabulary is this wide. A `Colon` advances ONE section; a `ColonColonOp` (a
+// REAL token — `::` is already needed for C23 attribute namespaces) advances TWO
+// and forces the section between it EMPTY. Each fused (`ColonColonOp`) arm is its
+// OWN NAMED RULE precisely so that "is a section present" is a `RuleId` question:
+// an inline fused arm with an empty label list would leave NO node in the tree,
+// and section presence would then be unanswerable — which is exactly the fact
+// `S_InlineAsmLabelSectionRequiresGoto` is a predicate over.
+//
+// ★ SECTION ROLE COMES FROM THE PARENT TAIL RULE, never from position: one
+// `operandListRule` shape serves both operand sections, and it is OUTPUTS under
+// `outputsTailRule`, INPUTS under `inputsTailRule`/`inputsTailFusedRule`.
+//
+// ★ THE THREE PAYLOAD-CARRYING RULES ARE `operandListRule`, `clobberListRule`
+// and `gotoLabelListRule` — those, and only those, can hold anything the compiler
+// would have to bind, clobber-track or branch to. That closure is what makes a
+// descendant scan over the three a COMPLETE test for "this asm carries payload",
+// both in the semantic gate and in `cst_to_hir`'s lowering backstop.
+//
+// ALL-OR-NOTHING BY CONSTRUCTION: the loader requires every field below whenever
+// the `inlineAsm` object is present, so a half-declared facet is a LOAD ERROR
+// rather than a silently-disabled check (the `validateTypeNameCommitGuards`
+// precedent). `rule` invalid ⇒ the object was absent ⇒ the language has no
+// inline-asm surface at all (toy/tsql) and none of these checks run.
+struct DSS_EXPORT InlineAsmConfig {
+    // The inline-asm STATEMENT rule (`asmStmt`) — the node every check below is
+    // anchored on. Invalid ⇒ no inline-asm surface.
+    RuleId rule{};                  std::string ruleName;
+    // The TEMPLATE expression rule (`stringLiteralExpr`). The template is located
+    // BY THIS RuleId, never positionally: with a tail present the template is
+    // "first of ≥2" Internal children rather than the only one, and
+    // `decodeAdjacentStringBodies` returns "" (NOT nullopt) for a node with no
+    // body token — so a mis-picked node makes the empty-template check PASS
+    // silently. See the fail-loud locator in `semantic_analyzer.cpp`.
+    RuleId templateRule{};          std::string templateRuleName;
+    // The seven TAIL rules — the colon-boundary chain. `*Fused` = the
+    // `ColonColonOp` arm that skips the preceding section.
+    RuleId outputsTailRule{};       std::string outputsTailRuleName;
+    RuleId inputsTailRule{};        std::string inputsTailRuleName;
+    RuleId inputsTailFusedRule{};   std::string inputsTailFusedRuleName;
+    RuleId clobbersTailRule{};      std::string clobbersTailRuleName;
+    RuleId clobbersTailFusedRule{}; std::string clobbersTailFusedRuleName;
+    RuleId labelsTailRule{};        std::string labelsTailRuleName;
+    RuleId labelsTailFusedRule{};   std::string labelsTailFusedRuleName;
+    // The three PAYLOAD-carrying list rules (see the closure note above).
+    RuleId operandListRule{};       std::string operandListRuleName;
+    RuleId clobberListRule{};       std::string clobberListRuleName;
+    RuleId gotoLabelListRule{};     std::string gotoLabelListRuleName;
+    // The `goto` QUALIFIER token kind. A token, not a rule: it is the same
+    // keyword the `goto` statement uses, and the check is "does this kind occur
+    // among the statement's pre-template tokens".
+    SchemaTokenId gotoQualifierToken{}; std::string gotoQualifierTokenName;
+
+    // Is `r` any of the seven tail rules? Section PRESENCE, the question
+    // `S_InlineAsmLabelSectionRequiresGoto` and the qualifier-scan pruning ask.
+    [[nodiscard]] bool isTailRule(RuleId r) const {
+        if (!r.valid()) return false;
+        return r.v == outputsTailRule.v       || r.v == inputsTailRule.v
+            || r.v == inputsTailFusedRule.v   || r.v == clobbersTailRule.v
+            || r.v == clobbersTailFusedRule.v || r.v == labelsTailRule.v
+            || r.v == labelsTailFusedRule.v;
+    }
+};
+
 // The full `semantics` block. Every facet is optional; absent ⇒ that
 // facet is just not analyzed.
 struct DSS_EXPORT SemanticConfig {
@@ -2146,15 +2219,23 @@ struct DSS_EXPORT SemanticConfig {
     // hirLowering row maps to Skip). Invalid ⇒ the language has no static-assertion
     // surface (toy/tsql — the check never runs).
     RuleId        staticAssertRule{}; std::string staticAssertRuleName;
-    // FC17.9(i) (D-CSUBSET-INLINE-ASM, C23 6.8 / GNU 6.47): the `__asm__` inline-asm
-    // STATEMENT rule (asmStmt). Pass 2 decodes the template child (the SAME
-    // decodeAdjacentStringBodies chokepoint staticAssert's message uses) and REQUIRES
-    // a strictly-empty decoded string; a non-empty / whitespace-only / malformed-escape
-    // template fails loud S_InlineAsmNonEmptyTemplate (real per-target asm text is the
-    // D-CSUBSET-INLINE-ASM-TEXT deferral). The empty form lowers to a MirOpcode::
-    // CompilerBarrier fence (hirLowering asmStmt → InlineAsm). Invalid ⇒ the language
-    // has no inline-asm surface (toy/tsql — the check never runs).
-    RuleId        inlineAsmRule{}; std::string inlineAsmRuleName;
+    // FC17.9(i) + inline-asm P1 (D-CSUBSET-INLINE-ASM /
+    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED, C23 6.8 / GNU 6.47): the whole
+    // inline-asm rule/token vocabulary — see `InlineAsmConfig` above for the
+    // colon-boundary model and the payload-closure argument. Pass 2 runs three
+    // gates over an `inlineAsm.rule` node, in order: a label section with no
+    // `goto` qualifier fails loud S_InlineAsmLabelSectionRequiresGoto; ANY payload
+    // or qualifier (outputs / inputs / clobbers / labels / `goto`) fails loud
+    // S_InlineAsmExtendedUnsupported quoting the constraint + clobber strings it
+    // found; otherwise the template — located by `templateRule`, never
+    // positionally — must decode to a strictly-empty string, else
+    // S_InlineAsmNonEmptyTemplate. A duplicated qualifier
+    // (S_InlineAsmDuplicateQualifier) is orthogonal and may fire alongside. Only
+    // the fully-bare, empty-template form survives all four, and it lowers to a
+    // MirOpcode::CompilerBarrier fence (hirLowering asmStmt → InlineAsm).
+    // `inlineAsm.rule` invalid ⇒ the language has no inline-asm surface
+    // (toy/tsql — none of the checks run).
+    InlineAsmConfig inlineAsm;
     // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): `_Generic` generic
     // selection. `genericRule` = the `genericExpr` shape; `genericControlChild` =
     // the visible-child index of the controlling `assignmentExpr`. When Pass 2

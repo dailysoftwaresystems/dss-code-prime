@@ -562,6 +562,10 @@ HirLoweringConfig const& GrammarSchema::hirLowering() const noexcept {
     return d_.hirLowering;
 }
 
+PipelineEntryConfig const& GrammarSchema::pipelineEntry() const noexcept {
+    return d_.pipelineEntry;
+}
+
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
                                        std::span<ScopeKind const> stack) const noexcept {
     // Walk the scope stack top-down so the innermost scope's rules win —

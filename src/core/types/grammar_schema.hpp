@@ -11,6 +11,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/pipeline_entry_config.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/schema_cursor.hpp"
@@ -350,6 +351,26 @@ struct DSS_EXPORT GrammarSchemaData {
     // walker-managed frames, not user-declared shapes.
     std::unordered_set<std::uint32_t>                 wrapperRuleIds;
 
+    // ── cross-language reference provenance (plan 29 P1+P2) ──────────────
+    // Shape name → the label of the REFERENCED document that declared it,
+    // for shapes folded in through `languageReferences`. Populated ONLY for
+    // foreign shapes: a name that is absent from this map was declared by
+    // the host document itself, which keeps the map empty for every
+    // self-contained language and makes "is this shape foreign?" a single
+    // lookup rather than a set difference.
+    //
+    // WHY IT IS LOAD-TIME DATA THAT NEVERTHELESS LIVES HERE: once two
+    // documents contribute shapes, the JSON pointer `/shapes/<name>` that
+    // every grammar diagnostic quotes is AMBIGUOUS — it names a location in
+    // "the config" without saying which file to open. The six diagnostic
+    // sites that format that pointer (`buildPositionTables`,
+    // `detectAmbiguousAlternatives`, `validateBodyDefaultKindsOffGrammar`,
+    // the reference-resolution pass, the wrapper-rule collision check and
+    // `validateTypeNameCommitGuards`) all reach the schema data and nothing
+    // else, so this is the one channel that reaches them without changing
+    // six signatures. `shapePointer()` in the loader is the sole reader.
+    std::unordered_map<std::string, std::string>      shapeOriginDoc;
+
     // Numeric-literal lexical grammar (08.55 cleanup; schema v4
     // `numberStyle`). nullopt for languages that declare no numeric
     // literals; required (loader emits `C_MissingNumberStyle`)
@@ -368,6 +389,13 @@ struct DSS_EXPORT GrammarSchemaData {
     // omits the block — the lowering engine then produces nothing for it.
     // Read-only after construction; the loader is the only writer.
     HirLoweringConfig                                 hirLowering;
+
+    // Per-RULE pipeline entry tier (plan 29; schema v4 `pipelineEntry`).
+    // Empty when the language declares no block — every construct then takes
+    // the ordinary CST→HIR→MIR→LIR path. Read-only after construction; the
+    // loader is the only writer. See `pipeline_entry_config.hpp` for why the
+    // declaration is per-CONSTRUCT and never per-language.
+    PipelineEntryConfig                               pipelineEntry;
 };
 
 } // namespace detail
@@ -746,6 +774,14 @@ public:
     // `hirLowering`). Default-constructed (`empty()`) when the language omits
     // the block. Read-only; the loader is the only writer.
     [[nodiscard]] HirLoweringConfig const& hirLowering() const noexcept;
+
+    // Per-RULE pipeline entry tier (plan 29; schema v4 `pipelineEntry`).
+    // Empty when the language declares no block. The engine that consumes it
+    // dispatches on `PipelineTier` — a closed enum — and must NEVER read the
+    // language name; a tier whose entry path this build has not implemented
+    // is refused AT USE with a precise diagnostic, never demoted to another
+    // tier. Read-only; the loader is the only writer.
+    [[nodiscard]] PipelineEntryConfig const& pipelineEntry() const noexcept;
 
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,

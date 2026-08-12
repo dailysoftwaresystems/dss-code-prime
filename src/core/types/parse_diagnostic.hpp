@@ -1311,6 +1311,79 @@ enum class DiagnosticCode : std::uint16_t {
     //   must not be able to restore an accepted-then-faulting binary.
     S_EntryShapeNotDeclared = 0xE061,
 
+    // ★★ D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED (inline-asm P1): a GNU
+    // EXTENDED inline-asm statement — one carrying an output list, an input list,
+    // a clobber list, a label section, or the `goto` qualifier
+    // (`__asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));`). P1 PARSES the full
+    // extended form and REFUSES it here, with ONE diagnostic per construct.
+    //
+    // ★ WHY PARSE-THEN-REFUSE RATHER THAN LEAVE IT A PARSE ERROR. Before P1 the
+    // grammar's `asmStmt` ended at `)`, so the first `:` produced P_UnexpectedToken
+    // and the parser never recovered — MEASURED 53 diagnostics for the ONE `rdtsc`
+    // statement in sqlite's `src/hwtime.h:43`. A construct the compiler cannot
+    // support should cost exactly one message that says so, not a cascade that
+    // buries every real error after it in the file.
+    //
+    // ⛔ ACCEPT-AND-IGNORE IS THE FORBIDDEN OUTCOME, and it is why this is an ERROR
+    // and not a warning. The operands are the WHOLE CONTRACT: `"=a"(lo)` tells the
+    // register allocator that this statement writes `eax` and that `lo` receives it.
+    // Parsing the operands and lowering the statement to a bare barrier would emit
+    // code that clobbers registers the allocator still believes are live AND leave
+    // `lo`/`hi` holding whatever was there before — a silent miscompile with no
+    // trace in the build log. In `kUnsuppressableCodes` for exactly that reason.
+    //
+    // ★ THE MESSAGE QUOTES THE CONSTRAINT AND CLOBBER STRINGS IT FOUND, labelled by
+    // role, decoded through the SAME `decodeAdjacentStringBodies` chokepoint the
+    // template uses. That is deliberate scoping instrumentation: running a real
+    // corpus through this diagnostic INVENTORIES which constraint letters actually
+    // occur, which is the data phase P5 needs. P1 NEVER INTERPRETS a constraint
+    // letter — it quotes text it does not understand; the constraint-letter
+    // vocabulary is P3's `.target.json` job, because `"a"` means `eax` on x86 and
+    // nothing at all on arm64. Renders error[S0062].
+    S_InlineAsmExtendedUnsupported = 0xE062,
+
+    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED (inline-asm P1): an inline-asm
+    // statement with a FOURTH (label) section but no `goto` qualifier — `asm("" :
+    // : ::)`, `asm("" :: ::)`, `asm("" ::::)`. GNU 6.47.2.7: the label section
+    // exists only for `asm goto`; without the qualifier the statement has no
+    // control-flow edges to label. ✔MEASURED 2026-08-12: gcc, clang and MSVC all
+    // hard-error on each of the three spellings above.
+    //
+    // ★ IT IS ITS OWN CODE, AHEAD OF `S_InlineAsmExtendedUnsupported`, because it
+    // is a CONSTRAINT VIOLATION rather than a not-yet-implemented feature: the
+    // construct is ill-formed in every conforming compiler and will STILL be
+    // ill-formed after P5 implements extended asm, so the "not yet supported"
+    // message would be a lie that ages into a wrong answer. Unsuppressable: the
+    // section boundaries decide which colon-separated group is which, so a
+    // suppressed emission would hand the operand binder a mis-sectioned statement.
+    // Renders error[S0063].
+    S_InlineAsmLabelSectionRequiresGoto = 0xE063,
+
+    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED (inline-asm P1): two inline-asm
+    // qualifier tokens of the SAME KIND on one statement (`__asm__ volatile
+    // volatile ("")`, `asm goto goto ("" ::::l)`). The grammar admits the run as a
+    // `{repeat}` — deliberately, so the qualifiers may appear in any order — so the
+    // arity constraint is enforced here rather than by a shape that would also
+    // forbid the legal orderings (the `S_AsmLabelDuplicate` precedent).
+    // ✔MEASURED 2026-08-12: gcc, clang and MSVC all hard-error on a repeated
+    // qualifier.
+    //
+    // ★ THE DEDUP IS BY TOKEN KIND, NOT BY SPELLING, and that is load-bearing here:
+    // `volatile __volatile__` is ONE kind written two ways, and DSS's keyword table
+    // aliases the dunder spellings onto the same `VolatileKeyword`
+    // ($gnuDunderSpellingsAreUnconditionalComment). A spelling-keyed check would
+    // accept it. The message therefore ECHOES THE OFFENDING TOKEN'S SOURCE TEXT
+    // rather than a hardcoded name, so the dunder form prints as the author wrote it.
+    //
+    // ★ DELIBERATELY *NOT* IN `kUnsuppressableCodes`, and the criterion is that
+    // file's own: membership is for codes whose suppression ships WRONG BYTES or
+    // hides a build failure. `volatile volatile` suppressed compiles to exactly what
+    // `volatile` means — the repeat is redundant, not ambiguous, so there is no
+    // second candidate lowering to pick silently. It stays an ERROR by default
+    // (matching all three reference compilers); `--suppress` merely restores the
+    // reading every reader already assumes. Renders error[S0064].
+    S_InlineAsmDuplicateQualifier = 0xE064,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

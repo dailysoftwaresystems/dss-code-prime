@@ -42,7 +42,39 @@ def repo_root():
 
 
 def open_rows(text):
-    """name -> status excerpt, for every row whose status cell is not marked closed."""
+    """name -> status excerpt, for every row whose status cell is not marked closed.
+
+    A row is CLOSED iff its status cell OPENS with the closure mark (after any
+    leading markdown emphasis/whitespace).  Everything else -- every other glyph,
+    every novel glyph, no glyph at all -- is OPEN.  The complement is defined, never
+    the variants, so a marker nobody has thought of yet counts as open, which is the
+    safe direction.
+
+    star **THE LEADING-POSITION TEST IS THE FIX FOR A MEASURED UNDERCOUNT, 2026-08-12.**
+    This previously asked `CLOSED_MARK not in status` -- the mark ANYWHERE in the cell.
+    Open rows legitimately use the check mark mid-prose to flag a DONE HALF or a piece
+    of good news, e.g. D-EXAMPLES-RELEASE-ARM-NOT-COMPILED-WHEN-ITS-BASELINE-DID-NOT-RUN
+    opens `orange **OPEN -- normal ...` and later says `... the arms themselves are GOOD`
+    with a check mark.  The substring test read that as CLOSED.  MEASURED at the time of
+    the fix by running BOTH rules over the registry at HEAD: the substring rule reported
+    577 open, the leading-position rule reports 642 -- EXACTLY 65 rows hidden, 11.3%.
+    star CORRECTED 2026-08-12, hours after this docstring was first written, by an
+    independent audit.  It originally read "49 rows ... of which ~39 were genuinely open
+    ... ~7%".  Those came from a scratch regex that only matched rows whose cell HEAD
+    carried an EXPLICIT open glyph -- so rows with no marker at all plus a mid-prose check
+    mark were invisible to the very scan that was measuring the blind spot.  The registry
+    row D-GATE-ANCHOR-BALANCE-DECORATIVE-CLOSE-MARK-UNDERCOUNTS carried the right numbers
+    and this docstring did not, which is the worse way round: this is the surface a future
+    maintainer of open_rows() reads FIRST.  Measure with the tool, never with a scratch
+    grep that may share the bug you are hunting.
+    star star AND NOTE THE DIRECTION, BECAUSE IT IS THE SAME DIRECTION TWICE.  Version 1 of
+    this gate enumerated the OPEN glyphs and was blind to the hourglass, reporting 269
+    open where there were 579.  That was fixed by inverting to "open unless closed" --
+    and the inversion introduced THIS blind spot.  Both errors flattered the cycle by
+    hiding open rows.  An instrument that keeps failing toward "you are doing fine" is
+    the one to distrust; when you change this function, ask which direction the new
+    rule errs in and pin it in self_test().
+    """
     out = {}
     for line in text.split("\n"):
         m = ROW.match(line)
@@ -50,7 +82,7 @@ def open_rows(text):
             continue
         name, rest = m.group(1), m.group(2)
         status = rest.split("|")[0]
-        if CLOSED_MARK not in status:
+        if not status.lstrip().lstrip("*_ ").startswith(CLOSED_MARK):
             out[name] = " ".join(status.split())[:80]
     return out
 
@@ -82,6 +114,18 @@ def self_test():
         ("| `D-H` | ✅ **CLOSED** | supersedes a \U0001f7e0 row | refs |", set(),
          "only the STATUS cell decides"),
         ("not a row at all", set(), "non-rows are ignored"),
+        # star THE 2026-08-12 UNDERCOUNT, pinned. An OPEN row routinely uses the check
+        # mark mid-prose for a done HALF or a piece of good news. A substring test read
+        # these as closed and hid 65 open rows. Leading position is what decides.
+        ("| `D-I` | \U0001f7e0 **OPEN** -- half ✅ done, half not | work | refs |",
+         {"D-I"}, "mid-prose check mark does NOT close an open row (the 2nd miss)"),
+        ("| `D-J` | ⏳ **PARTIALLY CLOSED -- ✅ part (1); part (2) open** | work | refs |",
+         {"D-J"}, "PARTIALLY closed is OPEN, however many marks it carries"),
+        # ... while the genuinely-closed spelling that RECAPS its own history still closes.
+        ("| `D-K` | ✅ **CLOSED 2026-01-01.** *(Was: OPEN -- \U0001f534 HIGH.)* | done | refs |",
+         set(), "a closed row may recap 'Was: OPEN' and stays closed"),
+        ("| `D-L` | **✅ CLOSED** | done | refs |", set(),
+         "leading markdown emphasis before the mark still closes"),
     ]
     failed = 0
     for text, expect, why in cases:

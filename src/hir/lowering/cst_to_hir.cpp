@@ -1193,6 +1193,48 @@ struct Lowerer {
     }
     [[nodiscard]] bool isToken(NodeId n) const { return tree().kind(n) == NodeKind::Token; }
 
+    // inline-asm P1 (D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): the FIRST
+    // descendant of an inline-asm statement that carries extended-asm payload —
+    // an operand list, a clobber list or a goto-label list — or an invalid NodeId
+    // when the statement is the bare barrier form. The three rules are exactly
+    // the payload-carrying shapes `semantics.inlineAsm` declares (see
+    // `InlineAsmConfig`), so "none of the three" is a COMPLETE test for "there is
+    // nothing here to drop", not a sampling of likely cases.
+    //
+    // Config-resolved RuleIds only — no rule name, no keyword, no language check.
+    // A clean probe (no node, not truncated) is returned immediately when the
+    // language declares no inline-asm facet (toy/tsql, or any grammar whose asm
+    // statement is template-only): there is then no payload shape to find.
+    //
+    // `scanTruncated` is reported SEPARATELY rather than folded into "no payload":
+    // a walk that did not finish has not shown the statement is clean, and the
+    // whole point of this backstop is that "we did not see a problem" and "there
+    // is no problem" are different claims. Both outcomes fail loud at the caller.
+    struct InlineAsmPayloadProbe { NodeId node{}; bool scanTruncated = false; };
+    [[nodiscard]] InlineAsmPayloadProbe inlineAsmPayloadProbe(NodeId asmNode) const {
+        auto const& ia = sem.inlineAsm;
+        if (!ia.operandListRule.valid() && !ia.clobberListRule.valid()
+            && !ia.gotoLabelListRule.valid())
+            return {};
+        std::vector<NodeId> stack{asmNode};
+        // The subtree is a TREE, so termination needs no guard; the guard is a
+        // malformed-graph backstop, sized far above any real asm statement.
+        for (int guard = 0; !stack.empty(); ++guard) {
+            if (guard > (1 << 20)) return {.node = {}, .scanTruncated = true};
+            NodeId const cur = stack.back();
+            stack.pop_back();
+            if (tree().kind(cur) == NodeKind::Internal && cur.v != asmNode.v) {
+                std::uint32_t const r = tree().rule(cur).v;
+                if ((ia.operandListRule.valid()   && r == ia.operandListRule.v)
+                    || (ia.clobberListRule.valid()   && r == ia.clobberListRule.v)
+                    || (ia.gotoLabelListRule.valid() && r == ia.gotoLabelListRule.v))
+                    return {.node = cur, .scanTruncated = false};
+            }
+            for (NodeId c : visible(cur)) stack.push_back(c);
+        }
+        return {};
+    }
+
     // ── declaration-specifier prefix (D-DECL-SPECIFIER-PREFIX-SUBSTRATE consumer)
     // The c-subset's `static`/`__attribute__` prefix rides as an OPTIONAL leading
     // child of a declaration. CST→HIR resolves positional declaration children
@@ -5597,12 +5639,76 @@ struct Lowerer {
             if (k == "ReturnStmt")  { stmtResult = lowerReturn(n); return; }
             if (k == "BreakStmt")    { stmtResult = track(builder.makeBreak(0), n); return; }
             if (k == "ContinueStmt") { stmtResult = track(builder.makeContinue(0), n); return; }
-            // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template `__asm__ [volatile]
-            // ("")` statement lowers to a 0-child InlineAsm leaf (no payload). The
-            // template gate lives in the semantic tier (semantics.inlineAsmRule →
-            // S_InlineAsmNonEmptyTemplate rejects a non-empty template before codegen),
-            // so this arm need not re-decode — it emits the barrier UNCONDITIONALLY.
-            if (k == "InlineAsm")    { stmtResult = track(builder.addLeaf(HirKind::InlineAsm), n); return; }
+            // ★★ FC17.9(i) + inline-asm P1 (D-CSUBSET-INLINE-ASM /
+            // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): the bare, empty-template
+            // `__asm__ [volatile] ("")` statement lowers to a 0-child InlineAsm leaf
+            // → MirOpcode::CompilerBarrier. It carries NO payload by construction —
+            // and the assertion below is what makes "by construction" true here
+            // rather than merely true somewhere else.
+            //
+            // ★ WHY THE ASSERTION EXISTS — AND IT *CAN* FIRE: see the TEST TIER
+            // paragraph below, which is the correction to this heading's earlier
+            // wording ("…EVEN THOUGH IT CANNOT FIRE TODAY"). That claim was false
+            // of the third caller, and a heading twelve lines above its own
+            // retraction is read as the fact — a block is read top-first, which is
+            // why the correction lives here rather than only below
+            // ([[D-CONFIG-COMMENT-CLAIM-ROT]] (g2)). This arm
+            // used to lower UNCONDITIONALLY, justified by "the gate lives in the
+            // semantic tier". That was SOUND while `asmStmt` could carry only a
+            // template — there was nothing to drop. P1 taught the grammar the full
+            // GNU extended form, so the node can now carry operand / clobber / label
+            // subtrees, and an unconditional leaf would discard them SILENTLY BY
+            // CONSTRUCTION: exactly one gate, no second line of defence, on exactly
+            // the failure the P1 arc exists to prevent (`"=a"(lo)` dropped ⇒ `rdtsc`
+            // clobbers eax/edx with the allocator uninformed and `lo` never written).
+            // ✔MEASURED that the semantic gate does hold: `compile_pipeline.cpp:303`
+            // and `c_header_parser.cpp:313` both bail on `hasErrors()` before
+            // lowering, so a refused asm never reaches here in a correct build.
+            // ★ UNREACHABLE FROM THE DRIVER, REACHABLE FROM THE TEST TIER — AND
+            // HERE IS THE TEST. An earlier revision of this comment said flatly
+            // "unreachable today", which was true of the two driver entry points
+            // above and FALSE of the third caller: `tests/mir/
+            // test_mir_lowering_c_subset.cpp`'s `lowerCSubset` calls `lowerToHir`
+            // with NO `hasErrors()` guard, deliberately, so a lowering bug cannot
+            // hide behind a semantic diagnostic. `MirLoweringCSubset.
+            // ExtendedInlineAsmReachingHirLoweringIsRefusedNotDropped` now drives
+            // exactly that path and pins the diagnostic — the project's own rule
+            // is to EXERCISE the failure arm rather than read it, and an arm
+            // believed unreachable is the one that most needs the run. The arm
+            // also remains the thing that stays true if someone later reorders
+            // those bails, relaxes the semantic gate, or adds a fourth lowering
+            // entry point: a silent drop must cost a diagnostic, not a code review.
+            //
+            // Payload is tested over the THREE payload-carrying rules the config
+            // names (`operandListRule` / `clobberListRule` / `gotoLabelListRule`) —
+            // config-resolved RuleIds, no rule names and no keyword spellings — and
+            // those three are the only rules in the asm grammar that can hold
+            // anything to bind, clobber-track or branch to, so the scan is complete.
+            if (k == "InlineAsm") {
+                auto const probe = inlineAsmPayloadProbe(n);
+                if (probe.node.valid()) {
+                    // The `reportedError` idiom used by the block-scope-extern guard
+                    // above: a loud error node, never a silent drop.
+                    stmtResult = reportedError(probe.node,
+                        "extended inline-asm reached HIR lowering with an operand / "
+                        "clobber / label section still attached — the semantic tier "
+                        "must have refused it (S_InlineAsmExtendedUnsupported, "
+                        "D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED). Lowering it to "
+                        "a bare barrier would DROP the operand binding: a silent "
+                        "miscompile");
+                    return;
+                }
+                if (probe.scanTruncated) {
+                    stmtResult = reportedError(n,
+                        "inline-asm payload scan did not finish (node budget "
+                        "exhausted), so this statement has NOT been shown to be the "
+                        "bare barrier form — refusing rather than lowering it to a "
+                        "0-child leaf on an unverified assumption");
+                    return;
+                }
+                stmtResult = track(builder.addLeaf(HirKind::InlineAsm), n);
+                return;
+            }
             // Switch is a DEEP form: its arm-grouping re-enters the driver for each
             // arm body (`lowerStmt(body)`), so a switch nested in a switch-arm body
             // would recurse on the host stack. Flatten it through a Switch frame —

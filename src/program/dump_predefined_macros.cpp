@@ -350,9 +350,9 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
     if (!grammarR.has_value()) {
         emitLoadFailure(err, grammarR.error(), DiagnosticCode::D_SchemaLoadFailed,
                         "language schema '" + args.languageName
-                        + "' could not be loaded — check that "
+                        + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
                           "src/dss-config/sources/" + args.languageName
-                        + ".lang.json exists and parses cleanly.");
+                        + ".lang.json).");
         return 1;
     }
     auto const grammar = *grammarR;
@@ -391,9 +391,9 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
             emitLoadFailure(err, targetR.error(),
                             DiagnosticCode::D_SchemaLoadFailed,
                             "target schema '" + parsed->targetName
-                            + "' could not be loaded — check that "
+                            + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
                               "src/dss-config/targets/" + parsed->targetName
-                            + ".target.json exists and parses cleanly.");
+                            + ".target.json).");
             return 1;
         }
         auto formatR = ObjectFormatSchema::loadShipped(parsed->formatName);
@@ -401,10 +401,10 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
             emitLoadFailure(err, formatR.error(),
                             DiagnosticCode::D_SchemaLoadFailed,
                             "object-format schema '" + parsed->formatName
-                            + "' could not be loaded — check that "
+                            + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
                               "src/dss-config/object-formats/"
                             + parsed->formatName
-                            + ".format.json exists and parses cleanly.");
+                            + ".format.json).");
             return 1;
         }
         PredefinedMacroDumpRequest req;

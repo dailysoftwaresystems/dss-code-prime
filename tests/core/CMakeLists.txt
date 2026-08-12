@@ -37,6 +37,16 @@ dss_add_test(NAME core/test_string_style        SOURCES test_string_style.cpp)
 dss_add_test(NAME core/test_tsql_subset         SOURCES test_tsql_subset.cpp)
 dss_add_test(NAME core/test_sha256              SOURCES test_sha256.cpp)
 
+# Cross-language `languageReferences` reuse (plan 29 P1+P2). Loads a SYNTHETIC
+# host schema built inside the test and reaches the shipped
+# `sources/asm.lang.json` through it, so the "asm language is REUSED, zero new
+# grammar rules" property has a standing guard that does not depend on
+# c-subset — its only real consumer today. Links nlohmann_json because the test
+# reads its OWN host document back to prove the host declares none of the rules
+# it inherits (a hand-copied list would rot into a tautology).
+dss_add_test(NAME core/test_language_references  SOURCES test_language_references.cpp)
+target_link_libraries(dss_core_test_language_references PRIVATE nlohmann_json::nlohmann_json)
+
 # Generalized arena substrate (SP1). The test sources live under substrate/
 # and include the shared `substrate/arena_test_types.hpp`, so this directory
 # is on their include path.

@@ -71,6 +71,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_IncompatiblePointerIntegerPointee";
         case DiagnosticCode::S_EntryShapeNotDeclared:
             return "S_EntryShapeNotDeclared";
+        case DiagnosticCode::S_InlineAsmExtendedUnsupported:
+            return "S_InlineAsmExtendedUnsupported";
+        case DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto:
+            return "S_InlineAsmLabelSectionRequiresGoto";
+        case DiagnosticCode::S_InlineAsmDuplicateQualifier:
+            return "S_InlineAsmDuplicateQualifier";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

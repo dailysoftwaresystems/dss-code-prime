@@ -11,6 +11,7 @@
 #include "core/types/artifact_profile.hpp"     // kRegisteredArtifactProfiles / isRegisteredArtifactProfile (shared with the object-format loader, AP3)
 #include "core/types/attribute_naming.hpp"     // stripDunder — the ONE dunder normalizer, shared with the semantic attribute scans (TF-C73 drift cross-check)
 #include "core/types/config_key_vocabulary.hpp" // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74: shared with the target loader)
+#include "core/types/config_path_walk.hpp"     // findShippedConfig — the ONE shipped-config discovery precedence, reused by `languageReferences` (plan 29)
 #include "core/types/data_model.hpp"           // dataModelFromName (FC3 c1 coreByDataModel keys)
 #include "core/types/predefined_macro_json.hpp" // parsePredefinedMacroArray (TF-C74: shared with the target loader)
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
@@ -22,13 +23,17 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -124,6 +129,35 @@ constexpr std::string_view kBuiltinTokenKindNames[] = {
 };
 
 using Collector = substrate::DiagnosticCollector;
+
+// ── diagnostic provenance for a MULTI-DOCUMENT grammar (plan 29 P1+P2) ────
+//
+// Every grammar diagnostic quotes a JSON pointer into `/shapes/<name>`. That
+// was unambiguous while a language's grammar lived in exactly one file. The
+// moment `languageReferences` folds a second document's shapes in, the same
+// pointer names a location the reader cannot open: `/shapes/asmOperand` is a
+// perfectly good pointer into `asm.lang.json` and a dangling one into
+// `c-subset.lang.json`, and the diagnostic does not say which.
+//
+// This is the ONE place that answers it. A foreign shape is quoted as
+//     asm.lang.json#/shapes/asmOperand
+// — the URI fragment convention, so the part before `#` is the document and
+// the part after is the same pointer the reader already knows. A HOST shape
+// keeps the bare `/shapes/<name>` it has always had, byte for byte, so no
+// existing diagnostic text moves and no test that pins one has to change.
+//
+// ⚠ Use this instead of `std::format("/shapes/{}", name)` at every site that
+// can be reached by a merged rule. A site that keeps the raw format string
+// does not fail — it silently mis-attributes, which is the failure mode this
+// whole facility exists to remove.
+[[nodiscard]] std::string shapePointer(GrammarSchemaData const& data,
+                                       std::string_view shapeName) {
+    auto const it = data.shapeOriginDoc.find(std::string{shapeName});
+    if (it == data.shapeOriginDoc.end()) {
+        return std::format("/shapes/{}", shapeName);
+    }
+    return std::format("{}#/shapes/{}", it->second, shapeName);
+}
 
 // Soft upper bound on how many entries a single scopeRequire list may
 // hold. Real configs use 1–4; anything larger is almost certainly a
@@ -1028,7 +1062,7 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
         // positions[0] is the sentinel for cursor posId==0 (invalid).
         // positions[1] is the End that body completions fall through to.
         rule.positions.emplace_back();
-        const auto shapePath = std::format("/shapes/{}", shapeName);
+        const auto shapePath = shapePointer(data, shapeName);
         PositionBuilder builder{rule.positions, data, coll, shapePath};
         const auto endId   = builder.emplace(detail::Position::makeEnd());
         const auto entryId = builder.build(body, endId);
@@ -1204,13 +1238,130 @@ void validateTypeNameCommitGuards(GrammarSchemaData& data, Collector& coll) {
         if (!rule.typeNameCommitRule.valid()) continue;
         if (!data.semantics.identifierToken.valid()) {
             coll.emit(DiagnosticCode::C_MissingField,
-                      std::format("/shapes/{}/commitRequiresTypeName",
-                                  data.rules->name(RuleId{rid})),
+                      shapePointer(data, data.rules->name(RuleId{rid}))
+                          + "/commitRequiresTypeName",
                       "'commitRequiresTypeName' requires the language to "
                       "declare 'semantics.identifierToken' — the type-name "
                       "triage cannot decide what a lone identifier is "
                       "without it");
         }
+    }
+}
+
+// ★★ Late cross-block validation: A RULE THAT LOWERS TO `InlineAsm` MUST BE THE
+// RULE `semantics.inlineAsm` GATES (inline-asm P1,
+// D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED). Runs after BOTH `semantics` and
+// `hirLowering` are parsed, which is the only point where the two halves can be
+// compared.
+//
+// ✔MEASURED, AND THIS GUARD EXISTS BECAUSE OF THE MEASUREMENT. Deleting ONLY the
+// `semantics.inlineAsm` object from a throwaway copy of `c-subset.lang.json` —
+// leaving the asm GRAMMAR and its `asmStmt → InlineAsm` lowering row untouched —
+// made `__asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));` compile **rc=0 with
+// ZERO diagnostics** on `elf64-x86_64-linux-exec`: the statement parsed, no
+// semantic gate ran because the facet was absent, and the lowering emitted a
+// 0-child barrier leaf with the operand list discarded. That is the exact
+// accept-and-ignore miscompile the P1 arc exists to prevent, reachable by
+// DELETING one JSON object. `cst_to_hir`'s payload backstop cannot catch it
+// either — with no facet there are no payload RuleIds to scan FOR, so it returns
+// clean. A backstop that needs the config to be right is not a backstop against
+// the config being wrong; the check has to live where the config is read.
+//
+// THREE CLAUSES. (a) and (b) walk from the LOWERING ROW to the facet; (c) walks
+// back the other way, and it was missing:
+//   (a) an `InlineAsm` lowering row REQUIRES the `semantics.inlineAsm` facet —
+//       otherwise nothing anywhere checks the statement;
+//   (b) EVERY rule that lowers to `InlineAsm` must be the very rule the facet
+//       names. With (a) alone, a config could declare the facet over `asmStmt`
+//       and lower a SECOND, ungated rule to the same HIR kind — the gate would
+//       look present while one asm shape walked straight past it.
+//   (c) ★★ THE RECIPROCAL: the facet REQUIRES the row. Both directions are
+//       needed because the two failures are DIFFERENT, and the second one is
+//       quieter. ✔MEASURED: re-key `asmStmt`'s `hirLowering` row from
+//       `"InlineAsm"` to `"Skip"` and the config LOADS CLEAN, all twelve
+//       semantic inline-asm pins stay GREEN — the whole refusal ladder still
+//       runs, because it is the SEMANTIC tier — and the compiler barrier is
+//       SILENTLY DROPPED. Every diagnostic-tier witness agrees the feature
+//       works; only a MIR-tier barrier-count pin notices anything at all. A
+//       one-directional gate is therefore not "most of" the guard: it leaves
+//       the arm where the construct is accepted, checked, and then lowered to
+//       nothing — which is the accept-and-ignore class this whole gate exists
+//       to close, arriving from the side the first version did not look at.
+//       ⛔ Deleting clause (c) restores exactly that hole; the twelve green
+//       pins are what makes it invisible.
+// The legal configuration this deliberately still permits is BOTH-ABSENT: no
+// lowering row and no facet ⇒ the language has no inline-asm surface (toy/tsql).
+// (c) is written to fire only when the facet IS present, so that stays legal.
+//
+// ⓘ ON THE `"InlineAsm"` STRING. It is the HIR-KIND vocabulary, not a language
+// name — the identical literal `cst_to_hir.cpp`'s statement dispatch matches on
+// (`k == "InlineAsm"`), and `hirKind` is stored by this loader as a string for
+// core kinds (only EXTENSION kinds are name-validated). Matching the same
+// literal the consumer matches is precisely what makes the two agree; core
+// cannot include `hir/hir_node.hpp` for the enum without inverting the layering.
+void validateInlineAsmGate(GrammarSchemaData& data, Collector& coll) {
+    auto const& ia = data.semantics.inlineAsm;
+    for (auto const& m : data.hirLowering.ruleMappings) {
+        if (m.hirKind != "InlineAsm") continue;
+        auto const path = std::format("/hirLowering/ruleMappings/{}", m.ruleName);
+        if (!ia.rule.valid()) {
+            coll.emit(DiagnosticCode::C_MissingField, path,
+                      std::format("shape '{}' lowers to the 'InlineAsm' HIR kind "
+                                  "but the language declares no "
+                                  "'semantics.inlineAsm' — NOTHING would then "
+                                  "check the statement, and an extended asm "
+                                  "(`(\"rdtsc\" : \"=a\"(lo))`) would lower to a "
+                                  "0-child barrier with its operand binding "
+                                  "SILENTLY DISCARDED. Declare the facet, or "
+                                  "remove the lowering row",
+                                  m.ruleName));
+            continue;
+        }
+        if (m.rule.valid() && m.rule.v != ia.rule.v) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("shape '{}' lowers to the 'InlineAsm' HIR kind "
+                                  "but 'semantics.inlineAsm.rule' names '{}' — "
+                                  "the inline-asm gate would run on one shape "
+                                  "while the other lowered past it ungated. "
+                                  "Exactly one shape may lower to 'InlineAsm', "
+                                  "and it must be the one the facet gates",
+                                  m.ruleName, ia.ruleName));
+        }
+    }
+
+    // ── clause (c): the facet requires the row ──
+    // Walks from `semantics.inlineAsm.rule` back to `hirLowering`. Absent
+    // facet ⇒ nothing to require (the legal BOTH-ABSENT configuration).
+    if (!ia.rule.valid()) return;
+    HirRuleMapping const* row = nullptr;
+    for (auto const& m : data.hirLowering.ruleMappings) {
+        if (m.rule.valid() && m.rule.v == ia.rule.v) { row = &m; break; }
+    }
+    if (row == nullptr) {
+        coll.emit(DiagnosticCode::C_MissingField, "/semantics/inlineAsm/rule",
+                  std::format("'semantics.inlineAsm' gates shape '{}', but "
+                              "'hirLowering.ruleMappings' has NO row for it — "
+                              "the whole semantic refusal ladder would still "
+                              "run and every diagnostic-tier witness would stay "
+                              "green while the construct lowered to NOTHING, "
+                              "silently dropping the compiler barrier. Add a "
+                              "row mapping '{}' to the 'InlineAsm' HIR kind, or "
+                              "remove the facet",
+                              ia.ruleName, ia.ruleName));
+        return;
+    }
+    if (row->hirKind != "InlineAsm") {
+        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                  std::format("/hirLowering/ruleMappings/{}", row->ruleName),
+                  std::format("'semantics.inlineAsm' gates shape '{}', but its "
+                              "'hirLowering' row maps it to the '{}' HIR kind "
+                              "instead of 'InlineAsm' — ✔MEASURED with '{}' = "
+                              "'Skip': the config loads clean, all twelve "
+                              "semantic inline-asm pins stay green, and the "
+                              "compiler barrier is SILENTLY DROPPED. A gated "
+                              "construct must reach the lowering its gate "
+                              "assumes",
+                              ia.ruleName, row->hirKind, row->ruleName));
     }
 }
 
@@ -1254,7 +1405,7 @@ void detectAmbiguousAlternatives(GrammarSchemaData& data, Collector& coll,
                     }
                     if (found) {
                         coll.emit(DiagnosticCode::C_AmbiguousAlternatives,
-                                  std::format("/shapes/{}", shapeName),
+                                  shapePointer(data, shapeName),
                                   std::format("alt branches share FIRST token '{}' — the cursor would silently take the first branch; restructure the alt or factor the shared prefix",
                                               data.schemaTokens->name(overlap)));
                     }
@@ -1682,7 +1833,7 @@ void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll
             if (p.slotKind() != SlotKind::TokenLeaf) continue;
             if (!bodyKinds.contains(p.tokenId())) continue;
             coll.emit(DiagnosticCode::C_BodyDefaultKindInShape,
-                      std::format("/shapes/{}", ruleName),
+                      shapePointer(data, ruleName),
                       std::format("token '{}' is declared as a lexer mode's "
                                   "defaultToken.kind and is therefore off-"
                                   "grammar — referencing it from a shape "
@@ -1967,6 +2118,964 @@ void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll
     return meanings;
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+//  CROSS-LANGUAGE REFERENCES — one language's grammar reaching another's
+//  (plan 29 §4 P1+P2; operator decision 2026-08-12, "whatever it costs")
+// ═════════════════════════════════════════════════════════════════════════
+//
+// ★★★ WHAT THIS IS, IN ONE SENTENCE: a document may declare grammar rules
+// with DECLARED HOLES, and another document may fill those holes with its own
+// rules and token kinds — so `asm.lang.json` owns the GNU inline-asm grammar once
+// and every host language that wants it references it with ZERO new grammar
+// rules of its own.
+//
+// ★★ THE PROPERTY THAT MAKES IT A MECHANISM AND NOT A FILE SPLIT. A merge that
+// simply concatenated two `shapes` maps would work for exactly one host — the
+// one whose token kinds the fragment happened to spell. `asm.lang.json` never
+// spells `Colon` or `ColonColonOp` or `expression`; it spells
+// `sectionSeparator`, `sectionSeparatorFused` and `operandExpr`, and the HOST
+// says what those are. That indirection is the whole deliverable: a second
+// host with a different lexical surface binds the same holes to ITS names and
+// inherits the same twelve rules, the same semantic refusal and the same HIR
+// lowering row without authoring one line of grammar.
+//
+// ★★ TWO SATISFACTION SOURCES, ONE VOCABULARY (operator decision 2026-08-12,
+// second). A `requires` name is a hole only from the REFERENCING document's
+// point of view. When the same document is loaded as the ROOT — `asm.lang.json`
+// compiling a standalone `.s` — nobody is there to bind anything, and the
+// names must be satisfied by the document's OWN `shapes` / `tokens`
+// declarations. The loader therefore states satisfaction ONCE, with two
+// sources:
+//
+//     a `requires` name must be SATISFIED — by the referencing document's
+//     binding when this document is REFERENCED, or by this document's own
+//     declaration when this document is the ROOT. Unsatisfied is a LOAD
+//     ERROR in both modes, never a silent disable.
+//
+// `checkRequiresSatisfiedLocally` is the root-mode half; the per-reference
+// binding checks below are the referenced-mode half. Neither can be skipped,
+// and the two never both apply to the same load of the same document — which
+// is exactly why one grammar can serve both modes without forking.
+//
+// ⚠ ONE LEVEL, ENFORCED, NOT ASSUMED. A referenced document may not itself
+// declare `languageReferences`. This is a REFUSAL, not an omission: a
+// transitive chain would need bottom-up hole composition and a cycle guard,
+// and nothing in the tree can exercise either today (there is one referencable
+// document). Shipping an untested transitive path and shipping a silent
+// ignore are both worse than the loud refusal below — when a second
+// referencable document exists, delete the refusal and build the composition
+// against a real case. THAT SECOND DOCUMENT IS THE TRIGGER, and it is the
+// whole prerequisite — plan 29 §4 (P1+P2) owns the arc. The refusal is the
+// thing that makes waiting safe: nothing can quietly depend on a composition
+// that was never built.
+
+// The inclusive window of schema versions this loader understands. HOISTED
+// out of `buildSchemaFromJsonText` so the REFERENCED-document check below
+// reads the same two constants rather than a copy that could drift: a
+// referenced document is a language document and gets the identical gate.
+// Bump the upper bound only after the loader actually parses the new
+// version's exclusive fields — accepting a version implies all documented
+// features for that version round-trip cleanly.
+constexpr std::uint32_t kMinSchemaVersion = 1;
+// v3 adds the optional `typeExtensions[]` field (SP2); v4 adds the optional
+// `imports` block. Earlier configs remain valid since both are optional.
+constexpr std::uint32_t kMaxSchemaVersion = 4;
+
+// Closed key vocabulary for the DOCUMENT itself (typo discriminator, the
+// same shape the nested blocks use). This is the widest-blast-radius
+// instance of the class: every block below is OPTIONAL and absence is
+// meaningful ("no `semantics` ⇒ the analyzer performs no semantic
+// analysis"), so a single misspelled block name — `"semantcs"`,
+// `"lexerModes "` — used to load perfectly clean and silently drop that
+// ENTIRE phase. Every name here is a key the loader genuinely reads.
+// Shared with the referenced-document check so a fragment gets the same
+// typo discrimination its host does.
+constexpr std::array<std::string_view, 21> kDocumentKeys{
+    // identity + loader gates
+    "dssSchemaVersion", "language", "reservedWordPolicy", "parser",
+    // lexical surface
+    "lexerModes", "tokens", "keywords", "operators", "scopes",
+    "syncTokens", "numberStyle",
+    // type-extension + artifact declarations (SP2 / schema v3)
+    "typeExtensions", "artifactProfiles",
+    // grammar surface
+    "shapes",
+    // schema v4 blocks
+    "imports", "preprocess", "semantics", "hirLowering",
+    // ⚠ `pipelineEntry` MUST stay in this table (plan 29). It is OPTIONAL and
+    // its absence means "the ordinary CST→HIR→MIR→LIR pipeline", so a typo'd
+    // `pipelineEntries` would load perfectly clean and silently restore the
+    // full pipeline for a construct that declared otherwise — for assembly
+    // that means running hand-written instructions through MIR and the
+    // OPTIMIZER, a silent miscompile of the programmer's intent.
+    "pipelineEntry",
+    // cross-language reference surface (plan 29): the holes this document
+    // declares, and the documents it reaches into to fill theirs.
+    "requires", "languageReferences"};
+DSS_CHECK_KEY_VOCABULARY(kDocumentKeys);
+
+void checkDocumentKeys(json const& doc, std::string_view docLabel,
+                       Collector& coll) {
+    for (auto it = doc.begin(); it != doc.end(); ++it) {
+        // `$`-prefixed keys are the codebase-wide documentation convention
+        // (`$comment` / `$…Comment`) — never a block, so exempt them from the
+        // typo discriminator (the same carve-out every nested block applies).
+        if (isDocumentationKey(it.key())) continue;
+        if (std::ranges::find(kDocumentKeys, it.key()) != kDocumentKeys.end()) {
+            continue;
+        }
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  std::format("{}/{}", docLabel, it.key()),
+                  std::format("unknown top-level key '{}' (typo "
+                              "discriminator)", it.key()));
+    }
+}
+
+// ★★ THE BLOCKS A REFERENCED DOCUMENT MAY DECLARE — a NARROWER table than
+// `kDocumentKeys` above, deliberately, because the two answer DIFFERENT
+// questions. `checkDocumentKeys` answers "is this key spelled like a block?";
+// it does not answer "does anything READ this block HERE?". A referenced
+// document is folded into its host by `mergeLanguageReferences`, and that merge
+// consumes exactly FOUR blocks — `shapes`, `semantics`, `hirLowering`,
+// `pipelineEntry` — plus the three the reference machinery reads for itself
+// (`dssSchemaVersion` for the version gate, `language` for identity, `requires`
+// for the hole table). EVERY OTHER BLOCK IS SILENTLY DISCARDED: a referenced
+// `tokens` / `preprocess` / `operators` / `imports` block passes the typo
+// discriminator, loads perfectly clean, and then VANISHES — the host's language
+// behaves exactly as if nobody had written it.
+//
+// ★ THIS IS THE SIBLING OF THE DECLARED-BUT-UNREACHED `entry` HOLE (see the
+// `hostRefAtoms` check in `mergeLanguageReferences`), and it is DATED rather
+// than hypothetical: `asm.lang.json`'s own header states that its STANDALONE
+// half lands a `tokens` block (plan 29 P2.5), and `asm` is referenced by
+// `c-subset` today — so the day that block is written it would quietly do
+// nothing for every host that references the document. The refusal is what
+// forces P2.5 to decide (teach the merge, or keep the block out of the
+// referenced surface) instead of discovering the silence downstream.
+//
+// ⓘ `languageReferences` is deliberately ABSENT from the table and skipped
+// below: it has its own, more specific refusal (the ONE-LEVEL rule) in the
+// merge, and two diagnostics for one fact is worse than one. A key that is not
+// a document key AT ALL is likewise skipped — `checkDocumentKeys` has already
+// called it a typo, which is the more useful of the two things to say.
+constexpr std::array<std::string_view, 7> kReferencedDocumentKeys{
+    // read by the reference machinery itself
+    "dssSchemaVersion", "language", "requires",
+    // folded into the host by `mergeLanguageReferences`
+    "shapes", "semantics", "hirLowering", "pipelineEntry"};
+DSS_CHECK_KEY_VOCABULARY(kReferencedDocumentKeys);
+
+void checkReferencedDocumentBlocks(json const& refDoc,
+                                   std::string_view docLabel,
+                                   std::string_view hostLabel,
+                                   Collector& coll) {
+    for (auto it = refDoc.begin(); it != refDoc.end(); ++it) {
+        if (isDocumentationKey(it.key())) continue;
+        if (std::ranges::find(kReferencedDocumentKeys, it.key())
+            != kReferencedDocumentKeys.end()) continue;
+        if (it.key() == "languageReferences") continue;   // its own refusal
+        if (std::ranges::find(kDocumentKeys, it.key()) == kDocumentKeys.end()) {
+            continue;                                     // already a typo
+        }
+        coll.emit(DiagnosticCode::C_ConflictingField,
+                  std::format("{}/{}", docLabel, it.key()),
+                  std::format("referenced document '{}' declares a '{}' block, "
+                              "which the merge into '{}' does NOT consume — it "
+                              "would load clean and then be SILENTLY DISCARDED, "
+                              "so '{}' would behave as though '{}' had never "
+                              "written it. A referenced document may declare "
+                              "only the blocks the merge folds in ('shapes', "
+                              "'semantics', 'hirLowering', 'pipelineEntry') plus "
+                              "'dssSchemaVersion', 'language' and 'requires'. "
+                              "Either teach mergeLanguageReferences to consume "
+                              "'{}', or declare it in '{}' instead",
+                              docLabel, it.key(), hostLabel, hostLabel, docLabel,
+                              it.key(), hostLabel));
+    }
+}
+
+// The declared holes of one document, split by what fills them. A hole is a
+// NAME, not a slot: it appears verbatim wherever the document's own rules
+// would otherwise have spelled a concrete rule or token kind.
+struct DeclaredHoles {
+    std::vector<std::string> rules;
+    std::vector<std::string> tokens;
+};
+
+// Parse a `requires` block. Absent ⇒ no holes, which is every self-contained
+// language shipped today. Present-but-malformed fails loud rather than
+// degrading to "no holes" — a document that declares holes and has them
+// silently dropped would resolve its abstract names against nothing and
+// produce a pile of unknown-reference errors pointing at the wrong file.
+[[nodiscard]] DeclaredHoles parseRequires(json const& doc,
+                                          std::string_view docLabel,
+                                          Collector& coll) {
+    DeclaredHoles holes;
+    if (!doc.contains("requires")) return holes;
+    json const& req = doc.at("requires");
+    const auto reqPath = std::format("{}/requires", docLabel);
+    if (!req.is_object()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, reqPath,
+                  "'requires' must be an object { rules: [...], tokens: [...] }");
+        return holes;
+    }
+    static constexpr std::array<std::string_view, 2> kRequiresKeys{
+        "rules", "tokens"};
+    DSS_CHECK_KEY_VOCABULARY(kRequiresKeys);
+    for (auto it = req.begin(); it != req.end(); ++it) {
+        if (isDocumentationKey(it.key())) continue;
+        if (std::ranges::find(kRequiresKeys, it.key()) != kRequiresKeys.end()) {
+            continue;
+        }
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  std::format("{}/{}", reqPath, it.key()),
+                  std::format("unknown key '{}' in 'requires' — allowed keys "
+                              "are 'rules' and 'tokens' (typo discriminator)",
+                              it.key()));
+    }
+    auto readList = [&](char const* key, std::vector<std::string>& out) {
+        if (!req.contains(key)) return;
+        json const& arr = req.at(key);
+        const auto path = std::format("{}/{}", reqPath, key);
+        if (!arr.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      std::format("'requires.{}' must be an array of names", key));
+            return;
+        }
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+            if (!arr[i].is_string() || arr[i].get<std::string>().empty()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("{}/{}", path, i),
+                          std::format("each 'requires.{}' entry must be a "
+                                      "non-empty string", key));
+                continue;
+            }
+            out.push_back(arr[i].get<std::string>());
+        }
+    };
+    readList("rules",  holes.rules);
+    readList("tokens", holes.tokens);
+    return holes;
+}
+
+// Structural checks a hole set must pass NO MATTER which source satisfies it.
+// Runs once per document that declares `requires`. Returns false when the hole
+// set is malformed, so a caller about to SUBSTITUTE with it can stop: rewriting
+// names against a hole table that is itself wrong turns one precise complaint
+// into a page of consequences.
+[[nodiscard]] bool checkHolesWellFormed(DeclaredHoles const& holes,
+                                        json const& shapesObj,
+                                        std::string_view docLabel,
+                                        Collector& coll) {
+    bool wellFormed = true;
+    std::unordered_set<std::string> seen;
+    auto checkOne = [&](std::string const& name, char const* listKey) {
+        const auto path = std::format("{}/requires/{}", docLabel, listKey);
+        if (!seen.insert(name).second) {
+            wellFormed = false;
+            coll.emit(DiagnosticCode::C_ConflictingField, path,
+                      std::format("'{}' is declared more than once in "
+                                  "'requires' — a hole has exactly one "
+                                  "category, and a name in both 'rules' and "
+                                  "'tokens' could be filled twice with "
+                                  "different things", name));
+        }
+        // ★ A HOLE MAY NOT SHADOW A DECLARATION IN ITS OWN DOCUMENT. If
+        // `asm.lang.json` both required `asmOperand` and declared a shape named
+        // `asmOperand`, substitution would rewrite every REFERENCE to the
+        // local rule while leaving the DEFINITION's key untouched (keys are
+        // never substituted — see `substituteHoles`), so the shape would
+        // become unreachable and the host's binding would silently take over
+        // a name the document thought it owned. Loud, at the declaration.
+        if (shapesObj.is_object() && shapesObj.contains(name)) {
+            wellFormed = false;
+            coll.emit(DiagnosticCode::C_ConflictingField, path,
+                      std::format("'{}' is declared as a hole in 'requires' "
+                                  "AND as a shape in the same document — a "
+                                  "hole is a name this document does NOT "
+                                  "define; rename one of them", name));
+        }
+    };
+    for (auto const& n : holes.rules)  checkOne(n, "rules");
+    for (auto const& n : holes.tokens) checkOne(n, "tokens");
+    return wellFormed;
+}
+
+// ★★★ ROOT-MODE SATISFACTION — the check that decides whether a document can
+// be loaded as a LANGUAGE IN ITS OWN RIGHT, and the one that replaced a
+// filename convention with a property.
+//
+// When a document is the root, nobody is binding its holes, so it must satisfy
+// them itself: each `requires.rules` name must be one of its own shapes and
+// each `requires.tokens` name one of its own token kinds. A document that
+// cannot is not "missing"; it EXISTS and simply cannot stand alone yet — and
+// saying so is the whole point. Before this check, `--language asm` answered
+// "no such language", which is the wrong reason and sends the reader looking
+// for a file that is right there.
+//
+// ★★ IT IS SELF-RETIRING, WHICH IS WHY IT IS A PROPERTY AND NOT A SUFFIX. The
+// moment a document declares the tokens and shapes it currently borrows, the
+// unsatisfied list empties and this stops firing — no rename, no flag, no
+// resolver change, nothing to remember to undo. (`asm` reaches that state at
+// plan 29 P2.5, when it gains its own lexical surface and an `asmUnit` root.)
+//
+// ONE diagnostic, not one per hole: fifteen separate errors would bury the
+// single fact the reader needs — this document is not standalone yet — under
+// fifteen restatements of it. The names are listed in DECLARATION order and
+// split by category, because "declare a shape" and "declare a token kind" are
+// different fixes.
+//
+// ⚠ AND THE CALLER MUST STOP WHEN THIS RETURNS FALSE. ✔MEASURED by RUNNING the
+// arm rather than reading it: with the load allowed to continue, the one
+// precise diagnostic was followed by 27 restatements of the same fact from
+// THREE further consumers — Pass B's reference resolution (one per occurrence
+// of each unsatisfied name in each shape), and `semantics.inlineAsm`'s rule and
+// token resolution — for 32 diagnostics total. Every one of them was true and
+// none added information: a grammar whose vocabulary is missing has nothing
+// further worth saying about it. The caller returns immediately, which is the
+// same shape as the existing `dssSchemaVersion` / `language` hard returns.
+//
+// Runs after the token interner is populated (the token half needs it) and
+// against the raw `shapes` JSON (available from the start), so both halves are
+// answerable at one site.
+[[nodiscard]] bool checkRootModeHolesSatisfied(DeclaredHoles const& holes,
+                                               json const& shapesObj,
+                                               GrammarSchemaData const& data,
+                                               Collector& coll) {
+    std::vector<std::string> missingRules;
+    std::vector<std::string> missingTokens;
+    for (auto const& name : holes.rules) {
+        if (shapesObj.is_object() && shapesObj.contains(name)) continue;
+        missingRules.push_back(name);
+    }
+    for (auto const& name : holes.tokens) {
+        if (data.schemaTokens->contains(name)) continue;
+        missingTokens.push_back(name);
+    }
+    if (missingRules.empty() && missingTokens.empty()) return true;
+
+    auto join = [](std::vector<std::string> const& v) {
+        std::string out;
+        for (auto const& s : v) {
+            if (!out.empty()) out += ", ";
+            out += s;
+        }
+        return out;
+    };
+    std::string detail;
+    if (!missingRules.empty()) {
+        detail += std::format("rules ({}): {}", missingRules.size(),
+                              join(missingRules));
+    }
+    if (!missingTokens.empty()) {
+        if (!detail.empty()) detail += "; ";
+        detail += std::format("token kinds ({}): {}", missingTokens.size(),
+                              join(missingTokens));
+    }
+    // The missing-`root` fact rides along rather than being left to the shapes
+    // block: the caller stops before that block runs, and "has no entry point
+    // of its own" is part of the same answer — reporting it here loses nothing
+    // and keeps the whole verdict on one line.
+    const bool hasRoot = shapesObj.is_object() && shapesObj.contains("root");
+    coll.emit(DiagnosticCode::C_MissingField, "/requires",
+              std::format(
+                  "language '{}' cannot be loaded standalone: {} of its "
+                  "'requires' names are UNSATISFIED — {}.{} A document loaded "
+                  "as the root has nobody to bind its holes, so it must "
+                  "declare them itself; either declare those shapes / token "
+                  "kinds here (the standalone mode), or load this document "
+                  "through another document's 'languageReferences' (the "
+                  "embedded mode), where the host binds them.",
+                  data.name, missingRules.size() + missingTokens.size(), detail,
+                  hasRoot ? ""
+                          : " It also declares no 'root' shape, so it has no "
+                            "entry point of its own either."));
+    return false;
+}
+
+// Rewrite every hole NAME to the name that fills it. Applied to a referenced
+// document's `shapes`, `semantics` and `hirLowering` after the bindings
+// validate.
+//
+// ★ THE RULE IS ONE SENTENCE, AND THAT IS DELIBERATE: a declared hole name is
+// a RESERVED IDENTIFIER inside its own document, and every string VALUE equal
+// to one is the hole. Keys are never rewritten (a shape name is a key, and
+// `checkHolesWellFormed` has already refused a hole that collides with one),
+// and values under `$`-documentation keys are never rewritten (prose that
+// happens to quote a hole name stays readable — and stays TRUE, since it is
+// describing the abstract name).
+//
+// The alternative — rewriting only the atoms `collectReferences` would visit —
+// was rejected: it covers `shapes` and NOTHING else, so `semantics.inlineAsm`
+// and the `hirLowering` rows would need a second, differently-shaped rewriter,
+// and a facet added later would silently get neither.
+void substituteHoles(json& v,
+                     std::unordered_map<std::string, std::string> const& bind) {
+    if (v.is_string()) {
+        auto const it = bind.find(v.get_ref<json::string_t const&>());
+        if (it != bind.end()) v = it->second;
+        return;
+    }
+    if (v.is_array()) {
+        for (auto& e : v) substituteHoles(e, bind);
+        return;
+    }
+    if (v.is_object()) {
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (isDocumentationKey(it.key())) continue;
+            substituteHoles(it.value(), bind);
+        }
+    }
+}
+
+// One validated cross-language reference, carried from the merge phase to the
+// late token-resolution check.
+struct LanguageReferenceBinding {
+    std::string refName;   // the `languageReferences` key ("asm")
+    std::string docLabel;  // the referenced document's diagnostic label
+    std::vector<std::pair<std::string, std::string>> tokens;  // hole → host kind
+};
+
+// ── the merge itself ─────────────────────────────────────────────────────
+//
+// ★★ WHERE THIS RUNS, AND WHY IT MATTERS MORE THAN IT LOOKS. The merge folds
+// the referenced document INTO `doc` before any other block is parsed, so
+// every downstream pass sees ONE document and needs no change at all: the
+// `$`-filtered shapes view, the Pass-A intern loop, `computeFirstAndNullable`,
+// `buildPositionTables`, `detectAmbiguousAlternatives`, the FOLLOW/ambiguity
+// analyses, the semantics reader and the HIR-lowering reader are all
+// correct-by-construction.
+//
+// ⚠ MEASURED HAZARD THIS PLACEMENT AVOIDS: injecting shapes AFTER the Pass-A
+// intern loop makes `data.rules->find(name)` return `RuleId{}` (v == 0) for
+// every merged rule, and `RuleInterner` has no diagnostic for a find-miss
+// (interner.hpp:84-87) — every merged rule would collapse onto slot 0 and the
+// load would report NOTHING. Keep the merge upstream of interning.
+void mergeLanguageReferences(
+        json& doc, std::string_view hostLabel, Collector& coll,
+        std::vector<LanguageReferenceBinding>& outRefs,
+        std::unordered_map<std::string, std::string>& outShapeOrigin) {
+
+    if (!doc.contains("languageReferences")) return;
+    json const& lrs = doc.at("languageReferences");
+    if (!lrs.is_object()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, "/languageReferences",
+                  "'languageReferences' must be an object keyed by referenced "
+                  "language name");
+        return;
+    }
+
+    // The host's OWN reference atoms, collected before anything is merged, so
+    // "does the host actually reach the entry rule?" is answerable. Reuses the
+    // shipped traversal with a THROWAWAY collector: these same bodies go
+    // through `collectReferences` again at Pass B with the real collector, so
+    // no diagnostic is lost here — only duplicated if kept.
+    std::unordered_set<std::string> hostRefAtoms;
+    if (doc.contains("shapes") && doc.at("shapes").is_object()) {
+        Collector scratch;
+        for (auto const& [shapeName, body] : doc.at("shapes").items()) {
+            if (isDocumentationKey(shapeName)) continue;
+            std::vector<std::string> refs;
+            collectReferences(body, std::string{}, refs, scratch);
+            hostRefAtoms.insert(refs.begin(), refs.end());
+        }
+    }
+
+    // Bindings are validated against the FINAL merged shape map, so the rule
+    // half runs after every reference has contributed. Collected here.
+    std::vector<std::pair<std::string, std::pair<std::string, std::string>>>
+        pendingRuleBindings;   // (diag path, (hole, host rule name))
+
+    for (auto const& [refName, spec] : lrs.items()) {
+        if (isDocumentationKey(refName)) continue;
+        const auto refPath = std::format("/languageReferences/{}", refName);
+        if (!spec.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, refPath,
+                      "each 'languageReferences' entry must be an object "
+                      "{ entry, bindRules, bindTokens }");
+            continue;
+        }
+        static constexpr std::array<std::string_view, 3> kReferenceKeys{
+            "entry", "bindRules", "bindTokens"};
+        DSS_CHECK_KEY_VOCABULARY(kReferenceKeys);
+        for (auto it = spec.begin(); it != spec.end(); ++it) {
+            if (isDocumentationKey(it.key())) continue;
+            if (std::ranges::find(kReferenceKeys, it.key())
+                != kReferenceKeys.end()) continue;
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/{}", refPath, it.key()),
+                      std::format("unknown key '{}' in a 'languageReferences' "
+                                  "entry — allowed keys are 'entry', "
+                                  "'bindRules', 'bindTokens' (typo "
+                                  "discriminator)", it.key()));
+        }
+
+        // ── resolve + read the referenced document ──
+        // ★★ ONE RESOLUTION RULE FOR THE WHOLE PROJECT — the SAME
+        // `findShippedConfig({name, "sources", ".lang.json", …})` that
+        // `GrammarSchema::loadShipped` uses (grammar_schema.cpp:158): same
+        // `DSS_CONFIG_ROOT`-then-cwd-walk precedence, same path-like-name
+        // rejection, same namespace. A referenced document is not a second
+        // class of file; it is a language document that a host happens to
+        // reach into.
+        //
+        // ⚠ AN EARLIER VERSION OF THIS RESOLVED `.json` INSTEAD, TO KEEP A
+        // HOLE-CARRYING DOCUMENT OUT OF `loadShipped`'S NAMESPACE. The
+        // CONSTRAINT was right — a document whose holes nobody satisfies
+        // cannot stand alone — but the enforcement was wrong: it encoded a
+        // TEMPORARY property in a PERMANENT filename. When `asm` gains its own
+        // tokens and root (plan 29 P2.5) its holes become self-satisfied and
+        // the file would have to be renamed, dragging the resolver, the
+        // reference name and every comment with it. The constraint now lives
+        // where it belongs — in `checkRootModeHolesSatisfied` below, which
+        // tests the PROPERTY and therefore SELF-RETIRES the moment the holes
+        // are satisfied, with no rename, no resolver change and no flag.
+        // ⛔ Do not reintroduce a suffix trick.
+        auto resolved = findShippedConfig({refName, "sources", ".lang.json",
+                                           "language",
+                                           DiagnosticCode::C_InvalidLanguageName});
+        if (!resolved) {
+            coll.emit(DiagnosticCode::C_InvalidLanguageName, refPath,
+                      std::format("referenced language '{}' has no document at "
+                                  "src/dss-config/sources/{}.lang.json",
+                                  refName, refName));
+            continue;
+        }
+        const std::string docLabel = resolved->filename().string();
+        std::string text;
+        {
+            std::ifstream in(*resolved, std::ios::binary);
+            if (!in) {
+                coll.emit(DiagnosticCode::C_MalformedJson, refPath,
+                          std::format("cannot open referenced language document "
+                                      "'{}'", resolved->string()));
+                continue;
+            }
+            std::ostringstream buf;
+            buf << in.rdbuf();
+            text = std::move(buf).str();
+        }
+        json refDoc;
+        try {
+            refDoc = json::parse(text);
+        } catch (json::parse_error const& e) {
+            coll.emit(DiagnosticCode::C_MalformedJson, docLabel,
+                      std::format("JSON parse error in referenced language "
+                                  "document: {}", e.what()));
+            continue;
+        }
+        if (!refDoc.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, docLabel,
+                      "top-level value of a referenced language document must "
+                      "be a JSON object");
+            continue;
+        }
+        // A referenced document IS a language document: same closed key
+        // vocabulary, same version gate. Skipping either would make a
+        // fragment the one place in the tree where a misspelled block name
+        // loads clean.
+        checkDocumentKeys(refDoc, docLabel, coll);
+        // ...and it is a REFERENCED language document, which is a strictly
+        // narrower thing: a correctly-spelled block the merge does not consume
+        // is discarded in silence, so the two checks are not redundant. It
+        // deliberately does NOT `continue` — the load fails on this diagnostic
+        // either way, and skipping the merge would bury the one precise fact
+        // under a pile of "unknown reference '<entry>'" consequences.
+        checkReferencedDocumentBlocks(refDoc, docLabel, hostLabel, coll);
+        if (!refDoc.contains("dssSchemaVersion")
+            || !refDoc.at("dssSchemaVersion").is_number_integer()) {
+            coll.emit(DiagnosticCode::C_VersionMismatch,
+                      std::format("{}/dssSchemaVersion", docLabel),
+                      "a referenced language document must declare an integer "
+                      "'dssSchemaVersion'");
+            continue;
+        }
+        {
+            const auto v = refDoc.at("dssSchemaVersion").get<std::uint32_t>();
+            if (v < kMinSchemaVersion || v > kMaxSchemaVersion) {
+                coll.emit(DiagnosticCode::C_VersionMismatch,
+                          std::format("{}/dssSchemaVersion", docLabel),
+                          std::format("unsupported dssSchemaVersion {} (this "
+                                      "build supports {}..{})", v,
+                                      kMinSchemaVersion, kMaxSchemaVersion));
+                continue;
+            }
+        }
+        // ⚠ ONE LEVEL — see the block comment at the top of this section.
+        if (refDoc.contains("languageReferences")) {
+            coll.emit(DiagnosticCode::C_ConflictingField,
+                      std::format("{}/languageReferences", docLabel),
+                      std::format("'{}' is referenced by '{}' and itself "
+                                  "declares 'languageReferences' — transitive "
+                                  "language references are REFUSED, not "
+                                  "ignored: composing holes across more than "
+                                  "one hop needs bottom-up substitution and a "
+                                  "cycle guard that nothing in the tree can "
+                                  "exercise yet",
+                                  docLabel, hostLabel));
+            continue;
+        }
+        if (!refDoc.contains("shapes") || !refDoc.at("shapes").is_object()) {
+            coll.emit(DiagnosticCode::C_MissingField,
+                      std::format("{}/shapes", docLabel),
+                      "a referenced language document must declare a 'shapes' "
+                      "object — a reference with no rules to contribute is a "
+                      "typo, not a configuration");
+            continue;
+        }
+        json const& refShapes = refDoc.at("shapes");
+        // ★ A REFERENCED DOCUMENT MAY NOT DECLARE `root`. `root` is interned
+        // by NAME and becomes THE language's entry point; a fragment's root
+        // would either collide with the host's (caught by the duplicate check
+        // below) or — far worse — become the root of a host that has none,
+        // silently. The entry point of a language is the host's decision.
+        if (refShapes.contains("root")) {
+            coll.emit(DiagnosticCode::C_ConflictingField,
+                      std::format("{}#/shapes/root", docLabel),
+                      std::format("referenced document '{}' declares a 'root' "
+                                  "shape — 'root' is the HOST language's entry "
+                                  "point and is interned by name, so a "
+                                  "referenced root would silently become the "
+                                  "language's root; name it something else and "
+                                  "expose it through 'entry'", docLabel));
+            continue;
+        }
+
+        // ── holes and their bindings ──
+        const auto refHoles = parseRequires(refDoc, docLabel, coll);
+        if (!checkHolesWellFormed(refHoles, refShapes, docLabel, coll)) {
+            continue;   // substituting against a broken hole table only adds noise
+        }
+
+        // Bindings validated below get appended to `pendingRuleBindings`, which
+        // is checked after the loop. If THIS reference turns out to be
+        // half-bound we drop back to here, so a document that never merged does
+        // not also get told its bindings point nowhere.
+        auto const pendingMark = pendingRuleBindings.size();
+
+        std::unordered_map<std::string, std::string> bind;   // hole → concrete
+        std::unordered_set<std::string> ruleHoles(refHoles.rules.begin(),
+                                                  refHoles.rules.end());
+        std::unordered_set<std::string> tokenHoles(refHoles.tokens.begin(),
+                                                   refHoles.tokens.end());
+        std::vector<std::pair<std::string, std::string>> tokenBindings;
+        bool bindingsClean = true;
+
+        // Direction 1 — every BINDING must name a hole the document declares,
+        // in the right category. A `bindRules` entry for a token hole is not
+        // a near miss: it would rewrite a token reference to a rule name and
+        // the grammar would compile to a different shape.
+        auto readBindings = [&](char const* key, char const* category,
+                                std::unordered_set<std::string> const& holes,
+                                std::unordered_set<std::string> const& otherHoles,
+                                char const* otherKey, char const* otherCategory,
+                                auto&& sink) {
+            if (!spec.contains(key)) return;
+            json const& obj = spec.at(key);
+            const auto path = std::format("{}/{}", refPath, key);
+            if (!obj.is_object()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                          std::format("'{}' must be an object mapping each "
+                                      "declared hole name to a name in THIS "
+                                      "document", key));
+                bindingsClean = false;
+                return;
+            }
+            for (auto it = obj.begin(); it != obj.end(); ++it) {
+                if (isDocumentationKey(it.key())) continue;
+                const auto entryPath = std::format("{}/{}", path, it.key());
+                if (!it.value().is_string()
+                    || it.value().get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, entryPath,
+                              "a binding value must be a non-empty name");
+                    bindingsClean = false;
+                    continue;
+                }
+                if (!holes.contains(it.key())) {
+                    if (otherHoles.contains(it.key())) {
+                        coll.emit(DiagnosticCode::C_ConflictingField, entryPath,
+                                  std::format("'{}' is declared by '{}' as a "
+                                              "{} hole, not a {} hole — bind "
+                                              "it under '{}'", it.key(),
+                                              docLabel, otherCategory, category,
+                                              otherKey));
+                    } else {
+                        coll.emit(DiagnosticCode::C_UnknownShape, entryPath,
+                                  std::format("'{}' binds '{}', which '{}' "
+                                              "does not declare in its "
+                                              "'requires' block — a binding "
+                                              "with no hole silently does "
+                                              "nothing", key, it.key(),
+                                              docLabel));
+                    }
+                    bindingsClean = false;
+                    continue;
+                }
+                auto value = it.value().get<std::string>();
+                sink(it.key(), value, entryPath);
+                bind.emplace(it.key(), std::move(value));
+            }
+        };
+        readBindings("bindRules", "rule", ruleHoles, tokenHoles,
+                     "bindTokens", "token",
+                     [&](std::string const& hole, std::string const& target,
+                         std::string const& entryPath) {
+                         pendingRuleBindings.emplace_back(
+                             entryPath, std::pair{hole, target});
+                     });
+        readBindings("bindTokens", "token", tokenHoles, ruleHoles,
+                     "bindRules", "rule",
+                     [&](std::string const& hole, std::string const& target,
+                         std::string const& entryPath) {
+                         (void)entryPath;
+                         tokenBindings.emplace_back(hole, target);
+                     });
+
+        // Direction 2 — every declared HOLE must be bound. This is the clause
+        // HARD REQUIREMENT 1 turns on: an unbound hole must never degrade to
+        // "that rule just doesn't match", which is a silent disable of a whole
+        // construct. Same reasoning as `validateTypeNameCommitGuards`: a guard
+        // whose input is missing fails loud at LOAD rather than quietly
+        // choosing the dangerous default at runtime.
+        auto requireBound = [&](std::vector<std::string> const& holes,
+                                char const* key) {
+            for (auto const& hole : holes) {
+                if (bind.contains(hole)) continue;
+                coll.emit(DiagnosticCode::C_MissingField,
+                          std::format("{}/{}", refPath, key),
+                          std::format("hole '{}' declared by '{}' is UNBOUND — "
+                                      "'{}' must map it to one of this "
+                                      "document's own names. An unbound hole "
+                                      "is never a silent disable: the rules "
+                                      "that spell it would resolve against "
+                                      "nothing", hole, docLabel, key));
+                bindingsClean = false;
+            }
+        };
+        requireBound(refHoles.rules,  "bindRules");
+        requireBound(refHoles.tokens, "bindTokens");
+
+        // ── entry ──
+        std::string entry;
+        if (!spec.contains("entry") || !spec.at("entry").is_string()
+            || spec.at("entry").get<std::string>().empty()) {
+            coll.emit(DiagnosticCode::C_MissingField,
+                      std::format("{}/entry", refPath),
+                      "'entry' is required and must name the rule this host "
+                      "reaches the referenced grammar through");
+            bindingsClean = false;
+        } else {
+            entry = spec.at("entry").get<std::string>();
+            if (!refShapes.contains(entry) || isDocumentationKey(entry)) {
+                coll.emit(DiagnosticCode::C_UnknownShape,
+                          std::format("{}/entry", refPath),
+                          std::format("'{}' declares no shape '{}'", docLabel,
+                                      entry));
+                bindingsClean = false;
+            } else if (!hostRefAtoms.contains(entry)) {
+                // ★ A DECLARED-BUT-UNREACHED REFERENCE IS THE SILENT FAILURE
+                // THIS WHOLE BLOCK EXISTS TO PREVENT. Every rule would merge,
+                // every binding would validate, the load would be clean — and
+                // the construct would still be a parse error, because no host
+                // rule ever descends into it. Loud.
+                coll.emit(DiagnosticCode::C_UnknownShape,
+                          std::format("{}/entry", refPath),
+                          std::format("no shape in '{}' references the entry "
+                                      "rule '{}' — the referenced grammar "
+                                      "would merge cleanly and still never be "
+                                      "reached; add '{}' to the host rule that "
+                                      "should descend into it", hostLabel,
+                                      entry, entry));
+                bindingsClean = false;
+            }
+        }
+
+        if (!bindingsClean) {
+            // Do not merge a half-bound document, and do not re-report its
+            // bindings against a shape map it never contributed to.
+            pendingRuleBindings.resize(pendingMark);
+            continue;
+        }
+
+        // ── substitute, then merge ──
+        json merged = refDoc;   // local copy: substitution rewrites in place
+        for (auto const* block : {"shapes", "semantics", "hirLowering",
+                                  "pipelineEntry"}) {
+            if (merged.contains(block)) substituteHoles(merged.at(block), bind);
+        }
+
+        // shapes — ELEMENT-wise union, because `shapes` is a collection of
+        // independent rule-scoped definitions.
+        //
+        // ★★ THE DUPLICATE-SHAPE GUARD. Before this existed the merge point
+        // was `shapes[name] = body`, which LAST-WINS in silence: a referenced
+        // document declaring a name the host already uses would replace the
+        // host's rule wholesale, the load would be clean, and the language
+        // would parse something nobody wrote. There was no `C_DuplicateShape`
+        // and nothing equivalent anywhere in the loader. Two documents make
+        // that reachable by accident, so it is checked here and named at BOTH
+        // ends — you cannot fix a collision you can only see one side of.
+        json& hostShapes = doc["shapes"];
+        if (!hostShapes.is_object()) hostShapes = json::object();
+        for (auto const& [shapeName, body] : merged.at("shapes").items()) {
+            if (isDocumentationKey(shapeName)) continue;
+            if (hostShapes.contains(shapeName)) {
+                auto const owner = outShapeOrigin.find(shapeName);
+                const std::string ownerLabel =
+                    owner == outShapeOrigin.end() ? std::string{hostLabel}
+                                                  : owner->second;
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          std::format("{}#/shapes/{}", docLabel, shapeName),
+                          std::format("shape '{}' is declared by BOTH '{}' and "
+                                      "'{}' — a merged grammar has one "
+                                      "definition per name, and last-wins "
+                                      "would silently replace a rule nobody "
+                                      "changed; rename one of them",
+                                      shapeName, ownerLabel, docLabel));
+                continue;
+            }
+            hostShapes[shapeName] = body;
+            outShapeOrigin.emplace(shapeName, docLabel);
+        }
+
+        // ── the non-`shapes` blocks — ONE stated policy, applied three times ──
+        //
+        // ★★ THE MERGE POLICY, IN FULL, BECAUSE IT IS A DESIGN DECISION AND
+        // NOT AN IMPLEMENTATION DETAIL:
+        //   • a block whose entries are INDEPENDENT RULE-SCOPED ROWS merges
+        //     ELEMENT-wise — `shapes` above, and the `rowArrayKey` of each
+        //     block below (`hirLowering.ruleMappings`,
+        //     `pipelineEntry.byRule`). A key-wise union would discard the
+        //     host's entire row set, which is not a merge.
+        //   • every OTHER key merges KEY-wise, and a collision is a REFUSAL
+        //     rather than an override in either direction. "The host wins"
+        //     would let a host silently weaken a refusal it did not write;
+        //     "the fragment wins" would let a fragment silently retune the
+        //     host's language. Neither may happen quietly.
+        // A referenced document owns the semantics and the lowering of the
+        // constructs it contributes — `asm.lang.json` owns `semantics.inlineAsm`
+        // and the `asmStmt` lowering row — so a host inherits the refusal FOR
+        // FREE. That inheritance is exactly what "reused" means here.
+        // `$`-documentation keys merge under the same rule, so a moved
+        // rationale travels with the facet it explains.
+        auto mergeBlock = [&](char const* blockName, char const* rowArrayKey,
+                              DiagnosticCode shapeCode) {
+            if (!merged.contains(blockName)) return;
+            if (!merged.at(blockName).is_object()) {
+                coll.emit(shapeCode,
+                          std::format("{}/{}", docLabel, blockName),
+                          std::format("'{}' must be an object", blockName));
+                return;
+            }
+            json& hostBlock = doc[blockName];
+            if (!hostBlock.is_object()) hostBlock = json::object();
+            for (auto const& [key, value] : merged.at(blockName).items()) {
+                if (rowArrayKey != nullptr && key == rowArrayKey) {
+                    if (!value.is_array()) {
+                        coll.emit(shapeCode,
+                                  std::format("{}#/{}/{}", docLabel, blockName,
+                                              key),
+                                  std::format("'{}.{}' must be an array",
+                                              blockName, key));
+                        continue;
+                    }
+                    json& hostRows = hostBlock[key];
+                    if (!hostRows.is_array()) hostRows = json::array();
+                    // Duplicate `rule` values across the concatenation are
+                    // caught HERE and not by the consuming engine: every
+                    // consumer keys on RuleId and would silently honour
+                    // whichever row it indexed last.
+                    //
+                    // ⚠ THE CLAIM TABLE STORES THE OWNER, NOT JUST THE NAME,
+                    // AND THAT IS A CORRECTION MADE BY RUNNING THE ARM. With a
+                    // plain name set the message read "declared by BOTH <host>
+                    // and <ref>" for a duplicate that was entirely INSIDE the
+                    // referenced document — true-sounding, and it would have
+                    // sent the reader to the wrong file. Naming the actual
+                    // owner of each side is the difference between a
+                    // diagnostic and a wild goose chase.
+                    std::unordered_map<std::string, std::string> claimedBy;
+                    for (auto const& row : hostRows) {
+                        if (row.is_object() && row.contains("rule")
+                            && row.at("rule").is_string()) {
+                            claimedBy.emplace(row.at("rule").get<std::string>(),
+                                              std::string{hostLabel});
+                        }
+                    }
+                    for (auto const& row : value) {
+                        if (row.is_object() && row.contains("rule")
+                            && row.at("rule").is_string()) {
+                            auto const r = row.at("rule").get<std::string>();
+                            auto const [it, fresh] =
+                                claimedBy.emplace(r, docLabel);
+                            if (!fresh) {
+                                coll.emit(
+                                    DiagnosticCode::C_ConflictingField,
+                                    std::format("{}#/{}/{}", docLabel,
+                                                blockName, key),
+                                    it->second == docLabel
+                                        ? std::format("rule '{}' has more than "
+                                                      "one '{}.{}' row in '{}' "
+                                                      "— a rule maps to exactly "
+                                                      "one row, and the "
+                                                      "consuming engine keys on "
+                                                      "RuleId, so it would "
+                                                      "silently honour one of "
+                                                      "them", r, blockName, key,
+                                                      docLabel)
+                                        : std::format("rule '{}' has a '{}.{}' "
+                                                      "row in BOTH '{}' and "
+                                                      "'{}' — the consuming "
+                                                      "engine keys on RuleId "
+                                                      "and would silently "
+                                                      "honour one of them", r,
+                                                      blockName, key,
+                                                      it->second, docLabel));
+                                continue;
+                            }
+                        }
+                        hostRows.push_back(row);
+                    }
+                    continue;
+                }
+                if (hostBlock.contains(key)) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}#/{}/{}", docLabel, blockName, key),
+                              std::format("'{}.{}' is declared by BOTH '{}' and "
+                                          "'{}' — the referenced document owns "
+                                          "the {} of the constructs it "
+                                          "contributes, so a host that also "
+                                          "declares this facet is overriding a "
+                                          "decision it did not write; remove "
+                                          "one", blockName, key, hostLabel,
+                                          docLabel, blockName));
+                    continue;
+                }
+                hostBlock[key] = value;
+            }
+        };
+        mergeBlock("semantics",     nullptr,        DiagnosticCode::C_InvalidSemantics);
+        mergeBlock("hirLowering",   "ruleMappings", DiagnosticCode::C_InvalidHirLowering);
+        mergeBlock("pipelineEntry", "byRule",       DiagnosticCode::C_InvalidHirLowering);
+
+        outRefs.push_back(LanguageReferenceBinding{refName, docLabel,
+                                                   std::move(tokenBindings)});
+    }
+
+    // Rule bindings resolve against the FINAL merged shape map — a host may
+    // legitimately bind a hole to a rule that another reference contributed,
+    // and checking mid-loop would depend on `languageReferences` key order.
+    const bool hasShapes = doc.contains("shapes") && doc.at("shapes").is_object();
+    for (auto const& [entryPath, binding] : pendingRuleBindings) {
+        if (hasShapes && doc.at("shapes").contains(binding.second)) continue;
+        coll.emit(DiagnosticCode::C_UnknownShape, entryPath,
+                  std::format("hole '{}' is bound to '{}', which is not a "
+                              "shape in the grammar '{}' assembles (its own "
+                              "shapes plus every referenced document's)",
+                              binding.first, binding.second, hostLabel));
+    }
+}
+
 } // anonymous namespace
 
 LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
@@ -1989,42 +3098,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         return std::unexpected(std::move(coll).release());
     }
 
-    // Closed key vocabulary for the DOCUMENT itself (typo discriminator, the
-    // same shape the nested blocks use). This is the widest-blast-radius
-    // instance of the class: every block below is OPTIONAL and absence is
-    // meaningful ("no `semantics` ⇒ the analyzer performs no semantic
-    // analysis"), so a single misspelled block name — `"semantcs"`,
-    // `"lexerModes "` — used to load perfectly clean and silently drop that
-    // ENTIRE phase. Every name here is a key the loader genuinely reads.
-    static constexpr std::array<std::string_view, 18> kDocumentKeys{
-        // identity + loader gates
-        "dssSchemaVersion", "language", "reservedWordPolicy", "parser",
-        // lexical surface
-        "lexerModes", "tokens", "keywords", "operators", "scopes",
-        "syncTokens", "numberStyle",
-        // type-extension + artifact declarations (SP2 / schema v3)
-        "typeExtensions", "artifactProfiles",
-        // grammar surface
-        "shapes",
-        // schema v4 blocks
-        "imports", "preprocess", "semantics", "hirLowering"};
-    DSS_CHECK_KEY_VOCABULARY(kDocumentKeys);
-    for (auto it = doc.begin(); it != doc.end(); ++it) {
-        // `$`-prefixed keys are the codebase-wide documentation convention
-        // (`$comment` / `$…Comment`) — never a block, so exempt them from the
-        // typo discriminator (the same carve-out every nested block applies).
-        if (isDocumentationKey(it.key())) continue;
-        bool known = false;
-        for (auto const& k : kDocumentKeys) {
-            if (it.key() == k) { known = true; break; }
-        }
-        if (!known) {
-            coll.emit(DiagnosticCode::C_MalformedJson,
-                      std::format("/{}", it.key()),
-                      std::format("unknown top-level key '{}' (typo "
-                                  "discriminator)", it.key()));
-        }
-    }
+    // Closed key vocabulary for the DOCUMENT itself — `kDocumentKeys`, hoisted
+    // to the anonymous namespace so a REFERENCED language document is checked
+    // against the identical table (plan 29). A fragment is a language
+    // document; it does not get a weaker typo discriminator than its host.
+    checkDocumentKeys(doc, "", coll);
 
     // dssSchemaVersion ──
     if (!present(doc, "dssSchemaVersion", coll, std::string{sourceLabel})) {
@@ -2035,14 +3113,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                   "must be a positive integer");
         return std::unexpected(std::move(coll).release());
     }
-    // Inclusive window of schema versions this loader understands. Bump
-    // the upper bound only after the loader actually parses the new
-    // version's exclusive fields — accepting a version implies all
-    // documented features for that version round-trip cleanly.
-    constexpr std::uint32_t kMinSchemaVersion = 1;
-    // v3 adds the optional `typeExtensions[]` field (SP2); v4 adds the optional
-    // `imports` block. Earlier configs remain valid since both are optional.
-    constexpr std::uint32_t kMaxSchemaVersion = 4;
+    // The version window is `kMinSchemaVersion`/`kMaxSchemaVersion` in the
+    // anonymous namespace above — ONE pair of constants, so a referenced
+    // language document is gated identically instead of against a copy.
     const auto schemaVer = doc.at("dssSchemaVersion").get<std::uint32_t>();
     if (schemaVer < kMinSchemaVersion || schemaVer > kMaxSchemaVersion) {
         coll.emit(DiagnosticCode::C_VersionMismatch, "/dssSchemaVersion",
@@ -2077,6 +3150,51 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         for (auto const& ext : langObj.at("fileExtensions")) {
             if (ext.is_string()) data.fileExtensions.push_back(ext.get<std::string>());
         }
+    }
+
+    // ── languageReferences ── (plan 29 P1+P2) ────────────────────────────
+    // ★★ EVERYTHING BELOW THIS POINT SEES ONE DOCUMENT. The merge folds each
+    // referenced document's `shapes`, `semantics`, `hirLowering` and
+    // `pipelineEntry` — the FOUR blocks of `kReferencedDocumentKeys`, and a
+    // referenced document may declare no other (a fifth would be discarded in
+    // silence) — into `doc` here: upstream of the `$` shapes filter, upstream of the Pass-A
+    // intern loop, upstream of every compile pass and both late block
+    // readers. That is why the mechanism costs the rest of the loader ZERO
+    // changes: `computeFirstAndNullable`, `buildPositionTables`,
+    // `detectAmbiguousAlternatives`, the FOLLOW/ambiguity analyses, the
+    // semantics reader and the HIR-lowering reader are all driven by the
+    // merged document and are correct by construction.
+    //
+    // The short label (filename, not full path) is what diagnostics quote on
+    // BOTH sides of a collision, so `c-subset.lang.json` and `asm.lang.json` read
+    // as peers rather than one being an absolute path and the other a name.
+    const std::string hostLabel = [&] {
+        auto leaf = std::filesystem::path{sourceLabel}.filename().string();
+        return leaf.empty() ? std::string{sourceLabel} : leaf;
+    }();
+    std::vector<LanguageReferenceBinding> languageRefs;
+    mergeLanguageReferences(doc, hostLabel, coll, languageRefs,
+                            data.shapeOriginDoc);
+
+    // This document's OWN holes, if it declares any. In ROOT mode (this is
+    // the top-level document, so nobody binds anything) they must be
+    // satisfied by this document's own declarations — the standalone half of
+    // the two-source rule described at `mergeLanguageReferences`. The RULE
+    // half is answerable now; the TOKEN half waits for the token interner and
+    // runs just before the `shapes` block below.
+    const auto ownHoles = parseRequires(doc, "", coll);
+    // Root mode substitutes nothing (a root document's holes are satisfied by
+    // its own declarations, which is an IDENTITY binding), so the
+    // well-formedness check cannot cascade here the way it can on the
+    // referenced path. The SATISFACTION half needs the token interner and runs
+    // further down, just before the `shapes` block — see
+    // `checkRootModeHolesSatisfied`.
+    bool ownHolesWellFormed = true;
+    if (!ownHoles.rules.empty() || !ownHoles.tokens.empty()) {
+        static const json kNoShapes = json::object();
+        json const& ownShapes = doc.contains("shapes") ? doc.at("shapes")
+                                                       : kNoShapes;
+        ownHolesWellFormed = checkHolesWellFormed(ownHoles, ownShapes, "", coll);
     }
 
     // reservedWordPolicy: "strict" (default) | "contextual". Contextual
@@ -3233,6 +4351,45 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // ── cross-language TOKEN resolution (plan 29) ────────────────────────
+    // Runs HERE and not in `mergeLanguageReferences` for one reason: the
+    // token interner is only complete once `tokens` / `keywords` / `operators`
+    // / `lexerModes` have all been read, and it is complete now. Placing the
+    // check before `shapes` keeps the HOST-attributed message first — Pass B
+    // below would also catch an unresolvable name, but it would quote the
+    // REFERENCED document's shape (the substitution already happened there),
+    // blaming `asm.lang.json` for a typo in `c-subset.lang.json`'s binding table.
+    // Both fire; this one names the file you have to edit.
+    for (auto const& ref : languageRefs) {
+        for (auto const& [hole, tokenName] : ref.tokens) {
+            if (data.schemaTokens->contains(tokenName)) continue;
+            coll.emit(DiagnosticCode::C_UnknownToken,
+                      std::format("/languageReferences/{}/bindTokens/{}",
+                                  ref.refName, hole),
+                      std::format("hole '{}' declared by '{}' is bound to token "
+                                  "kind '{}', which this language does not "
+                                  "declare", hole, ref.docLabel, tokenName));
+        }
+    }
+    // ROOT-mode satisfaction — the other half of the two-source rule, and the
+    // gate that decides whether this document is a standalone language yet.
+    // Placed here because the token interner is complete and the raw `shapes`
+    // JSON is available, so ONE diagnostic can name every unsatisfied role
+    // instead of scattering one per hole. Skipped when the hole table itself
+    // is malformed — that complaint is already on the record and satisfaction
+    // against a broken table would only restate it.
+    if (ownHolesWellFormed
+        && (!ownHoles.rules.empty() || !ownHoles.tokens.empty())) {
+        static const json kNoShapes = json::object();
+        json const& ownShapes = doc.contains("shapes") ? doc.at("shapes")
+                                                       : kNoShapes;
+        if (!checkRootModeHolesSatisfied(ownHoles, ownShapes, data, coll)) {
+            // HARD RETURN — see the function's comment for the measurement.
+            // Continuing produced 32 diagnostics where 1 was informative.
+            return std::unexpected(std::move(coll).release());
+        }
+    }
+
     // shapes ──
     if (doc.contains("shapes")) {
         if (!doc.at("shapes").is_object()) {
@@ -3263,6 +4420,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // regardless of definition order.
             for (auto const& [shapeName, _] : shapes.items()) {
                 (void)data.rules->intern(shapeName);
+            }
+
+            // ★ A SHAPE MAY NOT BE NAMED AFTER A TOKEN KIND. Reference
+            // resolution asks the rule interner FIRST and the token interner
+            // only on a miss (the Pass-B loop below), so a shape called
+            // `Colon` does not conflict with the token `Colon` — it SHADOWS
+            // it, silently, everywhere in the grammar. Every `"Colon"` atom in
+            // every other rule would quietly stop being a token slot and start
+            // descending into that shape, and the load would be clean.
+            //
+            // ⚠ WHY IT IS CHECKED NOW AND WAS NOT BEFORE: a single-document
+            // grammar could only hit this by an author naming their own shape
+            // after their own token kind, which is visible in the file you are
+            // editing. `languageReferences` makes it reachable BY ACCIDENT —
+            // `asm.lang.json` cannot see the token vocabulary of a host it has
+            // never heard of, so a perfectly reasonable rule name over there
+            // can collide with a kind name over here, and the person who
+            // suffers it is a third party. ✔MEASURED at the time of writing:
+            // zero collisions across all four shipped source documents, so
+            // this guard changes no shipped config's behaviour.
+            for (auto const& [shapeName, _] : shapes.items()) {
+                if (!data.schemaTokens->contains(shapeName)) continue;
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          shapePointer(data, shapeName),
+                          std::format("shape '{}' has the same name as a "
+                                      "declared TOKEN KIND — a rule reference "
+                                      "resolves against rules before tokens, "
+                                      "so this shape would silently shadow the "
+                                      "token everywhere in the grammar; rename "
+                                      "the shape", shapeName));
             }
 
             // Auto-intern each `expr` shape's declared wrapper rule
@@ -3336,7 +4523,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 if (shapes.contains(name)) {
                     coll.emit(
                         DiagnosticCode::C_UnknownShape,
-                        std::format("/shapes/{}", name),
+                        shapePointer(data, name),
                         std::format(
                             "shape name '{}' is declared as a "
                             "Pratt-walker wrapper rule by an `expr` "
@@ -3394,7 +4581,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // (SchemaTokenInterner). Diagnostics surface here; the compile
             // pass below trusts the references have already resolved.
             for (auto const& [shapeName, body] : shapes.items()) {
-                const auto shapePath = std::format("/shapes/{}", shapeName);
+                const auto shapePath = shapePointer(data, shapeName);
                 std::vector<std::string> refs;
                 collectReferences(body, shapePath, refs, coll);
 
@@ -4713,6 +5900,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // key lands next to the reader that consumes it.
             // 56 after UCRT-P4 (Decision 1) removed `externLibraryByFormat`; the
             // DSS_CHECK_KEY_VOCABULARY assertion below is what caught the stale 57.
+            // ⓘ STILL 56 after inline-asm P1: that change SWAPPED the flat
+            // `inlineAsmRule` for the nested `inlineAsm` object (one out, one in),
+            // it did not add a facet. The old key is GONE from this table on
+            // purpose — a `.lang.json` still spelling `inlineAsmRule` is now
+            // REFUSED at load rather than silently loading with every extended-asm
+            // check disarmed, which is the whole point of the closed vocabulary.
             static constexpr std::array<std::string_view, 56> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
@@ -4730,7 +5923,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // attribute surface (FC17)
                 "attributeSemantics", "nodiscard",
                 // remaining expression / declaration facets
-                "variadic", "staticAssertRule", "inlineAsmRule", "generic",
+                "variadic", "staticAssertRule", "inlineAsm", "generic",
                 "compoundLiterals", "builtinFunctions",
                 // statement surface
                 "returnRules", "loopRules", "loopControls",
@@ -10156,30 +11349,139 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
-            // ── inlineAsmRule (FC17.9(i), D-CSUBSET-INLINE-ASM) ──
-            // A single OPTIONAL top-level rule reference: the `__asm__` inline-asm
-            // statement shape (asmStmt). Pass 2 decodes its template child + emits
-            // S_InlineAsmNonEmptyTemplate unless it decodes to strictly zero bytes.
-            // Absent ⇒ the language has no inline-asm surface (the check never runs).
-            // A present-but-bad value (not a string, or an unknown shape) emits +
-            // fails the load — a typo can never silently disarm the non-empty guard.
-            if (sem.contains("inlineAsmRule")) {
-                if (!sem.at("inlineAsmRule").is_string()) {
+            // ── inlineAsm (FC17.9(i) + inline-asm P1, D-CSUBSET-INLINE-ASM /
+            //    D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED) ──
+            // The inline-asm statement's COMPLETE rule/token vocabulary — see
+            // `InlineAsmConfig` (semantic_config.hpp) for the colon-BOUNDARY model
+            // and why every tail arm needs its own named rule. Pass 2 gates a label
+            // section without `goto`, then ANY extended payload, then the
+            // empty-template requirement, plus an orthogonal duplicate-qualifier
+            // check. Absent ⇒ the language has no inline-asm surface (toy/tsql) and
+            // none of those checks run; that stays legal.
+            //
+            // ★★ PRESENT ⇒ COMPLETE. Every key below is REQUIRED once the object
+            // exists, and a missing one is a LOAD ERROR — never a quietly-disabled
+            // check. This is the `validateTypeNameCommitGuards` reasoning applied a
+            // facet up: a guard that cannot decide its question "would silently
+            // degrade to commit-always — the wrong failure mode. Fail loud at load
+            // instead." Here the degraded mode is worse than commit-always, because
+            // the facts these rules answer are what SEPARATE the accepted bare
+            // barrier from the refused extended form: drop `operandListRule` and
+            // `__asm__("rdtsc" : "=a"(lo))` stops looking like it has outputs, walks
+            // past the extended gate, and lowers to a 0-child barrier with the
+            // operand binding discarded — accept-and-ignore, reached by omitting one
+            // JSON key. So a partial declaration must never load.
+            // ⓘ There is no "disable just this check" spelling ON PURPOSE. The
+            // whole-object-absent case is the only opt-out, and it is honest
+            // (a language with no `asm` statement at all).
+            if (sem.contains("inlineAsm")) {
+                json const& ia = sem.at("inlineAsm");
+                if (!ia.is_object()) {
                     coll.emit(DiagnosticCode::C_InvalidSemantics,
-                              "/semantics/inlineAsmRule",
-                              "'semantics.inlineAsmRule' must be a string");
+                              "/semantics/inlineAsm",
+                              "'semantics.inlineAsm' must be an object "
+                              "{ rule, templateRule, outputsTailRule, "
+                              "inputsTailRule, inputsTailFusedRule, "
+                              "clobbersTailRule, clobbersTailFusedRule, "
+                              "labelsTailRule, labelsTailFusedRule, "
+                              "operandListRule, clobberListRule, "
+                              "gotoLabelListRule, gotoQualifierToken }");
                 } else {
-                    cfg.inlineAsmRuleName =
-                        sem.at("inlineAsmRule").get<std::string>();
-                    if (!data.rules->contains(cfg.inlineAsmRuleName)) {
-                        coll.emit(DiagnosticCode::C_UnknownShape,
-                                  "/semantics/inlineAsmRule",
-                                  std::format("'inlineAsmRule' references unknown "
-                                              "shape '{}'", cfg.inlineAsmRuleName));
-                        cfg.inlineAsmRuleName.clear();
-                    } else {
-                        cfg.inlineAsmRule =
-                            data.rules->find(cfg.inlineAsmRuleName);
+                    // Closed keys (typo discriminator) — the `$`-prefixed
+                    // documentation convention stays exempt, exactly as in
+                    // `attributeSemantics` and the enclosing `semantics` object.
+                    static constexpr std::array<std::string_view, 13>
+                        kInlineAsmKeys{"rule", "templateRule",
+                                       "outputsTailRule", "inputsTailRule",
+                                       "inputsTailFusedRule", "clobbersTailRule",
+                                       "clobbersTailFusedRule", "labelsTailRule",
+                                       "labelsTailFusedRule", "operandListRule",
+                                       "clobberListRule", "gotoLabelListRule",
+                                       "gotoQualifierToken"};
+                    DSS_CHECK_KEY_VOCABULARY(kInlineAsmKeys);
+                    for (auto it = ia.begin(); it != ia.end(); ++it) {
+                        if (isDocumentationKey(it.key())) continue;
+                        if (std::ranges::find(kInlineAsmKeys, it.key())
+                            != kInlineAsmKeys.end()) continue;
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  std::format("/semantics/inlineAsm/{}", it.key()),
+                                  std::format("unknown key '{}' in 'inlineAsm' "
+                                              "(typo discriminator)", it.key()));
+                    }
+                    // REQUIRED-and-resolved, per key. A missing / non-string key is
+                    // C_MissingField; a present name that is not a declared shape is
+                    // C_UnknownShape. Both emit ⇒ both fail the load, so `cfg.inlineAsm`
+                    // can only ever reach the analyzer fully populated or not at all.
+                    auto readRule = [&](char const* key, RuleId& outRule,
+                                        std::string& outName) {
+                        auto const path =
+                            std::format("/semantics/inlineAsm/{}", key);
+                        if (!ia.contains(key) || !ia.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path,
+                                      std::format("'inlineAsm.{}' is required and "
+                                                  "must be a string — the "
+                                                  "'inlineAsm' object is "
+                                                  "ALL-OR-NOTHING, because a "
+                                                  "missing rule silently disarms "
+                                                  "the extended-asm gate that "
+                                                  "rule answers", key));
+                            return;
+                        }
+                        outName = ia.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'inlineAsm.{}' references "
+                                                  "unknown shape '{}'", key,
+                                                  outName));
+                            outName.clear();
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    auto& cia = cfg.inlineAsm;
+                    readRule("rule",                  cia.rule,                  cia.ruleName);
+                    readRule("templateRule",          cia.templateRule,          cia.templateRuleName);
+                    readRule("outputsTailRule",       cia.outputsTailRule,       cia.outputsTailRuleName);
+                    readRule("inputsTailRule",        cia.inputsTailRule,        cia.inputsTailRuleName);
+                    readRule("inputsTailFusedRule",   cia.inputsTailFusedRule,   cia.inputsTailFusedRuleName);
+                    readRule("clobbersTailRule",      cia.clobbersTailRule,      cia.clobbersTailRuleName);
+                    readRule("clobbersTailFusedRule", cia.clobbersTailFusedRule, cia.clobbersTailFusedRuleName);
+                    readRule("labelsTailRule",        cia.labelsTailRule,        cia.labelsTailRuleName);
+                    readRule("labelsTailFusedRule",   cia.labelsTailFusedRule,   cia.labelsTailFusedRuleName);
+                    readRule("operandListRule",       cia.operandListRule,       cia.operandListRuleName);
+                    readRule("clobberListRule",       cia.clobberListRule,       cia.clobberListRuleName);
+                    readRule("gotoLabelListRule",     cia.gotoLabelListRule,     cia.gotoLabelListRuleName);
+                    // The one TOKEN key — resolved against the schema's token
+                    // interner exactly like `volatileMarker`/`identifierToken`, and
+                    // REQUIRED on the same all-or-nothing grounds: without it
+                    // `asm goto` is indistinguishable from `asm`, so the label
+                    // section's own legality check has no input.
+                    {
+                        constexpr char const* kPath =
+                            "/semantics/inlineAsm/gotoQualifierToken";
+                        if (!ia.contains("gotoQualifierToken")
+                            || !ia.at("gotoQualifierToken").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, kPath,
+                                      "'inlineAsm.gotoQualifierToken' is required "
+                                      "and must be a string — without it `asm goto` "
+                                      "is indistinguishable from `asm`, and the "
+                                      "label-section legality check has no input");
+                        } else {
+                            cia.gotoQualifierTokenName =
+                                ia.at("gotoQualifierToken").get<std::string>();
+                            if (!data.schemaTokens->contains(
+                                    cia.gotoQualifierTokenName)) {
+                                coll.emit(DiagnosticCode::C_UnknownToken, kPath,
+                                          std::format("'inlineAsm.gotoQualifier"
+                                                      "Token' references unknown "
+                                                      "token kind '{}'",
+                                                      cia.gotoQualifierTokenName));
+                                cia.gotoQualifierTokenName.clear();
+                            } else {
+                                cia.gotoQualifierToken = data.schemaTokens->find(
+                                    cia.gotoQualifierTokenName);
+                            }
+                        }
                     }
                 }
             }
@@ -11975,9 +13277,193 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // ── pipelineEntry ── per-RULE pipeline entry tier (plan 29; schema v4).
+    //
+    // OPTIONAL, and a rule absent from `byRule` is equally untouched: both mean
+    // the ordinary CST→HIR→MIR→LIR path, which is what every shipped language
+    // takes today (operator decision 2026-08-12 — *"a language without this
+    // specification follows the original pipeline"*).
+    //
+    // ★★ THAT DEFAULT IS SILENT, AND THE THREE CLOSED KEY SETS BELOW ARE THE
+    // ONLY REASON IT IS SAFE. `pipelineEntry` is in `kDocumentKeys`, so a
+    // typo'd `pipelineEntries` is a load error instead of a dropped facet;
+    // this block's own keys are closed, so a typo'd `byRule` is a load error
+    // instead of "no overrides"; and `tier` is a closed verb set. Remove any
+    // one of them and a misspelling routes hand-written assembly through MIR
+    // and the OPTIMIZER — a silent miscompile of the programmer's intent,
+    // which is precisely what this facet exists to prevent. Parsed LATE, after
+    // the shapes block interned the rules, so a `rule` name resolves here.
+    if (doc.contains("pipelineEntry")) {
+        json const& pe = doc.at("pipelineEntry");
+        if (!pe.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidHirLowering, "/pipelineEntry",
+                      "'pipelineEntry' must be an object { byRule: [...] }");
+        } else {
+            static constexpr std::array<std::string_view, 1> kPipelineEntryKeys{
+                "byRule"};
+            DSS_CHECK_KEY_VOCABULARY(kPipelineEntryKeys);
+            for (auto it = pe.begin(); it != pe.end(); ++it) {
+                if (isDocumentationKey(it.key())) continue;
+                if (std::ranges::find(kPipelineEntryKeys, it.key())
+                    != kPipelineEntryKeys.end()) continue;
+                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                          std::format("/pipelineEntry/{}", it.key()),
+                          std::format("unknown key '{}' in 'pipelineEntry' — "
+                                      "the only key is 'byRule' (typo "
+                                      "discriminator: a misspelling here would "
+                                      "silently mean 'no overrides')",
+                                      it.key()));
+            }
+            if (pe.contains("byRule")) {
+                json const& arr = pe.at("byRule");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/pipelineEntry/byRule",
+                              "'pipelineEntry.byRule' must be an array of "
+                              "{ rule, tier } rows");
+                } else {
+                    PipelineEntryConfig cfg;
+                    std::unordered_set<std::uint32_t> claimed;
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path =
+                            std::format("/pipelineEntry/byRule/{}", i);
+                        json const& row = arr[i];
+                        if (!row.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each 'byRule' entry must be an object "
+                                      "{ rule, tier }");
+                            continue;
+                        }
+                        static constexpr std::array<std::string_view, 2>
+                            kRowKeys{"rule", "tier"};
+                        DSS_CHECK_KEY_VOCABULARY(kRowKeys);
+                        for (auto it = row.begin(); it != row.end(); ++it) {
+                            if (isDocumentationKey(it.key())) continue;
+                            if (std::ranges::find(kRowKeys, it.key())
+                                != kRowKeys.end()) continue;
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      std::format("{}/{}", path, it.key()),
+                                      std::format("unknown key '{}' in a "
+                                                  "'byRule' row — allowed keys "
+                                                  "are 'rule' and 'tier' (typo "
+                                                  "discriminator)", it.key()));
+                        }
+                        PipelineEntryRow entry;
+                        if (!row.contains("rule") || !row.at("rule").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      path + "/rule",
+                                      "'rule' is required and must be a string");
+                            continue;
+                        }
+                        entry.ruleName = row.at("rule").get<std::string>();
+                        // A row naming a rule that does not exist is a LOAD
+                        // ERROR, not a no-op: an entry-tier declaration that
+                        // silently applies to nothing is a capability claim
+                        // with no subject, and the construct it meant to
+                        // divert would quietly take the default pipeline.
+                        if (!data.rules->contains(entry.ruleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      path + "/rule",
+                                      std::format("'pipelineEntry.byRule' names "
+                                                  "unknown shape '{}' — a "
+                                                  "pipeline entry that applies "
+                                                  "to no rule would silently do "
+                                                  "nothing", entry.ruleName));
+                            continue;
+                        }
+                        entry.rule = data.rules->find(entry.ruleName);
+                        if (!row.contains("tier") || !row.at("tier").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      path + "/tier",
+                                      std::format("'tier' is required and must "
+                                                  "be one of {}",
+                                                  pipelineTierNameList()));
+                            continue;
+                        }
+                        const auto tierName = row.at("tier").get<std::string>();
+                        const auto tier = pipelineTierFromName(tierName);
+                        if (!tier) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/tier",
+                                      std::format("unknown pipeline tier '{}' — "
+                                                  "the closed set is {}",
+                                                  tierName,
+                                                  pipelineTierNameList()));
+                            continue;
+                        }
+                        entry.tier = *tier;
+                        // ★★ A DECLARED TIER THIS BUILD CANNOT ENTER AT IS A
+                        // LOAD ERROR, NOT A NO-OP. This is the clause that
+                        // keeps the facet from being a knob that lies: today
+                        // the driver has exactly ONE pipeline entry
+                        // (`buildCuMirImpl`: analyze → CST→HIR → HIR→MIR, then
+                        // `lowerMirModuleToAssembly` from MIR), so a `mir` or
+                        // `lir` row would load perfectly clean, be read by
+                        // nobody, and leave its construct on the FULL pipeline
+                        // — for assembly that is running hand-written
+                        // instructions through the optimizer, the exact silent
+                        // miscompile of intent this facet exists to prevent.
+                        // Refusing here is the only place that can see it.
+                        //
+                        // ⚠ LAYERING, STATED RATHER THAN HIDDEN: "which tiers
+                        // this build can enter at" is a property of the
+                        // DRIVER, and `core` cannot ask it. The constant below
+                        // is therefore a deliberate, named, DELETABLE
+                        // duplication — plan 29 P2.5/P4 adds the LIR entry
+                        // path and the SAME change widens or removes this
+                        // guard. It is not a claim that the vocabulary is
+                        // smaller than {hir, mir, lir}; the vocabulary is the
+                        // closed set above, and this is a statement about what
+                        // is WIRED UP. Do not "simplify" it away by narrowing
+                        // `PipelineTier` — that would delete the vocabulary
+                        // the next phase declares against.
+                        constexpr PipelineTier kOnlyImplementedEntryTier =
+                            PipelineTier::Hir;
+                        if (entry.tier != kOnlyImplementedEntryTier) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/tier",
+                                      std::format(
+                                          "rule '{}' declares pipeline entry "
+                                          "tier '{}', but no component of this "
+                                          "build consumes an entry other than "
+                                          "'{}' yet — accepting the row would "
+                                          "SILENTLY leave '{}' on the full "
+                                          "CST->HIR->MIR->LIR pipeline instead "
+                                          "of the tier it asked for. The entry "
+                                          "path and the row land together "
+                                          "(plan 29 P2.5/P4)", entry.ruleName,
+                                          pipelineTierName(entry.tier),
+                                          pipelineTierName(
+                                              kOnlyImplementedEntryTier),
+                                          entry.ruleName));
+                            continue;
+                        }
+                        if (!claimed.insert(entry.rule.v).second) {
+                            coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                      std::format("rule '{}' has more than one "
+                                                  "pipeline-entry row — a "
+                                                  "construct enters the "
+                                                  "pipeline at exactly one tier",
+                                                  entry.ruleName));
+                            continue;
+                        }
+                        cfg.byRule.push_back(std::move(entry));
+                    }
+                    data.pipelineEntry = std::move(cfg);
+                }
+            }
+        }
+    }
+
     // Late cross-block validation: `commitRequiresTypeName` guards need
     // `semantics.identifierToken` (parsed above) — see the function's doc.
     validateTypeNameCommitGuards(data, coll);
+
+    // Late cross-block validation: a rule that lowers to `InlineAsm` must be the
+    // rule `semantics.inlineAsm` gates. MUST run after the `hirLowering` block
+    // above (it compares the two halves) — see the function's doc for the
+    // measured rc=0-zero-diagnostics miscompile this closes.
+    validateInlineAsmGate(data, coll);
 
     // Freeze interners — post-load, no further internment allowed.
     data.rules->freeze();
