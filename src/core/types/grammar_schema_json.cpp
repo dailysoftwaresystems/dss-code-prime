@@ -2232,14 +2232,30 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     // `contextual: true` per entry marks soft keywords (await/yield etc.).
     // The top-level `reservedWordPolicy: "contextual"` flag forces every
     // keyword soft regardless of the per-entry setting.
+    //
+    // ★ A PRESENT-BUT-WRONG-TYPE `keywords` USED TO BE SILENT, and that was the
+    // SECOND defect in this statement. Every other top-level block ENTERS its
+    // branch and then diagnoses a bad type (`tokens` → "'tokens' must be an
+    // object"; same for `lexerModes`, `operators`, `syncTokens`, `shapes`,
+    // `semantics`). `keywords` folded the type test into the `if` CONDITION, so
+    // `"keywords": { "if": "IfKw" }` fell out of the dispatch entirely and the
+    // document loaded PERFECTLY CLEAN with the ENTIRE keyword table dropped —
+    // every keyword in the language silently demoted to a plain `Identifier`.
+    // The two conditions below are complementary and exhaustive over
+    // `contains("keywords")`, so exactly one of them runs; they are written as
+    // two `if`s rather than an if/else purely to keep the 120-line body's
+    // indentation — and therefore the reviewable diff — unchanged.
+    if (doc.contains("keywords") && !doc.at("keywords").is_array()) {
+        coll.emit(DiagnosticCode::C_ConflictingField, "/keywords",
+                  "'keywords' must be an array of entry objects");
+    }
     if (doc.contains("keywords") && doc.at("keywords").is_array()) {
         const bool forceContextual =
             (data.reservedWordPolicy == ReservedWordPolicy::Contextual);
         for (std::size_t i = 0; i < doc.at("keywords").size(); ++i) {
             json const& kw = doc.at("keywords").at(i);
             const auto kwPath = std::format("/keywords/{}", i);
-            if (!kw.is_object() || !kw.contains("word") || !kw.contains("kind") ||
-                !kw.at("word").is_string() || !kw.at("kind").is_string()) {
+            if (!kw.is_object()) {
                 coll.emit(DiagnosticCode::C_MissingField, kwPath,
                           "keyword entry needs string 'word' and string 'kind'");
                 continue;
@@ -2248,6 +2264,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // `tokens` entries; keywords resolve contextually (soft-
             // keyword demotion), a distinct mechanism from mode
             // switching or delimited-string opening. Reject loudly.
+            //
+            // ★ THESE RUN BEFORE THE CLOSED-KEY VOCABULARY BELOW, AND THE ORDER
+            // IS THE DESIGN. `modeOp` / `modeArg` / `stringStyle` are keys this
+            // loader KNOWS — it knows exactly what they mean and which block
+            // they belong on — so reporting them as "unknown" would be a false
+            // statement in a diagnostic, and the redirect ("move the entry to
+            // 'tokens'") is the sentence the author can act on. Excluding them
+            // by CONTROL FLOW rather than by a second parallel list is what
+            // makes that safe in both drift directions: add a redirect above
+            // and it is honoured automatically; delete one and the key falls
+            // through to the vocabulary and is still REJECTED, just with the
+            // generic message. A parallel "misplaced keys" table could instead
+            // go stale in the one direction that is silent — a name listed
+            // there whose redirect no longer exists would be skipped by the
+            // vocabulary AND matched by nothing, i.e. silently accepted, which
+            // is the very defect this block is closing.
             if (kw.contains("modeOp") || kw.contains("modeArg")) {
                 coll.emit(DiagnosticCode::C_ConflictingField, kwPath,
                           "mode operations belong on 'tokens' entries; keywords "
@@ -2259,6 +2291,52 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 coll.emit(DiagnosticCode::C_ConflictingField, kwPath,
                           "'stringStyle' belongs on 'tokens' entries; keywords "
                           "are word-shaped and cannot open delimited strings");
+                continue;
+            }
+            // CLOSED KEY VOCABULARY (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD) —
+            // the ONE per-entry table in this loader that never had one.
+            //
+            // ★ WHY IT MATTERS HERE SPECIFICALLY, and it is not "a typo is
+            // untidy": `contextual` is an OPT-IN whose absence is meaningful and
+            // whose default is the DANGEROUS value. A near-miss spelling
+            // (`contextul`, `Contextual`, `contextual_`) used to load perfectly
+            // clean, leave `lm.contextual` false, and install the keyword as a
+            // HARD RESERVED WORD — so a soft keyword the author declared to be
+            // identifier-compatible silently starts breaking user code that uses
+            // the word as an identifier, with no diagnostic anywhere. The
+            // authored intent and the shipped behaviour are opposites and
+            // nothing says so.
+            //
+            // ★ AND IT RUNS BEFORE THE REQUIRED-`word`/`kind` CHECK, for the
+            // reason the `defaultToken` sibling records: a misspelled `word`
+            // ("wrd") would otherwise be reported ONLY as a MISSING 'word' — a
+            // field the author demonstrably did write — sending them hunting in
+            // the wrong place. Both diagnostics fire now, typo named first.
+            // `$`-prefixed keys are the codebase-wide documentation convention,
+            // never a knob, so they are exempt.
+            {
+                static constexpr std::array<std::string_view, 3>
+                    kKeywordKeys{"word", "kind", "contextual"};
+                DSS_CHECK_KEY_VOCABULARY(kKeywordKeys);
+                for (auto it = kw.begin(); it != kw.end(); ++it) {
+                    if (isDocumentationKey(it.key())) continue;
+                    bool known = false;
+                    for (auto const& k : kKeywordKeys) {
+                        if (it.key() == k) { known = true; break; }
+                    }
+                    if (known) continue;
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/{}", kwPath, it.key()),
+                              std::format("unknown key '{}' in a 'keywords' entry "
+                                          "— allowed keys are 'word', 'kind', "
+                                          "'contextual' (typo discriminator)",
+                                          it.key()));
+                }
+            }
+            if (!kw.contains("word") || !kw.contains("kind") ||
+                !kw.at("word").is_string() || !kw.at("kind").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField, kwPath,
+                          "keyword entry needs string 'word' and string 'kind'");
                 continue;
             }
             LexemeMeaning lm{};
@@ -2918,8 +2996,29 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     }
 
     // scopes.validity ──
+    //
+    // ★ THE `keywords` TWIN, closed in the same pass and for the same reason: a
+    // present-but-wrong-type value used to fall out of the `if` CONDITION and
+    // silently disable EVERY scope-validity rule the author wrote. ⚠ Note the
+    // trap that makes the wrong type plausible enough to write by accident:
+    // `semantics.scopes` IS an array (every shipped config declares one), while
+    // this TOP-LEVEL `scopes` is an OBJECT whose one member is `validity`. Two
+    // different keys, one spelling. Each pair of conditions below is
+    // complementary and exhaustive over its own `contains`, so exactly one arm
+    // of each runs; two `if`s rather than if/else keeps the body's indentation
+    // and the reviewable diff intact.
+    if (doc.contains("scopes") && !doc.at("scopes").is_object()) {
+        coll.emit(DiagnosticCode::C_ConflictingField, "/scopes",
+                  "'scopes' must be an object; its one recognized member is "
+                  "'validity' (note 'semantics.scopes' is a DIFFERENT key and "
+                  "IS an array)");
+    }
     if (doc.contains("scopes") && doc.at("scopes").is_object()) {
         auto const& sv = doc.at("scopes");
+        if (sv.contains("validity") && !sv.at("validity").is_array()) {
+            coll.emit(DiagnosticCode::C_ConflictingField, "/scopes/validity",
+                      "'validity' must be an array of scope-rule objects");
+        }
         if (sv.contains("validity") && sv.at("validity").is_array()) {
             for (std::size_t i = 0; i < sv.at("validity").size(); ++i) {
                 json const& v = sv.at("validity").at(i);

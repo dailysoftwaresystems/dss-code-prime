@@ -3442,6 +3442,282 @@ TEST(GrammarSchema, DeclarationRowDollarPrefixedKeyIsExempt) {
     EXPECT_EQ((*r)->semantics().declarations.size(), 1u);
 }
 
+// ── `keywords[]` ENTRY closed key vocabulary (typo discriminator) ─────────
+//
+// The last per-entry table in this loader that had none: the block type-checked
+// `word`/`kind`/`contextual` and rejected misplaced `modeOp`/`stringStyle`, but
+// ran no vocabulary check, so any OTHER key was silently ignored.
+//
+// ★ WHY THIS ENTRY IS THE SHARP ONE. `contextual` is an opt-in whose absence is
+// meaningful and whose DEFAULT IS THE DANGEROUS VALUE. A near-miss spelling
+// loaded clean, left the flag false, and installed the keyword as a HARD
+// RESERVED WORD — the exact opposite of the authored intent — so user code that
+// legally uses the word as an identifier starts failing with no diagnostic
+// anywhere. Every pin below therefore checks the DIAGNOSTIC, not merely that the
+// load failed: "it failed" is equally true of a config that failed for an
+// unrelated reason.
+
+namespace {
+// The minimal loadable document from §keywords, with one keyword ENTRY body
+// spliced at %X%. `Identifier` is the root shape so no entry's `kind` has to be
+// referenced by a shape — the pins are about KEYS, and a shape reference would
+// add a second reason for the load to fail.
+[[nodiscard]] std::string keywordEntrySchemaWith(std::string_view entryBody) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "KwKeys", "version": "0.1.0" },
+      "keywords": [ %X% ],
+      "shapes": { "root": { "sequence": [ "Identifier" ] } }
+    })JSON";
+    auto const pos = cfg.find("%X%");
+    cfg.replace(pos, 3, entryBody);
+    return cfg;
+}
+
+// The same minimal document with a whole top-level BLOCK spliced RAW at %X%.
+// The entry-level helper above cannot express a `keywords` whose value is not
+// an array, which is exactly what the type pins below need.
+[[nodiscard]] std::string keywordBlockSchemaWith(std::string_view rawBlock) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "KwKeys", "version": "0.1.0" },
+      %X%
+      "shapes": { "root": { "sequence": [ "Identifier" ] } }
+    })JSON";
+    auto const pos = cfg.find("%X%");
+    cfg.replace(pos, 3, rawBlock);
+    return cfg;
+}
+
+// Does ANY diagnostic carry this substring? Used to pin the MESSAGE, because a
+// code alone cannot distinguish "rejected the typo'd key" from "rejected for
+// some other reason that happens to share the code".
+[[nodiscard]] bool hasDiagMessage(std::vector<ConfigDiagnostic> const& diags,
+                                  std::string_view needle) {
+    return std::ranges::any_of(diags, [needle](auto const& d) {
+        return d.message.find(needle) != std::string::npos;
+    });
+}
+} // namespace
+
+// BASELINE, and it carries the "not too tight" half of the pin: ALL THREE legal
+// keys load, and `contextual` still reaches `LexemeMeaning`. A vocabulary that
+// omitted one of these would break every shipped language at LOAD, so this is
+// not a courtesy test — it is the guard against over-tightening.
+TEST(GrammarSchema, KeywordEntryClosedKeyBaselineLoadsAllThreeLegalKeys) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "if", "kind": "IfKw" },
+            { "word": "await", "kind": "AwaitKw", "contextual": true })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+    auto const ifKw = (*r)->lookupLexeme("if");
+    ASSERT_EQ(ifKw.size(), 1u);
+    EXPECT_FALSE(ifKw[0].contextual);
+    auto const awaitKw = (*r)->lookupLexeme("await");
+    ASSERT_EQ(awaitKw.size(), 1u);
+    EXPECT_TRUE(awaitKw[0].contextual)
+        << "the baseline must prove `contextual` is READ, not merely tolerated — "
+           "otherwise a vocabulary that accepted the key while the loader ignored "
+           "it would pass this test";
+}
+
+// ★ THE DEFECT THIS CLOSES, in its most damaging spelling. `contextul` used to
+// load clean and turn a soft keyword into a hard reserved word.
+TEST(GrammarSchema, KeywordEntryMisspelledContextualReportsConflict) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "await", "kind": "AwaitKw", "contextul": true })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a typo'd `contextual` must fail the load — silently shipping the "
+           "keyword as HARD when the author declared it SOFT is the "
+           "knob-that-lies, and it breaks user code that uses the word as an "
+           "identifier";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_ConflictingField));
+    EXPECT_TRUE(hasDiagMessage(r.error(), "unknown key 'contextul' in a "
+                                          "'keywords' entry"))
+        << "the pin is on the DIAGNOSTIC, not on the failure: the message must "
+           "name the offending key. Got:" << errorDiags(r.error());
+}
+
+// Case is part of the spelling — `Contextual` is a different key, and JSON has
+// no case-folding rule that would make it the same one.
+TEST(GrammarSchema, KeywordEntryCasedContextualReportsConflict) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "await", "kind": "AwaitKw", "Contextual": true })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "unknown key 'Contextual'"))
+        << errorDiags(r.error());
+}
+
+// A second axis: the vocabulary is a VOCABULARY, not one special-cased name. A
+// trailing-underscore near-miss on `contextual` and a misspelling of the
+// REQUIRED `word` are both caught.
+TEST(GrammarSchema, KeywordEntryTrailingUnderscoreKeyReportsConflict) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "await", "kind": "AwaitKw", "contextual_": true })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "unknown key 'contextual_'"))
+        << errorDiags(r.error());
+}
+
+// ★ WHY THE VOCABULARY RUNS BEFORE THE REQUIRED-FIELD CHECK. With only the
+// required-field rule, `wrd` was reported as a MISSING 'word' — a field the
+// author demonstrably DID write — which sends them hunting in the wrong place.
+// Both diagnostics must now fire, and the typo must be NAMED.
+TEST(GrammarSchema, KeywordEntryMisspelledWordNamesTheTypoNotJustTheAbsence) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "wrd": "await", "kind": "AwaitKw" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "unknown key 'wrd'"))
+        << "the required-'word' diagnostic alone names a field the author DID "
+           "write; the vocabulary must run first and name the key. Got:"
+        << errorDiags(r.error());
+    EXPECT_TRUE(hasDiagMessage(r.error(),
+                               "keyword entry needs string 'word' and string 'kind'"))
+        << "and the required-field rule must still fire — the vocabulary check "
+           "reports, it does not swallow. Got:" << errorDiags(r.error());
+}
+
+// The two MISPLACED keys keep their own, more specific redirect and must NOT be
+// reported as "unknown": this loader knows exactly what `modeOp` and
+// `stringStyle` are and which block they belong on, so calling them unknown
+// would be a false statement in a diagnostic. This pins the ORDER of the two
+// checks, which is the only thing that makes that true.
+TEST(GrammarSchema, KeywordEntryMisplacedModeOpKeepsItsRedirectDiagnostic) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "if", "kind": "IfKw", "modeOp": "pushMode", "modeArg": "main" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "keywords cannot switch lexer modes"))
+        << errorDiags(r.error());
+    EXPECT_FALSE(hasDiagMessage(r.error(), "unknown key 'modeOp'"))
+        << "`modeOp` is a key this loader KNOWS — reporting it as unknown would "
+           "be false, and it would bury the redirect that says where the entry "
+           "belongs. Got:" << errorDiags(r.error());
+}
+
+TEST(GrammarSchema, KeywordEntryMisplacedStringStyleKeepsItsRedirectDiagnostic) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "string", "kind": "StringKw",
+             "stringStyle": { "escapeKind": "none", "endsAt": "'" } })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "keywords are word-shaped"))
+        << errorDiags(r.error());
+    EXPECT_FALSE(hasDiagMessage(r.error(), "unknown key 'stringStyle'"))
+        << errorDiags(r.error());
+}
+
+// `$`-prefixed documentation keys stay EXEMPT on a keyword entry too — the same
+// carve-out every sibling vocabulary applies.
+TEST(GrammarSchema, KeywordEntryDollarPrefixedKeyIsExempt) {
+    auto const cfg = keywordEntrySchemaWith(
+        R"({ "word": "await", "kind": "AwaitKw", "contextual": true,
+             "$contextualComment": "soft: `await` is a valid identifier here" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << "a '$'-prefixed documentation key must not trip the typo "
+           "discriminator: " << errorDiags(r.error());
+    auto const awaitKw = (*r)->lookupLexeme("await");
+    ASSERT_EQ(awaitKw.size(), 1u);
+    EXPECT_TRUE(awaitKw[0].contextual);
+}
+
+// ── the top-level blocks that were SILENTLY SKIPPED on a WRONG TYPE ───────
+//
+// A SECOND defect found in the same `if` statement while closing the vocabulary
+// above, and measured rather than assumed. Every OTHER top-level block ENTERS
+// its branch and then DIAGNOSES a wrong type — `tokens` emits "'tokens' must be
+// an object", and `lexerModes` / `operators` / `syncTokens` / `shapes` /
+// `semantics` all do the same. `keywords` and `scopes` alone folded the type
+// test INTO the `if` CONDITION:
+//
+//     if (doc.contains("keywords") && doc.at("keywords").is_array()) { … }
+//
+// so a present-but-wrong-type value fell out of the dispatch entirely and the
+// document loaded PERFECTLY CLEAN with the whole table dropped — every keyword
+// silently demoted to a plain `Identifier`, or every scope-validity rule gone.
+// Same shape as the vocabulary gap: the authored intent and the shipped
+// behaviour are opposites and nothing says so.
+//
+// ⚠ THE COUNTERPART FORM IS PINNED TOO. Both blocks are OPTIONAL, so ABSENT
+// must stay silent, and `scopes` without `validity` must stay silent. A check
+// that also reds on absence is a different bug wearing this fix's clothes, and
+// only the positive pins can tell the two apart.
+
+TEST(GrammarSchema, KeywordsBlockNonArrayFailsLoud) {
+    auto const cfg = keywordBlockSchemaWith(R"("keywords": { "if": "IfKw" },)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a `keywords` that is not an array must FAIL, not vanish: dropping "
+           "the whole keyword table turns every keyword in the language into a "
+           "plain Identifier with no diagnostic";
+    EXPECT_TRUE(hasDiagMessage(r.error(), "'keywords' must be an array"))
+        << errorDiags(r.error());
+}
+
+// A second wrong type, so the check is about the TYPE and not about objects.
+TEST(GrammarSchema, KeywordsBlockStringValueFailsLoud) {
+    auto const cfg = keywordBlockSchemaWith(R"("keywords": "if",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagMessage(r.error(), "'keywords' must be an array"))
+        << errorDiags(r.error());
+}
+
+// ABSENT `keywords` is legal — a language may have none.
+TEST(GrammarSchema, KeywordsBlockAbsentStaysSilent) {
+    auto r = GrammarSchema::loadFromText(keywordBlockSchemaWith(""));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+}
+
+// An EMPTY array is also legal, and it is the case a naive "is it there and
+// non-trivial" check would wrongly reject.
+TEST(GrammarSchema, KeywordsBlockEmptyArrayStaysSilent) {
+    auto r = GrammarSchema::loadFromText(keywordBlockSchemaWith(R"("keywords": [],)"));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+}
+
+// ★ The `scopes` twin. ⚠ `semantics.scopes` IS an array (every shipped config
+// declares one) — this is the TOP-LEVEL `scopes`, whose one member is
+// `validity`. Confusing the two is the reason the wrong-type value looks
+// plausible enough to write by accident.
+TEST(GrammarSchema, ScopesBlockNonObjectFailsLoud) {
+    auto const cfg = keywordBlockSchemaWith(R"("scopes": [ "block" ],)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a top-level `scopes` that is not an object must FAIL: silently "
+           "dropping it disables every scope-validity rule the author wrote";
+    EXPECT_TRUE(hasDiagMessage(r.error(), "'scopes' must be an object"))
+        << errorDiags(r.error());
+}
+
+TEST(GrammarSchema, ScopesValidityNonArrayFailsLoud) {
+    auto const cfg =
+        keywordBlockSchemaWith(R"("scopes": { "validity": { "scope": "B" } },)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "`validity` is the ONLY member `scopes` has — a wrong type there "
+           "empties the block just as completely as a wrong-typed `scopes`";
+    EXPECT_TRUE(hasDiagMessage(r.error(), "'validity' must be an array"))
+        << errorDiags(r.error());
+}
+
+// `scopes` present with NO `validity`, and `scopes` absent: both legal.
+TEST(GrammarSchema, ScopesBlockWithoutValidityStaysSilent) {
+    auto r = GrammarSchema::loadFromText(keywordBlockSchemaWith(R"("scopes": {},)"));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+}
+
+TEST(GrammarSchema, ScopesBlockEmptyValidityStaysSilent) {
+    auto r = GrammarSchema::loadFromText(
+        keywordBlockSchemaWith(R"("scopes": { "validity": [] },)"));
+    ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
+}
+
 // ── TOP-LEVEL document closed key vocabulary (typo discriminator) ────────
 //
 // The widest-blast-radius instance: every block is optional and absence is

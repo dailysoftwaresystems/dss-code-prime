@@ -1192,6 +1192,51 @@ constexpr std::size_t kMinDirectionBProbes = 15;
         // spelling. Named the day it was found so it cannot be trimmed before it
         // is fixed.
         "a_alignof_expression_operand_gnu",
+        // ★ REGISTRATION GAP, FOUND AND FIXED 2026-08-12. The comment directly
+        // above has claimed since 2026-08-11 that "deleting EITHER now would
+        // retire the only cross-compiler evidence that the alias still
+        // resolves" — but `a_typeof_gnu_spelling` was never actually added to
+        // this list, so only `a_alignof_gnu_spelling` was protected and the
+        // typeof row could have been trimmed in silence. A comment that
+        // describes a guard the code does not implement is worse than no
+        // comment: it makes a reader stop checking. Adding it here is the whole
+        // fix; the claim above is now true.
+        "a_typeof_gnu_spelling",
+        // ── the GNU `__`-wrapped QUALIFIER / SPECIFIER spellings
+        // (D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS, 2026-08-12) ──
+        // This whole CLASS was uncensused: the corpus had rows for the GNU
+        // `__typeof__` / `__alignof__` / `__inline__` spellings but none for
+        // volatile / const / signed / restrict / complex, so five direction-A
+        // gaps were INVISIBLE rather than absent — the same shape as the alignof
+        // OPERAND axis one cycle earlier. They are listed as FEATURE guards
+        // (all six were closed the day they were censused): each is the only
+        // cross-compiler evidence that its alias still resolves, and
+        // `a_asm_volatile_gnu_spelling` additionally guards a SECOND grammar
+        // slot (`asmStmt`'s optional qualifier) that no declaration-position
+        // probe reaches.
+        "a_volatile_gnu_spelling", "a_const_gnu_spelling",
+        "a_signed_gnu_spelling", "a_restrict_gnu_spelling",
+        "a_complex_gnu_spelling", "a_asm_volatile_gnu_spelling",
+        // ── the two GNU spellings that cycle DELIBERATELY EXCLUDED, plus the
+        // ISO gap that censusing them EXPOSED (2026-08-12) ──
+        // `__thread` and `__extension__` are not spelling aliases, so neither
+        // could ride the keyword-row mechanism: `__thread` would inherit
+        // `_Thread_local`'s position-freedom (a placement rule DSS does not
+        // model, and one the references disagree about IN KIND — gcc hard
+        // error, clang pedantic warning), and `__extension__` has no plain-C
+        // counterpart to alias onto at all. Listed here the day they were
+        // censused so an OPEN gap cannot be trimmed before it is fixed — the
+        // same reason `a_alignof_expression_operand_gnu` is above.
+        //
+        // `a_thread_local_definition_c11` is the ISO row the `__thread`
+        // measurement UNCOVERED, and it is the one that keeps the spelling row
+        // honest: DSS refuses a thread-local DEFINITION at the LINKER (no
+        // relocatable-object format advertises `tbss`), so a future edit that
+        // "simplified" the spelling probe's body from `extern` to `static`
+        // would silently start measuring the linker instead of the vocabulary.
+        // Two rows, two variables, neither able to hide the other.
+        "a_thread_local_gnu_spelling", "a_extension_prefix_gnu",
+        "a_thread_local_definition_c11",
     };
 }
 

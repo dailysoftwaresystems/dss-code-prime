@@ -104,6 +104,19 @@ def main():
                     help="check the instrument, not the registry")
     args = ap.parse_args()
 
+    # ⚠ A GATE THAT CRASHES WHILE REPORTING IS WORSE THAN ONE THAT SAYS NOTHING.
+    # ✔MEASURED 2026-08-12: this script died with UnicodeEncodeError on a Windows
+    # cp1252 console the first time it had to print an OPENED row, because the
+    # status excerpt began with 🟠 (U+1F7E0). Every prior run had printed only
+    # counts, so the reporting path had never been exercised with real content —
+    # the crash was latent for exactly as long as the gate was passing. The
+    # excerpt is diagnostic prose; an unencodable glyph must degrade to a
+    # placeholder, never take the gate down.
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError):          # pragma: no cover - old python
+        pass
+
     if args.self_test:
         return self_test()
 

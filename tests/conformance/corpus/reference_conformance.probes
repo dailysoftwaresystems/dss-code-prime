@@ -400,6 +400,18 @@ _Atomic int dss_atomic_probe;
 _Noreturn void dss_noreturn_probe(void);
 @end
 
+@probe a_thread_local_definition_c11
+@direction A
+@mode strict
+@min-stdc 201112
+@families gnu,msvc
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap, found 2026-08-12 while censusing the `__thread` spelling and NOT previously in this corpus. The refusal is NOT in the front end and that is the whole point of the row: DSS PARSES and lowers `static _Thread_local int x;` and then the LINKER refuses it — `K_NoMatchingObjectFormat`: "module carries an AssembledData item with section=tbss but format 'elf64-x86_64-linux' (kind=elf) does not advertise that section in its 'supportedDataSections' set". Identical refusal on the pe64 target. ✔MEASURED: `tbss` is advertised by EXACTLY FOUR shipped formats, all of them `*-exec` (elf64-x86_64-linux-exec, elf64-aarch64-linux-exec, pe64-x86_64-windows-exec, macho64-arm64-darwin-exec), so a thread-local DEFINITION reaches no relocatable-object, PIE, shared-library or staticlib arm — and note macho64-x86_64-darwin-exec is absent from even that list. The four `D-CSUBSET-THREAD-LOCAL` legs were closed for EXECUTABLES; this corpus compiles to relocatable objects (`-c` / `/c`), which is the arm nothing covered. It is LOUD, never a silent miscompile. Tracked at D-LK-RELOCATABLE-TBSS-UNSUPPORTED. ⚠ Do NOT "close" this row by giving the probe an `extern` body: an extern declaration emits no data item at all, so it would sail past the linker and the row would silently stop measuring anything (that is exactly why a_thread_local_gnu_spelling uses `extern` — it must isolate the SPELLING from this gap, and this row must isolate this gap from the spelling).
+@why C11 6.7.1 `_Thread_local` storage-class specifier on a file-scope DEFINITION. Accepted by gcc 13.3.0, clang 18.1.3, clang 19.1.1 (`-std=c17 -pedantic-errors`) and cl 19.51 (`/std:c17` and `/std:clatest`).
+@code
+static _Thread_local int dss_thread_local_definition_probe;
+@end
+
 # ── C99 surface ────────────────────────────────────────────────────────────
 
 @probe a_compound_literal_c99
@@ -1119,6 +1131,93 @@ double dss_alignof_expr_src;
 int dss_alignof_expr_probe(void) { return (int)__alignof__(dss_alignof_expr_src); }
 @end
 
+@probe a_volatile_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU `__volatile__` / `__volatile` — the qualifier spelling that works at EVERY -std level. UNCENSUSED UNTIL 2026-08-12: the whole `__`-wrapped QUALIFIER class was missing from this corpus, which had probes for the GNU `__typeof__`/`__alignof__`/`__inline__` spellings but none for volatile/const/signed/restrict/complex — so five direction-A gaps were invisible rather than absent, exactly the way the alignof OPERAND axis was. CLOSED the day it was censused (D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS): both spellings are keyword-table aliases onto the EXISTING VolatileKeyword, so they reach the interned Volatile qualifier bit the ISO word reaches — no new kind, no grammar, no C++. Both spellings are exercised below, which also proves the lexer takes the LONGEST match (`__volatile__` is not read as `__volatile` plus a stray `__`), and BOTH grammar slots are exercised: the declaration head (`headQualifier`) and after a `*` (`ptrQualifier`), because a row can be reachable from one and not the other. MEASURED accepted by gcc 13.3.0, clang 18.1.3, clang 19.1.1 — and by `gcc -pedantic-errors`, since a dunder spelling is in C 7.1.3's implementation-reserved namespace and cannot collide with a conforming program's identifiers. That is why this needed no dialect flag. ⚠ NOT claimed here: real `cl.exe` REFUSES the dunder qualifier forms; two of three reference compilers is the bar this corpus applies.
+@code
+__volatile__ int dss_volatile_gnu_probe;
+__volatile int dss_volatile_gnu_probe2;
+int * __volatile__ dss_volatile_gnu_ptr;
+int * __volatile dss_volatile_gnu_ptr2;
+@end
+
+@probe a_const_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU `__const__` / `__const` — the pre-C89-portable spelling of `const`, still emitted by generator-produced headers. CLOSED 2026-08-12 (D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS): keyword-table aliases onto the EXISTING ConstKeyword, so they reach `constMarker` and an assignment through one is S_ConstViolation exactly as through `const` — the SEMANTIC effect, not merely a parse. Three grammar positions below: declaration head, EAST/trailing specifier (C 6.7.1 lets decl-specifiers appear in any order), and after a `*`. MEASURED accepted by gcc 13.3.0, clang 18.1.3, clang 19.1.1 and by `gcc -pedantic-errors`. A parameter-position use is exercised too, since parameters take a different head rule than file-scope declarations.
+@code
+__const__ int dss_const_gnu_probe = 1;
+__const int dss_const_gnu_probe2 = 2;
+int __const__ dss_const_gnu_east = 3;
+int * __const__ dss_const_gnu_ptr;
+void dss_const_gnu_param(__const__ int a, __const int b);
+@end
+
+@probe a_signed_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU `__signed__` / `__signed` — the pre-C89-portable spelling of the `signed` type-specifier. CLOSED 2026-08-12 (D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS): keyword-table aliases onto the EXISTING SignedKeyword, so they participate in the same type-specifier MULTISET rows the ISO word does — `__signed__ char` resolves I8, NOT the U8 an UnsignedKeyword mis-key would give nor the I32 a dropped specifier would give. Three multiset shapes below: with `char`, BARE (== `signed int`), and in the multi-token `long` combination, because a specifier alias must reach every row it belongs to and not merely the first. MEASURED accepted by gcc 13.3.0, clang 18.1.3, clang 19.1.1 and by `gcc -pedantic-errors`.
+@code
+__signed__ char dss_signed_gnu_probe;
+__signed char dss_signed_gnu_probe2;
+__signed__ int dss_signed_gnu_int;
+__signed__ dss_signed_gnu_bare;
+__signed dss_signed_gnu_bare2;
+__signed__ long dss_signed_gnu_long;
+@end
+
+@probe a_restrict_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU `__restrict__` / `__restrict` — the spelling that works below C99, which is why libstdc++/glibc headers use it in preference to `restrict`. CLOSED 2026-08-12 (D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS): keyword-table aliases onto the EXISTING RestrictKeyword, reachable from `ptrQualifier` and from the array-suffix modifier list, exercised in every one of those positions below (post-star object, two in one signature, mixed spellings in one signature, and the `int a[__restrict__ 4]` array-parameter slot). ★ NOTE FOR WHOEVER READS THIS NEXT: `restrict` — ISO OR GNU — is NOT admitted in DECLARATION-HEAD position (`__restrict__ int x;`), because `headQualifier` is {const, volatile, _Atomic}. That is PRE-EXISTING and correct: C 6.7.3 restricts the qualifier to pointer types, so head position has nothing to qualify. It is also the property that PINS these rows to RestrictKeyword rather than to a plausible neighbour — Const/Volatile/Atomic/Signed/Complex are all accepted bare in front of a base type, so a mis-keyed row would have been accepted there. MEASURED accepted by gcc 13.3.0, clang 18.1.3, clang 19.1.1 and by `gcc -pedantic-errors`.
+@code
+int * __restrict__ dss_restrict_gnu_probe;
+int * __restrict dss_restrict_gnu_probe2;
+void dss_restrict_gnu_sig(int * __restrict__ a, int * __restrict__ b);
+void dss_restrict_gnu_mixed(int * __restrict__ a, int * __restrict b);
+void dss_restrict_gnu_array(int a[__restrict__ 4], int b[__restrict 4]);
+@end
+
+@probe a_complex_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU `__complex__` / `__complex` — the pre-C99-portable spelling of `_Complex`. CLOSED 2026-08-12 (D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS): keyword-table aliases onto the EXISTING ComplexKeyword, so they participate in the same type-specifier multiset rows and resolve to a Complex type over the right ELEMENT (`__complex__ double` → F64 element, `__complex__ float` → F32). Both spellings, both element widths, and the EAST/trailing position below. The mis-key this guards against is the ADJACENT ImaginaryKeyword, which sits in NO multiset row: an `__complex__` landed there would resolve as an unknown type name instead. MEASURED accepted by gcc 13.3.0, clang 18.1.3, clang 19.1.1 and by `gcc -pedantic-errors`, including `__complex__ long double`.
+@code
+__complex__ double dss_complex_gnu_probe;
+__complex double dss_complex_gnu_probe2;
+double __complex__ dss_complex_gnu_east;
+__complex__ float dss_complex_gnu_float;
+__complex float dss_complex_gnu_float2;
+@end
+
+@probe a_asm_volatile_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why `__asm__ __volatile__ ("")` — the GNU qualifier spelling INSIDE the inline-asm statement, which is the form real headers write. This is a SECOND-ORDER consequence of the `__volatile__` keyword row and it gets its own probe because it is a different GRAMMAR SLOT: `asmStmt`'s `{optional VolatileKeyword}`, not a declaration qualifier position. CLOSED 2026-08-12 as a side effect of D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS, which also closed the `__volatile__` half of D-CSUBSET-INLINE-ASM-SPELLING. ⚠ WHAT IS *NOT* CLOSED, stated here so the half-closure is never read as a whole one: bare `asm` is still deliberately absent (it is an ordinary identifier in standard C, so reserving it would take a name user code may have defined — that one genuinely needs a dialect opt-in), and the `:` OPERAND LIST is a separate open gap censused by a_inline_asm_gnu above (D-CSUBSET-INLINE-ASM-OPERANDS / D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED). sqlite's `src/hwtime.h:43` needs BOTH, so its `--scanstatus` build stays off; this row moved that file's failure from the spelling to the colon and nothing further. Only the EMPTY template is probed here — a non-empty one carries per-target instructions DSS cannot emit and is refused LOUD by design (D-CSUBSET-INLINE-ASM-TEXT).
+@code
+int dss_asm_volatile_gnu_probe(int x) { __asm__ __volatile__ (""); return x; }
+int dss_asm_volatile_gnu_probe2(int x) { __asm__ __volatile (""); return x; }
+@end
+
 @probe a_attribute_constructor_gnu
 @direction A
 @mode extended
@@ -1142,4 +1241,36 @@ int dss_attr_constructor_probe(void) __attribute__((constructor));
 @code
 int dss_alias_target_probe(void) { return 1; }
 int dss_alias_probe(void) __attribute__((alias("dss_alias_target_probe")));
+@end
+
+# ── The two GNU spellings DELIBERATELY EXCLUDED from the `__`-qualifier alias
+# cycle (D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS, 2026-08-12). Neither is a
+# spelling alias, so neither could ride that cycle's keyword-row mechanism —
+# which is a reason to CENSUS them here, not a reason to leave them invisible.
+# The alternative was a silent exclusion, and a gap nobody wrote down is a gap
+# the next cycle re-derives from scratch.
+
+@probe a_thread_local_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: `extern __thread int x;` is rejected by DSS (P0009 at the declarator — `__thread` is absent from the keyword vocabulary, so it parses as the declared NAME and the following `int` has nowhere to go) and accepted by gcc 13.3.0, clang 18.1.3 and clang 19.1.1 at BOTH `-std=gnu17` and `-std=c17 -pedantic-errors`. Tracked at D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS (this class's exclusion set). ★ DELIBERATELY NOT CLOSED BY A KEYWORD-ALIAS ROW, and the reason is an OPERATOR DECISION, not an oversight: a plain alias would land `__thread` on `ThreadLocalKeyword` and thereby inherit `_Thread_local`'s POSITION-FREEDOM, shipping a placement rule DSS does not model — and the reference compilers DISAGREE about that rule, so there is no "what gcc/clang do" to copy. ✔MEASURED on `__thread static int x;`: gcc 13.3.0 rejects it as a HARD ERROR at every level (`error: '__thread' before 'static'`), while clang 18.1.3 and clang 19.1.1 ACCEPT it under `-std=gnu17` and reject it only under `-pedantic-errors`, where the same text is a `[-Wpedantic]` warning promoted by `-Werror`. So the two references differ in KIND (error vs pedantic warning), not merely in verdict. A further complication: `_Thread_local` and `thread_local` are DISTINCT kinds in c-subset.lang.json (ThreadLocalKeyword vs ThreadLocalC23Keyword), so `__thread` is not cleanly an alias of either one.
+@why GNU `__thread` — the pre-C11 thread-local storage-class specifier, still what glibc's own headers write. ★ THE BODY USES `extern` ON PURPOSE. A DEFINITION (`static __thread int x;`) would ALSO be refused by DSS for a completely unrelated, MEASURED reason — the linker advertises `tbss` on no relocatable-object format (see a_thread_local_definition_c11) — so this row would then red on that gap forever and never turn when the spelling was added. `extern _Thread_local int x;` and `extern thread_local int x;` are both ACCEPTED by DSS today on both fixed targets (✔MEASURED), so with an `extern` body the SPELLING is the only variable left.
+@code
+extern __thread int dss_thread_local_gnu_probe;
+@end
+
+@probe a_extension_prefix_gnu
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: both positions are rejected by DSS — the DECLARATION prefix at parse (P0009, `__extension__` read as the declared name) and the EXPRESSION prefix in semantics (S0001 "got __extension__", an unknown identifier) — and both are accepted by gcc 13.3.0, clang 18.1.3, clang 19.1.1 at `-std=gnu17` AND `-std=c17 -pedantic-errors`, and by cl 19.51 at `/std:clatest /W4` with ZERO diagnostics (measured with a matched negative control: cl rejects `__no_such_keyword__ int x;` with C2054, so its acceptance here is recognition, not leniency). Tracked at D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS (this class's exclusion set). ★ DELIBERATELY NOT FOLDED INTO THE SPELLING-ALIAS CYCLE: `__extension__` has NO plain-C counterpart to alias onto. It is a transparent diagnostic-suppression prefix — a small GRAMMAR feature in two distinct slots (declaration-specifier position and unary-expression position) that must parse and then vanish, leaving the operand's type and value untouched. Calling that an alias would have mis-scoped it, and a keyword row cannot express it at all.
+@why GNU `__extension__` — the prefix that suppresses pedantic diagnostics for the construct it precedes. It is how glibc and libstdc++ headers keep `-pedantic` builds quiet, so a translation unit reaching those headers meets it without ever writing it.
+@code
+__extension__ int dss_extension_decl_probe;
+int dss_extension_expr_probe(void) { return __extension__ (0); }
 @end

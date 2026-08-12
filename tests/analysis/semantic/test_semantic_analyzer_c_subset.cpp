@@ -15426,3 +15426,493 @@ TEST(SemanticAnalyzerCSubset, TFC121SuppressedDarwinRowCarriesItsPerTargetLinkNa
            "link name would put `_fstat$INODE64` here and break the arch that "
            "was already correct";
 }
+
+// ── THE GNU `__`-WRAPPED QUALIFIER / SPECIFIER SPELLINGS ─────────────────────
+// (D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS, 2026-08-12)
+//
+// Ten keyword-table rows, five kinds, zero C++: `__volatile__`/`__volatile` →
+// VolatileKeyword, `__const__`/`__const` → ConstKeyword, `__signed__`/`__signed`
+// → SignedKeyword, `__restrict__`/`__restrict` → RestrictKeyword,
+// `__complex__`/`__complex` → ComplexKeyword. Same many-words-one-kind facility
+// as `inline`/`__inline`/`__inline__` (InlineGnuSpellingsAreSynonyms) and
+// `__typeof__`/`__alignof__`.
+//
+// ★★ WHY THESE PINS ASSERT SEMANTIC EFFECTS AND NEVER "IT COMPILED".
+// A parse-only test cannot tell a CORRECT alias from a PLAUSIBLE WRONG one, and
+// for this particular set the wrong mappings are not far-fetched — all five
+// kinds are cv/specifier tokens that share grammar slots, so `__const__` landed
+// on VolatileKeyword, or `__restrict__` landed on ConstKeyword, would still
+// PARSE every declaration below. What separates them is the observable each kind
+// uniquely owns, and each pin below asserts that observable, so a mis-keyed row
+// is red here rather than green-and-silently-wrong:
+//   * VolatileKeyword — the interned Volatile QUALIFIER BIT
+//     (`ti.isVolatileQualified`). No other kind sets it.
+//   * ConstKeyword    — reaches `constMarker`, marks the symbol `isConst`, and
+//     an assignment through it is S_ConstViolation. No other kind is loud there.
+//   * SignedKeyword   — participates in the `typeSpecifiers` MULTISET, so
+//     `__signed__ char` is I8 (not U8, which is where an Unsigned mis-key lands,
+//     and not I32, which is where a dropped specifier lands).
+//   * ComplexKeyword  — also a multiset participant: `__complex__ double` is
+//     TypeKind::Complex over an F64 element, and `__complex__ int` is the LOUD
+//     invalid multiset S_InvalidTypeSpecifierCombination — whereas the adjacent
+//     ImaginaryKeyword sits in NO row and would give S_UnknownType instead.
+//   * RestrictKeyword — has NO interned bit at all (only VolatileQual is
+//     interned), so it is the one kind with no positive type observable. It is
+//     pinned by WHERE IT IS REFUSED instead: `headQualifier` is
+//     {Const, Volatile, Atomic} and `typeSpecifierSeq` admits Signed/Complex, so
+//     EVERY other candidate kind is ACCEPTED bare in front of a base type while
+//     RestrictKeyword is not. `__restrict__ int x;` must therefore be REJECTED —
+//     identically to ISO `restrict int x;` — which is exactly the assertion a
+//     Const/Volatile/Atomic/Signed/Complex mis-key fails.
+//
+// ★ MULTI-FORM, not a sampled subset: every one of the ten spellings appears,
+// and each family is exercised in more than one grammar position (declaration
+// head, pointer qualifier, parameter, array-suffix modifier, east/trailing
+// specifier), because a row can be reachable from one slot and not another.
+//
+// MEASURED on this host with matched positive controls (a plain-ISO file) and a
+// NEGATIVE control (`__no_such_keyword__`, rejected — so the lexer is NOT
+// blanket-accepting dunder words and these ten prove something): gcc 13.3.0,
+// clang 18.1.3 and clang 19.1.1 accept all ten, and `gcc -pedantic-errors`
+// accepts them too — the spellings are in C 7.1.3's implementation-reserved
+// namespace, so no conforming program can collide with them and no dialect flag
+// is needed. ⚠ NOT claimed: real `cl.exe` does NOT accept the dunder forms of
+// volatile/const/signed/restrict. Two of three reference compilers is the bar.
+
+namespace {
+// Error-severity TREE-BUILDER (parse) diagnostics across a CU. The refusal pins
+// below need the POSITIVE form of what `assertNoBuilderErrors` asserts the
+// absence of, and a parse refusal never reaches the semantic model — so a
+// SemanticModel-based check would read clean on exactly the inputs these pins
+// are about. Mirrors the fixture's own traversal (per-tree, Error severity only).
+[[nodiscard]] std::size_t countBuilderErrors(CompilationUnit const& cu) {
+    std::size_t n = 0;
+    for (auto const& t : cu.trees())
+        for (auto const& d : t.diagnostics().all())
+            if (d.severity == DiagnosticSeverity::Error) ++n;
+    return n;
+}
+} // namespace
+
+// (1) `__volatile__` / `__volatile` set the interned VOLATILE QUALIFIER BIT —
+// the observable no other candidate kind can produce. Two grammar positions:
+// the declaration head (a volatile OBJECT) and after a `*` (a volatile POINTER).
+TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingsQualifyLikeIsoSpelling) {
+    // (a) HEAD position. `volatile int` / `__volatile__ int` / `__volatile int`
+    // must be the SAME interned TypeId — not merely all volatile, but literally
+    // one type, which is what "alias" means at the lattice.
+    auto cu = buildShippedUnit("c-subset", {
+        "volatile int iso;\n"
+        "__volatile__ int gnuLong;\n"
+        "__volatile int gnuShort;\n"
+        "int plain;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* iso = findSym(model, "iso");
+    ASSERT_NE(iso, nullptr);
+    ASSERT_TRUE(iso->type.valid());
+    ASSERT_TRUE(ti.isVolatileQualified(iso->type))
+        << "instrument check: the ISO spelling must set the bit, else the "
+           "comparisons below are vacuous";
+    for (char const* name : {"gnuLong", "gnuShort"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        ASSERT_TRUE(s->type.valid()) << name;
+        EXPECT_TRUE(ti.isVolatileQualified(s->type))
+            << name << ": a GNU volatile spelling must set the SAME interned "
+                       "Volatile qualifier bit `volatile` sets — this is the "
+                       "assertion a row mapped to ConstKeyword (which parses "
+                       "here just as happily) fails";
+        EXPECT_EQ(s->type.v, iso->type.v)
+            << name << ": the alias must intern to the IDENTICAL TypeId as the "
+                       "ISO spelling, not merely to some volatile type";
+    }
+    // NEGATIVE control in the same CU: an unqualified `int` must NOT carry the
+    // bit, so the pin above is discriminating rather than always-true.
+    SymbolRecord const* plain = findSym(model, "plain");
+    ASSERT_NE(plain, nullptr);
+    ASSERT_TRUE(plain->type.valid());
+    EXPECT_FALSE(ti.isVolatileQualified(plain->type))
+        << "a plain `int` must not be volatile-qualified";
+    EXPECT_NE(plain->type.v, iso->type.v)
+        << "`volatile int` and `int` are DISTINCT interned types";
+}
+
+// (1b) POINTER-qualifier position (`int * __volatile__ p`) — a different
+// grammar slot (`ptrQualifier`, not `headQualifier`), so it needs its own pin:
+// a row can be reachable from one slot and not the other. Asserted against the
+// ISO spelling's own answer in the same CU rather than against a hard-coded
+// expectation, so the pin states "the alias agrees with `volatile`" — which is
+// the claim — whether or not a post-star volatile qualifies the pointer.
+TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingsInPointerQualifierPosition) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int * volatile pIso;\n"
+        "int * __volatile__ pGnuLong;\n"
+        "int * __volatile pGnuShort;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* iso = findSym(model, "pIso");
+    ASSERT_NE(iso, nullptr);
+    ASSERT_TRUE(iso->type.valid());
+    ASSERT_EQ(ti.kind(iso->type), TypeKind::Ptr);
+    for (char const* name : {"pGnuLong", "pGnuShort"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        ASSERT_TRUE(s->type.valid()) << name;
+        EXPECT_EQ(s->type.v, iso->type.v)
+            << name << ": a post-star GNU volatile must resolve to the SAME "
+                       "interned type the ISO spelling resolves to in the same "
+                       "position";
+        EXPECT_EQ(ti.isVolatileQualified(s->type),
+                  ti.isVolatileQualified(iso->type))
+            << name << ": the alias must agree with `volatile` about the "
+                       "pointer's own qualification, whatever that answer is";
+    }
+}
+
+// (2) `__const__` / `__const` reach `constMarker` and make the object CONST —
+// pinned by `isConst` on the symbol AND by the S_ConstViolation an assignment
+// through it must raise. A row mis-keyed to VolatileKeyword parses every line
+// here and raises NOTHING, which is precisely the silent const-loss this pin
+// exists to catch. Three positions: declaration head, EAST/trailing specifier,
+// and a parameter.
+TEST(SemanticAnalyzerCSubset, GnuConstSpellingsMarkObjectsConst) {
+    auto cu = buildShippedUnit("c-subset", {
+        "const int iso = 1;\n"
+        "__const__ int gnuLong = 2;\n"
+        "__const int gnuShort = 3;\n"
+        "int __const__ gnuEast = 4;\n"     // EAST/trailing specifier position
+        "int mut = 5;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    SymbolRecord const* iso = findSym(model, "iso");
+    ASSERT_NE(iso, nullptr);
+    ASSERT_TRUE(iso->isConst)
+        << "instrument check: the ISO spelling must mark const, else the "
+           "comparisons below are vacuous";
+    for (char const* name : {"gnuLong", "gnuShort", "gnuEast"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        EXPECT_TRUE(s->isConst)
+            << name << ": a GNU const spelling must reach `constMarker` and "
+                       "mark the symbol const — a row mapped to "
+                       "VolatileKeyword parses this line and marks NOTHING";
+    }
+    // NEGATIVE control: a plain object must NOT come out const.
+    SymbolRecord const* mut = findSym(model, "mut");
+    ASSERT_NE(mut, nullptr);
+    EXPECT_FALSE(mut->isConst) << "a plain `int` is not const";
+}
+
+// (2b) The ENFORCEMENT half: assigning through each GNU const spelling is LOUD,
+// exactly as through `const`. `isConst` on the record is a flag; this is the
+// behaviour that flag is for, and it is a separate tier (SE4's const check).
+TEST(SemanticAnalyzerCSubset, GnuConstSpellingsAreEnforcedOnAssignment) {
+    // Instrument check: the ISO spelling raises exactly one violation.
+    auto isoModel = analyzeShipped(
+        "c-subset", {"int main(void){ const int c = 5; c = 6; return c; }\n"});
+    ASSERT_EQ(countCode(isoModel.diagnostics(),
+                        DiagnosticCode::S_ConstViolation), 1u)
+        << "instrument check: ISO `const` must be enforced here";
+    for (std::string_view spelling : {"__const__", "__const"}) {
+        auto model = analyzeShipped(
+            "c-subset", {"int main(void){ " + std::string(spelling) +
+                         " int c = 5; c = 6; return c; }\n"});
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_ConstViolation), 1u)
+            << spelling << ": assigning through a GNU const spelling must be "
+                           "S_ConstViolation, exactly as through `const`";
+    }
+    // NEGATIVE control: without any const spelling the SAME assignment is
+    // clean, so the pin above is measuring the qualifier and not the statement.
+    auto mutModel = analyzeShipped(
+        "c-subset", {"int main(void){ int c = 5; c = 6; return c; }\n"});
+    EXPECT_EQ(countCode(mutModel.diagnostics(),
+                        DiagnosticCode::S_ConstViolation), 0u)
+        << "assigning to a NON-const object must be clean";
+}
+
+// (2c) `__const__` as a POINTER qualifier (`int * __const__ p`) — the
+// `ptrQualifier` slot, a different reach than the head. Pinned against the ISO
+// spelling's own interned answer in the same CU.
+TEST(SemanticAnalyzerCSubset, GnuConstSpellingsInPointerQualifierPosition) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int * const pIso = 0;\n"
+        "int * __const__ pGnuLong = 0;\n"
+        "int * __const pGnuShort = 0;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* iso = findSym(model, "pIso");
+    ASSERT_NE(iso, nullptr);
+    ASSERT_TRUE(iso->type.valid());
+    ASSERT_EQ(ti.kind(iso->type), TypeKind::Ptr);
+    for (char const* name : {"pGnuLong", "pGnuShort"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        ASSERT_TRUE(s->type.valid()) << name;
+        EXPECT_EQ(s->type.v, iso->type.v)
+            << name << ": a post-star GNU const must intern to the SAME type "
+                       "`int * const` interns to";
+    }
+}
+
+// (3) `__signed__` / `__signed` participate in the type-specifier MULTISET, so
+// the resolved CORE TYPE is the pin: `__signed__ char` is I8. A row mis-keyed to
+// UnsignedKeyword yields U8 and a dropped specifier yields I32 — both parse, and
+// both are caught here. Four multiset shapes per spelling, including the
+// bare-specifier form (`__signed__ x;` == `int`) and a two-token `long` combo.
+TEST(SemanticAnalyzerCSubset, GnuSignedSpellingsResolveLikeIsoSpelling) {
+    auto cu = buildShippedUnit("c-subset", {
+        "signed char isoC;\n"
+        "__signed__ char gnuLongC;\n"
+        "__signed char gnuShortC;\n"
+        "__signed__ gnuLongBare;\n"        // bare specifier == `signed int`
+        "__signed gnuShortBare;\n"
+        "__signed__ long gnuLongLong;\n"   // multi-token multiset
+        "unsigned char uC;\n",             // the mis-key's destination
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* iso = findSym(model, "isoC");
+    ASSERT_NE(iso, nullptr);
+    ASSERT_TRUE(iso->type.valid());
+    ASSERT_EQ(ti.kind(iso->type), TypeKind::I8)
+        << "instrument check: ISO `signed char` must be I8";
+    for (char const* name : {"gnuLongC", "gnuShortC"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        ASSERT_TRUE(s->type.valid()) << name;
+        EXPECT_EQ(ti.kind(s->type), TypeKind::I8)
+            << name << ": `<gnu signed> char` is I8 — U8 would mean the row "
+                       "landed on UnsignedKeyword, I32 would mean the "
+                       "specifier was dropped";
+        EXPECT_EQ(s->type.v, iso->type.v)
+            << name << ": and it must be the IDENTICAL interned type";
+    }
+    for (char const* name : {"gnuLongBare", "gnuShortBare"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        ASSERT_TRUE(s->type.valid()) << name;
+        EXPECT_EQ(ti.kind(s->type), TypeKind::I32)
+            << name << ": a BARE GNU signed specifier is `signed int` (I32) — "
+                       "the multiset row with SignedKeyword alone";
+    }
+    SymbolRecord const* sl = findSym(model, "gnuLongLong");
+    ASSERT_NE(sl, nullptr);
+    ASSERT_TRUE(sl->type.valid());
+    EXPECT_EQ(ti.kind(sl->type), TypeKind::I64)
+        << "`__signed__ long` must reach the [Signed, Long] multiset row "
+           "(I64 on this LP64 test target)";
+    // NEGATIVE control: the type the UnsignedKeyword mis-key would produce is
+    // genuinely DIFFERENT, so the I8 assertions above can actually fail.
+    SymbolRecord const* u = findSym(model, "uC");
+    ASSERT_NE(u, nullptr);
+    ASSERT_TRUE(u->type.valid());
+    EXPECT_EQ(ti.kind(u->type), TypeKind::U8);
+    EXPECT_NE(u->type.v, iso->type.v)
+        << "`signed char` and `unsigned char` must be distinct interned types, "
+           "else the mis-key this pin guards against would be undetectable";
+}
+
+// (4) `__complex__` / `__complex` are multiset participants too: the resolved
+// type is TypeKind::Complex over the right ELEMENT. Both spellings, both
+// element widths, and the EAST/trailing position (`double __complex__`), since
+// C 6.7.1 lets decl-specifiers appear in any order and the multiset is
+// order-independent — a mis-key to ImaginaryKeyword (which sits in NO multiset
+// row) makes every line here S_UnknownType instead.
+TEST(SemanticAnalyzerCSubset, GnuComplexSpellingsResolveLikeIsoSpelling) {
+    auto cu = buildShippedUnit("c-subset", {
+        "double _Complex isoD;\n"
+        "__complex__ double gnuLongD;\n"
+        "__complex double gnuShortD;\n"
+        "double __complex__ gnuEastD;\n"   // EAST/trailing specifier position
+        "__complex__ float gnuLongF;\n"
+        "__complex float gnuShortF;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* iso = findSym(model, "isoD");
+    ASSERT_NE(iso, nullptr);
+    ASSERT_TRUE(iso->type.valid());
+    ASSERT_EQ(ti.kind(iso->type), TypeKind::Complex)
+        << "instrument check: ISO `double _Complex` must be Complex";
+    for (char const* name : {"gnuLongD", "gnuShortD", "gnuEastD"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        ASSERT_TRUE(s->type.valid()) << name;
+        ASSERT_EQ(ti.kind(s->type), TypeKind::Complex) << name;
+        EXPECT_EQ(ti.kind(ti.complexElement(s->type)), TypeKind::F64)
+            << name << ": a GNU complex spelling over `double` must have an "
+                       "F64 element — the ELEMENT is what a wrong multiset row "
+                       "would get wrong";
+        EXPECT_EQ(s->type.v, iso->type.v)
+            << name << ": and it must be the IDENTICAL interned type as "
+                       "`double _Complex`";
+    }
+    for (char const* name : {"gnuLongF", "gnuShortF"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        ASSERT_TRUE(s->type.valid()) << name;
+        ASSERT_EQ(ti.kind(s->type), TypeKind::Complex) << name;
+        EXPECT_EQ(ti.kind(ti.complexElement(s->type)), TypeKind::F32)
+            << name << ": `<gnu complex> float` must have an F32 element";
+    }
+}
+
+// (4b) The GNU complex spelling inherits the ISO spelling's LOUD invalid
+// multiset: `__complex__ int` is S_InvalidTypeSpecifierCombination, exactly as
+// `_Complex int` is (ComplexKeyword IS in the specifier vocabulary but
+// [Complex, Int] is not a row). This is the mirror of
+// ComplexIntAndImaginaryFailLoud, and it is the pin that separates
+// ComplexKeyword from the adjacent ImaginaryKeyword: an `__complex__` mis-keyed
+// to ImaginaryKeyword would give S_UnknownType here, not this code.
+TEST(SemanticAnalyzerCSubset, GnuComplexSpellingsInheritInvalidMultisetDiagnostic) {
+    for (std::string_view spelling : {"__complex__", "__complex"}) {
+        auto model = analyzeShipped(
+            "c-subset",
+            {"int main(void){ " + std::string(spelling) + " int y; return 0; }\n"});
+        EXPECT_TRUE(model.hasErrors()) << spelling;
+        EXPECT_GT(countCode(model.diagnostics(),
+                            DiagnosticCode::S_InvalidTypeSpecifierCombination),
+                  0u)
+            << spelling << " int` must fail with the SAME invalid-multiset code "
+                           "`_Complex int` fails with — S_UnknownType here "
+                           "would mean the row landed on ImaginaryKeyword";
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType),
+                  0u)
+            << spelling << ": the spelling IS a known specifier; only the "
+                           "COMBINATION is invalid";
+    }
+}
+
+// (5) `__restrict__` / `__restrict` — the kind with no interned bit, pinned in
+// BOTH directions.
+//
+// ★ THE REFUSAL IS THE DISCRIMINATOR, and this is the pin that makes the
+// restrict rows provable at all. `headQualifier` is {Const, Volatile, Atomic}
+// and `typeSpecifierSeq` admits Signed/Complex, so a bare qualifier in front of
+// a base type is ACCEPTED for every other kind these rows could plausibly have
+// landed on — and REFUSED for RestrictKeyword. MEASURED: the P0009 for both
+// `restrict int x;` and `__restrict__ int x;` lists ConstKeyword,
+// VolatileKeyword, AtomicKeyword, SignedKeyword and ComplexKeyword among the
+// tokens it WOULD have accepted there. So "the GNU spelling is rejected in head
+// position, exactly like ISO `restrict`" is a live, falsifiable assertion that
+// only the correct mapping satisfies.
+TEST(SemanticAnalyzerCSubset, GnuRestrictSpellingsMatchIsoIncludingWhereRefused) {
+    // (a) ACCEPTED where `restrict` is accepted: after a `*` (pointer
+    // qualifier), on a parameter, twice in one signature, and in the
+    // array-suffix modifier slot. Same interned types as the ISO spelling.
+    auto cu = buildShippedUnit("c-subset", {
+        "int * restrict pIso;\n"
+        "int * __restrict__ pGnuLong;\n"
+        "int * __restrict pGnuShort;\n"
+        "void fIso(int * restrict a, int * restrict b);\n"
+        "void fGnuLong(int * __restrict__ a, int * __restrict__ b);\n"
+        "void fGnuShort(int * __restrict a, int * __restrict b);\n"
+        "void fMixed(int * __restrict__ a, int * __restrict b);\n"
+        "void aIso(int a[restrict 4]);\n"
+        "void aGnuLong(int a[__restrict__ 4]);\n"
+        "void aGnuShort(int a[__restrict 4]);\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "every position ISO `restrict` is legal in must accept both GNU "
+           "spellings — including the array-suffix modifier slot";
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* iso = findSym(model, "pIso");
+    ASSERT_NE(iso, nullptr);
+    ASSERT_TRUE(iso->type.valid());
+    ASSERT_EQ(ti.kind(iso->type), TypeKind::Ptr);
+    for (char const* name : {"pGnuLong", "pGnuShort"}) {
+        SymbolRecord const* s = findSym(model, name);
+        ASSERT_NE(s, nullptr) << name;
+        ASSERT_TRUE(s->type.valid()) << name;
+        EXPECT_EQ(s->type.v, iso->type.v)
+            << name << ": a GNU restrict spelling must intern to the SAME type "
+                       "`int * restrict` interns to";
+        // restrict is NOT an interned qualifier (only VolatileQual is), so a
+        // row mis-keyed to VolatileKeyword would set the volatile bit here.
+        EXPECT_FALSE(ti.isVolatileQualified(s->type))
+            << name << ": restrict has no interned bit — a volatile bit here "
+                       "means the row landed on VolatileKeyword";
+    }
+
+    // (b) REFUSED where `restrict` is refused — the discriminating half. Both
+    // GNU spellings must fail in head position, and they must fail the SAME WAY
+    // ISO `restrict` fails: a BUILDER (parse) error, which is why this counts
+    // tree diagnostics rather than semantic ones.
+    auto const headPositionErrors = [](std::string_view spelling) -> bool {
+        auto cu2 = buildShippedUnit(
+            "c-subset", {std::string(spelling) + " int headQualified;\n"});
+        return countBuilderErrors(*cu2) > 0u;
+    };
+    ASSERT_TRUE(headPositionErrors("restrict"))
+        << "instrument check: ISO `restrict int x;` must ALREADY be refused in "
+           "head position (headQualifier is {Const, Volatile, Atomic}); if it "
+           "were accepted, the assertions below would prove nothing";
+    for (std::string_view spelling : {"__restrict__", "__restrict"}) {
+        EXPECT_TRUE(headPositionErrors(spelling))
+            << spelling << " must be REFUSED in declaration-head position, "
+                           "exactly as ISO `restrict` is. Accepting it here is "
+                           "the signature of a row mis-keyed to Const/Volatile/"
+                           "Atomic/Signed/Complex — every one of which IS legal "
+                           "in this slot, so this refusal is what pins the row "
+                           "to RestrictKeyword";
+    }
+    // NEGATIVE control for (b): a kind that IS legal in head position is
+    // accepted there, proving the helper detects acceptance and is not simply
+    // reporting an error for every input.
+    EXPECT_FALSE(headPositionErrors("const"))
+        << "`const int x;` must be ACCEPTED in head position — otherwise the "
+           "refusal assertions above are vacuous";
+    EXPECT_FALSE(headPositionErrors("__const__"))
+        << "`__const__ int x;` must be ACCEPTED in head position — the GNU "
+           "const alias reaches headQualifier";
+}
+
+// (6) THE SIDE EFFECT THAT IS A FEATURE, pinned so it cannot silently regress:
+// `__volatile__` reaching VolatileKeyword means `asmStmt`'s
+// `{optional VolatileKeyword}` slot now accepts `__asm__ __volatile__ ("")` —
+// the form real headers write. That closes the `__volatile__` half of
+// D-CSUBSET-INLINE-ASM-SPELLING. Bare `asm` stays deliberately absent (it is an
+// ordinary identifier in standard C), and the `:` OPERAND LIST is a separate
+// open gap — so the second half of this test pins the RESIDUE as still LOUD,
+// which is what keeps the half-closure from being read as a whole one.
+TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingReachesInlineAsmQualifierSlot) {
+    for (std::string_view qual : {"volatile", "__volatile__", "__volatile"}) {
+        auto cu = buildShippedUnit(
+            "c-subset", {"int main(void){ __asm__ " + std::string(qual) +
+                         " (\"\"); return 0; }\n"});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        EXPECT_FALSE(model.hasErrors())
+            << qual << ": the empty-template barrier must be accepted with "
+                       "this qualifier spelling";
+    }
+    // THE RESIDUE, still loud: sqlite's src/hwtime.h:43 shape. The SPELLING now
+    // passes and the `:` operand list does not, so this must still be refused —
+    // at the COLON. A green here would mean operand lists were silently
+    // accepted and dropped, which is a miscompile, not progress.
+    auto cu = buildShippedUnit("c-subset", {
+        "unsigned long long hw(void){ unsigned int lo, hi;\n"
+        "  __asm__ __volatile__ (\"rdtsc\" : \"=a\" (lo), \"=d\" (hi));\n"
+        "  return (unsigned long long)hi << 32 | lo; }\n",
+    });
+    EXPECT_GT(countBuilderErrors(*cu), 0u)
+        << "GNU EXTENDED inline asm (a `:` operand list) is a separate OPEN gap "
+           "(D-CSUBSET-INLINE-ASM-OPERANDS / "
+           "D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED). It must still fail "
+           "LOUD — the `__volatile__` row moves this failure from the spelling "
+           "to the colon, it does not close it, and sqlite's --scanstatus stays "
+           "off until it does";
+}
