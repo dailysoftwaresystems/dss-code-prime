@@ -1,0 +1,69 @@
+# Delegation is the default
+
+### Step C.0 — DELEGATION IS THE DEFAULT (read before every step below)
+
+**Every step of this cycle that is not inherently serial runs in a SUBAGENT. This is not an
+optimization — it is how the cycle is meant to execute, and it does not require the user to
+ask for it each time.** Some host configurations ship an ambient "don't spawn agents unless
+asked" default; **this skill overrides it.** A project rule beats an ambient default, and
+the reason is concrete: the orchestrator's context is the cycle's scarcest resource. Reading
+300 lines of a pass to learn one API, or grepping four files to find a config field, burns
+budget that should be spent on judgment — deciding, gating, and landing. An agent absorbs
+that reading and hands back a conclusion.
+
+**The failure this prevents, observed repeatedly:** the orchestrator does everything inline,
+runs low on context mid-cycle, and ends the turn with design notes instead of shipped code —
+cycle after cycle. If you find yourself opening a large file mainly to *learn* something,
+that is a delegation you skipped.
+
+**Delegate by default:**
+
+| step | agent | notes |
+|---|---|---|
+| 1–2 pick / clear blockers | `Explore` or `general-purpose` | when it means sweeping plans, the registry, or `src/` to locate work |
+| 3 plan | `Plan` / `feature-dev:code-architect` | returns the execution plan; you judge it |
+| **3.5 design-audit** | **independent `general-purpose`** | MUST be a fresh agent — the point is that it did not author the plan |
+| 4 implement | one agent per DISJOINT file set, **in parallel** | see the parallelism rule below |
+| 5 review & fold | `pr-review-toolkit:*` / `feature-dev:code-reviewer` | |
+| 7–8 deferrals + cross-plan | `general-purpose` | mechanical registry/plan reconciliation |
+| **8.5 code-audit** | **independent `general-purpose`, READ-ONLY** | must not be the agent that wrote the code |
+
+**PARALLELISM:** when a step splits into disjoint file sets — engine `.cpp` vs `*.json`
+config vs `examples/` corpus vs `tests/` — launch those agents IN ONE MESSAGE so they run
+concurrently, and tell each agent explicitly which paths it owns and which it must not
+touch. Overlapping writes are the only real hazard; disjointness removes it.
+
+**★ DO NOT DELEGATE — the orchestrator keeps these:**
+- **Step 6, the gate** (builds, ctest, the 3-leg run, the sqlite re-probe). A delegated
+  build/gate agent reliably **yields mid-build** — it kicks the build off, reports "standing
+  by", and leaves an orphaned detached job. This has bitten this project repeatedly. Drive
+  builds yourself, FOREGROUND-BLOCKING, or via a harness-tracked `run_in_background` command
+  that re-invokes you on exit. If you *do* hand a build to an agent, say FOREGROUND-BLOCKING
+  in the prompt and treat a "standing by" reply as a failed step.
+- **Step 9, commit & push**, and every §B decision. Those are judgment and authority.
+- **Verifying an agent's claim.** An agent reporting "done, all green" is a claim, not
+  evidence (§B: green ≠ clean). Re-run the gate yourself. A delegated agent that refutes its
+  own pre-registered hypothesis mid-task is doing it RIGHT — read its reasoning, do not
+  rubber-stamp it.
+
+**Prompt quality is the whole game.** A vague prompt returns vague work you must redo. Give
+each agent: the exact files it owns, the invariants it must not break (§A — agnosticism,
+fail-loud, strict tests), the house comment style, the specific traps already known (the
+eager-import law, closed descriptor key sets, `--define` not `-D`, capture rc directly), and
+what to REPORT BACK. Tell it what NOT to do as explicitly as what to do.
+
+★★★ **AND EVERY BRIEF MUST SAY "ANCHOR *AND CLOSE*" — "anchor every issue you find", written
+alone, is an instruction to generate OPEN ROWS.** ✔MEASURED 2026-08-11: that exact sentence went
+into four consecutive lane briefs; the lanes obeyed it perfectly and the branch ended with 22 open
+rows, nine of them from a lane whose assignment WAS the thing it was documenting. The lanes were
+not at fault — the brief asked for anchors and got anchors. Put this in every brief, verbatim:
+
+> Anchor every issue you come across — and **close it in this cycle**. A row you hand me OPEN is
+> work you are asking someone else to do; hand me rows **born ✅ CLOSED**, with the fix and its
+> verification in them. If something is genuinely out of reach it needs a **NAMED blocker** — a
+> specific missing prerequisite, an unfired trigger, or a decision only the operator can make.
+> "Out of scope", "bigger than this cycle", "a follow-up" and "the natural next step" are not
+> blockers. Bring me the decision; do not park it in the registry.
+
+Then CHECK the returned rows before you write them. An agent reporting "anchored 6 findings" is
+reporting six unfinished jobs unless every one says CLOSED.
