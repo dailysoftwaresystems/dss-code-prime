@@ -79,7 +79,7 @@ void emit(DiagnosticReporter& reporter,
 // a fresh path opens, an EXISTING path is REFUSED (null) and left byte-intact.
 // RED ON DISABLE, stated PER ARM because the two arms are genuinely different
 // code and one measurement cannot cover both (the TF-C104 lesson recurring):
-// on Windows, swap `L"wbx"` for `L"wb"`; on POSIX, drop `O_EXCL` from the
+// on Windows, swap `L"wbxN"` for `L"wbN"`; on POSIX, drop `O_EXCL` from the
 // `open` flags. Either one turns that second pin red.
 namespace detail {
 
@@ -137,7 +137,7 @@ namespace detail {
 // ★ THE TWO ARMS DELIBERATELY USE DIFFERENT PRIMITIVES, and the asymmetry is
 // the point rather than an oversight:
 //
-//   * Windows uses `_wfopen(…, L"wbx")` because it is MEASURED working on the
+//   * Windows uses `_wfopen(…, L"wbxN")` because it is MEASURED working on the
 //     leg we actually build here (fresh path opens; existing path refused,
 //     left byte-intact), and it keeps the wide path wide.
 //
@@ -174,17 +174,71 @@ namespace detail {
 // emit a diagnostic blaming "an earlier run was killed before it could clean
 // up" — a FALSE attribution of a fault that is entirely inside THIS process.
 //
-// The Windows arm has no such window: `_wfopen(…, L"wbx")` creates nothing
+// The Windows arm has no such window: `_wfopen(…, L"wbxN")` creates nothing
 // when it fails. So both arms keep one promise — a claim that does not hand
 // back a stream leaves the directory exactly as it found it.
+//
+// ★ AND NEITHER ARM MAY LET THIS HANDLE CROSS INTO A SPAWNED CHILD — which is
+// what the `N` and the `O_CLOEXEC` below are for, and they are the ONLY reason
+// either appears. `writeBytes` holds the returned stream open across its
+// `fwrite`, and the compiler now creates processes
+// (`core/substrate/process_spawn.cpp`, whose header names two consumers: a
+// user build hook and `git` dependency acquisition). Inheritance is a property
+// of the HANDLE, decided where the handle is made, so refusing it here is the
+// whole fix; refusing it at the spawn instead would mean adopting
+// `STARTF_USESTDHANDLES` plus a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` to filter,
+// and that is precisely the mechanism `process_spawn.cpp` declines to use (its
+// `bInheritHandles=TRUE` with NO `STARTF_USESTDHANDLES` is deliberate and has
+// its own pin, `TheChildWritesToTheParentsOwnStdoutAndStderr`).
+//
+// ⚠ MEASURED, because the CRT's mode-flag behaviour is documented but the call
+// had never been probed. `GetHandleInformation` on `_get_osfhandle(_fileno(f))`
+// immediately after the open:
+//     L"wbx"  -> flags=0x00000001, HANDLE_FLAG_INHERIT SET
+//     L"wbxN" -> flags=0x00000000, HANDLE_FLAG_INHERIT clear
+// ON BOTH WINDOWS TOOLCHAINS — MSVC 14.51 and MinGW-W64 UCRT g++ 13.2 — with
+// identical flags and, the half that actually matters here, a SUCCESSFUL open
+// in every case. That second half is not a formality: this function exists
+// because TF-C104 shipped a spelling one library layer REFUSED, which failed
+// every artifact write on Windows. An unrecognised mode character would do the
+// same thing, so "does `N` open at all" was measured before it was adopted.
+// And end to end, with a child created (`bInheritHandles=TRUE`) while the temp
+// was open, the parent's own copy then closed, and the commit below attempted:
+//     L"wbx"  -> MoveFileExW FAILS, GetLastError=32 ERROR_SHARING_VIOLATION
+//     L"wbxN" -> MoveFileExW succeeds
+// 32 is the rename at the bottom of `writeBytes` refusing to replace a target
+// that is open elsewhere — and the diagnostic it emits blames "a running .exe
+// or a scanner" while the real holder is OUR OWN child, so the operator is
+// sent after a process that has nothing to do with it. Non-deterministic by
+// construction: it needs a spawn to overlap a staged write.
+//
+// The POSIX consequence is a DIFFERENT one and is not a rename failure —
+// `rename(2)` is a directory operation and does not care that the file is
+// open, so the commit succeeds either way. What leaks there is the descriptor
+// itself: a hook or a `git` gets a WRITABLE fd onto the compiler's staged
+// artifact, which is a capability the substrate's own security note ("every
+// consumer interpolates user-supplied text") says it must not hand out.
+// MEASURED on gcc 13.3 / glibc 2.39 / Linux 5.15, a real `fork` + `execv`:
+// without `O_CLOEXEC` the child finds fd 3 in its own `/proc/self/fd` pointing
+// at `…dsstmp-…` and OPEN FOR WRITING; with it, the child inherits nothing of
+// ours. `fdopen` does not disturb the descriptor flag either way, so the one
+// `O_CLOEXEC` on the `open` is the whole of it. The same run confirms the
+// asymmetry above is real rather than assumed: `rename(2)` returned 0 in BOTH
+// modes, so the leak here never shows up as the Windows failure.
+// Both arms therefore hold ONE property — the staging temp never crosses an
+// exec — even though the failure each was preventing differs.
+//
+// RED ON DISABLE, per arm: drop the `N` on Windows, or `O_CLOEXEC` on POSIX,
+// and `AClaimedStagingTempNeverCrossesIntoASpawnedChild` goes red on that leg.
 [[nodiscard]] std::FILE*
 createExclusiveBinary(std::filesystem::path const& p) {
 #ifdef _WIN32
-    return ::_wfopen(p.c_str(), L"wbx");
+    return ::_wfopen(p.c_str(), L"wbxN");
 #else
     // 0666 & umask — the same permissions `fopen` would have created, so
     // `writeImage`'s load-bearing re-apply (D-OUTPUT-EXEC-BIT) is unaffected.
-    int const fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    int const fd =
+        ::open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
     if (fd < 0) { return nullptr; }
     std::FILE* const f = ::fdopen(fd, "wb");
     if (!f) {

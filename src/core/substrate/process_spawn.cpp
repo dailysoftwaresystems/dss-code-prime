@@ -30,9 +30,11 @@
     // `fcntl(F_SETFD)` leaks the write end into an unrelated child, which then
     // holds the pipe open so the parent's blocking `read` never reaches EOF —
     // and this facility has NO TIMEOUT by design (`process_spawn.hpp`), so the
-    // observable failure is the compiler HANGING. The threading premise is this
-    // file's own: the async-signal-safety discipline further down exists because
-    // of the per-CU compile pool.
+    // observable failure is the compiler HANGING. Whether such a sibling thread
+    // EXISTS is a separate question from whether the code may assume it does
+    // not; both are answered, with the measurement, under "THE THREADING
+    // PREMISE" at the `fork` arm below. The short version: today none does, and
+    // the discipline is kept regardless.
     //
     //   * `pipe2(O_CLOEXEC)` sets the flag IN THE KERNEL, atomically with the
     //     descriptors' creation, so there is no window. Linux (since 2.6.27) and
@@ -138,16 +140,99 @@ std::string windowsErrorText(DWORD code) {
 
 #else
 
+// ★ WHICH `strerror_r` THIS PLATFORM DECLARED, DECIDED BY OVERLOAD RESOLUTION
+// RATHER THAN BY GUESSING AT FEATURE MACROS. There are two incompatible
+// functions behind one name — GNU's returns `char*` (and is free to hand back
+// an immutable static instead of touching the caller's buffer), XSI's returns
+// `int` (0, or an errno). Which one a header declares depends on `_GNU_SOURCE`,
+// `_POSIX_C_SOURCE`, the libc and the platform, and every `#if` that tries to
+// predict it is a guess that compiles on the host it was written for. Handing
+// the return value to an overload SET asks the compiler instead, and the
+// compiler is reading the actual declaration. MEASURED: glibc 2.39 / g++ 13.3
+// `-std=c++23` selects the GNU arm, Apple clang 21 / Darwin 25.5 selects the
+// XSI arm, and both produce text byte-identical to `std::strerror` across all
+// 145 codes probed (0..140 plus four invalid ones) — which is what keeps the
+// exact-string pins in `test_process_spawn.cpp` green, since they rebuild their
+// expectations through `std::strerror`.
+//
+// A host that declares NEITHER fails to compile here, loudly, which is the same
+// posture the `pipe2` predicate at the top of this file takes: a port to an
+// unforeseen POSIX host should be given the mechanism it does have, not left to
+// discover a silent fallback.
+//
+// `[[maybe_unused]]` on BOTH, because exactly one of them is ever selected and
+// the other is then a defined-but-unused function in an anonymous namespace —
+// which is the whole design working, not a leftover. Marking them is what keeps
+// a `-Wunused-function` leg from reporting the mechanism as a defect.
+[[maybe_unused]] char const* selectStrerrorResult(char* gnuResult,
+                                                  char* buffer) {
+    // GNU: the RETURN VALUE is the message. It may or may not be `buffer`.
+    return gnuResult != nullptr ? gnuResult : buffer;
+}
+
+[[maybe_unused]] char const* selectStrerrorResult(int xsiResult, char* buffer) {
+    // XSI: the BUFFER is the message. A non-zero return is EINVAL (no such
+    // errno) or ERANGE (buffer too small); both still normally leave usable
+    // text, and the caller cleared `buffer[0]` beforehand so a genuinely
+    // untouched buffer reads back as empty and gets the fallback sentence
+    // instead of whatever was on the stack.
+    (void)xsiResult;
+    return buffer;
+}
+
 std::string errnoText(int code) {
-    // std::strerror is not thread-safe in the strictest reading, and the
-    // thread-safe spellings are a portability minefield (GNU strerror_r
-    // returns char*, XSI returns int, macOS differs again). This is a
-    // failure-path-only call in a function that is already about to return an
-    // error, so the practical exposure is nil and the portability win is
-    // real. Numeric errno is included so the message is never the only clue.
-    char const* const msg = std::strerror(code);
+    // ★ `std::strerror` USED TO BE CALLED HERE, under a comment arguing its
+    // thread-safety exposure was "nil" because this is a failure-path call.
+    // ⚠ MEASURED, AND THE ANSWER IS NARROWER AND SHARPER THAN EITHER THE OLD
+    // COMMENT OR A FIRST PROBE SUGGESTED. Darwin 25.5 / Apple clang 21, 12
+    // threads x 20,000 calls each, every thread on its OWN error code:
+    //
+    //   codes the libc KNOWS      0 wrong strings. `strerror` hands back an
+    //                             immutable table entry; there is no buffer to
+    //                             share and nothing to race.
+    //   codes it does NOT know    33,692 wrong strings out of 240,000 — and
+    //                             100,265 when the callers do the string work
+    //                             `errnoText` really does, because that work
+    //                             WIDENS the window between the pointer coming
+    //                             back and being read. "Unknown error: N" is
+    //                             formatted into ONE shared static buffer, so
+    //                             every thread on an unknown code overwrites
+    //                             every other's message.
+    //
+    // glibc 2.39 shows 0 on BOTH populations (its buffer is thread-local) and
+    // the Windows UCRT never reaches this function. So this is one platform,
+    // on one sub-population of inputs — not a "strictest reading" concern, and
+    // not a general one either. Saying which is the whole value of the
+    // measurement.
+    //
+    // ⚠ AND IT IS EXACTLY THE POPULATION THIS FUNCTION CANNOT PROMISE TO AVOID.
+    // Every caller here passes a kernel-supplied errno, which is normally a
+    // code the libc knows — but "the set of errnos a kernel can return" is not
+    // closed and is not ours to bound: `Unknown error: N` exists precisely
+    // because a filesystem or a future release can hand back a number this
+    // libc's table does not cover. Betting the diagnostic on that never
+    // happening is the same shape of bet the old comment made and lost.
+    //
+    // Blast radius stays bounded — garbled TEXT, never a wrong `spawned`
+    // verdict — so this was not a correctness cliff. It is a diagnostic that
+    // LIES, in the substrate whose stated contract is that "every OS failure
+    // carries the platform's own error text" (the header's FAIL LOUD, NEVER
+    // SWALLOW note), and on the host where that text carries the most weight:
+    // macOS takes the `posix_spawn` arm, whose single errno is the entire error
+    // channel and already cannot say whether chdir or exec failed.
+    //
+    // 256 bytes is larger than any message either libc produces; on a host that
+    // disagreed, XSI reports ERANGE and the truncated-but-terminated text is
+    // still better than none. Numeric errno is included first so the message is
+    // never the only clue.
+    char buffer[256];
+    buffer[0] = '\0';
+    char const* const msg =
+        selectStrerrorResult(::strerror_r(code, buffer, sizeof buffer), buffer);
     return "errno=" + std::to_string(code) + ": "
-         + (msg != nullptr ? msg : "<no message text for this errno>");
+         + (msg != nullptr && msg[0] != '\0'
+                ? msg
+                : "<no message text for this errno>");
 }
 
 #endif
@@ -680,12 +765,47 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
 #else
     // Everything the child needs is built BEFORE the process is created. On the
     // `fork` arm that is a hard requirement rather than tidiness: between fork
-    // and exec only async-signal-safe calls are legal in a process that may have
-    // threads (and this one does — the per-CU compile pool), so no allocation,
-    // no std::string construction and no locking may happen after the fork. The
-    // `posix_spawn` arm has no such window — none of our code ever runs in the
-    // child — but it consumes exactly these three values, so they are prepared
-    // once for both rather than duplicated into each.
+    // and exec only async-signal-safe calls are legal in a process that has
+    // threads, so no allocation, no std::string construction and no locking may
+    // happen after the fork. The `posix_spawn` arm has no such window — none of
+    // our code ever runs in the child — but it consumes exactly these three
+    // values, so they are prepared once for both rather than duplicated into
+    // each.
+    //
+    // ── ★ THE THREADING PREMISE, CORRECTED ─────────────────────────────────
+    //
+    // This block used to justify itself with "and this one does have threads —
+    // the per-CU compile pool". THAT IS NOT TRUE AT THE MOMENT OF A SPAWN, and
+    // a justification that is factually wrong is worse than none: the next
+    // reader checks it, finds no sibling thread anywhere near the call, and
+    // concludes the whole discipline is dead weight to be simplified away.
+    //
+    // ⚠ MEASURED against the live call graph, not assumed. The only compile
+    // pool is `localPool` — a `std::optional<ThreadPool>` scope-local to
+    // `compileOneTarget`'s multi-CU branch, whose destructor runs
+    // `ThreadPool::shutdown()` and JOINS every worker before that branch ends.
+    // The only alternative executor is injected through `Program::executor_`,
+    // which is null on every path except three tests. The only other thread the
+    // compiler ever creates is the `callOnLargeStack` worker, and its caller
+    // joins it before returning. Meanwhile the sole consumer of this function,
+    // `runBuildScripts`, is invoked from `Program::compileProject` strictly
+    // BEFORE and strictly AFTER that entire compile. So every spawn this
+    // program performs today happens on a process with exactly one thread.
+    //
+    // THE DISCIPLINE STAYS, and none of its reasons depend on that count:
+    //   * this is a `DSS_EXPORT`ed entry point in a shared library, reachable
+    //     through the `extern "C"` API (`dss_compile_project`) that an embedder
+    //     may call from a thread, or from two;
+    //   * a SECOND consumer is arriving — `git` dependency acquisition, named
+    //     in the header — and "one thread" is a property of today's call graph
+    //     that nothing whatsoever enforces;
+    //   * the failure it prevents is INVISIBLE when it happens. A malloc taken
+    //     across `fork` deadlocks the child on a lock no one will release, and
+    //     a leaked pipe end makes the parent's `read` wait forever; both surface
+    //     as the compiler hanging, with no diagnostic, and no test in this suite
+    //     can produce either on demand.
+    // Code whose correctness cannot be re-derived from a red test must never be
+    // made to rest on a call-graph accident.
     std::string const        exePath = exe->string();
     std::string const        cwdPath = cwd.empty() ? std::string{} : cwd.string();
     std::vector<std::string> storage = argv;
@@ -827,15 +947,20 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     //
     // ★ THE CLOEXEC MUST BE ATOMIC WITH THE CREATION WHERE THE HOST ALLOWS IT.
     // `pipe` followed by a separate `fcntl(F_SETFD, FD_CLOEXEC)` leaves a window
-    // in which BOTH descriptors are inheritable, and the process is threaded —
-    // that is the same premise the async-signal-safety note directly above is
-    // written for (the per-CU compile pool). A sibling thread that forks and
+    // in which BOTH descriptors are inheritable. A sibling thread that forks and
     // execs inside that window leaks the WRITE end into an unrelated child; that
     // child then holds the pipe open, so the parent's blocking `read` below
     // never sees EOF, and this facility has NO TIMEOUT by design
     // (`process_spawn.hpp`). The observable failure is the compiler hanging
     // until some unrelated process happens to exit. `pipe2` closes the window
     // inside the kernel; there is nothing to race.
+    //
+    // The sibling thread in that sentence is HYPOTHETICAL and is deliberately
+    // written as one: no thread runs alongside a spawn in this program today,
+    // measured and set out under "THE THREADING PREMISE" above. This arm takes
+    // the atomic call for the same reasons the discipline there is kept — a
+    // public entry point, a second consumer landing, and a failure mode that
+    // manifests as a hang no test can force.
     //
     // ✅ D-SPAWN-CLOEXEC-RACE-OPEN-ON-MACOS — CLOSED. macOS used to reach the
     // two-step `#else` below because it offers no `pipe2`, and the window was

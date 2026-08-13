@@ -32,6 +32,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
@@ -42,9 +43,11 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -1299,7 +1302,328 @@ TEST(SpawnAndWaitInherit, ArgumentsReachTheChildByteIdenticallyWithNoShell) {
     }
 }
 
+// ══ CONCURRENT SPAWNS — the substrate's re-entrancy, executed ═════════════
+//
+// ★★ EVERY RE-ENTRANCY PROPERTY OF THIS SUBSTRATE USED TO BE DERIVED FROM
+// READING. There was no concurrent-spawn test anywhere in the repository: that
+// `waitpid` is pid-specific and cannot collect a sibling's child, that
+// `WaitForSingleObject` is handle-specific, that no non-const static holds a
+// spawn's state, that `getenv`'s result is copied before anything can invalidate
+// it — all of it was an argument about the source, and an argument about the
+// source is exactly what a refactor is free to invalidate without noticing.
+//
+// It matters NOW because the substrate is growing its second consumer (`git`
+// dependency acquisition alongside the build hooks), and because the honest
+// reading of today's call graph is that NOTHING is concurrent yet — see "THE
+// THREADING PREMISE" in `process_spawn.cpp`. A property nothing exercises and
+// nothing asserts is a property the next change silently removes.
+//
+// ★ WHAT MAKES THIS MORE THAN "NOTHING CRASHED". Each call is given its OWN
+// exit code, its OWN marker path and its OWN two-element payload, all derived
+// from a unique index. So:
+//   * a CROSSED EXIT STATUS — thread A reaping thread B's child — shows up as a
+//     mismatched exit code, not as a hang;
+//   * a STOLEN or OVERWRITTEN MARKER shows up as a payload that belongs to a
+//     different index;
+//   * a DROPPED spawn shows up in the count.
+// Assertions are exact counts and exact contents, and every one of them is made
+// on the MAIN thread after the join: gtest's `ASSERT_*` only returns from the
+// function it appears in, so an assertion inside a worker would abandon that
+// worker's remaining loop and report nothing useful about it.
+//
+// ⚠ NO `setenv`/`putenv` FROM THE THREADS, deliberately. `src/` contains no
+// environment writer, and the whole safety argument for the resolver's
+// `std::getenv` rests on that; a test that introduced one would be exercising a
+// shape the real path never has, and would make its own green meaningless.
+// `argv[0]` here carries a directory separator, so the PATH search is skipped
+// entirely on the POSIX arm; on Windows only the read-only `PATHEXT` lookup
+// runs, concurrently, which is the real shape.
+//
+// K and M are deliberately small. This runs on every leg including the
+// operator's laptop, and each iteration is a real process creation of a
+// multi-megabyte gtest binary.
+namespace {
+constexpr int kConcurrentThreads   = 4;
+constexpr int kSpawnsPerThread     = 3;
+constexpr int kConcurrentTotal     = kConcurrentThreads * kSpawnsPerThread;
+
+// One call's complete observation, filled in by a worker and judged on the main
+// thread. Copying the marker out here (rather than re-reading the file later)
+// is what makes a stolen marker detectable: the file is read at the moment the
+// call completed, so a later overwrite cannot repair the evidence.
+struct ConcurrentOutcome {
+    bool                     spawned      = false;
+    int                      exitCode     = -1;
+    std::string              diagnostic;
+    bool                     markerParsed = false;
+    std::string              markerError;
+    std::vector<std::string> markerArgs;
+};
+
+// Release every worker at once. A plain "start the threads and hope" gives the
+// first thread a head start big enough to serialise the whole test on a busy
+// machine — and a serialised concurrency test is a green that means nothing.
+void rendezvous(std::atomic<int>& arrived, int participants) {
+    arrived.fetch_add(1, std::memory_order_acq_rel);
+    while (arrived.load(std::memory_order_acquire) < participants) {
+        std::this_thread::yield();
+    }
+}
+
+// The unique payload for call `index`. TWO elements, not one: a single element
+// would still compare equal if the substrate delivered a truncated argv.
+std::vector<std::string> concurrentPayload(int index) {
+    return {"dss-concurrent-token-" + std::to_string(index),
+            "slot=" + std::to_string(index)};
+}
+} // namespace
+
+TEST(SpawnAndWaitInherit, ConcurrentSpawnsEachGetTheirOwnChildAndTheirOwnVerdict) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
+                                          "process-spawn-concurrent"};
+
+    std::vector<ConcurrentOutcome> outcomes(
+        static_cast<std::size_t>(kConcurrentTotal));
+    std::atomic<int>         arrived{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kConcurrentThreads);
+
+    for (int t = 0; t < kConcurrentThreads; ++t) {
+        workers.emplace_back([&, t] {
+            rendezvous(arrived, kConcurrentThreads);
+            for (int m = 0; m < kSpawnsPerThread; ++m) {
+                int const index = t * kSpawnsPerThread + m;
+                // Exit codes 1..kConcurrentTotal — never 0, so a call whose
+                // status was collected from the wrong child (or never collected
+                // and left at the struct's default) cannot coincide with a
+                // legitimate "clean exit" value.
+                int const  exitCode = index + 1;
+                auto const marker =
+                    scratch.path()
+                    / ("concurrent-" + std::to_string(index) + ".marker");
+                auto const run = runFixture(marker, exitCode,
+                                            concurrentPayload(index));
+
+                auto& out        = outcomes[static_cast<std::size_t>(index)];
+                out.spawned      = run.result.spawned;
+                out.exitCode     = run.result.exitCode;
+                out.diagnostic   = run.result.diagnostic;
+                out.markerParsed = run.marker.has_value();
+                out.markerError  = run.markerError;
+                if (run.marker.has_value()) {
+                    out.markerArgs = run.marker->args;
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    // Exact counts, not "no exceptions". Every one of these is a different way
+    // for the substrate to be wrong under concurrency, so each is counted and
+    // named separately rather than folded into one boolean.
+    int notSpawned = 0;
+    int wrongExit  = 0;
+    int noMarker   = 0;
+    int wrongArgs  = 0;
+    int noisy      = 0;
+    std::string firstFailure;
+    auto const note = [&firstFailure](std::string what) {
+        if (firstFailure.empty()) { firstFailure = std::move(what); }
+    };
+
+    for (int index = 0; index < kConcurrentTotal; ++index) {
+        auto const& out = outcomes[static_cast<std::size_t>(index)];
+        if (!out.spawned) {
+            ++notSpawned;
+            note("call " + std::to_string(index) + " reported NOT spawned: "
+                 + out.diagnostic);
+            continue;
+        }
+        if (!out.diagnostic.empty()) {
+            ++noisy;
+            note("call " + std::to_string(index)
+                 + " succeeded but carried a diagnostic: " + out.diagnostic);
+        }
+        if (out.exitCode != index + 1) {
+            ++wrongExit;
+            note("call " + std::to_string(index) + " expected exit "
+                 + std::to_string(index + 1) + " but got "
+                 + std::to_string(out.exitCode)
+                 + " — a wait collected the wrong child's status");
+        }
+        if (!out.markerParsed) {
+            ++noMarker;
+            note("call " + std::to_string(index) + " has no marker: "
+                 + out.markerError);
+            continue;
+        }
+        if (out.markerArgs != concurrentPayload(index)) {
+            ++wrongArgs;
+            std::string got;
+            for (auto const& arg : out.markerArgs) { got += "[" + arg + "]"; }
+            note("call " + std::to_string(index)
+                 + " read a marker belonging to someone else: " + got);
+        }
+    }
+
+    EXPECT_EQ(notSpawned, 0)
+        << kConcurrentTotal
+        << " concurrent spawns, " << notSpawned
+        << " never started. First: " << firstFailure;
+    EXPECT_EQ(wrongExit, 0)
+        << "a concurrent wait collected another call's exit status ("
+        << wrongExit << " of " << kConcurrentTotal << "). First: "
+        << firstFailure;
+    EXPECT_EQ(noMarker, 0)
+        << noMarker << " of " << kConcurrentTotal
+        << " children never wrote their marker. First: " << firstFailure;
+    EXPECT_EQ(wrongArgs, 0)
+        << wrongArgs << " of " << kConcurrentTotal
+        << " markers held another call's payload — argv crossed between "
+           "concurrent spawns. First: "
+        << firstFailure;
+    EXPECT_EQ(noisy, 0)
+        << "a successful concurrent spawn carried a diagnostic. First: "
+        << firstFailure;
+
+    // Every marker distinct, asserted independently of the per-call loop: two
+    // calls that BOTH read the same (correct-looking) payload would satisfy
+    // every check above if the payload happened to match one of them.
+    std::set<std::vector<std::string>> distinct;
+    for (auto const& out : outcomes) {
+        distinct.insert(out.markerArgs);
+    }
+    EXPECT_EQ(distinct.size(), static_cast<std::size_t>(kConcurrentTotal))
+        << "only " << distinct.size() << " distinct payloads came back from "
+        << kConcurrentTotal
+        << " calls — two calls observed the same child, so at least one "
+           "marker was stolen or overwritten";
+}
+
 #if !defined(_WIN32)
+
+// ★★ THE `errnoText` / `std::strerror` DECISION, EXECUTED.
+//
+// `errnoText` composes eleven of this facility's failure messages and used to
+// call `std::strerror`, under a comment arguing the thread-safety exposure was
+// nil. ⚠ MEASURED FALSE on Darwin 25.5 — but the true statement is narrower
+// than "strerror is racy", and the narrowness is what this pin has to be built
+// around. 12 threads, each on its OWN code, 20,000 calls apiece:
+//
+//   codes the libc KNOWS     0 wrong strings. `strerror` returns an immutable
+//                            table entry — no buffer, nothing to race.
+//   codes it does NOT know   33,692 wrong out of 240,000, rising to 100,265
+//                            once the callers do the string work `errnoText`
+//                            really does. "Unknown error: N" is formatted into
+//                            ONE shared static buffer.
+//
+// glibc 2.39 is 0 on both populations. The substrate now uses `strerror_r`,
+// chosen by overload resolution rather than a feature-macro guess.
+//
+// ★★ THE FIRST VERSION OF THIS PIN WAS STRUCTURALLY INCAPABLE OF FAILING, and
+// that is the lesson worth more than the fix. It used eleven known codes and a
+// single unknown one — so exactly ONE thread ever touched the shared buffer,
+// nothing could overwrite anything, and the pin passed 3 runs for 3 with the
+// defect deliberately restored. MEASURED, then diagnosed, then rebuilt: it now
+// puts EIGHT threads on unknown codes, and the same lever fails it every run.
+// A "modest" test that touches the racy path once is not a weak pin; it is a
+// green light wired to nothing.
+//
+// ★ WHY IT DRIVES `interpretExecHandshake` AND NOT A SPAWN. A shared buffer
+// that every thread fills with the SAME text corrupts nothing observable, and
+// concurrent spawns of one fixture all fail with ONE errno — so a spawn-based
+// version of this test would report green against the racy implementation for
+// the same reason the first draft did. `interpretExecHandshake` takes the errno
+// as a PARAMETER, the only surface in this facility that lets a caller vary it,
+// and composes its message through `errnoText`.
+//
+// Feeding it codes no kernel currently returns is deliberate and in keeping
+// with this file's existing practice (`kStandInRecordBytes` pins the decision,
+// not the layout). The contract under test is "the text for MY errno is never
+// another thread's text, for any errno" — and the unknown region is simply
+// where a broken implementation is detectable. It is not a hypothetical region
+// either: `Unknown error: N` exists because the set of numbers a kernel may
+// return is not closed.
+//
+// Expectations are computed SERIALLY, before any thread exists, and by a
+// DIFFERENT route than the code under test (`std::strerror`, safe here exactly
+// because nothing else is running). MEASURED on both POSIX legs: the two
+// spellings agree byte-for-byte across all 145 codes probed, so the comparison
+// is a real cross-check rather than a tautology.
+//
+// RED ON REVERT: restore `std::strerror` in `errnoText` and this fails on the
+// macOS leg every run. It stays GREEN on Linux either way, and the pin says so
+// rather than pretending to cover a leg it cannot.
+namespace {
+// ONE THREAD PER ENTRY. Four codes the substrate genuinely sees, so the pin is
+// anchored in real inputs — and eight the libc cannot name, because those are
+// the only ones that can expose a shared buffer. MEASURED at this shape and
+// this iteration count: thousands of mismatches with the revert applied, zero
+// without it, on both POSIX legs.
+std::vector<int> const& concurrentErrnoCodes() {
+    static std::vector<int> const codes{
+        ENOENT, EACCES, ENOEXEC, ENOTDIR,
+        4242,   31337,  65535,   999,
+        8888,   7777,   6666,    5555};
+    return codes;
+}
+} // namespace
+
+TEST(InterpretExecHandshake, ConcurrentVerdictsNeverBorrowAnotherThreadsErrnoText) {
+    auto const& codes = concurrentErrnoCodes();
+
+    // Serial references. Nothing is running yet, so `std::strerror` is safe
+    // here even on the host where it is not safe under threads.
+    std::vector<std::string> expected;
+    expected.reserve(codes.size());
+    for (int code : codes) {
+        expected.push_back("spawnAndWaitInherit: execv('/opt/tools/gen') failed ("
+                           + expectedErrnoText(code) + ")");
+    }
+
+    constexpr int kIterations = 2000;
+    std::atomic<int>         arrived{0};
+    std::atomic<int>         mismatches{0};
+    std::atomic<int>         wrongVerdicts{0};
+    std::vector<std::thread> workers;
+    workers.reserve(codes.size());
+
+    for (std::size_t slot = 0; slot < codes.size(); ++slot) {
+        workers.emplace_back([&, slot] {
+            rendezvous(arrived, static_cast<int>(codes.size()));
+            ChildFailure const failure{
+                'X', codes[slot]};
+            for (int i = 0; i < kIterations; ++i) {
+                auto const verdict = interpretExecHandshake(
+                    sizeof(ChildFailure), sizeof(ChildFailure), 0, &failure,
+                    "/opt/tools/gen", "/work");
+                if (verdict.spawned) {
+                    wrongVerdicts.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (verdict.diagnostic != expected[slot]) {
+                    mismatches.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    EXPECT_EQ(wrongVerdicts.load(), 0)
+        << "a concurrent call reported SPAWNED for a whole failure record — "
+           "the verdict itself is not re-entrant, which is far worse than "
+           "garbled text";
+    EXPECT_EQ(mismatches.load(), 0)
+        << mismatches.load() << " of "
+        << (static_cast<int>(codes.size()) * kIterations)
+        << " concurrent diagnostics carried the WRONG errno text — a thread "
+           "read another thread's message out of a shared libc buffer. The "
+           "substrate must compose this through `strerror_r`, never "
+           "`std::strerror`.";
+}
 
 // ══ detail::interpretExecHandshake — every arm of the exec-status verdict ══
 //

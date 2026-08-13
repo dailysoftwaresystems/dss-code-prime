@@ -61,8 +61,13 @@
 // sibling `large_stack_call.cpp`'s thread-API split.
 //
 // FAIL LOUD, NEVER SWALLOW. Every OS failure carries the platform's own error
-// text (`GetLastError` / `errno` + `strerror`) into `SpawnResult::diagnostic`.
-// Nothing here returns a plausible-looking success it did not achieve.
+// text (`FormatMessage` over `GetLastError`; `strerror_r` over `errno`) into
+// `SpawnResult::diagnostic`. Nothing here returns a plausible-looking success
+// it did not achieve — and nothing here reports SOMEONE ELSE's error text
+// either: `strerror_r` rather than `strerror`, because Apple's libc formats an
+// UNRECOGNISED errno into one shared static buffer and was measured handing a
+// thread its neighbour's message on 42% of such calls (see `errnoText` in the
+// .cpp for the full split — known codes are safe there, glibc is safe on both).
 //
 // ── WHY TWO SPAWN IMPLEMENTATIONS LEGITIMATELY COEXIST ────────────────────
 // `tests/test_support/run_binary.hpp` also spawns processes, and a future
@@ -187,8 +192,12 @@ struct SpawnResult {
 //     rather than buffered and replayed.
 //   * `cwd` empty (the default) = inherit the caller's current directory.
 //     Otherwise the child starts in `cwd`; the PARENT's current directory is
-//     never changed (which is what makes this safe to call from the
-//     per-compilation-unit thread pool — no process-global `chdir`).
+//     never changed. That is what makes the function safe to call from a
+//     thread at all — a `chdir` here would be process-global and would move
+//     every other thread's idea of "here" with it. Stated as the property it
+//     is, not as a description of where the call happens: today no caller is
+//     on a pool thread (the .cpp's "THE THREADING PREMISE" measures it), and a
+//     comment that claimed otherwise would rot the moment someone checked.
 //   * NO TIMEOUT, by design. See the two-implementations note above.
 //
 // EXIT CODE. On Windows this is the process exit code as returned by
