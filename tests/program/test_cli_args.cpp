@@ -206,8 +206,45 @@ TEST(CliArgs, CompileModeRejectsEmptyFileList) {
     EXPECT_EQ(r.error().kind, CliArgsError::EmptyFileList);
 }
 
-TEST(CliArgs, CompileModeRequiresLanguage) {
-    Argv a{"dss-code-prime", "--compile", "hello.c",
+// ★★ `--language` IS OPTIONAL FOR --compile (D-DRIVER-ASM-DIALECT-SELECTED-BY-
+// TARGET). This test previously asserted the OPPOSITE — `MissingLanguage` —
+// and the assertion was correct until a second assembly dialect shipped. Both
+// `asm-x86_64-att` and `asm-arm64-gas` declare `.s`/`.S`, so the extension
+// cannot name one and a single `--language` would force the wrong dialect on
+// every target but one; omitting it now means "ask each --target for the
+// language it declares as its own assembly dialect".
+//
+// ⚠ THE REQUIREMENT MOVED, IT DID NOT VANISH. If neither the caller nor the
+// target supplies a language, the DRIVER fails loud naming the target — see
+// `tests/program/test_asm_dialect_per_target.cpp`. Parsing succeeding here is
+// not the same as the build being allowed to proceed languageless.
+TEST(CliArgs, CompileModeAcceptsAnOmittedLanguage) {
+    Argv a{"dss-code-prime", "--compile", "hello.s",
+           "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value())
+        << "omitting --language must parse: the target supplies the language "
+           "it declares as its assembly dialect";
+    EXPECT_TRUE(r->languageName.empty())
+        << "an omitted --language must stay EMPTY — a parser-invented default "
+           "would silence the driver's per-target resolution";
+}
+
+TEST(CliArgs, DirectoryModeAcceptsAnOmittedLanguage) {
+    Argv a{"dss-code-prime", "--directory", "src/",
+           "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->languageName.empty());
+}
+
+// ★ AND IT IS STILL REQUIRED WHERE THE TARGET HAS NO ANSWER. The target's
+// declared language is its ASSEMBLY dialect: it answers "what is this `.s`?"
+// and says nothing about a source-to-source translation's INPUT language.
+// Defaulting `--transpile` to the assembly dialect would replace a precise
+// error with a confidently wrong answer.
+TEST(CliArgs, TranspileModeStillRequiresLanguage) {
+    Argv a{"dss-code-prime", "--transpile", "hello.c",
            "--target", "x86_64:elf64-x86_64-linux"};
     auto r = parseCliArgs(a.argc(), a.argv());
     ASSERT_FALSE(r.has_value());

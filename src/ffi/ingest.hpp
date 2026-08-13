@@ -124,6 +124,40 @@ struct DSS_EXPORT BinaryLibrarySource {
     std::string declaredImportName;
 };
 
+// ★★★ THE RECORDED-IMPORT-IDENTITY DECISION, AS A FUNCTION — the ONE place the
+// three levels documented on `BinaryLibrarySource` above are ranked.
+//
+// The linker emits `ExternImport.libraryPath` as the artifact's DT_NEEDED /
+// LC_LOAD_DYLIB / PE import-descriptor name, so this expression IS the emitted
+// binary's runtime dependency. It was an inline conditional inside `ingest()`
+// while `ingest()` was the only binder; the `encode` pipeline tier
+// (D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER) is a SECOND binder —
+// a hand-written `.s` names its externs as ON-BINARY symbols and never has a
+// canonical C identifier to mangle, so it matches a library's export table by a
+// different key and cannot go through `ingest()`'s HIR-node-keyed path. Two
+// binders that ranked the identity levels separately would be exactly the
+// "second owner of one fact" this codebase keeps deleting (the per-language
+// `externLibraryByFormat` default that UCRT-P4 removed), so the ranking became
+// a function instead of being copied.
+//
+//   1. `declaredImportName` — the caller STATED it (`--resolve-library
+//      <path>=<import-name>`). Beats everything: the file being READ may be a
+//      cross-compilation STAND-IN whose own embedded identity names a path that
+//      will not exist on the target.
+//   2. `embeddedSoname` — the binary's OWN identity (ELF DT_SONAME / Mach-O
+//      LC_ID_DYLIB / PE export DllName), normalised into `ImportSurface::soname`
+//      by the FF1 readers.
+//   3. `readerLibraryPath` — the reader's own label for the file, which the
+//      driver supplies as the path BASENAME for a library declaring no soname.
+//
+// FORMAT-BLIND and LANGUAGE-BLIND: no arm branches on object format, target or
+// source language — the readers already collapsed all three formats' embedded
+// identities into one field, and both callers pass plain strings.
+[[nodiscard]] DSS_EXPORT std::string
+recordedImportIdentity(std::string_view declaredImportName,
+                       std::string_view embeddedSoname,
+                       std::string_view readerLibraryPath);
+
 struct DSS_EXPORT CHeaderSource {
     std::filesystem::path path;
     // Owning library name (e.g. "libc.so.6") — headers don't

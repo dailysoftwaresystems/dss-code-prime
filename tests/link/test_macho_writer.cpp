@@ -173,7 +173,15 @@ TEST(MachOFormatJson, ShippedFileLoadsCleanly) {
     ASSERT_NE(textRow, nullptr);
     EXPECT_EQ(textRow->name, "__text");
     EXPECT_EQ(textRow->segment, "__TEXT");
-    EXPECT_EQ(textRow->addrAlign, 4u);   // log2(16)
+    // D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD: this row used to
+    // read `4u // log2(16)` — the object schemas alone spelled `addrAlign` as
+    // a log2 exponent while every exec/dylib schema and every other section
+    // row spelled it in RAW BYTES. The intent asserted here is unchanged
+    // ("`__text` is 16-byte aligned"); only the unit is, now that one key has
+    // one meaning. The writer converts to `section_64.align` with
+    // `countr_zero`, and `MachOTextSectionAlign` pins that conversion
+    // end-to-end on every arm.
+    EXPECT_EQ(textRow->addrAlign, 16u);  // RAW BYTES; log2 is the writer's job
     EXPECT_EQ(textRow->type, 0x80000400u);
     // Mach-O has NO section headers for symtab/strtab.
     EXPECT_EQ(loaded.format->sectionByKind(SectionKind::Symtab), nullptr);

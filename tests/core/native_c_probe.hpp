@@ -361,7 +361,27 @@ struct CompilerLocation {
         // `call vcvars` KEEPS its silencer: on success it prints a banner that is
         // pure noise, and its failure mode is already covered upstream — this batch
         // is only written after `locateMsvcToolchain` has validated the path.
+        // ★★★ `cd /d <work>` IS THE FIX FOR [D-TEST-NATIVE-PROBE-COMPILE-FAILS-
+        // UNDER-CONCURRENT-LOAD], AND IT IS A ROOT CAUSE, NOT A RETRY.
+        // ✔MEASURED (ctest -j 6, dss-wt-lane2): `core/test_bitfield_abi_conformance`
+        // failed `NATIVE-PROBE-COMPILE-FAILED` with the compiler's own words —
+        //   probe.c : fatal error C1083: Cannot open compiler generated file:
+        //   '…/build-dbg/tests/core/probe.obj': Permission denied
+        // — and PASSED when re-run alone. `/Fe:` names the EXE in this test's
+        // private scratch, but nothing named the OBJECT, so `cl` wrote
+        // `<stem>.obj` into the PROCESS CWD. Under ctest that cwd is the SHARED
+        // build directory, and every native-probe test names its source
+        // `probe.c`, so all of them write ONE path: `…/tests/core/probe.obj`.
+        // Two probes in flight at once therefore fight over a single file, and
+        // the loser reports a toolchain failure that has nothing to do with any
+        // toolchain. Serializing the suite would have "fixed" it by hiding it —
+        // a workaround this project has refused by name.
+        // ⚠ `cd /d` rather than `/Fo`, deliberately: `.obj` is not the only
+        // artifact `cl` drops in the cwd (`vc*.pdb` is another), so moving the
+        // WORKING DIRECTORY closes the whole class instead of the one member
+        // that happened to be observed. `work` is already per-test-unique.
         b << "@echo off\r\n"
+          << "cd /d \"" << work.string() << "\"\r\n"
           << "call \"" << vcvars.string() << "\" >nul 2>&1\r\n"
           << "cl /nologo /W3 /Fe:\"" << exe.string() << "\" \""
           << src.string() << "\"\r\n";

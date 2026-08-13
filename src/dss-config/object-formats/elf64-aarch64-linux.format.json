@@ -179,6 +179,12 @@
       "name": "R_AARCH64_LD64_GOT_LO12_NC",
       "kind": 8,
       "nativeId": 312
+    },
+    {
+      "$comment": "D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: the DWARF FDE `initial_location` pointer in a relocatable `.eh_frame` (DW_EH_PE_pcrel|sdata4). ELF type R_AARCH64_PREL32 = 261 -- a 32-bit PC-relative DATA word, the only aarch64 row here that patches data rather than an instruction field. `kind` = 9 matches arm64.target.json's `pcrel32` row. No `pltNativeId`: an FDE pointer never names an extern call. ✔MEASURED 2026-08-13 against `aarch64-linux-gnu-gcc -c`: `readelf -r` shows `R_AARCH64_PREL32  .text + <fnOffset>` on every FDE -- the reference toolchain's own choice, not an inference.",
+      "name": "R_AARCH64_PREL32",
+      "kind": 9,
+      "nativeId": 261
     }
   ]
 }

@@ -27,9 +27,11 @@
 #include "core/types/glob_match.hpp"          // D-AP2-SOURCES-GLOB: matcher + expander
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/project_config.hpp"  // the loader under test (moved from
+                                          // `program/` — see the header's own
+                                          // note on why it lives in `core`)
 #include "link/object_format_schema.hpp"  // ObjectFormatSchema::loadShipped (AP3 format-gate integration)
 #include "program/program.hpp"          // Program, routesToMultiUnit
-#include "program/project_config.hpp"
 #include "run_binary.hpp"               // runBinary (behavioral exit-code proof)
 #include "scratch_dir.hpp"
 

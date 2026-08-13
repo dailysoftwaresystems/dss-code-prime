@@ -2,7 +2,8 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
-#include "program/cli_args.hpp"  // ResolveLibrarySpec (shared with the CLI surface)
+#include "core/types/resolve_library_spec.hpp"  // ResolveLibrarySpec (shared
+                                                // with the CLI surface)
 
 #include <cstdint>
 #include <filesystem>
@@ -20,6 +21,21 @@
 // (AP1's `GrammarSchema::artifactProfiles()`), then delegates to the
 // existing compile path. Threading the resolved profile to codegen is
 // AP3/AP4 (D-AP2-COMPILATION-CONTEXT) — AP2 validates + delegates.
+//
+// ★ WHY THIS LIVES IN `core` AND NOT IN `program`
+// (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS, closed 2026-08-13). It was
+// born in `src/program/` because the DRIVER was its only reader. Then the LSP
+// tier needed the same answer — `src/lsp/workspace_project.cpp` reads a
+// workspace's `*.dss-project.json` to learn which assembly dialect a `.s` file
+// speaks — and reached UP into `program/` for it. Writing a second reader would
+// have been strictly worse (an editor and a compiler that disagree about what a
+// manifest MEANS), so the reuse was right and only the LOCATION was wrong:
+// `program` already declares `target_link_libraries(program PUBLIC ... lsp)`,
+// so the two OBJECT libs referenced each other's headers. Moving the parser
+// down to `core` — the tier BOTH depend on — makes the dependency one-way
+// again without duplicating a single line of parsing. Nothing here knows what a
+// CLI flag, an editor, or a compile pipeline is; it turns manifest TEXT into a
+// value type and reports what it could not read.
 
 namespace dss {
 

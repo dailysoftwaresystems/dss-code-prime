@@ -2321,9 +2321,9 @@ TEST(X86VariableEncoder, NegativeDispEmitsAsTwosComplement) {
 
 TEST(X86VariableEncoder, NegativeDispLeaSingleInstructionUnchanged) {
     // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (c94) AGNOSTICISM GUARD: the
-    // shared variant matcher gained a `negMemoffset` SIGN axis for arm64's SUB
+    // shared variant matcher gained a `negValue` SIGN axis for arm64's SUB
     // negative-disp lea. x86_64's `lea` base+disp variant has NO immMin/immMax
-    // AND NO negMemoffset (its disp32 field is SIGNED), so it stays the
+    // AND NO negValue (its disp32 field is SIGNED), so it stays the
     // match-any slot that swallows BOTH signs in ONE instruction — the sign
     // axis must NOT perturb it. `lea rax, [rbx - 8]` → 48 8D 83 F8 FF FF FF
     // (REX.W 0x8D /r ModR/M(mod=10 reg=rax=0 rm=rbx=3 → 0x83) disp32=-8). This

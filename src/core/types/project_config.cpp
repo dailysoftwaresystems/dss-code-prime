@@ -1,4 +1,4 @@
-#include "program/project_config.hpp"
+#include "core/types/project_config.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
 

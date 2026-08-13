@@ -71,6 +71,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_IncompatiblePointerIntegerPointee";
         case DiagnosticCode::S_EntryShapeNotDeclared:
             return "S_EntryShapeNotDeclared";
+        case DiagnosticCode::S_InlineAsmExtendedUnsupported:
+            return "S_InlineAsmExtendedUnsupported";
+        case DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto:
+            return "S_InlineAsmLabelSectionRequiresGoto";
+        case DiagnosticCode::S_InlineAsmDuplicateQualifier:
+            return "S_InlineAsmDuplicateQualifier";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -329,6 +335,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_OverAlignedStackLocal:        return "L_OverAlignedStackLocal";
         case DiagnosticCode::L_VlaDynamicAllocaUnsupported:  return "L_VlaDynamicAllocaUnsupported";
         case DiagnosticCode::L_VlaNonLeafFrameUnsupported:   return "L_VlaNonLeafFrameUnsupported";
+        case DiagnosticCode::L_TerminatorSuccessorMismatch:  return "L_TerminatorSuccessorMismatch";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";
@@ -340,6 +347,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::A_NoMatchingEncodingVariant:    return "A_NoMatchingEncodingVariant";
         case DiagnosticCode::A_RoundTripMismatch:            return "A_RoundTripMismatch";
         case DiagnosticCode::A_ImmediateOperandOutOfRange:   return "A_ImmediateOperandOutOfRange";
+        case DiagnosticCode::A_AsmTextUnsupported:           return "A_AsmTextUnsupported";
         case DiagnosticCode::K_SymbolUndefined:              return "K_SymbolUndefined";
         case DiagnosticCode::K_RelocationKindMismatch:       return "K_RelocationKindMismatch";
         case DiagnosticCode::K_NoMatchingObjectFormat:       return "K_NoMatchingObjectFormat";
@@ -449,6 +457,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_ProgramEntryUndefined";
         case DiagnosticCode::K_ProgramEntryAmbiguous:
             return "K_ProgramEntryAmbiguous";
+        case DiagnosticCode::K_UnwindRuleUnrepresentable:
+            return "K_UnwindRuleUnrepresentable";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

@@ -13,6 +13,22 @@
 #include <utility>
 
 
+// ── PIN (D-CORE-JSON-LEAKS-INTO-TWO-PUBLIC-HEADERS) ─────────────────────────
+// This TU uses only `validateRelocationsTable`, which touches no JSON, and the
+// `relocations[]` substrate was split so it would stop seeing nlohmann for it.
+// The split is invisible to every test: a TU that gains a transitive include is
+// not an error, so a stray `#include <nlohmann/json.hpp>` in ANY header reached
+// from here would silently undo the split and the suite would stay green. This
+// guard is therefore the whole enforcement, and it is red-on-disable by
+// construction -- restore the include and the build stops here.
+// Loader work belongs in the matching `*_json.cpp`, which includes
+// `core/substrate/relocation_table_json.hpp`.
+#ifdef NLOHMANN_JSON_VERSION_MAJOR
+#error "nlohmann/json re-entered this TU's include set. This file validates \
+typed rows and must not see JSON; move the JSON work to its *_json.cpp sibling \
+(see core/substrate/relocation_table_json.hpp)."
+#endif
+
 // ─────────────────────────────────────────────────────────────────────────
 // ★★★ COMPILE-ERROR PIN — D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-
 // BRANCHES (TF-C125). DO NOT DELETE TO "FIX A BUILD ERROR".
@@ -265,6 +281,51 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // R_X86_64_NONE relocation that the linker treats as a no-op — a
     // miscompile that round-trips as syntactically valid. Reject at
     // load time when relocations[] is non-empty.
+    // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: `nativeId → kind` is a
+    // reverse map every object READER builds, so it must be a FUNCTION. A
+    // wire type may therefore be claimed by AT MOST ONE non-alias row; any
+    // further row sharing it must declare `emitOnly` (an emission alias, e.g.
+    // R_X86_64_PC32 serving both the call-site rel32 and the DWARF FDE
+    // pointer, which differ only in an implicit addend bias the wire format
+    // does not carry).
+    // ✔MEASURED 2026-08-13: without this, an ambiguous pair was discovered at
+    // READ time and rejected every x86_64 ELF object — DSS-produced and
+    // gcc-produced alike. Checking it here fails the SCHEMA that is wrong
+    // rather than every object that is right.
+    {
+        std::unordered_map<std::uint32_t, std::size_t> primaryOf;
+        for (std::size_t i = 0; i < relocations.size(); ++i) {
+            if (relocations[i].emitOnly) continue;
+            auto const ins = primaryOf.emplace(relocations[i].nativeId, i);
+            if (!ins.second) {
+                fail(std::format("/relocations/{}/nativeId", i),
+                     std::format(
+                         "relocation '{}': nativeId {} is already claimed by "
+                         "'{}' at /relocations/{}. A native wire id maps back "
+                         "to exactly ONE RelocationKind (object readers build "
+                         "that reverse map); if this row exists only so the "
+                         "emitter can reach the same wire type through a "
+                         "different kind, declare \"emitOnly\": true",
+                         relocations[i].name, relocations[i].nativeId,
+                         relocations[ins.first->second].name,
+                         ins.first->second));
+            }
+        }
+        // An alias that aliases nothing is a typo, not an alias: it would sit
+        // in no reverse map at all and silently decode as an unknown type.
+        for (std::size_t i = 0; i < relocations.size(); ++i) {
+            if (relocations[i].emitOnly
+                && !primaryOf.contains(relocations[i].nativeId)) {
+                fail(std::format("/relocations/{}/emitOnly", i),
+                     std::format(
+                         "relocation '{}' declares emitOnly but no other row "
+                         "claims nativeId {}; an emission alias must alias a "
+                         "real row, otherwise nothing can DECODE this wire id",
+                         relocations[i].name, relocations[i].nativeId));
+            }
+        }
+    }
+
     for (std::size_t i = 0; i < relocations.size(); ++i) {
         if (relocations[i].nativeId == 0) {
             fail(std::format("/relocations/{}/nativeId", i),

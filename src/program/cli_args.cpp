@@ -146,11 +146,11 @@ std::string cliHelpText() {
         "dss-code-prime — universal config-driven compiler\n"
         "\n"
         "Usage:\n"
-        "  dss-code-prime --compile <file>... --language <name> "
+        "  dss-code-prime --compile <file>... [--language <name>] "
             "--target <spec> [options]\n"
         "  dss-code-prime --transpile <file>... --language <name> "
             "--target <spec> [options]\n"
-        "  dss-code-prime --directory <path> --language <name> "
+        "  dss-code-prime --directory <path> [--language <name>] "
             "--target <spec> [options]\n"
         "  dss-code-prime --project <file.dss-project.json>\n"
         "  dss-code-prime --dump-predefined-macros --language <name> "
@@ -185,7 +185,13 @@ std::string cliHelpText() {
         "\n"
         "Common compile / transpile options:\n"
         "  --language <name>      source-language schema name "
-            "(e.g. c-subset)\n"
+            "(e.g. c-subset). REQUIRED for --transpile and "
+            "--dump-predefined-macros. OPTIONAL for --compile / --directory: "
+            "omitted, each --target supplies the language it declares as its "
+            "own assembly dialect ('defaultAssemblyLanguage'), which is how "
+            "one invocation compiles a .s for two different CPUs — both "
+            "shipped dialects claim .s, so the extension alone cannot name "
+            "one. A named --language wins over every target's default.\n"
         "  --target <spec>        <targetName>:<formatName> "
             "(repeatable; e.g. x86_64:elf64-x86_64-linux). The "
             "`=`-form is also accepted (--target=spec).\n"
@@ -246,7 +252,11 @@ std::string cliHelpText() {
         "  dss-code-prime --directory src/ --language c-subset "
             "--target x86_64:elf64-x86_64-linux --config=release\n"
         "  dss-code-prime --dump-predefined-macros --language c-subset "
-            "--target x86_64:pe64-x86_64-windows-exec --define SQLITE_TEST\n";
+            "--target x86_64:pe64-x86_64-windows-exec --define SQLITE_TEST\n"
+        "  dss-code-prime --compile boot.s "
+            "--target x86_64:elf64-x86_64-linux "
+            "--target arm64:elf64-aarch64-linux   (no --language: each "
+            "target picks its own assembly dialect)\n";
     return text;
 }
 
@@ -862,11 +872,37 @@ parseCliArgs(int argc, char* argv[]) {
     // ★ The message NAMES every mode it can be reached from: a mode-list that
     // omits the mode the operator actually typed reads as "this flag is not
     // supported", which is the opposite of what happened.
-    if (out.languageName.empty()) {
+    // ★★ D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: `--language` is now OPTIONAL
+    // for --compile and --directory, and REQUIRED for the other two. The split
+    // is not a convenience — it is where a second answer exists.
+    //
+    // `--compile` / `--directory` have a TARGET, and a target declares the
+    // name of the source language that spells its own assembly
+    // (`defaultAssemblyLanguage`). That second answer is the ONLY way one
+    // invocation can compile a `.s` for two different CPUs: both shipped
+    // dialects claim `.s`/`.S`, so the extension cannot name one and a
+    // single `--language` would force the wrong dialect on every target but
+    // one. Omitting the flag now means "ask each target"; naming it still
+    // wins outright. If neither answer exists, the driver fails loud NAMING
+    // THE TARGET — the flag moved from CLI-required to driver-enforced, not
+    // from required to optional-and-forgiving.
+    //
+    // `--transpile` and `--dump-predefined-macros` keep the hard requirement,
+    // and for opposite-looking but identical reasons: the target's declared
+    // language is its ASSEMBLY dialect, which answers "what is this `.s`?" and
+    // answers nothing about a source-to-source translation's INPUT language or
+    // about which language's predefined macros to print. Defaulting either to
+    // the assembly dialect would produce a confidently wrong answer where
+    // there is currently a precise error.
+    bool const languageOptional =
+        mode == Mode::Compile || mode == Mode::Directory;
+    if (out.languageName.empty() && !languageOptional) {
         return std::unexpected(make_error(
             CliArgsError::MissingLanguage,
-            "--language <name> is required for compile / transpile / "
-            "directory / dump-predefined-macros mode"));
+            "--language <name> is required for transpile / "
+            "dump-predefined-macros mode (for compile / directory mode it is "
+            "OPTIONAL — omitted, each --target supplies the source language "
+            "it declares as its assembly dialect)"));
     }
     if (out.targets.empty()) {
         return std::unexpected(make_error(

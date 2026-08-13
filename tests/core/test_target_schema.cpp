@@ -1,7 +1,11 @@
 #include "core/types/target_schema.hpp"
 
+#include "mutate_target_schema.hpp"
+
 #include <algorithm>
+#include <array>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <string>
 #include <string_view>
@@ -23,6 +27,11 @@ namespace {
 using ::dss::DiagnosticCode;
 using ::dss::TargetRegClass;
 using ::dss::TargetSchema;
+using ::dss::EncodingSlotKind;
+using ::dss::encodingSlotKindName;
+using ::dss::encodingSlotKindFromName;
+using ::dss::isSymbolBearingSlot;
+using ::dss::slotShapeFor;
 
 bool anyHasCode(auto const& diags, DiagnosticCode code) {
     return std::ranges::any_of(diags, [code](auto const& d) {
@@ -1164,7 +1173,8 @@ TEST(TargetSchema, OpcodeMinSuccessorsGreaterThanMaxRejected) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[
               {"mnemonic":"invalid","result":"none"},
-              {"mnemonic":"jmp","result":"none","isTerminator":true,
+              {"mnemonic":"jmp","result":"none",
+               "terminatorKind":"cond-br",
                "minSuccessors":3,"maxSuccessors":1}
             ]})");
     ASSERT_FALSE(r.has_value());
@@ -1178,7 +1188,8 @@ TEST(TargetSchema, OpcodeTerminatorMinSuccessorsButZeroMaxRejected) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[
               {"mnemonic":"invalid","result":"none"},
-              {"mnemonic":"jmp","result":"none","isTerminator":true,
+              {"mnemonic":"jmp","result":"none",
+               "terminatorKind":"cond-br",
                "minSuccessors":1,"maxSuccessors":0}
             ]})");
     ASSERT_FALSE(r.has_value());
@@ -1192,7 +1203,7 @@ TEST(TargetSchema, OpcodeNonTerminatorWithSuccessorsRejected) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[
               {"mnemonic":"invalid","result":"none"},
-              {"mnemonic":"mov","result":"value","isTerminator":false,
+              {"mnemonic":"mov","result":"value",
                "maxSuccessors":2}
             ]})");
     ASSERT_FALSE(r.has_value());
@@ -1204,11 +1215,15 @@ TEST(TargetSchema, OpcodeReturnShapeIsLegal) {
     // (minSuccessors=0, maxSuccessors=0) must validate cleanly.
     // `terminatorKind` is MANDATORY on every terminator (validate()
     // enforces `isTerminator ↔ terminatorKind ≠ NotATerminator`).
+    // (The stray legacy `isTerminator` key this fixture used to carry was
+    // incidental scaffolding, not the property under test, and it is now a
+    // load-time reject — see RetiredIsTerminatorKeyIsRefusedNotIgnored. The
+    // pin still asserts exactly what it protected: the RETURN SHAPE.)
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[
               {"mnemonic":"invalid","result":"none"},
-              {"mnemonic":"ret","result":"none","isTerminator":true,
+              {"mnemonic":"ret","result":"none",
                "terminatorKind":"return",
                "minSuccessors":0,"maxSuccessors":0}
             ]})");
@@ -1220,21 +1235,28 @@ TEST(TargetSchema, TerminatorKindIsTheSingleSourceOfTruth) {
     // With the `isTerminator` boolean field deleted (3-agent
     // convergence ML8 cycle 3 review: type-design + simplifier +
     // silent-failure), terminator-ness derives solely from
-    // `terminatorKind != none`. The JSON `isTerminator` key is
-    // IGNORED by the loader (kept here only to prove the loader
-    // doesn't choke on a stray legacy key — but the value has no
-    // effect). What matters is `terminatorKind`.
+    // `terminatorKind != none`.
+    //
+    // ★ THIS PIN WAS STRENGTHENED, NOT WEAKENED, by the opcode-row key gate
+    // (D-CONFIG-TARGET-LOADER-CONTAINER-KEYS-UNGATED). It used to assert that
+    // a stray legacy `isTerminator` key was SILENTLY IGNORED — which is the
+    // sharpest form of the very hazard that gate closes: `isTerminator` is a
+    // spelling that USED TO WORK, so an author who writes it and omits
+    // `terminatorKind` has every reason to believe they declared a terminator
+    // and gets a NON-terminator with no diagnostic. What this pin PROTECTED
+    // is the DERIVATION ("terminator-ness comes from `terminatorKind`"), and
+    // refusing the retired key preserves that derivation while removing the
+    // trap. Half 2 is the sibling test below.
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[
               {"mnemonic":"invalid","result":"none"},
-              {"mnemonic":"add","result":"value","isTerminator":true,
+              {"mnemonic":"add","result":"value",
                "minOperands":2,"maxOperands":2}
             ]})");
     ASSERT_TRUE(r.has_value())
-        << "Legacy `isTerminator` key must be silently ignored; terminator-"
-           "ness derives from `terminatorKind` (default `none` = non-"
-           "terminator).";
+        << "terminator-ness derives from `terminatorKind` (default `none` = "
+           "non-terminator).";
     auto info = r.value()->opcodeInfo(1);
     ASSERT_NE(info, nullptr);
     EXPECT_FALSE(info->isTerminator())
@@ -1594,12 +1616,61 @@ TEST(TargetSchema, LinkRegisterMustBeString) {
 }
 
 TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
-    // 16 GPRs + 16 FPRs + rflags = 33. EXPECT_EQ (not EXPECT_GE) so a
-    // future accidental duplicate / addition trips the test rather than
-    // silently passing.
+    // 16 GPRs + 16 FPRs + rflags + the 16 32-bit GPR views (eax..r15d)
+    // + the 16 8-bit views (al..r15b) = 65.
+    // EXPECT_EQ (not EXPECT_GE) so a future accidental duplicate / addition
+    // trips the test rather than silently passing.
+    //
+    // ★ THE PIN GAINED A COMPOSITION CHECK WHEN THE 32-BIT VIEWS LANDED
+    // (2026-08-13), rather than just a new total. What it protects is "no
+    // register appears here by accident", and a bare total re-cut to fit each
+    // new row would keep saying less every time it fired: 49 is also reachable
+    // by, say, 17 GPRs + 32 sub-registers. Asserting each BUCKET keeps the
+    // guard at least as strong after the change as before it — a swapped class,
+    // a sub-register that forgot its `subOf`, or a full-width register that
+    // grew one, all trip it now and none of them tripped the total.
     auto r = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ((*r)->registerCount(), 33u);
+    EXPECT_EQ((*r)->registerCount(), 65u);
+
+    // ★★ THE COMPOSITION IS KEYED ON (class, sub-ness, WIDTH), NOT JUST
+    // (class, sub-ness) — extended when the 8-bit views landed
+    // (D-ASM-X86-NO-8BIT-REGISTER-FILE, 2026-08-13). A bucket that lumped every
+    // `subOf` GPR together would have gone from "16" to "32" and said nothing
+    // about WHICH 32; a pin has to be at least as strong after each change as
+    // it was before, or it is the guard-weakened-by-its-own-subject shape this
+    // tree has already been bitten by twice. With the width axis in, a byte
+    // view that forgot its `subOf`, a 32-bit view that grew a byte width, and a
+    // duplicated file at either width each trip a DIFFERENT expectation than
+    // the bare total does.
+    std::size_t fullGpr = 0, subGpr32 = 0, subGpr8 = 0, subGprOther = 0;
+    std::size_t fpr = 0, flags = 0, other = 0;
+    for (auto const& info : (*r)->registers()) {
+        bool const sub = !info.subOf.empty();
+        switch (info.regClass) {
+            case TargetRegClass::GPR:
+                if (!sub) { ++fullGpr; break; }
+                if (info.widthBytes == 4)      ++subGpr32;
+                else if (info.widthBytes == 1) ++subGpr8;
+                else                           ++subGprOther;
+                break;
+            case TargetRegClass::FPR:   sub ? ++other : ++fpr;      break;
+            case TargetRegClass::Flags: sub ? ++other : ++flags;    break;
+            default:                    ++other;                    break;
+        }
+    }
+    EXPECT_EQ(fullGpr,  16u) << "rax..r15";
+    EXPECT_EQ(subGpr32, 16u) << "eax..r15d — the 32-bit views, `subOf` their "
+                                "64-bit parent";
+    EXPECT_EQ(subGpr8,  16u) << "al..r15b — the 8-bit views; without them "
+                                "gas's `sete %al` is unspellable and the only "
+                                "form DSS could spell (`sete %rax`) is one gas "
+                                "rejects";
+    EXPECT_EQ(subGprOther, 0u) << "no 16-bit (ax..r15w) file is declared — no "
+                                  "consumer writes one yet";
+    EXPECT_EQ(fpr,      16u) << "xmm0..xmm15";
+    EXPECT_EQ(flags,     1u) << "rflags";
+    EXPECT_EQ(other,     0u);
 }
 
 // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the wideFloatSoftcalls table
@@ -1898,6 +1969,153 @@ TEST(TargetSchema, TFC74PredefinedMacroDuplicateNameRejected) {
     ASSERT_FALSE(r.has_value())
         << "two entries for one name would make the effective value depend on "
            "which preprocessor seed site iterated last — fail loud instead";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ── D-CONFIG-PREDEFINED-MACRO-ROW-KEYS-UNGATED ───────────────────────────
+//
+// The ENTRY object had no closed key vocabulary. Every optional field below is
+// read with a bare `contains()` probe, so a misspelled key was silently DROPPED
+// and the entry loaded clean carrying the default it was written to override —
+// `"availabelObjectFormats"` predefining an architecture spelling on EVERY
+// format is the sharpest form of it. Same archetype as the encoding-variant
+// row whose `"tempalte"` yielded an all-default template.
+//
+// The gate is in the SHARED entry parser, so the TARGET family inherits it
+// rather than re-implementing it — the same argument that extracted the parser
+// at TF-C74. This pin exists because "inherited" is a claim about THIS caller,
+// and a claim about a caller is only true where a test drives that caller.
+//
+// RED-ON-DISABLE: delete the rejection loop in `parsePredefinedMacroArray` and
+// this load succeeds.
+TEST(TargetSchema, PredefinedMacroEntryUnknownKeyRejectedAndNamed) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
+                                 "availabelObjectFormats":["elf"]}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled entry key must be REFUSED — silently ignoring this "
+           "one predefines an architecture spelling on EVERY object format";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    bool named = false;
+    for (auto const& d : r.error()) {
+        named = d.message.find("availabelObjectFormats") != std::string::npos
+             && d.message.find("predefinedMacros") != std::string::npos;
+        if (named) break;
+    }
+    EXPECT_TRUE(named)
+        << "the diagnostic must name the offending key AND the container";
+}
+
+// The `$`-prefix carve-out inside an ENTRY (the root-key carve-out is pinned
+// separately). Both shipped targets and the shipped c-subset language put prose
+// inside these rows, so without this the gate would reject them at load — the
+// inverse failure, and the one that actually fires.
+TEST(TargetSchema, PredefinedMacroEntryDollarPrefixedKeyStillAccepted) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}],
+            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
+                                 "$valueComment":"why this spelling"}]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value())
+        << "`$`-prefixed keys are prose, not knobs — and the carve-out must be "
+           "the PREFIX predicate, not a literal `$comment` compare";
+}
+
+// ── defaultAssemblyLanguage (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET) ─────
+//
+// A NAME, and only a name. The value is a `loadShipped` stem — exactly what
+// `--language` takes — and the loader deliberately does NOT check that the
+// language exists or that it claims `.s`: resolving a language name is the
+// grammar loader's job, and a second copy of language discovery here would be
+// a drifting one.
+
+TEST(TargetSchema, DefaultAssemblyLanguageIsReadAsAName) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "defaultAssemblyLanguage":"asm-x86_64-att",
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->defaultAssemblyLanguage(), "asm-x86_64-att");
+}
+
+// ABSENT is a legitimate state, not a malformed document: a target with no
+// assembly dialect simply fails loud BY NAME at the driver when a build needs
+// one. Rejecting it here would force every target file to carry the key.
+TEST(TargetSchema, DefaultAssemblyLanguageAbsentIsEmptyNotAnError) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE((*r)->defaultAssemblyLanguage().empty());
+}
+
+TEST(TargetSchema, DefaultAssemblyLanguageNonStringRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "defaultAssemblyLanguage":["asm-x86_64-att"],
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a list would imply a SELECTOR between dialects, which does not "
+           "exist — the key is one name and a wrong shape must say so";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// `""` is rejected rather than folded into "absent". The two states are
+// operator-distinguishable — absent says "this target has no dialect", `""`
+// says "I meant to name one" — and silently equating them is how a config key
+// stops meaning anything.
+TEST(TargetSchema, DefaultAssemblyLanguageEmptyStringRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "defaultAssemblyLanguage":"",
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "an empty name is a half-filled key, not a declaration of absence";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ★ THE SHIPPED TARGETS MUST ACTUALLY CARRY IT, and they must carry DIFFERENT
+// values. Equal values would mean one dialect served both CPUs, which is the
+// state the whole per-target resolution exists because we are NOT in: `#` is a
+// line comment in the x86_64 dialect and an immediate marker in the arm64 one.
+TEST(TargetSchema, ShippedTargetsDeclareDistinctAssemblyLanguages) {
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(x86.has_value());
+    ASSERT_TRUE(arm.has_value());
+    EXPECT_EQ((*x86)->defaultAssemblyLanguage(), "asm-x86_64-att");
+    EXPECT_EQ((*arm)->defaultAssemblyLanguage(), "asm-arm64-gas");
+    EXPECT_NE((*x86)->defaultAssemblyLanguage(),
+              (*arm)->defaultAssemblyLanguage())
+        << "one invocation compiling a .s for both CPUs must resolve TWO "
+           "grammars; equal names here would silently make it one";
+}
+
+// ★★ THE LINE BETWEEN VOCABULARY AND GRAMMAR, PINNED IN A TEST.
+// An `asmSyntax` block carrying `registerPrefix`/`immediatePrefix`/comment
+// characters/operand order was written into both shipped target files once and
+// REVERTED ([[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]]): those are
+// (target, DIALECT) facts — ✔MEASURED with gcc on ONE target, AT&T
+// `movq %rsi, (%rdi)` vs Intel `mov QWORD PTR [rdi], rsi`. The closed root-key
+// vocabulary is what makes re-proposing it fail rather than load, so assert
+// that directly instead of trusting the reverted diff to stay reverted.
+TEST(TargetSchema, AsmGrammarKeyOnATargetIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "asmSyntax":{"registerPrefix":"%","immediatePrefix":"$"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "assembly GRAMMAR on a target must not load — a register prefix is "
+           "a function of (target, dialect), not of target";
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
 }
 
@@ -2456,5 +2674,405 @@ TEST(TargetSchema, TFC76SoftcallLibrarySentinelSlotAlwaysEmpty) {
             (*t)->wideFloatSoftcallLibrary(ObjectFormatKind::Unknown).empty())
             << "the Unknown slot is unwritable by the loader, so it must never "
                "resolve to a library: " << name;
+    }
+}
+
+// ── D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE — guard-axis loader pins ──
+//
+// The sign-routing axis was `guard.negMemoffset` and was MEMOFFSET-ONLY by
+// its validate() rule alone — the matcher underneath always read "the first
+// ImmInt-or-MemOffset operand". Sign-routing an IMMEDIATE (arm64 MOVN vs
+// MOVZ) is the same question about a different operand kind, so the axis was
+// RENAMED to `guard.negValue` and its coherence rule widened to the SAME
+// predicate immMin/immMax already used. These pins hold that shape.
+
+namespace {
+// The minimum well-formed target document, with one opcode's encoding
+// variant guard supplied by the caller. Keeps each pin to the ONE key it is
+// actually about.
+[[nodiscard]] std::string targetDocWithGuard(std::string_view guardBody,
+                                             std::string_view slotKind) {
+    return std::string{
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"mov","result":"value",
+               "minOperands":1,"maxOperands":1,
+               "encoding":{"format":"fixed32","variants":[
+                 {"guard":{)"} + std::string{guardBody} + R"(},
+                  "template":{"fixedWord":2457862144},
+                  "resultSlot":"rd",
+                  "wires":[{"index":0,"slotKind":")"
+        + std::string{slotKind} + R"("}]}
+               ]}}
+            ]})";
+}
+} // namespace
+
+TEST(TargetSchema, NegValueOnAnImmediateOperandLoads) {
+    // The POINT of the generalization: `negValue` on an `imm32` guard — the
+    // arm64 MOVN shape — must be ACCEPTED. Under the old memoffset-only rule
+    // this exact document was rejected, which is why the anchor needed a
+    // schema change and not just a config row.
+    auto r = TargetSchema::loadFromText(
+        targetDocWithGuard(R"("operandKinds":["imm32"],"negValue":true,)"
+                           R"("immMin":1,"immMax":65536)",
+                           "imm16.inverted"),
+        "<inline>");
+    if (!r.has_value()) {
+        for (auto const& d : r.error()) {
+            ADD_FAILURE() << "load: " << d.path << ": " << d.message;
+        }
+    }
+    EXPECT_TRUE(r.has_value())
+        << "negValue must be legal on an immediate-bearing guard";
+}
+
+TEST(TargetSchema, NegValueOnAMemoffsetOperandStillLoads) {
+    // The axis's ORIGINAL consumer must keep working after the widening —
+    // a generalization that quietly drops its first caller is a regression.
+    auto r = TargetSchema::loadFromText(
+        targetDocWithGuard(
+            R"("operandKinds":["memoffset"],"negValue":true,"immMax":4095)",
+            "imm12"),
+        "<inline>");
+    EXPECT_TRUE(r.has_value())
+        << "negValue must remain legal on a memoffset-bearing guard";
+}
+
+TEST(TargetSchema, NegValueWithNoValueBearingOperandRejected) {
+    // The coherence rule, still enforced — just against the WIDER predicate.
+    // A `reg`-only guard carries nothing to sign-route on, so the flag would
+    // key on a value that does not exist and the variant would silently
+    // match nothing.
+    auto r = TargetSchema::loadFromText(
+        targetDocWithGuard(R"("operandKinds":["reg"],"negValue":true)", "rm"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, UnknownGuardKeyRejectedIncludingTheOldNegMemoffsetSpelling) {
+    // ★ THE RENAME'S SAFETY NET, and the reason the rename is not a silent
+    // hazard. Every `guard` sub-key is read through a bare `contains(...)`,
+    // so before this gate a stale or typo'd key was SILENTLY IGNORED — the
+    // variant would quietly take default routing. For the renamed axis that
+    // is not cosmetic: a leftover `negMemoffset:true` read as `false` turns
+    // arm64's three negative-displacement `lea` variants into duplicate
+    // POSITIVE ones. Both spellings below must be rejected at load.
+    for (auto key : {std::string_view{"negMemoffset"},
+                     std::string_view{"negVlaue"}}) {
+        auto r = TargetSchema::loadFromText(
+            targetDocWithGuard(
+                std::string{R"("operandKinds":["memoffset"],")"}
+                    + std::string{key} + R"(":true)",
+                "imm12"),
+            "<inline>");
+        ASSERT_FALSE(r.has_value()) << "guard key '" << key
+            << "' must be rejected, never silently ignored";
+        EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    }
+}
+
+TEST(TargetSchema, GuardCommentKeyIsAccepted) {
+    // `$comment` is the one universally-allowed unknown key across DSS
+    // configs; the new gate must not break the convention.
+    auto r = TargetSchema::loadFromText(
+        targetDocWithGuard(
+            R"("$comment":"why this variant exists","operandKinds":["imm32"])",
+            "imm16"),
+        "<inline>");
+    EXPECT_TRUE(r.has_value())
+        << "'$comment' must stay legal inside a variant guard";
+}
+
+TEST(TargetSchema, InvertedImm16SlotNameRoundTrips) {
+    // The slot vocabulary is SHARED and its JSON spelling is the config
+    // contract. Pin the name in BOTH directions so a table edit that renames
+    // it breaks here rather than in every arm64 target file at once. The
+    // name is deliberately generic ("an inverted 16-bit immediate"), never
+    // arm64- or MOVN-named.
+    EXPECT_EQ(encodingSlotKindName(EncodingSlotKind::Imm16Inverted),
+              "imm16.inverted");
+    auto const back = encodingSlotKindFromName("imm16.inverted");
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(*back, EncodingSlotKind::Imm16Inverted);
+    // It shares Imm16's ENCODING SHAPE (both are fixed32 bit-windows) but is
+    // a DISTINCT slot — the two must never collapse into one enumerator.
+    EXPECT_EQ(slotShapeFor(EncodingSlotKind::Imm16Inverted),
+              slotShapeFor(EncodingSlotKind::Imm16));
+    EXPECT_NE(EncodingSlotKind::Imm16Inverted, EncodingSlotKind::Imm16);
+    // Not symbol-bearing: the encoder writes the complement directly, so a
+    // wire to it must NOT declare a relocationKind.
+    EXPECT_FALSE(isSymbolBearingSlot(EncodingSlotKind::Imm16Inverted));
+}
+
+TEST(TargetSchema, RetiredIsTerminatorKeyIsRefusedNotIgnored) {
+    // Half 2 of the single-source-of-truth property. A RETIRED key is more
+    // dangerous than a typo: a typo was never meaningful, but `isTerminator`
+    // WAS, so silently dropping it hands the author a non-terminator they
+    // believe they declared. The opcode-row key gate refuses it, and the
+    // message names the vocabulary that replaced it, so the fix is readable
+    // straight off the diagnostic.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[
+              {"mnemonic":"invalid","result":"none"},
+              {"mnemonic":"add","result":"value","isTerminator":true,
+               "minOperands":2,"maxOperands":2}
+            ]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "the retired `isTerminator` key must be REFUSED, never ignored";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    bool namesReplacement = false;
+    for (auto const& d : r.error()) {
+        if (d.message.find("terminatorKind") != std::string::npos) {
+            namesReplacement = true;
+        }
+    }
+    EXPECT_TRUE(namesReplacement)
+        << "the diagnostic must name `terminatorKind` — the vocabulary that "
+           "replaced the retired key";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// D-CONFIG-TARGET-LOADER-CONTAINER-KEYS-UNGATED — the CLASS, not the instance.
+//
+// The archetype: a CONTAINER object with no key set sitting next to NESTED
+// objects that have one. The neighbours' rejection loops are exactly what make
+// the container's absence invisible — you see `variants[j]/guard` refusing
+// typos and conclude the variant ROW does too, when a misspelled `"tempalte"`
+// was silently yielding an all-default encoding template.
+//
+// These pins are TABLE-DRIVEN over the REAL SHIPPED arm64 document, so they
+// cannot rot against a hand-written sample, and each container is asserted in
+// BOTH directions:
+//
+//   * a typo'd key is REFUSED               (the gate exists and bites)
+//   * a `$`-prefixed prose key is ACCEPTED  (the carve-out survives)
+//
+// ★ THE SECOND DIRECTION IS NOT DECORATION. Three of the file's five original
+// gates hardcoded the literal `"$comment"` or nothing at all instead of the
+// `$`-PREFIX predicate, so a `$templateComment` / `$framePointerComment` —
+// spellings the shipped targets actually use — would have been reported as
+// typos. A closed key set that omits a real key breaks EVERY target at load;
+// that inverse failure is the one this half catches.
+
+namespace {
+
+// Insert `key` into the container named by `label` inside a parsed shipped
+// arm64 document, then load. Each mutator navigates to ONE container.
+using ContainerMutator = void (*)(nlohmann::json&, std::string const&);
+
+struct GatedContainer {
+    char const*      label;
+    ContainerMutator inject;
+};
+
+[[nodiscard]] nlohmann::json& firstOpcodeWithEncoding(nlohmann::json& doc) {
+    for (auto& o : doc["opcodes"]) {
+        if (o.contains("encoding") && o["encoding"].contains("variants")
+            && !o["encoding"]["variants"].empty()) {
+            return o;
+        }
+    }
+    return doc["opcodes"][0];
+}
+
+[[nodiscard]] nlohmann::json& firstVariantWithWires(nlohmann::json& doc) {
+    for (auto& o : doc["opcodes"]) {
+        if (!o.contains("encoding") || !o["encoding"].contains("variants")) continue;
+        for (auto& v : o["encoding"]["variants"]) {
+            if (v.contains("wires") && !v["wires"].empty()
+                && v.contains("template")) {
+                return v;
+            }
+        }
+    }
+    return doc["opcodes"][0];
+}
+
+[[nodiscard]] nlohmann::json* firstOpcodeWithImplicitRegisters(nlohmann::json& doc) {
+    for (auto& o : doc["opcodes"]) {
+        if (o.contains("implicitRegisters")) return &o["implicitRegisters"];
+    }
+    return nullptr;
+}
+
+constexpr std::array<GatedContainer, 13> kGatedContainers{{
+    {"/target",
+     [](nlohmann::json& d, std::string const& k) { d["target"][k] = true; }},
+    {"/aggregateLayout",
+     [](nlohmann::json& d, std::string const& k) { d["aggregateLayout"][k] = true; }},
+    {"/opcodes[i]",
+     [](nlohmann::json& d, std::string const& k) { d["opcodes"][0][k] = true; }},
+    {"/opcodes[i]/encoding",
+     [](nlohmann::json& d, std::string const& k) {
+         firstOpcodeWithEncoding(d)["encoding"][k] = true; }},
+    {"/opcodes[i]/encoding/variants[j]",
+     [](nlohmann::json& d, std::string const& k) {
+         firstVariantWithWires(d)[k] = true; }},
+    {"/opcodes[i]/encoding/variants[j]/guard",
+     [](nlohmann::json& d, std::string const& k) {
+         firstVariantWithWires(d)["guard"][k] = true; }},
+    {"/opcodes[i]/encoding/variants[j]/template",
+     [](nlohmann::json& d, std::string const& k) {
+         firstVariantWithWires(d)["template"][k] = true; }},
+    {"/opcodes[i]/encoding/variants[j]/wires[k]",
+     [](nlohmann::json& d, std::string const& k) {
+         firstVariantWithWires(d)["wires"][0][k] = true; }},
+    {"/registers[i]",
+     [](nlohmann::json& d, std::string const& k) { d["registers"][0][k] = true; }},
+    {"/registerClassOps[i]",
+     [](nlohmann::json& d, std::string const& k) { d["registerClassOps"][0][k] = true; }},
+    {"/relocations[i]",
+     [](nlohmann::json& d, std::string const& k) { d["relocations"][0][k] = true; }},
+    {"/callingConventions[i]",
+     [](nlohmann::json& d, std::string const& k) { d["callingConventions"][0][k] = true; }},
+    {"/callingConventions[i]/vaListLayout",
+     [](nlohmann::json& d, std::string const& k) {
+         d["callingConventions"][0]["vaListLayout"][k] = true; }},
+}};
+
+} // namespace
+
+TEST(TargetSchema, EveryGatedContainerRefusesATypoKey) {
+    for (auto const& c : kGatedContainers) {
+        // `before`/`after` prove the mutation actually landed — a navigator
+        // that missed its container would make this pin assert nothing (the
+        // failure mode the implicitRegisters pins below walked into).
+        nlohmann::json before, after;
+        auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+            "arm64", [&](nlohmann::json& doc) {
+                before = doc;
+                c.inject(doc, "zzNotARealKey");
+                after = doc;
+            });
+        EXPECT_NE(before, after)
+            << c.label << ": the typo mutation was a NO-OP — the navigator "
+                          "did not reach that container";
+        EXPECT_FALSE(mutated.has_value())
+            << c.label << " has NO closed key vocabulary — a misspelled key "
+                          "there loads clean and the feature it names stays "
+                          "silently switched off";
+    }
+}
+
+TEST(TargetSchema, EveryGatedContainerStillAcceptsDollarPrefixedProse) {
+    // The carve-out must be the PREFIX predicate, not a literal "$comment".
+    // `$zzProseComment` is deliberately NOT `$comment`: a gate that
+    // allowlisted the exact string would pass a `$comment` probe and still
+    // reject the `$templateComment` / `$framePointerComment` spellings the
+    // shipped targets use.
+    for (auto const& c : kGatedContainers) {
+        nlohmann::json before, after;
+        auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+            "arm64", [&](nlohmann::json& doc) {
+                before = doc;
+                c.inject(doc, "$zzProseComment");
+                after = doc;
+            });
+        EXPECT_NE(before, after)
+            << c.label << ": the prose mutation was a NO-OP — the navigator "
+                          "did not reach that container";
+        EXPECT_TRUE(mutated.has_value())
+            << c.label << " rejects a `$`-prefixed documentation key — the "
+                          "carve-out must be the PREFIX predicate, never a "
+                          "literal \"$comment\" entry";
+    }
+}
+
+// ⚠ THESE TWO USE x86_64, NOT arm64, AND THE REASON IS A NULL EXPERIMENT I
+// WALKED INTO: arm64 declares ZERO `implicitRegisters` blocks (they are the
+// x86 div/mul/shift/cmpxchg projection), so the arm64 mutation was a NO-OP and
+// the "refuses a typo" pin failed for the right reason while the "accepts
+// prose" pin PASSED for the wrong one — it asserted nothing at all. Every
+// mutation below therefore asserts the container WAS FOUND before asserting
+// anything about the load.
+TEST(TargetSchema, ImplicitRegistersAcceptsDollarPrefixedProse) {
+    bool injected = false;
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [&injected](nlohmann::json& doc) {
+            if (auto* ir = firstOpcodeWithImplicitRegisters(doc)) {
+                (*ir)["$zzProseComment"] = "prose, not a register list";
+                injected = true;
+            }
+        });
+    ASSERT_TRUE(injected)
+        << "no shipped x86_64 opcode carries an `implicitRegisters` block — "
+           "the mutation was a no-op and this pin would assert nothing";
+    EXPECT_TRUE(mutated.has_value())
+        << "an implicitRegisters block must accept `$`-prefixed prose (its "
+           "hand-rolled loop rejected every `$` key before it was routed "
+           "through the shared rejector)";
+}
+
+TEST(TargetSchema, CondCodeEncodingAcceptsDollarPrefixedProse) {
+    bool injected = false;
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "arm64", [&injected](nlohmann::json& doc) {
+            if (doc.contains("condCodeEncoding")) {
+                doc["condCodeEncoding"]["$zzProseComment"] =
+                    "prose, not a condition";
+                injected = true;
+            }
+        });
+    ASSERT_TRUE(injected)
+        << "arm64 declares no `condCodeEncoding` — the mutation was a no-op";
+    EXPECT_TRUE(mutated.has_value())
+        << "condCodeEncoding must accept `$`-prefixed prose — its loop "
+           "matches names against a closed table and needs the same "
+           "carve-out every other closed vocabulary gets";
+}
+
+TEST(TargetSchema, CondCodeEncodingRefusesATypoKey) {
+    bool injected = false;
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "arm64", [&injected](nlohmann::json& doc) {
+            if (doc.contains("condCodeEncoding")) {
+                doc["condCodeEncoding"]["eqq"] = 0;
+                injected = true;
+            }
+        });
+    ASSERT_TRUE(injected);
+    EXPECT_FALSE(mutated.has_value())
+        << "a misspelled condition name must be refused — silently ignoring "
+           "it leaves that condition unencoded and every branch using it "
+           "resolves to the zero nibble";
+}
+
+TEST(TargetSchema, ImplicitRegistersRefusesATypoKey) {
+    bool injected = false;
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [&injected](nlohmann::json& doc) {
+            if (auto* ir = firstOpcodeWithImplicitRegisters(doc)) {
+                (*ir)["inpts"] = nlohmann::json::array();
+                injected = true;
+            }
+        });
+    ASSERT_TRUE(injected)
+        << "the mutation was a no-op — this pin would assert nothing";
+    EXPECT_FALSE(mutated.has_value())
+        << "a misspelled `inputs` must be refused, not silently leave the "
+           "implicit-register block empty";
+}
+
+TEST(TargetSchema, ShippedTargetsLoadCleanUnderEveryContainerGate) {
+    // ★ THE INVERSE-FAILURE PIN, and it has already earned its place: the
+    // first cut of these gates omitted `/target/description` — a key both
+    // shipped targets declare and the loader reads for nothing — and every
+    // shipped target stopped loading (✔MEASURED: 21 red tests). A closed key
+    // set is a claim about the CONFIGS, so it is pinned against the configs.
+    for (char const* name : {"arm64", "x86_64"}) {
+        auto r = TargetSchema::loadShipped(name);
+        if (!r.has_value()) {
+            for (auto const& d : r.error()) {
+                ADD_FAILURE() << name << ": " << d.path << ": " << d.message;
+            }
+        }
+        EXPECT_TRUE(r.has_value())
+            << name << ".target.json must load clean under EVERY closed "
+                       "container-key vocabulary, not just the root one";
     }
 }

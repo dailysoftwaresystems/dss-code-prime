@@ -21,6 +21,14 @@ add_library(core OBJECT
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
     types/predefined_macro_json.cpp
+    # The ONE `.dss-project.json` reader. It lived in `src/program/` until
+    # 2026-08-13, when the LSP tier's `workspace_project.cpp` — which reads the
+    # same manifest to learn a workspace's assembly dialect — had to reach UP
+    # into the driver tier to reuse it (`program` already links `lsp`, so the
+    # two OBJECT libs referenced each other's headers).
+    # D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS: moved down to the tier
+    # both readers already depend on, so the dependency runs one way again.
+    types/project_config.cpp
     types/target_schema.cpp
     types/target_schema_json.cpp
     types/lexer_mode.cpp
@@ -56,10 +64,51 @@ target_compile_definitions(core PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 # BUILD rather than silently predefining a wrong identity.
 target_compile_definitions(core PRIVATE DSS_PROJECT_VERSION="${DSS_VERSION}")
 
-# nlohmann/json is included by exactly one translation unit
-# (grammar_schema_json.cpp). PRIVATE keeps the include path off the
-# transitive consumers — every other file in `core` (and every consumer
-# of `core`) sees just our public headers, never <nlohmann/json.hpp>.
+# nlohmann/json is PRIVATE: the include path is a build requirement of `core`'s
+# own sources, NOT a usage requirement re-exported to consumers.
+#
+# ⚠ MEASURED 2026-08-13, because the comment that stood here claimed
+# "included by exactly one translation unit (grammar_schema_json.cpp) ... every
+# other file in `core` sees just our public headers, never <nlohmann/json.hpp>"
+# and BOTH halves had drifted false. The actual `#include <nlohmann/json.hpp>`
+# set inside src/core/ is:
+#     types/grammar_schema_json.cpp     types/target_schema_json.cpp
+#     types/project_config.cpp          types/predefined_macro_json.hpp
+#     substrate/relocation_table_json.hpp
+# Keep this list honest: `grep -rn '#include <nlohmann' src/core/` is the whole
+# instrument.
+#
+# ── THE CONVENTION, STATED CORRECTLY ─────────────────────────────────────────
+# A public header does not put <nlohmann/json.hpp> on its consumers — EXCEPT a
+# header whose declared job IS to accept a `nlohmann::json const&`, which names
+# itself `_json` and is included only by TUs already holding a parsed document.
+# The two entries above ending in `_json.hpp` are that sanctioned shape; the
+# exception is mechanical, not taste, because a parser interface cannot hide the
+# type it parses, and these are TEMPLATES with no `.cpp` to hide an include in.
+#
+# ⚠⚠ AN EARLIER VERSION OF THIS COMMENT DREW A CAUSAL CLAIM FROM THE LIST ABOVE
+# THAT IS FALSE, AND IT WAS ABOUT TO DRIVE A DESIGN DECISION. It read: the two
+# headers are why "`tests/`, `program`, `link`, `lsp` etc. carry their own
+# `nlohmann_json::nlohmann_json` edges" — offered as evidence that this
+# convention was never really enforced. ✔MEASURED 2026-08-13, all three parts
+# wrong (D-CORE-JSON-LEAKS-INTO-TWO-PUBLIC-HEADERS):
+#   (1) `program` carries NO nlohmann edge at all, and src/program/CMakeLists.txt
+#       documents that absence explicitly as correct.
+#   (2) EVERY other edge is self-explained: ffi(1), opt(1), link(2), lsp(3) each
+#       `#include <nlohmann/json.hpp>` DIRECTLY in their own translation units.
+#       Not one edge traces to a leaked core header.
+#       ⚠ Measure this with the pattern anchored — `^#include <nlohmann` — never
+#       a bare `grep -l nlohmann/json.hpp`. The loose form counts a file whose
+#       COMMENT names the header: src/lsp/protocol.hpp says "NO
+#       <nlohmann/json.hpp> in this header" and the loose grep scored it a
+#       violation, briefly turning a refusal into a finding.
+#   (3) So the fix those premises implied — "hide the JSON and watch the edges
+#       disappear" — had no valid check behind it; the edges would not have moved.
+# The real defect was narrower: `substrate/relocation_table.hpp` was a JSON
+# parser interface NOT named as one. It is now split — the typed half (the
+# `relocation_row` concept + `validateRelocationsTable`) keeps the plain name and
+# pulls no JSON, so `object_format_schema.cpp` and `target_schema.cpp` stop
+# seeing nlohmann for a function that never touched it.
 target_link_libraries(core PRIVATE nlohmann_json::nlohmann_json)
 
 # Big-object assembler flag for the large auto-generated grammar-schema TU.

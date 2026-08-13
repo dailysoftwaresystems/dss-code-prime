@@ -2427,6 +2427,45 @@ TEST(FormatPredefinedMacros, SharedEntryGrammarIsInherited) {
     EXPECT_TRUE(anyHasMalformedJson(notAnArray.error()));
 }
 
+// ── D-CONFIG-PREDEFINED-MACRO-ROW-KEYS-UNGATED ───────────────────────────
+//
+// The typo discriminator over the ROOT key (`predefinedMacro`, above) existed;
+// the one over an ENTRY's keys did not, so a level down the same silent no-op
+// was still live. Every optional entry field is read with a bare `contains()`
+// probe, so a misspelling was DROPPED and the row loaded clean carrying the
+// default the author was overriding.
+//
+// This family is the THIRD caller of the shared entry parser, and it is pinned
+// here for the reason `SharedEntryGrammarIsInherited` above is: a rule that
+// lives in a shared parser is only *inherited* where a test drives the
+// inheriting caller.
+//
+// RED-ON-DISABLE: delete the rejection loop in `parsePredefinedMacroArray` and
+// the first arm loads clean.
+TEST(FormatPredefinedMacros, EntryUnknownKeyRejectedAndNamed) {
+    auto typo = ObjectFormatSchema::loadFromText(withRootKey(
+        R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
+                                "availabelObjectFormats":["elf"]}])"));
+    ASSERT_FALSE(typo.has_value())
+        << "a misspelled entry key must be REFUSED — silently ignoring this "
+           "one makes a format-gated macro leak onto every format";
+    EXPECT_TRUE(anyHasMalformedJson(typo.error()));
+    EXPECT_TRUE(anyMessageMentions(typo.error(), "availabelObjectFormats"))
+        << "the diagnostic must NAME the offending key";
+    EXPECT_TRUE(anyMessageMentions(typo.error(), "predefinedMacros"))
+        << "the diagnostic must NAME the container the key was found in";
+
+    // The carve-out. Without it the gate rejects every shipped document that
+    // documents a macro row inline — the inverse failure, which is the one that
+    // actually fires.
+    auto prose = ObjectFormatSchema::loadFromText(withRootKey(
+        R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
+                                "$valueComment":"why this spelling"}])"));
+    EXPECT_TRUE(prose.has_value())
+        << "`$`-prefixed keys are prose, not knobs — and the carve-out must be "
+           "the PREFIX predicate, not a literal `$comment` compare";
+}
+
 // ★ THE SHIPPED-POPULATION PIN, BOTH DIRECTIONS, OVER ALL 24 FILES.
 //
 // The expectation is keyed on each schema's OWN `dataModel()` — never on its

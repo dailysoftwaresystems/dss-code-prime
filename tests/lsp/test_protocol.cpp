@@ -28,6 +28,19 @@ TEST(LspProtocol, ParseMethodKnownStrings) {
     EXPECT_EQ(parseMethod("textDocument/references"),     Method::TextDocumentReferences);
     EXPECT_EQ(parseMethod("textDocument/rename"),         Method::TextDocumentRename);
     EXPECT_EQ(parseMethod("textDocument/signatureHelp"),  Method::TextDocumentSignatureHelp);
+    // The four workspace notifications that can move the project-manifest set
+    // (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE). Spelling matters more
+    // here than anywhere else in this table: a typo makes the notification fall
+    // through to `Unknown`, which LSP §3.1 says to DROP SILENTLY — so the
+    // liveness would simply stop working with no error anywhere.
+    EXPECT_EQ(parseMethod("workspace/didChangeWatchedFiles"),
+              Method::WorkspaceDidChangeWatchedFiles);
+    EXPECT_EQ(parseMethod("workspace/didCreateFiles"),
+              Method::WorkspaceDidCreateFiles);
+    EXPECT_EQ(parseMethod("workspace/didRenameFiles"),
+              Method::WorkspaceDidRenameFiles);
+    EXPECT_EQ(parseMethod("workspace/didDeleteFiles"),
+              Method::WorkspaceDidDeleteFiles);
 }
 
 TEST(LspProtocol, ParseMethodUnknownStringMapsToUnknown) {
@@ -53,6 +66,10 @@ TEST(LspProtocol, MethodNameRoundTripsForKnownMethods) {
         Method::TextDocumentReferences,
         Method::TextDocumentRename,
         Method::TextDocumentSignatureHelp,
+        Method::WorkspaceDidChangeWatchedFiles,
+        Method::WorkspaceDidCreateFiles,
+        Method::WorkspaceDidRenameFiles,
+        Method::WorkspaceDidDeleteFiles,
     };
     for (auto m : known) {
         const auto name = methodName(m);

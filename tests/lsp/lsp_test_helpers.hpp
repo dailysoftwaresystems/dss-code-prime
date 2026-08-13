@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -107,6 +108,27 @@ public:
               return server_.run();
           })) {}
 
+    // ★★ THE HARNESS MUST SURVIVE A FAILING TEST, NOT HANG IT.
+    // Members destruct in REVERSE declaration order, so `exitFuture_` — an
+    // `std::async` future, whose destructor BLOCKS until the task finishes —
+    // goes first, while the server thread is still parked in
+    // `InMemoryTransport::readMessage()` waiting for a message that will never
+    // come. Any test that returns early (a failed `ASSERT_*` before it could
+    // push `shutdown`/`exit`, or a `runUntilExit` timeout) therefore used to
+    // DEADLOCK the whole binary: no failure report, no other test, just a hung
+    // process the CI eventually kills with no log. That is the
+    // "silence instead of a verdict" shape this tree keeps deleting, and it was
+    // one early `ASSERT` away in every existing e2e test.
+    //
+    // Closing the transport here — in the destructor BODY, which runs before
+    // any member is destroyed — makes `readMessage()` return `Eof`, `run()`
+    // return, and the future become ready. `close()` is idempotent, so the
+    // normal shutdown+exit path is unaffected. `transport_` is owned by
+    // `server_`'s `unique_ptr`, which is still alive at this point.
+    ~LspTestHarness() {
+        if (transport_) transport_->close();
+    }
+
     LspTestHarness(LspTestHarness const&)            = delete;
     LspTestHarness& operator=(LspTestHarness const&) = delete;
     LspTestHarness(LspTestHarness&&)                 = delete;
@@ -146,6 +168,33 @@ private:
 [[nodiscard]] inline std::string lspInitialize(int id) {
     return R"({"jsonrpc":"2.0","id":)" + std::to_string(id)
          + R"(,"method":"initialize","params":{}})";
+}
+
+// `file:///…` URI for a local path — the spelling every LSP client uses for a
+// workspace folder. Backslashes become forward slashes and a Windows drive path
+// gains the extra leading slash the URI grammar requires (`C:\d` →
+// `file:///C:/d`), so a fixture built here round-trips through
+// `dss::lsp::pathFromFileUri`.
+[[nodiscard]] inline std::string fileUriFromPath(
+    std::filesystem::path const& p) {
+    auto s = p.generic_string();
+    return (!s.empty() && s.front() == '/') ? "file://" + s
+                                            : "file:///" + s;
+}
+
+// `initialize` naming workspace folders — the ONLY message that carries them,
+// and therefore the only way an editor can learn the workspace's compile
+// target. `lspInitialize` (params `{}`) is the deliberate no-workspace control.
+[[nodiscard]] inline std::string lspInitializeWithRoots(
+    int id, std::vector<std::filesystem::path> const& roots) {
+    std::string folders;
+    for (auto const& r : roots) {
+        if (!folders.empty()) folders += ",";
+        folders += R"({"uri":")" + fileUriFromPath(r) + R"(","name":"ws"})";
+    }
+    return R"({"jsonrpc":"2.0","id":)" + std::to_string(id)
+         + R"(,"method":"initialize","params":{"workspaceFolders":[)"
+         + folders + R"(]}})";
 }
 
 [[nodiscard]] inline std::string lspShutdown(int id) {

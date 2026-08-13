@@ -1,5 +1,6 @@
 add_library(asm OBJECT
     asm.cpp
+    asm_text_to_lir.cpp
     disasm.cpp
     format/fixed32.cpp
     format/fixed32_disasm.cpp

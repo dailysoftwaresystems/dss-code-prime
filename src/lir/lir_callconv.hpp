@@ -4,6 +4,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/strong_ids.hpp"          // SymbolId (c116 SEH funclet-parent map)
 #include "core/types/target_schema.hpp"
+#include "core/types/cfi.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_regalloc.hpp"
 
@@ -285,9 +286,65 @@ struct DSS_EXPORT FrameLayout {
     }
 };
 
+// One CFI rule change, keyed by the LIR instruction that establishes it.
+//
+// This is the producer-side intermediate between the callconv materializer
+// (which knows WHICH instruction changes the frame, but not where it will land
+// in the byte stream) and the assembler (which knows the byte offsets, but not
+// what any instruction means). Neither half can produce a PC-keyed `CfiOp`
+// alone; the pipeline joins them.
+//
+// * The alternative -- recovering the prologue's byte offsets downstream by
+//   counting instructions or by assuming their encodings -- is what the
+//   pre-existing pe64 `.pdata`/`.xdata` builder did, and it is exactly the
+//   fragility this replaces. An instruction id is a fact; an assumed byte
+//   length is a hypothesis that no longer holds the moment an encoder picks a
+//   shorter form.
+struct DSS_EXPORT LirCfiOp {
+    LirInstId    inst{};   // the instruction AFTER which the rule is in effect
+    CfiOpKind    kind  = CfiOpKind::DefCfaOffset;
+    CfiRegRef    reg{};
+    CfiRegRef    srcReg{};
+    std::int64_t offset = 0;
+    // When set, the rule takes effect at the END of `block` rather than after
+    // `inst`. Exists for exactly one op: the `restore_state` that re-arms the
+    // framed rules for the code FOLLOWING a `ret`.
+    //
+    // * A function with two returns has two epilogues, and the code BETWEEN
+    //   them still has a live frame. Without this, the stream would say the
+    //   frame was torn down from the first epilogue onward and every unwind
+    //   from the second half of the function would read the caller's return
+    //   address `totalFrameSize` bytes from where it is. gcc solves it the
+    //   same way (`.cfi_remember_state` / `.cfi_restore_state` bracketing each
+    //   epilogue); the restore has to land PAST the `ret`, and the block end
+    //   is that point -- the epilogue's own last instruction is not, because
+    //   the one-byte `ret` sits between them with the frame genuinely gone.
+    LirBlockId   block{};
+    bool         atBlockEnd = false;
+};
+
+// One function's CFI production, plus the one boundary only the materializer
+// can state: how many of these ops belong to the PROLOGUE.
+//
+// * `prologueOpCount` is recorded, not inferred. Win64 `UNWIND_INFO` has a
+//   mandatory `SizeOfProlog` field, and a consumer that guessed it -- "the ops
+//   before the first body instruction", say -- would be re-deriving, at a
+//   distance, a fact the emitter had in hand and threw away. An invented
+//   `SizeOfProlog` makes the OS unwinder mis-classify PCs as mid-prologue and
+//   unwind a frame that is not there yet.
+struct DSS_EXPORT LirFuncCfi {
+    std::vector<LirCfiOp> ops;
+    std::uint32_t         prologueOpCount = 0;
+};
+
 struct DSS_EXPORT LirCallconvResult {
     Lir                       lir{};
     std::vector<FrameLayout>  perFunc;  // 1:1 with src.funcAt(i)
+    // 1:1 with `perFunc`: the frame-affecting instructions this function's
+    // prologue / frame-pointer capture / epilogues emitted, in emission order.
+    // Empty for a function whose frame is entirely absent (a zero-size frame
+    // with no callee-saves changes nothing, so it has nothing to say).
+    std::vector<LirFuncCfi> perFuncCfi;
     // True iff `materializeCallingConvention` ran to its successful conclusion.
     // Set ONLY at the final return, so EVERY failure early-return (a config /
     // per-function / SEH / VLA-verifier reject — each returns an empty or
@@ -311,7 +368,12 @@ struct DSS_EXPORT LirCallconvResult {
     // hence the explicit completion flag.
     [[nodiscard]] bool ok() const noexcept {
         return allFunctionsLaidOut
-            && perFunc.size() == lir.moduleFuncCount();
+            && perFunc.size() == lir.moduleFuncCount()
+            // The CFI sink rides the SAME parallel-index discipline: a
+            // function that got a FrameLayout but no CFI slot would silently
+            // reach the writers as "this function has no unwind info", which
+            // is indistinguishable from a genuinely frameless leaf.
+            && perFuncCfi.size() == perFunc.size();
     }
 
     // Find the FrameLayout for the given function by position in

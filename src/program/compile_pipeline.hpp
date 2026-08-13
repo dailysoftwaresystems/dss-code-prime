@@ -225,6 +225,44 @@ resolvePipelineName(CompileConfig config) noexcept {
     return kPipelineNameTable[idx].second;
 }
 
+// Assemble ONE standalone-assembly CompilationUnit at the `encode` pipeline
+// tier (plan 29 P4) — the `assembleUnit` sibling for a language whose root rule
+// declares `{"tier": "encode"}`.
+//
+// ★★★ WHAT MAKES IT A SEPARATE ENTRY POINT RATHER THAN A FLAG ON `assembleUnit`:
+// it shares NO tier with it. A `.s` is already the machine tier, so this runs
+// text→LIR and then `assemble()`, and everything between — analyze, CST→HIR,
+// HIR→MIR, the optimizer, MIR→LIR, liveness, regalloc, two-address legalize,
+// callconv — does not run at all. Three of those would rewrite the programmer's
+// own decisions SILENTLY (registers, instruction forms, and the prologue), so
+// the two paths are different pipelines and not one pipeline with a switch.
+//
+// A defined label whose name is one of the language's entry spellings becomes
+// the module's `userEntrySymbol`. Returns nullopt on any failure (diagnostics
+// emitted via `reporter`).
+//
+// ★★ IT TAKES THE WHOLE `ObjectFormatSchema` AND THE WHOLE `CompileOptions`,
+// NOT A HAND-PICKED SLICE (D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY +
+// D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER). It used to take only
+// `formatVerbs` (the format's `entryVerbs()`), which was every fact the entry
+// election needed and NOTHING the extern binder needs: the platform-realization
+// oracle keys on the active object format KIND + DATA MODEL, and honoring
+// `--resolve-library` needs `opts`. A `.s` calling `putchar` therefore could not
+// bind ANY library and was refused at the EXEC link with `undefined symbol`,
+// while the exact flag that should have bound it was accepted and dropped
+// without a word. Both facts now arrive by the same route `assembleUnit` uses,
+// so the two tiers cannot drift on what "the active format" means.
+// ⚠ A DEFAULTED PARAMETER WAS REJECTED for `opts`: it would compile everywhere
+// while the shipped driver silently never passed one — precisely the shape of
+// the defect being closed.
+[[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
+assembleAsmUnit(CompilationUnit const&                cu,
+                GrammarSchema const&                  grammar,
+                TargetSchema const&                   target,
+                ObjectFormatSchema const&             format,
+                DiagnosticReporter&                   reporter,
+                CompileOptions const&                 opts);
+
 [[nodiscard]] DSS_EXPORT bool
 compileSingleUnit(CompilationUnit const&         cu,
                   GrammarSchema const&           grammar,

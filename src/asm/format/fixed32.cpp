@@ -1,5 +1,6 @@
 #include "asm/format/fixed32.hpp"
 
+#include "asm/asm_variant_elect.hpp"
 #include "asm/format/byte_emit.hpp"
 #include "asm/format/walker_util.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -12,6 +13,7 @@
 #include <format>
 #include <optional>
 #include <span>
+#include <string>
 
 namespace dss::fixed32 {
 
@@ -115,6 +117,13 @@ windowFor(EncodingSlotKind s) noexcept {
         // `orInto` twice with this window — once per MOVZ/MOVK word. The
         // third (operation) word carries no Imm32MovzMovk bits.
         case EncodingSlotKind::Imm32MovzMovk: return SlotBitWindow{ 5, 16 };
+        // Imm16Inverted (D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE): the
+        // SAME bits 5..20 window as Imm16 — AArch64 MOVN carries its imm16
+        // exactly where MOVZ does (Rd at 0..4). Distinct slot, identical
+        // placement, different encode ARITHMETIC: the wire arm writes the
+        // operand's bitwise COMPLEMENT `~V` rather than `V`, which is the
+        // Imm12 vs Imm12Scaled relationship one field over.
+        case EncodingSlotKind::Imm16Inverted: return SlotBitWindow{ 5, 16 };
         // SymbolPatchMarker (D-AS4-3): width-0 symbol-patch marker, like
         // MemBaseNoScale. The walker writes NO bits (the linker patches
         // the whole field via the wire's relocationKind); the slot only
@@ -197,14 +206,14 @@ bool encode(Lir const&                  lir,
     // the fixed32 walker consults the SAME shared matcher as
     // x86_variable (arm64 W-forms = width:32 variants whose fixedWord
     // clears bit 31; width-absent variants match any width).
+    // ⚠ THE LOOP ITSELF LIVES IN `asm_variant_elect.hpp` AND IS NOT INLINED
+    // HERE — see the x86_variable twin: the assembly-TEXT lowering runs the
+    // same selection earlier to decide which target opcode a dialect mnemonic
+    // denotes, and two copies that drifted would bind text to one opcode and
+    // encode another with no diagnostic.
     std::uint8_t const instWidth = lirInstWidthBits(lir.instFlags(inst));
-    TargetEncodingVariant const* selected = nullptr;
-    for (auto const& v : info->encoding.variants) {
-        if (walker_util::variantMatchesInst(instOps, instWidth, v)) {
-            selected = &v;
-            break;
-        }
-    }
+    TargetEncodingVariant const* selected =
+        asm_elect::selectEncodingVariant(*info, instOps, instWidth);
     if (selected == nullptr) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,
@@ -681,6 +690,78 @@ bool encode(Lir const&                  lir,
                     return false;
                 continue;
             }
+            // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the INVERTED
+            // immediate slot — the encoder writes the operand's bitwise
+            // COMPLEMENT into an otherwise ordinary unsigned window, because
+            // the NEGATE semantics live in the base word (AArch64 `MOVN Xd,
+            // #imm16` = `Xd := ~(imm16)`, the form `gas` itself aliases from
+            // `mov Xd,#-N`). The `negValue` variant guard routes only a
+            // strictly-negative immediate here; this arm re-derives the value
+            // rather than trusting that routing, for a reason that is a
+            // SILENT MISCOMPILE and not a formality:
+            //
+            //   ~V for a NON-NEGATIVE V is itself negative, so it clears the
+            //   ">maxVal" range test (a negative int64 is not > 65535) and
+            //   `orInto` would MASK it into the 16-bit window as a garbage
+            //   constant — `mov x1,#8` would encode `mov x1,#-9`. A schema
+            //   that wires this slot and FORGETS `negValue` must therefore
+            //   fail loud, not encode.
+            //
+            // The representable range is derived from the window WIDTH (never
+            // a baked literal), so a future wider/narrower inverted field
+            // reports its own bound: V in [-(2^width), -1].
+            // Handled BEFORE the Imm16/Imm12 reject so the inverted slot
+            // never leaks into the direct-value range logic.
+            if (wire.slotKind == EncodingSlotKind::Imm16Inverted) {
+                auto const w = windowFor(wire.slotKind);
+                if (!w.has_value()) {
+                    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': slot '{}' has no bit-window "
+                                       "(walker-vs-enum drift)", info->mnemonic,
+                                       encodingSlotKindName(wire.slotKind)));
+                    return false;
+                }
+                std::int64_t const raw = srcOp.immInt32;
+                if (raw >= 0) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': the inverted-immediate form "
+                                       "(complement base, e.g. MOVN) requires a "
+                                       "NEGATIVE immediate (got {}) — a "
+                                       "non-negative value must route to the "
+                                       "direct form; the sign matcher should "
+                                       "have excluded this",
+                                       info->mnemonic, raw));
+                    return false;
+                }
+                // `~raw` written as `-raw - 1` so it is exact in int64 for
+                // every int32 input INCLUDING INT32_MIN (whose |value|
+                // overflows int32). raw <= -1 ⇒ inverted >= 0.
+                std::int64_t const inverted = -raw - 1;
+                std::int64_t const maxVal =
+                    (std::int64_t{1} << w->width) - 1;
+                if (inverted > maxVal) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': immediate {} is out of range "
+                                       "for the {}-bit '{}' slot — its complement "
+                                       "{} exceeds the field's 0..{}, so only "
+                                       "values in {}..-1 are encodable here; a "
+                                       "more negative constant needs a shifted "
+                                       "(hw!=0) or multi-instruction "
+                                       "materialization, not yet supported",
+                                       info->mnemonic, raw, w->width,
+                                       encodingSlotKindName(wire.slotKind),
+                                       inverted, maxVal, -(maxVal + 1)));
+                    return false;
+                }
+                if (!orInto(wire.slotKind,
+                            static_cast<std::uint32_t>(inverted),
+                            wire.wordIndex))
+                    return false;
+                continue;
+            }
             // Immediate operand → an UNSIGNED immediate fixed32 slot.
             // Cycle scope (D-LK10-ENTRY-ARM64): Imm16 (AArch64 MOVZ
             // wide-immediate) or Imm12 (AArch64 ADD/SUB-immediate frame
@@ -721,7 +802,55 @@ bool encode(Lir const&                  lir,
             // future cycle. Unsuppressable (A_ImmediateOperandOutOfRange).
             std::int32_t const imm = srcOp.immInt32;
             std::uint32_t const maxVal = (1u << w->width) - 1u;
-            if (imm < 0 || static_cast<std::uint32_t>(imm) > maxVal) {
+            // D-ASM-FIXED32-NEGATIVE-IMM-DIAGNOSTIC-NAMES-UNSIGNED-RANGE:
+            // a NEGATIVE value reaching an unsigned slot is a DIFFERENT
+            // failure from "too wide", and lumping them together produced a
+            // message that was TRUE AND MISLEADING — found by RUNNING the
+            // arm, not reading it. `mov x1,#-65537` on arm64 falls through
+            // the (bounded) complement-immediate variant to the unsigned
+            // MOVZ one and was told "valid 0..65535", which points at the
+            // wrong window entirely: the reader cannot learn from it that
+            // -8 encodes fine and -65537 does not. When the opcode declares
+            // a `negValue` variant, report ITS window — read off the SCHEMA,
+            // so the message stays correct for any target and any future
+            // widening of that variant, with no constant duplicated here.
+            if (imm < 0) {
+                // First fully-bounded negative-routing variant of THIS
+                // opcode, if any. Bounds are magnitudes, so the encodable
+                // value window is [-immMax, -immMin].
+                std::string negClause;
+                for (auto const& cand : info->encoding.variants) {
+                    if (!cand.negValue) continue;
+                    if (!cand.immMin.has_value() || !cand.immMax.has_value()) {
+                        continue;
+                    }
+                    negClause = std::format(
+                        " — this opcode DOES encode negative immediates, but "
+                        "only in {}..{} (its negative-value variant's declared "
+                        "magnitude window); {} is outside it and needs a "
+                        "shifted or multi-instruction materialization",
+                        -static_cast<std::int64_t>(*cand.immMax),
+                        -static_cast<std::int64_t>(*cand.immMin), imm);
+                    break;
+                }
+                if (negClause.empty()) {
+                    negClause = std::format(
+                        " — this opcode declares no negative-value variant, so "
+                        "a negative constant has no encoding here; it needs a "
+                        "complement-immediate (inverted-slot) variant or a "
+                        "multi-instruction materialization");
+                }
+                report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': immediate {} is NEGATIVE but "
+                                   "the {}-bit '{}' slot is UNSIGNED (encodes "
+                                   "0..{}){}",
+                                   info->mnemonic, imm, w->width,
+                                   encodingSlotKindName(wire.slotKind),
+                                   maxVal, negClause));
+                return false;
+            }
+            if (static_cast<std::uint32_t>(imm) > maxVal) {
                 report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': immediate {} is out of range "
@@ -739,23 +868,23 @@ bool encode(Lir const&                  lir,
                         wire.wordIndex))
                 return false;
         } else if (srcOp.kind == LirOperandKind::MemOffset) {
-            // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: a `negMemoffset`
+            // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: a `negValue`
             // variant (the arm64 `SUB Xd,Xn,#|disp|` negative-disp lea) writes
             // the ABSOLUTE VALUE of a NEGATIVE displacement into its (unsigned)
             // imm12 / shifted-imm12 / MOVZ-MOVK slot — the subtract semantics
             // live in the SUB base word, not the field, so the field carries
             // |disp|. The matcher (variantNegMagnitude) only routes a strictly-
             // negative memoffset here, but the encoder DEFENDS the invariant:
-            // a non-negative disp on a negMemoffset variant is a lowering/
+            // a non-negative disp on a negValue variant is a lowering/
             // schema bug and fails LOUD (never silently negate a positive into
-            // a wrong address). `effectiveDisp` is |disp| for the negMemoffset
+            // a wrong address). `effectiveDisp` is |disp| for the negValue
             // path (computed as -(int64) so INT32_MIN widens cleanly) and the
             // raw signed disp otherwise — so every slot arm below feeds the
             // correct magnitude with no per-arm sign branching. A non-
-            // negMemoffset variant is byte-identical to before (effectiveDisp
+            // negValue variant is byte-identical to before (effectiveDisp
             // == srcOp.offset).
             std::int64_t effectiveDisp = srcOp.offset;
-            if (selected->negMemoffset) {
+            if (selected->negValue) {
                 if (srcOp.offset >= 0) {
                     report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                            DiagnosticSeverity::Error,
@@ -918,7 +1047,7 @@ bool encode(Lir const&                  lir,
             // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the negative-disp lea's
             // shifted `SUB Xd,Xn,#|disp|; SUB Xd,Xd,#hi,LSL#12` word-pair rides
             // the SAME imm12.hilo24 slot; `effectiveDisp` is already |disp| for
-            // the negMemoffset variant, so writeHiLo24 splits the magnitude
+            // the negValue variant, so writeHiLo24 splits the magnitude
             // identically to the positive ADD word-pair (the SUB base word
             // makes it a subtract).
             if (wire.slotKind == EncodingSlotKind::Imm12HiLo24) {
@@ -974,8 +1103,8 @@ bool encode(Lir const&                  lir,
             // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the value the field
             // receives. For the unsigned Imm12 slot the SUB negative-disp lea
             // wires |disp| here (effectiveDisp is already |disp| ≤ 4095 for the
-            // negMemoffset variant, the magnitude range-checked below). For the
-            // signed Imm9 slot negMemoffset is always false, so effectiveDisp
+            // negValue variant, the magnitude range-checked below). For the
+            // signed Imm9 slot negValue is always false, so effectiveDisp
             // == srcOp.offset — the two's-complement range/write is unchanged.
             std::int32_t const disp = static_cast<std::int32_t>(effectiveDisp);
             if (isSignedSlot) {

@@ -27,9 +27,17 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 
-#include <gtest/gtest.h>
+#include "mutate_target_schema.hpp"
 
+#include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
 #include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 using namespace dss;
@@ -1318,6 +1326,254 @@ TEST(Arm64Encoder, ImmediateWiderThanImm16FailsLoud) {
     EXPECT_GT(rep.errorCount(), 0u);
 }
 
+// ── D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE — `mov Xd,#-N` = MOVN ───
+//
+// EVERY word below is ✔MEASURED against the reference assembler, not
+// derived: `aarch64-linux-gnu-as` 2.42 + `aarch64-linux-gnu-objdump -d`
+// under WSL. gas ALIASES the negative `mov` onto MOVN, so `mov x1,#-8` and
+// `movn x1,#7` assemble to the IDENTICAL word — the pins are what the
+// reference toolchain actually emits, which is the standard
+// `feedback_reference_compilers_are_the_spec` sets.
+namespace {
+// The MOVN words the reference assembler produced, kept adjacent so a
+// future editor sees the whole measured set at once.
+constexpr std::uint32_t kMovnX1Neg8      = 0x928000E1u;  // mov x1,#-8
+constexpr std::uint32_t kMovnX1Neg1      = 0x92800001u;  // mov x1,#-1
+constexpr std::uint32_t kMovnX1Neg65536  = 0x929FFFE1u;  // mov x1,#-65536
+constexpr std::uint32_t kMovnW1Neg8      = 0x128000E1u;  // mov w1,#-8
+// The NON-negative siblings, measured in the SAME `aarch64-linux-gnu-as` 2.42
+// run as the four above (D-ASM-ARM64-MOVZ-W-FORM-UNDECLARED). They belong next
+// to the MOVN set because the pin below asserts the SIGN axis routes between
+// them: a non-negative immediate must reach MOVZ, never a MOVN arm.
+constexpr std::uint32_t kMovzX1Pos8      = 0xD2800101u;  // mov x1,#8
+constexpr std::uint32_t kMovzW1Pos8      = 0x52800101u;  // mov w1,#8
+
+// Assemble a single `mov <reg>, #imm` (plus the trailing `ret`) and return
+// the FIRST instruction word. `widthFlags` selects the X/W form.
+[[nodiscard]] std::optional<std::uint32_t>
+assembleMovImmWord(TargetSchema const& s, std::string_view destReg,
+                   std::int32_t imm, std::uint8_t widthFlags,
+                   DiagnosticReporter& rep) {
+    auto const movOp = s.opcodeByMnemonic("mov");
+    auto const retOp = s.opcodeByMnemonic("ret");
+    if (!movOp.has_value() || !retOp.has_value()) return std::nullopt;
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    auto const regId = s.registerByName(destReg);
+    if (!regId.has_value()) return std::nullopt;
+    LirReg const dest{static_cast<std::uint32_t>(*regId), 1, cls};
+
+    LirBuilder b{s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeImmInt32(imm) };
+    (void)b.addInst(*movOp, dest, ops, /*payload=*/0, widthFlags);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    auto r = assemble(lir, s, lirToMir, rep);
+    if (r.functions.empty() || r.functions[0].bytes.size() < 4) {
+        return std::nullopt;
+    }
+    auto const& by = r.functions[0].bytes;
+    return static_cast<std::uint32_t>(by[0])
+         | (static_cast<std::uint32_t>(by[1]) << 8)
+         | (static_cast<std::uint32_t>(by[2]) << 16)
+         | (static_cast<std::uint32_t>(by[3]) << 24);
+}
+
+[[nodiscard]] bool sawImmOutOfRange(DiagnosticReporter const& rep) {
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST(Arm64Encoder, MovNegativeImmediateEncodesMovn) {
+    // The anchor's headline case. BEFORE the `imm16.inverted` slot existed
+    // this failed loud (A_ImmediateOperandOutOfRange on the unsigned imm16
+    // window) — and BEFORE that it SILENTLY encoded `mov x1,#8`. It now
+    // encodes the same word gas emits: MOVN X1,#7 = ~7 = -8.
+    //   base 0x92800000 (sf=1, opc=00 MOVN, hw=00)
+    //   imm16 = ~(-8) = 7   at bits 5..20 → 7<<5  = 0x0E0
+    //   Rd    = X1 (1)      at bits 0..4  → 0x001
+    // word = 0x928000E1; LE: E1 00 80 92.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    auto const word = assembleMovImmWord(**s, "x1", -8, /*widthFlags=*/0, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_TRUE(word.has_value());
+    EXPECT_EQ(*word, kMovnX1Neg8)
+        << "mov x1,#-8 must encode the MOVN word gas emits (0x928000E1)";
+}
+
+TEST(Arm64Encoder, MovNegativeImmediateBoundaryValuesEncodeMovn) {
+    // The two ENDS of the encodable window, both measured. -1 exercises the
+    // all-zero complement (a value the encoder must not confuse with "no
+    // immediate wired"); -65536 exercises the full-width complement 0xFFFF.
+    // Together they pin that the range is derived from the 16-bit WINDOW,
+    // not from a narrower baked constant.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    {
+        DiagnosticReporter rep;
+        auto const word =
+            assembleMovImmWord(**s, "x1", -1, /*widthFlags=*/0, rep);
+        EXPECT_EQ(rep.errorCount(), 0u);
+        ASSERT_TRUE(word.has_value());
+        EXPECT_EQ(*word, kMovnX1Neg1) << "mov x1,#-1 → MOVN X1,#0";
+    }
+    {
+        DiagnosticReporter rep;
+        auto const word =
+            assembleMovImmWord(**s, "x1", -65536, /*widthFlags=*/0, rep);
+        EXPECT_EQ(rep.errorCount(), 0u);
+        ASSERT_TRUE(word.has_value());
+        EXPECT_EQ(*word, kMovnX1Neg65536) << "mov x1,#-65536 → MOVN X1,#0xFFFF";
+    }
+}
+
+TEST(Arm64Encoder, MovNegativeImmediateWidth32EncodesMovnWForm) {
+    // ★ THE WIDTH ARM. `MOVN Xd,#7` writes 0xFFFFFFFFFFFFFFF8 while
+    // `MOVN Wd,#7` writes 0x00000000FFFFFFF8 — NOT value-identical, so the
+    // W form cannot ride the X variant the way the positive MOVZ forms can.
+    // ✔MEASURED: gas emits 0x128000E1 for `mov w1,#-8` (bit 31 cleared).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    auto const word =
+        assembleMovImmWord(**s, "x1", -8, kLirInstFlagWidth32, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_TRUE(word.has_value());
+    EXPECT_EQ(*word, kMovnW1Neg8)
+        << "mov w1,#-8 must encode the sf=0 MOVN word (0x128000E1), not the "
+           "64-bit 0x928000E1 — the two differ in whether bits 63:32 survive";
+    EXPECT_NE(*word, kMovnX1Neg8);
+}
+
+TEST(Arm64Encoder, MovNegativeImmediateBeyondImm16FailsLoudNamingTheRange) {
+    // A STATED BOUNDARY, not an oversight: -65537 needs MOVN's hw=1 shifted
+    // form (gas emits 0x92A00021), which is a SEPARATE variant this cycle
+    // does not declare. It must therefore stay fail-loud — and the message
+    // must NAME the encodable range so the next reader knows where the wall
+    // is rather than guessing.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    DiagnosticReporter rep;
+    (void)assembleMovImmWord(**s, "x1", -65537, /*widthFlags=*/0, rep);
+    EXPECT_GT(rep.errorCount(), 0u);
+    EXPECT_TRUE(sawImmOutOfRange(rep))
+        << "a negative immediate beyond the inverted imm16 reach must emit "
+           "A_ImmediateOperandOutOfRange, never a truncated constant";
+    // ★ AND THE MESSAGE MUST NAME THE *NEGATIVE* WINDOW, NOT THE UNSIGNED
+    // ONE. Writing this assertion is what EXERCISED the failure arm and
+    // exposed D-ASM-FIXED32-NEGATIVE-IMM-DIAGNOSTIC-NAMES-UNSIGNED-RANGE:
+    // -65537 misses the bounded MOVN variant, falls through to the unsigned
+    // MOVZ one, and used to be told "valid 0..65535" — TRUE, and useless,
+    // because it points at the wrong window and never reveals that -8
+    // encodes fine. The unsigned arm now reads the opcode's own negative
+    // variant off the SCHEMA and reports ITS bounds.
+    bool namesNegativeWindow = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("-65536") != std::string::npos
+            && d.actual.find("-1") != std::string::npos) {
+            namesNegativeWindow = true;
+        }
+    }
+    EXPECT_TRUE(namesNegativeWindow)
+        << "the diagnostic must name the ENCODABLE NEGATIVE window "
+           "(-65536..-1), not the unsigned slot's 0..65535";
+}
+
+TEST(Arm64Encoder, MovNegativeImmediateRoundTripsToTheOriginalValue) {
+    // The disasm mirror must RE-INVERT: the bytes carry the complement (7)
+    // but the LIR operand was -8. A mirror that reported the raw field would
+    // make the round-trip oracle red on a CORRECT encoding — a false red is
+    // how an oracle gets weakened.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const movOp = (*s)->opcodeByMnemonic("mov");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x1{
+        static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeImmInt32(-8) };
+    auto const movInst = b.addInst(*movOp, x1, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    DiagnosticReporter rtRep;
+    EXPECT_TRUE(roundTripVerify(
+        **s, lir, movInst,
+        std::span<std::uint8_t const>{bytes.data(), 4}, rtRep))
+        << "the inverted-imm16 slot must disassemble back to -8, not 7";
+    EXPECT_EQ(rtRep.errorCount(), 0u);
+}
+
+TEST(Arm64Encoder, MovPositiveImmediateStillEncodesMovzAfterMovnLanded) {
+    // ★★ THE SIGN AXIS, pinned adjacent to the change that could break it:
+    // adding variants to `mov` re-runs ELECTION for every existing consumer.
+    // Both MOVN arms are sign-gated, so a NON-NEGATIVE immediate must land on
+    // a MOVZ arm at BOTH widths and never on a MOVN one — THAT is the property
+    // this test exists to protect, and it is asserted here in both directions
+    // (the expected MOVZ word, and an explicit inequality against the MOVN
+    // word of the same width) rather than being implied by one constant.
+    //
+    // ⓘ UPDATED 2026-08-13 — D-ASM-ARM64-MOVZ-W-FORM-UNDECLARED. This test
+    // USED to expect 0xD2800101 at BOTH widths, because the MOVZ variant was
+    // width-ABSENT and a width-32 request elected the X form. That was
+    // value-identical (MOVZ X zeroes all 64 bits) and therefore invisible —
+    // and collapsing two widths onto ONE expected constant is precisely what
+    // made the missing W form invisible HERE too. The operator accepted the
+    // byte change; the pin is now width-DISCRIMINATING, which is strictly
+    // stronger: it can tell the two arms apart, which the old form could not.
+    //   ✔MEASURED (aarch64-linux-gnu-as 2.42, one run, all four words):
+    //     mov x1,#8  = 0xD2800101   mov w1,#8  = 0x52800101
+    //     mov x1,#-8 = 0x928000E1   mov w1,#-8 = 0x128000E1
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    struct Arm {
+        std::uint8_t  widthFlags;
+        std::uint32_t expectMovz;
+        std::uint32_t rejectMovn;
+        char const*   what;
+    };
+    for (auto const& arm : {
+             Arm{std::uint8_t{0}, kMovzX1Pos8, kMovnX1Neg8, "width 64"},
+             Arm{kLirInstFlagWidth32, kMovzW1Pos8, kMovnW1Neg8, "width 32"}}) {
+        SCOPED_TRACE(arm.what);
+        DiagnosticReporter rep;
+        auto const word = assembleMovImmWord(**s, "x1", 8, arm.widthFlags, rep);
+        EXPECT_EQ(rep.errorCount(), 0u);
+        ASSERT_TRUE(word.has_value());
+        EXPECT_EQ(*word, arm.expectMovz)
+            << "a non-negative immediate must elect the MOVZ arm OF ITS OWN "
+               "WIDTH";
+        EXPECT_NE(*word, arm.rejectMovn)
+            << "a non-negative immediate reached a MOVN arm — the sign gate "
+               "that keeps the two families apart has stopped working";
+    }
+    // ★ AND THE TWO WIDTHS MUST BE DISTINGUISHABLE, which is the regression
+    // the old single-constant form could not see: if the W arm disappears and
+    // the X arm goes width-absent again, both loops above collapse onto one
+    // word and this assertion is the one that stays red.
+    EXPECT_NE(kMovzX1Pos8, kMovzW1Pos8);
+    EXPECT_EQ(kMovzW1Pos8, kMovzX1Pos8 & ~0x80000000u)
+        << "the W word must be the X word with sf cleared — ✔MEASURED";
+}
+
 // ── fixed32 walker — load/store (LDUR/STUR) + ADD-imm — D-LK10-ENTRY-ARM64 ──
 
 namespace {
@@ -1617,7 +1873,7 @@ TEST(Arm64Encoder, BaseIndexLeaNonZeroDispFailsLoud) {
 TEST(Arm64Encoder, NegativeDispLeaEncodesNativeSubImm12) {
     // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (c94): a NEGATIVE const-disp
     // GEP (`p[-N]` → the 3-op `lea Xd,[base + MemOffset(<0)]`) now encodes in
-    // ONE NATIVE instruction `SUB Xd,Xn,#|disp|` — the negMemoffset sign
+    // ONE NATIVE instruction `SUB Xd,Xn,#|disp|` — the negValue sign
     // matcher routes it to the SUB variant; the encoder writes |disp| into the
     // unsigned imm12 field (the SUB base makes it a subtract). This REPLACES
     // c93's 5-7-instruction materialize-into-fresh-GPR + base+index fold (with
@@ -1661,7 +1917,7 @@ TEST(Arm64Encoder, NegativeDispLeaEncodesNativeSubImm12) {
 TEST(Arm64Encoder, NegativeDispLeaAtImm12BoundaryEncodesSub) {
     // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB boundary pin: |disp| = 4095 is
     // the LARGEST magnitude the single-word SUB-imm12 form encodes (immMax:4095
-    // on the negMemoffset variant). A magnitude 4096 falls through to the
+    // on the negValue variant). A magnitude 4096 falls through to the
     // shifted variant (next test). `lea X0, [X3 + (-4095)]` → SUB X0, X3, #4095:
     //   Rd=X0(0), Rn=X3(3)→0x60, imm12=4095(0xFFF)→0xFFF<<10 = 0x3FFC00
     // word = 0xD13FFC60; LE: 60 FC 3F D1.
@@ -3631,4 +3887,177 @@ TEST(Arm64Fpr, FullPipelineDoublePlusRodataConstEncodesLeaFldurFadd) {
     EXPECT_EQ(out.relocs[0].kind, adrp->kind);
     EXPECT_EQ(out.relocs[1].target, SymbolId{500});
     EXPECT_EQ(out.relocs[1].kind, add->kind);
+}
+
+// ── D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE — RED-ON-DISABLE ───────
+//
+// Each pin below MUTATES THE SHIPPED SCHEMA IN MEMORY (never a parallel
+// hand-authored JSON, which would rot against the shipped file) and proves
+// the WITNESS DISAPPEARS when the load-bearing piece is removed. The
+// mutation is a programmatic surgery on the parsed document, so the
+// mutation text never lives inside the file being mutated; every mutant is
+// asserted to still LOAD, so a green result cannot come from "the schema
+// broke" instead of "the variant is what encoded the bytes".
+
+namespace {
+// Locate `mov`'s inverted-immediate variants BY THEIR SLOT rather than by
+// array position — a positional index would silently mutate the wrong
+// variant the moment someone reorders the list.
+[[nodiscard]] bool variantWiresInvertedImm(nlohmann::json const& v) {
+    if (!v.contains("wires") || !v["wires"].is_array()) return false;
+    for (auto const& w : v["wires"]) {
+        if (w.value("slotKind", std::string{}) == "imm16.inverted") return true;
+    }
+    return false;
+}
+
+[[nodiscard]] int variantGuardWidth(nlohmann::json const& v) {
+    if (!v.contains("guard") || !v["guard"].is_object()) return 0;
+    return v["guard"].value("width", 0);
+}
+} // namespace
+
+TEST(Arm64EncoderRedOnDisable, StrippingBothMovnVariantsRestoresTheOldWall) {
+    // Remove EVERY inverted-immediate variant from `mov`. The witness
+    // (0x928000E1) must vanish and `mov x1,#-8` must revert to the exact
+    // pre-fix behavior: a fail-loud A_ImmediateOperandOutOfRange from the
+    // unsigned imm16 window. Checked with the SAME matcher the positive pin
+    // uses (assembleMovImmWord + the word compare), so the two pins cannot
+    // disagree about what "the witness" is.
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "arm64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", std::string{}) != "mov") continue;
+                auto& vs = op["encoding"]["variants"];
+                vs.erase(std::remove_if(vs.begin(), vs.end(),
+                                        variantWiresInvertedImm),
+                         vs.end());
+            }
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "the mutant must still LOAD — otherwise this pin would pass for "
+           "the wrong reason (a broken schema, not an absent variant)";
+    DiagnosticReporter rep;
+    auto const word =
+        assembleMovImmWord(**mutated, "x1", -8, /*widthFlags=*/0, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "with no inverted-immediate variant, `mov x1,#-8` must fail loud";
+    EXPECT_TRUE(sawImmOutOfRange(rep));
+    if (word.has_value()) {
+        EXPECT_NE(*word, kMovnX1Neg8)
+            << "the MOVN witness must be UNREACHABLE once its variant is gone";
+    }
+}
+
+TEST(Arm64EncoderRedOnDisable, StrippingTheMovnWFormFailsLoudNeverTheXWord) {
+    // ★ THE WIDTH HAZARD, exercised rather than asserted. Remove ONLY the
+    // 32-bit MOVN sibling. The correct residual behavior is a LOUD refusal
+    // (the width-32 request falls through to the width-32 MOVZ variant, whose
+    // unsigned window rejects a negative — ⓘ that arm was width-ABSENT until
+    // D-ASM-ARM64-MOVZ-W-FORM-UNDECLARED landed; the refusal is unchanged
+    // either way, only the arm it comes from moved) — NOT a silent fallback onto
+    // the 64-bit MOVN word, which would leave bits 63:32 set where the W form
+    // must zero them. This is the pin that separates "we shipped both arms"
+    // from "we shipped one arm and got lucky".
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "arm64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", std::string{}) != "mov") continue;
+                auto& vs = op["encoding"]["variants"];
+                vs.erase(std::remove_if(vs.begin(), vs.end(),
+                             [](nlohmann::json const& v) {
+                                 return variantWiresInvertedImm(v)
+                                     && variantGuardWidth(v) == 32;
+                             }),
+                         vs.end());
+            }
+        });
+    ASSERT_TRUE(mutated.has_value());
+    DiagnosticReporter rep;
+    auto const word = assembleMovImmWord(**mutated, "x1", -8,
+                                         kLirInstFlagWidth32, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a width-32 negative `mov` with no W-form MOVN must fail loud";
+    if (word.has_value()) {
+        EXPECT_NE(*word, kMovnX1Neg8)
+            << "the 64-bit MOVN must NEVER serve a width-32 request — that is "
+               "the width-absent silent miscompile this cycle refused to "
+               "recreate";
+    }
+    // ...and the SHIPPED schema DOES produce the W word, so the assertion
+    // above is testing an ABSENCE, not an impossibility.
+    auto shipped = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(shipped.has_value());
+    DiagnosticReporter shippedRep;
+    auto const shippedWord = assembleMovImmWord(**shipped, "x1", -8,
+                                                kLirInstFlagWidth32,
+                                                shippedRep);
+    EXPECT_EQ(shippedRep.errorCount(), 0u);
+    ASSERT_TRUE(shippedWord.has_value());
+    EXPECT_EQ(*shippedWord, kMovnW1Neg8);
+}
+
+TEST(Arm64EncoderRedOnDisable, MovnXFormWithoutItsWidthKeyIsRejectedAtLoad) {
+    // The LOADER is the first line of defense on the width hazard, not the
+    // encoder. Strip `guard.width` off the 64-bit MOVN variant: it becomes a
+    // width-absent (match-any) sibling of the width-32 MOVN, which is the
+    // ambiguous mix D-CSUBSET-32BIT-ALU-FORMS rejects — a match-any variant
+    // silently absorbs the widths its keyed sibling does not declare. If this
+    // ever starts LOADING, the width axis has stopped being enforced and the
+    // encoder pins above are all that is left.
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "arm64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", std::string{}) != "mov") continue;
+                for (auto& v : op["encoding"]["variants"]) {
+                    if (!variantWiresInvertedImm(v)) continue;
+                    if (variantGuardWidth(v) != 64) continue;
+                    v["guard"].erase("width");
+                }
+            }
+        });
+    EXPECT_FALSE(mutated.has_value())
+        << "a width-absent MOVN alongside a width-keyed MOVN sibling must be "
+           "rejected at load, never silently first-matched";
+}
+
+TEST(Arm64EncoderRedOnDisable,
+     InvertedSlotWithoutNegValueRejectsANonNegativeImmediate) {
+    // The encoder's own sign gate, EXERCISED rather than read. Re-point the
+    // POSITIVE MOVZ variant's wire at `imm16.inverted` while leaving its
+    // guard sign-free — the shape a schema author reaches by wiring the new
+    // slot and forgetting `negValue`. Without the gate, `~8` = -9 clears the
+    // ">maxVal" test (a negative is not greater than 65535) and `orInto`
+    // masks it into the 16-bit window: `mov x0,#8` would encode `mov x0,#-9`
+    // with no diagnostic at all. The gate must make that LOUD.
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "arm64", [](nlohmann::json& doc) {
+            for (auto& op : doc["opcodes"]) {
+                if (op.value("mnemonic", std::string{}) != "mov") continue;
+                for (auto& v : op["encoding"]["variants"]) {
+                    if (variantWiresInvertedImm(v)) continue;
+                    if (!v.contains("wires")) continue;
+                    for (auto& w : v["wires"]) {
+                        if (w.value("slotKind", std::string{}) == "imm16") {
+                            w["slotKind"] = "imm16.inverted";
+                        }
+                    }
+                }
+            }
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "the mutant is a WELL-FORMED schema — the defect it carries is a "
+           "semantic one the loader cannot see, which is exactly why the "
+           "encoder must catch it";
+    DiagnosticReporter rep;
+    auto const word =
+        assembleMovImmWord(**mutated, "x0", 8, /*widthFlags=*/0, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a NON-NEGATIVE immediate on the inverted slot must fail loud";
+    EXPECT_TRUE(sawImmOutOfRange(rep));
+    if (word.has_value()) {
+        // 0xD2800000 | ((~8 & 0xFFFF) << 5) | Rd=0 = the silent miscompile.
+        EXPECT_NE(*word, 0xD29FFEE0u)
+            << "the masked complement must NEVER be emitted";
+    }
 }

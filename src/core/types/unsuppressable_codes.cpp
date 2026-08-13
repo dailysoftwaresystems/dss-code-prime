@@ -46,7 +46,23 @@ namespace {
 // `EveryMemberHasAnEmitSiteOrIsMarkedRetired` in
 // `tests/core/test_unsuppressable_codes.cpp` now enforces the property that
 // found them, so the next retirement cannot leave its row behind silently.
-constexpr std::array<DiagnosticCode, 139> kUnsuppressableCodes{{
+//
+// 139 → 141 (inline-asm P1, D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): TWO of
+// that arc's three new codes join — `S_InlineAsmExtendedUnsupported` and
+// `S_InlineAsmLabelSectionRequiresGoto`. The THIRD,
+// `S_InlineAsmDuplicateQualifier`, deliberately does NOT (see the ⓘ note at its
+// siblings): it is an Error by default but its suppression ships no wrong bytes,
+// which is this table's whole membership criterion. Two out of three is the
+// evidence the criterion was applied rather than the codes swept in as a batch.
+//
+// 142 → 143 (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED):
+// `L_TerminatorSuccessorMismatch` joins — a terminator whose recorded successors
+// and whose own BlockRef operands disagree. Suppressed, the encoder takes its
+// branch displacement from an operand list the CFG no longer agrees with: a
+// branch to the wrong block, or no branch target at all, with a green build.
+// ⓘ The step before this one was 141 → 142 and went unrecorded here, which is
+// why the running total above stops at 141 while the array held 142.
+constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -441,6 +457,13 @@ constexpr std::array<DiagnosticCode, 139> kUnsuppressableCodes{{
     // VLA would place outgoing call args INSIDE the VLA region under the moved SP (an
     // ABI break — a silent stack miscompile). Same load-bearing-boundary class.
     DiagnosticCode::L_VlaNonLeafFrameUnsupported,
+    // L_TerminatorSuccessorMismatch (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED):
+    // the terminator's two CFG channels (recorded successors vs. its own BlockRef
+    // operands) disagree. A member: suppressed, the encoder would take its branch
+    // displacement from an operand list that no longer matches the CFG — a branch
+    // to the wrong block, or (the shape that minted the code) no displacement at
+    // all. Same structural-invariant class as the rest of the L_ band.
+    DiagnosticCode::L_TerminatorSuccessorMismatch,
 
     // R_* regalloc band — calling-convention / class invariants.
     // R_SpilledDueToPressure + R_SpilledDueToCrossCallExhaustion
@@ -468,6 +491,10 @@ constexpr std::array<DiagnosticCode, 139> kUnsuppressableCodes{{
     // truncated to a wrong machine-code constant (e.g. wrong syscall
     // number). Same bytes-on-disk-invariant band as the others above.
     DiagnosticCode::A_ImmediateOperandOutOfRange,
+    // plan 29 P4: an unrecognized .s construct. Suppressing it would mean
+    // building a binary that silently omits an instruction the programmer
+    // wrote — the one thing an assembler may never do.
+    DiagnosticCode::A_AsmTextUnsupported,
 
     // S_* semantic band — silent-MISCOMPILE guards.
     // c27 (D-CSUBSET-VOLATILE-POINTEE, 2026-06-27) RETIRED
@@ -688,6 +715,46 @@ constexpr std::array<DiagnosticCode, 139> kUnsuppressableCodes{{
     // a silent no-op barrier — the instructions vanish, a miscompile. Same silent-
     // miscompile-guard class as the S_Vla* / S_AtomicNonLockFree siblings above.
     DiagnosticCode::S_InlineAsmNonEmptyTemplate,
+    // ★★ S_InlineAsmExtendedUnsupported (inline-asm P1,
+    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): a GNU EXTENDED inline-asm
+    // statement — outputs, inputs, clobbers, a label section, or `goto`.
+    // NAME THE MISCOMPILE, since that is the membership criterion: suppressed,
+    // `__asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));` PARSES, the
+    // diagnostic is dropped, and `cst_to_hir`'s `InlineAsm` arm lowers the
+    // statement to a 0-child barrier leaf — the operand list is discarded by
+    // construction. The emitted program then (i) executes `rdtsc`, which writes
+    // `eax`/`edx` while the register allocator still believes those registers
+    // hold whatever it last put there, and (ii) leaves `lo`/`hi` holding their
+    // PRIOR values, because nothing ever moved the results into them. Both halves
+    // are wrong bytes with a clean build log. The clobber list is the same story
+    // one step out: `: : : "memory"` suppressed lets the optimizer keep a load
+    // hoisted across a statement that invalidates it.
+    // ⛔ THIS IS THE `accept-and-ignore` OUTCOME THE WHOLE P1 ARC EXISTS TO
+    // PREVENT, so it must not be reachable through a flag either. Same
+    // silent-miscompile-guard class as S_InlineAsmNonEmptyTemplate above — that
+    // code guards a dropped INSTRUCTION, this one guards a dropped OPERAND
+    // BINDING.
+    DiagnosticCode::S_InlineAsmExtendedUnsupported,
+    // S_InlineAsmLabelSectionRequiresGoto (inline-asm P1,
+    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): a label section without the
+    // `goto` qualifier (`asm("" ::::)`). Suppressed, the statement continues to
+    // the extended-asm gate with its colon boundaries MIS-SECTIONED: a group the
+    // author wrote as labels is the only reading a fourth section has, and with
+    // the qualifier absent there is no such reading — so whatever the binder
+    // eventually makes of that group is a guess about which colon meant what.
+    // Suppressing a section-boundary constraint is suppressing the frame the
+    // operand roles are read in, so it must not be droppable ahead of the P5
+    // binder that will consume those roles. (It is also ill-formed in gcc, clang
+    // and MSVC alike — ✔MEASURED — so no conforming program depends on it.)
+    DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto,
+    // ⓘ S_InlineAsmDuplicateQualifier (the third P1 code) is deliberately NOT a
+    // member, on this file's own criterion — "suppression ships no wrong bytes and
+    // hides no build failure". `__asm__ volatile volatile ("")` suppressed compiles
+    // to EXACTLY what `volatile` means: the repeat is redundant, not ambiguous, so
+    // there is no second candidate lowering for silence to pick. It remains an
+    // Error by default (✔MEASURED: gcc, clang and MSVC all hard-error), which is
+    // the `S_AsmLabelOnAutomaticVariable` posture — loud about a written-but-
+    // meaningless token, never load-bearing for the emitted bytes.
     // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-
     // RESIDUAL): a bit-field compound/inc-dec/value mutation through an anonymous-
     // member or array-arrow base. Suppressed, the mutation falls to the generic

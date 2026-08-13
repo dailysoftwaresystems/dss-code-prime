@@ -163,14 +163,20 @@ variantImmMagnitude(std::span<LirOperand const>        instOps,
 // (which reports non-negative magnitudes). Reads the FIRST operand whose
 // guard filter is `ImmInt` or `MemOffset`. Returns the operand's |value| ONLY
 // when the value is STRICTLY NEGATIVE; nullopt when it is non-negative (a
-// non-negative value never matches a `negMemoffset` variant — the POSITIVE
+// non-negative value never matches a `negValue` variant — the POSITIVE
 // sibling serves it) or when no value-bearing operand exists. Computed as
 // `-(int64)v` so `INT32_MIN` (whose positive |value| overflows int32)
 // widens cleanly into the uint32 magnitude range. Source/target-agnostic:
 // reads the LIR operand pool, never the arch. Symmetric partner of
 // `variantImmMagnitude` — together they split the signed value line into
 // the non-negative half (immMin/immMax on the default axis) and the negative
-// half (immMin/immMax on the negMemoffset axis).
+// half (immMin/immMax on the negValue axis).
+// ★ THIS FUNCTION NEEDED NO WIDENING when the sign axis generalized from
+// "a negative memory displacement" to "a negative value-bearing operand"
+// (D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE, arm64 MOVN): it has read BOTH
+// `ImmInt` and `MemOffset` since it was written, exactly like its
+// non-negative twin. Only the validate() coherence rule was
+// memoffset-specific — and only the axis's NAME said so.
 [[nodiscard]] inline std::optional<std::uint32_t>
 variantNegMagnitude(std::span<LirOperand const>        instOps,
                     std::span<OperandKindFilter const> guard) noexcept {
@@ -203,9 +209,9 @@ variantNegMagnitude(std::span<LirOperand const>        instOps,
 // matches ANY immediate magnitude (every pre-existing variant); a
 // magnitude-keyed variant matches only when its value-bearing operand's
 // magnitude is in [immMin, immMax]. The D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-
-// SUB SIGN axis (`negMemoffset`) selects WHICH magnitude the range gate reads:
+// SUB SIGN axis (`negValue`) selects WHICH magnitude the range gate reads:
 // the non-negative half (default) or the |value| of a strictly-negative
-// operand (negMemoffset=true, e.g. arm64's `SUB Xd,Xn,#|disp|` negative-disp
+// operand (negValue=true, e.g. arm64's `SUB Xd,Xn,#|disp|` negative-disp
 // lea vs its positive `ADD` sibling). Shared by BOTH walkers (x86_variable +
 // fixed32) — all three axes are format-agnostic by construction.
 [[nodiscard]] inline bool
@@ -219,21 +225,21 @@ variantMatchesInst(std::span<LirOperand const>  instOps,
         return false;
     }
     // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the SIGN axis selects which
-    // magnitude the imm-range gate reads. `negMemoffset=false` (the default,
+    // magnitude the imm-range gate reads. `negValue=false` (the default,
     // every pre-existing variant) reads the NON-NEGATIVE magnitude — a
     // negative value-bearing operand reports nullopt and matches no bounded
-    // variant, EXACTLY as before this axis existed. `negMemoffset=true` reads
+    // variant, EXACTLY as before this axis existed. `negValue=true` reads
     // the |value| of a STRICTLY-NEGATIVE operand — a non-negative operand
-    // reports nullopt so a negMemoffset variant never shadows its positive
+    // reports nullopt so a negValue variant never shadows its positive
     // sibling. The two axes partition the signed value line; the [immMin,
     // immMax] bound then applies to whichever half's magnitude was read.
-    auto const magnitude = v.negMemoffset
+    auto const magnitude = v.negValue
         ? variantNegMagnitude(instOps, v.operandKinds)
         : variantImmMagnitude(instOps, v.operandKinds);
-    // A negMemoffset variant is ALWAYS sign-gated (it must reject a
+    // A negValue variant is ALWAYS sign-gated (it must reject a
     // non-negative operand even with no immMin/immMax bound), so consult
     // the magnitude whenever the sign axis is on OR an imm-range is declared.
-    if (v.negMemoffset || v.immMin.has_value() || v.immMax.has_value()) {
+    if (v.negValue || v.immMin.has_value() || v.immMax.has_value()) {
         if (!magnitude.has_value()) return false;  // wrong sign / no operand
         if (v.immMin.has_value() && *magnitude < *v.immMin) return false;
         if (v.immMax.has_value() && *magnitude > *v.immMax) return false;

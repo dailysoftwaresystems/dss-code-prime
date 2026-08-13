@@ -1173,7 +1173,7 @@ struct Lowerer {
     // `targetHasSignedDispLea` capability probe is GONE. A negative-disp Gep no
     // longer needs a lowering-time fold — BOTH targets encode the plain 3-op
     // `lea [base + MemOffset(disp<0)]` natively: x86 via its signed disp32
-    // field, arm64 via the config's `negMemoffset` SUB variants routed by the
+    // field, arm64 via the config's `negValue` SUB variants routed by the
     // shared sign matcher. The lowering is target-blind; the config picks the
     // encoding. See lowerGep's const-disp arm.)
 
@@ -3982,7 +3982,7 @@ struct Lowerer {
                 // `MemOffset` slot — SIGN AND ALL. Both targets now encode the
                 // plain 3-op `lea [base + MemOffset(disp)]` NATIVELY, in ONE
                 // instruction, with NO fold: x86 via its SIGNED disp32 field;
-                // arm64 via the c94 `negMemoffset` SUB variants (`SUB Xd,Xn,#|disp|`
+                // arm64 via the c94 `negValue` SUB variants (`SUB Xd,Xn,#|disp|`
                 // / shifted / MOVZ-MOVK), which the variant matcher routes to by
                 // the memoffset's SIGN. This REPLACES c93's config-gated fold
                 // (`targetHasSignedDispLea` → materialize the disp into a fresh

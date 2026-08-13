@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 namespace dss {
@@ -140,7 +141,12 @@ using dss::report;
         }
         srcMap.push_back(SourceMapEntry{
             preEncodeOffset,
-            lirToMir[inst.v]
+            lirToMir[inst.v],
+            // The LIR instruction these bytes came from. Always valid (unlike
+            // the MIR anchor beside it) -- this is the join key an unwind
+            // producer uses to turn "the instruction that establishes the
+            // frame" into a measured byte offset.
+            inst
         });
     }
     return encoded;
@@ -303,7 +309,22 @@ AssembledModule assemble(Lir const&                 lir,
         // linker writes the symbol's bytes via the adjacent `lea`
         // relocation), so no rollback of bytes is needed on failure — the
         // diagnostic + the function-shape invariant carry it.
+        //
+        // ⚠⚠ ONE ENTRY PER SYMBOL, NOT PER PATCH — AND THIS WAS A LIVE BUG,
+        // NOT A PRECAUTION. ✔MEASURED 2026-08-13: `void *a = &&L; void *b =
+        // &&L;` FAILED TO COMPILE with `K_SymbolUndefined: symbol #N is
+        // declared more than once`. `mintBlockSymbol` is memoized per target
+        // block, so N block-address `lea`s of the SAME label are N patches
+        // carrying ONE SymbolId — and pushing one `SyntheticBlockSymbol` per
+        // patch declared that symbol N times to the linker. Every `.s` and
+        // every C function that took one label's address TWICE was refused.
+        // The duplicates are IDENTICAL (same symbol, same block, therefore
+        // same offset), so collapsing them is not a choice between two
+        // answers. The jump-table arm of `compile_pipeline.cpp` already had
+        // this guard (`alreadyBound`); the encoder-driven arm did not, which
+        // is precisely how one path can be right while its sibling is wrong.
         bool blockSymOk = true;
+        std::unordered_set<std::uint32_t> boundBlockSyms;
         for (auto const& bsp : blockSymPatches) {
             auto it = blockOffsets.find(bsp.targetBlock);
             if (it == blockOffsets.end()) {
@@ -317,6 +338,7 @@ AssembledModule assemble(Lir const&                 lir,
                 blockSymOk = false;
                 break;
             }
+            if (!boundBlockSyms.insert(bsp.symbol.v).second) continue;
             outFn.blockSymbols.push_back(SyntheticBlockSymbol{
                 bsp.symbol, it->second});
         }
@@ -584,13 +606,17 @@ primitiveByteSize(TypeKind k) noexcept {
 // dedicated widen+append paths (appendF80Extended / the binary128 arm) and
 // I128/U128 fail loud at the kind-keyed 128-bit gate, so the only widths that
 // arrive are the 1/2/4/8-byte ones this loop can encode.
+//
+// ★ THE LOOP ITSELF MOVED TO `asm.hpp::appendLittleEndianBytes` when the
+// assembly-text data directives needed the same append
+// (D-ASM-NO-DATA-DEFINING-DIRECTIVE, 2026-08-13). This name stays as the
+// in-file spelling its ~15 call sites already use; what must not exist is a
+// SECOND byte-order loop, since a divergence between two of them is a green
+// build emitting reversed words.
 void appendLE(std::vector<std::uint8_t>& bytes,
               std::uint64_t value,
               std::size_t width) noexcept {
-    for (std::size_t j = 0; j < width; ++j) {
-        bytes.push_back(static_cast<std::uint8_t>(
-            (value >> (j * 8)) & 0xFFu));
-    }
+    appendLittleEndianBytes(bytes, value, width);
 }
 
 // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): widen a host `double` (IEEE-754

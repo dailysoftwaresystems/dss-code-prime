@@ -156,10 +156,20 @@ TEST(LspServerE2E, DidOpenPublishesDiagnosticsForToySource) {
     EXPECT_TRUE(sawParser);
 }
 
-TEST(LspServerE2E, DidOpenWithoutExtensionPublishesEmptyDiagnostics) {
-    // Pins current behavior: a URI with no recognized extension
-    // resolves to no schema, so the parse worker publishes an
-    // empty diagnostics array (no schema → nothing to validate).
+// ★★ THIS PIN WAS INVERTED, DELIBERATELY (D-LSP-ASSEMBLY-DIALECT-UNSERVABLE).
+//
+// It used to assert an EMPTY diagnostics array for a URI with no recognized
+// extension, and its comment called that "current behavior". It was: the server
+// opened the document with a null schema, said nothing, and the parse worker
+// published `[]`. But on the wire, `[]` is what a CLEAN file publishes — so the
+// two states an editor most needs to tell apart, "no problems" and "no language
+// service at all", were byte-identical, and this test was pinning the
+// indistinguishability in place.
+//
+// What survives unchanged is everything the pin was RIGHT about: exactly one
+// publish, addressed to the right URI, no crash on a schema-less document. What
+// changed is the one assertion that made silence a contract.
+TEST(LspServerE2E, DidOpenWithoutExtensionPublishesTheReasonNotAnEmptyArray) {
     LspTestHarness h;
     h.push(lspInitialize(1));
     h.push(lspDidOpen("file:///untitled-1", 1, "anything"));
@@ -172,8 +182,21 @@ TEST(LspServerE2E, DidOpenWithoutExtensionPublishesEmptyDiagnostics) {
     auto pub = json::parse(msgs[1]);
     EXPECT_EQ(pub.at("method"), "textDocument/publishDiagnostics");
     EXPECT_EQ(pub.at("params").at("uri"), "file:///untitled-1");
-    EXPECT_TRUE(pub.at("params").at("diagnostics").is_array());
-    EXPECT_EQ(pub.at("params").at("diagnostics").size(), 0u);
+    auto const& diags = pub.at("params").at("diagnostics");
+    ASSERT_TRUE(diags.is_array());
+    ASSERT_EQ(diags.size(), 1u)
+        << "a schema-less document must publish exactly one reason — not zero "
+           "(indistinguishable from clean) and not a pile";
+    EXPECT_EQ(diags[0].at("code"), "D_UnknownFileExtension")
+        << "reuses the compiler's own code for `this file's source language "
+           "cannot be determined`, so an editor and a build agree on the "
+           "identity of the condition";
+    EXPECT_EQ(diags[0].at("severity"), 1) << "LSP severity 1 == Error";
+    EXPECT_NE(diags[0].at("message").get<std::string>()
+                  .find("no file extension"),
+              std::string::npos)
+        << "the reason must be specific: this URI has nothing to resolve BY; "
+           "got: " << diags[0].at("message");
 }
 
 // ── Semantic stub handlers ────────────────────────────────────────────

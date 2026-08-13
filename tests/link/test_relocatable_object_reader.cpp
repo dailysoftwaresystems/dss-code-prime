@@ -992,12 +992,20 @@ TEST(RelocatableObjectReader, OverlappingFunctionRangesFailsLoud) {
 
 // LOW guard: a format schema whose reverse map is AMBIGUOUS -- two reloc rows
 // sharing a nativeId but mapping to different kinds -- must fail loud rather
-// than let "last row wins" silently mis-decode. (The schema validator does not
-// enforce nativeId uniqueness, so this is the reader's belt.)
-TEST(RelocatableObjectReader, DuplicateNativeIdInSchemaFailsLoud) {
-    auto loaded = loadShipped();
-    ASSERT_TRUE(loaded.target && loaded.format);
-    auto obj = validObject(loaded);   // a structurally valid ELF object
+// than let "last row wins" silently mis-decode.
+//
+// ★ THIS GUARD MOVED EARLIER, IT DID NOT WEAKEN.
+//   It used to read "the schema validator does not enforce nativeId
+//   uniqueness, so this is the reader's belt". Since
+//   D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS the validator DOES enforce it,
+//   so the ambiguous schema no longer LOADS and the reader can never see one.
+//   That is strictly stronger: the schema that is wrong fails, instead of
+//   every object that is right. What the guard protected -- "an ambiguous
+//   reverse map must never silently mis-decode" -- is asserted here at the new,
+//   earlier boundary. `elf_object_reader.cpp` keeps its runtime check as
+//   defence-in-depth for any future schema built without `validate()`; it is
+//   unreachable through `loadFromText`, which is why the assertion lives here.
+TEST(RelocatableObjectReader, DuplicateNativeIdInSchemaFailsLoudAtLoad) {
     auto collide = ObjectFormatSchema::loadFromText(
         R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
             "cSymbolDecoration":{"scheme":"none"},
@@ -1005,13 +1013,63 @@ TEST(RelocatableObjectReader, DuplicateNativeIdInSchemaFailsLoud) {
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
             "relocations":[{"name":"A","kind":1,"nativeId":7},
                            {"name":"B","kind":2,"nativeId":7}]})");
-    ASSERT_TRUE(collide.has_value())
-        << "the colliding schema must load (the validator does not enforce "
-           "nativeId uniqueness -- the reader is the belt)";
+    ASSERT_FALSE(collide.has_value())
+        << "two ordinary rows claiming one wire id make nativeId -> kind "
+           "ambiguous; the schema must be rejected at load";
+    bool named = false;
+    for (auto const& d : collide.error()) {
+        if (d.message.find("already claimed by") != std::string::npos) named = true;
+    }
+    EXPECT_TRUE(named) << "the refusal must name the collision, not merely fail";
+}
+
+// The POSITIVE control for the escape hatch. `emitOnly` exists so ONE wire type
+// can serve two DSS patch-site semantics (x86_64's R_X86_64_PC32 is both the
+// call-site rel32, implicit addend bias -4, and the DWARF FDE pointer, bias 0).
+// Without this test `emitOnly` could silently degrade into "turn the ambiguity
+// guard off", and the suite above would still be green.
+TEST(RelocatableObjectReader, EmitOnlyAliasLoadsAndDecodesThroughTheRealRow) {
+    auto aliased = ObjectFormatSchema::loadFromText(
+        R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
+            "cSymbolDecoration":{"scheme":"none"},
+            "format":{"name":"elf-alias","kind":"elf"},
+            "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
+            "relocations":[{"name":"A","kind":1,"nativeId":7},
+                           {"name":"B","kind":2,"nativeId":7,"emitOnly":true}]})");
+    ASSERT_TRUE(aliased.has_value())
+        << "an emission alias is exactly how a format states that one wire "
+           "type carries two patch-site semantics";
+    // The alias must NOT displace the real row: decoding wire id 7 has to keep
+    // yielding kind 1. Reading the shipped path proves it end-to-end.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto obj = validObject(loaded);
     DiagnosticReporter rep;
-    EXPECT_FALSE(elf::readRelocatableObject(obj, *loaded.target, **collide, rep).has_value())
-        << "an ambiguous nativeId reverse map must fail loud";
-    EXPECT_GT(rep.errorCount(), 0u);
+    auto back = elf::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(back.has_value())
+        << "the shipped x86_64 schema carries an emitOnly alias of "
+           "R_X86_64_PC32; if it entered the reverse map, every object using "
+           "that entirely ordinary relocation would be rejected -- DSS-built "
+           "and gcc-built alike (✔MEASURED 2026-08-13, three suites red)";
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// An alias that aliases nothing is a typo, not an alias: nothing could decode
+// its wire id. Load-time refusal, so a mistyped nativeId cannot ship.
+TEST(RelocatableObjectReader, EmitOnlyRowThatAliasesNothingFailsLoud) {
+    auto orphan = ObjectFormatSchema::loadFromText(
+        R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
+            "cSymbolDecoration":{"scheme":"none"},
+            "format":{"name":"elf-orphan","kind":"elf"},
+            "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
+            "relocations":[{"name":"A","kind":1,"nativeId":7},
+                           {"name":"B","kind":2,"nativeId":9,"emitOnly":true}]})");
+    ASSERT_FALSE(orphan.has_value());
+    bool named = false;
+    for (auto const& d : orphan.error()) {
+        if (d.message.find("must alias a real row") != std::string::npos) named = true;
+    }
+    EXPECT_TRUE(named);
 }
 
 TEST(RelocatableObjectReader, NonElfFormatSchemaFailsLoud) {

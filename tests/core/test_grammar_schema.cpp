@@ -289,6 +289,18 @@ TEST(GrammarSchema, LoadShippedToy) {
     }
 }
 
+// ⓘ "EVERY SHIPPED CONFIG STILL LOADS" — the other direction of every closed
+// key set in this loader, and the direction that breaks every language at once
+// if a set omits a REAL key — is ALREADY PINNED, by
+// `LexerModesLoader.EveryShippedConfigLoadsWithoutWarnings` in
+// `tests/core/test_lexer_modes.cpp`. It is stronger than a plain load check
+// (zero WARNINGS, not merely no error) and it names the documents EXPLICITLY,
+// with a stated reason: "a directory walk that found zero files would pass
+// vacuously". A second, globbing copy here would contradict that decision and
+// become the drifting duplicate. Adding a new `*.lang.json` means adding its
+// name to that list by hand — deliberately.
+
+
 // The shipped c-subset config must load cleanly and round-trip every rule
 // the JSON declares. Pins three layers: (a) loader accepts the file, (b)
 // each named shape resolves via `rules().find(...)` so a typo in any
@@ -1508,6 +1520,202 @@ TEST(GrammarSchema, PrefixFloatUnknownKeyRejected) {
       })JSON"));
     ASSERT_FALSE(result.has_value());
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidNumberStyle));
+}
+
+// ══ D-ASM-DIALECT-IDENTIFIER-CONTINUATION-NOT-CONFIGURABLE (2026-08-13) ═════
+//
+// ★★★ THE `identifierClass` BLOCK. Before it, the identifier character set was
+// a hardcoded `constexpr` pair in `tokenizer.cpp`, so a language whose names
+// legitimately contain a character outside `[A-Za-z0-9_]` had exactly one way
+// to spell them: declare each WHOLE NAME as a lexeme in `tokens`. The arm64 gas
+// dialect paid that twelve times over (`b.eq`…`b.cs`, each declared as a token
+// AND as an instruction row, the two required to agree).
+namespace {
+[[nodiscard]] std::string wrapIdentifierClass(std::string_view body) {
+    return std::format(R"JSON({{
+      "dssSchemaVersion": 4,
+      "language": {{ "name": "IdClass", "version": "0.1.0" }},
+      "tokens": {{ ";": [{{ "kind": "Semi" }}] }},
+      "identifierClass": {},
+      "shapes": {{
+        "root": {{ "sequence": ["Identifier", "Semi"] }}
+      }}
+    }})JSON", body);
+}
+}  // namespace
+
+TEST(GrammarSchema, IdentifierClassExtraContinueLoads) {
+    auto result =
+        GrammarSchema::loadFromText(wrapIdentifierClass(R"({ "extraContinue": "." })"));
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->identifierClass().extraContinue, ".");
+    EXPECT_TRUE((*result)->identifierClass().continuesIdentifier('.'));
+    // ★ ADDITIVE, NEVER SUBTRACTIVE: the universal set still holds.
+    EXPECT_TRUE((*result)->identifierClass().continuesIdentifier('_'));
+    EXPECT_TRUE((*result)->identifierClass().continuesIdentifier('7'));
+    EXPECT_FALSE((*result)->identifierClass().continuesIdentifier(','));
+}
+
+// ★ A LANGUAGE THAT DECLARES NOTHING GETS THE UNIVERSAL RULE — and the accessor
+// answers rather than returning a null the hot path must branch on.
+TEST(GrammarSchema, IdentifierClassAbsentMeansTheUniversalRule) {
+    auto result = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_TRUE((*result)->identifierClass().extraContinue.empty());
+    EXPECT_FALSE((*result)->identifierClass().continuesIdentifier('.'))
+        << "a C document must never read `a.b` as one identifier";
+    EXPECT_TRUE((*result)->identifierClass().continuesIdentifier('z'));
+}
+
+// ★★ `extraStart` IS REFUSED BY NAME, NOT MERELY UNKNOWN. It is the key a
+// reader reaches for, and an "unknown key" message alone reads as an oversight
+// that the next implementer should fix. A leading character that also
+// introduces a directive or an operator is owned by that TOKEN; two mechanisms
+// for one byte cannot agree about which construct it opens.
+TEST(GrammarSchema, IdentifierClassStartKeyIsRefusedWithItsReason) {
+    auto result = GrammarSchema::loadFromText(wrapIdentifierClass(
+        R"({ "extraContinue": ".", "extraStart": "." })"));
+    ASSERT_FALSE(result.has_value());
+    auto const msg = errorDiags(result.error());
+    EXPECT_NE(msg.find("extraStart"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("may CONTINUE an identifier and may never START one"),
+              std::string::npos)
+        << "the refusal must say WHY, or it reads as an unimplemented key: "
+        << msg;
+}
+
+// ★ A CHARACTER THAT ALREADY CONTINUES AN IDENTIFIER IS REFUSED. Declaring it
+// changes nothing, so accepting it would be a key that reads as a capability
+// and delivers none — and the reader would go looking for the bug elsewhere.
+TEST(GrammarSchema, IdentifierClassRedundantCharacterIsRefused) {
+    for (auto const* cls : {R"({ "extraContinue": "_" })",
+                            R"({ "extraContinue": "0-9" })",
+                            R"({ "extraContinue": ".x" })"}) {
+        auto result = GrammarSchema::loadFromText(wrapIdentifierClass(cls));
+        ASSERT_FALSE(result.has_value()) << cls;
+        EXPECT_NE(errorDiags(result.error())
+                      .find("already continues an identifier"),
+                  std::string::npos)
+            << cls << ": " << errorDiags(result.error());
+    }
+}
+
+// ★★ WHITESPACE AND CONTROL BYTES ARE REFUSED BECAUSE THEY DO NOT WIDEN THE
+// CLASS, THEY DISSOLVE TOKENISATION. A space in the class makes `mov x0, x1`
+// one identifier; a newline makes a line-oriented language's whole file one.
+// Both are WRONG PARSES rather than parse errors — the failure mode this facet's
+// own postmortem is about.
+TEST(GrammarSchema, IdentifierClassWhitespaceIsRefused) {
+    for (auto const* cls : {R"({ "extraContinue": " " })",
+                            R"({ "extraContinue": "\n" })",
+                            R"({ "extraContinue": "\t" })"}) {
+        auto result = GrammarSchema::loadFromText(wrapIdentifierClass(cls));
+        ASSERT_FALSE(result.has_value()) << cls;
+        EXPECT_NE(errorDiags(result.error())
+                      .find("is whitespace or a control character"),
+                  std::string::npos)
+            << cls << ": " << errorDiags(result.error());
+    }
+}
+
+// ★ AN EMPTY BLOCK IS REFUSED: a block declaring nothing silently does nothing,
+// and the way to say "the universal rule" is to omit the block.
+TEST(GrammarSchema, IdentifierClassEmptyBlockIsRefused) {
+    auto result = GrammarSchema::loadFromText(wrapIdentifierClass("{}"));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingField));
+}
+
+// ══ D-CONFIG-NUMBERSTYLE-KEYS-UNCHECKED (2026-08-13) ═══════════════════════
+//
+// ★★★ THE `numberStyle` BLOCK REJECTED UNKNOWN KEYS AT ONE LEVEL AND ACCEPTED
+// THEM AT THREE. `numberStyle.exponent` and each prefix's `float` had a typo
+// discriminator (the two tests above pin it); `numberStyle` ITSELF, each
+// `integerPrefixes[]` ENTRY and `emitKind` had none — every field was read with
+// a bare `contains()` probe and nothing looked at the keys left over. So
+// `"fracionPoint"`, `"digitSeperator"`, `"trailingFractions"`, a prefix's
+// `"radx"` and `emitKind`'s `"floating"` all LOADED CLEAN and silently changed
+// numeric lexing: the knob-that-lies archetype, and a direct contradiction of
+// the discipline `kDocumentKeys` states in the same loader.
+//
+// ⓘ EACH TEST NAMES A DIFFERENT LEVEL, deliberately — one test over one level
+// would have gone green while the other two stayed open, which is exactly how
+// this gap survived (the covered level had tests).
+
+TEST(GrammarSchema, NumberStyleDirectKeyTypoIsRejected) {
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "fracionPoint": ".",
+        "emitKind": { "integer": "IntLiteral" }
+      })JSON"));
+    ASSERT_FALSE(result.has_value())
+        << "a misspelled 'fractionPoint' used to load clean and silently leave "
+           "the language with no fraction point at all";
+    EXPECT_TRUE(hasDiagCode(result.error(),
+                            DiagnosticCode::C_InvalidNumberStyle));
+    EXPECT_NE(errorDiags(result.error()).find("fracionPoint"),
+              std::string::npos)
+        << "the diagnostic must name the key that was actually written: "
+        << errorDiags(result.error());
+}
+
+TEST(GrammarSchema, NumberStyleIntegerPrefixEntryKeyTypoIsRejected) {
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "integerPrefixes": [
+          { "prefix": "0x", "radx": 16, "digits": "0-9a-fA-F" }
+        ],
+        "emitKind": { "integer": "IntLiteral" }
+      })JSON"));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(),
+                            DiagnosticCode::C_InvalidNumberStyle));
+    EXPECT_NE(errorDiags(result.error()).find("radx"), std::string::npos)
+        << "without the entry-level discriminator this surfaced as \"'radix' "
+           "must be an integer\" — true, but pointing at a line nobody wrote: "
+        << errorDiags(result.error());
+}
+
+TEST(GrammarSchema, NumberStyleEmitKindKeyTypoIsRejected) {
+    // ★ THE ASYMMETRIC ONE. `integer` is REQUIRED, so misspelling it already
+    // surfaced as C_MissingField; `float` is required only when a
+    // float-producing facet is declared — so `"floating"` was GENUINELY SILENT
+    // for every language without one, and would have become a mystery for the
+    // first language that grew one.
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "emitKind": { "integer": "IntLiteral", "floating": "FloatLiteral" }
+      })JSON"));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_TRUE(hasDiagCode(result.error(),
+                            DiagnosticCode::C_InvalidNumberStyle));
+    EXPECT_NE(errorDiags(result.error()).find("floating"), std::string::npos)
+        << errorDiags(result.error());
+}
+
+// ★★ THE OTHER DIRECTION OF A NEW CLOSED KEY SET, AND THE ONE THAT BREAKS
+// EVERYTHING AT ONCE IF IT IS WRONG: a set that omits a REAL key rejects every
+// document that uses it. Every direct `numberStyle` key a shipped config
+// writes must still load — asserted here as one document naming ALL TEN, so a
+// key dropped from `kNumberStyleKeys` fails this test rather than a random
+// language's.
+TEST(GrammarSchema, NumberStyleAcceptsEveryDeclaredKey) {
+    auto result = GrammarSchema::loadFromText(wrapNumberStyle(R"JSON({
+        "decimal": true,
+        "integerPrefixes": [
+          { "prefix": "0x", "radix": 16, "digits": "0-9a-fA-F",
+            "float": { "exponent": { "letters": ["p"] }, "exponentDigits": "0-9" } }
+        ],
+        "exponent": { "letters": ["e","E"], "signOptional": true },
+        "fractionPoint": ".",
+        "digitSeparator": "'",
+        "trailingFraction": true,
+        "leadingFraction": true,
+        "integerSuffixes": ["u","U"],
+        "floatSuffixes": ["f","F"],
+        "emitKind": { "integer": "IntLiteral", "float": "FloatLiteral" }
+      })JSON"));
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
 }
 
 TEST(GrammarSchema, PrefixFloatMissingExponentRejected) {

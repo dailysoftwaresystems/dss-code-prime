@@ -5,7 +5,6 @@ add_library(program OBJECT
     cli_args.cpp
     input_resolver.cpp
     cross_validate_target_format.cpp
-    project_config.cpp
     dump_predefined_macros.cpp
 )
 
@@ -31,8 +30,11 @@ if(MSVC)
     target_compile_options(program PRIVATE /bigobj)
 endif()
 
-# `project_config.cpp` parses the `.dss-project.json` project file with
-# nlohmann/json. `core` links it PRIVATE, so the include path does NOT
-# propagate transitively — `program` needs its own (PRIVATE: only this
-# OBJECT lib's own sources use it; no usage requirement to re-export).
-target_link_libraries(program PRIVATE nlohmann_json::nlohmann_json)
+# NO nlohmann/json EDGE, and that is now correct rather than an omission.
+# `project_config.cpp` was the only source here that included it, and it moved
+# to `core/types/` on 2026-08-13
+# (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS) — `core` already links
+# nlohmann PRIVATE for its own config-document readers. Verified by
+# `grep -rn '#include <nlohmann' src/program/` returning nothing. Re-add the
+# edge (PRIVATE) the day a `program` source parses JSON directly again; the
+# include path does NOT arrive transitively from `core`.

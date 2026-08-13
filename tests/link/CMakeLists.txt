@@ -27,6 +27,19 @@ dss_add_test(NAME link/test_macho_chained_fixups SOURCES test_macho_chained_fixu
 dss_add_test(NAME link/test_string_table         SOURCES test_string_table.cpp)
 dss_add_test(NAME link/test_elf_exec_writer      SOURCES test_elf_exec_writer.cpp)
 
+# Plan 15 DB4 -- the DWARF `.eh_frame` CIE/FDE + `.eh_frame_hdr` encoder.
+# Includes the load-bearing REFUSAL when a target declares no DWARF register
+# numbering (emitting the hardware encoding instead names a DIFFERENT
+# register and walks the wrong frame) and an object-level oracle witness.
+dss_add_test(NAME link/test_dwarf_cfi            SOURCES test_dwarf_cfi.cpp)
+
+# The ELF WIRING of that encoder: `.eh_frame` + `.eh_frame_hdr` sections and
+# the PT_GNU_EH_FRAME segment. ★ Carries the permutation pin — the CIE's CFA
+# base register must be DWARF 7 for `%rsp`, whose DSS ordinal AND x86 hardware
+# encoding are both 4, so reading either neighbouring field emits a table every
+# reader accepts and every unwinder follows into the wrong frame.
+dss_add_test(NAME link/test_elf_eh_frame         SOURCES test_elf_eh_frame.cpp)
+
 # c150 (D-LK1-4 shared-library half) — ELF ET_DYN (.so) writer:
 # ET_DYN header/phdr pins, DT_SONAME knob, real-named .dynsym exports
 # findable via the SysV .hash walk, R_X86_64_RELATIVE for internal
@@ -211,3 +224,15 @@ dss_add_test(NAME link/test_runtime_library_roles
              SOURCES test_runtime_library_roles.cpp)
 target_link_libraries(dss_link_test_runtime_library_roles
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO (Mach-O half) — the
+# `__TEXT,__eh_frame` writer. The DWARF encoder (test_dwarf_cfi) was complete
+# and wired into NO writer, so a DSS Mach-O image carried no unwind table at
+# all. Pins the section's existence/placement inside __TEXT, `__TEXT.nsects`
+# against the section_64 records its own cmdsize reserves (the invariant a
+# hand-maintained count breaks), every FDE's pcrel `initial_location` resolving
+# to the function it describes (a desync loads fine and walks the wrong frame),
+# the DWARF-vs-hardware register numbering on x86_64 where the two genuinely
+# differ, the no-CFI control that must emit NO section, and the __got early/late
+# VA congruence a __TEXT-appended section would otherwise slide.
+dss_add_test(NAME link/test_macho_eh_frame       SOURCES test_macho_eh_frame.cpp)

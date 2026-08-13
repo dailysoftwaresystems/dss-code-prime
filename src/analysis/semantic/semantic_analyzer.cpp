@@ -128,10 +128,13 @@ struct SchemaIndexes {
     // declaration rule. Pass 2 (`pass2Post`) const-evaluates its condition + emits
     // S_StaticAssertFailed on a zero / non-constant fold. Empty ⇒ no surface.
     std::unordered_map<std::uint32_t, bool>        staticAssertByRule;
-    // FC17.9(i) (D-CSUBSET-INLINE-ASM): true for the inline-asm statement rule
-    // (asmStmt). pass2Post decodes its template child and emits
-    // S_InlineAsmNonEmptyTemplate unless it decodes to strictly zero bytes. Empty
-    // ⇒ no surface.
+    // FC17.9(i) + inline-asm P1 (D-CSUBSET-INLINE-ASM /
+    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): true for the inline-asm
+    // statement rule (`inlineAsm.rule`, asmStmt) — the node-visit HOOK only. The
+    // rest of the facet's vocabulary (tails, payload lists, the goto qualifier
+    // token) is read straight off `cfg.inlineAsm` inside the check, which needs the
+    // RuleIds as VALUES to compare against during a descendant scan, not as a
+    // membership map. Empty ⇒ no surface.
     std::unordered_map<std::uint32_t, bool>        inlineAsmByRule;
     // Built-in type name → TypeId (interned once per schema, into the CU
     // lattice; FC3 c1 — the per-row `coreByDataModel` override for the
@@ -1224,7 +1227,7 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
     for (auto const& lr : cfg.loopRules)    idx.loopByRule[lr.rule.v] = true;
     for (auto const& lc : cfg.loopControls) idx.loopControlByRule[lc.rule.v] = true;
     if (cfg.staticAssertRule.valid()) idx.staticAssertByRule[cfg.staticAssertRule.v] = true;
-    if (cfg.inlineAsmRule.valid())    idx.inlineAsmByRule[cfg.inlineAsmRule.v] = true;
+    if (cfg.inlineAsm.rule.valid()) idx.inlineAsmByRule[cfg.inlineAsm.rule.v] = true;
     for (auto const& bt : cfg.builtinTypes) {
         if (bt.extension.has_value()) {
             // The mapping names a registered type-extension (e.g. T-SQL's
@@ -9484,6 +9487,278 @@ foldedConditionOperands(EngineState& s, SemanticConfig const& cfg,
            + ")";
 }
 
+// ── inline-asm P1 (D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED) ────────────
+//
+// Every fact the three inline-asm gates need, gathered in ONE pass over the
+// statement's own subtree. A struct-of-facts rather than three tree walks
+// because the gates are ORDERED and share their inputs: "is there a label
+// section" feeds both the goto-qualifier constraint and the extended-asm gate,
+// and rederiving it per gate is how the two answers drift apart.
+struct InlineAsmFacts {
+    // ── section PRESENCE ──
+    bool hasOutputs        = false;   // an operandList under the OUTPUTS tail
+    bool hasInputs         = false;   // an operandList under an INPUTS tail
+    bool hasClobbers       = false;   // a clobberList node
+    bool hasLabelList      = false;   // a gotoLabelList PAYLOAD node
+    // ★ The label SECTION is the TAIL node, which is a strictly weaker (and
+    // therefore safer) fact than the label LIST: `asm("" ::::)` has the fourth
+    // section with nothing in it, and that is precisely the shape all three
+    // reference compilers reject without a `goto` qualifier. Keeping the two
+    // apart is why each fused arm is its own named rule.
+    bool hasLabelsSection  = false;
+    bool hasGotoQualifier  = false;
+    // ★ FAIL-SAFE: set when the structural scan hit its iteration guard, i.e.
+    // the subtree was not fully inspected. Treated as "payload present" by the
+    // gate — an unfinished scan must never be read as a clean bare barrier.
+    bool scanTruncated     = false;
+
+    // ── the payload, QUOTED, for the diagnostic's inventory ──
+    // Constraint / clobber strings decoded through the SHARED
+    // `decodeAdjacentStringBodies` chokepoint; goto labels as identifier text.
+    // P1 NEVER INTERPRETS these — it quotes text it does not understand, so a
+    // corpus run inventories which constraint letters actually occur (the data
+    // P5 needs). The constraint-letter vocabulary is P3's `.target.json` job.
+    std::vector<std::string> outputs;
+    std::vector<std::string> inputs;
+    std::vector<std::string> clobbers;
+    std::vector<std::string> labels;
+    std::string              gotoQualifierText;   // as WRITTEN (`goto`)
+
+    // ── nodes the diagnostics are positioned on ──
+    NodeId templateNode{};        // located by RuleId — invalid ⇒ fail loud
+    NodeId labelsSectionNode{};   // the offending tail, for check 1's span
+    NodeId dupQualifierTok{};     // the SECOND token of a repeated kind
+    std::string dupQualifierText; // its SOURCE TEXT (`__volatile__`, as written)
+};
+
+// Descendants of `parent` in DOCUMENT order, pushed onto `stk` so that
+// `stk.back()` pops the FIRST child (an explicit-stack pre-order DFS — the
+// recursion-free idiom this file uses everywhere).
+inline void pushChildrenReversed(Tree const& tree, NodeId parent,
+                                 std::vector<NodeId>& stk) {
+    auto const kids = visibleChildren(tree, parent);
+    for (auto it = kids.rbegin(); it != kids.rend(); ++it) stk.push_back(*it);
+}
+
+// The SHALLOWEST `templateRule` (string-literal-expression) nodes under
+// `listNode`, decoded, in document order.
+//
+// ★ WHY SHALLOWEST-LEVEL AND NOT "every string in the subtree". An operand is
+// `[symbolic-name] "constraint" ( expr )`, so within one operand list EVERY
+// constraint sits at the SAME depth (one per operand node) while any string
+// literal inside an operand's EXPRESSION — `"r"(sizeof("abc"))` — is strictly
+// deeper, because it hangs off the expression that is the constraint's SIBLING.
+// Taking the minimum-depth level therefore takes exactly the constraints. This
+// is diagnostic INVENTORY only: it decides nothing about acceptance (the gate
+// already fired on the list's PRESENCE), so the worst case of a pathological
+// grammar is an over-quoted string in a message on code that is refused anyway.
+// A clobber list has no expressions at all, so the same walk is exact there.
+[[nodiscard]] inline std::vector<std::string>
+decodeShallowestStrings(Tree const& tree, NodeId listNode,
+                        RuleId stringExprRule, SchemaTokenId bodyToken) {
+    std::vector<std::string> out;
+    if (!stringExprRule.valid() || !bodyToken.valid()) return out;
+    std::vector<NodeId> level = visibleChildren(tree, listNode);
+    for (int depth = 0; depth < 64 && !level.empty(); ++depth) {
+        std::vector<NodeId> found;
+        for (NodeId n : level) {
+            if (tree.kind(n) != NodeKind::Internal) continue;
+            if (tree.rule(n).v == stringExprRule.v) found.push_back(n);
+        }
+        if (!found.empty()) {
+            for (NodeId n : found) {
+                auto decoded = decodeAdjacentStringBodies(tree, n, bodyToken);
+                // A malformed escape in a constraint is REPORTED AS SUCH rather
+                // than dropped or guessed — the section still refuses, and the
+                // reader learns which piece was unreadable.
+                out.push_back(decoded ? *decoded
+                                      : std::string{"<malformed string literal>"});
+            }
+            return out;
+        }
+        std::vector<NodeId> next;
+        for (NodeId n : level) {
+            if (tree.kind(n) != NodeKind::Internal) continue;
+            for (NodeId c : visibleChildren(tree, n)) next.push_back(c);
+        }
+        level = std::move(next);
+    }
+    return out;
+}
+
+// Gather every inline-asm fact for `asmNode`. Config-keyed throughout: not one
+// keyword spelling, rule NAME or language identity is consulted.
+[[nodiscard]] inline InlineAsmFacts
+gatherInlineAsmFacts(Tree const& tree, NodeId asmNode, InlineAsmConfig const& ia,
+                     SchemaTokenId identifierToken, SchemaTokenId bodyToken) {
+    InlineAsmFacts f;
+
+    // ── (0) the TEMPLATE, located by RuleId — NEVER positionally ──
+    // ★ THIS WAS A LATENT SILENT MISCOMPILE. The pre-P1 locator took the FIRST
+    // Internal child, which was sound only while `asmStmt` could carry nothing
+    // but a template. With a tail present it is "first of ≥2", and
+    // `decodeAdjacentStringBodies` returns "" (NOT nullopt) for a node with no
+    // body token — so a mis-picked node decodes to the empty string and the
+    // empty-template check PASSES on an asm that is anything but empty.
+    if (ia.templateRule.valid()) {
+        for (NodeId c : visibleChildren(tree, asmNode)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (tree.rule(c).v != ia.templateRule.v) continue;
+            f.templateNode = c;
+            break;
+        }
+    }
+
+    // ── (1) the STRUCTURAL scan: sections + payload, UNPRUNED at tails ──
+    // Tails NEST (`outputsTail` contains `inputsTail` contains …), so pruning at
+    // the first tail would hide every later section — the label section most of
+    // all. Each frame carries its NEAREST ENCLOSING TAIL, which is what gives an
+    // `operandList` its ROLE: the same list shape is OUTPUTS under the outputs
+    // tail and INPUTS under either inputs tail. Payload lists ARE pruned: they
+    // provably contain no tail and no other list (they are the leaf sections of
+    // the asm grammar), so descending into them would only walk user expressions.
+    struct Frame { NodeId node; std::uint32_t tail; };
+    std::vector<Frame> stack;
+    {
+        auto const kids = visibleChildren(tree, asmNode);
+        for (auto it = kids.rbegin(); it != kids.rend(); ++it)
+            stack.push_back({*it, 0u});
+    }
+    int guard = 0;
+    while (!stack.empty()) {
+        if (++guard > 65536) { f.scanTruncated = true; break; }
+        Frame const cur = stack.back();
+        stack.pop_back();
+        if (tree.kind(cur.node) != NodeKind::Internal) continue;
+        RuleId const r = tree.rule(cur.node);
+        std::uint32_t tail = cur.tail;
+        if (ia.isTailRule(r)) {
+            tail = r.v;
+            if ((ia.labelsTailRule.valid()      && r.v == ia.labelsTailRule.v)
+                || (ia.labelsTailFusedRule.valid()
+                    && r.v == ia.labelsTailFusedRule.v)) {
+                f.hasLabelsSection = true;
+                if (!f.labelsSectionNode.valid()) f.labelsSectionNode = cur.node;
+            }
+        } else if (ia.operandListRule.valid() && r.v == ia.operandListRule.v) {
+            bool const isOutputs = ia.outputsTailRule.valid()
+                                   && tail == ia.outputsTailRule.v;
+            bool const isInputs =
+                (ia.inputsTailRule.valid()      && tail == ia.inputsTailRule.v)
+                || (ia.inputsTailFusedRule.valid()
+                    && tail == ia.inputsTailFusedRule.v);
+            auto strs = decodeShallowestStrings(tree, cur.node, ia.templateRule,
+                                                bodyToken);
+            if (isOutputs) {
+                f.hasOutputs = true;
+                f.outputs.insert(f.outputs.end(), strs.begin(), strs.end());
+            } else {
+                // ★ NOT AN `else if (isInputs)`. An operand list whose enclosing
+                // tail is neither (a grammar shape this build does not know) is
+                // still OPERANDS — real payload that must refuse. Attributing it
+                // to inputs over-reports a role in a message; DROPPING it would
+                // under-report PAYLOAD, and only one of those is a miscompile.
+                f.hasInputs = true;
+                f.inputs.insert(f.inputs.end(), strs.begin(), strs.end());
+                (void)isInputs;
+            }
+            continue;                              // prune: a leaf section
+        } else if (ia.clobberListRule.valid() && r.v == ia.clobberListRule.v) {
+            f.hasClobbers = true;
+            auto strs = decodeShallowestStrings(tree, cur.node, ia.templateRule,
+                                                bodyToken);
+            f.clobbers.insert(f.clobbers.end(), strs.begin(), strs.end());
+            continue;                              // prune: a leaf section
+        } else if (ia.gotoLabelListRule.valid() && r.v == ia.gotoLabelListRule.v) {
+            f.hasLabelList = true;
+            if (identifierToken.valid()) {
+                std::vector<NodeId> lstk;
+                pushChildrenReversed(tree, cur.node, lstk);
+                int lguard = 0;
+                while (!lstk.empty() && ++lguard <= 4096) {
+                    NodeId const ln = lstk.back();
+                    lstk.pop_back();
+                    if (tree.kind(ln) == NodeKind::Token) {
+                        if (tree.tokenKind(ln).v == identifierToken.v)
+                            f.labels.emplace_back(tree.text(ln));
+                        continue;
+                    }
+                    pushChildrenReversed(tree, ln, lstk);
+                }
+            }
+            continue;                              // prune: a leaf section
+        }
+        auto const kids = visibleChildren(tree, cur.node);
+        for (auto it = kids.rbegin(); it != kids.rend(); ++it)
+            stack.push_back({*it, tail});
+    }
+
+    // ── (2) the QUALIFIER scan: PRE-TEMPLATE tokens, PRUNED at every tail ──
+    // ★ THE BOUND IS LOAD-BEARING, NOT AN OPTIMISATION. A qualifier is a plain
+    // keyword token, and an operand EXPRESSION can legitimately contain the same
+    // keyword — `"r"(*(volatile int*)p)` is real code. An unbounded search for
+    // "a volatile token under this asm statement" would report that cast as a
+    // duplicate qualifier, i.e. REFUSE VALID C (the TF-C77 lesson: a gate that
+    // refuses code every real toolchain compiles is worse than the silence it
+    // replaced). Qualifiers sit between the keyword and the `(`; sections sit
+    // after the template. Stopping at the template and never entering a tail
+    // leaves exactly {asm keyword, qualifiers, `(`} — and of those only a
+    // qualifier can repeat, since the grammar requires exactly one of the others.
+    // That is also why the duplicate test is over ALL kinds in this window rather
+    // than an enumerated qualifier set: a language that later adds `asm inline`
+    // is covered WITHOUT a code change, instead of silently unchecked.
+    {
+        std::vector<NodeId> stk;
+        pushChildrenReversed(tree, asmNode, stk);
+        std::vector<std::pair<std::uint32_t, NodeId>> seen;
+        int qguard = 0;
+        while (!stk.empty() && ++qguard <= 4096) {
+            NodeId const cur = stk.back();
+            stk.pop_back();
+            if (f.templateNode.valid() && cur.v == f.templateNode.v) break;
+            if (tree.kind(cur) == NodeKind::Token) {
+                std::uint32_t const kind = tree.tokenKind(cur).v;
+                if (ia.gotoQualifierToken.valid()
+                    && kind == ia.gotoQualifierToken.v) {
+                    f.hasGotoQualifier = true;
+                    if (f.gotoQualifierText.empty())
+                        f.gotoQualifierText = tree.text(cur);
+                }
+                for (auto const& [k2, n2] : seen) {
+                    if (k2 != kind) continue;
+                    if (!f.dupQualifierTok.valid()) {
+                        f.dupQualifierTok  = cur;      // the SECOND occurrence
+                        f.dupQualifierText = tree.text(cur);
+                    }
+                    break;
+                }
+                seen.emplace_back(kind, cur);
+                continue;
+            }
+            if (ia.isTailRule(tree.rule(cur))) continue;   // never enter a section
+            pushChildrenReversed(tree, cur, stk);
+        }
+    }
+    return f;
+}
+
+// `label: "a", "b"` for the extended-asm inventory, or "" when the section
+// carried nothing readable (the section's PRESENCE has already decided the
+// verdict; this only decorates it).
+[[nodiscard]] inline std::string
+inlineAsmSection(std::string_view label, std::vector<std::string> const& items,
+                 bool quote) {
+    if (items.empty()) return {};
+    std::string out{label};
+    out += ": ";
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i != 0) out += ", ";
+        if (quote) { out += '"'; out += items[i]; out += '"'; }
+        else       { out += items[i]; }
+    }
+    return out;
+}
+
 // ── Pass 2: post-order — resolve uses + literal/init typing + checks ───────
 // `loopDepth` (GAP C) is the count of enclosing `loopRules` subtrees the
 // walk is currently inside; a `loopControls` node at depth 0 is outside
@@ -10622,52 +10897,155 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
     }
 
-    // FC17.9(i) (D-CSUBSET-INLINE-ASM, C23 6.8 / GNU 6.47): the GNU inline-asm
-    // STATEMENT `__asm__ [volatile] ( <string-literal-template> ) ;`. Cycle-1
-    // implements ONLY the empty-template optimizer barrier: the template must
-    // decode to STRICTLY ZERO bytes (`__asm__ volatile("")`), which HIR→MIR lowers
-    // to a pure compiler reordering + full-memory fence (MirOpcode::CompilerBarrier,
-    // the _ReadWriteBarrier op). A NON-EMPTY template carries real per-target
-    // instructions we cannot yet emit — decode the template (the SAME chokepoint
-    // staticAssert's message uses) and FAIL LOUD S_InlineAsmNonEmptyTemplate on
-    // anything but a strictly-empty decoded string: non-empty text, whitespace-only
-    // (`"  "` is NOT provably inert — we do not parse asm), or a malformed escape
-    // (decode → nullopt). This reject is an Error → the driver aborts before codegen,
-    // so a rejected asm's MIR is never emitted; silently lowering a non-empty asm to
-    // a no-op barrier would DROP its instructions — a miscompile — so the code is
-    // UNSUPPRESSABLE (unsuppressable_codes.cpp). Operand/clobber lists (`: … : …`) and
-    // `asm goto` never reach here: the asmStmt grammar ends at `)`, so those fail loud
-    // at parse (P_UnexpectedToken) — the D-CSUBSET-INLINE-ASM-OPERANDS / -GOTO
-    // deferrals. `volatile` is accepted but semantically INERT for the empty form.
-    // The template is the SOLE Internal child (the keyword / volatile / parens /
-    // semicolon are Tokens), located exactly as staticAssert locates its message.
+    // ★★ FC17.9(i) + inline-asm P1 (D-CSUBSET-INLINE-ASM /
+    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED, C23 6.8 / GNU 6.47): the GNU
+    // inline-asm STATEMENT. P1 PARSES the full extended form
+    // (`__asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));`) and REFUSES it
+    // here, at the SEMANTIC tier, with ONE precise diagnostic per construct.
+    //
+    // ★ WHY REFUSE AT THIS TIER AT ALL, rather than let the grammar stop at `)`.
+    // It used to: the first `:` produced P_UnexpectedToken and the parser never
+    // recovered — MEASURED 53 diagnostics for the single `rdtsc` statement in
+    // sqlite's `src/hwtime.h:43`, burying every later error in the file. A
+    // construct the compiler cannot support should cost exactly one message.
+    //
+    // ⛔ ACCEPT-AND-IGNORE IS THE FORBIDDEN OUTCOME. The operands ARE the
+    // contract: `"=a"(lo)` says this statement writes `eax` and `lo` receives it.
+    // Parsing them and lowering to a bare barrier would clobber registers the
+    // allocator still believes are live AND leave `lo`/`hi` untouched — a silent
+    // miscompile with a clean build log. That is why the gate below keys off
+    // section PRESENCE (never off whether a section could be interpreted), why
+    // both codes are unsuppressable, and why `cst_to_hir`'s `InlineAsm` arm
+    // carries a second, independent payload assertion.
+    //
+    // THE ORDER MATTERS. (1) a label section without `goto` is a CONSTRAINT
+    // VIOLATION — ill-formed in gcc/clang/MSVC alike and still ill-formed after
+    // P5 lands, so "not yet supported" would be a lie; it is reported first and
+    // alone. (2) any payload or qualifier ⇒ extended asm, unsupported. (3) only a
+    // fully-bare statement reaches the cycle-1 empty-template requirement.
+    // (4) a duplicated qualifier is ORTHOGONAL to all of it and may fire
+    // alongside — it is a property of the qualifier run, not of the sections.
     if (k == NodeKind::Internal
         && s.idx().inlineAsmByRule.contains(tree.rule(node).v)) {
-        NodeId tmplNode{};
-        for (NodeId c : visibleChildren(tree, node)) {
-            if (tree.kind(c) != NodeKind::Internal) continue;   // skip kw / volatile / ( ) ;
-            tmplNode = c;
-            break;
-        }
-        std::optional<std::string> decoded;
-        if (tmplNode.valid() && s.idx().stringLiteralBodyToken.valid()) {
-            decoded = decodeAdjacentStringBodies(
-                tree, tmplNode, s.idx().stringLiteralBodyToken);
-        }
-        // Acceptance = a template that decodes to STRICTLY zero bytes. Anything else
-        // (non-empty / whitespace-only / malformed-escape nullopt / a malformed node
-        // with no template) fails loud — never a silently dropped instruction.
-        if (!(decoded && decoded->empty())) {
+        auto const& ia = cfg.inlineAsm;
+        auto const  f  = gatherInlineAsmFacts(tree, node, ia, cfg.identifierToken,
+                                              s.idx().stringLiteralBodyToken);
+        auto const  report = [&](DiagnosticCode code, NodeId at, std::string msg) {
             ParseDiagnostic d;
-            d.code     = DiagnosticCode::S_InlineAsmNonEmptyTemplate;
+            d.code     = code;
             d.severity = DiagnosticSeverity::Error;
             d.buffer   = tree.source().id();
-            d.span     = tree.span(tmplNode.valid() ? tmplNode : node);
-            d.actual   = "inline asm with a non-empty template is not yet supported "
-                         "(only the empty-template optimizer barrier "
-                         "`__asm__ volatile(\"\")` is implemented); real asm text is a "
-                         "per-target deferral (D-CSUBSET-INLINE-ASM-TEXT)";
+            d.span     = tree.span(at.valid() ? at : node);
+            d.actual   = std::move(msg);
             s.reporter.report(std::move(d));
+        };
+
+        // ── (1) a label section requires the `goto` qualifier ──
+        // ✔MEASURED 2026-08-12: gcc, clang and MSVC all reject `("" : : ::)`,
+        // `("" :: ::)` and `("" ::::)`. The predicate is the TAIL's presence, not
+        // the label list's: `("" ::::)` has the fourth section carrying nothing,
+        // and that is exactly the shape they reject.
+        if (f.hasLabelsSection && !f.hasGotoQualifier) {
+            report(DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto,
+                   f.labelsSectionNode,
+                   "inline asm has a label section (the fourth `:` group) but no "
+                   "`goto` qualifier — the label section exists only for "
+                   "`asm goto`, and without the qualifier the statement has no "
+                   "control-flow edges to label (GNU 6.47.2.7); rejected by gcc, "
+                   "clang and MSVC alike");
+        }
+        // ── (2) ANY extended payload or qualifier ⇒ unsupported, ONE message ──
+        // ★ EVERY presence flag is in this condition, including the two label
+        // ones. That redundancy is deliberate: if check (1) alone gated a label
+        // section, regressing (1) would turn `("" :::: lbl)` into a CLEAN
+        // BARRIER with `lbl` silently dropped. Two independent gates, and the
+        // survivor of both is a statement with provably nothing to bind.
+        // `scanTruncated` joins them for the same reason — a scan that did not
+        // finish must never be read as "nothing found".
+        else if (f.hasOutputs || f.hasInputs || f.hasClobbers
+                 || f.hasLabelsSection || f.hasLabelList || f.hasGotoQualifier
+                 || f.scanTruncated) {
+            // The inventory: what was actually written, labelled by role, decoded
+            // through the SHARED `decodeAdjacentStringBodies` chokepoint. This is
+            // the scoping data P5 needs — which constraint letters real code uses.
+            // P1 quotes; it never interprets. (Constraint-letter vocabulary is
+            // P3's `.target.json` job: `"a"` means `eax` on x86 and nothing on
+            // arm64, so the meaning is not knowable at this tier at all.)
+            std::vector<std::string> parts;
+            for (auto&& p : {inlineAsmSection("outputs",  f.outputs,  true),
+                             inlineAsmSection("inputs",   f.inputs,   true),
+                             inlineAsmSection("clobbers", f.clobbers, true),
+                             inlineAsmSection("labels",   f.labels,   false)}) {
+                if (!p.empty()) parts.push_back(p);
+            }
+            if (!f.gotoQualifierText.empty())
+                parts.push_back("qualifier: " + f.gotoQualifierText);
+            std::string detail;
+            for (std::size_t i = 0; i < parts.size(); ++i) {
+                detail += (i == 0 ? " (" : "; ");
+                detail += parts[i];
+            }
+            if (!detail.empty()) detail += ")";
+            report(DiagnosticCode::S_InlineAsmExtendedUnsupported, node,
+                   "extended inline-asm is not yet supported" + detail
+                   + "; operand binding, clobber tracking and asm-goto control "
+                     "flow are not implemented "
+                     "(D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED)");
+        }
+        // ── (3) cycle-1's empty-template requirement (unchanged) ──
+        // Reached only when (1) and (2) found nothing: a bare `__asm__
+        // [volatile] ("")` with no sections at all. The template must decode to
+        // STRICTLY ZERO bytes, which HIR→MIR lowers to a pure reordering +
+        // full-memory fence (MirOpcode::CompilerBarrier). Non-empty text,
+        // whitespace-only (`"  "` is NOT provably inert — we do not parse asm) or
+        // a malformed escape (decode → nullopt) carries real per-target
+        // instructions we cannot emit, and silently lowering it to a no-op
+        // barrier would DROP them (D-CSUBSET-INLINE-ASM-TEXT).
+        else if (!f.templateNode.valid()) {
+            // ★ THE LOCATOR FAILS LOUD, AND SEPARATELY. `decodeAdjacentString-
+            // Bodies` returns "" — not nullopt — for a node carrying no body
+            // token, so folding "no template found" into the decode test would
+            // make a mis-located template look like an EMPTY one and PASS. The
+            // only way to reach here is a grammar/config disagreement: the shape
+            // `inlineAsm.templateRule` names is not among this statement's
+            // children. Say that, name the rule, and refuse.
+            report(DiagnosticCode::S_InlineAsmNonEmptyTemplate, node,
+                   std::format("inline asm has no template child of the "
+                               "configured shape '{}' "
+                               "(semantics.inlineAsm.templateRule) — the template "
+                               "cannot be read, so it cannot be shown to be empty; "
+                               "refusing rather than treating an unlocatable "
+                               "template as an empty one",
+                               ia.templateRuleName));
+        } else {
+            std::optional<std::string> decoded;
+            if (s.idx().stringLiteralBodyToken.valid()) {
+                decoded = decodeAdjacentStringBodies(
+                    tree, f.templateNode, s.idx().stringLiteralBodyToken);
+            }
+            if (!(decoded && decoded->empty())) {
+                report(DiagnosticCode::S_InlineAsmNonEmptyTemplate, f.templateNode,
+                       "inline asm with a non-empty template is not yet supported "
+                       "(only the empty-template optimizer barrier "
+                       "`__asm__ volatile(\"\")` is implemented); real asm text is "
+                       "a per-target deferral (D-CSUBSET-INLINE-ASM-TEXT)");
+            }
+        }
+        // ── (4) a duplicated qualifier — ORTHOGONAL, may fire alongside ──
+        // ✔MEASURED 2026-08-12: gcc, clang and MSVC all reject a repeated
+        // qualifier. Detected by TOKEN KIND, never by spelling, which is what
+        // makes `volatile __volatile__` a duplicate — DSS's keyword table aliases
+        // the dunder spellings onto one kind. The message therefore ECHOES THE
+        // TOKEN'S SOURCE TEXT so the dunder form prints as the author wrote it.
+        if (f.dupQualifierTok.valid()) {
+            report(DiagnosticCode::S_InlineAsmDuplicateQualifier,
+                   f.dupQualifierTok,
+                   "duplicate inline-asm qualifier `" + f.dupQualifierText
+                   + "` — this statement already carries that qualifier. "
+                     "Duplicates are detected by TOKEN KIND rather than by "
+                     "spelling, so alternate spellings of one qualifier count as "
+                     "the same qualifier (e.g. `volatile __volatile__`). "
+                     "Rejected by gcc, clang and MSVC alike");
         }
     }
 

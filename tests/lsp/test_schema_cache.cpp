@@ -55,6 +55,81 @@ TEST(SchemaCache, UnknownExtensionReturnsNoMatch) {
     EXPECT_EQ(r.error().kind, SchemaResolveErrorKind::NoExtensionMatch);
 }
 
+// ── `.s` IS CLAIMED BY TWO LANGUAGES (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET)
+//
+// `asm-x86_64-att.lang.json` and `asm-arm64-gas.lang.json` BOTH declare
+// `.s`/`.S`. The resolver used to `return` the first candidate that matched,
+// over a list sorted alphabetically by stem — so `asm-arm64-gas` was the
+// permanent answer for every `.s` an editor opened, silently, because 'a-r'
+// sorts before 'x-8'. An x86 assembly file would have been highlighted, folded
+// and diagnosed as arm64 assembly with nothing to say so.
+//
+// This resolver has NO target, and the dialect is a question the TARGET
+// answers, so refusing is the only honest answer available here.
+//
+// RED-ON-DISABLE: restore the early `return loaded;` inside the candidate loop
+// in `SchemaCache::resolveByExtension` and this test fails — the call succeeds
+// and hands back whichever dialect sorted first.
+TEST(SchemaCache, AmbiguousExtensionNamesEveryClaimant) {
+    SchemaCache c;
+    auto r = c.resolveByExtension(".s");
+    ASSERT_FALSE(r.has_value())
+        << "two shipped languages declare `.s`; answering with either of them "
+           "is registration/sort order deciding what the source MEANS";
+    EXPECT_EQ(r.error().kind, SchemaResolveErrorKind::AmbiguousExtension);
+    // The claimants must be NAMED — "ambiguous" without the names leaves the
+    // operator with no action, and the whole point of the error is that a
+    // choice has to be made.
+    EXPECT_NE(r.error().detail.find("asm-x86_64-att"), std::string::npos)
+        << "detail must name the x86_64 claimant; got: " << r.error().detail;
+    EXPECT_NE(r.error().detail.find("asm-arm64-gas"), std::string::npos)
+        << "detail must name the arm64 claimant; got: " << r.error().detail;
+}
+
+// The UPPERCASE spelling resolves through the same index (both documents
+// declare `.S` too), so it must reach the same verdict — a `.S` that answered
+// while `.s` refused would be the collision surviving behind a case difference.
+TEST(SchemaCache, AmbiguousExtensionIsCaseInsensitive) {
+    SchemaCache c;
+    auto r = c.resolveByExtension(".S");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, SchemaResolveErrorKind::AmbiguousExtension);
+}
+
+// ★★ THE WARM-CACHE PATH MUST REACH THE SAME VERDICT AS THE COLD ONE.
+//
+// `resolveByName` indexes the resolved language's extensions, so resolving ONE
+// dialect by name leaves `.s` looking like it has exactly one claimant. The
+// fast path in `resolveByExtension` must not answer from that: "one claimant so
+// far" is not "one claimant", and treating it as one is the first-wins bug
+// re-entered through the cache. Which file the editor opened FIRST must not
+// decide what the second file means.
+//
+// RED-ON-DISABLE: drop the `shippedExtIndexComplete_` guard from the fast path
+// and this test fails — the pre-warmed name makes `.s` resolve to that dialect.
+TEST(SchemaCache, WarmCacheDoesNotMakeAnAmbiguousExtensionUnique) {
+    SchemaCache c;
+    auto primed = c.resolveByName("asm-x86_64-att");
+    ASSERT_TRUE(primed.has_value())
+        << "the x86_64 AT&T dialect must load; it ships in "
+           "src/dss-config/sources/";
+    auto r = c.resolveByExtension(".s");
+    ASSERT_FALSE(r.has_value())
+        << "priming the cache with ONE claimant must not make the extension "
+           "unique — the other dialect still claims it";
+    EXPECT_EQ(r.error().kind, SchemaResolveErrorKind::AmbiguousExtension);
+}
+
+// The unambiguous extensions must be UNAFFECTED. Collecting all claimants
+// instead of returning the first one changes nothing when there is exactly one
+// — and if it did, this whole change would have broken every other language.
+TEST(SchemaCache, UnambiguousExtensionsStillResolveAfterTheAmbiguityFix) {
+    SchemaCache c;
+    auto r = c.resolveByExtension(".toy");
+    ASSERT_TRUE(r.has_value()) << "exactly one shipped language claims .toy";
+    EXPECT_EQ((*r)->name(), "Toy");
+}
+
 TEST(SchemaCache, HasSchemaDirReflectsConstructionMode) {
     SchemaCache shipped;
     EXPECT_FALSE(shipped.hasSchemaDir());

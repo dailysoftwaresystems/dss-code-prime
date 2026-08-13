@@ -1,9 +1,12 @@
 #include "core/types/predefined_macro_json.hpp"
 
+#include "core/types/config_key_vocabulary.hpp" // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY — the SHARED closed-key substrate
 #include "core/types/object_format_kind.hpp"
 
 #include <algorithm>
+#include <array>
 #include <format>
+#include <string>
 
 namespace dss {
 
@@ -97,6 +100,89 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
             continue;
         }
         PredefinedMacroDef pm;
+        // ── D-CONFIG-PREDEFINED-MACRO-ROW-KEYS-UNGATED ────────────────────
+        //
+        // The CLOSED key vocabulary of a `predefinedMacros` ENTRY. Every
+        // field below is read with a bare `e.contains(...)` probe, so before
+        // this gate existed a misspelled optional key was silently DROPPED
+        // and the entry loaded clean carrying the default the author was
+        // trying to override: `"paramss"` shipped an OBJECT-like macro where
+        // a function-like one was declared, `"availabelObjectFormats"` made a
+        // pe-only spelling predefine on EVERY format, and
+        // `"componentWeigths"` turned the `version` kind's missing-field
+        // diagnostic into the only thing standing between a typo and a wrong
+        // encoding. Same archetype as the encoding-variant row whose
+        // `"tempalte"` yielded an all-default template
+        // (`D-CONFIG-TARGET-VARIANT-GUARD-UNKNOWN-KEY-SILENTLY-IGNORED`): a
+        // CONTAINER with no key set sitting beside leaves that have one.
+        //
+        // ★ IT LIVES IN THE SHARED PARSER, WHICH IS THE WHOLE POINT AND NOT A
+        // COMPLICATION. `predefinedMacros` is declared by THREE config
+        // families — the LANGUAGE (`/preprocess/predefinedMacros` in
+        // `<lang>.lang.json`), the TARGET (`/predefinedMacros` in
+        // `<arch>.target.json`) and the OBJECT FORMAT (`/predefinedMacros` in
+        // `<fmt>.format.json`) — and all three reach the entry grammar
+        // through this one function. A gate written in any one loader would
+        // leave the other two accepting typos, i.e. it would re-create by
+        // omission exactly the drift the TF-C74 extraction removed. Written
+        // here it is inherited, and a family cannot opt out of it.
+        //
+        // ★ THE VOCABULARY WAS ENUMERATED FROM WHAT THE SHIPPED DOCUMENTS
+        // CONTAIN, NOT ONLY FROM WHAT THIS FUNCTION READS. Those are
+        // different sets in general — the sibling target-loader gate's first
+        // cut omitted `/target/description`, a key BOTH shipped targets
+        // declare and nothing reads, and 21 tests went red. ✔MEASURED here
+        // over every `predefinedMacros` array in `src/dss-config/` (21 files,
+        // 82 entries: 33 language, 13 target, 36 format): the declared set is
+        // `name`/`kind`/`value`/`availableObjectFormats`/`params`/
+        // `componentWeights` plus 7 `$comment`s — and it coincides exactly
+        // with the read set, so this family has no declared-but-unread key.
+        //
+        // `$`-prefixed keys are PROSE (the codebase-wide convention) and are
+        // exempt via the shared predicate, never a literal `"$comment"`
+        // compare — the shipped `c-subset.lang.json` uses `$comment` INSIDE
+        // macro entries, and a literal compare would still reject a
+        // `$valueComment`.
+        //
+        // ★ AND IT RUNS BEFORE THE REQUIRED-`name`/`kind` CHECKS, for the
+        // reason the `keywords`-entry gate in the grammar loader records: a
+        // misspelled `"nmae"` would otherwise be reported ONLY as a MISSING
+        // 'name' — a field the author demonstrably did write — sending them
+        // hunting in the wrong place. Both diagnostics fire, typo named
+        // first. The entry is NOT skipped here for the same reason: the
+        // emitted diagnostic already fails the load, and continuing lets the
+        // author see every problem with the row in one pass.
+        {
+            static constexpr std::array<std::string_view, 6> kMacroEntryKeys{
+                "name", "kind", "value", "params", "componentWeights",
+                "availableObjectFormats"};
+            DSS_CHECK_KEY_VOCABULARY(kMacroEntryKeys);
+            for (auto it = e.begin(); it != e.end(); ++it) {
+                if (isDocumentationKey(it.key())) continue;
+                if (std::ranges::find(kMacroEntryKeys, it.key())
+                    != kMacroEntryKeys.end()) continue;
+                // The allowed list is RENDERED FROM THE TABLE, never retyped
+                // into the message — a hand-written list is one that silently
+                // stops matching the array the next time a key is added.
+                std::string allowed;
+                for (auto const& k : kMacroEntryKeys) {
+                    if (!allowed.empty()) allowed += ", ";
+                    allowed += '\'';
+                    allowed += k;
+                    allowed += '\'';
+                }
+                coll.emit(entryCode, std::format("{}/{}", mpath, it.key()),
+                          std::format("unknown key '{}' in a "
+                                      "'predefinedMacros' entry — allowed "
+                                      "keys are {} (plus any '$'-prefixed "
+                                      "documentation key). An unrecognized "
+                                      "key is REFUSED rather than ignored: "
+                                      "silently dropping it would ship the "
+                                      "macro with the very default the key "
+                                      "was written to override",
+                                      it.key(), allowed));
+            }
+        }
         // `name` -- REQUIRED, non-empty string.
         if (!e.contains("name")) {
             coll.emit(DiagnosticCode::C_MissingField, mpath + "/name",

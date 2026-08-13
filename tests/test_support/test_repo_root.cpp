@@ -25,6 +25,7 @@
 
 #include "golden_file.hpp"   // findCorpusRoot / readFile — the real consumers
 #include "repo_root.hpp"
+#include "scoped_env.hpp"    // the ONE env override (this file used to carry a copy)
 
 #include <gtest/gtest.h>
 
@@ -40,49 +41,7 @@
 
 namespace fs = std::filesystem;
 
-namespace {
-
-// Portable RAII env override — restores the prior value (or clears) on exit.
-// Mirrors the helper in tests/core/test_config_path_walk.cpp; kept local for
-// the same reason that one is, so a test that mutates the environment cannot
-// leak that mutation into a sibling binary's expectations.
-class ScopedEnv {
-public:
-    ScopedEnv(char const* name, std::string const& value) : name_(name) {
-        if (char const* prev = std::getenv(name)) { had_ = true; prev_ = prev; }
-        set(value);
-    }
-    // Construct-to-CLEAR: used by the tests that must prove a candidate is
-    // absent rather than merely wrong.
-    explicit ScopedEnv(char const* name) : name_(name) {
-        if (char const* prev = std::getenv(name)) { had_ = true; prev_ = prev; }
-        clear();
-    }
-    ~ScopedEnv() { had_ ? set(prev_) : clear(); }
-    ScopedEnv(ScopedEnv const&)            = delete;
-    ScopedEnv& operator=(ScopedEnv const&) = delete;
-
-private:
-    void set(std::string const& v) {
-#ifdef _WIN32
-        _putenv_s(name_.c_str(), v.c_str());
-#else
-        ::setenv(name_.c_str(), v.c_str(), 1);
-#endif
-    }
-    void clear() {
-#ifdef _WIN32
-        _putenv_s(name_.c_str(), "");
-#else
-        ::unsetenv(name_.c_str());
-#endif
-    }
-    std::string name_;
-    bool        had_ = false;
-    std::string prev_;
-};
-
-} // namespace
+using dss::test_support::ScopedEnv;
 
 // ── ordinary conditions ─────────────────────────────────────────────────
 

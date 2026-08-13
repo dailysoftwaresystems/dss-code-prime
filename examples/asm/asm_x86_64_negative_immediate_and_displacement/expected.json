@@ -1,0 +1,21 @@
+{
+  "$comment": "★★★ THE RUNNABLE WITNESS FOR A SIGN THAT WAS SILENTLY DROPPED — D-ASM-NEGATIVE-SCALAR-LOSES-ITS-SIGN, shipped in `e5b60f6c` and found 2026-08-13.\n\n★★★ WHY THIS EXAMPLE EXISTS AT ALL, WHICH IS THE PART WORTH READING. The defect lived for a full cycle behind a unit tier that was otherwise thorough: `tests/asm/test_asm_text_to_lir.cpp` had 43 tests over this walker, several of them asserting encoded BYTES, and not one of them wrote a negative number. The walker happily produced a well-formed LIR module, the assembler happily encoded it, the linker happily linked it, every leg was green — and the program computed the wrong answer. A corpus example whose EXIT CODE depends on the value is the instrument that catches that class, and this is it.\n\n★★ WHAT EACH HALF PINS, AND WHY THEY ARE BOTH HERE.\n  • The IMMEDIATE half (`movq $-8, %rcx`) is the plain case: `100 + (-8)` must be 92, and a dropped sign makes it 108. ⚠ It is DEPENDENT arithmetic on purpose — a program that merely `movq $-8, %rax; ret` would exit 248 either way on a byte-truncating exit status, and would prove nothing.\n  • The DISPLACEMENT half (`movq %r9, -8(%rdx)`) is the strictly worse case: the dropped sign produces a WRONG ADDRESS, not a wrong constant. rsp+24 is poisoned with 1 and the store must clear it; if the store lands on rsp+40 instead, the poison survives and is added in. ✔MEASURED: on the pre-fix binary this arm alone moved the answer by exactly 1, which is why the two halves are given different magnitudes.\n\n★ THE FOUR OUTCOMES ARE ALL DISTINCT — 92 correct · 108 immediate-sign dropped · 93 displacement-sign dropped · 109 both — so a partial regression cannot be read as a partial pass. That separation is deliberate: the first draft used the same magnitude for both halves and would have reported 100 for a single-half break AND for a double-half break with opposite errors.\n\n★ THE FRAME IS HAND-WRITTEN because that is what the `encode` tier means: `subq $64, %rsp` / `addq $64, %rsp` is the programmer's own prologue and epilogue, and `materializeCallingConvention` does not run here by design. 64 keeps %rsp 16-byte aligned, and both touched slots (rsp+24, rsp+40) sit ABOVE the 32-byte region Win64 reserves as callee shadow space, so the same file is correct under both ABIs. ⚠ `-8(%rdx)` is computed from `leaq 32(%rsp), %rdx` rather than written as `-8(%rsp)` ON PURPOSE: a negative displacement off %rsp addresses the red zone, which System V permits and Windows does not, and this file must be correct on both.\n\n★ ONLY REGISTERS VOLATILE UNDER *BOTH* ABIs ARE TOUCHED — rax, rcx, rdx, r8, r9. rsi/rdi would be the natural System V choice and are CALLEE-SAVED on Win64; using them yields a fixture that passes on Linux and corrupts the trampoline's state on Windows.\n\n★ THE `release` ARM, SCOPED HONESTLY. At the `encode` tier no MIR module exists, so the optimizer, the register allocator and calling-convention materialization never run — this arm does NOT witness the optimizer and cannot. It pins the narrower fact that `--config=release` still produces a working binary from assembly text.",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "exitCode": 92,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

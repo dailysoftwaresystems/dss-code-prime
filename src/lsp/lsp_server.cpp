@@ -10,9 +10,11 @@
 #include "lsp/diagnostic_translator.hpp"
 #include "lsp/json_rpc.hpp"
 #include "lsp/lsp_semantic_query.hpp"
+#include "lsp/workspace_project.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -40,6 +42,54 @@ using json = nlohmann::json;
     for (auto& c : ext) c = static_cast<char>(
         std::tolower(static_cast<unsigned char>(c)));
     return ext;
+}
+
+// Every workspace folder the `initialize` request named, deduplicated, in the
+// order the client listed them.
+//
+// ALL THREE SPELLINGS, UNIONED. LSP has deprecated `rootPath` in favour of
+// `rootUri` and `rootUri` in favour of `workspaceFolders`, but real clients
+// still send the older keys (and often several at once), so reading only the
+// modern one would leave whole editors with no workspace. Deduplication makes
+// the overlap harmless.
+//
+// ★ EVERY folder, not the first. A multi-root workspace that declared two
+// projects and got answered from folder[0] would be first-wins with extra
+// steps — the same defect one layer up. Taking all of them means two folders
+// that disagree produce an AMBIGUITY, which is the truth.
+[[nodiscard]] std::vector<std::filesystem::path>
+workspaceRootsFromInitialize(json const& params) {
+    std::vector<std::filesystem::path> roots;
+    auto push = [&roots](std::filesystem::path p) {
+        if (std::find(roots.begin(), roots.end(), p) == roots.end()) {
+            roots.push_back(std::move(p));
+        }
+    };
+    auto pushUri = [&push](std::string const& uri) {
+        // A non-`file:` root (a virtual or remote workspace) yields nullopt and
+        // is DROPPED rather than guessed at — there is no local directory to
+        // scan, and inventing one would answer with the wrong project.
+        if (auto p = pathFromFileUri(uri)) push(std::move(*p));
+    };
+    if (auto wf = params.find("workspaceFolders");
+        wf != params.end() && wf->is_array()) {
+        for (auto const& folder : *wf) {
+            if (auto u = folder.find("uri");
+                u != folder.end() && u->is_string()) {
+                pushUri(u->get<std::string>());
+            }
+        }
+    }
+    if (auto ru = params.find("rootUri"); ru != params.end() && ru->is_string()) {
+        pushUri(ru->get<std::string>());
+    }
+    if (auto rp = params.find("rootPath"); rp != params.end() && rp->is_string()) {
+        // `rootPath` is a plain filesystem path, not a URI — no scheme, no
+        // percent-encoding.
+        auto raw = rp->get<std::string>();
+        if (!raw.empty()) push(std::filesystem::path{raw});
+    }
+    return roots;
 }
 
 // Parse a `TextDocumentItem` from the params JSON.
@@ -268,6 +318,20 @@ void LspServer::registerHandlers_() {
     dispatcher_.registerNotification(Method::TextDocumentDidSave,
         [this](Notification const& n) { handleDidSave_(n); });
 
+    // ── The four workspace notifications that can move the manifest set ─────
+    // (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE). ONE handler for all
+    // four: none of their params tells us anything the filesystem does not, so
+    // discriminating between them would be a switch whose arms are identical.
+    for (auto m : {Method::WorkspaceDidChangeWatchedFiles,
+                   Method::WorkspaceDidCreateFiles,
+                   Method::WorkspaceDidRenameFiles,
+                   Method::WorkspaceDidDeleteFiles}) {
+        dispatcher_.registerNotification(m,
+            [this](Notification const& n) {
+                handleWorkspaceManifestsMayHaveChanged_(n);
+            });
+    }
+
     // Semantic request handlers (SE7) — backed by the cached SemanticModel.
     dispatcher_.registerRequest(Method::TextDocumentHover,
         [this](Request const& r) { return handleHover_(r); });
@@ -314,7 +378,38 @@ int LspServer::run() {
     return shutdownReceived_.load(std::memory_order_acquire) ? 0 : 1;
 }
 
-std::optional<std::string> LspServer::handleInitialize_(Request const& /*req*/) {
+std::optional<std::string> LspServer::handleInitialize_(Request const& req) {
+    // ── The workspace's TARGET channel (D-LSP-ASSEMBLY-DIALECT-UNSERVABLE) ──
+    // `initialize` is the ONLY message that carries the workspace ROOTS, and a
+    // root is the only thing that leads to a project manifest, so this is where
+    // the editor learns which CPU its `.s` files belong to. The ROOTS are fixed
+    // here; the PREFERENCE derived from them is not — see
+    // `refreshWorkspacePreference_` (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-
+    // INITIALIZE), which re-derives it whenever the manifest set may have moved
+    // and republishes the open documents whose answer changed.
+    //
+    // Threading: every dispatcher handler runs on the `run()` thread, so this
+    // write and the `handleDidOpen_` read below need no synchronisation. Worker
+    // threads never touch `workspacePreference_` — they see only the per-
+    // document `schemaError` string, which the DocumentStore's mutex covers.
+    if (!req.params.empty()) {
+        try {
+            auto params      = json::parse(req.params);
+            workspaceRoots_  = workspaceRootsFromInitialize(params);
+        } catch (...) {
+            // Malformed params: keep the empty root list. The resulting
+            // `NoWorkspaceRoot` reason is the honest one — nothing named a
+            // workspace — and it reaches the user on the first ambiguous open.
+            workspaceRoots_.clear();
+        }
+    }
+    initializeReceived_ = true;
+    // No document can be open yet, so the republish half of this is a no-op and
+    // the call reduces to the first resolution. Going through the SAME function
+    // is what stops "how the preference is computed at initialize" and "how it
+    // is recomputed later" from drifting apart.
+    (void)refreshWorkspacePreference_();
+
     json result;
     auto& caps = result["capabilities"];
     caps["textDocumentSync"] = 1; // 1 == Full per LSP §13.7
@@ -331,6 +426,55 @@ std::optional<std::string> LspServer::handleInitialize_(Request const& /*req*/) 
     caps["referencesProvider"]     = true;
     caps["renameProvider"]         = true;
     caps["signatureHelpProvider"]  = json::object();
+
+    // ── `workspace.fileOperations` — A STATIC REGISTRATION, NO OUTBOUND
+    //    REQUEST (LSP 3.16 `ServerCapabilities.workspace.fileOperations`) ─────
+    //
+    // ✔VERIFIED against Microsoft's own reference implementation
+    // (`vscode-languageserver-node/protocol/src/common/protocol.fileOperations.ts`):
+    //   FileOperationOptions            { didCreate?/willCreate?/didRename?/… : FileOperationRegistrationOptions }
+    //   FileOperationRegistrationOptions{ filters: FileOperationFilter[] }
+    //   FileOperationFilter             { scheme?: string; pattern: FileOperationPattern }
+    //   FileOperationPattern            { glob: string; matches?: 'file'|'folder'; options?: { ignoreCase?: boolean } }
+    // and the wire methods `workspace/didCreateFiles` / `didRenameFiles` /
+    // `didDeleteFiles`, gated by the client capability
+    // `workspace.fileOperations.didCreate` (…`didRename`, …`didDelete`).
+    //
+    // ★ THIS IS THE PART THAT NEEDED NO PROTOCOL SURFACE. It is declared in the
+    // `initialize` RESULT — a response to an inbound request — so it does not
+    // need `client/registerCapability`, which is a server→client REQUEST this
+    // server cannot originate (`JsonRpc` has serializeResponse / serializeError
+    // / serializeNotification and no serializeRequest; `MethodDispatcher`
+    // correlates INBOUND ids only). That distinction is the whole reason
+    // D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE was believed blocked.
+    //
+    // ⚠ WHAT IT DOES *NOT* COVER, STATED: these three fire for file operations
+    // the CLIENT performs (its explorer / its API) — not for a manifest written
+    // by `git checkout` or a terminal, and not for a CONTENT edit to an
+    // existing manifest. Those are covered by the refresh hung off `didOpen` /
+    // `didSave`, which re-reads the filesystem regardless of who touched it.
+    // The two channels overlap on purpose: this one is immediate, that one is
+    // universal.
+    //
+    // The glob is DERIVED from `kProjectFileSuffix`, never re-spelled — one
+    // place decides what a project manifest is called.
+    {
+        json filter;
+        filter["scheme"]             = "file";
+        filter["pattern"]["glob"]    =
+            std::string{"**/*"} + std::string{kProjectFileSuffix};
+        filter["pattern"]["matches"] = "file";
+        const json filters = json::array({std::move(filter)});
+        auto& fileOps = caps["workspace"]["fileOperations"];
+        fileOps["didCreate"]["filters"] = filters;
+        fileOps["didRename"]["filters"] = filters;
+        fileOps["didDelete"]["filters"] = filters;
+        // No `willCreate`/`willRename`/`willDelete`: those are REQUESTS the
+        // client waits on and whose result is a `WorkspaceEdit`. We have no
+        // edit to contribute, and claiming them would make the editor block on
+        // a server that has nothing to say.
+    }
+
     result["serverInfo"]["name"]    = options_.diagnosticSource;
     result["serverInfo"]["version"] = "0.1.0";
     return result.dump();
@@ -354,20 +498,99 @@ void LspServer::handleExit_(Notification const& /*n*/) {
     if (transport_) transport_->close();
 }
 
+LspServer::SchemaResolution
+LspServer::resolveSchemaForUri_(std::string const& uri) {
+    // ── Resolve schema by file extension, with the workspace as tie-breaker ──
+    //
+    // ★★ THE FAILURE ARM USED TO BE EMPTY. This block read
+    //     `if (resolved.has_value()) schema = *resolved;`
+    // and nothing else: a document whose language could not be determined was
+    // opened with a null schema and NO diagnostic, and the parse worker then
+    // published an empty diagnostics array — indistinguishable, in the editor,
+    // from a file with no problems. Both halves of that (the missing tie-break
+    // AND the missing diagnostic) are D-LSP-ASSEMBLY-DIALECT-UNSERVABLE.
+    SchemaResolution out;
+    const auto ext = extensionFromUri(uri);
+    if (ext.empty()) {
+        // Not a resolver failure — there is nothing to resolve. Still a REASON
+        // the document has no language service, so it is still said out loud.
+        out.reason = "no language service for `" + uri
+            + "` — the document URI has no file extension, and the extension is "
+              "what selects a source language";
+        return out;
+    }
+    std::span<std::string const> preferred{};
+    if (workspacePreference_.has_value()) {
+        preferred = workspacePreference_->languages;
+    }
+    auto resolved = schemaCache_.resolveByExtension(ext, preferred);
+    if (resolved.has_value()) {
+        out.schema = *resolved;
+    } else {
+        out.reason = describeUnresolvedSchema(
+            ext, resolved.error(), workspacePreference_);
+    }
+    return out;
+}
+
+bool LspServer::refreshWorkspacePreference_() {
+    // Before `initialize` the held value is the deliberately-distinct "the
+    // client has not sent `initialize` yet" reason. Recomputing would replace it
+    // with "the client named no workspace folder", which is a different claim
+    // and, at that point, an unfounded one.
+    if (!initializeReceived_) return false;
+
+    auto fresh = resolveWorkspaceLanguagePreference(workspaceRoots_);
+    if (fresh == workspacePreference_) return false;
+    workspacePreference_ = std::move(fresh);
+
+    // ★ REPUBLISH, DON'T JUST REMEMBER. Every open document is re-resolved
+    // under the new preference; the ones whose schema (or whose reason for
+    // having none) actually moved are re-parsed, and the parse worker's
+    // `publishDiagnostics_` puts the new answer on the wire. `setSchema`
+    // returns false for a document that did not move, so an unrelated manifest
+    // edit costs no republishes at all.
+    for (auto const& uri : documents_.openUris()) {
+        auto r = resolveSchemaForUri_(uri);
+        if (documents_.setSchema(uri, std::move(r.schema), std::move(r.reason))) {
+            enqueueParse_(uri);
+        }
+    }
+    return true;
+}
+
+void LspServer::handleWorkspaceManifestsMayHaveChanged_(
+    Notification const& /*n*/) {
+    // Params ignored on purpose — see the note on the `Method::Workspace*`
+    // enumerators. Whatever they name, the answer is re-derived by re-reading
+    // the manifests, and a filter here could only make us MISS a change.
+    //
+    // ⚠ `workspace/didChangeWatchedFiles` is handled but NOT registered:
+    // registering a watcher needs `client/registerCapability`, a server→client
+    // REQUEST this protocol layer cannot originate
+    // (D-LSP-NO-OUTBOUND-REQUEST-CHANNEL). Handling it anyway is strictly
+    // better than the alternative, which is what happened before: the
+    // dispatcher's unknown-notification path DROPPED it silently, so a client
+    // that does send one — unprompted, or because a user configured a watcher
+    // in client config — was ignored for no reason.
+    (void)refreshWorkspacePreference_();
+}
+
 void LspServer::handleDidOpen_(Notification const& n) {
     auto params = tryParseParams(n);
     if (!params) return;
     const auto item = parseTextDocumentItem(*params);
     if (item.uri.empty()) return;
 
-    // Resolve schema by file extension.
-    std::shared_ptr<dss::GrammarSchema const> schema;
-    const auto ext = extensionFromUri(item.uri);
-    if (!ext.empty()) {
-        auto resolved = schemaCache_.resolveByExtension(ext);
-        if (resolved.has_value()) schema = *resolved;
-    }
-    documents_.open(item.uri, item.version, item.text, schema);
+    // ★ LOOK BEFORE RESOLVING (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE).
+    // The manifest set may have changed since `initialize`; this document is not
+    // in the store yet, so the refresh's republish sweep cannot touch it and the
+    // resolution below simply uses the up-to-date preference.
+    (void)refreshWorkspacePreference_();
+
+    auto r = resolveSchemaForUri_(item.uri);
+    documents_.open(item.uri, item.version, item.text, std::move(r.schema),
+                    std::move(r.reason));
     enqueueParse_(item.uri);
 }
 
@@ -398,7 +621,25 @@ void LspServer::handleDidClose_(Notification const& n) {
 }
 
 void LspServer::handleDidSave_(Notification const& /*n*/) {
-    // didChange already re-parses on every edit.
+    // The SAVED DOCUMENT needs nothing — `didChange` already re-parsed it on
+    // every edit. What a save additionally means is that the FILESYSTEM moved,
+    // and if what moved was a `*.dss-project.json` the workspace's dialect
+    // preference moved with it.
+    //
+    // ★ THIS IS THE UNIVERSAL HALF OF THE LIVENESS
+    // (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE). The
+    // `workspace.fileOperations` registration advertised in `initialize` is
+    // immediate but partial — it fires only for CLIENT-performed create /
+    // rename / delete, never for a content edit and never for a file `git` or a
+    // terminal wrote. Re-checking on any save (and on any open) covers all of
+    // those, from any source, at the cost of a latency of one user action. It
+    // needs no client capability, no registration, and no outbound request,
+    // which is precisely why it is the load-bearing half.
+    //
+    // Deliberately NOT hung off `didChange`: that arrives per keystroke, and a
+    // directory scan plus a manifest parse per keystroke is a cost the answer
+    // does not justify (a manifest the user has not saved is not yet a fact).
+    (void)refreshWorkspacePreference_();
 }
 
 void LspServer::enqueueParse_(std::string uri) {
@@ -409,7 +650,10 @@ void LspServer::enqueueParse_(std::string uri) {
                        uri    = std::move(uri),
                        snap   = std::move(*snap)]() mutable {
         if (!snap.schema) {
-            // No schema — clear any prior diagnostics.
+            // No schema — clear any prior PARSE diagnostics. The document's
+            // `schemaError` is NOT cleared here and is re-attached by
+            // `publishDiagnostics_`, so this publish carries the reason rather
+            // than an empty array (which reads as "clean" in every editor).
             std::vector<dss::ParseDiagnostic> empty;
             if (documents_.setDiagnostics(uri, snap.parseGeneration,
                                            std::move(empty))) {
@@ -494,6 +738,29 @@ void LspServer::publishDiagnostics_(std::string const& uri) {
     params.version     = snap->clientVersion;
     params.diagnostics = translateDiagnostics(
         std::span<dss::ParseDiagnostic const>{diags}, *src);
+    // ★ THE SCHEMA-LESS DOCUMENT SPEAKS. Emitted on EVERY publish, not just the
+    // first: the reason lives on the document, so an edit that re-publishes an
+    // (still) unresolvable file restates it instead of clearing it. Placed
+    // FIRST so it is what the editor's problem panel shows at the top — it is
+    // the reason the other diagnostics are absent.
+    //
+    // The code is `D_UnknownFileExtension`, REUSED rather than minted: it is
+    // already the compiler's code for "this file's source language cannot be
+    // determined", covering both the zero-claimant and the two-or-more-claimant
+    // shapes, and it is what the driver emits when no `--language` was given
+    // and the target's declared dialect cannot answer either. One code, both
+    // halves of the program, so an editor and a build report the same identity
+    // for the same condition.
+    if (!snap->schemaError.empty()) {
+        Diagnostic d;
+        // Range 0:0–0:0. The condition is a property of the DOCUMENT, not of
+        // any span inside it, and LSP has no document-level diagnostic channel.
+        d.severity = DiagnosticSeverity::Error;
+        d.code     = std::string{dss::diagnosticCodeName(
+            dss::DiagnosticCode::D_UnknownFileExtension)};
+        d.message  = snap->schemaError;
+        params.diagnostics.insert(params.diagnostics.begin(), std::move(d));
+    }
     for (auto& d : params.diagnostics) {
         d.source = options_.diagnosticSource;
     }

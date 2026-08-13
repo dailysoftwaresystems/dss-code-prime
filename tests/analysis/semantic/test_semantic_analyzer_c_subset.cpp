@@ -15881,13 +15881,28 @@ TEST(SemanticAnalyzerCSubset, GnuRestrictSpellingsMatchIsoIncludingWhereRefused)
 }
 
 // (6) THE SIDE EFFECT THAT IS A FEATURE, pinned so it cannot silently regress:
-// `__volatile__` reaching VolatileKeyword means `asmStmt`'s
-// `{optional VolatileKeyword}` slot now accepts `__asm__ __volatile__ ("")` —
-// the form real headers write. That closes the `__volatile__` half of
-// D-CSUBSET-INLINE-ASM-SPELLING. Bare `asm` stays deliberately absent (it is an
-// ordinary identifier in standard C), and the `:` OPERAND LIST is a separate
-// open gap — so the second half of this test pins the RESIDUE as still LOUD,
-// which is what keeps the half-closure from being read as a whole one.
+// `__volatile__` reaching VolatileKeyword means `asmStmt`'s qualifier slot
+// accepts `__asm__ __volatile__ ("")` — the form real headers write. That closes
+// the `__volatile__` half of D-CSUBSET-INLINE-ASM-SPELLING. Bare `asm` stays
+// deliberately absent (it is an ordinary identifier in standard C), and the `:`
+// OPERAND LIST is a separate open gap — so the second half of this test pins the
+// RESIDUE as still LOUD, which is what keeps the half-closure from being read as
+// a whole one.
+//
+// ★★ THE INTENT OF THE SECOND HALF IS UNCHANGED — THE TIER IT MEASURES MOVED,
+// AND THIS PARAGRAPH EXISTS SO THE EDIT IS NOT READ AS A WEAKENING (updated
+// 2026-08-12, inline-asm P1). It used to assert `countBuilderErrors(*cu) > 0`,
+// i.e. "the `rdtsc` shape produces a PARSE error". P1 moved the refusal from the
+// parse tier to the SEMANTIC tier BY DESIGN: `asmStmt` now admits the full GNU
+// extended form (`asm.lang.json`, reached through `languageReferences`) precisely so
+// the compiler can say WHICH construct it cannot support instead of dying at the
+// first `:` — the parse error was measured to never recover, burying every later
+// error in the file. So the PARSE count is now legitimately 0, and reading that
+// 0 as "it still fails loud" would be exactly the accept-and-ignore this test was
+// written to forbid. The assertion below is therefore STRICTER, not looser: it
+// no longer accepts "some parse error, any number of them", it demands EXACTLY
+// ONE diagnostic and demands it be `S_InlineAsmExtendedUnsupported`. A silent
+// acceptance still fails this test — at the tier where the refusal now lives.
 TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingReachesInlineAsmQualifierSlot) {
     for (std::string_view qual : {"volatile", "__volatile__", "__volatile"}) {
         auto cu = buildShippedUnit(
@@ -15899,20 +15914,466 @@ TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingReachesInlineAsmQualifierSlot) 
             << qual << ": the empty-template barrier must be accepted with "
                        "this qualifier spelling";
     }
-    // THE RESIDUE, still loud: sqlite's src/hwtime.h:43 shape. The SPELLING now
-    // passes and the `:` operand list does not, so this must still be refused —
-    // at the COLON. A green here would mean operand lists were silently
-    // accepted and dropped, which is a miscompile, not progress.
+    // THE RESIDUE, still loud: sqlite's src/hwtime.h:43 shape. The SPELLING
+    // passes and the OPERAND LIST is still refused — now as one precise SEMANTIC
+    // diagnostic instead of an unrecovered parse cascade. A green here would mean
+    // operand lists were silently accepted and dropped, which is a miscompile,
+    // not progress.
     auto cu = buildShippedUnit("c-subset", {
         "unsigned long long hw(void){ unsigned int lo, hi;\n"
         "  __asm__ __volatile__ (\"rdtsc\" : \"=a\" (lo), \"=d\" (hi));\n"
         "  return (unsigned long long)hi << 32 | lo; }\n",
     });
-    EXPECT_GT(countBuilderErrors(*cu), 0u)
+    EXPECT_EQ(countBuilderErrors(*cu), 0u)
+        << "P1 admits the extended form at the PARSE tier on purpose — a parse "
+           "error here would be the pre-P1 unrecovered cascade coming back";
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u)
         << "GNU EXTENDED inline asm (a `:` operand list) is a separate OPEN gap "
            "(D-CSUBSET-INLINE-ASM-OPERANDS / "
            "D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED). It must still fail "
-           "LOUD — the `__volatile__` row moves this failure from the spelling "
-           "to the colon, it does not close it, and sqlite's --scanstatus stays "
+           "LOUD — the `__volatile__` row moved this failure from the spelling to "
+           "the operand list, it did not close it, and sqlite's --scanstatus stays "
            "off until it does";
+    EXPECT_EQ(model.diagnostics().all().size(), 1u)
+        << "and it must cost EXACTLY that one message — no cascade, no second "
+           "opinion about the same statement";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// inline-asm P1 (D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): the accept /
+// refuse PARITY surface, and the headline "one diagnostic, parser recovers"
+// property. The asm grammar itself lives in `src/dss-config/sources/asm.lang.json`
+// and reaches c-subset through `languageReferences`; these pins are written
+// against the OBSERVABLE behaviour (diagnostic code + count + message content +
+// which symbols survived), never against a rule name, so moving a rule between
+// the two documents cannot silently break or silently satisfy them.
+//
+// ★ WHY MESSAGE CONTENT IS ASSERTED AND NOT JUST THE CODE. P1's stated bonus is
+// that it INVENTORIES the constraint strings it refuses — that inventory is the
+// data phase P5 needs to scope real operand binding, and it is emitted only from
+// the extended-asm path. A count-only pin stays green if the inventory silently
+// stops being gathered; asserting the quoted text keeps the payload walk honest.
+namespace {
+// The `actual` text of the FIRST diagnostic carrying `code`, or "" when the code
+// is absent. Content assertions read through this so a missing code fails with a
+// readable empty string rather than an out-of-range index.
+[[nodiscard]] std::string
+firstMessageWithCode(DiagnosticReporter const& r, DiagnosticCode code) {
+    for (auto const& d : r.all())
+        if (d.code == code) return d.actual;
+    return {};
+}
+// The whole reporter's text, for a failure message that has to explain a COUNT.
+[[nodiscard]] std::string allMessages(DiagnosticReporter const& r) {
+    std::string out;
+    for (auto const& d : r.all()) {
+        out += "\n      [";
+        out += diagnosticCodeName(d.code);
+        out += "] ";
+        out += d.actual;
+    }
+    return out.empty() ? std::string{"<none>"} : out;
+}
+} // namespace
+
+// ★★ THE HEADLINE PIN: sqlite `src/hwtime.h`'s `rdtsc` shape costs EXACTLY ONE
+// diagnostic, AND the four functions written after it are REALLY PARSED.
+//
+// ✔MEASURED pre-P1 (recorded in asm.lang.json's `asmStmt` $comment): the first `:`
+// produced P_UnexpectedToken and the parser NEVER RECOVERED — it consumed the
+// rest of the translation unit inside an unterminated paren scope, so the error
+// count scaled with FILE LENGTH (53 diagnostics for this very file shape). The
+// invariant P1 buys is not "fewer messages", it is that the count does NOT move
+// with what follows the asm statement.
+//
+// ★★ THE SECOND HALF IS THE LOAD-BEARING ONE, AND IT IS WHY THIS TEST NAMES
+// FUNCTIONS INSTEAD OF COUNTING SILENCE. "No further diagnostics" is satisfied
+// by a parser that silently EATS the remainder of the file — the exact pre-P1
+// failure, minus its error messages, which would be strictly worse than what it
+// replaced. So recovery is asserted POSITIVELY: each of the four trailing
+// functions must exist as a Function symbol BY NAME, and each must have minted
+// its own body-local variable BY NAME, which a recovery that resynchronised at
+// top level but skipped the bodies could not produce.
+TEST(SemanticAnalyzerCSubset, InlineAsmExtendedRefusalCostsOneDiagnosticAndParserRecovers) {
+    auto cu = buildShippedUnit("c-subset", {
+        "unsigned long long hw(void){ unsigned int lo, hi;\n"
+        "  __asm__ __volatile__ (\"rdtsc\" : \"=a\" (lo), \"=d\" (hi));\n"
+        "  return (unsigned long long)hi << 32 | lo; }\n"
+        "int afterOne(int a){ int localOne = a + 1; return localOne; }\n"
+        "int afterTwo(int a){ int localTwo = a + 2; return localTwo; }\n"
+        "int afterThree(int a){ int localThree = a + 3; return localThree; }\n"
+        "int afterFour(int a){ int localFour = a + 4; return localFour; }\n"
+        "int main(void){ return afterOne(1)+afterTwo(2)+afterThree(3)+afterFour(4); }\n",
+    });
+    // (a) the PARSE tier is silent — P1 admits the construct so it can refuse it
+    //     precisely. A parse error here is the unrecovered cascade returning.
+    EXPECT_EQ(countBuilderErrors(*cu), 0u)
+        << "the extended form must PARSE; the refusal is semantic";
+
+    auto model = analyze(cu);
+
+    // (b) EXACTLY ONE diagnostic in the whole unit, and it is the right one.
+    // ⚠ NOT `ASSERT_EQ` ON THE COUNT, AND THAT IS DELIBERATE. An ASSERT here
+    // returns from the test, so a mutation that broke the COUNT would abort
+    // before half (d) below ever ran — and (d) is the load-bearing half. The
+    // red-on-disable harness measured exactly that: the pre-P1 grammar mutant
+    // reproduced the historical 53 parse errors and the test stopped at this
+    // line, leaving the recovery assertions unexercised and therefore unproven.
+    // Every half is an EXPECT so one broken property cannot mask another; the
+    // only guard that must not proceed is the [0] indexing, which is why the
+    // code is asserted through `countCode` instead of through a subscript.
+    EXPECT_EQ(model.diagnostics().all().size(), 1u)
+        << "a construct the compiler cannot support must cost exactly ONE "
+           "message, and that count must not scale with the four functions "
+           "written after it (the pre-P1 cascade produced 53 for this shape). "
+           "Got: " << allMessages(model.diagnostics());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u)
+        << "and it must be the extended-asm refusal specifically. Got: "
+        << allMessages(model.diagnostics());
+
+    // (c) the message INVENTORIES the constraint strings it refused. P1 quotes
+    //     text it does not interpret; that inventory is what P5 scopes against.
+    //     Asserting content rather than a count is what keeps the payload walk
+    //     (decodeShallowestStrings over the outputs list) from silently dying.
+    std::string const msg = firstMessageWithCode(
+        model.diagnostics(), DiagnosticCode::S_InlineAsmExtendedUnsupported);
+    EXPECT_NE(msg.find("outputs: \"=a\", \"=d\""), std::string::npos)
+        << "the refusal must quote the ACTUAL constraint strings, in source "
+           "order, labelled by role — got: " << msg;
+
+    // (d) ★ RECOVERY, ASSERTED POSITIVELY AND BY EXACT NAME. Both the function
+    //     and a variable declared INSIDE its body: the pair distinguishes "the
+    //     parser resynchronised and read the whole file" from "it resynchronised
+    //     at top level and skipped every body".
+    for (auto const& [fn, local] :
+         std::initializer_list<std::pair<char const*, char const*>>{
+             {"afterOne", "localOne"}, {"afterTwo", "localTwo"},
+             {"afterThree", "localThree"}, {"afterFour", "localFour"}}) {
+        SymbolRecord const* f = findSym(model, fn);
+        EXPECT_NE(f, nullptr) << fn << " was not parsed at all — the asm "
+                                 "statement swallowed the rest of the file";
+        if (f != nullptr) EXPECT_EQ(f->kind, DeclarationKind::Function) << fn;
+        SymbolRecord const* v = findSym(model, local);
+        EXPECT_NE(v, nullptr) << local << ": " << fn << "'s BODY was not parsed "
+                                 "— recovery resynchronised at top level only";
+        if (v != nullptr) EXPECT_EQ(v->kind, DeclarationKind::Variable) << local;
+    }
+    // `main` and the asm-carrying function itself round out the file.
+    EXPECT_NE(findSym(model, "main"), nullptr);
+    EXPECT_NE(findSym(model, "hw"), nullptr);
+}
+
+// ── ACCEPT parity: the section-bearing-but-EMPTY forms ─────────────────────
+// ✔MEASURED 2026-08-12 on gcc/clang: every form below is not merely accepted but
+// RUN — they are ordinary empty optimizer barriers that happen to be written
+// with separators. An empty section produces NO list node (each payload rule is
+// non-nullable), so "section present" and "payload present" are different
+// questions and only the second one refuses. Refusing these would be the TF-C77
+// failure mode: a gate that rejects code every real toolchain compiles.
+// ⚠ `("" :: )` and `("" ::: )` arrive as the FUSED `ColonColonOp` token by
+// maximal munch, so this group also covers the fused tail rules, not just the
+// plain ones.
+// ★★ EACH ACCEPTED FORM CARRIES A POSITIVE ANCHOR, AND WITHOUT ONE THIS TEST IS
+// SATISFIED BY THE GATE NEVER RUNNING. `diagnostics().all().size() == 0` is a
+// pure absence claim: it stays green if the inline-asm tier stops visiting the
+// asm statement entirely, if the semantic facet vanishes from the config, or if
+// these forms stop reaching the analyzer at all — i.e. through exactly the
+// regressions that would silently accept an asm nobody checked. So every form is
+// ALSO fed with a NON-EMPTY template, which must land on
+// S_InlineAsmNonEmptyTemplate exactly once. Read as a pair: the gate DOES look at
+// this shape (the mutant refuses), and looking at it, it says nothing (the
+// original is clean). Neither half is the property on its own.
+TEST(SemanticAnalyzerCSubset, InlineAsmEmptySectionFormsAreAccepted) {
+    for (std::string_view form : {"(\"\")", "(\"\" : : )", "(\"\" : : : )",
+                                  "(\"\" :: )", "(\"\" ::: )"}) {
+        auto cu = buildShippedUnit(
+            "c-subset",
+            {"int main(void){ __asm__ " + std::string(form) + "; return 0; }\n"});
+        EXPECT_EQ(countBuilderErrors(*cu), 0u) << form << ": must PARSE";
+        auto model = analyze(cu);
+        EXPECT_EQ(model.diagnostics().all().size(), 0u)
+            << form << ": accepted by gcc and clang and RUN — DSS must emit "
+                       "nothing at all. Got: " << allMessages(model.diagnostics());
+
+        // THE ANCHOR: the SAME shape with a non-empty template. One character of
+        // payload is the whole difference, so a refusal here proves the gate
+        // reaches this exact form.
+        std::string mutant{form};
+        mutant.replace(mutant.find("\"\""), 2, "\"hlt\"");
+        auto mutCu = buildShippedUnit(
+            "c-subset",
+            {"int main(void){ __asm__ " + mutant + "; return 0; }\n"});
+        EXPECT_EQ(countBuilderErrors(*mutCu), 0u) << mutant << ": must PARSE";
+        auto mutModel = analyze(mutCu);
+        EXPECT_EQ(countCode(mutModel.diagnostics(),
+                            DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u)
+            << mutant << ": the inline-asm gate must VISIT this shape — "
+                         "otherwise the zero-diagnostic assertion above is "
+                         "satisfied by nothing running. Got: "
+            << allMessages(mutModel.diagnostics());
+    }
+    // The GNU dunder qualifier spelling on the same accepted shape.
+    auto cu = buildShippedUnit(
+        "c-subset", {"int main(void){ __asm__ __volatile__ (\"\"); return 0; }\n"});
+    EXPECT_EQ(countBuilderErrors(*cu), 0u);
+    auto model = analyze(cu);
+    EXPECT_EQ(model.diagnostics().all().size(), 0u)
+        << "`__asm__ __volatile__ (\"\")` is the form real headers write. Got: "
+        << allMessages(model.diagnostics());
+    // ...and its anchor, for the same reason.
+    auto dunderMut = buildShippedUnit(
+        "c-subset",
+        {"int main(void){ __asm__ __volatile__ (\"hlt\"); return 0; }\n"});
+    EXPECT_EQ(countBuilderErrors(*dunderMut), 0u);
+    auto dunderModel = analyze(dunderMut);
+    EXPECT_EQ(countCode(dunderModel.diagnostics(),
+                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u)
+        << "the dunder-qualifier shape must reach the gate too. Got: "
+        << allMessages(dunderModel.diagnostics());
+}
+
+// ── REJECT parity (1): a label section without `goto` ──────────────────────
+// ✔MEASURED 2026-08-12: gcc 13.3.0, clang 18.1.3 and clang 19.1.1 all reject
+// these. It is a CONSTRAINT VIOLATION, not a not-yet-supported deferral — still
+// ill-formed after P5 lands — which is why it has its own code AHEAD of
+// S_InlineAsmExtendedUnsupported and must not degrade into it.
+// ★★ FOUR SPELLINGS, THREE TOKEN ROUTES — AND THE ROUTE IS MEASURED HERE, NOT
+// DESCRIBED IN PROSE. An earlier revision of this comment claimed "the three
+// spellings reach the fourth section by three different token routes (all-fused,
+// plain+fused, fused+fused), so each exercises a different tail rule". ✔MEASURED
+// FALSE 2026-08-12: `("" ::::)` and `("" :: ::)` are the SAME token pair
+// (`::`, `::`) — whitespace BETWEEN two fused pairs is lexically irrelevant, so
+// those two share ONE route — and the loop was missing the ALL-PLAIN form
+// altogether, which is the only spelling that reaches `asmLabelsTail` unfused.
+// Two routes claimed as three, with the third one absent: [[D-CONFIG-COMMENT-
+// CLAIM-ROT]] in test prose. The four forms and their routes now are
+//     ("" ::::)      ::  ::         asmInputsTailFused → asmLabelsTailFused
+//     ("" :: ::)     ::  ::         the SAME route — kept as the WHITESPACE
+//                                   CONTROL, the pair that proves the fusion is
+//                                   lexical rather than written-form
+//     ("" : : ::)    :  :  ::       asmInputsTail      → asmLabelsTailFused
+//     ("" : : : : )  :  :  :  :     asmInputsTail      → asmLabelsTail
+// and each row's route is CHECKED AGAINST THE CST below, so the claim cannot rot
+// again: a tokenizer or grammar change that re-routes a form goes red here
+// rather than quietly making a sentence false.
+// ⓘ ON THE ADDED ALL-PLAIN FORM AND THE REFERENCE COMPILERS: the ✔MEASURED note
+// above is over the CONSTRAINT — a fourth section with no `goto` — not over a
+// spelling, and the all-plain form violates exactly that constraint. Its DSS
+// behaviour is measured right here; no new gcc/clang run is claimed for it.
+TEST(SemanticAnalyzerCSubset, InlineAsmLabelSectionWithoutGotoIsRefused) {
+    struct Form {
+        char const* text;
+        bool        inputsFused;   // the SECOND section was reached by a `::`
+        bool        labelsFused;   // the FOURTH section was reached by a `::`
+    };
+    for (auto const& form : std::initializer_list<Form>{
+             {"(\"\" ::::)",     true,  true},
+             {"(\"\" :: ::)",    true,  true},
+             {"(\"\" : : ::)",   false, true},
+             {"(\"\" : : : : )", false, false}}) {
+        auto cu = buildShippedUnit(
+            "c-subset",
+            {"int main(void){ __asm__ " + std::string(form.text) + "; return 0; }\n"});
+        EXPECT_EQ(countBuilderErrors(*cu), 0u) << form.text << ": must PARSE";
+
+        // THE ROUTE, off the CST. `asmInputsTail`/`asmLabelsTail` are opened by
+        // a PLAIN separator; their `…Fused` siblings are the sections a single
+        // `::` jumped into. Which of each pair minted a node IS the route.
+        Tree const& tree = cu->trees()[0];
+        RuleId const inputsPlainRule = tree.schema().rules().find("asmInputsTail");
+        RuleId const inputsFusedRule = tree.schema().rules().find("asmInputsTailFused");
+        RuleId const labelsPlainRule = tree.schema().rules().find("asmLabelsTail");
+        RuleId const labelsFusedRule = tree.schema().rules().find("asmLabelsTailFused");
+        ASSERT_TRUE(inputsPlainRule.valid() && inputsFusedRule.valid()
+                    && labelsPlainRule.valid() && labelsFusedRule.valid())
+            << "the four tail rules must reach c-subset through asm's "
+               "languageReferences merge — without them this measurement is "
+               "vacuous rather than false";
+        bool sawInputsPlain = false, sawInputsFused = false;
+        bool sawLabelsPlain = false, sawLabelsFused = false;
+        walkPreOrder(tree, [&](TreeCursor const& cursor) {
+            NodeId const n = cursor.current();
+            if (tree.kind(n) != NodeKind::Internal) return;
+            auto const r = tree.rule(n).v;
+            if (r == inputsPlainRule.v) sawInputsPlain = true;
+            if (r == inputsFusedRule.v) sawInputsFused = true;
+            if (r == labelsPlainRule.v) sawLabelsPlain = true;
+            if (r == labelsFusedRule.v) sawLabelsFused = true;
+        });
+        EXPECT_EQ(sawInputsFused,  form.inputsFused)
+            << form.text << ": inputs boundary took the wrong arm";
+        EXPECT_EQ(sawInputsPlain, !form.inputsFused)
+            << form.text << ": inputs boundary took the wrong arm";
+        EXPECT_EQ(sawLabelsFused,  form.labelsFused)
+            << form.text << ": labels boundary took the wrong arm — the "
+                            "all-plain form is the ONLY one that may reach "
+                            "asmLabelsTail unfused";
+        EXPECT_EQ(sawLabelsPlain, !form.labelsFused)
+            << form.text << ": labels boundary took the wrong arm";
+
+        auto model = analyze(cu);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto), 1u)
+            << form.text << ": a fourth `:` group without `goto` is ill-formed "
+                            "in gcc, clang and MSVC alike. Got: "
+            << allMessages(model.diagnostics());
+        EXPECT_EQ(model.diagnostics().all().size(), 1u)
+            << form.text << ": exactly one message — it must NOT also report "
+                            "the generic extended-asm deferral for the same "
+                            "statement";
+    }
+    // NEGATIVE CONTROL — without it the three assertions above are satisfiable by
+    // a gate that fires on any asm at all. `asm goto` with the SAME fourth
+    // section and a real label is NOT a constraint violation: it is a supported-
+    // in-principle construct DSS has not implemented, so it must land on the
+    // OTHER code, and the message must inventory the label and the qualifier.
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ __asm__ goto (\"\" : : : : lbl); lbl: return 0; }\n"});
+    EXPECT_EQ(countBuilderErrors(*cu), 0u);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto), 0u)
+        << "WITH `goto` the label section is legal — reporting the constraint "
+           "violation here would refuse valid C";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u);
+    std::string const msg = firstMessageWithCode(
+        model.diagnostics(), DiagnosticCode::S_InlineAsmExtendedUnsupported);
+    EXPECT_NE(msg.find("labels: lbl"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("qualifier: goto"), std::string::npos) << msg;
+}
+
+// ── REJECT parity (2): a duplicated qualifier, BY KIND not by spelling ─────
+// ✔MEASURED 2026-08-12: gcc, clang and MSVC all reject a repeated qualifier.
+// ★ THE SECOND AND THIRD CASES ARE THE INTERESTING ONES. `volatile __volatile__`
+// is two DIFFERENT SPELLINGS of ONE qualifier — DSS's keyword table aliases the
+// dunder form onto `VolatileKeyword` — so a spelling-based duplicate check would
+// accept it. The message additionally ECHOES THE SOURCE TEXT of the offending
+// token, so the reader sees what they wrote rather than a canonicalised form;
+// that content assertion is what distinguishes "detected by kind" from "detected
+// by kind and then reported as the wrong word".
+TEST(SemanticAnalyzerCSubset, InlineAsmDuplicateQualifierIsRefusedByKindNotSpelling) {
+    for (auto const& [quals, echoed] :
+         std::initializer_list<std::pair<char const*, char const*>>{
+             {"volatile volatile", "volatile"},
+             {"volatile __volatile__", "__volatile__"},
+             {"__volatile__ volatile", "volatile"}}) {
+        auto cu = buildShippedUnit(
+            "c-subset", {"int main(void){ __asm__ " + std::string(quals) +
+                         " (\"\"); return 0; }\n"});
+        EXPECT_EQ(countBuilderErrors(*cu), 0u) << quals << ": must PARSE";
+        auto model = analyze(cu);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_InlineAsmDuplicateQualifier), 1u)
+            << quals << ": a repeated qualifier is rejected by gcc, clang and "
+                        "MSVC alike — and `volatile __volatile__` IS repeated, "
+                        "because the two spellings are one qualifier. Got: "
+            << allMessages(model.diagnostics());
+        EXPECT_EQ(model.diagnostics().all().size(), 1u)
+            << quals << ": exactly one message";
+        std::string const msg = firstMessageWithCode(
+            model.diagnostics(), DiagnosticCode::S_InlineAsmDuplicateQualifier);
+        EXPECT_NE(msg.find(std::string{"`"} + echoed + "`"), std::string::npos)
+            << quals << ": the message must echo the SECOND occurrence's own "
+                        "source text, got: " << msg;
+    }
+    // NEGATIVE CONTROL: two DIFFERENT qualifiers are not a duplicate. Without
+    // this, a check that fired on "two qualifier tokens" would pass above.
+    //
+    // ★★ AND IT CARRIES A POSITIVE ANCHOR, WHICH IT DID NOT BEFORE. Asserting
+    // ONLY `countBuilderErrors == 0` and `DuplicateQualifier == 0` is satisfied
+    // by a qualifier scan that NEVER RAN — on this statement, on this shape, or
+    // at all. "The duplicate check did not misfire" and "the duplicate check
+    // exists" are different claims and the absence assertion is only the first.
+    // Its twin thirty lines up (the `asm goto` control in
+    // `InlineAsmLabelSectionWithoutGotoIsRefused`) gets this right by pinning
+    // the OTHER code positively, and this one now does the same: the statement
+    // has a fourth section and a `goto`, so it MUST land on
+    // S_InlineAsmExtendedUnsupported exactly once, with the label inventoried.
+    // If the inline-asm tier ever stops visiting this shape, that arm goes red
+    // where the two zeros below would stay green.
+    auto cu = buildShippedUnit(
+        "c-subset", {"int main(void){ __asm__ goto volatile (\"\" : : : : l); "
+                     "l: return 0; }\n"});
+    EXPECT_EQ(countBuilderErrors(*cu), 0u);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmDuplicateQualifier), 0u)
+        << "`goto volatile` is two distinct qualifiers in a free-order run — "
+           "not a duplicate. Got: " << allMessages(model.diagnostics());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u)
+        << "the POSITIVE anchor: this statement IS refused, by the extended-asm "
+           "code, exactly once — without it the two zeros above are satisfied "
+           "by a qualifier scan that never ran. Got: "
+        << allMessages(model.diagnostics());
+    EXPECT_EQ(model.diagnostics().all().size(), 1u)
+        << "exactly one message. Got: " << allMessages(model.diagnostics());
+    std::string const ctrlMsg = firstMessageWithCode(
+        model.diagnostics(), DiagnosticCode::S_InlineAsmExtendedUnsupported);
+    EXPECT_NE(ctrlMsg.find("labels: l"), std::string::npos)
+        << "the refusal must inventory the goto label — got: " << ctrlMsg;
+}
+
+// ── REJECT parity (3): the cycle-1 non-empty-template refusal is UNCHANGED ──
+// P1 widened what PARSES without widening what LOWERS. `("hlt")` carries real
+// per-target instructions; lowering it to a no-op barrier would DELETE them.
+// This pins that P1's new gates did not shadow the older one — a bare non-empty
+// template has no sections, so it must fall through gates (1) and (2) into (3).
+TEST(SemanticAnalyzerCSubset, InlineAsmNonEmptyTemplateStillRefusedUnderP1) {
+    auto cu = buildShippedUnit(
+        "c-subset", {"int main(void){ __asm__ (\"hlt\"); return 0; }\n"});
+    EXPECT_EQ(countBuilderErrors(*cu), 0u);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u)
+        << "real asm TEXT is still a per-target deferral "
+           "(D-CSUBSET-INLINE-ASM-TEXT). Got: "
+        << allMessages(model.diagnostics());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 0u)
+        << "a sectionless statement is not EXTENDED asm — the two refusals must "
+           "not collapse into each other";
+    EXPECT_EQ(model.diagnostics().all().size(), 1u);
+}
+
+// ── ★ THE QUALIFIER SCAN'S BOUND: it stops at the template ─────────────────
+// This pins a REAL BOUND in the implementation, and the bound is load-bearing
+// rather than an optimisation. A qualifier is a plain keyword token, and an
+// operand EXPRESSION may legitimately contain the same keyword —
+// `"r"(*(volatile int*)&p)` is real code. An UNBOUNDED "is there a second
+// `volatile` token under this asm statement" scan would see the cast's
+// `volatile` and report a duplicate qualifier: i.e. REFUSE VALID C, which is
+// strictly worse than the silence it replaced. The scan therefore stops at the
+// template node and never enters a section, and this test is what holds it there.
+//
+// The statement is still refused — it has an INPUT operand — but by the
+// extended-asm code, exactly once, and the message must inventory `"r"`.
+TEST(SemanticAnalyzerCSubset, InlineAsmQualifierScanStopsAtTemplateAndIgnoresOperandKeywords) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ int p = 0;\n"
+        "  __asm__ (\"\" : : \"r\"(*(volatile int*)&p));\n"
+        "  return 0; }\n"});
+    EXPECT_EQ(countBuilderErrors(*cu), 0u);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmDuplicateQualifier), 0u)
+        << "the `volatile` inside the operand's CAST is not a qualifier of the "
+           "asm statement — an unbounded qualifier scan would refuse valid C "
+           "here. Got: " << allMessages(model.diagnostics());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u);
+    EXPECT_EQ(model.diagnostics().all().size(), 1u)
+        << "exactly one message. Got: " << allMessages(model.diagnostics());
+    std::string const msg = firstMessageWithCode(
+        model.diagnostics(), DiagnosticCode::S_InlineAsmExtendedUnsupported);
+    EXPECT_NE(msg.find("inputs: \"r\""), std::string::npos)
+        << "the operand must still be inventoried under the INPUTS role — got: "
+        << msg;
+    // The `volatile` cast must not be mistaken for a clobber or an output either.
+    EXPECT_EQ(msg.find("outputs:"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("clobbers:"), std::string::npos) << msg;
 }

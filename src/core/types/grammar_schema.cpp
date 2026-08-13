@@ -182,6 +182,10 @@ bool GrammarSchema::isEmptySpace(SchemaTokenId id) const noexcept {
     return d_.emptySpaceTokens.contains(id.v);
 }
 
+bool GrammarSchema::declaresLexemeToken(SchemaTokenId id) const noexcept {
+    return d_.declaredLexemeTokens.contains(id.v);
+}
+
 NodeFlags GrammarSchema::flagsForKind(SchemaTokenId id) const noexcept {
     // No schema field populates per-kind flags today, so every kind
     // returns None. The accessor is the structural channel the
@@ -554,12 +558,29 @@ NumberStyle const* GrammarSchema::numberStyle() const noexcept {
     return d_.numberStyle.has_value() ? &(*d_.numberStyle) : nullptr;
 }
 
+IdentifierClass const& GrammarSchema::identifierClass() const noexcept {
+    return d_.identifierClass;
+}
+
 SemanticConfig const& GrammarSchema::semantics() const noexcept {
     return d_.semantics;
 }
 
 HirLoweringConfig const& GrammarSchema::hirLowering() const noexcept {
     return d_.hirLowering;
+}
+
+PipelineEntryConfig const& GrammarSchema::pipelineEntry() const noexcept {
+    return d_.pipelineEntry;
+}
+
+AssemblyConfig const& GrammarSchema::assembly() const noexcept {
+    return d_.assembly;
+}
+
+std::span<ConfigDiagnostic const>
+GrammarSchema::loadDiagnostics() const noexcept {
+    return d_.loadDiagnostics;
 }
 
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,

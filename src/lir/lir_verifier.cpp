@@ -70,6 +70,123 @@ void checkMemOperandPairing(Lir const& lir, TargetSchema const& sch,
     }
 }
 
+// Rule 1b (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED): a terminator writes
+// its CFG edges down TWICE and nothing cross-checked the two channels.
+//
+// ★★★ WHY TWO CHANNELS EXIST AT ALL, because "then delete one" is the obvious
+// wrong answer. The block's recorded successor list (`blockSuccessors`) is the
+// CFG: liveness, `simplifyCfg`, the `.dsslir` terminator dispatch and every
+// walk read it, and it must stay a first-class edge set that survives a pass
+// rebuilding the instruction. The BlockRef OPERANDS are the ENCODER's input:
+// `x86_variable.cpp` takes a branch's displacement from `srcOp.blockSlot`, and
+// a `cond-br` additionally uses operand[1] to emit the trailing unconditional
+// jump, so the operand list is what turns into bytes. Both are load-bearing;
+// what was missing is the rule that they say the SAME THING.
+//
+// ★★ AND THE RULE ASSERTS PRESENCE, NOT MERELY AGREEMENT. The defect that minted
+// it was a SILENT DROP — the `.dsslir` reader filtered every BlockRef out of a
+// `cond-br`'s operand list, so a lowered `jcc` came back with two successors and
+// ZERO operands. An agreement-only rule ("if it has refs they must match") is
+// vacuously satisfied by exactly that state, which is how the drop survived a
+// verifier, two round-trip tests and three comments. So for the kinds whose
+// successors RIDE their operands, an absence is a violation.
+//
+// ⚠ THE CLASSIFICATION IS A TOTAL SWITCH ON `TargetTerminatorKind` WITH NO
+// `default:` — a new enumerator is a COMPILE error here rather than a silently
+// unchecked terminator shape, the same totality discipline `parseInst`'s
+// dispatch uses. It is schema VOCABULARY (a closed enum every `.target.json`
+// declares into), never an arch / format / language identity: no arm asks which
+// CPU or which object format this is.
+void checkTerminatorBlockRefsMatchSuccessors(Lir const& lir,
+                                             TargetSchema const& sch,
+                                             DiagnosticReporter& reporter) {
+    std::size_t const fnCount = lir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const bb = lir.funcBlockAt(fn, bi);
+            std::uint32_t const n = lir.blockInstCount(bb);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                LirInstId const inst = lir.blockInstAt(bb, i);
+                auto const* info = sch.opcodeInfo(lir.instOpcode(inst));
+                if (info == nullptr || !info->isTerminator()) continue;
+
+                // Does this terminator kind carry its successor list on its own
+                // operands? `Br`/`CondBr` do (the encoder reads them). `Return`
+                // and `Unreachable` have NO successors, so "carries them" is the
+                // assertion that they carry no BlockRef at all — the same rule,
+                // not an exemption. `Switch` is reserved-unbuilt and
+                // `IndirectBr` carries only its address register (its variadic
+                // address-taken edges ride the successor list alone), so for
+                // those the operands are OPTIONAL and only their CONTENT is
+                // checked.
+                bool refsRequired = false;
+                switch (info->terminatorKind) {
+                    case TargetTerminatorKind::Br:
+                    case TargetTerminatorKind::CondBr:
+                    case TargetTerminatorKind::Return:
+                    case TargetTerminatorKind::Unreachable:
+                        refsRequired = true;
+                        break;
+                    case TargetTerminatorKind::Switch:
+                    case TargetTerminatorKind::IndirectBr:
+                        refsRequired = false;
+                        break;
+                    case TargetTerminatorKind::None:
+                        // Unreachable by construction: `isTerminator()` IS
+                        // `terminatorKind != None`, and the `continue` above
+                        // already took every non-terminator. Enumerated so the
+                        // switch stays total.
+                        continue;
+                }
+
+                std::vector<std::uint32_t> refs;
+                for (auto const& o : lir.instOperands(inst)) {
+                    if (o.kind == LirOperandKind::BlockRef) {
+                        refs.push_back(o.blockSlot);
+                    }
+                }
+                auto const succs = lir.blockSuccessors(bb);
+                if (refs.empty() && !refsRequired) continue;
+
+                bool same = (refs.size() == succs.size());
+                for (std::size_t k = 0; same && k < refs.size(); ++k) {
+                    same = (refs[k] == succs[k].v);
+                }
+                if (same) continue;
+
+                std::string refText;
+                for (std::uint32_t r : refs) {
+                    if (!refText.empty()) refText += ", ";
+                    refText += std::format("^{}", r);
+                }
+                std::string succText;
+                for (LirBlockId s : succs) {
+                    if (!succText.empty()) succText += ", ";
+                    succText += std::format("^{}", s.v);
+                }
+                report(reporter, std::format(
+                    "LirVerifier: terminator inst {} ('{}', {}) declares "
+                    "successors [{}] but its BlockRef operands are [{}] — the "
+                    "CFG edge list and the operand list the ENCODER turns into "
+                    "branch displacements must name the same blocks in the same "
+                    "order{}",
+                    inst.v, info->mnemonic,
+                    targetTerminatorKindName(info->terminatorKind),
+                    succText.empty() ? "" : succText,
+                    refText.empty() ? "" : refText,
+                    refs.empty()
+                        ? ". The operand list is EMPTY: the branch has no target "
+                          "to encode, which is what a dropped-operand round trip "
+                          "looks like"
+                        : ""),
+                    DiagnosticCode::L_TerminatorSuccessorMismatch);
+            }
+        }
+    }
+}
+
 // Look up the source MIR inst for a LIR inst via the `lirToMirMap`.
 // Returns `InvalidMirInst` (default-constructed) when:
 //   - the LIR inst id is past the map's range (defensive; means the
@@ -235,6 +352,7 @@ LirVerifyResult verifyLir(Lir const&                  lir,
                           DiagnosticReporter&         reporter) {
     auto const baseline = reporter.errorCount();
     checkMemOperandPairing(lir, schema, reporter);
+    checkTerminatorBlockRefsMatchSuccessors(lir, schema, reporter);
     checkStoreRegClassMatchesMirType(lir, mir, interner, schema, lirToMirMap, reporter);
     checkVregClassMatchesMirType(lir, mir, interner, lirToMirMap, reporter);
     checkIntrinsicCallResultValidity(lir, mir, interner, schema, lirToMirMap, reporter);
@@ -303,11 +421,17 @@ bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
 bool verifyLirText(Lir const& lir, TargetSchema const& schema,
                    DiagnosticReporter& reporter) {
     auto const baseline = reporter.errorCount();
-    // Currently the only LIR-only rule; future LIR-only rules added
-    // to `verifyLir` should join here too. The text-load path has no
-    // MIR cross-reference (the source MIR isn't part of `.dsslir`),
-    // so MIR-dependent rules (2–4) are deliberately not invoked.
+    // The LIR-only rules; future LIR-only rules added to `verifyLir` should
+    // join here too. The text-load path has no MIR cross-reference (the source
+    // MIR isn't part of `.dsslir`), so MIR-dependent rules (2–4) are
+    // deliberately not invoked.
+    // ★ Rule 1b matters MOST on this path (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-
+    // DROPPED): the text reader is the one producer that ever built a
+    // terminator whose two CFG channels disagreed, and it did so silently with
+    // `ok == true`. A rule that runs only where the bug cannot occur is not a
+    // net.
     checkMemOperandPairing(lir, schema, reporter);
+    checkTerminatorBlockRefsMatchSuccessors(lir, schema, reporter);
     return reporter.errorCount() == baseline;
 }
 

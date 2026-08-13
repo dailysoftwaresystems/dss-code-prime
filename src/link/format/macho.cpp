@@ -3,6 +3,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
+#include "link/format/dwarf_cfi.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
@@ -98,6 +99,15 @@ constexpr std::size_t kSection64Size      = 80;
 constexpr std::size_t kSymtabCommandSize  = 24;
 constexpr std::size_t kNlist64Size        = 16;
 constexpr std::size_t kRelocationInfoSize = 8;
+// The address width of the 64-bit Mach-O wire format, in bytes — the
+// same `64` the `k*64Size` record sizes above are named for. Deliberately
+// NOT spelled `kGotSlotSize` (which happens to hold the same 8): one says
+// "how wide is an address in this file format", the other "how big is a
+// __got entry", and a use site that folded them would read as if the GOT
+// governed DWARF record padding. Consumed by the `__eh_frame` builder
+// (CIE/FDE records pad to the address size) and as that section's
+// alignment.
+constexpr std::uint32_t kMachO64AddressSize = 8;
 
 // ── Fixed-width name field (16 chars, NUL-padded) ──────────────
 
@@ -435,6 +445,46 @@ machoStubSizeFor(std::uint32_t cputype) noexcept {
 commandSizeWithPath(std::size_t fixedSize, std::string const& path) {
     std::size_t const raw = fixedSize + path.size() + 1;
     return (raw + kLoadCmdAlign - 1) & ~(kLoadCmdAlign - 1);
+}
+
+// ── `section_64.align` is a LOG2 EXPONENT, and the schema is RAW BYTES ──
+//
+// D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD.
+// ✔MEASURED 2026-08-13: `__text`'s `section_64.align` was written from the
+// schema row VERBATIM at all three writer arms, while `__const` / `__data` /
+// `__got` / `__thread_*` / `__bss` all convert with `std::countr_zero`. The
+// two arms disagreed about what the field MEANS, and the schemas had been
+// edited to match each arm locally:
+//   * the MH_OBJECT rows carried `addrAlign: 4` with a `$comment` declaring
+//     it "log2 form" — verbatim gave align 4 = 16 bytes, CORRECT;
+//   * the exec/dylib rows carried `addrAlign: 16` with a `$comment` saying
+//     "log2 not used here" — verbatim gave align 16 = **2^16 = 64 KiB**,
+//     a claim no DSS image can honour and no other section makes.
+// One schema key had two meanings, which is the drift shape the bar names:
+// a fact with an owner does not get a second owner. `addrAlign` is RAW BYTES
+// everywhere now (its name, its ELF `sh_addralign` twin, and every other
+// Mach-O row already said so), and every writer converts HERE.
+//
+// The pow2 check is not defensive padding: a non-power-of-two alignment has
+// no log2, and `countr_zero` would silently emit a WRONG exponent — 24 would
+// become 3 (8 bytes), a quieter and more damaging answer than a refusal. The
+// data sections already carry this belt; `__text` never did.
+[[nodiscard]] inline bool
+sectionAlignLog2(std::uint64_t rawAlign, std::string_view writerName,
+                 std::string_view sectionLabel, DiagnosticReporter& reporter,
+                 std::uint32_t& out) {
+    if (rawAlign == 0 || !std::has_single_bit(rawAlign)) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("{}: {} section alignment {} is not a power of two - "
+                         "section_64.align is a LOG2 exponent, so there is no "
+                         "value to write; the schema row's addrAlign must be a "
+                         "power-of-two BYTE COUNT "
+                         "(D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD)",
+                         writerName, sectionLabel, rawAlign));
+        return false;
+    }
+    out = static_cast<std::uint32_t>(std::countr_zero(rawAlign));
+    return true;
 }
 
 // ULEB128 encoder (used by the bind-opcode stream emitter).
@@ -853,9 +903,9 @@ encode(AssembledModule const&    module,
     // substrate (`exec_data_section.hpp`) — the SAME helper the ELF ET_REL /
     // exec arms use, so per-item validation + byte layout + the H1 section-
     // align raise stay single-sourced. Floors are the schema rows' addrAlign
-    // in RAW BYTES (the exec-schema data-row convention; the rows' $comments
-    // pin it — the .o `__text` row alone is literal log2, written verbatim
-    // below, unchanged). `data` + `relro` ALLOW item relocations (the c145
+    // in RAW BYTES — EVERY row of EVERY Mach-O schema, since
+    // D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD retired the `.o`
+    // `__text` row's log2 exception; `sectionAlignLog2` does the conversion. `data` + `relro` ALLOW item relocations (the c145
     // analog: the writer emits their relocation_info tables below); a
     // reloc-bearing `rodata` item stays fail-loud (allow=false — the
     // RodataDataItemWithRelocationFailsLoud discipline), and `bss` items
@@ -944,6 +994,15 @@ encode(AssembledModule const&    module,
     if (hasData && !dataAlignIsPow2(dataLayout, "data")) return {};
     if (hasRelRo && !dataAlignIsPow2(relroLayout, "relro")) return {};
     if (hasBss && !dataAlignIsPow2(bssLayout, "bss")) return {};
+    // `__text` gets the SAME belt the four data sections have had all along —
+    // it is the one section that never did, which is why its schema row could
+    // drift into log2 and stay drifted.
+    // D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD.
+    std::uint32_t textAlignLog2 = 0;
+    if (!sectionAlignLog2(secText->addrAlign, "macho::encode (MH_OBJECT)",
+                          "text", reporter, textAlignLog2)) {
+        return {};
+    }
 
     // ── Build .text + per-function symbols ─────────────────────
     std::vector<std::uint8_t> textBody;
@@ -1609,7 +1668,11 @@ encode(AssembledModule const&    module,
     appendU64LE(bytes, 0);  // addr (flat space starts at __text)
     appendU64LE(bytes, textRawSize);  // size
     appendU32LE(bytes, static_cast<std::uint32_t>(textRawOffset));
-    appendU32LE(bytes, static_cast<std::uint32_t>(secText->addrAlign));
+    // `section_64.align` = log2(addrAlign). ld64 HONOURS this field when it
+    // places a `.o`'s `__text` in the output, so a wrong exponent here is a
+    // real layout defect, not a cosmetic one.
+    // D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD.
+    appendU32LE(bytes, textAlignLog2);
     appendU32LE(bytes, static_cast<std::uint32_t>(textRelocOffset));
     appendU32LE(bytes, textRelocCount);
     appendU32LE(bytes, secText->type);  // section flags from JSON
@@ -1761,6 +1824,14 @@ encodeExec(AssembledModule const&    module,
            DiagnosticReporter&       reporter) {
     auto const& id = fmt.macho();
     auto const& im = fmt.machoImage();
+    // `section_64.align` is a log2 exponent; the schema row is raw bytes.
+    // Resolved once, up front, so the refusal fires before any layout work.
+    // D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD.
+    std::uint32_t textAlignLog2 = 0;
+    if (!sectionAlignLog2(secText.addrAlign, "macho::encodeExec", "text",
+                          reporter, textAlignLog2)) {
+        return {};
+    }
 
     // ── (a) Build .text body + per-function start map ─────────
     std::vector<std::uint8_t> textBody;
@@ -2057,7 +2128,11 @@ encodeExec(AssembledModule const&    module,
     appendU64LE(bytes, sectionVa);
     appendU64LE(bytes, textFileSize);      // size
     appendU32LE(bytes, static_cast<std::uint32_t>(textFileOff));
-    appendU32LE(bytes, static_cast<std::uint32_t>(secText.addrAlign));
+    // log2(addrAlign), NOT the raw byte count. ✔MEASURED 2026-08-13: this
+    // site wrote the schema's raw 16 into a LOG2 field, so every static
+    // Mach-O image shipped `__text` claiming 2^16 = 64 KiB alignment.
+    // D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD.
+    appendU32LE(bytes, textAlignLog2);
     appendU32LE(bytes, 0);                 // reloff (no .o-style relocs)
     appendU32LE(bytes, 0);                 // nreloc
     appendU32LE(bytes, secText.type);      // flags from JSON
@@ -2195,6 +2270,14 @@ encodeExecDynamic(AssembledModule const&    module,
                   DiagnosticReporter&       reporter) {
     auto const& id = fmt.macho();
     auto const& im = fmt.machoImage();
+    // `section_64.align` is a log2 exponent; the schema row is raw bytes.
+    // Resolved once, up front, so the refusal fires before any layout work.
+    // D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD.
+    std::uint32_t textAlignLog2 = 0;
+    if (!sectionAlignLog2(secText.addrAlign, "macho::encodeExecDynamic",
+                          "text", reporter, textAlignLog2)) {
+        return {};
+    }
     // c153 (D-LK3-3): the MH_DYLIB arm rides THIS dynamic substrate
     // with schema-keyed divergences (filetype is closed-enum schema
     // data — the elf.cpp `isDyn` precedent, never a format-name
@@ -2386,6 +2469,64 @@ encodeExecDynamic(AssembledModule const&    module,
              "contributed zero bytes — `__text` is empty.");
         return {};
     }
+
+    // ── (c.5) __TEXT,__eh_frame — the DWARF call-frame table ─────
+    //
+    // D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO, Mach-O half.
+    // Without this section nothing can walk a DSS stack frame: a
+    // debugger, a profiler and a C++ `throw` all read the same CIE/FDE
+    // chain, and its absence is invisible until one of them silently
+    // stops at the first DSS frame.
+    //
+    // ★ BUILT HERE, not down in the layout block, for TWO reasons:
+    //   * the section's SIZE feeds `sizeofcmds` (one more 80-byte
+    //     `section_64`) AND the __TEXT VA chain that `gotVaStart`
+    //     below is measured from — and `gotVaStart` binds every extern
+    //     DATA import's `symbolVa` BEFORE the relocation kernel runs;
+    //   * the size is knowable now. `initial_location` is a pcrel
+    //     sdata4 PLACEHOLDER of fixed width, patched post-layout by
+    //     `applyEhFramePcRel`, so no byte count depends on the layout
+    //     the byte count feeds. There is no circularity to break.
+    //
+    // The register numbering is a per-target psABI table read off the
+    // target schema — never the hardware encoding, which names a
+    // DIFFERENT register and yields a table a debugger follows into the
+    // wrong frame. `buildEhFrame` REFUSES (with the diagnostic) rather
+    // than guess, so a nullopt here fails the encode with no second
+    // message.
+    //
+    // A function whose `cfi` is nullopt contributes no FDE. That is the
+    // shared builder's own contract (its input is a span of OPTIONALs),
+    // and it is the right answer for the two producers that legitimately
+    // have no frame to describe: the linker-synthesized entry
+    // trampoline — the OUTERMOST frame, which gcc/clang likewise give no
+    // FDE — and, today, assembly-source functions
+    // (D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED, whose fix is upstream of
+    // every writer).
+    // ★ CALLED UNCONDITIONALLY. `buildEhFrame` decides BOTH "is there
+    //   anything to describe" and "can this target name the registers a
+    //   rule needs", in that order — a module with no frame information
+    //   links clean on a target that declares no DWARF numbering, while a
+    //   module that HAS frame information refuses. Re-deciding the first
+    //   half here would put a second home under a fact the builder owns,
+    //   and it is a fact both format writers must agree on.
+    std::vector<std::optional<CfiFunction>> perFuncCfi;
+    perFuncCfi.reserve(module.functions.size());
+    for (auto const& fn : module.functions) perFuncCfi.push_back(fn.cfi);
+    auto ehFrameOpt = link::format::buildEhFrame(
+        perFuncCfi, link::format::dwarfRegisterMappingOf(targetSchema),
+        kMachO64AddressSize, reporter);
+    // Already reported by the builder, naming the register it could not
+    // describe — a second diagnostic here would only dilute it. Never
+    // continue without the table: an image that silently ships without
+    // the unwind information it was asked to write is the defect.
+    if (!ehFrameOpt.has_value()) return {};
+    link::format::EhFrameSection& ehFrame = *ehFrameOpt;
+    // ★ EMPTY means "nothing to describe" — emit NO section at all rather
+    // than a zero-size `__eh_frame`, which would advertise an unwind table
+    // that describes nothing.
+    bool const hasEhFrame = !ehFrame.bytes.empty();
+    std::uint64_t const ehFrameSize = ehFrame.bytes.size();
 
     // ── (d) Resolve entry function index — shared resolver
     // (D-LK10-ENTRY Slice C audit fold). A DYLIB has no entry: no
@@ -2829,10 +2970,26 @@ encodeExecDynamic(AssembledModule const&    module,
     // __DATA_CONST.vmaddr (page boundary) — the __got section begins here;
     // the LATE layout (below) recomputes gotVa via file-offset deltas and
     // asserts congruence with this early value.
-    std::uint64_t const gotVaStart =
-        alignUp((hasConst ? constSectionVa + constSize
-                          : stubsVa + stubsBytes),
-                kPageSize);
+    // __TEXT,__eh_frame's EARLY VA — the `stubsVa`-anchored chain
+    // `constSectionVa` walks, extended one link (__text → __stubs →
+    // __const → __eh_frame). Computed HERE, not only in the LATE layout,
+    // because `gotVaStart` right below is measured from the END of
+    // __TEXT and binds every extern DATA import's `symbolVa` before the
+    // relocation kernel runs: a section appended to __TEXT without
+    // extending this chain would slide __DATA_CONST past the address the
+    // relocations already resolved against. The LATE layout recomputes
+    // the same VA from file offsets and asserts congruence.
+    std::uint64_t const ehFrameSectionVa =
+        hasEhFrame
+            ? alignUp(hasConst ? constSectionVa + constSize
+                               : stubsVa + stubsBytes,
+                      kMachO64AddressSize)
+            : 0;
+    std::uint64_t const textEndVaEarly =
+        hasEhFrame ? ehFrameSectionVa + ehFrameSize
+        : hasConst ? constSectionVa + constSize
+                   : stubsVa + stubsBytes;
+    std::uint64_t const gotVaStart = alignUp(textEndVaEarly, kPageSize);
     std::uint64_t const dataConstEndVaEarly =
         gotVaStart + gotBytesEarly;             // + __got contents
     // D-LK-EXTERN-DATA-IMPORT (c117): bind each extern-DATA symbol to its
@@ -3660,21 +3817,37 @@ encodeExecDynamic(AssembledModule const&    module,
     // ── (l) Layout: compute file offsets for everything ─────────
     //
     // Layout order:
-    //   header + load commands + pad → __text → __stubs → __got
-    //   (__got page-aligned, in __DATA_CONST) → pad → __LINKEDIT
-    //   (bind opcodes → indirect symtab → nlist → strtab)
+    //   header + load commands + pad → __text → __stubs → [__const] →
+    //   [__eh_frame] (all four in __TEXT) → __got (page-aligned, in
+    //   __DATA_CONST) → pad → __LINKEDIT (bind opcodes → indirect
+    //   symtab → nlist → strtab)
 
     constexpr std::size_t kSegCmdPageZeroSize = kSegmentCommand64Size;
     // __TEXT carries __text + __stubs, plus __const when data globals
-    // are present (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). One extra 80-byte
+    // are present (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror)
+    // and __eh_frame when any function carries CFI. Each extra 80-byte
     // section_64 grows `sizeofcmds` → `headerAndCmds` →
     // `textFileOff = alignUp(headerAndCmds, kPageSize)`. The full
     // load-command region is well under one page (~840 bytes for the
-    // arm64 corpus + 80 = ~920 ≪ 0x4000 segmentPageSize), so
+    // arm64 corpus + 160 = ~1000 ≪ 0x4000 segmentPageSize), so
     // `textFileOff` stays 0x4000 and `__text.virtualAddress`
-    // congruence (the guard at the top of this function) still holds.
+    // congruence (`textSegmentVaMatchesFileOff` below) still holds —
+    // and fails LOUD, never silently, if a future section ever pushes
+    // the load commands past the page.
+    //
+    // ★ COUNTED, not hand-maintained. This was a literal (`hasConst ?
+    //   3u : 2u`) that had to be edited in lockstep with the emission
+    //   loop below; the __DATA sibling (`dataSegNsects`) has always
+    //   derived its count from the same predicates it emits on, and
+    //   that is the shape that survives the NEXT section. The one
+    //   count now feeds both `kSegCmdTextSize` and the emitted
+    //   `nsects` field, so the two cannot disagree.
+    std::uint32_t const textSegNsects =
+        2u                              // __text + __stubs (always)
+        + (hasConst ? 1u : 0u)
+        + (hasEhFrame ? 1u : 0u);
     std::size_t const kSegCmdTextSize =
-        kSegmentCommand64Size + kSection64Size * (hasConst ? 3u : 2u);
+        kSegmentCommand64Size + kSection64Size * textSegNsects;
     constexpr std::size_t kSegCmdDataConstSize =
         kSegmentCommand64Size + kSection64Size;      // __got
     // __DATA segment (D-LK4-DATA-PRODUCER + TLS C4) — one LC_SEGMENT_64 + a
@@ -3814,13 +3987,54 @@ encodeExecDynamic(AssembledModule const&    module,
         return {};
     }
 
+    // __TEXT,__eh_frame file offset — address-aligned above __const
+    // (or above __stubs when the module has no read-only data), the
+    // LAST section in __TEXT. It carries the SAME file/VA congruence
+    // obligation `__const` does, and for a sharper reason: its FDEs'
+    // `initial_location` fields are PC-RELATIVE, computed below from
+    // `ehFrameSectionVa`. A desynced VA does not fail to load — it
+    // produces a table whose every entry points a fixed distance away
+    // from the function it claims to describe, which an unwinder
+    // follows without complaint. Assert the two independent
+    // derivations (the EARLY VA chain, the LATE file chain) agree.
+    std::uint64_t const ehFrameFileOff =
+        hasEhFrame ? alignUp(constEnd, kMachO64AddressSize) : constEnd;
+    std::uint64_t const ehFrameEnd =
+        hasEhFrame ? (ehFrameFileOff + ehFrameSize) : constEnd;
+    if (hasEhFrame
+     && ehFrameSectionVa != sectionVa + (ehFrameFileOff - textFileOff)) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: __eh_frame file/VA "
+                         "congruence broken — ehFrameSectionVa(0x{:x}) != "
+                         "sectionVa(0x{:x}) + (ehFrameFileOff(0x{:x}) - "
+                         "textFileOff(0x{:x})). The __TEXT segment requires "
+                         "the on-disk __eh_frame-from-__text offset to equal "
+                         "the VA offset; the FDE initial_location fields are "
+                         "computed from the VA, so a desync would emit an "
+                         "unwind table that silently describes the wrong "
+                         "addresses "
+                         "(D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO).",
+                         ehFrameSectionVa, sectionVa, ehFrameFileOff,
+                         textFileOff));
+        return {};
+    }
+    // Post-layout patch: every FDE's `initial_location` is a pcrel
+    // sdata4 to its function, unknowable until the section has a VA.
+    // `funcVa(i) = sectionVa + funcTextStart[i]` is the SAME expression
+    // the nlist_64 records use for a defined function's `n_value` — one
+    // statement of where function `i` lives, read by both.
+    if (hasEhFrame) {
+        link::format::applyEhFramePcRel(
+            ehFrame, ehFrameSectionVa,
+            [&](std::size_t i) { return sectionVa + funcTextStart[i]; });
+    }
+
     // __got lives in __DATA_CONST — separate segment, separate page.
     // dyld maps each segment independently. Place __got's file
-    // offset on a page boundary above __const (when present) / __stubs
-    // (and above the header/cmds region in VA via __DATA_CONST.vmaddr).
-    std::uint64_t const gotFileOff =
-        alignUp(hasConst ? constEnd : (stubsFileOff + stubsFileSize),
-                kPageSize);
+    // offset on a page boundary above the END of __TEXT (`ehFrameEnd`
+    // collapses to `constEnd`, and `constEnd` to the __stubs end, when
+    // those sections are absent).
+    std::uint64_t const gotFileOff = alignUp(ehFrameEnd, kPageSize);
     std::uint64_t const gotFileSize =
         static_cast<std::uint64_t>(numExterns) * kGotSlotSize;
     // gotVa derives from the file-offset delta because __TEXT.fileoff
@@ -3835,6 +4049,29 @@ encodeExecDynamic(AssembledModule const&    module,
     // segment-anchored form (code-architect MEDIUM, LK6 cycle 2c).
     std::uint64_t const gotVa =
         sectionVa + (gotFileOff - textFileOff);
+    // ★ EARLY/LATE __got congruence. `gotVaStart` (computed from the
+    // __TEXT VA chain, far above) is what every extern DATA import's
+    // `symbolVa` was bound to BEFORE the relocation kernel ran, and what
+    // the EARLY __DATA VAs are measured from; `gotVa` (computed from the
+    // file chain, here) is what the __DATA_CONST segment record and the
+    // stub→slot arithmetic actually use. Nothing compared them: the
+    // __DATA sibling check below catches a divergence only for a module
+    // that HAS writable globals, so an image whose only data is an
+    // extern import (`extern FILE* stdout;` and nothing else) would ship
+    // with every data-import load pointed at the wrong page — a
+    // wrong-address read, not a crash at link. Fail loud instead.
+    if (gotVaStart != gotVa) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: __got VA congruence "
+                         "broken — the EARLY VA chain says 0x{:x} but the "
+                         "LATE file chain says 0x{:x}. Every extern DATA "
+                         "import's symbolVa, and the EARLY __DATA VAs, were "
+                         "resolved against the EARLY value; a section added "
+                         "to __TEXT without extending the EARLY chain "
+                         "produces exactly this divergence.",
+                         gotVaStart, gotVa));
+        return {};
+    }
 
     // __DATA segment (D-LK4-DATA-PRODUCER) — writable (rw-), placed on a page
     // boundary after __DATA_CONST (the GOT). Holds __data (file-backed, mutable
@@ -4174,12 +4411,12 @@ encodeExecDynamic(AssembledModule const&    module,
         return {};
     }
     // The __TEXT segment covers __text + __stubs, plus __const when
-    // present (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). `constEnd` already
-    // equals `stubsFileOff + stubsFileSize` on the no-data path, so
-    // this is byte-identical when hasConst is false.
-    std::uint64_t const textSegCoveredEnd = hasConst
-        ? constEnd
-        : (stubsFileOff + stubsFileSize);
+    // present (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror) and
+    // __eh_frame when the module carries CFI. `ehFrameEnd` already
+    // collapses to `constEnd`, and `constEnd` to `stubsFileOff +
+    // stubsFileSize`, on the absent paths — so this is byte-identical
+    // when neither section is present.
+    std::uint64_t const textSegCoveredEnd = ehFrameEnd;
     std::uint64_t const textSegVmsize =
         alignUp(textSegCoveredEnd - textFileOff + textSecOffsetInSeg,
                 kPageSize);
@@ -4273,7 +4510,8 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU64LE(bytes, textSegFileSize);
     appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRx));
     appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRx));
-    appendU32LE(bytes, hasConst ? 3u : 2u);   // nsects
+    appendU32LE(bytes, textSegNsects);        // nsects (same count that
+                                              // sized kSegCmdTextSize)
     appendU32LE(bytes, 0);
 
     // section_64 __text
@@ -4282,7 +4520,11 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU64LE(bytes, sectionVa);
     appendU64LE(bytes, textFileSize);
     appendU32LE(bytes, static_cast<std::uint32_t>(textFileOff));
-    appendU32LE(bytes, static_cast<std::uint32_t>(secText.addrAlign));
+    // log2(addrAlign) — see the MH_OBJECT site. This arm ships every
+    // dynamic exe and every dylib DSS produces, so the 2^16 claim was on
+    // every Mach-O artifact in the tree.
+    // D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD.
+    appendU32LE(bytes, textAlignLog2);
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
     appendU32LE(bytes, secText.type);
@@ -4319,6 +4561,45 @@ encodeExecDynamic(AssembledModule const&    module,
         appendU32LE(bytes, static_cast<std::uint32_t>(constFileOff));
         appendU32LE(bytes, static_cast<std::uint32_t>(
                                std::countr_zero(constLayout.maxAlign)));
+        appendU32LE(bytes, 0);                 // reloff
+        appendU32LE(bytes, 0);                 // nreloc
+        appendU32LE(bytes, 0);                 // flags = S_REGULAR
+        appendU32LE(bytes, 0);                 // reserved1
+        appendU32LE(bytes, 0);                 // reserved2
+        appendU32LE(bytes, 0);                 // reserved3
+    }
+
+    // section_64 __eh_frame — the DWARF CIE/FDE chain, LAST in __TEXT
+    // (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO).
+    //
+    // ★ WRITER-OWNED, exactly like __stubs and __got: the name, segment
+    //   and flags are this writer's statement about a table it
+    //   synthesized, not a schema row describing where the module's own
+    //   content goes. Adding it to `sections[]` would ask every format
+    //   JSON to declare a section no producer ever fills, and it would
+    //   perturb the `segIdxDataConst` / `segIdxData` cross-checks; the
+    //   ld64 convention puts it in __TEXT for exactly the same reason
+    //   __stubs is there (read-only, mapped with the code it describes).
+    //
+    // flags = 0 (S_REGULAR, no attributes). ld64 marks `.o` input
+    // sections S_COALESCED so the STATIC LINKER can drop duplicate CIEs
+    // arriving from many translation units; this writer emits ONE
+    // section from ONE module into a FULLY LINKED image, where there is
+    // nothing left to coalesce and the attribute would be a request
+    // aimed at a link step that already happened. Not
+    // S_ATTR_PURE_INSTRUCTIONS either — these are data bytes that merely
+    // live in an executable segment.
+    //
+    // `align` is a LOG2 EXPONENT in section_64 (the same convention
+    // __got's 3 and __const's countr_zero use), so log2(8) = 3.
+    if (hasEhFrame) {
+        appendName16(bytes, "__eh_frame");
+        appendName16(bytes, "__TEXT");
+        appendU64LE(bytes, ehFrameSectionVa);
+        appendU64LE(bytes, ehFrameSize);
+        appendU32LE(bytes, static_cast<std::uint32_t>(ehFrameFileOff));
+        appendU32LE(bytes, static_cast<std::uint32_t>(
+                               std::countr_zero(kMachO64AddressSize)));
         appendU32LE(bytes, 0);                 // reloff
         appendU32LE(bytes, 0);                 // nreloc
         appendU32LE(bytes, 0);                 // flags = S_REGULAR
@@ -4712,6 +4993,16 @@ encodeExecDynamic(AssembledModule const&    module,
         while (bytes.size() < constFileOff) bytes.push_back(0);
         bytes.insert(bytes.end(), constLayout.bytes.begin(),
                      constLayout.bytes.end());
+    }
+
+    // __TEXT,__eh_frame body — the CIE + FDE chain, with every FDE's
+    // `initial_location` already patched to its function by
+    // `applyEhFramePcRel` up in the layout block. No-op when no function
+    // carries CFI (the section is not emitted at all).
+    if (hasEhFrame) {
+        while (bytes.size() < ehFrameFileOff) bytes.push_back(0);
+        bytes.insert(bytes.end(), ehFrame.bytes.begin(),
+                     ehFrame.bytes.end());
     }
 
     // Pad to gotFileOff (separate page from __TEXT)

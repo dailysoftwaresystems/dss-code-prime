@@ -717,14 +717,14 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
 // pre-fold unified helper passed `0` for the unused arm, which would
 // have dispatched to the schema's invalid-sentinel opcode if the sign
 // ever flipped). One helper, one operation, no sentinel arm.
-void emitSpAdjust(LirBuilder& b, std::uint16_t op, LirReg sp,
-                  std::uint32_t bytes) {
-    if (bytes == 0) return;
+LirInstId emitSpAdjust(LirBuilder& b, std::uint16_t op, LirReg sp,
+                       std::uint32_t bytes) {
+    if (bytes == 0) return InvalidLirInst;
     std::array<LirOperand, 2> ops{
         LirOperand::makeReg(sp),
         LirOperand::makeImmInt32(static_cast<std::int32_t>(bytes))
     };
-    b.addInst(op, sp, ops);
+    return b.addInst(op, sp, ops);
 }
 
 // D-CSUBSET-VLA (C1b): emit `sp_copy dst, src` — the SP register move the
@@ -733,9 +733,9 @@ void emitSpAdjust(LirBuilder& b, std::uint16_t op, LirReg sp,
 // the fixed-frame base), and (at MIR->LIR) the VLA-base capture base<-SP. `dst` is
 // the result, `src` the single source operand. The op is hasSideEffects=true (it
 // reads/writes the physical SP) so no pass drops or reorders it.
-void emitSpCopy(LirBuilder& b, std::uint16_t op, LirReg dst, LirReg src) {
+LirInstId emitSpCopy(LirBuilder& b, std::uint16_t op, LirReg dst, LirReg src) {
     std::array<LirOperand, 1> ops{LirOperand::makeReg(src)};
-    b.addInst(op, dst, ops);
+    return b.addInst(op, dst, ops);
 }
 
 // D-WIN64-LARGE-FRAME-STACK-PROBE: emit the `stack_probe` virtual op —
@@ -749,14 +749,14 @@ void emitSpCopy(LirBuilder& b, std::uint16_t op, LirReg dst, LirReg src) {
 // op's result is `none` — like a bare `sub SP,F`, it mutates SP in place
 // and exposes no SSA value; SP is a fixed physical reg the encoder reads
 // from operand 0.
-void emitStackProbe(LirBuilder& b, std::uint16_t op, LirReg sp,
-                    std::uint32_t frameBytes, std::uint32_t pageBytes) {
+LirInstId emitStackProbe(LirBuilder& b, std::uint16_t op, LirReg sp,
+                         std::uint32_t frameBytes, std::uint32_t pageBytes) {
     std::array<LirOperand, 3> ops{
         LirOperand::makeReg(sp),
         LirOperand::makeImmInt32(static_cast<std::int32_t>(frameBytes)),
         LirOperand::makeImmInt32(static_cast<std::int32_t>(pageBytes))
     };
-    b.addInst(op, InvalidLirReg, ops);
+    return b.addInst(op, InvalidLirReg, ops);
 }
 
 // D-ASM-AARCH64-LARGE-FRAME-IMM12 (chokepoint selection): pick the frame
@@ -822,17 +822,17 @@ selectFrameMemOp(std::uint16_t baseOp, std::uint16_t universalGprOp,
 // selectFrameMemOp). Threading them through the ONE store chokepoint covers
 // every frame-store caller (saved-reg, spill, va-spill, by-value copy) by
 // construction.
-void emitFrameStore(LirBuilder& b, std::uint16_t storeOp, LirReg value,
-                    LirReg sp, std::int32_t offset,
-                    std::uint16_t universalStore = 0, std::uint16_t storeU = 0) {
+LirInstId emitFrameStore(LirBuilder& b, std::uint16_t storeOp, LirReg value,
+                         LirReg sp, std::int32_t offset,
+                         std::uint16_t universalStore = 0, std::uint16_t storeU = 0) {
     std::array<LirOperand, 4> ops{
         LirOperand::makeReg(value),
         LirOperand::makeReg(sp),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(offset)
     };
-    b.addInst(selectFrameMemOp(storeOp, universalStore, storeU, offset),
-              InvalidLirReg, ops);
+    return b.addInst(selectFrameMemOp(storeOp, universalStore, storeU, offset),
+                     InvalidLirReg, ops);
 }
 
 // Emit `result = load [SP + offset]`. `load` operand layout:
@@ -840,16 +840,16 @@ void emitFrameStore(LirBuilder& b, std::uint16_t storeOp, LirReg value,
 // `universalLoad`/`loadU` are the universal GPR `load` opcode and its scaled-
 // imm12 twin `load_u` (both 0 if none); the chokepoint swaps to `loadU` for
 // an out-of-imm9 GPR-load offset (see selectFrameMemOp).
-void emitFrameLoad(LirBuilder& b, std::uint16_t loadOp, LirReg result,
-                   LirReg sp, std::int32_t offset,
-                   std::uint16_t universalLoad = 0, std::uint16_t loadU = 0) {
+LirInstId emitFrameLoad(LirBuilder& b, std::uint16_t loadOp, LirReg result,
+                        LirReg sp, std::int32_t offset,
+                        std::uint16_t universalLoad = 0, std::uint16_t loadU = 0) {
     std::array<LirOperand, 3> ops{
         LirOperand::makeReg(sp),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(offset)
     };
-    b.addInst(selectFrameMemOp(loadOp, universalLoad, loadU, offset),
-              result, ops);
+    return b.addInst(selectFrameMemOp(loadOp, universalLoad, loadU, offset),
+                     result, ops);
 }
 
 // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): emit
@@ -1037,12 +1037,32 @@ classOpHandle(TargetSchema const&  schema,
     return handle;
 }
 
+// `cfiOut` receives one `LirCfiOp` per frame-affecting instruction this
+// prologue emits, keyed by the `LirInstId` the builder just returned.
+// * THIS IS THE POINT OF THE WHOLE PRODUCER DESIGN. The unwind description is
+//   written HERE, at the emit site, by the one function that KNOWS what it
+//   emitted -- not reconstructed downstream from a frame SHAPE. The old
+//   `FrameUnwindInfo` model forced its consumer (the pe64 `.pdata`/`.xdata`
+//   builder) to re-derive every prologue byte offset by ASSUMING DSS's own
+//   instruction encodings (`sub rsp,imm32` is 7 bytes; a GPR spill store is 8;
+//   an xmm8-15 spill is 9), cross-checked against the real bytes for the FIRST
+//   instruction only. An id the assembler later resolves to a MEASURED byte
+//   offset assumes nothing at all.
 void emitPrologue(LirBuilder& b, FrameLayout const& layout,
                   TargetSchema const& schema,
                   TargetCallingConvention const& cc, LirReg sp,
                   std::uint16_t subOp, std::uint16_t stackProbeOp,
                   std::uint16_t gprStore, std::uint16_t gprStoreU,
+                  std::vector<LirCfiOp>& cfiOut,
                   DiagnosticReporter& reporter, bool& ok) {
+    // The CFA offset once this prologue's SP-adjust has run: what the CALL
+    // itself pushed (`cc.callPushBytes` -- the same field the frame-alignment
+    // rule reads, because the two are consequences of one physical fact) plus
+    // what we just subtracted.
+    std::int64_t const entryCfaOffset =
+        static_cast<std::int64_t>(cc.callPushBytes);
+    std::int64_t const framedCfaOffset =
+        entryCfaOffset + static_cast<std::int64_t>(layout.totalFrameSize);
     // D-WIN64-LARGE-FRAME-STACK-PROBE: when the cc declares a guard-page
     // size (Windows ms_x64 = 4096) AND the frame DESCENDS past one guard
     // page, the single `sub SP, F` would skip the OS guard page and
@@ -1069,10 +1089,22 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
             ok = false;
             return;
         }
-        emitStackProbe(b, stackProbeOp, sp, layout.totalFrameSize,
-                       static_cast<std::uint32_t>(cc.stackProbePageBytes));
+        cfiOut.push_back(LirCfiOp{
+            emitStackProbe(b, stackProbeOp, sp, layout.totalFrameSize,
+                           static_cast<std::uint32_t>(cc.stackProbePageBytes)),
+            CfiOpKind::DefCfaOffset, CfiRegRef{}, CfiRegRef{},
+            framedCfaOffset});
     } else {
-        emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
+        LirInstId const adj = emitSpAdjust(b, subOp, sp, layout.totalFrameSize);
+        // A zero-size frame emits NO instruction (`emitSpAdjust` returns the
+        // invalid id) and therefore no rule change -- the CFA is still the
+        // entry CFA. Recording an op against an instruction that was never
+        // emitted is how a table acquires a PC no execution ever reaches.
+        if (adj != InvalidLirInst) {
+            cfiOut.push_back(LirCfiOp{adj, CfiOpKind::DefCfaOffset,
+                                      CfiRegRef{}, CfiRegRef{},
+                                      framedCfaOffset});
+        }
     }
     // D-ML7-2.2 audit-fold (2026-06-02 silent-failure CRITICAL C1):
     // saved regs sit at [SP + savedRegAreaOffset() + i*slotSize),
@@ -1096,18 +1128,33 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
         // Chokepoint swaps to store_u when a high saved-reg slot exceeds the
         // imm9 reach (gprStore/gprStoreU are the GPR store + its scaled twin;
         // an FPR saved-reg store keeps its class form — selectFrameMemOp gate).
-        emitFrameStore(b, *storeOp, layout.savedRegs[i], sp,
-                       static_cast<std::int32_t>(base + i * layout.slotSize),
-                       gprStore, gprStoreU);
+        std::int32_t const slotOff =
+            static_cast<std::int32_t>(base + i * layout.slotSize);
+        LirInstId const st = emitFrameStore(b, *storeOp, layout.savedRegs[i],
+                                            sp, slotOff, gprStore, gprStoreU);
+        // The slot is at SP_post + slotOff and CFA == SP_post + framedCfaOffset,
+        // so the saved location is CFA + (slotOff - framedCfaOffset) -- negative,
+        // as every unwinder expects for a callee-save below the CFA.
+        cfiOut.push_back(LirCfiOp{
+            st, CfiOpKind::RegAtCfaOffset,
+            CfiRegRef::physical(layout.savedRegs[i].id), CfiRegRef{},
+            static_cast<std::int64_t>(slotOff) - framedCfaOffset});
     }
     ok = true;
 }
 
+// The epilogue half of the same contract. * It is NOT optional detail: after
+// `add sp, F` the CFA is the ENTRY CFA again, and an unwinder that samples a PC
+// in the last instructions of a function without this rule reads the caller's
+// return address `totalFrameSize` bytes away from where it actually is. gcc
+// emits it (`.cfi_def_cfa 7, 8` after the frame teardown) for exactly this
+// reason. A frame SHAPE cannot express it -- there is no PC to hang it on.
 void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
                   TargetSchema const& schema, LirReg sp,
                   std::uint16_t addOp, std::uint16_t gprLoad,
-                  std::uint16_t gprLoadU, DiagnosticReporter& reporter,
-                  bool& ok) {
+                  std::uint16_t gprLoadU, std::int64_t entryCfaOffset,
+                  std::vector<LirCfiOp>& cfiOut,
+                  DiagnosticReporter& reporter, bool& ok) {
     // Reverse the prologue: load saved regs FIRST, then restore SP.
     // Same savedRegAreaOffset() bias as the prologue (mirrored
     // reads — silent miscompile if these diverge).
@@ -1119,11 +1166,21 @@ void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
         if (!loadOp.has_value()) { ok = false; return; }
         // Chokepoint swaps to load_u for a high saved-reg slot (mirrors the
         // prologue store; gprLoad/gprLoadU = GPR load + its scaled twin).
-        emitFrameLoad(b, *loadOp, layout.savedRegs[i], sp,
-                      static_cast<std::int32_t>(base + i * layout.slotSize),
-                      gprLoad, gprLoadU);
+        LirInstId const ld = emitFrameLoad(
+            b, *loadOp, layout.savedRegs[i], sp,
+            static_cast<std::int32_t>(base + i * layout.slotSize),
+            gprLoad, gprLoadU);
+        // Restored: the register holds its entry value again, so revert to this
+        // function's ENTRY rule rather than inventing a fresh one.
+        cfiOut.push_back(LirCfiOp{ld, CfiOpKind::RegRestoreInitial,
+                                  CfiRegRef::physical(layout.savedRegs[i].id),
+                                  CfiRegRef{}, 0});
     }
-    emitSpAdjust(b, addOp, sp, layout.totalFrameSize);
+    LirInstId const adj = emitSpAdjust(b, addOp, sp, layout.totalFrameSize);
+    if (adj != InvalidLirInst) {
+        cfiOut.push_back(LirCfiOp{adj, CfiOpKind::DefCfaOffset, CfiRegRef{},
+                                  CfiRegRef{}, entryCfaOffset});
+    }
     ok = true;
 }
 
@@ -1888,6 +1945,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                    LirFuncAllocation const& alloc,
                    LirBuilder& b, OpcodeHandles const& h,
                    FrameLayout& outLayout,
+                   // The frame-affecting instructions this function emits, in
+                   // emission order, for the pipeline to resolve to byte PCs,
+                   // plus the recorded prologue boundary.
+                   LirFuncCfi& outCfiFn,
                    // c116 H1 (D-WIN64-SEH-FUNCLETS): the FrameLayouts of the
                    // functions materialized BEFORE this one (the funclet is appended
                    // AFTER its parent by the synth pass, so the parent's layout is
@@ -2204,7 +2265,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         if (bi == 0) {
             bool prologueOk = false;
             emitPrologue(b, outLayout, schema, cc, sp, h.sub,
-                         h.stackProbe, h.store, h.storeU, reporter, prologueOk);
+                         h.stackProbe, h.store, h.storeU, outCfiFn.ops, reporter,
+                         prologueOk);
             if (!prologueOk) return false;
             // FC12a/b/c: a function that calls va_start spills its arg registers
             // immediately after the prologue's SP-adjust + saved-reg stores (so the
@@ -2231,8 +2293,21 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                            "target schema declares none (D-CSUBSET-VLA)");
                     return false;
                 }
-                emitSpCopy(b, h.spCopy, fp, sp);   // FP <- SP  (capture FB)
+                // FP <- SP (capture FB). * The CFA rule must MOVE WITH IT: from
+                // here on SP is free to travel (the runtime VLA `sub_sp_reg`),
+                // so an SP-based CFA rule would be wrong at every PC after the
+                // first VLA allocation. The OFFSET is unchanged -- FP now holds
+                // exactly the SP value the offset was computed against -- which
+                // is precisely what `def_cfa_register` means.
+                outCfiFn.ops.push_back(
+                    LirCfiOp{emitSpCopy(b, h.spCopy, fp, sp),
+                             CfiOpKind::DefCfaRegister,
+                             CfiRegRef::physical(fp.id), CfiRegRef{}, 0});
             }
+            // Everything emitted above is prologue. Recorded HERE, where the
+            // fact is known, rather than reconstructed by a consumer.
+            outCfiFn.prologueOpCount =
+                static_cast<std::uint32_t>(outCfiFn.ops.size());
         }
 
         std::uint32_t const instN = src.blockInstCount(srcBlock);
@@ -3773,13 +3848,41 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // epilogue's saved-reg loads to FP — after this move SP == FB is
                     // the right base, AND the frame pointer is itself reloaded there.
                     if (hasVla) {
-                        emitSpCopy(b, h.spCopy, sp, fp);   // SP <- FP  (discard VLA)
+                        // SP <- FP (discard VLA). The CFA base returns to SP,
+                        // which again holds the value the offset is measured
+                        // from -- the exact mirror of the capture above.
+                        outCfiFn.ops.push_back(
+                            LirCfiOp{emitSpCopy(b, h.spCopy, sp, fp),
+                                     CfiOpKind::DefCfaRegister,
+                                     CfiRegRef::physical(sp.id), CfiRegRef{}, 0});
                     }
                     // Emit epilogue BEFORE the return.
+                    std::size_t const cfiMark = outCfiFn.ops.size();
                     bool epilogueOk = false;
                     emitEpilogue(b, outLayout, schema, sp, h.add,
-                                 h.load, h.loadU, reporter, epilogueOk);
+                                 h.load, h.loadU,
+                                 static_cast<std::int64_t>(cc.callPushBytes),
+                                 outCfiFn.ops, reporter, epilogueOk);
                     if (!epilogueOk) return false;
+                    if (outCfiFn.ops.size() > cfiMark) {
+                        // Bracket the teardown: remember the framed rules at
+                        // the epilogue's first PC (the insert lands BEFORE the
+                        // first teardown op at that same PC, so it captures the
+                        // state while the frame is still up), and restore them
+                        // past the `ret` for whatever code follows.
+                        LirCfiOp remember{};
+                        remember.inst = outCfiFn.ops[cfiMark].inst;
+                        remember.kind = CfiOpKind::RememberState;
+                        outCfiFn.ops.insert(
+                            outCfiFn.ops.begin()
+                                + static_cast<std::ptrdiff_t>(cfiMark),
+                            remember);
+                        LirCfiOp restore{};
+                        restore.kind       = CfiOpKind::RestoreState;
+                        restore.block      = dstBlock;
+                        restore.atBlockEnd = true;
+                        outCfiFn.ops.push_back(restore);
+                    }
                 }
                 if (!lir_pass_util::emitTerminator(b, op, info, succs, newOps,
                                                    payload, src.instFlags(inst),
@@ -3951,13 +4054,15 @@ materializeCallingConvention(Lir const&           src,
             perAllocaAligns = it->second;
         }
         bool const isSehParent = sehParentSymbols.contains(rewrittenSymbol);
+        LirFuncCfi funcCfi;
         if (!materializeOneFunc(src, fn, schema, *cc, funcAlloc, b, *opcodes,
-                                layout, out.perFunc, parentLayoutIndex,
+                                layout, funcCfi, out.perFunc, parentLayoutIndex,
                                 maxLocalAlign, perAllocaAligns, isSehParent,
                                 reporter)) {
             return LirCallconvResult{};
         }
         out.perFunc.push_back(std::move(layout));
+        out.perFuncCfi.push_back(std::move(funcCfi));
     }
 
     out.lir = std::move(b).finish();

@@ -4,6 +4,14 @@
 # self-tests for the substrate itself.)
 
 dss_add_test(NAME test_support/test_scratch_dir SOURCES test_scratch_dir.cpp)
+# D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS. `scoped_env.hpp` is the ONE env
+# override, hoisted from five hand-copied versions none of which was ever
+# exercised directly. Its job is RESTORING state, so a wrong restore fails in a
+# LATER, unrelated test in the same binary — the symptom lands arbitrarily far
+# from the cause. The pin that matters most is "absent restores to ABSENT, never
+# to empty": `getenv` returns nullptr vs "", and the construct-to-clear callers
+# exist precisely to tell those apart.
+dss_add_test(NAME test_support/test_scoped_env SOURCES test_scoped_env.cpp)
 # The ONE test-side repo-root resolver. This ordinary entry runs the
 # precedence/validation suite; the `BakedRootOnly.*` suite in the same binary is
 # the out-of-tree regression guard and is EXCLUDED here, because it asserts

@@ -12346,6 +12346,148 @@ TEST(MirLoweringCSubset, InlineAsmEmptyTemplateNoVolatileLowersToCompilerBarrier
     EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::CompilerBarrier), 1);
 }
 
+// ── inline-asm P1 (D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): the N-BARRIER
+//    pin over the SECTION-BEARING but EMPTY forms ────────────────────────────
+// ★★ THIS GUARDS SOMETHING THE RUNNABLE CORPUS EXAMPLE STRUCTURALLY CANNOT SEE,
+// which is the whole reason it is here rather than there. An empty asm barrier
+// is RESULT-NEUTRAL: it emits no instruction and changes no value, so a corpus
+// example containing N of them returns exactly the same exit code whether N, one
+// or ZERO barriers survive. Its own comment says so. The only tier at which
+// "the barrier is still there" is a decidable question is this one.
+//
+// ★ WHY THE SECTION-BEARING FORMS SPECIFICALLY, and why N and not 1. P1 newly
+// ACCEPTS `("" : : )`, `("" ::: )`, `("" :: )` and `("" : : : )` — they carry
+// section separators but no payload, so the semantic gate passes them through to
+// the same empty-template barrier the bare `("")` has always produced. That is a
+// NEW road into the lowering, and nothing else pins it: the pre-existing
+// `InlineAsmEmptyTemplateLowersToCompilerBarrier` above only ever feeds the bare
+// form. A lowering that recognised the bare shape and quietly dropped the
+// sectioned ones would leave that test green, leave the semantic tests green
+// (they assert diagnostics, not codegen), and leave every exit-code arm at 42.
+// Counting N barriers for N statements is what closes it: a per-form drop shows
+// up as a WRONG COUNT, where a one-statement fixture would only catch a total
+// collapse to zero.
+//
+// RED-ON-DISABLE — ⚠ THE CONFIG-ONLY RECIPE THAT USED TO STAND HERE IS DEAD,
+// AND RECORDING THAT IS HALF THE VALUE OF THIS PARAGRAPH. It read: "flip
+// `asm.lang.json`'s `hirLowering.ruleMappings` row for `asmStmt` from the
+// `InlineAsm` HIR kind to `Skip`. The schema still LOADS … the source still
+// parses, every semantic test above stays green, and the barrier count here
+// drops to 0." The middle clause was true when written and is now FALSE:
+// `validateInlineAsmGate` gained clause (c) IN THIS SAME CYCLE — a rule the
+// `semantics.inlineAsm` facet gates MUST reach an `InlineAsm` lowering row — so
+// that edit now fails the LOAD (C_InvalidHirLowering, surfacing through the
+// driver as D_SchemaLoadFailed). Following the dead recipe produces red for the
+// WRONG REASON, and a reader would wrongly conclude this pin was effective.
+// ✔MEASURED, and now STANDING rather than remembered: that exact configuration
+// is pinned by `tests/core/test_language_references.cpp`'s
+// `LanguageReferenceRefusals.InlineAsmFacetWithASkipLoweringRowFailsLoud`, so
+// "the old recipe is a load error" is a test, not a sentence.
+//
+// THE RECIPE THAT REPLACES IT is the SAME disable one tier lower, where clause
+// (c) cannot intercept it — ONE expression in `src/hir/lowering/cst_to_hir.cpp`'s
+// `k == "InlineAsm"` arm: swap `builder.addLeaf(HirKind::InlineAsm)` for
+// `builder.makeBlock({})`, the Skip precedent that file's block-scope-extern arm
+// already uses. ✔MEASURED 2026-08-12 on this build: the schema loads, the source
+// parses, ALL TEN semantic inline-asm tests stay green (semantics runs BEFORE
+// lowering, so it cannot see this), and the barrier count here drops 5 → 0 ⇒
+// RED — together with the two single-form barrier pins above, which is the
+// expected blast radius for a total drop. Deleting the
+// `mir.addInst(MirOpcode::CompilerBarrier, …)` in `hir_to_mir.cpp`'s
+// `case HirKind::InlineAsm:` is the equivalent disable one tier lower again,
+// with the same result.
+TEST(MirLoweringCSubset, InlineAsmEmptySectionFormsEachLowerToOneCompilerBarrier) {
+    // Five statements, five DISTINCT written shapes: plain-separator two- and
+    // three-section forms, both FUSED (`::` is one token by maximal munch) forms,
+    // and the bare form as the in-fixture control that the count is per-statement.
+    static constexpr int kExpectedBarriers = 5;
+    auto L = lowerCSubset(
+        "void f(void){\n"
+        "  __asm__ (\"\" : : );\n"
+        "  __asm__ volatile (\"\" ::: );\n"
+        "  __asm__ (\"\" :: );\n"
+        "  __asm__ __volatile__ (\"\" : : : );\n"
+        "  __asm__ (\"\");\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    ASSERT_FALSE(L.model.hasErrors())
+        << "every form here is ACCEPTED by gcc/clang and must reach lowering "
+           "with no semantic complaint: "
+        << (L.model.diagnostics().all().empty()
+                ? std::string{}
+                : L.model.diagnostics().all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::CompilerBarrier), kExpectedBarriers)
+        << "each of the five accepted empty-asm forms must lower to EXACTLY ONE "
+           "CompilerBarrier — a form silently lowering to nothing is invisible "
+           "to every exit-code test, because an empty barrier is result-neutral";
+    // The barrier emits no runtime instruction and is NOT a call to anything.
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Call), 0)
+        << "an inline-asm barrier must never lower to a Call";
+}
+
+// ── ★ THE cst_to_hir EXTENDED-ASM BACKSTOP, EXERCISED RATHER THAN READ ─────
+// `cst_to_hir.cpp`'s `k == "InlineAsm"` arm refuses an asm statement that still
+// carries an operand / clobber / label section instead of lowering it to a bare
+// 0-child barrier — which would DROP the operand binding, the exact silent
+// miscompile the P1 arc exists to prevent (`"=a"(lo)` gone ⇒ `rdtsc` clobbers
+// eax/edx with the allocator uninformed and `lo` never written).
+//
+// ★★ ITS OWN COMMENT CALLED IT UNREACHABLE, AND THAT WAS TRUE OF THE DRIVER
+// ONLY. `compile_pipeline.cpp:303` and `c_header_parser.cpp:313` both bail on
+// `hasErrors()` before lowering, and the semantic tier refuses extended asm, so
+// production never gets here. THIS TIER HAS NO SUCH GUARD: `lowerCSubset` at the
+// top of this file calls `lowerToHir(model, hirReporter)` unconditionally — on
+// purpose, so a lowering bug cannot hide behind a semantic diagnostic — which
+// makes the backstop reachable in exactly one place, here. Until this test it
+// was the one link in the inline-asm chain with NO witness at all, and "the
+// assertion cannot fire today" was a claim nobody had run.
+//
+// RED-ON-DISABLE: delete the `if (probe.node.valid())` refusal in that arm (or
+// make `inlineAsmPayloadProbe` return `{}` unconditionally) → the statement
+// lowers to a 0-child InlineAsm leaf, the diagnostic count drops to 0 and the
+// barrier count rises to 1 ⇒ BOTH halves below go red, which is what makes the
+// pair a routing assertion rather than a smoke test.
+TEST(MirLoweringCSubset, ExtendedInlineAsmReachingHirLoweringIsRefusedNotDropped) {
+    auto L = lowerCSubset(
+        "void f(void){ int p = 0; __asm__ (\"\" : : \"r\"(p)); }");
+    // PREMISE, ASSERTED: the semantic tier DID refuse this statement. Without
+    // the check the test could silently become a test of an ACCEPTED construct
+    // — the "absence is satisfied by nothing existing" shape, one tier over.
+    ASSERT_TRUE(L.model.hasErrors())
+        << "the extended asm was accepted semantically, so this fixture no "
+           "longer reaches the backstop and every assertion below is vacuous";
+    // ...and lowering ran ANYWAY, which is the whole reason the arm is live
+    // here: the backstop fires, exactly once, loud.
+    EXPECT_EQ(dss::test_support::countCode(
+                  L.hirReporter, DiagnosticCode::H_UnsupportedLoweringForKind), 1u)
+        << "the backstop must fail LOUD, exactly once — a silent drop of the "
+           "operand section is the miscompile it exists to refuse. Got: "
+        << (L.hirReporter.all().empty() ? std::string{"<no diagnostics>"}
+                                        : L.hirReporter.all()[0].actual);
+    // The message must NAME what was dropped and where the refusal belongs,
+    // otherwise it is a wrong-turn signpost rather than a diagnostic.
+    if (!L.hirReporter.all().empty()) {
+        std::string const msg = L.hirReporter.all()[0].actual;
+        EXPECT_NE(msg.find("extended inline-asm"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("silent miscompile"), std::string::npos) << msg;
+    }
+    // AND NOTHING WAS LOWERED IN ITS PLACE — ✔MEASURED, not assumed: the Error
+    // node the backstop returns is FATAL to MIR lowering, so no MIR module is
+    // produced at all and there is no barrier left to drop an operand from.
+    // Written as an assertion rather than as an `if (L.mir.ok)` guard around a
+    // barrier count, deliberately: that guard would NEVER RUN, and a dormant
+    // branch is the same "satisfied by nothing happening" defect this cycle
+    // corrected in the semantic suite.
+    EXPECT_FALSE(L.mir.ok)
+        << "MIR lowering SUCCEEDED on a statement HIR lowering refused — "
+           "'diagnose and lower anyway' leaves the barrier standing with the "
+           "operand binding gone, which is the silent drop this arm exists to "
+           "refuse";
+}
+
 // ── TF-C95 D-CSUBSET-ATOMIC-FENCE: the __sync_synchronize→AtomicFence ROUTING pin ──
 // The BUILTIN→OPCODE half of the fence feature, and the ONLY test that covers it:
 // every other AtomicFence pin (test_mir_to_lir's slot routing, the test_asm_* byte

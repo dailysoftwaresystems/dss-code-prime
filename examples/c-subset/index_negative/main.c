@@ -17,7 +17,7 @@
  *   `p[-N]` folds to a bare NEGATIVE Const byte-offset -> the const-disp Gep ->
  *   `lea [base + MemOffset(<0)]`. BOTH targets now encode that NATIVELY in ONE
  *   instruction: x86 via its hardware-sign-extended `lea [base+disp32]`; arm64
- *   via the c94 `negMemoffset` SUB variants (`SUB Xd,Xn,#|disp|` / shifted /
+ *   via the c94 `negValue` SUB variants (`SUB Xd,Xn,#|disp|` / shifted /
  *   MOVZ-MOVK), which the shared variant matcher routes to by the memoffset's
  *   SIGN. This REPLACED c93's config-gated fold (materialize the disp into a
  *   fresh GPR + a 4-op base+index `ADD Xd,Xn,Xm`), which cost 5-7 arm64
@@ -38,7 +38,7 @@
  *   - revert the lowerGep c42 index-widen -> the un-widened I32 negative offset
  *     zero-extends in the 64-bit lea -> a +4GiB address -> SIGSEGV (non-42) on
  *     the first runtime-stride-Mul subscript (debug).
- *   - revert the c94 arm64 negMemoffset SUB variants -> the arm64 RELEASE arm
+ *   - revert the c94 arm64 negValue SUB variants -> the arm64 RELEASE arm
  *     fails to compile with `A_NoMatchingEncodingVariant opcode 'lea' width 64`
  *     on the first constant `p[-N]` (x86 stays green via signed disp32; the c93
  *     fold that used to catch this is GONE — native SUB or bust). */

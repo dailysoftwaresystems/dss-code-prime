@@ -2,7 +2,7 @@
 
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
-#include "core/substrate/relocation_table.hpp"
+#include "core/substrate/relocation_table_json.hpp"
 #include "core/types/config_key_vocabulary.hpp"   // TF-C74: the shared closed-key guard
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/predefined_macro_json.hpp"   // TF-C74: the shared predefine parser
@@ -38,6 +38,67 @@ using Collector = substrate::DiagnosticCollector;
 // Note: `targetTerminatorKindFromName` lives in `target_schema.hpp`
 // alongside the enum, so loader + future emit-side serializers share
 // one source of truth for the string mapping.
+
+// ── D-CONFIG-TARGET-LOADER-CONTAINER-KEYS-UNGATED ─────────────────────────
+//
+// Reject every key of `obj` that is not in `known`. THE ONE loop; every
+// closed-key object in this loader calls it.
+//
+// ★ WHY A HELPER AND NOT A LOOP PER SITE — this is not tidying, it is the
+// defect. Before this existed the file had FIVE hand-rolled key loops and
+// THREE of them were wrong in the same way: they hardcoded the literal
+// `"$comment"` (or nothing at all) instead of the `$`-PREFIX predicate, so a
+// `$templateComment` / `$framePointerComment` — spellings the shipped targets
+// actually use — would have been rejected as a typo. A carve-out that must be
+// remembered per site is a carve-out that holds only where someone remembered
+// it. Here it is UNSKIPPABLE: `isDocumentationKey` is applied by the helper,
+// not by the caller.
+//
+// ★★ AND THE ARCHETYPE THIS CLOSES, because it showed up twice in one day in
+// two unrelated files: a CONTAINER object with no key set sitting next to
+// NESTED objects that have one. The neighbours' rejection loops are exactly
+// what makes the container's absence invisible — you read `variants[j]/guard`
+// rejecting typos and conclude the variant row does too, when a misspelled
+// `"tempalte"` was silently yielding an all-default encoding template. Same
+// shape as `numberStyle`'s direct keys in the LANGUAGE loader (routed to that
+// lane). The cure is per-CONTAINER, not per-leaf.
+//
+// `objectLabel` names the object in the message ("variant", "register row")
+// so the diagnostic reads as prose rather than as a path echo.
+template <std::size_t N>
+void rejectUnknownKeys(json const& obj,
+                       std::array<std::string_view, N> const& known,
+                       std::string_view path,
+                       std::string_view objectLabel,
+                       Collector& coll) {
+    if (!obj.is_object()) return;   // shape is the caller's own diagnostic
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        // `$`-prefixed keys are PROSE (config-wide convention). Prefix
+        // predicate, never a literal — see the header note above.
+        if (detail::isDocumentationKey(it.key())) continue;
+        bool found = false;
+        for (auto const& k : known) {
+            if (it.key() == k) { found = true; break; }
+        }
+        if (found) continue;
+        std::string allowed;
+        for (auto const& k : known) {
+            if (!allowed.empty()) allowed += ", ";
+            allowed += '\'';
+            allowed += k;
+            allowed += '\'';
+        }
+        coll.emit(DiagnosticCode::C_MalformedJson,
+                  std::format("{}/{}", path, it.key()),
+                  std::format("unknown key '{}' in {} — allowed keys are {} "
+                              "(plus any '$'-prefixed documentation key). An "
+                              "unrecognized key is REFUSED rather than "
+                              "ignored: a silently-dropped key leaves the "
+                              "feature it names switched off with no "
+                              "diagnostic",
+                              it.key(), objectLabel, allowed));
+    }
+}
 
 // Single helper for "read a bounded non-negative integer field". Replaces
 // the cycle-2b-first-cut `readByte` + `readU16` duplication — the only
@@ -140,24 +201,50 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     };
     parseImmBound("immMin", variant.immMin);
     parseImmBound("immMax", variant.immMax);
-    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: OPTIONAL `negMemoffset` (bool).
-    // Absent ⇒ false (the non-negative magnitude axis — every pre-existing
-    // variant). Present-and-true ⇒ the variant matches only a NEGATIVE
-    // memoffset, keyed by |disp| against [immMin, immMax]. A non-boolean is a
-    // load-time reject (never a silently dropped flag). validate() rejects
-    // negMemoffset on a guard with no `memoffset` operand (nothing to sign-
-    // route) — the same coherence family as immMin/immMax.
-    if (g.contains("negMemoffset")) {
-        auto const& nv = g.at("negMemoffset");
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (introduced) /
+    // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE (generalized + renamed):
+    // OPTIONAL `negValue` (bool). Absent ⇒ false (the non-negative magnitude
+    // axis — every pre-existing variant). Present-and-true ⇒ the variant
+    // matches only a STRICTLY NEGATIVE value-bearing operand (ImmInt or
+    // MemOffset), keyed by |value| against [immMin, immMax]. A non-boolean is
+    // a load-time reject (never a silently dropped flag). validate() rejects
+    // negValue on a guard with neither an `imm32` nor a `memoffset` operand
+    // (nothing to sign-route) — the same coherence family as immMin/immMax.
+    // ⚠ The key was spelled `negMemoffset` before 2026-08-13; the old
+    // spelling is REJECTED by the unknown-key gate below rather than silently
+    // read as `false` (which would have turned arm64's three negative-disp
+    // `lea` variants into duplicate positive ones).
+    if (g.contains("negValue")) {
+        auto const& nv = g.at("negValue");
         if (!nv.is_boolean()) {
             coll.emit(DiagnosticCode::C_MalformedJson,
-                      std::format("/opcodes/{}/encoding/variants/{}/guard/negMemoffset",
+                      std::format("/opcodes/{}/encoding/variants/{}/guard/negValue",
                                   opIdx, vi),
-                      "'negMemoffset' must be a boolean");
+                      "'negValue' must be a boolean");
         } else {
-            variant.negMemoffset = nv.get<bool>();
+            variant.negValue = nv.get<bool>();
         }
     }
+    // `D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD` discipline: every key this
+    // guard object may carry is read ABOVE (or just below, for
+    // `operandKinds`) via a bare `g.contains(...)`, so a typo — or a
+    // spelling this loader USED to accept — would be silently ignored and
+    // the variant would quietly take the default routing. That is precisely
+    // how a renamed axis turns into a wrong-variant election with no
+    // diagnostic. Allowlist the known sub-keys and emit per unknown key.
+    // `$comment` is the ONE universally allowed unknown key (config-wide
+    // convention).
+    // ⚠ 'negMemoffset' was RENAMED to 'negValue' when the sign axis
+    // generalized from a memory displacement to any value-bearing operand;
+    // the old spelling now lands here as an unknown key rather than being
+    // read as `false`.
+    static constexpr std::array<std::string_view, 5> kGuardKeys{
+        "operandKinds", "width", "immMin", "immMax", "negValue"};
+    DSS_CHECK_KEY_VOCABULARY(kGuardKeys);
+    rejectUnknownKeys(g, kGuardKeys,
+                      std::format("/opcodes/{}/encoding/variants/{}/guard",
+                                  opIdx, vi),
+                      "a variant guard", coll);
     if (!g.contains("operandKinds")) return;
     auto const& oks = g.at("operandKinds");
     if (!oks.is_array()) {
@@ -194,6 +281,18 @@ void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
                   "'template' must be an object");
         return;
     }
+    // A template key is a BIT PATTERN or a prefix byte; a typo here emits a
+    // different instruction. `fixedWord`/`fixedWords` are mutually exclusive
+    // (checked below) but both belong to the vocabulary.
+    static constexpr std::array<std::string_view, 11> kTemplateKeys{
+        "rexW", "opcode", "mandatoryPrefix", "modrmRegExt",
+        "condCodeFromPayload", "condBitPos", "condInvert",
+        "payloadBytePrefix", "forceRexPrefix", "fixedWord", "fixedWords"};
+    DSS_CHECK_KEY_VOCABULARY(kTemplateKeys);
+    rejectUnknownKeys(t, kTemplateKeys,
+                      std::format("/opcodes/{}/encoding/variants/{}/template",
+                                  opIdx, vi),
+                      "an encoding template", coll);
     if (t.contains("rexW") && t.at("rexW").is_boolean()) {
         tmpl.rexW = t.at("rexW").get<bool>();
     }
@@ -455,6 +554,11 @@ void parseVariantExtraResultSlots(json const& v, std::size_t opIdx,
                       "each 'extraResultSlots' entry must be an object");
             continue;
         }
+        static constexpr std::array<std::string_view, 2> kExtraSlotKeys{
+            "slotKind", "wordIndex"};
+        DSS_CHECK_KEY_VOCABULARY(kExtraSlotKeys);
+        rejectUnknownKeys(e, kExtraSlotKeys, ePath,
+                          "an extra result-slot placement", coll);
         if (!e.contains("slotKind") || !e.at("slotKind").is_string()) {
             coll.emit(DiagnosticCode::C_MissingField,
                       std::format("{}/slotKind", ePath),
@@ -510,6 +614,14 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
                       "wire entry must be an object");
             continue;
         }
+        // A dropped `relocationKind` is the sharpest hazard here: the wire
+        // would encode literal bits where the linker was meant to patch a
+        // symbol address.
+        static constexpr std::array<std::string_view, 5> kWireKeys{
+            "index", "slotKind", "relocationKind", "wordIndex",
+            "prefixOpcodeBytes"};
+        DSS_CHECK_KEY_VOCABULARY(kWireKeys);
+        rejectUnknownKeys(o2, kWireKeys, wirePath, "an operand wire", coll);
         TargetEncodingWire wire;
         if (!o2.contains("index") || !o2.at("index").is_number_integer()) {
             coll.emit(DiagnosticCode::C_MissingField,
@@ -647,6 +759,20 @@ void parseEncodingVariants(json const& vs,
                       "variant entry must be an object");
             continue;
         }
+        // ★ THE HIGHEST-VALUE GATE IN THIS FILE, and the archetype's exact
+        // shape: the variant ROW had no key set while its nested `guard`
+        // object did. A misspelled `"tempalte"` therefore loaded clean and
+        // `parseVariantTemplate`'s `v.contains("template")` simply returned —
+        // leaving an ALL-DEFAULT template (fixedWord 0, no opcode bytes) that
+        // the encoder would emit as zero words. The neighbouring guard loop
+        // is what made the absence invisible.
+        static constexpr std::array<std::string_view, 5> kVariantKeys{
+            "guard", "template", "resultSlot", "extraResultSlots", "wires"};
+        DSS_CHECK_KEY_VOCABULARY(kVariantKeys);
+        rejectUnknownKeys(v, kVariantKeys,
+                          std::format("/opcodes/{}/encoding/variants/{}",
+                                      opIdx, vi),
+                          "an encoding variant", coll);
         TargetEncodingVariant variant;
         parseVariantGuard      (v, opIdx, vi, variant, coll);
         parseVariantTemplate   (v, opIdx, vi, variant.tmpl, coll);
@@ -693,11 +819,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // guard would reject every shipped target on its first load.
     //
     // Every name here is a key the loader genuinely reads.
-    static constexpr std::array<std::string_view, 14> kTargetDocumentKeys{
+    static constexpr std::array<std::string_view, 15> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
         "charIsUnsigned", "predefinedMacros", "aggregateLayout", "tls",
+        // which SOURCE LANGUAGE document spells this processor's assembly
+        // (a NAME — D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET)
+        "defaultAssemblyLanguage",
         // machine description
         "opcodes", "registers", "registerClassOps", "relocations",
         "condCodeEncoding",
@@ -744,6 +873,20 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         return std::unexpected(std::move(coll).release());
     }
     auto const& target = doc.at("target");
+    // ⚠ `description` is DECLARED BY BOTH SHIPPED TARGETS AND READ BY
+    // NOTHING — it is human metadata that predates the `$`-prefix prose
+    // convention. It belongs in the vocabulary because the vocabulary is
+    // "keys this object may legally carry", not "keys the loader stores";
+    // omitting it made BOTH shipped targets fail to load (✔MEASURED: 21 red
+    // tests), which is the INVERSE failure a closed key set can cause and the
+    // reason every gate here is pinned against the real shipped configs
+    // rather than against a hand-written sample.
+    static constexpr std::array<std::string_view, 7> kTargetKeys{
+        "name", "version", "abiModel", "frameLoadMnemonic",
+        "frameStoreMnemonic", "description", "dwarfReturnAddressColumn"};
+    DSS_CHECK_KEY_VOCABULARY(kTargetKeys);
+    rejectUnknownKeys(target, kTargetKeys, "/target",
+                      "the target identity block", coll);
     if (!target.contains("name") || !target.at("name").is_string()) {
         coll.emit(DiagnosticCode::C_MissingField, "/target/name",
                   "missing or non-string 'name'");
@@ -808,6 +951,18 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         && target.at("frameStoreMnemonic").is_string()) {
         data.frameStoreMnemonic = target.at("frameStoreMnemonic").get<std::string>();
     }
+    // The CIE's `return_address_register` — the other half of the psABI
+    // DWARF numbering whose per-register half is `/registers/N/dwarfNumber`.
+    // Declared rather than derived because on x86_64 SysV it is column 16,
+    // a synthetic column no register row can carry (see the field docblock
+    // in `TargetSchemaData`). The two halves are cross-checked for presence
+    // in `validate()`; here we only read.
+    if (target.contains("dwarfReturnAddressColumn")) {
+        std::uint16_t ra = 0;
+        auto const before = coll.size();
+        readBoundedInt(target, coll, "/target", "dwarfReturnAddressColumn", ra);
+        if (coll.size() == before) data.dwarfReturnAddressColumn = ra;
+    }
 
     // ── relocations (AS1 §2.6 — optional) ─────────────────────────
     // Loaded BEFORE opcodes so the per-wire `relocationKind` name
@@ -837,6 +992,19 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         data.relocationKindIndex, coll,
         [](nlohmann::json const& r, TargetRelocationInfo& info,
            Collector& c, std::size_t i) -> bool {
+            // ⚠ THIS ROW IS PARSED BY TWO FILES: `name`/`kind` by the shared
+            // `substrate::loadRelocationsTable`, the rest by this extension
+            // lambda. The closed set must therefore be the UNION, and it
+            // belongs HERE rather than in the substrate — `ObjectFormatSchema`
+            // drives the same substrate loader with a DIFFERENT extension set,
+            // so a set placed there would reject the other family's keys.
+            static constexpr std::array<std::string_view, 7> kRelocationKeys{
+                "name", "kind", "formula", "widthBytes", "pcRelative",
+                "addendBias", "tls"};
+            DSS_CHECK_KEY_VOCABULARY(kRelocationKeys);
+            rejectUnknownKeys(r, kRelocationKeys,
+                              std::format("/relocations/{}", i),
+                              "a relocation row", c);
             if (r.contains("formula")) {
                 if (!r.at("formula").is_string()) {
                     c.emit(DiagnosticCode::C_MalformedJson,
@@ -991,14 +1159,21 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // capability signal that the target realizes that FCmp
             // predicate via the two-setcc composition instead of a
             // single native condition; see mir_to_lir floatCmpPlan).
-            constexpr std::array<std::string_view, 17> kCondNames{
+            static constexpr std::array<std::string_view, 17> kCondNames{
                 "eq", "ne", "slt", "sle", "sgt", "sge",
                 "ult", "ule", "ugt", "uge",
                 "fogt", "foge", "foeq", "fone", "fune", "fuo", "ford"};
+            DSS_CHECK_KEY_VOCABULARY(kCondNames);
             constexpr std::size_t kRequiredCount = 10;
             std::array<bool, 17> seen{};
             for (auto it = cc.begin(); it != cc.end(); ++it) {
                 auto const& key = it.key();
+                // A `$`-prefixed key here is PROSE, not a condition. This
+                // loop matches names against a closed table, so it needs the
+                // same carve-out every other closed vocabulary gets —
+                // without it a `$comment` documenting the table would be
+                // rejected as an unknown cond code.
+                if (detail::isDocumentationKey(key)) continue;
                 std::size_t idx = kCondNames.size();
                 for (std::size_t i = 0; i < kCondNames.size(); ++i) {
                     if (kCondNames[i] == key) { idx = i; break; }
@@ -1069,6 +1244,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             coll.emit(DiagnosticCode::C_MalformedJson, "/aggregateLayout",
                       "must be an object { scalarAlignment, maxAlignment }");
         } else {
+            static constexpr std::array<std::string_view, 3> kAggregateLayoutKeys{
+                "scalarAlignment", "maxAlignment", "bitFieldStrategy"};
+            DSS_CHECK_KEY_VOCABULARY(kAggregateLayoutKeys);
+            rejectUnknownKeys(al, kAggregateLayoutKeys, "/aggregateLayout",
+                              "the aggregate-layout block", coll);
             bool ok = true;
             if (!al.contains("scalarAlignment")
                 || !al.at("scalarAlignment").is_string()) {
@@ -1312,6 +1492,46 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
+    // ── defaultAssemblyLanguage (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET) ──
+    //
+    // The NAME of the shipped source-language document that spells this
+    // processor's assembly — a `<stem>` for `GrammarSchema::loadShipped`,
+    // exactly what `--language` takes. OPTIONAL; absent ⇒ the target declares
+    // none and any build that would have needed it fails loud naming the
+    // target (the driver's job, not the loader's — a target with no assembly
+    // dialect is a legitimate state, not a malformed document).
+    //
+    // A PRESENT key is strict on both axes a lying knob could hide behind:
+    // non-string, and the empty string. `""` is rejected rather than treated
+    // as absent because the two states are operator-distinguishable — absent
+    // says "this target has no dialect", `""` says "I meant to name one" — and
+    // silently folding the second into the first is how a config key stops
+    // meaning anything. The loader deliberately does NOT check that the named
+    // language EXISTS or that it claims `.s`: resolving a language name is the
+    // grammar loader's job, and duplicating it here would put a second,
+    // drifting copy of language discovery in the target family. An unloadable
+    // name fails loud at the driver with the language loader's own diagnostic.
+    if (doc.contains("defaultAssemblyLanguage")) {
+        json const& dal = doc.at("defaultAssemblyLanguage");
+        if (!dal.is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/defaultAssemblyLanguage",
+                      "'defaultAssemblyLanguage' must be a string naming a "
+                      "shipped source language (the `<stem>` of "
+                      "src/dss-config/sources/<stem>.lang.json, e.g. "
+                      "\"asm-x86_64-att\")");
+        } else if (dal.get<std::string>().empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/defaultAssemblyLanguage",
+                      "'defaultAssemblyLanguage' must not be empty — OMIT the "
+                      "key to declare that this target has no assembly "
+                      "dialect; an empty string reads as a name that was meant "
+                      "to be filled in");
+        } else {
+            data.defaultAssemblyLanguage = dal.get<std::string>();
+        }
+    }
+
     // ── tls identity (TLS C1, D-CSUBSET-THREAD-LOCAL — optional) ──
     // The target's static-TLS layout convention: `"tls": { "variant":
     // "variant1"|"variant2", "tcbHeaderBytes": N }`. OPTIONAL like
@@ -1329,6 +1549,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       "'tls' must be an object { \"variant\": "
                       "\"variant1\"|\"variant2\", \"tcbHeaderBytes\": N }");
         } else {
+            static constexpr std::array<std::string_view, 2> kTlsKeys{
+                "variant", "tcbHeaderBytes"};
+            DSS_CHECK_KEY_VOCABULARY(kTlsKeys);
+            rejectUnknownKeys(tb, kTlsKeys, "/tls", "the tls block", coll);
             TlsIdentity tlsId{};
             bool ok = true;
             if (!tb.contains("variant") || !tb.at("variant").is_string()) {
@@ -1399,6 +1623,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       "opcode entry must be an object");
             continue;
         }
+        static constexpr std::array<std::string_view, 12> kOpcodeKeys{
+            "mnemonic", "result", "hasSideEffects", "requires2Address",
+            "isCall", "terminatorKind", "minOperands", "maxOperands",
+            "minSuccessors", "maxSuccessors", "encoding",
+            "implicitRegisters"};
+        DSS_CHECK_KEY_VOCABULARY(kOpcodeKeys);
+        rejectUnknownKeys(o, kOpcodeKeys, std::format("/opcodes/{}", i),
+                          "an opcode row", coll);
         TargetOpcodeInfo info;
         // mnemonic (required)
         if (!o.contains("mnemonic") || !o.at("mnemonic").is_string()) {
@@ -1484,6 +1716,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // intent to declare an encoding would be silently dropped.
         if (o.contains("encoding")) {
             auto const& enc = o.at("encoding");
+            static constexpr std::array<std::string_view, 2> kEncodingKeys{
+                "format", "variants"};
+            DSS_CHECK_KEY_VOCABULARY(kEncodingKeys);
+            rejectUnknownKeys(enc, kEncodingKeys,
+                              std::format("/opcodes/{}/encoding", i),
+                              "an encoding block", coll);
             if (!enc.is_object()) {
                 coll.emit(DiagnosticCode::C_MalformedJson,
                           std::format("/opcodes/{}/encoding", i),
@@ -1547,26 +1785,18 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // empty + slip through to a misleading "empty block"
                 // reject. Allowlist the known sub-keys + emit per
                 // unknown key.
+                // ⚠ THIS LOOP USED TO BE HAND-ROLLED AND REJECTED `$comment`.
+                // It predates the shared helper and never grew the `$`-prefix
+                // carve-out, so a prose key here was reported as a typo — the
+                // INVERSE failure, and the reason `rejectUnknownKeys` applies
+                // the carve-out itself rather than trusting each call site.
                 static constexpr std::array<std::string_view, 5>
-                    kKnownKeys{"inputs", "outputs", "clobbered",
-                               "inputRoles", "outputRoles"};
-                for (auto it = ir.begin(); it != ir.end(); ++it) {
-                    bool known = false;
-                    for (auto const& k : kKnownKeys) {
-                        if (it.key() == k) { known = true; break; }
-                    }
-                    if (!known) {
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  std::format("/opcodes/{}/implicitRegisters/{}",
-                                              i, it.key()),
-                                  std::format("unknown key '{}' — allowed "
-                                              "keys are 'inputs', 'outputs', "
-                                              "'clobbered', 'inputRoles', "
-                                              "'outputRoles' (typo "
-                                              "discriminator)",
-                                              it.key()));
-                    }
-                }
+                    kImplicitRegisterKeys{"inputs", "outputs", "clobbered",
+                                          "inputRoles", "outputRoles"};
+                DSS_CHECK_KEY_VOCABULARY(kImplicitRegisterKeys);
+                rejectUnknownKeys(ir, kImplicitRegisterKeys,
+                                  std::format("/opcodes/{}/implicitRegisters", i),
+                                  "an implicitRegisters block", coll);
                 ImplicitRegisterConstraint irc;
                 auto readRegArray = [&](char const* field,
                                         std::vector<std::string>& out) {
@@ -1615,6 +1845,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         return;
                     }
                     for (auto it = obj.begin(); it != obj.end(); ++it) {
+                        // The keys here are ROLE NAMES (identifiers), so this
+                        // map must stay open — its vocabulary is checked later
+                        // against `kKnownImplicitRegisterRoles`. But a
+                        // `$`-prefixed PROSE key would be captured as a role
+                        // and then rejected downstream as an unknown one,
+                        // which reads as a config error instead of a comment.
+                        if (detail::isDocumentationKey(it.key())) continue;
                         if (!it.value().is_string()) {
                             coll.emit(DiagnosticCode::C_MalformedJson,
                                       std::format("/opcodes/{}/implicitRegisters/{}/{}",
@@ -1668,6 +1905,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               "register entry must be an object");
                     continue;
                 }
+                static constexpr std::array<std::string_view, 6> kRegisterKeys{
+                    "name", "class", "subOf", "widthBytes", "hwEncoding",
+                    "dwarfNumber"};
+                DSS_CHECK_KEY_VOCABULARY(kRegisterKeys);
+                rejectUnknownKeys(r, kRegisterKeys,
+                                  std::format("/registers/{}", i),
+                                  "a register row", coll);
                 TargetRegisterInfo info;
                 if (!r.contains("name") || !r.at("name").is_string()) {
                     coll.emit(DiagnosticCode::C_MissingField,
@@ -1693,6 +1937,18 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 std::string const regPath = std::format("/registers/{}", i);
                 readBoundedInt(r, coll, regPath, "widthBytes", info.widthBytes);
                 readBoundedInt(r, coll, regPath, "hwEncoding", info.hwEncoding);
+                // The psABI DWARF number. ABSENT is a real state (a narrow
+                // view, or AArch64's `xzr` which has no DWARF number) — see
+                // `TargetRegisterInfo::dwarfNumber`. `readBoundedInt` writes
+                // through a reference and cannot express "absent", so the
+                // presence test is explicit and the scratch value is only
+                // committed once the read succeeded.
+                if (r.contains("dwarfNumber")) {
+                    std::uint16_t dw = 0;
+                    auto const before = coll.size();
+                    readBoundedInt(r, coll, regPath, "dwarfNumber", dw);
+                    if (coll.size() == before) info.dwarfNumber = dw;
+                }
 
                 std::uint16_t const ordinal =
                     static_cast<std::uint16_t>(data.registers.size());
@@ -1727,6 +1983,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               "registerClassOps entry must be an object");
                     continue;
                 }
+                static constexpr std::array<std::string_view, 4> kRegClassOpKeys{
+                    "class", "move", "load", "store"};
+                DSS_CHECK_KEY_VOCABULARY(kRegClassOpKeys);
+                rejectUnknownKeys(r, kRegClassOpKeys,
+                                  std::format("/registerClassOps/{}", i),
+                                  "a registerClassOps row", coll);
                 if (!r.contains("class") || !r.at("class").is_string()) {
                     coll.emit(DiagnosticCode::C_MissingField,
                               std::format("/registerClassOps/{}/class", i),
@@ -1792,6 +2054,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               "wideFloatSoftcalls entry must be an object");
                     continue;
                 }
+                static constexpr std::array<std::string_view, 4> kSoftcallKeys{
+                    "op", "helperSymbol", "argRegisters", "resultRegister"};
+                DSS_CHECK_KEY_VOCABULARY(kSoftcallKeys);
+                rejectUnknownKeys(r, kSoftcallKeys,
+                                  std::format("/wideFloatSoftcalls/{}", i),
+                                  "a wideFloatSoftcalls row", coll);
                 if (!r.contains("op") || !r.at("op").is_string()) {
                     coll.emit(DiagnosticCode::C_MissingField,
                               std::format("/wideFloatSoftcalls/{}/op", i),
@@ -1967,6 +2235,27 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               "calling-convention entry must be an object");
                     continue;
                 }
+                // The widest row in the file, and the one whose shipped
+                // instances carry the most `$...Comment` prose keys - which is
+                // exactly why the carve-out lives in `rejectUnknownKeys` as a
+                // PREFIX test rather than a literal `"$comment"` entry.
+                static constexpr std::array<std::string_view, 26> kCallConvKeys{
+                    "name",
+                    "argGprs", "argFprs", "returnGprs", "returnFprs",
+                    "argVrs", "returnVrs", "callerSaved", "calleeSaved",
+                    "stackAlignment", "shadowSpaceBytes", "redZoneBytes",
+                    "entryStackPointerBias", "callPushBytes",
+                    "stackProbePageBytes", "aggregateMaxRegBytes",
+                    "aggregateClassification", "slotAligned",
+                    "variadicArgsAlwaysStack",
+                    "aggregateStackExhaustsRegisters",
+                    "linkRegister", "stackPointer", "framePointer",
+                    "variadicVectorCountReg", "indirectResultRegister",
+                    "vaListLayout"};
+                DSS_CHECK_KEY_VOCABULARY(kCallConvKeys);
+                rejectUnknownKeys(c, kCallConvKeys,
+                                  std::format("/callingConventions/{}", i),
+                                  "a calling-convention row", coll);
                 TargetCallingConvention cc;
                 if (!c.contains("name") || !c.at("name").is_string()) {
                     coll.emit(DiagnosticCode::C_MissingField,
@@ -2209,6 +2498,57 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                   "must be an object");
                     } else {
                         auto const& vl = c.at("vaListLayout");
+                        // ── D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY ──
+                        //
+                        // The key set is PER-STRATEGY, not a union over all
+                        // three. A union accepts `gpOffsetLimit` on an
+                        // `aapcs64_dual_cursor` layout: the key is spelled
+                        // correctly, it loads clean, and the strategy's own
+                        // parse arm never reads it — so the producer declared
+                        // a limit, got no limit, and got no diagnostic. That
+                        // is the same silently-switched-off-feature failure
+                        // `rejectUnknownKeys` exists to prevent, just one
+                        // level in: the gate was checking that the key is a
+                        // key SOMEWHERE, not that it is a key HERE.
+                        //
+                        // ★ The union below is DERIVED from the per-strategy
+                        //   arrays and never written a second time — a
+                        //   hand-maintained union is precisely how the two
+                        //   would drift back apart.
+                        static constexpr std::array<std::string_view, 2>
+                            kVaListCommonKeys{"strategy", "namedArgSlotBytes"};
+                        static constexpr std::array<std::string_view, 10>
+                            kVaListSysVKeys{
+                                "gpOffsetField", "fpOffsetField",
+                                "overflowArgAreaField", "regSaveAreaField",
+                                "gpSaveCount", "gpSlotBytes",
+                                "fpSaveCount", "fpSlotBytes",
+                                "gpOffsetLimit", "fpOffsetLimit"};
+                        static constexpr std::array<std::string_view, 1>
+                            kVaListHomogeneousKeys{"variadicUsesOverflowBase"};
+                        static constexpr std::array<std::string_view, 9>
+                            kVaListAapcs64Keys{
+                                "stackField", "grTopField", "vrTopField",
+                                "grOffsField", "vrOffsField",
+                                "gpSaveCount", "gpSlotBytes",
+                                "fpSaveCount", "fpSlotBytes"};
+                        DSS_CHECK_KEY_VOCABULARY(kVaListCommonKeys);
+                        DSS_CHECK_KEY_VOCABULARY(kVaListSysVKeys);
+                        DSS_CHECK_KEY_VOCABULARY(kVaListHomogeneousKeys);
+                        DSS_CHECK_KEY_VOCABULARY(kVaListAapcs64Keys);
+                        auto const keysOf =
+                            [&](VaListStrategy s)
+                                -> std::span<std::string_view const> {
+                            switch (s) {
+                                case VaListStrategy::SysVRegisterSave:
+                                    return kVaListSysVKeys;
+                                case VaListStrategy::HomogeneousPointer:
+                                    return kVaListHomogeneousKeys;
+                                case VaListStrategy::Aapcs64DualCursor:
+                                    return kVaListAapcs64Keys;
+                            }
+                            return {};
+                        };
                         VaListLayout layout;
                         bool vlOk = true;
                         // Read a required non-negative u32 scalar; emit + clear vlOk on miss.
@@ -2234,6 +2574,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                 return;
                             }
                             auto const& f = vl.at(key);
+                            static constexpr std::array<std::string_view, 2>
+                                kVaListFieldKeys{"byteOffset", "widthBytes"};
+                            DSS_CHECK_KEY_VOCABULARY(kVaListFieldKeys);
+                            rejectUnknownKeys(
+                                f, kVaListFieldKeys,
+                                std::format("{}/vaListLayout/{}", ccPath, key),
+                                "a vaListLayout field row", coll);
                             if (!f.contains("byteOffset") || !f.at("byteOffset").is_number_unsigned()
                              || !f.contains("widthBytes") || !f.at("widthBytes").is_number_unsigned()) {
                                 coll.emit(DiagnosticCode::C_MalformedJson,
@@ -2249,12 +2596,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the lowering
                         // strategy gates WHICH fields are required. ABSENT defaults
                         // to SysVRegisterSave (the pre-FC12b shape — back-compat).
+                        bool strategyResolved = true;
                         if (vl.contains("strategy")) {
                             if (!vl.at("strategy").is_string()) {
                                 coll.emit(DiagnosticCode::C_MalformedJson,
                                           std::format("{}/vaListLayout/strategy", ccPath),
                                           "'strategy' must be a string");
                                 vlOk = false;
+                                strategyResolved = false;
                             } else {
                                 auto const sname =
                                     vl.at("strategy").get<std::string>();
@@ -2267,9 +2616,89 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                                           "homogeneous_pointer / "
                                                           "aapcs64_dual_cursor)", sname));
                                     vlOk = false;
+                                    strategyResolved = false;
                                 } else {
                                     layout.strategy = *s;
                                 }
+                            }
+                        }
+                        // ── The per-strategy key gate ────────────────────
+                        //
+                        // Runs HERE, after `strategy` is known, because the
+                        // legal key set is a function of it. Skipped when the
+                        // strategy did not resolve: reporting every field of
+                        // an `aapcs46_duel_cursor` typo as a cross-strategy
+                        // key would bury the one diagnostic that matters
+                        // under nine that do not.
+                        if (strategyResolved) {
+                            auto const own = keysOf(layout.strategy);
+                            auto const inSet =
+                                [](std::span<std::string_view const> set,
+                                   std::string const& k) {
+                                    for (auto const& e : set) {
+                                        if (k == e) return true;
+                                    }
+                                    return false;
+                                };
+                            for (auto it = vl.begin(); it != vl.end(); ++it) {
+                                auto const& key = it.key();
+                                // The `$`-prefix prose convention, applied by
+                                // the SAME predicate `rejectUnknownKeys` uses
+                                // — a second spelling of it here is how one
+                                // site ends up rejecting `$fooComment`.
+                                if (detail::isDocumentationKey(key)) continue;
+                                if (inSet(kVaListCommonKeys, key)) continue;
+                                if (inSet(own, key)) continue;
+                                // Name the strategy (or strategies) that WOULD
+                                // have taken it — that is what turns "unknown
+                                // key" into a message the author can act on,
+                                // and it is the difference between a typo and
+                                // a copy-paste from the wrong ABI.
+                                std::string accepted;
+                                for (auto s : {VaListStrategy::SysVRegisterSave,
+                                               VaListStrategy::HomogeneousPointer,
+                                               VaListStrategy::Aapcs64DualCursor}) {
+                                    if (s == layout.strategy) continue;
+                                    if (!inSet(keysOf(s), key)) continue;
+                                    if (!accepted.empty()) accepted += "' / '";
+                                    accepted += vaListStrategyName(s);
+                                }
+                                std::string allowed;
+                                for (auto const& e : kVaListCommonKeys) {
+                                    if (!allowed.empty()) allowed += ", ";
+                                    allowed += '\''; allowed += e; allowed += '\'';
+                                }
+                                for (auto const& e : own) {
+                                    allowed += ", '"; allowed += e; allowed += '\'';
+                                }
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    std::format("{}/vaListLayout/{}", ccPath, key),
+                                    accepted.empty()
+                                        ? std::format(
+                                              "unknown key '{}' in a vaListLayout "
+                                              "block — no va_list strategy declares "
+                                              "it. Allowed for the declared strategy "
+                                              "'{}' are {} (plus any '$'-prefixed "
+                                              "documentation key)",
+                                              key,
+                                              vaListStrategyName(layout.strategy),
+                                              allowed)
+                                        : std::format(
+                                              "key '{}' belongs to va_list strategy "
+                                              "'{}', but this block declares "
+                                              "strategy '{}' — the '{}' parse arm "
+                                              "never reads it, so it would load "
+                                              "clean and do NOTHING "
+                                              "(D-CONFIG-VALISTLAYOUT-INERT-CROSS-"
+                                              "STRATEGY-KEY). Allowed here are {} "
+                                              "(plus any '$'-prefixed documentation "
+                                              "key)",
+                                              key, accepted,
+                                              vaListStrategyName(layout.strategy),
+                                              vaListStrategyName(layout.strategy),
+                                              allowed));
+                                vlOk = false;
                             }
                         }
                         // FC12c: an optional bool on the va_list block — default false.
@@ -2497,6 +2926,24 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             kKnownImplicitRegisterRoles{"dividend", "quotient", "remainder",
                                         "count", "multiplicand", "high", "low",
                                         "comparand", "old"};
+        DSS_CHECK_KEY_VOCABULARY(kKnownImplicitRegisterRoles);
+        // ⚠ THE LIST IS RENDERED FROM THE TABLE, never re-typed. The message
+        // below used to spell out four roles by hand while the table held
+        // NINE — a diagnostic that told the reader their valid role was
+        // invalid. Every role added since (multiplicand/high/low/comparand/
+        // old) grew the table and left the prose behind, which is the exact
+        // "the comment records half of what the code does" failure this file
+        // is being swept for, one layer up.
+        auto const knownImplicitRoleList = [&] {
+            std::string out;
+            for (auto const& k : kKnownImplicitRegisterRoles) {
+                if (!out.empty()) out += ", ";
+                out += '\'';
+                out += k;
+                out += '\'';
+            }
+            return out;
+        };
         auto resolveRoles =
             [&](std::vector<std::pair<std::string, std::string>> const& roles,
                 std::vector<std::pair<std::string, std::uint16_t>>& resolved,
@@ -2515,12 +2962,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                   opIdx, field, role),
                               std::format("opcode '{}': unknown implicit-"
                                           "register role '{}' — registered "
-                                          "roles are 'dividend', 'quotient', "
-                                          "'remainder', 'count' (typo "
-                                          "discriminator; extend the "
-                                          "registered vocabulary for a new "
-                                          "projection shape)",
-                                          info.mnemonic, role));
+                                          "roles are {} (typo discriminator; "
+                                          "extend the registered vocabulary "
+                                          "for a new projection shape)",
+                                          info.mnemonic, role,
+                                          knownImplicitRoleList()));
                     continue;
                 }
                 bool member = false;

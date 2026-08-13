@@ -1809,7 +1809,7 @@ TEST(LinkerEndToEnd, PeExecAcceptsAndBindsDataExternImport) {
 
 TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     // D-WIN64-PDATA-XDATA-UNWIND host-independent structural pin. A pe64
-    // function carrying a FrameUnwindInfo (frame alloc + callee-saves) gets
+    // function carrying call-frame information (frame alloc + callee-saves) gets
     // a .pdata RUNTIME_FUNCTION + a .xdata UNWIND_INFO, and the EXCEPTION
     // data directory (index 3) points at .pdata. Also pins the c114 FPR
     // decision: a saved FPR (MS-x64 xmm6..15, spilled low-64 via MOVSD) is
@@ -1835,16 +1835,25 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     // sub rsp, 0x20 (48 81 EC 20 00 00 00) ; ret (C3) — first byte 0x48
     // satisfies the prologue-shape guard; the rest is opaque to the builder.
     fn.bytes = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
-    FrameUnwindInfo ui;
-    ui.totalFrameSize      = 0x20;
-    ui.usesStackProbe      = false;
-    ui.stackProbePageBytes = 0;
-    ui.savedRegs = {
-        FrameSavedReg{/*regEncoding=*/6, /*isFpr=*/true,  /*saveOffset=*/0},
-        FrameSavedReg{/*regEncoding=*/3, /*isFpr=*/false, /*saveOffset=*/8},
-        FrameSavedReg{/*regEncoding=*/5, /*isFpr=*/false, /*saveOffset=*/16},
+    // The CFI states each rule's PC DIRECTLY -- these are the byte offsets the
+    // assembler measures for this prologue, not lengths the writer re-derives
+    // from an assumed encoding. Frame 0x20 on a convention whose CALL pushes 8,
+    // so the CFA is 8+0x20 = 40 once the sub retires, and each save's
+    // CFA-relative offset is its RSP slot minus 40. xmm6 is physical ordinal 22
+    // (the FPR file starts at 16); its HARDWARE encoding is 6.
+    CfiFunction cfi;
+    cfi.codeLength    = 8;
+    cfi.initial       = CfiInitialState{/*cfaRegister=*/4, /*cfaOffset=*/8,
+                                        /*returnAddressAtCfaOffset=*/-8,
+                                        /*returnAddressRegister=*/std::nullopt};
+    cfi.prologueEndPc = 31;
+    cfi.ops = {
+        CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{},  40},
+        CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(22), CfiRegRef{}, -40},
+        CfiOp{23, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(3),  CfiRegRef{}, -32},
+        CfiOp{31, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(5),  CfiRegRef{}, -24},
     };
-    fn.unwind = std::move(ui);
+    fn.cfi = std::move(cfi);
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
@@ -1886,8 +1895,11 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     EXPECT_EQ(img[u + 4], 31u)   << "rbp CodeOffset";
     EXPECT_EQ(img[u + 5], 0x54u) << "rbp SAVE_NONVOL | reg=5";
     EXPECT_EQ(readU16LE(img, u + 6), 2u) << "rbp scaled offset 16/8";
-    // rbx: 0x34, CodeOffset 23 (proves xmm6's store advanced the cursor by
-    // 8, not 9 — hwEncoding 6, not the ordinal 30), node 8/8=1.
+    // rbx: 0x34, CodeOffset 23 -- the PC the CFI STATED, carried through
+    // untouched. The builder no longer computes it from an assumed store width,
+    // which is exactly the defect that left every FPR-saving pe64 function's
+    // SizeOfProlog one byte short PER SAVE
+    // (D-WIN64-UNWIND-XMM-SPILL-WIDTH-ASSUMED-NINE-MEASURED-TEN).
     EXPECT_EQ(img[u + 8], 23u)   << "rbx CodeOffset (xmm6 width was 8)";
     EXPECT_EQ(img[u + 9], 0x34u) << "rbx SAVE_NONVOL | reg=3";
     EXPECT_EQ(readU16LE(img, u + 10), 1u) << "rbx scaled offset 8/8";
@@ -1923,15 +1935,21 @@ TEST(PeExecWriter, FunctionUnwindInfoStackProbePrologueUsesFixedAllocLen) {
     // The probe prologue's first byte is 0x41 (mov r11d,imm) — the builder's
     // prologue-shape guard checks exactly that; the rest of the body is opaque.
     fn.bytes = {0x41, 0xBB, 0x00, 0x20, 0x00, 0x00, 0xC3, 0x90};
-    FrameUnwindInfo ui;
-    ui.totalFrameSize      = 0x2000;   // 8192 B = 2 guard pages → ALLOC_LARGE
-    ui.usesStackProbe      = true;
-    ui.stackProbePageBytes = 4096;
-    ui.savedRegs = {
-        FrameSavedReg{/*regEncoding=*/3, /*isFpr=*/false, /*saveOffset=*/0},
-        FrameSavedReg{/*regEncoding=*/6, /*isFpr=*/false, /*saveOffset=*/8},
+    // Probe path: the CFI states the MEASURED end of the 37-byte inline
+    // page-probe loop (37) and of each 8-byte GPR store (45, 53). The writer no
+    // longer keeps a private copy of `kStackProbeLoopBytes` to reach these.
+    CfiFunction cfi;
+    cfi.codeLength    = 8;
+    cfi.initial       = CfiInitialState{/*cfaRegister=*/4, /*cfaOffset=*/8,
+                                        /*returnAddressAtCfaOffset=*/-8,
+                                        /*returnAddressRegister=*/std::nullopt};
+    cfi.prologueEndPc = 53;
+    cfi.ops = {
+        CfiOp{37, CfiOpKind::DefCfaOffset,   CfiRegRef{},            CfiRegRef{},  0x2008},
+        CfiOp{45, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(3), CfiRegRef{}, -0x2008},
+        CfiOp{53, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(6), CfiRegRef{}, -0x2000},
     };
-    fn.unwind = std::move(ui);
+    fn.cfi = std::move(cfi);
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
@@ -1967,7 +1985,7 @@ TEST(PeExecWriter, FunctionUnwindInfoStackProbePrologueUsesFixedAllocLen) {
 
 TEST(PeExecWriter, SehScopeTableEmitsEhandlerFlagAndScopeRecord) {
     // c116 (D-WIN64-SEH-FUNCLETS) host-independent
-    // structural pin. A function carrying a FrameUnwindInfo with a non-empty
+    // structural pin. A function carrying call-frame information with a non-empty
     // `sehScopes` gets:
     //   (1) UNW_FLAG_EHANDLER in its UNWIND_INFO byte0 (0x01 → 0x09);
     //   (2) after the DWORD-aligned unwind codes: a u32 handler RVA (the
@@ -1997,16 +2015,23 @@ TEST(PeExecWriter, SehScopeTableEmitsEhandlerFlagAndScopeRecord) {
                      0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,   // 16..23
                      0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xC3};  // 24..31
     {
-        FrameUnwindInfo ui;
-        ui.totalFrameSize = 0x20;
+        CfiFunction cfi;
+        cfi.codeLength    = 32;
+        cfi.initial       = CfiInitialState{4, 8, -8, std::nullopt};
+        cfi.prologueEndPc = 7;
+        cfi.ops = { CfiOp{7, CfiOpKind::DefCfaOffset, CfiRegRef{},
+                          CfiRegRef{}, 0x28} };
+        parent.cfi = std::move(cfi);
         SehScopeEntry sc;
         sc.beginByteOffset      = 0x08;
         sc.endByteOffset        = 0x10;
         sc.jumpTargetByteOffset = 0x18;
         sc.filterFuncletSymbol  = SymbolId{2};   // function 1
         sc.personalitySymbol    = SymbolId{3};   // the extern
-        ui.sehScopes.push_back(sc);
-        parent.unwind = std::move(ui);
+        // ★ SEH scopes are now a SIBLING of the frame description, not a member
+        //   of it: an exception scope is a source-language construct, not a
+        //   statement about where a register was spilled.
+        parent.sehScopes.push_back(sc);
     }
     mod.functions.push_back(std::move(parent));
     // Function 1: the FILTER FUNCLET — a trivial `xor eax,eax; ret`. It carries a
@@ -2016,9 +2041,13 @@ TEST(PeExecWriter, SehScopeTableEmitsEhandlerFlagAndScopeRecord) {
     funclet.symbol = SymbolId{2};
     funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
     {
-        FrameUnwindInfo ui;
-        ui.totalFrameSize = 0x20;
-        funclet.unwind = std::move(ui);
+        CfiFunction cfi;
+        cfi.codeLength    = 8;
+        cfi.initial       = CfiInitialState{4, 8, -8, std::nullopt};
+        cfi.prologueEndPc = 7;
+        cfi.ops = { CfiOp{7, CfiOpKind::DefCfaOffset, CfiRegRef{},
+                          CfiRegRef{}, 0x28} };
+        funclet.cfi = std::move(cfi);
     }
     mod.functions.push_back(std::move(funclet));
     // The __C_specific_handler personality import (SEH-gated — synthesized on
@@ -2085,31 +2114,44 @@ TEST(PeExecWriter, SehGuardingFunctionSavingNonVolatileXmmFailsLoud) {
     mod.expectedFuncCount = 2;
     // Same parent shape as the scope-table test, but its prologue ALSO saves a
     // non-volatile xmm (xmm6). sub rsp,0x20 (7B) then movsd [rsp],xmm6 — the
-    // bytes past [0] are opaque to the unwind builder (it reads the FrameUnwindInfo).
+    // bytes past [0] are opaque to the unwind builder (it reads the CFI).
     AssembledFunction parent;
     parent.symbol = SymbolId{1};
     parent.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,          // sub rsp,0x20
                      0xF2, 0x0F, 0x11, 0x34, 0x24,                      // movsd [rsp],xmm6
                      0x90, 0x90, 0x90, 0xC3};
     {
-        FrameUnwindInfo ui;
-        ui.totalFrameSize = 0x20;
-        ui.savedRegs = { FrameSavedReg{/*regEncoding=*/6, /*isFpr=*/true,
-                                       /*saveOffset=*/0} };   // xmm6 — non-volatile
+        CfiFunction cfi;
+        cfi.codeLength    = 16;
+        cfi.initial       = CfiInitialState{4, 8, -8, std::nullopt};
+        cfi.prologueEndPc = 17;
+        cfi.ops = {
+            CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},             CfiRegRef{}, 0x28},
+            // xmm6 = physical ordinal 22 (non-volatile under ms_x64).
+            CfiOp{17, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(22), CfiRegRef{}, -0x28},
+        };
+        parent.cfi = std::move(cfi);
         SehScopeEntry sc;
         sc.beginByteOffset      = 0x0C;
         sc.endByteOffset        = 0x0F;
         sc.jumpTargetByteOffset = 0x0F;
         sc.filterFuncletSymbol  = SymbolId{2};
         sc.personalitySymbol    = SymbolId{3};
-        ui.sehScopes.push_back(sc);
-        parent.unwind = std::move(ui);
+        parent.sehScopes.push_back(sc);
     }
     mod.functions.push_back(std::move(parent));
     AssembledFunction funclet;
     funclet.symbol = SymbolId{2};
     funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
-    { FrameUnwindInfo ui; ui.totalFrameSize = 0x20; funclet.unwind = std::move(ui); }
+    {
+        CfiFunction cfi;
+        cfi.codeLength    = 8;
+        cfi.initial       = CfiInitialState{4, 8, -8, std::nullopt};
+        cfi.prologueEndPc = 7;
+        cfi.ops = { CfiOp{7, CfiOpKind::DefCfaOffset, CfiRegRef{},
+                          CfiRegRef{}, 0x28} };
+        funclet.cfi = std::move(cfi);
+    }
     mod.functions.push_back(std::move(funclet));
     mod.externImports.push_back(
         ExternImport{SymbolId{3}, "__C_specific_handler", "msvcrt.dll",
@@ -2120,6 +2162,171 @@ TEST(PeExecWriter, SehGuardingFunctionSavingNonVolatileXmmFailsLoud) {
     EXPECT_GT(rep.errorCount(), 0u)
         << "a SEH-guarding function saving a non-volatile xmm must fail loud "
            "(D-WIN64-XMM-UNWIND-RESTORE), not silently omit its restore";
+}
+
+namespace {
+// D-WIN64-PDATA-ARM64-SILENT-SKIP fixture. A SYNTHETIC pe-exec schema
+// whose only meaningful divergence from the shipped
+// pe64-x86_64-windows-exec is `pe.machine` = 0xAA64 (IMAGE_FILE_MACHINE_
+// ARM64, 43620) instead of 0x8664. No arm64-PE format SHIPS — that is
+// precisely why the walker's unwind gap had no leg to expose it, and why
+// the fixture has to be synthesized here. Everything else (convention,
+// relocation vocabulary) is spelled arm64-honestly so the fixture never
+// reads as "x64 with one number changed".
+[[nodiscard]] char const* arm64PeExecSchemaJson() {
+    return R"({
+      "$comment": "SYNTHETIC arm64 PE-exec schema for D-WIN64-PDATA-ARM64-SILENT-SKIP. No arm64-PE format ships; this exists only to drive pe::encode with a machine the unwind path has no emitter for.",
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LLP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name": "pe-exec-arm64-synthetic", "version": "1.0", "kind": "pe"},
+      "entryPoint": "",
+      "externCallDispatch": "direct-plt",
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
+      "entryCallingConvention": "aapcs64",
+      "pe": {"machine": 43620, "characteristics": 34, "type": "exec"},
+      "optionalHeader": {"magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "majorOperatingSystemVersion": 6, "minorOperatingSystemVersion": 0, "majorSubsystemVersion": 6, "minorSubsystemVersion": 0, "subsystem": 3, "dllCharacteristics": 33120, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096},
+      "sections": [
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
+      ],
+      "relocations": [
+        {"name":"IMAGE_REL_ARM64_BRANCH26","kind":1,"nativeId":3},
+        {"name":"IMAGE_REL_ARM64_ADDR64","kind":2,"nativeId":14},
+        {"name":"IMAGE_REL_ARM64_ADDR32","kind":3,"nativeId":1}
+      ]
+    })";
+}
+
+// ONE module shape, two arms. `withCfi` is the ONLY difference between
+// the refusal case and the complementary encodes-fine case, so the pin
+// measures the presence of unwind information and nothing else.
+[[nodiscard]] AssembledModule makeArm64PeModule(bool withCfi) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // `sub sp, sp, #0x20` ; `ret` (a64, little-endian). Opaque to the
+    // walker — it never decodes instruction bytes on this path.
+    fn.bytes = {0xFF, 0x83, 0x00, 0xD1, 0xC0, 0x03, 0x5F, 0xD6};
+    if (withCfi) {
+        // The MINIMAL honest "this function carries unwind information":
+        // a prologue end plus one CFA-offset rule. Deliberately free of
+        // register references — the refusal must fire before anything
+        // decodes a register ordinal, so the fixture cannot accidentally
+        // pass/fail on an x86_64-vs-arm64 ordinal mismatch.
+        CfiFunction cfi;
+        cfi.codeLength    = 8;
+        cfi.initial       = CfiInitialState{/*cfaRegister=*/31, /*cfaOffset=*/0,
+                                            /*returnAddressAtCfaOffset=*/-8,
+                                            /*returnAddressRegister=*/std::nullopt};
+        cfi.prologueEndPc = 4;
+        cfi.ops = { CfiOp{4, CfiOpKind::DefCfaOffset, CfiRegRef{},
+                          CfiRegRef{}, 0x20} };
+        fn.cfi = std::move(cfi);
+    }
+    mod.functions.push_back(std::move(fn));
+    return mod;
+}
+} // namespace
+
+TEST(PeExecWriter, NonX64MachineCarryingUnwindInfoFailsLoudButCfiFreeStillEncodes) {
+    // D-WIN64-PDATA-ARM64-SILENT-SKIP. The `.pdata`/`.xdata` builder is
+    // gated on `machine == 0x8664` and, before this cycle, had NO `else`:
+    // an arm64 PE image was emitted happily with every function's MEASURED
+    // call-frame information discarded, the EXCEPTION data directory left
+    // 0/0, and not one diagnostic. Unwind info accepted and then dropped
+    // yields a binary that RUNS correctly and cannot be unwound — no
+    // debugger backtrace, no profiler stack, an exception thrown through
+    // the frame terminates — and none of that surfaces until a core dump.
+    // Building ARM64 `.pdata` v2 packed unwind is a genuinely different
+    // encoding and is NOT what this pin asks for; it asks for a refusal.
+    //
+    // TWO ARMS, one module shape:
+    //   (1) machine 0xAA64 + a function carrying `cfi` → encode FAILS with
+    //       K_UnwindRuleUnrepresentable naming the machine, the sections,
+    //       and the count.
+    //   (2) the SAME module with NO `cfi` → encodes CLEANLY. This is the
+    //       half that keeps the guard honest: the trigger is INFORMATION
+    //       LOSS, not the architecture. A guard keyed on the machine alone
+    //       would break a complete non-x64 encode and still pass arm (1).
+    //
+    // RED-on-disable (MEASURED, not asserted): deleting the `else` arm in
+    // pe.cpp restores the silent skip → arm (1)'s `errorCount()` goes to 0,
+    // `img` is non-empty, and the witness substring never appears.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(arm64PeExecSchemaJson(),
+                                                "synthetic-arm64-pe");
+    ASSERT_TRUE(fmt.has_value());
+
+    // ── (1) unwind information present ⇒ loud refusal ──────────────
+    {
+        DiagnosticReporter rep;
+        auto img = encodeUntrampolined(makeArm64PeModule(/*withCfi=*/true),
+                                       **target, **fmt, rep);
+        EXPECT_TRUE(img.empty())
+            << "an image whose unwind tables cannot be encoded must emit NO "
+               "bytes -- never a silently unwind-less binary";
+        EXPECT_GT(rep.errorCount(), 0u)
+            << "dropping .pdata/.xdata must be LOUD (D-WIN64-PDATA-ARM64-"
+               "SILENT-SKIP)";
+        EXPECT_EQ(::dss::test_support::countCode(
+                      rep, DiagnosticCode::K_UnwindRuleUnrepresentable),
+                  1u);
+        // Assert on the MESSAGE, not merely on a failure boolean: a
+        // refusal that does not say WHICH machine, WHAT is missing, HOW
+        // MUCH is lost and WHAT would close it sends the reader nowhere.
+        bool named = false;
+        for (auto const& d : rep.all()) {
+            if (d.code != DiagnosticCode::K_UnwindRuleUnrepresentable) continue;
+            if (d.actual.find("no unwind-table emitter for PE machine")
+                    == std::string::npos) continue;
+            named = true;
+            EXPECT_NE(d.actual.find("0xaa64"), std::string::npos)
+                << "must name the machine in hex: " << d.actual;
+            EXPECT_NE(d.actual.find("1 function(s)"), std::string::npos)
+                << "must say how many functions lose unwind info: " << d.actual;
+            EXPECT_NE(d.actual.find("`.pdata`"), std::string::npos)
+                << "must name .pdata as what goes missing: " << d.actual;
+            EXPECT_NE(d.actual.find("`.xdata`"), std::string::npos)
+                << "must name .xdata as what goes missing: " << d.actual;
+            EXPECT_NE(d.actual.find("per-machine unwind"), std::string::npos)
+                << "must state what would close it: " << d.actual;
+            EXPECT_NE(d.actual.find("D-WIN64-PDATA-ARM64-SILENT-SKIP"),
+                      std::string::npos)
+                << "must cite the anchor for future-grep navigability: "
+                << d.actual;
+            break;
+        }
+        EXPECT_TRUE(named)
+            << "the refusal's witness substring is the pin -- a bare failure "
+               "boolean would stay green over a refusal for an unrelated "
+               "reason";
+    }
+
+    // ── (2) SAME module, no unwind information ⇒ encodes cleanly ────
+    {
+        DiagnosticReporter rep;
+        auto img = encodeUntrampolined(makeArm64PeModule(/*withCfi=*/false),
+                                       **target, **fmt, rep);
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        EXPECT_EQ(rep.errorCount(), 0u)
+            << "a non-x64 PE image that carries NO call-frame information "
+               "loses nothing here -- refusing it would be a gratuitous break";
+        EXPECT_FALSE(img.empty());
+        EXPECT_EQ(::dss::test_support::countCode(
+                      rep, DiagnosticCode::K_UnwindRuleUnrepresentable),
+                  0u);
+        // And it really did take the no-tables path: no .pdata/.xdata, and
+        // the EXCEPTION data directory (index 3) stays 0/0.
+        EXPECT_EQ(findExecSection(img, {'.','p','d','a','t','a',0,0}).first, 0u);
+        EXPECT_EQ(findExecSection(img, {'.','x','d','a','t','a',0,0}).first, 0u);
+        EXPECT_EQ(readU32LE(img, 0x120), 0u) << "EXCEPTION dir RVA";
+        EXPECT_EQ(readU32LE(img, 0x124), 0u) << "EXCEPTION dir size";
+    }
 }
 
 TEST(PeExecWriter, DosHeaderMzSignature) {

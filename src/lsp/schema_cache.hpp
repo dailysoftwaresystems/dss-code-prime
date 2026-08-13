@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -34,6 +35,15 @@ enum class SchemaResolveErrorKind : std::uint8_t {
     NotFound,           // schema dir / shipped name doesn't exist
     LoadFailed,         // file exists but loader rejected it
     NoExtensionMatch,   // file extension matches no known language
+    // More than one language declares this file extension, so the extension
+    // alone cannot name one (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET:
+    // `asm-x86_64-att` and `asm-arm64-gas` both declare `.s`/`.S`). DISTINCT
+    // from `NoExtensionMatch` because the operator action is opposite — there
+    // is no missing language to install, there is a choice to make, and the
+    // detail NAMES the claimants. An assembly file is target-specific by
+    // nature, so the dialect is a question the compile TARGET answers; this
+    // resolver has no target and must not invent one.
+    AmbiguousExtension,
     // Shipped-mode only: neither `$DSS_CONFIG_ROOT` nor the 8-level
     // cwd-walk located the `src/dss-config/sources/` directory.
     // Without it, extension-based resolution has no candidate list. Loud
@@ -98,9 +108,29 @@ public:
     [[nodiscard]] SchemaResult resolveByName(std::string_view languageName);
 
     // Iterates known languages' `fileExtensions()` and returns the
-    // first case-insensitive match. In shipped mode, probes each
-    // shipped candidate on cache miss.
+    // single case-insensitive match. In shipped mode, probes each
+    // shipped candidate on cache miss. More than one claimant ⇒
+    // `AmbiguousExtension` — this overload has no tie-breaker.
     [[nodiscard]] SchemaResult resolveByExtension(std::string_view fileExtension);
+
+    // Same resolution, plus a caller-supplied PREFERENCE over equally-valid
+    // claimants. Used only when the extension is genuinely ambiguous:
+    //   * exactly one claimant is named in `preferredLanguages` ⇒ that one;
+    //   * zero or two-or-more matches            ⇒ `AmbiguousExtension`, whose
+    //     detail states the claimants, the preference, and how many matched.
+    // A UNIQUE claimant is returned regardless of the preference — a preference
+    // breaks ties, it does not override an unambiguous answer.
+    //
+    // ★ THE CACHE STAYS TARGET-BLIND. It takes language NAMES, not a target,
+    // not a CPU, not a file kind. Everything that knows what a `.target.json`
+    // is lives in `workspace_project.{hpp,cpp}`; this resolver only knows that
+    // its caller may prefer some names over others, which is why the same
+    // mechanism serves the next ambiguous extension without an edit here.
+    // Order-independent: the answer is decided by the MATCH COUNT, never by
+    // which claimant or which preference came first.
+    [[nodiscard]] SchemaResult resolveByExtension(
+        std::string_view                   fileExtension,
+        std::span<std::string const>       preferredLanguages);
 
     [[nodiscard]] bool hasSchemaDir() const noexcept {
         return schemaDir_.has_value();
@@ -114,12 +144,40 @@ private:
     // serialize). Returns unexpected with diagnostic detail on miss.
     [[nodiscard]] SchemaResult loadFresh(std::string_view name);
 
+    // Adjudicate a contested extension against the caller's preference. The
+    // ONE site both the warm-index path and the cold scan use — a verdict that
+    // differed by cache warmth would make the behaviour depend on which file
+    // the editor opened first, which is the defect this resolver already
+    // learned once.
+    // ⚠ MUST BE CALLED WITH `mutex_` UNHELD: it may `resolveByName` the winner,
+    // and that re-takes the same non-recursive mutex.
+    [[nodiscard]] SchemaResult breakTie(std::string const&              ext,
+                                        std::vector<std::string> const& claimants,
+                                        std::span<std::string const>    preferred);
+
     std::optional<std::filesystem::path>                                schemaDir_;
     mutable std::mutex                                                  mutex_;
     std::unordered_map<std::string,
                        std::shared_ptr<dss::GrammarSchema const>>       byName_;
-    // Built lazily during `resolveByExtension`: ext → language name.
-    std::unordered_map<std::string, std::string>                        extToName_;
+    // Built lazily as languages resolve: ext → EVERY language name that claims
+    // it, in first-indexed order, deduplicated by name.
+    //
+    // ★ A LIST, NOT A NAME (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET). The
+    // predecessor was `ext → name` populated with `emplace`, which SILENTLY
+    // DROPPED the second claimant of an already-indexed extension: the map
+    // kept whichever language was resolved first and every later claimant
+    // vanished without a diagnostic. `.s` has two claimants today
+    // (`asm-x86_64-att`, `asm-arm64-gas`), so the drop decided what an
+    // assembly file MEANT in the editor. Keeping the whole list is what lets
+    // `resolveByExtension` refuse instead of guess.
+    std::unordered_map<std::string, std::vector<std::string>>           extClaimants_;
+    // True once `resolveByExtension`'s cold scan has resolved-or-skipped every
+    // entry of `shippedCandidates_`, i.e. once `extClaimants_` covers the whole
+    // shipped universe. Until then a single-claimant entry means only "one so
+    // far", which is NOT enough to answer with — see the fast path in
+    // `resolveByExtension`. Meaningless (and unused) in --schema-dir mode,
+    // where no universe is ever enumerated.
+    bool                                                                shippedExtIndexComplete_ = false;
     // List of shipped language names probed once at construction.
     // Empty in --schema-dir mode (we don't enumerate the dir
     // upfront; we load lazily on demand).

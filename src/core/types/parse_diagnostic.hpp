@@ -1311,6 +1311,79 @@ enum class DiagnosticCode : std::uint16_t {
     //   must not be able to restore an accepted-then-faulting binary.
     S_EntryShapeNotDeclared = 0xE061,
 
+    // ★★ D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED (inline-asm P1): a GNU
+    // EXTENDED inline-asm statement — one carrying an output list, an input list,
+    // a clobber list, a label section, or the `goto` qualifier
+    // (`__asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));`). P1 PARSES the full
+    // extended form and REFUSES it here, with ONE diagnostic per construct.
+    //
+    // ★ WHY PARSE-THEN-REFUSE RATHER THAN LEAVE IT A PARSE ERROR. Before P1 the
+    // grammar's `asmStmt` ended at `)`, so the first `:` produced P_UnexpectedToken
+    // and the parser never recovered — MEASURED 53 diagnostics for the ONE `rdtsc`
+    // statement in sqlite's `src/hwtime.h:43`. A construct the compiler cannot
+    // support should cost exactly one message that says so, not a cascade that
+    // buries every real error after it in the file.
+    //
+    // ⛔ ACCEPT-AND-IGNORE IS THE FORBIDDEN OUTCOME, and it is why this is an ERROR
+    // and not a warning. The operands are the WHOLE CONTRACT: `"=a"(lo)` tells the
+    // register allocator that this statement writes `eax` and that `lo` receives it.
+    // Parsing the operands and lowering the statement to a bare barrier would emit
+    // code that clobbers registers the allocator still believes are live AND leave
+    // `lo`/`hi` holding whatever was there before — a silent miscompile with no
+    // trace in the build log. In `kUnsuppressableCodes` for exactly that reason.
+    //
+    // ★ THE MESSAGE QUOTES THE CONSTRAINT AND CLOBBER STRINGS IT FOUND, labelled by
+    // role, decoded through the SAME `decodeAdjacentStringBodies` chokepoint the
+    // template uses. That is deliberate scoping instrumentation: running a real
+    // corpus through this diagnostic INVENTORIES which constraint letters actually
+    // occur, which is the data phase P5 needs. P1 NEVER INTERPRETS a constraint
+    // letter — it quotes text it does not understand; the constraint-letter
+    // vocabulary is P3's `.target.json` job, because `"a"` means `eax` on x86 and
+    // nothing at all on arm64. Renders error[S0062].
+    S_InlineAsmExtendedUnsupported = 0xE062,
+
+    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED (inline-asm P1): an inline-asm
+    // statement with a FOURTH (label) section but no `goto` qualifier — `asm("" :
+    // : ::)`, `asm("" :: ::)`, `asm("" ::::)`. GNU 6.47.2.7: the label section
+    // exists only for `asm goto`; without the qualifier the statement has no
+    // control-flow edges to label. ✔MEASURED 2026-08-12: gcc, clang and MSVC all
+    // hard-error on each of the three spellings above.
+    //
+    // ★ IT IS ITS OWN CODE, AHEAD OF `S_InlineAsmExtendedUnsupported`, because it
+    // is a CONSTRAINT VIOLATION rather than a not-yet-implemented feature: the
+    // construct is ill-formed in every conforming compiler and will STILL be
+    // ill-formed after P5 implements extended asm, so the "not yet supported"
+    // message would be a lie that ages into a wrong answer. Unsuppressable: the
+    // section boundaries decide which colon-separated group is which, so a
+    // suppressed emission would hand the operand binder a mis-sectioned statement.
+    // Renders error[S0063].
+    S_InlineAsmLabelSectionRequiresGoto = 0xE063,
+
+    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED (inline-asm P1): two inline-asm
+    // qualifier tokens of the SAME KIND on one statement (`__asm__ volatile
+    // volatile ("")`, `asm goto goto ("" ::::l)`). The grammar admits the run as a
+    // `{repeat}` — deliberately, so the qualifiers may appear in any order — so the
+    // arity constraint is enforced here rather than by a shape that would also
+    // forbid the legal orderings (the `S_AsmLabelDuplicate` precedent).
+    // ✔MEASURED 2026-08-12: gcc, clang and MSVC all hard-error on a repeated
+    // qualifier.
+    //
+    // ★ THE DEDUP IS BY TOKEN KIND, NOT BY SPELLING, and that is load-bearing here:
+    // `volatile __volatile__` is ONE kind written two ways, and DSS's keyword table
+    // aliases the dunder spellings onto the same `VolatileKeyword`
+    // ($gnuDunderSpellingsAreUnconditionalComment). A spelling-keyed check would
+    // accept it. The message therefore ECHOES THE OFFENDING TOKEN'S SOURCE TEXT
+    // rather than a hardcoded name, so the dunder form prints as the author wrote it.
+    //
+    // ★ DELIBERATELY *NOT* IN `kUnsuppressableCodes`, and the criterion is that
+    // file's own: membership is for codes whose suppression ships WRONG BYTES or
+    // hides a build failure. `volatile volatile` suppressed compiles to exactly what
+    // `volatile` means — the repeat is redundant, not ambiguous, so there is no
+    // second candidate lowering to pick silently. It stays an ERROR by default
+    // (matching all three reference compilers); `--suppress` merely restores the
+    // reading every reader already assumes. Renders error[S0064].
+    S_InlineAsmDuplicateQualifier = 0xE064,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -1328,10 +1401,20 @@ enum class DiagnosticCode : std::uint16_t {
     // the target, so the driver does not treat them as build-fatal here.
     D_UnresolvedImport            = 0xD004,
     D_UnresolvedReference         = 0xD005,
-    // HR11/CU5: in a MULTI-language CU, `addFile`'s path extension matched no
-    // registered source language's `fileExtensions` — fail loud rather than
-    // silently parse the file under the primary grammar. (A single-language CU
-    // always routes to its one schema, so this never fires there.)
+    // HR11/CU5: `addFile`'s path extension did not resolve to EXACTLY ONE
+    // registered source language — fail loud rather than silently parse the
+    // file under a grammar nothing chose. TWO shapes, one predicate, two
+    // messages:
+    //   • ZERO claimants in a MULTI-language CU. (A single-language CU routes
+    //     to its one schema, so this shape never fires there.)
+    //   • TWO OR MORE claimants (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET) —
+    //     `asm-x86_64-att` and `asm-arm64-gas` both declare `.s`/`.S`. The
+    //     message NAMES every claimant, because "pick a different set of
+    //     languages, or name this file's language" is the only action
+    //     available and it needs the names.
+    // Also the driver's code when no --language was given and the TARGET's
+    // declared assembly dialect cannot answer either (the message names the
+    // target).
     D_UnknownFileExtension        = 0xD006,
     // LK10 cycle 2 (plan 14): driver-tier codes emitted by
     // `Program::compileFiles` / `compileDirectory` / `compileProject`
@@ -2022,6 +2105,26 @@ enum class DiagnosticCode : std::uint16_t {
     //   VLA region (an ABI break). Red-on-disable via the non-leaf fail-loud pins.
     L_VlaNonLeafFrameUnsupported   = 0xB00E,
 
+    // D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED: a terminator's CFG edges are
+    //   written down TWICE — once as the block's recorded successor list
+    //   (`Lir::blockSuccessors`) and once as `BlockRef` OPERANDS on the
+    //   terminator instruction itself — and the two channels DISAGREE. Both are
+    //   real inputs: the successor list drives every CFG walk (liveness, the
+    //   `.dsslir` terminator dispatch, `simplifyCfg`), while the ENCODER reads
+    //   the operands (`x86_variable.cpp` takes the branch displacement from
+    //   `srcOp.blockSlot`), so a divergence is a jump to the wrong block or an
+    //   un-encodable branch — never a cosmetic difference.
+    //   ⚠ The defect that minted this code was a SILENT DROP, not a mismatch: the
+    //   `.dsslir` reader filtered every BlockRef out of a `cond-br`'s operand
+    //   list, so a real lowered `jcc` came back with the successor list intact
+    //   and ZERO operands. The rule therefore also asserts PRESENCE for the kinds
+    //   whose successors ride their operands — an absence is exactly the shape
+    //   that regressed, and "they match because there are none" is how that
+    //   regression passed for its whole life.
+    //   UNSUPPRESSABLE: suppressed, this is a wrong-target branch with a green
+    //   build. Red-on-disable via the `.dsslir` CondBr round-trip pins.
+    L_TerminatorSuccessorMismatch  = 0xB00F,
+
     // ── Register allocator (renders as `R`) ────────────────────────────
     //
     // The linear-scan register allocator emits these when a target
@@ -2102,6 +2205,21 @@ enum class DiagnosticCode : std::uint16_t {
     //   multi-instruction sequence (MOVZ+MOVK / shifted MOVZ) once that
     //   lowering lands, or narrow the value. Unsuppressable.
     A_ImmediateOperandOutOfRange   = 0x1007,
+    // ── Standalone assembly TEXT → LIR (plan 29 P4; the `encode` tier) ──
+    //
+    // ★★ ONE CODE, MANY MESSAGES, AND THAT IS DELIBERATE. Every failure this
+    // walker can hit is the SAME defect from the user's side — "this .s says
+    // something this (dialect × target) pair does not realize" — and the useful
+    // discrimination is the MESSAGE (which spelling, which dialect, which
+    // target), not a code the reader has to look up. Splitting it into
+    // A_UnknownMnemonic / A_UnknownRegister / A_UnknownDirective / … would give
+    // five codes whose only difference is a noun that is already in the text.
+    // ⚠ WHAT IT MUST NEVER BECOME is a fallback: there is no arm of the walker
+    // that continues past one of these. Assembly is the one language where a
+    // silently-substituted instruction is indistinguishable from what was
+    // written, so an unrecognized construct stops the build. Unsuppressable for
+    // that reason.
+    A_AsmTextUnsupported           = 0x1008,
 
     // ── Optimizer (renders as `X`) ────────────────────────────────────
     //
@@ -2642,7 +2760,31 @@ enum class DiagnosticCode : std::uint16_t {
     //   every candidate and attaches the declaration sites as related locations
     //   where the resolving path has them.
     K_ProgramEntryAmbiguous        = 0x8020,
-    // K-NEXT-SLOT: 0x8021 — grep this marker before adding a K_* code.
+    // K_UnwindRuleUnrepresentable
+    //   (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO /
+    //   D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED): a call-frame rule that
+    //   the active object format's unwind encoding cannot express, or a CFI
+    //   stream that is internally malformed.
+    //   ⚠ THE NAME ABOVE IS DELIBERATELY NOT WRAPPED. A `D-*` name broken
+    //   across a line break mints a PHANTOM anchor: the guard scans for the
+    //   name pattern, finds the truncated prefix, and reports it unresolved —
+    //   and no registry row can ever satisfy it, because the row is keyed on
+    //   the whole name. This one cost a guard failure the day it was written.
+    //   Reflow the prose around an anchor name; never through it.
+    //   ★ IT EXISTS BECAUSE THE ALTERNATIVE IS THE FAILURE THIS SLICE CLOSES.
+    //   Unwind information that is accepted and then dropped produces a binary
+    //   that runs correctly and cannot be unwound — no debugger backtrace, no
+    //   profiler stack, an exception thrown through the frame terminates. That
+    //   is invisible until a core dump, which is why every writer here refuses
+    //   loudly instead of emitting a table that silently covers a subset of the
+    //   image. The message always NAMES the rule (`cfiOpKindName`) and the
+    //   function, because "unsupported unwind opcode 5" sends the reader
+    //   nowhere.
+    //   ⓘ Distinct from K_NoMatchingObjectFormat, which the pe64 unwind builder
+    //   previously borrowed: that code is about a FORMAT that could not be
+    //   selected, not about a frame it could not describe.
+    K_UnwindRuleUnrepresentable    = 0x8021,
+    // K-NEXT-SLOT: 0x8022 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
