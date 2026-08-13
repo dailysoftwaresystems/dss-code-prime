@@ -75,6 +75,85 @@ static_assert(std::is_trivially_copyable_v<ScopeMatch>,
               "ScopeMatch must stay trivially copyable — copied through "
               "the candidate-filtering hot path in resolveMeaning.");
 
+// ★★★ THE PER-LANGUAGE IDENTIFIER CHARACTER CLASS (schema v4
+// `identifierClass`) — D-ASM-DIALECT-IDENTIFIER-CONTINUATION-NOT-CONFIGURABLE,
+// 2026-08-13. Until this existed the tokenizer's identifier rule was a pair of
+// hardcoded `constexpr` predicates (`isIdStart` / `isIdContinue` in
+// `tokenizer.cpp`), so a language whose names legitimately contain a character
+// outside `[A-Za-z0-9_]` had exactly one way to spell them: declare each whole
+// name as a LEXEME in the `tokens` map.
+//
+// ✔MEASURED, and this is the cost that forced the facet: `aarch64-linux-gnu-as`
+// accepts `b.eq` (one mnemonic — you cannot write `b . eq`) and `foo.bar:` (one
+// symbol), both rc=0. `.` is the arm64 dialect's `directiveIntroducer`, so
+// without a continuation rule the tokenizer produced Identifier(`b`) +
+// DirectiveDot + Identifier(`eq`) and the line was a parse error. The dialect's
+// workaround was to declare all TWELVE conditional-branch spellings TWICE — once
+// as a `tokens` lexeme and once as an `instructions[]` row — with the two
+// required to agree. Both mismatch directions failed loud, so nothing was
+// silent, but the duplication is exactly the shape this project keeps closing.
+//
+// ★★ IT DECLARES CONTINUATION ONLY, NEVER START, AND THAT ASYMMETRY IS THE
+// DESIGN RATHER THAN AN OMISSION. gas lets `.` both start and continue a
+// symbol; DSS reaches the leading `.` through the `directiveIntroducer` TOKEN
+// plus `asmDirective`'s `{optional asmLabelTail}` slot, which is what already
+// makes `.L3:` a label and `.text` a directive — two constructs that are
+// byte-identical up to the token AFTER the name. Adding an `extraStart` would
+// mint a SECOND mechanism for the same byte, and the two would then have to
+// agree about which of `.L3:` / `.text` / `.section` each owns. One mechanism
+// per question: a leading `.` is the introducer token; an interior `.` is this.
+// ⇒ An `extraStart` key is NOT accepted — it is not a gap awaiting a follow-up,
+// and a language needing one is the trigger to re-derive the question, not to
+// widen this struct.
+//
+// ★ ADDITIVE ONLY: the universal `[A-Za-z0-9_]` + UTF-8 continuation set stays
+// in force and cannot be REMOVED by config. Nothing measured needs subtraction,
+// and a language that could delete `_` from its own identifiers would break
+// every lexeme lookup in its own `tokens` map with no diagnostic.
+struct DSS_EXPORT IdentifierClass {
+    // Extra characters that CONTINUE an identifier once one has started, as a
+    // character-class string in the SAME syntax `numberStyle`'s `digits` uses
+    // (literal characters and `a-z` ranges) — matched by the shared
+    // `digitClassMatches` helper in `number_style.hpp`, which its own docblock
+    // already names as the single source for "does this character land in this
+    // class". EMPTY (the default, and the value for every language declaring no
+    // block) means the universal rule and nothing more.
+    std::string extraContinue;
+
+    [[nodiscard]] bool declared() const noexcept {
+        return !extraContinue.empty();
+    }
+
+    // ★★★ THE UNIVERSAL RULE, AND THE ONE PLACE IT IS WRITTEN DOWN. It lived as
+    // a file-local `constexpr` in `tokenizer.cpp` until this facet needed a
+    // SECOND reader: the loader has to know which characters ALREADY continue an
+    // identifier, so it can refuse an `extraContinue` that silently declares
+    // nothing. Two copies of "what continues a name" is how the loader starts
+    // accepting a class the tokenizer ignores — the knob-that-lies shape,
+    // arrived at from the validation side instead of the consumption side.
+    //
+    // ASCII letters, digits and `_`, plus every byte ≥ 0x80: the tokenizer is
+    // byte-oriented, and a multi-byte UTF-8 run must not terminate mid-sequence
+    // (its LEAD byte is what `isIdStart` gates on).
+    [[nodiscard]] static constexpr bool universalContinue(char c) noexcept {
+        const auto u = static_cast<unsigned char>(c);
+        return (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') || u == '_'
+            || (u >= '0' && u <= '9')
+            || u >= 0x80;
+    }
+
+    // The full question the tokenizer asks per identifier byte: the universal
+    // rule OR this language's declared extras. ⚠ ADDITIVE BY CONSTRUCTION —
+    // there is no arm in which a declaration makes `universalContinue` stop
+    // holding, so no config can delete `_` from its own identifiers and break
+    // every lexeme lookup in its own `tokens` map with no diagnostic.
+    [[nodiscard]] bool continuesIdentifier(char c) const noexcept {
+        return universalContinue(c)
+            || (!extraContinue.empty()
+                && digitClassMatches(extraContinue, c));
+    }
+};
+
 // Pratt-walker wrapper rule names per `expr` shape (schema v4
 // `expr.wrapperRules`). Each `expr`-kind rule declares the three
 // names the walker will synthesize around operator-precedence
@@ -388,6 +467,11 @@ struct DSS_EXPORT GrammarSchemaData {
     // literals; required (loader emits `C_MissingNumberStyle`)
     // when the language declares `IntLiteral`/`FloatLiteral` tokens.
     std::optional<NumberStyle>                        numberStyle;
+
+    // Per-language identifier character class (schema v4 `identifierClass`).
+    // Empty `extraContinue` — the default for every language that declares no
+    // block — means the universal ASCII+UTF-8 rule and nothing more.
+    IdentifierClass                                   identifierClass;
 
     // Per-language semantic config (plan 08.6; schema v4 `semantics`
     // block). Empty / default-constructed when the language omits the
@@ -811,6 +895,14 @@ public:
     // (`C_MissingNumberStyle`), so any reachable scanNumber call
     // sees a non-null pointer.
     [[nodiscard]] NumberStyle const* numberStyle() const noexcept;
+
+    // Per-language identifier character class (schema v4 `identifierClass`).
+    // ⚠ RETURNED BY REFERENCE TO A DEFAULTED STRUCT, NOT AS A NULLABLE POINTER
+    // LIKE `numberStyle`: the tokenizer needs an answer for EVERY byte of every
+    // identifier run, so "the language declared nothing" and "the language
+    // declared the universal rule" must be the same object rather than a null
+    // the hot path has to branch on.
+    [[nodiscard]] IdentifierClass const& identifierClass() const noexcept;
 
     // Per-language semantic config (plan 08.6; schema v4 `semantics`).
     // Default-constructed (every facet empty) when the language omits

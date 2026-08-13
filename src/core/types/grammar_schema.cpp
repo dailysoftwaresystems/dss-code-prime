@@ -558,6 +558,10 @@ NumberStyle const* GrammarSchema::numberStyle() const noexcept {
     return d_.numberStyle.has_value() ? &(*d_.numberStyle) : nullptr;
 }
 
+IdentifierClass const& GrammarSchema::identifierClass() const noexcept {
+    return d_.identifierClass;
+}
+
 SemanticConfig const& GrammarSchema::semantics() const noexcept {
     return d_.semantics;
 }

@@ -63,6 +63,16 @@ windowFor(EncodingSlotKind s) noexcept {
         // under D-AS5-MULTIWORD-DISASM (the round-trip oracle today pins
         // per-word fields, not the recombined value).
         case EncodingSlotKind::Imm12HiLo24:    return SlotBitWindow{ 10, 12 };
+        // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the inverted-imm16
+        // slot occupies the SAME bits 5..20 window as Imm16 (AArch64 MOVN
+        // places its imm16 exactly where MOVZ does). `windowFor` reports the
+        // raw window; the wire loop below RE-INVERTS the extracted field so
+        // the round-trip oracle recovers the ORIGINAL negative LIR operand
+        // (`-8`) rather than the encoded complement (`7`). This slot is
+        // FULLY decodable — a single word, a lossless bijection — so unlike
+        // the multi-word slots below it is NOT part of the
+        // D-AS5-MULTIWORD-DISASM gap.
+        case EncodingSlotKind::Imm16Inverted:  return SlotBitWindow{ 5, 16 };
         // Every remaining slot decodes to nullopt. This is an
         // intentionally PARTIAL mirror of `fixed32::windowFor`: the
         // round-trip decoder only needs the register/immediate windows
@@ -255,6 +265,19 @@ disassemble(TargetSchema const&            schema,
                 // consult the Relocation entry, not the bytes."
                 result.wires.push_back(DisassembledSlot{
                     wire.slotKind, std::nullopt
+                });
+            } else if (wire.slotKind == EncodingSlotKind::Imm16Inverted) {
+                // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the encoder
+                // wrote the operand's bitwise COMPLEMENT into this window, so
+                // the decoder must invert BACK — otherwise the round-trip
+                // oracle compares the encoded field (7) against the LIR
+                // operand (-8) and reports a mismatch on a correct encoding,
+                // which is a false red that would push someone to weaken the
+                // oracle. `~bits` written as `-bits - 1`: the field is 0..
+                // 2^width-1, so the recovered value is -2^width..-1 — the
+                // exact inverse of the encoder's `-raw - 1`.
+                result.wires.push_back(DisassembledSlot{
+                    wire.slotKind, -extract(wire.slotKind) - 1
                 });
             } else {
                 result.wires.push_back(DisassembledSlot{

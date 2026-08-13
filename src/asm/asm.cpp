@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 namespace dss {
@@ -140,7 +141,12 @@ using dss::report;
         }
         srcMap.push_back(SourceMapEntry{
             preEncodeOffset,
-            lirToMir[inst.v]
+            lirToMir[inst.v],
+            // The LIR instruction these bytes came from. Always valid (unlike
+            // the MIR anchor beside it) -- this is the join key an unwind
+            // producer uses to turn "the instruction that establishes the
+            // frame" into a measured byte offset.
+            inst
         });
     }
     return encoded;
@@ -303,7 +309,22 @@ AssembledModule assemble(Lir const&                 lir,
         // linker writes the symbol's bytes via the adjacent `lea`
         // relocation), so no rollback of bytes is needed on failure — the
         // diagnostic + the function-shape invariant carry it.
+        //
+        // ⚠⚠ ONE ENTRY PER SYMBOL, NOT PER PATCH — AND THIS WAS A LIVE BUG,
+        // NOT A PRECAUTION. ✔MEASURED 2026-08-13: `void *a = &&L; void *b =
+        // &&L;` FAILED TO COMPILE with `K_SymbolUndefined: symbol #N is
+        // declared more than once`. `mintBlockSymbol` is memoized per target
+        // block, so N block-address `lea`s of the SAME label are N patches
+        // carrying ONE SymbolId — and pushing one `SyntheticBlockSymbol` per
+        // patch declared that symbol N times to the linker. Every `.s` and
+        // every C function that took one label's address TWICE was refused.
+        // The duplicates are IDENTICAL (same symbol, same block, therefore
+        // same offset), so collapsing them is not a choice between two
+        // answers. The jump-table arm of `compile_pipeline.cpp` already had
+        // this guard (`alreadyBound`); the encoder-driven arm did not, which
+        // is precisely how one path can be right while its sibling is wrong.
         bool blockSymOk = true;
+        std::unordered_set<std::uint32_t> boundBlockSyms;
         for (auto const& bsp : blockSymPatches) {
             auto it = blockOffsets.find(bsp.targetBlock);
             if (it == blockOffsets.end()) {
@@ -317,6 +338,7 @@ AssembledModule assemble(Lir const&                 lir,
                 blockSymOk = false;
                 break;
             }
+            if (!boundBlockSyms.insert(bsp.symbol.v).second) continue;
             outFn.blockSymbols.push_back(SyntheticBlockSymbol{
                 bsp.symbol, it->second});
         }

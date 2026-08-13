@@ -51,6 +51,18 @@ enum class Method : std::uint8_t {
     TextDocumentReferences,
     TextDocumentRename,
     TextDocumentSignatureHelp,
+    // ── Workspace notifications that can invalidate the project manifests ──
+    // (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE). All four are INBOUND
+    // notifications and all four route to the SAME handler, because none of
+    // their params matter to us: the workspace preference is re-derived by
+    // re-reading the manifests, so "something about the manifest set may have
+    // moved" is the entire signal. Handling a notification is free of the
+    // server→client REQUEST channel this server does not have — see the note
+    // on `LspServer::handleWorkspaceManifestsMayHaveChanged_`.
+    WorkspaceDidChangeWatchedFiles,
+    WorkspaceDidCreateFiles,
+    WorkspaceDidRenameFiles,
+    WorkspaceDidDeleteFiles,
 };
 
 // LSP `id` can be a number, a string, or absent (notifications).

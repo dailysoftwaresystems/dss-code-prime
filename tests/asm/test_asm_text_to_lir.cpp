@@ -17,6 +17,7 @@
 
 #include "asm_text_fixture.hpp"
 #include "asm_test_support.hpp"
+#include "mutate_target_schema.hpp"
 #include "asm/asm.hpp"
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"
@@ -25,12 +26,17 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <format>
+#include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <span>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace dss;
@@ -1935,7 +1941,12 @@ std::vector<DirRow> dataDirectives() {
     rows.push_back({"bss",    "sectionData", ""});
     rows.push_back({"byte",   "emitData",    ""});
     rows.push_back({"quad",   "emitData",    ""});
-    rows.push_back({"zero",   "reserveZeroBytes", ""});
+    // ⚠ THE VERB WAS `reserveZeroBytes` UNTIL 2026-08-13. It was renamed with
+    // the behaviour, not for tidiness: the directive now takes an optional FILL
+    // BYTE, so a name promising zeroes would describe half of what it does.
+    // D-ASM-SPACE-DIRECTIVE-FILL-BYTE-UNMODELLED.
+    rows.push_back({"zero",   "reserveFillBytes", ""});
+    rows.push_back({"space",  "reserveFillBytes", ""});
     return rows;
 }
 
@@ -1950,6 +1961,26 @@ void setDataDirectives(nlohmann::json& doc) {
         if (sp == "byte")   row["unitBytes"] = 1;
         if (sp == "quad")   row["unitBytes"] = 8;
     }
+}
+
+// The same surface with `rodata` reachable ONLY as `.section rodata` — the
+// shape both shipped dialects now declare, and the one gas itself has.
+// ★ IT IS A SEPARATE HELPER RATHER THAN A CHANGE TO THE ONE ABOVE so the
+// existing data tests keep asserting against the vocabulary they were written
+// for; the two shapes are both legal config and the tests below pin the
+// DIFFERENCE between them.
+void setSectionByNameDirectives(nlohmann::json& doc) {
+    setDataDirectives(doc);
+    auto& arr = doc["assembly"]["directives"];
+    for (auto& row : arr) {
+        if (row["spelling"].get<std::string>() == "rodata") {
+            row["operandOnly"] = true;
+        }
+    }
+    nlohmann::json sec;
+    sec["spelling"] = "section";
+    sec["verb"]     = "sectionByName";
+    arr.push_back(std::move(sec));
 }
 
 TEST(AsmTextToLir, DataDirectivesProduceAssembledDataItems) {
@@ -2084,21 +2115,40 @@ TEST(AsmTextToLir, DataValueWiderThanItsUnitIsRefused) {
         << messages(*bad);
 }
 
-// ★ A SYMBOL-VALUED DATA ITEM IS REFUSED. The bytes would otherwise be whatever
-// the address happened to be at compile time; a real one needs a relocation
-// this build does not reach from assembly.
-TEST(AsmTextToLir, SymbolValuedDataIsRefusedNotGuessed) {
+// ★★ A SYMBOL-VALUED DATA ITEM IS A RELOCATION.
+// ⓘ SUPERSEDED 2026-08-13, NOT RE-CUT. This test previously asserted that
+// `.quad main` was REFUSED ("needs a relocation this build does not reach from
+// assembly yet"). That row — D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-
+// OFFSET — is closed, so the pin whose whole subject was the refusal is
+// replaced by one asserting the capability, exactly as the
+// `asm_x86_64_extern_call_exec_*` pair was. Re-cutting it to keep it green
+// (e.g. narrowing it to some other still-refused shape) is the weakened-guard
+// failure mode this repo has a scar for.
+TEST(AsmTextToLir, SymbolValuedDataBecomesARelocationAgainstThatSymbol) {
     auto doc = baseDialectDoc();
     setDataDirectives(doc);
     auto const run = lowerAsmText(doc, src(
         ".globl main\n.func main\nmain:\n  ret\n"
         ".rodata\ntable:\n  .quad main\n"));
     ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
-    EXPECT_FALSE(run->module.has_value());
-    EXPECT_NE(messages(*run).find("needs a relocation this build does not "
-                                  "reach from assembly yet"),
-              std::string::npos)
-        << messages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+
+    ASSERT_EQ(run->module->dataItems.size(), 1u);
+    auto const& item = run->module->dataItems[0];
+    EXPECT_EQ(item.bytes.size(), 8u);
+    ASSERT_EQ(item.relocations.size(), 1u);
+    EXPECT_EQ(item.relocations[0].offset, 0u);
+    EXPECT_EQ(item.relocations[0].addend, 0);
+    // It names the FUNCTION's own ModuleSymbol — not a second, synthetic one.
+    // (`table` is the other symbol: a data label gets one too.)
+    SymbolId mainSym{};
+    for (auto const& s : run->module->symbols) {
+        if (s.name == "main") mainSym = s.symbol;
+    }
+    ASSERT_TRUE(mainSym.valid());
+    EXPECT_EQ(item.relocations[0].target.v, mainSym.v);
+    // A function entry is not a block, so nothing needs a block binding.
+    EXPECT_TRUE(run->module->blockSymbolBindings.empty());
 }
 
 // ── the `assembly.directives[]` loader contract ────────────────────────────
@@ -2169,6 +2219,465 @@ TEST(AsmTextToLir, UnitBytesMustBeOneTwoFourOrEight) {
         << parseMessages(*run);
 }
 
+// ══ D-ASM-SECTION-DIRECTIVE-WITH-OPERAND-UNMODELLED ════════════════════════
+//
+// ★★★ `.section .rodata` — THE SECTION AS AN OPERAND. Until this arc the
+// `sectionData` verb fixed its section PER ROW, so gas's read-only data section
+// was unreachable in every dialect: ✔MEASURED 2026-08-13, BOTH
+// `aarch64-linux-gnu-as` and x86_64 `as` REJECT a bare `.rodata` ("unknown
+// pseudo-op") and ACCEPT `.section .rodata` (rc=0, PROGBITS+A).
+//
+// ★★ THE MECHANISM MINTS NO SECOND VOCABULARY — `.section X` DELEGATES to the
+// dialect's own section-opening rows. These tests pin that delegation from both
+// ends: the operand-only row is reachable through `.section` and NOT bare, and
+// a row that IS bare-writable (`.data`) is reachable BOTH ways and lands in the
+// identical section.
+
+TEST(AsmTextToLir, SectionByNameOpensTheSectionItsOperandNames) {
+    auto doc = baseDialectDoc();
+    setSectionByNameDirectives(doc);
+    auto const run = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".section .rodata\n"
+        "k:\n  .quad 58\n"
+        // The SAME directive reaching a bare-writable row: `.section .data` and
+        // `.data` must be the same thing, because they resolve to one row.
+        ".section .data\n"
+        "m:\n  .quad 1\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+
+    auto const& items = run->module->dataItems;
+    ASSERT_EQ(items.size(), 2u);
+    EXPECT_EQ(items[0].section, DataSectionKind::Rodata)
+        << "`.section .rodata` did not reach the operandOnly row";
+    EXPECT_EQ(items[0].bytes,
+              (std::vector<std::uint8_t>{58, 0, 0, 0, 0, 0, 0, 0}));
+    EXPECT_EQ(items[1].section, DataSectionKind::Data)
+        << "`.section .data` must reach the SAME row `.data` does";
+}
+
+// ★★ THE BIDIRECTIONAL HALF: a section NAME is not a directive. Declaring
+// `.rodata` as an ordinary row would make this dialect accept a spelling no
+// reference assembler does, so the row is `operandOnly` and the bare form is
+// refused BY NAME — naming the form that works, not "unknown directive" about a
+// spelling the dialect visibly declares.
+TEST(AsmTextToLir, BareOperandOnlySectionSpellingIsRefused) {
+    auto doc = baseDialectDoc();
+    setSectionByNameDirectives(doc);
+    auto const run = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".rodata\n"
+        "k:\n  .quad 58\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    EXPECT_NE(messages(*run).find("is a SECTION NAME in this dialect, not a "
+                                  "directive"),
+              std::string::npos)
+        << messages(*run);
+    EXPECT_NE(messages(*run).find("'section'"), std::string::npos)
+        << "the refusal must name the directive that DOES reach it: "
+        << messages(*run);
+}
+
+// ★★★ FLAGS AND TYPE FAIL LOUD — the decision this anchor asked to be STATED.
+// ✔MEASURED: gas accepts `.section .rodata,"a",@progbits`. Every operand after
+// the name decides what the section IS (writable / executable / zero-fill) and
+// this build derives all of those from the section KIND, so honouring the name
+// while dropping the rest would place data somewhere the source did not ask
+// for. Refusing is the only arm with no silent path.
+TEST(AsmTextToLir, SectionByNameRefusesFlagsAndTypeOperands) {
+    auto doc = baseDialectDoc();
+    setSectionByNameDirectives(doc);
+    auto const run = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".section .rodata, 1\n"
+        "k:\n  .quad 58\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    EXPECT_NE(messages(*run).find("models the section NAME and nothing else"),
+              std::string::npos)
+        << messages(*run);
+}
+
+// ★ THE INTRODUCER IS PART OF THE NAME. ✔MEASURED: gas's `.section rodata`
+// (undotted) creates a section literally NAMED `rodata` with NO allocation
+// flag — a DIFFERENT section from `.rodata`. Accepting the undotted spelling as
+// a synonym would place data somewhere the reference assembler does not.
+TEST(AsmTextToLir, SectionByNameRequiresTheDialectsOwnIntroducer) {
+    auto doc = baseDialectDoc();
+    setSectionByNameDirectives(doc);
+    auto const run = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".section rodata\n"
+        "k:\n  .quad 58\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    EXPECT_NE(messages(*run).find("names its section WITH this dialect's "
+                                  "directive introducer"),
+              std::string::npos)
+        << messages(*run);
+}
+
+// ★ AN UNDECLARED SECTION IS REFUSED BY NAME AND THE REFUSAL LISTS WHAT IS
+// AVAILABLE — including the operand-only rows, which `spellingsForVerb`
+// deliberately excludes. The two lists differ by exactly those rows, and both
+// are derived from the same table so neither can go stale.
+TEST(AsmTextToLir, SectionByNameRefusesAnUndeclaredSection) {
+    auto doc = baseDialectDoc();
+    setSectionByNameDirectives(doc);
+    auto const run = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".section .note\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    auto const msg = messages(*run);
+    EXPECT_NE(msg.find("names section '.note'"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("'rodata'"), std::string::npos)
+        << "the available-sections list must include the operand-only rows: "
+        << msg;
+}
+
+// ★ THE "NOTHING CAN REACH THIS ROW" LOAD REFUSAL. `operandOnly` says "not
+// writable as a directive"; the only other door is a `sectionByName` row. A
+// dialect declaring the first without the second has written config that reads
+// as support for a section and delivers none.
+TEST(AsmTextToLir, OperandOnlyWithNoSectionByNameRowIsALoadError) {
+    auto doc = baseDialectDoc();
+    setDataDirectives(doc);   // NOTE: no `.section` row
+    for (auto& row : doc["assembly"]["directives"]) {
+        if (row["spelling"] == "rodata") row["operandOnly"] = true;
+    }
+    auto const run = lowerAsmText(doc, src(".globl main\n.func main\nmain:\n  ret\n"));
+    ASSERT_FALSE(run->loadErrors.empty())
+        << "an unreachable directive row must be a LOAD error";
+    EXPECT_NE(parseMessages(*run).find("The row is unreachable config"),
+              std::string::npos)
+        << parseMessages(*run);
+}
+
+// ★ AND `operandOnly` ON A VERB NO `.section` OPERAND CAN RESOLVE TO is refused
+// rather than ignored — the same posture `marker` and `unitBytes` already have.
+TEST(AsmTextToLir, OperandOnlyOnANonSectionVerbIsALoadError) {
+    auto doc = baseDialectDoc();
+    setSectionByNameDirectives(doc);
+    for (auto& row : doc["assembly"]["directives"]) {
+        if (row["spelling"] == "quad") row["operandOnly"] = true;
+    }
+    auto const run = lowerAsmText(doc, src(".globl main\n.func main\nmain:\n  ret\n"));
+    ASSERT_FALSE(run->loadErrors.empty());
+    EXPECT_NE(parseMessages(*run).find("only meaningful on a directive that "
+                                       "OPENS a section"),
+              std::string::npos)
+        << parseMessages(*run);
+}
+
+// ══ D-ASM-SPACE-DIRECTIVE-FILL-BYTE-UNMODELLED ═════════════════════════════
+//
+// ★★★ `.space 4, 7` WRITES `07 07 07 07`, AND THE BYTES ARE THE ASSERTION.
+// ✔MEASURED 2026-08-13 against the reference assembler with `objdump -s`:
+// `aarch64-linux-gnu-as` on `.space 4, 7` AND on `.zero 4, 7` both emit
+// `07070707` — so `.zero` is not a fill-less special case and one verb serves
+// all three spellings.
+//
+// ★★ AND IT NEEDED NO NEW REPRESENTATION, which is what the anchor actually
+// asked. `AssembledData` already carries raw `bytes` for a file-backed section,
+// so the fill is the existing `insert(count, …)` call with the byte
+// parameterised; the zero-fill arm has no `bytes` at all by invariant, which is
+// why the two arms differ.
+TEST(AsmTextToLir, SpaceDirectiveMaterializesItsFillByte) {
+    auto doc = baseDialectDoc();
+    setDataDirectives(doc);
+    auto const run = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".rodata\n"
+        "pad:\n  .space 4, 7\n"
+        // No fill ⇒ zero, which is what the directive meant before the fill
+        // existed and must keep meaning.
+        "pad2:\n  .space 3\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+    auto const& items = run->module->dataItems;
+    ASSERT_EQ(items.size(), 2u);
+    EXPECT_EQ(items[0].bytes, (std::vector<std::uint8_t>{7, 7, 7, 7}))
+        << "the fill byte was dropped or zeroed";
+    EXPECT_EQ(items[1].bytes, (std::vector<std::uint8_t>{0, 0, 0}));
+}
+
+// ★ A NEGATIVE FILL IS THE SAME BYTE READ THE OTHER WAY — `.space 2, -1` is
+// `FF FF`, and gas takes it (✔MEASURED rc=0). The bound is a union of the
+// signed and unsigned ranges because assembly writes both, and it is the SAME
+// `valueFitsUnit` chokepoint `.byte` uses rather than a second opinion.
+TEST(AsmTextToLir, SpaceFillAcceptsBothSignedAndUnsignedByteReadings) {
+    auto doc = baseDialectDoc();
+    setDataDirectives(doc);
+    auto const run = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".rodata\np:\n  .space 2, -1\n  .space 1, 255\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+    ASSERT_EQ(run->module->dataItems.size(), 1u);
+    EXPECT_EQ(run->module->dataItems[0].bytes,
+              (std::vector<std::uint8_t>{0xFF, 0xFF, 0xFF}));
+}
+
+// ★ A FILL OUTSIDE ONE BYTE IS REFUSED — a KNOWN, DELIBERATE divergence.
+// ✔MEASURED: gas TRUNCATES `.space 4, 300` to `0x2c` with a warning and exits
+// 0. This build refuses through the same chokepoint it already refuses
+// `.byte 300` with, so the divergence is one module-wide policy and errs toward
+// refusing input rather than writing a byte the source did not name.
+TEST(AsmTextToLir, SpaceFillWiderThanOneByteIsRefused) {
+    auto doc = baseDialectDoc();
+    setDataDirectives(doc);
+    auto const run = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".rodata\np:\n  .space 4, 300\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    EXPECT_NE(messages(*run).find("does not fit the 1 byte(s)"),
+              std::string::npos)
+        << messages(*run);
+}
+
+// ★ A THIRD OPERAND IS REFUSED. gas has no such form, and accepting one would
+// mean silently ignoring whatever it was.
+TEST(AsmTextToLir, SpaceWithAThirdOperandIsRefused) {
+    auto doc = baseDialectDoc();
+    setDataDirectives(doc);
+    auto const run = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".rodata\np:\n  .space 4, 7, 9\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    EXPECT_NE(messages(*run).find("at most two operands"), std::string::npos)
+        << messages(*run);
+}
+
+// ★★★ A NON-ZERO FILL IN A ZERO-FILL SECTION: WARN AND IGNORE, EXACTLY AS gas
+// DOES. ✔MEASURED 2026-08-13 — `.bss` + `.space 4, 7` exits 0 under
+// `aarch64-linux-gnu-as` with `Warning: ignoring fill value in section '.bss'`.
+// The wire format stores NO file bytes for a zero-fill section (the invariant
+// `validateAssembledData` enforces), so a pattern has nowhere to live; refusing
+// would reject what the reference accepts, and silence would drop the
+// programmer's fill with nothing said. Matching a reference compiler means
+// matching all three: exit status, effect, and the diagnostic.
+TEST(AsmTextToLir, NonZeroFillInAZeroFillSectionWarnsAndIsIgnored) {
+    auto doc = baseDialectDoc();
+    setDataDirectives(doc);
+    auto const run = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".bss\nb:\n  .space 4, 7\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value())
+        << "gas ACCEPTS this input; refusing it is the other direction of the "
+           "same conformance defect: " << messages(*run);
+    ASSERT_EQ(run->module->dataItems.size(), 1u);
+    auto const& item = run->module->dataItems[0];
+    EXPECT_TRUE(item.bytes.empty())
+        << "a zero-fill section must store no file bytes";
+    EXPECT_EQ(item.reservedSize, 4u);
+
+    // The diagnostic is a WARNING, not an error — and it exists. A silent
+    // accept would be the accept-and-ignore this project refuses.
+    bool warned = false;
+    for (auto const& d : run->reporter.all()) {
+        if (d.severity != DiagnosticSeverity::Warning) continue;
+        if (d.actual.find("nowhere for a non-zero pattern to live")
+            != std::string::npos) {
+            warned = true;
+        }
+    }
+    EXPECT_TRUE(warned) << "the dropped fill was not reported: "
+                        << messages(*run);
+    for (auto const& d : run->reporter.all()) {
+        EXPECT_NE(d.severity, DiagnosticSeverity::Error)
+            << "gas exits 0 here; an Error would be a refusal: " << d.actual;
+    }
+
+    // ★ AND AN EXPLICIT ZERO IS NOT WARNED ABOUT: nothing is being dropped, so
+    // there is nothing to say. A warning that fires on the harmless case is a
+    // warning readers learn to ignore.
+    auto const zero = lowerAsmText(doc, src(
+        ".globl main\n.func main\nmain:\n  ret\n"
+        ".bss\nb:\n  .space 4, 0\n"));
+    ASSERT_TRUE(zero->module.has_value()) << messages(*zero);
+    EXPECT_EQ(zero->reporter.all().size(), 0u) << messages(*zero);
+}
+
+// ── RED-ON-DISABLE, against the REAL shipped arm64 dialect ─────────────────
+//
+// ★★★ THE TWO PINS BELOW MUTATE THE SHIPPED DOCUMENT'S TEXT and assert that the
+// guarantee DISAPPEARS. A test that only asserts the good behaviour cannot tell
+// "the mechanism works" from "the mechanism is unreachable and something else
+// produced the same answer"; these show the answer CHANGES when the declaration
+// is removed. Both follow the fail-closed checklist the `runtimeLibraries` pin
+// established: witness UNIQUE in the subject, mutant differs by HASH (never a
+// line count), witness ABSENT by the SAME matcher, mutant still well-formed
+// JSON, and the mutation described HERE rather than inside the mutated file.
+
+namespace {
+// The shipped arm64 dialect's raw TEXT (not the parsed doc) — a substring
+// mutation is what proves the DECLARATION is load-bearing, where a parsed-JSON
+// edit could silently apply to nothing.
+[[nodiscard]] std::string shippedArm64Text() {
+    auto pathR = findShippedConfig(
+        ShippedConfigLocator{"asm-arm64-gas", "sources", ".lang.json",
+                             "language", DiagnosticCode::C_InvalidTargetName});
+    if (!pathR.has_value()) return {};
+    std::ifstream in{*pathR};
+    if (!in) return {};
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    return buf.str();
+}
+
+// Replace the FIRST occurrence; false when the anchor has drifted, so a
+// mutation that applied to nothing FAILS instead of quietly proving nothing.
+[[nodiscard]] bool substituteOnce(std::string& text, std::string_view from,
+                                  std::string_view to) {
+    auto const at = text.find(from);
+    if (at == std::string::npos) return false;
+    text.replace(at, from.size(), to);
+    return true;
+}
+
+// The four fail-closed checks, in one place so no pin can quietly skip one.
+// `label` is the mutation description — it lands in the HARNESS output.
+void assertWellFormedMutant(std::string const& subject, std::string const& mutant,
+                            std::string_view witness, char const* label) {
+    SCOPED_TRACE(label);
+    // 1 — the witness is UNIQUE in the subject. If it appeared twice, removing
+    // one occurrence would leave the fact in place and the pin would be green
+    // over a mutation that changed nothing.
+    std::size_t occurrences = 0;
+    for (std::size_t at = subject.find(witness); at != std::string::npos;
+         at = subject.find(witness, at + 1)) {
+        ++occurrences;
+    }
+    ASSERT_EQ(occurrences, 1u)
+        << "the witness must appear EXACTLY once in the subject";
+    // 2 — the mutant DIFFERS, asserted on a HASH of the whole text. Never on a
+    // line count: these mutations remove no line, so a line count would report
+    // "unchanged" and pass while proving nothing.
+    ASSERT_NE(std::hash<std::string>{}(mutant), std::hash<std::string>{}(subject))
+        << "the mutant must differ from the subject";
+    // 3 — the witness is ABSENT from the mutant, BY THE SAME MATCHER that
+    // asserted its uniqueness.
+    ASSERT_EQ(mutant.find(witness), std::string::npos)
+        << "the witness must be ABSENT from the mutant, by the same matcher";
+    // 4 — the mutant is still well-formed JSON, which separates "the rule under
+    // test stopped firing" from "we handed the loader garbage".
+    auto const doc = nlohmann::json::parse(mutant, nullptr,
+                                           /*allow_exceptions=*/false);
+    ASSERT_FALSE(doc.is_discarded())
+        << "the mutant must remain well-formed JSON, or the result below is a "
+           "parse error wearing the rule's clothes";
+}
+}  // namespace
+
+// ★★★ RED-ON-DISABLE FOR `identifierClass` — the pin that proves the twelve
+// deleted token rows were replaced by something that actually runs. With the
+// block present, `b.eq` is ONE identifier and the file lowers; with it removed
+// the tokenizer splits it at the directive dot and the SAME source stops
+// parsing. If the tokenizer ignored the key (the knob-that-lies shape this
+// facet's own postmortem is about), both arms would behave identically.
+TEST(AsmTextToLir, Arm64DottedMnemonicNeedsTheDeclaredIdentifierClass) {
+    std::string const subject = shippedArm64Text();
+    ASSERT_FALSE(subject.empty()) << "the shipped arm64 dialect must be readable";
+
+    constexpr std::string_view kSource =
+        ".global main\n"
+        ".type main, %function\n"
+        "main:\n"
+        "  cmp x0, x0\n"
+        "  b.eq Lwin\n"
+        "  mov x0, #1\n"
+        "  ret\n"
+        "Lwin:\n"
+        "  mov x0, #42\n"
+        "  ret\n";
+
+    // The WITNESS: it lowers today, with the declaration in place.
+    {
+        auto const doc = nlohmann::json::parse(subject);
+        auto const ok  = lowerAsmText(doc, std::string{kSource}, "arm64");
+        ASSERT_TRUE(parsedCleanly(*ok)) << parseMessages(*ok);
+        ASSERT_TRUE(ok->module.has_value()) << messages(*ok);
+    }
+
+    constexpr std::string_view kWitness = R"("extraContinue": ".")";
+    std::string mutant = subject;
+    ASSERT_TRUE(substituteOnce(mutant, kWitness, R"("extraContinue": "$")"))
+        << "the mutation anchor must still exist — a no-op mutation is how a "
+           "red-on-disable pin goes green forever";
+    // ⓘ THE MUTATION IS A SUBSTITUTION, NOT A DELETION, and that is on purpose:
+    // `extraContinue` is REQUIRED when the block is present, so deleting the
+    // key would make the document fail to LOAD and the pin would be measuring
+    // the loader instead of the tokenizer. Swapping `.` for a character no
+    // arm64 source contains keeps the document valid and changes exactly one
+    // thing — whether `.` continues an identifier.
+    assertWellFormedMutant(subject, mutant, kWitness,
+                           "identifierClass.extraContinue '.' -> '$' in "
+                           "asm-arm64-gas.lang.json");
+
+    auto const bad = lowerAsmText(nlohmann::json::parse(mutant),
+                                  std::string{kSource}, "arm64");
+    EXPECT_FALSE(parsedCleanly(*bad))
+        << "with `.` no longer continuing an identifier, `b.eq` must split at "
+           "the directive dot and the line must fail to parse. It did not — "
+           "which means the tokenizer is not reading the declared class at "
+           "all, and the shipped block is decoration: " << parseMessages(*bad);
+}
+
+// ★★★ RED-ON-DISABLE FOR `operandOnly` — the pin that proves the BIDIRECTIONAL
+// half is enforced rather than merely documented. ✔MEASURED: gas rejects a bare
+// `.rodata`. With the flag present DSS rejects it too; with the flag removed the
+// spelling becomes an ordinary directive and DSS starts accepting input no
+// reference assembler does — which is the defect, in the direction that is easy
+// to miss because nothing breaks.
+TEST(AsmTextToLir, Arm64BareRodataStaysRefusedOnlyBecauseOfOperandOnly) {
+    std::string const subject = shippedArm64Text();
+    ASSERT_FALSE(subject.empty());
+
+    constexpr std::string_view kSource =
+        ".global main\n"
+        ".type main, %function\n"
+        ".rodata\n"
+        "k:\n"
+        "  .quad 58\n"
+        ".text\n"
+        "main:\n"
+        "  mov x0, #42\n"
+        "  ret\n";
+
+    // The WITNESS: today the bare spelling is refused, by name.
+    {
+        auto const run = lowerAsmText(nlohmann::json::parse(subject),
+                                      std::string{kSource}, "arm64");
+        ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+        EXPECT_FALSE(run->module.has_value());
+        EXPECT_NE(messages(*run).find("is a SECTION NAME in this dialect"),
+                  std::string::npos)
+            << messages(*run);
+    }
+
+    constexpr std::string_view kWitness = R"("operandOnly": true)";
+    std::string mutant = subject;
+    ASSERT_TRUE(substituteOnce(mutant, kWitness, R"("operandOnly": false)"));
+    assertWellFormedMutant(subject, mutant, kWitness,
+                           "directives[rodata].operandOnly true -> false in "
+                           "asm-arm64-gas.lang.json");
+
+    auto const loose = lowerAsmText(nlohmann::json::parse(mutant),
+                                    std::string{kSource}, "arm64");
+    ASSERT_TRUE(parsedCleanly(*loose)) << parseMessages(*loose);
+    EXPECT_TRUE(loose->module.has_value())
+        << "with the flag cleared, the bare `.rodata` must become an ordinary "
+           "directive — if it is STILL refused, the refusal is coming from "
+           "somewhere other than `operandOnly` and this pin is not measuring "
+           "the guard it names: " << messages(*loose);
+}
+
 // ══ D-ASM-ATT-LEAL-UNREACHABLE-NO-WIDTH-KEYED-LEA ══════════════════════════
 //
 // ★★ THE ONLY DIFFERENCE BETWEEN `leaq` AND `leal` ON THIS ISA IS REX.W, which
@@ -2207,4 +2716,575 @@ TEST(AsmTextToLir, LealReachesTheNonRexWFormAndLeaqKeepsRexW) {
     // ⚠ THE RED ARM: if `leal` had elected the REX.W variant there would be TWO
     // `48 8D` windows and no bare `8D 47`.
     EXPECT_EQ(countWindow(bytes, {0x48, 0x8D}), 1u) << hex(bytes);
+}
+
+// ══ D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET ═════════════════════
+// (folding D-ASM-SYMBOL-OPERAND-NOT-LOWERED and
+//  D-ASM-INDIRECT-BRANCH-SUCCESSOR-SET-UNSTATED)
+//
+// ★★★ THE CLAIM UNDER TEST IS A REUSE CLAIM, NOT A FEATURE CLAIM. The
+// interior-symbol MODEL already shipped for C (`SyntheticBlockSymbol`, the
+// three object writers, `addInteriorBlockSymbolVas`); what was missing was the
+// assembly front end's wiring to it. So every assertion below pins that the
+// `.s` produced the SAME shapes the C tier already produces — `[SymbolRef]`
+// for a data/function address (`lowerGlobalAddr`), `[SymbolRef, BlockRef]` for
+// an interior label (`lowerBlockAddress`), and an abs-width relocation with
+// addend 0 for a data slot — rather than pinning anything assembly-private.
+
+namespace {
+
+// A dialect that can write a jump table: the kind-split `jmp` (so `jmp *%rax`
+// reaches `jmp_indirect`) plus the data directives.
+nlohmann::json jumpTableDoc() {
+    auto doc = kindSplitJmpDoc();
+    setDataDirectives(doc);
+    // A 4-byte element too, so the "the relocation's width is the DIRECTIVE's"
+    // assertion has a width to disagree with.
+    nlohmann::json row;
+    row["spelling"]  = "long";
+    row["verb"]      = "emitData";
+    row["unitBytes"] = 4;
+    doc["assembly"]["directives"].push_back(std::move(row));
+    return doc;
+}
+
+// The single function's instructions, flattened in block order.
+std::vector<LirInstId> flatInsts(Lir const& lir) {
+    std::vector<LirInstId> out;
+    auto const fn = lir.funcAt(0);
+    for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+        auto const blk = lir.funcBlockAt(fn, bi);
+        for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+            out.push_back(lir.blockInstAt(blk, ii));
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+// ★★★ M2 — AN INTERIOR LABEL'S ADDRESS IS `[SymbolRef, BlockRef]`, BYTE-FOR-
+// BYTE THE SHAPE `mir_to_lir.cpp`'s `lowerBlockAddress` EMITS FOR `&&label`.
+// The trailing BlockRef is what lets the assembler bind the symbol to the
+// block's byte offset; without it the symbol would name nothing and the
+// relocation would resolve to address 0.
+TEST(AsmTextToLir, InteriorLabelAddressEmitsSymbolRefPlusBlockRef) {
+    auto const run = lowerAsmText(baseDialectDoc(), src(
+        ".globl main\n.func main\nmain:\n"
+        "  leaq Lw, %rax\n"
+        "  jmp Lw\n"
+        "Lw:\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+
+    auto const& lir  = run->module->lir;
+    auto const  lea  = op(*run->target, "lea");
+    bool        seen = false;
+    for (auto const inst : flatInsts(lir)) {
+        if (lir.instOpcode(inst) != lea) continue;
+        seen = true;
+        auto const ops = lir.instOperands(inst);
+        ASSERT_EQ(ops.size(), 2u) << "an interior label's address is the "
+                                     "2-operand block-address form";
+        EXPECT_EQ(ops[0].kind, LirOperandKind::SymbolRef);
+        EXPECT_EQ(ops[1].kind, LirOperandKind::BlockRef);
+        // The BlockRef names the block the label opened — the SAME block the
+        // `jmp Lw` above branches to, which is what makes the two agree.
+        auto const fn = lir.funcAt(0);
+        EXPECT_EQ(ops[1].blockSlot, lir.funcBlockAt(fn, 1).v);
+    }
+    EXPECT_TRUE(seen) << "no `lea` reached LIR";
+}
+
+// ★★★ M6 — THE INDIRECT BRANCH'S SUCCESSOR SET, DERIVED. This is the
+// prediction D-ASM-INDIRECT-BRANCH-SUCCESSOR-SET-UNSTATED made when it chose
+// to key its refusal on DERIVABILITY instead of on the opcode: the refusal
+// site was not edited at all, and it simply stopped firing once the front end
+// could bind an interior label's address.
+//
+// ⚠ THE SET IS PINNED BY MEMBERSHIP, NOT BY SIZE. "Two successors" would also
+// be true of a build that emitted the wrong two.
+TEST(AsmTextToLir, IndirectBranchDerivesItsSuccessorsFromAddressedLabels) {
+    auto const run = lowerAsmText(kindSplitJmpDoc(), src(
+        ".globl main\n.func main\nmain:\n"
+        "  leaq La, %rax\n"
+        "  leaq Lb, %rdx\n"
+        "  jmp *%rax\n"
+        "La:\n"
+        "  ret\n"
+        "Lb:\n"
+        "  ret\n"
+        "Lc:\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+
+    auto const& lir  = run->module->lir;
+    auto const  jmpi = op(*run->target, "jmp_indirect");
+    auto const  fn   = lir.funcAt(0);
+    ASSERT_EQ(lir.funcBlockCount(fn), 4u) << "entry + La + Lb + Lc";
+
+    bool seen = false;
+    for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+        auto const blk = lir.funcBlockAt(fn, bi);
+        for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+            auto const inst = lir.blockInstAt(blk, ii);
+            if (lir.instOpcode(inst) != jmpi) continue;
+            seen = true;
+            auto const succs = lir.blockSuccessors(blk);
+            ASSERT_EQ(succs.size(), 2u)
+                << "exactly the two labels whose address was taken";
+            EXPECT_EQ(succs[0].v, lir.funcBlockAt(fn, 1).v) << "La";
+            EXPECT_EQ(succs[1].v, lir.funcBlockAt(fn, 2).v) << "Lb";
+            // ⚠ `Lc` IS THE CONTROL. It is an interior label of the same
+            // function that NOTHING took the address of, so a build that
+            // over-approximated with "every block" would list it here — which
+            // is the arm the refusal's own text names as forbidden.
+            for (auto const s : succs) {
+                EXPECT_NE(s.v, lir.funcBlockAt(fn, 3).v)
+                    << "Lc is not address-taken and must not be a successor";
+            }
+        }
+    }
+    EXPECT_TRUE(seen) << "the indirect branch never reached LIR";
+}
+
+// ★ THE REFUSAL STILL FIRES WHEN NOTHING IS ADDRESS-TAKEN — the derivability
+// key cuts both ways, and a capability that made the refusal unreachable would
+// have replaced a precise diagnostic with a silent under-approximated CFG.
+TEST(AsmTextToLir, IndirectBranchWithNoAddressedLabelIsStillRefused) {
+    auto const run = lowerAsmText(kindSplitJmpDoc(), src(
+        ".globl main\n.func main\nmain:\n"
+        "  movq %rsp, %rax\n"
+        "  jmp *%rax\n"
+        "Lw:\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    EXPECT_NE(messages(*run).find("SUCCESSOR SET CANNOT BE DERIVED"),
+              std::string::npos) << messages(*run);
+    EXPECT_EQ(countDiagnostics(run->reporter, kAsmCode), 1u);
+}
+
+// ★★★ M3 — `.quad Lw` IS A RELOCATION, AT THE ABSOLUTE KIND THE TARGET
+// DECLARES, WITH ADDEND 0. The addend is the load-bearing half: interiority
+// lives in the SYMBOL'S VA (a synthetic own-VA symbol), which is exactly why
+// no relocation kind had to learn about interior labels.
+TEST(AsmTextToLir, DataSlotNamingALabelBecomesAnAbsoluteRelocation) {
+    auto const run = lowerAsmText(jumpTableDoc(), src(
+        ".data\n"
+        "tbl:\n"
+        "  .quad La\n"
+        "  .quad Lb\n"
+        ".text\n"
+        ".globl main\n.func main\nmain:\n"
+        "  movq $0, %rax\n"
+        "  jmp *%rax\n"
+        "La:\n"
+        "  ret\n"
+        "Lb:\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+
+    ASSERT_EQ(run->module->dataItems.size(), 1u);
+    auto const& item = run->module->dataItems[0];
+    EXPECT_EQ(item.bytes.size(), 16u) << "two 8-byte slots, zero-filled";
+    for (auto const b : item.bytes) EXPECT_EQ(b, 0u);
+    ASSERT_EQ(item.relocations.size(), 2u);
+    EXPECT_EQ(item.relocations[0].offset, 0u);
+    EXPECT_EQ(item.relocations[1].offset, 8u);
+    for (auto const& r : item.relocations) {
+        EXPECT_EQ(r.addend, 0) << "interiority lives in the symbol's VA";
+        EXPECT_TRUE(r.target.valid());
+    }
+    EXPECT_NE(item.relocations[0].target.v, item.relocations[1].target.v)
+        << "two labels are two symbols";
+
+    // ★ THE KIND IS THE TARGET'S OWN ABSOLUTE-8-BYTE ROW, FOUND BY THE
+    // width/pc-relative FORMULA — never by the name "abs64".
+    std::optional<RelocationKind> expected;
+    for (auto const& r : run->target->relocations()) {
+        if (r.widthBytes == 8 && !r.pcRelative) { expected = r.kind; break; }
+    }
+    ASSERT_TRUE(expected.has_value());
+    EXPECT_EQ(item.relocations[0].kind, *expected);
+}
+
+// ★★★ M4 — THE ONE GENUINELY NEW CHANNEL. A label named ONLY from data emits
+// no instruction, so the encoder records no `BlockSymPatch` and `assemble()`
+// cannot bind the symbol. The lowering hands the driver the (function, block,
+// symbol) triple instead, and the driver binds it through the SAME helper the
+// C jump-table path uses.
+TEST(AsmTextToLir, DataOnlyBlockSymbolsAreHandedToTheDriverToBind) {
+    auto const run = lowerAsmText(jumpTableDoc(), src(
+        ".data\n"
+        "tbl:\n"
+        "  .quad La\n"
+        "  .quad Lb\n"
+        ".text\n"
+        ".globl main\n.func main\nmain:\n"
+        "  movq $0, %rax\n"
+        "  jmp *%rax\n"
+        "La:\n"
+        "  ret\n"
+        "Lb:\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+
+    auto const& b = run->module->blockSymbolBindings;
+    ASSERT_EQ(b.size(), 2u) << "one per interior label the table names";
+    auto const fn = run->module->lir.funcAt(0);
+    EXPECT_EQ(b[0].funcIndex, 0u);
+    EXPECT_EQ(b[1].funcIndex, 0u);
+    EXPECT_EQ(b[0].lirBlockV, run->module->lir.funcBlockAt(fn, 1).v) << "La";
+    EXPECT_EQ(b[1].lirBlockV, run->module->lir.funcBlockAt(fn, 2).v) << "Lb";
+    // The bindings name the SAME symbols the relocations target — one symbol
+    // per label, reached from both sides.
+    ASSERT_EQ(run->module->dataItems.size(), 1u);
+    auto const& rel = run->module->dataItems[0].relocations;
+    ASSERT_EQ(rel.size(), 2u);
+    EXPECT_EQ(b[0].symbol.v, rel[0].target.v);
+    EXPECT_EQ(b[1].symbol.v, rel[1].target.v);
+}
+
+// ★ A DATA LABEL NEEDS THE SymbolRef ONLY — no BlockRef, because it is not a
+// block. This is D-ASM-SYMBOL-OPERAND-NOT-LOWERED's own example
+// (`adr x0, mydata`), written in the dialect this fixture speaks.
+TEST(AsmTextToLir, DataLabelAddressEmitsSymbolRefAlone) {
+    auto const run = lowerAsmText(jumpTableDoc(), src(
+        ".data\n"
+        "msg:\n"
+        "  .quad 7\n"
+        ".text\n"
+        ".globl main\n.func main\nmain:\n"
+        "  leaq msg, %rax\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+
+    auto const& lir  = run->module->lir;
+    auto const  lea  = op(*run->target, "lea");
+    bool        seen = false;
+    for (auto const inst : flatInsts(lir)) {
+        if (lir.instOpcode(inst) != lea) continue;
+        seen = true;
+        auto const ops = lir.instOperands(inst);
+        ASSERT_EQ(ops.size(), 1u) << "a data label is not a block — no BlockRef";
+        EXPECT_EQ(ops[0].kind, LirOperandKind::SymbolRef);
+    }
+    EXPECT_TRUE(seen) << "no `lea` reached LIR";
+    // No block-symbol binding: nothing here names a BLOCK.
+    EXPECT_TRUE(run->module->blockSymbolBindings.empty());
+}
+
+// ★ A FUNCTION ENTRY'S ADDRESS IS ALSO SymbolRef-ONLY, and it must reuse the
+// function's OWN symbol rather than minting a second one — two symbols for one
+// function is how a call and an address-of would stop agreeing.
+TEST(AsmTextToLir, FunctionAddressReusesTheFunctionSymbol) {
+    auto const run = lowerAsmText(baseDialectDoc(), src(
+        ".globl main\n.func main\n.func other\nmain:\n"
+        "  leaq other, %rax\n"
+        "  ret\n"
+        "other:\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+
+    SymbolId otherSym{};
+    for (auto const& s : run->module->symbols) {
+        if (s.name == "other") otherSym = s.symbol;
+    }
+    ASSERT_TRUE(otherSym.valid());
+
+    auto const& lir  = run->module->lir;
+    auto const  lea  = op(*run->target, "lea");
+    bool        seen = false;
+    for (auto const inst : flatInsts(lir)) {
+        if (lir.instOpcode(inst) != lea) continue;
+        seen = true;
+        auto const ops = lir.instOperands(inst);
+        ASSERT_EQ(ops.size(), 1u);
+        EXPECT_EQ(ops[0].kind, LirOperandKind::SymbolRef);
+        EXPECT_EQ(ops[0].symbolV, otherSym.v)
+            << "the address-of must name the function's own ModuleSymbol";
+    }
+    EXPECT_TRUE(seen);
+}
+
+// ── the fail-loud arms ────────────────────────────────────────────────────
+
+// ★ A NAME THIS FILE DEFINES NOWHERE IS REFUSED, NOT IMPORTED — because an
+// import states CODE-vs-DATA (which selects the linker's indirection slot) and
+// an address operand states neither.
+TEST(AsmTextToLir, AddressOfAnUndefinedNameIsRefused) {
+    auto const run = lowerAsmText(baseDialectDoc(), src(
+        ".globl main\n.func main\nmain:\n"
+        "  leaq nowhere, %rax\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    EXPECT_NE(messages(*run).find("'nowhere'"), std::string::npos)
+        << messages(*run);
+    EXPECT_NE(messages(*run).find("CODE or DATA"), std::string::npos)
+        << messages(*run);
+    EXPECT_EQ(countDiagnostics(run->reporter, kAsmCode), 1u);
+}
+
+TEST(AsmTextToLir, DataSlotNamingAnUndefinedSymbolIsRefused) {
+    auto const run = lowerAsmText(jumpTableDoc(), src(
+        ".data\n"
+        "tbl:\n"
+        "  .quad nowhere\n"
+        ".text\n"
+        ".globl main\n.func main\nmain:\n  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    EXPECT_NE(messages(*run).find("'nowhere'"), std::string::npos)
+        << messages(*run);
+    EXPECT_EQ(countDiagnostics(run->reporter, kAsmCode), 1u);
+}
+
+// ★ AN INTERIOR LABEL OF ANOTHER FUNCTION IS REFUSED FOR THE SAME REASON A
+// CROSS-FUNCTION BRANCH IS: `makeBlockRef` names a block SLOT, and a slot from
+// another function resolves to whatever block sits at that index here — a
+// SILENTLY WRONG binding rather than an absent one.
+TEST(AsmTextToLir, AddressOfAnotherFunctionsInteriorLabelIsRefused) {
+    auto const run = lowerAsmText(baseDialectDoc(), src(
+        ".globl main\n.func main\n.func other\nmain:\n"
+        "  leaq Lin, %rax\n"
+        "  ret\n"
+        "other:\n"
+        "  jmp Lin\n"
+        "Lin:\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    EXPECT_NE(messages(*run).find("DIFFERENT function"), std::string::npos)
+        << messages(*run);
+    EXPECT_EQ(countDiagnostics(run->reporter, kAsmCode), 1u);
+}
+
+// ★ THE RELOCATION'S WIDTH FOLLOWS THE DIRECTIVE, NOT THE POINTER SIZE, so a
+// table's stride can never disagree with its relocations. `.long La` on
+// x86_64 works because the target declares a 4-byte non-pc-relative row; a
+// target declaring none for that width is refused rather than narrowed.
+TEST(AsmTextToLir, DataSlotRelocationWidthFollowsTheDirectiveNotThePointer) {
+    auto const run = lowerAsmText(jumpTableDoc(), src(
+        ".data\n"
+        "tbl:\n"
+        "  .long La\n"
+        ".text\n"
+        ".globl main\n.func main\nmain:\n"
+        "  movq $0, %rax\n"
+        "  jmp *%rax\n"
+        "La:\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+    ASSERT_EQ(run->module->dataItems.size(), 1u);
+    auto const& item = run->module->dataItems[0];
+    EXPECT_EQ(item.bytes.size(), 4u) << "the ROW's unitBytes, not a pointer";
+    ASSERT_EQ(item.relocations.size(), 1u);
+    std::optional<RelocationKind> expected;
+    for (auto const& r : run->target->relocations()) {
+        if (r.widthBytes == 4 && !r.pcRelative) { expected = r.kind; break; }
+    }
+    ASSERT_TRUE(expected.has_value());
+    EXPECT_EQ(item.relocations[0].kind, *expected);
+}
+
+// ★★★ TAKING ONE LABEL'S ADDRESS TWICE IS ONE SYMBOL, BOUND ONCE.
+// ✔MEASURED 2026-08-13: before the `assemble()` dedup this REFUSED TO LINK
+// (`K_SymbolUndefined: symbol #N is declared more than once`) in BOTH source
+// languages — C's `void *a = &&L; void *b = &&L;` failed identically. The
+// duplicate entries were IDENTICAL, so collapsing them is not a choice between
+// two answers.
+TEST(AsmTextToLir, TakingOneLabelsAddressTwiceMintsOneSymbol) {
+    auto const run = lowerAsmText(kindSplitJmpDoc(), src(
+        ".globl main\n.func main\nmain:\n"
+        "  leaq Lw, %rax\n"
+        "  leaq Lw, %rdx\n"
+        "  jmp *%rax\n"
+        "Lw:\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+
+    auto const& lir = run->module->lir;
+    auto const  lea = op(*run->target, "lea");
+    std::vector<std::uint32_t> syms;
+    for (auto const inst : flatInsts(lir)) {
+        if (lir.instOpcode(inst) != lea) continue;
+        auto const ops = lir.instOperands(inst);
+        ASSERT_EQ(ops.size(), 2u);
+        syms.push_back(ops[0].symbolV);
+    }
+    ASSERT_EQ(syms.size(), 2u);
+    EXPECT_EQ(syms[0], syms[1]) << "one label is one symbol";
+
+    // And the ASSEMBLER binds it exactly once — two `SyntheticBlockSymbol`
+    // rows for one SymbolId is what the linker rejects as a duplicate
+    // declaration.
+    DiagnosticReporter     rep;
+    std::vector<MirInstId> lirToMir(lir.instCount(), InvalidMirInst);
+    auto const asmMod = assemble(lir, *run->target, lirToMir, rep);
+    ASSERT_TRUE(asmMod.ok());
+    ASSERT_EQ(asmMod.functions.size(), 1u);
+    EXPECT_EQ(asmMod.functions[0].blockSymbols.size(), 1u)
+        << "one binding per SYMBOL, not per relocation site";
+}
+
+// ★★ THE ASSEMBLER GIVES THE BLOCK SYMBOL THE INTERIOR BYTE OFFSET, and the
+// offset is NON-ZERO — a binding that always produced 0 would point every
+// interior label at its function's entry, which is exactly the failure a
+// byte-level pin on the `lea` alone would not see.
+TEST(AsmTextToLir, InteriorBlockSymbolCarriesItsByteOffsetWithinTheFunction) {
+    auto const run = lowerAsmText(kindSplitJmpDoc(), src(
+        ".globl main\n.func main\nmain:\n"
+        "  leaq Lw, %rax\n"
+        "  jmp *%rax\n"
+        "Lw:\n"
+        "  ret\n"));
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+
+    DiagnosticReporter     rep;
+    auto const&            lir = run->module->lir;
+    std::vector<MirInstId> lirToMir(lir.instCount(), InvalidMirInst);
+    auto const asmMod = assemble(lir, *run->target, lirToMir, rep);
+    ASSERT_TRUE(asmMod.ok());
+    ASSERT_EQ(asmMod.functions.size(), 1u);
+    auto const& fn = asmMod.functions[0];
+    ASSERT_EQ(fn.blockSymbols.size(), 1u);
+    EXPECT_GT(fn.blockSymbols[0].blockByteOffset, 0u)
+        << "an interior label is not the function entry";
+    EXPECT_LT(fn.blockSymbols[0].blockByteOffset, fn.bytes.size());
+    // The `lea` relocation targets that same symbol, with addend 0.
+    bool found = false;
+    for (auto const& r : fn.relocations) {
+        if (r.target.v != fn.blockSymbols[0].symbol.v) continue;
+        found = true;
+        EXPECT_EQ(r.addend, 0);
+    }
+    EXPECT_TRUE(found) << "the block symbol is never relocated against";
+}
+
+// ── red-on-disable: the capability is ELECTED, never coincidental ─────────
+//
+// ★★★ WHY THESE TWO MUTANTS AND NOT A BYTE PIN. The whole finding of this
+// cycle is that nothing new had to be built — the shapes, the variants and the
+// relocation kinds already existed. That makes "it worked" the WEAKEST possible
+// evidence: a build that quietly fell back to a DIFFERENT existing shape would
+// also link, and would also produce plausible bytes. Each mutant below removes
+// exactly one declaration the capability depends on and asserts the lowering
+// REFUSES rather than reaching for the neighbouring shape.
+
+// ★ MUTANT 1 — REMOVE THE `["symbol","blockref"]` `lea` VARIANT.
+// The 1-operand `["symbol"]` variant is still there and is BYTE-IDENTICAL (the
+// target's own `$comment` says so), so a fallback would assemble and would look
+// right — and the block symbol would never be bound to a byte offset, leaving
+// the relocation pointing at a symbol with no address. This is the exact shape
+// of "perfect bytes, wrong runtime" this repo has a scar for.
+TEST(AsmTextToLir, RedOnDisableStrippedBlockAddressLeaVariantFailsLoud) {
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& opc : doc["opcodes"]) {
+                if (opc.value("mnemonic", "") != "lea") continue;
+                auto& variants = opc["encoding"]["variants"];
+                variants.erase(
+                    std::remove_if(
+                        variants.begin(), variants.end(),
+                        [](nlohmann::json const& v) {
+                            if (!v.contains("guard")) return false;
+                            auto const& g = v["guard"];
+                            if (!g.contains("operandKinds")) return false;
+                            return g["operandKinds"]
+                                   == nlohmann::json::array({"symbol",
+                                                             "blockref"});
+                        }),
+                    variants.end());
+            }
+        });
+    ASSERT_TRUE(mutated.has_value()) << "the mutant target must still LOAD — "
+                                        "a mutant that fails to load proves "
+                                        "nothing about the lowering";
+
+    auto const subject = lowerAsmText(kindSplitJmpDoc(), src(
+        ".globl main\n.func main\nmain:\n"
+        "  leaq Lw, %rax\n"
+        "  jmp *%rax\n"
+        "Lw:\n"
+        "  ret\n"));
+    ASSERT_TRUE(subject->module.has_value()) << messages(*subject);
+
+    auto const mutant = lowerAsmTextWithTarget(kindSplitJmpDoc(), src(
+        ".globl main\n.func main\nmain:\n"
+        "  leaq Lw, %rax\n"
+        "  jmp *%rax\n"
+        "Lw:\n"
+        "  ret\n"), *mutated);
+    ASSERT_TRUE(parsedCleanly(*mutant)) << parseMessages(*mutant);
+    EXPECT_FALSE(mutant->module.has_value())
+        << "stripping the block-address variant must FAIL LOUD, never fall "
+           "back to the byte-identical 1-operand form: " << messages(*mutant);
+    EXPECT_GE(countDiagnostics(mutant->reporter,
+                               DiagnosticCode::A_AsmTextUnsupported), 1u);
+}
+
+// ★ MUTANT 2 — REMOVE THE TARGET'S ABSOLUTE 8-BYTE RELOCATION ROW.
+// `.quad Lw` must then refuse NAMING THE WIDTH, never silently narrow to the
+// 4-byte row that is still declared — a table whose slots are 8 bytes wide and
+// whose relocations write 4 would jump into the middle of an address.
+TEST(AsmTextToLir, RedOnDisableStrippedAbsolute8ByteRelocFailsLoud) {
+    auto mutated = test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            auto& rels = doc["relocations"];
+            rels.erase(
+                std::remove_if(
+                    rels.begin(), rels.end(),
+                    [](nlohmann::json const& r) {
+                        return r.value("widthBytes", 0) == 8
+                               && !r.value("pcRelative", false);
+                    }),
+                rels.end());
+        });
+    ASSERT_TRUE(mutated.has_value()) << "the mutant target must still LOAD";
+    // The mutation is real: the formula the code uses finds nothing now.
+    bool anyAbs8 = false;
+    for (auto const& r : (*mutated)->relocations()) {
+        if (r.widthBytes == 8 && !r.pcRelative) anyAbs8 = true;
+    }
+    EXPECT_FALSE(anyAbs8) << "the mutant still declares an absolute-64 row — "
+                             "the mutation did not take";
+
+    std::string const source =
+        ".data\n"
+        "tbl:\n"
+        "  .quad Lw\n"
+        ".text\n"
+        ".globl main\n.func main\nmain:\n"
+        "  movq $0, %rax\n"
+        "  jmp *%rax\n"
+        "Lw:\n"
+        "  ret\n";
+
+    auto const subject = lowerAsmText(jumpTableDoc(), src(source));
+    ASSERT_TRUE(subject->module.has_value()) << messages(*subject);
+    ASSERT_EQ(subject->module->dataItems.size(), 1u);
+    EXPECT_EQ(subject->module->dataItems[0].relocations.size(), 1u);
+
+    auto const mutant =
+        lowerAsmTextWithTarget(jumpTableDoc(), src(source), *mutated);
+    ASSERT_TRUE(parsedCleanly(*mutant)) << parseMessages(*mutant);
+    EXPECT_FALSE(mutant->module.has_value())
+        << "no absolute-8 relocation must REFUSE, never narrow to the 4-byte "
+           "row: " << messages(*mutant);
+    // The SAME matcher the diagnostic is written for: it must name the width.
+    EXPECT_NE(messages(*mutant).find("ABSOLUTE 8-byte relocation"),
+              std::string::npos) << messages(*mutant);
+    EXPECT_EQ(countDiagnostics(mutant->reporter,
+                               DiagnosticCode::A_AsmTextUnsupported), 1u);
 }

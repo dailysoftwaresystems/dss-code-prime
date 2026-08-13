@@ -29,6 +29,11 @@ constexpr MethodEntry kMethodTable[] = {
     {"textDocument/references",     Method::TextDocumentReferences},
     {"textDocument/rename",         Method::TextDocumentRename},
     {"textDocument/signatureHelp",  Method::TextDocumentSignatureHelp},
+    {"workspace/didChangeWatchedFiles",
+                                    Method::WorkspaceDidChangeWatchedFiles},
+    {"workspace/didCreateFiles",    Method::WorkspaceDidCreateFiles},
+    {"workspace/didRenameFiles",    Method::WorkspaceDidRenameFiles},
+    {"workspace/didDeleteFiles",    Method::WorkspaceDidDeleteFiles},
 };
 
 } // namespace

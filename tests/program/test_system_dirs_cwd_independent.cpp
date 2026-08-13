@@ -36,6 +36,7 @@
 #include "diagnostic_count.hpp"
 #include "program/program.hpp"
 #include "repo_root.hpp"
+#include "scoped_env.hpp"    // the ONE env override (this file used to carry a copy)
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -49,6 +50,9 @@
 
 using namespace dss;
 using namespace dss::test_support;
+using dss::test_support::ScopedEnv;   // named explicitly: this file's env
+                                      // override is the HOISTED one, not a
+                                      // local class it happens to also see
 namespace fs = std::filesystem;
 
 namespace {
@@ -64,39 +68,14 @@ constexpr char const* kSource =
     "#include <stdio.h>\n"
     "int main(void){ return 0; }\n";
 
-// Portable RAII env override. Kept LOCAL rather than hoisted for the same
-// reason the copies in tests/core/test_config_path_walk.cpp and
-// tests/test_support/test_repo_root.cpp are: a test that mutates the
-// environment must not leak that mutation into a sibling binary's expectations.
-class ScopedEnv {
-public:
-    ScopedEnv(char const* name, std::string const& value) : name_(name) {
-        if (char const* prev = std::getenv(name)) { had_ = true; prev_ = prev; }
-        set(value);
-    }
-    ~ScopedEnv() { had_ ? set(prev_) : clear(); }
-    ScopedEnv(ScopedEnv const&)            = delete;
-    ScopedEnv& operator=(ScopedEnv const&) = delete;
-
-private:
-    void set(std::string const& v) {
-#ifdef _WIN32
-        _putenv_s(name_.c_str(), v.c_str());
-#else
-        ::setenv(name_.c_str(), v.c_str(), 1);
-#endif
-    }
-    void clear() {
-#ifdef _WIN32
-        _putenv_s(name_.c_str(), "");
-#else
-        ::unsetenv(name_.c_str());
-#endif
-    }
-    std::string name_;
-    bool        had_ = false;
-    std::string prev_;
-};
+// The env override (`DSS_CONFIG_ROOT`) is `dss::test_support::ScopedEnv`, the
+// ONE hoisted copy. The local class that used to sit here justified itself with
+// a non-sequitur — "kept LOCAL … so a test that mutates the environment cannot
+// leak that mutation into a sibling binary's expectations" — which cannot be
+// true: every test binary is its own PROCESS with its own environment block, so
+// sharing a HEADER leaks nothing. The RESTORE prevents the leak, and it is
+// measured in `tests/test_support/test_scoped_env.cpp`, which no hand-rolled
+// copy ever was.
 
 // RAII cwd pin. `ScratchDir::useAsCwd` deliberately REFUSES `Location::Temp`
 // (a temp scratch is outside the repo, which used to break every schema

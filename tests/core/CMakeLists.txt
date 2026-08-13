@@ -13,7 +13,30 @@ dss_add_test(NAME core/test_diagnostic_reporter SOURCES test_diagnostic_reporter
 dss_add_test(NAME core/test_unsuppressable_codes SOURCES test_unsuppressable_codes.cpp)
 dss_add_test(NAME core/test_header_name_matching SOURCES test_header_name_matching.cpp)
 dss_add_test(NAME core/test_grammar_schema      SOURCES test_grammar_schema.cpp)
+# Plan 15 CFI slice (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO): the
+# shared PC-keyed unwind representation -- per-PC state, the remember/restore
+# stack, and the malformed-stream refusals every format writer relies on.
+dss_add_test(NAME core/test_cfi                 SOURCES test_cfi.cpp)
 dss_add_test(NAME core/test_target_schema       SOURCES test_target_schema.cpp)
+# D-CONFIG-TARGET-LOADER-CONTAINER-KEYS-UNGATED: the container key-gate pins
+# mutate the SHIPPED target JSON in memory (nlohmann consumer) — injecting a
+# typo key at each gated container and proving the load fails, and injecting a
+# `$`-prefixed prose key and proving it does not.
+target_link_libraries(dss_core_test_target_schema PRIVATE nlohmann_json::nlohmann_json)
+# Two `.target.json` loader gates that close the same shape — a config that
+# loads clean and then does nothing:
+#   * D-UNWIND-NO-EH-FRAME-…: the psABI DWARF numbering must arrive in BOTH
+#     halves, and every register a calling convention names as frame-relevant
+#     must be numbered (derived from what the target already declares).
+#   * D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY: `vaListLayout`'s key set
+#     is PER-STRATEGY, so a correctly-spelled key from a different strategy is
+#     rejected with a message naming both sides.
+# Mutates the SHIPPED JSON in memory (nlohmann consumer), never a parallel
+# hand-written file that could drift from the real config.
+dss_add_test(NAME core/test_target_dwarf_and_valist_gates
+             SOURCES test_target_dwarf_and_valist_gates.cpp)
+target_link_libraries(dss_core_test_target_dwarf_and_valist_gates
+                      PRIVATE nlohmann_json::nlohmann_json)
 dss_add_test(NAME core/test_target_subregister_validation SOURCES test_target_subregister_validation.cpp)
 dss_add_test(NAME core/test_number_decode       SOURCES test_number_decode.cpp)
 dss_add_test(NAME core/test_bit_int_value       SOURCES test_bit_int_value.cpp)

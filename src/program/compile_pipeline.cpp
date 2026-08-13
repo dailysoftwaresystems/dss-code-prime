@@ -871,6 +871,37 @@ static std::optional<CuMirModule> buildCuMirImpl(
 //   * `cuId`              — stamped onto the AssembledModule so the linker keys symbols.
 // Returns nullopt on any back-half tier failure (diagnostics already emitted via `reporter`).
 //
+// ★★★ BIND ONE INTERIOR-BLOCK SYMBOL TO ITS BYTE OFFSET — THE ONE STEP TWO
+// SOURCE LANGUAGES SHARE. `assemble()` binds a block symbol automatically when
+// an INSTRUCTION named the block (the block-address `lea`'s trailing `BlockRef`
+// becomes a `BlockSymPatch`). A block named only from DATA emits no such
+// instruction, so the binding has to happen here, from the function's published
+// `blockByteOffsets`. Two producers reach this:
+//   * a C dense `switch` — `JumpTableDescriptor` (D-OPT-SWITCH-JUMP-TABLE);
+//   * a hand-written `.s` jump table — `AsmBlockSymbolBinding`
+//     (D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET).
+// They differ in what ELSE they carry (the C path also has to synthesize the
+// table's bytes; a `.s` already wrote them), so only the binding is shared —
+// but it is shared as CODE, not as a copied pair of lines, because a second
+// copy is how the two would start disagreeing about `alreadyBound`.
+//
+// Returns false when the function published no byte offset for `lirBlockV` —
+// malformed IR, which each caller reports with its own subject.
+[[nodiscard]] static bool
+bindBlockSymbol(AssembledFunction& outFn, std::uint32_t lirBlockV,
+                SymbolId blockSymbol,
+                std::unordered_set<std::uint32_t>& alreadyBound) {
+    // Already bound (a block that is ALSO a computed-goto `&&label`, or a
+    // duplicate/gap slot reusing one SymbolId) — binding twice would give the
+    // linker two VAs for one symbol.
+    if (!alreadyBound.insert(blockSymbol.v).second) return true;
+    auto const offIt = outFn.blockByteOffsets.find(lirBlockV);
+    if (offIt == outFn.blockByteOffsets.end()) return false;
+    outFn.blockSymbols.push_back(
+        SyntheticBlockSymbol{blockSymbol, offIt->second});
+    return true;
+}
+
 // The grammar's entry-name list is intentionally NOT a parameter — the entry-name SCAN
 // needs to ENUMERATE symbols + names (which `nameOf` cannot do) plus the ambiguity
 // fail-loud, so each caller runs it and hands the resolved id here. Keeping a dead
@@ -1049,42 +1080,161 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         assembled.userEntrySymbol = userEntrySymbol;
     }
 
-    // c114 (D-WIN64-PDATA-XDATA-UNWIND): project each function's frame
-    // prologue (from the callconv pass's per-function FrameLayout) onto its
-    // AssembledFunction, so a downstream unwind-table emitter (the pe64
-    // writer's .pdata/.xdata builder) can describe the frame WITHOUT a lir/
-    // dependency. Positional, mirroring the dataItems/userEntrySymbol
-    // post-`assemble()` splices: cc.perFunc and assembled.functions are BOTH
-    // guaranteed size == moduleFuncCount() (cc.ok() @561 + assembled.ok()
-    // @577) and enumerated identically (asm.cpp populates via lir.funcAt(i),
-    // the same order as perFunc's `1:1 with src.funcAt(i)`). The projection
-    // is format-neutral frame data; only the pe64 writer reads it today.
-    if (cc.perFunc.size() == assembled.functions.size()) {
+    // ── CALL FRAME INFORMATION (plan 15 CFI slice) ──
+    //
+    // Join the two halves of the unwind description that no single tier holds:
+    //   * `cc.perFuncCfi[fi]` -- WHICH instructions change the frame and WHAT
+    //     each one means. Emitted by `emitPrologue` / `emitEpilogue` / the VLA
+    //     frame-pointer capture, at their own emit sites, keyed by `LirInstId`.
+    //   * `assembled.functions[fi].sourceMap` -- WHERE each of those
+    //     instructions landed in the byte stream. Recorded by the assembler.
+    //
+    // * NOTHING HERE ASSUMES AN ENCODING. The predecessor of this block built a
+    //   `FrameUnwindInfo` -- a frame SHAPE with no PC dimension -- and left its
+    //   consumer to reconstruct prologue byte offsets from hardcoded instruction
+    //   lengths (`sub rsp,imm32` is 7; a GPR spill store is 8; an xmm8-15 spill
+    //   is 9). Those numbers were right only because one encoder happened to
+    //   pick one form; a `MemDisp8` selection pass would have silently shifted
+    //   every unwind CodeOffset with nothing to catch it.
+    //
+    // Positional, mirroring the dataItems/userEntrySymbol post-`assemble()`
+    // splices: `cc.perFunc`, `cc.perFuncCfi` and `assembled.functions` are ALL
+    // guaranteed size == moduleFuncCount() (`cc.ok()` + `assembled.ok()`) and
+    // enumerated identically.
+    if (cc.perFuncCfi.size() == assembled.functions.size()) {
+        // The entry state, straight off the calling convention -- no new config.
+        // `callPushBytes` is defined as the SP delta at call entry, which IS the
+        // CFA offset at function entry; `linkRegister` states whether the return
+        // address is on the stack or in a register. Reading them here keeps the
+        // frame-alignment rule and the unwind rule on ONE fact.
+        auto const* ccDesc = target.callingConvention(callingConventionIndex);
+        if (ccDesc == nullptr || !ccDesc->stackPointer.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_UnwindRuleUnrepresentable;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "calling convention index {} declares no stack-pointer register, "
+                "so no canonical-frame-address rule can be stated for this "
+                "module's functions; unwind information would have to be guessed "
+                "(plan 15 CFI)", callingConventionIndex);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        CfiInitialState initial;
+        initial.cfaRegister = ccDesc->stackPointer->ordinal;
+        initial.cfaOffset   = static_cast<std::int64_t>(ccDesc->callPushBytes);
+        if (ccDesc->callPushBytes > 0) {
+            // The CALL pushed the return address, so it sits immediately below
+            // the CFA -- at CFA minus exactly what was pushed.
+            initial.returnAddressAtCfaOffset =
+                -static_cast<std::int64_t>(ccDesc->callPushBytes);
+        } else if (ccDesc->linkRegister.has_value()) {
+            initial.returnAddressRegister = ccDesc->linkRegister->ordinal;
+        }
+        // NOTE the deliberate absence of an `else` fail-loud: a convention with
+        // neither a pushed return address nor a link register is a machine model
+        // with no return address to describe at all (an operand-stack VM). Its
+        // functions get a CFA rule and no RA rule, which is the truth.
+
         for (std::size_t fi = 0; fi < assembled.functions.size(); ++fi) {
-            FrameLayout const& fl = cc.perFunc[fi];
-            FrameUnwindInfo ui;
-            ui.totalFrameSize      = fl.totalFrameSize;
-            ui.stackProbePageBytes = fl.stackProbePageBytes;
-            ui.usesStackProbe      = fl.stackProbePageBytes > 0
-                                  && fl.totalFrameSize > fl.stackProbePageBytes;
-            std::uint32_t const base = fl.savedRegAreaOffset();
-            ui.savedRegs.reserve(fl.savedRegs.size());
-            for (std::size_t i = 0; i < fl.savedRegs.size(); ++i) {
-                LirReg const r = fl.savedRegs[i];
-                FrameSavedReg sr;
-                // The x64 unwind register number is the HARDWARE encoding
-                // (rax=0..r15=15; xmm0=0..xmm15=15) — NOT the DSS physical
-                // ORDINAL, which offsets FPRs past the 16 GPRs (xmm14 = ordinal
-                // 30). GPR ordinal == hwEncoding so it was coincidentally right;
-                // FPR needs the mapping. registerInfo(ordinal) is the source.
-                auto const* ri = target.registerInfo(static_cast<std::uint16_t>(r.id));
-                sr.regEncoding = ri != nullptr ? ri->hwEncoding
-                                               : static_cast<std::uint16_t>(r.id);
-                sr.isFpr       = r.regClass() != LirRegClass::GPR;
-                sr.saveOffset  = base + static_cast<std::uint32_t>(i) * fl.slotSize;
-                ui.savedRegs.push_back(sr);
+            AssembledFunction& outFn = assembled.functions[fi];
+            LirFuncCfi const&  src   = cc.perFuncCfi[fi];
+
+            // LirInstId -> the byte offset ONE PAST that instruction. The source
+            // map is stamped once per successfully encoded instruction, in
+            // emission order, so instruction k spans
+            // [sourceMap[k].byteOffset, sourceMap[k+1].byteOffset).
+            std::unordered_map<std::uint32_t, std::uint32_t> pcAfter;
+            pcAfter.reserve(outFn.sourceMap.size());
+            for (std::size_t k = 0; k < outFn.sourceMap.size(); ++k) {
+                std::uint32_t const endOff =
+                    (k + 1 < outFn.sourceMap.size())
+                        ? outFn.sourceMap[k + 1].byteOffset
+                        : static_cast<std::uint32_t>(outFn.bytes.size());
+                pcAfter[outFn.sourceMap[k].lirInst.v] = endOff;
             }
-            assembled.functions[fi].unwind = std::move(ui);
+
+            CfiFunction fnCfi;
+            fnCfi.codeLength = static_cast<std::uint32_t>(outFn.bytes.size());
+            fnCfi.initial    = initial;
+            fnCfi.ops.reserve(src.ops.size());
+            // A frame that allocates nothing and saves nothing has an empty
+            // prologue, which is a MEASURED fact (offset 0), not an absent one.
+            std::optional<std::uint32_t> prologueEnd;
+            if (src.prologueOpCount == 0) prologueEnd = 0u;
+            for (std::size_t oi = 0; oi < src.ops.size(); ++oi) {
+                LirCfiOp const& op = src.ops[oi];
+                if (op.atBlockEnd) {
+                    // Resolve to the end of the named block -- the byte offset
+                    // of whatever block is laid out immediately after it, or
+                    // the function's extent when it is laid out last. Block
+                    // LAYOUT order is not creation order (the optimizer
+                    // reorders by RPO), so this is a scan for the smallest
+                    // strictly-greater offset -- the identical idiom the SEH
+                    // scope-end binding below uses, for the identical reason.
+                    auto const bIt = outFn.blockByteOffsets.find(op.block.v);
+                    if (bIt == outFn.blockByteOffsets.end()) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::K_UnwindRuleUnrepresentable;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.actual   = std::format(
+                            "function index {}: the frame rule '{}' is anchored "
+                            "to LIR block {}, which has no byte offset "
+                            "(plan 15 CFI)", fi, cfiOpKindName(op.kind),
+                            op.block.v);
+                        reporter.report(std::move(d));
+                        return std::nullopt;
+                    }
+                    std::uint32_t end =
+                        static_cast<std::uint32_t>(outFn.bytes.size());
+                    for (auto const& [blkV, off] : outFn.blockByteOffsets) {
+                        (void)blkV;
+                        if (off > bIt->second && off < end) end = off;
+                    }
+                    // A restore that lands at the function's very end re-arms
+                    // rules for code that does not exist. Dropping it keeps the
+                    // single-return case -- the overwhelming majority -- byte-
+                    // identical to a stream that never had the mechanism, and a
+                    // dangling remember_state is harmless (nothing pops it).
+                    if (end >= fnCfi.codeLength) continue;
+                    fnCfi.ops.push_back(CfiOp{end, op.kind, op.reg,
+                                              op.srcReg, op.offset});
+                    continue;
+                }
+                auto const it = pcAfter.find(op.inst.v);
+                if (it == pcAfter.end()) {
+                    // The materializer said an instruction establishes a frame
+                    // rule and the assembler never emitted it. That is a
+                    // substrate-invariant break, and the WRONG response is to
+                    // drop the op: the resulting table would describe a frame
+                    // that is only partly built. Refuse, naming the rule.
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::K_UnwindRuleUnrepresentable;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "function index {}: the frame rule '{}' is attached to LIR "
+                        "instruction {}, which produced no bytes -- the unwind "
+                        "description and the emitted code disagree (plan 15 CFI)",
+                        fi, cfiOpKindName(op.kind), op.inst.v);
+                    reporter.report(std::move(d));
+                    return std::nullopt;
+                }
+                fnCfi.ops.push_back(CfiOp{it->second, op.kind, op.reg,
+                                          op.srcReg, op.offset});
+                if (oi + 1 == src.prologueOpCount) prologueEnd = it->second;
+            }
+            fnCfi.prologueEndPc = prologueEnd;
+            if (auto const why = validateCfiFunction(fnCfi); !why.empty()) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_UnwindRuleUnrepresentable;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "function index {}: malformed call-frame information -- {} "
+                    "(plan 15 CFI)", fi, why);
+                reporter.report(std::move(d));
+                return std::nullopt;
+            }
+            outFn.cfi = std::move(fnCfi);
         }
     }
 
@@ -1185,11 +1335,9 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             SymbolId const blkSym = symIt->second;
             // Bind the block symbol from the function's byte-offset map (once per
             // distinct symbol; a gap/duplicate reuses the same SymbolId).
-            if (alreadyBound.insert(blkSym.v).second) {
-                auto offIt = outFn.blockByteOffsets.find(lirBlockV);
-                if (offIt == outFn.blockByteOffsets.end()) { tableOk = false; break; }
-                outFn.blockSymbols.push_back(
-                    SyntheticBlockSymbol{blkSym, offIt->second});
+            if (!bindBlockSymbol(outFn, lirBlockV, blkSym, alreadyBound)) {
+                tableOk = false;
+                break;
             }
             // abs64 reloc at slot byte offset (slotIdx * 8) → the block symbol.
             table.relocations.push_back(Relocation{
@@ -1234,8 +1382,9 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     }
 
     // c116 (D-WIN64-SEH-FUNCLETS): bind each SEH scope descriptor to its owning
-    // function's `FrameUnwindInfo.sehScopes`. Runs AFTER the unwind projection
-    // (which created the FrameUnwindInfo) AND after assemble() (which populated each
+    // function's `sehScopes`. Runs AFTER the CFI production (whose
+    // `prologueEndPc` the pe writer needs to host a scope table) AND after
+    // assemble() (which populated each
     // function's `blockByteOffsets`) — the same ordering the c70 jump-table binding
     // relies on. Translates the descriptor's LIR block ids to byte offsets within
     // the parent function; the pe writer resolves the funclet + personality symbols
@@ -1253,17 +1402,16 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             return std::nullopt;
         }
         AssembledFunction& outFn = assembled.functions[desc.funcIndex];
-        if (!outFn.unwind.has_value()) {
-            // A SEH-guarding function ALWAYS has a frame (the unwind projection
-            // attaches FrameUnwindInfo to every callconv'd function). A missing one
-            // means the projection was skipped — fail loud, never emit a dangling
-            // scope table with no UNWIND_INFO to host it.
+        if (!outFn.cfi.has_value()) {
+            // A SEH-guarding function ALWAYS has a frame, so it always produced
+            // CFI. A missing one means the production was skipped — fail loud,
+            // never emit a dangling scope table with no UNWIND_INFO to host it.
             ParseDiagnostic d;
             d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
-                "SEH scope on function index {} has no FrameUnwindInfo to host its "
-                "scope table (D-WIN64-SEH-FUNCLETS)", desc.funcIndex);
+                "SEH scope on function index {} has no call-frame information to "
+                "host its scope table (D-WIN64-SEH-FUNCLETS)", desc.funcIndex);
             reporter.report(std::move(d));
             return std::nullopt;
         }
@@ -1304,7 +1452,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         e.jumpTargetByteOffset = handIt->second;
         e.filterFuncletSymbol  = desc.filterFuncletSymbol;
         e.personalitySymbol    = desc.personalitySymbol;
-        outFn.unwind->sehScopes.push_back(e);
+        outFn.sehScopes.push_back(e);
     }
 
     // D-LK4-3: stamp the owning CompilationUnit's id so the linker keys this
@@ -2643,6 +2791,49 @@ assembleAsmUnit(CompilationUnit const&     cu,
         // item set for their unit, and an `insert` here would silently tolerate
         // an `assemble()` that had started emitting its own.
         assembled.dataItems       = std::move(lowered->dataItems);
+        // D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET: bind the block
+        // symbols that only a DATA slot names (a hand-written jump table). This
+        // runs AFTER `assemble()` for the same reason the C jump-table arm does
+        // — `blockByteOffsets` is what `assemble()` computes — and through the
+        // SAME `bindBlockSymbol` helper, so "symbol S is block B of function F"
+        // has one implementation for both source languages.
+        //
+        // ⚠ `alreadyBound` IS SEEDED FROM WHAT THE ENCODER ALREADY BOUND. A
+        // label that is BOTH `lea`'d and listed in a table (the ordinary
+        // computed-goto-plus-jump-table shape) is one symbol reached twice, and
+        // binding it twice would hand the linker two VAs for it.
+        for (auto const& b : lowered->blockSymbolBindings) {
+            if (b.funcIndex >= assembled.functions.size()) {
+                report(reporter, DiagnosticCode::A_AsmTextUnsupported,
+                       DiagnosticSeverity::Error,
+                       std::format(
+                           "a data slot takes the address of a label in "
+                           "function #{}, but this unit assembled {} "
+                           "function(s) — the assembly lowering and the "
+                           "assembler disagree about this file's function list "
+                           "(D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-"
+                           "OFFSET)",
+                           b.funcIndex, assembled.functions.size()));
+                return std::nullopt;
+            }
+            AssembledFunction& outFn = assembled.functions[b.funcIndex];
+            std::unordered_set<std::uint32_t> alreadyBound;
+            for (auto const& bs : outFn.blockSymbols) {
+                alreadyBound.insert(bs.symbol.v);
+            }
+            if (!bindBlockSymbol(outFn, b.lirBlockV, b.symbol, alreadyBound)) {
+                report(reporter, DiagnosticCode::A_AsmTextUnsupported,
+                       DiagnosticSeverity::Error,
+                       std::format(
+                           "a data slot takes the address of a label whose "
+                           "basic block (id {}) the assembler published no byte "
+                           "offset for — the relocation would name a symbol "
+                           "with no address (D-ASM-INTERIOR-LABELS-NOT-"
+                           "ADDRESSABLE-AT-AN-OFFSET)",
+                           b.lirBlockV));
+                return std::nullopt;
+            }
+        }
         // ⚠ ONE TREE PER UNIT TODAY. A multi-file `.s` build would need each
         // file's SymbolIds namespaced before the merge; refusing is the honest
         // answer while that is unbuilt, because silently keeping the LAST tree

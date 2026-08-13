@@ -160,6 +160,18 @@ EXCLUDED_HEADERS = {
     ("phase", "what", "closes"),
     ("pattern", "reason"),
     ("order", "gap to address", "resolution"),
+    # ── `.plans/_handoff.md` prose tables (added 2026-08-13, read before adding) ──
+    # The handoff is a STATE document, not an anchor home: no row of these tables
+    # declares a deferral, and none has a status cell for this gate to read. They
+    # trip the "looks like an anchor table" heuristic only because a first cell may
+    # MENTION a `D-*` name -- e.g. "FC18 — D-DIAG-CORPUS-EVERY-CODE" naming the
+    # phase, or a priority row naming the anchor that blocks it.
+    # ★ Excluded BY HEADER SHAPE, deliberately, NOT by filename. If a future handoff
+    # ever grows a real 4-column anchor table, it still gets counted -- excluding the
+    # whole file would have created exactly the silent skip this gate exists to stop.
+    ("destination", "the named gap"),
+    ("pr", "branch", "what it is doing", "last update"),
+    ("date", "commit", "what shipped", "gate"),
 }
 
 

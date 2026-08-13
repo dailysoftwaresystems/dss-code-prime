@@ -42,6 +42,41 @@
 
 namespace dss {
 
+// D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET: one interior-label block
+// symbol that ONLY a DATA item names, awaiting the byte offset `assemble()`
+// computes for its block.
+//
+// ★★★ WHY THIS ROW EXISTS AT ALL, AND WHY IT IS NOT A SECOND JUMP-TABLE MODEL.
+// The interior-symbol MODEL is already built and already ships:
+// `SyntheticBlockSymbol{symbol, blockByteOffset}` (asm.hpp), published per
+// function by `assemble()` and turned into an interior VA by
+// `link/format/interior_block_symbol_va.hpp` — identically for ELF, PE and
+// Mach-O. A `.s` reaching it needs exactly ONE fact the assembler cannot
+// supply: which LIR block a symbol names. There are two carriers for that fact
+// already, and NEITHER can hold this case:
+//   * `walker_util::BlockSymPatch` — the ENCODER's channel. It is recorded when
+//     an instruction carries a trailing `BlockRef` operand (the block-address
+//     `lea`), so it fires for `adr x0, Lw` and NEVER for a label named only by
+//     `.quad Lw`, which emits no instruction at all.
+//   * `JumpTableDescriptor` — carries `funcIndex` + a block→symbol map, but it
+//     also OWNS THE TABLE'S BYTES: `compile_pipeline.cpp` synthesizes an
+//     `AssembledData` of `slotCount * 8` zero bytes for every descriptor. A
+//     `.s` already WROTE those bytes with its own data directives (which may
+//     interleave `.quad`s with anything else in one item), so populating a
+//     descriptor would emit the table TWICE.
+// ⇒ what is genuinely missing is the BINDING, not a table. This row carries
+// only it, and the pipeline binds it through the SAME two lines the jump-table
+// path uses (`bindBlockSymbol` in `program/compile_pipeline.cpp`), so the two
+// languages share one implementation of "symbol S is block B of function F".
+struct DSS_EXPORT AsmBlockSymbolBinding {
+    // Index into `lir.funcAt(i)` / `AssembledModule::functions` of the function
+    // that CONTAINS the block. Assembly's function order is source order of
+    // function-entry labels, which is also `addFunction` call order.
+    std::size_t   funcIndex = 0;
+    std::uint32_t lirBlockV = 0;   // LirBlockId.v of the addressed block
+    SymbolId      symbol{};        // the interior label's minted symbol
+};
+
 // The lowered module plus the symbol identity the driver needs to finish the
 // link. Returned by value; `lir` is move-only.
 struct DSS_EXPORT AsmTextModule {
@@ -109,6 +144,19 @@ struct DSS_EXPORT AsmTextModule {
     // `program/compile_pipeline.cpp`'s `assembleAsmUnit`). Anchored:
     // D-ASM-DATA-ITEMS-NOT-WIRED-INTO-THE-DRIVER.
     std::vector<AssembledData> dataItems;
+
+    // D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET: the interior-label
+    // block symbols that only `dataItems`' relocations name. EMPTY unless a
+    // data directive named a code label — the ordinary `.s` binds every one of
+    // its block symbols through the encoder's `BlockSymPatch`, and this vector
+    // exists solely for the jump-table shape, which emits no instruction that
+    // could carry a `BlockRef`.
+    //
+    // ⚠ THE DRIVER MUST BIND THESE AFTER `assemble()` RETURNS. Until it does,
+    // the relocation in the data item names a symbol with NO VA, which the
+    // linker reports as an undefined symbol rather than silently — but the
+    // diagnostic would point at the linker instead of at the missing wiring.
+    std::vector<AsmBlockSymbolBinding> blockSymbolBindings;
 };
 
 // Lower one parsed `.s` translation unit to `encode`-tier LIR.

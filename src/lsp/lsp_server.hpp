@@ -98,6 +98,40 @@ private:
     void handleDidClose_(Notification const& n);
     void handleDidSave_(Notification const& n);
 
+    // ONE handler for all four `workspace/did*` notifications that can move the
+    // manifest set (`didChangeWatchedFiles`, `didCreateFiles`, `didRenameFiles`,
+    // `didDeleteFiles`). Their params are deliberately ignored: the preference
+    // is re-DERIVED by re-reading the manifests, so the only bit any of them
+    // carries that we can act on is "look again".
+    void handleWorkspaceManifestsMayHaveChanged_(Notification const& n);
+
+    // The ONE schema-resolution site: a document URI → the schema it must be
+    // parsed under, or the REASON there is none. `didOpen` and the liveness
+    // refresh both go through it, so a document opened under one preference and
+    // a document RE-resolved under a changed one can never disagree about how
+    // the answer is computed. Reads `workspacePreference_` ⇒ `run()` thread only.
+    struct SchemaResolution {
+        std::shared_ptr<dss::GrammarSchema const> schema;  // null ⇒ see `reason`
+        std::string                               reason;  // empty iff `schema`
+    };
+    [[nodiscard]] SchemaResolution resolveSchemaForUri_(std::string const& uri);
+
+    // ── LIVENESS (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE) ──────────
+    // Re-read the workspace's project manifests. If the preference they yield
+    // DIFFERS from the held one, adopt it and then RE-RESOLVE + REPUBLISH every
+    // open document whose schema (or whose reason for having none) changed.
+    // Returns true iff the preference changed.
+    //
+    // ★ THE REPUBLISH IS THE POINT, NOT AN EXTRA. Re-reading the manifests per
+    // `didOpen` was REJECTED when this channel was built, because it would let a
+    // mid-session edit silently change the meaning of ALREADY-OPEN documents
+    // while the editor kept displaying diagnostics computed under the old
+    // grammar. That objection is answered by doing the second half — the
+    // affected documents are re-parsed and re-published — not by refusing to
+    // look. A refresh that changed future resolutions only would reintroduce
+    // exactly the defect the original design refused.
+    bool refreshWorkspacePreference_();
+
     // Submit a parse job for `uri`. Captures the current generation
     // from the document store; the worker drops the result if a
     // newer update has bumped it.
@@ -115,14 +149,21 @@ private:
     DocumentStore                  documents_;
 
     // Workspace folders named by `initialize`, and the language preference
-    // derived from their project manifests. Written once in
-    // `handleInitialize_`, read in `handleDidOpen_` — both on the `run()`
-    // thread, so neither needs a lock. Parse workers never see them.
+    // derived from their project manifests. `workspaceRoots_` is written once
+    // in `handleInitialize_`; `workspacePreference_` is RE-derived from it by
+    // `refreshWorkspacePreference_` whenever the manifest set may have moved.
+    // Every writer and reader runs on the `run()` thread, so neither needs a
+    // lock. Parse workers never see them.
     //
     // The pre-`initialize` value is a LOUD one, not an empty preference: a
     // default-constructed `expected` would read as "a preference exists and
     // names nothing", which is the silent-answer shape. A client that opens a
-    // document before initializing gets a reason that says exactly that.
+    // document before initializing gets a reason that says exactly that — which
+    // is why `refreshWorkspacePreference_` refuses to run before `initialize`
+    // (`initializeReceived_`): recomputing would overwrite "the client has not
+    // sent `initialize` yet" with the merely-plausible "the client named no
+    // workspace folder", losing the distinction on purpose.
+    bool                               initializeReceived_ = false;
     std::vector<std::filesystem::path> workspaceRoots_;
     WorkspacePreferenceResult          workspacePreference_ =
         std::unexpected(WorkspaceProjectError{

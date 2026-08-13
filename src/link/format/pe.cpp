@@ -217,23 +217,45 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
 // header byte) is the whole-prologue length. All offsets are single bytes — a
 // prologue > 255 B is undescribable (fails loud → D-WIN64-CHKSTK-LARGE-PROLOGUE).
 //
-// Byte lengths are recomputed deterministically from FrameUnwindInfo (the
-// x86-variable encoder never emits a shorter-than-worst-case form for a fixed
-// operand shape): `sub rsp,imm32` = 7 B; the inline stack-probe loop = a FIXED
-// `kStackProbeLoopBytes` (37 B — the loop iterates at RUNTIME, it is not
-// unrolled per page; sourced from x86_variable.hpp so it can't drift from
-// emitStackProbeLoop); each GPR save `mov [rsp+disp32],r` = 8 B, each FPR save
-// `movsd [rsp+disp32],xmm` = 8 B (xmm0–7) / 9 B (xmm8–15). A first-byte-opcode
-// check fail-louds if the real prologue diverges.
+// * BYTE OFFSETS ARE NO LONGER RECOMPUTED HERE, AND THAT IS THE POINT OF THIS
+// REWRITE. The previous builder consumed a `FrameUnwindInfo` -- a frame SHAPE
+// with no PC dimension -- and reconstructed every prologue offset from hardcoded
+// instruction lengths (`sub rsp,imm32` = 7 B; the inline probe loop = 37 B; a GPR
+// save = 8 B; an xmm8-15 save = 9 B), defended by an opcode check on the FIRST
+// instruction only. Those lengths were right only because one encoder happened to
+// pick one form for each shape: the same `subq $40,%rsp` is FOUR bytes out of GNU
+// as (`48 83 ec 28`) and SEVEN out of the DSS x86-variable encoder
+// (`48 81 ec 28 00 00 00`), and a future `MemDisp8` selection would shorten every
+// save with nothing downstream to notice. Every CodeOffset below now comes from
+// `CfiOp::pcOffset`, which the assembler MEASURED.
+//
+// The mapping is direct because the two formats describe the same physical fact:
+// a DWARF-style CFA rule change at PC X is a Win64 UNWIND_CODE with CodeOffset X.
+//   * CFA offset grows by N          -> UWOP_ALLOC_{SMALL,LARGE} of N
+//   * CFA base becomes register R    -> UWOP_SET_FPREG (R, offset 0)
+//   * register R saved at CFA+K      -> UWOP_SAVE_NONVOL (R, (K + cfaOffset)/8)
+// Anything else is REFUSED by name -- see `fail` below. A saved FPR (MS-x64
+// xmm6..15) is spilled low-64 via MOVSD, for which there is no matching UWOP
+// (SAVE_XMM128 describes a full 16-byte MOVAPS slot); since an xmm save does not
+// move RSP it is OMITTED from the codes -- the RSP/return-address walk stays
+// exact -- and a __try-guarding function that saves one fails LOUD
+// (D-WIN64-XMM-UNWIND-RESTORE).
+//
+// CRITICAL (audit-F1): each UNWIND_CODE's CodeOffset = the byte offset of the END
+// of the instruction that performs that op (NOT the whole-prologue length), and
+// the array must be emitted SORTED DESCENDING by CodeOffset. `SizeOfProlog` is a
+// separate header byte. All offsets are single bytes -- a prologue > 255 B is
+// undescribable (fails loud -> D-WIN64-CHKSTK-LARGE-PROLOGUE).
 constexpr std::uint8_t kUwopAllocLarge  = 1;  // 2 nodes (opinfo 0, size/8 as u16) — frames ≤ 512 KiB
 constexpr std::uint8_t kUwopAllocSmall  = 2;  // 1 node, opinfo = size/8 - 1 — frames 8..128 B
+constexpr std::uint8_t kUwopSetFpReg    = 3;  // 1 node, opinfo 0 — CFA base becomes the frame register
 constexpr std::uint8_t kUwopSaveNonvol  = 4;  // 2 nodes (opinfo=reg, offset/8 as u16)
 constexpr std::size_t  kRuntimeFunctionSize = 12;  // BeginAddress + EndAddress + UnwindInfoAddress (3 u32)
 
 // Build one function's UNWIND_INFO blob (aligned to a multiple of 4 bytes so the
 // next one and any RUNTIME_FUNCTION stays DWORD-aligned). Returns nullopt (with a
-// loud diagnostic) on a >255-byte prologue, a > 512 KiB frame, a non-8-aligned
-// frame/save, or a prologue-shape mismatch — never a silent wrong table.
+// loud diagnostic) on any frame rule Win64 cannot encode — never a silent wrong
+// table, and never a table that quietly describes only the part it understood.
 // c116 (D-WIN64-SEH-FUNCLETS): one deferred back-patch of
 // the UNWIND_INFO exception-handler RVA field (the __C_specific_handler personality
 // THUNK RVA — a .text address resolved only in the LATER .idata pass). `xdataOffset`
@@ -242,8 +264,9 @@ constexpr std::size_t  kRuntimeFunctionSize = 12;  // BeginAddress + EndAddress 
 struct SehHandlerPatch { std::uint32_t xdataOffset; SymbolId symbol; };
 
 [[nodiscard]] inline std::optional<std::vector<std::uint8_t>>
-buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
-                        std::span<std::uint8_t const>   funcBytes,
+buildFunctionUnwindInfo(CfiFunction const&              cfi,
+                        std::span<SehScopeEntry const>  sehScopes,
+                        TargetSchema const&             targetSchema,
                         std::size_t                     funcIndex,
                         // c116: this function's image-RVA base (= textRva0 +
                         // funcTextStart[funcIndex]) — the scope table's Begin/End/
@@ -260,59 +283,32 @@ buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
                         std::vector<SehHandlerPatch>&   handlerPatches,
                         DiagnosticReporter&             reporter) {
     auto fail = [&](std::string msg) -> std::optional<std::vector<std::uint8_t>> {
-        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+        emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
              "pe::encodeExec: unwind info for function #"
                  + std::to_string(funcIndex) + ": " + msg);
         return std::nullopt;
     };
-    std::uint32_t const frame = ui.totalFrameSize;
-    if (frame % 8u != 0u) {
-        return fail("frame size " + std::to_string(frame)
-                    + " is not 8-byte aligned — x64 UWOP_ALLOC requires /8");
+    // Win64 UNWIND_INFO's `SizeOfProlog` is mandatory and there is no honest
+    // default: a wrong value makes RtlVirtualUnwind classify body PCs as
+    // mid-prologue and unwind a frame that is not built yet. A CFI stream that
+    // cannot state where its prologue ends (hand-written assembly, whose
+    // `.cfi_*` family has no such verb) is REFUSED, not guessed at.
+    if (!cfi.prologueEndPc.has_value()) {
+        return fail("call-frame information states no prologue end, which Win64 "
+                    "UNWIND_INFO requires as SizeOfProlog — refusing rather than "
+                    "inventing one (D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED)");
+    }
+    std::uint32_t const prologueEnd = *cfi.prologueEndPc;
+    if (prologueEnd > 255u) {
+        return fail("prologue " + std::to_string(prologueEnd) + " > 255 bytes "
+                    "(x64 UNWIND_INFO offsets are single bytes) — switch the "
+                    "large-frame probe to __chkstk (D-WIN64-CHKSTK-LARGE-PROLOGUE)");
     }
 
-    // (1) The RSP-adjust instruction's byte length + its CodeOffset (= its end).
-    std::uint32_t allocLen = 0;
-    if (ui.usesStackProbe) {
-        // The inline page-probe loop is a FIXED-length sequence — it ITERATES
-        // at runtime, it is NOT unrolled per page — so its prologue byte count
-        // is the emitter's own authoritative constant, independent of frame/
-        // page. (The c114 audit caught a drifted private `9 + 28*pages + 3`
-        // here that mis-sized SizeOfProlog + every CodeOffset for any frame
-        // over one guard page → a silently-wrong unwind table.)
-        allocLen = dss::x86_variable::kStackProbeLoopBytes;
-    } else if (frame > 0u) {
-        allocLen = 7u;                       // sub rsp, imm32 = 48 81 EC id
-    }
-    // Prologue-shape guard: verify the first real byte matches (sub → 0x48, probe
-    // → 0x41) so a future prologue-encoding change can't silently desync the
-    // recomputed offsets from the emitted bytes.
-    if (allocLen > 0u) {
-        if (funcBytes.empty()) return fail("empty function body but frame > 0");
-        std::uint8_t const b0 = funcBytes[0];
-        std::uint8_t const want = ui.usesStackProbe ? 0x41u : 0x48u;
-        if (b0 != want) {
-            return fail("prologue first byte 0x"
-                        + std::format("{:02x}", b0) + " != expected 0x"
-                        + std::format("{:02x}", want)
-                        + " — the recomputed unwind offsets would desync");
-        }
-    }
-
-    // (2) Saved-reg stores. Walk them in prologue (emission) order to advance the
-    //     byte cursor by EACH store's exact width, so a later GPR save's CodeOffset
-    //     is right even after an interleaved FPR save. GPR save `mov [rsp+d32],r`
-    //     = 8 B (REX.W always present). FPR save is DSS's `movsd [rsp+d32],xmm`
-    //     (F2 0F 11 /r, the low-64 store — Win64 spill) = 8 B for xmm0-7, 9 B for
-    //     xmm8-15 (REX.R). We EMIT a UWOP_SAVE_NONVOL per GPR but OMIT the FPR
-    //     saves from the unwind codes: DSS saves only the low 64 bits via MOVSD,
-    //     for which there is no x64 UWOP (SAVE_XMM128 restores a full 16 B from a
-    //     movaps slot), and an XMM save does NOT affect RSP/return-address
-    //     reconstruction — so stack unwinding stays exact. The handler-case xmm
-    //     RESTORE is deferred to D-WIN64-XMM-UNWIND-RESTORE (c116): either spill
-    //     xmm6-15 with movaps + emit SAVE_XMM128, or confirm no handler reads them.
     struct Code { std::uint8_t codeOffset; std::uint8_t opAndInfo; std::uint16_t node; bool hasNode; };
-    std::vector<Code> saveCodes;
+    // Codes accumulate in ASCENDING CodeOffset (the order the ops arrive, which
+    // the representation guarantees is sorted by PC) and are emitted REVERSED.
+    std::vector<Code> codes;
     // c116b (D-WIN64-XMM-UNWIND-RESTORE): a function that GUARDS a `__try` has an
     // exception handler that RESUMES in this frame post-unwind and runs parent code.
     // If that code reads a non-volatile xmm (xmm6-15) that was live before the fault,
@@ -321,88 +317,166 @@ buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
     // bits (movsd) and OMITS the FPR unwind codes (fine for NON-SEH functions: an xmm
     // save never affects RSP/return-address reconstruction). For a SEH function it is
     // NOT fine — so fail LOUD rather than emit an unwind table that silently fails to
-    // restore a non-volatile xmm on the handler path. sqlite's WAL SEH functions are
-    // pure integer/pointer code (empirically: 0 non-volatile-xmm spills across all
-    // their prologues), so this guard never fires for sqlite; the day a SEH function
-    // DOES spill an xmm, D-WIN64-XMM-UNWIND-RESTORE's spill-with-SAVE_XMM128 path must
-    // land first. This converts the H5 "no consumer" proof into an enforced invariant.
-    bool const guardsSeh = !ui.sehScopes.empty();
-    std::uint32_t cursor = allocLen;
-    for (auto const& sr : ui.savedRegs) {
-        std::uint32_t const width =
-            sr.isFpr ? (sr.regEncoding < 8u ? 8u : 9u) : 8u;
-        cursor += width;
-        if (cursor > 255u) {
-            return fail("prologue exceeds 255 bytes (x64 UNWIND_INFO offsets are "
-                        "single bytes) — switch the large-frame probe to __chkstk "
-                        "(D-WIN64-CHKSTK-LARGE-PROLOGUE)");
-        }
-        if (sr.isFpr) {
-            if (guardsSeh) {
-                return fail("a __try-guarding function saves non-volatile xmm"
-                            + std::to_string(sr.regEncoding)
-                            + " but DSS omits UWOP_SAVE_XMM128 (spills low-64 via "
-                              "movsd) — the __except handler could read an unrestored "
-                              "xmm on resume. D-WIN64-XMM-UNWIND-RESTORE (spill xmm6-"
-                              "15 with movaps + emit SAVE_XMM128) must land before a "
-                              "SEH function may use a non-volatile xmm.");
+    // restore a non-volatile xmm on the handler path.
+    bool const guardsSeh = !sehScopes.empty();
+    std::uint8_t frameRegisterByte = 0x00u;   // FrameRegister nibble | FrameOffset nibble
+    std::int64_t cfaOffset = cfi.initial.cfaOffset;
+
+    for (auto const& op : cfi.ops) {
+        if (op.pcOffset > prologueEnd) {
+            // ── Post-prologue. Win64 does NOT describe epilogues in
+            // UNWIND_INFO: the OS reconstructs them by pattern-scanning for the
+            // canonical teardown, which is why the format has a `SizeOfProlog`
+            // and no `SizeOfEpilog`. So the teardown VOCABULARY is accepted and
+            // carries no codes — but anything OUTSIDE that vocabulary is a rule
+            // the format genuinely cannot carry, and is refused by name rather
+            // than dropped.
+            switch (op.kind) {
+                case CfiOpKind::RegRestoreInitial:
+                case CfiOpKind::DefCfaOffset:
+                case CfiOpKind::DefCfaRegister:
+                case CfiOpKind::RememberState:
+                case CfiOpKind::RestoreState:
+                    continue;
+                default:
+                    return fail("the frame rule '"
+                                + std::string(cfiOpKindName(op.kind))
+                                + "' appears at byte offset "
+                                + std::to_string(op.pcOffset)
+                                + ", past the prologue; Win64 UNWIND_INFO "
+                                  "describes the prologue only and has no way to "
+                                  "carry it");
             }
-            continue;   // non-SEH: low-64 MOVSD save — omitted (RSP-irrelevant)
         }
-        if (sr.saveOffset % 8u != 0u) {
-            return fail("saved-reg offset " + std::to_string(sr.saveOffset)
-                        + " not 8-aligned — UWOP_SAVE_NONVOL node is offset/8");
+        switch (op.kind) {
+        case CfiOpKind::DefCfaOffset: {
+            std::int64_t const delta = op.offset - cfaOffset;
+            cfaOffset = op.offset;
+            if (delta == 0) continue;
+            if (delta < 0) {
+                return fail("the prologue shrinks the canonical frame address by "
+                            + std::to_string(-delta) + " bytes at offset "
+                            + std::to_string(op.pcOffset)
+                            + "; Win64 UNWIND_INFO has no code for a prologue "
+                              "that releases stack");
+            }
+            if (delta % 8 != 0) {
+                return fail("frame allocation " + std::to_string(delta)
+                            + " is not 8-byte aligned — x64 UWOP_ALLOC requires /8");
+            }
+            std::uint64_t const slots = static_cast<std::uint64_t>(delta) / 8u;
+            if (delta <= 128) {
+                codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
+                                     static_cast<std::uint8_t>(
+                                         kUwopAllocSmall
+                                         | ((static_cast<std::uint8_t>(slots) - 1u) << 4)),
+                                     0u, false});
+            } else if (slots <= 0xFFFFu) {  // ≤ 512 KiB — opinfo 0, one u16 node
+                codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
+                                     static_cast<std::uint8_t>(kUwopAllocLarge | (0u << 4)),
+                                     static_cast<std::uint16_t>(slots), true});
+            } else {
+                return fail("frame " + std::to_string(delta) + " > 512 KiB needs "
+                            "UWOP_ALLOC_LARGE op-info=1 (u32 node) — no shipped "
+                            "corpus reaches it (D-WIN64-HUGE-FRAME-ALLOC)");
+            }
+            break;
         }
-        saveCodes.push_back(Code{
-            static_cast<std::uint8_t>(cursor),
-            static_cast<std::uint8_t>(kUwopSaveNonvol | (sr.regEncoding << 4)),
-            static_cast<std::uint16_t>(sr.saveOffset / 8u), true});
-    }
-    std::uint32_t const sizeOfProlog = cursor;
-    if (sizeOfProlog > 255u) {
-        return fail("prologue " + std::to_string(sizeOfProlog) + " > 255 bytes");
+        case CfiOpKind::DefCfaRegister: {
+            // The CFA base moved to a register that, at this PC, holds exactly
+            // the value the offset was measured against — so the Win64 frame
+            // register's scaled offset from RSP is zero. That is precisely
+            // UWOP_SET_FPREG, and it is what makes a variable-length-array
+            // function describable: after it, the runtime `sub rsp,<vla>` moves
+            // RSP freely and the frame register still locates the frame.
+            auto const* ri = targetSchema.registerInfo(op.reg.ordinal);
+            if (ri == nullptr) {
+                return fail("frame-pointer rule names register ordinal "
+                            + std::to_string(op.reg.ordinal)
+                            + ", which the target schema does not declare");
+            }
+            if (ri->hwEncoding == 0u) {
+                // UNWIND_INFO encodes "no frame register" as 0, so a frame
+                // register whose hardware encoding IS 0 (rax) is inexpressible.
+                return fail("frame register '" + ri->name + "' has hardware "
+                            "encoding 0, which UNWIND_INFO reserves for "
+                            "\"no frame register\"");
+            }
+            frameRegisterByte = static_cast<std::uint8_t>(ri->hwEncoding & 0x0Fu);
+            codes.push_back(Code{static_cast<std::uint8_t>(op.pcOffset),
+                                 kUwopSetFpReg, 0u, false});
+            break;
+        }
+        case CfiOpKind::RegAtCfaOffset: {
+            if (op.reg.isReturnAddress) {
+                // The return address is described by the x64 unwind machinery
+                // implicitly (it is at the frame base). An explicit rule for it
+                // has no UNWIND_CODE, and pretending otherwise would emit a
+                // SAVE_NONVOL for a register that does not exist.
+                continue;
+            }
+            auto const* ri = targetSchema.registerInfo(op.reg.ordinal);
+            if (ri == nullptr) {
+                return fail("save rule names register ordinal "
+                            + std::to_string(op.reg.ordinal)
+                            + ", which the target schema does not declare");
+            }
+            // CFA = RSP + cfaOffset at this PC, and the register sits at
+            // CFA + op.offset, so its RSP-relative slot is the sum.
+            std::int64_t const slotFromSp = op.offset + cfaOffset;
+            if (ri->regClass != TargetRegClass::GPR) {
+                if (guardsSeh) {
+                    return fail("a __try-guarding function saves non-volatile "
+                                + ri->name
+                                + " but DSS omits UWOP_SAVE_XMM128 (spills low-64 via "
+                                  "movsd) — the __except handler could read an unrestored "
+                                  "xmm on resume. D-WIN64-XMM-UNWIND-RESTORE (spill xmm6-"
+                                  "15 with movaps + emit SAVE_XMM128) must land before a "
+                                  "SEH function may use a non-volatile xmm.");
+                }
+                continue;   // non-SEH: low-64 MOVSD save — omitted (RSP-irrelevant)
+            }
+            if (slotFromSp < 0 || slotFromSp % 8 != 0) {
+                return fail("saved-reg slot " + std::to_string(slotFromSp)
+                            + " for " + ri->name
+                            + " is negative or not 8-aligned — UWOP_SAVE_NONVOL "
+                              "node is offset/8 from the frame base");
+            }
+            if (slotFromSp / 8 > 0xFFFF) {
+                return fail("saved-reg slot " + std::to_string(slotFromSp)
+                            + " exceeds the UWOP_SAVE_NONVOL u16 node range "
+                              "(UWOP_SAVE_NONVOL_FAR not emitted)");
+            }
+            codes.push_back(Code{
+                static_cast<std::uint8_t>(op.pcOffset),
+                static_cast<std::uint8_t>(kUwopSaveNonvol | (ri->hwEncoding << 4)),
+                static_cast<std::uint16_t>(slotFromSp / 8), true});
+            break;
+        }
+        default:
+            return fail("the frame rule '" + std::string(cfiOpKindName(op.kind))
+                        + "' at byte offset " + std::to_string(op.pcOffset)
+                        + " has no Win64 UNWIND_CODE equivalent");
+        }
     }
 
-    // (3) The ALLOC code (at CodeOffset allocLen — the SMALLEST prologue offset).
-    std::optional<Code> allocCode;
-    if (frame > 0u) {
-        std::uint32_t const slots = frame / 8u;
-        if (frame <= 128u) {
-            allocCode = Code{static_cast<std::uint8_t>(allocLen),
-                             static_cast<std::uint8_t>(
-                                 kUwopAllocSmall | ((slots - 1u) << 4)),
-                             0u, false};
-        } else if (slots <= 0xFFFFu) {  // ≤ 512 KiB — opinfo 0, one u16 node
-            allocCode = Code{static_cast<std::uint8_t>(allocLen),
-                             static_cast<std::uint8_t>(kUwopAllocLarge | (0u << 4)),
-                             static_cast<std::uint16_t>(slots), true};
-        } else {
-            return fail("frame " + std::to_string(frame) + " > 512 KiB needs "
-                        "UWOP_ALLOC_LARGE op-info=1 (u32 node) — no shipped "
-                        "corpus reaches it (D-WIN64-HUGE-FRAME-ALLOC)");
-        }
-    }
-
-    // (4) Emit: header, then codes DESCENDING by CodeOffset (saves — already in
-    //     ascending store order, so REVERSED — then the ALLOC last).
+    // Emit: header, then codes DESCENDING by CodeOffset.
     std::uint32_t nodeCount = 0;
-    for (auto const& c : saveCodes) nodeCount += c.hasNode ? 2u : 1u;
-    if (allocCode.has_value()) nodeCount += allocCode->hasNode ? 2u : 1u;
+    for (auto const& c : codes) nodeCount += c.hasNode ? 2u : 1u;
     if (nodeCount > 255u) return fail("unwind-code node count > 255");
 
     // c116 (D-WIN64-SEH-FUNCLETS): a function that guards a `__try` sets
     // UNW_FLAG_EHANDLER (bit 0 of the Flags nibble ⇒ (1<<3) in byte0's high nibble)
     // and carries a trailing handler-RVA + SCOPE_TABLE after the DWORD-aligned
     // codes. `__C_specific_handler` (the x64 C personality) walks the scope table.
-    bool const hasSeh = !ui.sehScopes.empty();
-    std::uint8_t const byte0 = hasSeh ? 0x09u   // Version=1 | Flags(EHANDLER=1)<<3
-                                      : 0x01u;   // Version=1, Flags=0
+    std::uint8_t const byte0 = guardsSeh ? 0x09u  // Version=1 | Flags(EHANDLER=1)<<3
+                                         : 0x01u; // Version=1, Flags=0
 
     std::vector<std::uint8_t> out;
     out.push_back(byte0);
-    out.push_back(static_cast<std::uint8_t>(sizeOfProlog));
+    out.push_back(static_cast<std::uint8_t>(prologueEnd));
     out.push_back(static_cast<std::uint8_t>(nodeCount));
-    out.push_back(0x00u);                                  // FrameRegister=0, Offset=0
+    out.push_back(frameRegisterByte);            // FrameRegister | FrameOffset<<4
     auto pushCode = [&](Code const& c) {
         out.push_back(c.codeOffset);
         out.push_back(c.opAndInfo);
@@ -411,11 +485,10 @@ buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
             out.push_back(static_cast<std::uint8_t>((c.node >> 8) & 0xFFu));
         }
     };
-    for (auto it = saveCodes.rbegin(); it != saveCodes.rend(); ++it) pushCode(*it);
-    if (allocCode.has_value()) pushCode(*allocCode);
+    for (auto it = codes.rbegin(); it != codes.rend(); ++it) pushCode(*it);
     while (out.size() % 4u != 0u) out.push_back(0x00u);    // DWORD-align the codes
 
-    if (hasSeh) {
+    if (guardsSeh) {
         auto pushU32 = [&](std::uint32_t v) {
             out.push_back(static_cast<std::uint8_t>(v & 0xFFu));
             out.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFFu));
@@ -429,23 +502,23 @@ buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
         std::uint32_t const handlerFieldOff =
             xdataBaseOffset + static_cast<std::uint32_t>(out.size());
         handlerPatches.push_back(
-            SehHandlerPatch{handlerFieldOff, ui.sehScopes.front().personalitySymbol});
+            SehHandlerPatch{handlerFieldOff, sehScopes.front().personalitySymbol});
         pushU32(0u);   // placeholder — back-patched to the thunk RVA post-.idata
 
         // SCOPE_TABLE: u32 Count; then Count × { Begin, End, Handler, JumpTarget }.
-        pushU32(static_cast<std::uint32_t>(ui.sehScopes.size()));
-        for (auto const& s : ui.sehScopes) {
-            std::uint32_t const filterRva = symbolToRva(s.filterFuncletSymbol);
+        pushU32(static_cast<std::uint32_t>(sehScopes.size()));
+        for (auto const& sc : sehScopes) {
+            std::uint32_t const filterRva = symbolToRva(sc.filterFuncletSymbol);
             if (filterRva == 0u) {
                 return fail("SEH scope's filter funclet symbol #"
-                            + std::to_string(s.filterFuncletSymbol.v)
+                            + std::to_string(sc.filterFuncletSymbol.v)
                             + " has no function RVA (unresolved funclet) — "
                               "D-WIN64-SEH-FUNCLETS");
             }
-            pushU32(funcBeginRva + s.beginByteOffset);       // BeginAddress
-            pushU32(funcBeginRva + s.endByteOffset);         // EndAddress
-            pushU32(filterRva);                              // HandlerAddress (filter funclet)
-            pushU32(funcBeginRva + s.jumpTargetByteOffset);  // JumpTarget (__except body)
+            pushU32(funcBeginRva + sc.beginByteOffset);       // BeginAddress
+            pushU32(funcBeginRva + sc.endByteOffset);         // EndAddress
+            pushU32(filterRva);                               // HandlerAddress (filter funclet)
+            pushU32(funcBeginRva + sc.jumpTargetByteOffset);  // JumpTarget (__except body)
         }
         // The blob already ends u32-aligned (every appended field is a u32).
     }
@@ -2250,8 +2323,11 @@ encodeExec(AssembledModule const&    module,
     // UnwindInfoAddress}). Chained after `.bss`, BEFORE `.idata`/`.reloc`
     // (so their VA cursor + the .reloc prevVaEnd hand-off account for them
     // with no extra edit). Emitted ONLY for the x64 machine (arm64-PE would
-    // need its own unwind format — not shipped); a function WITHOUT
-    // `unwind` (a leaf / the post-pipeline entry trampoline) gets NO entry
+    // need its own unwind format — not shipped, and any other machine
+    // holding unwind information is REFUSED by the `else` arm rather than
+    // silently stripped — D-WIN64-PDATA-ARM64-SILENT-SKIP); a function WITHOUT
+    // `cfi` (the post-pipeline entry trampoline, an assembly-sourced
+    // function) gets NO entry
     // (x64 leaf treatment). RUNTIME_FUNCTIONs are naturally ascending-by-
     // BeginAddress (funcTextStart is ascending) — the loader binary-searches.
     std::vector<std::uint8_t> xdataBytes;
@@ -2286,13 +2362,13 @@ encodeExec(AssembledModule const&    module,
         std::vector<PdataEntry> pdataEntries;
         for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
             auto const& fn = module.functions[fi];
-            if (!fn.unwind.has_value()) continue;
+            if (!fn.cfi.has_value()) continue;
             std::uint32_t const funcBeginRva =
                 textRva0 + static_cast<std::uint32_t>(funcTextStart[fi]);
             auto uwOpt = buildFunctionUnwindInfo(
-                *fn.unwind, fn.bytes, fi, funcBeginRva, symbolToRva,
-                static_cast<std::uint32_t>(xdataBytes.size()), sehHandlerPatches,
-                reporter);
+                *fn.cfi, fn.sehScopes, targetSchema, fi, funcBeginRva,
+                symbolToRva, static_cast<std::uint32_t>(xdataBytes.size()),
+                sehHandlerPatches, reporter);
             if (!uwOpt.has_value()) return {};
             pdataEntries.push_back(
                 {fi, static_cast<std::uint32_t>(xdataBytes.size())});
@@ -2323,6 +2399,52 @@ encodeExec(AssembledModule const&    module,
                 static_cast<std::uint32_t>(alignUp(pdataBytes.size(), sectionAlignE));
             pdata = pl;
             dataChainRva += pl.virtualSize;
+        }
+    } else {
+        // ── Any OTHER machine: REFUSE, never drop the tables in silence ──
+        // D-WIN64-PDATA-ARM64-SILENT-SKIP.
+        //
+        // The arm above is the walker's ONLY unwind-table emitter and it
+        // speaks exactly one encoding — x64 `UNWIND_INFO`. Before this arm
+        // existed the `if` had no `else`: a non-x64 PE image was emitted
+        // happily, the EXCEPTION data directory stayed 0/0, and every
+        // function's MEASURED call-frame information was discarded without
+        // a word. That is precisely the failure `K_UnwindRuleUnrepresentable`
+        // exists for — a binary that runs correctly and cannot be unwound
+        // (no debugger backtrace, no profiler stack, an exception thrown
+        // through the frame terminates), invisible until a core dump.
+        //
+        // ★ THE TRIGGER IS THE INFORMATION, NOT THE ARCHITECTURE. Refusing
+        // on `machine != kMachineAmd64PE` alone would break a non-x64 PE
+        // encode that is in fact COMPLETE: a module in which no function
+        // carries `cfi` loses nothing here, because the x64 arm would also
+        // produce nothing for it (its loop `continue`s past every cfi-less
+        // function, and both sections stay absent when `xdataBytes` ends up
+        // empty). So the condition is "at least one function carries unwind
+        // information that this walker cannot encode", and `cfi.has_value()`
+        // is deliberately the SAME predicate the x64 loop selects on — the
+        // two arms cannot disagree about what "carries unwind information"
+        // means. (`sehScopes` needs no separate clause: the x64 arm reads
+        // them only for a function that already has `cfi`.)
+        std::size_t unwindFunctionCount = 0;
+        for (auto const& fn : module.functions) {
+            if (fn.cfi.has_value()) ++unwindFunctionCount;
+        }
+        if (unwindFunctionCount > 0) {
+            emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+                 std::format(
+                     "pe::encodeExec: no unwind-table emitter for PE machine "
+                     "0x{:x} — {} function(s) carry call-frame information, and "
+                     "emitting this image would drop it together with the "
+                     "`.pdata` + `.xdata` sections that carry it. The PE unwind "
+                     "path implements the x86_64 (0x{:x}) UNWIND_INFO encoding "
+                     "only; ARM64 (0xaa64) uses `.pdata` v2 packed/extended "
+                     "unwind, a DIFFERENT encoding. Add a per-machine unwind "
+                     "encoder (see buildFunctionUnwindInfo) to ship unwindable "
+                     "code for this architecture "
+                     "(D-WIN64-PDATA-ARM64-SILENT-SKIP).",
+                     id.machine, unwindFunctionCount, kMachineAmd64PE));
+            return {};
         }
     }
 

@@ -1932,7 +1932,7 @@ TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
             "opcodes":[
               {"mnemonic":"invalid","result":"none"},
               {"mnemonic":"add","result":"value","minOperands":2,"maxOperands":2},
-              {"mnemonic":"ret","result":"none","isTerminator":true,
+              {"mnemonic":"ret","result":"none",
                "terminatorKind":"return",
                "minOperands":0,"maxOperands":1}
             ]})");

@@ -318,6 +318,20 @@ void LspServer::registerHandlers_() {
     dispatcher_.registerNotification(Method::TextDocumentDidSave,
         [this](Notification const& n) { handleDidSave_(n); });
 
+    // ── The four workspace notifications that can move the manifest set ─────
+    // (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE). ONE handler for all
+    // four: none of their params tells us anything the filesystem does not, so
+    // discriminating between them would be a switch whose arms are identical.
+    for (auto m : {Method::WorkspaceDidChangeWatchedFiles,
+                   Method::WorkspaceDidCreateFiles,
+                   Method::WorkspaceDidRenameFiles,
+                   Method::WorkspaceDidDeleteFiles}) {
+        dispatcher_.registerNotification(m,
+            [this](Notification const& n) {
+                handleWorkspaceManifestsMayHaveChanged_(n);
+            });
+    }
+
     // Semantic request handlers (SE7) — backed by the cached SemanticModel.
     dispatcher_.registerRequest(Method::TextDocumentHover,
         [this](Request const& r) { return handleHover_(r); });
@@ -366,12 +380,13 @@ int LspServer::run() {
 
 std::optional<std::string> LspServer::handleInitialize_(Request const& req) {
     // ── The workspace's TARGET channel (D-LSP-ASSEMBLY-DIALECT-UNSERVABLE) ──
-    // `initialize` is the ONLY message that carries the workspace root, and the
+    // `initialize` is the ONLY message that carries the workspace ROOTS, and a
     // root is the only thing that leads to a project manifest, so this is where
-    // the editor learns which CPU its `.s` files belong to. Resolved ONCE here
-    // rather than per-`didOpen`: the answer is a property of the workspace, and
-    // re-reading the manifest on every file open would let a mid-session edit
-    // change the meaning of already-open documents without re-publishing them.
+    // the editor learns which CPU its `.s` files belong to. The ROOTS are fixed
+    // here; the PREFERENCE derived from them is not — see
+    // `refreshWorkspacePreference_` (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-
+    // INITIALIZE), which re-derives it whenever the manifest set may have moved
+    // and republishes the open documents whose answer changed.
     //
     // Threading: every dispatcher handler runs on the `run()` thread, so this
     // write and the `handleDidOpen_` read below need no synchronisation. Worker
@@ -388,7 +403,12 @@ std::optional<std::string> LspServer::handleInitialize_(Request const& req) {
             workspaceRoots_.clear();
         }
     }
-    workspacePreference_ = resolveWorkspaceLanguagePreference(workspaceRoots_);
+    initializeReceived_ = true;
+    // No document can be open yet, so the republish half of this is a no-op and
+    // the call reduces to the first resolution. Going through the SAME function
+    // is what stops "how the preference is computed at initialize" and "how it
+    // is recomputed later" from drifting apart.
+    (void)refreshWorkspacePreference_();
 
     json result;
     auto& caps = result["capabilities"];
@@ -406,6 +426,55 @@ std::optional<std::string> LspServer::handleInitialize_(Request const& req) {
     caps["referencesProvider"]     = true;
     caps["renameProvider"]         = true;
     caps["signatureHelpProvider"]  = json::object();
+
+    // ── `workspace.fileOperations` — A STATIC REGISTRATION, NO OUTBOUND
+    //    REQUEST (LSP 3.16 `ServerCapabilities.workspace.fileOperations`) ─────
+    //
+    // ✔VERIFIED against Microsoft's own reference implementation
+    // (`vscode-languageserver-node/protocol/src/common/protocol.fileOperations.ts`):
+    //   FileOperationOptions            { didCreate?/willCreate?/didRename?/… : FileOperationRegistrationOptions }
+    //   FileOperationRegistrationOptions{ filters: FileOperationFilter[] }
+    //   FileOperationFilter             { scheme?: string; pattern: FileOperationPattern }
+    //   FileOperationPattern            { glob: string; matches?: 'file'|'folder'; options?: { ignoreCase?: boolean } }
+    // and the wire methods `workspace/didCreateFiles` / `didRenameFiles` /
+    // `didDeleteFiles`, gated by the client capability
+    // `workspace.fileOperations.didCreate` (…`didRename`, …`didDelete`).
+    //
+    // ★ THIS IS THE PART THAT NEEDED NO PROTOCOL SURFACE. It is declared in the
+    // `initialize` RESULT — a response to an inbound request — so it does not
+    // need `client/registerCapability`, which is a server→client REQUEST this
+    // server cannot originate (`JsonRpc` has serializeResponse / serializeError
+    // / serializeNotification and no serializeRequest; `MethodDispatcher`
+    // correlates INBOUND ids only). That distinction is the whole reason
+    // D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE was believed blocked.
+    //
+    // ⚠ WHAT IT DOES *NOT* COVER, STATED: these three fire for file operations
+    // the CLIENT performs (its explorer / its API) — not for a manifest written
+    // by `git checkout` or a terminal, and not for a CONTENT edit to an
+    // existing manifest. Those are covered by the refresh hung off `didOpen` /
+    // `didSave`, which re-reads the filesystem regardless of who touched it.
+    // The two channels overlap on purpose: this one is immediate, that one is
+    // universal.
+    //
+    // The glob is DERIVED from `kProjectFileSuffix`, never re-spelled — one
+    // place decides what a project manifest is called.
+    {
+        json filter;
+        filter["scheme"]             = "file";
+        filter["pattern"]["glob"]    =
+            std::string{"**/*"} + std::string{kProjectFileSuffix};
+        filter["pattern"]["matches"] = "file";
+        const json filters = json::array({std::move(filter)});
+        auto& fileOps = caps["workspace"]["fileOperations"];
+        fileOps["didCreate"]["filters"] = filters;
+        fileOps["didRename"]["filters"] = filters;
+        fileOps["didDelete"]["filters"] = filters;
+        // No `willCreate`/`willRename`/`willDelete`: those are REQUESTS the
+        // client waits on and whose result is a `WorkspaceEdit`. We have no
+        // edit to contribute, and claiming them would make the editor block on
+        // a server that has nothing to say.
+    }
+
     result["serverInfo"]["name"]    = options_.diagnosticSource;
     result["serverInfo"]["version"] = "0.1.0";
     return result.dump();
@@ -429,12 +498,8 @@ void LspServer::handleExit_(Notification const& /*n*/) {
     if (transport_) transport_->close();
 }
 
-void LspServer::handleDidOpen_(Notification const& n) {
-    auto params = tryParseParams(n);
-    if (!params) return;
-    const auto item = parseTextDocumentItem(*params);
-    if (item.uri.empty()) return;
-
+LspServer::SchemaResolution
+LspServer::resolveSchemaForUri_(std::string const& uri) {
     // ── Resolve schema by file extension, with the workspace as tie-breaker ──
     //
     // ★★ THE FAILURE ARM USED TO BE EMPTY. This block read
@@ -444,30 +509,88 @@ void LspServer::handleDidOpen_(Notification const& n) {
     // published an empty diagnostics array — indistinguishable, in the editor,
     // from a file with no problems. Both halves of that (the missing tie-break
     // AND the missing diagnostic) are D-LSP-ASSEMBLY-DIALECT-UNSERVABLE.
-    std::shared_ptr<dss::GrammarSchema const> schema;
-    std::string schemaError;
-    const auto ext = extensionFromUri(item.uri);
+    SchemaResolution out;
+    const auto ext = extensionFromUri(uri);
     if (ext.empty()) {
         // Not a resolver failure — there is nothing to resolve. Still a REASON
         // the document has no language service, so it is still said out loud.
-        schemaError = "no language service for `" + item.uri
+        out.reason = "no language service for `" + uri
             + "` — the document URI has no file extension, and the extension is "
               "what selects a source language";
+        return out;
+    }
+    std::span<std::string const> preferred{};
+    if (workspacePreference_.has_value()) {
+        preferred = workspacePreference_->languages;
+    }
+    auto resolved = schemaCache_.resolveByExtension(ext, preferred);
+    if (resolved.has_value()) {
+        out.schema = *resolved;
     } else {
-        std::span<std::string const> preferred{};
-        if (workspacePreference_.has_value()) {
-            preferred = workspacePreference_->languages;
-        }
-        auto resolved = schemaCache_.resolveByExtension(ext, preferred);
-        if (resolved.has_value()) {
-            schema = *resolved;
-        } else {
-            schemaError = describeUnresolvedSchema(
-                ext, resolved.error(), workspacePreference_);
+        out.reason = describeUnresolvedSchema(
+            ext, resolved.error(), workspacePreference_);
+    }
+    return out;
+}
+
+bool LspServer::refreshWorkspacePreference_() {
+    // Before `initialize` the held value is the deliberately-distinct "the
+    // client has not sent `initialize` yet" reason. Recomputing would replace it
+    // with "the client named no workspace folder", which is a different claim
+    // and, at that point, an unfounded one.
+    if (!initializeReceived_) return false;
+
+    auto fresh = resolveWorkspaceLanguagePreference(workspaceRoots_);
+    if (fresh == workspacePreference_) return false;
+    workspacePreference_ = std::move(fresh);
+
+    // ★ REPUBLISH, DON'T JUST REMEMBER. Every open document is re-resolved
+    // under the new preference; the ones whose schema (or whose reason for
+    // having none) actually moved are re-parsed, and the parse worker's
+    // `publishDiagnostics_` puts the new answer on the wire. `setSchema`
+    // returns false for a document that did not move, so an unrelated manifest
+    // edit costs no republishes at all.
+    for (auto const& uri : documents_.openUris()) {
+        auto r = resolveSchemaForUri_(uri);
+        if (documents_.setSchema(uri, std::move(r.schema), std::move(r.reason))) {
+            enqueueParse_(uri);
         }
     }
-    documents_.open(item.uri, item.version, item.text, schema,
-                    std::move(schemaError));
+    return true;
+}
+
+void LspServer::handleWorkspaceManifestsMayHaveChanged_(
+    Notification const& /*n*/) {
+    // Params ignored on purpose — see the note on the `Method::Workspace*`
+    // enumerators. Whatever they name, the answer is re-derived by re-reading
+    // the manifests, and a filter here could only make us MISS a change.
+    //
+    // ⚠ `workspace/didChangeWatchedFiles` is handled but NOT registered:
+    // registering a watcher needs `client/registerCapability`, a server→client
+    // REQUEST this protocol layer cannot originate
+    // (D-LSP-NO-OUTBOUND-REQUEST-CHANNEL). Handling it anyway is strictly
+    // better than the alternative, which is what happened before: the
+    // dispatcher's unknown-notification path DROPPED it silently, so a client
+    // that does send one — unprompted, or because a user configured a watcher
+    // in client config — was ignored for no reason.
+    (void)refreshWorkspacePreference_();
+}
+
+void LspServer::handleDidOpen_(Notification const& n) {
+    auto params = tryParseParams(n);
+    if (!params) return;
+    const auto item = parseTextDocumentItem(*params);
+    if (item.uri.empty()) return;
+
+    // ★ LOOK BEFORE RESOLVING (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE).
+    // The manifest set may have changed since `initialize`; this document is not
+    // in the store yet, so the refresh's republish sweep cannot touch it and the
+    // resolution below simply uses the up-to-date preference.
+    (void)refreshWorkspacePreference_();
+
+    auto r = resolveSchemaForUri_(item.uri);
+    documents_.open(item.uri, item.version, item.text, std::move(r.schema),
+                    std::move(r.reason));
     enqueueParse_(item.uri);
 }
 
@@ -498,7 +621,25 @@ void LspServer::handleDidClose_(Notification const& n) {
 }
 
 void LspServer::handleDidSave_(Notification const& /*n*/) {
-    // didChange already re-parses on every edit.
+    // The SAVED DOCUMENT needs nothing — `didChange` already re-parsed it on
+    // every edit. What a save additionally means is that the FILESYSTEM moved,
+    // and if what moved was a `*.dss-project.json` the workspace's dialect
+    // preference moved with it.
+    //
+    // ★ THIS IS THE UNIVERSAL HALF OF THE LIVENESS
+    // (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE). The
+    // `workspace.fileOperations` registration advertised in `initialize` is
+    // immediate but partial — it fires only for CLIENT-performed create /
+    // rename / delete, never for a content edit and never for a file `git` or a
+    // terminal wrote. Re-checking on any save (and on any open) covers all of
+    // those, from any source, at the cost of a latency of one user action. It
+    // needs no client capability, no registration, and no outbound request,
+    // which is precisely why it is the load-bearing half.
+    //
+    // Deliberately NOT hung off `didChange`: that arrives per keystroke, and a
+    // directory scan plus a manifest parse per keystroke is a cost the answer
+    // does not justify (a manifest the user has not saved is not yet a fact).
+    (void)refreshWorkspacePreference_();
 }
 
 void LspServer::enqueueParse_(std::string uri) {

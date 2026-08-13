@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/alignment.hpp"
+#include "core/types/cfi.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
@@ -75,6 +76,19 @@ namespace dss {
 struct DSS_EXPORT SourceMapEntry {
     std::uint32_t byteOffset;
     MirInstId     mirInst;
+    // The LIR instruction that produced these bytes.
+    //
+    // * Distinct from `mirInst` and NOT a duplicate of it. `mirInst` is the
+    //   DEBUG-INFO anchor and is deliberately allowed to be invalid: the
+    //   post-legalize / post-callconv LIR arena has diverged from MIR, so the
+    //   whole-pipeline path stamps `InvalidMirInst` for every instruction (see
+    //   `compile_pipeline.cpp` step 10). `lirInst` names the instruction in the
+    //   LIR the assembler is CURRENTLY walking, so it is always valid, and it
+    //   is what lets a producer that knows an instruction's MEANING (the
+    //   callconv materializer, which emits the frame) be joined to the byte
+    //   offset only the assembler knows. Without it, unwind PCs have to be
+    //   re-derived downstream by assuming instruction encodings.
+    LirInstId     lirInst{};
 };
 
 // One relocation — an unresolved symbol reference the linker will
@@ -115,25 +129,17 @@ struct DSS_EXPORT SyntheticBlockSymbol {
     std::uint32_t blockByteOffset = 0; // offset of the target block within THIS fn's bytes
 };
 
-// c114 (D-WIN64-PDATA-XDATA-UNWIND): a FORMAT-NEUTRAL projection of a
-// function's frame prologue — just enough for an unwind-table emitter to
-// describe the frame WITHOUT depending on `lir/` (AssembledFunction has
-// zero lir/ coupling by design). Populated by the compile pipeline from
-// the callconv pass's `FrameLayout`; consumed today ONLY by the pe64
-// writer's `.pdata`/`.xdata` builder, but the data is generic (ELF
-// `.eh_frame` / Mach-O compact-unwind are legitimate future consumers).
-//
-// The canonical DSS x86_64 prologue is `sub rsp, totalFrameSize` (or, for
-// `totalFrameSize > stackProbePageBytes`, the inline page-probe loop) then
-// one `mov [rsp + saveOffset], reg` per USED callee-saved register — no
-// push, no frame pointer. `savedRegs` is in emission (ascending-offset)
-// order; each entry carries the platform register number + class so the
-// emitter can pick UWOP_SAVE_NONVOL (GPR) vs UWOP_SAVE_XMM128 (FPR).
-struct DSS_EXPORT FrameSavedReg {
-    std::uint16_t regEncoding = 0;   // the register's platform ordinal (x64: rax=0..r15=15; xmm N = N)
-    bool          isFpr       = false;  // FPR/vector class ⇒ 16-byte XMM save, else 8-byte GPR
-    std::uint32_t saveOffset  = 0;   // byte offset from post-prologue RSP where the reg is stored
-};
+// D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO (plan 15 CFI slice):
+// `FrameSavedReg` + `FrameUnwindInfo` USED TO LIVE HERE and are GONE, not
+// wrapped. They were a projection of one canonical prologue SHAPE with no PC
+// dimension; the replacement is `AssembledFunction::cfi`, a PC-keyed
+// `CfiFunction` (`core/types/cfi.hpp`) carrying MEASURED byte offsets. Keeping
+// the old struct as a view over the new one would have left two unwind models
+// in the tree, and the whole failure this closes is two descriptions of one
+// frame drifting apart. The one field of the old struct that was never unwind
+// data at all -- `sehScopes`, which describes EXCEPTION scopes, not frames --
+// moved up to `AssembledFunction` unchanged.
+
 // c116 (D-WIN64-SEH-FUNCLETS): one MSVC-x64 SEH scope,
 // as byte offsets WITHIN the owning (parent) function's `bytes` + the SymbolIds
 // the pe writer resolves to image-RVAs at link time. Produced by the compile
@@ -153,17 +159,6 @@ struct DSS_EXPORT SehScopeEntry {
     SymbolId      filterFuncletSymbol{};     // the synthesized filter-funclet function symbol
     SymbolId      personalitySymbol{};       // __C_specific_handler extern (its thunk RVA = the UNWIND handler field)
 };
-struct DSS_EXPORT FrameUnwindInfo {
-    std::uint32_t              totalFrameSize = 0;  // bytes the prologue subtracts from RSP
-    bool                       usesStackProbe = false;  // frame > cc.stackProbePageBytes ⇒ the inline probe loop
-    std::uint32_t              stackProbePageBytes = 0; // the cc's guard-page size (probe stride); 0 = no probing
-    std::vector<FrameSavedReg> savedRegs;           // callee-saved regs stored in the prologue, ascending saveOffset
-    // c116 (D-WIN64-SEH-FUNCLETS): the SEH scopes this function guards. Empty for
-    // every function without a `__try` (the overwhelming majority). Non-empty ⇒
-    // the pe writer sets UNW_FLAG_EHANDLER + appends the __C_specific_handler
-    // scope table to this function's UNWIND_INFO.
-    std::vector<SehScopeEntry> sehScopes;
-};
 
 // One assembled function — bytes + symbol-relative metadata. `symbol`
 // is sourced from the originating `lir.funcSymbol(fn)` so the linker
@@ -174,12 +169,26 @@ struct DSS_EXPORT AssembledFunction {
     std::vector<std::uint8_t>   bytes;
     std::vector<Relocation>     relocations;
     std::vector<SourceMapEntry> sourceMap;
-    // c114 (D-WIN64-PDATA-XDATA-UNWIND): the frame prologue projection an
-    // unwind-table emitter needs (see FrameUnwindInfo). nullopt when the
-    // pipeline did not attach it (object-file `.obj` path, or a producer
-    // that skips frame layout) — the pe64 exec writer then emits no
-    // unwind entry for this function (a leaf/frameless entry).
-    std::optional<FrameUnwindInfo> unwind;
+    // This function's CALL FRAME INFORMATION -- the PC-keyed unwind state
+    // machine every format's unwind table is encoded from (`.eh_frame` CIE/FDE
+    // on ELF and Mach-O, `.pdata`/`.xdata` UNWIND_INFO on PE).
+    //
+    // nullopt when no producer attached one: the object-file `.obj` path, the
+    // linker-synthesized entry trampoline, and -- today -- every function that
+    // came from assembly source, whose `.cfi_*` directives are still parsed and
+    // dropped (D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED). A format writer that
+    // cannot describe such a function must SAY SO rather than emit a table that
+    // silently covers a subset of the image.
+    std::optional<CfiFunction> cfi;
+    // c116 (D-WIN64-SEH-FUNCLETS): the SEH scopes this function guards. Empty
+    // for every function without a `__try` (the overwhelming majority).
+    // Non-empty ⇒ the pe writer sets UNW_FLAG_EHANDLER + appends the
+    // __C_specific_handler scope table to this function's UNWIND_INFO.
+    //
+    // Deliberately a SIBLING of `cfi`, not a member of it: an exception SCOPE
+    // is a source-language construct (`__try`), not a statement about where a
+    // register was spilled, and no other format's unwind encoder wants it.
+    std::vector<SehScopeEntry> sehScopes;
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols this
     // function's block-address `lea`s reference, each paired with the
     // target block's byte offset within `bytes`. The encoder records a

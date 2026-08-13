@@ -4,7 +4,7 @@
 
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
-#include "core/substrate/relocation_table.hpp"
+#include "core/substrate/relocation_table_json.hpp"
 #include "core/types/artifact_profile.hpp"  // isRegisteredArtifactProfile / registeredArtifactProfileList (AP3, shared w/ grammar loader)
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74 extraction)
 #include "core/types/parse_diagnostic.hpp"
@@ -2048,6 +2048,19 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     return false;
                 }
                 info.pltNativeId = static_cast<std::uint32_t>(pv);
+            }
+            // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: an EMISSION ALIAS —
+            // a row sharing its wire type with another row, present only so the
+            // emitter can reach that wire type through a different DSS kind.
+            // Excluded from the nativeId → kind REVERSE map a reader builds.
+            if (r.contains("emitOnly")) {
+                if (!r.at("emitOnly").is_boolean()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/emitOnly", i),
+                           "'emitOnly' must be a boolean");
+                    return false;
+                }
+                info.emitOnly = r.at("emitOnly").get<bool>();
             }
             return true;
         });

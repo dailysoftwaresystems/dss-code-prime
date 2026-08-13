@@ -76,6 +76,33 @@ public:
     [[nodiscard]] std::optional<std::uint32_t>
         update(std::string const& uri, std::int32_t clientVersion, std::string text);
 
+    // Re-point an ALREADY-OPEN document at a different schema (or at none, with
+    // the reason), leaving its text and clientVersion untouched. Returns true
+    // iff the document exists AND the `(schema, schemaError)` pair actually
+    // CHANGED — so the caller republishes exactly the affected documents and
+    // nothing else.
+    //
+    // ★ WHY IT EXISTS (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE). The
+    // schema a document is parsed under is not only a property of its
+    // extension: when the extension is claimed by two languages the WORKSPACE's
+    // project manifests break the tie, and a manifest can be added or edited
+    // mid-session. `open()` cannot serve that — it resets text, version and
+    // diagnostics, i.e. it would forget everything the client has typed.
+    //
+    // ★ IT BUMPS `parseGeneration`, reusing the EXISTING stale-suppression
+    // invariant instead of inventing a second one: a parse already in flight was
+    // started under the OLD grammar, and its diagnostics must lose to the reparse
+    // the caller is about to enqueue.
+    [[nodiscard]] bool setSchema(std::string const& uri,
+                                 std::shared_ptr<dss::GrammarSchema const> schema,
+                                 std::string schemaError);
+
+    // Every currently-open URI, SORTED. Sorted rather than in hash order for
+    // the same reason `collectManifests` sorts: a republish sweep must visit
+    // documents in an order two machines agree on, or the wire trace this
+    // server is tested through becomes environment-dependent.
+    [[nodiscard]] std::vector<std::string> openUris() const;
+
     // Close (remove) a document. No-op if not open.
     void close(std::string const& uri);
 
@@ -116,6 +143,18 @@ public:
         semanticModelFor(std::string const& uri) const;
 
 private:
+    struct Entry;
+
+    // ★ THE SILENT STATE IS MADE UNREPRESENTABLE AT EVERY DOOR, NOT AT ONE.
+    // `schema == nullptr` with an empty `schemaError` is the shape
+    // D-LSP-ASSEMBLY-DIALECT-UNSERVABLE removed (the publish path then emits an
+    // empty diagnostics array, which an editor renders as "this file is
+    // clean"). `open` enforced it; `setSchema` is a SECOND door into the same
+    // state, so both call this rather than each carrying its own copy of the
+    // substitute message — two copies is how the doors drift apart.
+    // Caller must hold `mutex_`.
+    static void enforceSchemaReasonLocked_(Entry& entry);
+
     struct Entry {
         std::int32_t                                clientVersion = 0;
         std::uint32_t                               parseGeneration = 0;

@@ -7569,6 +7569,97 @@ TEST(Preprocessor, TFC74TargetPredefineHonoursAvailableObjectFormats) {
     }
 }
 
+// ── D-CONFIG-PREDEFINED-MACRO-ROW-KEYS-UNGATED ────────────────────────────
+//
+// A `predefinedMacros` ENTRY had no closed key vocabulary, so every optional
+// key was a knob that could be misspelled into silence: `"paramss"` ships an
+// OBJECT-like macro where a function-like one was declared,
+// `"availabelObjectFormats"` predefines a pe-only spelling on EVERY format,
+// and `"componentWeigths"` leaves the `version` kind's missing-field
+// diagnostic as the only thing between a typo and a wrong encoding.
+//
+// The gate lives in the SHARED entry parser (`predefined_macro_json.cpp`), so
+// all THREE declaring families inherit it. This suite pins the LANGUAGE family
+// (`/preprocess/predefinedMacros`); `tests/core/test_target_schema.cpp` and
+// `tests/link/test_object_format_schema.cpp` pin the other two, because "the
+// shared parser gained a rule" is a claim about all of its callers.
+//
+// ★ DRIVEN THROUGH THE REAL INPUT PATH — the SHIPPED c-subset document,
+// spliced, never a hand-typed minimal stub. That matters twice over. The
+// pristine arm is the INVERSE-FAILURE guard: a vocabulary enumerated from what
+// the code READS rather than from what the shipped documents CONTAIN is
+// exactly how the sibling target-loader gate turned 21 tests red on its first
+// cut. And this is the one document that uses `$comment` INSIDE macro entries
+// — seven times — so the `$`-prefix carve-out is witnessed on real data.
+namespace {
+
+// The shipped c-subset text with ONE extra entry spliced into the FRONT of its
+// `predefinedMacros` array. A whole extra entry (rather than a corrupted
+// existing one) keeps the splice independent of the file's hand-aligned
+// formatting, and keeps the probe's own name out of every other assertion.
+[[nodiscard]] std::string cSubsetWithExtraMacroKey(std::string_view extraKey) {
+    std::string       text  = loadShippedCSubsetText();
+    const std::string anchor = "\"predefinedMacros\": [";
+    const auto        pos    = text.find(anchor);
+    if (pos == std::string::npos) return {};
+    std::string entry = "{\"name\":\"__DSS_KEY_GATE_PROBE__\","
+                        "\"kind\":\"constant\",\"value\":\"1\",";
+    entry += '"';
+    entry += extraKey;
+    entry += "\":\"1\"},";
+    text.insert(pos + anchor.size(), entry);
+    return text;
+}
+
+} // namespace
+
+TEST(Preprocessor, PredefinedMacroEntryPristineShippedDocumentStillLoads) {
+    const std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
+    auto loaded = GrammarSchema::loadFromText(text, "<pristine-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << "the closed entry vocabulary must admit every key the SHIPPED "
+           "document declares — including the seven `$comment`s inside macro "
+           "entries. First diagnostic: "
+        << (loaded.error().empty() ? "<none>" : loaded.error()[0].message);
+}
+
+// RED-ON-DISABLE: delete the rejection loop in `parsePredefinedMacroArray` and
+// this load succeeds — which is the silent no-op the gate exists to stop.
+TEST(Preprocessor, PredefinedMacroEntryUnknownKeyRejectedAndNamed) {
+    const std::string text = cSubsetWithExtraMacroKey("vaule");
+    ASSERT_FALSE(text.empty()) << "shipped c-subset config no longer carries a "
+                                  "`predefinedMacros` array to splice";
+    auto loaded = GrammarSchema::loadFromText(text, "<typo-c-subset>");
+    ASSERT_FALSE(loaded.has_value())
+        << "a misspelled entry key must be REFUSED — silently dropping it "
+           "ships the macro with the very default the key was overriding";
+    bool named = false;
+    for (auto const& d : loaded.error()) {
+        named = d.message.find("vaule") != std::string::npos
+             && d.message.find("predefinedMacros") != std::string::npos;
+        if (named) break;
+    }
+    EXPECT_TRUE(named)
+        << "the diagnostic must name BOTH the offending key and the container "
+           "it was found in — 'unknown key' alone sends the author hunting";
+}
+
+// The carve-out, on its own. Without it the gate would reject every shipped
+// language document on first load, which is the inverse failure and the more
+// expensive one.
+TEST(Preprocessor, PredefinedMacroEntryDollarPrefixedKeyStillAccepted) {
+    const std::string text = cSubsetWithExtraMacroKey("$valueComment");
+    ASSERT_FALSE(text.empty());
+    auto loaded = GrammarSchema::loadFromText(text, "<documented-c-subset>");
+    ASSERT_TRUE(loaded.has_value())
+        << "`$`-prefixed keys are the codebase-wide documentation convention "
+           "and must survive the typo discriminator — and the carve-out must "
+           "be the PREFIX predicate, not a literal `$comment` compare, or "
+           "`$valueComment` would be rejected as a typo. First diagnostic: "
+        << (loaded.error().empty() ? "<none>" : loaded.error()[0].message);
+}
+
 // ── the COLLISION policy ──────────────────────────────────────────────────
 // A name owned by BOTH config families is FATAL. Neither may silently win:
 // picking either quietly is a wrong-value miscompile with no diagnostic.

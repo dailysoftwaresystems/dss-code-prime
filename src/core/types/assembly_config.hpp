@@ -114,15 +114,60 @@ enum class AsmDirectiveVerb : std::uint8_t {
     // (`unitBytes`), never guessed from the value: `.byte 1` and `.quad 1`
     // differ only in the row.
     EmitData,
-    // `.zero 16` / `.space 16` / `.skip 16` — the single operand is a byte
-    // COUNT of zeroes, not a value. A distinct verb rather than an `EmitData`
-    // flag because the operand MEANS something different: `.byte 16` writes one
-    // byte 0x10 and `.zero 16` writes sixteen bytes 0x00, and a shared verb
-    // would put that difference in a key the reader has to notice.
-    ReserveZeroBytes,
+    // `.zero 16` / `.space 16, 7` / `.skip 16` — the FIRST operand is a byte
+    // COUNT, not a value, and the OPTIONAL SECOND is the byte to fill with
+    // (absent ⇒ zero). A distinct verb rather than an `EmitData` flag because
+    // the first operand MEANS something different: `.byte 16` writes one byte
+    // 0x10 and `.zero 16` writes sixteen bytes 0x00, and a shared verb would
+    // put that difference in a key the reader has to notice.
+    //
+    // ⚠ THIS VERB WAS SPELLED `reserveZeroBytes` UNTIL 2026-08-13 AND THE NAME
+    // HAD BECOME A LIE — D-ASM-SPACE-DIRECTIVE-FILL-BYTE-UNMODELLED. The old
+    // name was TRUE while the fill byte was unmodelled and the second operand
+    // was refused; it stops being true the moment `.space 4, 7` writes
+    // `07 07 07 07`. ✔MEASURED 2026-08-13, `aarch64-linux-gnu-as` + `objdump
+    // -s`: `.space 4, 7` AND `.zero 4, 7` BOTH assemble rc=0 and BOTH produce
+    // `07070707` — so this is ONE verb with an optional fill and not two verbs
+    // split by spelling, which is what a `.zero`-takes-no-fill reading would
+    // have shipped. A config verb whose name states the wrong default is the
+    // "comment records the full fact while the code uses half of it" failure
+    // with the halves swapped, so the name moved with the behaviour.
+    ReserveFillBytes,
+
+    // ★★★ `.section .rodata` — THE SECTION IS THE DIRECTIVE'S OPERAND, NOT THE
+    // ROW'S (D-ASM-SECTION-DIRECTIVE-WITH-OPERAND-UNMODELLED, 2026-08-13).
+    // `SectionData` fixes its section PER ROW, so a directive that takes the
+    // section as an operand had no shape at all and `.rodata` was unreachable
+    // in every dialect.
+    //
+    // ★★ IT MINTS NO SECTION VOCABULARY AND NO SECOND LOOKUP TABLE — it
+    // DELEGATES. `.section X` means "do what the section-opening directive
+    // spelled X would do", resolved against THIS dialect's own `directives[]`
+    // rows (`SectionText` / `SectionData`). So `.section .data` and `.data`
+    // reach the identical row by construction and can never drift, and the
+    // only thing `.rodata` adds is one more row in the table that was already
+    // there.
+    // ⚠ WHY THAT ROW CANNOT SIMPLY BE A BARE `.rodata` DIRECTIVE: ✔MEASURED
+    // 2026-08-13 against BOTH reference assemblers — `aarch64-linux-gnu-as`
+    // and x86_64 `as` accept `.section .rodata` (rc=0, section `.rodata`
+    // PROGBITS+A) and REJECT a bare `.rodata` ("unknown pseudo-op"). Accepting
+    // what the reference assembler rejects is the other half of bidirectional
+    // conformance, so the row declares `operandOnly` and the bare spelling
+    // stays refused BY NAME.
+    // ⚠ WHAT IT MODELS IS THE SECTION NAME AND NOTHING ELSE. Real `.section`
+    // also carries flags and a type (`.section .note.GNU-stack,"",@progbits`,
+    // `.section .rodata,"a",@progbits` — both ✔MEASURED accepted by gas).
+    // Those change the section's WIRE SEMANTICS (`"aw"` writable, `"ax"`
+    // executable, `@nobits` zero-fill), and DSS derives every one of them from
+    // the `DataSectionKind` instead — so honouring the name while dropping the
+    // flags would place `.section .rodata,"aw"` read-only in a program that
+    // writes it. A `.section` carrying more than the name is therefore
+    // REFUSED, naming the operand it will not interpret; it is never silently
+    // ignored and never half-applied.
+    SectionByName,
 };
 
-inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 7>
+inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 8>
     kAsmDirectiveVerbNames{{
         {"sectionText", AsmDirectiveVerb::SectionText},
         {"globalSymbol", AsmDirectiveVerb::GlobalSymbol},
@@ -130,13 +175,24 @@ inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 7>
         {"functionEntry", AsmDirectiveVerb::FunctionEntry},
         {"sectionData", AsmDirectiveVerb::SectionData},
         {"emitData", AsmDirectiveVerb::EmitData},
-        {"reserveZeroBytes", AsmDirectiveVerb::ReserveZeroBytes},
+        {"reserveFillBytes", AsmDirectiveVerb::ReserveFillBytes},
+        {"sectionByName", AsmDirectiveVerb::SectionByName},
     }};
 static_assert(kAsmDirectiveVerbNames.size()
                   == static_cast<std::size_t>(
-                         AsmDirectiveVerb::ReserveZeroBytes)
+                         AsmDirectiveVerb::SectionByName)
                          + 1,
               "every AsmDirectiveVerb enumerator needs a config spelling");
+
+// Does this verb OPEN A SECTION — i.e. can a `SectionByName` operand resolve
+// to a row carrying it? ★ ONE PREDICATE, SO THE LOADER'S "which rows may be
+// `operandOnly`" CHECK AND THE WALKER'S OPERAND RESOLUTION CANNOT DISAGREE.
+// Two independent lists is how a row becomes declarable-but-unreachable.
+[[nodiscard]] constexpr bool
+asmVerbOpensSection(AsmDirectiveVerb v) noexcept {
+    return v == AsmDirectiveVerb::SectionText
+        || v == AsmDirectiveVerb::SectionData;
+}
 
 // The operand ROLES the lowering understands, each bound by the dialect to one
 // of its own rules. ★ THE ENGINE WALKS ROLES, NEVER RULE NAMES — a dialect whose
@@ -274,7 +330,34 @@ struct AsmDirectiveSpelling {
     // THE PROOF: it is 2 bytes on x86 gas and 4 bytes on several other gas
     // ports. An engine that knew "`.word` means two bytes" would silently halve
     // every table on the ports where it does not.
+    // ✔MEASURED 2026-08-13 on BOTH ports, one label per directive with the
+    // offsets read back by `objdump -t` (each delta IS the width above it):
+    // x86_64 `as` — byte 1, word 2, short 2, long 4, quad 8, and `.xword` is
+    // REJECTED outright; `aarch64-linux-gnu-as` — byte 1, hword 2, short 2,
+    // word 4, long 4, quad 8, xword 8. `.word` really is 2 on one and 4 on the
+    // other, in the same build of binutils.
     std::uint32_t    unitBytes = 0;
+
+    // ★★★ IS THIS SPELLING REACHABLE AS A BARE DIRECTIVE, OR ONLY AS THE
+    // OPERAND OF A `SectionByName` ONE?
+    // (D-ASM-SECTION-DIRECTIVE-WITH-OPERAND-UNMODELLED.)
+    // True on a row that names a section the dialect can SELECT but cannot
+    // WRITE as a directive of its own — gas's `.rodata`, which exists only
+    // as `.section .rodata`.
+    //
+    // ★ IT IS A REACHABILITY FACT, NOT A SECOND VOCABULARY, AND THAT IS THE
+    // whole reason the row lives in `directives[]` at all rather than in a
+    // private section-name table hung off the `.section` row. A separate table
+    // would have restated the `.data`→`Data` and `.bss`→`Bss` mappings that are
+    // already here — the exact duplication shape this arc keeps closing (a
+    // dotted mnemonic declared once as a token and once as an instruction) —
+    // and the two copies would drift the first time a section was renamed.
+    // ⇒ ONE table, one lookup, and this flag says which door a row opens.
+    // ⚠ REFUSED ON ANY VERB THAT DOES NOT OPEN A SECTION (`asmVerbOpensSection`)
+    // and refused in a dialect that declares no `SectionByName` row at all —
+    // in either case nothing could ever reach the row, and a row nothing can
+    // reach is config that silently does nothing.
+    bool             operandOnly = false;
 };
 
 struct DSS_EXPORT AssemblyConfig {
@@ -368,21 +451,66 @@ struct DSS_EXPORT AssemblyConfig {
         return (mask & (1u << static_cast<std::size_t>(role))) != 0;
     }
 
-    // Every directive spelling bound to `verb`, comma-joined and written with
-    // the dialect's own introducer omitted (the row stores it that way). Built
-    // for the refusal that has to tell a reader WHICH directive it wanted; a
-    // hand-written list in the diagnostic would go stale the first time a
-    // dialect renamed a spelling.
+    // Every directive spelling bound to `verb` that a source file may actually
+    // WRITE, comma-joined and with the dialect's own introducer omitted (the
+    // row stores it that way). Built for the refusal that has to tell a reader
+    // WHICH directive it wanted; a hand-written list in the diagnostic would go
+    // stale the first time a dialect renamed a spelling.
+    // ⚠ `operandOnly` ROWS ARE EXCLUDED, AND THAT IS THE POINT OF THE FLAG
+    // REACHING THIS FUNCTION. Every caller is telling a reader "write one of
+    // these"; listing `rodata` there would send them to write `.rodata`, which
+    // this dialect (and gas) refuse. A diagnostic that suggests a fix the next
+    // compile rejects is worse than one that lists less.
     [[nodiscard]] std::string spellingsForVerb(AsmDirectiveVerb verb) const {
         std::string out;
         for (auto const& row : directives) {
-            if (row.verb != verb) continue;
+            if (row.verb != verb || row.operandOnly) continue;
             if (!out.empty()) out += ", ";
             out += '\'';
             out += row.spelling;
             out += '\'';
         }
         return out;
+    }
+
+    // Every spelling a `SectionByName` operand may name — i.e. every row whose
+    // verb OPENS a section, `operandOnly` or not. ★ THE TWO LISTS ARE
+    // DELIBERATELY DIFFERENT AND BOTH ARE DERIVED FROM THE SAME ROWS: what you
+    // may WRITE as a directive and what you may NAME after `.section` differ by
+    // exactly the `operandOnly` rows, and stating each from the table means
+    // neither can go stale.
+    [[nodiscard]] std::string sectionOperandSpellings() const {
+        std::string out;
+        for (auto const& row : directives) {
+            if (!asmVerbOpensSection(row.verb)) continue;
+            if (!out.empty()) out += ", ";
+            out += '\'';
+            out += row.spelling;
+            out += '\'';
+        }
+        return out;
+    }
+
+    // The section-opening row a `SectionByName` operand names, or nullptr.
+    // ⚠ LOOKUP IS OVER SECTION-OPENING ROWS ONLY, so `.section text` reaches
+    // the `sectionText` row and `.section globl` reaches nothing rather than
+    // silently reaching a directive that has no section to open.
+    [[nodiscard]] AsmDirectiveSpelling const*
+    sectionRowByName(std::string_view s) const noexcept {
+        for (auto const& row : directives) {
+            if (!asmVerbOpensSection(row.verb)) continue;
+            if (row.spelling == s) return &row;
+        }
+        return nullptr;
+    }
+
+    // Does this dialect declare a directive that names its section by operand?
+    // The loader uses it to refuse an `operandOnly` row nothing could reach.
+    [[nodiscard]] bool hasSectionByName() const noexcept {
+        for (auto const& row : directives) {
+            if (row.verb == AsmDirectiveVerb::SectionByName) return true;
+        }
+        return false;
     }
 
     [[nodiscard]] AsmInstructionSpelling const*

@@ -16,6 +16,22 @@
 #include <unordered_map>
 #include <utility>
 
+// ── PIN (D-CORE-JSON-LEAKS-INTO-TWO-PUBLIC-HEADERS) ─────────────────────────
+// This TU uses only `validateRelocationsTable`, which touches no JSON, and the
+// `relocations[]` substrate was split so it would stop seeing nlohmann for it.
+// The split is invisible to every test: a TU that gains a transitive include is
+// not an error, so a stray `#include <nlohmann/json.hpp>` in ANY header reached
+// from here would silently undo the split and the suite would stay green. This
+// guard is therefore the whole enforcement, and it is red-on-disable by
+// construction -- restore the include and the build stops here.
+// Loader work belongs in the matching `*_json.cpp`, which includes
+// `core/substrate/relocation_table_json.hpp`.
+#ifdef NLOHMANN_JSON_VERSION_MAJOR
+#error "nlohmann/json re-entered this TU's include set. This file validates \
+typed rows and must not see JSON; move the JSON work to its *_json.cpp sibling \
+(see core/substrate/relocation_table_json.hpp)."
+#endif
+
 namespace dss {
 
 // All three helpers iterate `kRelocFormulaTable` — single source of
@@ -164,14 +180,19 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "instruction (silent dead variant)",
                                  o.mnemonic, vi, *v.immMin, *v.immMax));
             }
+            // The VALUE-BEARING operand predicate, shared by the two guard
+            // axes that key on an operand's value: the magnitude range
+            // (immMin/immMax) and the sign (negValue). Both read the FIRST
+            // ImmInt-or-MemOffset operand (`variantImmMagnitude` /
+            // `variantNegMagnitude`), so both demand the same declaration.
+            bool const hasValueOperand = std::any_of(
+                v.operandKinds.begin(), v.operandKinds.end(),
+                [](OperandKindFilter f) {
+                    return f == OperandKindFilter::ImmInt
+                        || f == OperandKindFilter::MemOffset;
+                });
             if (v.immMin.has_value() || v.immMax.has_value()) {
-                bool const hasImmOperand = std::any_of(
-                    v.operandKinds.begin(), v.operandKinds.end(),
-                    [](OperandKindFilter f) {
-                        return f == OperandKindFilter::ImmInt
-                            || f == OperandKindFilter::MemOffset;
-                    });
-                if (!hasImmOperand) {
+                if (!hasValueOperand) {
                     fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
                          std::format("opcode '{}' variant {}: declares "
                                      "immMin/immMax but its operandKinds carry "
@@ -180,27 +201,22 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                      o.mnemonic, vi));
                 }
             }
-            // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: negMemoffset requires a
-            // `memoffset` operand to sign-route on — the same coherence family
-            // as immMin/immMax. A negMemoffset flag on a variant with no
-            // memoffset operand keys on a sign that does not exist (the sign
-            // axis reads only ImmInt/MemOffset; an ImmInt is never a
-            // displacement, so negMemoffset is memoffset-specific). Reject at
-            // load rather than match nothing silently.
-            if (v.negMemoffset) {
-                bool const hasMemOffset = std::any_of(
-                    v.operandKinds.begin(), v.operandKinds.end(),
-                    [](OperandKindFilter f) {
-                        return f == OperandKindFilter::MemOffset;
-                    });
-                if (!hasMemOffset) {
-                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
-                         std::format("opcode '{}' variant {}: declares "
-                                     "negMemoffset but its operandKinds carry "
-                                     "no 'memoffset' operand — there is no "
-                                     "displacement to sign-route on",
-                                     o.mnemonic, vi));
-                }
+            // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (introduced) /
+            // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE (generalized):
+            // `negValue` requires a VALUE-BEARING operand to sign-route on —
+            // the SAME coherence rule as immMin/immMax, and deliberately the
+            // same predicate. The axis was memoffset-only by this rule alone
+            // (the matcher underneath always read ImmInt-or-MemOffset), and
+            // sign-routing an IMMEDIATE — arm64's `MOVN` vs `MOVZ` — is the
+            // same question about a different operand kind. Reject at load
+            // rather than match nothing silently.
+            if (v.negValue && !hasValueOperand) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
+                     std::format("opcode '{}' variant {}: declares "
+                                 "negValue but its operandKinds carry no "
+                                 "'imm32' or 'memoffset' operand — there is "
+                                 "no value to sign-route on",
+                                 o.mnemonic, vi));
             }
             // `opcodeBytes` is meaningful only for the x86-variable
             // shape. fixed32 carries the analog as `fixedWord` (a
@@ -862,15 +878,15 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 if (va.operandKinds != vb.operandKinds) continue;
                 // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the SIGN axis is a
                 // THIRD disambiguator. Two same-operandKinds variants that
-                // differ in `negMemoffset` route on DISJOINT sign domains (one
-                // matches only a negative memoffset, the other only a
-                // non-negative one), so neither shadows the other — regardless
-                // of width or imm-range. The effLo/effHi magnitude ranges below
-                // are per-sign (a |disp| bound on the negative half, a disp
-                // bound on the non-negative half); comparing them ACROSS the
-                // sign boundary is meaningless, so skip the overlap check when
-                // the sign axis already separates them.
-                if (va.negMemoffset != vb.negMemoffset) continue;
+                // differ in `negValue` route on DISJOINT sign domains (one
+                // matches only a negative value-bearing operand, the other
+                // only a non-negative one), so neither shadows the other —
+                // regardless of width or imm-range. The effLo/effHi magnitude
+                // ranges below are per-sign (a |value| bound on the negative
+                // half, a value bound on the non-negative half); comparing
+                // them ACROSS the sign boundary is meaningless, so skip the
+                // overlap check when the sign axis already separates them.
+                if (va.negValue != vb.negValue) continue;
                 // Disjoint imm-ranges ⇒ value-distinguishable, never a
                 // shadow. `[loA,hiA]` and `[loB,hiB]` are disjoint iff
                 // hiA < loB or hiB < loA.
@@ -1279,6 +1295,96 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "intrinsically; 'addendBias' must be 0.",
                                  r.name,
                                  relocFormulaName(r.formulaKind)));
+            }
+        }
+    }
+
+    // ── DWARF register numbering ──────────────────────
+    // (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO)
+    //
+    // The psABI table the `.eh_frame` writer needs, in two halves:
+    // `/registers/N/dwarfNumber` and `/target/dwarfReturnAddressColumn`.
+    // Two gates, and both exist because the failure they prevent is a
+    // table that LOADS CLEAN and cannot be used.
+    //
+    //  (1) PRESENCE COHERENCE. The halves arrive together or not at all.
+    //      Numbers without a return-address column leave
+    //      `DwarfRegisterMapping::declared()` false, so every register
+    //      number in the file is dead weight and `.eh_frame` silently
+    //      never appears; a column without numbers is the same defect
+    //      mirrored. Neither half is individually detectable at the use
+    //      site as a CONFIG mistake — the writer can only say "this
+    //      target declares no numbering", which is true and useless.
+    //
+    //  (2) COMPLETENESS OVER THE REGISTERS A FRAME RULE CAN NAME.
+    //      "Every register" is the wrong requirement: DWARF numbers
+    //      ARCHITECTURAL registers, so narrow views (`eax`, `w0`) have
+    //      none by construction, and AArch64's `xzr` has none at all.
+    //      The set that MUST be numbered is derivable from what the
+    //      target already declares — the stack pointer, the frame
+    //      pointer, the link register and the callee-saves of each
+    //      calling convention are exactly the registers `lir_callconv`
+    //      can emit a CFI rule about. Deriving it means no new config
+    //      key and no way for the two to disagree.
+    {
+        bool anyRegNumbered = false;
+        for (auto const& r : registers) {
+            if (r.dwarfNumber.has_value()) { anyRegNumbered = true; break; }
+        }
+        if (anyRegNumbered && !dwarfReturnAddressColumn.has_value()) {
+            fail("/target/dwarfReturnAddressColumn",
+                 "the register table declares DWARF register numbers but "
+                 "'/target/dwarfReturnAddressColumn' is absent — both halves "
+                 "of the psABI numbering are required together. Without the "
+                 "return-address column the .eh_frame writer treats the whole "
+                 "numbering as undeclared and refuses, so every dwarfNumber in "
+                 "this file would be inert (x86_64 SysV = 16, a synthetic "
+                 "column; AArch64 = 30)");
+        }
+        if (!anyRegNumbered && dwarfReturnAddressColumn.has_value()) {
+            fail("/target/dwarfReturnAddressColumn",
+                 "'/target/dwarfReturnAddressColumn' is declared but no "
+                 "register row carries a 'dwarfNumber' — both halves of the "
+                 "psABI numbering are required together. A return-address "
+                 "column alone names no register, so the .eh_frame writer "
+                 "would refuse on the first frame rule it tried to encode");
+        }
+        if (anyRegNumbered) {
+            // `role` names the declaration that made this register
+            // frame-relevant, so the diagnostic points at the line that
+            // created the requirement rather than at the register row.
+            auto requireNumber = [&](std::size_t ccIdx, char const* role,
+                                     std::string const& regName) {
+                auto it = registerIndex.find(regName);
+                if (it == registerIndex.end()) return;  // checkRefs owns this
+                auto const& reg = registers[it->second];
+                if (reg.dwarfNumber.has_value()) return;
+                fail(std::format("/registers/{}/dwarfNumber", it->second),
+                     std::format(
+                         "register '{}' is named by callingConvention '{}'.{} "
+                         "but declares no 'dwarfNumber'. This target declares "
+                         "a DWARF numbering, and a {} register is one the "
+                         "frame rules WILL name — the .eh_frame writer would "
+                         "refuse the whole section rather than emit a rule it "
+                         "cannot number (emitting 'hwEncoding' instead names a "
+                         "DIFFERENT register on every psABI that permutes the "
+                         "two, and an unwinder follows it into the wrong frame)",
+                         regName, callingConventions[ccIdx].name, role, role));
+            };
+            for (std::size_t i = 0; i < callingConventions.size(); ++i) {
+                auto const& cc = callingConventions[i];
+                if (cc.stackPointer.has_value()) {
+                    requireNumber(i, "stackPointer", cc.stackPointer->name);
+                }
+                if (cc.framePointer.has_value()) {
+                    requireNumber(i, "framePointer", cc.framePointer->name);
+                }
+                if (cc.linkRegister.has_value()) {
+                    requireNumber(i, "linkRegister", cc.linkRegister->name);
+                }
+                for (auto const& cs : cc.calleeSaved) {
+                    requireNumber(i, "calleeSaved", cs);
+                }
             }
         }
     }

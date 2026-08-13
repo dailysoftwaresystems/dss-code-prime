@@ -315,6 +315,31 @@ struct DSS_EXPORT TargetRegisterInfo {
     // Hardware encoding (e.g. ModR/M ordinal on x86) — opaque to the
     // substrate; AS1 assembler reads this directly to emit machine code.
     std::uint16_t  hwEncoding = 0;
+    // ★ The psABI-assigned DWARF register number — a DIFFERENT PERMUTATION
+    //   of the same register file than `hwEncoding`, and the reason this is
+    //   a declared table rather than a derivation. On x86_64 SysV (psABI
+    //   Fig 3.36) `rdx` is DWARF 1 but hardware 2, `rcx` is DWARF 2 but
+    //   hardware 1, `rsi`/`rdi` are DWARF 4/5 but hardware 6/7, and
+    //   `rbx`/`rsp`/`rbp` all move too. An unwinder handed the hardware
+    //   number reads a table naming a DIFFERENT register, follows it into
+    //   the wrong frame, and prints a plausible-looking backtrace — which
+    //   is strictly worse than no table at all, because no table fails
+    //   VISIBLY. (`D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO`.)
+    //
+    // EMPTY means "this register has no DWARF number", which is a real
+    // state and not a config omission: DWARF numbers ARCHITECTURAL
+    // registers, so the narrow views (`eax`, `w0`) inherit their parent's
+    // identity rather than getting one of their own, and AArch64's `xzr`
+    // has no DWARF number at all. A CFI rule naming such a register is
+    // REFUSED by the `.eh_frame` writer, naming the register — never
+    // silently given the parent's number, which would describe a save of
+    // the full-width register that never happened.
+    //
+    // What IS required is checked in `validate()`: every register a
+    // calling convention names as its stack pointer / frame pointer /
+    // link register / callee-save must have one, because those are
+    // exactly the registers a frame rule can be about.
+    std::optional<std::uint16_t> dwarfNumber;
 };
 
 // FC2 Part B (per-register-class operation table): the three universal
@@ -1278,11 +1303,39 @@ enum class EncodingSlotKind : std::uint8_t {
     // bytes + relocation. Generic: PE's C3 final
     // `lea rax, [slot + tlsOffset(sym)]` reuses it verbatim.
     MemRelocDisp32 = 30,
+    // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: an INVERTED 16-bit
+    // immediate — the SAME bit-window as `Imm16` (bits 5..20), but the
+    // encoder writes the operand's BITWISE COMPLEMENT `~V` (= `−V − 1`)
+    // instead of `V`. Distinct slot, identical placement, different encode
+    // arithmetic — exactly the `Imm12` / `Imm12Scaled` relationship one
+    // level up.
+    //
+    // GENERIC BY CONSTRUCTION, and the name says the operation rather than
+    // the instruction: "an ISA that materializes a negative constant by
+    // storing the complement of its magnitude in an unsigned field". The
+    // first consumer is AArch64 `MOVN Xd,#imm16` (which `gas` itself
+    // ALIASES from `mov Xd,#-N` — ✔MEASURED with `aarch64-linux-gnu-as`
+    // 2.42: `mov x1,#-8` and `movn x1,#7` both assemble to the IDENTICAL
+    // word 0x928000E1), but nothing here is AArch64-shaped: any fixed-width
+    // ISA with a complement-immediate form declares this slot.
+    //
+    // ENCODE CONTRACT (fixed32.cpp): the operand value MUST be strictly
+    // NEGATIVE. `~V` for a non-negative V is itself negative and would be
+    // MASKED into the window as a garbage constant — a silent miscompile —
+    // so the encoder rejects a non-negative value LOUDLY rather than
+    // relying on the variant guard's `negValue` sign-routing alone. The
+    // representable range follows from the window WIDTH, never a baked
+    // literal: V in [−2^width, −1].
+    //
+    // DECODE CONTRACT (fixed32_disasm.cpp): the mirror re-inverts, so the
+    // round-trip oracle recovers the ORIGINAL negative LIR operand value
+    // rather than the raw field.
+    Imm16Inverted = 31,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 31> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 32> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -1314,6 +1367,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 31> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Imm32MovzMovk, "imm32.movzmovk" },
     { EncodingSlotKind::AbsoluteDisp32Mem, "absdisp32.mem" },
     { EncodingSlotKind::MemRelocDisp32,    "memreloc.disp32" },
+    { EncodingSlotKind::Imm16Inverted, "imm16.inverted" },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -1332,7 +1386,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 31,
+static_assert(kEncodingSlotKindCount == 32,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -1396,6 +1450,11 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
+        // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the inverted-imm16
+        // slot shares `Imm16`'s bit-window, so it is a fixed32 slot for the
+        // same reason Imm16 is (an x86-variable opcode wiring it would be a
+        // cross-shape declaration and validate() rejects it).
+        case EncodingSlotKind::Imm16Inverted:
             return TargetEncodingShape::Fixed32;
     }
     return TargetEncodingShape::None;  // unreachable; satisfies non-exhaustive switches
@@ -1631,6 +1690,13 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         // distinguishes Imm26's dual use by operand kind — a BlockRef
         // operand is block-relative, a SymbolRef operand emits the reloc.)
         case EncodingSlotKind::Imm19:
+        // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the inverted-imm16
+        // slot writes the operand's COMPLEMENT into the field directly —
+        // a literal value, never a relocated symbol reference (a symbol's
+        // link-time address is not knowable at encode, so its complement
+        // is not either; a symbol-bearing complement form would need the
+        // LINKER to invert and is not a shape any target declares).
+        case EncodingSlotKind::Imm16Inverted:
             // D-AS4-1 / D-AS4-5 memory-addressing slots write immediate
             // displacements / register encodings (not symbol-relative).
             // The companion symbol-bearing slot for RIP-relative `lea`
@@ -1752,27 +1818,43 @@ struct DSS_EXPORT TargetEncodingVariant {
     // (validate() rejects it — there is no value to key on).
     std::optional<std::uint32_t>       immMin;
     std::optional<std::uint32_t>       immMax;
-    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: OPTIONAL negative-memoffset
-    // routing axis — the JSON key `guard.negMemoffset` (bool). FALSE (the
-    // default, every pre-existing variant) ⇒ the variant's magnitude axis
-    // reads a NON-NEGATIVE value-bearing operand; a NEGATIVE memoffset
-    // reports nullopt magnitude and matches NO bounded variant (unchanged).
-    // TRUE ⇒ the variant matches ONLY a NEGATIVE MemOffset, keyed by its
-    // ABSOLUTE VALUE |disp| against [immMin, immMax]. This is the third
-    // routing axis (alongside width + imm-range) that lets one opcode carry
-    // BOTH a positive base+disp variant (`ADD Xd,Xn,#disp`) AND a negative
-    // one (`SUB Xd,Xn,#|disp|`) with the SAME operandKinds — the matcher
-    // routes by the memoffset's SIGN, agnostically (any ISA whose base+disp
-    // encoding is unsigned-magnitude with separate add/subtract opcodes
-    // declares a negMemoffset sibling; the matcher reads the LIR operand's
-    // sign, never the arch). A target whose disp field is SIGNED (x86
-    // disp32) needs no negMemoffset variant at all — its match-any
-    // (no immMin/immMax, negMemoffset=false) slot swallows both signs.
-    // The encoder writes |disp| into the variant's (unsigned) imm12 /
-    // shifted-imm12 / MOVZ-MOVK slot; the subtract semantics live in the
-    // fixedWord (the SUB base). validate() rejects negMemoffset on a
-    // variant with no `memoffset` operand (no displacement to sign-route).
-    bool                               negMemoffset = false;
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (introduced) /
+    // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE (generalized): OPTIONAL
+    // NEGATIVE-VALUE routing axis — the JSON key `guard.negValue` (bool).
+    // FALSE (the default, every pre-existing variant) ⇒ the variant's
+    // magnitude axis reads a NON-NEGATIVE value-bearing operand; a NEGATIVE
+    // one reports nullopt magnitude and matches NO bounded variant
+    // (unchanged). TRUE ⇒ the variant matches ONLY a STRICTLY NEGATIVE
+    // value-bearing operand, keyed by its ABSOLUTE VALUE against
+    // [immMin, immMax].
+    //
+    // ★ "VALUE-BEARING OPERAND", NOT "MEMOFFSET". This axis was born as
+    // `negMemoffset` and was memoffset-ONLY by its validate() rule alone —
+    // the matcher underneath (`variantNegMagnitude`) has ALWAYS read
+    // "the first ImmInt-or-MemOffset operand", exactly like its non-negative
+    // twin `variantImmMagnitude` and exactly like the immMin/immMax
+    // coherence rule. Sign-routing an IMMEDIATE is the SAME QUESTION about a
+    // DIFFERENT OPERAND KIND, so the axis was renamed and its validate()
+    // rule widened to the immMin/immMax predicate rather than growing a
+    // parallel `negImmediate` axis that would have duplicated the matcher.
+    //
+    // This is the third routing axis (alongside width + imm-range) that lets
+    // ONE opcode carry both a positive and a negative form with the SAME
+    // operandKinds:
+    //   * memoffset — `lea`'s positive `ADD Xd,Xn,#disp` vs its negative
+    //     `SUB Xd,Xn,#|disp|` (the encoder writes |disp| into the unsigned
+    //     imm12 / shifted-imm12 / MOVZ-MOVK slot; the subtract semantics
+    //     live in the fixedWord's SUB base).
+    //   * immediate — `mov`'s positive `MOVZ Xd,#imm16` vs its negative
+    //     `MOVN Xd,#~imm16` (the encoder writes the COMPLEMENT into the
+    //     `imm16.inverted` slot; the negate semantics live in the MOVN base).
+    // Agnostic by construction: the matcher reads the LIR operand's SIGN,
+    // never the arch. A target whose field is SIGNED (x86 disp32 / imm32)
+    // needs no negValue variant at all — its match-any (no immMin/immMax,
+    // negValue=false) slot swallows both signs. validate() rejects negValue
+    // on a variant with NEITHER an `imm32` NOR a `memoffset` operand (no
+    // value to sign-route on).
+    bool                               negValue = false;
     TargetEncodingTemplate             tmpl;
     // Where the instruction's RESULT register goes (when the inst
     // has a result). Nullopt for value-less instructions (e.g.
@@ -2612,6 +2694,25 @@ struct DSS_EXPORT TargetSchemaData {
     std::vector<TargetRegisterInfo> registers;
     substrate::TransparentStringMap<std::uint16_t> registerIndex;
 
+    // The CIE's `return_address_register` — the DWARF column an unwinder
+    // reads to find where this frame's return address went.
+    //
+    // ★ DECLARED, NOT DERIVED, and this is the whole reason it is a
+    //   separate field rather than "the DWARF number of `cc.linkRegister`":
+    //   on x86_64 SysV it is column **16**, which is NOT A REGISTER — it is
+    //   a synthetic column with no hardware counterpart, so no register row
+    //   can carry it. On AArch64 it is 30, which happens also to be x30's
+    //   ordinary number. A derivation that worked on AArch64 would have
+    //   nothing to read on x86_64 and would have to invent a value.
+    //
+    // Empty ⇒ the target declares no DWARF numbering at all, and the
+    // `.eh_frame` writer refuses (naming the target and this key) rather
+    // than emitting a table it cannot number. The loader keeps the two
+    // halves of the psABI table together: declaring this without any
+    // register number, or any register number without this, is REJECTED —
+    // half a numbering is a table that loads clean and cannot be used.
+    std::optional<std::uint16_t> dwarfReturnAddressColumn;
+
     // FC2 Part B: per-register-class move/load/store mnemonic table
     // (the JSON `registerClassOps[]` section), indexed by the
     // TargetRegClass ordinal. A class WITHOUT a row resolves to the
@@ -2936,6 +3037,15 @@ public:
         auto it = d_.registerIndex.find(name);
         if (it == d_.registerIndex.end()) return std::nullopt;
         return it->second;
+    }
+
+    // The CIE's `return_address_register` (see the field's docblock in
+    // `TargetSchemaData`). Nullopt ⇒ this target declares no DWARF
+    // register numbering, which every unwind-table writer treats as a
+    // REFUSAL rather than a licence to guess.
+    [[nodiscard]] std::optional<std::uint16_t>
+    dwarfReturnAddressColumn() const noexcept {
+        return d_.dwarfReturnAddressColumn;
     }
 
     // FC2 Part B: resolve the opcode handle that performs `op` on a

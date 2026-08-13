@@ -134,6 +134,28 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     // names an extern call — e.g. abs64/abs32 data relocs), and the emitter
     // uses `nativeId` unchanged.
     std::uint32_t  pltNativeId = 0;
+    // ── EMISSION ALIAS (D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS) ──
+    //
+    // True iff this row shares its `nativeId` with another row and exists
+    // only so the EMITTER can reach that wire type through a different DSS
+    // `kind`. x86_64 is the shipped case: `R_X86_64_PC32` = 2 is BOTH the
+    // call-site `rel32` (implicit addend bias -4, because a call's
+    // displacement is relative to the instruction END) and the DWARF FDE
+    // `initial_location` pointer (bias 0, because it is a DATA word). One
+    // ELF wire type, two DSS patch-site semantics.
+    //
+    // ★ WHY A FLAG AND NOT SIMPLY TWO ROWS. `nativeId → kind` is a REVERSE
+    //   map every object READER builds, and it must be a FUNCTION. Two
+    //   ordinary rows sharing a nativeId make it ambiguous, and
+    //   `elf_object_reader.cpp` fails loud on exactly that — correctly:
+    //   ✔MEASURED 2026-08-13, declaring the FDE row as an ordinary second
+    //   row made the reader reject EVERY x86_64 ELF object, DSS-produced
+    //   AND gcc-produced (3 suites red, one diagnostic). The wire format
+    //   carries no bias, so the distinction is real for EMISSION and
+    //   meaningless for DECODING; this states that, and `validate()` turns
+    //   the reader's runtime discovery into a LOAD-TIME invariant (at most
+    //   one non-alias row per nativeId).
+    bool           emitOnly = false;
 };
 
 // ── Per-section row (plan 14 D-LK4-2) ───────────────────────────

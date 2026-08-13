@@ -331,6 +331,10 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
+        // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the inverted-imm16
+        // (complement-immediate) slot is fixed32, like Imm16 whose window it
+        // shares.
+        case EncodingSlotKind::Imm16Inverted:
             // Other shapes — the fixed32 register/immediate slots plus
             // the symbol-bearing Disp32, none handled by the x86
             // register-wiring walker. slotShapeFor + validate's cross-

@@ -95,6 +95,15 @@ struct DirRow {
     std::string spelling;
     std::string verb;
     std::string marker;   // empty = absent
+    // ⚠ EACH OPTIONAL KEY HAS AN "OMIT" SENTINEL RATHER THAN A DEFAULT VALUE,
+    // because the loader treats present-and-wrong differently from absent on
+    // every one of them: `section` is REQUIRED on `sectionData` and REFUSED
+    // elsewhere, `unitBytes` likewise on `emitData`, and `operandOnly` is
+    // refused on any verb that does not open a section. A fixture that always
+    // emitted the keys could not express the rows those refusals are about.
+    std::string section;              // empty = omit the key
+    unsigned    unitBytes   = 0;      // 0     = omit the key
+    bool        operandOnly = false;  // false = omit the key
 };
 
 inline void setDirectives(nlohmann::json& doc,
@@ -104,7 +113,10 @@ inline void setDirectives(nlohmann::json& doc,
         nlohmann::json row;
         row["spelling"] = r.spelling;
         row["verb"]     = r.verb;
-        if (!r.marker.empty()) row["marker"] = r.marker;
+        if (!r.marker.empty())  row["marker"]      = r.marker;
+        if (!r.section.empty()) row["section"]     = r.section;
+        if (r.unitBytes != 0)   row["unitBytes"]   = r.unitBytes;
+        if (r.operandOnly)      row["operandOnly"] = true;
         arr.push_back(std::move(row));
     }
     doc["assembly"]["directives"] = std::move(arr);
@@ -167,12 +179,18 @@ struct LoweringRun {
     std::vector<std::string>        loadErrors;   // non-empty ⇒ grammar refused
 };
 
-// Load `doc` as a grammar, parse `source` with it, and lower against `target`.
+// Load `doc` as a grammar, parse `source` with it, and lower against
+// `target` — an ALREADY-LOADED schema, so a caller can hand in a MUTATED one.
+// ★ THIS IS THE RED-ON-DISABLE DOOR. `mutate_target_schema.hpp` builds a
+// schema with one encoding variant or one relocation row removed; feeding it
+// here is what turns "the lowering elected the 2-operand block-address form"
+// from an observation into a claim, because the mutant must then FAIL LOUD
+// rather than fall back to the 1-operand form.
 // A grammar that fails to load leaves `loadErrors` non-empty and `module`
 // unset — the shape the "two roles on one rule is a LOAD error" test asserts.
 [[nodiscard]] inline std::unique_ptr<LoweringRun>
-lowerAsmText(nlohmann::json const& doc, std::string_view source,
-             std::string_view targetName = "x86_64") {
+lowerAsmTextWithTarget(nlohmann::json const& doc, std::string_view source,
+                       std::shared_ptr<TargetSchema> target) {
     auto run = std::make_unique<LoweringRun>();
 
     auto grammarR = GrammarSchema::loadFromText(doc.dump(), "<test-dialect>");
@@ -183,12 +201,7 @@ lowerAsmText(nlohmann::json const& doc, std::string_view source,
         return run;
     }
     run->grammar = *grammarR;
-
-    auto targetR = TargetSchema::loadShipped(targetName);
-    if (!targetR.has_value()) {
-        throw std::runtime_error{"cannot load shipped target schema"};
-    }
-    run->target = *targetR;
+    run->target  = std::move(target);
 
     UnitBuilder builder{run->grammar};
     builder.addInMemory(std::string{source}, "<mem>.s");
@@ -202,6 +215,17 @@ lowerAsmText(nlohmann::json const& doc, std::string_view source,
         run->unit->trees()[0], *run->grammar, *run->target,
         run->grammar->assembly().entryLabels, run->reporter);
     return run;
+}
+
+// The shipped-target form — every structural test's entry point.
+[[nodiscard]] inline std::unique_ptr<LoweringRun>
+lowerAsmText(nlohmann::json const& doc, std::string_view source,
+             std::string_view targetName = "x86_64") {
+    auto targetR = TargetSchema::loadShipped(targetName);
+    if (!targetR.has_value()) {
+        throw std::runtime_error{"cannot load shipped target schema"};
+    }
+    return lowerAsmTextWithTarget(doc, source, *targetR);
 }
 
 // Did the grammar load AND the parse produce zero errors? A test asserting a

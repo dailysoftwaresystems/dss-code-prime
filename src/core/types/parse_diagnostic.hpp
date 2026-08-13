@@ -2760,7 +2760,31 @@ enum class DiagnosticCode : std::uint16_t {
     //   every candidate and attaches the declaration sites as related locations
     //   where the resolving path has them.
     K_ProgramEntryAmbiguous        = 0x8020,
-    // K-NEXT-SLOT: 0x8021 — grep this marker before adding a K_* code.
+    // K_UnwindRuleUnrepresentable
+    //   (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO /
+    //   D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED): a call-frame rule that
+    //   the active object format's unwind encoding cannot express, or a CFI
+    //   stream that is internally malformed.
+    //   ⚠ THE NAME ABOVE IS DELIBERATELY NOT WRAPPED. A `D-*` name broken
+    //   across a line break mints a PHANTOM anchor: the guard scans for the
+    //   name pattern, finds the truncated prefix, and reports it unresolved —
+    //   and no registry row can ever satisfy it, because the row is keyed on
+    //   the whole name. This one cost a guard failure the day it was written.
+    //   Reflow the prose around an anchor name; never through it.
+    //   ★ IT EXISTS BECAUSE THE ALTERNATIVE IS THE FAILURE THIS SLICE CLOSES.
+    //   Unwind information that is accepted and then dropped produces a binary
+    //   that runs correctly and cannot be unwound — no debugger backtrace, no
+    //   profiler stack, an exception thrown through the frame terminates. That
+    //   is invisible until a core dump, which is why every writer here refuses
+    //   loudly instead of emitting a table that silently covers a subset of the
+    //   image. The message always NAMES the rule (`cfiOpKindName`) and the
+    //   function, because "unsupported unwind opcode 5" sends the reader
+    //   nowhere.
+    //   ⓘ Distinct from K_NoMatchingObjectFormat, which the pe64 unwind builder
+    //   previously borrowed: that code is about a FORMAT that could not be
+    //   selected, not about a frame it could not describe.
+    K_UnwindRuleUnrepresentable    = 0x8021,
+    // K-NEXT-SLOT: 0x8022 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

@@ -2195,12 +2195,18 @@ constexpr std::uint32_t kMaxSchemaVersion = 4;
 // ENTIRE phase. Every name here is a key the loader genuinely reads.
 // Shared with the referenced-document check so a fragment gets the same
 // typo discrimination its host does.
-constexpr std::array<std::string_view, 22> kDocumentKeys{
+constexpr std::array<std::string_view, 23> kDocumentKeys{
     // identity + loader gates
     "dssSchemaVersion", "language", "reservedWordPolicy", "parser",
     // lexical surface
     "lexerModes", "tokens", "keywords", "operators", "scopes",
     "syncTokens", "numberStyle",
+    // ⚠ `identifierClass` shares `numberStyle`'s reason for being in this
+    // table: it is OPTIONAL and its absence means the universal ASCII rule, so
+    // a typo'd `identifierClasses` would load perfectly clean and silently
+    // restore the narrower class — turning a dialect's `b.eq` back into three
+    // tokens and its `.s` into a parse error the config never mentions.
+    "identifierClass",
     // type-extension + artifact declarations (SP2 / schema v3)
     "typeExtensions", "artifactProfiles",
     // grammar surface
@@ -2297,8 +2303,16 @@ DSS_CHECK_KEY_VOCABULARY(kReferencedDocumentKeys);
 // does mean "silently does nothing". Adding a key here is a claim that the
 // referenced document itself consumes it — do not add one to quiet a
 // diagnostic.
-constexpr std::array<std::string_view, 7> kStandaloneOnlyDocumentKeys{
+constexpr std::array<std::string_view, 8> kStandaloneOnlyDocumentKeys{
     "tokens", "numberStyle", "keywords", "syncTokens", "artifactProfiles",
+    // `identifierClass` widens the class of THIS document's own identifier
+    // runs. Merging it into a host would change how the HOST tokenizes its own
+    // file — the same "two token tables for one input" wrongness `tokens`
+    // above is excluded for, and a sharper one: a host that referenced a gas
+    // dialect would silently start reading `a.b` as ONE identifier and lose
+    // member access with no diagnostic. It rides with the token table because
+    // it IS part of the token table.
+    "identifierClass",
     // `lexerModes` is the other half of `tokens` — a `pushMode` with no mode to
     // push is a load error, so the two are one lexical surface, not two blocks.
     "lexerModes",
@@ -5070,6 +5084,80 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             } else {
                 NumberStyle style;
 
+                // ★★★ THE ONE UNKNOWN-KEY TYPO DISCRIMINATOR FOR THIS WHOLE
+                // BLOCK — D-CONFIG-NUMBERSTYLE-KEYS-UNCHECKED (2026-08-13).
+                //
+                // ⚠ THE GAP THIS CLOSES WAS THREE LEVELS DEEP AND ONLY THE
+                // MIDDLE ONE WAS COVERED. `numberStyle.exponent` and each
+                // prefix's `float` rejected unknown keys; `numberStyle` ITSELF,
+                // each `integerPrefixes[]` ENTRY, and `emitKind` did not — every
+                // one of their fields was read with a bare `contains()` probe
+                // and nothing looked at the keys that were left over. So
+                // `"fracionPoint"`, `"digitSeperator"`, `"trailingFractions"`,
+                // `"integerSufixes"`, a prefix's `"radx"`, or `emitKind`'s
+                // `"floating"` LOADED PERFECTLY CLEAN and silently changed
+                // numeric lexing — the knob-that-lies archetype
+                // `src/tokenizer/tokenizer.cpp` names in its own hardcoded-
+                // newline-kind postmortem, and a direct contradiction of the
+                // discipline `kDocumentKeys` states earlier in this same file.
+                // ⓘ Two of the six were partly masked rather than silent:
+                // `emitKind.integer` is REQUIRED, so misspelling it surfaced as
+                // C_MissingField; `emitKind.float` is required only when a
+                // float-producing facet is declared, so `"floating"` was
+                // genuinely silent for every other language.
+                //
+                // ★ ONE LAMBDA, FIVE CALL SITES, RATHER THAN FIVE COPIES OF THE
+                // LOOP. The two pre-existing sites are routed through it too:
+                // the fix is for the CLASS, and leaving their hand-written
+                // copies in place would have been the second drifting copy the
+                // sibling `parseExponentFields` exists to avoid. Same shape,
+                // same `C_InvalidNumberStyle` code, same `$`-documentation
+                // carve-out, same "(typo discriminator)" tail as the pattern it
+                // generalizes.
+                // Returns false when an unknown key was found (diagnostics
+                // already emitted) — every caller treats that as fatal for the
+                // object it was checking, because a config whose keys are not
+                // understood must never be half-applied.
+                auto rejectUnknownKeys =
+                    [&](json const& obj, std::string const& path,
+                        std::span<std::string_view const> allowed) -> bool {
+                    std::string allowedList;
+                    for (auto const& k : allowed) {
+                        if (!allowedList.empty()) allowedList += ", ";
+                        allowedList += '\'';
+                        allowedList += k;
+                        allowedList += '\'';
+                    }
+                    bool clean = true;
+                    for (auto it = obj.begin(); it != obj.end(); ++it) {
+                        if (isDocumentationKey(it.key())) continue;
+                        if (std::ranges::find(allowed, it.key()) != allowed.end()) {
+                            continue;
+                        }
+                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
+                                  std::format("{}/{}", path, it.key()),
+                                  std::format("unknown key '{}' — allowed keys "
+                                              "are {} (typo discriminator)",
+                                              it.key(), allowedList));
+                        clean = false;
+                    }
+                    return clean;
+                };
+
+                // The `numberStyle` block's OWN direct keys.
+                static constexpr std::array<std::string_view, 10>
+                    kNumberStyleKeys{"decimal", "integerPrefixes", "exponent",
+                                     "fractionPoint", "digitSeparator",
+                                     "trailingFraction", "leadingFraction",
+                                     "integerSuffixes", "floatSuffixes",
+                                     "emitKind"};
+                DSS_CHECK_KEY_VOCABULARY(kNumberStyleKeys);
+                // ⚠ NOT AN EARLY `return`/`continue`: the block keeps parsing so
+                // a document with a typo ALSO reports whatever else is wrong
+                // with it, and `Collector` already makes the load fail. Bailing
+                // here would turn a two-defect config into a two-load-cycle fix.
+                (void)rejectUnknownKeys(ns, "/numberStyle", kNumberStyleKeys);
+
                 // Shared exponent-object parser (FC1 cycle 2): the
                 // top-level decimal `exponent` block and each prefix's
                 // `float.exponent` block carry the SAME field shape
@@ -5088,22 +5176,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     static constexpr std::array<std::string_view, 2>
                         kExponentKeys{"letters", "signOptional"};
                     DSS_CHECK_KEY_VOCABULARY(kExponentKeys);
-                    for (auto it = e.begin(); it != e.end(); ++it) {
-                        if (isDocumentationKey(it.key())) continue;
-                        bool known = false;
-                        for (auto const& k : kExponentKeys) {
-                            if (it.key() == k) { known = true; break; }
-                        }
-                        if (!known) {
-                            coll.emit(DiagnosticCode::C_InvalidNumberStyle,
-                                      std::format("{}/{}", path, it.key()),
-                                      std::format("unknown key '{}' — allowed "
-                                                  "keys are 'letters', "
-                                                  "'signOptional' (typo "
-                                                  "discriminator)", it.key()));
-                            return false;
-                        }
-                    }
+                    if (!rejectUnknownKeys(e, path, kExponentKeys)) return false;
                     if (!e.contains("letters") || !e.at("letters").is_array()
                         || e.at("letters").empty()) {
                         coll.emit(DiagnosticCode::C_MissingField,
@@ -5163,6 +5236,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 coll.emit(DiagnosticCode::C_InvalidNumberStyle, ppath,
                                           "each integer prefix must be an object with "
                                           "'prefix', 'radix', and 'digits' fields");
+                                continue;
+                            }
+                            // The prefix ENTRY's own closed key set — the
+                            // second of the three levels that had none. A
+                            // `"radx"` used to surface as "'radix' must be an
+                            // integer" (true, but pointing at the wrong line),
+                            // and a `"digts"` as a missing-digits error; the
+                            // discriminator names the key that was actually
+                            // written.
+                            static constexpr std::array<std::string_view, 4>
+                                kPrefixKeys{"prefix", "radix", "digits",
+                                            "float"};
+                            DSS_CHECK_KEY_VOCABULARY(kPrefixKeys);
+                            if (!rejectUnknownKeys(arr[i], ppath, kPrefixKeys)) {
                                 continue;
                             }
                             NumberPrefix np{};
@@ -5225,24 +5312,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 static constexpr std::array<std::string_view, 2>
                                     kFloatKeys{"exponent", "exponentDigits"};
                                 DSS_CHECK_KEY_VOCABULARY(kFloatKeys);
-                                bool badKey = false;
-                                for (auto it = fj.begin(); it != fj.end(); ++it) {
-                                    if (isDocumentationKey(it.key())) continue;
-                                    bool known = false;
-                                    for (auto const& k : kFloatKeys) {
-                                        if (it.key() == k) { known = true; break; }
-                                    }
-                                    if (!known) {
-                                        coll.emit(DiagnosticCode::C_InvalidNumberStyle,
-                                                  std::format("{}/{}", fpath, it.key()),
-                                                  std::format("unknown key '{}' — allowed "
-                                                              "keys are 'exponent', "
-                                                              "'exponentDigits' (typo "
-                                                              "discriminator)", it.key()));
-                                        badKey = true;
-                                    }
+                                if (!rejectUnknownKeys(fj, fpath, kFloatKeys)) {
+                                    continue;
                                 }
-                                if (badKey) continue;
                                 if (!fj.contains("exponent")
                                     || !fj.at("exponent").is_object()) {
                                     coll.emit(DiagnosticCode::C_MissingField,
@@ -5402,6 +5474,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "token-kind names");
                 } else {
                     json const& ek = ns.at("emitKind");
+                    // The THIRD uncovered level, and the one whose silence was
+                    // asymmetric: `integer` is required so a typo there already
+                    // surfaced as C_MissingField, but `float` is required only
+                    // when a float-producing facet is declared — so `"floating"`
+                    // loaded clean and did nothing for every language without
+                    // one, which is precisely the case a future float-carrying
+                    // language would inherit as a mystery.
+                    static constexpr std::array<std::string_view, 2>
+                        kEmitKindKeys{"integer", "float"};
+                    DSS_CHECK_KEY_VOCABULARY(kEmitKindKeys);
+                    (void)rejectUnknownKeys(ek, "/numberStyle/emitKind",
+                                            kEmitKindKeys);
                     auto readKind = [&](char const* key, SchemaTokenId& out, bool required) {
                         if (!ek.contains(key)) {
                             if (required) {
@@ -5454,6 +5538,126 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                       "shape but declares no 'numberStyle' block — the "
                       "tokenizer's numeric scanner is config-driven, so the "
                       "block is required when numeric literal tokens are used");
+        }
+    }
+
+    // identifierClass ── the per-language identifier CHARACTER CLASS (schema v4;
+    // D-ASM-DIALECT-IDENTIFIER-CONTINUATION-NOT-CONFIGURABLE, 2026-08-13).
+    // OPTIONAL: absent means the universal ASCII+UTF-8 rule, which is what every
+    // shipped language had before the block existed.
+    //
+    // ⓘ THE DIAGNOSTIC CODE IS `C_MalformedJson`, WHICH IS A REUSE AND IS STATED
+    // RATHER THAN GLOSSED. There is no `C_InvalidIdentifierClass`, and minting
+    // one means editing `core/types/parse_diagnostic.hpp` — a file this lane was
+    // not granted, and one whose code set the FC18 every-code diagnostic corpus
+    // enumerates. `C_MalformedJson` is the channel `checkDocumentKeys` already
+    // uses for a lexical-surface key that is wrong with no dedicated code, so
+    // this is the established seat rather than a new one.
+    {
+        if (doc.contains("identifierClass")) {
+            json const& ic = doc.at("identifierClass");
+            if (!ic.is_object()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/identifierClass",
+                          "'identifierClass' must be an object with an "
+                          "'extraContinue' character-class string");
+            } else {
+                static constexpr std::array<std::string_view, 1>
+                    kIdentifierClassKeys{"extraContinue"};
+                DSS_CHECK_KEY_VOCABULARY(kIdentifierClassKeys);
+                bool clean = true;
+                for (auto it = ic.begin(); it != ic.end(); ++it) {
+                    if (isDocumentationKey(it.key())) continue;
+                    if (std::ranges::find(kIdentifierClassKeys, it.key())
+                        != kIdentifierClassKeys.end()) continue;
+                    // ⚠ `extraStart` IS THE KEY A READER WILL REACH FOR, AND IT
+                    // IS REFUSED ON PURPOSE RATHER THAN UNIMPLEMENTED. The
+                    // message says so, because "unknown key" alone reads as an
+                    // oversight and would send the next implementer to add it.
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/identifierClass/{}", it.key()),
+                              std::format(
+                                  "unknown key '{}' — the only key is "
+                                  "'extraContinue' (typo discriminator). There "
+                                  "is deliberately NO start-character key: an "
+                                  "extra character may CONTINUE an identifier "
+                                  "and may never START one, because a leading "
+                                  "character that also introduces a directive "
+                                  "or an operator is owned by that TOKEN, and "
+                                  "two mechanisms for one byte cannot agree "
+                                  "about which construct it opens", it.key()));
+                    clean = false;
+                }
+                if (clean) {
+                    if (!ic.contains("extraContinue")
+                        || !ic.at("extraContinue").is_string()
+                        || ic.at("extraContinue").get<std::string>().empty()) {
+                        // A block declaring nothing is a block that silently
+                        // does nothing — the absence of the block is the way to
+                        // say "the universal rule".
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/identifierClass/extraContinue",
+                                  "'extraContinue' is required and must be a "
+                                  "non-empty character-class string (the same "
+                                  "syntax as numberStyle's 'digits' — literal "
+                                  "characters and 'a-z' ranges). Omit the whole "
+                                  "'identifierClass' block to mean 'the "
+                                  "universal identifier rule'");
+                    } else {
+                        auto const cls =
+                            ic.at("extraContinue").get<std::string>();
+                        bool bad = false;
+                        for (char const c : cls) {
+                            if (c == '-') continue;   // range syntax, not a char
+                            // ★ A CHARACTER THAT ALREADY CONTINUES AN IDENTIFIER
+                            // IS REFUSED, NOT ABSORBED. `"_"` or `"0-9"` here
+                            // changes nothing, so accepting it would be a
+                            // declaration that reads as a capability and
+                            // delivers none — and the reader would go looking
+                            // for the bug somewhere else. The check asks the
+                            // SAME predicate the tokenizer runs, so the two can
+                            // never disagree about what "already" means.
+                            if (IdentifierClass::universalContinue(c)) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    "/identifierClass/extraContinue",
+                                    std::format(
+                                        "'{}' already continues an identifier "
+                                        "under the universal rule (ASCII "
+                                        "letters, digits, '_', and every byte "
+                                        "≥ 0x80), so declaring it here "
+                                        "changes nothing — a key that reads as "
+                                        "a capability and delivers none is "
+                                        "worse than an absent one", c));
+                                bad = true;
+                                continue;
+                            }
+                            // ★ AND A WHITESPACE / CONTROL BYTE IS REFUSED
+                            // BECAUSE IT DOES NOT MERELY WIDEN THE CLASS, IT
+                            // DISSOLVES TOKENISATION: a space in the class makes
+                            // `mov x0, x1` one identifier, and a newline makes a
+                            // line-oriented language's whole file one. Both are
+                            // WRONG PARSES rather than parse errors, which is
+                            // the failure mode this facet's own postmortem names.
+                            if (static_cast<unsigned char>(c) <= 0x20) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    "/identifierClass/extraContinue",
+                                    std::format(
+                                        "byte 0x{:02x} is whitespace or a "
+                                        "control character; an identifier that "
+                                        "may contain one runs into the next "
+                                        "token (and, for a newline, into the "
+                                        "next line) — a wrong parse rather than "
+                                        "a parse error",
+                                        static_cast<unsigned>(
+                                            static_cast<unsigned char>(c))));
+                                bad = true;
+                            }
+                        }
+                        if (!bad) data.identifierClass.extraContinue = cls;
+                    }
+                }
+            }
         }
     }
 
@@ -14250,9 +14454,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             assemblyClean = false;
                             continue;
                         }
-                        static constexpr std::array<std::string_view, 5>
+                        static constexpr std::array<std::string_view, 6>
                             kDirRowKeys{"spelling", "verb", "marker",
-                                        "section", "unitBytes"};
+                                        "section", "unitBytes", "operandOnly"};
                         DSS_CHECK_KEY_VOCABULARY(kDirRowKeys);
                         for (auto it = row.begin(); it != row.end(); ++it) {
                             if (isDocumentationKey(it.key())) continue;
@@ -14451,6 +14655,48 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             assemblyClean = false;
                             continue;
                         }
+                        // ── operandOnly ── OPTIONAL, and legal only on a verb
+                        // that OPENS A SECTION. True marks a spelling this
+                        // dialect can SELECT (`.section rodata`) but cannot
+                        // WRITE as a directive of its own — gas's `.rodata`,
+                        // which ✔MEASURED 2026-08-13 is rejected bare by BOTH
+                        // `aarch64-linux-gnu-as` and x86_64 `as` ("unknown
+                        // pseudo-op") while `.section .rodata` assembles rc=0.
+                        // ⚠ REFUSED ELSEWHERE rather than ignored, for the same
+                        // reason `marker` is: on a verb no `sectionByName`
+                        // operand can ever resolve to, the key reads as a
+                        // reachability rule the engine applies, and the engine
+                        // applies none.
+                        if (row.contains("operandOnly")) {
+                            if (!asmVerbOpensSection(dir.verb)) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/operandOnly",
+                                          std::format(
+                                              "'operandOnly' is only meaningful "
+                                              "on a directive that OPENS a "
+                                              "section ('sectionText' / "
+                                              "'sectionData') — those are the "
+                                              "rows a 'sectionByName' operand "
+                                              "can resolve to. '{}' declares "
+                                              "verb '{}', where the key would "
+                                              "be silently ignored",
+                                              dir.spelling, verbName));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            if (!row.at("operandOnly").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/operandOnly",
+                                          "'operandOnly' must be a boolean "
+                                          "(omit the key entirely to mean 'this "
+                                          "spelling is a directive in its own "
+                                          "right')");
+                                assemblyClean = false;
+                                continue;
+                            }
+                            dir.operandOnly =
+                                row.at("operandOnly").get<bool>();
+                        }
                         if (!seenDirectives.insert(dir.spelling).second) {
                             coll.emit(DiagnosticCode::C_ConflictingField,
                                       path + "/spelling",
@@ -14463,6 +14709,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         cfg.directives.push_back(std::move(dir));
+                    }
+                    // ★★ CROSS-ROW: AN `operandOnly` ROW NEEDS A DOOR TO REACH
+                    // IT. `operandOnly` says "not writable as a directive"; the
+                    // only other way in is a `sectionByName` row. A dialect
+                    // declaring the first without the second has written a row
+                    // NOTHING can reach — dead config that reads as support,
+                    // which is the accept-and-ignore this project refuses, only
+                    // one tier up. ⚠ CHECKED AFTER THE LOOP because the two
+                    // rows may appear in either order.
+                    if (!cfg.hasSectionByName()) {
+                        for (auto const& r : cfg.directives) {
+                            if (!r.operandOnly) continue;
+                            coll.emit(
+                                DiagnosticCode::C_InvalidHirLowering,
+                                "/assembly/directives",
+                                std::format(
+                                    "directive '{}' declares 'operandOnly', so "
+                                    "no `.s` can write it directly — but this "
+                                    "dialect declares no directive with verb "
+                                    "'sectionByName', which is the only thing "
+                                    "that could name it. The row is unreachable "
+                                    "config: it reads as support for a section "
+                                    "and delivers none",
+                                    r.spelling));
+                            assemblyClean = false;
+                        }
                     }
                 }
             }

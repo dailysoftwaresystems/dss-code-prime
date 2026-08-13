@@ -2025,16 +2025,28 @@ namespace {
 }
 
 // Find PT_TLS (p_type 7); returns the phdr's file offset or 0.
-[[nodiscard]] std::size_t findPtTls(std::vector<std::uint8_t> const& b) {
+[[nodiscard]] std::size_t findPhdrOfType(std::vector<std::uint8_t> const& b,
+                                         std::uint32_t pType) {
     std::uint64_t const phoff = rdU64(b, 32);
     std::uint16_t const phnum = rdU16(b, 56);
     for (std::uint16_t i = 0; i < phnum; ++i) {
         std::size_t const o = static_cast<std::size_t>(phoff) + i * 56u;
-        if (b[o] == 7 && b[o + 1] == 0 && b[o + 2] == 0 && b[o + 3] == 0)
-            return o;
+        std::uint32_t v = 0;
+        for (int k = 0; k < 4; ++k) {
+            v |= static_cast<std::uint32_t>(b[o + static_cast<std::size_t>(k)])
+                 << (k * 8);
+        }
+        if (v == pType) return o;
     }
     return 0;
 }
+[[nodiscard]] std::size_t findPtTls(std::vector<std::uint8_t> const& b) {
+    return findPhdrOfType(b, 7u);
+}
+// D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO: the runtime unwinder
+// finds `.eh_frame_hdr` through THIS segment (`dl_iterate_phdr`), so its
+// presence is a property worth asserting rather than a number to absorb.
+inline constexpr std::uint32_t kPtGnuEhFrame = 0x6474e550u;
 
 } // namespace
 
@@ -2059,9 +2071,17 @@ TEST(Program_CompileFiles, ThreadLocalEmitsPtTlsAndFsAccessSequence) {
     auto const bytes = readAllBytes(out);
     ASSERT_GT(bytes.size(), 64u);
 
-    // e_phnum == 6 (the PT_TLS slot) and PT_TLS covers the 4-byte
-    // template with the initial value 7.
-    EXPECT_EQ(rdU16(bytes, 56), 6u);
+    // e_phnum == 7: PHDR + INTERP + LOAD*2 + DYNAMIC + PT_TLS +
+    // PT_GNU_EH_FRAME. ★ This is an EXACT count on purpose — it is the only
+    // assertion that notices a segment nobody meant to add — so it must be
+    // updated deliberately, WITH the composition written out, whenever the
+    // image legitimately gains one. It went 6 -> 7 when `.eh_frame_hdr` and
+    // its segment landed (D-UNWIND-NO-EH-FRAME-...); the two property pins
+    // below are what actually say WHICH segments those are.
+    EXPECT_EQ(rdU16(bytes, 56), 7u);
+    EXPECT_NE(findPhdrOfType(bytes, kPtGnuEhFrame), 0u)
+        << "PT_GNU_EH_FRAME must be present — without it the process's own "
+           "unwinder cannot locate the frame tables";
     std::size_t const tlsPh = findPtTls(bytes);
     ASSERT_NE(tlsPh, 0u) << "PT_TLS program header must be present";
     std::uint64_t const pOff    = rdU64(bytes, tlsPh + 8);
@@ -2111,9 +2131,13 @@ TEST(Program_CompileFiles, Arm64ThreadLocalEmitsPtTlsAndMrsAccessSequence) {
     auto const bytes = readAllBytes(out);
     ASSERT_GT(bytes.size(), 64u);
 
-    // e_machine = EM_AARCH64 (183); e_phnum == 6 (the PT_TLS slot).
+    // e_machine = EM_AARCH64 (183); e_phnum == 7 (PT_TLS +
+    // PT_GNU_EH_FRAME on top of the base five) -- see the x86_64 twin above
+    // for why the exact count is kept.
     EXPECT_EQ(rdU16(bytes, 18), 183u);
-    EXPECT_EQ(rdU16(bytes, 56), 6u);
+    EXPECT_EQ(rdU16(bytes, 56), 7u);
+    EXPECT_NE(findPhdrOfType(bytes, kPtGnuEhFrame), 0u)
+        << "the unwind segment is target-agnostic: arm64 gets it too";
     std::size_t const tlsPh = findPtTls(bytes);
     ASSERT_NE(tlsPh, 0u) << "PT_TLS program header must be present";
     std::uint64_t const pOff    = rdU64(bytes, tlsPh + 8);
@@ -2268,8 +2292,14 @@ TEST(Program_CompileFiles, NoThreadLocalControlHasNoTlsTrace) {
     auto const bytes = readAllBytes(out);
     ASSERT_GT(bytes.size(), 64u);
 
-    EXPECT_EQ(rdU16(bytes, 56), 5u) << "no PT_TLS slot without thread_local";
+    EXPECT_EQ(rdU16(bytes, 56), 6u)
+        << "no PT_TLS slot without thread_local (the base five + "
+           "PT_GNU_EH_FRAME, which every image with frame information gets)";
     EXPECT_EQ(findPtTls(bytes), 0u);
+    // The control's real job: PT_TLS is CONDITIONAL. Pinning that the
+    // unwind segment is present here too keeps the count above honest --
+    // otherwise a 6 could be read as a PT_TLS that leaked back in.
+    EXPECT_NE(findPhdrOfType(bytes, kPtGnuEhFrame), 0u);
     EXPECT_EQ(countTlsBaseSeq(bytes), 0u)
         << "no fs-read sequence may appear without thread_local";
 }

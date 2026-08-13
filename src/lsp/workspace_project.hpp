@@ -28,7 +28,7 @@
 //                        →  a PREFERRED LANGUAGE NAME
 //
 // Every arrow is an EXISTING mechanism. `dss::loadProjectConfig`
-// (`program/project_config.hpp`) is the same parser `Program::compileProject`
+// (`core/types/project_config.hpp`) is the same parser `Program::compileProject`
 // uses — the manifest's schema, its closed key vocabulary and its diagnostics
 // are all inherited rather than restated. `dss::TargetSpec::parse` is the same
 // `<targetName>:<formatName>` splitter the driver uses. `TargetSchema::
@@ -83,6 +83,14 @@ enum class WorkspaceProjectErrorKind : std::uint8_t {
 struct DSS_EXPORT WorkspaceProjectError {
     WorkspaceProjectErrorKind kind;
     std::string               detail;
+
+    // Value equality over the WHOLE struct, `detail` included. The liveness
+    // refresh (`LspServer::refreshWorkspacePreference_`) republishes open
+    // documents only when a freshly-resolved preference DIFFERS from the held
+    // one; comparing `kind` alone would call "the manifest now fails for a
+    // different reason" no change at all, and the editor would keep showing the
+    // stale reason after the user had already half-fixed the file.
+    [[nodiscard]] bool operator==(WorkspaceProjectError const&) const = default;
 };
 
 // What the workspace's declared targets prefer, and which manifests said so.
@@ -98,6 +106,14 @@ struct DSS_EXPORT WorkspaceProjectError {
 struct DSS_EXPORT WorkspaceLanguagePreference {
     std::vector<std::filesystem::path> projectFiles;
     std::vector<std::string>           languages;
+
+    // Both vectors participate. `projectFiles` is deliberately part of the
+    // identity even though only `languages` steers resolution: adding a second
+    // manifest that happens to prefer the same dialect still changes what the
+    // "no language service" message NAMES, and that message is republished from
+    // this value.
+    [[nodiscard]] bool operator==(WorkspaceLanguagePreference const&) const
+        = default;
 };
 
 using WorkspacePreferenceResult =
@@ -129,8 +145,16 @@ inline constexpr std::string_view kProjectFileSuffix = ".dss-project.json";
 // naming the target when `--language` is absent and the target declares no
 // dialect. One rule, both halves of the program.
 //
-// Not cached here — the server calls this once per `initialize` and holds the
-// result. Pure w.r.t. its arguments plus the filesystem.
+// Not cached here, and deliberately so: the server RE-CALLS it whenever the
+// manifest set may have moved (`initialize`, every `didOpen`, every `didSave`,
+// and the four `workspace/did*` notifications) and republishes the open
+// documents whose answer changed — `LspServer::refreshWorkspacePreference_`,
+// D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE. Caching here would put the
+// staleness one layer lower instead of removing it. Cost per call: one
+// `directory_iterator` per root, one JSON parse per manifest, one
+// `TargetSchema::loadShipped` per declared target — which is why the refresh is
+// hung off open/save and NOT off `didChange` (a per-keystroke message).
+// Pure w.r.t. its arguments plus the filesystem.
 [[nodiscard]] DSS_EXPORT WorkspacePreferenceResult
     resolveWorkspaceLanguagePreference(
         std::span<std::filesystem::path const> workspaceRoots);

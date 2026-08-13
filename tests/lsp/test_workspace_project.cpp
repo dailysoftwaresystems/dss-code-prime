@@ -17,11 +17,20 @@
 // pin whose subject is a struct literal tests the literal, and the whole claim
 // being made is about a file on disk.
 
+#include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/project_config.hpp"   // dss::loadProjectConfig — the SHARED
+                                           // parser the LSP must be running
 #include "lsp/schema_cache.hpp"
 #include "lsp/workspace_project.hpp"
 #include "lsp_test_helpers.hpp"
 #include "repo_root.hpp"
+// The ONE test-side env override (D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS).
+// The local copy that used to sit below carried a note claiming the hoist was
+// "outside this lane's files" — which was never true; `tests/test_support/**`
+// was in the grant the whole time. A stated blocker that is WRONG is worse than
+// none, because the next reader trusts it and routes around an open door.
+#include "scoped_env.hpp"
 #include "scratch_dir.hpp"
 
 #include <nlohmann/json.hpp>
@@ -29,12 +38,15 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -46,6 +58,7 @@ using dss::lsp::SchemaCache;
 using dss::lsp::SchemaResolveErrorKind;
 using dss::lsp::WorkspaceProjectErrorKind;
 using dss::test_support::Location;
+using dss::test_support::ScopedEnv;
 using dss::test_support::ScratchDir;
 using json = nlohmann::json;
 
@@ -77,44 +90,6 @@ void writeFile(fs::path const& dir, std::string_view name, std::string_view body
   "sources": ["main.c"]
 })";
 }
-
-// Portable RAII env override. Restores the prior value (or clears) on exit so
-// the CMake-set `DSS_CONFIG_ROOT` (`dss_add_test`) survives the test.
-//
-// ⚠ THIRD COPY IN THE TREE (`tests/core/test_config_path_walk.cpp` and
-// `tests/test_support/test_repo_root.cpp` carry the other two) ⇒
-// `D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS`. Hoisting it into
-// `tests/test_support/` is a `tests/test_support/**` change, outside this
-// lane's files.
-class ScopedEnv {
-public:
-    ScopedEnv(char const* name, std::string const& value) : name_(name) {
-        if (char const* prev = std::getenv(name)) { had_ = true; prev_ = prev; }
-        set(value);
-    }
-    ~ScopedEnv() { had_ ? set(prev_) : clear(); }
-    ScopedEnv(ScopedEnv const&)            = delete;
-    ScopedEnv& operator=(ScopedEnv const&) = delete;
-
-private:
-    void set(std::string const& v) {
-#ifdef _WIN32
-        ::_putenv_s(name_, v.c_str());
-#else
-        ::setenv(name_, v.c_str(), /*overwrite=*/1);
-#endif
-    }
-    void clear() {
-#ifdef _WIN32
-        ::_putenv_s(name_, "");
-#else
-        ::unsetenv(name_);
-#endif
-    }
-    char const* name_;
-    bool        had_ = false;
-    std::string prev_;
-};
 
 } // namespace
 
@@ -346,6 +321,69 @@ TEST(WorkspaceProject, UnknownManifestKeyIsRejectedByTheSharedParser) {
            "re-implemented; got: " << pref.error().detail;
 }
 
+// ★★ THE ANTI-DUPLICATION PIN (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS).
+//
+// `project_config.{hpp,cpp}` moved from `src/program/` down to
+// `src/core/types/` so the editor and the compiler could share it without the
+// LSP reaching UP into the driver tier. The move is only worth anything if the
+// LSP is still running THAT parser — the standing temptation, whenever the
+// include looks awkward, is to write a ten-line "just read `targets`" reader
+// here instead. This pin makes that choice RED, on two independent axes:
+//
+//   1. BEHAVIOURAL. The fixture is well-formed as far as a `targets`-only
+//      reader is concerned — `language`, `artifactProfile`, `targets` and
+//      `sources` are all valid and would yield a clean arm64 preference. What
+//      it also carries is a `resolveLibraries` entry in the OBJECT form with no
+//      `importName`, which the shared loader REFUSES (an object that states no
+//      identity is a typo, and a silent drop would lose the very thing the
+//      entry exists to carry). A duplicate reader would neither know nor care
+//      about that key and would happily return a preference.
+//   2. TEXTUAL, and byte-for-byte. The expected message is not typed into this
+//      file — it is COMPUTED by running `dss::loadProjectConfig` on the same
+//      file and rendering its first diagnostic the way `workspace_project.cpp`
+//      does. A second parser would have to reproduce the shared one's code AND
+//      its prose exactly to stay green, which is indistinguishable from just
+//      calling it.
+TEST(WorkspaceProject, LspAndDriverParseAManifestThroughTheSameLoader) {
+    ScratchDir ws{Location::Temp, "lsp-ws-sameparser"};
+    // Valid to a `targets`-only reader; rejected by the shared loader.
+    writeFile(ws.path(), "app.dss-project.json", R"({
+  "language": "c-subset",
+  "artifactProfile": "cli",
+  "targets": ["arm64:elf64-aarch64-linux-exec"],
+  "sources": ["main.c"],
+  "resolveLibraries": [{"path": "libfoo.so"}]
+})");
+    const auto manifestPath = ws.path() / "app.dss-project.json";
+
+    // ── What the DRIVER's parser says about this exact file, measured now ──
+    dss::DiagnosticReporter rep;
+    auto cfg = dss::loadProjectConfig(manifestPath, rep);
+    ASSERT_FALSE(cfg.has_value())
+        << "fixture is stale: the shared loader must REFUSE an object-form "
+           "`resolveLibraries` entry with no `importName`";
+    ASSERT_FALSE(rep.all().empty())
+        << "the shared loader must report a reason, not fail mutely";
+    const std::string driverSays =
+        std::string{dss::diagnosticCodeName(rep.all()[0].code)} + ": "
+        + rep.all()[0].actual;
+
+    // ── What the LSP says about it ──
+    const std::array<fs::path, 1> roots{ws.path()};
+    auto pref = resolveWorkspaceLanguagePreference(roots);
+
+    ASSERT_FALSE(pref.has_value())
+        << "axis 1 (behaviour): a `targets`-only re-implementation would have "
+           "returned a preference here. The LSP must inherit the shared "
+           "loader's refusal, key vocabulary and all";
+    EXPECT_EQ(pref.error().kind,
+              WorkspaceProjectErrorKind::ProjectFileLoadFailed);
+    EXPECT_NE(pref.error().detail.find(driverSays), std::string::npos)
+        << "axis 2 (text): the LSP's reason must CONTAIN the driver's own "
+           "rendered diagnostic byte-for-byte.\n  driver: " << driverSays
+        << "\n  lsp:    " << pref.error().detail;
+}
+
 TEST(WorkspaceProject, MalformedTargetSpecIsItsOwnFailure) {
     ScratchDir ws{Location::Temp, "lsp-ws-badspec"};
     writeFile(ws.path(), "app.dss-project.json", manifest(R"(["x86_64"])"));
@@ -506,6 +544,90 @@ using dss::lsp::testing::lspShutdown;
     return n.dump();
 }
 
+[[nodiscard]] std::string didSave(fs::path const& file) {
+    json params;
+    params["textDocument"]["uri"] = fileUriFromPath(file);
+    json n;
+    n["jsonrpc"] = "2.0";
+    n["method"]  = "textDocument/didSave";
+    n["params"]  = std::move(params);
+    return n.dump();
+}
+
+// A `workspace/did*` notification. Params are built spec-shaped even though the
+// server ignores them: a fixture that sent `{}` would pass against a handler
+// that crashed on real client traffic.
+[[nodiscard]] std::string workspaceFileNotification(std::string_view method,
+                                                    fs::path const& file) {
+    json n;
+    n["jsonrpc"] = "2.0";
+    n["method"]  = std::string{method};
+    if (method == "workspace/didChangeWatchedFiles") {
+        // FileEvent.type: 1 = Created, 2 = Changed, 3 = Deleted (LSP §3.17).
+        n["params"]["changes"] = json::array(
+            {json{{"uri", fileUriFromPath(file)}, {"type", 1}}});
+    } else {
+        n["params"]["files"] = json::array(
+            {json{{"uri", fileUriFromPath(file)}}});
+    }
+    return n.dump();
+}
+
+// One entry per `textDocument/publishDiagnostics` FOR `uri`, in wire order:
+// the `D_UnknownFileExtension` message that publish carried, or "" when it
+// carried none. Publish COUNT is as load-bearing as publish CONTENT here — the
+// claim under test is that an already-open document is RE-published, and a
+// matcher that only unioned messages could not tell "republished clean" from
+// "never republished".
+[[nodiscard]] std::vector<std::string> schemaErrorPerPublish(
+    std::vector<std::string> const& wireMessages, std::string const& uri) {
+    std::vector<std::string> out;
+    for (auto const& raw : wireMessages) {
+        auto msg = json::parse(raw);
+        auto m = msg.find("method");
+        if (m == msg.end() || *m != "textDocument/publishDiagnostics") continue;
+        if (msg.at("params").at("uri") != uri) continue;
+        std::string found;
+        for (auto const& d : msg.at("params").at("diagnostics")) {
+            if (d.at("code") == "D_UnknownFileExtension") {
+                found = d.at("message").get<std::string>();
+            }
+        }
+        out.push_back(std::move(found));
+    }
+    return out;
+}
+
+[[nodiscard]] std::size_t countPublishes(
+    std::vector<std::string> const& wireMessages, std::string const& uri) {
+    return schemaErrorPerPublish(wireMessages, uri).size();
+}
+
+// Drain the server's outbound traffic into `sink` until it has published
+// `want` diagnostics notifications for `uri`. FAILS the test on timeout.
+//
+// ⚠ THE HARNESS IS ASYNCHRONOUS AND A MID-SESSION TEST MUST SYNCHRONISE.
+// `push` only enqueues; the server thread consumes at its own pace, and
+// `initialize` alone does a cold shipped-config scan. A test that pushed
+// `didOpen` and then immediately wrote a manifest would be RACING the server
+// for the open's resolution — and losing that race silently converts "the
+// manifest arrived mid-session" into "the manifest was there all along", which
+// is precisely the scenario under test. Waiting for the open's publish is what
+// makes the fixture state a fact instead of a hope.
+void awaitPublishes(LspTestHarness& h, std::string const& uri,
+                    std::size_t want, std::vector<std::string>& sink) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (countPublishes(sink, uri) < want) {
+        for (auto& m : h.takeServerMessages()) sink.push_back(std::move(m));
+        if (countPublishes(sink, uri) >= want) return;
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+            << "timed out waiting for publish #" << want << " of `" << uri
+            << "`; saw " << countPublishes(sink, uri);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 // Every `D_UnknownFileExtension` diagnostic message across all published
 // notifications. Matching on the CODE (not on prose) is what lets the
 // red-on-disable mutation below be detected by the same matcher the pin uses.
@@ -629,4 +751,247 @@ TEST(WorkspaceProjectE2E, ExtensionlessUriGetsADiagnosticNotSilence) {
     auto errs = schemaErrorMessages(h.takeServerMessages());
     ASSERT_EQ(errs.size(), 1u);
     EXPECT_NE(errs[0].find("no file extension"), std::string::npos) << errs[0];
+}
+
+// ── ★★ LIVENESS: THE PREFERENCE IS NO LONGER FROZEN AT `initialize` ─────────
+// (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE)
+//
+// The preference used to be resolved exactly once, in `handleInitialize_`, so a
+// user who added their first `.dss-project.json` mid-session had to RESTART the
+// server. Re-reading per `didOpen` was rejected at the time for a good reason —
+// it would silently change what an ALREADY-OPEN document means without
+// republishing it — and the answer is to do the second half, not to refuse to
+// look. Every pin below therefore asserts on the REPUBLISH, not on the internal
+// preference: an implementation that updated its own state and left the editor
+// showing diagnostics computed under the old grammar would be the original
+// defect wearing a fresh coat.
+//
+// None of this needs a server→client REQUEST. `client/registerCapability` is
+// genuinely unavailable (`JsonRpc` exposes no `serializeRequest`), and it is
+// genuinely not needed: every trigger below is an INBOUND notification, and the
+// one capability that IS advertised rides in the `initialize` RESULT.
+
+TEST(WorkspaceProjectE2E, AddingAManifestMidSessionRepublishesAnOpenDocument) {
+    ScratchDir ws{Location::Temp, "lsp-live-add"};
+    const auto file = ws.path() / "boot.s";
+    const auto uri  = fileUriFromPath(file);
+
+    std::vector<std::string> wire;
+    LspTestHarness h;
+    h.push(lspInitializeWithRoots(1, {ws.path()}));
+    h.push(didOpen(file, "nop\n"));          // no manifest yet: `.s` ambiguous
+    ASSERT_NO_FATAL_FAILURE(awaitPublishes(h, uri, 1, wire));
+
+    // The user creates their first project file, then saves the document they
+    // were already editing. No restart, no re-open, no client capability.
+    writeFile(ws.path(), "app.dss-project.json",
+              manifest(R"(["arm64:elf64-aarch64-linux-exec"])"));
+    h.push(didSave(file));
+    ASSERT_NO_FATAL_FAILURE(awaitPublishes(h, uri, 2, wire));
+
+    h.push(lspShutdown(2));
+    h.push(std::string{lspExit});
+    ASSERT_EQ(h.runUntilExit(), 0);
+
+    auto perPublish = schemaErrorPerPublish(wire, uri);
+    ASSERT_EQ(perPublish.size(), 2u)
+        << "expected TWO publishes for this URI: the open (unserved) and the "
+           "republish once the manifest named a CPU. A size of 1 means the "
+           "already-open document was never revisited -- the frozen-preference "
+           "defect itself";
+    EXPECT_NE(perPublish[0].find("ProjectFileNotFound"), std::string::npos)
+        << "the open must still say why it could not serve the file; got: "
+        << perPublish[0];
+    EXPECT_EQ(perPublish[1], "")
+        << "after the manifest named arm64 the document resolves, so the "
+           "republish must carry NO schema complaint; got: " << perPublish[1];
+}
+
+// The same claim through `workspace/didChangeWatchedFiles`. The server does not
+// REGISTER a watcher (that needs `client/registerCapability`), but a client that
+// sends one unprompted used to be dropped on the dispatcher's
+// unknown-notification path. Handling it costs one method-table row.
+TEST(WorkspaceProjectE2E, DidChangeWatchedFilesRepublishesAnOpenDocument) {
+    ScratchDir ws{Location::Temp, "lsp-live-watch"};
+    const auto file         = ws.path() / "boot.s";
+    const auto uri          = fileUriFromPath(file);
+    const auto manifestFile = ws.path() / "app.dss-project.json";
+
+    std::vector<std::string> wire;
+    LspTestHarness h;
+    h.push(lspInitializeWithRoots(1, {ws.path()}));
+    h.push(didOpen(file, "nop\n"));
+    ASSERT_NO_FATAL_FAILURE(awaitPublishes(h, uri, 1, wire));
+    writeFile(ws.path(), "app.dss-project.json",
+              manifest(R"(["arm64:elf64-aarch64-linux-exec"])"));
+    h.push(workspaceFileNotification("workspace/didChangeWatchedFiles",
+                                     manifestFile));
+    ASSERT_NO_FATAL_FAILURE(awaitPublishes(h, uri, 2, wire));
+    h.push(lspShutdown(2));
+    h.push(std::string{lspExit});
+    ASSERT_EQ(h.runUntilExit(), 0);
+
+    auto perPublish = schemaErrorPerPublish(wire, uri);
+    ASSERT_EQ(perPublish.size(), 2u);
+    EXPECT_NE(perPublish[0].find("ProjectFileNotFound"), std::string::npos)
+        << perPublish[0];
+    EXPECT_EQ(perPublish[1], "");
+}
+
+// `workspace/didCreateFiles` is the channel the `initialize` result now
+// advertises STATICALLY (`capabilities.workspace.fileOperations.didCreate`) --
+// the half that proves no outbound request was ever required here.
+TEST(WorkspaceProjectE2E, DidCreateFilesRepublishesAnOpenDocument) {
+    ScratchDir ws{Location::Temp, "lsp-live-create"};
+    const auto file         = ws.path() / "boot.s";
+    const auto uri          = fileUriFromPath(file);
+    const auto manifestFile = ws.path() / "app.dss-project.json";
+
+    std::vector<std::string> wire;
+    LspTestHarness h;
+    h.push(lspInitializeWithRoots(1, {ws.path()}));
+    h.push(didOpen(file, "nop\n"));
+    ASSERT_NO_FATAL_FAILURE(awaitPublishes(h, uri, 1, wire));
+    writeFile(ws.path(), "app.dss-project.json",
+              manifest(R"(["arm64:elf64-aarch64-linux-exec"])"));
+    h.push(workspaceFileNotification("workspace/didCreateFiles", manifestFile));
+    ASSERT_NO_FATAL_FAILURE(awaitPublishes(h, uri, 2, wire));
+    h.push(lspShutdown(2));
+    h.push(std::string{lspExit});
+    ASSERT_EQ(h.runUntilExit(), 0);
+
+    auto perPublish = schemaErrorPerPublish(wire, uri);
+    ASSERT_EQ(perPublish.size(), 2u);
+    EXPECT_NE(perPublish[0].find("ProjectFileNotFound"), std::string::npos)
+        << perPublish[0];
+    EXPECT_EQ(perPublish[1], "");
+}
+
+// ★ THE ADVERTISEMENT ITSELF. A handler for a notification no client was ever
+// told to send would be a guard that can never fire. The `initialize` RESULT is
+// where this one is asked for -- a response, not a server-originated request.
+TEST(WorkspaceProjectE2E, InitializeAdvertisesStaticManifestFileOperations) {
+    ScratchDir ws{Location::Temp, "lsp-live-caps"};
+
+    LspTestHarness h;
+    h.push(lspInitializeWithRoots(1, {ws.path()}));
+    h.push(lspShutdown(2));
+    h.push(std::string{lspExit});
+    ASSERT_EQ(h.runUntilExit(), 0);
+
+    json caps;
+    for (auto const& raw : h.takeServerMessages()) {
+        auto msg = json::parse(raw);
+        if (msg.contains("result") && msg["result"].contains("capabilities")) {
+            caps = msg["result"]["capabilities"];
+            break;
+        }
+    }
+    ASSERT_FALSE(caps.is_null()) << "no initialize result was published";
+    auto const& ops = caps.at("workspace").at("fileOperations");
+    for (char const* key : {"didCreate", "didRename", "didDelete"}) {
+        ASSERT_TRUE(ops.contains(key)) << key;
+        auto const& filters = ops.at(key).at("filters");
+        ASSERT_EQ(filters.size(), 1u) << key;
+        EXPECT_EQ(filters[0].at("scheme"), "file") << key;
+        EXPECT_EQ(filters[0].at("pattern").at("matches"), "file") << key;
+        // Derived from `kProjectFileSuffix`, never re-spelled -- asserted
+        // against the constant so renaming the manifest suffix cannot leave a
+        // stale glob advertised to every client in the world.
+        EXPECT_EQ(filters[0].at("pattern").at("glob"),
+                  std::string{"**/*"}
+                      + std::string{dss::lsp::kProjectFileSuffix}) << key;
+    }
+    // `will*` are REQUESTS the client blocks on, expecting a WorkspaceEdit back.
+    // We have no edit to contribute, so claiming them would stall the editor.
+    for (char const* key : {"willCreate", "willRename", "willDelete"}) {
+        EXPECT_FALSE(ops.contains(key))
+            << key << " must not be advertised -- it is a request we cannot "
+                      "answer";
+    }
+}
+
+// ★★ LIVENESS RUNS BOTH WAYS. A refresh that only ever IMPROVES an answer is
+// half a guard: removing the manifest must take the language service away
+// again, loudly, rather than leaving the editor parsing `.s` under a dialect
+// the workspace no longer declares.
+TEST(WorkspaceProjectE2E, RemovingTheManifestRepublishesTheReason) {
+    ScratchDir ws{Location::Temp, "lsp-live-remove"};
+    const auto file = ws.path() / "boot.s";
+    const auto uri  = fileUriFromPath(file);
+    writeFile(ws.path(), "app.dss-project.json",
+              manifest(R"(["arm64:elf64-aarch64-linux-exec"])"));
+
+    std::vector<std::string> wire;
+    LspTestHarness h;
+    h.push(lspInitializeWithRoots(1, {ws.path()}));
+    h.push(didOpen(file, "nop\n"));          // resolves cleanly
+    ASSERT_NO_FATAL_FAILURE(awaitPublishes(h, uri, 1, wire));
+
+    std::error_code ec;
+    fs::remove(ws.path() / "app.dss-project.json", ec);
+    ASSERT_FALSE(ec) << "fixture teardown failed: " << ec.message();
+    h.push(didSave(file));
+    ASSERT_NO_FATAL_FAILURE(awaitPublishes(h, uri, 2, wire));
+
+    h.push(lspShutdown(2));
+    h.push(std::string{lspExit});
+    ASSERT_EQ(h.runUntilExit(), 0);
+
+    auto perPublish = schemaErrorPerPublish(wire, uri);
+    ASSERT_EQ(perPublish.size(), 2u);
+    EXPECT_EQ(perPublish[0], "")
+        << "the open happened while the manifest existed; got: " << perPublish[0];
+    EXPECT_NE(perPublish[1].find("ProjectFileNotFound"), std::string::npos)
+        << "with the manifest gone the document must be told so; got: "
+        << perPublish[1];
+}
+
+// ★ NO CHURN. `setSchema` reports "changed" only when the (schema, reason) pair
+// actually moved, so a save that changed nothing about the manifest set costs
+// ZERO republishes. Without that check every save would re-publish every open
+// document -- a different bug wearing this feature's clothes.
+TEST(WorkspaceProjectE2E, ASaveThatChangesNoManifestRepublishesNothing) {
+    ScratchDir ws{Location::Temp, "lsp-live-nochurn"};
+    const auto file = ws.path() / "boot.s";
+    const auto uri  = fileUriFromPath(file);
+    writeFile(ws.path(), "app.dss-project.json",
+              manifest(R"(["arm64:elf64-aarch64-linux-exec"])"));
+
+    LspTestHarness h;
+    h.push(lspInitializeWithRoots(1, {ws.path()}));
+    h.push(didOpen(file, "nop\n"));
+    h.push(didSave(file));                   // nothing on disk moved
+    h.push(didSave(file));
+    h.push(lspShutdown(2));
+    h.push(std::string{lspExit});
+    ASSERT_EQ(h.runUntilExit(), 0);
+
+    auto perPublish = schemaErrorPerPublish(h.takeServerMessages(), uri);
+    EXPECT_EQ(perPublish.size(), 1u)
+        << "the open publishes; two saves that changed no manifest must "
+           "publish nothing further";
+}
+
+// ★ THE PRE-`initialize` REASON SURVIVES. The placeholder preference says "the
+// client has not sent `initialize` yet", which is a DIFFERENT claim from "the
+// client named no workspace folder". A refresh that ran before `initialize`
+// would overwrite the first with the second and quietly lose the distinction,
+// so the refresh refuses to run until `initialize` has been handled.
+TEST(WorkspaceProjectE2E, ADocumentOpenedBeforeInitializeSaysExactlyThat) {
+    ScratchDir ws{Location::Temp, "lsp-live-preinit"};
+    const auto file = ws.path() / "boot.s";
+
+    LspTestHarness h;
+    h.push(didOpen(file, "nop\n"));          // no `initialize` at all
+    h.push(didSave(file));                   // would trigger a refresh
+    h.push(lspShutdown(1));
+    h.push(std::string{lspExit});
+    ASSERT_EQ(h.runUntilExit(), 0);
+
+    auto errs = schemaErrorMessages(h.takeServerMessages());
+    ASSERT_EQ(errs.size(), 1u);
+    EXPECT_NE(errs[0].find("has not sent `initialize` yet"), std::string::npos)
+        << "the pre-initialize reason must not be replaced by the "
+           "no-workspace-folder one; got: " << errs[0];
 }

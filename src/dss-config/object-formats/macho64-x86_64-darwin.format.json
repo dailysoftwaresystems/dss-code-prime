@@ -47,13 +47,13 @@
 
   "sections": [
     {
-      "$comment": "Executable code. Mach-O two-level naming: section `__text` inside segment `__TEXT`. section_64.flags = S_REGULAR (0x0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign in log2 form: 4 = 16 bytes. PE's substrate `type` field repurposed for Mach-O section_64.flags.",
+      "$comment": "Executable code. Mach-O two-level naming: section `__text` inside segment `__TEXT`. section_64.flags = S_REGULAR (0x0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign = 16 RAW BYTES (x86_64/arm64 code alignment). section_64.align is a LOG2 exponent and the walker converts (std::countr_zero), exactly as every other section row here is converted; this row used to carry the literal log2 4 and be written VERBATIM, which made one schema key mean two different things across the object and exec families (D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD). PE's substrate `type` field repurposed for Mach-O section_64.flags.",
       "kind": "text",
       "name": "__text",
       "segment": "__TEXT",
       "type": 2147484672,
       "flags": 0,
-      "addrAlign": 4,
+      "addrAlign": 16,
       "entrySize": 0
     },
     {

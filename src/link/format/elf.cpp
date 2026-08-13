@@ -5,6 +5,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"  // isExternallyVisible (ET_DYN exports)
 #include "link/format/byte_emit.hpp"
+#include "link/format/dwarf_cfi.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
@@ -67,6 +68,14 @@ constexpr std::uint8_t STT_NOTYPE = 0;
 constexpr std::uint8_t STT_OBJECT = 1;  // data object (vs a function)
 constexpr std::uint8_t STT_FUNC   = 2;
 constexpr std::uint8_t STT_SECTION = 3;
+
+// `.symtab` index of the `.text` STT_SECTION symbol in an ET_REL object.
+// The relocatable writer emits STN_UNDEF at 0 and this symbol at 1, before
+// anything else, so the index is fixed by construction. `.rela.eh_frame`
+// names it as every FDE's relocation target (the shape `gcc -c` emits);
+// the emit site re-checks the position rather than trusting this comment.
+// D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS.
+constexpr std::uint32_t kTextSectionSymIdx = 1;
 constexpr std::uint16_t SHN_UNDEF = 0;
 
 // The ELF vocabulary for a shared `SymbolBinding` decision (the ONE per-format
@@ -108,6 +117,13 @@ constexpr std::uint32_t PT_PHDR    = 6;
 // thread (the main thread included — the CSU runs before main on
 // DSS's always-dynamic ELF arm, so no DSS-side arch_prctl is needed).
 constexpr std::uint32_t PT_TLS     = 7;
+// D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO: the LSB-defined
+// segment whose p_vaddr is `.eh_frame_hdr`. It is how a runtime unwinder
+// (`_Unwind_Find_FDE` via `dl_iterate_phdr`) LOCATES the frame tables at
+// all — a `.eh_frame` with no PT_GNU_EH_FRAME pointing at its index is
+// found only by a debugger reading section headers, never by the process
+// itself, so `backtrace()`/C++ EH would still walk nothing.
+constexpr std::uint32_t PT_GNU_EH_FRAME = 0x6474e550;
 constexpr std::uint32_t PF_X = 1;
 constexpr std::uint32_t PF_W = 2;
 constexpr std::uint32_t PF_R = 4;
@@ -1079,6 +1095,78 @@ encodeElfExecDynamic(
     }
     bool const emitVersioning = !versionReqs.empty();
 
+    // ── (b.6.5) `.eh_frame` + `.eh_frame_hdr` ──────────────────
+    //
+    // Sits BEFORE the section-index cursor below because both sections are
+    // conditional and the cursor must know whether they exist.
+    //
+    // D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO. ✔MEASURED
+    // 2026-08-13: before this block, `readelf -S` on a DSS elf64 build of
+    // ordinary C found ZERO `.eh_frame` sections where gcc's build of the
+    // same source has one — so nothing, not a debugger and not the process
+    // itself, could walk a DSS stack frame.
+    //
+    // Built HERE, before layout, because the section's SIZE is
+    // VA-independent: only the FDE `initial_location` fields need real
+    // addresses, and those are patched after (i) — the same sized-then-
+    // filled shape `.plt` already uses in this writer.
+    //
+    // Both names are WRITER-OWNED, like `.plt` / `.got` / `.rela.dyn` and
+    // unlike `.text` / `.rodata` (whose names come from the format schema's
+    // `sections[]` rows). That is the right shape rather than two new
+    // `SectionKind` enumerators: a `SectionKind` is the vocabulary a
+    // PRODUCER emits into and the format JSON names, and
+    // `object_format_schema.cpp`'s kind-uniqueness rule would then demand a
+    // row per format for a section no producer ever writes and whose flags
+    // no format needs to vary. Nothing here is producer-supplied — the
+    // writer synthesizes every byte from `AssembledFunction::cfi`.
+    std::vector<std::optional<CfiFunction>> perFuncCfi;
+    perFuncCfi.reserve(module.functions.size());
+    for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+        auto const& fn = module.functions[fi];
+        // ★ The FDE's `address_range` is `CfiFunction::codeLength`, while the
+        //   PC that finds the FDE comes from the function's real extent in
+        //   `.text`. If the two disagree the table is confidently wrong for
+        //   the tail of the function — an unwinder finds no FDE for a PC the
+        //   function really occupies and silently stops the walk. Cheap to
+        //   check here, impossible to see in a dump.
+        if (fn.cfi.has_value()
+            && fn.cfi->codeLength != static_cast<std::uint32_t>(fn.bytes.size())) {
+            emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+                 std::format(
+                     "elf::encodeElfExecDynamic: function #{} carries call-frame "
+                     "information describing {} bytes but its machine code is {} "
+                     "bytes — the FDE's address_range would not cover the whole "
+                     "function and an unwinder would stop mid-walk with no error "
+                     "(D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO)",
+                     fi, fn.cfi->codeLength, fn.bytes.size()));
+            return {};
+        }
+        perFuncCfi.push_back(fn.cfi);
+    }
+    auto ehFrameOpt =
+        link::format::buildEhFrame(perFuncCfi,
+                                   link::format::dwarfRegisterMappingOf(targetSchema),
+                                   /*addressSize=*/8, reporter);
+    if (!ehFrameOpt.has_value()) {
+        // `buildEhFrame` has already reported the specific refusal (an
+        // undeclared numbering, an unencodable rule, disagreeing entry
+        // states). Emitting a second, vaguer diagnostic here would bury it.
+        return {};
+    }
+    // EMPTY means "no function in this module carries frame information", not
+    // "the encoder produced nothing": in that case there is nothing to
+    // describe and the two sections are omitted entirely — a zero-size
+    // `.eh_frame` is a record every reader parses as an immediate
+    // end-of-chain sitting in front of live data.
+    bool const hasEhFrame = !ehFrameOpt->bytes.empty();
+    std::uint64_t const ehFrameSz = ehFrameOpt->bytes.size();
+    // `.eh_frame_hdr` is a 4-byte header + eh_frame_ptr + fde_count + an
+    // 8-byte row per FDE. Sized here so layout can reserve it; the CONTENT
+    // needs both its own VA and `.eh_frame`'s, so it is built after (i).
+    std::uint64_t const ehFrameHdrSz =
+        hasEhFrame ? 12 + 8 * ehFrameOpt->patches.size() : 0;
+
     // ── Section indices (hoisted above the dynsym build — c84/c150) ──
     // Computed INCREMENTALLY from the emit order below so adding/
     // removing an optional section ([.interp]/[.rodata]/[.data]/
@@ -1122,6 +1210,19 @@ encodeElfExecDynamic(
         emitVersioning ? nextIdx() : std::uint16_t{0};
     (void)IDX_GNU_VERSION_R;
     std::uint16_t const IDX_RELADYN = nextIdx(); (void)IDX_RELADYN;
+    // `.eh_frame` + `.eh_frame_hdr` close PT_LOAD #1
+    // (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO).
+    // Present only when some function carries frame information, so a module
+    // without any keeps every following index — and the whole image —
+    // unshifted, exactly like the `.gnu.version*` pair above.
+    // ⚠ THIS CURSOR IS ORDER-COUPLED to the header-emission order in (o) and
+    // to nothing else; the two must be edited together.
+    std::uint16_t const IDX_EH_FRAME =
+        hasEhFrame ? nextIdx() : std::uint16_t{0};
+    (void)IDX_EH_FRAME;
+    std::uint16_t const IDX_EH_FRAME_HDR =
+        hasEhFrame ? nextIdx() : std::uint16_t{0};
+    (void)IDX_EH_FRAME_HDR;
     std::uint16_t const IDX_TDATA  = hasTdataDyn ? nextIdx() : std::uint16_t{0};
     (void)IDX_TDATA;
     std::uint16_t const IDX_TBSS   = hasTbssDyn ? nextIdx() : std::uint16_t{0};
@@ -1438,8 +1539,13 @@ encodeElfExecDynamic(
     // DYNAMIC (gcc PIE ground truth carries both PHDR and INTERP);
     // TLS-in-dyn (both sub-shapes) was rejected above, so the PIE
     // never takes the 6-phdr TLS arm.
+    // + PT_GNU_EH_FRAME whenever `.eh_frame_hdr` exists
+    // (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO)
+    // FRAME-…). Conditional for the same reason PT_TLS is: a module with no
+    // frame information keeps every downstream offset — and therefore the
+    // whole image — byte-identical to the pre-unwind writer.
     std::uint32_t const numPhdrs =
-        !isExecveImage ? 3u : (hasTls ? 6u : 5u);
+        (!isExecveImage ? 3u : (hasTls ? 6u : 5u)) + (hasEhFrame ? 1u : 0u);
     std::uint64_t const phtOff = kEhdrSize;
     std::uint64_t const phtSize = numPhdrs * kPhdrSize;
     std::uint64_t const interpOff = phtOff + phtSize;
@@ -1556,7 +1662,19 @@ encodeElfExecDynamic(
     std::uint64_t const relaDynSz  =
         (numExterns + numRelativeRelocs + numExecExternAddrRelocs) * 24;
 
-    std::uint64_t const ptLoad1End = relaDynOff + relaDynSz;
+    // `.eh_frame` (align 8) then `.eh_frame_hdr` (align 4) close PT_LOAD #1.
+    // Both are SHF_ALLOC read-only, so this is the segment they belong in;
+    // when absent they collapse to relaDynOff+relaDynSz and `ptLoad1End` is
+    // the exact pre-unwind expression.
+    std::uint64_t const ehFrameOff =
+        hasEhFrame ? alignUp(relaDynOff + relaDynSz, 8)
+                   : (relaDynOff + relaDynSz);
+    std::uint64_t const ehFrameVa  = baseImageVa + ehFrameOff;
+    std::uint64_t const ehFrameHdrOff =
+        hasEhFrame ? alignUp(ehFrameOff + ehFrameSz, 4) : ehFrameOff;
+    std::uint64_t const ehFrameHdrVa = baseImageVa + ehFrameHdrOff;
+
+    std::uint64_t const ptLoad1End = ehFrameHdrOff + ehFrameHdrSz;
 
     // PT_LOAD #2 (R+W) — page-aligned in both file + VA. Holds the WRITABLE
     // sections: `.data` (file-backed, mutable initialized globals — D-LK4-
@@ -1656,6 +1774,37 @@ encodeElfExecDynamic(
         std::uint64_t const slotVa = gotVa + slot * 8;
         std::size_t   const stubOffset = slot * pltStubSize;
         if (!emitPltStub(machine, plt, stubOffset, stubVa, slotVa, reporter)) {
+            return {};
+        }
+    }
+
+    // ── (j.5) Fill `.eh_frame`'s pcrel fields + build `.eh_frame_hdr` ──
+    //
+    // Both need real addresses, which only exist after (i). `funcVa` is the
+    // SAME expression the symbol table and the entry point use (elf.cpp's
+    // `textVa + funcTextStart[i]`) — deliberately not a second derivation,
+    // because an FDE that points one byte off its function is a table the
+    // unwinder follows into the previous frame without complaining.
+    std::vector<std::uint8_t> ehFrameHdr;
+    if (hasEhFrame) {
+        auto const funcVa = [&](std::size_t i) -> std::uint64_t {
+            return textVa + funcTextStart[i];
+        };
+        link::format::applyEhFramePcRel(*ehFrameOpt, ehFrameVa, funcVa);
+        ehFrameHdr = link::format::buildEhFrameHdr(*ehFrameOpt, ehFrameHdrVa,
+                                                   ehFrameVa, funcVa);
+        // The layout above RESERVED a size for this section before its bytes
+        // existed. If the two ever disagree the image is silently
+        // mis-laid-out — every following section shifted, or `.eh_frame_hdr`
+        // overrunning into `.tdata`. Assert the reservation, do not trust it.
+        if (ehFrameHdr.size() != ehFrameHdrSz) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format(
+                     "elf::encodeElfExecDynamic: .eh_frame_hdr layout reserved "
+                     "{} bytes but the built section is {} — the reservation "
+                     "formula and buildEhFrameHdr have diverged, and every "
+                     "section after it would be laid out at the wrong offset",
+                     ehFrameHdrSz, ehFrameHdr.size()));
             return {};
         }
     }
@@ -1839,6 +1988,13 @@ encodeElfExecDynamic(
         hasTdataDyn ? shstrtab.add(std::string{secTdataDyn->name}) : 0u;
     std::uint32_t const shsTbss =
         hasTbssDyn ? shstrtab.add(std::string{secTbssDyn->name}) : 0u;
+    // `.eh_frame` / `.eh_frame_hdr` — added ONLY when present, for the same
+    // reason `.tdata`/`.tbss` are: an unconditional add grows `.shstrtab` on
+    // every image and shifts every following offset.
+    std::uint32_t const shsEhFrame =
+        hasEhFrame ? shstrtab.add(".eh_frame") : 0u;
+    std::uint32_t const shsEhFrameHdr =
+        hasEhFrame ? shstrtab.add(".eh_frame_hdr") : 0u;
     auto const shsPlt      = shstrtab.add(".plt");
     auto const shsDynsym   = shstrtab.add(".dynsym");
     auto const shsDynstr   = shstrtab.add(".dynstr");
@@ -2455,6 +2611,18 @@ encodeElfExecDynamic(
         appendPhdrEntry(PT_TLS, PF_R, tdataOff, tdataVa,
                         tdataSpan, tlsBlockMemsz, tlsAlign);
     }
+    // PT_GNU_EH_FRAME
+    // (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO) -- p_vaddr is the
+    // `.eh_frame_hdr` SEARCH TABLE, never `.eh_frame` itself. That is the
+    // whole point of the segment: `_Unwind_Find_FDE` walks the program
+    // headers, finds this one, and binary-searches the table it points at.
+    // Aiming it at `.eh_frame` produces a header every reader accepts and
+    // every unwinder mis-parses (it would read a CIE length as a version
+    // byte).
+    if (hasEhFrame) {
+        appendPhdrEntry(PT_GNU_EH_FRAME, PF_R, ehFrameHdrOff, ehFrameHdrVa,
+                        ehFrameHdrSz, ehFrameHdrSz, 4);
+    }
 
     // Section bodies: pad-to-offset + append per section (simplifier
     // #1 + #4 fold using local padToOffset / appendBytes helpers).
@@ -2476,6 +2644,10 @@ encodeElfExecDynamic(
         padToOffset(bytes, gnuVersionROff); appendBytes(bytes, gnuVersionR);
     }
     padToOffset(bytes, relaDynOff);   appendBytes(bytes, relaDyn);
+    if (hasEhFrame) {
+        padToOffset(bytes, ehFrameOff);    appendBytes(bytes, ehFrameOpt->bytes);
+        padToOffset(bytes, ehFrameHdrOff); appendBytes(bytes, ehFrameHdr);
+    }
     padToOffset(bytes, ptLoad2Start);                                // PT_LOAD #2 boundary
     // `.tdata` (thread-local template) opens PT_LOAD #2 (D-CSUBSET-THREAD-
     // LOCAL) — its (possibly reloc-patched) bytes precede `.data`'s.
@@ -2570,6 +2742,21 @@ encodeElfExecDynamic(
         .name_offset = shsRelaDyn, .type = SHT_RELA, .flags = SHF_ALLOC,
         .addr = relaDynVa, .offset = relaDynOff, .size = relaDynSz,
         .link = IDX_DYNSYM, .addr_align = 8, .entry_size = 24});
+    // `.eh_frame` + `.eh_frame_hdr` -- writer-owned names, SHT_PROGBITS +
+    // SHF_ALLOC (read-only, mapped: the runtime unwinder reads them in the
+    // live process, so they are NOT debug-only sections). Emitted in the
+    // SAME order the index cursor assigned above -- the two are coupled and
+    // a mismatch silently mislabels every following section.
+    if (hasEhFrame) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsEhFrame, .type = SHT_PROGBITS, .flags = SHF_ALLOC,
+            .addr = ehFrameVa, .offset = ehFrameOff, .size = ehFrameSz,
+            .addr_align = 8});
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsEhFrameHdr, .type = SHT_PROGBITS,
+            .flags = SHF_ALLOC, .addr = ehFrameHdrVa, .offset = ehFrameHdrOff,
+            .size = ehFrameHdrSz, .addr_align = 4});
+    }
     // `.tdata` / `.tbss` (D-CSUBSET-THREAD-LOCAL): sh_type / sh_flags read
     // from the SCHEMA ROWS (SHT_PROGBITS / SHT_NOBITS, both
     // SHF_WRITE|SHF_ALLOC|SHF_TLS = 0x403), never hardcoded. `.tbss`'s
@@ -3112,6 +3299,115 @@ encode(AssembledModule const&    module,
                             static_cast<std::uint64_t>(fn.bytes.size())});
     }
 
+    // ── `.eh_frame` + `.rela.eh_frame` (ET_REL) ────────────────
+    //
+    // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS. ✔MEASURED 2026-08-13:
+    // every `eh_frame` token in this file sat inside `encodeElfExecDynamic`,
+    // so a DSS `.o` carried NO unwind table at all — silently. That matters
+    // because DSS `.o` files are a shipped, proven capability (PR #41: they
+    // link and run under gcc), and a `.o` with no `.eh_frame` produces a
+    // FINAL IMAGE with no FDE for those functions: the linker cannot invent
+    // what the object never stated, so a C++ throw crossing a DSS frame
+    // calls `std::terminate` and a profiler's stack walk stops dead — with
+    // no diagnostic anywhere in the chain.
+    //
+    // Built HERE, right after `.text` is assembled, because `funcTextStart`
+    // is what the relocation addends are, and before the symtab because the
+    // section-index cursor below must know whether these two sections exist.
+    //
+    // ★ THE EXEC PATH'S pcrel PATCH CANNOT BE REUSED, AND THAT IS THE WHOLE
+    //   DIFFICULTY. `applyEhFramePcRel` computes `funcVa - fieldVa`; in a
+    //   relocatable object NEITHER address exists. So the field ships ZERO
+    //   and a real ELF relocation carries the reference — against the
+    //   `.text` SECTION symbol, addend = the function's offset within
+    //   `.text`, exactly the shape `readelf -r` shows on `gcc -c` output.
+    //
+    // Names are WRITER-OWNED, for the same reason the exec path's are: no
+    // producer emits into `.eh_frame`, the writer synthesizes every byte
+    // from `AssembledFunction::cfi`, and a `SectionKind` row would demand a
+    // per-format entry for a section whose flags no format needs to vary.
+    // `.rela.eh_frame`'s name is derived from the format's own rela prefix
+    // (below), never a hardcoded `.rela` literal.
+    //
+    // ET_REL ONLY. The static ET_EXEC arm this function also serves keeps
+    // its current behaviour: it has no `.eh_frame_hdr` and no
+    // PT_GNU_EH_FRAME, so a `.eh_frame` there would be readable by a
+    // debugger and INVISIBLE to the running process's own unwinder — half a
+    // table, which is the shape this project treats as worse than none.
+    // That gap is anchored (D-UNWIND-STATIC-ET-EXEC-NO-EH-FRAME); the
+    // shipped pipeline reaches the dynamic writer, which has both.
+    std::optional<link::format::EhFrameSection> ehFrameOpt;
+    TargetRelocationInfo const* fdePtrReloc = nullptr;
+    std::uint32_t fdePtrNativeId = 0;
+    if (!isExec) {
+        std::vector<std::optional<CfiFunction>> perFuncCfi;
+        perFuncCfi.reserve(module.functions.size());
+        for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+            auto const& fn = module.functions[fi];
+            // The FDE's `address_range` is `CfiFunction::codeLength`, while
+            // the PC that finds the FDE comes from the function's real
+            // extent in `.text`. If they disagree the table is confidently
+            // wrong for the tail of the function. Same check the exec writer
+            // makes, for the same reason — it is invisible in a dump.
+            if (fn.cfi.has_value()
+                && fn.cfi->codeLength
+                       != static_cast<std::uint32_t>(fn.bytes.size())) {
+                emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+                     std::format(
+                         "elf::encode (ET_REL): function #{} carries call-frame "
+                         "information describing {} bytes but its machine code "
+                         "is {} bytes — the FDE's address_range would not cover "
+                         "the whole function and an unwinder would stop mid-walk "
+                         "with no error "
+                         "(D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS)",
+                         fi, fn.cfi->codeLength, fn.bytes.size()));
+                return {};
+            }
+            perFuncCfi.push_back(fn.cfi);
+        }
+        ehFrameOpt = link::format::buildEhFrame(
+            perFuncCfi, link::format::dwarfRegisterMappingOf(targetSchema),
+            /*addressSize=*/8, reporter);
+        if (!ehFrameOpt.has_value()) {
+            // `buildEhFrame` already reported the specific refusal.
+            return {};
+        }
+        // Resolve the FDE-pointer relocation ONLY when there is a table to
+        // relocate. The order is the same one `buildEhFrame` documents: a
+        // refusal must fire when information would actually be LOST, so a
+        // module with no frame information must not be failed over a psABI
+        // row it has no use for.
+        if (!ehFrameOpt->bytes.empty()) {
+            std::string relocErr;
+            fdePtrReloc =
+                link::format::fdePointerRelocationOf(targetSchema, relocErr);
+            if (fdePtrReloc == nullptr) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     "elf::encode (ET_REL): " + relocErr);
+                return {};
+            }
+            auto const* fmtFdeReloc = fmt.relocationByKind(fdePtrReloc->kind);
+            if (fmtFdeReloc == nullptr) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format(
+                         "elf::encode (ET_REL): target '{}' declares the FDE "
+                         "pointer relocation '{}' (kind {}) but ELF format '{}' "
+                         "maps no ELF type to it, so `.eh_frame` could only ship "
+                         "with its `initial_location` fields left ZERO — every "
+                         "FDE would claim to describe the start of the output "
+                         "section and an unwinder would attribute every frame to "
+                         "the first function "
+                         "(D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS)",
+                         targetSchema.name(), fdePtrReloc->name,
+                         fdePtrReloc->kind.v, fmt.name()));
+                return {};
+            }
+            fdePtrNativeId = fmtFdeReloc->nativeId;
+        }
+    }
+    bool const hasEhFrame =
+        ehFrameOpt.has_value() && !ehFrameOpt->bytes.empty();
+
     // .rodata runtime VA — contiguous after `.text`, rounded up to
     // the rodata section's addralign (D-LK1-ELF-EXEC-DATA-SECTIONS).
     // Computed HERE (now that `text.size()` is known) so it is in
@@ -3297,8 +3593,23 @@ encode(AssembledModule const&    module,
     // ELF consumers expect for section-relative references. Its
     // st_shndx points at the .text section index; we pin that to
     // IDX_TEXT (=1) by the section ordering below.
+    // `kTextSectionSymIdx` names the index for the `.rela.eh_frame` builder
+    // above, which relocates every FDE against exactly this symbol
+    // (D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS). It is a constant rather
+    // than a re-derivation because the symbol is emitted unconditionally at
+    // a fixed position; the static_assert-style guard is the append order
+    // itself (STN_UNDEF at 0, this at 1, everything else after).
     appendSym(0, makeStInfo(STB_LOCAL, STT_SECTION),
               0, /*shndx=.text*/ 1, 0, 0);
+    if (symtab.size() / 24 != kTextSectionSymIdx + 1u) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             std::format("elf::encode: the .text STT_SECTION symbol landed at "
+                         "index {} but every `.eh_frame` relocation names index "
+                         "{}; a mismatch would relocate every FDE against the "
+                         "wrong symbol",
+                         symtab.size() / 24 - 1, kTextSectionSymIdx));
+        return {};
+    }
 
     // Map each SymbolId to its symtab index (for relocs).
     std::unordered_map<SymbolId, std::uint32_t> symIdxBySymbol;
@@ -3638,6 +3949,63 @@ encode(AssembledModule const&    module,
     bool const hasRelaData  = !relaData.empty();
     bool const hasRelaRelRo = !relaRelRo.empty();
 
+    // ── Build `.rela.eh_frame` ─────────────────────────────────
+    //
+    // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS. One RELA per FDE, at the
+    // `initial_location` field `buildEhFrame` recorded, against the `.text`
+    // SECTION symbol with the function's offset within `.text` as the
+    // addend — the shape `gcc -c` emits (✔MEASURED: `R_X86_64_PC32 .text +
+    // 0/+19/+48`; `R_AARCH64_PREL32 .text + 0/+24/+56`).
+    //
+    // ★ WHY THE SECTION SYMBOL AND NOT THE FUNCTION SYMBOL. Both resolve to
+    //   the same address, so this cannot be caught by reading the numbers.
+    //   Two things separate them: `ld --gc-sections` associates an FDE with
+    //   the code it describes THROUGH this relocation's target section, and
+    //   a GLOBAL function symbol is interposable — a definition preempted at
+    //   link time would drag its FDE's initial_location with it, describing
+    //   a frame that is no longer there. The section symbol is neither.
+    //
+    // NO psABI addend BIAS is added here, unlike `.rela.text` above: this
+    // patches a DATA word, not an instruction field, and `fdePointerRelocationOf`
+    // selected a row whose `addendBias` is zero precisely so that stays true.
+    // Asserted rather than assumed — a future row edit must not silently
+    // reintroduce an instruction-end bias into a data field.
+    std::vector<std::uint8_t> relaEhFrame;
+    if (hasEhFrame) {
+        if (fdePtrReloc->addendBias != 0) {
+            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                 std::format(
+                     "elf::encode (ET_REL): the FDE pointer relocation '{}' "
+                     "declares addendBias {}, but the DWARF `initial_location` "
+                     "field is a DATA word with no implicit bias. Emitting it "
+                     "would point every FDE {} bytes away from its function and "
+                     "an unwinder would follow it without complaint "
+                     "(D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS)",
+                     fdePtrReloc->name, fdePtrReloc->addendBias,
+                     fdePtrReloc->addendBias));
+            return {};
+        }
+        for (auto const& p : ehFrameOpt->patches) {
+            appendU64LE(relaEhFrame, p.byteOffset);
+            appendU64LE(relaEhFrame,
+                        makeRelaInfo(kTextSectionSymIdx, fdePtrNativeId));
+            appendI64LE(relaEhFrame,
+                        static_cast<std::int64_t>(funcTextStart[p.funcIndex]));
+        }
+        // A `.eh_frame` whose FDE count and relocation count disagree is a
+        // table that describes some functions from a zeroed pointer — i.e.
+        // from the start of the output section. Cheap to check, impossible
+        // to see in a dump.
+        if (relaEhFrame.size() / 24 != ehFrameOpt->patches.size()) {
+            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                 std::format("elf::encode (ET_REL): built {} .eh_frame "
+                             "relocations for {} FDE pointers",
+                             relaEhFrame.size() / 24,
+                             ehFrameOpt->patches.size()));
+            return {};
+        }
+    }
+
     // ── Section ordering + .shstrtab ───────────────────────────
     //
     // ET_REL order: SHT_NULL, .text, .rela.text, .symtab, .strtab,
@@ -3663,6 +4031,8 @@ encode(AssembledModule const&    module,
     SectionHeader hStrtab{};
     SectionHeader hShStrtab{};
     SectionHeader hNote{};
+    SectionHeader hEhFrame{};      // .eh_frame (ET_REL)
+    SectionHeader hRelaEhFrame{};  // .rela.eh_frame (ET_REL)
     // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): derive the `.rela.<section>` names
     // for the data relocation tables. ELF names an SHT_RELA table the format's
     // rela-prefix + the section it applies to; recover the prefix from the
@@ -3671,6 +4041,12 @@ encode(AssembledModule const&    module,
     // same way). ET_REL only (secRela is null on the exec path).
     std::string relaDataName;
     std::string relaRelRoName;
+    // `.eh_frame` / `.rela.eh_frame` — writer-owned names, for the reason the
+    // build block above documents. The rela name uses the SAME derived prefix
+    // as the data tables, so a `.rel`/SHT_REL format would get `.rel.eh_frame`
+    // without an edit here. D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS.
+    static constexpr std::string_view kEhFrameName = ".eh_frame";
+    std::string relaEhFrameName;
     if (secRela != nullptr) {
         std::string_view relaPrefix{secRela->name};
         std::string_view const textName{secText->name};
@@ -3685,6 +4061,8 @@ encode(AssembledModule const&    module,
         if (hasRelRo)
             relaRelRoName =
                 std::string{relaPrefix} + std::string{secRelRo->name};
+        if (hasEhFrame)
+            relaEhFrameName = std::string{relaPrefix} + std::string{kEhFrameName};
     }
     hText.name_offset      = shstrtab.add(secText->name);
     if (hasRodata) {
@@ -3713,6 +4091,10 @@ encode(AssembledModule const&    module,
     hShStrtab.name_offset  = shstrtab.add(secShStrtab->name);
     if (hasNote) {
         hNote.name_offset  = shstrtab.add(secNote->name);
+    }
+    if (hasEhFrame) {
+        hEhFrame.name_offset     = shstrtab.add(std::string{kEhFrameName});
+        hRelaEhFrame.name_offset = shstrtab.add(relaEhFrameName);
     }
 
     // Section indices — IDX_TEXT==1 is pinned (the STT_SECTION sym
@@ -3764,6 +4146,13 @@ encode(AssembledModule const&    module,
     std::uint16_t const IDX_SYMTAB   = nextIdxS();
     std::uint16_t const IDX_STRTAB   = nextIdxS();
     std::uint16_t const IDX_SHSTRTAB = nextIdxS();
+    // `.note.GNU-stack`, then `.eh_frame` + `.rela.eh_frame`, are appended
+    // AFTER `.shstrtab` for the same reason the note already is: every
+    // pre-existing section index and `e_shstrndx` stay exactly where they
+    // were, so adding unwind tables to the `.o` grows `e_shnum` and nothing
+    // else. D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS.
+    if (hasNote) { (void)nextIdxS(); }
+    std::uint16_t const IDX_EH_FRAME = hasEhFrame ? nextIdxS() : 0u;
 
     hText.type       = secText->type;
     hText.flags      = secText->flags;
@@ -3888,6 +4277,32 @@ encode(AssembledModule const&    module,
         hNote.addr_align = std::max<std::uint64_t>(1, secNote->addrAlign);
         hNote.entry_size = secNote->entrySize;
         hNote.size       = 0;
+    }
+    // `.eh_frame`: SHT_PROGBITS + SHF_ALLOC, addralign = the DWARF record
+    // alignment (`buildEhFrame` pads every CIE/FDE to the address size, and a
+    // section laid out below that alignment would put the records off it).
+    // SHF_ALLOC and NOT a debug flag: these tables are MAPPED — the running
+    // process's own unwinder reads them, not just a debugger. Both facts are
+    // what `readelf -S` reports for `gcc -c` output (`A`, align 8).
+    // `.rela.eh_frame` reuses the `.rela.text` schema row's structural fields
+    // (SHT_RELA / SHF_INFO_LINK / align / entsize are FORMAT-owned properties
+    // of a relocation table, identical whichever section it patches), with
+    // sh_info naming `.eh_frame` as the section these relocations apply to.
+    // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS.
+    if (hasEhFrame) {
+        hEhFrame.type       = SHT_PROGBITS;
+        hEhFrame.flags      = SHF_ALLOC;
+        hEhFrame.addr_align = 8;
+        hEhFrame.size       = ehFrameOpt->bytes.size();
+        hEhFrame.addr       = 0;  // ET_REL: unbound
+
+        hRelaEhFrame.type       = secRela->type;
+        hRelaEhFrame.flags      = secRela->flags;
+        hRelaEhFrame.addr_align = secRela->addrAlign;
+        hRelaEhFrame.entry_size = secRela->entrySize;
+        hRelaEhFrame.link       = IDX_SYMTAB;
+        hRelaEhFrame.info       = IDX_EH_FRAME;
+        hRelaEhFrame.size       = relaEhFrame.size();
     }
 
     // ── Layout pass: compute sh_offset for each section ────────
@@ -4015,6 +4430,11 @@ encode(AssembledModule const&    module,
     // sh_offset (no bytes appended). Keeping it after .shstrtab is what leaves
     // every existing section index + e_shstrndx untouched.
     if (hasNote) layoutSection(hNote, std::span<std::uint8_t const>{});
+    // `.eh_frame` + `.rela.eh_frame` last, matching the index cursor above.
+    if (hasEhFrame) {
+        layoutSection(hEhFrame, ehFrameOpt->bytes);
+        layoutSection(hRelaEhFrame, relaEhFrame);
+    }
 
     padTo(bytes, 8);  // SHT alignment
     std::uint64_t const shoff = bytes.size();
@@ -4052,8 +4472,27 @@ encode(AssembledModule const&    module,
     // `.note.GNU-stack` appended LAST (after .shstrtab) so it grows only
     // `e_shnum` — every prior index + `e_shstrndx` are unchanged.
     if (hasNote) headers.push_back(&hNote);
+    // `.eh_frame` + `.rela.eh_frame` last — ORDER MUST MATCH the index cursor
+    // (IDX_EH_FRAME) and the layout pass, or `.rela.eh_frame`'s sh_info names
+    // the wrong section and `ld` applies the FDE relocations somewhere else.
+    if (hasEhFrame) {
+        headers.push_back(&hEhFrame);
+        headers.push_back(&hRelaEhFrame);
+    }
     std::uint16_t const sectionCount =
         static_cast<std::uint16_t>(headers.size());
+    // The cursor and the push order are two statements of one fact and they
+    // are 400 lines apart. A drift makes every index past the divergence name
+    // the wrong section — which `readelf` renders as a perfectly well-formed
+    // object. D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS.
+    if (hasEhFrame && headers[IDX_EH_FRAME] != &hEhFrame) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("elf::encode (ET_REL): section-index cursor says "
+                         ".eh_frame is index {} but the header table has a "
+                         "different section there",
+                         IDX_EH_FRAME));
+        return {};
+    }
     for (auto const* h : headers) writeSectionHeader(bytes, *h);
 
     // ── Elf64_Ehdr (overwrite the leading 64 zero bytes) ───────

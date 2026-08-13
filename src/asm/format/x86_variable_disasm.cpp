@@ -375,6 +375,10 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::Imm32MovzMovk:
                 case EncodingSlotKind::SymbolPatchMarker:
                 case EncodingSlotKind::Imm19:
+                // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the
+                // inverted-imm16 (complement-immediate) slot is fixed32,
+                // like Imm16 whose window it shares.
+                case EncodingSlotKind::Imm16Inverted:
                     // fixed32 slots. Validate-time rules reject
                     // cross-shape variants, but if a future variant
                     // drift reached this arm, returning nullopt

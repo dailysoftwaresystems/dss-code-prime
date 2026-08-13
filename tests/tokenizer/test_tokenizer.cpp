@@ -124,6 +124,86 @@ TEST(Tokenizer, NonKeywordWordLeavesSchemaKindInvalidForBuilderFallback) {
     EXPECT_FALSE(result.tokens[0].schemaKind.valid());
 }
 
+// ══ D-ASM-DIALECT-IDENTIFIER-CONTINUATION-NOT-CONFIGURABLE (2026-08-13) ═════
+//
+// ★★★ THE IDENTIFIER CONTINUATION CLASS IS CONFIG-DRIVEN, AND THIS IS THE
+// LEXICAL-TIER PIN THAT IT IS ACTUALLY CONSUMED. The tokenizer's identifier rule
+// was a hardcoded `constexpr` pair; a language whose names legitimately contain
+// a character outside `[A-Za-z0-9_]` (gas: `b.eq`, `foo.bar`,
+// `DW.ref.__gxx_personality_v0` — all ✔MEASURED accepted by
+// `aarch64-linux-gnu-as`) had to declare each WHOLE NAME as a lexeme.
+//
+// ★★ THE TWO SCHEMAS DIFFER IN EXACTLY ONE BLOCK AND THE SAME INPUT LEXES
+// DIFFERENTLY. Without that contrast the test could pass because `.` happened to
+// be unlexable rather than because the class was read — the shape of the
+// `declaredNewlineKind` defect, where the loader accepted a lexical key the
+// tokenizer never consulted and the cost was a WRONG PARSE.
+namespace {
+[[nodiscard]] std::string identClassSchema(bool declareDotContinues) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "IdCont", "version": "0.1.0" },
+      "tokens": {
+        ".": [{ "kind": "Dot" }],
+        ";": [{ "kind": "Semi" }]
+      },
+      %X%
+      "shapes": { "root": { "sequence": [ "Identifier", "Semi" ] } }
+    })JSON";
+    auto const pos = cfg.find("%X%");
+    cfg.replace(pos, 3,
+                declareDotContinues
+                    ? R"("identifierClass": { "extraContinue": "." },)"
+                    : "");
+    return cfg;
+}
+}  // namespace
+
+TEST(Tokenizer, DeclaredIdentifierClassMakesDotContinueAWord) {
+    auto loaded = GrammarSchema::loadFromText(identClassSchema(true));
+    ASSERT_TRUE(loaded.has_value()) << "the identifierClass schema must load";
+    H h{.src    = SourceBuffer::fromString("b.eq;", "<idcont>"),
+        .schema = *loaded};
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 2u)
+        << "`b.eq` must be ONE Word plus the terminator";
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "b.eq");
+    EXPECT_TRUE(result.diags.empty());
+}
+
+// ★ RED-ON-DISABLE: the SAME input, the SAME two token declarations, one block
+// removed — and it becomes THREE tokens. The `.` still lexes (as its own `Dot`
+// kind), so this is measuring the identifier class and not the token table.
+TEST(Tokenizer, WithoutTheDeclarationTheDotSplitsTheIdentifier) {
+    auto loaded = GrammarSchema::loadFromText(identClassSchema(false));
+    ASSERT_TRUE(loaded.has_value());
+    H h{.src    = SourceBuffer::fromString("b.eq;", "<idcont>"),
+        .schema = *loaded};
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 4u)
+        << "without the declaration `b.eq` must split into Word/Dot/Word — if "
+           "it did not, the tokenizer is not reading the class at all and the "
+           "declared version passes for some other reason";
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "b");
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), ".");
+    EXPECT_EQ(textOf(*h.src, result.tokens[2]), "eq");
+}
+
+// ★★ THE CLASS IS ADDITIVE AND CANNOT NARROW. A declaration naming only `.`
+// must leave `_` and digits continuing names exactly as before — otherwise a
+// language could delete `_` from its own identifiers and break every lexeme
+// lookup in its own `tokens` map with no diagnostic.
+TEST(Tokenizer, DeclaredIdentifierClassIsAdditiveNotReplacing) {
+    auto loaded = GrammarSchema::loadFromText(identClassSchema(true));
+    ASSERT_TRUE(loaded.has_value());
+    H h{.src    = SourceBuffer::fromString("_a9.b_2;", "<idcont>"),
+        .schema = *loaded};
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 2u);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "_a9.b_2");
+}
+
 TEST(Tokenizer, IdentifiersAcceptUnderscoreAndDigits) {
     auto h      = loadToy("_x9");
     auto result = lex(h);

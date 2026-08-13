@@ -1,14 +1,22 @@
 #include "lsp/workspace_project.hpp"
 
 #include "core/types/diagnostic_reporter.hpp"
+// ★ THE ONE PROJECT-MANIFEST PARSER — now reached DOWNWARD, not across
+// (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS, closed 2026-08-13).
+// `core/types/project_config.hpp` is the very parser `Program::compileProject`
+// runs; it used to live in `src/program/`, so this file reached UP into the
+// driver tier for it. Writing a second reader of the same document was never an
+// option — an editor that disagreed with the compiler about what a manifest
+// MEANS would be worse than no editor support — so the parser moved down to the
+// tier both readers already depend on.
+#include "core/types/project_config.hpp"
 #include "core/types/target_schema.hpp"
-// ⚠ THE ONE PROJECT-MANIFEST PARSER, REACHED ACROSS A LAYER (see the note in
-// `src/lsp/CMakeLists.txt`). `program/project_config.hpp` is the parser
-// `Program::compileProject` runs; `program/target_spec.hpp` is the splitter the
-// driver runs. Writing a second reader of the same document is precisely the
-// duplication this tree keeps deleting — an editor that disagreed with the
-// compiler about what a manifest MEANS would be worse than no editor support.
-#include "program/project_config.hpp"
+// ⚠ STILL REACHED ACROSS A LAYER: `TargetSpec::parse` is the driver's
+// `<targetName>:<formatName>` splitter and cannot follow `project_config` down,
+// because `TargetSpec::outputExtension` binds the type to
+// `link/object_format_schema.hpp` and `core` must not depend on `link`.
+// Anchored `D-LSP-TARGET-SPEC-SPLITTER-LIVES-ABOVE-ITS-CONSUMERS`; see the note
+// in `src/lsp/CMakeLists.txt`.
 #include "program/target_spec.hpp"
 
 #include <algorithm>

@@ -22,7 +22,7 @@
 // that must agree byte-for-byte drift when each rolls its own.
 //
 // There is deliberately NO new guard vocabulary here. Every axis
-// (`operandKinds`, `guard.width`, `guard.immMin/immMax`, `negMemoffset`) is the
+// (`operandKinds`, `guard.width`, `guard.immMin/immMax`, `guard.negValue`) is the
 // target's own, evaluated by the target's own predicate
 // (`walker_util::variantMatchesInst`); this header only adds the LOOP and the
 // candidate-set walk on top of it.

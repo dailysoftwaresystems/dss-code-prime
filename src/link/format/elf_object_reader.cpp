@@ -419,6 +419,16 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         return std::nullopt;
     };
     for (auto const& r : objectFormatSchema.relocations()) {
+        // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: an EMISSION ALIAS
+        // shares its wire type with a real row and exists only so the emitter
+        // can reach that type through a different DSS kind (x86_64's DWARF FDE
+        // pointer vs the call-site rel32 — same R_X86_64_PC32, different
+        // implicit addend bias). The wire carries no bias, so there is nothing
+        // to decode differently; including it here would make the reverse map
+        // ambiguous and reject every object using that perfectly ordinary
+        // relocation. `validate()` guarantees the aliased row is present, so
+        // skipping this one never leaves the id unmapped.
+        if (r.emitOnly) continue;
         if (auto f = mapNative(r.nativeId, r.kind); f.has_value()) return *f;
         if (r.pltNativeId != 0u) {
             if (auto f = mapNative(r.pltNativeId, r.kind); f.has_value()) return *f;

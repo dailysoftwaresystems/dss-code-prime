@@ -163,6 +163,13 @@
       "name": "R_X86_64_32",
       "kind": 3,
       "nativeId": 10
+    },
+    {
+      "$comment": "D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: the DWARF FDE `initial_location` pointer in a relocatable `.eh_frame` (DW_EH_PE_pcrel|sdata4). SAME ELF wire type as the kind-1 row above (R_X86_64_PC32 = 2); the `_UNBIASED` suffix is a DSS-side disambiguator, NOT a psABI spelling -- the format loader requires row names to be unique and both rows emit r_type 2. The two DSS kinds differ ONLY in the implicit addend the emitter bakes in (kind 1 `rel32` = -4, correct for a call site whose displacement is relative to the instruction END; kind 5 `pcrel32` = 0, correct for a DATA word). No `pltNativeId`: an FDE pointer never names an extern call, and routing it through a PLT stub would make the unwinder's PC lookup land on jump-stub bytes. ✔MEASURED 2026-08-13 against `gcc -c`: `readelf -r` shows `R_X86_64_PC32  .text + <fnOffset>` on every FDE.",
+      "name": "R_X86_64_PC32_UNBIASED",
+      "kind": 5,
+      "nativeId": 2,
+      "emitOnly": true
     }
   ]
 }

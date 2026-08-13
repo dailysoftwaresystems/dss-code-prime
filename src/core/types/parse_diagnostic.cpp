@@ -457,6 +457,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_ProgramEntryUndefined";
         case DiagnosticCode::K_ProgramEntryAmbiguous:
             return "K_ProgramEntryAmbiguous";
+        case DiagnosticCode::K_UnwindRuleUnrepresentable:
+            return "K_UnwindRuleUnrepresentable";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

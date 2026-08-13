@@ -213,6 +213,40 @@ NodeId findDescendantOfRule(Tree const& tree, NodeId n, RuleId rule) {
     return NodeId{};
 }
 
+// The FIRST / LAST visible TOKEN anywhere under `n`, in document order, or
+// invalid. ⚠ DEPTH-FIRST AND NOT DIRECT-CHILDREN-ONLY, AND THAT DISTINCTION IS
+// A MEASURED BUG RATHER THAN A PRECAUTION: an operand arrives wrapped in the
+// dialect's `{alt}` node, so `visibleChildren(operand)` yields ONE INTERNAL
+// child and no tokens at all. A direct-children scan therefore found no leading
+// token for `.section .rodata` and refused a line that was perfectly written
+// (✔MEASURED through the CLI before this helper existed). How deeply a dialect
+// nests its operand production is the dialect's business, which is the same
+// reason `findDescendantOfRule` is rule-keyed rather than position-keyed.
+NodeId firstVisibleToken(Tree const& tree, NodeId n) {
+    if (!n.valid()) return NodeId{};
+    if (tree.kind(n) == NodeKind::Token) return n;
+    for (NodeId const c : tree.children(n)) {
+        if (isEmptySpace(tree.flags(c))) continue;
+        if (NodeId const hit = firstVisibleToken(tree, c); hit.valid()) {
+            return hit;
+        }
+    }
+    return NodeId{};
+}
+
+NodeId lastVisibleToken(Tree const& tree, NodeId n) {
+    if (!n.valid()) return NodeId{};
+    if (tree.kind(n) == NodeKind::Token) return n;
+    NodeId found{};
+    for (NodeId const c : tree.children(n)) {
+        if (isEmptySpace(tree.flags(c))) continue;
+        if (NodeId const hit = lastVisibleToken(tree, c); hit.valid()) {
+            found = hit;
+        }
+    }
+    return found;
+}
+
 // Every descendant (self included) whose rule is `rule`, in DOCUMENT ORDER.
 // Used for the memory operand's register list: a base/index pair is ordered by
 // position in every addressing syntax there is, so document order is the one
@@ -264,20 +298,39 @@ public:
         if (!scanUnit()) return std::nullopt;
         // PASS 1b — decide which labels open functions and which are blocks.
         if (!classifyLabels()) return std::nullopt;
+        // PASS 1c — resolve every symbol-valued DATA slot to the label it
+        // names and MINT that label's symbol.
+        //
+        // ★★★ THE POSITION OF THIS PASS IS LOAD-BEARING AND IT IS NOT A
+        // CONVENIENCE. It runs BEFORE the emit walk because
+        // `derivableIndirectSuccessors()` reads `LabelInfo::symbol.valid()` as
+        // the address-taken predicate, and the emit walk is where an indirect
+        // branch consults it. A jump table in `.data` is the ONLY way a `.s`
+        // makes a block address-taken without writing an instruction, so
+        // resolving these AFTER the walk would leave `br x0` refusing a
+        // successor set the file had already stated — the refusal would be
+        // true of the pass ORDER rather than of the source.
+        if (!bindPendingDataSymbols()) return std::nullopt;
         // PASS 2 — emit.
         if (!emitAll()) return std::nullopt;
         // PASS 3 — the data labels' module symbols. Deferred to here for the
         // one reason `.globl` exists: it may appear AFTER the label it exports,
         // so binding is only decidable once every directive has been seen.
         addDataSymbols();
+        // PASS 3b — write each pending data relocation into its item. Deferred
+        // to here because a slot naming an INTERIOR label also has to state
+        // WHICH LIR BLOCK the symbol is, and blocks are created by the emit
+        // walk (`openFunction` reserves a function's blocks when it opens).
+        emitPendingDataRelocations();
         if (!ok_) return std::nullopt;
 
         AsmTextModule out;
-        out.lir             = std::move(builder_).finish();
-        out.symbols         = std::move(symbols_);
-        out.userEntrySymbol = userEntry_;
-        out.externImports   = std::move(externs_);
-        out.dataItems       = std::move(dataItems_);
+        out.lir                 = std::move(builder_).finish();
+        out.symbols             = std::move(symbols_);
+        out.userEntrySymbol     = userEntry_;
+        out.externImports       = std::move(externs_);
+        out.dataItems           = std::move(dataItems_);
+        out.blockSymbolBindings = std::move(blockSymbolBindings_);
         return out;
     }
 
@@ -294,6 +347,28 @@ private:
         d.buffer = tree_.source().id();
         reporter_.report(std::move(d));
         ok_ = false;
+    }
+
+    // ★★ A DIAGNOSTIC THAT DOES NOT REFUSE THE FILE — the one shape this walker
+    // needed and did not have. It exists for exactly one situation, and the
+    // situation is defined by the reference assembler rather than by taste:
+    // where gas ACCEPTS an input (rc=0), does something the wire format forces,
+    // and SAYS SO. ✔MEASURED 2026-08-13 — `.bss` + `.space 4, 7` assembles
+    // rc=0 with `Warning: ignoring fill value in section '.bss'`.
+    // ⇒ Refusing would reject what the reference accepts; accepting silently
+    // would drop the programmer's fill with nothing said. Matching gas means
+    // matching BOTH halves: the exit code AND the message.
+    // ⚠ IT DOES NOT TOUCH `ok_`. A warning that failed the lowering would be an
+    // error wearing a different severity, and the harness would report a refusal
+    // where gas reports a build.
+    void warn(NodeId at, std::string message) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::A_AsmTextUnsupported;
+        d.severity = DiagnosticSeverity::Warning;
+        d.actual   = std::move(message);
+        if (at.valid()) d.span = tree_.span(at);
+        d.buffer = tree_.source().id();
+        reporter_.report(std::move(d));
     }
 
     // Every "this pair does not realize that" message ends the same way, and
@@ -640,6 +715,19 @@ private:
         std::size_t dataItem = kNoLabel;   // index into `dataItems_`
     };
 
+    // One `.quad Lw`-style data slot whose value is a symbol's ADDRESS, held
+    // between the pass that read it and the passes that can resolve it.
+    // D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET.
+    struct PendingDataReloc {
+        std::size_t    itemIndex  = 0;  // index into `dataItems_`
+        std::uint32_t  byteOffset = 0;  // offset of the slot within that item
+        std::string    name;            // the label the directive named
+        NodeId         at{};            // the operand's span, for the diagnostic
+        RelocationKind kind{};          // the target's absolute reloc of this width
+        std::string    spelling;        // the directive that wrote it
+        std::size_t    labelIndex = kNoLabel;  // resolved in pass 1c
+    };
+
     // ★★★ A DOT-PREFIXED NAME IS A LABEL WHENEVER IT CARRIES A LABEL TAIL.
     // `.L3:` and `.text` are BYTE-IDENTICAL up to the token after the name, so
     // the shared grammar reads both as `asmDirective` and hangs an
@@ -795,43 +883,40 @@ private:
                              spelling, pairSuffix()));
             return;
         }
+        // ★★ A SECTION NAME IS NOT A DIRECTIVE (D-ASM-SECTION-DIRECTIVE-WITH-
+        // OPERAND-UNMODELLED). The row exists so `.section rodata` can resolve;
+        // writing it bare is what gas itself refuses, and the refusal names the
+        // form that works rather than saying "unknown directive" about a
+        // spelling the dialect visibly declares.
+        if (row->operandOnly) {
+            fail(kids[1],
+                 std::format("'.{}' is a SECTION NAME in this dialect, not a "
+                             "directive — it is reachable only as the operand "
+                             "of {}, which is exactly what the reference "
+                             "assembler accepts ('.section .{}' assembles; a "
+                             "bare '.{}' is an unknown pseudo-op){}",
+                             spelling,
+                             cfg_.spellingsForVerb(
+                                 AsmDirectiveVerb::SectionByName),
+                             spelling, spelling, pairSuffix()));
+            return;
+        }
         switch (row->verb) {
         case AsmDirectiveVerb::SectionText:
-            // Every function this walker emits lands in the text section — LIR
-            // has no other — so the verb's whole job is to CLOSE whatever data
-            // section was open, which is what makes a `.data … .text …` file
-            // put its instructions back in code.
-            scanSection_.reset();
-            openDataItem_ = kNoLabel;
+        case AsmDirectiveVerb::SectionData:
+            applySectionRow(*row, kids[1], spelling);
             return;
-        case AsmDirectiveVerb::SectionData: {
-            // ★ THE SECTION IS THE DIALECT ROW'S, RESOLVED THROUGH THE ONE
-            // SHARED TAXONOMY. The loader already refused an unknown name, so a
-            // miss here is a substrate bug and says so rather than defaulting.
-            auto const kind = dataSectionKindFromName(row->sectionName);
-            if (!kind.has_value()) {
-                fail(kids[1],
-                     std::format("internal: directive '.{}' declares data "
-                                 "section '{}', which the substrate's "
-                                 "DataSectionKind vocabulary does not name — "
-                                 "the load-time validation that guarantees this "
-                                 "did not hold{}",
-                                 spelling, row->sectionName, pairSuffix()));
-                return;
-            }
-            scanSection_ = *kind;
-            // ⚠ THE OPEN ITEM DOES NOT SURVIVE A SECTION CHANGE. An item
-            // carries ONE `DataSectionKind`, so bytes written after `.data`
-            // cannot append to an item opened under `.rodata` — they would be
-            // emitted read-only and the program would fault writing them.
-            openDataItem_ = kNoLabel;
+        case AsmDirectiveVerb::SectionByName: {
+            auto const* named = sectionRowFromOperand(directive, kids, spelling);
+            if (named == nullptr) return;
+            applySectionRow(*named, kids[1], named->spelling);
             return;
         }
         case AsmDirectiveVerb::EmitData:
             emitDataValues(directive, kids, *row, spelling);
             return;
-        case AsmDirectiveVerb::ReserveZeroBytes:
-            reserveZeroBytes(directive, kids, spelling);
+        case AsmDirectiveVerb::ReserveFillBytes:
+            reserveFillBytes(directive, kids, spelling);
             return;
         case AsmDirectiveVerb::GlobalSymbol: {
             if (kids.size() < 3) {
@@ -881,25 +966,169 @@ private:
         fail(kids[1], "unhandled directive verb");
     }
 
+    // ★★★ APPLY ONE SECTION-OPENING ROW — the single place a section change
+    // happens in pass 1, whether the row was reached by writing the directive
+    // (`.data`) or by naming it (`.section .data`). Two code paths for one
+    // effect is how `.section .data` would start differing from `.data`; there
+    // is exactly one, so they cannot.
+    void applySectionRow(AsmDirectiveSpelling const& row, NodeId at,
+                         std::string_view spelling) {
+        if (row.verb == AsmDirectiveVerb::SectionText) {
+            // Every function this walker emits lands in the text section — LIR
+            // has no other — so the verb's whole job is to CLOSE whatever data
+            // section was open, which is what makes a `.data … .text …` file
+            // put its instructions back in code.
+            scanSection_.reset();
+            openDataItem_ = kNoLabel;
+            return;
+        }
+        // ★ THE SECTION IS THE DIALECT ROW'S, RESOLVED THROUGH THE ONE SHARED
+        // TAXONOMY. The loader already refused an unknown name, so a miss here
+        // is a substrate bug and says so rather than defaulting.
+        auto const kind = dataSectionKindFromName(row.sectionName);
+        if (!kind.has_value()) {
+            fail(at,
+                 std::format("internal: directive '.{}' declares data section "
+                             "'{}', which the substrate's DataSectionKind "
+                             "vocabulary does not name — the load-time "
+                             "validation that guarantees this did not hold{}",
+                             spelling, row.sectionName, pairSuffix()));
+            return;
+        }
+        scanSection_ = *kind;
+        // ⚠ THE OPEN ITEM DOES NOT SURVIVE A SECTION CHANGE. An item carries
+        // ONE `DataSectionKind`, so bytes written after `.data` cannot append
+        // to an item opened under `.rodata` — they would be emitted read-only
+        // and the program would fault writing them.
+        openDataItem_ = kNoLabel;
+    }
+
+    // ★★★ THE SECTION A `SectionByName` DIRECTIVE'S OPERAND NAMES, or nullptr
+    // (diagnostic already emitted). `.section .rodata` — the section is the
+    // OPERAND, and it resolves against this dialect's OWN section-opening rows,
+    // so `.section .data` and `.data` reach the identical row by construction.
+    //
+    // ★★ THE INTRODUCER IS READ OFF THE TREE, NEVER HARDCODED AS `"."`. kids[0]
+    // is this very directive's introducer token, so the check costs nothing and
+    // a dialect spelling it `@` or `!` behaves correctly rather than silently
+    // comparing against a dot nobody wrote. And the operand MUST carry it:
+    // ✔MEASURED 2026-08-13, gas's `.section rodata` (no dot) creates a section
+    // literally named `rodata` with NO alloc flag, which is a different section
+    // from `.rodata` — accepting the undotted spelling as a synonym would place
+    // data somewhere the reference assembler does not.
+    [[nodiscard]] AsmDirectiveSpelling const*
+    sectionRowFromOperand(NodeId directive, std::vector<NodeId> const& kids,
+                          std::string_view spelling) {
+        if (kids.size() < 3) {
+            fail(directive,
+                 std::format("'.{}' needs the section it opens as its operand "
+                             "(one of {}){}",
+                             spelling, cfg_.sectionOperandSpellings(),
+                             pairSuffix()));
+            return nullptr;
+        }
+        std::vector<NodeId> operands;
+        for (NodeId const o : visibleChildren(tree_, kids[2])) {
+            if (tree_.kind(o) == NodeKind::Internal) operands.push_back(o);
+        }
+        if (operands.empty()) {
+            fail(directive,
+                 std::format("'.{}' needs the section it opens as its operand "
+                             "(one of {}){}",
+                             spelling, cfg_.sectionOperandSpellings(),
+                             pairSuffix()));
+            return nullptr;
+        }
+        // ★★ FLAGS AND TYPE ARE REFUSED, NOT IGNORED, AND THIS IS THE DECISION
+        // THE ANCHOR ASKED TO BE STATED. Real `.section` carries them —
+        // ✔MEASURED 2026-08-13, gas accepts `.section .rodata,"a",@progbits`
+        // and `.section .note.GNU-stack,"",@progbits` rc=0. Every one of those
+        // operands changes the section's WIRE SEMANTICS (`"aw"` writable,
+        // `"ax"` executable, `@nobits` zero-fill), and DSS derives all of them
+        // from the `DataSectionKind` instead. So honouring the name while
+        // dropping the flags would put `.section .rodata,"aw"` in a read-only
+        // section the program then faults writing — a silent accept-and-ignore
+        // with a runtime cost. WHAT IS MODELLED: the section NAME. WHAT FAILS
+        // LOUD: everything after it.
+        if (operands.size() > 1) {
+            fail(operands[1],
+                 std::format("'.{}' carries {} operands; this build models the "
+                             "section NAME and nothing else. The flags/type "
+                             "operands ('{}' here) change what the section IS — "
+                             "writable, executable, zero-fill — and this build "
+                             "derives every one of those from the section kind, "
+                             "so honouring the name while dropping them would "
+                             "place data somewhere the source did not ask for, "
+                             "with no diagnostic{}",
+                             spelling, operands.size(),
+                             tree_.text(operands[1]), pairSuffix()));
+            return nullptr;
+        }
+        std::string_view const introducer = tree_.text(kids[0]);
+        NodeId const lead = firstVisibleToken(tree_, operands[0]);
+        if (!lead.valid() || tree_.text(lead) != introducer) {
+            fail(operands[0],
+                 std::format("'.{}' names its section WITH this dialect's "
+                             "directive introducer ('{}'); '{}' does not carry "
+                             "it. The reference assembler treats the two as "
+                             "DIFFERENT sections — an undotted name creates a "
+                             "section of exactly that name with no allocation "
+                             "flag — so they are not synonyms{}",
+                             spelling, introducer, tree_.text(operands[0]),
+                             pairSuffix()));
+            return nullptr;
+        }
+        NodeId const nameTok = lastVisibleToken(tree_, operands[0]);
+        std::string_view const name =
+            nameTok.valid() ? tree_.text(nameTok) : std::string_view{};
+        auto const* named = cfg_.sectionRowByName(name);
+        if (named == nullptr) {
+            fail(operands[0],
+                 std::format("'.{}' names section '{}{}', which this dialect "
+                             "does not declare — the sections it can open are "
+                             "{}. A section this build cannot place is refused "
+                             "by name rather than mapped onto a different one, "
+                             "because data in the wrong section is read-only "
+                             "where the program writes it, or writable where it "
+                             "must not be{}",
+                             spelling, introducer, name,
+                             cfg_.sectionOperandSpellings(), pairSuffix()));
+            return nullptr;
+        }
+        return named;
+    }
+
     // ★ THE ONE "ARE WE IN DATA?" GATE, shared by both data verbs. Emitting
     // data into the text section would put bytes where LIR puts instructions
     // and the linker would run them.
     [[nodiscard]] bool requireDataSection(NodeId at, std::string_view spelling) {
         if (scanSection_.has_value()) return true;
+        // ⚠ THE SUGGESTION LISTS ONLY WHAT A `.s` MAY ACTUALLY WRITE.
+        // `spellingsForVerb` excludes `operandOnly` rows precisely so this
+        // message never tells a reader to write `.rodata`, which this dialect
+        // and gas both refuse; the `.section` route is named separately, with
+        // its own operand list, so both doors are stated and neither is wrong.
+        auto const direct =
+            cfg_.spellingsForVerb(AsmDirectiveVerb::SectionData);
+        auto const byName =
+            cfg_.spellingsForVerb(AsmDirectiveVerb::SectionByName);
+        std::string how;
+        if (!direct.empty()) how = std::format("write one of {}", direct);
+        if (!byName.empty()) {
+            if (!how.empty()) how += ", or ";
+            how += std::format("name one after {} (the sections it can open "
+                               "are {})",
+                               byName, cfg_.sectionOperandSpellings());
+        }
+        if (how.empty()) {
+            how = "this dialect declares none — it needs a directive row with "
+                  "verb 'sectionData'";
+        }
         fail(at,
              std::format("'.{}' defines data, but no data section is open — "
                          "bytes written here would land in the TEXT section and "
-                         "be executed. Open one with this dialect's data-section "
-                         "directive ({}){}",
-                         spelling,
-                         cfg_.spellingsForVerb(AsmDirectiveVerb::SectionData)
-                                 .empty()
-                             ? std::string{"this dialect declares none — it "
-                                           "needs a directive row with verb "
-                                           "'sectionData'"}
-                             : cfg_.spellingsForVerb(
-                                   AsmDirectiveVerb::SectionData),
-                         pairSuffix()));
+                         "be executed. To open one, {}{}",
+                         spelling, how, pairSuffix()));
         return false;
     }
 
@@ -929,7 +1158,8 @@ private:
                              spelling));
             return;
         }
-        auto& item = dataItems_[currentDataItem()];
+        std::size_t const itemIdx = currentDataItem();
+        auto&             item    = dataItems_[itemIdx];
         // ★ ALIGNMENT IS DERIVED FROM THE WIDEST ELEMENT THE ITEM CARRIES, not
         // declared. A `.quad` table must be 8-aligned for the loads that read
         // it; a `.byte` string needs 1. `.p2align` is an `ignoredAnnotation` in
@@ -943,18 +1173,33 @@ private:
             auto decoded = decodeOperand(operandNode);
             if (!decoded) return;
             if (!decoded->hasValue) {
-                fail(decoded->node,
-                     std::format("'.{}' names '{}', and a symbol-valued data "
-                                 "item needs a relocation this build does not "
-                                 "reach from assembly yet — the bytes would "
-                                 "otherwise be whatever the address happened to "
-                                 "be at compile time{}",
-                                 spelling,
-                                 decoded->symbol.empty()
-                                     ? std::string{"a non-numeric operand"}
-                                     : decoded->symbol,
-                                 pairSuffix()));
-                return;
+                // ★★★ A SYMBOL-VALUED DATA SLOT IS A RELOCATION, AND THE
+                // RELOCATION IS ALL IT IS (D-ASM-INTERIOR-LABELS-NOT-
+                // ADDRESSABLE-AT-AN-OFFSET). `.quad Lcase0` writes
+                // `unitBytes` ZERO bytes now and asks the linker to write the
+                // address later — byte-for-byte the shape a C
+                // symbol-address global (`int* p = &x;`) already emits
+                // through `lowerMirGlobalsToDataItems`.
+                //
+                // ⚠ THE NAME CANNOT BE RESOLVED HERE, AND THE REASON IS THE
+                // WHOLE PASS STRUCTURE: this runs in PASS 1, where
+                // `labelIndex_` is still filling (assembly is not
+                // declare-before-use — a jump table above the blocks it
+                // names is the NORMAL layout), no label has been classified
+                // as code or data, and no LIR block exists. So the slot is
+                // RECORDED against the name and resolved in pass 1c.
+                if (decoded->symbol.empty()) {
+                    fail(decoded->node,
+                         std::format("'.{}' takes a value or a symbol name, and "
+                                     "this operand is neither{}",
+                                     spelling, pairSuffix()));
+                    return;
+                }
+                if (!recordDataRelocation(itemIdx, *decoded, row.unitBytes,
+                                          spelling)) {
+                    return;
+                }
+                continue;
             }
             if (!valueFitsUnit(decoded->value, row.unitBytes, decoded->node,
                                spelling)) {
@@ -964,6 +1209,60 @@ private:
                 item.bytes, static_cast<std::uint64_t>(decoded->value),
                 row.unitBytes);
         }
+    }
+
+    // ★★★ THE TARGET'S ABSOLUTE-ADDRESS RELOCATION OF `widthBytes` BYTES,
+    // FOUND BY FORMULA AND NEVER BY NAME. `widthBytes == n && !pcRelative` is
+    // the same scan `compile_pipeline.cpp` runs for a C jump table and a
+    // symbol-address global, and the same one the linker runs for a cross-CU
+    // thunk slot. Matching on the string "abs64" would bind DSS to one
+    // target's spelling of a property every target states structurally.
+    [[nodiscard]] std::optional<RelocationKind>
+    absoluteRelocKind(std::uint32_t widthBytes) const {
+        for (auto const& r : target_.relocations()) {
+            if (r.widthBytes == widthBytes && !r.pcRelative) return r.kind;
+        }
+        return std::nullopt;
+    }
+
+    // Reserve a symbol-valued slot in data item `itemIdx` and record the
+    // relocation that will fill it. Returns false with a diagnostic when the
+    // target cannot express an absolute address of this width.
+    [[nodiscard]] bool recordDataRelocation(std::size_t             itemIdx,
+                                            DecodedOperand const&   operand,
+                                            std::uint32_t           unitBytes,
+                                            std::string_view        spelling) {
+        auto const kind = absoluteRelocKind(unitBytes);
+        if (!kind.has_value()) {
+            // ⚠ REFUSED, NOT NARROWED TO A DIFFERENT WIDTH. `.long Lw` on a
+            // target with only an 8-byte absolute relocation would silently
+            // store the low half of an address; a table read through it jumps
+            // somewhere that is not the label.
+            fail(operand.node,
+                 std::format("'.{}' names '{}', which needs an ABSOLUTE "
+                             "{}-byte relocation to write that address at link "
+                             "time, and this target declares none (its "
+                             "relocations are matched by the width/pc-relative "
+                             "FORMULA, never by name). Emitting the slot "
+                             "without one would store whatever the address "
+                             "happened to be at compile time{}",
+                             spelling, operand.symbol, unitBytes,
+                             pairSuffix()));
+            return false;
+        }
+        auto& item = dataItems_[itemIdx];
+        PendingDataReloc pending;
+        pending.itemIndex  = itemIdx;
+        pending.byteOffset = static_cast<std::uint32_t>(item.bytes.size());
+        pending.name       = operand.symbol;
+        pending.at         = operand.node;
+        pending.kind       = *kind;
+        pending.spelling   = std::string{spelling};
+        pendingDataRelocs_.push_back(std::move(pending));
+        // The slot itself is ZERO bytes of the declared width — the linker
+        // writes the address over them.
+        item.bytes.insert(item.bytes.end(), unitBytes, std::uint8_t{0});
+        return true;
     }
 
     // Does `v` fit `unitBytes` bytes read either as signed or as unsigned?
@@ -988,33 +1287,85 @@ private:
         return false;
     }
 
-    // `.zero 16` / `.space 16` / `.skip 16` — the operand is a byte COUNT.
+    // `.zero 16` / `.space 16, 7` / `.skip 16` — the first operand is a byte
+    // COUNT, the OPTIONAL second is the byte to fill with (absent ⇒ zero).
     //
     // ★ ONE VERB, TWO REALIZATIONS, SPLIT BY THE SUBSTRATE'S OWN `isZeroFill`
     // PREDICATE rather than by a section name: a zero-fill section reserves the
     // extent (`reservedSize`, no file bytes — the invariant
     // `validateAssembledData` enforces), and every other section stores real
-    // zero bytes. That is the same chokepoint `AssembledData::sizeInSection`
-    // and the walkers use, so a future zero-fill kind lands at one point.
-    void reserveZeroBytes(NodeId directive, std::vector<NodeId> const& kids,
+    // bytes. That is the same chokepoint `AssembledData::sizeInSection` and the
+    // walkers use, so a future zero-fill kind lands at one point.
+    //
+    // ★★★ WHY THE FILL NEEDED NO NEW REPRESENTATION, WHICH IS THE QUESTION
+    // D-ASM-SPACE-DIRECTIVE-FILL-BYTE-UNMODELLED ACTUALLY ASKED. `AssembledData`
+    // already answers it BOTH ways and the answer is the `isZeroFill` split:
+    //   • FILE-BACKED (`Rodata`/`Data`/`Tdata`/`RelRoConst`) — `bytes` is a raw
+    //     `std::vector<std::uint8_t>`, so a fill is materialized straight into
+    //     it. The old code already wrote `insert(count, 0)` here; the fill is
+    //     that same call with the byte parameterised, and NOTHING was added.
+    //   • ZERO-FILL (`Bss`/`Tbss`) — `bytes` MUST stay empty (the invariant
+    //     `validateAssembledData` enforces as `K_BssDataHasBytes`) and only
+    //     `reservedSize` exists. There is no representation for "reserve N bytes
+    //     of 0x07" and there cannot be one: the wire format stores no file bytes
+    //     for the section at all.
+    // ⇒ a non-zero fill in a zero-fill section is not "unimplemented", it is
+    // INEXPRESSIBLE — and gas agrees, which settles what to do about it.
+    void reserveFillBytes(NodeId directive, std::vector<NodeId> const& kids,
                           std::string_view spelling) {
         if (!requireDataSection(directive, spelling)) return;
         if (kids.size() < 3) {
             fail(directive,
-                 std::format("'.{}' needs the number of zero bytes to reserve",
+                 std::format("'.{}' needs the number of bytes to reserve",
                              spelling));
             return;
         }
         std::optional<std::int64_t> count;
+        std::optional<std::int64_t> fill;
+        NodeId                      fillNode{};
         for (NodeId const operandNode : visibleChildren(tree_, kids[2])) {
             if (tree_.kind(operandNode) != NodeKind::Internal) continue;
             auto decoded = decodeOperand(operandNode);
             if (!decoded) return;
-            if (count.has_value()) {
+            if (fill.has_value()) {
                 fail(decoded->node,
-                     std::format("'.{}' takes exactly one byte count{}",
+                     std::format("'.{}' takes a byte count and an optional fill "
+                                 "byte — at most two operands{}",
                                  spelling, pairSuffix()));
                 return;
+            }
+            if (count.has_value()) {
+                // ★ THE FILL IS ONE BYTE, CHECKED THROUGH THE SAME CHOKEPOINT
+                // `.byte` USES. Reusing `valueFitsUnit` keeps ONE policy for
+                // "does this value fit N bytes": both signed and unsigned
+                // readings accepted (`.space 4, -1` and `.space 4, 255` are the
+                // same byte and gas takes either — ✔MEASURED, `-1` rc=0), and a
+                // value outside BOTH refused. ⚠ THAT REFUSAL IS A KNOWN,
+                // DELIBERATE DIVERGENCE: ✔MEASURED, gas TRUNCATES `.space 4,
+                // 300` with `Warning: value 0x12c truncated to 0x2c` and exits
+                // 0. This build refuses instead — the same call this walker
+                // already makes for `.byte 300`, so the divergence is one
+                // module-wide policy rather than a second opinion invented
+                // here, and it errs toward refusing input rather than silently
+                // writing a byte the source did not name.
+                if (!decoded->hasValue) {
+                    fail(decoded->node,
+                         std::format("'.{}' needs a numeric fill byte; '{}' is "
+                                     "a symbol, and its address is not known "
+                                     "when these bytes are laid out{}",
+                                     spelling,
+                                     decoded->symbol.empty()
+                                         ? std::string{"a non-numeric operand"}
+                                         : decoded->symbol,
+                                     pairSuffix()));
+                    return;
+                }
+                if (!valueFitsUnit(decoded->value, 1, decoded->node, spelling)) {
+                    return;
+                }
+                fill     = decoded->value;
+                fillNode = decoded->node;
+                continue;
             }
             if (!decoded->hasValue || decoded->value < 0) {
                 fail(decoded->node,
@@ -1026,18 +1377,42 @@ private:
         }
         if (!count.has_value()) {
             fail(directive,
-                 std::format("'.{}' needs the number of zero bytes to reserve",
+                 std::format("'.{}' needs the number of bytes to reserve",
                              spelling));
             return;
         }
         auto& item = dataItems_[currentDataItem()];
         if (isZeroFill(item.section)) {
+            // ★★ A NON-ZERO FILL HAS NOWHERE TO GO HERE, AND THE REFERENCE
+            // ASSEMBLER'S ANSWER IS THE ONE THIS BUILD GIVES. ✔MEASURED
+            // 2026-08-13: `aarch64-linux-gnu-as` on `.bss` + `.space 4, 7`
+            // exits 0 with `Warning: ignoring fill value in section '.bss'`. So
+            // gas ACCEPTS the input, DROPS the fill, and SAYS SO — and matching
+            // a reference compiler means matching all three
+            // ([[feedback_reference_compilers_are_the_spec]], which is
+            // bidirectional: refusing what gas accepts is a defect too).
+            // ⇒ warn, do not fail. An explicit `0` is not warned about: nothing
+            // is being dropped, so there is nothing to say.
+            if (fill.has_value() && *fill != 0) {
+                warn(fillNode.valid() ? fillNode : directive,
+                     std::format("'.{}' names fill byte {}, but the open "
+                                 "section is zero-fill ({}) — the wire format "
+                                 "reserves its size WITHOUT storing file bytes, "
+                                 "so there is nowhere for a non-zero pattern to "
+                                 "live and the fill is ignored (the reference "
+                                 "assembler does the same, and warns){}",
+                                 spelling, *fill,
+                                 dataSectionKindName(item.section),
+                                 pairSuffix()));
+            }
             item.reservedSize += static_cast<std::uint64_t>(*count);
             return;
         }
         item.bytes.insert(item.bytes.end(),
                           static_cast<std::size_t>(*count),
-                          static_cast<std::uint8_t>(0));
+                          static_cast<std::uint8_t>(
+                              static_cast<std::uint64_t>(fill.value_or(0))
+                              & 0xFFu));
     }
 
     // ── pass 1b: which labels are functions ───────────────────────────────
@@ -1217,7 +1592,25 @@ private:
         auto const kids = visibleChildren(tree_, directive);
         if (kids.size() < 2) return;
         auto const* row = cfg_.directiveBySpelling(std::string{tree_.text(kids[1])});
-        if (row == nullptr) return;
+        if (row == nullptr || row->operandOnly) return;
+        // ★ A `SectionByName` DIRECTIVE IS RESOLVED TO ITS NAMED ROW FIRST, so
+        // pass 2 tracks `.section .data` exactly as it tracks `.data`. ⚠ THIS
+        // WALK IS SILENT ON FAILURE BY DESIGN — pass 1 already reported every
+        // way the operand can be wrong, and re-reporting here would double
+        // every `.section` diagnostic. `sectionRowFromOperand` cannot be reused
+        // for that reason; the lookup is repeated WITHOUT its diagnostics.
+        if (row->verb == AsmDirectiveVerb::SectionByName) {
+            if (kids.size() < 3) return;
+            AsmDirectiveSpelling const* named = nullptr;
+            for (NodeId const o : visibleChildren(tree_, kids[2])) {
+                if (tree_.kind(o) != NodeKind::Internal) continue;
+                NodeId const t = lastVisibleToken(tree_, o);
+                if (t.valid()) named = cfg_.sectionRowByName(tree_.text(t));
+                break;
+            }
+            if (named == nullptr) return;
+            row = named;
+        }
         if (row->verb == AsmDirectiveVerb::SectionText) {
             emitSection_.reset();
         } else if (row->verb == AsmDirectiveVerb::SectionData) {
@@ -1520,11 +1913,13 @@ private:
         buildLirInst(ins, row, resolved);
     }
 
-    // The register-name text a node spells: the LAST visible token, because a
-    // sigil (`%`) leads and carries no identity. Shared by the role
-    // disambiguation and by `decodeRegister`, so the two can never disagree
-    // about which token is the name.
-    [[nodiscard]] std::string_view registerNameOf(NodeId node) const {
+    // The NAME text a node spells: the LAST visible token, because whatever
+    // leads it is a SIGIL and carries no identity — `%` before a register,
+    // `@`/`%` before a type marker, the directive introducer before a section
+    // name. Shared by the role disambiguation, by `decodeRegister` and by the
+    // `SectionByName` operand read, so no two of them can disagree about which
+    // token is the name.
+    [[nodiscard]] std::string_view trailingNameOf(NodeId node) const {
         std::string_view name;
         for (NodeId const k : visibleChildren(tree_, node)) {
             if (tree_.kind(k) == NodeKind::Token) name = tree_.text(k);
@@ -1548,7 +1943,7 @@ private:
     [[nodiscard]] AsmOperandRole resolveRole(NodeId node,
                                              std::uint8_t mask) const {
         if (AssemblyConfig::maskHas(mask, AsmOperandRole::Register)) {
-            auto const name = registerNameOf(node);
+            auto const name = trailingNameOf(node);
             if (!name.empty() && target_.registerByName(name).has_value()) {
                 return AsmOperandRole::Register;
             }
@@ -2231,11 +2626,20 @@ private:
             case AsmOperandRole::NegNumber:
             case AsmOperandRole::Displaced: {
                 if (!src.hasValue) {
-                    fail(src.node,
-                         std::format("symbolic operand '{}' is not yet lowered "
-                                     "by this build{}", src.symbol,
-                                     pairSuffix()));
-                    return;
+                    // ★★★ M2 — A SYMBOL-VALUED SOURCE IS AN ADDRESS, AND IT
+                    // LOWERS TO THE OPERAND SHAPE THE C FRONT END ALREADY
+                    // EMITS. Nothing here asks which mnemonic was written: the
+                    // operand becomes `[SymbolRef]` (a data/function address,
+                    // as `lowerGlobalAddr` emits) or `[SymbolRef, BlockRef]`
+                    // (an interior label, as `lowerBlockAddress` emits), and
+                    // the ELECTION decides whether this target has an opcode
+                    // that takes it. An opcode with no symbol-shaped variant
+                    // fails through the ordinary "no candidate target opcode
+                    // encodes that shape" path, naming the candidates.
+                    if (!sourceOperandForSymbol(src, ins.mnemonic, sources)) {
+                        return;
+                    }
+                    break;
                 }
                 if (src.value < std::numeric_limits<std::int32_t>::min()
                     || src.value > std::numeric_limits<std::int32_t>::max()) {
@@ -2408,6 +2812,80 @@ private:
         if (!checkElectedWidth(*chosen, *width, ins)) return;
         builder_.addInst(chosen->opcode, destReg, operands, payload, flags);
         ++blockInstCount_;
+    }
+
+    // ★★★ M2 — LOWER A SYMBOL-NAMED SOURCE OPERAND TO ITS ADDRESS.
+    // D-ASM-SYMBOL-OPERAND-NOT-LOWERED + D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-
+    // AT-AN-OFFSET, which are ONE mechanism seen from two sides: `adr x0, msg`
+    // and `adr x0, Lcase1` differ only in WHAT the label is, and the second
+    // operand is the whole difference.
+    //
+    // ★★ THE TWO SHAPES ARE THE C FRONT END'S, VERBATIM (`mir_to_lir.cpp`):
+    //   * a DATA or FUNCTION label → `[SymbolRef]`, what `lowerGlobalAddr`
+    //     emits for `&global`;
+    //   * an INTERIOR label → `[SymbolRef, BlockRef]`, what `lowerBlockAddress`
+    //     emits for `&&label`. The trailing BlockRef is metadata that wires to
+    //     no encoding field — the encoder reads it and records a
+    //     `BlockSymPatch`, which is how the synthetic symbol learns its byte
+    //     offset. Both targets already declare a `lea` variant for each shape
+    //     (`["symbol"]` / `["symbol","blockref"]`), so this needed no config,
+    //     no new `LirOperandKind` and no relocation kind: interiority lives in
+    //     the SYMBOL'S VA, so `addend == 0` and the existing rel32 / ADRP+ADD
+    //     formulas resolve it unchanged.
+    [[nodiscard]] bool sourceOperandForSymbol(DecodedOperand const&    src,
+                                              std::string_view         mnemonic,
+                                              std::vector<LirOperand>& sources) {
+        if (src.symbol.empty()) {
+            fail(src.node,
+                 std::format("'{}' reads an operand that is neither a value nor "
+                             "a name{}", mnemonic, pairSuffix()));
+            return false;
+        }
+        auto const it = labelIndex_.find(src.symbol);
+        if (it == labelIndex_.end()) {
+            // ⚠ REFUSED RATHER THAN IMPORTED, for the reason
+            // `bindPendingDataSymbols` states: `ExternImport::isData` selects
+            // the linker's indirection slot and an address-materializing
+            // instruction says nothing about code-vs-data. Anchored:
+            // D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL.
+            fail(src.node,
+                 std::format("'{}' takes the address of '{}', which this file "
+                             "defines no label for. An undefined name would "
+                             "have to become an import, and an import states "
+                             "whether it is CODE or DATA — which selects the "
+                             "linker's indirection slot — while an address "
+                             "operand says neither. A CALL is the one reference "
+                             "that answers it, which is why only a call mints "
+                             "one today{}", mnemonic, src.symbol, pairSuffix()));
+            return false;
+        }
+        std::size_t const labelIdx = it->second;
+        auto const&       L        = labels_[labelIdx];
+        if (L.isEntry || L.isData) {
+            // Already carries its symbol — a function entry from
+            // `classifyLabels`, a data label from the scan.
+            sources.push_back(LirOperand::makeSymbolRef(L.symbol.v));
+            return true;
+        }
+        // ⚠ AN INTERIOR LABEL OF ANOTHER FUNCTION IS REFUSED, exactly as
+        // `branchTarget` refuses a cross-function branch and for the identical
+        // reason: `makeBlockRef` names a block SLOT, and a slot from another
+        // function resolves to whatever block sits at that index here. The
+        // binding would be silently wrong rather than absent.
+        if (L.functionLabel != openFunctionLabel_) {
+            fail(src.node,
+                 std::format("'{}' takes the address of '{}', a label inside a "
+                             "DIFFERENT function — the block reference that "
+                             "binds an interior label's symbol to its byte "
+                             "offset is function-local, so this address cannot "
+                             "be expressed here{}",
+                             mnemonic, src.symbol, pairSuffix()));
+            return false;
+        }
+        SymbolId const sym = symbolForAddressedLabel(labelIdx);
+        sources.push_back(LirOperand::makeSymbolRef(sym.v));
+        sources.push_back(LirOperand::makeBlockRef(labels_[labelIdx].block.v));
+        return true;
     }
 
     void appendMemory(DecodedOperand const& m,
@@ -2808,6 +3286,122 @@ private:
         ++blockInstCount_;
     }
 
+    // ★★★ M1 — THE ONE PLACE AN INTERIOR LABEL ACQUIRES A SymbolId, AND IT IS
+    // REACHED ONLY FROM A RELOCATION SITE. `classifyLabels` mints for an ENTRY
+    // label (it becomes a function symbol) and the scan mints for a DATA label
+    // (it names an `AssembledData`); a BLOCK label deliberately gets none,
+    // because carrying a symbol is exactly what
+    // `derivableIndirectSuccessors()` reads as "this block's address was
+    // taken". That is the obligation the comment below states, and it is why
+    // this function is private to the two callers that bind a relocation:
+    // `sourceOperandForSymbol` (an address-materializing instruction) and
+    // `bindPendingDataSymbols` (a symbol-valued data slot). A third caller with
+    // any other motive would WIDEN the successor set of every indirect branch
+    // in the function.
+    [[nodiscard]] SymbolId symbolForAddressedLabel(std::size_t labelIdx) {
+        auto& L = labels_[labelIdx];
+        if (!L.symbol.valid()) L.symbol = mintSymbol();
+        return L.symbol;
+    }
+
+    // The index into `lir.funcAt(i)` of the function whose entry label is
+    // `entryIdx`. ★ DERIVED, NOT STORED: `openFunction` calls
+    // `builder_.addFunction` once per entry label in source order, so a
+    // function's LIR index IS its ordinal among the entry labels. A stored
+    // field would be a second copy of that fact, free to disagree.
+    [[nodiscard]] std::size_t functionOrdinalOf(std::size_t entryIdx) const {
+        std::size_t ordinal = 0;
+        for (std::size_t i = 0; i < entryIdx && i < labels_.size(); ++i) {
+            if (labels_[i].isEntry) ++ordinal;
+        }
+        return ordinal;
+    }
+
+    // PASS 1c — resolve each pending data slot's NAME to a label and mint the
+    // symbol the relocation will target.
+    bool bindPendingDataSymbols() {
+        for (auto& p : pendingDataRelocs_) {
+            auto const it = labelIndex_.find(p.name);
+            if (it == labelIndex_.end()) {
+                // ★ A NAME THIS FILE DEFINES NOWHERE IS REFUSED RATHER THAN
+                // IMPORTED. `internExtern` mints a row whose `isData` drives
+                // the linker's GOT-vs-PLT slot choice (`elf.cpp`), and a data
+                // directive states nothing about whether the thing it points
+                // at is code or data — so the import would be a guess with a
+                // wire-format consequence. Anchored:
+                // D-ASM-DATA-SLOT-CANNOT-NAME-AN-UNDEFINED-SYMBOL.
+                fail(p.at,
+                     std::format("'.{}' names '{}', which this file defines no "
+                                 "label for. A data slot holding an address "
+                                 "must name something this translation unit "
+                                 "defines: an undefined name would have to be "
+                                 "imported, and an import states whether it is "
+                                 "CODE or DATA (which selects the linker's "
+                                 "indirection slot), while a data directive "
+                                 "says neither{}",
+                                 p.spelling, p.name, pairSuffix()));
+                return false;
+            }
+            p.labelIndex = it->second;
+            auto const& L = labels_[p.labelIndex];
+            // An entry or data label already carries its symbol; only an
+            // interior BLOCK label is minted here, and minting it is precisely
+            // the act that makes its block address-taken.
+            if (L.isEntry || L.isData) continue;
+            if (L.functionLabel == kNoLabel) {
+                fail(p.at,
+                     std::format("'.{}' names '{}', which is a label inside no "
+                                 "function — its address is not part of any "
+                                 "function's bytes, so there is nothing to "
+                                 "relocate against{}",
+                                 p.spelling, p.name, pairSuffix()));
+                return false;
+            }
+            symbolForAddressedLabel(p.labelIndex);
+        }
+        return ok_;
+    }
+
+    // PASS 3b — write each pending slot's relocation, and, for a slot naming an
+    // INTERIOR label, the block-symbol binding the driver needs.
+    void emitPendingDataRelocations() {
+        for (auto const& p : pendingDataRelocs_) {
+            if (p.labelIndex == kNoLabel) continue;   // pass 1c already failed
+            auto const& L = labels_[p.labelIndex];
+            dataItems_[p.itemIndex].relocations.push_back(
+                Relocation{p.byteOffset, L.symbol, p.kind, /*addend=*/0});
+            if (L.isEntry || L.isData) continue;
+            // ★★★ M4 — THE ONE CHANNEL THAT DID NOT ALREADY EXIST. An interior
+            // label named ONLY from data emits no instruction, so the encoder
+            // records no `BlockSymPatch` and `assemble()` never binds the
+            // symbol to a byte offset. `AsmTextModule::blockSymbolBindings`
+            // carries the (function, block, symbol) triple to the driver, which
+            // binds it from the assembled function's `blockByteOffsets` through
+            // the SAME helper the C jump-table path uses.
+            //
+            // ⚠ AN INVALID BLOCK ID FAILS LOUD RATHER THAN BEING SKIPPED, and
+            // the difference matters: the relocation was ALREADY pushed above,
+            // so skipping the binding would leave a data slot relocating
+            // against a symbol with no address — the linker would report an
+            // undefined symbol and point at the link, not at this label.
+            // `openFunction` reserves every block of a function when it opens
+            // and pass 1c already refused a label belonging to no function, so
+            // reaching this is a pass-ordering bug in this file.
+            if (!L.block.valid()) {
+                fail(p.at,
+                     std::format("internal: '.{}' takes the address of '{}', "
+                                 "which reserved no basic block — the emit walk "
+                                 "never opened the function that contains it, "
+                                 "so this slot's relocation would name a symbol "
+                                 "with no address{}",
+                                 p.spelling, p.name, pairSuffix()));
+                return;
+            }
+            blockSymbolBindings_.push_back(AsmBlockSymbolBinding{
+                functionOrdinalOf(L.functionLabel), L.block.v, L.symbol});
+        }
+    }
+
     // The successor set an indirect branch in the OPEN function can be DERIVED
     // to reach: every INTERIOR label of that function whose address this file
     // has bound a relocation against. Empty ⇒ nothing to derive the set FROM.
@@ -2850,19 +3444,18 @@ private:
     // ⚠⚠ AND THE REFUSAL IS KEYED ON **DERIVABILITY**, NOT ON THE OPCODE —
     // WHICH IS THE WHOLE DESIGN AND NOT A WORDING PREFERENCE. LIR's
     // `addIndirectBr` takes every ADDRESS-TAKEN successor block, and a `.s`
-    // binds that set in exactly two ways, BOTH of which need a relocation from
-    // assembly text to a LABEL that this build does not yet reach:
-    //   * `leaq .L4(%rip), %rax` — refused today by `decodeMemory`'s
-    //     "symbol-relative memory operand needs a relocation" arm;
-    //   * a jump table in data (`.quad .L4`) — refused by the data-value walk's
-    //     "symbol-valued data item needs a relocation" arm.
-    // So the condition below is `derivableIndirectSuccessors().empty()`, and
-    // it is a QUESTION rather than a constant: WHEN INTERIOR-LABEL RELOCATION
-    // LANDS, THIS SAME CODE PATH STARTS SUCCEEDING AND ONLY THE CONDITION
-    // STOPS HOLDING. A refusal keyed on the opcode ("indirect branches are
-    // unsupported") would have to be DELETED by that change and would say
-    // nothing true in the meantime; one keyed on derivability stays where it
-    // is and becomes correct.
+    // binds that set in exactly two ways:
+    //   * materializing a label's address (`adr x1, Lcase1` / `leaq Lw, %rax`)
+    //     — `sourceOperandForSymbol`;
+    //   * a jump table in data (`.quad Lcase1`) — `bindPendingDataSymbols`.
+    // ★★★ ✔MEASURED 2026-08-13: THE PREDICTION THIS COMMENT MADE CAME TRUE
+    // WITH NO EDIT TO THIS FUNCTION. Both bindings landed, and the ONLY thing
+    // that changed here is that the condition stopped holding — the refusal
+    // below was not moved, rewritten or deleted, and `addIndirectBr` needed no
+    // relaxation. That is what a refusal keyed on the missing INPUT buys over
+    // one keyed on the opcode ("indirect branches are unsupported"), which
+    // would have had to be deleted by the very change that made it obsolete
+    // and would have said nothing true in the meantime.
     //
     // ⚠ `addIndirectBr` IS NOT RELAXED TO ACCEPT AN EMPTY LIST, and that is the
     // opposite of a granularity fork: its explicit successor list is the
@@ -2918,12 +3511,10 @@ private:
                              "the instruction, which elected fine. A `.s` writes "
                              "one by materializing a label's address "
                              "(`lea`/`adr` of a label) or by listing labels in a "
-                             "jump table (`.quad <label>`); this build refuses "
-                             "both today, in the symbol-relative memory operand "
-                             "arm and the symbol-valued data item arm, and when "
-                             "either lands this same lowering emits the branch "
-                             "with the derived set. Until then both alternatives "
-                             "are wrong: NO successors would claim control "
+                             "jump table (`.quad <label>`); this build realizes "
+                             "BOTH, so add one of them for the label(s) this "
+                             "branch may reach. Guessing is what stays refused: "
+                             "NO successors would claim control "
                              "leaves the function here, which liveness and "
                              "register allocation read as 'every value live "
                              "across this edge is dead'; EVERY block would be "
@@ -3062,6 +3653,11 @@ private:
     // Data items in SOURCE order, plus the section state each pass tracks. A
     // nullopt section means TEXT — the default a `.s` starts in.
     std::vector<AssembledData>                  dataItems_;
+    // D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET: symbol-valued data
+    // slots in SOURCE order, and the interior-label block symbols only they
+    // name. Both empty for a `.s` whose data holds no addresses.
+    std::vector<PendingDataReloc>               pendingDataRelocs_;
+    std::vector<AsmBlockSymbolBinding>          blockSymbolBindings_;
     std::optional<DataSectionKind>              scanSection_;
     std::optional<DataSectionKind>              emitSection_;
     std::size_t                                 openDataItem_      = kNoLabel;

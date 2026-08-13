@@ -10,6 +10,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/project_config.hpp"  // the ONE `.dss-project.json` parser
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (fresh merge host)
 #include "ffi/abi/abi_catalog.hpp"
@@ -27,7 +28,6 @@
 #include "program/compile_pipeline.hpp"
 #include "program/cross_validate_target_format.hpp"
 #include "program/input_resolver.hpp"
-#include "program/project_config.hpp"
 #include "program/target_spec.hpp"
 
 #include <algorithm>

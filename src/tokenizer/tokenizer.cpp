@@ -69,11 +69,22 @@ namespace {
         || (u >= 0xC2 && u <= 0xF4);
 }
 
+// ★★★ THE CONTINUATION RULE MOVED TO `IdentifierClass` (grammar_schema.hpp) —
+// D-ASM-DIALECT-IDENTIFIER-CONTINUATION-NOT-CONFIGURABLE, 2026-08-13 — because
+// it grew a SECOND reader. A language may now widen the class
+// (`identifierClass.extraContinue`), and the LOADER has to know the universal
+// set to refuse an extra that already continues an identifier; a copy of the
+// rule here and a copy there is how the loader starts accepting a class the
+// tokenizer ignores. This alias keeps the local call sites reading the same as
+// `isIdStart` beside it.
+// ⚠ AND `isIdStart` DELIBERATELY HAS NO CONFIG SIBLING: an extra character may
+// CONTINUE a name and may never START one. See `IdentifierClass`'s docblock —
+// the leading-`.` case a gas dialect needs is owned by the
+// `directiveIntroducer` TOKEN plus `asmDirective`'s `{optional asmLabelTail}`
+// slot, and a second mechanism for the same byte is exactly how `.L3:` and
+// `.text` would start disagreeing about who owns them.
 [[nodiscard]] constexpr bool isIdContinue(char c) noexcept {
-    const auto u = static_cast<unsigned char>(c);
-    return (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') || u == '_'
-        || (u >= '0' && u <= '9')
-        || u >= 0x80;   // accept any non-ASCII byte (continuation bytes legal mid-run)
+    return IdentifierClass::universalContinue(c);
 }
 
 [[nodiscard]] constexpr bool isDigit(char c) noexcept {
@@ -635,6 +646,20 @@ TokenizeResult Tokenizer::tokenize() && {
     // bare digit can still be claimed by a language-specific token.
     NumberStyle const* const numberStyle = schema_->numberStyle();
 
+    // Identifier continuation class (schema v4 `identifierClass`; config-
+    // driven). EMPTY for every language that declares no block, which is the
+    // universal ASCII+UTF-8 rule and the behaviour every shipped language had
+    // before the facet existed.
+    // ⚠ RESOLVED ONCE, OUTSIDE THE LOOP — same posture as `numberStyle` and
+    // `declaredNewlineKind` above, and for the same reason: this feeds a
+    // per-BYTE predicate inside the identifier run.
+    // ★ AND IT IS CONSUMED ON THE HOT PATH RATHER THAN VALIDATED AND FORGOTTEN,
+    // which is the whole lesson of the `declaredNewlineKind` postmortem twenty
+    // lines up: the loader accepting a lexical key that the tokenizer ignores
+    // produces a WRONG PARSE, not a parse error. The single call site is the
+    // continuation loop in the id-start branch.
+    IdentifierClass const& identClass = schema_->identifierClass();
+
     // Probe length is bounded by the schema's longest declared lexeme
     // key. Recomputing this per call would re-walk the lexeme table;
     // pin it once for the entire tokenize() invocation.
@@ -1071,7 +1096,7 @@ TokenizeResult Tokenizer::tokenize() && {
         // global lookup loses (`if`, `if_foo`, `Nxyz`).
         if (isIdStart(c)) {
             std::size_t identLen = 1;
-            while (isIdContinue(r.peek(identLen))) ++identLen;
+            while (identClass.continuesIdentifier(r.peek(identLen))) ++identLen;
 
             const auto globalHit = longestMatchInMode(*schema_, activeMode,
                                                       r.remaining(), lexemeProbeMax);

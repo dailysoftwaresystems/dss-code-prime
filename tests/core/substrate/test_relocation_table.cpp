@@ -7,7 +7,7 @@
 // and the `relocation_row` concept boundary.
 
 #include "core/substrate/diagnostic_collector.hpp"
-#include "core/substrate/relocation_table.hpp"
+#include "core/substrate/relocation_table_json.hpp"
 #include "core/substrate/transparent_string_hash.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"

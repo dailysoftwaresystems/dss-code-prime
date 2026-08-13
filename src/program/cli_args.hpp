@@ -2,6 +2,8 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/resolve_library_spec.hpp"  // ResolveLibrarySpec (shared
+                                                // with the manifest surface)
 #include "program/input_resolver.hpp"
 
 #include <cstdint>
@@ -49,29 +51,13 @@ enum class CompileConfig : std::uint8_t {
 [[nodiscard]] DSS_EXPORT std::string_view
     compileConfigName(CompileConfig c) noexcept;
 
-// ── ResolveLibrarySpec (D-FFI-DECLARED-IMPORT-NAME) ─────────────────
-//
-// ONE `--resolve-library` entry: the binary to READ, plus the OPTIONAL
-// runtime identity to RECORD for the symbols read out of it. The two are
-// separate questions and a stand-in binary answers them differently — see
-// the three-level precedence docblock on `ffi::BinaryLibrarySource`
-// (`src/ffi/ingest.hpp`), which is where the ranking is decided.
-//
-// ONE type for the whole driver tier: the CLI parses into it, the project
-// manifest parses into it, `Program` stores it, and `CompileOptions` carries
-// it to the pipeline — so no layer can drop the declared name in transit.
-// Source / target / object-format agnostic: two opaque strings, no arm of
-// either field branches on language, CPU, or format.
-struct DSS_EXPORT ResolveLibrarySpec {
-    // The on-disk binary whose EXPORT SURFACE is read. Always required.
-    std::filesystem::path path;
-    // The runtime identity to record (ELF DT_NEEDED / Mach-O LC_LOAD_DYLIB /
-    // PE import-descriptor name). EMPTY = NOT STATED ⇒ the binary's own
-    // embedded soname wins, else the file basename. Guaranteed non-degenerate
-    // when non-empty: the CLI + manifest boundaries reject an empty side LOUD
-    // rather than storing a value the loader could never resolve.
-    std::string declaredImportName;
-};
+// `ResolveLibrarySpec` — the `--resolve-library` value type — now lives in
+// `core/types/resolve_library_spec.hpp`, which this header includes above.
+// It moved DOWN when the project-config loader that parses the same value out
+// of a manifest moved into `core`
+// (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS); leaving it here would have
+// kept `core` reaching up into the driver tier for it. The type is unchanged —
+// still ONE type for the CLI, the manifest, `Program`, and `CompileOptions`.
 
 struct DSS_EXPORT CliArgs {
     // ── Mode flags (mutually exclusive at dispatch time) ────────

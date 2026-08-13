@@ -108,6 +108,27 @@ public:
               return server_.run();
           })) {}
 
+    // ★★ THE HARNESS MUST SURVIVE A FAILING TEST, NOT HANG IT.
+    // Members destruct in REVERSE declaration order, so `exitFuture_` — an
+    // `std::async` future, whose destructor BLOCKS until the task finishes —
+    // goes first, while the server thread is still parked in
+    // `InMemoryTransport::readMessage()` waiting for a message that will never
+    // come. Any test that returns early (a failed `ASSERT_*` before it could
+    // push `shutdown`/`exit`, or a `runUntilExit` timeout) therefore used to
+    // DEADLOCK the whole binary: no failure report, no other test, just a hung
+    // process the CI eventually kills with no log. That is the
+    // "silence instead of a verdict" shape this tree keeps deleting, and it was
+    // one early `ASSERT` away in every existing e2e test.
+    //
+    // Closing the transport here — in the destructor BODY, which runs before
+    // any member is destroyed — makes `readMessage()` return `Eof`, `run()`
+    // return, and the future become ready. `close()` is idempotent, so the
+    // normal shutdown+exit path is unaffected. `transport_` is owned by
+    // `server_`'s `unique_ptr`, which is still alive at this point.
+    ~LspTestHarness() {
+        if (transport_) transport_->close();
+    }
+
     LspTestHarness(LspTestHarness const&)            = delete;
     LspTestHarness& operator=(LspTestHarness const&) = delete;
     LspTestHarness(LspTestHarness&&)                 = delete;

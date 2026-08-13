@@ -32,6 +32,7 @@
 #include "core/types/target_schema.hpp"
 #include "program/input_resolver.hpp"
 #include "program/program.hpp"
+#include "scoped_env.hpp"    // the ONE env override (this file used to carry a copy)
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -47,6 +48,7 @@
 namespace fs = std::filesystem;
 using namespace dss;
 using dss::test_support::Location;
+using dss::test_support::ScopedEnv;
 using dss::test_support::ScratchDir;
 
 namespace {
@@ -105,38 +107,12 @@ constexpr std::string_view kUnmarkedAsm =
     return out;
 }
 
-// Portable RAII env override (the shape `tests/core/test_config_path_walk.cpp`
-// uses). Restores the CMake-set `DSS_CONFIG_ROOT` on exit so one test cannot
-// leak a patched config tree into the next.
-class ScopedEnv {
-public:
-    ScopedEnv(char const* name, std::string const& value) : name_(name) {
-        if (char const* prev = std::getenv(name)) { had_ = true; prev_ = prev; }
-        set(value);
-    }
-    ~ScopedEnv() { had_ ? set(prev_) : clear(); }
-    ScopedEnv(ScopedEnv const&)            = delete;
-    ScopedEnv& operator=(ScopedEnv const&) = delete;
-
-private:
-    void set(std::string const& v) {
-#ifdef _WIN32
-        _putenv_s(name_.c_str(), v.c_str());
-#else
-        ::setenv(name_.c_str(), v.c_str(), 1);
-#endif
-    }
-    void clear() {
-#ifdef _WIN32
-        _putenv_s(name_.c_str(), "");
-#else
-        ::unsetenv(name_.c_str());
-#endif
-    }
-    std::string name_;
-    std::string prev_;
-    bool        had_ = false;
-};
+// The env override this file uses (`DSS_CONFIG_ROOT`, restored on scope exit so
+// one test cannot leak a patched config tree into the next) is
+// `dss::test_support::ScopedEnv` — see the using-declaration above. The local
+// copy that used to sit here was one of five byte-identical hand-rolls; it is
+// gone, and `tests/test_support/test_scoped_env.cpp` is where the restore
+// semantics are actually measured.
 
 } // namespace
 

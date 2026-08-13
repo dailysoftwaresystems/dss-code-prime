@@ -96,6 +96,27 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      still worthless. **Add a fourth check: assert the witness is absent from the mutant BY THE
      SAME MATCHER THE PIN USES**, not by eye and not by a different reader. Describe a mutation in
      the harness's output, never inside the mutated file.
+   - **★★★ A GREEN RED-ON-DISABLE IS UNPROVEN UNTIL THE MUTANT IS SHOWN TO HAVE BEEN *READ*.**
+     ✔MEASURED 2026-08-13 — **two independent mechanisms in ONE cycle** each produced a green pin over
+     a live mutant, and in both the four fail-closed clauses above were fully satisfied. They are not
+     variants of one bug; they fail at different layers, which is why the rule has to be about the
+     *read*, not about any one layer:
+     - **The mutant was never COMPILED IN.** `ninja -t deps <obj>` reported **`#deps 0`** — ninja had
+       recorded zero header dependencies, so a header-only change did not rebuild its consumer.
+       **10 of 403 objects** in `build-dbg` were in that state
+       (`D-BUILD-NINJA-RECORDS-ZERO-HEADER-DEPS-UNDER-CONCURRENT-BUILDS`). ⇒ use the subject
+       **binary's mtime** as the build-success criterion. **Never a grep over build output** — the
+       same lane's grep reported "BUILD OK" over a link that had failed.
+     - **The mutant was never LOADED.** `findShippedConfig` reads `DSS_CONFIG_ROOT` *else* walks the
+       cwd. `dss_add_test` sets that variable, so **ctest** reads the intended tree — but running a
+       test `.exe` **directly** takes the cwd-walk and silently reads whichever tree the shell stands
+       in, so a worktree binary run from the shared tree's cwd read the *shared* config and never saw
+       the mutant (`D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE`). ⇒ **a config-level
+       red-on-disable MUST run through `ctest`, never a bare `.exe`.**
+     ⇒ **The fifth check, and it subsumes the others: prove the mutated bytes reached the process that
+     ran the pin.** A changed file on disk is not a changed input. Show the artifact rebuilt (mtime),
+     or the config tree that was read (`DSS_CONFIG_ROOT`), or both — and if you cannot show it, the
+     demonstration proved nothing no matter how red or green it came out.
    - **★★ A PIN MUST DRIVE ITS SUBJECT THROUGH THE SUBJECT'S REAL INPUT PATH — never re-type its
      data.** ✔MEASURED 2026-08-06: a pin stubbed a driver's vocabulary list with eight hand-typed
      tokens — clean by construction, in a shape the driver NEVER RECEIVES — and so could not see

@@ -15,6 +15,7 @@
 // the caller never called it.
 
 #include "core/types/config_path_walk.hpp"
+#include "scoped_env.hpp"    // the ONE env override (this file used to carry a copy)
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -33,47 +34,10 @@ using dss::findShippedConfig;
 using dss::findShippedConfigDir;
 using dss::ShippedConfigLocator;
 using dss::test_support::Location;
+using dss::test_support::ScopedEnv;
 using dss::test_support::ScratchDir;
 
 namespace {
-
-// Portable RAII env override — restores the prior value (or clears) on exit so
-// the CMake-set DSS_CONFIG_ROOT (dss_add_test) is untouched after each test.
-class ScopedEnv {
-public:
-    ScopedEnv(char const* name, std::string const& value) : name_(name) {
-        if (char const* prev = std::getenv(name)) { had_ = true; prev_ = prev; }
-        set(value);
-    }
-    // Construct-to-CLEAR: for the cases that must prove a candidate is ABSENT
-    // rather than merely wrong (mirrors tests/test_support/test_repo_root.cpp).
-    explicit ScopedEnv(char const* name) : name_(name) {
-        if (char const* prev = std::getenv(name)) { had_ = true; prev_ = prev; }
-        clear();
-    }
-    ~ScopedEnv() { had_ ? set(prev_) : clear(); }
-    ScopedEnv(ScopedEnv const&) = delete;
-    ScopedEnv& operator=(ScopedEnv const&) = delete;
-
-private:
-    void set(std::string const& v) {
-#ifdef _WIN32
-        _putenv_s(name_.c_str(), v.c_str());
-#else
-        ::setenv(name_.c_str(), v.c_str(), 1);
-#endif
-    }
-    void clear() {
-#ifdef _WIN32
-        _putenv_s(name_.c_str(), "");
-#else
-        ::unsetenv(name_.c_str());
-#endif
-    }
-    std::string name_;
-    bool        had_ = false;
-    std::string prev_;
-};
 
 ShippedConfigLocator targetLocator(std::string_view name) {
     return ShippedConfigLocator{name, "targets", ".target.json", "target",
