@@ -20,8 +20,21 @@ set -uo pipefail
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 CONF=$REPO/.secrets/arm64-vps.env
+
+# ★ ENV MUST WIN OVER THE CONFIG FILE — see the twin block in `ssh-macos.sh` for the
+# measurement. `.` sources into THIS shell, so a bare `. "$CONF"` overwrites what the
+# caller exported, reversing the precedence stated at the top of this file. Here the
+# contradiction is written three lines apart: the failure message below says "or set
+# those in the environment", which the sourcing made impossible. Fixed in both `.sh`
+# scripts together because they are one capability pair with the `.ps1` siblings, and
+# the siblings were already correct.
+_envHost=${DSS_VPS_HOST:-} ; _envUser=${DSS_VPS_USER:-} ; _envKey=${DSS_VPS_KEY:-}
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
+if [ -n "$_envHost" ]; then DSS_VPS_HOST=$_envHost ; fi
+if [ -n "$_envUser" ]; then DSS_VPS_USER=$_envUser ; fi
+if [ -n "$_envKey"  ]; then DSS_VPS_KEY=$_envKey   ; fi
+unset _envHost _envUser _envKey
 
 : "${DSS_VPS_HOST:=}" ; : "${DSS_VPS_USER:=}" ; : "${DSS_VPS_KEY:=}"
 DSS_VPS_KEY=$(eval printf '%s' "\"$DSS_VPS_KEY\"")   # allow $HOME in the config
