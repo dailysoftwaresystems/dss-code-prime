@@ -1,0 +1,17 @@
+{
+  "$comment": "★★★ A HAND-WRITTEN `.s` CALLS LIBC AND THE PROCESS RUNS — the closing witness for D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY. ✔MEASURED: the pe64 artifact executes on Windows, writes the single byte 0x2A ('*') to stdout, and exits 0. This example REPLACES `asm_x86_64_extern_call_exec_unbound_error`, whose whole assertion was that this build FAILED; that row is closed, so the pin is superseded rather than re-cut (the anchor said so by name).\n\n★★ THREE DEFECTS THAT ONLY A RUN COULD FIND, all on the path this example now covers, and all invisible to a build-only or byte-level check: (1) omitting the `va_list` NamedTypeBinding makes `stdio.json` fail to DECODE, and the realization oracle SKIPS an unreadable descriptor BY DESIGN — so `call abort` (stdlib.json) linked while `call putchar` did not, a silent per-descriptor split with no diagnostic; the binding is now DERIVED from `resolveAbi(target,format)`'s vaListLayout strategy rather than picked, because Win64's `char*` is 8 bytes and SysV's `__va_list_tag[1]` is 24. (2) The FFI corpus is keyed on the CANONICAL C identifier while a `.s` writes the DECORATED one, so Mach-O kept failing on `_putchar` while elf and pe worked — a feature correct on two formats of three, with nothing saying so on the third. (3) The obvious repair OVER-CORRECTED: un-decorating passes an already-undecorated name through unchanged by design, so a bare `putchar` on Mach-O bound to a spelling libSystem does not export — trading a BUILD error for a dyld failure at process start, which is strictly worse. The gate is now a decoration ROUND TRIP, and bare `putchar` on Mach-O is refused exactly as it was before the binder existed.\n\n⚠ THE `release` ARM PROVES A NARROW THING AND THE COMMENT SAYS SO. On the `encode` tier no optimizer, regalloc or callconv pass runs at all, so this arm does NOT witness the optimizer over assembly — it witnesses that REQUESTING release does not BREAK the assembly route. Claiming more would be the masked-effectiveness trap this corpus already had to correct once.\n\n⚠ NO arm64 LEG HERE, DELIBERATELY: this file is x86_64 AT&T assembly and names x86 registers, so it is not portable text. The arm64 half of extern binding is measured in the unit tier (`tests/program/test_asm_extern_binding.cpp` covers all five legs); manufacturing an arm64 row here would need a second source file and would be a different example, not this one.",
+
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "exitCode": 0,
+  "expectedStdout": "*",
+
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] }
+  ],
+
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

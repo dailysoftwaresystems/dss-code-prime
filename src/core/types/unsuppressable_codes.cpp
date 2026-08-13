@@ -54,7 +54,15 @@ namespace {
 // siblings): it is an Error by default but its suppression ships no wrong bytes,
 // which is this table's whole membership criterion. Two out of three is the
 // evidence the criterion was applied rather than the codes swept in as a batch.
-constexpr std::array<DiagnosticCode, 142> kUnsuppressableCodes{{
+//
+// 142 → 143 (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED):
+// `L_TerminatorSuccessorMismatch` joins — a terminator whose recorded successors
+// and whose own BlockRef operands disagree. Suppressed, the encoder takes its
+// branch displacement from an operand list the CFG no longer agrees with: a
+// branch to the wrong block, or no branch target at all, with a green build.
+// ⓘ The step before this one was 141 → 142 and went unrecorded here, which is
+// why the running total above stops at 141 while the array held 142.
+constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -449,6 +457,13 @@ constexpr std::array<DiagnosticCode, 142> kUnsuppressableCodes{{
     // VLA would place outgoing call args INSIDE the VLA region under the moved SP (an
     // ABI break — a silent stack miscompile). Same load-bearing-boundary class.
     DiagnosticCode::L_VlaNonLeafFrameUnsupported,
+    // L_TerminatorSuccessorMismatch (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED):
+    // the terminator's two CFG channels (recorded successors vs. its own BlockRef
+    // operands) disagree. A member: suppressed, the encoder would take its branch
+    // displacement from an operand list that no longer matches the CFG — a branch
+    // to the wrong block, or (the shape that minted the code) no displacement at
+    // all. Same structural-invariant class as the rest of the L_ band.
+    DiagnosticCode::L_TerminatorSuccessorMismatch,
 
     // R_* regalloc band — calling-convention / class invariants.
     // R_SpilledDueToPressure + R_SpilledDueToCrossCallExhaustion

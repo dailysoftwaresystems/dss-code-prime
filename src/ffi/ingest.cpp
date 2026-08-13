@@ -18,6 +18,17 @@
 
 namespace dss::ffi {
 
+// The recorded-import-identity ranking. Doc + rationale live on the declaration
+// in `ingest.hpp`; the two callers are `ingest()` below (the C/HIR binder) and
+// the `encode` tier's `.s` extern binder in `program/compile_pipeline.cpp`.
+std::string recordedImportIdentity(std::string_view declaredImportName,
+                                   std::string_view embeddedSoname,
+                                   std::string_view readerLibraryPath) {
+    if (!declaredImportName.empty()) return std::string{declaredImportName};
+    if (!embeddedSoname.empty())     return std::string{embeddedSoname};
+    return std::string{readerLibraryPath};
+}
+
 namespace {
 
 // Linkage / visibility conversion from the FFI `ImportSurface`
@@ -404,10 +415,13 @@ ingest(std::span<IngestionSource const> sources,
         // FORMAT-BLIND: no arm of this branches on ObjectFormatKind -- the
         // readers already collapsed all three formats' embedded identities
         // into `row.soname`.
-        meta.importLibrary =
-            !matched.declaredImportName.empty() ? matched.declaredImportName
-          : !matched.row.soname.empty()         ? matched.row.soname
-          :                                       matched.row.libraryPath;
+        // ⚠ THE RANKING ITSELF NOW LIVES IN `recordedImportIdentity` (ingest.hpp)
+        // because the `encode` tier binds `.s` externs against the same
+        // `--resolve-library` binaries without being able to come through this
+        // function. Same decision, still ONE implementation.
+        meta.importLibrary = recordedImportIdentity(matched.declaredImportName,
+                                                    matched.row.soname,
+                                                    matched.row.libraryPath);
         // ── THE REQUIRED-SYMBOL-VERSION DECISION SITE ────────────────────
         // c156 (D-LK-ELF-SYMBOL-VERSIONING) established the rail: a
         // non-empty version here becomes a `.gnu.version_r` requirement

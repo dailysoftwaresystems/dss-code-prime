@@ -415,6 +415,31 @@ struct DSS_EXPORT GrammarSchemaData {
     // loader is the only writer; see `assembly_config.hpp` for why a dialect is
     // a LANGUAGE and not a `.target.json` facet.
     AssemblyConfig                                    assembly;
+
+    // ★★★ THE NON-FATAL DIAGNOSTICS THIS DOCUMENT PRODUCED WHILE LOADING
+    // SUCCESSFULLY — D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD.
+    //
+    // `LoadResult<T> = std::expected<T, std::vector<ConfigDiagnostic>>` has an
+    // ERROR side and no success side, so before this slot existed every
+    // Warning/Info/Hint a clean load emitted was collected, counted by nothing,
+    // and destroyed with the collector. That is 13 emit sites in
+    // `grammar_schema_json.cpp` whose output no user has ever seen.
+    //
+    // ★★ WHY THE FACT LIVES ON THE OBJECT RATHER THAN BEING HANDED TO THE
+    // CALLER AT THE LOAD SITE, which was the other candidate: two consumers
+    // MEMOIZE the loaded schema (`program.cpp`'s per-target grammar cache and
+    // `lsp/schema_cache.cpp`'s `byName_`), so a value returned only from the
+    // load call is available only on a cache MISS — the warnings would appear
+    // or not depending on which target happened to be compiled first. Hung off
+    // the schema, the diagnostics travel with the cached object and any holder
+    // can ask.
+    //
+    // ⚠ SEVERITY IS PRESERVED VERBATIM AND NOT FILTERED HERE. The loader only
+    // reaches this slot when `hasErrors()` is false, so in practice it carries
+    // no Errors — but filtering by severity at the producer would make this a
+    // second, silently diverging definition of "what counts as fatal", which
+    // `DiagnosticCollector::hasErrors()` already owns.
+    std::vector<ConfigDiagnostic>                     loadDiagnostics;
 };
 
 } // namespace detail
@@ -813,6 +838,16 @@ public:
     // declared an empty instruction table". Read-only; the loader is the only
     // writer.
     [[nodiscard]] AssemblyConfig const& assembly() const noexcept;
+
+    // The non-fatal diagnostics this document emitted while loading
+    // SUCCESSFULLY (D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD). Empty for
+    // a clean document. Feed it to `forwardConfigDiagnostics` to surface it on
+    // a DiagnosticReporter — that helper already preserves severity verbatim,
+    // so a warning stays a warning and `--warnings-as-errors` still governs.
+    // ⚠ A FAILED load returns its diagnostics through `LoadResult`'s error side
+    // instead; there is no GrammarSchema object to ask in that case, which is
+    // why the two channels are not merged into one.
+    [[nodiscard]] std::span<ConfigDiagnostic const> loadDiagnostics() const noexcept;
 
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,

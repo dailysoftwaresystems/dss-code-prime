@@ -48,6 +48,38 @@ TEST(DocumentStore, OpenSnapshotRoundTrip) {
     EXPECT_EQ(snap->schema, nullptr);
 }
 
+// ★★ EXERCISE THE FAILURE ARM RATHER THAN READ IT
+// (D-LSP-ASSEMBLY-DIALECT-UNSERVABLE). A document with no schema and no reason
+// publishes an EMPTY diagnostics array, which an editor renders exactly like a
+// clean file — so the two states a user most needs to tell apart become
+// identical on the wire. `open` therefore refuses to store that pair: it
+// substitutes a reason that names the omission as a server defect. The
+// production caller always supplies one, so this arm is only ever reached by a
+// call site that forgot — which is precisely who it is for.
+TEST(DocumentStore, SchemalessOpenWithoutAReasonSubstitutesALoudOne) {
+    DocumentStore s;
+    s.open("file:///mystery", 1, "x", nullptr);
+    auto snap = s.snapshot("file:///mystery");
+    ASSERT_TRUE(snap.has_value());
+    EXPECT_EQ(snap->schema, nullptr);
+    EXPECT_FALSE(snap->schemaError.empty())
+        << "a null schema with no reason is the silent state; the store must "
+           "not be able to hold it";
+    EXPECT_NE(snap->schemaError.find("did not record why"), std::string::npos)
+        << "the substitute must say the SERVER failed to explain itself, not "
+           "invent a property of the file; got: " << snap->schemaError;
+}
+
+// The caller's own reason is kept verbatim — the substitution above is a
+// backstop, never an overwrite.
+TEST(DocumentStore, SchemalessOpenKeepsTheCallersReason) {
+    DocumentStore s;
+    s.open("file:///a.s", 1, "nop", nullptr, "two dialects claim .s");
+    auto snap = s.snapshot("file:///a.s");
+    ASSERT_TRUE(snap.has_value());
+    EXPECT_EQ(snap->schemaError, "two dialects claim .s");
+}
+
 TEST(DocumentStore, SnapshotMissingUriReturnsNullopt) {
     DocumentStore s;
     EXPECT_FALSE(s.snapshot("file:///nope").has_value());

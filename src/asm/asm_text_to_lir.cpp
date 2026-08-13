@@ -137,18 +137,49 @@ enum class CfClass : std::uint8_t {
     return "an unclassified instruction";
 }
 
+// ★★★ IS THIS OPCODE REACHED THROUGH A REGISTER RATHER THAN A NAMED BLOCK?
+// The TARGET says so, with `terminatorKind: indirect-br` — a closed substrate
+// vocabulary entry, not an arch test and not a mnemonic match. It is the target
+// half of the two-sided key that lets ONE dialect spelling denote both a direct
+// and an indirect branch (D-ASM-ATT-INDIRECT-BRANCH-INEXPRESSIBLE); the dialect
+// half is whether the operand carried this dialect's indirect marker.
+[[nodiscard]] constexpr bool isIndirectClass(CfClass c) noexcept {
+    return c == CfClass::IndirectBr;
+}
+
 // One dialect instruction row, resolved against the ACTIVE target. Built once
 // per lowering, before any statement is walked, so a dialect/target
 // disagreement is reported for the CONFIG rather than for the first `.s` line
 // that happened to use it.
 struct ResolvedRow {
-    std::optional<CfClass>        cfClass;   // nullopt: no candidate resolves here
+    // ★★★ TWO CLASSES, NOT ONE, BECAUSE gas SPELLS TWO INSTRUCTIONS THE SAME
+    // WAY. `jmp .L1` and `jmp *%rax` are one mnemonic and two DSS opcodes with
+    // DIFFERENT terminator kinds (`br` / `indirect-br`), so a single
+    // `cfClass` could not hold the row and the loader refused it — "one
+    // spelling cannot denote both". That refusal was right about the CAUSE
+    // (the two reach different `LirBuilder` terminators) and wrong about the
+    // CONCLUSION: the choice is decidable, by the same two-sided shape that
+    // split `load` from `store`. The DIALECT says whether the operand carried
+    // its indirect marker; the TARGET says which of its opcodes is reached
+    // through a register. Neither side needed a new knob.
+    //
+    // ⚠ A ROW IS ONLY "KIND-SPLIT" WHEN BOTH ARE PRESENT. `call` on x86_64
+    // resolves to ONE opcode that encodes both `call foo` and `call *%rax` as
+    // variants, so its indirect arm is empty and the indirectness is settled
+    // inside `buildCall` by the operand — exactly as before. Candidates INSIDE
+    // one arm must still agree, which is what keeps `["mov", "jmp"]` refused.
+    std::optional<CfClass>        directClass;
+    std::optional<CfClass>        indirectClass;
     std::optional<TargetCondCode> cond;
     // Do this row's resolvable candidates read the instruction payload as a
     // condition code (`consumesCondCode`)? Unanimous by construction — a row
     // whose candidates disagree is refused at resolve time — so the emit walk
-    // can put `cond` into the payload without re-deciding per election.
+    // can put a condition into the payload without re-deciding per election.
     bool                          consumesCond = false;
+
+    [[nodiscard]] bool anyClass() const noexcept {
+        return directClass.has_value() || indirectClass.has_value();
+    }
 };
 
 // Visible (non-EmptySpace) children — the tree-wide indexing convention.
@@ -235,12 +266,18 @@ public:
         if (!classifyLabels()) return std::nullopt;
         // PASS 2 — emit.
         if (!emitAll()) return std::nullopt;
+        // PASS 3 — the data labels' module symbols. Deferred to here for the
+        // one reason `.globl` exists: it may appear AFTER the label it exports,
+        // so binding is only decidable once every directive has been seen.
+        addDataSymbols();
+        if (!ok_) return std::nullopt;
 
         AsmTextModule out;
         out.lir             = std::move(builder_).finish();
         out.symbols         = std::move(symbols_);
         out.userEntrySymbol = userEntry_;
         out.externImports   = std::move(externs_);
+        out.dataItems       = std::move(dataItems_);
         return out;
     }
 
@@ -311,13 +348,16 @@ private:
             }
 
             // The control-flow class, taken from whichever candidates this
-            // target declares. Candidates that disagree make the row
-            // unusable — the operand shape of a branch and of an arithmetic
-            // instruction are not the same kind of thing, so there would be no
-            // shape to elect over.
-            std::optional<CfClass> cls;
-            std::string_view       clsFrom;
-            bool                   mixed = false;
+            // target declares — kept in TWO buckets, split by the target's own
+            // `terminatorKind: indirect-br`. Candidates INSIDE one bucket that
+            // disagree make the row unusable: the operand shape of a branch and
+            // of an arithmetic instruction are not the same kind of thing, so
+            // there would be no shape to elect over. Candidates ACROSS the two
+            // buckets are the `jmp` / `jmp_indirect` pair, decided per
+            // instruction by the operand's indirect marker.
+            std::array<std::optional<CfClass>, 2> cls{};
+            std::array<std::string_view, 2>       clsFrom{};
+            bool                                  mixed = false;
             // Condition-consumption, tracked alongside the class for the same
             // reason: it must be UNANIMOUS across the candidates or the row's
             // `cond` would be honoured for one election and silently dropped
@@ -348,24 +388,59 @@ private:
                     mixed = true;
                     break;
                 }
-                CfClass const here = cfClassOf(*info);
-                if (!cls.has_value()) { cls = here; clsFrom = name; continue; }
-                if (*cls != here) {
+                CfClass const     here = cfClassOf(*info);
+                std::size_t const arm  = isIndirectClass(here) ? 1u : 0u;
+                if (!cls[arm].has_value()) {
+                    cls[arm]     = here;
+                    clsFrom[arm] = name;
+                    continue;
+                }
+                if (*cls[arm] != here) {
                     fail(NodeId{},
                          std::format("mnemonic '{}' lists target opcodes '{}' "
                                      "and '{}', which are {} and {} — one "
                                      "spelling cannot denote both, because the "
                                      "two take different operand shapes and "
-                                     "there would be nothing to elect over{}",
-                                     row.spelling, clsFrom, name,
-                                     cfClassName(*cls), cfClassName(here),
+                                     "there would be nothing to elect over. "
+                                     "(The one pair that IS decidable is a "
+                                     "DIRECT and an INDIRECT branch, told apart "
+                                     "by this dialect's indirect operand "
+                                     "marker; these two are on the same side of "
+                                     "that split.){}",
+                                     row.spelling, clsFrom[arm], name,
+                                     cfClassName(*cls[arm]), cfClassName(here),
                                      pairSuffix()));
                     mixed = true;
                     break;
                 }
             }
             if (mixed) continue;
-            out.cfClass = cls;
+            out.directClass   = cls[0];
+            out.indirectClass = cls[1];
+            // ⚠ A KIND-SPLIT ROW IS ONLY DECIDABLE IF THE DIALECT CAN WRITE THE
+            // MARKER. `operandForms.indirect` is `null` on a dialect that puts
+            // indirectness in the MNEMONIC instead (aarch64 spells the pair `b`
+            // / `br`), so such a dialect naming both opcodes on ONE row would
+            // leave the engine choosing — every instruction would take the
+            // direct arm and `br`'s opcode would be dead config.
+            if (out.directClass.has_value() && out.indirectClass.has_value()
+                && !cfg_.ruleForRole(AsmOperandRole::Indirect).valid()) {
+                fail(NodeId{},
+                     std::format("mnemonic '{}' lists both '{}' ({}) and '{}' "
+                                 "({}), which this build separates by the "
+                                 "operand's INDIRECT marker — but this dialect "
+                                 "declares no 'indirect' operand form (the role "
+                                 "is bound to null), so no `.s` it reads could "
+                                 "ever select the second. Give the two "
+                                 "instructions their own spellings, the way a "
+                                 "dialect that puts indirectness in the "
+                                 "mnemonic already does{}",
+                                 row.spelling, clsFrom[0],
+                                 cfClassName(*out.directClass), clsFrom[1],
+                                 cfClassName(*out.indirectClass),
+                                 pairSuffix()));
+                continue;
+            }
 
             // ★ `cond` AND THE ENCODER'S CONDITION SLOT PIN EACH OTHER. A row
             // whose opcode reads the payload as a condition but declares none
@@ -377,17 +452,18 @@ private:
             // demanded a condition on `jcc` (right, by coincidence) and refused
             // one on `setcc` (wrong: it is the opcode whose ONLY job is to
             // materialize a condition).
-            if (consumes.value_or(false) && row.condName.empty()) {
-                fail(NodeId{},
-                     std::format("mnemonic '{}' resolves to target opcode '{}', "
-                                 "whose encoding reads a condition code from the "
-                                 "instruction payload, but declares no 'cond' — "
-                                 "the condition would default to the target's "
-                                 "zero code and encode the wrong instruction "
-                                 "with no diagnostic{}",
-                                 row.spelling, consumesFrom, pairSuffix()));
-                continue;
-            }
+            // ⚠ THE "MISSING cond" HALF IS AN EMIT-TIME CHECK, NOT A LOAD-TIME
+            // ONE, AND THE MOVE IS FORCED BY A REAL DIALECT RATHER THAN CHOSEN.
+            // ✔MEASURED 2026-08-13: aarch64 writes the condition as an OPERAND
+            // (`cset x0, eq`), where AT&T fuses it into the mnemonic (`sete`).
+            // The ROW cannot say which — a row with no `cond` is either an
+            // operand-carrying spelling or a mistake, and only the INSTRUCTION
+            // distinguishes them. Refusing at load would make `cset`
+            // inexpressible; defaulting at emit would encode the target's zero
+            // condition. So the requirement becomes "the condition arrives from
+            // the row OR from an operand", enforced per instruction in
+            // `conditionFor` — where BOTH sources are visible and neither can
+            // be silently absent. D-ASM-ARM64-CONDITION-AS-OPERAND-UNMODELLED.
             if (consumes.has_value() && !*consumes && !row.condName.empty()) {
                 fail(NodeId{},
                      std::format("mnemonic '{}' declares condition '{}', but its "
@@ -409,29 +485,130 @@ private:
         return ok_;
     }
 
-    // The `LirInst.payload` a row's instructions carry: the declared condition
+    // ★★★ THE CONDITION AN OPERAND NAMES, OR NULLOPT WHEN IT NAMES NONE.
+    //
+    // ✔MEASURED 2026-08-13: aarch64 gas writes `cset x0, eq` and `csel x0, x1,
+    // x2, ne` — the condition is an OPERAND, where AT&T fuses it into the
+    // mnemonic (`sete`). No `operandForms` role fits a bare condition name, and
+    // MINTING ONE WOULD BREAK EVERY DIALECT: `operandForms` is REQUIRE-ALL, so
+    // an eighth role is a load error in every document that does not mention
+    // it, and the reuse rule forbids a language-private vocabulary when a
+    // substrate one exists.
+    //
+    // ★★ SO THE CONDITION IS RESOLVED THE WAY A REGISTER ALREADY IS: BY ASKING.
+    // A sigil-less operand is a register if `registerByName` says so; a
+    // condition name is one if `kTargetCondCodeTable` says so AND this target
+    // declares an encoding for it. The lookup is gated on the TARGET fact that
+    // the row's opcode reads a payload condition at all, so a label innocently
+    // named `eq` in a file full of ordinary branches is never reinterpreted —
+    // only an instruction that NEEDS a condition ever looks for one.
+    [[nodiscard]] std::optional<TargetCondCode>
+    condCodeOfOperand(DecodedOperand const& op) const {
+        if (op.isMemory || op.indirect || op.symbol.empty()) return std::nullopt;
+        auto const cc = kTargetCondCodeTable.fromName(op.symbol);
+        if (!cc.has_value()) return std::nullopt;
+        if (!target_.condCodeEncoding(*cc).has_value()) return std::nullopt;
+        return cc;
+    }
+
+    // The condition this instruction carries, from the ROW (a mnemonic that
+    // fuses it) or from an OPERAND (a dialect that writes it separately) —
+    // and the index of the operand it consumed, so the shape walk can drop it.
+    struct ResolvedCondition {
+        std::optional<TargetCondCode> cond;
+        std::size_t                   fromOperand = static_cast<std::size_t>(-1);
+        bool                          ok          = true;
+    };
+
+    [[nodiscard]] ResolvedCondition
+    conditionFor(ResolvedRow const& resolved, AsmInstructionSpelling const& row,
+                 DecodedInstruction const& ins) {
+        ResolvedCondition out;
+        if (!resolved.consumesCond) {
+            // ⚠ AN OPCODE WITH NO CONDITION SLOT NEVER LOOKS FOR ONE. The
+            // resolve-time pair already refused a `cond` on such a row; an
+            // operand spelled like a condition here is an ordinary symbol.
+            return out;
+        }
+        if (resolved.cond.has_value()) {
+            out.cond = resolved.cond;
+            // ⚠ AND THEN AN OPERAND-SPELLED CONDITION IS A REFUSAL, NOT A
+            // SECOND OPINION. `sete eq, %rcx` would otherwise let the row's
+            // condition win silently while the writer read the operand's.
+            for (std::size_t i = 0; i < ins.operands.size(); ++i) {
+                if (!condCodeOfOperand(ins.operands[i]).has_value()) continue;
+                fail(ins.operands[i].node,
+                     std::format("'{}' already fixes its condition in the "
+                                 "mnemonic (the dialect row declares '{}'), but "
+                                 "operand {} also names a condition — one "
+                                 "instruction cannot carry two, and the row's "
+                                 "would silently win{}",
+                                 ins.mnemonic, row.condName, i + 1,
+                                 pairSuffix()));
+                out.ok = false;
+                return out;
+            }
+            return out;
+        }
+        // No row condition: exactly one operand must name it.
+        for (std::size_t i = 0; i < ins.operands.size(); ++i) {
+            auto const cc = condCodeOfOperand(ins.operands[i]);
+            if (!cc.has_value()) continue;
+            if (out.cond.has_value()) {
+                fail(ins.operands[i].node,
+                     std::format("'{}' names more than one condition in its "
+                                 "operands ('{}' and '{}'), and its target "
+                                 "opcode reads exactly one from the instruction "
+                                 "payload{}",
+                                 ins.mnemonic,
+                                 targetCondCodeName(*out.cond),
+                                 targetCondCodeName(*cc), pairSuffix()));
+                out.ok = false;
+                return out;
+            }
+            out.cond        = cc;
+            out.fromOperand = i;
+        }
+        if (!out.cond.has_value()) {
+            fail(ins.node,
+                 std::format("'{}' resolves to a target opcode whose encoding "
+                             "reads a condition code from the instruction "
+                             "payload, but neither this dialect's row (no "
+                             "'cond' key) nor this instruction's operands names "
+                             "one — the condition would default to the target's "
+                             "zero code and encode the wrong instruction with no "
+                             "diagnostic. Either fuse the condition into the "
+                             "spelling (one row per condition, as a dialect "
+                             "writing 'sete'/'setne' does) or write it as an "
+                             "operand (as a dialect writing 'cset x0, eq' "
+                             "does){}", ins.mnemonic, pairSuffix()));
+            out.ok = false;
+        }
+        return out;
+    }
+
+    // The `LirInst.payload` a row's instructions carry: the resolved condition
     // when the elected opcode's encoder reads one (`condCodeFromPayload`), and
     // 0 otherwise — which is what every non-conditional opcode has always
     // carried.
     //
     // ⚠ NOT `value_or(0)`. Silently encoding the target's zero condition when
-    // the invariant broke is exactly the miscompile the resolve-time pair
-    // exists to prevent — `sete` would become `seto` with no diagnostic. The
-    // invariant is established above; a violation is a substrate bug and says
-    // so.
+    // the invariant broke is exactly the miscompile `conditionFor` exists to
+    // prevent — `sete` would become `seto` with no diagnostic.
     [[nodiscard]] std::uint32_t payloadFor(ResolvedRow const& resolved,
+                                           ResolvedCondition const& cond,
                                            DecodedInstruction const& ins) {
         if (!resolved.consumesCond) return 0;
-        if (!resolved.cond.has_value()) {
+        if (!cond.cond.has_value()) {
             fail(ins.node,
                  std::format("internal: '{}' resolves to an opcode that reads a "
-                             "condition from the instruction payload, but the "
-                             "row carries no resolved condition — the "
-                             "resolve-time pairing that guarantees this did not "
-                             "hold{}", ins.mnemonic, pairSuffix()));
+                             "condition from the instruction payload, but no "
+                             "condition was resolved — the pairing that "
+                             "guarantees this did not hold{}",
+                             ins.mnemonic, pairSuffix()));
             return 0;
         }
-        return static_cast<std::uint32_t>(*resolved.cond);
+        return static_cast<std::uint32_t>(*cond.cond);
     }
 
     [[nodiscard]] std::optional<std::size_t>
@@ -449,47 +626,154 @@ private:
         std::string name;
         NodeId      at{};
         bool        isEntry  = false;
-        SymbolId    symbol{};              // valid only when `isEntry`
+        SymbolId    symbol{};              // valid on an entry OR a data label
         std::size_t functionLabel = kNoLabel;  // index of the owning entry
         LirBlockId  block{};
         bool        opened = false;
+        // ★ THE THIRD KIND OF LABEL (D-ASM-NO-DATA-DEFINING-DIRECTIVE). A label
+        // seen while a DATA section is open names a data ITEM, not a function
+        // and not a basic block: it gets a SymbolId and an `AssembledData` slot,
+        // and the block model never sees it. Without this a `.s` that defines a
+        // string would have its label refused as "appears before any
+        // function-entry marker" — a true diagnostic aimed at the wrong thing.
+        bool        isData   = false;
+        std::size_t dataItem = kNoLabel;   // index into `dataItems_`
     };
 
-    bool scanUnit() {
-        walkElements(tree_.root(), [&](NodeId element) {
-            if (!ok_) return;
-            if (tree_.rule(element).v == cfg_.directiveRule.v) {
-                applyDirective(element);
+    // ★★★ A DOT-PREFIXED NAME IS A LABEL WHENEVER IT CARRIES A LABEL TAIL.
+    // `.L3:` and `.text` are BYTE-IDENTICAL up to the token after the name, so
+    // the shared grammar reads both as `asmDirective` and hangs an
+    // `{optional asmLabelTail}` slot off it; the presence of that slot IS the
+    // answer, read as a RuleId question rather than by inspecting spelling.
+    // Returns the defined name (introducer + name, e.g. `.L3`), or empty when
+    // the node is a real directive.
+    //
+    // ★★ THE INTRODUCER'S OWN TEXT IS READ FROM THE TREE, NEVER HARDCODED AS
+    // `"."`. `directiveIntroducer` is a dialect-declared TOKEN — both shipped
+    // dialects spell it `.`, and a third that spells it `@` or `!` would get a
+    // label whose name silently disagreed with every branch that targets it.
+    [[nodiscard]] std::string dotLabelName(NodeId directive,
+                                           NodeId& labelTail) const {
+        labelTail = NodeId{};
+        auto const kids = visibleChildren(tree_, directive);
+        if (kids.size() < 3) return {};
+        NodeId const tail =
+            findDescendantOfRule(tree_, kids[2], cfg_.labelTailRule);
+        if (!tail.valid()) return {};
+        labelTail = tail;
+        return std::string{tree_.text(kids[0])} + std::string{tree_.text(kids[1])};
+    }
+
+    // The element nested inside a label tail (`Lfoo: ret`, `.L3: .quad 1`), or
+    // invalid. One helper for both passes, so the two can never disagree about
+    // what a label line contains.
+    [[nodiscard]] NodeId elementInLabelTail(NodeId labelTail) const {
+        NodeId const element =
+            findDescendantOfRule(tree_, labelTail, cfg_.elementRule);
+        if (!element.valid()) return NodeId{};
+        for (NodeId const arm : visibleChildren(tree_, element)) {
+            if (tree_.kind(arm) == NodeKind::Internal) return arm;
+        }
+        return NodeId{};
+    }
+
+    // Record one label definition. Shared by the ordinary `name:` form and the
+    // dot-prefixed `.L3:` one, so a dot label is the same kind of thing to
+    // every later pass — including the data-section arm.
+    bool collectLabel(std::string name, NodeId at) {
+        if (labelIndex_.contains(name)) {
+            fail(at, std::format("label '{}' is defined more than once", name));
+            return false;
+        }
+        labelIndex_.emplace(name, labels_.size());
+        LabelInfo info;
+        info.name = std::move(name);
+        info.at   = at;
+        if (scanSection_.has_value()) {
+            // A data label OPENS A NEW ITEM. Every subsequent data-emitting
+            // directive appends to it until the next label or section change.
+            info.isData   = true;
+            info.symbol   = mintSymbol();
+            info.dataItem = openDataItem(info.symbol);
+        }
+        labels_.push_back(std::move(info));
+        return true;
+    }
+
+    void scanElement(NodeId element) {
+        if (!ok_) return;
+        if (tree_.rule(element).v == cfg_.directiveRule.v) {
+            NodeId      labelTail{};
+            std::string const dotted = dotLabelName(element, labelTail);
+            if (!dotted.empty()) {
+                // D-ASM-DOT-PREFIXED-LABEL-NOT-DEFINED-BY-CONSUMER: the node is
+                // an `asmDirective` and the thing it DEFINES is a label. Routing
+                // it to the directive vocabulary is what produced `A0008 unknown
+                // assembler directive '.L3'` on every `gcc -S` output.
+                if (!collectLabel(dotted, element)) return;
+                if (NodeId const nested = elementInLabelTail(labelTail);
+                    nested.valid()) {
+                    scanElement(nested);
+                }
                 return;
             }
-            // ⚠ THE CHAIN, NOT JUST THE FIRST LABEL. `a: b: ret` nests a second
-            // statement inside the first one's label tail, and `walkElements`
-            // only visits LINE-level elements — so collecting one label per
-            // line would silently drop every label after the first, and the
-            // emit pass would then fail on a label it had never minted.
-            NodeId cur = element;
-            while (cur.valid() && ok_) {
-                NodeId const label = labelOf(cur);
-                if (!label.valid()) return;
-                std::string name{tree_.text(label)};
-                if (labelIndex_.contains(name)) {
-                    fail(label,
-                         std::format("label '{}' is defined more than once",
-                                     name));
-                    return;
-                }
-                labelIndex_.emplace(name, labels_.size());
-                LabelInfo info;
-                info.name = std::move(name);
-                info.at   = label;
-                labels_.push_back(std::move(info));
-                // A label chain may end in a DIRECTIVE (`main: .globl main`);
-                // `nextStatementAfterLabel` only follows the statement arm, so
-                // the directive arm is picked up when the walk reaches it.
-                cur = nextStatementAfterLabel(cur);
-            }
-        });
+            applyDirective(element);
+            return;
+        }
+        // ⚠ THE CHAIN, NOT JUST THE FIRST LABEL. `a: b: ret` nests a second
+        // statement inside the first one's label tail, and `walkElements`
+        // only visits LINE-level elements — so collecting one label per
+        // line would silently drop every label after the first, and the
+        // emit pass would then fail on a label it had never minted.
+        NodeId cur = element;
+        while (cur.valid() && ok_) {
+            NodeId const label = labelOf(cur);
+            if (!label.valid()) return;
+            if (!collectLabel(std::string{tree_.text(label)}, label)) return;
+            // ★ A LABEL CHAIN MAY END IN A DIRECTIVE (`main: .globl main`,
+            // `msg: .asciz "hi"`) AND THE DIRECTIVE MUST BE APPLIED HERE.
+            // ⚠ THE COMMENT THAT USED TO SIT HERE SAID IT WAS "picked up
+            // when the walk reaches it" — measured FALSE: `walkElements`
+            // visits LINE-level elements only, and a directive nested in a
+            // label tail is never one, so `main: .globl main` silently
+            // dropped the export. The same shape now matters far more,
+            // because gas writes data on the label's own line.
+            // Anchored: D-ASM-DIRECTIVE-AFTER-LABEL-ON-ONE-LINE-DROPPED.
+            NodeId const tailDirective = nextDirectiveAfterLabel(cur);
+            if (tailDirective.valid()) scanElement(tailDirective);
+            cur = nextStatementAfterLabel(cur);
+        }
+    }
+
+    bool scanUnit() {
+        walkElements(tree_.root(), [&](NodeId element) { scanElement(element); });
         return ok_;
+    }
+
+    // ── data items ────────────────────────────────────────────────────────
+    //
+    // ★★★ ONE `AssembledData` PER DATA LABEL, IN THE SECTION THAT WAS OPEN.
+    // The row type, the section vocabulary and the linker walkers are the SAME
+    // ONES THE C PATH USES (`lowerMirGlobalsToDataItems`) — this walker mints no
+    // parallel taxonomy, which is why the directive verbs bind `DataSectionKind`
+    // rather than naming sections themselves.
+    std::size_t openDataItem(SymbolId symbol) {
+        AssembledData item;
+        item.symbol  = symbol;
+        item.section = *scanSection_;
+        dataItems_.push_back(std::move(item));
+        openDataItem_ = dataItems_.size() - 1;
+        return openDataItem_;
+    }
+
+    // The item data lands in right now, opening an ANONYMOUS one if the section
+    // was entered without a label. ⚠ `SymbolId{}` is the substrate's declared
+    // "anonymous data" marker (`validateAssembledData` exempts it from the
+    // duplicate check), so unlabelled data is representable rather than refused
+    // — `.rodata` padding and literal blobs legitimately have no name.
+    std::size_t currentDataItem() {
+        if (openDataItem_ != kNoLabel) return openDataItem_;
+        return openDataItem(SymbolId{});
     }
 
     // ── directives ────────────────────────────────────────────────────────
@@ -513,11 +797,41 @@ private:
         }
         switch (row->verb) {
         case AsmDirectiveVerb::SectionText:
-            // Every function this walker emits already lands in the text
-            // section — LIR has no other. Accepting the directive states that
-            // the file's intent and the walker's behaviour agree; a `.data`
-            // spelling has no verb and is refused above, which is the honest
-            // answer while data emission is unmodelled.
+            // Every function this walker emits lands in the text section — LIR
+            // has no other — so the verb's whole job is to CLOSE whatever data
+            // section was open, which is what makes a `.data … .text …` file
+            // put its instructions back in code.
+            scanSection_.reset();
+            openDataItem_ = kNoLabel;
+            return;
+        case AsmDirectiveVerb::SectionData: {
+            // ★ THE SECTION IS THE DIALECT ROW'S, RESOLVED THROUGH THE ONE
+            // SHARED TAXONOMY. The loader already refused an unknown name, so a
+            // miss here is a substrate bug and says so rather than defaulting.
+            auto const kind = dataSectionKindFromName(row->sectionName);
+            if (!kind.has_value()) {
+                fail(kids[1],
+                     std::format("internal: directive '.{}' declares data "
+                                 "section '{}', which the substrate's "
+                                 "DataSectionKind vocabulary does not name — "
+                                 "the load-time validation that guarantees this "
+                                 "did not hold{}",
+                                 spelling, row->sectionName, pairSuffix()));
+                return;
+            }
+            scanSection_ = *kind;
+            // ⚠ THE OPEN ITEM DOES NOT SURVIVE A SECTION CHANGE. An item
+            // carries ONE `DataSectionKind`, so bytes written after `.data`
+            // cannot append to an item opened under `.rodata` — they would be
+            // emitted read-only and the program would fault writing them.
+            openDataItem_ = kNoLabel;
+            return;
+        }
+        case AsmDirectiveVerb::EmitData:
+            emitDataValues(directive, kids, *row, spelling);
+            return;
+        case AsmDirectiveVerb::ReserveZeroBytes:
+            reserveZeroBytes(directive, kids, spelling);
             return;
         case AsmDirectiveVerb::GlobalSymbol: {
             if (kids.size() < 3) {
@@ -567,6 +881,165 @@ private:
         fail(kids[1], "unhandled directive verb");
     }
 
+    // ★ THE ONE "ARE WE IN DATA?" GATE, shared by both data verbs. Emitting
+    // data into the text section would put bytes where LIR puts instructions
+    // and the linker would run them.
+    [[nodiscard]] bool requireDataSection(NodeId at, std::string_view spelling) {
+        if (scanSection_.has_value()) return true;
+        fail(at,
+             std::format("'.{}' defines data, but no data section is open — "
+                         "bytes written here would land in the TEXT section and "
+                         "be executed. Open one with this dialect's data-section "
+                         "directive ({}){}",
+                         spelling,
+                         cfg_.spellingsForVerb(AsmDirectiveVerb::SectionData)
+                                 .empty()
+                             ? std::string{"this dialect declares none — it "
+                                           "needs a directive row with verb "
+                                           "'sectionData'"}
+                             : cfg_.spellingsForVerb(
+                                   AsmDirectiveVerb::SectionData),
+                         pairSuffix()));
+        return false;
+    }
+
+    // `.byte 1,2` / `.long 42` / `.quad -1` — each operand occupies the row's
+    // `unitBytes` bytes, little-endian.
+    //
+    // ★★ THE ELEMENT WIDTH COMES FROM THE ROW, NEVER FROM THE VALUE. `.byte 1`
+    // and `.quad 1` are the same value and different bytes; sizing from the
+    // value would make a table's stride depend on its contents.
+    void emitDataValues(NodeId directive, std::vector<NodeId> const& kids,
+                        AsmDirectiveSpelling const& row,
+                        std::string_view spelling) {
+        if (!requireDataSection(directive, spelling)) return;
+        if (isZeroFill(*scanSection_)) {
+            fail(directive,
+                 std::format("'.{}' writes bytes, but the open section is "
+                             "zero-fill ({}) — the wire format reserves its "
+                             "size WITHOUT storing file bytes, so the bytes "
+                             "would be silently dropped{}",
+                             spelling, dataSectionKindName(*scanSection_),
+                             pairSuffix()));
+            return;
+        }
+        if (kids.size() < 3) {
+            fail(directive,
+                 std::format("'.{}' needs at least one value to emit",
+                             spelling));
+            return;
+        }
+        auto& item = dataItems_[currentDataItem()];
+        // ★ ALIGNMENT IS DERIVED FROM THE WIDEST ELEMENT THE ITEM CARRIES, not
+        // declared. A `.quad` table must be 8-aligned for the loads that read
+        // it; a `.byte` string needs 1. `.p2align` is an `ignoredAnnotation` in
+        // both shipped dialects, so honouring it would be a second, silently
+        // conflicting source for the same fact.
+        if (auto const a = Alignment::fromBytes(row.unitBytes); a.has_value()) {
+            if (a->bytes() > item.alignment.bytes()) item.alignment = *a;
+        }
+        for (NodeId const operandNode : visibleChildren(tree_, kids[2])) {
+            if (tree_.kind(operandNode) != NodeKind::Internal) continue;
+            auto decoded = decodeOperand(operandNode);
+            if (!decoded) return;
+            if (!decoded->hasValue) {
+                fail(decoded->node,
+                     std::format("'.{}' names '{}', and a symbol-valued data "
+                                 "item needs a relocation this build does not "
+                                 "reach from assembly yet — the bytes would "
+                                 "otherwise be whatever the address happened to "
+                                 "be at compile time{}",
+                                 spelling,
+                                 decoded->symbol.empty()
+                                     ? std::string{"a non-numeric operand"}
+                                     : decoded->symbol,
+                                 pairSuffix()));
+                return;
+            }
+            if (!valueFitsUnit(decoded->value, row.unitBytes, decoded->node,
+                               spelling)) {
+                return;
+            }
+            appendLittleEndianBytes(
+                item.bytes, static_cast<std::uint64_t>(decoded->value),
+                row.unitBytes);
+        }
+    }
+
+    // Does `v` fit `unitBytes` bytes read either as signed or as unsigned?
+    // ⚠ BOTH READINGS ARE ACCEPTED because assembly writes both: `.byte 255`
+    // and `.byte -1` are the same byte and gas takes either. What is refused is
+    // a value outside BOTH ranges, which would be silently truncated.
+    [[nodiscard]] bool valueFitsUnit(std::int64_t v, std::uint32_t unitBytes,
+                                     NodeId at, std::string_view spelling) {
+        if (unitBytes >= 8) return true;   // every std::int64_t fits 8 bytes
+        std::int64_t const  signedMin = -(std::int64_t{1} << (unitBytes * 8 - 1));
+        std::uint64_t const unsignedMax =
+            (std::uint64_t{1} << (unitBytes * 8)) - 1u;
+        if (v >= signedMin && v <= static_cast<std::int64_t>(unsignedMax)) {
+            return true;
+        }
+        fail(at,
+             std::format("value {} does not fit the {} byte(s) '.{}' emits — it "
+                         "is outside [{}, {}] read as signed and unsigned, so "
+                         "encoding it would silently truncate{}",
+                         v, unitBytes, spelling, signedMin, unsignedMax,
+                         pairSuffix()));
+        return false;
+    }
+
+    // `.zero 16` / `.space 16` / `.skip 16` — the operand is a byte COUNT.
+    //
+    // ★ ONE VERB, TWO REALIZATIONS, SPLIT BY THE SUBSTRATE'S OWN `isZeroFill`
+    // PREDICATE rather than by a section name: a zero-fill section reserves the
+    // extent (`reservedSize`, no file bytes — the invariant
+    // `validateAssembledData` enforces), and every other section stores real
+    // zero bytes. That is the same chokepoint `AssembledData::sizeInSection`
+    // and the walkers use, so a future zero-fill kind lands at one point.
+    void reserveZeroBytes(NodeId directive, std::vector<NodeId> const& kids,
+                          std::string_view spelling) {
+        if (!requireDataSection(directive, spelling)) return;
+        if (kids.size() < 3) {
+            fail(directive,
+                 std::format("'.{}' needs the number of zero bytes to reserve",
+                             spelling));
+            return;
+        }
+        std::optional<std::int64_t> count;
+        for (NodeId const operandNode : visibleChildren(tree_, kids[2])) {
+            if (tree_.kind(operandNode) != NodeKind::Internal) continue;
+            auto decoded = decodeOperand(operandNode);
+            if (!decoded) return;
+            if (count.has_value()) {
+                fail(decoded->node,
+                     std::format("'.{}' takes exactly one byte count{}",
+                                 spelling, pairSuffix()));
+                return;
+            }
+            if (!decoded->hasValue || decoded->value < 0) {
+                fail(decoded->node,
+                     std::format("'.{}' needs a non-negative byte count{}",
+                                 spelling, pairSuffix()));
+                return;
+            }
+            count = decoded->value;
+        }
+        if (!count.has_value()) {
+            fail(directive,
+                 std::format("'.{}' needs the number of zero bytes to reserve",
+                             spelling));
+            return;
+        }
+        auto& item = dataItems_[currentDataItem()];
+        if (isZeroFill(item.section)) {
+            item.reservedSize += static_cast<std::uint64_t>(*count);
+            return;
+        }
+        item.bytes.insert(item.bytes.end(),
+                          static_cast<std::size_t>(*count),
+                          static_cast<std::uint8_t>(0));
+    }
+
     // ── pass 1b: which labels are functions ───────────────────────────────
     //
     // ★★★ NO FALLBACK GUESS (operator ruling, 2026-08-12). A `.s` with labels
@@ -585,8 +1058,28 @@ private:
         for (std::size_t i = 0; i < labels_.size(); ++i) {
             auto& L = labels_[i];
             L.isEntry = functionEntryNames_.contains(L.name);
+            // ★ A DATA LABEL IS NEITHER, AND SAYING SO EXPLICITLY IS WHAT KEEPS
+            // A `.s` THAT DEFINES A STRING FROM BEING REFUSED. It carries its
+            // own SymbolId and its own `AssembledData` slot (minted during the
+            // scan, where the open section was known); the block model never
+            // sees it, and it does not open, close or continue a function.
+            // ⚠ A LABEL MARKED BOTH IS REFUSED rather than resolved: the file
+            // says one thing in the section directive and another in the
+            // function-entry marker, and picking either would silently ignore
+            // half of what was written.
+            if (L.isData) {
+                if (L.isEntry) {
+                    fail(L.at,
+                         std::format("label '{}' is marked as a function entry "
+                                     "but is defined inside a DATA section — "
+                                     "one label cannot be both code and data{}",
+                                     L.name, pairSuffix()));
+                    return false;
+                }
+                continue;
+            }
             if (L.isEntry) {
-                L.symbol = SymbolId{static_cast<std::uint32_t>(functionCount_)};
+                L.symbol = mintSymbol();
                 ++functionCount_;
                 currentFunction = i;
                 L.functionLabel = i;
@@ -635,11 +1128,39 @@ private:
 
     // ── pass 2: emit ──────────────────────────────────────────────────────
     bool emitAll() {
-        walkElements(tree_.root(), [&](NodeId element) {
+        walkElements(tree_.root(), [&](NodeId element) { emitElement(element); });
+        if (!ok_) return false;
+        closeFunction();
+        return ok_;
+    }
+
+    void emitElement(NodeId element) {
+        {
             if (!ok_) return;
             // Directives were applied in pass 1; re-applying them here would
-            // double-report every directive diagnostic.
-            if (tree_.rule(element).v == cfg_.directiveRule.v) return;
+            // double-report every directive diagnostic. ⚠ THE SECTION STATE IS
+            // STILL RE-READ, because pass 2 must know whether an instruction
+            // sits in code or in data — and re-reading the ROW (not re-applying
+            // the directive) keeps one source of truth with no second report.
+            if (tree_.rule(element).v == cfg_.directiveRule.v) {
+                NodeId      labelTail{};
+                std::string const dotted = dotLabelName(element, labelTail);
+                if (!dotted.empty()) {
+                    // A dot-prefixed LABEL, not a directive - see
+                    // `dotLabelName`. It enters the block model exactly as
+                    // `Lfoo:` does, which is what makes `jmp .L3` reach a real
+                    // LirBlockId once the dialect can spell the operand.
+                    enterLabel(dotted, element);
+                    if (!ok_) return;
+                    if (NodeId const nested = elementInLabelTail(labelTail);
+                        nested.valid()) {
+                        emitElement(nested);
+                    }
+                    return;
+                }
+                trackSection(element);
+                return;
+            }
             // A statement: a label definition, an instruction, or a label
             // followed on the same line by one.
             NodeId cur = element;
@@ -662,15 +1183,20 @@ private:
                 if (tail.valid()) {
                     enterLabel(std::string{tree_.text(name)}, name);
                     if (!ok_) return;
-                    // The tail may carry another element on the same line.
-                    auto const tailKids = visibleChildren(tree_, tail);
+                    // The tail may carry another element on the same line: a
+                    // STATEMENT continues this loop's label chain, a DIRECTIVE
+                    // is handed back to `emitElement` - which is also what
+                    // routes a nested dot-LABEL (`Lfoo: .L3: ret`) and what
+                    // replays a `main: .text` line's SECTION effect, instead of
+                    // dropping either.
+                    NodeId const nested = elementInLabelTail(tail);
                     cur = NodeId{};
-                    for (NodeId const tk : tailKids) {
-                        if (tree_.kind(tk) != NodeKind::Internal) continue;
-                        if (tree_.rule(tk).v == cfg_.directiveRule.v) break;
-                        if (tree_.rule(tk).v == cfg_.statementRule.v) {
-                            cur = tk;
-                            break;
+                    if (nested.valid()) {
+                        if (tree_.rule(nested).v == cfg_.statementRule.v) {
+                            cur = nested;
+                        } else {
+                            emitElement(nested);
+                            return;
                         }
                     }
                     continue;
@@ -680,10 +1206,23 @@ private:
                                                      cfg_.operandSeqRule));
                 return;
             }
-        });
-        if (!ok_) return false;
-        closeFunction();
-        return ok_;
+        }
+    }
+
+    // Replay a directive's SECTION effect during pass 2. ★ IT READS THE SAME
+    // ROW `applyDirective` reads and does nothing else — an unknown spelling
+    // was already refused in pass 1, so silence here is the absence of a SECOND
+    // report rather than a second policy.
+    void trackSection(NodeId directive) {
+        auto const kids = visibleChildren(tree_, directive);
+        if (kids.size() < 2) return;
+        auto const* row = cfg_.directiveBySpelling(std::string{tree_.text(kids[1])});
+        if (row == nullptr) return;
+        if (row->verb == AsmDirectiveVerb::SectionText) {
+            emitSection_.reset();
+        } else if (row->verb == AsmDirectiveVerb::SectionData) {
+            emitSection_ = dataSectionKindFromName(row->sectionName);
+        }
     }
 
     // ── functions and blocks ──────────────────────────────────────────────
@@ -694,6 +1233,9 @@ private:
             return;
         }
         auto& L = labels_[it->second];
+        // A data label named its `AssembledData` item during the scan; there is
+        // nothing for the block model to do with it.
+        if (L.isData) return;
         if (L.isEntry) {
             openFunction(it->second);
             return;
@@ -713,6 +1255,12 @@ private:
         // IS block order — there is no layout pass to reorder them afterwards.
         entry.block = builder_.createBlock();
         for (std::size_t i = labelIdx + 1; i < labels_.size(); ++i) {
+            // ⚠ A DATA LABEL DOES NOT END THE FUNCTION'S BLOCK RUN. A `.s` may
+            // interleave `.data`/`.text`, and stopping at the first data label
+            // would leave every later block of this function with an INVALID
+            // LirBlockId — which `beginBlock` turns into a process abort rather
+            // than a diagnostic.
+            if (labels_[i].isData) continue;
             if (labels_[i].functionLabel != labelIdx) break;
             labels_[i].block = builder_.createBlock();
         }
@@ -851,6 +1399,7 @@ private:
         // source defect — surface it as a diagnostic naming the label instead
         // of killing the process with no span.
         for (std::size_t i = openFunctionLabel_; i < labels_.size(); ++i) {
+            if (labels_[i].isData) continue;   // never reserved a block
             if (i != openFunctionLabel_
                 && labels_[i].functionLabel != openFunctionLabel_) break;
             if (labels_[i].opened) continue;
@@ -902,6 +1451,16 @@ private:
     // ── instructions ──────────────────────────────────────────────────────
     void emitInstruction(NodeId statement, NodeId mnemonicNode, NodeId tail) {
         std::string_view const spelling = tree_.text(mnemonicNode);
+        if (emitSection_.has_value()) {
+            fail(mnemonicNode,
+                 std::format("instruction '{}' appears while the '{}' DATA "
+                             "section is open — LIR places code in the text "
+                             "section only, so this instruction would be "
+                             "emitted as if the data section were code{}",
+                             spelling, dataSectionKindName(*emitSection_),
+                             pairSuffix()));
+            return;
+        }
         auto const rowIdx = rowIndexBySpelling(spelling);
         if (!rowIdx.has_value()) {
             fail(mnemonicNode,
@@ -916,7 +1475,7 @@ private:
         }
         auto const& row      = cfg_.instructions[*rowIdx];
         auto const& resolved = rows_[*rowIdx];
-        if (!resolved.cfClass.has_value()) {
+        if (!resolved.anyClass()) {
             std::string names;
             for (auto const& n : row.opcodeNames) {
                 if (!names.empty()) names += ", ";
@@ -1069,7 +1628,21 @@ private:
                 out.value    = 0;
                 out.hasValue = false;
                 if (!decodeMemory(base, out)) return std::nullopt;
-                out.disp = disp;
+                // ⚠ TWO DISPLACEMENTS ARE REFUSED, NOT MERGED. A dialect that
+                // writes one OUTSIDE the memory form and nests another INSIDE
+                // it has said the address twice, and picking either (or adding
+                // them) would be this build deciding which one the programmer
+                // meant. Neither shipped dialect can express both; the refusal
+                // exists so a third one cannot do it silently.
+                if (out.disp != 0 && disp != 0) {
+                    fail(cur,
+                         std::format("this operand carries TWO displacements "
+                                     "({} outside the memory form and {} inside "
+                                     "it) and LIR addresses model exactly one{}",
+                                     disp, out.disp, pairSuffix()));
+                    return std::nullopt;
+                }
+                if (disp != 0) out.disp = disp;
                 return out;
             }
             if (!decodeScalar(scalar.valid() ? scalar : cur, out)) {
@@ -1233,12 +1806,25 @@ private:
     }
 
     // ★ THE MEMORY OPERAND IS READ AS "THE REGISTERS IT NAMES, IN ORDER, PLUS
-    // AN OPTIONAL SCALE" — which is LIR's own addressing model, not a dialect
-    // shape. Base is the first register the form names, index the second; the
-    // scale is the one numeric token that is not inside either of them (a
-    // displacement never lives here — the dialect puts it in the sibling
-    // scalar). A dialect whose memory form nests differently binds `memory` to
-    // its own rule and this reading is unchanged.
+    // AN OPTIONAL DISPLACEMENT AND AN OPTIONAL SCALE" — which is LIR's own
+    // addressing model, not a dialect shape. Base is the first register the
+    // form names, index the second. A dialect whose memory form nests
+    // differently binds `memory` to its own rule and this reading is unchanged.
+    //
+    // ★★★ WHERE THE DISPLACEMENT LIVES IS A DIALECT FACT, AND ASSUMING IT WAS
+    // ALWAYS OUTSIDE WAS A SILENT MISCOMPILE. AT&T writes it OUTSIDE the parens
+    // (`-8(%rbp)`), so `decodeOperand`'s `Displaced` arm reads it and this
+    // function saw only registers and a scale. aarch64 writes it INSIDE the
+    // brackets (`[x29, #-8]`) as an `immediate`-role child — and the old
+    // reading swept its numeric token up as the SCALE. ✔MEASURED: `[x29, #-8]`
+    // produced base=x29, scale=8, disp=0, silently addressing `x29 * 8`; and
+    // because 1/2/4/8 are exactly the legal scales, the offsets that a
+    // programmer is most likely to write are precisely the ones that pass the
+    // scale validation without a word. `#-16` would have failed loud; `#-8`
+    // did not.
+    // ⇒ the displacement is read from the dialect's OWN `immediate` role when
+    // the memory form nests one, and the scale is then the numeric token that
+    // is inside NEITHER a register NOR that immediate.
     bool decodeMemory(NodeId memory, DecodedOperand& out) {
         std::vector<NodeId> regs;
         collectDescendantsOfRule(
@@ -1272,7 +1858,31 @@ private:
             out.indexOrdinal = indexDecoded->regOrdinal;
             out.indexClass   = indexDecoded->regClass;
         }
-        // The scale: numeric tokens outside every register subtree.
+        // The displacement, when this dialect nests one inside the memory form.
+        NodeId const innerImm =
+            findDescendantOfRule(tree_, memory,
+                                 cfg_.ruleForRole(AsmOperandRole::Immediate));
+        if (innerImm.valid()) {
+            DecodedOperand disp;
+            NodeId const   scalar =
+                findDescendantOfRule(tree_, innerImm,
+                                     cfg_.ruleForRole(AsmOperandRole::Scalar));
+            if (!decodeScalar(scalar.valid() ? scalar : innerImm, disp)) {
+                return false;
+            }
+            if (!disp.hasValue) {
+                fail(innerImm,
+                     std::format("memory displacement '{}' is a symbol, and a "
+                                 "symbol-relative memory operand needs a "
+                                 "relocation this build does not reach from "
+                                 "assembly yet{}", disp.symbol, pairSuffix()));
+                return false;
+            }
+            if (!fitsDisp(disp.value, innerImm)) return false;
+            out.disp = static_cast<std::int32_t>(disp.value);
+        }
+        // The scale: numeric tokens outside every register subtree AND outside
+        // the displacement read above.
         std::vector<std::string_view> numerics;
         collectNumericTokensOutsideRegisters(memory, numerics);
         if (numerics.size() > 1) {
@@ -1303,6 +1913,15 @@ private:
         if (tree_.kind(n) == NodeKind::Internal
             && tree_.rule(n).v
                    == cfg_.ruleForRole(AsmOperandRole::Register).v) {
+            return;
+        }
+        // ⚠ AND OUTSIDE THE DISPLACEMENT. A dialect nesting its offset inside
+        // the memory form (`[x29, #-8]`) puts a numeric token there too, and
+        // counting it as a scale is the miscompile `decodeMemory` documents.
+        if (tree_.kind(n) == NodeKind::Internal
+            && cfg_.ruleForRole(AsmOperandRole::Immediate).valid()
+            && tree_.rule(n).v
+                   == cfg_.ruleForRole(AsmOperandRole::Immediate).v) {
             return;
         }
         if (tree_.kind(n) == NodeKind::Token) {
@@ -1355,32 +1974,59 @@ private:
 
     bool decodeScalar(NodeId node, DecodedOperand& out) {
         // A scalar is either a number (possibly negated) or a symbol name.
-        bool negate = false;
-        NodeId cur  = node;
-        if (tree_.kind(cur) == NodeKind::Internal
-            && tree_.rule(cur).v
-                   == cfg_.ruleForRole(AsmOperandRole::NegNumber).v) {
-            negate = true;
-        }
-        std::string_view text;
-        for (NodeId const k : visibleChildren(tree_, cur)) {
-            if (tree_.kind(k) == NodeKind::Token) {
-                text = tree_.text(k);
-                if (tree_.kind(cur) == NodeKind::Internal && negate) continue;
-            }
-        }
-        if (text.empty() && tree_.kind(cur) == NodeKind::Token) {
-            text = tree_.text(cur);
-        }
-        if (text.empty()) {
-            // Nested one level deeper (an alt wrapper): take the deepest token.
-            NodeId probe = cur;
-            while (tree_.kind(probe) == NodeKind::Internal) {
-                auto const kids = visibleChildren(tree_, probe);
-                if (kids.empty()) break;
-                probe = kids.back();
-            }
-            if (tree_.kind(probe) == NodeKind::Token) text = tree_.text(probe);
+        //
+        // ★★★ THE NEGATION IS SEARCHED FOR ON THE WHOLE DESCENT, NOT TESTED ON
+        // THE NODE WE WERE HANDED — and that distinction was a LIVE SILENT
+        // MISCOMPILE for a full cycle (D-ASM-NEGATIVE-SCALAR-LOSES-ITS-SIGN,
+        // shipped in `e5b60f6c`, found 2026-08-13).
+        //
+        // ✔MEASURED three ways, every one of them exit-code visible and none of
+        // them diagnosed: `movq $-8,%rcx` + `addq %rcx,%rax` returned 108 where
+        // 92 was written (it ADDED 8); the arm64 twin `mov x1,#-8` did the
+        // same; and `leaq -8(%rsp),%rax` computed a WRONG ADDRESS, which is
+        // strictly worse than a wrong constant.
+        //
+        // ⚠ THE MECHANISM, because the shape recurs: `decodeOperand` resolves
+        // the SCALAR role and hands over the alt WRAPPER (`attScalar` /
+        // `armScalar`), whose own rule is the wrapper's — never `negNumber`. So
+        // the old equality test on that one node was false for every negative,
+        // control fell through to the "deepest token" probe, and the probe
+        // returned the `IntLiteral` from UNDER `attNegNumber` with the
+        // `MinusSign` sibling left behind. A node-identity test asked the wrong
+        // node; nothing in the grammar was wrong.
+        //
+        // ⚠ AND THE SIGN COMES FROM THE PARSE STRUCTURE, NEVER FROM RE-READING
+        // TEXT. `attNegNumber`/`armNegNumber` exist precisely so `-` is grammar
+        // rather than lexing (gas's `-` is also a binary operator, so a signed
+        // literal token would make `8-4` lex as two numbers); recovering the
+        // sign by scanning for a '-' character would re-introduce exactly the
+        // ambiguity the rule was written to remove.
+        RuleId const negRule = cfg_.ruleForRole(AsmOperandRole::NegNumber);
+        NodeId const negNode = findDescendantOfRule(tree_, node, negRule);
+        bool const   negate  = negNode.valid();
+
+        // ★★ WHICH TOKENS SPELL THE VALUE, AND WHY THE TWO ARMS DIFFER.
+        //   * NEGATED: the negation rule is (sign, magnitude), so the value is
+        //     its LAST token and the sign is carried by `negate`. Joining the
+        //     tokens would produce "-8", which `parseInteger` reads as a
+        //     non-number and would then be taken for a SYMBOL named `-8`.
+        //   * NOT NEGATED: the value is EVERY token, joined in document order.
+        //     ✔MEASURED 2026-08-13: `.L3` as an operand is
+        //     `DirectiveDot Identifier`, and the old "deepest token" probe
+        //     returned `L3` — a different symbol from the one the file wrote,
+        //     which would have bound a branch to the wrong label (or minted a
+        //     bogus extern) with no diagnostic. Joining is also what makes a
+        //     plain `IntLiteral`, a bare `Identifier` and an alt wrapper around
+        //     either read identically, which is the one reading a dialect-blind
+        //     walker can defend. D-ASM-DOTTED-NAME-NOT-AN-OPERAND.
+        std::string text;
+        if (negate) {
+            std::string_view last;
+            forEachTokenInOrder(negNode,
+                                [&](std::string_view t) { last = t; });
+            text = std::string{last};
+        } else {
+            forEachTokenInOrder(node, [&](std::string_view t) { text += t; });
         }
         if (text.empty()) {
             fail(node, "could not read the operand's value");
@@ -1398,8 +2044,21 @@ private:
             out.hasValue = true;
             return true;
         }
-        out.symbol = std::string{text};
+        out.symbol = std::move(text);
         return true;
+    }
+
+    // Every TOKEN at or under `n`, in document order. The one traversal both
+    // scalar arms use, so "which tokens spell this operand" has a single
+    // answer.
+    template <class Fn>
+    void forEachTokenInOrder(NodeId n, Fn&& fn) const {
+        if (!n.valid()) return;
+        if (tree_.kind(n) == NodeKind::Token) { fn(tree_.text(n)); return; }
+        for (NodeId const c : tree_.children(n)) {
+            if (isEmptySpace(tree_.flags(c))) continue;
+            forEachTokenInOrder(c, fn);
+        }
     }
 
     // ★★★ THE OPERAND→LIR SHAPE IS DERIVED FROM THE TARGET, NOT RE-DECLARED
@@ -1421,13 +2080,47 @@ private:
     // TARGET's own encoding guards (`asm_variant_elect.hpp`), so a shape no
     // declared variant accepts fails loud naming the mnemonic and every opcode
     // that was tried — instead of being fitted.
-    void buildLirInst(DecodedInstruction const& ins,
+    void buildLirInst(DecodedInstruction const& insIn,
                       AsmInstructionSpelling const& row,
                       ResolvedRow const& resolved) {
+        // ★★ WHICH ARM OF A KIND-SPLIT ROW: the DIALECT fact (did the operand
+        // carry this dialect's indirect marker?) times the TARGET fact (which
+        // of the row's opcodes is reached through a register). A row with only
+        // one arm has nothing to decide — `call` on x86_64 encodes both forms
+        // as variants of ONE opcode and settles it inside `buildCall`.
+        bool wroteIndirect = false;
+        for (auto const& o : insIn.operands) {
+            wroteIndirect = wroteIndirect || o.indirect;
+        }
+        std::optional<CfClass> const cfClass =
+            (resolved.directClass.has_value() && resolved.indirectClass.has_value())
+                ? (wroteIndirect ? resolved.indirectClass : resolved.directClass)
+                : (resolved.directClass.has_value() ? resolved.directClass
+                                                    : resolved.indirectClass);
+
+        // ★ THE CONDITION, RESOLVED BEFORE THE SHAPE — because on a dialect
+        // that writes it as an OPERAND it is not part of the shape at all.
+        // `cset x0, eq` has ONE value operand; leaving `eq` in the list would
+        // present the elector a two-operand shape the target's `setcc` (zero
+        // value operands, reads FLAGS) declares no variant for.
+        auto const cond = conditionFor(resolved, row, insIn);
+        if (!cond.ok) return;
+        DecodedInstruction stripped;
+        if (cond.fromOperand != static_cast<std::size_t>(-1)) {
+            stripped.mnemonic = insIn.mnemonic;
+            stripped.node     = insIn.node;
+            for (std::size_t i = 0; i < insIn.operands.size(); ++i) {
+                if (i == cond.fromOperand) continue;
+                stripped.operands.push_back(insIn.operands[i]);
+            }
+        }
+        DecodedInstruction const& ins =
+            cond.fromOperand != static_cast<std::size_t>(-1) ? stripped : insIn;
+
         // ⚠ A CONTROL-FLOW INSTRUCTION'S REGISTER OPERAND IS AN ADDRESS, NOT
         // DATA (`call *%rax`, `br x16`), so its width says nothing about the
         // operation and must not be derived from.
-        bool const dataOperands = *resolved.cfClass == CfClass::Plain;
+        bool const dataOperands = *cfClass == CfClass::Plain;
         auto const width = effectiveWidth(ins, row, dataOperands);
         if (!width.has_value()) return;
 
@@ -1460,22 +2153,29 @@ private:
         // shape D-ASM-COND-ALLOWED-ONLY-ON-JCC was; the resolve-time pair would
         // have DEMANDED a `cond` on such a row and the emit walk would have
         // thrown it away.
-        std::uint32_t const payload = payloadFor(resolved, ins);
+        std::uint32_t const payload = payloadFor(resolved, cond, ins);
         if (!ok_) return;
 
-        switch (*resolved.cfClass) {
-        case CfClass::Return:      buildReturn(ins, row, payload, flags); return;
-        case CfClass::Br:          buildBr(ins, row, payload, flags); return;
-        case CfClass::CondBr:      buildCondBr(ins, row, payload, flags); return;
-        case CfClass::Call:        buildCall(ins, row, payload, flags, widthBits); return;
-        case CfClass::IndirectBr:
+        // The candidate names the elected arm may draw from. A kind-split row
+        // must NOT offer the other arm's opcode to the elector — `jmp *%rax`
+        // presenting `[reg]` would otherwise be handed to `jmp`, whose only
+        // variant guards on `[blockref]`, and the rejection list would name an
+        // opcode the instruction was never eligible for.
+        auto const armNames = candidatesForClass(row, *cfClass);
+
+        switch (*cfClass) {
+        case CfClass::Return:      buildReturn(ins, armNames, payload, flags); return;
+        case CfClass::Br:          buildBr(ins, armNames, payload, flags); return;
+        case CfClass::CondBr:      buildCondBr(ins, armNames, payload, flags); return;
+        case CfClass::Call:        buildCall(ins, armNames, payload, flags, widthBits); return;
+        case CfClass::IndirectBr:  buildIndirectBr(ins, armNames, payload, flags, widthBits); return;
         case CfClass::Unreachable:
             fail(ins.node,
                  std::format("'{}' is {}, which this build does not lower from "
-                             "assembly text: its successor set is not something "
-                             "a `.s` states, and inventing one would silently "
-                             "change the control-flow graph{}",
-                             ins.mnemonic, cfClassName(*resolved.cfClass),
+                             "assembly text: an unreachable trap written by hand "
+                             "asserts a claim about control flow that the rest "
+                             "of the file cannot be checked against{}",
+                             ins.mnemonic, cfClassName(*cfClass),
                              pairSuffix()));
             return;
         case CfClass::Plain:       break;
@@ -1486,7 +2186,7 @@ private:
             fail(ins.node,
                  std::format("'{}' has no operands, which this build cannot "
                              "map onto {}{}", ins.mnemonic,
-                             candidateList(row), pairSuffix()));
+                             candidateList(armNames), pairSuffix()));
             return;
         }
         std::size_t const destIndex =
@@ -1568,7 +2268,7 @@ private:
         // a new knob.
         std::vector<std::string> producers;
         std::vector<std::string> consumers;
-        for (auto const& name : row.opcodeNames) {
+        for (auto const& name : armNames) {
             auto const ordinal = target_.opcodeByMnemonic(name);
             if (!ordinal) continue;
             auto const* info = target_.opcodeInfo(*ordinal);
@@ -1587,9 +2287,9 @@ private:
             std::vector<LirOperand> operands = sources;
             appendMemory(dest, operands);
             auto const chosen =
-                electAmong(consumers, operands, widthBits, row, ins);
+                electAmong(consumers, operands, widthBits, ins);
             if (!chosen.has_value()) return;
-            if (!checkElectedWidth(*chosen, row, *width, ins)) return;
+            if (!checkElectedWidth(*chosen, *width, ins)) return;
             builder_.addInst(chosen->opcode, InvalidLirReg, operands, payload,
                              flags);
             ++blockInstCount_;
@@ -1648,9 +2348,35 @@ private:
         destFirst.reserve(sources.size() + 1);
         destFirst.push_back(LirOperand::makeReg(destReg));
         destFirst.insert(destFirst.end(), sources.begin(), sources.end());
+        // ★★★ THE GATE IS "THIS ROW HAS A PRODUCER", NOT "A MEMORY OPERAND IS
+        // PRESENT" — and the difference is the whole of arm64's `str`.
+        // ✔MEASURED 2026-08-13: `str x1, [sp, #24]` was INEXPRESSIBLE. arm64 is
+        // `destinationFirst`, so operand 0 is `x1` — a REGISTER — while the
+        // thing the instruction actually writes is the MEMORY operand written
+        // second. Shape 3 (memory destination) therefore never fired, shape 1
+        // needs a producer and `store` produces nothing, and shape 2 was gated
+        // off by the mere presence of a memory reference. The result was
+        // `A0008: 'str' produced 3 LIR operand(s) … no candidate target opcode
+        // encodes that shape` on the most ordinary store in the ISA.
+        // ⚠ THE OLD GATE WAS PROTECTING SOMETHING REAL, WHICH IS WHY IT NARROWS
+        // RATHER THAN DISAPPEARS. ✔MEASURED earlier in this arc: AT&T
+        // `movq 8(%rdi),%rax` builds the shape-2 list `[rax, rdi, MemBase,
+        // MemOffset]`, BYTE-FOR-BYTE the guard `store` declares, so `load`
+        // (shape 1) and `store` (shape 2) BOTH elected and the run was refused
+        // as ambiguous. What separates that case from arm64's `str` is not the
+        // memory operand — both have one — it is that AT&T's `movq` row lists a
+        // PRODUCER (`mov`/`load`) and arm64's `str` row lists none.
+        // ⇒ a row that can produce a value keeps LIR's memory-side rule (memory
+        // source ⇒ shape 1, memory destination ⇒ shape 3); a row that can ONLY
+        // consume gets its destination as an input. That also keeps the
+        // dangerous direction unreachable BY CONSTRUCTION rather than by
+        // coincidence: a load whose producer candidate failed can never fall
+        // through to its store sibling, because the presence of the producer
+        // candidate is exactly what withholds shape 2.
         Election ce =
-            anyMemory ? Election{}
-                      : electQuiet(consumers, destFirst, widthBits);
+            (anyMemory && !producers.empty())
+                ? Election{}
+                : electQuiet(consumers, destFirst, widthBits);
         if (!ce.ambiguousWith.empty()) {
             reportAmbiguous(ins, ce, widthBits);
             return;
@@ -1666,7 +2392,7 @@ private:
             return;
         }
         if (ce.opcode.has_value()) {
-            if (!checkElectedWidth(*ce.opcode, row, *width, ins)) return;
+            if (!checkElectedWidth(*ce.opcode, *width, ins)) return;
             builder_.addInst(ce.opcode->opcode, InvalidLirReg, destFirst,
                              payload, flags);
             ++blockInstCount_;
@@ -1679,7 +2405,7 @@ private:
             reportNoShape(ins, sources.size(), widthBits, rejections);
             return;
         }
-        if (!checkElectedWidth(*chosen, row, *width, ins)) return;
+        if (!checkElectedWidth(*chosen, *width, ins)) return;
         builder_.addInst(chosen->opcode, destReg, operands, payload, flags);
         ++blockInstCount_;
     }
@@ -1696,27 +2422,37 @@ private:
         operands.push_back(LirOperand::makeMemOffset(m.disp));
     }
 
-    [[nodiscard]] std::string
-    candidateList(AsmInstructionSpelling const& row) const {
-        std::string names;
-        for (auto const& n : row.opcodeNames) {
-            if (!names.empty()) names += ", ";
-            names += '\'';
-            names += n;
-            names += '\'';
-        }
-        return std::format("target opcode(s) {}", names);
-    }
-
-    [[nodiscard]] TargetOpcodeInfo const*
-    twoAddressCandidate(AsmInstructionSpelling const& row) const {
+    // The candidate opcodes of `row` whose control-flow class is `cls` — the
+    // ARM of a kind-split row. Order is the dialect's declaration order, which
+    // is the elector's only tie-break, so filtering preserves it.
+    // ⚠ A CANDIDATE THIS TARGET DOES NOT DECLARE IS DROPPED HERE, exactly as
+    // `resolveRows` skipped it: a shared dialect base may name a spelling this
+    // CPU has no opcode for, and the refusal for that belongs at the point of
+    // USE (which `emitInstruction`'s `anyClass()` gate already owns).
+    [[nodiscard]] std::vector<std::string>
+    candidatesForClass(AsmInstructionSpelling const& row, CfClass cls) const {
+        std::vector<std::string> out;
         for (auto const& name : row.opcodeNames) {
             auto const ordinal = target_.opcodeByMnemonic(name);
             if (!ordinal) continue;
             auto const* info = target_.opcodeInfo(*ordinal);
-            if (info != nullptr && info->requires2Address) return info;
+            if (info == nullptr) continue;
+            if (cfClassOf(*info) != cls) continue;
+            out.push_back(name);
         }
-        return nullptr;
+        return out;
+    }
+
+    [[nodiscard]] std::string
+    candidateList(std::vector<std::string> const& names) const {
+        std::string joined;
+        for (auto const& n : names) {
+            if (!joined.empty()) joined += ", ";
+            joined += '\'';
+            joined += n;
+            joined += '\'';
+        }
+        return std::format("target opcode(s) {}", joined);
     }
 
     // One election attempt: the winner (if any), why each loser lost, and the
@@ -1801,9 +2537,7 @@ private:
     std::optional<asm_elect::ElectedOpcode>
     electAmong(std::vector<std::string> const& names,
                std::span<LirOperand const> operands, std::uint8_t widthBits,
-               AsmInstructionSpelling const& row,
                DecodedInstruction const& ins) {
-        (void)row;
         Election e = electQuiet(names, operands, widthBits);
         if (e.opcode.has_value()) return e.opcode;
         if (!e.ambiguousWith.empty()) {
@@ -1829,10 +2563,8 @@ private:
     // `asm_variant_elect.hpp`'s `variantHonorsDeclaredWidth` for the measured
     // arm64-`mov` / x86-`lea` case this closes.
     bool checkElectedWidth(asm_elect::ElectedOpcode const& elected,
-                           AsmInstructionSpelling const& row,
                            std::uint32_t width,
                            DecodedInstruction const& ins) {
-        (void)row;
         if (asm_elect::variantHonorsDeclaredWidth(
                 *elected.variant, static_cast<std::uint8_t>(width))) {
             return true;
@@ -1851,8 +2583,8 @@ private:
 
     // ── control-flow arms ─────────────────────────────────────────────────
     void buildReturn(DecodedInstruction const& ins,
-                     AsmInstructionSpelling const& row, std::uint32_t payload,
-                     std::uint8_t flags) {
+                     std::vector<std::string> const& names,
+                     std::uint32_t payload, std::uint8_t flags) {
         if (!ins.operands.empty()) {
             fail(ins.node,
                  std::format("'{}' is a return and this build lowers only its "
@@ -1861,10 +2593,9 @@ private:
             return;
         }
         auto const elected = electAmong(
-            row.opcodeNames, std::span<LirOperand const>{},
-            lirInstWidthBits(flags), row, ins);
+            names, std::span<LirOperand const>{}, lirInstWidthBits(flags), ins);
         if (!elected.has_value()) return;
-        if (!checkElectedWidth(*elected, row, lirInstWidthBits(flags), ins)) {
+        if (!checkElectedWidth(*elected, lirInstWidthBits(flags), ins)) {
             return;
         }
         builder_.addReturn(elected->opcode, {}, payload, flags);
@@ -1907,7 +2638,7 @@ private:
     }
 
     void buildBr(DecodedInstruction const& ins,
-                 AsmInstructionSpelling const& row, std::uint32_t payload,
+                 std::vector<std::string> const& names, std::uint32_t payload,
                  std::uint8_t flags) {
         if (ins.operands.size() != 1) {
             fail(ins.node,
@@ -1921,9 +2652,9 @@ private:
         std::array<LirOperand, 1> const ops{
             LirOperand::makeBlockRef(target->v)};
         auto const elected =
-            electAmong(row.opcodeNames, ops, lirInstWidthBits(flags), row, ins);
+            electAmong(names, ops, lirInstWidthBits(flags), ins);
         if (!elected.has_value()) return;
-        if (!checkElectedWidth(*elected, row, lirInstWidthBits(flags), ins)) {
+        if (!checkElectedWidth(*elected, lirInstWidthBits(flags), ins)) {
             return;
         }
         builder_.addBr(elected->opcode, *target, payload, flags);
@@ -1932,7 +2663,7 @@ private:
     }
 
     void buildCondBr(DecodedInstruction const& ins,
-                     AsmInstructionSpelling const& row,
+                     std::vector<std::string> const& names,
                      std::uint32_t payload, std::uint8_t flags) {
         if (ins.operands.size() != 1) {
             fail(ins.node,
@@ -1953,9 +2684,9 @@ private:
             LirOperand::makeBlockRef(taken->v),
             LirOperand::makeBlockRef(fallthrough.v)};
         auto const elected =
-            electAmong(row.opcodeNames, ops, lirInstWidthBits(flags), row, ins);
+            electAmong(names, ops, lirInstWidthBits(flags), ins);
         if (!elected.has_value()) return;
-        if (!checkElectedWidth(*elected, row, lirInstWidthBits(flags), ins)) {
+        if (!checkElectedWidth(*elected, lirInstWidthBits(flags), ins)) {
             return;
         }
         // ⚠ THE SHARED `payload`, NOT `*resolved.cond`. Under the old
@@ -1980,11 +2711,10 @@ private:
     // `(mangledName, libraryPath, version)` key would collapse them anyway,
     // leaving one dead SymbolId that `declare()` had already registered).
     //
-    // ★ SYMBOL IDS CONTINUE THE FUNCTION NUMBERING. `classifyLabels` (pass 1b)
-    // hands the function-entry labels 0..functionCount_-1 and has already run
-    // when any statement is emitted, so `functionCount_ + n` cannot collide
-    // with a defined symbol — which the linker's per-CU `declare()` would
-    // otherwise reject as a duplicate.
+    // ★ SYMBOL IDS COME FROM THE SAME MONOTONIC MINT AS EVERY OTHER SYMBOL
+    // THIS FILE DEFINES (`mintSymbol`), so an import can never collide with a
+    // defined function or a data item — which the linker's per-CU `declare()`
+    // would otherwise reject as a duplicate.
     //
     // ★ THE NAME IS TAKEN VERBATIM, NOT MANGLED. A `.s` writes the ON-BINARY
     // symbol — a Mach-O source writes `_puts` itself, exactly as gas requires —
@@ -1996,8 +2726,7 @@ private:
             return externs_[it->second].symbol;
         }
         ExternImport row;
-        row.symbol = SymbolId{static_cast<std::uint32_t>(functionCount_
-                                                         + externs_.size())};
+        row.symbol      = mintSymbol();
         row.mangledName = name;
         // `libraryPath` / `version` stay EMPTY (unbound), `isEagerImport` false
         // (nothing shipped this row, so the reference gate may drop it when
@@ -2010,7 +2739,7 @@ private:
     }
 
     void buildCall(DecodedInstruction const& ins,
-                   AsmInstructionSpelling const& row, std::uint32_t payload,
+                   std::vector<std::string> const& names, std::uint32_t payload,
                    std::uint8_t flags, std::uint8_t widthBits) {
         if (ins.operands.size() != 1) {
             fail(ins.node,
@@ -2067,16 +2796,144 @@ private:
                              ins.mnemonic, pairSuffix()));
             return;
         }
-        auto const elected = electAmong(row.opcodeNames, ops, widthBits, row,
-                                        ins);
+        auto const elected = electAmong(names, ops, widthBits, ins);
         if (!elected.has_value()) return;
-        if (!checkElectedWidth(*elected, row, widthBits, ins)) return;
+        if (!checkElectedWidth(*elected, widthBits, ins)) return;
         // ★ A CALL IS NOT A TERMINATOR — plain `addInst`. And this path runs
         // POST-callconv (no pass follows), so the operand list is exactly the
         // callee reference: the argument registers were set by the instructions
         // the programmer wrote above it.
         builder_.addInst(elected->opcode, InvalidLirReg, ops, payload,
                          flags);
+        ++blockInstCount_;
+    }
+
+    // The successor set an indirect branch in the OPEN function can be DERIVED
+    // to reach: every INTERIOR label of that function whose address this file
+    // has bound a relocation against. Empty ⇒ nothing to derive the set FROM.
+    //
+    // ★★★ "ADDRESS-TAKEN" IS ASKED OF THE EXISTING LABEL MODEL, AND THE TEST
+    // IS `symbol.valid()` FOR A REASON. A relocation names a SYMBOL; an
+    // interior label is a BLOCK and carries none until something needs to name
+    // it — which is exactly the step the C path performs at the same moment
+    // (`lowerBlockAddress` calls `mintBlockSymbol(target)` and only then emits
+    // the `lea` that materializes the address). So "this interior label carries
+    // a symbol" and "this file bound a relocation against this interior label"
+    // are ONE fact, read off `LabelInfo` rather than mirrored into a side-table
+    // — the same property `Mir::isBlockAddressTaken` states for the C tier
+    // ("DERIVED from the IR … NO parallel side-table to maintain"). No
+    // asm-private successor list, no jump-table model, no new operand kind.
+    //
+    // ⚠ THE ONE OBLIGATION THIS PLACES ON A FUTURE CHANGE: whatever mints a
+    // symbol for an INTERIOR label must be the code that binds a relocation
+    // against it. A minter with any other motive would WIDEN this set, and a
+    // wider indirect-branch successor set is precisely the "every block"
+    // over-approximation the refusal below exists to refuse.
+    [[nodiscard]] std::vector<LirBlockId> derivableIndirectSuccessors() const {
+        std::vector<LirBlockId> out;
+        for (auto const& L : labels_) {
+            if (L.isEntry || L.isData) continue;          // not a block
+            if (L.functionLabel != openFunctionLabel_) continue;
+            if (!L.symbol.valid()) continue;              // no relocation bound
+            out.push_back(L.block);
+        }
+        return out;
+    }
+
+    // ★★★ THE INDIRECT BRANCH — REACHED ONLY BECAUSE ELECTION NOW SPANS
+    // TERMINATOR KINDS (D-ASM-ATT-INDIRECT-BRANCH-INEXPRESSIBLE). gas spells
+    // `jmp .L1` and `jmp *%rax` with ONE mnemonic; the row names both target
+    // opcodes and the star on the operand picks the arm. Nothing below asks
+    // WHICH opcode was elected — the dispatch already happened, keyed on the
+    // `TargetTerminatorKind::IndirectBr` the TARGET declares.
+    //
+    // ⚠⚠ AND THE REFUSAL IS KEYED ON **DERIVABILITY**, NOT ON THE OPCODE —
+    // WHICH IS THE WHOLE DESIGN AND NOT A WORDING PREFERENCE. LIR's
+    // `addIndirectBr` takes every ADDRESS-TAKEN successor block, and a `.s`
+    // binds that set in exactly two ways, BOTH of which need a relocation from
+    // assembly text to a LABEL that this build does not yet reach:
+    //   * `leaq .L4(%rip), %rax` — refused today by `decodeMemory`'s
+    //     "symbol-relative memory operand needs a relocation" arm;
+    //   * a jump table in data (`.quad .L4`) — refused by the data-value walk's
+    //     "symbol-valued data item needs a relocation" arm.
+    // So the condition below is `derivableIndirectSuccessors().empty()`, and
+    // it is a QUESTION rather than a constant: WHEN INTERIOR-LABEL RELOCATION
+    // LANDS, THIS SAME CODE PATH STARTS SUCCEEDING AND ONLY THE CONDITION
+    // STOPS HOLDING. A refusal keyed on the opcode ("indirect branches are
+    // unsupported") would have to be DELETED by that change and would say
+    // nothing true in the meantime; one keyed on derivability stays where it
+    // is and becomes correct.
+    //
+    // ⚠ `addIndirectBr` IS NOT RELAXED TO ACCEPT AN EMPTY LIST, and that is the
+    // opposite of a granularity fork: its explicit successor list is the
+    // CORRECT LIR shape (it matches LLVM's `indirectbr` and matches what the C
+    // path already supplies through `lowerIndirectBr`). The gap is that this
+    // front end cannot yet DERIVE the input, not that LIR asks the wrong
+    // question. An EMPTY successor list would say "control leaves this function
+    // here" — an UNDER-approximation, and unsound rather than merely imprecise,
+    // because liveness and regalloc read the successor pool and would judge
+    // every value live across the edge to be dead. "Every block of this
+    // function" would be a sound over-approximation and is still this build
+    // deciding what the programmer meant, which this walker does nowhere else.
+    // Anchored: D-ASM-INDIRECT-BRANCH-SUCCESSOR-SET-UNSTATED, whose blocker is
+    // the merged capability row D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET.
+    void buildIndirectBr(DecodedInstruction const& ins,
+                         std::vector<std::string> const& names,
+                         std::uint32_t payload, std::uint8_t flags,
+                         std::uint8_t widthBits) {
+        if (ins.operands.size() != 1) {
+            fail(ins.node,
+                 std::format("'{}' is an indirect branch and takes exactly one "
+                             "target-address operand; {} were written{}",
+                             ins.mnemonic, ins.operands.size(), pairSuffix()));
+            return;
+        }
+        DecodedOperand const& op = ins.operands[0];
+        if (op.role != AsmOperandRole::Register || op.isMemory) {
+            fail(op.node,
+                 std::format("'{}' is an indirect branch and this build lowers "
+                             "only its REGISTER form — the target address must "
+                             "already be in a register{}",
+                             ins.mnemonic, pairSuffix()));
+            return;
+        }
+        std::array<LirOperand, 1> const ops{
+            LirOperand::makeReg(makePhysicalReg(op.regOrdinal, op.regClass))};
+        // The election still runs, and runs FIRST: a row whose indirect arm
+        // names an opcode that cannot take a register is a config defect, and
+        // reporting it before the successor-set refusal keeps the two failures
+        // distinguishable.
+        auto const elected = electAmong(names, ops, widthBits, ins);
+        if (!elected.has_value()) return;
+        if (!checkElectedWidth(*elected, widthBits, ins)) return;
+        std::vector<LirBlockId> const succs = derivableIndirectSuccessors();
+        if (succs.empty()) {
+            fail(ins.node,
+                 std::format("'{}' elects target opcode '{}', an indirect "
+                             "branch, and its SUCCESSOR SET CANNOT BE DERIVED: "
+                             "function '{}' binds no relocation against any of "
+                             "its INTERIOR LABELS, so none of its blocks is "
+                             "address-taken and there is nothing to derive the "
+                             "set from. That binding is the missing input — not "
+                             "the instruction, which elected fine. A `.s` writes "
+                             "one by materializing a label's address "
+                             "(`lea`/`adr` of a label) or by listing labels in a "
+                             "jump table (`.quad <label>`); this build refuses "
+                             "both today, in the symbol-relative memory operand "
+                             "arm and the symbol-valued data item arm, and when "
+                             "either lands this same lowering emits the branch "
+                             "with the derived set. Until then both alternatives "
+                             "are wrong: NO successors would claim control "
+                             "leaves the function here, which liveness and "
+                             "register allocation read as 'every value live "
+                             "across this edge is dead'; EVERY block would be "
+                             "this build deciding which labels you meant{}",
+                             ins.mnemonic, elected->info->mnemonic,
+                             labels_[openFunctionLabel_].name, pairSuffix()));
+            return;
+        }
+        builder_.addIndirectBr(elected->opcode, ops, succs, payload, flags);
+        openTerminated_ = true;
         ++blockInstCount_;
     }
 
@@ -2098,6 +2955,26 @@ private:
                 }
             }
         }
+    }
+
+    // The DIRECTIVE that follows a label ON THE SAME LINE, or invalid.
+    //
+    // ★★ `msg: .asciz "hi"` AND `main: .globl main` ARE ORDINARY gas, AND THE
+    // SCAN USED TO DROP BOTH. `walkElements` visits LINE-level elements, and a
+    // directive nested inside a label tail is not one — the old comment claimed
+    // it would be "picked up when the walk reaches it", which is false. A
+    // dropped `.globl` emits the entry symbol with LOCAL linkage; a dropped
+    // data directive emits an empty item. Neither says anything.
+    NodeId nextDirectiveAfterLabel(NodeId statement) {
+        auto const kids = visibleChildren(tree_, statement);
+        if (kids.size() < 2) return NodeId{};
+        NodeId const labelTail =
+            findDescendantOfRule(tree_, kids[1], cfg_.labelTailRule);
+        if (!labelTail.valid()) return NodeId{};
+        NodeId const element =
+            findDescendantOfRule(tree_, labelTail, cfg_.elementRule);
+        if (!element.valid()) return NodeId{};
+        return findDescendantOfRule(tree_, element, cfg_.directiveRule);
     }
 
     // The statement that follows a label ON THE SAME LINE, or invalid.
@@ -2129,6 +3006,38 @@ private:
         return labelTail.valid() ? kids.front() : NodeId{};
     }
 
+    // ★ ONE MONOTONIC SYMBOL MINT FOR EVERY SYMBOL THIS FILE DEFINES OR
+    // IMPORTS — functions, data items and extern references alike.
+    // ⚠⚠ IT STARTS AT 1, NOT 0, AND THAT IS THE WHOLE POINT.
+    // `SymbolId::valid()` is `v != 0`, so the previous numbering handed the
+    // FIRST function the id the substrate reserves as its INVALID SENTINEL.
+    // ✔MEASURED LATENT, NOT LIVE at the time: no `.valid()` gate sat on the
+    // link/emit path, so every emitted object was byte-correct — which is
+    // exactly what makes it a booby trap rather than a bug. The first consumer
+    // to write `if (sym.valid())` would silently drop function 0, and nothing
+    // in the output would show it. D-ASM-FIRST-FUNCTION-TAKES-SYMBOLID-ZERO.
+    [[nodiscard]] SymbolId mintSymbol() noexcept {
+        return SymbolId{nextSymbolId_++};
+    }
+
+    // One `ModuleSymbol` per DATA label, so the linker can match it across CUs
+    // by NAME exactly as it does a function's. ⚠ THE BINDING IS READ FROM THE
+    // SAME `globals_` SET the function arm reads — a `.globl msg` and a
+    // `.globl main` are one directive with one meaning, and a second policy for
+    // data would drift from the first.
+    void addDataSymbols() {
+        for (auto const& L : labels_) {
+            if (!L.isData) continue;
+            ModuleSymbol sym;
+            sym.symbol     = L.symbol;
+            sym.name       = L.name;
+            sym.binding    = globals_.contains(L.name) ? SymbolBinding::Global
+                                                       : SymbolBinding::Local;
+            sym.visibility = SymbolVisibility::Default;
+            symbols_.push_back(std::move(sym));
+        }
+    }
+
     Tree const&                  tree_;
     GrammarSchema const&         grammar_;
     TargetSchema const&          target_;
@@ -2150,6 +3059,13 @@ private:
     std::vector<ExternImport>                    externs_;
     std::unordered_map<std::string, std::size_t> externIndex_;
     std::optional<SymbolId>                     userEntry_;
+    // Data items in SOURCE order, plus the section state each pass tracks. A
+    // nullopt section means TEXT — the default a `.s` starts in.
+    std::vector<AssembledData>                  dataItems_;
+    std::optional<DataSectionKind>              scanSection_;
+    std::optional<DataSectionKind>              emitSection_;
+    std::size_t                                 openDataItem_      = kNoLabel;
+    std::uint32_t                               nextSymbolId_      = 1;
     std::size_t                                 functionCount_     = 0;
     std::size_t                                 openFunctionLabel_ = kNoLabel;
     std::size_t                                 openBlockLabel_    = kNoLabel;

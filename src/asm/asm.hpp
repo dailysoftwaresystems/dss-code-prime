@@ -211,6 +211,32 @@ struct DSS_EXPORT AssembledFunction {
     std::unordered_map<std::uint32_t, std::uint32_t> blockByteOffsets;
 };
 
+// ★ THE ONE LITTLE-ENDIAN SCALAR APPEND, shared by every producer of data
+// bytes in this tier. `lowerMirGlobalsToDataItems` (asm.cpp, the C path) and
+// the assembly-text data directives (`asm_text_to_lir.cpp`, the `.s` path) both
+// route through it, because two copies of a byte-order loop is exactly the
+// shape that drifts into a green build emitting reversed words.
+//
+// ⚠ CALLER INVARIANT: `width` MUST be ≤ 8. `value` is a `std::uint64_t`, so
+// `value >> (j*8)` is UNDEFINED BEHAVIOUR for j ≥ 8 — it is NOT a zero fill,
+// and on both shipped host arches the masked shift count REPEATS the low 8
+// bytes into the high 8, writing plausible-looking WRONG bytes rather than
+// crashing (measured at TF-C94, D-CSUBSET-INT128-DATA-GLOBAL).
+//
+// ⚠ LITTLE-ENDIAN IS UNCONDITIONAL HERE AND NO TARGET DECLARES ITS BYTE ORDER
+// — `TargetSchema` has no endianness facet, and every encoder in this tier
+// (`readU32LE`, the x86/fixed32 templates) already assumes LE. Both shipped
+// CPUs are little-endian so nothing is currently wrong; a big-endian target
+// would need the facet FIRST, and this is one of the sites it would key.
+// Anchored: D-ASM-TARGET-DECLARES-NO-BYTE-ORDER.
+inline void appendLittleEndianBytes(std::vector<std::uint8_t>& bytes,
+                                    std::uint64_t             value,
+                                    std::size_t               width) noexcept {
+    for (std::size_t j = 0; j < width; ++j) {
+        bytes.push_back(static_cast<std::uint8_t>((value >> (j * 8)) & 0xFFu));
+    }
+}
+
 // One assembled data item — bytes + symbol identity, destined for a
 // non-executable section in the output object file (typically PE
 // `.rdata`, ELF `.rodata`, Mach-O `__cstring`/`__const`). Mirrors

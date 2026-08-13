@@ -15,6 +15,7 @@
 #include "core/types/data_model.hpp"           // dataModelFromName (FC3 c1 coreByDataModel keys)
 #include "core/types/predefined_macro_json.hpp" // parsePredefinedMacroArray (TF-C74: shared with the target loader)
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
+#include "core/types/section_kind.hpp"         // dataSectionKindFromName — the ONE data-section taxonomy (`assembly.directives[].section`)
 #include "core/types/symbol_attrs.hpp"         // symbolBindingFromName / symbolVisibilityFromName
 
 #include <nlohmann/json.hpp>
@@ -3996,13 +3997,72 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             // tokens field: "default" inherits top-level lexemeTable;
             // an inline object IS the per-mode override table. While the
-            // tokenizer is in this mode it consults THIS table first and
+            // tokenizer is in a SCANNING mode it consults THIS table first and
             // falls back to the global `lexemeTable` for any lexeme the
             // mode doesn't override (see GrammarSchema::lookupLexemeInMode
             // + the tokenizer's mode-aware longest-match). So the inline
             // object lists ONLY the lexemes whose meaning differs in this
             // mode — everything else lexes exactly as it does globally.
+            // ⚠ "SCANNING mode" is load-bearing and used to read "this mode":
+            // a mode carrying a `defaultToken` is a BODY mode and never
+            // reaches that lookup at all. See the guard directly below.
             const bool hasTokens = modeObj.contains("tokens");
+
+            // ★★★ D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD, the FIRST
+            // half: this guard used to test `!hasTokens && defaultToken`, and
+            // it was WRONG IN EVERY CASE IT EVER FIRED. It is corrected here
+            // BEFORE the success-path warnings are surfaced, because surfacing
+            // it unchanged would have reddened four shipped configs for a
+            // non-defect.
+            //
+            // ✔MEASURED — the old condition's true firing set is all 14
+            // `defaultToken`-and-no-`tokens` modes in the shipped corpus
+            // (c-subset 5: string/charBody/header-body/line-comment/
+            // block-comment · tsql-subset 5: bracket-id/single-string/
+            // unicode-string/line-comment/block-comment · asm-x86_64-att 2 ·
+            // asm-arm64-gas 2), and EVERY ONE of them is the canonical body
+            // scanner. Worse, its own suggested remediation (`tokens:
+            // "default"`) was actively harmful: re-enabling the global table
+            // inside a body scan is what makes a string body stop being a
+            // string body.
+            //
+            // ★★★ AND THE INVERSION IS **NOT** "NEITHER FIELD", WHICH WAS THE
+            // OBVIOUS-LOOKING FIX AND IS ALSO WRONG. A mode declaring neither
+            // was assumed to "match no lexeme at all"; it does not.
+            // ✔MEASURED in `tokenizer.cpp`'s `longestMatchInMode`: when the
+            // mode's override table yields nothing the lookup FALLS BACK to
+            // the global `longestMatch` (its "zero-regression fallback"), so a
+            // mode with neither field lexes IDENTICALLY to the default mode.
+            // That is a working, useful shape — it is exactly what a
+            // `popAtNewline` line-scoped mode wants, and `popAtNewline` is
+            // mutually exclusive with `defaultToken`, so those modes have
+            // neither BY CONSTRUCTION. Warning on it would have replaced one
+            // never-correct warning with another.
+            //
+            // ★★ WHAT IS GENUINELY DEAD CONFIG — and what this now warns on —
+            // is the OPPOSITE pairing: a `tokens` table on a mode that also
+            // declares `defaultToken`. ✔MEASURED in `tokenizer.cpp`: the
+            // body-mode branch is entered on `currentMode.defaultToken
+            // .has_value()` and `continue`s on every one of its exits (the
+            // main scan's own comment says so: "The body-mode branch above
+            // already `continue`d"), so `lookupLexemeInMode` is UNREACHABLE
+            // for such a mode and the table can never be consulted. The author
+            // wrote a table that does nothing, which is the silent outcome a
+            // warning is for. ⓘ It fires on NOTHING in today's corpus — that
+            // is the point: the old predicate was 14-for-14 wrong, this one is
+            // 0-for-0 and describes a real trap.
+            if (hasTokens && defaultToken.has_value()) {
+                coll.emit(DiagnosticCode::C_RedundantField,
+                          std::format("{}/tokens", modePath),
+                          "mode declares BOTH 'defaultToken' and 'tokens', and "
+                          "the 'tokens' table can never be consulted — a mode "
+                          "with a 'defaultToken' is a BODY mode, which the "
+                          "tokenizer scans one codepoint at a time until its "
+                          "'endsAt' without ever reaching the per-mode token "
+                          "lookup. Drop 'tokens' if a body scanner was meant, "
+                          "or drop 'defaultToken' if a scanning mode was",
+                          DiagnosticSeverity::Warning);
+            }
             if (hasTokens) {
                 json const& tk = modeObj.at("tokens");
                 if (tk.is_string() && tk.get<std::string>() == "default") {
@@ -4035,18 +4095,6 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               std::format("{}/tokens", modePath),
                               "'tokens' must be 'default' or an inline tokens object");
                 }
-            } else if (defaultToken.has_value()) {
-                // A mode with defaultToken but no `tokens` field will
-                // only ever match its defaultToken — legitimate for
-                // string-body-style scanners, but a frequent typo. Warn
-                // so authors who meant `tokens: "default"` don't get a
-                // silently empty mode.
-                coll.emit(DiagnosticCode::C_RedundantField, modePath,
-                          "mode declares 'defaultToken' but no 'tokens' field — "
-                          "only 'defaultToken' will ever match. Add "
-                          "'tokens: \"default\"' if you also want the top-level "
-                          "token map active in this mode",
-                          DiagnosticSeverity::Warning);
             }
         }
     }
@@ -14202,8 +14250,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             assemblyClean = false;
                             continue;
                         }
-                        static constexpr std::array<std::string_view, 3>
-                            kDirRowKeys{"spelling", "verb", "marker"};
+                        static constexpr std::array<std::string_view, 5>
+                            kDirRowKeys{"spelling", "verb", "marker",
+                                        "section", "unitBytes"};
                         DSS_CHECK_KEY_VOCABULARY(kDirRowKeys);
                         for (auto it = row.begin(); it != row.end(); ++it) {
                             if (isDocumentationKey(it.key())) continue;
@@ -14292,6 +14341,116 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                             dir.marker = row.at("marker").get<std::string>();
                         }
+                        // ── section ── `sectionData` ONLY, and REQUIRED there.
+                        // The name is a `DataSectionKind` spelling from
+                        // `core/types/section_kind.hpp` — the taxonomy
+                        // `src/asm/` and `src/link/` already share. ⚠ VALIDATED
+                        // HERE rather than at lowering time even though the
+                        // struct stores the name: a mistyped section is a
+                        // CONFIG defect with no target in it, so discovering it
+                        // only when some `.s` happens to switch sections would
+                        // make the same document "fine" for one input and
+                        // broken for the next.
+                        if (dir.verb == AsmDirectiveVerb::SectionData) {
+                            if (!row.contains("section")
+                                || !row.at("section").is_string()
+                                || row.at("section").get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/section",
+                                          std::format(
+                                              "'section' is required on a "
+                                              "'sectionData' directive — it "
+                                              "names which data section '{}' "
+                                              "opens, and there is no default: "
+                                              "an item that landed in the wrong "
+                                              "section would be read-only where "
+                                              "the program writes it, or "
+                                              "writable where it must not be",
+                                              dir.spelling));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            auto const secName =
+                                row.at("section").get<std::string>();
+                            if (!dataSectionKindFromName(secName).has_value()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/section",
+                                          std::format(
+                                              "unknown data section '{}' — the "
+                                              "closed set is 'rodata', 'data', "
+                                              "'bss', 'tdata', 'tbss', 'relro' "
+                                              "(the substrate's DataSectionKind "
+                                              "vocabulary, shared with the "
+                                              "linker). A section this build "
+                                              "cannot place must stay "
+                                              "UNDECLARED and fail loud by "
+                                              "name, never be mapped onto a "
+                                              "different one", secName));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            dir.sectionName = secName;
+                        } else if (row.contains("section")) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/section",
+                                      std::format("'section' is only meaningful "
+                                                  "on a 'sectionData' "
+                                                  "directive; '{}' declares "
+                                                  "verb '{}', where the key "
+                                                  "would be silently ignored",
+                                                  dir.spelling, verbName));
+                            assemblyClean = false;
+                            continue;
+                        }
+                        // ── unitBytes ── `emitData` ONLY, and REQUIRED there.
+                        // ⚠ NO DEFAULT. `.byte 1` and `.quad 1` differ ONLY in
+                        // this number, so a defaulted width would silently
+                        // write the wrong number of bytes for every row that
+                        // forgot it.
+                        if (dir.verb == AsmDirectiveVerb::EmitData) {
+                            if (!row.contains("unitBytes")
+                                || !row.at("unitBytes").is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/unitBytes",
+                                          std::format(
+                                              "'unitBytes' is required on an "
+                                              "'emitData' directive and must be "
+                                              "1, 2, 4 or 8 — how many bytes ONE "
+                                              "operand of '{}' occupies. It is "
+                                              "dialect data and not engine data: "
+                                              "gas's '.word' is 2 bytes on x86 "
+                                              "and 4 on other ports",
+                                              dir.spelling));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            auto const unit =
+                                row.at("unitBytes").get<std::uint32_t>();
+                            if (unit != 1 && unit != 2 && unit != 4
+                                && unit != 8) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/unitBytes",
+                                          std::format("'unitBytes' is {}, which "
+                                                      "is not one of 1, 2, 4, 8 "
+                                                      "— a data element this "
+                                                      "build cannot encode",
+                                                      unit));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            dir.unitBytes = unit;
+                        } else if (row.contains("unitBytes")) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/unitBytes",
+                                      std::format("'unitBytes' is only "
+                                                  "meaningful on an 'emitData' "
+                                                  "directive; '{}' declares verb "
+                                                  "'{}', where the key would be "
+                                                  "silently ignored",
+                                                  dir.spelling, verbName));
+                            assemblyClean = false;
+                            continue;
+                        }
                         if (!seenDirectives.insert(dir.spelling).second) {
                             coll.emit(DiagnosticCode::C_ConflictingField,
                                       path + "/spelling",
@@ -14372,6 +14531,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     if (coll.hasErrors()) {
         return std::unexpected(std::move(coll).release());
     }
+    // D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD: `coll` used to be
+    // DESTROYED here, taking every non-fatal diagnostic with it. `LoadResult`
+    // has no success-side slot to hand them back through, so they ride the
+    // schema itself — see `GrammarSchemaData::loadDiagnostics`.
+    // ★ THE SAME `release()` THE ERROR PATH USES, one line up, rather than a
+    // filtered copy: `hasErrors()` is already the single definition of which
+    // side a load lands on, so anything still in the collector at this point
+    // is by construction non-fatal and is forwarded verbatim.
+    data.loadDiagnostics = std::move(coll).release();
     return std::make_shared<GrammarSchema>(std::move(data));
 }
 

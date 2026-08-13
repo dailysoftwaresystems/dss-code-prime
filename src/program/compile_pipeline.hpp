@@ -237,16 +237,31 @@ resolvePipelineName(CompileConfig config) noexcept {
 // own decisions SILENTLY (registers, instruction forms, and the prologue), so
 // the two paths are different pipelines and not one pipeline with a switch.
 //
-// `formatVerbs` is the active format's `entryVerbs()`; a defined label whose
-// name is one of the language's entry spellings AND whose verb this format
-// realizes becomes the module's `userEntrySymbol`. Returns nullopt on any
-// failure (diagnostics emitted via `reporter`).
+// A defined label whose name is one of the language's entry spellings becomes
+// the module's `userEntrySymbol`. Returns nullopt on any failure (diagnostics
+// emitted via `reporter`).
+//
+// ★★ IT TAKES THE WHOLE `ObjectFormatSchema` AND THE WHOLE `CompileOptions`,
+// NOT A HAND-PICKED SLICE (D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY +
+// D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER). It used to take only
+// `formatVerbs` (the format's `entryVerbs()`), which was every fact the entry
+// election needed and NOTHING the extern binder needs: the platform-realization
+// oracle keys on the active object format KIND + DATA MODEL, and honoring
+// `--resolve-library` needs `opts`. A `.s` calling `putchar` therefore could not
+// bind ANY library and was refused at the EXEC link with `undefined symbol`,
+// while the exact flag that should have bound it was accepted and dropped
+// without a word. Both facts now arrive by the same route `assembleUnit` uses,
+// so the two tiers cannot drift on what "the active format" means.
+// ⚠ A DEFAULTED PARAMETER WAS REJECTED for `opts`: it would compile everywhere
+// while the shipped driver silently never passed one — precisely the shape of
+// the defect being closed.
 [[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
 assembleAsmUnit(CompilationUnit const&                cu,
                 GrammarSchema const&                  grammar,
                 TargetSchema const&                   target,
-                std::span<EntryMaterialization const> formatVerbs,
-                DiagnosticReporter&                   reporter);
+                ObjectFormatSchema const&             format,
+                DiagnosticReporter&                   reporter,
+                CompileOptions const&                 opts);
 
 [[nodiscard]] DSS_EXPORT bool
 compileSingleUnit(CompilationUnit const&         cu,

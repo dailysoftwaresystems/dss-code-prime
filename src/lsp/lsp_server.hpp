@@ -7,9 +7,12 @@
 #include "lsp/protocol.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/transport.hpp"
+#include "lsp/workspace_project.hpp"
 
 #include <atomic>
+#include <filesystem>
 #include <memory>
+#include <vector>
 
 // LSP server. Composes the transport (stdio or in-memory), the
 // method dispatcher, the schema cache, the document store, and the
@@ -60,6 +63,15 @@ public:
         return documents_;
     }
 
+    // The workspace's language preference as resolved at `initialize` — the
+    // channel that lets the editor tell two assembly dialects apart. Exposed
+    // read-only so a test can assert on the RESOLUTION itself, not only on its
+    // downstream effect on a document.
+    [[nodiscard]] WorkspacePreferenceResult const&
+    workspacePreference() const noexcept {
+        return workspacePreference_;
+    }
+
 private:
     void registerHandlers_();
 
@@ -101,6 +113,22 @@ private:
     LspServerOptions               options_;
     MethodDispatcher               dispatcher_;
     DocumentStore                  documents_;
+
+    // Workspace folders named by `initialize`, and the language preference
+    // derived from their project manifests. Written once in
+    // `handleInitialize_`, read in `handleDidOpen_` — both on the `run()`
+    // thread, so neither needs a lock. Parse workers never see them.
+    //
+    // The pre-`initialize` value is a LOUD one, not an empty preference: a
+    // default-constructed `expected` would read as "a preference exists and
+    // names nothing", which is the silent-answer shape. A client that opens a
+    // document before initializing gets a reason that says exactly that.
+    std::vector<std::filesystem::path> workspaceRoots_;
+    WorkspacePreferenceResult          workspacePreference_ =
+        std::unexpected(WorkspaceProjectError{
+            WorkspaceProjectErrorKind::NoWorkspaceRoot,
+            "the client has not sent `initialize` yet, so no workspace folder "
+            "is known"});
 
     // `shutdownReceived_` flips on `shutdown` — observed by `run()`
     // to distinguish a clean (exit-code 0) EOF from a premature one

@@ -10,9 +10,11 @@
 #include "lsp/diagnostic_translator.hpp"
 #include "lsp/json_rpc.hpp"
 #include "lsp/lsp_semantic_query.hpp"
+#include "lsp/workspace_project.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -40,6 +42,54 @@ using json = nlohmann::json;
     for (auto& c : ext) c = static_cast<char>(
         std::tolower(static_cast<unsigned char>(c)));
     return ext;
+}
+
+// Every workspace folder the `initialize` request named, deduplicated, in the
+// order the client listed them.
+//
+// ALL THREE SPELLINGS, UNIONED. LSP has deprecated `rootPath` in favour of
+// `rootUri` and `rootUri` in favour of `workspaceFolders`, but real clients
+// still send the older keys (and often several at once), so reading only the
+// modern one would leave whole editors with no workspace. Deduplication makes
+// the overlap harmless.
+//
+// ★ EVERY folder, not the first. A multi-root workspace that declared two
+// projects and got answered from folder[0] would be first-wins with extra
+// steps — the same defect one layer up. Taking all of them means two folders
+// that disagree produce an AMBIGUITY, which is the truth.
+[[nodiscard]] std::vector<std::filesystem::path>
+workspaceRootsFromInitialize(json const& params) {
+    std::vector<std::filesystem::path> roots;
+    auto push = [&roots](std::filesystem::path p) {
+        if (std::find(roots.begin(), roots.end(), p) == roots.end()) {
+            roots.push_back(std::move(p));
+        }
+    };
+    auto pushUri = [&push](std::string const& uri) {
+        // A non-`file:` root (a virtual or remote workspace) yields nullopt and
+        // is DROPPED rather than guessed at — there is no local directory to
+        // scan, and inventing one would answer with the wrong project.
+        if (auto p = pathFromFileUri(uri)) push(std::move(*p));
+    };
+    if (auto wf = params.find("workspaceFolders");
+        wf != params.end() && wf->is_array()) {
+        for (auto const& folder : *wf) {
+            if (auto u = folder.find("uri");
+                u != folder.end() && u->is_string()) {
+                pushUri(u->get<std::string>());
+            }
+        }
+    }
+    if (auto ru = params.find("rootUri"); ru != params.end() && ru->is_string()) {
+        pushUri(ru->get<std::string>());
+    }
+    if (auto rp = params.find("rootPath"); rp != params.end() && rp->is_string()) {
+        // `rootPath` is a plain filesystem path, not a URI — no scheme, no
+        // percent-encoding.
+        auto raw = rp->get<std::string>();
+        if (!raw.empty()) push(std::filesystem::path{raw});
+    }
+    return roots;
 }
 
 // Parse a `TextDocumentItem` from the params JSON.
@@ -314,7 +364,32 @@ int LspServer::run() {
     return shutdownReceived_.load(std::memory_order_acquire) ? 0 : 1;
 }
 
-std::optional<std::string> LspServer::handleInitialize_(Request const& /*req*/) {
+std::optional<std::string> LspServer::handleInitialize_(Request const& req) {
+    // ── The workspace's TARGET channel (D-LSP-ASSEMBLY-DIALECT-UNSERVABLE) ──
+    // `initialize` is the ONLY message that carries the workspace root, and the
+    // root is the only thing that leads to a project manifest, so this is where
+    // the editor learns which CPU its `.s` files belong to. Resolved ONCE here
+    // rather than per-`didOpen`: the answer is a property of the workspace, and
+    // re-reading the manifest on every file open would let a mid-session edit
+    // change the meaning of already-open documents without re-publishing them.
+    //
+    // Threading: every dispatcher handler runs on the `run()` thread, so this
+    // write and the `handleDidOpen_` read below need no synchronisation. Worker
+    // threads never touch `workspacePreference_` — they see only the per-
+    // document `schemaError` string, which the DocumentStore's mutex covers.
+    if (!req.params.empty()) {
+        try {
+            auto params      = json::parse(req.params);
+            workspaceRoots_  = workspaceRootsFromInitialize(params);
+        } catch (...) {
+            // Malformed params: keep the empty root list. The resulting
+            // `NoWorkspaceRoot` reason is the honest one — nothing named a
+            // workspace — and it reaches the user on the first ambiguous open.
+            workspaceRoots_.clear();
+        }
+    }
+    workspacePreference_ = resolveWorkspaceLanguagePreference(workspaceRoots_);
+
     json result;
     auto& caps = result["capabilities"];
     caps["textDocumentSync"] = 1; // 1 == Full per LSP §13.7
@@ -360,14 +435,39 @@ void LspServer::handleDidOpen_(Notification const& n) {
     const auto item = parseTextDocumentItem(*params);
     if (item.uri.empty()) return;
 
-    // Resolve schema by file extension.
+    // ── Resolve schema by file extension, with the workspace as tie-breaker ──
+    //
+    // ★★ THE FAILURE ARM USED TO BE EMPTY. This block read
+    //     `if (resolved.has_value()) schema = *resolved;`
+    // and nothing else: a document whose language could not be determined was
+    // opened with a null schema and NO diagnostic, and the parse worker then
+    // published an empty diagnostics array — indistinguishable, in the editor,
+    // from a file with no problems. Both halves of that (the missing tie-break
+    // AND the missing diagnostic) are D-LSP-ASSEMBLY-DIALECT-UNSERVABLE.
     std::shared_ptr<dss::GrammarSchema const> schema;
+    std::string schemaError;
     const auto ext = extensionFromUri(item.uri);
-    if (!ext.empty()) {
-        auto resolved = schemaCache_.resolveByExtension(ext);
-        if (resolved.has_value()) schema = *resolved;
+    if (ext.empty()) {
+        // Not a resolver failure — there is nothing to resolve. Still a REASON
+        // the document has no language service, so it is still said out loud.
+        schemaError = "no language service for `" + item.uri
+            + "` — the document URI has no file extension, and the extension is "
+              "what selects a source language";
+    } else {
+        std::span<std::string const> preferred{};
+        if (workspacePreference_.has_value()) {
+            preferred = workspacePreference_->languages;
+        }
+        auto resolved = schemaCache_.resolveByExtension(ext, preferred);
+        if (resolved.has_value()) {
+            schema = *resolved;
+        } else {
+            schemaError = describeUnresolvedSchema(
+                ext, resolved.error(), workspacePreference_);
+        }
     }
-    documents_.open(item.uri, item.version, item.text, schema);
+    documents_.open(item.uri, item.version, item.text, schema,
+                    std::move(schemaError));
     enqueueParse_(item.uri);
 }
 
@@ -409,7 +509,10 @@ void LspServer::enqueueParse_(std::string uri) {
                        uri    = std::move(uri),
                        snap   = std::move(*snap)]() mutable {
         if (!snap.schema) {
-            // No schema — clear any prior diagnostics.
+            // No schema — clear any prior PARSE diagnostics. The document's
+            // `schemaError` is NOT cleared here and is re-attached by
+            // `publishDiagnostics_`, so this publish carries the reason rather
+            // than an empty array (which reads as "clean" in every editor).
             std::vector<dss::ParseDiagnostic> empty;
             if (documents_.setDiagnostics(uri, snap.parseGeneration,
                                            std::move(empty))) {
@@ -494,6 +597,29 @@ void LspServer::publishDiagnostics_(std::string const& uri) {
     params.version     = snap->clientVersion;
     params.diagnostics = translateDiagnostics(
         std::span<dss::ParseDiagnostic const>{diags}, *src);
+    // ★ THE SCHEMA-LESS DOCUMENT SPEAKS. Emitted on EVERY publish, not just the
+    // first: the reason lives on the document, so an edit that re-publishes an
+    // (still) unresolvable file restates it instead of clearing it. Placed
+    // FIRST so it is what the editor's problem panel shows at the top — it is
+    // the reason the other diagnostics are absent.
+    //
+    // The code is `D_UnknownFileExtension`, REUSED rather than minted: it is
+    // already the compiler's code for "this file's source language cannot be
+    // determined", covering both the zero-claimant and the two-or-more-claimant
+    // shapes, and it is what the driver emits when no `--language` was given
+    // and the target's declared dialect cannot answer either. One code, both
+    // halves of the program, so an editor and a build report the same identity
+    // for the same condition.
+    if (!snap->schemaError.empty()) {
+        Diagnostic d;
+        // Range 0:0–0:0. The condition is a property of the DOCUMENT, not of
+        // any span inside it, and LSP has no document-level diagnostic channel.
+        d.severity = DiagnosticSeverity::Error;
+        d.code     = std::string{dss::diagnosticCodeName(
+            dss::DiagnosticCode::D_UnknownFileExtension)};
+        d.message  = snap->schemaError;
+        params.diagnostics.insert(params.diagnostics.begin(), std::move(d));
+    }
     for (auto& d : params.diagnostics) {
         d.source = options_.diagnosticSource;
     }

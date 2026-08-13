@@ -88,6 +88,27 @@ struct DSS_EXPORT AsmTextModule {
     // LOUD naming the symbol. One policy, one implementation, two source
     // languages.
     std::vector<ExternImport> externImports;
+
+    // D-ASM-NO-DATA-DEFINING-DIRECTIVE: the data items the file's data-defining
+    // directives produced (`.data` / `.rodata` + `.byte` / `.quad` / `.zero`),
+    // one per data LABEL plus at most one anonymous item per section run.
+    //
+    // ★ THE SAME ROW TYPE AND THE SAME SECTION VOCABULARY THE C PATH PRODUCES.
+    // `lowerMirGlobalsToDataItems` (asm.cpp) hands the driver exactly this
+    // vector for a C translation unit; the linker walkers already concatenate
+    // items by `DataSectionKind` and map each item's `symbol` to its
+    // section-relative address. Nothing here is assembly-specific — which is
+    // why the verb set binds `DataSectionKind` instead of minting one.
+    //
+    // ⚠ THE DRIVER MUST COPY THIS INTO `AssembledModule::dataItems`, and until
+    // it does the bytes are computed and DROPPED. `assemble()` builds its
+    // module from the LIR, which carries no data; the C path's driver arm
+    // assigns `assembled.dataItems = lowerMirGlobalsToDataItems(...)`, and the
+    // assembly arm needs the one-line twin
+    // (`assembled.dataItems = std::move(lowered->dataItems);` in
+    // `program/compile_pipeline.cpp`'s `assembleAsmUnit`). Anchored:
+    // D-ASM-DATA-ITEMS-NOT-WIRED-INTO-THE-DRIVER.
+    std::vector<AssembledData> dataItems;
 };
 
 // Lower one parsed `.s` translation unit to `encode`-tier LIR.

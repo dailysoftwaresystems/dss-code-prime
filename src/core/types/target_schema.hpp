@@ -2342,7 +2342,20 @@ struct DSS_EXPORT TargetRelocationInfo {
 enum class TargetTerminatorKind : std::uint8_t {
     None        = 0,    // non-terminator opcode (default)
     Br          = 1,    // 1 successor, embeds BlockRef operand (LirBuilder::addBr)
-    CondBr      = 2,    // 2 successors, NO BlockRef operands       (LirBuilder::addCondBr)
+    // 2 successors. ★★ ITS BlockRef OPERANDS ARE ALSO THE ENCODER’S
+    // BRANCH TARGETS — every `mir_to_lir` / `asm_text_to_lir` jcc carries
+    // TWO, and `x86_variable.cpp` takes its displacement from operand[0]
+    // and emits the trailing unconditional jump to operand[1].
+    // ⚠ THIS LINE USED TO READ “NO BlockRef operands” AND A CONSUMER
+    // IMPLEMENTED IT: the `.dsslir` reader filtered every BlockRef out and
+    // called `addCondBr` with what was left, so a real lowered jcc read
+    // back from text had ZERO operands and could not assemble
+    // ([[D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED]]). `Br` survived only
+    // because `addBr` re-synthesizes its operand. `LirVerifier` Rule 1b now
+    // cross-checks the two writable channels, and asserts PRESENCE rather
+    // than mere agreement — an agreement-only rule is vacuously satisfied
+    // by the zero-operand state that WAS the defect.
+    CondBr      = 2,    //                                          (LirBuilder::addCondBr)
     Switch      = 3,    // >=2 successors                           (LirBuilder::addSwitch — reserved)
     Return      = 4,    // 0 successors, may carry return-value ops (LirBuilder::addReturn)
     Unreachable = 5,    // 0 successors, 0 operands                 (LirBuilder::addUnreachable)
@@ -2823,6 +2836,15 @@ struct DSS_EXPORT TargetSchemaData {
     //       where ONLY callingConventions is declared)
     //     - argGprs/returnGprs/callerSaved/calleeSaved must be GPR class
     //     - argFprs/returnFprs must be FPR class
+    //     - NO referenced register may declare `subOf`
+    //       (D-TARGET-CC-NAMES-SUB-REGISTER). A cc names full registers
+    //       only. Applies to every list AND every singleton role
+    //       (stackPointer / framePointer / linkRegister /
+    //       indirectResultRegister), because all of them resolve to a
+    //       table ordinal that the allocator pools — built by
+    //       intersecting the register table with these very names —
+    //       would otherwise skip in silence. This rule is what makes
+    //       that name filter load-bearing on its own.
     //     - stackAlignment is a power of two (and >0 when ANY field set)
     //     - shadowSpaceBytes % stackAlignment == 0
     //     - redZoneBytes    % stackAlignment == 0

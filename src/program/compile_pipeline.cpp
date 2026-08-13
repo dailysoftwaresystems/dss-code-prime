@@ -9,6 +9,9 @@
 #include "core/substrate/mint_monotonic_id.hpp"  // c165: fresh per-member CompilationUnitId (static pull)
 #include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/type_lattice/type_lattice.hpp"  // encode-tier extern binder's scratch lattice
+#include "ffi/abi/abi_catalog.hpp"  // resolveAbi (encode-tier va_list shape, per active ABI)
+#include "ffi/binary_reader.hpp"  // readImports (encode-tier --resolve-library binder)
 #include "ffi/binary_readers/ar_reader.hpp"  // c165: readArArchive (static-pull member index)
 #include "ffi/ingest.hpp"
 #include "ffi/mangling/c_mangle.hpp"  // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: applyCMangling
@@ -2204,12 +2207,332 @@ assembleUnit(CompilationUnit const&        cu,
                                 format.name(), format.kind(), reporter);
 }
 
+namespace {
+
+// ── D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY + ────────────────────────────────
+// ── D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER ────────────────────
+//
+// Bind the `encode` tier's unbound extern rows to an owning image, by the SAME
+// two oracles the C path consults for a HAND-DECLARED name, in the same order.
+//
+// ★★★ WHY THE `.s` PATH NEEDS ITS OWN BINDER RATHER THAN `ffi::ingest()`.
+// `ingest()` matches a CANONICAL C IDENTIFIER: it runs `linkNameFor` to compute
+// the on-binary spelling, then un-mangles it back to key the export table, and
+// it writes its answers into an `HirFfiMap` keyed by `HirNodeId`. A `.s` has
+// neither end of that. It writes the ON-BINARY SYMBOL ITSELF — a Mach-O source
+// spells `_puts`, exactly as gas requires (`asm_text_to_lir.cpp`: "THE NAME IS
+// TAKEN VERBATIM, NOT MANGLED") — so there is no canonical identifier to mangle
+// and no HIR node to key. Matching the export table by the written name is
+// therefore not a shortcut, it is the ONLY exact key; and running the name
+// through un-mangle→re-mangle to reach `ingest()` would push it through a lossy
+// inverse to arrive back where it started. What the two binders MUST share is
+// the recorded-import IDENTITY ranking, and they do — `ffi::recordedImportIdentity`
+// is one function with two callers, not a copied conditional.
+//
+// ★★ AGNOSTIC. Nothing here asks which language, CPU or object format this is.
+// The library map is folded by `objectFormatKindName(format.kind())` — the same
+// key `buildCuMir` folds `HirExternRecord.libraryOverride` on, and the ONE
+// format-keyed step the C path has too. Every other input is data off a
+// descriptor row or an export table.
+//
+// Returns false iff a diagnostic was reported and the build must stop.
+[[nodiscard]] bool bindAsmExternImports(std::vector<ExternImport>& externs,
+                                        CompilationUnit const&     cu,
+                                        GrammarSchema const&       grammar,
+                                        TargetSchema const&        target,
+                                        ObjectFormatSchema const&  format,
+                                        CompileOptions const&      opts,
+                                        DiagnosticReporter&        reporter) {
+    if (externs.empty()) return true;
+
+    // ── (1) `--resolve-library` — the binaries the build was POINTED AT ──────
+    //
+    // Highest precedence for the same reason it is on the C path: the operator
+    // named this file, so its export table outranks any platform default. The
+    // match key is the extern's `mangledName`, which for a `.s` IS the symbol
+    // as written, compared against the export table's own on-binary spelling —
+    // decorated-to-decorated, so no mangling rule is consulted on either side
+    // and there is no format arm.
+    if (!opts.resolveLibraries.empty()) {
+        struct BoundIdentity {
+            std::string library;
+            std::string version;
+        };
+        // FIRST-SOURCE-WINS across the named binaries, matching `ingest()`'s
+        // documented rule for a symbol two libraries both export.
+        std::unordered_map<std::string, BoundIdentity> bySymbol;
+        for (auto const& lib : opts.resolveLibraries) {
+            auto surface = ffi::readImports(lib.path, reporter);
+            // `readImports` reports its own failure LOUD (`emitAndReturn`
+            // names the path and the structural cause), so this refuses
+            // WITHOUT a second diagnostic — the same contract `ingest()`'s
+            // source loop honours. What must not happen is continuing with
+            // the flag quietly ineffective, which is the anchor.
+            if (!surface.has_value()) return false;
+            std::string const basename = lib.path.filename().string();
+            for (auto const& row : *surface) {
+                if (row.mangledName.empty()) continue;
+                std::string identity = ffi::recordedImportIdentity(
+                    lib.declaredImportName, row.soname, basename);
+                // The version policy is `ingest()`'s, clause for clause: a
+                // DEFAULT version only (re-requesting a `sym@COMPAT` row we
+                // merely walked past would manufacture the misbinding
+                // D-LK-ELF-SYMBOL-VERSIONING exists to prevent), and only when
+                // the identity we RECORD is the identity the file claims for
+                // itself (a declared stand-in name means we never observed the
+                // real library's version set). Format-blind: PE and Mach-O rows
+                // carry no `elfSymbolVersion` at all.
+                std::string version;
+                if (row.elfSymbolVersion.has_value()
+                    && row.elfSymbolVersion->isDefaultVersion) {
+                    std::string const& observedIdentity =
+                        row.soname.empty() ? row.libraryPath : row.soname;
+                    if (identity == observedIdentity) {
+                        version = row.elfSymbolVersion->name;
+                    }
+                }
+                bySymbol.try_emplace(
+                    row.mangledName,
+                    BoundIdentity{std::move(identity), std::move(version)});
+            }
+        }
+        for (auto& e : externs) {
+            if (!e.libraryPath.empty()) continue;
+            auto const it = bySymbol.find(e.mangledName);
+            if (it == bySymbol.end()) continue;
+            e.libraryPath = it->second.library;
+            e.version     = it->second.version;
+        }
+    }
+
+    // ── (2) THE PLATFORM REALIZATION ORACLE ─────────────────────────────────
+    //
+    // The same `ffi::realizeShippedExternSymbols` the semantic tier asks about a
+    // hand-written C prototype. A `.s` that writes `call putchar` and a `.c`
+    // that writes `extern int putchar(int);` are making the SAME claim about the
+    // platform, so they must reach the same descriptor row and produce a
+    // byte-identical import — the corpus is the single owner of "which image
+    // owns this name here" (UCRT-P4 Decision 1).
+    // ★★ THE CORPUS IS KEYED ON THE CANONICAL C IDENTIFIER; A `.s` WROTE THE
+    // DECORATED ONE. ✔MEASURED: a Mach-O source spells `call _putchar` (gas
+    // requires it, and `asm_text_to_lir` takes the name VERBATIM by design), so
+    // looking the written name up in the descriptor index missed on every
+    // decorating format while elf and pe — where the decoration is empty — bound
+    // fine. That is the worst shape of gap: a feature that works on two of three
+    // formats with no diagnostic on the third.
+    // ⚠ AND IT IS UN-DECORATED BY ASKING THE FORMAT, never by stripping a `_`:
+    // `cSymbolDecoration().scheme` is the format's DECLARED rule and
+    // `unapplyCMangling` is the one shared inverse (the same call `ingest()`
+    // makes on binary-reader rows), so there is no `if (format == macho)` here
+    // and a format that declares no decoration is a byte-identical no-op.
+    //
+    // ★★★ AND THE INVERSE IS CHECKED BY RE-APPLYING IT, WHICH IS NOT PEDANTRY —
+    // ✔MEASURED, THE CONSERVATIVE INVERSE ALONE TURNED A BUILD ERROR INTO A LOAD
+    // ERROR. `unapplyCMangling` passes an undecorated name THROUGH unchanged (its
+    // documented, deliberately lenient contract), so a Mach-O source writing
+    // `call putchar` — without the `_` that format requires — recovered the
+    // canonical `putchar`, matched the corpus, and got BOUND to libSystem under a
+    // spelling libSystem does not export. Before this binder existed that source
+    // was refused at link with `K_SymbolUndefined`; a "fix" that replaces a build
+    // error with a dyld failure at process start is a regression, not a feature.
+    // So a row binds ONLY when re-decorating the recovered name reproduces
+    // BYTE-FOR-BYTE what the file wrote; anything else is not this platform's C
+    // symbol and stays unbound for the link tier to judge, exactly as before.
+    // The round trip is the format's own declared rule applied in both
+    // directions — no `_` literal and no format name appears here.
+    auto const scheme = format.cSymbolDecoration().scheme;
+    std::vector<std::string> unbound;
+    std::vector<std::string> canonicalOf(externs.size());
+    for (std::size_t i = 0; i < externs.size(); ++i) {
+        if (!externs[i].libraryPath.empty()) continue;
+        std::string canonical =
+            ffi::unapplyCMangling(externs[i].mangledName, scheme);
+        if (ffi::applyCMangling(canonical, scheme) != externs[i].mangledName) {
+            continue;   // not a C symbol under this format's convention
+        }
+        canonicalOf[i] = std::move(canonical);
+        unbound.push_back(canonicalOf[i]);
+    }
+    if (unbound.empty()) return true;
+
+    // The oracle interns each row's declared signature, so it needs a lattice.
+    // The `encode` tier has no `SemanticModel` (that absence IS the tier), so
+    // one is built here, scoped to this call: the asm binder consumes only
+    // `library` / `version` / `recipeId`, never the TypeId, and a throwaway
+    // interner keeps the descriptor read byte-for-byte the one the `#include`
+    // path performs rather than inventing a second, signature-free reader.
+    TypeLattice lattice{cu.id(), std::string{grammar.name()}};
+
+    // ★★★ `va_list` IS A REQUIRED PART OF THE CORPUS'S TYPE VOCABULARY, AND
+    // OMITTING IT SILENTLY LOSES A WHOLE DESCRIPTOR. ✔MEASURED: without this
+    // binding, `stdio.json` fails to decode (`vfprintf` and friends spell
+    // `va_list`, which no descriptor can declare — it is compiler-provided),
+    // `realizeShippedExternSymbols` SKIPS the unreadable descriptor by design,
+    // and every stdio name comes back absent ⇒ `Unknown` ⇒ unbound. So a `.s`
+    // calling `abort` (stdlib.json, no va_list anywhere) linked while one
+    // calling `putchar` did NOT — a per-descriptor split with no diagnostic
+    // between them. The corpus-wide decode test binds it for exactly this
+    // reason (`sysvVaListBinding`, tests/ffi).
+    //
+    // ★★ AND IT IS DERIVED FROM THE ACTIVE ABI, NEVER PICKED. The three shapes
+    // are the three `VaListStrategy` arms the semantic tier injects from the
+    // SAME `cc->vaListLayout->strategy`, so the descriptor read here sees the
+    // identical type the `#include` path would give it on this (target, format)
+    // — Win64's `char*` is 8 bytes and SysV's `__va_list_tag[1]` is 24, and a
+    // corpus row that ever gained a `signatureByDataModel` arm keyed on the
+    // difference would otherwise decode one way here and another way there.
+    // Hard-coding one arm would be a platform GUESS in shared substrate; asking
+    // the ABI is a fact lookup, with no `if (arch)` and no `if (format)`.
+    // ⓘ The resulting TypeId is not read by this binder. It is threaded so the
+    // READ succeeds and so that, when a future consumer does read it, it is
+    // already the right one rather than a placeholder someone must remember.
+    std::array<NamedTypeBinding, 1> namedTypeStorage{};
+    std::span<NamedTypeBinding const> namedTypes{};
+    {
+        DiagnosticReporter abiScratch;   // an ABI miss is not this tier's error
+        auto const abi = ffi::resolveAbi(target, format, abiScratch);
+        std::optional<VaListStrategy> strat;
+        if (abi.has_value() && abi->cc != nullptr
+            && abi->cc->vaListLayout.has_value()) {
+            strat = abi->cc->vaListLayout->strategy;
+        }
+        auto& in = lattice.interner();
+        TypeId vaListTy;
+        if (strat == VaListStrategy::HomogeneousPointer) {
+            vaListTy = in.pointer(in.primitive(TypeKind::I8));   // Win64: char*
+        } else if (strat == VaListStrategy::Aapcs64DualCursor) {
+            TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+            std::array<TypeId, 5> f{voidPtr, voidPtr, voidPtr,
+                                    in.primitive(TypeKind::I32),
+                                    in.primitive(TypeKind::I32)};
+            vaListTy = in.structType("__va_list", f);
+        } else {
+            // SysVRegisterSave, and the nullopt default: a cc with no
+            // `vaListLayout` has no variadic-callee surface at all, so the
+            // SysV-family shape is inert there — the identical fallback the
+            // semantic injector takes.
+            TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+            std::array<TypeId, 4> f{in.primitive(TypeKind::U32),
+                                    in.primitive(TypeKind::U32), voidPtr,
+                                    voidPtr};
+            vaListTy = in.array(in.structType("__va_list_tag", f), 1);
+        }
+        namedTypeStorage[0] = NamedTypeBinding{"va_list", vaListTy};
+        namedTypes = std::span<NamedTypeBinding const>{namedTypeStorage.data(),
+                                                       1};
+    }
+
+    auto const realized = ffi::realizeShippedExternSymbols(
+        unbound, lattice.interner(), lattice.registry(), format.dataModel(),
+        std::optional<std::string_view>{target.name()}, format.kind(),
+        namedTypes);
+    // nullopt ⇒ the shippedLibs directory could not be located. A statement
+    // about the ENVIRONMENT, never about the user's program: every name stays
+    // unbound and the link tier judges the reference, exactly as before this
+    // binder existed.
+    if (!realized.has_value()) return true;
+
+    std::string const formatKey{objectFormatKindName(format.kind())};
+    for (std::size_t i = 0; i < externs.size(); ++i) {
+        ExternImport& e = externs[i];
+        if (!e.libraryPath.empty()) continue;
+        if (canonicalOf[i].empty()) continue;   // failed the decoration round trip
+        auto const row = realized->find(canonicalOf[i]);
+        if (row == realized->end()) continue;
+        // Only a fully realized row binds. `Unknown`, `UnavailableForFormat` and
+        // `NoLibraryForFormat` all mean "the platform states no image for this
+        // name here" ⇒ leave it unbound for the link tier. Enumerated by the
+        // status check, never fallen through.
+        if (row->second.status != ffi::ShippedRealizationStatus::Realized) {
+            continue;
+        }
+        // ★★★ A `synthesize` ROW IS REFUSED HERE, LOUDLY, AND THAT REFUSAL IS
+        // THE POINT RATHER THAN A GAP. A recipe row is realized as a
+        // COMPILER-EMITTED BODY (pe `printf` is a shim over
+        // `__stdio_common_vfprintf`), and the tier that emits those bodies is
+        // MIR synthesis — which the `encode` tier does not run, by construction.
+        // Binding the row as a plain import would request a symbol the image
+        // genuinely does not export: ucrtbase exports no bare `printf`, so the
+        // artifact would LINK CLEAN and die at LOAD with 0xC0000139 and no
+        // diagnostic anywhere. That is the exact failure mode the eager-import
+        // law exists to prevent, and it is worth a compile error.
+        if (!row->second.recipeId.empty()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::A_AsmTextUnsupported;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "assembly unit references '{}', which this platform realizes as "
+                "a COMPILER-SYNTHESIZED body (shipped-descriptor recipe '{}' for "
+                "object format '{}') rather than as a library export. The "
+                "'encode' pipeline tier emits no such bodies — it runs no MIR "
+                "synthesis, which is what the tier IS — and importing the name "
+                "directly would produce a binary that links clean and then fails "
+                "to LOAD, because '{}' exports no such symbol. Call the "
+                "descriptor's underlying core symbol from this file, or route "
+                "this reference through a compiled translation unit.",
+                e.mangledName, row->second.recipeId, formatKey,
+                [&] {
+                    auto const lib = row->second.library.find(formatKey);
+                    return lib != row->second.library.end() ? lib->second
+                                                            : formatKey;
+                }());
+            reporter.report(std::move(d));
+            return false;
+        }
+        // Fold the row's per-object-format `library` map on the active format —
+        // the identical fold `buildCuMir` performs for the C path, keyed on the
+        // same `objectFormatKindName`. A key ABSENT means the platform states no
+        // image for this name on this format: leave it unbound (there is no
+        // format-level default left to fall back to since UCRT-P4).
+        auto const lib = row->second.library.find(formatKey);
+        if (lib == row->second.library.end() || lib->second.empty()) continue;
+        e.libraryPath = lib->second;
+        e.version     = row->second.version;
+        // ⚠ `mangledName` IS NOT REWRITTEN, and a `linkName` row is REFUSED
+        // rather than silently re-spelled. `ShippedSymbolRealization::linkName`
+        // replaces the C identifier a C declaration would have been decorated
+        // from (Darwin's `fstat` → `fstat$INODE64`); a `.s` did not write a C
+        // identifier, it wrote the on-binary symbol, and its own relocations
+        // already name that symbol. Rewriting the import's name here would leave
+        // the file's `call fstat` pointing at an import row named
+        // `_fstat$INODE64` — a mismatch resolved at LOAD, not at build.
+        // The comparison goes through `linkNameFor`, so the row's UNDECORATED
+        // link base is decorated by the FORMAT's rule before it is measured
+        // against what the file wrote — a source that already spelled
+        // `_fstat$INODE64` is correct and must not be refused.
+        if (!row->second.linkName.empty()
+            && ffi::linkNameFor(canonicalOf[i], /*asmLabel=*/{}, scheme,
+                                row->second.linkName) != e.mangledName) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::A_AsmTextUnsupported;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "assembly unit references '{}', but on this target the platform "
+                "exports that facility under the link name '{}' (shipped-"
+                "descriptor per-target linkName). A '.s' names the ON-BINARY "
+                "symbol directly, so DSS will not silently re-spell the "
+                "reference: write '{}' in the source if that is the symbol you "
+                "mean.",
+                e.mangledName, row->second.linkName,
+                ffi::linkNameFor(canonicalOf[i], /*asmLabel=*/{}, scheme,
+                                 row->second.linkName));
+            reporter.report(std::move(d));
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 std::optional<AssembledModule>
 assembleAsmUnit(CompilationUnit const&     cu,
                 GrammarSchema const&       grammar,
                 TargetSchema const&        target,
-                std::span<EntryMaterialization const> formatVerbs,
-                DiagnosticReporter&        reporter) {
+                ObjectFormatSchema const&  format,
+                DiagnosticReporter&        reporter,
+                CompileOptions const&      opts) {
+    std::span<EntryMaterialization const> const formatVerbs = format.entryVerbs();
     // ★★★ THE `encode` TIER'S WHOLE BODY. Compare it with `assembleUnit` above:
     // no semantic analysis, no CST→HIR, no HIR→MIR, no optimizer, no MIR→LIR,
     // no liveness, no register allocation, no two-address legalization, no
@@ -2277,6 +2600,20 @@ assembleAsmUnit(CompilationUnit const&     cu,
                                          reporter);
         if (!lowered) return std::nullopt;
 
+        // D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY +
+        // D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER: the rows
+        // arrive here UNBOUND by construction (a `.s` states no owning image
+        // and gas has no extern directive), and BEFORE this call nothing on
+        // this route ever asked the platform — so `call putchar` reached the
+        // EXEC link with an empty `libraryPath` and was refused as an undefined
+        // symbol, on every format. The binder runs between the lowering and the
+        // assembler because `assemble()` copies `externImports` verbatim: a row
+        // bound after that call would be bound too late.
+        if (!bindAsmExternImports(lowered->externImports, cu, grammar, target,
+                                  format, opts, reporter)) {
+            return std::nullopt;
+        }
+
         auto const asmEntry = reporter.errorCount();
         std::vector<MirInstId> lirToMir(lowered->lir.instCount(), InvalidMirInst);
         // D-ASM-EXTERNAL-CALL-UNREPRESENTABLE: the extern rows ride the SAME
@@ -2294,6 +2631,18 @@ assembleAsmUnit(CompilationUnit const&     cu,
         assembled.cuId            = cu.id();
         assembled.symbols         = std::move(lowered->symbols);
         assembled.userEntrySymbol = lowered->userEntrySymbol;
+        // D-ASM-DATA-ITEMS-NOT-WIRED-INTO-THE-DRIVER: without this line the
+        // data-defining directives' bytes were COMPUTED AND DROPPED. `assemble()`
+        // builds its module from the LIR, and LIR carries no data — so the only
+        // copy of `.data`/`.byte`/`.quad`/`.zero`'s output is the one the text
+        // walker returns, and nothing else was reading it.
+        //
+        // ★ THE ONE-LINE TWIN OF THE C PATH'S `assembled.dataItems =
+        // std::move(dataItems)` (this file, `assembleUnit`), and deliberately the
+        // SAME statement rather than a merge: both arms produce the complete
+        // item set for their unit, and an `insert` here would silently tolerate
+        // an `assemble()` that had started emitting its own.
+        assembled.dataItems       = std::move(lowered->dataItems);
         // ⚠ ONE TREE PER UNIT TODAY. A multi-file `.s` build would need each
         // file's SymbolIds namespaced before the merge; refusing is the honest
         // answer while that is unbuilt, because silently keeping the LAST tree

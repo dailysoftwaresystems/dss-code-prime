@@ -1594,7 +1594,8 @@ TEST(TargetSchema, LinkRegisterMustBeString) {
 }
 
 TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
-    // 16 GPRs + 16 FPRs + rflags + the 16 32-bit GPR views (eax..r15d) = 49.
+    // 16 GPRs + 16 FPRs + rflags + the 16 32-bit GPR views (eax..r15d)
+    // + the 16 8-bit views (al..r15b) = 65.
     // EXPECT_EQ (not EXPECT_GE) so a future accidental duplicate / addition
     // trips the test rather than silently passing.
     //
@@ -1608,24 +1609,46 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // grew one, all trip it now and none of them tripped the total.
     auto r = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ((*r)->registerCount(), 49u);
+    EXPECT_EQ((*r)->registerCount(), 65u);
 
-    std::size_t fullGpr = 0, subGpr = 0, fpr = 0, flags = 0, other = 0;
+    // ★★ THE COMPOSITION IS KEYED ON (class, sub-ness, WIDTH), NOT JUST
+    // (class, sub-ness) — extended when the 8-bit views landed
+    // (D-ASM-X86-NO-8BIT-REGISTER-FILE, 2026-08-13). A bucket that lumped every
+    // `subOf` GPR together would have gone from "16" to "32" and said nothing
+    // about WHICH 32; a pin has to be at least as strong after each change as
+    // it was before, or it is the guard-weakened-by-its-own-subject shape this
+    // tree has already been bitten by twice. With the width axis in, a byte
+    // view that forgot its `subOf`, a 32-bit view that grew a byte width, and a
+    // duplicated file at either width each trip a DIFFERENT expectation than
+    // the bare total does.
+    std::size_t fullGpr = 0, subGpr32 = 0, subGpr8 = 0, subGprOther = 0;
+    std::size_t fpr = 0, flags = 0, other = 0;
     for (auto const& info : (*r)->registers()) {
         bool const sub = !info.subOf.empty();
         switch (info.regClass) {
-            case TargetRegClass::GPR:   (sub ? subGpr : fullGpr)++; break;
+            case TargetRegClass::GPR:
+                if (!sub) { ++fullGpr; break; }
+                if (info.widthBytes == 4)      ++subGpr32;
+                else if (info.widthBytes == 1) ++subGpr8;
+                else                           ++subGprOther;
+                break;
             case TargetRegClass::FPR:   sub ? ++other : ++fpr;      break;
             case TargetRegClass::Flags: sub ? ++other : ++flags;    break;
             default:                    ++other;                    break;
         }
     }
-    EXPECT_EQ(fullGpr, 16u) << "rax..r15";
-    EXPECT_EQ(subGpr,  16u) << "eax..r15d — the 32-bit views, `subOf` their "
-                               "64-bit parent";
-    EXPECT_EQ(fpr,     16u) << "xmm0..xmm15";
-    EXPECT_EQ(flags,    1u) << "rflags";
-    EXPECT_EQ(other,    0u);
+    EXPECT_EQ(fullGpr,  16u) << "rax..r15";
+    EXPECT_EQ(subGpr32, 16u) << "eax..r15d — the 32-bit views, `subOf` their "
+                                "64-bit parent";
+    EXPECT_EQ(subGpr8,  16u) << "al..r15b — the 8-bit views; without them "
+                                "gas's `sete %al` is unspellable and the only "
+                                "form DSS could spell (`sete %rax`) is one gas "
+                                "rejects";
+    EXPECT_EQ(subGprOther, 0u) << "no 16-bit (ax..r15w) file is declared — no "
+                                  "consumer writes one yet";
+    EXPECT_EQ(fpr,      16u) << "xmm0..xmm15";
+    EXPECT_EQ(flags,     1u) << "rflags";
+    EXPECT_EQ(other,     0u);
 }
 
 // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the wideFloatSoftcalls table

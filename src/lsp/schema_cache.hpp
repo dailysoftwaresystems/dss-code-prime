@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -107,9 +108,29 @@ public:
     [[nodiscard]] SchemaResult resolveByName(std::string_view languageName);
 
     // Iterates known languages' `fileExtensions()` and returns the
-    // first case-insensitive match. In shipped mode, probes each
-    // shipped candidate on cache miss.
+    // single case-insensitive match. In shipped mode, probes each
+    // shipped candidate on cache miss. More than one claimant ⇒
+    // `AmbiguousExtension` — this overload has no tie-breaker.
     [[nodiscard]] SchemaResult resolveByExtension(std::string_view fileExtension);
+
+    // Same resolution, plus a caller-supplied PREFERENCE over equally-valid
+    // claimants. Used only when the extension is genuinely ambiguous:
+    //   * exactly one claimant is named in `preferredLanguages` ⇒ that one;
+    //   * zero or two-or-more matches            ⇒ `AmbiguousExtension`, whose
+    //     detail states the claimants, the preference, and how many matched.
+    // A UNIQUE claimant is returned regardless of the preference — a preference
+    // breaks ties, it does not override an unambiguous answer.
+    //
+    // ★ THE CACHE STAYS TARGET-BLIND. It takes language NAMES, not a target,
+    // not a CPU, not a file kind. Everything that knows what a `.target.json`
+    // is lives in `workspace_project.{hpp,cpp}`; this resolver only knows that
+    // its caller may prefer some names over others, which is why the same
+    // mechanism serves the next ambiguous extension without an edit here.
+    // Order-independent: the answer is decided by the MATCH COUNT, never by
+    // which claimant or which preference came first.
+    [[nodiscard]] SchemaResult resolveByExtension(
+        std::string_view                   fileExtension,
+        std::span<std::string const>       preferredLanguages);
 
     [[nodiscard]] bool hasSchemaDir() const noexcept {
         return schemaDir_.has_value();
@@ -122,6 +143,17 @@ private:
     // Loads a schema OUTSIDE the cache lock (file I/O too slow to
     // serialize). Returns unexpected with diagnostic detail on miss.
     [[nodiscard]] SchemaResult loadFresh(std::string_view name);
+
+    // Adjudicate a contested extension against the caller's preference. The
+    // ONE site both the warm-index path and the cold scan use — a verdict that
+    // differed by cache warmth would make the behaviour depend on which file
+    // the editor opened first, which is the defect this resolver already
+    // learned once.
+    // ⚠ MUST BE CALLED WITH `mutex_` UNHELD: it may `resolveByName` the winner,
+    // and that re-takes the same non-recursive mutex.
+    [[nodiscard]] SchemaResult breakTie(std::string const&              ext,
+                                        std::vector<std::string> const& claimants,
+                                        std::span<std::string const>    preferred);
 
     std::optional<std::filesystem::path>                                schemaDir_;
     mutable std::mutex                                                  mutex_;

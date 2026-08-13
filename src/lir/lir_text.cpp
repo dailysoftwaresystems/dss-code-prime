@@ -668,10 +668,17 @@ private:
     // trip when a future builder change reorders mints).
     std::unordered_map<std::uint32_t, LirReg>   vregMap_;
     // Successor list parsed from the current block's header `-> [...]`.
-    // The terminator dispatch uses this (not the operand-list BlockRef
-    // count) because addCondBr does not embed BlockRef operands on the
-    // inst — the block-header successor list is the authoritative
-    // count for the dispatch fork (0=Ret/Unreachable, 1=Br, 2=CondBr).
+    // ★ THE DISPATCH FORK KEYS ON THIS LIST, NEVER ON THE OPERAND-LIST BlockRef
+    // COUNT — but NOT because a terminator has no BlockRef operands. It does:
+    // every `mir_to_lir` and `asm_text_to_lir` `cond-br` carries exactly two,
+    // and the ENCODER reads them for its displacements. This comment claimed
+    // the opposite for the whole life of the file, and the code below acted on
+    // the claim by FILTERING them out (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-
+    // DROPPED). The real reason is that the header list is the AUTHORITATIVE
+    // edge set: it is present on every terminator kind, including the ones whose
+    // operands hold no BlockRef at all (`indirect-br`'s address register), so it
+    // is the only channel that can drive the fork for all of them
+    // (0=Ret/Unreachable, 1=Br, 2=CondBr, N=IndirectBr).
     std::vector<std::uint32_t>                  currentBlockSuccSlots_;
     bool                                        errors_ = false;
     // Set ONLY by `refuseTerminator` — "the open block was left without a
@@ -1147,10 +1154,13 @@ private:
         // Successor list `-> [^b..., ...]`. Captured into
         // `currentBlockSuccSlots_` so the terminator dispatch knows
         // whether to call `addReturn` (0 succs), `addBr` (1), or
-        // `addCondBr` (2) — addCondBr does not embed BlockRef
-        // operands on the inst, so without this list the parser would
-        // see zero BlockRefs in the operand list and silently
-        // mis-dispatch a CondBr as a Return.
+        // `addCondBr` (2). ⚠ NOT because the inst carries no BlockRef
+        // operands — a real `cond-br` carries two, and dropping them
+        // was D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED. The header
+        // list is used because it is the one channel present on EVERY
+        // terminator kind: an `indirect-br`'s operands hold only its
+        // address register, so an operand-derived fork would see zero
+        // BlockRefs there and mis-dispatch it as a Return.
         currentBlockSuccSlots_.clear();
         if (lex_.peek().kind == TokKind::Arrow) {
             lex_.take();
@@ -1447,6 +1457,19 @@ private:
             // takes 0 operands (e.g. a future void-only-return target).
             // Now the JSON declares it explicitly and the loader's
             // `validate()` enforces `isTerminator ↔ terminatorKind`.
+            // ★★★ `nonBlock` IS FOR `addReturn` AND NOTHING ELSE (D-LIR-TEXT-
+            // CONDBR-BLOCKREF-OPERANDS-DROPPED). It used to feed `addCondBr`
+            // and `addIndirectBr` as well, on the strength of a comment saying
+            // a CondBr carries no BlockRef operands — which is false for every
+            // `cond-br` any producer in this tree emits. The effect was SILENT
+            // DATA LOSS with `ok == true`: a lowered `jcc` written out as
+            // `jcc ^b1, ^b2` came back with its successor list intact and its
+            // operand list EMPTY, and the encoder takes its branch displacement
+            // from exactly those operands. `Br` looked fine only because
+            // `addBr` re-synthesizes its one BlockRef; `addCondBr` does not.
+            // A `ret` is the one terminator kind that legitimately cannot name
+            // a block, so filtering there is a real (if today vacuous)
+            // assertion rather than a convenience.
             std::vector<LirOperand> nonBlock;
             for (auto const& o : operands) {
                 if (o.kind != LirOperandKind::BlockRef) {
@@ -1493,6 +1516,27 @@ private:
                         }
                         return;
                     }
+                    // ⚠ `addBr` TAKES NO OPERAND LIST — it SYNTHESIZES exactly
+                    // one BlockRef naming its target. So the only way this arm
+                    // can be lossless is if what was written is byte-identical
+                    // to what will be synthesized, and the only way to know
+                    // that is to CHECK it rather than assume it. Anything else
+                    // (an extra operand, a second BlockRef, a BlockRef naming
+                    // a block other than the declared successor, or none at
+                    // all) would be dropped or invented in silence — the same
+                    // shape as the CondBr defect this arm's sibling carried.
+                    if (operands.size() != 1
+                        || operands[0].kind != LirOperandKind::BlockRef
+                        || operands[0].blockSlot != (*ts)[0].v) {
+                        refuseTerminator(std::format(
+                            "Br opcode '{}' must carry exactly one BlockRef "
+                            "operand naming its declared successor; the operand "
+                            "list holds {} operand(s). `addBr` synthesizes that "
+                            "one operand, so any other list would be silently "
+                            "rewritten on load rather than round-tripped",
+                            mnem.text, operands.size()));
+                        return;
+                    }
                     builder_.addBr(op, (*ts)[0], payload, flags);
                     break;
                 }
@@ -1510,7 +1554,14 @@ private:
                         }
                         return;
                     }
-                    builder_.addCondBr(op, nonBlock, (*ts)[0], (*ts)[1],
+                    // ★ THE WHOLE OPERAND LIST, BlockRefs INCLUDED. `addCondBr`
+                    // stores what it is given verbatim and synthesizes nothing,
+                    // so passing the filtered list here deleted the two
+                    // BlockRefs the encoder needs and produced a `jcc` with no
+                    // target. `lir_pass_util::emitTerminator` — the sibling
+                    // dispatch every LIR pass rebuilds through — has always
+                    // passed its (remapped) full list; this arm was the outlier.
+                    builder_.addCondBr(op, operands, (*ts)[0], (*ts)[1],
                                        payload, flags);
                     break;
                 }
@@ -1539,9 +1590,17 @@ private:
                     // what it cannot read back is a hole in a shipped
                     // guarantee. Everything the call needs is already on the
                     // page: the variadic address-taken successors ride the
-                    // block header's `-> [...]` list (same channel CondBr
-                    // uses — they are NOT BlockRef operands on the inst), and
-                    // the address register is the sole non-BlockRef operand.
+                    // block header's `-> [...]` list (the same channel CondBr's
+                    // successors ride), and the address register is the sole
+                    // operand every producer in this tree emits.
+                    // ⚠ THIS PARENTHETICAL USED TO READ "they are NOT BlockRef
+                    // operands on the inst" AND GENERALISED IT TO CondBr, WHICH
+                    // WAS FALSE (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED).
+                    // For `indirect-br` itself it holds of every producer today
+                    // — but "no producer does it" is not "the reader may delete
+                    // it", so the full operand list is passed through here too
+                    // and `LirVerifier` Rule 1b judges the two channels'
+                    // agreement.
                     //
                     // Arity mirrors `CondBr` with the kind's own shape from
                     // `kTargetTerminatorShapes`: >=1 successor (255 =
@@ -1561,7 +1620,7 @@ private:
                         }
                         return;
                     }
-                    builder_.addIndirectBr(op, nonBlock, *ts, payload, flags);
+                    builder_.addIndirectBr(op, operands, *ts, payload, flags);
                     break;
                 }
                 case TargetTerminatorKind::None:

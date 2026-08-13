@@ -574,6 +574,11 @@ AssemblyConfig const& GrammarSchema::assembly() const noexcept {
     return d_.assembly;
 }
 
+std::span<ConfigDiagnostic const>
+GrammarSchema::loadDiagnostics() const noexcept {
+    return d_.loadDiagnostics;
+}
+
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
                                        std::span<ScopeKind const> stack) const noexcept {
     // Walk the scope stack top-down so the innermost scope's rules win —

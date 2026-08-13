@@ -1323,6 +1323,52 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 continue;
             }
             auto const& reg = registers[it->second];
+            // D-TARGET-CC-NAMES-SUB-REGISTER: a calling convention may
+            // only name a FULL register — never a narrower view of one
+            // (`subOf` non-empty). `.target.json` is user-authorable, so
+            // this is a producer mistake that must be attributable to the
+            // line that made it.
+            //
+            // Every consumer of a cc register reference resolves the name
+            // to a table ordinal and then treats a `subOf` row as a
+            // non-entity, so without this rule the mistake is ABSORBED IN
+            // SILENCE, two different ways:
+            //
+            //   * The allocatable pools (`buildFreeLists` in
+            //     lir_regalloc.cpp, `pickScratchRegs` in lir_rewrite.cpp)
+            //     are the register table INTERSECTED with these very name
+            //     lists. A sub-register named in `callerSaved` therefore
+            //     contributes nothing: the producer declared a register,
+            //     got no register, and got no diagnostic.
+            //   * The singleton roles are worse than dropped. A
+            //     `framePointer` spelled as a sub-register reserves the
+            //     SUB ordinal while the parent stays allocatable — a VLA
+            //     function's fixed-frame base is then handed out to a
+            //     vreg (a silent stack miscompile). Same shape for
+            //     `indirectResultRegister` (sret pointer) and
+            //     `linkRegister`.
+            //
+            // Handing out a sub-register and its parent as two independent
+            // allocatable registers would put two live values in one
+            // machine register, so "make sub-registers allocatable" is not
+            // the alternative — a sub-register-aware allocator is, and that
+            // is a cycle, not a config edit. Until then the only correct
+            // answer to this config is to reject it at LOAD.
+            //
+            // With this rule in force the name filter is load-bearing on
+            // its own: the two pool loops above no longer carry a private
+            // `subOf` skip (deleted with this rule; they were unreachable
+            // defence that could only rot).
+            if (!reg.subOf.empty()) {
+                fail(std::format("/callingConventions/{}/{}/{}", ccIdx, field, k),
+                     std::format("callingConvention '{}'.{}: register '{}' is a "
+                                 "sub-register of '{}' — a calling convention must "
+                                 "name the full register ('{}'), never a narrower "
+                                 "view of it; a sub-register is never allocatable, "
+                                 "so naming one here would silently drop it from "
+                                 "the register pool",
+                                 cc.name, field, ref, reg.subOf, reg.subOf));
+            }
             if (expectedClass != TargetRegClass::None
                 && reg.regClass != TargetRegClass::None
                 && reg.regClass != expectedClass) {

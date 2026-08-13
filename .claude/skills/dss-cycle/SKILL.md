@@ -616,6 +616,40 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   Opening rows is fine and often right; ENDING ON A HIGHER NUMBER is what is forbidden, because that
   is the arithmetic by which a 3,000-row audit trail became a 350-row backlog nobody reads.
 
+  ★★★ **THE DENOMINATOR IS `registry + plans`, NOT THE REGISTRY ALONE — widened 2026-08-13, and
+  finding this was the THIRD and FOURTH times this one instrument under-counted.** §F.2 sanctions
+  **two homes** for an anchor (this registry AND the owning plan's deferral table) and §F.4 lets a
+  `src/` citation resolve to either — but the tool counted only registry rows. ⇒ **a cycle that
+  closed a registry row and deferred the work into a plan row was reported as an IMPROVEMENT.**
+  Both homes are now counted, so MOVING a deferral between them is arithmetically NEUTRAL.
+  - **✔MEASURED the day it was fixed: `661 → 662 → 987`**, decomposing with no residue. The
+    registry-only number was itself wrong (**+2 −1**): the row regex `^\| \`(D-[A-Z0-9-]+)\` \|`
+    admitted no `_`, so **two OPEN rows were INVISIBLE** (`D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY`,
+    `D-TEST-CORPUS-NO-QEMU-X86_64-ON-ARM64-HOST`) — ★ **a row the gate cannot SEE cannot be seen
+    to OPEN either** — and one row it counted lives in the registry's own **“Allowlist (code-internal
+    pins, NOT deferrals)”** table. The remaining **+325** is the plan side (231 deferred-items, 84
+    reserved, 10 registry-shaped).
+  - **No stored baseline exists and none is needed:** both sides of the comparison use the same rule,
+    so widening moves the HEADLINE, never the DELTA. Cross-checked at `--base HEAD~1`, which
+    reproduces the recorded asm-arm64 **+20** exactly. `--denominator registry` reproduces the
+    pre-2026-08-13 headline on demand, and the output always NAMES which denominator gated.
+  - ⚠⚠ **RECOGNITION IS BY COLUMN SHAPE, NEVER BY HEADING NUMBER — “§3.1” is NOT the contract, and
+    assuming it was would have missed most of the tables.** ✔MEASURED: `17-shader-gpu-plan` keeps its
+    anchor table at **§5.4** while its §3.1 is a `Tier | Example` prose table; `23-full-c-plan`'s §3.1
+    is **not a table at all**; `09.5`/`24`/`28` use §9/§6/§12 and `08` uses §2.5–§2.8. Three anchor
+    shapes are counted (the registry's 4-column; `# | Deferred item |` with **five** different tails;
+    and `Anchor | Owns`, which has **no status column** so every row is unconditionally OPEN); four
+    non-deferral shapes are excluded BY NAME. Row inclusion is decided **by table, never by how an
+    anchor is spelled** — which is what makes the underscore blind spot unrepeatable by construction.
+  - **Severity rule, and it is not a softening: FATAL iff the measurement is INCOMPLETE.** An
+    unrecognized table shape or an orphan row means rows exist that could not be counted → exit 1. A
+    merely *interrupted* table (e.g. an inline HTML comment parked mid-body, which severs the rows
+    below it from their header) loses nothing once the reader steps over it → loud WARN. Never
+    silently skip a table: a silently skipped table is the exact defect this whole rule exists about.
+  - `--self-test` covers **32** cases including a deliberately novel glyph in a plan row, a mid-prose
+    `✅` that must still count OPEN, a `✅` in a non-status column, an underscore name, a strikethrough
+    name, an orphan row, and a mid-table comment. Run it if you touch the script.
+
   ★★ **THE FAILURE MODE THIS EXISTS TO KILL, ✔MEASURED 2026-08-11 and it is not subtle:** a lane was
   dispatched to FIX the predefined-macro set. When it was stopped it had written **nine new OPEN rows
   describing predefined-macro gaps** — `D-PP-COMPILER-IDENTITY-INCOHERENT`,

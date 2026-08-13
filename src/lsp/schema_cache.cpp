@@ -178,25 +178,82 @@ SchemaResult SchemaCache::resolveByName(std::string_view languageName) {
 // the fast and slow halves of one answer, and an ambiguity that reported
 // differently depending on cache warmth would be untestable.
 [[nodiscard]] static SchemaResolveError ambiguousExtensionError(
-    std::string const& ext, std::vector<std::string> const& claimants) {
-    std::string names;
-    for (auto const& n : claimants) {
-        if (!names.empty()) names += ", ";
-        names += n;
-    }
-    return SchemaResolveError{
-        SchemaResolveErrorKind::AmbiguousExtension,
+    std::string const&              ext,
+    std::vector<std::string> const& claimants,
+    std::span<std::string const>    preferred,
+    std::vector<std::string> const& matched) {
+    auto join = [](auto const& range) {
+        std::string names;
+        for (auto const& n : range) {
+            if (!names.empty()) names += ", ";
+            names += n;
+        }
+        return names;
+    };
+    std::string detail =
         "file extension " + ext + " is claimed by "
             + std::to_string(claimants.size()) + " shipped languages ("
-            + names
+            + join(claimants)
             + ") — the extension alone cannot name one of them. An assembly "
               "file is target-specific by nature, so the dialect is a question "
-              "the compile TARGET answers; this resolver has no target, so it "
-              "refuses rather than guessing."};
+              "the compile TARGET answers.";
+    // State what the tie-break SAW, not just that it failed. "Ambiguous" with
+    // no account of the preference leaves the operator unable to tell a missing
+    // project file from a project file that declares two CPUs — opposite fixes.
+    if (preferred.empty()) {
+        detail += " No preferred language was supplied to break the tie.";
+    } else {
+        detail += " The preferred languages (" + join(preferred) + ") matched "
+                + std::to_string(matched.size()) + " of them"
+                + (matched.empty() ? "" : " (" + join(matched) + ")")
+                + "; exactly one match is required to break the tie.";
+    }
+    return SchemaResolveError{
+        SchemaResolveErrorKind::AmbiguousExtension, std::move(detail)};
+}
+
+// Intersect the claimant list with the caller's preference. Iterates CLAIMANTS
+// (not `preferred`) so the result order is a property of the shipped set rather
+// than of the caller's argument, and so a duplicate inside `preferred` cannot
+// inflate the match count into a false ambiguity.
+[[nodiscard]] static std::vector<std::string> preferredClaimants(
+    std::vector<std::string> const& claimants,
+    std::span<std::string const>    preferred) {
+    std::vector<std::string> matched;
+    for (auto const& c : claimants) {
+        if (std::find(preferred.begin(), preferred.end(), c) != preferred.end()) {
+            matched.push_back(c);
+        }
+    }
+    return matched;
+}
+
+// The ONE place an ambiguity is adjudicated. Both the warm-cache path and the
+// cold scan route through it, for the same reason `ambiguousExtensionError` is
+// shared: an answer that depended on cache warmth would make the behaviour
+// depend on which file the editor opened first.
+SchemaResult SchemaCache::breakTie(std::string const&              ext,
+                                   std::vector<std::string> const& claimants,
+                                   std::span<std::string const>    preferred) {
+    auto matched = preferredClaimants(claimants, preferred);
+    if (matched.size() == 1u) return resolveByName(matched.front());
+    return std::unexpected(
+        ambiguousExtensionError(ext, claimants, preferred, matched));
 }
 
 SchemaResult SchemaCache::resolveByExtension(std::string_view fileExtension) {
+    return resolveByExtension(fileExtension, std::span<std::string const>{});
+}
+
+SchemaResult SchemaCache::resolveByExtension(
+    std::string_view             fileExtension,
+    std::span<std::string const> preferredLanguages) {
     const auto lower = lowercase(fileExtension);
+    // Set (still under the lock) when the warm index already knows this
+    // extension is contested. The adjudication itself happens AFTER the lock is
+    // dropped, because `breakTie` may `resolveByName` the winner and that
+    // re-takes this same non-recursive mutex.
+    std::vector<std::string> warmClaimants;
     {
         std::lock_guard lk{mutex_};
         if (auto it = extClaimants_.find(lower); it != extClaimants_.end()) {
@@ -204,9 +261,12 @@ SchemaResult SchemaCache::resolveByExtension(std::string_view fileExtension) {
             // A warm cache that answered a `.s` while a cold one refused would
             // make the defect depend on which file the editor opened first.
             if (it->second.size() > 1u) {
-                return std::unexpected(
-                    ambiguousExtensionError(lower, it->second));
+                warmClaimants = it->second;
             }
+            // `else` — NOT a fallthrough. A contested extension must never
+            // reach the unique-claimant short-circuit below; that line reads
+            // `it->second.front()`, which is first-wins by construction.
+            else
             // ⚠⚠ AND "ONE CLAIMANT SO FAR" IS NOT "ONE CLAIMANT". The index
             // only holds languages somebody already resolved BY NAME, so a
             // single `resolveByName("asm-x86_64-att")` leaves `.s` looking
@@ -228,6 +288,9 @@ SchemaResult SchemaCache::resolveByExtension(std::string_view fileExtension) {
                 }
             }
         }
+    }
+    if (!warmClaimants.empty()) {
+        return breakTie(lower, warmClaimants, preferredLanguages);
     }
     // Cache miss. In --schema-dir mode there is no shipped-candidate
     // list (we don't enumerate the user's dir up front) — fall through
@@ -289,7 +352,7 @@ SchemaResult SchemaCache::resolveByExtension(std::string_view fileExtension) {
         shippedExtIndexComplete_ = true;
     }
     if (claimants.size() > 1u) {
-        return std::unexpected(ambiguousExtensionError(lower, claimants));
+        return breakTie(lower, claimants, preferredLanguages);
     }
     if (claimants.size() == 1u) return resolveByName(claimants.front());
     return std::unexpected(SchemaResolveError{

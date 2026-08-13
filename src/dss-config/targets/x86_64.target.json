@@ -880,7 +880,14 @@
         "format": "x86-variable",
         "variants": [
           {
-            "guard":    { "operandKinds": [] },
+            "$comment": "\u2605\u2605\u2605 THE 8-BIT-KEYED TWIN, AND IT IS DECLARED FIRST ON PURPOSE (D-ASM-X86-NO-8BIT-REGISTER-FILE, 2026-08-13). `0F 90+cc /0 r8` writes a BYTE register and always did; what was missing was any variant SAYING so, and the consequence was that gas's `sete %al` \u2014 the only spelling gas accepts \u2014 could not be shipped. The text-lowering derives width 8 from `%al`, and `variantHonorsDeclaredWidth` refuses a width-absent variant at any width other than the target's natural 64, so without this row `sete %al` failed loud and `sete %rax` (which gas REJECTS) was the only form DSS could take: bidirectional non-conformance.\n\u2605 VARIANT ORDER IS THE MECHANISM: `selectEncodingVariant` is FIRST-MATCH, so an 8-bit instruction takes this row and a 64-bit one falls through to the width-absent row below. \u2714MEASURED that the fall-through is required: the C path (`lowerICmp` in mir_to_lir.cpp) emits `setcc` with DEFAULT flags, i.e. width 64, and making the existing row width-8 instead of adding this one would have broken every C compare.\n\u26a0 THE TEMPLATE IS BYTE-IDENTICAL to the row below, including `forceRexPrefix` \u2014 the encoder reads width ONLY to select a variant, never to choose a prefix, so the two rows differ in what they MATCH and not in what they EMIT.",
+            "guard":    { "operandKinds": [], "width": 8 },
+            "template": { "opcode": [15, 144], "condCodeFromPayload": true, "modrmRegExt": 0, "forceRexPrefix": true },
+            "resultSlot": "modrm.rm"
+          },
+          {
+            "$comment": "The 64-bit sibling. ⚠ IT IS WIDTH-KEYED RATHER THAN MATCH-ANY, AND THE LOADER IS WHAT INSISTED: ✔MEASURED 2026-08-13, leaving it width-absent alongside the 8-bit row above fails load with `C_MalformedJson … variants 0 and 1 share operandKinds but mix a width-keyed guard with a width-absent (match-any) one` (convergence-fix D / D-CSUBSET-32BIT-ALU-FORMS). That rule exists precisely so a match-any sibling cannot shadow a width-discriminated one, which is the shape this pair would otherwise have had. 64 is the width the C path's `setcc` already carries (default flags), so keying it changes nothing there.",
+            "guard":    { "operandKinds": [], "width": 64 },
             "$templateComment": "D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold, code-reviewer C2): `forceRexPrefix: true` forces a REX prefix even when no W/R/X/B bit is set. Required so the byte-register-bearing setcc accesses spl/bpl/sil/dil (low byte of r4..r7) instead of the legacy ah/ch/dh/bh high-byte aliases. Without this, regalloc picking rsp/rbp/rsi/rdi would silently write the setcc result into the HIGH byte of a DIFFERENT physical register.",
             "template": { "opcode": [15, 144], "condCodeFromPayload": true, "modrmRegExt": 0, "forceRexPrefix": true },
             "resultSlot": "modrm.rm"
@@ -1285,8 +1292,8 @@
         "format": "x86-variable",
         "variants": [
           {
-            "$comment": "3-op no-index form: `lea reg, [base + disp32]`.",
-            "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
+            "$comment": "3-op no-index form: `lea reg, [base + disp32]`. \u2605 WIDTH-KEYED 2026-08-13 (D-ASM-ATT-LEAL-UNREACHABLE-NO-WIDTH-KEYED-LEA): every `lea` variant used to be width-ABSENT, and `variantMatchesInst` treats a width-absent guard as matching ANY width \u2014 so a dialect row for gas's 32-bit `leal` elected THIS REX.W form and would have encoded a 64-bit address computation. The text-lowering gate (`variantHonorsDeclaredWidth`) caught it and refused, which made `leal` UNSHIPPABLE rather than wrong; keying the width is what makes it shippable. \u2714MEASURED that this is a no-op for the C path: every `lea` emission in `mir_to_lir.cpp` passes default flags, i.e. width 64.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [141] },
             "wires":      [
@@ -1296,8 +1303,8 @@
             ]
           },
           {
-            "$comment": "4-op indexed form: `lea reg, [base + index*scale + disp32]`.",
-            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
+            "$comment": "4-op indexed form: `lea reg, [base + index*scale + disp32]`. Width-keyed for the reason the 3-op form states.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [141] },
             "wires":      [
@@ -1309,7 +1316,7 @@
           },
           {
             "$comment": "1-op RIP-relative form: `lea reg, [rip + sym]` (D-LK4-RODATA-PRODUCER 2026-06-02). The lone SymbolRef operand is wired to the RipRelDisp32 slot, which (a) records a rel32 Relocation at the trailing 4-byte position and (b) forces ModR/M to mod=00 rm=101 (the [rip+disp32] encoding in 64-bit mode). Used by `lowerGlobalAddr` to materialize a global's address into a register.",
-            "guard":      { "operandKinds": ["symbol"] },
+            "guard":      { "operandKinds": ["symbol"], "width": 64 },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [141] },
             "wires":      [
@@ -1318,7 +1325,7 @@
           },
           {
             "$comment": "2-op block-address form: `lea reg, [rip + sym]` where sym is a SYNTHETIC per-block symbol (D-CSUBSET-COMPUTED-GOTO `&&label`). Byte-IDENTICAL to the 1-op RIP-relative form above — the SymbolRef (operand 0) wires to RipRelDisp32 with a rel32 reloc; the trailing BlockRef (operand 1) is METADATA, wired to NOTHING (it names the target LIR block so the assembler can bind `sym` to that block's byte offset). The assembler reads the BlockRef from the operand list and records a `BlockSymPatch{sym, targetBlock}`; the linker assigns `sym` the interior-block VA. Distinct guard `[symbol, blockref]` so the variant matcher routes this 2-operand `lea` here rather than failing A_NoMatchingEncodingVariant.",
-            "guard":      { "operandKinds": ["symbol", "blockref"] },
+            "guard":      { "operandKinds": ["symbol", "blockref"], "width": 64 },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [141] },
             "wires":      [
@@ -1327,12 +1334,35 @@
           },
           {
             "$comment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): 2-op relocated-displacement form: `lea reg, [base + tpoff32(sym)]` — REX.W 0x8D ModRM(mod=10 reg=dest rm=base) [SIB when base.lo3=100] + a 4-byte RELOC PLACEHOLDER at the memory-displacement position (Relocation{tls-tpoff32, sym}; the linker patches the SIGNED thread-pointer offset in). The base is the tp register `tlsbase` produced; the sum IS the thread-local object's per-thread address. Distinct guard [reg, symbol] — no other lea variant carries that shape.",
-            "guard":      { "operandKinds": ["reg", "symbol"] },
+            "guard":      { "operandKinds": ["reg", "symbol"], "width": 64 },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [141] },
             "wires":      [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "memreloc.disp32", "relocationKind": "tls-tpoff32" }
+            ]
+          },
+          {
+            "$comment": "\u2605\u2605 THE 32-BIT ADDRESSING TWIN \u2014 gas's `leal 8(%rsp), %eax`: the SAME 0x8D opcode WITHOUT REX.W, which computes a 32-bit effective address and zero-extends it into the 64-bit destination. It is the ONLY difference between `leaq` and `leal` on this ISA, which is exactly why a width-absent guard could not tell them apart. \u26a0 ONLY THE TWO ADDRESSING FORMS GET A 32-BIT TWIN: the RIP-relative, block-address and TLS forms materialize an ADDRESS the linker patches, and a 32-bit truncation of a 64-bit image address is not a thing a `.s` writer can mean \u2014 they stay 64-only and a 32-bit spelling of them fails loud.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "The indexed 32-bit twin \u2014 `leal 8(%rsp,%rcx,4), %eax`.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
             ]
           }
         ]
@@ -2330,7 +2360,7 @@
 
     { "name": "rflags", "class": "flags", "widthBytes": 8, "hwEncoding": 0 },
 
-    { "$comment": "★★ THE 32-BIT VIEWS — `subOf`'s FIRST REAL CONSUMER (2026-08-13). `subOf` has existed on `TargetRegisterInfo` since ML6, is loaded, is resolved-and-cycle-checked at validate() time, and BOTH allocator paths already skip a row that declares it — with ZERO rows using it. These are the rows. They exist so a hand-written `.s` can WRITE `%eax`: the assembly-text lowering resolves a narrow spelling to its PARENT ordinal (LIR names one register and carries the access width on the INSTRUCTION) and then enforces that the spelling's width matches the mnemonic's — gas rejects both `movl %rax,%ecx` and `movl %eax,%rcx`, and so does this. ⚠ THEY ARE NOT ALLOCATABLE AND MUST NEVER BECOME SO: `buildFreeLists` (lir_regalloc.cpp) and `pickScratchRegs` (lir_rewrite.cpp) both `continue` on a non-empty `subOf`, because handing out `eax` and `rax` as two independent registers would let the allocator place two live values in one machine register — a silent miscompile with no diagnostic anywhere. They are also absent from every calling-convention list, which is the second, independent reason they stay out of the pools. The 8- and 16-bit views (al/ax/...) are NOT declared: no consumer writes them yet, and the trigger-discipline rule is that a row lands with its first consumer (D-TARGET-SUBREGISTER-ALIASES).",
+    { "$comment": "★★ THE 32-BIT VIEWS — `subOf`'s FIRST REAL CONSUMER (2026-08-13). `subOf` has existed on `TargetRegisterInfo` since ML6, is loaded, is resolved-and-cycle-checked at validate() time, and BOTH allocator paths already skip a row that declares it — with ZERO rows using it. These are the rows. They exist so a hand-written `.s` can WRITE `%eax`: the assembly-text lowering resolves a narrow spelling to its PARENT ordinal (LIR names one register and carries the access width on the INSTRUCTION) and then enforces that the spelling's width matches the mnemonic's — gas rejects both `movl %rax,%ecx` and `movl %eax,%rcx`, and so does this. ⚠ THEY ARE NOT ALLOCATABLE AND CANNOT BECOME SO BY ACCIDENT, AND THE MECHANISM CHANGED ON 2026-08-13 — THIS SENTENCE USED TO NAME ONE THAT NO LONGER EXISTS. It said `buildFreeLists` (lir_regalloc.cpp) and `pickScratchRegs` (lir_rewrite.cpp) each `continue` on a non-empty `subOf`, and called cc-list absence 'the second, independent reason'. BOTH skips have been DELETED: ✔MEASURED, they were unreachable defence — `allocatable` is built EXCLUSIVELY from the six calling-convention lists (`lir_regalloc.cpp` buildFreeLists / `lir_rewrite.cpp` collectAllocatable), with no independent source, so a row absent from every cc list could never enter a pool for the skip to catch. What replaced them is a LOAD-TIME REJECTION: `TargetSchemaData::validate()`'s `checkRefs` refuses a calling convention that names a `subOf` register, with `C_MalformedJson` and a JSON path pointing at the offending element. ⇒ one config rule and one loud rejection, not two silent skips — and the rows below are safe because none of them appears in any cc list, which is now enforced rather than merely true. The 16-bit views (ax/cx/...) are still NOT declared, and the rule is unchanged: a row lands with its FIRST CONSUMER (D-TARGET-SUBREGISTER-ALIASES) — no shipped opcode form and no dialect spelling writes a 16-bit register yet. The 8-bit views DID get one; see the byte-view block below.",
       "name": "eax",   "class": "gpr", "widthBytes": 4, "subOf": "rax",  "hwEncoding": 0 },
     { "name": "ecx",   "class": "gpr", "widthBytes": 4, "subOf": "rcx",  "hwEncoding": 1 },
     { "name": "edx",   "class": "gpr", "widthBytes": 4, "subOf": "rdx",  "hwEncoding": 2 },
@@ -2346,7 +2376,25 @@
     { "name": "r12d",  "class": "gpr", "widthBytes": 4, "subOf": "r12",  "hwEncoding": 12 },
     { "name": "r13d",  "class": "gpr", "widthBytes": 4, "subOf": "r13",  "hwEncoding": 13 },
     { "name": "r14d",  "class": "gpr", "widthBytes": 4, "subOf": "r14",  "hwEncoding": 14 },
-    { "name": "r15d",  "class": "gpr", "widthBytes": 4, "subOf": "r15",  "hwEncoding": 15 }
+    { "name": "r15d",  "class": "gpr", "widthBytes": 4, "subOf": "r15",  "hwEncoding": 15 },
+
+    { "$comment": "★★★ THE 8-BIT VIEWS — the row that made `sete %al` SPELLABLE (D-ASM-X86-NO-8BIT-REGISTER-FILE, 2026-08-13). Before them this file declared 49 registers with NO byte file, and the consequence was BIDIRECTIONAL non-conformance in the sense [[feedback_reference_compilers_are_the_spec]] means it: gas WRITES `sete %al` and DSS could not read it, while the only destination DSS could spell — `%rax` — is one gas REJECTS. Shipping a dialect row that accepts input no reference assembler takes is the same defect as refusing input they do accept.\n★ SAME MECHANISM AS THE 32-BIT BLOCK ABOVE, and deliberately no other: `subOf` names the 64-bit PARENT (not `eax` — a two-hop chain would load and resolve identically, and one hop is what the table already reads as 'these are views of that machine register'). The assembly-text lowering resolves a narrow spelling to the parent ordinal and carries the ACCESS WIDTH on the LIR instruction, so `al` and `rax` are one register with two spellings, exactly as `eax` and `rax` are.\n⚠ NOT ALLOCATABLE, by the mechanism the 32-bit block states: a calling convention naming a `subOf` register is REFUSED AT CONFIG LOAD (`TargetSchemaData::validate()`), and the cc lists are the only source `allocatable` is built from — so none of these names can reach a register pool.\n⚠⚠ THE LOW-BYTE NAMES OF rsp/rbp/rsi/rdi ARE `spl`/`bpl`/`sil`/`dil` AND REQUIRE A REX PREFIX — without one, encoding 4..7 in a byte-register slot names the LEGACY HIGH bytes `ah`/`ch`/`dh`/`bh`, i.e. a DIFFERENT physical register. `setcc`'s template already carries `forceRexPrefix: true` for exactly this reason (D-LIR-SETCC-WIDTH-CONTRACT), so these four are safe there. `ah`/`ch`/`dh`/`bh` are deliberately UNDECLARED: they are not sub-registers of rax..rbx in the `subOf` sense this table means (they alias bits 8..15, not 0..7), and declaring them with the same parent would make the narrow-spelling resolution silently read the wrong byte.",
+      "name": "al",   "class": "gpr", "widthBytes": 1, "subOf": "rax",  "hwEncoding": 0 },
+    { "name": "cl",   "class": "gpr", "widthBytes": 1, "subOf": "rcx",  "hwEncoding": 1 },
+    { "name": "dl",   "class": "gpr", "widthBytes": 1, "subOf": "rdx",  "hwEncoding": 2 },
+    { "name": "bl",   "class": "gpr", "widthBytes": 1, "subOf": "rbx",  "hwEncoding": 3 },
+    { "name": "spl",  "class": "gpr", "widthBytes": 1, "subOf": "rsp",  "hwEncoding": 4 },
+    { "name": "bpl",  "class": "gpr", "widthBytes": 1, "subOf": "rbp",  "hwEncoding": 5 },
+    { "name": "sil",  "class": "gpr", "widthBytes": 1, "subOf": "rsi",  "hwEncoding": 6 },
+    { "name": "dil",  "class": "gpr", "widthBytes": 1, "subOf": "rdi",  "hwEncoding": 7 },
+    { "name": "r8b",  "class": "gpr", "widthBytes": 1, "subOf": "r8",   "hwEncoding": 8 },
+    { "name": "r9b",  "class": "gpr", "widthBytes": 1, "subOf": "r9",   "hwEncoding": 9 },
+    { "name": "r10b", "class": "gpr", "widthBytes": 1, "subOf": "r10",  "hwEncoding": 10 },
+    { "name": "r11b", "class": "gpr", "widthBytes": 1, "subOf": "r11",  "hwEncoding": 11 },
+    { "name": "r12b", "class": "gpr", "widthBytes": 1, "subOf": "r12",  "hwEncoding": 12 },
+    { "name": "r13b", "class": "gpr", "widthBytes": 1, "subOf": "r13",  "hwEncoding": 13 },
+    { "name": "r14b", "class": "gpr", "widthBytes": 1, "subOf": "r14",  "hwEncoding": 14 },
+    { "name": "r15b", "class": "gpr", "widthBytes": 1, "subOf": "r15",  "hwEncoding": 15 }
   ],
   "$registerClassOpsComment": "FC2 Part B: per-register-class move/load/store mnemonics. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (a GPR mov against an XMM hwEncoding assembles to valid-looking-but-WRONG bytes — the class-blind silent miscompile this table kills). fpr's `store` landed with its FIRST consumer (trigger discipline honored): the ms_x64 prologue saved-reg spill — Win64 callee-saved xmm6-15 + regalloc's callee-saved-first policy put the first FPR vreg in a callee-saved xmm, and classOpHandle failed loud L_RequiredLirOpcodeMissing until movsd_store was declared.",
   "registerClassOps": [

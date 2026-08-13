@@ -584,13 +584,17 @@ primitiveByteSize(TypeKind k) noexcept {
 // dedicated widen+append paths (appendF80Extended / the binary128 arm) and
 // I128/U128 fail loud at the kind-keyed 128-bit gate, so the only widths that
 // arrive are the 1/2/4/8-byte ones this loop can encode.
+//
+// ★ THE LOOP ITSELF MOVED TO `asm.hpp::appendLittleEndianBytes` when the
+// assembly-text data directives needed the same append
+// (D-ASM-NO-DATA-DEFINING-DIRECTIVE, 2026-08-13). This name stays as the
+// in-file spelling its ~15 call sites already use; what must not exist is a
+// SECOND byte-order loop, since a divergence between two of them is a green
+// build emitting reversed words.
 void appendLE(std::vector<std::uint8_t>& bytes,
               std::uint64_t value,
               std::size_t width) noexcept {
-    for (std::size_t j = 0; j < width; ++j) {
-        bytes.push_back(static_cast<std::uint8_t>(
-            (value >> (j * 8)) & 0xFFu));
-    }
+    appendLittleEndianBytes(bytes, value, width);
 }
 
 // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): widen a host `double` (IEEE-754

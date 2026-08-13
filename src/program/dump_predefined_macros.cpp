@@ -7,6 +7,7 @@
 #include "link/object_format_schema.hpp"
 #include "program/target_spec.hpp"
 
+#include <algorithm>
 #include <array>
 #include <ostream>
 #include <string>
@@ -37,6 +38,26 @@ void emitLoud(std::ostream& err, DiagnosticCode code, std::string_view message) 
         << diagnosticCodeName(code) << "] " << message << '\n';
 }
 
+// Print a config document's own diagnostics verbatim, severity preserved.
+//
+// ★★ THIS IS `forwardConfigDiagnostics`' JOB AND IT CANNOT BE CALLED HERE, SO
+// THE DUPLICATION IS ONE `<<` CHAIN AND NOT A SECOND POLICY. The shared helper
+// (grammar_schema.hpp) forwards into a `DiagnosticReporter`, which is exactly
+// the sink the banner above rules out for this flag: three independent gates in
+// `DiagnosticReporter::report` can drop a line in silence, and a dump that
+// answers with a silently-shortened list is the failure this mode exists to
+// rule out. What the two share is what MATTERS — severity is preserved
+// verbatim (a warning stays a warning, an error stays an error) and neither
+// re-words the loader's own message. Made one function so the SUCCESS side and
+// the FAILURE side below cannot drift into two renderings of one fact.
+void emitConfigDiagnostics(std::ostream&                     err,
+                           std::span<ConfigDiagnostic const> diags) {
+    for (ConfigDiagnostic const& d : diags) {
+        err << severityName(d.severity) << '[' << diagnosticCodeName(d.code)
+            << "] " << d.path << ": " << d.message << '\n';
+    }
+}
+
 // Forward a failed `loadShipped`'s own diagnostics, then the driver-tier
 // "which file to look at" line. Mirrors the pair of emits every `loadShipped`
 // call site in the driver performs; the loader's messages carry the JSON path
@@ -45,10 +66,7 @@ void emitLoadFailure(std::ostream&                     err,
                      std::span<ConfigDiagnostic const> diags,
                      DiagnosticCode                    driverCode,
                      std::string_view                  summary) {
-    for (ConfigDiagnostic const& d : diags) {
-        err << severityName(d.severity) << '[' << diagnosticCodeName(d.code)
-            << "] " << d.path << ": " << d.message << '\n';
-    }
+    emitConfigDiagnostics(err, diags);
     emitLoud(err, driverCode, summary);
 }
 
@@ -356,6 +374,50 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
         return 1;
     }
     auto const grammar = *grammarR;
+    // D-CONFIG-WARNINGS-DISCARDED-BY-DUMP-PREDEFINED-MACROS: a document that
+    // loads CLEANLY can still have said something, and this mode was the last
+    // route that read the failure side and dropped the success side. The
+    // compile paths forward the same span through `forwardConfigDiagnostics`;
+    // this one renders it directly, for the reporter reason above.
+    //
+    // ⚠ AND IT GOES TO `err`, NOT `out`, WHICH IS WHY IT IS SAFE HERE. stdout
+    // carries the machine-readable answer — the dump's own contract — so a
+    // config warning printed there would corrupt the very output a caller
+    // parses. Fixing one silent channel by writing into another one's payload
+    // would be trading the drop for a corruption.
+    emitConfigDiagnostics(err, grammar->loadDiagnostics());
+
+    // ★★ AND `--warnings-as-errors` NOW MEANS SOMETHING HERE, WHICH IT COULD
+    // NOT BEFORE THE LINE ABOVE.
+    // Anchored: D-DUMP-PREDEFINED-MACROS-IGNORES-WARNINGS-AS-ERRORS —
+    // the flag is accepted in this mode (✔MEASURED 2026-08-13: the dump
+    // printed normally and exited 0 with it set) and every other mode honours
+    // it. It was INERT rather than wrong while this mode emitted no warning at
+    // all; forwarding the load diagnostics is exactly what makes the gap
+    // reachable, so the two land together instead of one creating the other.
+    //
+    // ★ REFUSING IS THE ANSWER, NOT DEMOTING THE EXIT CODE AFTER PRINTING. The
+    // caller said "treat a warning as an error about this document"; an
+    // effective macro set computed from a document they asked to be treated as
+    // broken is an answer they told us not to trust, and printing it anyway
+    // with a non-zero status invites exactly the "it printed, so it worked"
+    // reading. stdout stays untouched, which is the same all-or-nothing rule
+    // the per-target section loop below follows.
+    if (args.warningsAsErrors
+        && std::ranges::any_of(grammar->loadDiagnostics(),
+                               [](ConfigDiagnostic const& d) {
+                                   return d.severity
+                                          == DiagnosticSeverity::Warning;
+                               })) {
+        emitLoud(err, DiagnosticCode::D_SchemaLoadFailed,
+                 "language schema '" + args.languageName
+                     + "' loaded with configuration warning(s) — printed above "
+                       "— and --warnings-as-errors was requested, so the "
+                       "effective macro set is NOT printed. Fix the "
+                       "configuration, or drop --warnings-as-errors to dump "
+                       "the set the compiler would actually see.");
+        return 1;
+    }
 
     // A language with NO preprocess block predefines nothing and has no
     // `predefinedMacros` list to report. Saying so is the answer; printing an

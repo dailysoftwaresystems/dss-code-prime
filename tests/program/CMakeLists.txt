@@ -32,6 +32,26 @@ dss_add_test(NAME program/test_project_config
 dss_add_test(NAME program/test_asm_dialect_per_target
              SOURCES test_asm_dialect_per_target.cpp)
 
+# D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY +
+# D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER: the `encode` tier's
+# extern binder. Driver tier because two of its four claims have no example-
+# manifest surface at all — `--resolve-library` is a DRIVER flag (a manifest
+# declares sources and targets, not link inputs), and the per-format decoration
+# gate needs ONE source text to be accepted on elf/pe and refused on Mach-O
+# inside one process. The positive end-to-end path (build, RUN, read stdout)
+# lives in examples/asm/**.
+dss_add_test(NAME program/test_asm_extern_binding
+             SOURCES test_asm_extern_binding.cpp)
+
+# D-ASM-DATA-ITEMS-NOT-WIRED-INTO-THE-DRIVER: the `.data`/`.byte`/`.word`/
+# `.quad`/`.zero` bytes a `.s` declares must reach the LINKED IMAGE, not merely
+# be computed. Driver tier because the corpus runner's only observable is an
+# EXIT CODE, so an example can witness data only once assembly can NAME a data
+# symbol in an instruction — which is anchored separately
+# (D-ASM-SYMBOL-OPERAND-NOT-LOWERED) and not yet reachable.
+dss_add_test(NAME program/test_asm_data_directives
+             SOURCES test_asm_data_directives.cpp)
+
 # `--dump-predefined-macros` (FC18 companion): the effective predefined-macro set
 # as an INSPECTABLE artifact, plus the sweep asserting no shipped object format
 # defines a C23 `__STDC_NO_*` non-support macro.

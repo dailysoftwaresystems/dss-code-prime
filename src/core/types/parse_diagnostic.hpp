@@ -2105,6 +2105,26 @@ enum class DiagnosticCode : std::uint16_t {
     //   VLA region (an ABI break). Red-on-disable via the non-leaf fail-loud pins.
     L_VlaNonLeafFrameUnsupported   = 0xB00E,
 
+    // D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED: a terminator's CFG edges are
+    //   written down TWICE — once as the block's recorded successor list
+    //   (`Lir::blockSuccessors`) and once as `BlockRef` OPERANDS on the
+    //   terminator instruction itself — and the two channels DISAGREE. Both are
+    //   real inputs: the successor list drives every CFG walk (liveness, the
+    //   `.dsslir` terminator dispatch, `simplifyCfg`), while the ENCODER reads
+    //   the operands (`x86_variable.cpp` takes the branch displacement from
+    //   `srcOp.blockSlot`), so a divergence is a jump to the wrong block or an
+    //   un-encodable branch — never a cosmetic difference.
+    //   ⚠ The defect that minted this code was a SILENT DROP, not a mismatch: the
+    //   `.dsslir` reader filtered every BlockRef out of a `cond-br`'s operand
+    //   list, so a real lowered `jcc` came back with the successor list intact
+    //   and ZERO operands. The rule therefore also asserts PRESENCE for the kinds
+    //   whose successors ride their operands — an absence is exactly the shape
+    //   that regressed, and "they match because there are none" is how that
+    //   regression passed for its whole life.
+    //   UNSUPPRESSABLE: suppressed, this is a wrong-target branch with a green
+    //   build. Red-on-disable via the `.dsslir` CondBr round-trip pins.
+    L_TerminatorSuccessorMismatch  = 0xB00F,
+
     // ── Register allocator (renders as `R`) ────────────────────────────
     //
     // The linear-scan register allocator emits these when a target

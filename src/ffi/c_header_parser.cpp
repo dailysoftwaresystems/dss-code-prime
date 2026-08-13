@@ -277,6 +277,12 @@ readCHeaderFromText(std::string_view    text,
                 + ".",
             reporter));
     }
+    // D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD: the twin of the forward
+    // above, on the arm where the document loaded. ⚠ It sits AFTER the
+    // `errStart` watermark this function took, and that is correct: these are
+    // Warnings, `tierClean`-style checks count Errors, and a config warning
+    // must not turn a good header read into a failure by itself.
+    forwardConfigDiagnostics((*loaded)->loadDiagnostics(), reporter);
 
     // TF-C74: DELIBERATELY no `setTargetPredefinedMacros` — this reader parses a
     // shipped FFI header for its DECLARATIONS, not for a specific machine, and

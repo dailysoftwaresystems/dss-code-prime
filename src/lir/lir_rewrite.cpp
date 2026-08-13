@@ -131,7 +131,14 @@ pickScratchRegs(TargetSchema const& schema, LirFuncAllocation const& alloc,
     for (std::uint16_t i = 0; i < regs.size(); ++i) {
         auto const& info = regs[i];
         if (info.regClass == TargetRegClass::None) continue;
-        if (!info.subOf.empty()) continue;
+        // D-TARGET-CC-NAMES-SUB-REGISTER: no `subOf` skip here, for the
+        // same reason as `buildFreeLists` (lir_regalloc.cpp) — this pool
+        // is likewise the register table intersected with the cc name
+        // lists `collectAllocatable` absorbed, and a cc naming a
+        // sub-register is now rejected by `TargetSchema::validate()` at
+        // load. Deleted rather than kept as defence in depth: the two
+        // copies could only ever be exercised by a config that no longer
+        // loads.
         if (!allocatable.contains(info.name)) continue;  // reserved-role filter
         // D-CSUBSET-VLA (C1b): in a VLA function the frame pointer is RESERVED as the
         // fixed-frame base (regalloc held it out of the allocatable pool). It is

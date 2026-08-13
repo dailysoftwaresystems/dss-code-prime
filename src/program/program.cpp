@@ -628,16 +628,35 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                            "namespaced before the modules merge");
                 return false;
             }
-            auto mod = assembleAsmUnit(cus[0], grammar, **targetR,
-                                       (*formatR)->entryVerbs(), reporter);
+            // D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY: the WHOLE format schema
+            // and the WHOLE per-CU options, by the same route `buildCuMir`
+            // takes. The old call handed over `entryVerbs()` alone, so the
+            // assembly tier could not name the active object format or its data
+            // model and had nothing to ask the platform-realization oracle with
+            // — which is why a `.s` calling libc could not bind ANY library.
+            // `perCuOpts` (not `compileOpts`) deliberately: it is the DYNAMIC
+            // half of `--resolve-library`, with `ar` archives already
+            // partitioned out for the static path below.
+            auto mod = assembleAsmUnit(cus[0], grammar, **targetR, **formatR,
+                                       reporter, perCuOpts);
             if (!mod) {
                 emitNullNoDiagnostic("the assembly unit build "
                                      "(assembleAsmUnit)");
                 return false;
             }
-            return reported(linkAndWrite(
-                std::span<AssembledModule const>{&*mod, 1}, **targetR,
-                **formatR, outPath, reporter, imageRequest));
+            // D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER, the STATIC
+            // half: this route used to call `linkAndWrite` directly, so a `.a` /
+            // `.lib` named on `--resolve-library` was partitioned out of the
+            // per-CU options above and then handed to NOBODY — accepted, and
+            // dropped without a word, exactly like its dynamic sibling. Routing
+            // through `linkAndWriteWithStaticArchives` is byte-identical to
+            // `linkAndWrite` when the archive list is empty (its documented
+            // contract), so the ordinary `.s` build is unchanged and the flag
+            // now has an effect on both halves.
+            return reported(linkAndWriteWithStaticArchives(
+                std::move(*mod),
+                std::span<std::filesystem::path const>{staticArchives},
+                **targetR, **formatR, outPath, reporter, imageRequest));
         }
         case PipelineTier::Mir:
         case PipelineTier::Lir:
@@ -1333,6 +1352,12 @@ struct CuBuildKey {
             // answer from a stale miss.
             return nullptr;
         }
+        // D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD: a document that loads
+        // CLEANLY can still have said something, and until now nothing read it.
+        // ★ INSIDE THE CACHE-MISS BLOCK ON PURPOSE — one emission per document
+        // per run. Forwarding after the cache lookup would repeat every warning
+        // once per TARGET, which is how a real warning gets tuned out.
+        forwardConfigDiagnostics((*loaded)->loadDiagnostics(), rep);
         it = cache.emplace(declared, *loaded).first;
     }
     auto const& schema = it->second;
@@ -1928,6 +1953,8 @@ int Program::compileProject(
         return 1;
     }
     auto grammar = *grammarR;
+    // D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD (see the accessor).
+    forwardConfigDiagnostics(grammar->loadDiagnostics(), rep);
 
     // AP2 driver gate: the requested profile must be ∈ the language's
     // declared set. Empty set ⇒ reject (fail-closed). One predicate, no
@@ -2260,6 +2287,8 @@ int Program::compileFiles(
             return 1;
         }
         grammar = *grammarR;
+        // D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD (see the accessor).
+        forwardConfigDiagnostics(grammar->loadDiagnostics(), rep);
     }
 
     // Build ONE CompilationUnit for ALL source files — the CU5 multi-file-single-CU shape
@@ -2374,6 +2403,8 @@ int Program::compileUnits(
             return 1;
         }
         grammar = *grammarR;
+        // D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD (see the accessor).
+        forwardConfigDiagnostics(grammar->loadDiagnostics(), rep);
     }
 
     // Build ONE CompilationUnit PER source file — the multi-CU model the linker MERGES
@@ -2477,6 +2508,8 @@ int Program::compileDirectory(
             return 1;
         }
         grammar = *grammarR;
+        // D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD (see the accessor).
+        forwardConfigDiagnostics(grammar->loadDiagnostics(), rep);
         for (auto const& ext : grammar->fileExtensions()) {
             scanExtensions.push_back(ext);
         }
@@ -2497,6 +2530,12 @@ int Program::compileDirectory(
         for (auto const& name : declaredNames) {
             auto loaded = GrammarSchema::loadShipped(name);
             if (!loaded.has_value()) continue;  // delegate → D_SchemaLoadFailed
+            // ⚠ AND ITS `loadDiagnostics()` ARE DELIBERATELY NOT FORWARDED
+            // HERE, for the same reason the failure above is not reported here:
+            // this loop only harvests file extensions for the directory scan,
+            // and `resolveGrammarForTarget` loads the very same document again
+            // per target and forwards there. Doing it in both places prints
+            // every config warning twice for one misconfiguration.
             for (auto const& ext : (*loaded)->fileExtensions()) {
                 scanExtensions.push_back(ext);
             }

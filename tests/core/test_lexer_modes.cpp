@@ -755,28 +755,143 @@ TEST(LookupLexemeInModeDeath, InvalidLexerModeIdAborts) {
                  "invalid LexerModeId");
 }
 
-// ── H1: mode with only defaultToken (no tokens) warns ──────────────────
+// ── D-CONFIG-WARNINGS-DISCARDED-ON-SUCCESSFUL-LOAD ──────────────────────
+//
+// ★★★ THIS BLOCK REPLACES A TEST THAT PINNED A WARNING WHICH WAS WRONG IN
+// EVERY CASE IT EVER FIRED (`DefaultTokenWithoutTokensFieldWarns`). Its shape
+// is worth recording, because the test PASSED for the warning's whole life and
+// still told us nothing: it fed the loader a config with a deliberate
+// root-ambiguity ERROR purely so the load would FAIL and the warning would
+// become visible through `LoadResult`'s error side. That workaround was itself
+// the evidence for the anchor — a warning reachable only by breaking the
+// document is a warning no user of a WORKING document can ever see.
 
-TEST(LexerModesLoader, DefaultTokenWithoutTokensFieldWarns) {
+// A body scanner — `defaultToken`, no `tokens` — is the CANONICAL shape, not a
+// typo, and must produce NO diagnostic. This is the false positive the old
+// warning fired on 14 times across four shipped configs.
+TEST(LexerModesLoader, BodyScannerShapeIsSilent) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 2,
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { "+": [{ "kind": "PlusOp" }] },
-      "shapes": {
-        "root":      { "alt": ["A", "B"] },
-        "A":         { "sequence": [ "PlusOp" ] },
-        "B":         { "sequence": [ "PlusOp" ] }
-      },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
       "lexerModes": {
         "string-body": { "defaultToken": { "kind": "StringChar" } }
       }
     })JSON";
     auto loaded = GrammarSchema::loadFromText(kCfg);
-    ASSERT_FALSE(loaded.has_value());
-    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
-        return d.code == DiagnosticCode::C_RedundantField &&
-               d.message.find("only 'defaultToken' will ever match") != std::string::npos;
-    }));
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    EXPECT_TRUE((*loaded)->loadDiagnostics().empty())
+        << "a body scanner is the canonical shape and must not warn; got: "
+        << (*loaded)->loadDiagnostics()[0].message;
+}
+
+// ★★ THE REFUTATION, PINNED. A mode declaring NEITHER `tokens` NOR
+// `defaultToken` was the obvious-looking replacement condition and is ALSO not
+// a defect: `tokenizer.cpp`'s `longestMatchInMode` falls back to the global
+// `longestMatch` when the mode's override table yields nothing, so such a mode
+// lexes exactly like the default mode. It is what a `popAtNewline` line-scoped
+// mode wants, and `popAtNewline` is mutually exclusive with `defaultToken`, so
+// those modes have neither BY CONSTRUCTION. If a future edit "fixes" the guard
+// by inverting it to this shape, this test is what says no.
+TEST(LexerModesLoader, ModeWithNeitherTokensNorDefaultTokenIsSilent) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
+      "lexerModes": {
+        "directive-line": { "popAtNewline": true }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    EXPECT_TRUE((*loaded)->loadDiagnostics().empty())
+        << "a mode with neither field still lexes via the global fallback and "
+           "must not warn; got: " << (*loaded)->loadDiagnostics()[0].message;
+}
+
+// The shape that IS dead config: a `tokens` table on a mode that also declares
+// `defaultToken`. The tokenizer's body branch is entered on `defaultToken` and
+// `continue`s on every exit, so the per-mode token lookup is unreachable and
+// the table can never be consulted.
+TEST(LexerModesLoader, TokensTableOnABodyModeWarns) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
+      "lexerModes": {
+        "string-body": {
+          "defaultToken": { "kind": "StringChar" },
+          "tokens": "default"
+        }
+      }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    // ★ THE LOAD SUCCEEDS, AND THE WARNING IS STILL OBSERVABLE. That is the
+    // whole point of the carrier: no sibling error is manufactured to make the
+    // diagnostic reachable.
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    EXPECT_TRUE(std::ranges::any_of(
+        (*loaded)->loadDiagnostics(), [](auto const& d) {
+            return d.code == DiagnosticCode::C_RedundantField
+                   && d.severity == DiagnosticSeverity::Warning
+                   && d.message.find("can never be consulted")
+                          != std::string::npos;
+        }))
+        << "a dead per-mode token table must warn on a SUCCESSFUL load";
+}
+
+// A clean document carries no load diagnostics at all — so a non-empty
+// `loadDiagnostics()` always means something was actually said.
+TEST(LexerModesLoader, CleanConfigCarriesNoLoadDiagnostics) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }] },
+      "shapes": { "root": { "sequence": [ "PlusOp" ] } },
+      "lexerModes": { "main": { "tokens": "default" } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_TRUE((*loaded)->loadDiagnostics().empty());
+}
+
+// ★★ THE REGRESSION GUARD FOR THE SHIPPED CORPUS, which is what the anchor was
+// really about: every config DSS ships must load with ZERO warnings, so the
+// channel stays worth reading. Before the guard inversion this asserted 14
+// warnings' worth of noise across four documents.
+TEST(LexerModesLoader, EveryShippedConfigLoadsWithoutWarnings) {
+    // Named explicitly rather than globbed: a directory walk that found zero
+    // files would pass vacuously, which is the failure mode a corpus sweep has.
+    //
+    // ⚠ `asm` IS DELIBERATELY ABSENT AND ITS ABSENCE IS NOT A GAP. `asm.lang.json`
+    // is the shared line grammar, reached only through another document's
+    // `languageReferences`; loading it standalone is REFUSED (loudly — it names
+    // all 19 unsatisfied holes and that it declares no `root`). Its diagnostics
+    // are still covered here, because `mergeLanguageReferences` folds them into
+    // the HOST document's collector — so the two `asm-*` dialect rows below are
+    // what carries them.
+    constexpr std::string_view kShipped[] = {
+        "c-subset", "tsql-subset", "toy",
+        "asm-x86_64-att", "asm-arm64-gas",
+    };
+    for (auto const name : kShipped) {
+        auto loaded = GrammarSchema::loadShipped(name);
+        ASSERT_TRUE(loaded.has_value())
+            << name << " failed to load: "
+            << (loaded.error().empty() ? "<no diagnostics>"
+                                       : loaded.error()[0].message);
+        for (auto const& d : (*loaded)->loadDiagnostics()) {
+            ADD_FAILURE() << name << " emits a load diagnostic that ships to "
+                             "every user of it: [" << diagnosticCodeName(d.code)
+                          << "] " << d.path << ": " << d.message;
+        }
+    }
 }
 
 // ── T1-T4: stack API gaps from round-2 review ───────────────────────────

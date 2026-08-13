@@ -14,6 +14,7 @@ dss_add_test(NAME core/test_unsuppressable_codes SOURCES test_unsuppressable_cod
 dss_add_test(NAME core/test_header_name_matching SOURCES test_header_name_matching.cpp)
 dss_add_test(NAME core/test_grammar_schema      SOURCES test_grammar_schema.cpp)
 dss_add_test(NAME core/test_target_schema       SOURCES test_target_schema.cpp)
+dss_add_test(NAME core/test_target_subregister_validation SOURCES test_target_subregister_validation.cpp)
 dss_add_test(NAME core/test_number_decode       SOURCES test_number_decode.cpp)
 dss_add_test(NAME core/test_bit_int_value       SOURCES test_bit_int_value.cpp)
 dss_add_test(NAME core/test_wide_float_value    SOURCES test_wide_float_value.cpp)

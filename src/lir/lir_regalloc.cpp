@@ -103,7 +103,14 @@ buildFreeLists(TargetSchema const&            schema,
     for (std::uint16_t i = 0; i < regs.size(); ++i) {
         auto const& info = regs[i];
         if (info.regClass == TargetRegClass::None) continue;
-        if (!info.subOf.empty()) continue;
+        // D-TARGET-CC-NAMES-SUB-REGISTER: no `subOf` skip here. A
+        // sub-register can only reach this pool by being named in one of
+        // the cc lists `allocatable` was built from, and `TargetSchema::
+        // validate()` now REJECTS such a config at load. The skip that
+        // used to sit on this line was therefore unreachable — and being
+        // unreachable, untestable, and so free to rot into a
+        // false-comfort guard. The load-time rule is the single
+        // enforcement point; this loop simply trusts it.
         if (!allocatable.contains(info.name)) continue;  // reserved (rsp / rflags / …)
         // D-CSUBSET-VLA (C1b): in a VLA function the frame pointer is reserved as the
         // fixed-frame base — hold it out of the allocatable pool (mirrors the rsp/

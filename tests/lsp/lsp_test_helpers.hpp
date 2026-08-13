@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -146,6 +147,33 @@ private:
 [[nodiscard]] inline std::string lspInitialize(int id) {
     return R"({"jsonrpc":"2.0","id":)" + std::to_string(id)
          + R"(,"method":"initialize","params":{}})";
+}
+
+// `file:///…` URI for a local path — the spelling every LSP client uses for a
+// workspace folder. Backslashes become forward slashes and a Windows drive path
+// gains the extra leading slash the URI grammar requires (`C:\d` →
+// `file:///C:/d`), so a fixture built here round-trips through
+// `dss::lsp::pathFromFileUri`.
+[[nodiscard]] inline std::string fileUriFromPath(
+    std::filesystem::path const& p) {
+    auto s = p.generic_string();
+    return (!s.empty() && s.front() == '/') ? "file://" + s
+                                            : "file:///" + s;
+}
+
+// `initialize` naming workspace folders — the ONLY message that carries them,
+// and therefore the only way an editor can learn the workspace's compile
+// target. `lspInitialize` (params `{}`) is the deliberate no-workspace control.
+[[nodiscard]] inline std::string lspInitializeWithRoots(
+    int id, std::vector<std::filesystem::path> const& roots) {
+    std::string folders;
+    for (auto const& r : roots) {
+        if (!folders.empty()) folders += ",";
+        folders += R"({"uri":")" + fileUriFromPath(r) + R"(","name":"ws"})";
+    }
+    return R"({"jsonrpc":"2.0","id":)" + std::to_string(id)
+         + R"(,"method":"initialize","params":{"workspaceFolders":[)"
+         + folders + R"(]}})";
 }
 
 [[nodiscard]] inline std::string lspShutdown(int id) {

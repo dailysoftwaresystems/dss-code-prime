@@ -32,6 +32,19 @@ struct DSS_EXPORT DocumentSnapshot {
     std::uint32_t                              parseGeneration = 0;
     std::string                                text;
     std::shared_ptr<dss::GrammarSchema const>  schema;     // null if no schema for this URI
+    // WHY `schema == nullptr`, in the document's own words. Empty iff a schema
+    // WAS resolved.
+    //
+    // ★ A NULL SCHEMA USED TO BE MUTE (D-LSP-ASSEMBLY-DIALECT-UNSERVABLE).
+    // `handleDidOpen_` resolved by extension and, on failure, simply opened the
+    // document with `schema == nullptr`; the parse worker then PUBLISHED AN
+    // EMPTY DIAGNOSTIC ARRAY, which an editor renders identically to "this file
+    // is clean". So the two states an editor most needs to tell apart — "no
+    // problems" and "no language service at all" — looked the same on the wire.
+    // The reason now travels WITH the document, so every publish (open, and
+    // every later edit) can restate it: a message that appears once and
+    // vanishes on the next keystroke is barely better than no message.
+    std::string                                schemaError;
 };
 
 class DSS_EXPORT DocumentStore {
@@ -45,10 +58,16 @@ public:
 
     // Open a document. Sets clientVersion + text + schema; resets
     // parseGeneration to 0. Replaces any prior state for the URI.
+    //
+    // `schemaError` is the reason `schema` is null — REQUIRED to be non-empty
+    // when `schema` is null and empty when it is not; see `DocumentSnapshot::
+    // schemaError`. Defaulted so the many "a schema resolved" call sites stay
+    // one argument shorter, never so a failure can be opened silently.
     void open(std::string uri,
               std::int32_t clientVersion,
               std::string text,
-              std::shared_ptr<dss::GrammarSchema const> schema);
+              std::shared_ptr<dss::GrammarSchema const> schema,
+              std::string schemaError = {});
 
     // Update an open document's text + clientVersion. Bumps
     // parseGeneration; returns the new generation (callers use it
@@ -102,6 +121,7 @@ private:
         std::uint32_t                               parseGeneration = 0;
         std::string                                 text;
         std::shared_ptr<dss::GrammarSchema const>   schema;
+        std::string                                 schemaError;
         std::vector<dss::ParseDiagnostic>           diagnostics;
         std::shared_ptr<dss::SemanticModel const>   semanticModel;
         std::uint32_t                               semanticGeneration = 0;

@@ -87,18 +87,54 @@ enum class AsmDirectiveVerb : std::uint8_t {
     // the engine only knows "this directive names a symbol, and — if a marker
     // is declared — the marker must be among its operands".
     FunctionEntry,
+
+    // ★★★ THE DATA TRIO (D-ASM-NO-DATA-DEFINING-DIRECTIVE, 2026-08-13). Until
+    // these existed the verb set could open a text section and name a symbol
+    // but could not put a single BYTE in the binary, so no `.s` could define a
+    // string, an array or a word — which is why the extern-call corpus example
+    // has to call `putchar` rather than print a message it owns.
+    //
+    // ★★ THEY MINT NO SECTION VOCABULARY, AND THAT WAS THE ONE DESIGN RULE.
+    // `core/types/section_kind.hpp` already declares `DataSectionKind`
+    // (`rodata`/`data`/`bss`/`tdata`/`tbss`/`relro`) and was deliberately
+    // placed under `core/types/` so `src/asm/` and `src/link/` speak ONE
+    // section taxonomy; `AssembledData` already carries a `DataSectionKind`.
+    // So `SectionData` names one of THOSE and nothing else — the row stores the
+    // NAME (see `AsmDirectiveSpelling::sectionName`) for the same layering
+    // reason `instructions[].opcodes` stores opcode names.
+    //
+    // `.data` / `.bss` / `.section .rodata` — subsequent data items land in the
+    // `DataSectionKind` this row names. ⚠ IT IS NOT A SECOND SPELLING OF
+    // `SectionText`: text is where CODE goes and LIR has no other, so the two
+    // verbs answer different questions and a dialect that mapped `.data` to
+    // `sectionText` would silently emit its data as instructions.
+    SectionData,
+    // `.byte 1,2` / `.word` / `.long` / `.quad 42` — each operand is a VALUE
+    // occupying `unitBytes` bytes. The element width is the row's
+    // (`unitBytes`), never guessed from the value: `.byte 1` and `.quad 1`
+    // differ only in the row.
+    EmitData,
+    // `.zero 16` / `.space 16` / `.skip 16` — the single operand is a byte
+    // COUNT of zeroes, not a value. A distinct verb rather than an `EmitData`
+    // flag because the operand MEANS something different: `.byte 16` writes one
+    // byte 0x10 and `.zero 16` writes sixteen bytes 0x00, and a shared verb
+    // would put that difference in a key the reader has to notice.
+    ReserveZeroBytes,
 };
 
-inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 4>
+inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 7>
     kAsmDirectiveVerbNames{{
         {"sectionText", AsmDirectiveVerb::SectionText},
         {"globalSymbol", AsmDirectiveVerb::GlobalSymbol},
         {"ignoredAnnotation", AsmDirectiveVerb::IgnoredAnnotation},
         {"functionEntry", AsmDirectiveVerb::FunctionEntry},
+        {"sectionData", AsmDirectiveVerb::SectionData},
+        {"emitData", AsmDirectiveVerb::EmitData},
+        {"reserveZeroBytes", AsmDirectiveVerb::ReserveZeroBytes},
     }};
 static_assert(kAsmDirectiveVerbNames.size()
                   == static_cast<std::size_t>(
-                         AsmDirectiveVerb::FunctionEntry)
+                         AsmDirectiveVerb::ReserveZeroBytes)
                          + 1,
               "every AsmDirectiveVerb enumerator needs a config spelling");
 
@@ -217,6 +253,28 @@ struct AsmDirectiveSpelling {
     // is object-format vocabulary, so it belongs in the dialect document and
     // not in the engine.
     std::string      marker;
+    // `SectionData` ONLY (required there, refused on every other verb). The
+    // `DataSectionKind` spelling from `core/types/section_kind.hpp` —
+    // `"rodata"` / `"data"` / `"bss"` / `"tdata"` / `"tbss"` / `"relro"`.
+    //
+    // ★ STORED AS A NAME, RESOLVED BY THE LOWERING — the same layering
+    // `opcodeNames` and `condName` already use, and for a structural reason
+    // rather than a stylistic one: `section_kind.hpp` includes
+    // `target_schema.hpp`, which includes `grammar_schema.hpp`, which includes
+    // THIS header, so naming the enum here is a genuine include cycle. The
+    // LOADER still validates the name against `dataSectionKindFromName`, so an
+    // unknown section is a load error naming the closed set — never a silently
+    // mis-routed item.
+    std::string      sectionName;
+    // `EmitData` ONLY (required there, refused on every other verb). How many
+    // bytes ONE operand of this directive occupies: 1 (`.byte`), 2 (`.word` /
+    // `.short` / `.hword`), 4 (`.long` / `.int` / `.word` on some ports) or 8
+    // (`.quad` / `.xword`).
+    // ⚠ THE SPELLING→WIDTH MAP IS DIALECT DATA, NOT ENGINE DATA, AND `.word` IS
+    // THE PROOF: it is 2 bytes on x86 gas and 4 bytes on several other gas
+    // ports. An engine that knew "`.word` means two bytes" would silently halve
+    // every table on the ports where it does not.
+    std::uint32_t    unitBytes = 0;
 };
 
 struct DSS_EXPORT AssemblyConfig {

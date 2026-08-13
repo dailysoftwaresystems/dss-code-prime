@@ -53,7 +53,7 @@ namespace dss {
 //     K_NoMatchingObjectFormat, K_FormatLacksImportSupport,
 //     K_RelocationKindMismatch, K_WalkerInputContractViolation
 //     (format-walker dispatch / extern / reloc invariants).
-//   - LIR verifier / lowering structural invariants (11 L_* codes):
+//   - LIR verifier / lowering structural invariants (14 L_* codes):
 //     L_UnsupportedLoweringForOpcode (MIR→LIR coverage-gap fail-loud),
 //     L_RequiredLirOpcodeMissing, L_VirtualRegInPostRegalloc,
 //     L_MemOperandMalformed, L_PhysRegOrdinalOutOfRange,
@@ -61,7 +61,15 @@ namespace dss {
 //     L_IndirectCallUnsupported,
 //     L_IndirectCalleeClobberedByArgSetup (FC4 c2 — the indirect-
 //     callee/arg-setup collision backstop), L_StackPassedArgUnsupported,
-//     L_CcRegLookupFailed.
+//     L_CcRegLookupFailed, L_VlaDynamicAllocaUnsupported,
+//     L_VlaNonLeafFrameUnsupported,
+//     L_TerminatorSuccessorMismatch (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-
+//     DROPPED — the terminator's recorded successors and its own BlockRef
+//     operands disagree).
+//     ⚠ THIS ENUMERATION WAS STALE AND SAID "11" WHILE THE ARRAY HELD 13:
+//     the two VLA codes were appended to `kUnsuppressableCodes` without
+//     being named here, so the header under-reported the band by two for
+//     two cycles. Counted from the array, not from this list.
 //   - Regalloc Error-severity invariants (3 R_* codes; Info-
 //     severity spillage codes intentionally OUT):
 //     R_NoCallingConventions, R_CallingConventionLookupFailed,

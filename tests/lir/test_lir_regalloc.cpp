@@ -1243,16 +1243,88 @@ TEST(LirRegAlloc, CrossCallRangesLandInCalleeSavedOrSpill) {
         << "test corpus must produce ≥1 cross-call range";
 }
 
+// Names the active cc absorbs into `buildFreeLists`' `allocatable` set —
+// the six lists, in the same order, so this mirror cannot drift silently.
+[[nodiscard]] std::unordered_set<std::string>
+ccAllocatableNames(TargetSchema const& sch, std::uint16_t ccIndex) {
+    std::unordered_set<std::string> out;
+    auto const* cc = sch.callingConvention(ccIndex);
+    EXPECT_NE(cc, nullptr);
+    if (cc == nullptr) return out;
+    for (auto const* list : {&cc->callerSaved, &cc->calleeSaved,
+                             &cc->argGprs, &cc->argFprs,
+                             &cc->returnGprs, &cc->returnFprs}) {
+        for (auto const& n : *list) out.insert(n);
+    }
+    return out;
+}
+
+// ★ THE POOL PROPERTY, asserted on every assignment.
+//
+// `buildFreeLists` is TU-private, so the pool cannot be read directly — but
+// its defining property is observable through what the allocator hands out:
+// every physical register assigned must be a member of the register table
+// INTERSECTED with the active cc's name lists. Checking membership (rather
+// than checking that one specific reserved register failed to appear) is
+// what makes this a pin instead of a coincidence: it does not depend on
+// register pressure happening to reach any particular ordinal.
+//
+// D-TEST-RESERVED-STACK-POINTER-PIN-BLIND-TO-FILTER-REMOVAL: the previous
+// form asserted only `physReg().id != rspOrdinal` over one 20-value
+// function, and MEASURABLY could not fail — deleting
+// `if (!allocatable.contains(info.name)) continue;` from buildFreeLists
+// (rsp's ONLY exclusion mechanism) left it green, because that function
+// never allocated deeply enough to reach rsp even with rsp in the pool.
+void expectEveryAssignedRegIsAllocatable(TargetSchema const&      sch,
+                                         std::uint16_t            ccIndex,
+                                         LirFuncAllocation const& alloc) {
+    auto const names = ccAllocatableNames(sch, ccIndex);
+    ASSERT_FALSE(names.empty()) << "cc declares no allocatable registers";
+
+    std::size_t checked = 0;
+    for (std::uint32_t id = 1; id < alloc.assignments.size(); ++id) {
+        auto const& a = alloc.assignments[id];
+        if (a.vreg.id == 0 || a.isSpilled()) continue;
+        auto const* info = sch.registerInfo(a.physReg().id);
+        ASSERT_NE(info, nullptr) << "vreg " << id << " assigned ordinal "
+                                 << a.physReg().id << " with no register row";
+        ++checked;
+
+        EXPECT_TRUE(names.contains(info->name))
+            << "vreg " << id << " was assigned '" << info->name
+            << "', which appears in NO calling-convention list — the "
+               "allocatable name filter is the sole exclusion mechanism for "
+               "reserved-role registers (rsp / rflags), and it did not hold";
+        // A sub-register can never enter a pool: handing out both a view and
+        // its parent puts two live values in one machine register.
+        // D-TARGET-CC-NAMES-SUB-REGISTER rejects the config that would allow
+        // it at LOAD; this is the behavioural half of that invariant.
+        EXPECT_TRUE(info->subOf.empty())
+            << "vreg " << id << " was assigned '" << info->name
+            << "', a sub-register of '" << info->subOf
+            << "' — it aliases its parent and must never be allocatable";
+    }
+    EXPECT_GT(checked, 0u)
+        << "no physical assignments to check — this pin is vacuous";
+}
+
 TEST(LirRegAlloc, ReservedStackPointerNeverAllocated) {
     // `rsp` is in NEITHER cc.callerSaved NOR cc.calleeSaved on SysV
     // AMD64 — the allocator's `buildFreeLists` must reserve it (omit
     // from both pools). Allocating rsp as a GPR is a fatal runtime
     // miscompile (stack frame disappears).
+    //
+    // Asserted two ways: the POOL property above (which fails the moment
+    // the name filter stops holding, regardless of pressure) and the
+    // named rsp/rflags checks below (which keep the failure message
+    // legible when it is one of those two).
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
     auto const rspOrdinal = sch.registerByName("rsp");
     ASSERT_TRUE(rspOrdinal.has_value());
+    auto const rflagsOrdinal = sch.registerByName("rflags");
+    ASSERT_TRUE(rflagsOrdinal.has_value());
 
     // Force high register pressure so allocation hits every bucket.
     std::array<TypeKind, 1> const paramKinds{TypeKind::I32};
@@ -1283,13 +1355,122 @@ TEST(LirRegAlloc, ReservedStackPointerNeverAllocated) {
     EXPECT_TRUE(out.ok());
     ASSERT_EQ(out.perFunc.size(), 1u);
     auto const& alloc = out.perFunc[0];
+    expectEveryAssignedRegIsAllocatable(sch, /*ccIndex=*/0, alloc);
     for (std::uint32_t id = 1; id < alloc.assignments.size(); ++id) {
         auto const& a = alloc.assignments[id];
         if (a.vreg.id == 0 || a.isSpilled()) continue;
         EXPECT_NE(a.physReg().id, *rspOrdinal)
             << "vreg " << id << " was assigned reserved rsp ordinal "
             << *rspOrdinal;
+        EXPECT_NE(a.physReg().id, *rflagsOrdinal)
+            << "vreg " << id << " was assigned reserved rflags ordinal "
+            << *rflagsOrdinal;
     }
+}
+
+// ★ THE VLA FRAME-POINTER RESERVATION — a CONDITIONAL property.
+//
+// D-TEST-VLA-FRAME-POINTER-RESERVATION-NO-UNIT-PIN: `reservedFramePointer`
+// had ZERO occurrences anywhere under tests/. MEASURED: deleting
+// `if (reservedFramePointer.has_value() && i == *reservedFramePointer)
+// continue;` from buildFreeLists left regalloc 29/29 AND callconv 85/85
+// green — the only thing that noticed was the runtime example
+// `examples/c-subset/c99_vla_spill` segfaulting instead of exiting 42.
+// That example STAYS as the end-to-end witness; this is the unit pin, and
+// the two are kept separately on purpose.
+//
+// ⚠ The property is CONDITIONAL, and asserting a blanket exclusion here
+// would red on correct behaviour: for a NON-VLA function the frame pointer
+// is an ordinary allocatable callee-saved GPR (the byte-identical-frames
+// invariant), so it is reserved IFF the function contains a dynamic stack
+// adjustment. Both arms are pinned, in one module, so neither can drift.
+TEST(LirRegAlloc, FramePointerReservedOnlyForFunctionsWithAVla) {
+    // Two functions: `withVla` holds 20 values live ACROSS a runtime-sized
+    // array (pressure high enough that an unreserved frame pointer really
+    // would be handed out); `noVla` is the control.
+    std::string src = "int withVla(int n) {\n  volatile int base = 0;\n";
+    for (int i = 0; i < 20; ++i) {
+        src += "  int s" + std::to_string(i) + " = base + "
+             + std::to_string(i + 1) + ";\n";
+    }
+    src += "  int a[n];\n  int i;\n"
+           "  for (i = 0; i < n; i = i + 1) { a[i] = i; }\n"
+           "  return ";
+    for (int i = 0; i < 20; ++i) src += "s" + std::to_string(i) + " + ";
+    src += "a[0];\n}\n"
+           "int noVla(int n) { return n + 1; }\n";
+
+    auto lowered = lowerCSubsetToLir(src);
+    ASSERT_TRUE(lowered.lir.ok) << "VLA fixture failed to lower";
+    auto const& sch = *lowered.target;
+    Lir const&  lir = lowered.lir.lir;
+
+    auto const subSpReg = sch.opcodeByMnemonic("sub_sp_reg");
+    ASSERT_TRUE(subSpReg.has_value())
+        << "x86_64 declares no sub_sp_reg — the VLA marker this pin keys on";
+    auto const* cc = sch.callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->framePointer.has_value())
+        << "cc declares no framePointer — the reservation has no input";
+    std::uint16_t const fpOrdinal = cc->framePointer->ordinal;
+
+    // The frame pointer must remain ELIGIBLE (in a cc list) — reserving it
+    // is a per-function decision, not a permanent exclusion.
+    auto const  names = ccAllocatableNames(sch, 0);
+    auto const* fpInfo = sch.registerInfo(fpOrdinal);
+    ASSERT_NE(fpInfo, nullptr);
+    EXPECT_TRUE(names.contains(fpInfo->name))
+        << "frame pointer '" << fpInfo->name << "' left the cc lists — a "
+           "non-VLA function must still be able to allocate it";
+
+    LirLiveness const  lv = analyzeLiveness(lir);
+    DiagnosticReporter rep;
+    LirAllocation const out = allocateRegisters(lir, sch, lv, /*ccIndex=*/0, rep);
+    ASSERT_TRUE(out.ok());
+    ASSERT_EQ(out.perFunc.size(), 2u);
+
+    auto containsSubSp = [&](LirFuncId fn) {
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(b); ++i) {
+                if (lir.instOpcode(lir.blockInstAt(b, i)) == *subSpReg) return true;
+            }
+        }
+        return false;
+    };
+
+    bool sawVla = false;
+    bool sawPlain = false;
+    for (auto const& alloc : out.perFunc) {
+        bool const isVla = containsSubSp(alloc.fn);
+        if (isVla) {
+            sawVla = true;
+            ASSERT_TRUE(alloc.reservedFramePointer.has_value())
+                << "a function containing sub_sp_reg must reserve a frame "
+                   "pointer as its fixed-frame base";
+            EXPECT_EQ(*alloc.reservedFramePointer, fpOrdinal)
+                << "the reservation must be the cc's declared framePointer";
+            // The reservation must reach the POOL, not merely the record.
+            for (std::uint32_t id = 1; id < alloc.assignments.size(); ++id) {
+                auto const& a = alloc.assignments[id];
+                if (a.vreg.id == 0 || a.isSpilled()) continue;
+                EXPECT_NE(a.physReg().id, fpOrdinal)
+                    << "vreg " << id << " was assigned the RESERVED frame "
+                       "pointer '" << fpInfo->name << "' in a VLA function — "
+                       "the fixed-frame base is clobbered and every spill "
+                       "addressed off it reads garbage below the array";
+            }
+        } else {
+            sawPlain = true;
+            EXPECT_FALSE(alloc.reservedFramePointer.has_value())
+                << "a NON-VLA function must NOT reserve a frame pointer — it "
+                   "stays an ordinary allocatable callee-saved GPR (the "
+                   "byte-identical-frames invariant)";
+        }
+        expectEveryAssignedRegIsAllocatable(sch, /*ccIndex=*/0, alloc);
+    }
+    EXPECT_TRUE(sawVla)   << "no function lowered a sub_sp_reg — pin vacuous";
+    EXPECT_TRUE(sawPlain) << "no non-VLA control function — pin one-sided";
 }
 
 TEST(LirRegAlloc, FprClassRangesGetFprRegisters) {

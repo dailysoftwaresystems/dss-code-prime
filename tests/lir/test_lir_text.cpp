@@ -20,6 +20,7 @@
 #include "lir/lir.hpp"
 #include "lir/lir_literal_pool.hpp"
 #include "lir/lir_text.hpp"
+#include "lir/lir_verifier.hpp"
 
 #include <gtest/gtest.h>
 
@@ -549,7 +550,12 @@ TEST(LirTextRoundTrip, VirtualRegsRoundTrip) {
     (void)roundTripOrFail(lir, *sch, ctx, "vreg %v.1");
 }
 
-TEST(LirTextRoundTrip, MultiBlockWithBrAndCondBr) {
+TEST(LirTextRoundTrip, MultiBlockWithBrAndReturn) {
+    // ⚠ RENAMED from `MultiBlockWithBrAndCondBr`, which claimed coverage it
+    // never had: the body builds `addBr` + `addReturn` and no CondBr at all. A
+    // name that advertises a case the body does not run is how the CondBr
+    // operand drop looked covered for its whole life
+    // (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED).
     auto sch = shippedX86();
     auto const movOp  = sch->opcodeByMnemonic("mov");
     auto const jmpOp  = sch->opcodeByMnemonic("jmp");
@@ -765,6 +771,17 @@ TEST(LirTextRoundTrip, CondBrTwoSuccessorsWithCondCodeEqPayload) {
     // forwarding into `addCondBr`, (c) `flags` forwarding through the
     // new builder signature, and (d) the `payload=0` (= CondCode::Eq)
     // edge case that justified cycle-1's unconditional payload emit.
+    //
+    // ★★★ RE-AIMED (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED). This test
+    // built its `jcc` with an EMPTY operand span and then ASSERTED that the
+    // round-tripped text contained `jcc ; payload=0 flags=0` — i.e. it pinned
+    // "a CondBr carries no BlockRef operands" as the expected shape. No
+    // producer in the tree emits that: `mir_to_lir` gives every `jcc` two
+    // BlockRefs (the encoder reads them for its displacement and its trailing
+    // `jmp`), and so does `asm_text_to_lir`. So the test encoded the same wrong
+    // assumption as the parser bug it should have caught, and the parser's
+    // BlockRef filter round-tripped cleanly for its entire life. It now builds
+    // the shape a real lowered branch has.
     auto sch = shippedX86();
     auto const movOp = sch->opcodeByMnemonic("mov");
     auto const cmpOp = sch->opcodeByMnemonic("cmp");
@@ -784,8 +801,11 @@ TEST(LirTextRoundTrip, CondBrTwoSuccessorsWithCondCodeEqPayload) {
     std::array<LirOperand, 2> cmpOps{
         LirOperand::makeReg(rax), LirOperand::makeImmInt32(0)};
     b.addInst(*cmpOp, InvalidLirReg, cmpOps);
-    // Eq = 0 — the payload-zero round-trip case.
-    b.addCondBr(*jccOp, std::span<LirOperand const>{}, thenB, elseB,
+    // Eq = 0 — the payload-zero round-trip case. Operands are the two
+    // BlockRefs `mir_to_lir` emits (taken target, fallthrough target).
+    std::array<LirOperand, 2> jccOps{
+        LirOperand::makeBlockRef(thenB.v), LirOperand::makeBlockRef(elseB.v)};
+    b.addCondBr(*jccOp, jccOps, thenB, elseB,
                 static_cast<std::uint32_t>(TargetCondCode::Eq));
     b.beginBlock(thenB);
     b.addReturn(*retOp, std::span<LirOperand const>{});
@@ -795,19 +815,25 @@ TEST(LirTextRoundTrip, CondBrTwoSuccessorsWithCondCodeEqPayload) {
     LirTextContext ctx;
     std::string const text = roundTripOrFail(
         lir, *sch, ctx, "CondBr with CondCode::Eq (payload=0)");
-    // CondBr embeds successors in the BLOCK header (`-> [^b1, ^b2]`),
-    // NOT in the inst's operand list. Pin the block-header form.
+    // A CondBr's edges are written down TWICE and BOTH must survive: the
+    // block-header successor list drives every CFG walk, the operand BlockRefs
+    // are what the encoder turns into a displacement.
     EXPECT_NE(text.find("block ^b0 [entry] -> [^b1, ^b2]"),
               std::string::npos)
         << "CondBr's 2 successors live on the block header";
-    EXPECT_NE(text.find("jcc ; payload=0 flags=0"), std::string::npos)
-        << "CondBr inst has zero operand BlockRefs and emits `payload=0` "
-           "(CondCode::Eq) lossless";
+    EXPECT_NE(text.find("jcc ^b1, ^b2 ; payload=0 flags=0"), std::string::npos)
+        << "CondBr inst must carry its two BlockRef operands through the round "
+           "trip AND emit `payload=0` (CondCode::Eq) lossless — the operand "
+           "list is the encoder's branch target";
 }
 
 TEST(LirTextRoundTrip, CondBrWithNonZeroPayloadAndFlags) {
     // Companion to the Eq-payload test: pins payload=Ne(=1) + flags=4
     // through the builder's new flags param.
+    // ★ RE-AIMED for the same reason as its sibling above
+    // (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED) — it also built the `jcc`
+    // with an empty operand span, so it too could not see the parser deleting
+    // operands that were never there.
     auto sch = shippedX86();
     auto const cmpOp = sch->opcodeByMnemonic("cmp");
     auto const jccOp = sch->opcodeByMnemonic("jcc");
@@ -822,7 +848,9 @@ TEST(LirTextRoundTrip, CondBrWithNonZeroPayloadAndFlags) {
     std::array<LirOperand, 2> cmpOps{
         LirOperand::makeReg(rax), LirOperand::makeImmInt32(0)};
     b.addInst(*cmpOp, InvalidLirReg, cmpOps);
-    b.addCondBr(*jccOp, std::span<LirOperand const>{}, a, c,
+    std::array<LirOperand, 2> jccOps{
+        LirOperand::makeBlockRef(a.v), LirOperand::makeBlockRef(c.v)};
+    b.addCondBr(*jccOp, jccOps, a, c,
                 static_cast<std::uint32_t>(TargetCondCode::Ne),
                 /*flags=*/4);
     b.beginBlock(a);
@@ -833,8 +861,166 @@ TEST(LirTextRoundTrip, CondBrWithNonZeroPayloadAndFlags) {
     LirTextContext ctx;
     std::string const text = roundTripOrFail(
         lir, *sch, ctx, "CondBr Ne + flags=4");
-    EXPECT_NE(text.find("payload=1 flags=4"), std::string::npos)
-        << "CondBr payload=Ne(1) + flags=4 must thread through builder";
+    EXPECT_NE(text.find("jcc ^b1, ^b2 ; payload=1 flags=4"), std::string::npos)
+        << "CondBr payload=Ne(1) + flags=4 must thread through builder, and "
+           "its two BlockRef operands must survive beside them";
+}
+
+// ── D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED — the dedicated pins ──────
+//
+// The two re-aimed round-trip tests above catch the drop through text EQUALITY.
+// These three catch it through the SEMANTICS, so a future change that keeps the
+// text byte-identical while corrupting the operands still reddens.
+
+TEST(LirTextRoundTrip, CondBrBlockRefOperandsSurviveParseNotJustText) {
+    // The parse-side assertion the byte-equality tests cannot make: read the
+    // PARSED module's operand list back and demand the two BlockRefs are there,
+    // naming the same blocks the successor list names. Before the fix this
+    // module parsed to a `jcc` with ZERO operands and `result->ok == true` —
+    // the encoder then had no target to compute a displacement from.
+    auto sch = shippedX86();
+    auto const cmpOp = sch->opcodeByMnemonic("cmp");
+    auto const jccOp = sch->opcodeByMnemonic("jcc");
+    auto const retOp = sch->opcodeByMnemonic("ret");
+    ASSERT_TRUE(cmpOp.has_value() && jccOp.has_value() && retOp.has_value());
+    LirBuilder b{*sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    LirBlockId const t = b.createBlock();
+    LirBlockId const f = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const rax = makePhysicalReg(0, LirRegClass::GPR);
+    std::array<LirOperand, 2> cmpOps{
+        LirOperand::makeReg(rax), LirOperand::makeImmInt32(0)};
+    b.addInst(*cmpOp, InvalidLirReg, cmpOps);
+    std::array<LirOperand, 2> jccOps{
+        LirOperand::makeBlockRef(t.v), LirOperand::makeBlockRef(f.v)};
+    b.addCondBr(*jccOp, jccOps, t, f,
+                static_cast<std::uint32_t>(TargetCondCode::Ne));
+    b.beginBlock(t);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    b.beginBlock(f);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep1, rep2;
+    LirTextContext ctx;
+    std::string const text = emitLir(lir, *sch, ctx, rep1);
+    auto parsed = parseLir(text, *sch, rep2);
+    ASSERT_NE(parsed, nullptr);
+    EXPECT_TRUE(parsed->ok) << "parse of an ordinary lowered jcc must succeed";
+
+    // Find the jcc in the parsed module and inspect BOTH channels.
+    bool sawJcc = false;
+    Lir const& out = parsed->lir;
+    for (std::uint32_t fi = 0; fi < out.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = out.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < out.funcBlockCount(fn); ++bi) {
+            LirBlockId const bb = out.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < out.blockInstCount(bb); ++i) {
+                LirInstId const inst = out.blockInstAt(bb, i);
+                if (out.instOpcode(inst) != *jccOp) continue;
+                sawJcc = true;
+                auto const ops   = out.instOperands(inst);
+                auto const succs = out.blockSuccessors(bb);
+                ASSERT_EQ(succs.size(), 2u);
+                ASSERT_EQ(ops.size(), 2u)
+                    << "the parsed jcc must keep BOTH BlockRef operands — a "
+                       "zero-operand cond-br has no branch target to encode";
+                EXPECT_EQ(ops[0].kind, LirOperandKind::BlockRef);
+                EXPECT_EQ(ops[1].kind, LirOperandKind::BlockRef);
+                EXPECT_EQ(ops[0].blockSlot, succs[0].v)
+                    << "operand[0] must name the taken successor";
+                EXPECT_EQ(ops[1].blockSlot, succs[1].v)
+                    << "operand[1] must name the fallthrough successor (the "
+                       "encoder emits the trailing unconditional jmp from it)";
+            }
+        }
+    }
+    EXPECT_TRUE(sawJcc) << "the parsed module must still contain the jcc";
+}
+
+TEST(LirVerifier, TerminatorBlockRefOperandsMustMatchRecordedSuccessors) {
+    // Rule 1b's fail-loud arm, EXERCISED rather than read. A hand-built module
+    // whose jcc names the successors in the WRONG ORDER is exactly the shape a
+    // buggy pass produces (and the shape the encoder would turn into a branch
+    // to the wrong block), so the verifier must reject it by name.
+    auto sch = shippedX86();
+    auto const cmpOp = sch->opcodeByMnemonic("cmp");
+    auto const jccOp = sch->opcodeByMnemonic("jcc");
+    auto const retOp = sch->opcodeByMnemonic("ret");
+    ASSERT_TRUE(cmpOp.has_value() && jccOp.has_value() && retOp.has_value());
+    LirBuilder b{*sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    LirBlockId const t = b.createBlock();
+    LirBlockId const f = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const rax = makePhysicalReg(0, LirRegClass::GPR);
+    std::array<LirOperand, 2> cmpOps{
+        LirOperand::makeReg(rax), LirOperand::makeImmInt32(0)};
+    b.addInst(*cmpOp, InvalidLirReg, cmpOps);
+    // SWAPPED against the successor list below — the corruption under test.
+    std::array<LirOperand, 2> jccOps{
+        LirOperand::makeBlockRef(f.v), LirOperand::makeBlockRef(t.v)};
+    b.addCondBr(*jccOp, jccOps, t, f,
+                static_cast<std::uint32_t>(TargetCondCode::Ne));
+    b.beginBlock(t);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    b.beginBlock(f);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    EXPECT_FALSE(verifyLirText(lir, *sch, rep))
+        << "a cond-br whose BlockRef operands disagree with its recorded "
+           "successors must be refused";
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_TerminatorSuccessorMismatch) {
+            sawCode = true;
+        }
+    }
+    EXPECT_TRUE(sawCode)
+        << "the mismatch must be named by L_TerminatorSuccessorMismatch, not "
+           "folded into a generic lowering code";
+}
+
+TEST(LirVerifier, CondBrWithNoBlockRefOperandsIsRefused) {
+    // ★ THE PRESENCE half of Rule 1b, and the one that matters: the defect was
+    // a DROP to zero operands, which an agreement-only rule ("if it has refs
+    // they must match") would call clean. This is the exact module the old
+    // parser produced.
+    auto sch = shippedX86();
+    auto const jccOp = sch->opcodeByMnemonic("jcc");
+    auto const retOp = sch->opcodeByMnemonic("ret");
+    ASSERT_TRUE(jccOp.has_value() && retOp.has_value());
+    LirBuilder b{*sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    LirBlockId const t = b.createBlock();
+    LirBlockId const f = b.createBlock();
+    b.beginBlock(entry);
+    b.addCondBr(*jccOp, std::span<LirOperand const>{}, t, f,
+                static_cast<std::uint32_t>(TargetCondCode::Eq));
+    b.beginBlock(t);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    b.beginBlock(f);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    EXPECT_FALSE(verifyLirText(lir, *sch, rep))
+        << "a cond-br carrying NO BlockRef operands has no branch target for "
+           "the encoder and must be refused, not accepted as vacuously "
+           "consistent";
+    bool sawCode = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_TerminatorSuccessorMismatch) {
+            sawCode = true;
+        }
+    }
+    EXPECT_TRUE(sawCode) << "refusal must be L_TerminatorSuccessorMismatch";
 }
 
 TEST(LirTextRoundTrip, VRegIdGapMintingFillsMissingSlots) {
