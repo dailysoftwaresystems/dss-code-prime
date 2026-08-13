@@ -2745,6 +2745,34 @@ struct DSS_EXPORT TargetSchemaData {
     // while `__aarch64__` is universal.
     std::vector<PredefinedMacroDef> predefinedMacros;
 
+    // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the NAME of the shipped source
+    // language document that spells THIS processor's assembly
+    // (`"defaultAssemblyLanguage": "asm-x86_64-att"`). A `<stem>` for
+    // `GrammarSchema::loadShipped`, i.e. exactly what `--language` takes.
+    // OPTIONAL; empty ⇒ this target declares none, and a build that would have
+    // needed it fails loud NAMING THIS TARGET rather than guessing a dialect.
+    //
+    // ★★ A NAME IS VOCABULARY; A PREFIX IS GRAMMAR, AND THE DIFFERENCE IS THE
+    // WHOLE REASON THIS KEY IS ONE STRING. An earlier cycle put an `asmSyntax`
+    // BLOCK here — `registerPrefix`, `immediatePrefix`, `commentPrefixes`, a
+    // per-instruction `destinationOperand` — and it was reverted the same day
+    // ([[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]]). ✔MEASURED with
+    // gcc on ONE target: AT&T `movq %rsi, (%rdi)` vs Intel (`-masm=intel`)
+    // `mov QWORD PTR [rdi], rsi` — same CPU, same compiler, and yet the
+    // register sigil, the immediate sigil, the comment character, the operand
+    // ORDER and the memory-operand form all differ. Every one of those is a
+    // function of (target, DIALECT), so storing it per-TARGET stores a
+    // per-(X,Y) fact per-X. What genuinely IS per-target is WHICH dialect
+    // document this processor defaults to — a name, resolved by the loader
+    // that owns the grammar. Do not re-propose the block.
+    //
+    // ★ Deliberately NOT a list. A second dialect of one CPU
+    // (`asm-x86_64-intel`) would need a way to SELECT between them, and the
+    // only honest selector is the one that already exists: naming the language
+    // explicitly. Building a `-masm=`-style flag before a second dialect ships
+    // would be a knob with nothing to switch to.
+    std::string defaultAssemblyLanguage;
+
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the target's static-TLS layout
     // convention (`"tls"` block — variant + tcbHeaderBytes). OPTIONAL:
     // a target without it (arm64 until TLS C2) cannot lay out a TLS
@@ -3045,6 +3073,21 @@ public:
     [[nodiscard]] std::span<PredefinedMacroDef const>
     predefinedMacros() const noexcept {
         return d_.predefinedMacros;
+    }
+
+    // ── Default assembly language (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET) ──
+    // The NAME of the shipped source-language document that spells this
+    // processor's assembly, or EMPTY when the target declares none. A name
+    // only — never a grammar fact; see the data member for the measurement
+    // that settled that line.
+    //
+    // The driver consumes this as the per-target source language when the
+    // CALLER NAMED NONE (`--language` omitted). Explicit `--language` wins:
+    // that is the correct interface when a file is written for one CPU, and it
+    // is what `examples/asm/*/expected.json` uses.
+    [[nodiscard]] std::string_view
+    defaultAssemblyLanguage() const noexcept {
+        return d_.defaultAssemblyLanguage;
     }
 
     // ── TLS identity (TLS C1, D-CSUBSET-THREAD-LOCAL) ─────────────

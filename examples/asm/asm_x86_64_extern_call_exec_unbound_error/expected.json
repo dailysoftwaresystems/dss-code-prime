@@ -1,0 +1,21 @@
+{
+  "$comment": "★★★ THE EXEC ARM OF THE EXTERN REFERENCE GATE, PINNED AT THE DRIVER TIER. Its sibling `asm_x86_64_extern_call_object` builds the IDENTICAL call into a relocatable `.o` / `.obj` and an ELF `.so`, where a later binder resolves the undefined symbol. An EXEC image has no later binder, so the reference is REFUSED — naming the symbol — rather than emitting an import table entry with no owning image, which would defer the failure to the LOADER (a `0xC0000139` at process start on PE, an ld.so 'undefined symbol' exit-127 on ELF: the failure mode that has cost this project the most).\n\n★★ THIS ROW PINS A GAP, NOT A LANGUAGE RULE, AND SAYS SO. `call putchar` from a `.s` SHOULD eventually link and run. What is missing is named and anchored: nothing on the `encode` route consults the platform's descriptor corpus for a hand-written name (D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY), the way the C path's `ffi::realizeShippedExternSymbols` oracle does for a hand-declared prototype. ⇒ WHEN THAT LANDS, THIS EXAMPLE MUST BE REPLACED — by the stdout-asserting, `release`-armed row the anchor asks for — NOT updated to expect a different diagnostic. A pin that gets re-cut to fit each new behaviour ends up asserting nothing.\n\n★ WHY THE DIAGNOSTIC IS DECLARED `positioned: false`: `K_SymbolUndefined` is emitted at the LINK tier, which holds no source span. A fabricated 1:1 coordinate would be a coordinate nobody measured; the harness matches such codes by NAME only, and the set equality stays EXACT — one produced diagnostic, one declared, on each format.\n\n★ BOTH FORMATS ARE DECLARED BECAUSE THE REFUSAL IS FORMAT-DRIVEN AND MUST NOT BE FORMAT-KEYED. The linker reads the schema's `allowsUndefinedImports()`, never a format name; running the same source through pe64 and elf64 is what witnesses that one policy answering twice, rather than a Windows-only or Linux-only code path that happens to agree.",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec"
+    },
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "K_SymbolUndefined",
+      "line": 1,
+      "col": 1,
+      "positioned": false
+    }
+  ]
+}

@@ -1,0 +1,219 @@
+{
+  "$comment": "★★★ THE x86_64 AT&T ASSEMBLY DIALECT — a peer SOURCE LANGUAGE that reads a real `.s` file (plan 29 P2.5/P3/P4, 2026-08-12).\n\n★★★ WHY A DIALECT IS A LANGUAGE AND NOT A `.target.json` KNOB. This is the operator's 2026-08-12 ruling, and it REVERSED a facet that had already been written, built and gated. An `asmSyntax` block carrying `registerPrefix`/`immediatePrefix`/`commentPrefixes`/operand order was added to both `.target.json` files; it loaded, it was fully config-driven, it had no identity branch, and the Windows leg was green with it in. It was wrong anyway. ✔MEASURED with gcc on ONE target: AT&T `movq %rsi, (%rdi)` versus Intel (`-masm=intel`) `mov QWORD PTR [rdi], rsi` — the same CPU and the same compiler, differing in register sigil, immediate sigil, comment character, OPERAND ORDER, memory-operand form AND mnemonic spelling. Per [[feedback_reference_compilers_are_the_spec]] both are legal `.s` input, so Intel is not optional forever ⇒ every one of those is a function of (target, DIALECT), and storing a per-(X,Y) fact per-X is the same duplication shape that killed the verbatim `_fstat$INODE64` binding. The decisive one is lexical rather than merely duplicative: `#` is a COMMENT here and the IMMEDIATE marker on arm64, so two dialects cannot share one `tokens` block even in principle.\n⇒ `.target.json` keeps VOCABULARY ONLY (`opcodes[]`, `registers[]` — unchanged by this arc). This document owns the GRAMMAR, the token table, and the spelling→opcode map, and reaches the shared line structure in `asm.lang.json` through `languageReferences` — the same mechanism `c-subset.lang.json` uses to embed `__asm__(…)`. That reuse is the point: a third dialect writes a token table and ONE operand rule and inherits all seven line-structure rules.\n\n★★ WHAT THIS DOCUMENT DELIBERATELY DOES NOT KNOW: which registers exist, which opcodes exist, or how anything encodes. `%rax` resolves through `TargetSchema::registerByName`, `mov` through `TargetSchema::opcodeByMnemonic`, and an unresolvable name is a precise diagnostic naming the target — never a fallback. That is what keeps a dialect document from becoming a second, drifting copy of the target description.\n\n⚠ THE INSTRUCTION TABLE'S LENGTH IS A VOCABULARY SIZE, NOT A MISSING MECHANISM. An undeclared mnemonic fails loud naming this dialect and the target, so growing it is a config edit with no code change. What is NOT vocabulary — a genuinely new operand SHAPE, a new addressing form — is grammar, and lands in `shapes` below.",
+
+  "dssSchemaVersion": 4,
+
+  "language": {
+    "$comment": "★ THE NAME CARRIES BOTH AXES (`asm` · `x86_64` · `att`) BECAUSE BOTH ARE REAL. `asm-x86_64-intel` is the sibling this shape exists to make cheap, and `asm-arm64-gas` is the other CPU. A name of just `asm` would have implied one assembly language, which is the assumption the operator's review disproved.\n★ `.s` AND `.S` ARE BOTH CLAIMED. gas reads `.S` as 'run the C preprocessor first'; DSS does not preprocess assembly yet, so a `.S` carrying `#include` FAILS LOUD at parse rather than silently ignoring the directive. That is the honest state — claiming the extension and refusing the content beats not claiming it and giving 'no language for .S'.\n⚠ TWO DIALECT DOCUMENTS CLAIMING `.s` IS AMBIGUOUS FOR EXTENSION-BASED ROUTING, AND THE AMBIGUITY IS REAL RATHER THAN A BUG IN THIS FILE: an assembly file is target-specific BY NATURE (no `.s` compiles for both x86_64 and arm64), so 'which dialect' is answered by the target, not by the extension. Until a driver reads that answer off the target, `--language asm-x86_64-att` names it explicitly — which is also what the examples corpus does. Anchored: D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET.",
+    "name": "AsmX86_64Att",
+    "version": "0.0.1",
+    "fileExtensions": [".s", ".S"]
+  },
+
+  "artifactProfiles": ["cli"],
+
+  "languageReferences": {
+    "$comment": "★★ THE SHARED LINE STRUCTURE, REACHED BY REFERENCE. `entry: \"asmLine\"` imports exactly the seven rules reachable from it (`asmLine`, `asmElement`, `asmDirective`, `asmStatement`, `asmStatementTail`, `asmLabelTail`, `asmOperandSeq`) and NOTHING of the embedded `__asm__(…)` surface — the entry-closure scoping in `mergeLanguageReferences`. That scoping is also why this document binds four holes rather than the sixteen `asm.lang.json` declares: a host owes the holes ITS entry's closure spells, and a `.s` file has no host expressions and no `__asm__` keyword to bind.\n★ `symbolName` AND `operandSeparator` ARE SPELLED BY BOTH SURFACES, so they are bound here too — the same role names `c-subset.lang.json` binds to ITS Identifier and Comma. Same roles, different vocabularies, one grammar: the property the mechanism exists to have.",
+    "asm": {
+      "entry": "asmLine",
+      "bindRules": {
+        "asmStandaloneOperand": "attOperand"
+      },
+      "bindTokens": {
+        "lineEnd": "LineEnd",
+        "labelSeparator": "LabelColon",
+        "directiveIntroducer": "DirectiveDot",
+        "operandSeparator": "OperandComma",
+        "symbolName": "Identifier"
+      }
+    }
+  },
+
+  "$tokensComment": "⚠ THIS BANNER SITS AT DOCUMENT LEVEL, NOT INSIDE `tokens`, AND THE LOADER IS RIGHT TO INSIST. A key in the `tokens` map is a LEXEME — arbitrary source text — not a name from a vocabulary the loader owns, and `$` is an ordinary operator character in real languages. There is deliberately no `$`-documentation carve-out there, so a `$comment` inside the map declares a token spelled `$comment`. ✔MEASURED: it failed loud as 'value must be an array of meaning objects' the first time this file was loaded.\n\n★★★ THE NEWLINE IS NOT WHITESPACE, AND THIS IS THE SINGLE MOST LOAD-BEARING LINE IN THE FILE. Assembly is line-oriented: there is no statement terminator, so the newline IS the terminator. Every other shipped language flags `\\n` as `EmptySpace` (the parser then never sees it); doing that here would not produce a parse error — it would produce a WRONG PARSE, with `ret` on one line swallowing the next line's `movq` as an operand. `LineEnd` therefore carries NO flags and is a first-class token the grammar names.\n★ `\\r` STAYS `EmptySpace` so a CRLF file behaves exactly like an LF one — the `\\r` is skipped and the `\\n` still terminates the line. A `\\r\\n` pair modelled as two significant tokens would make every Windows-authored `.s` a parse error, and a `\\r` modelled as a line terminator would double every line.\n★ `#` IS THE COMMENT INTRODUCER ON x86 gas, and it consumes to end-of-line EXCLUSIVE — the newline must survive as its own `LineEnd`, or a comment-terminated line would lose its terminator and merge with the next. This is verbatim the shape `c-subset.lang.json` uses for `//` (`$endsAtExclusiveComment` there), and the reason is the same one restated at a different tier.\n⚠ `#` BEING A COMMENT HERE AND THE IMMEDIATE MARKER ON arm64 IS THE MEASUREMENT THAT MADE A DIALECT A LANGUAGE. It is not a stylistic difference that a shared table could parameterise: the same byte opens a comment in one dialect and a value in the other.\n★ `@` IS THE SYMBOL-TYPE SIGIL, ADDED SO `.type main, @function` CAN LEX. It was undeclared until the `functionEntry` verb needed it, and the note that used to sit here (\"the `@function` operand is not yet lexable, so a `.type` line currently fails at the tokenizer\") described exactly that state. ⚠ IT IS NOT A GENERAL `@`: gas also writes `foo@PLT` and `foo@GOTPCREL`, which are symbol SUFFIXES with a different shape (no space, attached to a name, meaning a relocation kind) and are still UNDECLARED. Declaring the sigil does not declare those, and a `foo@PLT` operand now lexes but fails in the grammar rather than the tokenizer — a different, still-loud diagnostic.\n⚠ STILL NO `;`, NO `=`: gas's statement separator and `.set`-style assignment are real gas syntax this dialect does not model. UNDECLARED rather than half-declared, so they fail loud at the tokenizer rather than parsing into something else. Anchored: D-ASM-ATT-GAS-SURFACE-INCOMPLETE.\n⚠ AND ONE CONSEQUENCE OF THE `directiveIntroducer` CHOICE: a gas LOCAL label (`.L3:`) opens with the directive dot, so `asmElement` routes it to `asmDirective` and the trailing `:` has nowhere to go. Local labels are inexpressible in BOTH dialects — the corpus uses plain identifiers (`Lwin`, `Lfail`) for branch targets, which gas accepts identically. ✔MEASURED that this matters: every `-S` output of gcc uses `.L`-prefixed labels, so reading a compiler-emitted `.s` needs this. Anchored: D-ASM-DOT-PREFIXED-LOCAL-LABELS-UNPARSEABLE.",
+
+  "tokens": {
+    " ":  [{"kind": "Whitespace", "flags": ["EmptySpace"]}],
+    "\t": [{"kind": "Whitespace", "flags": ["EmptySpace"]}],
+    "\r": [{"kind": "Whitespace", "flags": ["EmptySpace"]}],
+    "\n": [{"kind": "LineEnd"}],
+    "#":  [{"kind": "LineCommentStart", "flags": ["EmptySpace"], "modeOp": "pushMode", "modeArg": "line-comment", "stringStyle": {"escapeKind": "none", "endsAt": "\n", "endsAtExclusive": true}}],
+    "/*": [{"kind": "BlockCommentStart", "flags": ["EmptySpace"], "modeOp": "pushMode", "modeArg": "block-comment", "stringStyle": {"escapeKind": "none", "endsAt": "*/"}}],
+    "%":  [{"kind": "RegisterSigil"}],
+    "$":  [{"kind": "ImmediateSigil"}],
+    "@":  [{"kind": "TypeSigil"}],
+    "*":  [{"kind": "IndirectStar"}],
+    ",":  [{"kind": "OperandComma"}],
+    ":":  [{"kind": "LabelColon"}],
+    ".":  [{"kind": "DirectiveDot"}],
+    "-":  [{"kind": "MinusSign"}],
+    "+":  [{"kind": "PlusSign"}],
+    "(":  [{"kind": "ParenOpen", "opensScope": "Paren"}],
+    ")":  [{"kind": "ParenClose", "closesScope": true}]
+  },
+
+  "lexerModes": {
+    "$comment": "The two comment bodies, verbatim in shape from `c-subset.lang.json`: every character inside becomes an `EmptySpace` CommentChar, and an unterminated body is reported as a comment rather than as a wall of stray tokens. The `endsAtExclusive` on `#` above is what keeps the terminating `LineEnd` outside the comment body — see the `tokens` banner.",
+    "line-comment": {"defaultToken": {"kind": "CommentChar", "flags": ["EmptySpace"]}, "unterminatedAs": "comment"},
+    "block-comment": {"defaultToken": {"kind": "CommentChar", "flags": ["EmptySpace"]}, "unterminatedAs": "comment"}
+  },
+
+  "numberStyle": {
+    "$comment": "gas integer literals: decimal, `0x` hex, and a leading `0` octal. No float literals — a floating-point CONSTANT in a `.s` appears only inside a `.double`/`.float` directive, which this dialect does not model yet (an undeclared directive fails loud). Declaring float syntax we cannot lower would be the accept-and-ignore this project refuses.",
+    "decimal": true,
+    "integerPrefixes": [
+      {"prefix": "0x", "radix": 16, "digits": "0-9a-fA-F"},
+      {"prefix": "0X", "radix": 16, "digits": "0-9a-fA-F"},
+      {"prefix": "0b", "radix": 2, "digits": "01"},
+      {"prefix": "0", "radix": 8, "digits": "0-7"}
+    ],
+    "emitKind": {"integer": "IntLiteral"}
+  },
+
+  "syncTokens": ["LineEnd"],
+
+  "shapes": {
+    "$comment": "★ ONLY THE ROOT AND THE OPERAND PRODUCTION LIVE HERE. Everything between them — the line, the label chain, the directive, the statement, the operand sequence — arrives from `asm.lang.json`. That split is the reuse claim, and it is measurable: a new dialect's `shapes` block is this size, not the size of an assembly grammar.",
+
+    "root": {
+      "$comment": "A `.s` translation unit: a run of lines, each terminated.\n★★ THE FINAL NEWLINE IS MANDATORY, AND THAT IS A MEASURED DECISION RATHER THAN AN OVERSIGHT. The first draft was `{repeat asmLine}` + a trailing `{optional asmElement}` to accept a file whose last line has no newline. ✔MEASURED: the loader REFUSED it — `C_AmbiguousAlternatives at /shapes/root: alt branches share FIRST token 'Identifier'` — and the refusal is right. After any complete line, an `Identifier` could open either another `asmLine` (which requires a terminator) or the unterminated final element, and LL(1) cannot tell them apart; the parser 'would silently take the first branch'.\n★ THE ALTERNATIVES AND WHY EACH LOSES. Marking the terminator `{optional}` inside `asmLine` removes the ambiguity by removing the LINE DISCIPLINE — `ret` followed on the next token by `movq` would then parse as `ret movq` (an instruction with an operand), which is the exact wrong-parse the significant newline exists to prevent. `speculative: true` would work and would put backtracking into the one grammar in this tree that has none. Appending a newline to the buffer would be the driver rewriting the user's source.\n⇒ A file whose last line lacks a newline is a LOUD parse error at that line. POSIX defines a line as ending in a newline and every toolchain that emits a `.s` writes one, so the cost is a precise diagnostic on a malformed file — against a silent misparse on a well-formed one. Anchored: D-ASM-FINAL-NEWLINE-REQUIRED.",
+      "repeat": "asmLine"
+    },
+
+    "attOperand": {
+      "$comment": "★★ ONE AT&T OPERAND — five FIRST-disjoint forms, no speculation:\n  • `%rax`            register        → RegisterSigil\n  • `$42` / `$foo`    immediate       → ImmediateSigil\n  • `(%rax,%rbx,8)`   memory, no disp → ParenOpen\n  • `-8(%rbp)` `foo`  displaced memory OR a bare symbol → IntLiteral | Identifier | MinusSign\n  • `*%rax`           indirect target → IndirectStar\n  • `@function`       symbol-type marker → TypeSigil\n★★ THE FOURTH ARM IS WHY `attDisplaced` EXISTS RATHER THAN SEPARATE `memory` AND `symbol` RULES: `foo(%rip)` and `foo` both open with an Identifier, so a two-arm alt would not be FIRST-disjoint. Reading the displacement first and making the base `{optional}` decides it on the following token — the same 'read once, dispatch on what follows' shape `asmStatement` uses for label-vs-mnemonic, and for the same reason.",
+      "alt": ["attRegister", "attImmediate", "attMemory", "attIndirect", "attTypeMarker", "attDisplaced"]
+    },
+
+    "attTypeMarker": {
+      "$comment": "`@function` / `@object` — the ELF symbol-TYPE marker, and the only operand form here that never appears on an INSTRUCTION. It exists so `.type main, @function` parses, and it is deliberately NOT bound to an `operandForms` role: a role is what an instruction operand is lowered THROUGH, and this one is read as TEXT by the directive handler (`AsmDirectiveSpelling::marker`) and compared against the dialect's declared marker string. An unroled rule reaching instruction position would fail loud in `decodeOperand` — 'operand shape is not one this dialect binds to an operand role' — which is the correct answer for `addq @function, %rax`.\n★ THE MARKER TEXT IS DIALECT DATA, NOT ENGINE DATA, AND THE TWO SHIPPED DIALECTS PROVE WHY: ✔MEASURED 2026-08-13, gcc 13 on x86_64 emits `.type main, @function` while aarch64-linux-gnu-gcc emits `.type main, %function` — the same directive, the same meaning, a different sigil, because `@` is a comment character on 32-bit ARM and the ARM gas port never took it back. An engine that hard-coded `@function` would have rejected every aarch64 compiler output.",
+      "sequence": ["TypeSigil", "Identifier"]
+    },
+
+    "attRegister": {
+      "$comment": "`%` + a bare name. The NAME is not vocabulary here — it resolves through the active `.target.json`'s `registers[]`, so `%rax` on a target that declares no `rax` is a precise diagnostic rather than a grammar error. A register list in this file would be exactly the target identity leak the bar forbids.",
+      "sequence": ["RegisterSigil", "Identifier"]
+    },
+
+    "attImmediate": {
+      "$comment": "`$` + a scalar. gas also accepts a full constant EXPRESSION here (`$(1<<3)`); this dialect models a single scalar and fails loud on anything else, rather than accepting an expression it would then have to fold with semantics nobody declared.",
+      "sequence": ["ImmediateSigil", "attScalar"]
+    },
+
+    "attScalar": {
+      "$comment": "A displacement / immediate value: a number, a negated number, or a symbol name.",
+      "alt": ["IntLiteral", "attNegNumber", "Identifier"]
+    },
+
+    "attNegNumber": {
+      "$comment": "`-8` — the ordinary frame-relative displacement. A separate rule (rather than a signed literal in `numberStyle`) because the sign is grammar: `-` is also a binary operator in gas expressions, and a signed-literal token would make `8-4` lex as two numbers.",
+      "sequence": ["MinusSign", "IntLiteral"]
+    },
+
+    "attMemory": {
+      "$comment": "`(base)` / `(base,index)` / `(base,index,scale)` with NO displacement. The comma inside the parens can never be confused with the operand-list separator: the choice at this position is between `OperandComma` (an index follows) and `ParenClose` (the operand ends), which are distinct kinds, and the operand list's own `{repeat}` only resumes after this rule completes.",
+      "sequence": ["ParenOpen", "attRegister", {"optional": "attMemIndex"}, "ParenClose"]
+    },
+
+    "attMemIndex": {
+      "sequence": ["OperandComma", "attRegister", {"optional": {"sequence": ["OperandComma", "IntLiteral"]}}]
+    },
+
+    "attDisplaced": {
+      "$comment": "A scalar, optionally followed by a memory base — `foo`, `-8(%rbp)`, `foo(%rip)`, `8(%rax,%rbx,4)`. Absent base ⇒ a bare symbol/absolute operand; present base ⇒ a displaced memory reference. The consumer distinguishes them by whether the `attMemory` child is there, a RuleId question.",
+      "sequence": ["attScalar", {"optional": "attMemory"}]
+    },
+
+    "attIndirect": {
+      "$comment": "`*%rax` / `*(%rax)` — gas's marker for an INDIRECT branch or call target. It is syntax, not decoration: `jmp foo` and `jmp *%rax` are different instructions, and dropping the star would silently turn an indirect jump into a direct one — a miscompile with no diagnostic. Modelled so the consumer can select the indirect opcode by RuleId.",
+      "sequence": ["IndirectStar", "attOperand"]
+    }
+  },
+
+  "pipelineEntry": {
+    "$comment": "★★★ A `.s` TRANSLATION UNIT ENTERS AT THE ASSEMBLER'S INPUT. `encode` is the fourth tier (operator decision, plan 29 §5) and means post-regalloc, post-two-address-legalize, post-calling-convention. ✔MEASURED in `src/program/compile_pipeline.cpp`, a `.s` must enter after THREE passes and not one: `allocateRegisters` (:956) would reassign the programmer's registers, `legalizeTwoAddress` (:971) would rewrite the instruction forms, and `materializeCallingConvention` (:1008) would inject a prologue/epilogue OVER the one the programmer wrote. Entering at `lir` — which an earlier comment in `pipeline_entry_config.hpp` would have led an implementer to do — silently reframes every hand-written function.\n★ AND THERE IS NO `optimize: false` SIBLING: entering at `encode` means no MIR module exists, so MIR passes cannot run BY CONSTRUCTION. 'Hand-written assembly is not optimized' is a consequence of the tier, never a second switch that could drift from it.",
+    "byRule": [
+      {"rule": "root", "tier": "encode"}
+    ]
+  },
+
+  "assembly": {
+    "$comment": "★★★ THE TEXT→LIR CONTRACT: the rule landmarks the lowering reads, the ONE dialect-wide operand-order fact, and the spelling vocabulary. Everything here is a NAME the engine resolves — no behaviour, no branch.\n\n★★★ `operandOrder` IS DECLARED ONCE, AND THE HISTORY OF THAT IS WORTH KEEPING. The reverted `asmSyntax` facet declared a `destinationOperand` PER INSTRUCTION, justified in three places by the claim *\"that flag is already false for x86 store forms\"*. ✔MEASURED: **false.** AT&T is uniformly destination-LAST *including stores* (`movq %rsi, (%rdi)`); Intel is uniformly destination-FIRST (`mov QWORD PTR [rdi], rsi`). Both dialects are internally uniform, so operand order is EXACTLY ONE dialect fact — and the per-instruction shape would have meant N edits to express the one thing that distinguishes Intel from AT&T. The claim was asserted without a probe and it invented the requirement it was used to satisfy.\n\n★★ WHAT IS *NOT* DECLARED HERE, ON PURPOSE: which asm operand becomes the LIR RESULT versus a LIR OPERAND. That is derivable from facts the TARGET already states — `opcodes[].result` (`value` / `none`) and `opcodes[].requires2Address` — and re-declaring it per instruction would be a second source of truth for something `.target.json` owns. The derivation is: the destination operand (per `operandOrder`) becomes the LIR result when the opcode produces a value; the remaining operands follow in source order; a `requires2Address` opcode additionally takes the destination as its FIRST input, which is precisely the legalized form AT&T already writes. ⚠ An opcode whose shape does not fit that derivation FAILS LOUD naming the mnemonic — it is never fitted by guessing.\n\n★ `instructions[]` maps an ASSEMBLY SPELLING to TARGET OPCODE NAMES plus the operand WIDTH the suffix encodes (`movq`→64, `movl`→32). ✔MEASURED and this is why the table exists at all: `opcodes[].mnemonic` is NOT assembly — the 86 x86_64 entries are DSS's virtual-ISA names (`shr_l`, `jcc`, `xor_rdx_zero`, `store_outgoing_arg`), while a real `.s` writes `movq`/`shrq`/`je`. A few overlap by coincidence (`mov`, `add`, `ret`), which is exactly what would have made reusing them LOOK like it worked.\n\n★★★ `opcodes` IS AN ARRAY BECAUSE ONE AT&T SPELLING IS GENUINELY SEVERAL DSS OPCODES, AND `movq` IS THE PROOF: `movq %rcx, %rax` is `mov`, `movq (%rdi), %rax` is `load`, and `movq %rax, (%rdi)` is `store` — three opcodes, one mnemonic, distinguished ONLY by which operand is a memory reference. The walker elects among the listed names using the TARGET's own `encoding.variants[].guard.operandKinds`, so the dialect never decides which one; it only says which are POSSIBLE. `jmp` is the second case (`jmp foo` → `jmp`, `jmp *%rax` → `jmp_indirect`), and `call` the third.\n⚠ A SINGLETON ARRAY IS NOT A WASTED FACILITY, IT IS A MEASUREMENT: `asm-arm64-gas.lang.json`'s rows are almost all singletons because arm64 does NOT overload — it spells load/store/move as `ldr`/`str`/`mov`. So WHICH spellings are overloaded is a DIALECT property, which is an independent argument for this array living in the dialect document rather than in the target.\n⚠ AND THE ELECTION HAS TO SETTLE OPERAND PLACEMENT, NOT JUST OPCODE IDENTITY — ✔MEASURED against the two `result: none` opcodes this table now reaches, which DISAGREE under one positional rule. `cmpq $93, %rax` must become LIR `[rax, imm 93]` (written order REVERSED — LIR's `cmp` takes the LHS first, and AT&T writes the LHS last), while `movq %rax, 16(%rsp)` must become LIR `[rax, rsp, MemBase, MemOffset]` (written order PRESERVED — LIR's `store` takes the stored VALUE first). Both are `destinationLast`, both produce no value, and no rule phrased in terms of position alone gets both right. ⇒ placement is matched by KIND against the elected variant's `operandKinds`, which is also what keeps `lir_verifier`'s independent 'MemBase then MemOffset must be the last two operands' rule satisfied by construction.\n\n★ `cond` NAMES AN EXISTING `TargetCondCode` — no new vocabulary was minted for the conditional branches. It is REQUIRED on a row whose elected target opcode declares `condCodeFromPayload` and REJECTED on one that does not, so a stray `cond` is a refusal rather than a silently-ignored key, and a missing one is a refusal rather than a silent encode of the target's zero condition.\n★★ THAT KEY USED TO BE `terminatorKind == cond-br`, AND IT WAS WRONG IN BOTH DIRECTIONS — fixed 2026-08-13, closing D-ASM-COND-ALLOWED-ONLY-ON-JCC. Both shipped targets declare exactly two condition-reading opcodes: `jcc` (a cond-br) and `setcc` (`terminatorKind: None`, `result: value`). Keyed on the terminator shape the rule coincided with the right answer on `jcc` and REFUSED a condition on `setcc` — the opcode whose only job is to materialize one. The encoder is the thing that actually decides, so the encoder's own declaration is now the key.\n⚠ AND `sete`/`setne` ROWS ARE STILL NOT SHIPPED HERE, FOR A REASON THAT IS NOT THIS ONE. ✔MEASURED 2026-08-13: gas writes `sete %al` — an 8-bit destination — and `x86_64.target.json` declares 49 registers with NO 8-bit file (16 GPR64, 16 GPR32, 16 xmm, rflags), so `%al` cannot resolve. The only destination this dialect could spell is `%rax`, which gas REJECTS, and shipping a row that accepts input no reference assembler takes is the same defect as refusing input they do accept ([[feedback_reference_compilers_are_the_spec]], which is bidirectional). The engine mechanism is landed and pinned through the ENCODED BYTE in tests/asm/test_asm_text_to_lir.cpp (`SetccCarriesItsConditionThroughToTheEncodedByte`); the rows land with the 8-bit register file. Anchored: D-ASM-X86-NO-8BIT-REGISTER-FILE.",
+
+    "unitRule":        "root",
+    "lineRule":        "asmLine",
+    "elementRule":     "asmElement",
+    "directiveRule":   "asmDirective",
+    "statementRule":   "asmStatement",
+    "labelTailRule":   "asmLabelTail",
+    "operandSeqRule":  "asmOperandSeq",
+
+    "operandOrder": "destinationLast",
+
+    "operandForms": {
+      "$comment": "Which of THIS document's rules realizes each operand ROLE the lowering understands. The engine walks roles, never rule names, so a dialect whose memory form is `[base, #off]` binds the same five roles to different rules and needs no engine change.",
+      "register":  "attRegister",
+      "immediate": "attImmediate",
+      "memory":    "attMemory",
+      "displaced": "attDisplaced",
+      "indirect":  "attIndirect",
+      "scalar":    "attScalar",
+      "negNumber": "attNegNumber"
+    },
+
+    "entryLabels": ["main"],
+
+    "instructions": [
+      { "$comment": "★★ THE OVERLOADED ROW. `movq` is `mov`, `load` OR `store` depending on where the memory operand sits, and the target's variant guards make the call — see the block banner. Order inside the array is NOT a priority list: the guards are mutually exclusive by operand kind, so an input matching two of them would be a target defect rather than something this ordering papers over.",
+        "spelling": "movq",  "opcodes": ["mov", "load", "store"], "width": 64 },
+      { "spelling": "movl",  "opcodes": ["mov", "load", "store"], "width": 32 },
+      { "spelling": "leaq",  "opcodes": ["lea"], "width": 64 },
+      { "spelling": "addq",  "opcodes": ["add"], "width": 64 },
+      { "spelling": "addl",  "opcodes": ["add"], "width": 32 },
+      { "spelling": "subq",  "opcodes": ["sub"], "width": 64 },
+      { "spelling": "subl",  "opcodes": ["sub"], "width": 32 },
+      { "spelling": "imulq", "opcodes": ["mul"], "width": 64 },
+      { "spelling": "imull", "opcodes": ["mul"], "width": 32 },
+      { "spelling": "andq",  "opcodes": ["and"], "width": 64 },
+      { "spelling": "andl",  "opcodes": ["and"], "width": 32 },
+      { "spelling": "orq",   "opcodes": ["or"], "width": 64 },
+      { "spelling": "orl",   "opcodes": ["or"], "width": 32 },
+      { "spelling": "xorq",  "opcodes": ["xor"], "width": 64 },
+      { "spelling": "xorl",  "opcodes": ["xor"], "width": 32 },
+      { "spelling": "notq",  "opcodes": ["not"], "width": 64 },
+      { "spelling": "negq",  "opcodes": ["neg"], "width": 64 },
+      { "spelling": "cmpq",  "opcodes": ["cmp"], "width": 64 },
+      { "spelling": "cmpl",  "opcodes": ["cmp"], "width": 32 },
+
+      { "$comment": "★ CONTROL FLOW — and one place where AT&T's spelling is RICHER than what a row can currently express. gas writes BOTH branches `jmp`: `jmp foo` is direct and `jmp *%rax` is indirect, distinguished only by the star on the operand (which is why `attIndirect` is a grammar rule and not decoration — dropping the star would silently turn an indirect jump into a direct one).\n⚠ SO THE HONEST ROW WOULD BE `[\"jmp\", \"jmp_indirect\"]`, AND THE ENGINE REFUSES IT — ✔MEASURED 2026-08-13, `A0008: … one spelling cannot denote both, because the two take different operand shapes and there would be nothing to elect over`. The refusal is defensible (the two need DIFFERENT LirBuilder terminators, `addBr` vs `addIndirectBr`, so electing an opcode would not be enough) and the consequence is real: `jmp *%rax` is currently INEXPRESSIBLE in this dialect. It is left that way — a loud 'this operand form is not yet lowered' — rather than papered over with an invented second spelling that no assembler accepts. Anchored: D-ASM-ATT-INDIRECT-BRANCH-INEXPRESSIBLE.",
+        "spelling": "jmp",   "opcodes": ["jmp"], "width": 64 },
+      { "spelling": "call",  "opcodes": ["call"], "width": 64 },
+      { "spelling": "ret",   "opcodes": ["ret"], "width": 64 },
+
+      { "$comment": "★★ THE CONDITIONAL BRANCHES, each naming an EXISTING `TargetCondCode`. ⚠ THE SIGNED/UNSIGNED SPLIT IS THE PART THAT MISCOMPILES SILENTLY IF GUESSED: AT&T's `jl/jle/jg/jge` are SIGNED (`slt/sle/sgt/sge`) and its unsigned peers are spelled `jb/jbe/ja/jae` (`ult/ule/ugt/uge`) — a table built by matching letters would map `jbe` to `sle` and quietly reverse every unsigned comparison near the sign boundary. gas's `jz`/`jnz` are accepted ALIASES of `je`/`jne`, and per [[feedback_reference_compilers_are_the_spec]] an alias the reference assembler accepts is not optional. ⓘ The arm64 sibling spells this same set `b.eq`/`b.lt`/`b.lo`/… — different letters, identical `cond` values, which is what 'the condition vocabulary is target-shared and the spelling is dialect-owned' looks like in practice.",
+        "spelling": "je",    "opcodes": ["jcc"], "width": 64, "cond": "eq" },
+      { "spelling": "jz",    "opcodes": ["jcc"], "width": 64, "cond": "eq" },
+      { "spelling": "jne",   "opcodes": ["jcc"], "width": 64, "cond": "ne" },
+      { "spelling": "jnz",   "opcodes": ["jcc"], "width": 64, "cond": "ne" },
+      { "spelling": "jl",    "opcodes": ["jcc"], "width": 64, "cond": "slt" },
+      { "spelling": "jle",   "opcodes": ["jcc"], "width": 64, "cond": "sle" },
+      { "spelling": "jg",    "opcodes": ["jcc"], "width": 64, "cond": "sgt" },
+      { "spelling": "jge",   "opcodes": ["jcc"], "width": 64, "cond": "sge" },
+      { "spelling": "jb",    "opcodes": ["jcc"], "width": 64, "cond": "ult" },
+      { "spelling": "jbe",   "opcodes": ["jcc"], "width": 64, "cond": "ule" },
+      { "spelling": "ja",    "opcodes": ["jcc"], "width": 64, "cond": "ugt" },
+      { "spelling": "jae",   "opcodes": ["jcc"], "width": 64, "cond": "uge" }
+    ],
+
+    "directives": [
+      { "$comment": "★ A DIRECTIVE IS A VERB, NOT A STRING. The engine switches on the closed `verb` set; the SPELLING is this dialect's. gas's `.globl`/`.global` are two spellings of one verb, which is exactly the shape this table exists to express. An undeclared directive fails loud naming the spelling and this dialect — never ignored, because a silently-dropped `.globl` produces a binary whose entry symbol is local and whose link failure points nowhere near the cause.",
+        "spelling": "text",    "verb": "sectionText" },
+      { "spelling": "globl",   "verb": "globalSymbol" },
+      { "spelling": "global",  "verb": "globalSymbol" },
+
+      { "$comment": "★★★ `.type NAME, @function` — THE DIRECTIVE THAT SAYS WHICH LABELS ARE FUNCTIONS, AND WITHOUT IT THE COMPILER IS GUESSING. This row USED to be `ignoredAnnotation`, on the reasoning that DSS derives ELF symbol types from the LIR shape. That reasoning was true and the conclusion was still wrong: with every label minting a function, a `.s` with an intra-function branch target could not be expressed at all, and the operator's ruling on the corpus example that relied on the guess was *\"an example that only works because the compiler guesses is the example being wrong.\"* The label→function question is decided HERE, by the file, and every label NOT so marked is a BLOCK in whatever function is open.\n★ `marker` IS WHY `.type foo, @object` DOES NOT MINT A FUNCTION. Both are `.type`; only the operand distinguishes them, so the spelling alone cannot carry the verb and the engine must be told which operand text means 'function'. ⚠ AND THE MARKER IS PER-DIALECT, NOT PER-ENGINE: ✔MEASURED 2026-08-13, aarch64-linux-gnu-gcc writes `%function` where x86_64 gcc writes `@function` (see `asm-arm64-gas.lang.json`, whose row differs in exactly this one string). Hard-coding either spelling in the engine would have rejected half of the reference compilers' output.",
+        "spelling": "type",    "verb": "functionEntry", "marker": "@function" },
+      { "spelling": "size",    "verb": "ignoredAnnotation" },
+      { "spelling": "p2align", "verb": "ignoredAnnotation" }
+    ]
+  }
+}

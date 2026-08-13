@@ -225,6 +225,29 @@ resolvePipelineName(CompileConfig config) noexcept {
     return kPipelineNameTable[idx].second;
 }
 
+// Assemble ONE standalone-assembly CompilationUnit at the `encode` pipeline
+// tier (plan 29 P4) — the `assembleUnit` sibling for a language whose root rule
+// declares `{"tier": "encode"}`.
+//
+// ★★★ WHAT MAKES IT A SEPARATE ENTRY POINT RATHER THAN A FLAG ON `assembleUnit`:
+// it shares NO tier with it. A `.s` is already the machine tier, so this runs
+// text→LIR and then `assemble()`, and everything between — analyze, CST→HIR,
+// HIR→MIR, the optimizer, MIR→LIR, liveness, regalloc, two-address legalize,
+// callconv — does not run at all. Three of those would rewrite the programmer's
+// own decisions SILENTLY (registers, instruction forms, and the prologue), so
+// the two paths are different pipelines and not one pipeline with a switch.
+//
+// `formatVerbs` is the active format's `entryVerbs()`; a defined label whose
+// name is one of the language's entry spellings AND whose verb this format
+// realizes becomes the module's `userEntrySymbol`. Returns nullopt on any
+// failure (diagnostics emitted via `reporter`).
+[[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
+assembleAsmUnit(CompilationUnit const&                cu,
+                GrammarSchema const&                  grammar,
+                TargetSchema const&                   target,
+                std::span<EntryMaterialization const> formatVerbs,
+                DiagnosticReporter&                   reporter);
+
 [[nodiscard]] DSS_EXPORT bool
 compileSingleUnit(CompilationUnit const&         cu,
                   GrammarSchema const&           grammar,

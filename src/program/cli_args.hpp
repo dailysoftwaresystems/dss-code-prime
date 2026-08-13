@@ -105,7 +105,13 @@ struct DSS_EXPORT CliArgs {
     std::optional<std::string> projectPath;   // populated by --project <file>
 
     // ── Compile-mode shared options ─────────────────────────────
-    std::string              languageName;     // --language <name>
+    // --language <name>. EMPTY is a legal state for --compile / --directory
+    // (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET) and means "ask each --target
+    // for the language it declares as its own assembly dialect" — the only way
+    // one invocation can compile a `.s` for two different CPUs. Still REQUIRED
+    // for --transpile / --dump-predefined-macros, where the target's answer
+    // would be a confidently wrong one.
+    std::string              languageName;
     std::vector<std::string> targets;          // --target <spec> (repeatable)
     InputResolver::Mode      directoryMode =
         InputResolver::Mode::Recursive;        // --recursive / --no-recursive
@@ -248,7 +254,9 @@ enum class CliArgsError : std::uint8_t {
     NoModeSelected      = 4,    // mode flags absent but mode-options set
     EmptyFileList       = 5,    // --compile / --transpile with no files
     EmptyTargetList     = 6,    // mode flag but no --target
-    MissingLanguage     = 7,    // mode flag but no --language
+    MissingLanguage     = 7,    // --transpile / --dump-predefined-macros with
+                                // no --language (compile / directory fall back
+                                // to the target's declared assembly dialect)
     InvalidSuppressCode = 8,    // --suppress=<bad-code>
     InvalidConfig       = 9,    // --config=<not-debug-not-release>
     EmptyFilename       = 10,   // --compile "" or bare `-` as positional

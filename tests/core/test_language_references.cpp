@@ -1102,17 +1102,25 @@ TEST(LanguageReferenceRefusals, TransitiveLanguageReferenceFailsLoud) {
 TEST(LanguageReferenceRefusals, ReferencedDocumentDeclaringANonMergedBlockFailsLoud) {
     // ★ THE SILENTLY-DISCARDED BLOCK. `checkDocumentKeys` validates a referenced
     // document against the full 21-key document vocabulary, but the merge folds
-    // in exactly four blocks. A correctly-spelled `tokens` block therefore used
-    // to pass the typo discriminator, load clean, and VANISH. Dated, not
-    // hypothetical: `asm.lang.json`'s header says its standalone half lands a
-    // `tokens` block at plan 29 P2.5, and `asm` is referenced today.
+    // in exactly four blocks. A correctly-spelled block outside that set
+    // therefore used to pass the typo discriminator, load clean, and VANISH.
+    //
+    // ⚠ THE SUBJECT USED TO BE `tokens`, AND P2.5 (2026-08-12) MOVED IT — read
+    // this before "restoring" it. `tokens` is now a STANDALONE-IDENTITY block:
+    // `asm.lang.json` declares its own lexical surface so a `.s` can be
+    // compiled directly, and that block is consumed by the standalone load
+    // path, so for it "not merged" no longer means "does nothing". The refusal
+    // itself is unchanged and still has teeth — it is demonstrated here on
+    // `operators`, which genuinely has no consumer on either side. The
+    // companion test below pins the OTHER polarity, so narrowing the guard
+    // again cannot pass silently.
     auto refDoc = probeReferencedDoc();
-    refDoc["tokens"] = nlohmann::json::parse(
-        R"({ "@": [{ "kind": "ProbeAtMark" }] })");
+    refDoc["operators"] = nlohmann::json::parse(
+        R"({ "binary": [{ "token": "ProbeAtMark", "precedence": 1 }] })");
     ProbeConfigRoot root{refDoc};
     auto const diags = loadExpectingRefusal(probeHostJson(), "non-merged block");
     expectRefusal(diags, DiagnosticCode::C_ConflictingField,
-                  {"probe.lang.json", "tokens", "SILENTLY DISCARDED"},
+                  {"probe.lang.json", "operators", "SILENTLY DISCARDED"},
                   "a referenced document declaring a block the merge drops");
     // ...and the block really would have been dropped: nothing it declared
     // reached the merged schema. (Asserted through the refusal's own subject
@@ -1120,7 +1128,40 @@ TEST(LanguageReferenceRefusals, ReferencedDocumentDeclaringANonMergedBlockFailsL
     EXPECT_TRUE(std::ranges::none_of(diags, [](ConfigDiagnostic const& d) {
         return d.message.find("ProbeAtMark") != std::string::npos;
     })) << "the token kind was consumed somewhere after all — re-check whether "
-           "the merge grew a consumer for 'tokens'";
+           "the merge grew a consumer for 'operators'";
+}
+
+TEST(LanguageReferenceRefusals, ReferencedDocumentStandaloneSurfaceBlockIsAllowed) {
+    // ★★ THE OTHER POLARITY OF THE NARROWING ABOVE, AND THE REASON IT IS SAFE.
+    // A referenced document may declare the blocks that describe how IT reads a
+    // file of its own — `tokens` here. That is not an unconsumed block: the
+    // standalone load path consumes it, which is the whole point of
+    // `asm.lang.json` being compilable as a `.s` language rather than only
+    // embeddable. A host that references the document reads its input with its
+    // OWN tokenizer (that is what `bindTokens` is for), so the block is
+    // deliberately not merged rather than silently lost.
+    //
+    // ⚠ WITHOUT THIS TEST the previous test alone would let someone "fix" a
+    // future diagnostic by appending any key to `kStandaloneOnlyDocumentKeys`,
+    // and the guard would erode one key at a time with every test still green —
+    // the weakened-guard failure this project has already been bitten by twice.
+    // Here the allowance is asserted as INTENDED behaviour, so the two tests
+    // together say exactly which keys may pass and which may not.
+    auto refDoc = probeReferencedDoc();
+    refDoc["tokens"] = nlohmann::json::parse(
+        R"({ "@": [{ "kind": "ProbeAtMark" }] })");
+    ProbeConfigRoot root{refDoc};
+    auto result = GrammarSchema::loadFromText(probeHostJson().dump(2),
+                                              "<refusal-probe>");
+    ASSERT_TRUE(result.has_value())
+        << "a referenced document's standalone-surface 'tokens' block must LOAD "
+           "(deliberately not merged, not an error): " << describe(result.error());
+    // ...and it really was NOT merged: the host's token table is untouched, so
+    // the referenced document's own lexical surface cannot contest the host's.
+    EXPECT_FALSE((*result)->schemaTokens().contains("ProbeAtMark"))
+        << "the referenced document's token kind reached the HOST's token "
+           "table — a referenced tokenizer must never silently join the host's, "
+           "or two token tables contest one input";
 }
 
 TEST(LanguageReferenceRefusals, ReferencedDocumentDeclaringAConsumedBlockStillLoads) {
@@ -1146,13 +1187,34 @@ TEST(LanguageReferenceRefusals, ReferencedDocumentDeclaringAConsumedBlockStillLo
 }
 
 TEST(LanguageReferenceRefusals, ShapeDeclaredByBothTheHostAndTheReferencedDocFailsLoud) {
+    // ★★ THE COLLIDING SHAPE MUST BE INSIDE THE ENTRY'S REACHABLE CLOSURE, and
+    // this arm used to get that WRONG in a way only a later change exposed.
+    // It added `hostValue` — the host rule the `probeValue` HOLE is bound to —
+    // as a shape of the referenced document, and the merge duly refused it. But
+    // the reason it was "reachable" was an artifact: the closure walk ran AFTER
+    // hole substitution, so `probeStmt`'s body had become `["probeMark",
+    // "hostValue"]` and the walk followed a name the referenced document never
+    // wrote. ✔MEASURED 2026-08-12: moving the walk to the UNSUBSTITUTED bodies
+    // (which is what "the document's own references" means) made this arm load
+    // CLEAN — correctly, because an unreachable shape does not merge and so
+    // cannot collide.
+    // ⇒ Re-aimed at a collision that is real: `probeTail` is spelled by
+    // `probeStmt` (so the closure imports it) AND declared by the host. That is
+    // strictly stronger than the old form — it pins the guard for a shape the
+    // reference actually contributes, which is the only case where last-wins
+    // could have silently replaced a host rule.
     auto refDoc = probeReferencedDoc();
-    refDoc["shapes"]["hostValue"] =
+    refDoc["shapes"]["probeStmt"] =
+        nlohmann::json::parse(R"({ "sequence": ["probeMark", "probeValue", "probeTail"] })");
+    refDoc["shapes"]["probeTail"] =
         nlohmann::json::parse(R"({ "sequence": ["probeMark"] })");
+    auto hostDoc = probeHostJson();
+    hostDoc["shapes"]["probeTail"] =
+        nlohmann::json::parse(R"({ "sequence": ["BraceOpen"] })");
     ProbeConfigRoot root{refDoc};
-    expectRefusal(loadExpectingRefusal(probeHostJson(), "duplicate shape"),
+    expectRefusal(loadExpectingRefusal(hostDoc, "duplicate shape"),
                   DiagnosticCode::C_ConflictingField,
-                  {"hostValue", "probe.lang.json"},
+                  {"probeTail", "probe.lang.json"},
                   "a shape declared by both documents");
 }
 

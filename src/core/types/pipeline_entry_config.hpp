@@ -16,10 +16,27 @@
 // ★★★ WHAT IT DECLARES: which tier of the CST→HIR→MIR→LIR pipeline a given
 // construct ENTERS at. Not every construct starts at the top. A `.s`
 // translation unit is already the post-register-allocation, physical-register
-// machine tier that LIR models — running it through HIR, MIR and the optimizer
-// would be re-deriving what the programmer already wrote, and OPTIMIZING it
-// would be a miscompile of intent: you cannot know why a human chose a given
-// instruction, order or register.
+// machine tier — running it through HIR, MIR and the optimizer would be
+// re-deriving what the programmer already wrote, and OPTIMIZING it would be a
+// miscompile of intent: you cannot know why a human chose a given instruction,
+// order or register.
+//
+// ★★ AND "THE MACHINE TIER" IS **NOT** THE `lir` TIER — AN EARLIER VERSION OF
+// THIS COMMENT SAID IT WAS, AND IT WAS WRONG IN THE DANGEROUS DIRECTION.
+// It read *"a `.s` … is the post-register-allocation, physical-register machine
+// tier THAT LIR MODELS"*, which would have sent P2.5's implementer to declare
+// `asmUnit` as `lir`. ✔MEASURED in `src/program/compile_pipeline.cpp`, whose
+// step 4 is literally commented "MIR → LIR (vreg-based)": entering at `lir`
+// puts the construct AHEAD of three passes that each rewrite it —
+//   :956  `allocateRegisters`            reassigns the programmer's registers
+//   :971  `legalizeTwoAddress`           rewrites the instruction forms
+//   :1008 `materializeCallingConvention` injects a prologue/epilogue OVER the
+//                                        one the programmer wrote
+// `src/asm/asm.hpp`'s own stated input contract names both halves ("every vreg
+// has been replaced by a physical register" AND "prologue/epilogue +
+// frame_load/frame_store materialized"), so the machine tier is the ASSEMBLER'S
+// INPUT — `Encode` below — and `Lir` is a TYPE that spans both sides of
+// regalloc rather than a single tier. The tier names name STAGES, not types.
 //
 // ★★★ WHY IT IS PER-RULE AND NOT PER-LANGUAGE, which is the whole design.
 // Plan 29 §1 rejected a language-level `skipToAssembler` flag and stated the
@@ -81,17 +98,42 @@ namespace dss {
 enum class PipelineTier : std::uint8_t {
     Hir,   // CST → HIR → MIR → LIR (the ordinary path every language takes)
     Mir,   // enters at MIR: no CST→HIR lowering for this construct
-    Lir,   // enters at LIR: no HIR, no MIR, and therefore no MIR optimizer
+    Lir,   // enters at LIR **pre-regalloc** (vreg-based, as `lowerToLir`
+           // produces it): no HIR, no MIR, therefore no MIR optimizer — but
+           // liveness, register allocation, two-address legalization and
+           // calling-convention materialization all still RUN over it.
+    Encode,// enters at the ASSEMBLER'S INPUT: post-regalloc, post-legalize,
+           // post-callconv, physical-register-only. Nothing rewrites the
+           // instructions or the register choices; the module goes straight
+           // to `assemble()`. This is the tier a hand-written `.s` needs, and
+           // the ONLY tier at which "the programmer's registers survive
+           // verbatim" is true.
 };
+
+// ★ WHY THESE FOUR AND NOT SOME OTHER CUT. The names are not invented here —
+// they track `substrate::CompilePhase` (`core/substrate/phase_timers.hpp`),
+// which already partitions the back half into `LowerLir` (MIR→LIR + wide-call
+// materialization), `Regalloc` (documented there as "liveness + allocation +
+// rewrite + 2-addr legalize + callconv") and `Encode` ("assemble to bytes").
+// `lir` is the entry BEFORE `Regalloc`; `encode` is the entry after it. Adding
+// a tier that does not correspond to a real phase boundary would be a name
+// with no stage behind it, which is how a vocabulary starts lying.
 
 // The config spelling of each tier, in ONE table so the parser and any
 // diagnostic that has to list the legal values cannot disagree.
-inline constexpr std::array<std::pair<std::string_view, PipelineTier>, 3>
+inline constexpr std::array<std::pair<std::string_view, PipelineTier>, 4>
     kPipelineTierNames{{
         {"hir", PipelineTier::Hir},
         {"mir", PipelineTier::Mir},
         {"lir", PipelineTier::Lir},
+        {"encode", PipelineTier::Encode},
     }};
+static_assert(kPipelineTierNames.size()
+                  == static_cast<std::size_t>(PipelineTier::Encode) + 1,
+              "every PipelineTier enumerator needs a config spelling — a tier "
+              "with no name is undeclarable, and a name list shorter than the "
+              "enum makes `pipelineTierName` return '<unknown>' for a value "
+              "the parser can legitimately produce");
 
 [[nodiscard]] inline std::optional<PipelineTier>
 pipelineTierFromName(std::string_view name) {

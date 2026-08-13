@@ -11,6 +11,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/assembly_config.hpp"
 #include "core/types/pipeline_entry_config.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/rule_id.hpp"
@@ -193,6 +194,17 @@ struct DSS_EXPORT GrammarSchemaData {
 
     // O(1) "is this token EmptySpace?" without scanning lexemeTable.
     std::unordered_set<std::uint32_t>                 emptySpaceTokens;
+
+    // Every SchemaTokenId that some `tokens` (or per-mode `tokens`) entry
+    // DECLARES. ★ IT IS THE COMPANION OF `emptySpaceTokens`, NOT A DUPLICATE:
+    // that set answers "is this token trivia?", this one answers "did the
+    // LANGUAGE say anything about this token at all?" — and without the second
+    // question the first cannot be trusted, because a built-in kind the schema
+    // never mentioned is absent from `emptySpaceTokens` for the same reason a
+    // deliberately-significant one is. The parser needs to tell "declared and
+    // NOT trivia" from "never declared", since only the first may override the
+    // core-kind default (see `isSkippableTrivia`).
+    std::unordered_set<std::uint32_t>                 declaredLexemeTokens;
 
     // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD: the set of SchemaTokenId
     // values that are CONTEXTUAL / scope-resolvable — a soft keyword that the
@@ -396,6 +408,13 @@ struct DSS_EXPORT GrammarSchemaData {
     // loader is the only writer. See `pipeline_entry_config.hpp` for why the
     // declaration is per-CONSTRUCT and never per-language.
     PipelineEntryConfig                               pipelineEntry;
+
+    // The text→LIR contract of an ASSEMBLY DIALECT (schema v4 `assembly`;
+    // plan 29 P3/P4). `declared == false` for every language that is not one —
+    // which is every shipped language except the `asm-*` dialect documents. The
+    // loader is the only writer; see `assembly_config.hpp` for why a dialect is
+    // a LANGUAGE and not a `.target.json` facet.
+    AssemblyConfig                                    assembly;
 };
 
 } // namespace detail
@@ -428,6 +447,11 @@ public:
     // ── Token recognition ──
     [[nodiscard]] std::span<LexemeMeaning const> lookupLexeme(std::string_view lexeme) const noexcept;
     [[nodiscard]] bool isEmptySpace(SchemaTokenId id) const noexcept;
+
+    // Did the language's `tokens` map say ANYTHING about this token kind?
+    // Distinguishes "declared, and deliberately not trivia" from "a built-in
+    // kind this language never mentioned" — see `declaredLexemeTokens`.
+    [[nodiscard]] bool declaresLexemeToken(SchemaTokenId id) const noexcept;
 
     // Longest declared lexeme key in bytes — used by the tokenizer to
     // bound its longest-match probe length so 5+ char lexemes can't
@@ -782,6 +806,13 @@ public:
     // is refused AT USE with a precise diagnostic, never demoted to another
     // tier. Read-only; the loader is the only writer.
     [[nodiscard]] PipelineEntryConfig const& pipelineEntry() const noexcept;
+
+    // The assembly-dialect text→LIR contract (plan 29; schema v4 `assembly`).
+    // `declared == false` for every non-dialect language, which is how a caller
+    // distinguishes "this language has no assembly surface" from "this dialect
+    // declared an empty instruction table". Read-only; the loader is the only
+    // writer.
+    [[nodiscard]] AssemblyConfig const& assembly() const noexcept;
 
     // ── Scope rules ──
     [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,

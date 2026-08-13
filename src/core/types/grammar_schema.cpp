@@ -182,6 +182,10 @@ bool GrammarSchema::isEmptySpace(SchemaTokenId id) const noexcept {
     return d_.emptySpaceTokens.contains(id.v);
 }
 
+bool GrammarSchema::declaresLexemeToken(SchemaTokenId id) const noexcept {
+    return d_.declaredLexemeTokens.contains(id.v);
+}
+
 NodeFlags GrammarSchema::flagsForKind(SchemaTokenId id) const noexcept {
     // No schema field populates per-kind flags today, so every kind
     // returns None. The accessor is the structural channel the
@@ -564,6 +568,10 @@ HirLoweringConfig const& GrammarSchema::hirLowering() const noexcept {
 
 PipelineEntryConfig const& GrammarSchema::pipelineEntry() const noexcept {
     return d_.pipelineEntry;
+}
+
+AssemblyConfig const& GrammarSchema::assembly() const noexcept {
+    return d_.assembly;
 }
 
 bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,

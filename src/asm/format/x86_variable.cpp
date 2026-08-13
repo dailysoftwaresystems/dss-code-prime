@@ -1,5 +1,6 @@
 #include "asm/format/x86_variable.hpp"
 
+#include "asm/asm_variant_elect.hpp"
 #include "asm/format/byte_emit.hpp"
 #include "asm/format/walker_util.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -700,14 +701,14 @@ bool encode(Lir const&                  lir,
     // Find the first variant whose guard matches the operand kinds AND
     // the instruction's operation width (FC3 c2 width axis —
     // D-CSUBSET-32BIT-ALU-FORMS; width-absent variants match any).
+    // ⚠ THE LOOP ITSELF LIVES IN `asm_variant_elect.hpp` AND IS NOT INLINED
+    // HERE: the assembly-TEXT lowering runs the same selection EARLIER (to
+    // decide which target opcode a dialect mnemonic denotes), and a second
+    // copy that drifted would bind text to one opcode and encode another —
+    // a green build emitting the wrong instruction, with no diagnostic.
     std::uint8_t const instWidth = lirInstWidthBits(lir.instFlags(inst));
-    TargetEncodingVariant const* selected = nullptr;
-    for (auto const& v : info->encoding.variants) {
-        if (walker_util::variantMatchesInst(instOps, instWidth, v)) {
-            selected = &v;
-            break;
-        }
-    }
+    TargetEncodingVariant const* selected =
+        asm_elect::selectEncodingVariant(*info, instOps, instWidth);
     if (selected == nullptr) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,

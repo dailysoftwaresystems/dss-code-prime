@@ -1,5 +1,6 @@
 #include "asm/format/fixed32.hpp"
 
+#include "asm/asm_variant_elect.hpp"
 #include "asm/format/byte_emit.hpp"
 #include "asm/format/walker_util.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -197,14 +198,14 @@ bool encode(Lir const&                  lir,
     // the fixed32 walker consults the SAME shared matcher as
     // x86_variable (arm64 W-forms = width:32 variants whose fixedWord
     // clears bit 31; width-absent variants match any width).
+    // ⚠ THE LOOP ITSELF LIVES IN `asm_variant_elect.hpp` AND IS NOT INLINED
+    // HERE — see the x86_variable twin: the assembly-TEXT lowering runs the
+    // same selection earlier to decide which target opcode a dialect mnemonic
+    // denotes, and two copies that drifted would bind text to one opcode and
+    // encode another with no diagnostic.
     std::uint8_t const instWidth = lirInstWidthBits(lir.instFlags(inst));
-    TargetEncodingVariant const* selected = nullptr;
-    for (auto const& v : info->encoding.variants) {
-        if (walker_util::variantMatchesInst(instOps, instWidth, v)) {
-            selected = &v;
-            break;
-        }
-    }
+    TargetEncodingVariant const* selected =
+        asm_elect::selectEncodingVariant(*info, instOps, instWidth);
     if (selected == nullptr) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,

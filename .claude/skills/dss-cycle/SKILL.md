@@ -38,6 +38,45 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    is config-driven (`.lang.json` / `.target.json` / `.format.json`); the engine walks a
    closed verb set, never a language/CPU/format identity. This is a hard veto: if the only
    way you see forward is an identity branch, that is a **decision gate** (§B), not a cycle.
+   - **★★★ 1b. REUSE THE PIPELINE'S EXISTING VERBS — a language-private verb set is the SLOW
+     form of this same violation, and the grep above CANNOT SEE IT.** A new source language
+     lands by binding its surface names to vocabulary that **already exists** in the
+     pipeline — `LirOperandKind`, `TargetOpcodeInfo` (`terminatorKind`/`isCall`/
+     `operandKinds`), `TargetCondCode`, `SymbolBinding`/`SymbolVisibility`,
+     `SectionKind`/`DataSectionKind`, `TargetRegisterInfo::subOf`, the relocation set.
+     Minting a `<Lang>*`-prefixed closed verb set is **FORBIDDEN**. If the surface genuinely
+     cannot be expressed with existing verbs, that is a **FINDING about the shared core's
+     expressiveness** — fix it IN THE CORE, where the next language inherits it, and never
+     in a language-private set.
+     ✔**Operator ruling, 2026-08-12, unprompted:** *"the reusable verbs is the whole core on
+     when we creating support for new languages, otherwise we are literally doomed (today is
+     asm, soon will be C++, then DSS Axis, then C#, and so on...)"*.
+     ★★ **WHY IT IS THE SAME VIOLATION:** the roadmap is many languages on one engine. One
+     private verb set per language turns the engine into N language-specific mechanisms
+     wearing a config costume — and **no single site is an identity branch**, so §D's
+     agnosticism scan stays clean the entire way down. It reads as "more vocabulary". This is
+     the slow-motion version of the break §A.1 exists to stop, and it is invisible to the
+     instrument that guards §A.1.
+     ★ **Two rules that fall out of it, both measured the day it was written:**
+     - **Do not restate a fact the target already declares.** A dialect knob duplicating
+       `opcodeInfo.isTerminator`/`isCall` is a knob that can **disagree** with the target, and
+       the loader cannot detect the disagreement (it has no target in scope). DERIVE it. This
+       is the same shape as the reverted `asmSyntax` facet — *a fact with an owner does not
+       get a second owner*.
+     - **Syntax shape vs semantics is a real distinction and NOT an excuse.** A language does
+       need to say "this text shape is a register reference"; it does **not** need its own
+       notion of what a register *is*. Bind the shape to the existing kind.
+     ⚠ **Check before inventing, and say what you found.** ✔MEASURED 2026-08-12: a plan
+     proposed a new `views` facet for narrow registers (`eax`→`rax`@32) *and gave a false
+     reason for it* — `TargetRegisterInfo::subOf` had existed all along, loaded, resolution-
+     and cycle-validated, with a comment naming that exact example, and both allocator paths
+     already skipped such rows. The invented facet would have been a **second spelling of an
+     existing facility** in the same config file. Before adding any verb/role/kind, grep the
+     pipeline for the concept and **report what you found or state plainly that nothing
+     matched** (§C.-1 1b applies to vocabulary, not only to anchors).
+     ⚠ There is often a mechanical payoff too: a REQUIRE-ALL config block (e.g.
+     `assembly.operandForms`) breaks the load of **every** existing language document each
+     time a role is invented.
 2. **Best long-term solution, no workarounds.** Implement the complete clean solution now.
    "Tight slice" / "just for this case" / "TODO later" is forbidden. A real blocker is
    named and pinned (§F) — never silently deferred.

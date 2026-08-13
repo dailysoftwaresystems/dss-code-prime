@@ -24,6 +24,13 @@ dss_add_test(NAME asm/test_asm_x86_tls        SOURCES test_asm_x86_tls.cpp)
 # ADD/ADD hi12/lo12 word pins + the Variant-I identity / tprel-row /
 # tlsAccess / TLSLE-native-id schema pins.
 dss_add_test(NAME asm/test_asm_arm64_tls      SOURCES test_asm_arm64_tls.cpp)
+# Plan 29 P4: the standalone assembly TEXT -> LIR walker. Its fixture builds a
+# dialect grammar by mutating the shipped `asm-x86_64-att.lang.json` in memory
+# (nlohmann consumer), the same posture `mutate_target_schema.hpp` takes for
+# targets -- so every test stays anchored to the real grammar and token table.
+dss_add_test(NAME asm/test_asm_text_to_lir    SOURCES test_asm_text_to_lir.cpp)
+target_link_libraries(dss_asm_test_asm_text_to_lir
+    PRIVATE nlohmann_json::nlohmann_json)
 
 # Tests under tests/asm/ share `asm_test_support.hpp` via this
 # include path. test_asm_substrate additionally reuses the LIR
@@ -32,7 +39,7 @@ foreach(t test_asm_substrate test_asm_x86_variable test_asm_x86_binaryops
           test_asm_x86_sse test_asm_x86_relocs test_asm_arm64
           test_asm_arm64_binops test_lir_2addr_legalize test_asm_roundtrip
           test_asm_pipeline test_asm_width_axis test_asm_x86_tls
-          test_asm_arm64_tls)
+          test_asm_arm64_tls test_asm_text_to_lir)
     target_include_directories(dss_asm_${t}
         PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
 endforeach()

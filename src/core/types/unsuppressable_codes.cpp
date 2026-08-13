@@ -54,7 +54,7 @@ namespace {
 // siblings): it is an Error by default but its suppression ships no wrong bytes,
 // which is this table's whole membership criterion. Two out of three is the
 // evidence the criterion was applied rather than the codes swept in as a batch.
-constexpr std::array<DiagnosticCode, 141> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 142> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -476,6 +476,10 @@ constexpr std::array<DiagnosticCode, 141> kUnsuppressableCodes{{
     // truncated to a wrong machine-code constant (e.g. wrong syscall
     // number). Same bytes-on-disk-invariant band as the others above.
     DiagnosticCode::A_ImmediateOperandOutOfRange,
+    // plan 29 P4: an unrecognized .s construct. Suppressing it would mean
+    // building a binary that silently omits an instruction the programmer
+    // wrote — the one thing an assembler may never do.
+    DiagnosticCode::A_AsmTextUnsupported,
 
     // S_* semantic band — silent-MISCOMPILE guards.
     // c27 (D-CSUBSET-VOLATILE-POINTEE, 2026-06-27) RETIRED

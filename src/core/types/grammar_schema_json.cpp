@@ -1939,6 +1939,10 @@ void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll
         if (isEmptySpace(lm.flagsApplied)) {
             data.emptySpaceTokens.insert(lm.id.v);
         }
+        // Recorded for EVERY meaning, trivia or not — the parser needs
+        // "the language declared this token" as a question separate from
+        // "the language declared it trivia" (see `declaredLexemeTokens`).
+        data.declaredLexemeTokens.insert(lm.id.v);
         if (m.contains("opensScope") && m.at("opensScope").is_string()) {
             const auto sk = parseScopeName(m.at("opensScope").get<std::string>());
             if (!sk) {
@@ -2190,7 +2194,7 @@ constexpr std::uint32_t kMaxSchemaVersion = 4;
 // ENTIRE phase. Every name here is a key the loader genuinely reads.
 // Shared with the referenced-document check so a fragment gets the same
 // typo discrimination its host does.
-constexpr std::array<std::string_view, 21> kDocumentKeys{
+constexpr std::array<std::string_view, 22> kDocumentKeys{
     // identity + loader gates
     "dssSchemaVersion", "language", "reservedWordPolicy", "parser",
     // lexical surface
@@ -2209,6 +2213,13 @@ constexpr std::array<std::string_view, 21> kDocumentKeys{
     // that means running hand-written instructions through MIR and the
     // OPTIMIZER, a silent miscompile of the programmer's intent.
     "pipelineEntry",
+    // ⚠ `assembly` (plan 29 P3/P4) — the text→LIR contract of an ASSEMBLY
+    // DIALECT document: the rule landmarks the lowering reads, the one
+    // dialect-wide operand-order fact, and the spelling→opcode vocabulary. It
+    // shares `pipelineEntry`'s reason for being in this table rather than
+    // tolerated as an unknown key: it is optional, so a typo'd `assemby` would
+    // load clean and leave a `.s` with no instruction vocabulary at all.
+    "assembly",
     // cross-language reference surface (plan 29): the holes this document
     // declares, and the documents it reaches into to fill theirs.
     "requires", "languageReferences"};
@@ -2265,6 +2276,37 @@ constexpr std::array<std::string_view, 7> kReferencedDocumentKeys{
     "shapes", "semantics", "hirLowering", "pipelineEntry"};
 DSS_CHECK_KEY_VOCABULARY(kReferencedDocumentKeys);
 
+// ★★★ THE STANDALONE SURFACE — blocks a referenced document may declare that
+// the merge deliberately does NOT fold in, decided at P2.5 (2026-08-12), which
+// is the decision the comment above predicted this phase would have to make.
+//
+// These describe how the document reads a file OF ITS OWN: its lexical surface,
+// its literal styles, its recovery points, the artifacts it can be built into.
+// A host that EMBEDS a construct from this document reads the file with its
+// OWN tokenizer — that is precisely what `bindTokens` exists for — so merging
+// the document's tokenizer into the host would not be an unconsumed block, it
+// would be WRONG: two token tables for one input, with the host's own spellings
+// silently contested.
+//
+// ⚠ THE DISTINCTION FROM THE REFUSAL BELOW IS "DELIBERATE" vs "DISCARDED", AND
+// IT IS NOT A SOFTENING OF THE GUARD. Every key here is one whose non-merging
+// is a stated design property with a consumer on the standalone side; a block
+// that is neither merged NOR standalone-identity (`preprocess`, `operators`,
+// `imports`, …) still hits the refusal, because for those "not merged" really
+// does mean "silently does nothing". Adding a key here is a claim that the
+// referenced document itself consumes it — do not add one to quiet a
+// diagnostic.
+constexpr std::array<std::string_view, 7> kStandaloneOnlyDocumentKeys{
+    "tokens", "numberStyle", "keywords", "syncTokens", "artifactProfiles",
+    // `lexerModes` is the other half of `tokens` — a `pushMode` with no mode to
+    // push is a load error, so the two are one lexical surface, not two blocks.
+    "lexerModes",
+    // `assembly` names the document's OWN rules and its own spellings; merging
+    // it would hand a host an instruction vocabulary for a language the host
+    // does not read. It is consumed by the standalone `.s` lowering only.
+    "assembly"};
+DSS_CHECK_KEY_VOCABULARY(kStandaloneOnlyDocumentKeys);
+
 void checkReferencedDocumentBlocks(json const& refDoc,
                                    std::string_view docLabel,
                                    std::string_view hostLabel,
@@ -2273,6 +2315,8 @@ void checkReferencedDocumentBlocks(json const& refDoc,
         if (isDocumentationKey(it.key())) continue;
         if (std::ranges::find(kReferencedDocumentKeys, it.key())
             != kReferencedDocumentKeys.end()) continue;
+        if (std::ranges::find(kStandaloneOnlyDocumentKeys, it.key())
+            != kStandaloneOnlyDocumentKeys.end()) continue;   // deliberate
         if (it.key() == "languageReferences") continue;   // its own refusal
         if (std::ranges::find(kDocumentKeys, it.key()) == kDocumentKeys.end()) {
             continue;                                     // already a typo
@@ -2747,6 +2791,157 @@ void mergeLanguageReferences(
             continue;   // substituting against a broken hole table only adds noise
         }
 
+        // ── entry ── resolved BEFORE the bindings, because the entry's
+        // reachable closure is what SCOPES them (see `reachable` below).
+        std::string entry;
+        {
+            bool entryClean = true;
+            if (!spec.contains("entry") || !spec.at("entry").is_string()
+                || spec.at("entry").get<std::string>().empty()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          std::format("{}/entry", refPath),
+                          "'entry' is required and must name the rule this host "
+                          "reaches the referenced grammar through");
+                entryClean = false;
+            } else {
+                entry = spec.at("entry").get<std::string>();
+                if (!refShapes.contains(entry) || isDocumentationKey(entry)) {
+                    coll.emit(DiagnosticCode::C_UnknownShape,
+                              std::format("{}/entry", refPath),
+                              std::format("'{}' declares no shape '{}'", docLabel,
+                                          entry));
+                    entryClean = false;
+                } else if (!hostRefAtoms.contains(entry)) {
+                    // ★ A DECLARED-BUT-UNREACHED REFERENCE IS THE SILENT FAILURE
+                    // THIS WHOLE BLOCK EXISTS TO PREVENT. Every rule would merge,
+                    // every binding would validate, the load would be clean — and
+                    // the construct would still be a parse error, because no host
+                    // rule ever descends into it. Loud.
+                    coll.emit(DiagnosticCode::C_UnknownShape,
+                              std::format("{}/entry", refPath),
+                              std::format("no shape in '{}' references the entry "
+                                          "rule '{}' — the referenced grammar "
+                                          "would merge cleanly and still never be "
+                                          "reached; add '{}' to the host rule that "
+                                          "should descend into it", hostLabel,
+                                          entry, entry));
+                    entryClean = false;
+                }
+            }
+            if (!entryClean) continue;   // nothing bound yet — nothing to unwind
+        }
+
+        // ── the entry's REACHABLE CLOSURE ─────────────────────────────────────
+        //
+        // ★★★ A REFERENCE IMPORTS THE ENTRY'S CLOSURE, NOT THE DOCUMENT (P2.5,
+        // 2026-08-12), and this set is the single answer used THREE times below:
+        // which shapes merge, which rule-scoped rows travel with them, and — the
+        // clause added when the standalone `.s` surface landed — which HOLES this
+        // host is on the hook for.
+        //
+        // A referenced language has TWO surfaces (plan 29 §4): the constructs a
+        // host EMBEDS, reached from the declared `entry`, and its own STANDALONE
+        // surface — a `root` translation unit read with its own tokenizer. Only
+        // the first is what a reference asks for. Merging the whole document
+        // instead breaks in three separate ways, each of them silent or fatal:
+        //   1. `root` COLLIDES. Every language's root shape is named `root`
+        //      (`data.rootRule = rules->intern("root")`), so the moment the
+        //      referenced document grows a standalone root, the duplicate-shape
+        //      guard fires on a host that did nothing wrong and asked for
+        //      nothing of the kind.
+        //   2. The standalone rules name the referenced document's OWN token
+        //      kinds, which the host's tokenizer does not have. They would
+        //      arrive in the host's grammar referring to kinds nothing can
+        //      produce — dead rules that make FIRST-set computation answer
+        //      questions about a language the host does not speak.
+        //   3. It makes `entry` decorative. A host declares exactly which
+        //      construct it is embedding; importing everything else says that
+        //      declaration did not mean anything.
+        // ⓘ Reachability is computed over the JSON bodies (pre-interning, and
+        // pre-substitution — substitution only rewrites HOLE names, which are
+        // never shape names, so the walk sees the identical set either side of
+        // it) by collecting every string that NAMES one of the referenced
+        // document's own shapes. Token kinds and hole names are strings too, but
+        // a shape name and a token kind cannot collide — the shadow guard forbids
+        // it — so the walk cannot over-include, and anything it cannot see is not
+        // a rule reference at all.
+        std::unordered_set<std::string> reachable;
+        {
+            std::vector<std::string> work;
+            reachable.insert(entry);
+            work.push_back(entry);
+            auto collectNames = [&](json const& node, auto&& self) -> void {
+                if (node.is_string()) {
+                    auto const name = node.get<std::string>();
+                    if (refShapes.contains(name) && reachable.insert(name).second) {
+                        work.push_back(name);
+                    }
+                    return;
+                }
+                if (node.is_array()) {
+                    for (auto const& e : node) self(e, self);
+                    return;
+                }
+                if (node.is_object()) {
+                    for (auto const& [k, v] : node.items()) {
+                        if (isDocumentationKey(k)) continue;
+                        self(v, self);
+                    }
+                }
+            };
+            while (!work.empty()) {
+                auto const name = work.back();
+                work.pop_back();
+                collectNames(refShapes.at(name), collectNames);
+            }
+        }
+
+        // ★★★ AND THE HOLES THE CLOSURE ACTUALLY SPELLS — the same scoping, one
+        // tier down, and it is what makes a MULTI-SURFACE referenced document
+        // usable at all. `requires` is declared once for the WHOLE document, but
+        // its two surfaces spell DIFFERENT holes: the embedded `asmStmt` chain
+        // needs the host's expression and string-payload rules, while the
+        // standalone `.s` line structure needs a mnemonic token and an operand
+        // production and has no use for either. Scoping `requires` by document
+        // would force every host to bind holes its entry can never reach — a
+        // binding that does nothing, which is exactly the silent no-op the two
+        // checks below exist to refuse. So the contract is per-ENTRY: a host owes
+        // bindings for the holes ITS closure spells, and owes nothing for the
+        // rest.
+        // ⚠ NOT "bind whatever you like and we'll ignore the extras": an unbound
+        // SPELLED hole is still a load error (Direction 2), and a binding for an
+        // UNSPELLED hole is also a load error (Direction 1) — a host that thinks
+        // it is configuring something must be told when it is not.
+        std::unordered_set<std::string> ruleHoles(refHoles.rules.begin(),
+                                                  refHoles.rules.end());
+        std::unordered_set<std::string> tokenHoles(refHoles.tokens.begin(),
+                                                   refHoles.tokens.end());
+        std::unordered_set<std::string> spelledHoles;
+        {
+            auto collectHoles = [&](json const& node, auto&& self) -> void {
+                if (node.is_string()) {
+                    auto const name = node.get<std::string>();
+                    if (ruleHoles.contains(name) || tokenHoles.contains(name)) {
+                        spelledHoles.insert(name);
+                    }
+                    return;
+                }
+                if (node.is_array()) {
+                    for (auto const& e : node) self(e, self);
+                    return;
+                }
+                if (node.is_object()) {
+                    for (auto const& [k, v] : node.items()) {
+                        if (isDocumentationKey(k)) continue;
+                        self(v, self);
+                    }
+                }
+            };
+            for (auto const& name : reachable) {
+                collectHoles(refShapes.at(name), collectHoles);
+            }
+        }
+
         // Bindings validated below get appended to `pendingRuleBindings`, which
         // is checked after the loop. If THIS reference turns out to be
         // half-bound we drop back to here, so a document that never merged does
@@ -2754,10 +2949,6 @@ void mergeLanguageReferences(
         auto const pendingMark = pendingRuleBindings.size();
 
         std::unordered_map<std::string, std::string> bind;   // hole → concrete
-        std::unordered_set<std::string> ruleHoles(refHoles.rules.begin(),
-                                                  refHoles.rules.end());
-        std::unordered_set<std::string> tokenHoles(refHoles.tokens.begin(),
-                                                   refHoles.tokens.end());
         std::vector<std::pair<std::string, std::string>> tokenBindings;
         bool bindingsClean = true;
 
@@ -2811,6 +3002,25 @@ void mergeLanguageReferences(
                     bindingsClean = false;
                     continue;
                 }
+                if (!spelledHoles.contains(it.key())) {
+                    // The hole EXISTS, in the right category — and this entry's
+                    // closure never spells it, so substituting it would rewrite
+                    // nothing. Refused for the same reason as an unknown hole:
+                    // a host that believes it is configuring a construct must be
+                    // told when the construct it named is on the OTHER surface.
+                    coll.emit(DiagnosticCode::C_UnknownShape, entryPath,
+                              std::format("'{}' binds the {} hole '{}', which "
+                                          "'{}' declares but which the rules "
+                                          "reachable from entry '{}' never spell "
+                                          "— the binding would substitute "
+                                          "nothing. A referenced document may "
+                                          "carry more than one surface; bind the "
+                                          "holes YOUR entry reaches",
+                                          key, category, it.key(), docLabel,
+                                          entry));
+                    bindingsClean = false;
+                    continue;
+                }
                 auto value = it.value().get<std::string>();
                 sink(it.key(), value, entryPath);
                 bind.emplace(it.key(), std::move(value));
@@ -2837,58 +3047,31 @@ void mergeLanguageReferences(
         // construct. Same reasoning as `validateTypeNameCommitGuards`: a guard
         // whose input is missing fails loud at LOAD rather than quietly
         // choosing the dangerous default at runtime.
+        // ⚠ SCOPED TO THE ENTRY'S CLOSURE (`spelledHoles`), NOT TO THE DOCUMENT.
+        // The strictness is unchanged for every hole this host can actually
+        // reach; what changed is that a hole belonging to the referenced
+        // document's OTHER surface is not this host's to bind. See the
+        // `spelledHoles` block above for why that is the contract rather than a
+        // relaxation.
         auto requireBound = [&](std::vector<std::string> const& holes,
                                 char const* key) {
             for (auto const& hole : holes) {
+                if (!spelledHoles.contains(hole)) continue;
                 if (bind.contains(hole)) continue;
                 coll.emit(DiagnosticCode::C_MissingField,
                           std::format("{}/{}", refPath, key),
-                          std::format("hole '{}' declared by '{}' is UNBOUND — "
-                                      "'{}' must map it to one of this "
+                          std::format("hole '{}' declared by '{}' and spelled by "
+                                      "the rules reachable from entry '{}' is "
+                                      "UNBOUND — '{}' must map it to one of this "
                                       "document's own names. An unbound hole "
                                       "is never a silent disable: the rules "
                                       "that spell it would resolve against "
-                                      "nothing", hole, docLabel, key));
+                                      "nothing", hole, docLabel, entry, key));
                 bindingsClean = false;
             }
         };
         requireBound(refHoles.rules,  "bindRules");
         requireBound(refHoles.tokens, "bindTokens");
-
-        // ── entry ──
-        std::string entry;
-        if (!spec.contains("entry") || !spec.at("entry").is_string()
-            || spec.at("entry").get<std::string>().empty()) {
-            coll.emit(DiagnosticCode::C_MissingField,
-                      std::format("{}/entry", refPath),
-                      "'entry' is required and must name the rule this host "
-                      "reaches the referenced grammar through");
-            bindingsClean = false;
-        } else {
-            entry = spec.at("entry").get<std::string>();
-            if (!refShapes.contains(entry) || isDocumentationKey(entry)) {
-                coll.emit(DiagnosticCode::C_UnknownShape,
-                          std::format("{}/entry", refPath),
-                          std::format("'{}' declares no shape '{}'", docLabel,
-                                      entry));
-                bindingsClean = false;
-            } else if (!hostRefAtoms.contains(entry)) {
-                // ★ A DECLARED-BUT-UNREACHED REFERENCE IS THE SILENT FAILURE
-                // THIS WHOLE BLOCK EXISTS TO PREVENT. Every rule would merge,
-                // every binding would validate, the load would be clean — and
-                // the construct would still be a parse error, because no host
-                // rule ever descends into it. Loud.
-                coll.emit(DiagnosticCode::C_UnknownShape,
-                          std::format("{}/entry", refPath),
-                          std::format("no shape in '{}' references the entry "
-                                      "rule '{}' — the referenced grammar "
-                                      "would merge cleanly and still never be "
-                                      "reached; add '{}' to the host rule that "
-                                      "should descend into it", hostLabel,
-                                      entry, entry));
-                bindingsClean = false;
-            }
-        }
 
         if (!bindingsClean) {
             // Do not merge a half-bound document, and do not re-report its
@@ -2915,10 +3098,14 @@ void mergeLanguageReferences(
         // and nothing equivalent anywhere in the loader. Two documents make
         // that reachable by accident, so it is checked here and named at BOTH
         // ends — you cannot fix a collision you can only see one side of.
+        // ★★★ THE MERGE IMPORTS THE ENTRY'S REACHABLE CLOSURE, NOT THE WHOLE
+        // DOCUMENT — `reachable`, computed above (with the full rationale) and
+        // used here for the shapes and below for the rule-scoped rows.
         json& hostShapes = doc["shapes"];
         if (!hostShapes.is_object()) hostShapes = json::object();
         for (auto const& [shapeName, body] : merged.at("shapes").items()) {
             if (isDocumentationKey(shapeName)) continue;
+            if (!reachable.contains(shapeName)) continue;   // standalone-only
             if (hostShapes.contains(shapeName)) {
                 auto const owner = outShapeOrigin.find(shapeName);
                 const std::string ownerLabel =
@@ -3006,6 +3193,22 @@ void mergeLanguageReferences(
                         if (row.is_object() && row.contains("rule")
                             && row.at("rule").is_string()) {
                             auto const r = row.at("rule").get<std::string>();
+                            // ★★★ ROWS FOLLOW THEIR RULE. A row whose rule was
+                            // NOT imported (standalone-only — see the closure
+                            // walk above) must not travel either, and this is
+                            // the clause that stops the worst outcome in the
+                            // whole mechanism: `asm.lang.json` declares
+                            // `pipelineEntry.byRule` = { rule: "root", tier:
+                            // "encode" } for its OWN standalone `.s` unit. Rows
+                            // are matched by rule NAME, and EVERY language's
+                            // root shape is named `root` — so an unscoped merge
+                            // would silently declare the HOST's translation
+                            // unit as entering at the assembler. Every C file
+                            // would then bypass HIR, MIR and the optimizer.
+                            // That is not a broken build; it is a silent
+                            // miscompile of the entire host language, produced
+                            // by a config that never mentioned C.
+                            if (!reachable.contains(r)) continue;
                             auto const [it, fresh] =
                                 claimedBy.emplace(r, docLabel);
                             if (!fresh) {
@@ -3038,7 +3241,87 @@ void mergeLanguageReferences(
                     }
                     continue;
                 }
+                // ★★★ A KEY-WISE ENTRY FOLLOWS ITS RULES TOO — the same scoping
+                // the shapes and the rule-scoped rows get, and it is what makes
+                // a MULTI-SURFACE referenced document loadable at all.
+                // ✔MEASURED 2026-08-12, the first time a dialect document
+                // referenced the standalone surface: `semantics.inlineAsm`
+                // describes the EMBEDDED `__asm__(…)` chain and names twelve
+                // rules (`asmStmt`, `asmOutputsTail`, …), NONE of which the
+                // `asmLine` closure imports. Merged unconditionally it arrived
+                // in a host that had never heard of them, and the load died
+                // with twelve `C_UnknownShape` errors pointing at a facet the
+                // host never asked for. Scoping the shapes without scoping the
+                // facets that DESCRIBE them is half a mechanism.
+                // The rule, stated once: an entry travels iff the referenced
+                // document's own rule names inside it are in the closure. An
+                // entry naming NO such rules is surface-neutral data and always
+                // travels; an entry naming rules from BOTH surfaces is refused,
+                // because a facet that half-applies is the silent
+                // half-configuration this loader refuses everywhere else.
+                {
+                    std::size_t inClosure = 0, outOfClosure = 0;
+                    std::string firstOut;
+                    auto scan = [&](json const& node, auto&& self) -> void {
+                        if (node.is_string()) {
+                            auto const n = node.get<std::string>();
+                            if (!refShapes.contains(n)) return;
+                            if (reachable.contains(n)) { ++inClosure; return; }
+                            if (firstOut.empty()) firstOut = n;
+                            ++outOfClosure;
+                            return;
+                        }
+                        if (node.is_array()) {
+                            for (auto const& e : node) self(e, self);
+                            return;
+                        }
+                        if (node.is_object()) {
+                            for (auto const& [k, v] : node.items()) {
+                                if (isDocumentationKey(k)) continue;
+                                self(v, self);
+                            }
+                        }
+                    };
+                    scan(value, scan);
+                    if (outOfClosure != 0 && inClosure != 0) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}#/{}/{}", docLabel, blockName,
+                                              key),
+                                  std::format("'{}.{}' in '{}' names rules on "
+                                              "BOTH sides of entry '{}'s "
+                                              "reachable closure (e.g. '{}' is "
+                                              "outside it) — a facet that "
+                                              "half-applies would be a silent "
+                                              "half-configuration; split it so "
+                                              "each surface owns its own",
+                                              blockName, key, docLabel, entry,
+                                              firstOut));
+                        continue;
+                    }
+                    if (outOfClosure != 0) continue;   // the OTHER surface's
+                }
                 if (hostBlock.contains(key)) {
+                    // ⚠ A DOCUMENTATION KEY IS NOT A CONFLICTING FACET, AND
+                    // REFUSING IT WAS WRONG. ✔MEASURED the same day: both
+                    // `asm.lang.json` and a dialect document explain their own
+                    // `pipelineEntry` rows in a `$comment`, and the collision
+                    // refused a load in which nothing had actually collided.
+                    // The stated intent of merging `$` keys is that "a moved
+                    // rationale travels with the facet it explains" — so it is
+                    // RE-KEYED under the referenced document's own name and
+                    // both survive, rather than one silently replacing the
+                    // other or the pair failing the load.
+                    if (isDocumentationKey(key)) {
+                        std::string alias = "$";
+                        for (char const ch : docLabel) {
+                            if (ch == '.') break;      // stem only
+                            alias += (ch == '-') ? '_' : ch;
+                        }
+                        alias += key.substr(1);
+                        alias += "Comment";
+                        if (!hostBlock.contains(alias)) hostBlock[alias] = value;
+                        continue;
+                    }
                     coll.emit(DiagnosticCode::C_ConflictingField,
                               std::format("{}#/{}/{}", docLabel, blockName, key),
                               std::format("'{}.{}' is declared by BOTH '{}' and "
@@ -13407,35 +13690,53 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         //
                         // ⚠ LAYERING, STATED RATHER THAN HIDDEN: "which tiers
                         // this build can enter at" is a property of the
-                        // DRIVER, and `core` cannot ask it. The constant below
-                        // is therefore a deliberate, named, DELETABLE
-                        // duplication — plan 29 P2.5/P4 adds the LIR entry
-                        // path and the SAME change widens or removes this
-                        // guard. It is not a claim that the vocabulary is
-                        // smaller than {hir, mir, lir}; the vocabulary is the
-                        // closed set above, and this is a statement about what
-                        // is WIRED UP. Do not "simplify" it away by narrowing
-                        // `PipelineTier` — that would delete the vocabulary
-                        // the next phase declares against.
-                        constexpr PipelineTier kOnlyImplementedEntryTier =
-                            PipelineTier::Hir;
-                        if (entry.tier != kOnlyImplementedEntryTier) {
+                        // DRIVER, and `core` cannot ask it. The table below
+                        // is therefore a deliberate, named, SHRINKABLE
+                        // duplication. It is not a claim that the vocabulary
+                        // is smaller than the closed set above; the vocabulary
+                        // is that set, and this states what is WIRED UP. Do
+                        // not "simplify" it away by narrowing `PipelineTier` —
+                        // that would delete the vocabulary a later phase
+                        // declares against.
+                        //
+                        // ★ P2.5/P4 (2026-08-12) added the SECOND entry:
+                        // `encode` is consumed by `compileAsmUnit` in
+                        // `program/compile_pipeline.cpp`, which parses a
+                        // standalone `.s`, builds physical-register LIR and
+                        // calls `assemble()` directly. `mir` and `lir` stay
+                        // refused — declaring either today would load clean,
+                        // be read by nobody, and leave the construct on the
+                        // FULL pipeline: for assembly, running hand-written
+                        // instructions through the optimizer, which is the
+                        // exact silent miscompile of intent this facet exists
+                        // to prevent. Refusing here is the only place that can
+                        // see it.
+                        static constexpr std::array kImplementedEntryTiers{
+                            PipelineTier::Hir, PipelineTier::Encode};
+                        if (std::ranges::find(kImplementedEntryTiers,
+                                              entry.tier)
+                            == kImplementedEntryTiers.end()) {
+                            std::string implemented;
+                            for (auto const t : kImplementedEntryTiers) {
+                                if (!implemented.empty()) implemented += ", ";
+                                implemented += '\'';
+                                implemented += pipelineTierName(t);
+                                implemented += '\'';
+                            }
                             coll.emit(DiagnosticCode::C_InvalidHirLowering,
                                       path + "/tier",
                                       std::format(
                                           "rule '{}' declares pipeline entry "
                                           "tier '{}', but no component of this "
-                                          "build consumes an entry other than "
-                                          "'{}' yet — accepting the row would "
+                                          "build consumes that entry yet (wired "
+                                          "up: {}) — accepting the row would "
                                           "SILENTLY leave '{}' on the full "
                                           "CST->HIR->MIR->LIR pipeline instead "
                                           "of the tier it asked for. The entry "
                                           "path and the row land together "
-                                          "(plan 29 P2.5/P4)", entry.ruleName,
+                                          "(plan 29)", entry.ruleName,
                                           pipelineTierName(entry.tier),
-                                          pipelineTierName(
-                                              kOnlyImplementedEntryTier),
-                                          entry.ruleName));
+                                          implemented, entry.ruleName));
                             continue;
                         }
                         if (!claimed.insert(entry.rule.v).second) {
@@ -13451,6 +13752,571 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                     data.pipelineEntry = std::move(cfg);
                 }
+            }
+        }
+    }
+
+    // ── assembly ── the text→LIR contract of an ASSEMBLY DIALECT (plan 29
+    // P3/P4; schema v4). Parsed LATE for the same reason `pipelineEntry` is:
+    // every landmark names a RULE, and the shapes block must have interned them
+    // (including the ones a `languageReferences` merge contributed) before a
+    // name can resolve here.
+    //
+    // ★★ EVERY KEY IS REQUIRED WHEN THE BLOCK IS PRESENT, and that is the
+    // `semantics.inlineAsm` discipline restated: a PARTIAL declaration is a load
+    // error, never a half-configuration. A missing `labelTailRule` would mean
+    // the lowering silently stops recognizing labels and reads every `main:` as
+    // a zero-operand instruction named `main` — which then fails as "unknown
+    // mnemonic 'main'", a true diagnostic pointing at the wrong thing. The block
+    // being ABSENT is the other, legal meaning: this language is not an assembly
+    // dialect, and no `.s` lowering will ever run for it.
+    if (doc.contains("assembly")) {
+        json const& as = doc.at("assembly");
+        if (!as.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidHirLowering, "/assembly",
+                      "'assembly' must be an object");
+        } else {
+            static constexpr std::array<std::string_view, 10> kAssemblyKeys{
+                "unitRule",      "lineRule",      "elementRule",
+                "directiveRule", "statementRule", "labelTailRule",
+                "operandSeqRule", "operandOrder", "operandForms",
+                "instructions"};
+            DSS_CHECK_KEY_VOCABULARY(kAssemblyKeys);
+            // `directives` is intentionally NOT in the required set above — it
+            // is validated separately below because it is the one key whose
+            // ABSENCE is legal (a dialect with no directive vocabulary refuses
+            // every directive by name, which is a coherent state).
+            for (auto it = as.begin(); it != as.end(); ++it) {
+                if (isDocumentationKey(it.key())) continue;
+                if (it.key() == "directives") continue;
+                if (it.key() == "entryLabels") continue;
+                if (std::ranges::find(kAssemblyKeys, it.key())
+                    != kAssemblyKeys.end()) continue;
+                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                          std::format("/assembly/{}", it.key()),
+                          std::format("unknown key '{}' in 'assembly' (typo "
+                                      "discriminator: a misspelled landmark "
+                                      "would leave its rule unrecognized and "
+                                      "the lowering would refuse valid input "
+                                      "for the wrong reason)", it.key()));
+            }
+
+            AssemblyConfig cfg;
+            bool assemblyClean = true;
+
+            // One landmark: required, must be a string, must name a rule that
+            // exists. A landmark naming nothing is the "capability claim with no
+            // subject" the `pipelineEntry` rule-check refuses one block up.
+            auto readRule = [&](char const* key, RuleId& out) {
+                const auto path = std::format("/assembly/{}", key);
+                if (!as.contains(key) || !as.at(key).is_string()
+                    || as.at(key).get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path,
+                              std::format("'{}' is required and must name one of "
+                                          "this grammar's rules", key));
+                    assemblyClean = false;
+                    return;
+                }
+                const auto name = as.at(key).get<std::string>();
+                if (!data.rules->contains(name)) {
+                    coll.emit(DiagnosticCode::C_UnknownShape, path,
+                              std::format("'assembly.{}' names unknown shape "
+                                          "'{}' — the lowering walks the tree by "
+                                          "RuleId, so a landmark that resolves to "
+                                          "nothing would silently never match",
+                                          key, name));
+                    assemblyClean = false;
+                    return;
+                }
+                out = data.rules->find(name);
+            };
+            readRule("unitRule",       cfg.unitRule);
+            readRule("lineRule",       cfg.lineRule);
+            readRule("elementRule",    cfg.elementRule);
+            readRule("directiveRule",  cfg.directiveRule);
+            readRule("statementRule",  cfg.statementRule);
+            readRule("labelTailRule",  cfg.labelTailRule);
+            readRule("operandSeqRule", cfg.operandSeqRule);
+
+            // ── operandOrder ── the ONE dialect-wide fact (see
+            // `assembly_config.hpp` for why it is not per-instruction).
+            if (!as.contains("operandOrder") || !as.at("operandOrder").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/assembly/operandOrder",
+                          std::format("'operandOrder' is required and must be one "
+                                      "of {} — it is the single fact that "
+                                      "distinguishes AT&T from Intel, and "
+                                      "defaulting it would silently reverse every "
+                                      "instruction's operands",
+                                      asmNameList(kAsmOperandOrderNames)));
+                assemblyClean = false;
+            } else {
+                const auto name = as.at("operandOrder").get<std::string>();
+                const auto v = asmOperandOrderFromName(name);
+                if (!v) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/assembly/operandOrder",
+                              std::format("unknown operand order '{}' — the "
+                                          "closed set is {}", name,
+                                          asmNameList(kAsmOperandOrderNames)));
+                    assemblyClean = false;
+                } else {
+                    cfg.operandOrder = *v;
+                }
+            }
+
+            // ── operandForms ── EVERY role bound, or the block is refused.
+            if (!as.contains("operandForms") || !as.at("operandForms").is_object()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/assembly/operandForms",
+                          "'operandForms' is required and must map every operand "
+                          "role to one of this document's rules");
+                assemblyClean = false;
+            } else {
+                json const& forms = as.at("operandForms");
+                for (auto it = forms.begin(); it != forms.end(); ++it) {
+                    if (isDocumentationKey(it.key())) continue;
+                    bool known = false;
+                    for (auto const& [text, role] : kAsmOperandRoleNames) {
+                        (void)role;
+                        if (text == it.key()) { known = true; break; }
+                    }
+                    if (!known) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  std::format("/assembly/operandForms/{}",
+                                              it.key()),
+                                  std::format("unknown operand role '{}' — the "
+                                              "closed set is {}", it.key(),
+                                              asmNameList(kAsmOperandRoleNames)));
+                        assemblyClean = false;
+                    }
+                }
+                // ★★★ A RULE BOUND TO TWO ROLES IS LEGAL AND MEANINGFUL — see
+                // `AssemblyConfig::rolesForRule`. aarch64 gas has no register
+                // sigil, so one token is both a register spelling and a symbol
+                // spelling, and the dialect says so by binding both roles to
+                // one rule; the LOOKUP (`registerByName`) decides per operand.
+                // ⚠ WHAT IS STILL REFUSED is the pairing no lookup can settle:
+                // two NON-register roles on one rule. `register` is the only
+                // role whose membership is decidable by asking the target, so a
+                // `scalar`+`immediate` pair (say) would leave the lowering
+                // picking by enumerator order — the silent first-match this
+                // check replaced.
+                std::unordered_map<std::string, std::string> ruleToNonRegRole;
+                for (auto const& [text, role] : kAsmOperandRoleNames) {
+                    const auto path =
+                        std::format("/assembly/operandForms/{}", text);
+                    if (!forms.contains(text)) {
+                        coll.emit(DiagnosticCode::C_MissingField, path,
+                                  std::format("operand role '{}' is UNMENTIONED "
+                                              "— every role must be either bound "
+                                              "to a rule or declared ABSENT "
+                                              "(null), because a role the "
+                                              "lowering cannot recognize makes "
+                                              "its operand shape refuse to match "
+                                              "rather than announce that it was "
+                                              "never configured", text));
+                        assemblyClean = false;
+                        continue;
+                    }
+                    // ★ EXPLICIT `null` = "this dialect has no such shape".
+                    // Distinguishable from an omission, which is why the key is
+                    // still required. aarch64 gas has no `displaced` and no
+                    // `indirect` form at all.
+                    if (forms.at(text).is_null()) continue;
+                    if (!forms.at(text).is_string()
+                        || forms.at(text).get<std::string>().empty()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                  std::format("operand role '{}' must name one "
+                                              "of this document's rules, or be "
+                                              "null to declare the shape absent",
+                                              text));
+                        assemblyClean = false;
+                        continue;
+                    }
+                    const auto ruleName = forms.at(text).get<std::string>();
+                    if (!data.rules->contains(ruleName)) {
+                        coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                  std::format("operand role '{}' is bound to '{}', "
+                                              "which is not a rule in this grammar",
+                                              text, ruleName));
+                        assemblyClean = false;
+                        continue;
+                    }
+                    if (role != AsmOperandRole::Register) {
+                        auto const [slot, fresh] =
+                            ruleToNonRegRole.emplace(ruleName,
+                                                     std::string{text});
+                        if (!fresh) {
+                            coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                      std::format("operand roles '{}' and '{}' "
+                                                  "are BOTH bound to rule '{}', "
+                                                  "and NEITHER is 'register' — "
+                                                  "so nothing can tell them "
+                                                  "apart and the lowering would "
+                                                  "pick by declaration order. A "
+                                                  "shared binding is legal when "
+                                                  "one side IS 'register' (the "
+                                                  "lowering asks the target "
+                                                  "whether the spelling names "
+                                                  "one, which is what a "
+                                                  "sigil-less assembly syntax "
+                                                  "needs). If this dialect has "
+                                                  "no such operand shape at all, "
+                                                  "say so: bind the role to null "
+                                                  "rather than to a stand-in "
+                                                  "rule",
+                                                  slot->second, text, ruleName));
+                            assemblyClean = false;
+                            continue;
+                        }
+                    }
+                    cfg.operandFormRules[static_cast<std::size_t>(role)] =
+                        data.rules->find(ruleName);
+                }
+            }
+
+            // ── instructions ── the spelling vocabulary. ⚠ THE OPCODE NAME IS
+            // NOT RESOLVED HERE, and that is layering rather than laxity: the
+            // opcode table lives in `.target.json` and `core` has no target in
+            // scope at schema-load time. The lowering resolves each name through
+            // `TargetSchema::opcodeByMnemonic` against the ACTIVE target and
+            // fails loud naming both the spelling and the target — which is the
+            // only place that can be right, since one dialect document is read
+            // for more than one (target, format) pair.
+            if (!as.contains("instructions") || !as.at("instructions").is_array()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/assembly/instructions",
+                          "'instructions' is required and must be an array of "
+                          "{ spelling, opcodes[], width, cond? } rows");
+                assemblyClean = false;
+            } else {
+                json const& arr = as.at("instructions");
+                std::unordered_set<std::string> seenSpellings;
+                for (std::size_t i = 0; i < arr.size(); ++i) {
+                    const auto path =
+                        std::format("/assembly/instructions/{}", i);
+                    json const& row = arr[i];
+                    if (!row.is_object()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                  "each 'instructions' entry must be an object");
+                        assemblyClean = false;
+                        continue;
+                    }
+                    static constexpr std::array<std::string_view, 4>
+                        kInstRowKeys{"spelling", "opcodes", "width", "cond"};
+                    DSS_CHECK_KEY_VOCABULARY(kInstRowKeys);
+                    for (auto it = row.begin(); it != row.end(); ++it) {
+                        if (isDocumentationKey(it.key())) continue;
+                        if (std::ranges::find(kInstRowKeys, it.key())
+                            != kInstRowKeys.end()) continue;
+                        // ★ NAME THE RENAME. `opcode` (a single string) was
+                        // this key's shape until one mnemonic had to denote a
+                        // SET of target opcodes chosen by operand shape. The
+                        // generic "unknown key" text would send a reader
+                        // hunting for a typo that is not there.
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  std::format("{}/{}", path, it.key()),
+                                  it.key() == "opcode"
+                                      ? std::string{
+                                            "'opcode' (a single opcode name) "
+                                            "was replaced by 'opcodes' — an "
+                                            "ARRAY of candidate target opcode "
+                                            "names, elected by the operand "
+                                            "shape against the target's own "
+                                            "encoding guards. Write "
+                                            "\"opcodes\": [\"mov\"] for the "
+                                            "single-candidate case"}
+                                      : std::format("unknown key '{}' in an "
+                                                    "'instructions' row (typo "
+                                                    "discriminator)", it.key()));
+                        assemblyClean = false;
+                    }
+                    AsmInstructionSpelling ins;
+                    if (!row.contains("spelling") || !row.at("spelling").is_string()
+                        || row.at("spelling").get<std::string>().empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  path + "/spelling",
+                                  "'spelling' is required and must be the "
+                                  "mnemonic as written in a .s file");
+                        assemblyClean = false;
+                        continue;
+                    }
+                    ins.spelling = row.at("spelling").get<std::string>();
+                    // ── opcodes ── the CANDIDATE SET, in election order.
+                    if (!row.contains("opcodes")
+                        || !row.at("opcodes").is_array()
+                        || row.at("opcodes").empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  path + "/opcodes",
+                                  "'opcodes' is required and must be a NON-EMPTY "
+                                  "array of opcode names from the active "
+                                  "target's 'opcodes[]' — one mnemonic denotes "
+                                  "the set of target opcodes its operand shapes "
+                                  "can elect (AT&T 'movq' is mov / load / "
+                                  "store), and an empty set denotes nothing");
+                        assemblyClean = false;
+                        continue;
+                    }
+                    {
+                        bool opcodesClean = true;
+                        json const& names = row.at("opcodes");
+                        for (std::size_t k = 0; k < names.size(); ++k) {
+                            if (!names[k].is_string()
+                                || names[k].get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          std::format("{}/opcodes/{}", path, k),
+                                          "each candidate must be a non-empty "
+                                          "opcode name");
+                                opcodesClean = false;
+                                continue;
+                            }
+                            auto name = names[k].get<std::string>();
+                            // ★ A REPEATED CANDIDATE IS DEAD CONFIG. Election
+                            // is first-match over this list, so the second
+                            // copy can never win — and a reader would take the
+                            // repetition as meaning something.
+                            if (std::ranges::find(ins.opcodeNames, name)
+                                != ins.opcodeNames.end()) {
+                                coll.emit(DiagnosticCode::C_ConflictingField,
+                                          std::format("{}/opcodes/{}", path, k),
+                                          std::format("opcode '{}' is listed "
+                                                      "twice for mnemonic '{}' "
+                                                      "— election is "
+                                                      "first-match, so the "
+                                                      "repeat can never be "
+                                                      "chosen", name,
+                                                      ins.spelling));
+                                opcodesClean = false;
+                                continue;
+                            }
+                            ins.opcodeNames.push_back(std::move(name));
+                        }
+                        if (!opcodesClean) {
+                            assemblyClean = false;
+                            continue;
+                        }
+                    }
+                    // ── cond ── OPTIONAL; the TargetCondCode this spelling
+                    // carries. ⚠ THE NAME IS NOT RESOLVED HERE, for the same
+                    // layering reason the opcode names are not: whether a
+                    // condition is realizable is a TARGET fact
+                    // (`condCodeEncoding`), and one dialect document is read
+                    // for more than one target. The lowering resolves it
+                    // EAGERLY — before any statement is walked — so a bad or
+                    // unrealizable condition fails naming the dialect and the
+                    // target, never later at the encoder.
+                    if (row.contains("cond")) {
+                        if (!row.at("cond").is_string()
+                            || row.at("cond").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/cond",
+                                      "'cond' must be a non-empty condition-code "
+                                      "name (the substrate's TargetCondCode "
+                                      "vocabulary: 'eq', 'ne', 'slt', ...)");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.condName = row.at("cond").get<std::string>();
+                    }
+                    // ── width ── OPTIONAL. ★★ ABSENT MEANS "THE OPERANDS SAY",
+                    // which is what a dialect that encodes width in the
+                    // REGISTER needs (aarch64: `add x0,x1,x2` vs `add
+                    // w0,w1,w2`, one mnemonic, two widths). PRESENT means the
+                    // suffix says (AT&T `movq`/`movl`) — and the lowering then
+                    // CHECKS it against the operands rather than trusting it.
+                    if (row.contains("width")) {
+                        if (!row.at("width").is_number_unsigned()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/width",
+                                      "'width' must be an operand width in BITS "
+                                      "(8, 16, 32 or 64); omit the key entirely "
+                                      "for a dialect whose registers carry the "
+                                      "width");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.width = row.at("width").get<std::uint32_t>();
+                    }
+                    // ★ A DUPLICATE SPELLING IS A LOAD ERROR. `instructionBySpelling`
+                    // is first-match, so a second row for `movq` would be dead
+                    // config that silently never applies — and the one that DID
+                    // apply would be whichever the author happened to write first.
+                    if (!seenSpellings.insert(ins.spelling).second) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  path + "/spelling",
+                                  std::format("mnemonic '{}' has more than one "
+                                              "'instructions' row — lookup is by "
+                                              "spelling, so the later row would "
+                                              "silently never apply",
+                                              ins.spelling));
+                        assemblyClean = false;
+                        continue;
+                    }
+                    cfg.instructions.push_back(std::move(ins));
+                }
+            }
+
+            // ── entryLabels ── optional; the names that start a program.
+            if (as.contains("entryLabels")) {
+                json const& arr = as.at("entryLabels");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/assembly/entryLabels",
+                              "'entryLabels' must be an array of label names");
+                    assemblyClean = false;
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        if (!arr[i].is_string()
+                            || arr[i].get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      std::format("/assembly/entryLabels/{}", i),
+                                      "each entry label must be a non-empty "
+                                      "name");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        cfg.entryLabels.push_back(arr[i].get<std::string>());
+                    }
+                }
+            }
+
+            // ── directives ── optional block, closed verb set.
+            if (as.contains("directives")) {
+                json const& arr = as.at("directives");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/assembly/directives",
+                              "'directives' must be an array of "
+                              "{ spelling, verb } rows");
+                    assemblyClean = false;
+                } else {
+                    std::unordered_set<std::string> seenDirectives;
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        const auto path =
+                            std::format("/assembly/directives/{}", i);
+                        json const& row = arr[i];
+                        if (!row.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each 'directives' entry must be an object");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        static constexpr std::array<std::string_view, 3>
+                            kDirRowKeys{"spelling", "verb", "marker"};
+                        DSS_CHECK_KEY_VOCABULARY(kDirRowKeys);
+                        for (auto it = row.begin(); it != row.end(); ++it) {
+                            if (isDocumentationKey(it.key())) continue;
+                            if (std::ranges::find(kDirRowKeys, it.key())
+                                != kDirRowKeys.end()) continue;
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      std::format("{}/{}", path, it.key()),
+                                      std::format("unknown key '{}' in a "
+                                                  "'directives' row (typo "
+                                                  "discriminator)", it.key()));
+                            assemblyClean = false;
+                        }
+                        AsmDirectiveSpelling dir;
+                        if (!row.contains("spelling")
+                            || !row.at("spelling").is_string()
+                            || row.at("spelling").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      path + "/spelling",
+                                      "'spelling' is required — the directive "
+                                      "name WITHOUT its introducer");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        dir.spelling = row.at("spelling").get<std::string>();
+                        if (!row.contains("verb") || !row.at("verb").is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      path + "/verb",
+                                      std::format("'verb' is required and must be "
+                                                  "one of {}",
+                                                  asmNameList(kAsmDirectiveVerbNames)));
+                            assemblyClean = false;
+                            continue;
+                        }
+                        const auto verbName = row.at("verb").get<std::string>();
+                        const auto verb = asmDirectiveVerbFromName(verbName);
+                        if (!verb) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/verb",
+                                      std::format("unknown directive verb '{}' — "
+                                                  "the closed set is {}. A "
+                                                  "directive whose meaning this "
+                                                  "build does not implement must "
+                                                  "be left UNDECLARED (and refused "
+                                                  "by name), never mapped to a "
+                                                  "verb that does something else",
+                                                  verbName,
+                                                  asmNameList(kAsmDirectiveVerbNames)));
+                            assemblyClean = false;
+                            continue;
+                        }
+                        dir.verb = *verb;
+                        // ── marker ── OPTIONAL, and legal on `functionEntry`
+                        // ONLY. It is the operand text that distinguishes
+                        // `.type main, @function` from `.type buf, @object` —
+                        // object-format vocabulary, which is why it is config
+                        // and not engine. ABSENT means "naming the symbol is
+                        // enough" (the shape a format with no type annotation
+                        // needs).
+                        // ⚠ REFUSED ON EVERY OTHER VERB rather than ignored: a
+                        // `marker` on `globalSymbol` would read as a filter the
+                        // engine applies, and the engine applies none.
+                        if (row.contains("marker")) {
+                            if (dir.verb != AsmDirectiveVerb::FunctionEntry) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/marker",
+                                          std::format("'marker' is only "
+                                                      "meaningful on a "
+                                                      "'functionEntry' "
+                                                      "directive; '{}' declares "
+                                                      "verb '{}', where the key "
+                                                      "would be silently "
+                                                      "ignored", dir.spelling,
+                                                      verbName));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            if (!row.at("marker").is_string()
+                                || row.at("marker").get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/marker",
+                                          "'marker' must be a non-empty operand "
+                                          "spelling (omit the key entirely to "
+                                          "mean 'no marker required')");
+                                assemblyClean = false;
+                                continue;
+                            }
+                            dir.marker = row.at("marker").get<std::string>();
+                        }
+                        if (!seenDirectives.insert(dir.spelling).second) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      path + "/spelling",
+                                      std::format("directive '{}' has more than "
+                                                  "one row — lookup is by "
+                                                  "spelling, so the later row "
+                                                  "would silently never apply",
+                                                  dir.spelling));
+                            assemblyClean = false;
+                            continue;
+                        }
+                        cfg.directives.push_back(std::move(dir));
+                    }
+                }
+            }
+
+            // ⚠ `declared` IS SET ONLY ON A CLEAN BLOCK. A half-parsed assembly
+            // config is worse than none: the lowering would run with landmarks
+            // that are default-invalid RuleIds, match nothing, and report every
+            // line of a perfectly good `.s` as unrecognized. The load has
+            // already failed by this point (every branch above emits an error),
+            // so this only governs what a diagnostic-tolerant caller sees.
+            if (assemblyClean) {
+                cfg.declared = true;
+                data.assembly = std::move(cfg);
             }
         }
     }

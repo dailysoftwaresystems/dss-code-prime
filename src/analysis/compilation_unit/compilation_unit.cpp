@@ -435,20 +435,45 @@ namespace {
 }
 } // namespace
 
-std::shared_ptr<GrammarSchema const>
-UnitBuilder::schemaForPath_(std::filesystem::path const& path) const {
-    // Match the path's extension (case-insensitively, including the leading dot)
-    // against each registered schema's declared `fileExtensions`; first
-    // registered match wins. Returns null on no match — `addFile` decides
-    // whether that is the single-schema fall-through or a multi-language error.
+std::vector<std::shared_ptr<GrammarSchema const>>
+UnitBuilder::schemasForPath_(std::filesystem::path const& path) const {
+    // ★★ EVERY claimant, not the first (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET).
+    //
+    // This used to `return s;` on the first registered schema whose
+    // `fileExtensions` matched, which is a correct answer only while no two
+    // registered languages can claim one extension. That stopped being true
+    // the moment a second assembly dialect shipped: `asm-x86_64-att` and
+    // `asm-arm64-gas` BOTH declare `.s`/`.S`, and they disagree about what a
+    // `#` means (a comment in one, an immediate in the other) — so
+    // first-registered-wins would not have produced a parse ERROR, it would
+    // have produced a WRONG PARSE under a plausible grammar, silently, with
+    // registration order as the deciding input.
+    //
+    // Collecting all claimants moves the decision to the caller, which is the
+    // only layer that can have the missing information (`addFile` has none and
+    // fails loud; the DRIVER has the target and answers). Deduplicated by
+    // schema IDENTITY so `registerSchema(s); registerSchema(s);` — explicitly
+    // allowed, and exercised by `test_hir_lowering_multi_lang` — reads as one
+    // claimant rather than a self-ambiguity.
+    std::vector<std::shared_ptr<GrammarSchema const>> claimants;
     std::string const ext = asciiLower(path.extension().string());
-    if (ext.empty()) return nullptr;
+    if (ext.empty()) return claimants;
     for (auto const& s : schemas_) {
+        bool matches = false;
         for (std::string_view declared : s->fileExtensions()) {
-            if (asciiLower(declared) == ext) return s;
+            if (asciiLower(declared) == ext) { matches = true; break; }
         }
+        if (!matches) continue;
+        bool already = false;
+        for (auto const& c : claimants) {
+            if (c.get() == s.get() || c->schemaId() == s->schemaId()) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) claimants.push_back(s);
     }
-    return nullptr;
+    return claimants;
 }
 
 void UnitBuilder::addIncludeDir(std::filesystem::path dir) {
@@ -597,15 +622,54 @@ void UnitBuilder::addFile(std::filesystem::path path) {
     // behavior — the registry has one entry and the caller chose the language).
     // A multi-language builder with an UNMATCHED extension fails loud rather
     // than silently parsing under the wrong grammar.
-    std::shared_ptr<GrammarSchema const> schema = schemaForPath_(path);
-    if (!schema) {
-        if (schemas_.size() == 1) {
-            schema = schema_;
-        } else {
-            reportDriver(driverDiagnostics_, DiagnosticCode::D_UnknownFileExtension,
-                         DiagnosticSeverity::Error, InvalidBuffer, path.string());
-            return;  // do not parse under an arbitrary grammar.
+    auto claimants = schemasForPath_(path);
+    std::shared_ptr<GrammarSchema const> schema;
+    if (claimants.size() == 1) {
+        schema = std::move(claimants.front());
+    } else if (claimants.size() > 1) {
+        // ★ TWO REGISTERED LANGUAGES CLAIM THIS EXTENSION — fail loud NAMING
+        // THEM (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET). The builder has no
+        // basis whatever for choosing: both documents declared the extension,
+        // both are legitimate, and the tie is broken only by knowledge this
+        // layer does not have (which CPU the file is written for). Picking one
+        // would be registration order deciding what the source MEANS.
+        //
+        // ⚠ THE PRIMARY DOES NOT WIN HERE, and that is deliberate. On the
+        // driver's path the primary is the caller's `--language` and it wins
+        // BEFORE this point — the driver resolves one grammar per target and
+        // registers exactly that one. A builder that reaches here with two
+        // claimants was assembled by a caller who registered two languages
+        // over one extension and then declined to say which; there is no
+        // "explicit" among them to prefer.
+        std::string names;
+        for (auto const& c : claimants) {
+            if (!names.empty()) names += ", ";
+            names += std::string{c->name()};
         }
+        //
+        // The CODE is `D_UnknownFileExtension` and that is not a compromise:
+        // 0xD006 means "this path's extension did not resolve to EXACTLY ONE
+        // registered source language", and zero claimants and two claimants
+        // are both that. The two MESSAGES differ — one says nothing claims it,
+        // this one names every language that does — which is the axis an
+        // operator acts on. Minting a second code would split one predicate
+        // across two entries of a closed set every suppression list and
+        // severity table then has to carry twice.
+        reportDriver(driverDiagnostics_,
+                     DiagnosticCode::D_UnknownFileExtension,
+                     DiagnosticSeverity::Error, InvalidBuffer,
+                     path.string() + ": extension claimed by "
+                     + std::to_string(claimants.size())
+                     + " registered source languages (" + names
+                     + ") — register only one of them, or name the language "
+                       "for this file explicitly");
+        return;  // do not parse under an arbitrarily-chosen grammar.
+    } else if (schemas_.size() == 1) {
+        schema = schema_;
+    } else {
+        reportDriver(driverDiagnostics_, DiagnosticCode::D_UnknownFileExtension,
+                     DiagnosticSeverity::Error, InvalidBuffer, path.string());
+        return;  // do not parse under an arbitrary grammar.
     }
     parseAndAdd_(std::move(src), std::move(schema));
     // Record the path→tree mapping so a later #include resolving to this same

@@ -31,6 +31,7 @@
 #include "program/target_spec.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -592,6 +593,63 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                              "(D-CSUBSET-TESTTU-SILENT-EXIT1 fail-loud net).");
         }
     };
+    // ── plan 29 P4: THE `encode` PIPELINE ENTRY ────────────────────────────
+    //
+    // ★★★ THE ONE PLACE THE TIER FACET IS READ, AND IT IS READ OFF THE ROOT
+    // RULE. `pipelineEntry.byRule` is per-CONSTRUCT by design (plan 29 §1 —
+    // "the pipeline entry point is a property of the CONSTRUCT, never of the
+    // language"), and a TRANSLATION UNIT is a construct like any other: the
+    // rule that owns it is the language's root. A dialect declaring
+    // `{ "rule": "root", "tier": "encode" }` is saying "my translation unit
+    // enters at the assembler's input", and this is where that is honoured.
+    // ⚠ NO LANGUAGE IDENTITY ANYWHERE. The branch is on a closed enum resolved
+    // at load; it never asks which language this is, and any language that
+    // declares the tier takes it. `tierForRule` returning nullopt (every
+    // shipped language except the `asm-*` dialects) leaves the ordinary path
+    // byte-identical.
+    // ⚠ AND AN UNHANDLED TIER FAILS LOUD RATHER THAN FALLING THROUGH. A
+    // `mir`/`lir` row is already refused at LOAD (`kImplementedEntryTiers`), so
+    // it cannot reach here — but if a future tier lands in the vocabulary
+    // before its route does, falling through would silently run hand-written
+    // code through the optimizer, which is the exact miscompile the facet
+    // exists to prevent. The switch has no `default:`, so a new enumerator is a
+    // COMPILE error here.
+    if (auto const rootTier =
+            grammar.pipelineEntry().tierForRule(grammar.rootCursor().rule());
+        rootTier.has_value()) {
+        switch (*rootTier) {
+        case PipelineTier::Hir:
+            break;   // the ordinary path below
+        case PipelineTier::Encode: {
+            if (cus.size() != 1) {
+                emitDriver(reporter, DiagnosticCode::D_PlanNotLanded,
+                           "a multi-CU standalone-assembly build is not yet "
+                           "lowered — each unit's symbol space would have to be "
+                           "namespaced before the modules merge");
+                return false;
+            }
+            auto mod = assembleAsmUnit(cus[0], grammar, **targetR,
+                                       (*formatR)->entryVerbs(), reporter);
+            if (!mod) {
+                emitNullNoDiagnostic("the assembly unit build "
+                                     "(assembleAsmUnit)");
+                return false;
+            }
+            return reported(linkAndWrite(
+                std::span<AssembledModule const>{&*mod, 1}, **targetR,
+                **formatR, outPath, reporter, imageRequest));
+        }
+        case PipelineTier::Mir:
+        case PipelineTier::Lir:
+            emitDriver(reporter, DiagnosticCode::D_PlanNotLanded,
+                       "the language's root declares a pipeline entry tier this "
+                       "driver has no route for — refused rather than silently "
+                       "taking the full pipeline, which would run the "
+                       "construct through tiers it asked to skip");
+            return false;
+        }
+    }
+
     std::vector<std::optional<CuMirModule>> cuMirSlots(cus.size());
     if (cus.size() <= 1) {
         if (!cus.empty()) {
@@ -1123,6 +1181,18 @@ std::optional<ObjectFormatKind> formatKindOfSpec(std::string const& spec) {
     return (*formatR)->kind();
 }
 
+// ASCII lower-case a copy. File extensions are ASCII, and the driver's
+// extension match must agree byte-for-byte with `UnitBuilder::schemasForPath_`'s
+// — a `.S` that the driver accepts and the builder then routes elsewhere would
+// be the two-resolvers-disagree bug one layer up.
+[[nodiscard]] std::string asciiLowerCopy(std::string_view in) {
+    std::string out{in};
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
 // ── TF-C74: what identifies ONE front-end build ───────────────────────────
 //
 // The front-end is built once per DISTINCT key and CACHED. Before TF-C74 the
@@ -1167,13 +1237,135 @@ struct CuBuildKey {
     // the key's rule ("everything that changes the preprocessed source") true
     // by construction rather than by an argument a reader has to reconstruct.
     HeaderNameMatching              headerNameMatching = kDefaultHeaderNameMatching;
+    // ★★★ D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the SOURCE LANGUAGE this
+    // target's CU is parsed under. `--language asm-x86_64-att` for every
+    // target when the caller named one; the TARGET's own
+    // `defaultAssemblyLanguage` when it did not — so `dss --compile hello.s
+    // --target x86_64:… --target arm64:…` parses ONE file under TWO grammars.
+    //
+    // ⚠⚠ POPULATED UNCONDITIONALLY — READ THE NEXT SENTENCE BEFORE MOVING IT.
+    // Every OTHER member of this key is populated only `if (ppEnabled)`,
+    // because every other member exists to distinguish PREPROCESSED text and a
+    // language without a preprocess pass produces identical CUs for every
+    // target. An assembly dialect has NO preprocess pass, so under that gate
+    // ALL targets would collapse onto the empty key, the first target's CU
+    // would be handed to every other target, and a `.s` would be parsed under
+    // the FIRST CPU's dialect and then compiled for the SECOND — a silent
+    // miscompile of exactly the family TF-C74 widened this key to prevent. The
+    // grammar is not a property of the preprocessed text; it is the property
+    // that DECIDES what the text means. It therefore belongs in the key on its
+    // own terms and is gated on nothing.
+    std::string                     languageName;
     [[nodiscard]] bool operator<(CuBuildKey const& o) const noexcept {
         if (targetName != o.targetName) return targetName < o.targetName;
         if (formatName != o.formatName) return formatName < o.formatName;
         if (format != o.format) return format < o.format;
-        return headerNameMatching < o.headerNameMatching;
+        if (headerNameMatching != o.headerNameMatching) {
+            return headerNameMatching < o.headerNameMatching;
+        }
+        return languageName < o.languageName;
     }
 };
+
+// ★★ D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: resolve the SOURCE LANGUAGE for
+// ONE target, or fail loud naming the target.
+//
+// Two inputs, in strict precedence:
+//   1. The CALLER's `--language <name>` (`explicitGrammar`), if given. It wins
+//      outright, for every target, with no extension gate — naming the
+//      language IS the interface for "this file is written for one CPU", the
+//      analogue of `gcc -x`, and it is what `examples/asm/*/expected.json`
+//      uses. A caller who says `--language c-subset` and hands over a `.s` has
+//      asked for that and gets it.
+//   2. Otherwise the TARGET's declared `defaultAssemblyLanguage` — a NAME the
+//      target file carries as vocabulary. Because it is read PER TARGET, one
+//      invocation resolves as many grammars as it has distinct CPUs.
+//
+// Under arm 2 the extension IS checked, and that check is the point: the
+// caller named nothing, so a wrong answer here would be silent. Every input
+// file's extension must be claimed by the resolved language's
+// `fileExtensions`; anything else fails loud naming the target, the language
+// it declared, and the offending file. `D_UnknownFileExtension` covers both
+// failure shapes — "the target declares no language at all" and "the language
+// it declares does not claim this extension" — because both are literally
+// "this extension resolved to no source language"; the MESSAGES differ, the
+// code does not.
+//
+// Returns null on failure, having emitted. AGNOSTIC: no language, CPU or
+// format NAME is compared against a literal anywhere below — the target
+// supplies the name, the grammar loader resolves it, and the extension match
+// is a set-membership test over config-declared strings.
+[[nodiscard]] std::shared_ptr<GrammarSchema const> resolveGrammarForTarget(
+    std::shared_ptr<GrammarSchema const> const& explicitGrammar,
+    TargetSchema const&                         target,
+    std::vector<std::string> const&             sourceFiles,
+    std::map<std::string, std::shared_ptr<GrammarSchema const>>& cache,
+    DiagnosticReporter&                         rep) {
+    if (explicitGrammar) return explicitGrammar;
+
+    std::string const declared{target.defaultAssemblyLanguage()};
+    if (declared.empty()) {
+        emitDriver(
+            rep, DiagnosticCode::D_UnknownFileExtension,
+            "no source language: no --language was given and target '"
+            + std::string{target.name()}
+            + "' declares no 'defaultAssemblyLanguage', so there is nothing "
+              "to parse these sources under. Either pass --language <name>, "
+              "or declare the target's assembly dialect by name in "
+              "src/dss-config/targets/" + std::string{target.name()}
+            + ".target.json.");
+        return nullptr;
+    }
+
+    auto it = cache.find(declared);
+    if (it == cache.end()) {
+        auto loaded = GrammarSchema::loadShipped(declared);
+        if (!loaded.has_value()) {
+            forwardConfigDiagnostics(loaded.error(), rep);
+            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                       "target '" + std::string{target.name()}
+                       + "' declares defaultAssemblyLanguage '" + declared
+                       + "', which could not be loaded — the reason is in the "
+                         "configuration diagnostic(s) above (config: "
+                         "src/dss-config/sources/" + declared + ".lang.json).");
+            // Negative NOT memoized: a load failure is fatal for this run
+            // anyway, and caching it would make a future retry-after-fix path
+            // answer from a stale miss.
+            return nullptr;
+        }
+        it = cache.emplace(declared, *loaded).first;
+    }
+    auto const& schema = it->second;
+
+    // Every input must be claimed by the language the TARGET chose. The
+    // comparison is case-insensitive on the extension INCLUDING its dot, the
+    // same rule `UnitBuilder::schemasForPath_` applies, so `foo.S` and `foo.s`
+    // route identically on every host filesystem.
+    for (auto const& file : sourceFiles) {
+        std::string const ext = asciiLowerCopy(fs::path{file}.extension().string());
+        bool claimed = false;
+        for (std::string_view declaredExt : schema->fileExtensions()) {
+            if (asciiLowerCopy(declaredExt) == ext) { claimed = true; break; }
+        }
+        if (claimed) continue;
+        std::string known;
+        for (std::string_view declaredExt : schema->fileExtensions()) {
+            if (!known.empty()) known += ", ";
+            known += std::string{declaredExt};
+        }
+        emitDriver(
+            rep, DiagnosticCode::D_UnknownFileExtension,
+            "no source language for '" + file + "': no --language was given, "
+            "so target '" + std::string{target.name()}
+            + "' selected its declared defaultAssemblyLanguage '" + declared
+            + "' — which claims " + (known.empty() ? "no extensions" : known)
+            + " and not '" + (ext.empty() ? std::string{"<none>"} : ext)
+            + "'. Pass --language <name> to name the source language "
+              "explicitly.");
+        return nullptr;
+    }
+    return schema;
+}
 
 // Build N CUs' front-end (via `buildCus`), then compile them to each target — the
 // linker MERGES the N CUs into ONE image per target (LK11). Shared by
@@ -1184,11 +1376,21 @@ struct CuBuildKey {
 // TF-C74 — its predefined macros depend on the target), so the CU is rebuilt only
 // when the key actually changes the preprocessed source; the common single-target
 // case builds exactly once. Returns 0 on success, 1 on any error.
+// D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: `grammar` used to be ONE
+// `GrammarSchema const&` for the whole invocation, resolved before the
+// per-target loop ever ran. It is now `explicitGrammar` — the caller's
+// `--language`, or NULL meaning "ask each target" — and the closure receives
+// the RESOLVED grammar for the key it is building. `sourceFiles` rides along
+// for exactly one reason: when the language came from the target rather than
+// the caller, every input's extension has to be checked against it, and that
+// check needs the paths (see `resolveGrammarForTarget`).
 int runCusToTargets(
     std::function<std::vector<CompilationUnit>(
         CuBuildKey const&, std::span<PredefinedMacroDef const>,
-        std::span<PredefinedMacroDef const>)> buildCus,
-    GrammarSchema const&                        grammar,
+        std::span<PredefinedMacroDef const>,
+        std::shared_ptr<GrammarSchema const> const&)> buildCus,
+    std::shared_ptr<GrammarSchema const> const& explicitGrammar,
+    std::vector<std::string> const&             sourceFiles,
     std::string const&                          sourceStem,
     std::vector<std::string> const&             targets,
     DiagnosticReporter&                         rep,
@@ -1212,8 +1414,6 @@ int runCusToTargets(
     // gates them. Passed PER TARGET, not resolved once: two targets of one
     // build can differ in whether their format can carry the request.
     ImageRequest const&                         imageRequest) {
-    bool const ppEnabled = grammar.preprocess().enabled;
-
     // ── TF-C74 (a): resolve every target — and every object format — BEFORE
     //    the CU build ───────────────────────────────────────────────────────
     //
@@ -1373,22 +1573,71 @@ int runCusToTargets(
         return 1;
     }
 
+    // ── D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET (a'): resolve every target's
+    //    SOURCE LANGUAGE before a single CU is built ─────────────────────────
+    //
+    // Its own pass, for the same reason TF-C74 (a) hoisted target+format
+    // resolution above: this loop can FAIL, and failing after some CUs are
+    // already built means the abort throws away those CUs' parse diagnostics
+    // (the drain that would have copied them is downstream). Resolving first
+    // makes the failure clean — every unresolvable target named in one run, no
+    // half-built front-end behind it, nothing dropped.
+    //
+    // Index-parallel to `targets`. The answer is carried to BOTH consumers: the
+    // CU build (through `CuBuildKey::languageName`) and `compileOneTarget`
+    // (through this vector).
+    std::vector<std::shared_ptr<GrammarSchema const>> grammarPerTarget;
+    grammarPerTarget.reserve(targets.size());
+    {
+        // Memoizes `loadShipped` across targets naming the SAME language, so a
+        // 5-target build of one CPU family loads its dialect once.
+        std::map<std::string, std::shared_ptr<GrammarSchema const>> grammarByName;
+        for (auto const& spec : targets) {
+            // Every spec parsed and every target loaded above (a failure
+            // returned at the drain), so both lookups resolve.
+            auto const parsedSpec = TargetSpec::parse(spec);
+            auto const& targetSchema = *targetByName.at(parsedSpec->targetName);
+            // NO `continue`-on-failure short-circuit: a build whose targets are
+            // wrong in several ways must report every one of them in ONE run,
+            // the same discipline the target/format pre-flight above follows.
+            // `nullptr` keeps the vector index-parallel; the drain below is
+            // what stops us using it.
+            grammarPerTarget.push_back(resolveGrammarForTarget(
+                explicitGrammar, targetSchema, sourceFiles, grammarByName, rep));
+        }
+    }
+    if (rep.hasErrors()) {
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+
     // c9 + TF-C74 (b): build the front-end ONCE PER DISTINCT `CuBuildKey`. A
     // language WITHOUT a preprocess pass produces identical CUs for every
     // target (both `activeFormat` and the target predefines are inert) → the
-    // key is {"" , nullopt} for every target → a single build, no waste. The
-    // COMMON case — ONE target — is exactly one build, as before c9. What
-    // CHANGES vs c9: two targets of DIFFERENT architecture sharing one object
-    // format (arm64:elf… + x86_64:elf…) now build TWICE, because their
+    // key is {"", nullopt, <language>} for every target → a single build, no
+    // waste. The COMMON case — ONE target — is exactly one build, as before c9.
+    // What CHANGES vs c9: two targets of DIFFERENT architecture sharing one
+    // object format (arm64:elf… + x86_64:elf…) now build TWICE, because their
     // architecture predefines differ and reusing one CU for both would splice
     // the wrong architecture's macros into the second image.
+    // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET adds the second way two targets
+    // can diverge: a DIFFERENT SOURCE LANGUAGE, which splits the key even when
+    // there is no preprocess pass at all. Two targets that resolve the same
+    // language still share one build, so a `.s` for two formats of ONE CPU is
+    // still built once.
     std::map<CuBuildKey, std::vector<CompilationUnit>> cuByKey;
     std::vector<CuBuildKey> keyPerTarget;
     keyPerTarget.reserve(targets.size());
-    for (auto const& spec : targets) {
+    for (std::size_t ti = 0; ti < targets.size(); ++ti) {
+        std::string const& spec = targets[ti];
         CuBuildKey key;
         std::span<PredefinedMacroDef const> targetPredefines;
         std::span<PredefinedMacroDef const> formatPredefines;
+        // ★★ KEYED UNCONDITIONALLY — see `CuBuildKey::languageName` for why
+        // this must NOT join the `ppEnabled` block below.
+        auto const& resolvedGrammar = grammarPerTarget[ti];
+        key.languageName = std::string{resolvedGrammar->name()};
+        bool const ppEnabled = resolvedGrammar->preprocess().enabled;
         if (ppEnabled) {
             key.format = formatKindOfSpec(spec);
             // The spec parsed cleanly above (we returned otherwise), so this
@@ -1410,7 +1659,8 @@ int runCusToTargets(
         keyPerTarget.push_back(key);
         if (cuByKey.find(key) == cuByKey.end()) {
             cuByKey.emplace(key,
-                            buildCus(key, targetPredefines, formatPredefines));
+                            buildCus(key, targetPredefines, formatPredefines,
+                                     resolvedGrammar));
         }
     }
 
@@ -1469,9 +1719,12 @@ int runCusToTargets(
         compileOpts.config           = config;
         compileOpts.pipelineOverride = pipelineOverride;
         compileOpts.resolveLibraries = resolveLibraries;  // c162 (D-FF1-READER-CONSUMER)
+        // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the grammar THIS target's
+        // CU was parsed under — never the invocation's, which no longer
+        // exists as a single value.
         bool const ok = compileOneTarget(
             std::span<CompilationUnit const>{cus.data(), cus.size()},
-            grammar, sourceStem, spec, scratch,
+            *grammarPerTarget[i], sourceStem, spec, scratch,
             outputDir, /*multiTargetBuild*/ targets.size() > 1u,
             artifactName, perFormatOutputSubdir, compileOpts,
             executor, jobsOverride, imageRequest);
@@ -1987,19 +2240,27 @@ int Program::compileFiles(
         return 1;
     }
 
-    // Load the language schema once for the whole call.
-    auto grammarR = GrammarSchema::loadShipped(languageName);
-    if (!grammarR.has_value()) {
-        forwardConfigDiagnostics(grammarR.error(), rep);
-        emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
-                   "language schema '" + languageName
-                   + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
-                     "src/dss-config/sources/" + languageName
-                   + ".lang.json).");
-        drainDiagnosticsToStderr(rep);
-        return 1;
+    // Load the language schema once for the whole call — WHEN THE CALLER NAMED
+    // ONE. D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: an EMPTY `languageName` is
+    // now legal and means "ask each target", which is the only way one
+    // invocation can compile a `.s` for two different CPUs (the two dialects
+    // both claim `.s`, so the extension alone cannot answer). A named language
+    // still wins outright — see `resolveGrammarForTarget`.
+    std::shared_ptr<GrammarSchema const> grammar;
+    if (!languageName.empty()) {
+        auto grammarR = GrammarSchema::loadShipped(languageName);
+        if (!grammarR.has_value()) {
+            forwardConfigDiagnostics(grammarR.error(), rep);
+            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                       "language schema '" + languageName
+                       + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
+                         "src/dss-config/sources/" + languageName
+                       + ".lang.json).");
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
+        grammar = *grammarR;
     }
-    auto grammar = *grammarR;
 
     // Build ONE CompilationUnit for ALL source files — the CU5 multi-file-single-CU shape
     // (cross-file references resolved WITHIN the CU; each file routes to the language's
@@ -2022,12 +2283,16 @@ int Program::compileFiles(
     // (D-PARSE-DEEP-FRONTEND-STACK).
     auto buildCus = [&](CuBuildKey const&                   key,
                         std::span<PredefinedMacroDef const> targetPredefines,
-                        std::span<PredefinedMacroDef const> formatPredefines)
+                        std::span<PredefinedMacroDef const> formatPredefines,
+                        // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the grammar
+                        // THIS key resolved to. Never the enclosing
+                        // `grammar` — that is null on the ask-the-target path.
+                        std::shared_ptr<GrammarSchema const> const& keyGrammar)
         -> std::vector<CompilationUnit> {
         auto cu = substrate::callOnLargeStack(
             substrate::kDeepRecursionStackBytes, [&] {
-                UnitBuilder builder{grammar};
-                applySystemDirs(builder, *grammar);
+                UnitBuilder builder{keyGrammar};
+                applySystemDirs(builder, *keyGrammar);
                 if (key.format) builder.setActiveFormat(*key.format);
                 // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
                 // header-name case rule (NOT derived from the format kind).
@@ -2054,7 +2319,7 @@ int Program::compileFiles(
     // will eventually let artifact profiles override this.
     std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();
     return runCusToTargets(
-        buildCus, *grammar, sourceStem, targets, rep,
+        buildCus, grammar, sourceFiles, sourceStem, targets, rep,
         outputDir_, artifactName_, perFormatOutputSubdir_, compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
         resolveLibraries_, executor_, jobs_,
@@ -2093,18 +2358,23 @@ int Program::compileUnits(
         return 1;
     }
 
-    auto grammarR = GrammarSchema::loadShipped(languageName);
-    if (!grammarR.has_value()) {
-        forwardConfigDiagnostics(grammarR.error(), rep);
-        emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
-                   "language schema '" + languageName
-                   + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
-                     "src/dss-config/sources/" + languageName
-                   + ".lang.json).");
-        drainDiagnosticsToStderr(rep);
-        return 1;
+    // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: empty ⇒ ask each target (see
+    // the sibling note in `compileFiles`).
+    std::shared_ptr<GrammarSchema const> grammar;
+    if (!languageName.empty()) {
+        auto grammarR = GrammarSchema::loadShipped(languageName);
+        if (!grammarR.has_value()) {
+            forwardConfigDiagnostics(grammarR.error(), rep);
+            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                       "language schema '" + languageName
+                       + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
+                         "src/dss-config/sources/" + languageName
+                       + ".lang.json).");
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
+        grammar = *grammarR;
     }
-    auto grammar = *grammarR;
 
     // Build ONE CompilationUnit PER source file — the multi-CU model the linker MERGES
     // into one image (CU6 + LK11). Distinct from `compileFiles` (one CU5 multi-file CU);
@@ -2115,7 +2385,10 @@ int Program::compileUnits(
     // truthful. `setActiveFormat(kind)` is the only addition vs the pre-c9 build.
     auto buildCus = [&](CuBuildKey const&                   key,
                         std::span<PredefinedMacroDef const> targetPredefines,
-                        std::span<PredefinedMacroDef const> formatPredefines)
+                        std::span<PredefinedMacroDef const> formatPredefines,
+                        // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: this key's
+                        // resolved grammar (see the `compileFiles` twin).
+                        std::shared_ptr<GrammarSchema const> const& keyGrammar)
         -> std::vector<CompilationUnit> {
         std::vector<CompilationUnit> cus;
         cus.reserve(sourceFiles.size());
@@ -2125,8 +2398,8 @@ int Program::compileUnits(
             // expression parses without overflowing the host main stack.
             cus.push_back(substrate::callOnLargeStack(
                 substrate::kDeepRecursionStackBytes, [&] {
-                    UnitBuilder builder{grammar};
-                    applySystemDirs(builder, *grammar);
+                    UnitBuilder builder{keyGrammar};
+                    applySystemDirs(builder, *keyGrammar);
                     if (key.format) builder.setActiveFormat(*key.format);
                     // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
                     // header-name case rule (NOT derived from the format kind).
@@ -2148,7 +2421,7 @@ int Program::compileUnits(
 
     std::string const sourceStem = fs::path{sourceFiles.front()}.stem().string();
     return runCusToTargets(
-        buildCus, *grammar, sourceStem,
+        buildCus, grammar, sourceFiles, sourceStem,
         targets, rep, outputDir_, artifactName_, perFormatOutputSubdir_,
         compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
@@ -2174,26 +2447,78 @@ int Program::compileDirectory(
 ) {
     DiagnosticReporter rep{reporterConfig};
 
-    auto grammarR = GrammarSchema::loadShipped(languageName);
-    if (!grammarR.has_value()) {
-        forwardConfigDiagnostics(grammarR.error(), rep);
-        emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
-                   "compileDirectory: language schema '" + languageName
-                   + "' could not be loaded.");
-        drainDiagnosticsToStderr(rep);
-        return 1;
+    // ── Which extensions does the scan collect? ───────────────────────────
+    //
+    // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET. The scan runs ONCE, before any
+    // target loop, so its filter cannot be per-target — but it must not be
+    // narrower than the union of what the per-target languages will accept, or
+    // a `.s` sitting in the directory is skipped SILENTLY (a scan filter drops
+    // files without a word, which is exactly why the widening lives here and
+    // not in the resolver).
+    //
+    //   • `--language X` named  ⇒ X's extensions. UNCHANGED, deliberately: the
+    //     caller named one language, so a mixed C+assembly directory would
+    //     have to build a mixed CU, and one CU carries one grammar to codegen.
+    //     Widening here would trade a silent skip for a silent mis-parse.
+    //   • `--language` omitted ⇒ the UNION over the named targets of each
+    //     target's declared assembly language. That is the set of files this
+    //     invocation can actually resolve, and a file whose extension only
+    //     SOME target claims still fails loud, per target, downstream.
+    std::vector<std::string> scanExtensions;
+    std::shared_ptr<GrammarSchema const> grammar;
+    if (!languageName.empty()) {
+        auto grammarR = GrammarSchema::loadShipped(languageName);
+        if (!grammarR.has_value()) {
+            forwardConfigDiagnostics(grammarR.error(), rep);
+            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                       "compileDirectory: language schema '" + languageName
+                       + "' could not be loaded.");
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
+        grammar = *grammarR;
+        for (auto const& ext : grammar->fileExtensions()) {
+            scanExtensions.push_back(ext);
+        }
+    } else {
+        std::set<std::string> declaredNames;
+        for (auto const& spec : targets) {
+            auto parsed = TargetSpec::parse(spec);
+            if (!parsed) continue;  // the delegate emits D_InvalidTargetSpec
+            auto targetR = TargetSchema::loadShipped(parsed->targetName);
+            if (!targetR.has_value()) continue;  // delegate → D_SchemaLoadFailed
+            std::string name{(*targetR)->defaultAssemblyLanguage()};
+            // An undeclared dialect contributes NOTHING to the filter and is
+            // NOT diagnosed here: the delegate's `resolveGrammarForTarget`
+            // owns that message (it names the target), and duplicating it
+            // would make one misconfiguration print twice with two wordings.
+            if (!name.empty()) declaredNames.insert(std::move(name));
+        }
+        for (auto const& name : declaredNames) {
+            auto loaded = GrammarSchema::loadShipped(name);
+            if (!loaded.has_value()) continue;  // delegate → D_SchemaLoadFailed
+            for (auto const& ext : (*loaded)->fileExtensions()) {
+                scanExtensions.push_back(ext);
+            }
+        }
+        if (scanExtensions.empty()) {
+            emitDriver(rep, DiagnosticCode::D_UnknownFileExtension,
+                       "compileDirectory: no --language was given and no named "
+                       "target declares a 'defaultAssemblyLanguage', so the "
+                       "directory scan has no file extensions to collect — it "
+                       "would silently find nothing. Pass --language <name>.");
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
     }
-    auto grammar = *grammarR;
 
     // Resolve files via the hoisted `InputResolver` (D-LK10-1
     // closure — landed at LK10 cycle 3). The recursive vs flat
     // policy axis is now an explicit caller parameter, mirroring
-    // plan 00 §4.1.3's spec. `fileExtensions()` returns a
-    // `std::span<std::string const>` directly compatible with the
-    // resolver's signature — no intermediate copy needed.
+    // plan 00 §4.1.3's spec.
     std::vector<std::string> sourceFiles;
     if (!InputResolver::resolveDirectory(
-            fs::path{directoryPath}, grammar->fileExtensions(),
+            fs::path{directoryPath}, scanExtensions,
             mode, sourceFiles, rep)) {
         drainDiagnosticsToStderr(rep);
         return 1;

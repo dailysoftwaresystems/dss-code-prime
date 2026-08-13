@@ -7,6 +7,8 @@
     "abiModel": "register-machine",
     "description": "ARM64 AArch64 — minimal opcode set + AAPCS64 calling convention + fixed32 byte-encoder. Cycle-3 scope: ret (0xD65F03C0) + mov reg-reg via ORR alias (0xAA0003E0 base + Rd + Rm)."
   },
+  "$defaultAssemblyLanguageComment": "★★★ A NAME, AND ONLY A NAME (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET, 2026-08-13) — the x86_64 twin carries the full argument; the short form is that this key answers 'when the caller names no source language, which shipped `<stem>.lang.json` spells THIS processor's assembly?' and a `loadShipped` stem is the entire answer. No sigils, no comment characters, no operand order: those are (target, DIALECT) facts and an `asmSyntax` block carrying them was written here and REVERTED ([[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]]).\n★★ THIS TARGET IS THE PROOF THAT THE VALUE HAD TO BE PER-TARGET AND THE GRAMMAR COULD NOT BE. `asm-arm64-gas` and `asm-x86_64-att` BOTH claim `.s`/`.S`, so the extension alone cannot name a dialect — but they disagree on the meaning of a single byte: `#` opens a line COMMENT in the AT&T document and introduces an IMMEDIATE here. No shared token table can hold both, which is why the dialect is a LANGUAGE and this file names it rather than describing it.\n★ `gas` rather than `arm64-att`: AArch64 assembly has no AT&T/Intel-style split, so the ASSEMBLER is the axis that distinguishes it (a future `asm-arm64-armasm` is the sibling the naming leaves room for).",
+  "defaultAssemblyLanguage": "asm-arm64-gas",
   "$aggregateLayoutComment": "FC6 (D-FF3-1): per-ABI layout params. `natural` (scalar align = byte size, capped) is the AAPCS64 + Apple arm64 rule; maxAlignment 16 = the AArch64 max fundamental alignment (128-bit vector / __int128 / long double).",
   "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "bitFieldStrategy": "gnu_packed" },
   "$tlsComment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): the CPU's static-TLS layout convention — psABI-per-CPU data (AArch64 is Variant I under EVERY OS, so it lives on the TARGET, not the format; the x86_64 twin declares variant2). variant1 = the thread pointer (TPIDR_EL0) points AT the TCB head and the TLS block FOLLOWS it; a symbol's link-time thread-pointer offset is POSITIVE: tpoff = alignUp(tcbHeaderBytes, p_align) + templateOffset. tcbHeaderBytes = 16 — the AArch64 TCB header is two pointers (the psABI/glibc `tcbhead_t` prefix: dtv pointer + private). Consumed ONLY by the walker's tpoff helper (addTlsSymbolOffsets) when the format's tlsAccess.model is local-exec — a config-keyed formula selector, never a machine-identity branch.",
@@ -141,12 +143,22 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "$comment": "★★ WIDTH-KEYED TO 64 AS OF 2026-08-13, AND THE KEY IS A SILENT-MISCOMPILE FIX RATHER THAN TIDYING. This variant carried NO `guard.width`, and `walker_util::variantMatchesInst` treats a width-absent guard as matching ANY width — so a width-32 `mov` with a register source selected THIS word and encoded `ORR Xd, XZR, Xm`, a 64-bit move. Nothing reported it: the guard matched, the encoder emitted, the build was green. It became reachable the moment a hand-written `.s` could write `mov w0, w1`, whose ONLY observable difference from `mov x0, x1` is that it zeroes bits 63:32. ✔MEASURED before the change: every `mov` the compiler emits with a REGISTER operand passes width-default flags (64) — the one flags-carrying emitter, `mir_to_lir.cpp`'s `emitMovToFresh`, is reached only from the constant-materialization paths, whose operand is an ImmInt32 or a LiteralIndex — so keying this to 64 and adding the W sibling below is BYTE-NEUTRAL for existing codegen. (The `[\"imm32\"]` MOVZ variant below is deliberately left width-absent: width-32 constants DO reach it today, and an X-form MOVZ zeroes all 64 bits, which is value-identical to the W form.)",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2852127712 },
             "resultSlot": "rd",
             "wires":      [
               { "$comment": "ORR Xd, XZR, Xm — bits 16..20 hold Rm (the source register's encoding). The fixed word's bits 9..5 = 0b11111 (XZR) are baked in; the wire only adds Rm bits.",
                 "index": 0, "slotKind": "rm" }
+            ]
+          },
+          {
+            "$comment": "ORR Wd, WZR, Wm — the sf=0 sibling (ARM ARM C6.2.206 ORR shifted-register): bit 31 cleared turns 0xAA0003E0 into 0x2A0003E0. Same slots, same Rn=WZR baked in. This is what `mov w0, w1` encodes, and writing a W register ZEROES bits 63:32 of the containing X register — the property the 64-bit form does not have and the reason the two cannot share one width-absent variant.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 704644064 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rm" }
             ]
           },
           {
@@ -2469,7 +2481,41 @@
     { "name": "v28", "class": "vr", "widthBytes": 16, "hwEncoding": 28 },
     { "name": "v29", "class": "vr", "widthBytes": 16, "hwEncoding": 29 },
     { "name": "v30", "class": "vr", "widthBytes": 16, "hwEncoding": 30 },
-    { "name": "v31", "class": "vr", "widthBytes": 16, "hwEncoding": 31 }
+    { "name": "v31", "class": "vr", "widthBytes": 16, "hwEncoding": 31 },
+
+    { "$comment": "★★ THE 32-BIT W VIEWS — the arm64 half of `subOf`'s first real consumer (2026-08-13); see the x86_64 twin for the full rationale. `w0` is the low 32 bits of `x0`: ONE machine register, two spellings, and the ISA distinguishes them by the instruction's sf bit rather than by a register number (the 5-bit hwEncoding is shared). So a narrow spelling resolves to the parent ordinal and the width rides the LIR instruction. `wzr` is included because it is the W view of `xzr` and `mov w0, wzr` is how AArch64 spells a 32-bit zero; `wsp` is omitted (no consumer). ⚠ NOT ALLOCATABLE — both allocator paths skip a non-empty `subOf`, and these appear in no calling-convention list.",
+      "name": "w0",   "class": "gpr", "widthBytes": 4, "subOf": "x0",   "hwEncoding": 0 },
+    { "name": "w1",   "class": "gpr", "widthBytes": 4, "subOf": "x1",   "hwEncoding": 1 },
+    { "name": "w2",   "class": "gpr", "widthBytes": 4, "subOf": "x2",   "hwEncoding": 2 },
+    { "name": "w3",   "class": "gpr", "widthBytes": 4, "subOf": "x3",   "hwEncoding": 3 },
+    { "name": "w4",   "class": "gpr", "widthBytes": 4, "subOf": "x4",   "hwEncoding": 4 },
+    { "name": "w5",   "class": "gpr", "widthBytes": 4, "subOf": "x5",   "hwEncoding": 5 },
+    { "name": "w6",   "class": "gpr", "widthBytes": 4, "subOf": "x6",   "hwEncoding": 6 },
+    { "name": "w7",   "class": "gpr", "widthBytes": 4, "subOf": "x7",   "hwEncoding": 7 },
+    { "name": "w8",   "class": "gpr", "widthBytes": 4, "subOf": "x8",   "hwEncoding": 8 },
+    { "name": "w9",   "class": "gpr", "widthBytes": 4, "subOf": "x9",   "hwEncoding": 9 },
+    { "name": "w10",  "class": "gpr", "widthBytes": 4, "subOf": "x10",  "hwEncoding": 10 },
+    { "name": "w11",  "class": "gpr", "widthBytes": 4, "subOf": "x11",  "hwEncoding": 11 },
+    { "name": "w12",  "class": "gpr", "widthBytes": 4, "subOf": "x12",  "hwEncoding": 12 },
+    { "name": "w13",  "class": "gpr", "widthBytes": 4, "subOf": "x13",  "hwEncoding": 13 },
+    { "name": "w14",  "class": "gpr", "widthBytes": 4, "subOf": "x14",  "hwEncoding": 14 },
+    { "name": "w15",  "class": "gpr", "widthBytes": 4, "subOf": "x15",  "hwEncoding": 15 },
+    { "name": "w16",  "class": "gpr", "widthBytes": 4, "subOf": "x16",  "hwEncoding": 16 },
+    { "name": "w17",  "class": "gpr", "widthBytes": 4, "subOf": "x17",  "hwEncoding": 17 },
+    { "name": "w18",  "class": "gpr", "widthBytes": 4, "subOf": "x18",  "hwEncoding": 18 },
+    { "name": "w19",  "class": "gpr", "widthBytes": 4, "subOf": "x19",  "hwEncoding": 19 },
+    { "name": "w20",  "class": "gpr", "widthBytes": 4, "subOf": "x20",  "hwEncoding": 20 },
+    { "name": "w21",  "class": "gpr", "widthBytes": 4, "subOf": "x21",  "hwEncoding": 21 },
+    { "name": "w22",  "class": "gpr", "widthBytes": 4, "subOf": "x22",  "hwEncoding": 22 },
+    { "name": "w23",  "class": "gpr", "widthBytes": 4, "subOf": "x23",  "hwEncoding": 23 },
+    { "name": "w24",  "class": "gpr", "widthBytes": 4, "subOf": "x24",  "hwEncoding": 24 },
+    { "name": "w25",  "class": "gpr", "widthBytes": 4, "subOf": "x25",  "hwEncoding": 25 },
+    { "name": "w26",  "class": "gpr", "widthBytes": 4, "subOf": "x26",  "hwEncoding": 26 },
+    { "name": "w27",  "class": "gpr", "widthBytes": 4, "subOf": "x27",  "hwEncoding": 27 },
+    { "name": "w28",  "class": "gpr", "widthBytes": 4, "subOf": "x28",  "hwEncoding": 28 },
+    { "name": "w29",  "class": "gpr", "widthBytes": 4, "subOf": "x29",  "hwEncoding": 29 },
+    { "name": "w30",  "class": "gpr", "widthBytes": 4, "subOf": "x30",  "hwEncoding": 30 },
+    { "name": "wzr", "class": "gpr", "widthBytes": 4, "subOf": "xzr", "hwEncoding": 31 }
   ],
   "$registerClassOpsComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): per-register-class move/load/store mnemonics — the same FC2 Part B table x86_64 declares. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (L_RequiredLirOpcodeMissing), because the class-blind alternative is a silent miscompile (a GPR ORR/LDUR against a D-register hwEncoding assembles to valid-looking words that move the WRONG register file). fpr: move=FMOV(D), load=LDUR(D), store=STUR(D).",
   "registerClassOps": [

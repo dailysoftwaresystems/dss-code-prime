@@ -23,6 +23,15 @@ dss_add_test(NAME program/test_cross_validate_target_format
 dss_add_test(NAME program/test_project_config
              SOURCES test_project_config.cpp)
 
+# D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the assembly dialect is resolved PER
+# TARGET, so one invocation compiling a `.s` for two CPUs parses it under two
+# grammars. Driver tier, not tests/examples/, for the structural reason the
+# TF-C74 CU-cache pin records: the corpus runner compiles each manifest target
+# ROW in its own single-target call, so no example can produce the
+# two-targets-one-invocation situation this anchor is about.
+dss_add_test(NAME program/test_asm_dialect_per_target
+             SOURCES test_asm_dialect_per_target.cpp)
+
 # `--dump-predefined-macros` (FC18 companion): the effective predefined-macro set
 # as an INSPECTABLE artifact, plus the sweep asserting no shipped object format
 # defines a C23 `__STDC_NO_*` non-support macro.

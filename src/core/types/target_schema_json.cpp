@@ -693,11 +693,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // guard would reject every shipped target on its first load.
     //
     // Every name here is a key the loader genuinely reads.
-    static constexpr std::array<std::string_view, 14> kTargetDocumentKeys{
+    static constexpr std::array<std::string_view, 15> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
         "charIsUnsigned", "predefinedMacros", "aggregateLayout", "tls",
+        // which SOURCE LANGUAGE document spells this processor's assembly
+        // (a NAME — D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET)
+        "defaultAssemblyLanguage",
         // machine description
         "opcodes", "registers", "registerClassOps", "relocations",
         "condCodeEncoding",
@@ -1309,6 +1312,46 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             detail::parsePredefinedMacroArray(
                 pms, "/predefinedMacros", DiagnosticCode::C_MalformedJson,
                 coll, data.predefinedMacros);
+        }
+    }
+
+    // ── defaultAssemblyLanguage (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET) ──
+    //
+    // The NAME of the shipped source-language document that spells this
+    // processor's assembly — a `<stem>` for `GrammarSchema::loadShipped`,
+    // exactly what `--language` takes. OPTIONAL; absent ⇒ the target declares
+    // none and any build that would have needed it fails loud naming the
+    // target (the driver's job, not the loader's — a target with no assembly
+    // dialect is a legitimate state, not a malformed document).
+    //
+    // A PRESENT key is strict on both axes a lying knob could hide behind:
+    // non-string, and the empty string. `""` is rejected rather than treated
+    // as absent because the two states are operator-distinguishable — absent
+    // says "this target has no dialect", `""` says "I meant to name one" — and
+    // silently folding the second into the first is how a config key stops
+    // meaning anything. The loader deliberately does NOT check that the named
+    // language EXISTS or that it claims `.s`: resolving a language name is the
+    // grammar loader's job, and duplicating it here would put a second,
+    // drifting copy of language discovery in the target family. An unloadable
+    // name fails loud at the driver with the language loader's own diagnostic.
+    if (doc.contains("defaultAssemblyLanguage")) {
+        json const& dal = doc.at("defaultAssemblyLanguage");
+        if (!dal.is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/defaultAssemblyLanguage",
+                      "'defaultAssemblyLanguage' must be a string naming a "
+                      "shipped source language (the `<stem>` of "
+                      "src/dss-config/sources/<stem>.lang.json, e.g. "
+                      "\"asm-x86_64-att\")");
+        } else if (dal.get<std::string>().empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/defaultAssemblyLanguage",
+                      "'defaultAssemblyLanguage' must not be empty — OMIT the "
+                      "key to declare that this target has no assembly "
+                      "dialect; an empty string reads as a name that was meant "
+                      "to be filled in");
+        } else {
+            data.defaultAssemblyLanguage = dal.get<std::string>();
         }
     }
 

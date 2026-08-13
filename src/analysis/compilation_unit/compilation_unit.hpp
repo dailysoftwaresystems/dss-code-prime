@@ -233,8 +233,11 @@ public:
     explicit UnitBuilder(std::vector<std::shared_ptr<GrammarSchema const>> schemas);
 
     // Register an additional source language so `addFile` can route a path to it
-    // by matching the extension against each registered schema's `fileExtensions`
-    // (first registered match wins). NOT required for the explicit-schema
+    // by matching the extension against each registered schema's
+    // `fileExtensions`. ★ The match must be UNIQUE: registering two languages
+    // that both claim one extension makes every such file fail loud naming
+    // both, never silently pick the first
+    // (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET). NOT required for the explicit-schema
     // `addInMemory` overload — that auto-registers its schema at parse. Aborts
     // after finish().
     void registerSchema(std::shared_ptr<GrammarSchema const> schema);
@@ -377,12 +380,20 @@ private:
     TreeId loadAndAdd_(std::filesystem::path const& path, bool& ok,
                        std::shared_ptr<GrammarSchema const> schema);
 
-    // Resolve `path`'s source language by matching its extension against each
-    // registered schema's `fileExtensions` (first match wins). Returns null on
-    // no match (empty/unknown extension); `addFile` applies the single-schema
-    // fall-through or emits `D_UnknownFileExtension`.
-    [[nodiscard]] std::shared_ptr<GrammarSchema const>
-    schemaForPath_(std::filesystem::path const& path) const;
+    // EVERY registered schema whose `fileExtensions` claims `path`'s extension
+    // (case-insensitive, dot included), deduplicated by schema identity and in
+    // registration order. Empty for an empty/unclaimed extension.
+    //
+    // ★ Returns the SET, not a winner (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET).
+    // The predecessor returned the first match, which silently made
+    // registration order decide the source language whenever two documents
+    // claimed one extension — live since a second assembly dialect shipped
+    // (`asm-x86_64-att` and `asm-arm64-gas` both declare `.s`/`.S`). `addFile`
+    // now routes only on a UNIQUE claimant, applies the single-schema
+    // fall-through when there are none, and emits `D_UnknownFileExtension`
+    // naming the claimants when there is more than one.
+    [[nodiscard]] std::vector<std::shared_ptr<GrammarSchema const>>
+    schemasForPath_(std::filesystem::path const& path) const;
 
     // FC2: per-tree parse sidecar, index-parallel to `trees_` (alignment
     // is by construction: addTree appends an EMPTY sidecar; parseAndAdd_

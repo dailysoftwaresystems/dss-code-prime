@@ -1594,12 +1594,38 @@ TEST(TargetSchema, LinkRegisterMustBeString) {
 }
 
 TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
-    // 16 GPRs + 16 FPRs + rflags = 33. EXPECT_EQ (not EXPECT_GE) so a
-    // future accidental duplicate / addition trips the test rather than
-    // silently passing.
+    // 16 GPRs + 16 FPRs + rflags + the 16 32-bit GPR views (eax..r15d) = 49.
+    // EXPECT_EQ (not EXPECT_GE) so a future accidental duplicate / addition
+    // trips the test rather than silently passing.
+    //
+    // ★ THE PIN GAINED A COMPOSITION CHECK WHEN THE 32-BIT VIEWS LANDED
+    // (2026-08-13), rather than just a new total. What it protects is "no
+    // register appears here by accident", and a bare total re-cut to fit each
+    // new row would keep saying less every time it fired: 49 is also reachable
+    // by, say, 17 GPRs + 32 sub-registers. Asserting each BUCKET keeps the
+    // guard at least as strong after the change as before it — a swapped class,
+    // a sub-register that forgot its `subOf`, or a full-width register that
+    // grew one, all trip it now and none of them tripped the total.
     auto r = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ((*r)->registerCount(), 33u);
+    EXPECT_EQ((*r)->registerCount(), 49u);
+
+    std::size_t fullGpr = 0, subGpr = 0, fpr = 0, flags = 0, other = 0;
+    for (auto const& info : (*r)->registers()) {
+        bool const sub = !info.subOf.empty();
+        switch (info.regClass) {
+            case TargetRegClass::GPR:   (sub ? subGpr : fullGpr)++; break;
+            case TargetRegClass::FPR:   sub ? ++other : ++fpr;      break;
+            case TargetRegClass::Flags: sub ? ++other : ++flags;    break;
+            default:                    ++other;                    break;
+        }
+    }
+    EXPECT_EQ(fullGpr, 16u) << "rax..r15";
+    EXPECT_EQ(subGpr,  16u) << "eax..r15d — the 32-bit views, `subOf` their "
+                               "64-bit parent";
+    EXPECT_EQ(fpr,     16u) << "xmm0..xmm15";
+    EXPECT_EQ(flags,    1u) << "rflags";
+    EXPECT_EQ(other,    0u);
 }
 
 // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the wideFloatSoftcalls table
@@ -1898,6 +1924,100 @@ TEST(TargetSchema, TFC74PredefinedMacroDuplicateNameRejected) {
     ASSERT_FALSE(r.has_value())
         << "two entries for one name would make the effective value depend on "
            "which preprocessor seed site iterated last — fail loud instead";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ── defaultAssemblyLanguage (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET) ─────
+//
+// A NAME, and only a name. The value is a `loadShipped` stem — exactly what
+// `--language` takes — and the loader deliberately does NOT check that the
+// language exists or that it claims `.s`: resolving a language name is the
+// grammar loader's job, and a second copy of language discovery here would be
+// a drifting one.
+
+TEST(TargetSchema, DefaultAssemblyLanguageIsReadAsAName) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "defaultAssemblyLanguage":"asm-x86_64-att",
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->defaultAssemblyLanguage(), "asm-x86_64-att");
+}
+
+// ABSENT is a legitimate state, not a malformed document: a target with no
+// assembly dialect simply fails loud BY NAME at the driver when a build needs
+// one. Rejecting it here would force every target file to carry the key.
+TEST(TargetSchema, DefaultAssemblyLanguageAbsentIsEmptyNotAnError) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE((*r)->defaultAssemblyLanguage().empty());
+}
+
+TEST(TargetSchema, DefaultAssemblyLanguageNonStringRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "defaultAssemblyLanguage":["asm-x86_64-att"],
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a list would imply a SELECTOR between dialects, which does not "
+           "exist — the key is one name and a wrong shape must say so";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// `""` is rejected rather than folded into "absent". The two states are
+// operator-distinguishable — absent says "this target has no dialect", `""`
+// says "I meant to name one" — and silently equating them is how a config key
+// stops meaning anything.
+TEST(TargetSchema, DefaultAssemblyLanguageEmptyStringRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "defaultAssemblyLanguage":"",
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "an empty name is a half-filled key, not a declaration of absence";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ★ THE SHIPPED TARGETS MUST ACTUALLY CARRY IT, and they must carry DIFFERENT
+// values. Equal values would mean one dialect served both CPUs, which is the
+// state the whole per-target resolution exists because we are NOT in: `#` is a
+// line comment in the x86_64 dialect and an immediate marker in the arm64 one.
+TEST(TargetSchema, ShippedTargetsDeclareDistinctAssemblyLanguages) {
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(x86.has_value());
+    ASSERT_TRUE(arm.has_value());
+    EXPECT_EQ((*x86)->defaultAssemblyLanguage(), "asm-x86_64-att");
+    EXPECT_EQ((*arm)->defaultAssemblyLanguage(), "asm-arm64-gas");
+    EXPECT_NE((*x86)->defaultAssemblyLanguage(),
+              (*arm)->defaultAssemblyLanguage())
+        << "one invocation compiling a .s for both CPUs must resolve TWO "
+           "grammars; equal names here would silently make it one";
+}
+
+// ★★ THE LINE BETWEEN VOCABULARY AND GRAMMAR, PINNED IN A TEST.
+// An `asmSyntax` block carrying `registerPrefix`/`immediatePrefix`/comment
+// characters/operand order was written into both shipped target files once and
+// REVERTED ([[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]]): those are
+// (target, DIALECT) facts — ✔MEASURED with gcc on ONE target, AT&T
+// `movq %rsi, (%rdi)` vs Intel `mov QWORD PTR [rdi], rsi`. The closed root-key
+// vocabulary is what makes re-proposing it fail rather than load, so assert
+// that directly instead of trusting the reverted diff to stay reverted.
+TEST(TargetSchema, AsmGrammarKeyOnATargetIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "asmSyntax":{"registerPrefix":"%","immediatePrefix":"$"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "assembly GRAMMAR on a target must not load — a register prefix is "
+           "a function of (target, dialect), not of target";
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
 }
 

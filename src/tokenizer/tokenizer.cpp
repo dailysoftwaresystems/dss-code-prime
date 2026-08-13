@@ -601,6 +601,34 @@ TokenizeResult Tokenizer::tokenize() && {
     const auto wsKind       = schema_->schemaTokens().find("Whitespace");
     const auto newlineKind  = schema_->schemaTokens().find("Newline");
 
+    // ★★★ THE NEWLINE'S SCHEMA KIND IS CONFIG-DRIVEN, AND IT USED TO BE
+    // HARDCODED. The `'\n'` branch in the main scan below emitted
+    // `newlineKind` — `schemaTokens().find("Newline")` — unconditionally,
+    // never consulting the `tokens` map for the `"\n"` lexeme the way every
+    // other byte in the language is resolved. For the three shipped languages
+    // that all declare `"\n"` AS `Newline` that was invisible.
+    // ✔MEASURED 2026-08-12 by the first language that does not: an assembly
+    // dialect is LINE-ORIENTED (the newline is the statement terminator, so it
+    // must NOT be `EmptySpace`) and declares `"\n": [{ "kind": "LineEnd" }]`.
+    // That declaration was silently discarded: the tokenizer emitted a
+    // `Newline` kind the dialect had never interned — an INVALID SchemaTokenId
+    // — so every line boundary vanished from the token stream and
+    // `ret \n ret` parsed as ONE instruction with the next line's mnemonic as
+    // its operand. A wrong parse, not a parse error, produced by a config key
+    // the loader had accepted. The knob-that-lies archetype, at the lexical
+    // tier.
+    // ⚠ RESOLVED ONCE, OUTSIDE THE LOOP, so the whitespace fast path this
+    // branch exists to be stays a fast path — the lookup cost is per
+    // tokenize(), not per newline.
+    // ⓘ Only the KIND is taken here. A `"\n"` meaning carrying a `modeOp` or a
+    // `stringStyle` would need the general longest-match path; no language
+    // declares one, and if one ever does the right answer is to route the
+    // branch through that path rather than to half-honour the meaning here.
+    const SchemaTokenId declaredNewlineKind = [&] {
+        auto const meanings = schema_->lookupLexeme("\n");
+        return meanings.empty() ? newlineKind : meanings.front().id;
+    }();
+
     // Numeric-literal grammar (08.55; config-driven). nullptr when the
     // language declares no `numberStyle`. The digit branch in the
     // dispatch loop falls back to longest-match when this is null so a
@@ -1014,7 +1042,7 @@ TokenizeResult Tokenizer::tokenize() && {
         // longest-match loop for these known single-byte lookups.
         if (c == '\n') {
             r.advance(1);
-            emit(CoreTokenKind::Newline, newlineKind);
+            emit(CoreTokenKind::Newline, declaredNewlineKind);
             // Line-scoped mode auto-pop: a mode declared `popAtNewline`
             // (a C-directive / assembly-line mode) drops its frame here,
             // AFTER the newline token, so its lexing rules never leak

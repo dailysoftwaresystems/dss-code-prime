@@ -153,18 +153,80 @@ SchemaResult SchemaCache::resolveByName(std::string_view languageName) {
     auto [it, inserted] = byName_.emplace(std::string{languageName}, *loaded);
     // Index every declared extension for this schema so subsequent
     // `resolveByExtension` calls are O(1).
+    //
+    // ★★ `emplace` USED TO SILENTLY DROP a second claimant of an already-
+    // indexed extension, which turned the cache into a memo of whichever
+    // language happened to resolve FIRST — and `.s` now has two claimants
+    // (`asm-x86_64-att`, `asm-arm64-gas`), so that drop is live rather than
+    // theoretical (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET). The index now
+    // records EVERY claimant per extension; `resolveByExtension` refuses to
+    // answer when there is more than one. Deduplicated by NAME so re-resolving
+    // one language does not make it ambiguous with itself.
     for (auto const& ext : it->second->fileExtensions()) {
-        extToName_.emplace(lowercase(ext), it->first);
+        auto& claimants = extClaimants_[lowercase(ext)];
+        if (std::find(claimants.begin(), claimants.end(), it->first)
+            == claimants.end()) {
+            claimants.push_back(it->first);
+        }
     }
     return it->second;
+}
+
+// Build the `AmbiguousExtension` error for an extension more than one shipped
+// language claims. Factored out so the cache-hit path and the cold-scan path
+// cannot drift in what they SAY about the same situation — the two used to be
+// the fast and slow halves of one answer, and an ambiguity that reported
+// differently depending on cache warmth would be untestable.
+[[nodiscard]] static SchemaResolveError ambiguousExtensionError(
+    std::string const& ext, std::vector<std::string> const& claimants) {
+    std::string names;
+    for (auto const& n : claimants) {
+        if (!names.empty()) names += ", ";
+        names += n;
+    }
+    return SchemaResolveError{
+        SchemaResolveErrorKind::AmbiguousExtension,
+        "file extension " + ext + " is claimed by "
+            + std::to_string(claimants.size()) + " shipped languages ("
+            + names
+            + ") — the extension alone cannot name one of them. An assembly "
+              "file is target-specific by nature, so the dialect is a question "
+              "the compile TARGET answers; this resolver has no target, so it "
+              "refuses rather than guessing."};
 }
 
 SchemaResult SchemaCache::resolveByExtension(std::string_view fileExtension) {
     const auto lower = lowercase(fileExtension);
     {
         std::lock_guard lk{mutex_};
-        if (auto it = extToName_.find(lower); it != extToName_.end()) {
-            if (auto cached = lookupCachedLocked(it->second)) return cached;
+        if (auto it = extClaimants_.find(lower); it != extClaimants_.end()) {
+            // ⚠ THE CACHE-HIT PATH MUST APPLY THE SAME RULE AS THE COLD SCAN.
+            // A warm cache that answered a `.s` while a cold one refused would
+            // make the defect depend on which file the editor opened first.
+            if (it->second.size() > 1u) {
+                return std::unexpected(
+                    ambiguousExtensionError(lower, it->second));
+            }
+            // ⚠⚠ AND "ONE CLAIMANT SO FAR" IS NOT "ONE CLAIMANT". The index
+            // only holds languages somebody already resolved BY NAME, so a
+            // single `resolveByName("asm-x86_64-att")` leaves `.s` looking
+            // unique while `asm-arm64-gas` claims it too — answering from that
+            // is the very first-wins bug, re-entered through the fast path.
+            // The short-circuit is therefore gated on the index being COMPLETE
+            // over the candidate universe.
+            //   • shipped mode: complete once the full candidate scan below
+            //     has run at least once.
+            //   • --schema-dir mode: there IS no enumerable universe (the
+            //     user's directory is never scanned up front), so the warm
+            //     index is all the knowledge that exists and answering from it
+            //     is not a shortcut past a check — it is the only path. A
+            //     collision inside that directory is still caught above,
+            //     because both languages land in one claimant list.
+            if (schemaDir_.has_value() || shippedExtIndexComplete_) {
+                if (auto cached = lookupCachedLocked(it->second.front())) {
+                    return cached;
+                }
+            }
         }
     }
     // Cache miss. In --schema-dir mode there is no shipped-candidate
@@ -193,13 +255,43 @@ SchemaResult SchemaCache::resolveByExtension(std::string_view fileExtension) {
             std::string{"shipped-language directory `"} +
                 shippedDir_->string() + "` contains no `*.lang.json` files"});
     }
+    // ★★ SCAN EVERY CANDIDATE — do NOT return on the first match.
+    //
+    // This loop used to `return loaded;` the moment a language claimed the
+    // extension, with the candidate list sorted alphabetically by stem
+    // (`scanSourcesDir`). That made `asm-arm64-gas` the permanent answer for
+    // every `.s` in the editor, silently, purely because 'a-r' sorts before
+    // 'x-8' — an x86 assembly file would have been highlighted, folded and
+    // diagnosed as arm64 assembly, and nothing would have said so. The scan
+    // now runs to completion and the CLAIMANT COUNT decides.
+    //
+    // Cost: unchanged in the common case and bounded in every case — the
+    // per-name resolve is memoized by `resolveByName`, so this is one pass
+    // over the shipped candidate list per cold extension, and the completion
+    // flag below makes subsequent lookups O(1).
+    std::vector<std::string> claimants;
     for (auto const& name : shippedCandidates_) {
         auto loaded = resolveByName(name);
+        // A candidate that fails to LOAD is skipped rather than fatal: one
+        // broken document in the shipped directory must not make every other
+        // language unresolvable. It also cannot silently become the answer —
+        // it contributes no claim.
         if (!loaded.has_value()) continue;
         for (auto const& ext : (*loaded)->fileExtensions()) {
-            if (lowercase(ext) == lower) return loaded;
+            if (lowercase(ext) == lower) { claimants.push_back(name); break; }
         }
     }
+    {
+        std::lock_guard lk{mutex_};
+        // Every shipped candidate has now been resolved-or-skipped, so the
+        // extension index covers the whole universe and the fast path above
+        // may trust a unique claimant from here on.
+        shippedExtIndexComplete_ = true;
+    }
+    if (claimants.size() > 1u) {
+        return std::unexpected(ambiguousExtensionError(lower, claimants));
+    }
+    if (claimants.size() == 1u) return resolveByName(claimants.front());
     return std::unexpected(SchemaResolveError{
         SchemaResolveErrorKind::NoExtensionMatch,
         std::string{"no shipped schema declares file extension "} + lower});

@@ -34,6 +34,15 @@ enum class SchemaResolveErrorKind : std::uint8_t {
     NotFound,           // schema dir / shipped name doesn't exist
     LoadFailed,         // file exists but loader rejected it
     NoExtensionMatch,   // file extension matches no known language
+    // More than one language declares this file extension, so the extension
+    // alone cannot name one (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET:
+    // `asm-x86_64-att` and `asm-arm64-gas` both declare `.s`/`.S`). DISTINCT
+    // from `NoExtensionMatch` because the operator action is opposite — there
+    // is no missing language to install, there is a choice to make, and the
+    // detail NAMES the claimants. An assembly file is target-specific by
+    // nature, so the dialect is a question the compile TARGET answers; this
+    // resolver has no target and must not invent one.
+    AmbiguousExtension,
     // Shipped-mode only: neither `$DSS_CONFIG_ROOT` nor the 8-level
     // cwd-walk located the `src/dss-config/sources/` directory.
     // Without it, extension-based resolution has no candidate list. Loud
@@ -118,8 +127,25 @@ private:
     mutable std::mutex                                                  mutex_;
     std::unordered_map<std::string,
                        std::shared_ptr<dss::GrammarSchema const>>       byName_;
-    // Built lazily during `resolveByExtension`: ext → language name.
-    std::unordered_map<std::string, std::string>                        extToName_;
+    // Built lazily as languages resolve: ext → EVERY language name that claims
+    // it, in first-indexed order, deduplicated by name.
+    //
+    // ★ A LIST, NOT A NAME (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET). The
+    // predecessor was `ext → name` populated with `emplace`, which SILENTLY
+    // DROPPED the second claimant of an already-indexed extension: the map
+    // kept whichever language was resolved first and every later claimant
+    // vanished without a diagnostic. `.s` has two claimants today
+    // (`asm-x86_64-att`, `asm-arm64-gas`), so the drop decided what an
+    // assembly file MEANT in the editor. Keeping the whole list is what lets
+    // `resolveByExtension` refuse instead of guess.
+    std::unordered_map<std::string, std::vector<std::string>>           extClaimants_;
+    // True once `resolveByExtension`'s cold scan has resolved-or-skipped every
+    // entry of `shippedCandidates_`, i.e. once `extClaimants_` covers the whole
+    // shipped universe. Until then a single-claimant entry means only "one so
+    // far", which is NOT enough to answer with — see the fast path in
+    // `resolveByExtension`. Meaningless (and unused) in --schema-dir mode,
+    // where no universe is ever enumerated.
+    bool                                                                shippedExtIndexComplete_ = false;
     // List of shipped language names probed once at construction.
     // Empty in --schema-dir mode (we don't enumerate the dir
     // upfront; we load lazily on demand).

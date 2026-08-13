@@ -1401,10 +1401,20 @@ enum class DiagnosticCode : std::uint16_t {
     // the target, so the driver does not treat them as build-fatal here.
     D_UnresolvedImport            = 0xD004,
     D_UnresolvedReference         = 0xD005,
-    // HR11/CU5: in a MULTI-language CU, `addFile`'s path extension matched no
-    // registered source language's `fileExtensions` — fail loud rather than
-    // silently parse the file under the primary grammar. (A single-language CU
-    // always routes to its one schema, so this never fires there.)
+    // HR11/CU5: `addFile`'s path extension did not resolve to EXACTLY ONE
+    // registered source language — fail loud rather than silently parse the
+    // file under a grammar nothing chose. TWO shapes, one predicate, two
+    // messages:
+    //   • ZERO claimants in a MULTI-language CU. (A single-language CU routes
+    //     to its one schema, so this shape never fires there.)
+    //   • TWO OR MORE claimants (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET) —
+    //     `asm-x86_64-att` and `asm-arm64-gas` both declare `.s`/`.S`. The
+    //     message NAMES every claimant, because "pick a different set of
+    //     languages, or name this file's language" is the only action
+    //     available and it needs the names.
+    // Also the driver's code when no --language was given and the TARGET's
+    // declared assembly dialect cannot answer either (the message names the
+    // target).
     D_UnknownFileExtension        = 0xD006,
     // LK10 cycle 2 (plan 14): driver-tier codes emitted by
     // `Program::compileFiles` / `compileDirectory` / `compileProject`
@@ -2175,6 +2185,21 @@ enum class DiagnosticCode : std::uint16_t {
     //   multi-instruction sequence (MOVZ+MOVK / shifted MOVZ) once that
     //   lowering lands, or narrow the value. Unsuppressable.
     A_ImmediateOperandOutOfRange   = 0x1007,
+    // ── Standalone assembly TEXT → LIR (plan 29 P4; the `encode` tier) ──
+    //
+    // ★★ ONE CODE, MANY MESSAGES, AND THAT IS DELIBERATE. Every failure this
+    // walker can hit is the SAME defect from the user's side — "this .s says
+    // something this (dialect × target) pair does not realize" — and the useful
+    // discrimination is the MESSAGE (which spelling, which dialect, which
+    // target), not a code the reader has to look up. Splitting it into
+    // A_UnknownMnemonic / A_UnknownRegister / A_UnknownDirective / … would give
+    // five codes whose only difference is a noun that is already in the text.
+    // ⚠ WHAT IT MUST NEVER BECOME is a fallback: there is no arm of the walker
+    // that continues past one of these. Assembly is the one language where a
+    // silently-substituted instruction is indistinguishable from what was
+    // written, so an unrecognized construct stops the build. Unsuppressable for
+    // that reason.
+    A_AsmTextUnsupported           = 0x1008,
 
     // ── Optimizer (renders as `X`) ────────────────────────────────────
     //

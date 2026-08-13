@@ -4,6 +4,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "asm/asm.hpp"
+#include "asm/asm_text_to_lir.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
 #include "core/substrate/mint_monotonic_id.hpp"  // c165: fresh per-member CompilationUnitId (static pull)
 #include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
@@ -2201,6 +2202,114 @@ assembleUnit(CompilationUnit const&        cu,
     return lowerCuMirToAssembly(*cuMir, format.processArgs(),
                                 format.entryVerbs(), format.sehPersonality(),
                                 format.name(), format.kind(), reporter);
+}
+
+std::optional<AssembledModule>
+assembleAsmUnit(CompilationUnit const&     cu,
+                GrammarSchema const&       grammar,
+                TargetSchema const&        target,
+                std::span<EntryMaterialization const> formatVerbs,
+                DiagnosticReporter&        reporter) {
+    // ★★★ THE `encode` TIER'S WHOLE BODY. Compare it with `assembleUnit` above:
+    // no semantic analysis, no CST→HIR, no HIR→MIR, no optimizer, no MIR→LIR,
+    // no liveness, no register allocation, no two-address legalization, no
+    // calling-convention materialization. That absence IS the tier — every one
+    // of those passes would rewrite something the programmer wrote by hand, and
+    // `pipeline_entry_config.hpp` names the three that would do it silently.
+    // ⚠ AND IT IS AN ABSENCE BY CONSTRUCTION, NOT BY A FLAG: there is no MIR
+    // module here for a MIR pass to run over, which is exactly why the facet has
+    // no `optimize: false` sibling key. Two sources of truth for "is this
+    // optimized" is how they drift apart.
+    if (cu.trees().empty()) {
+        // An empty unit is a valid empty object, matching every other language.
+        AssembledModule empty;
+        empty.cuId = cu.id();
+        return empty;
+    }
+    // ★★★ THE ENTRY NAMES ARE **NOT** INTERSECTED WITH THE FORMAT'S VERBS, AND
+    // THIS COMMENT USED TO CLAIM THEY WERE. The claim sat above a `(void)
+    // formatVerbs;` for the whole life of the function — fifteen lines
+    // describing an intersection that no line performed. Corrected rather than
+    // implemented, because the intersection is not merely unwritten: it has no
+    // subject here.
+    //
+    // ✔MEASURED in `resolveProgramEntry` (this file): the intersection is
+    // `EntryCandidate::verb ∈ formatVerbs`, and `verb` comes from
+    // `SemanticModel`'s `SymbolRecord::entryVerb` — the SEMANTIC tier's record
+    // of which declared entry SHAPE a definition's signature matched. The
+    // `encode` tier runs no semantic analysis by construction (there is no MIR
+    // module, which is the whole point of the tier), and a `.s` label carries
+    // no signature to match a shape against anyway. So an assembly label has no
+    // materialization verb, and "intersect the labels' verbs with the format's"
+    // is not a thing that can be computed — not a TODO.
+    //
+    // ⚠ WHAT `formatVerbs` CAN HONESTLY ANSWER HERE, AND NOW DOES: whether this
+    // format STARTS A PROGRAM at all. A non-empty declared verb set means it
+    // does (`ObjectFormatData::validate()` pins non-empty ⟺ exec-flavored, in
+    // both directions), and a dialect that declares no `entryLabels` can then
+    // never resolve one — every function would come back unelected and the
+    // trampoline would call whatever landed at functions[0]. That is the
+    // silently-wrong-entry outcome the previous comment named as the thing that
+    // must not happen, while the code it introduced did nothing to prevent it.
+    std::span<std::string const> const entryNames{
+        grammar.assembly().entryLabels};
+    if (!formatVerbs.empty() && entryNames.empty()) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_ProgramEntryUndefined;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual = std::format(
+            "assembly dialect '{}' declares no 'assembly.entryLabels', so no "
+            "label in a '{}' file can be this program's entry — but the object "
+            "format STARTS A PROGRAM (it declares {} entry-materialization "
+            "verb(s)), so it needs one. Without an elected entry the emitted "
+            "trampoline would call whichever function happened to land first. "
+            "Add the entry spelling(s) to the dialect's 'assembly.entryLabels', "
+            "or build this unit for a relocatable format.",
+            grammar.name(), grammar.name(), formatVerbs.size());
+        reporter.report(std::move(d));
+        return std::nullopt;
+    }
+
+    AssembledModule merged;
+    merged.cuId = cu.id();
+    for (auto const& tree : cu.trees()) {
+        auto lowered = lowerAsmTextToLir(tree, grammar, target, entryNames,
+                                         reporter);
+        if (!lowered) return std::nullopt;
+
+        auto const asmEntry = reporter.errorCount();
+        std::vector<MirInstId> lirToMir(lowered->lir.instCount(), InvalidMirInst);
+        // D-ASM-EXTERNAL-CALL-UNREPRESENTABLE: the extern rows ride the SAME
+        // channel the ordinary pipeline uses — `assemble()`'s `externs` span,
+        // which `lowerCuMirToAssembly` fills from `MirToLirResult::
+        // externImports`. Assigning to `assembled.externImports` afterwards
+        // would have worked and would have been a SECOND convention for one
+        // fact; the assembler already owns the copy (`asm.cpp`'s
+        // `result.externImports.assign(...)`).
+        auto assembled = assemble(lowered->lir, target, lirToMir, reporter,
+                                  lowered->externImports);
+        if (!assembled.ok() || !tierClean(reporter, asmEntry)) {
+            return std::nullopt;
+        }
+        assembled.cuId            = cu.id();
+        assembled.symbols         = std::move(lowered->symbols);
+        assembled.userEntrySymbol = lowered->userEntrySymbol;
+        // ⚠ ONE TREE PER UNIT TODAY. A multi-file `.s` build would need each
+        // file's SymbolIds namespaced before the merge; refusing is the honest
+        // answer while that is unbuilt, because silently keeping the LAST tree
+        // would drop every function in the others.
+        if (merged.expectedFuncCount != 0 || !merged.functions.empty()) {
+            report(reporter, DiagnosticCode::A_AsmTextUnsupported,
+                   DiagnosticSeverity::Error,
+                   "a compilation unit with more than one assembly source is "
+                   "not yet lowered — each file's symbol space would have to be "
+                   "namespaced before the modules merge, and keeping only one "
+                   "of them would silently drop the others' functions");
+            return std::nullopt;
+        }
+        merged = std::move(assembled);
+    }
+    return merged;
 }
 
 bool compileSingleUnit(CompilationUnit const&        cu,

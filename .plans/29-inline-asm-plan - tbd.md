@@ -12,7 +12,9 @@
 
 | | |
 |---|---|
-| Status | 🟡 **IN PROGRESS — ✅ P1+P2 LANDED 2026-08-12** (merged by operator decision, §4). ⏳ **P2.5 · P3 · P4 · P5 open**, each behind a NAMED prerequisite — and **P2.5 opens with an OPERATOR DECISION**, not with implementation (§5). ✔MEASURED at landing: the sqlite `hwtime.h:43` construct costs **53 diagnostics → 1** (`S0062`, quoting `outputs: "=a", "=d"`); the refusal moved **parse tier → semantic tier**; assembly became its own language (`src/dss-config/sources/asm.lang.json` — 12 rules over 2 rule holes + 13 token holes); and the reuse property was **TESTED, not asserted** (§4 exit criterion (c)). |
+| Status | 🟡 **IN PROGRESS — ✅ P1+P2 LANDED 2026-08-12; ★★★ P2.5 + THE FIRST HALF OF P3/P4 LANDED 2026-08-12: A STANDALONE `.s` FILE COMPILES AND RUNS.** ✔MEASURED end to end — `examples/asm/asm_arith_return42/main.s` (hand-written AT&T assembly, no C anywhere) compiled through the `encode` tier and EXECUTED returning 42 on **pe64-x86_64 natively on Windows** and on **elf64-x86_64 under WSL**, at debug AND under `--config=release`. The examples-runner arm ledger reports `2 verified (2 ran)` on a Windows host with the two ELF arms correctly `skipped-by-runOn`. **What landed:** the seven shared line-structure rules in `asm.lang.json` (`asmLine` … `asmOperandSeq`); `asm-x86_64-att.lang.json` — a dialect document that writes a token table, a root and a nine-rule operand production and inherits ALL the line grammar through `languageReferences`; the `assembly` schema block (rule landmarks + ONE operand-order fact + the spelling→opcode vocabulary); `src/asm/asm_text_to_lir.cpp` (text→physical-register LIR, target-blind and dialect-blind); and the driver's `encode` route in `program.cpp` + `assembleAsmUnit`. ★★ **AND FOUR SUBSTRATE DEFECTS THE FIRST REAL CONSUMER EXPOSED, each a config wire that was accepted and then ignored:** the tokenizer HARDCODED the `"
+"` lexeme ([[D-TOKENIZER-NEWLINE-LEXEME-HARDCODED]]); the parser keyed trivia on the CORE KIND rather than on the schema ([[D-PARSER-TRIVIA-KEYED-ON-CORE-KIND-NOT-CONFIG]]) — together these made `ret 
+ ret` parse as ONE instruction, a wrong parse rather than an error; the entry-closure scoping from §4.2 was INCOMPLETE, leaking `semantics.inlineAsm` into a host that imports only the standalone surface ([[D-CONFIG-LANGREF-KEYWISE-BLOCK-IGNORES-ENTRY-CLOSURE]]); and `requires` was scoped per-DOCUMENT where the contract is per-ENTRY ([[D-CONFIG-LANGREF-REQUIRES-SCOPED-BY-DOCUMENT-NOT-ENTRY]]). ⏳ **STILL OPEN, STATED PLAINLY — the `.s` half is NOT finished:** no arm64 dialect ([[D-ASM-ARM64-DIALECT-UNWRITTEN]], so the reuse claim is untested by a second dialect and the qemu-arm64 leg has no asm example); no memory operands, branches or calls ([[D-ASM-ATT-GAS-SURFACE-INCOMPLETE]], [[D-ASM-INTRA-FUNCTION-LABELS]]); and `.s` still needs an explicit `--language` ([[D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET]]). Those four rows are the cycle's net **+4 OPEN**, which FAILS the anchor-balance gate — an operator decision, not a shrug. |
 | Predecessors | ✅ [`05-parser-plan`](./05-parser-plan%20-%20ok.md) (predictive descent + FIRST-set alt dispatch) · ✅ [`08.6-semantic-plan`](./08.6-semantic-plan%20-%20ok.md) (the `pass2Post` facet walk P1's refusal lives in) · ✅ [`13-assembler-plan`](./13-assembler-plan%20-%20tbd.md) (the byte encoders P4 must reach) |
 | Successors | ⏳ [`12-mir-lir-plan`](./12-mir-lir-plan%20-%20ok.md) register allocation — P5 binds asm operands to it |
 | Scope | The GNU inline-asm surface end to end: syntax → its own language config → per-target vocabulary → real asm text → register allocation. |
@@ -170,12 +172,142 @@ pretend the embedding phase delivers it.
 | P | what | prerequisite | exit criterion |
 |---|---|---|---|
 | ✅ **P1+P2** (merged) — **LANDED 2026-08-12** | `src/dss-config/sources/asm.lang.json` as a peer language carrying the full extended-asm grammar + the **cross-language reference mechanism** + a PRECISE fail-loud semantic refusal naming the unsupported constraints | **none — startable now** | (a) the pre-P1 cascade becomes **ONE** diagnostic and the functions AFTER the asm statement are still parsed normally; (b) the asm grammar has exactly ONE owner and `c-subset.lang.json` contains NO asm grammar rule; (c) ✅ **TESTED, NOT ASSERTED — AND IT PASSED:** a 2nd host (`toy.lang.json`) bound asm through `languageReferences` and ✔MEASURED **18 shapes before, 18 after — ZERO new grammar rules**, inheriting the asm language's OWN semantics for free (`S0057` non-empty template, `S0062` extended-asm refusal, `S0063` label-section-without-`goto`), which is what “reused” was supposed to mean. ⚠ **The binding was an EXPERIMENT and was REVERTED** — `toy.lang.json` ships with no `languageReferences`, so this claim rests on that measurement and NOT on shipped config; re-run it before re-quoting it. ★★ **AND THE DURABLE GUARD THAT ACTUALLY SHIPPED — added here 2026-08-12 after an independent audit found this criterion resting ENTIRELY on the reverted experiment, whose 18-shape number is unreproducible from the tree: cite THIS as the evidence, and keep the experiment's caveat as history.** ✔TREE `tests/core/test_language_references.cpp` — **14 tests**, registered at `tests/core/CMakeLists.txt:47-48` — supplies the second consumer PERMANENTLY instead of borrowing one: a genuinely non-C-shaped synthetic host schema built as a JSON string in-test (`AsmHostProbeIsNotCShaped` pins that it is not C in disguise), loaded through the REAL loader, resolving the REAL shipped `src/dss-config/sources/asm.lang.json`. It asserts all **12** asm rules arrive **COMPILED, not merely interned** — a NON-EMPTY FIRST set each, since a name-only check passes on a rule that was interned but left BODILESS — rebound to the HOST's own alien token kinds, with one walked to completion through the schema's own `enterRule`/`advance`/`leaveRule`; plus the `semantics.inlineAsm`, `hirLowering` and `pipelineEntry` companion rows arriving FROM the asm language rather than from the host; plus **three fail-closed red-on-disable arms exercised on every run** (`WithoutTheReferenceEveryAsmRuleIsAbsent`, `WithoutTheReferenceNoCompanionRowArrives`, `ReachingAsmWithoutTheReferenceFailsLoud`), the disable being a SECOND schema string in the SAME process, so no file is mutated and nothing must be restored. Row: [[D-TEST-LANGUAGE-REFERENCE-REUSE-UNGUARDED]]; **(c) is met by that suite, not by the experiment**; (d) ⚠ **PARTIAL — NOT MET AS WRITTEN. Corrected 2026-08-12 by the same audit; it had been left stamped as met.** red-on-disable *"remove the reference and C's asm stops parsing"* has **NO test against the shipped `c-subset.lang.json`**. The nearest proxy is `LanguageReferences.ReachingAsmWithoutTheReferenceFailsLoud`, which strips the reference from the in-test SYNTHETIC host and asserts the loud failure THERE — a real red arm for the MECHANISM, and a different claim from the shipped C config, where a deleted `languageReferences` entry is caught by nothing named here. ⇒ **owed: the same red-on-disable against shipped C.** Proven-on-the-synthetic-host is the honest status |
-| **P2.5** | `asm.lang.json` gains its OWN lexical surface + an `asmUnit` root + an artifact profile, so a standalone `.s` file PARSES | P1+P2 | a `.s` file parses to a well-formed tree with no host language present — the referenced-vs-standalone symmetry proven by BOTH modes exercising the SAME shared rules |
-| **P3** | constraint + **instruction/register** vocabulary in `.target.json` | P2.5 | `=a`/`=d` on x86_64, `=r` on arm64; mnemonics resolve per target; an undeclared letter or mnemonic fails loud; agnosticism scan clean |
-| **P4** | asm TEXT reaches the assembler — text→LIR→bytes. Closes [[D-CSUBSET-INLINE-ASM-TEXT]] | P2.5 + P3 | ★ **`examples/asm/<name>/main.s` + `expected.json` COMPILES AND RUNS**, returning its asserted exit code on pe64 + elf64-x86_64 + elf64-arm64, debug and release — the operator's "prove it end-to-end". Plus `__asm__("nop")` running in the embedded mode |
+| ✅ **P2.5** — **DONE 2026-08-12** | `asm.lang.json` gains the shared standalone LINE STRUCTURE; a DIALECT document supplies the lexical surface, the root and the operand production, so a standalone `.s` PARSES | P1+P2 | ✅ MET, and by a running binary rather than by a tree dump. (a) the `encode` tier + name table + `static_assert`; (b) the entry-closure-scoped merge — shapes, rule-scoped ROWS **and** key-wise BLOCKS (§4.2, and the third of those was a second cycle's finding); (c) `kStandaloneOnlyDocumentKeys`; (d) the seven shared rules; (e) `asm-x86_64-att.lang.json`. ★★ **THE EXIT CLAUSE THAT WAS FLAGGED AS UNMEETABLE HERE STILL IS, AND THE REASON CHANGED:** *"both modes exercising the SAME shared rules"* — the embedded template is an opaque string until P5 parses its contents, so the two modes share the line-structure rules' NAMES but no rule instance. What DID become provable is the reuse property one tier down: the dialect writes ZERO line-structure rules. ⚠ And that is a ONE-dialect measurement — [[D-ASM-ARM64-DIALECT-UNWRITTEN]] is what would make it a claim |
+| 🟡 **P3** — HALF DONE | the instruction/register/directive vocabulary a `.s` resolves against, and WHERE each half lives | P2.5 | ✅ **The standalone half is met:** mnemonics resolve per target through the dialect's `assembly.instructions[]` → `TargetSchema::opcodeByMnemonic`; registers through `registerByName`; directives through a CLOSED verb set; an undeclared spelling of any of the three fails loud naming BOTH the dialect and the target; agnosticism scan clean (no arch/format/language identity in the walker). ★ The architecture question this phase existed to settle is settled and RECORDED in §4.3: `.target.json` keeps vocabulary only, a DIALECT is a language. ⏳ **Not met:** the EMBEDDED-asm constraint letters (`=a`/`=d` x86, `=r` arm64) — those are P5's operand binding and were never reachable from the standalone path |
+| ✅ **P4** — **DONE 2026-08-13, PROVEN ON BOTH CPUs BY EXECUTION** | asm TEXT reaches the assembler — text→LIR→bytes. Partially closes [[D-CSUBSET-INLINE-ASM-TEXT]] | P2.5 + P3 | ✅★★★ **arm64 CLOSED 2026-08-13 BY A RUNNING BINARY.** `examples/asm/asm_arm64_branch_call/main.s` — hand-written aarch64 GAS, no C — compiled to `arm64:elf64-aarch64-linux-exec` and **EXECUTED under qemu-aarch64 returning 42** (`file`: `ELF 64-bit LSB executable, ARM aarch64`). The exit code depends on a TAKEN branch, a NOT-TAKEN branch with an UNLABELED fallthrough between them, and a call to a second function in the same file — so a dropped CFG edge or a mis-elected opcode changes it. ★ **The second dialect was the experiment, and it returned a real result:** `asm.lang.json`’s seven shared line rules needed NOT ONE BYTE, but the text→LIR ENGINE needed SIX changes (sigil-less role ambiguity, dialect-dependent width source, absent operand roles, kind-vector election insufficiency, non-producing-opcode destination loss, width-absent variant matching any width — the last a live SILENT MISCOMPILE on arm64 `mov`). ⚠ “The shared GRAMMAR held” and “nothing had to change” are different claims; conflating them is the over-claim this plan keeps having to walk back. — ✅ **`examples/asm/asm_arith_return42/main.s` + `expected.json` COMPILES AND RUNS, exit 42, on pe64-x86_64 (native Windows) and elf64-x86_64 (WSL), debug AND release.** The arithmetic is three dependent steps in three opcode families (`sub`/`mul`/`xor`, all two-address) so any dropped or reordered instruction changes the exit code — deliberately not `mov $42; ret`, which passes even with every arithmetic instruction removed. ⏳ **NOT met:** elf64-**arm64** (needs [[D-ASM-ARM64-DIALECT-UNWRITTEN]]), and `__asm__("nop")` in the EMBEDDED mode (needs the template text parsed through the standalone instruction rules — P5). ⚠ The [[D-CSUBSET-INLINE-ASM-TEXT]] row therefore stays OPEN: standalone `.s` text now reaches the assembler; embedded template text does not |
 | **P5** | extended asm reaches register allocation — closes [[D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED]] | P4 + the `D-TARGET-IMPLICIT-REGISTER-CONSTRAINT` reuse assessment | `hwtime.h` compiles; `--scanstatus` back on in `legs.json` with `requiredDefines` proving it took; `scanstatus`/`scanstatus2` execute in the corpus |
 
 ⚠ **TWO EARLIER `P3`/`P4` ROWS WERE REMOVED FROM THE TABLE ABOVE ON 2026-08-12, NOT SILENTLY DROPPED.** They were leftovers from the phasing that existed *before* the operator's second decision (asm is a real input language), and they CONTRADICTED the rows that replaced them: the old `P3` was blocked on `P2` and scoped to constraint letters only, the old `P4` asked for `__asm__("nop")` and nothing standalone. The surviving `P3`/`P4` are blocked on **P2.5** and carry the `examples/asm/` end-to-end criterion the operator asked for. Two rows for one phase is not history, it is an ambiguity about what “P4 is done” means.
+
+### 4.2 ★★★ A reference imports the ENTRY'S CLOSURE, not the document (P2.5, 2026-08-12)
+
+`mergeLanguageReferences` used to fold in **every** shape of a referenced document. That was
+invisible while `asm.lang.json` had one surface; the standalone half makes it break three ways, and
+**one of them is a silent miscompile of the host language**:
+
+1. ★★★ **`pipelineEntry.byRule` rows are matched by rule NAME, and every language's root shape is
+   named `root`** (`data.rootRule = rules->intern("root")`). `asm.lang.json` declares
+   `{rule: "root", tier: "encode"}` for its own `.s` unit. Unscoped, that row merges into
+   `c-subset.lang.json` and declares **C's translation unit** as entering at the assembler — every
+   C file bypassing HIR, MIR and the optimizer. Not a broken build: a silent miscompile of an
+   entire host language, produced by a config that never mentions C.
+2. **`root` collides**, so the duplicate-shape guard fires on a host that asked for nothing of the
+   kind.
+3. The standalone rules name the referenced document's **own token kinds**, which the host's
+   tokenizer does not have — dead rules making FIRST-set computation answer questions about a
+   language the host does not speak.
+
+⇒ the merge now walks the reachable closure of the declared `entry` over the JSON bodies
+(pre-interning) and imports only those shapes **and only the rule-scoped rows whose rule is in that
+closure**. It also makes `entry` mean something: importing everything else said that declaration
+did not matter. ✔MEASURED after the change: `test_diagnostic_corpus`, `test_mir_lowering_c_subset`,
+`test_grammar_schema` and `test_language_references` all green, i.e. the whole `asmStmt` tail chain
+is reachable and C lost nothing.
+
+⚠ **Reachability is a conservative string walk** (any string naming one of the referenced
+document's own shapes). It cannot over-include, because a shape name and a token kind cannot
+collide — the shadow guard forbids exactly that — and anything the walk cannot see is not a rule
+reference.
+
+### 4.3 P3 — ⚠ A DESIGN THAT WAS BUILT, REVIEWED, AND REVERTED THE SAME DAY (2026-08-12)
+
+★★★ **A DIALECT IS A LANGUAGE, NOT A TARGET PROPERTY. An `asmSyntax` facet putting assembly
+GRAMMAR into `.target.json` was implemented, reviewed by the operator, and reverted before it
+shipped.** Recorded in full because the facet was *plausible* — it loaded, it was config-driven, it
+had no identity branch, and it was wrong anyway.
+
+**The disqualifying test, ✔MEASURED with gcc on one target:**
+
+| | store | load |
+|---|---|---|
+| AT&T (`gcc -S`) | `movq %rsi, (%rdi)` | `movq (%rdi), %rax` |
+| Intel (`gcc -S -masm=intel`) | `mov QWORD PTR [rdi], rsi` | `mov rax, QWORD PTR [rdi]` |
+
+One target, one compiler, **two dialects** — differing in register prefix (`%` / none), immediate
+prefix, comment character, **operand order**, memory-operand form (`(%rdi)` / `QWORD PTR [rdi]`)
+*and mnemonic spelling* (`movq` / `mov` + a width annotation). Per
+[[feedback_reference_compilers_are_the_spec]] both are things a `.s` may legally say, so Intel is
+not optional forever. ⇒ **`registerPrefix` is a function of (target, dialect), not of target.** The
+reverted facet worked only because exactly one dialect per target existed, i.e. it was a
+per-(X,Y) fact stored per-X — the same duplication shape as the verbatim `_fstat$INODE64` binding.
+
+⚠⚠ **AND THE JUSTIFICATION FOR ITS WORST PART WAS FABRICATED — this is the correction that matters
+most.** The facet declared `destinationOperand` PER INSTRUCTION, justified in three places (a code
+comment, both target configs, and this plan) by the claim *"that flag is already false for x86
+store forms"*. ✔MEASURED above: **it is false.** AT&T is uniformly destination-LAST including
+stores; Intel is uniformly destination-FIRST. Both dialects are internally uniform, so operand
+order is **exactly one dialect fact**, and encoding it per-instruction meant every future Intel
+row flipping N entries to express it. The claim was asserted without a probe, and it invented the
+requirement it was used to satisfy — the failure [[feedback_verify_before_asserting_2026_07_26]]
+exists to prevent, committed inside the very cycle that was correcting a different comment for the
+same reason.
+
+**THE SURVIVING FINDING, which is real and independent of the reverted shape:**
+★★ `opcodes[].mnemonic` is NOT assembly. ✔MEASURED across both shipped targets — the 86 x86_64 and
+80 arm64 entries are DSS's *virtual-ISA* names (`shr_l`, `shr_a`, `jcc`, `setcc`, `xor_rdx_zero`,
+`fneg_mask`, `sub_sp_reg`, `store_outgoing_arg`). A real `.s` writes `movq`/`shrq`/`je`/`sete` or
+`mov`/`lsr`/`b.eq`/`cset`. Some overlap by coincidence (`mov`, `add`, `ret`) — which is exactly
+what would have made reusing them *look* like it worked. So the assembly spelling layer is real and
+still needed; only its HOME was wrong.
+
+**THE CORRECTED SHAPE (to build at P2.5/P3):**
+* **`.target.json` — vocabulary only.** `opcodes[]` and `registers[]` already are this and need no
+  change. ⚠ Narrow-width register NAMES (`eax`→`rax`@32, `w0`→`x0`@32) are genuinely target facts,
+  but their LOOKUP is dialect-entangled (whether `%eax` strips its sigil before resolving is a
+  dialect rule), so they land WITH the dialect work rather than ahead of it.
+* **`<dialect>.asm.lang.json` — grammar.** Prefixes, comment syntax, operand ORDER (one
+  declaration), the memory-operand production, and the mnemonic spelling table. A dialect is a
+  language — which is the decision already taken when assembly was ruled its own source language —
+  and `languageReferences` is how it reaches a shared asm core. ✔CONFIRMED the `shapes` DSL can
+  express the memory-operand production: it has `sequence` / `alt` / `repeat` / `optional` plus
+  rule and token references, which covers both `disp(base,index,scale)` and `[base, #off]`.
+
+⇒ **the memory-operand divergence is NOT "blocked on a grammar that does not exist"** — the grammar
+file and its mechanism shipped at P1+P2. It is unwritten content in an existing section.
+
+<details><summary>The reverted facet's own rationale, kept so it is not re-proposed</summary>
+
+### 4.3 P3 substrate: the `asmSyntax` target facet (REVERTED — see above)
+
+★★ **The finding that shaped it: `opcodes[].mnemonic` is NOT assembly.** ✔MEASURED across both
+shipped targets — the 86 x86_64 and 80 arm64 entries are DSS's *virtual-ISA* names (`shr_l`,
+`shr_a`, `jcc`, `setcc`, `xor_rdx_zero`, `fneg_mask`, `sub_sp_reg`, `store_outgoing_arg`). A real
+`.s` writes `movq`/`shrq`/`sarq`/`je`/`sete` (x86, AT&T) or `mov`/`lsr`/`b.eq`/`cset` (arm64). Some
+overlap by coincidence (`mov`, `add`, `ret`), which is what would have made reusing them *look*
+like it worked. Reusing them would mean a `.s` had to be written in DSS's private IR spelling —
+not "a real input language", and a violation of [[feedback_reference_compilers_are_the_spec]] where
+`gas` is the reference for what a `.s` may say.
+
+⇒ `.target.json` gains `asmSyntax`: `registerPrefix` / `immediatePrefix` / `commentPrefixes` /
+`instructions[]` / `registerAliases[]`. **This is the measured answer to §5's open question about
+N configs per architecture, and it is "no":** x86_64 declares `%`, `$`, `#`, destination LAST;
+arm64 declares bare registers, `#`, `//`, destination FIRST. Same grammar, same engine, **no
+identity branch** — only these values differ, exactly as §1's table said ("dialect … / target
+selection").
+
+Two deliberate shapes worth not re-litigating:
+* **`destinationOperand` is per-INSTRUCTION, not a per-target "AT&T puts it last" flag** — that
+  flag is already false for x86 store forms, so a per-target rule would need re-litigating the
+  first time one instruction disagreed with it.
+* **`registerAliases` (`eax`→`rax`, `w0`→`x0`) are NOT rows in `registers[]`** — that array IS the
+  allocatable register file (regalloc enumerates it; `registerInfo(ordinal)` is keyed by position),
+  so adding `eax` there would invent a second allocatable register aliasing `rax` and corrupt
+  allocation for **every** language. An alias resolves to the same ordinal and carries only its
+  width. The loader refuses an alias that shadows a real register name, because
+  `asmRegisterBySpelling` consults the register file first and such a row could never resolve.
+* **No fall-through to `opcodeByMnemonic`** for an unknown assembly mnemonic. It would silently
+  accept `shr_l` in a `.s`, and — worse — silently accept an x86 spelling on arm64 wherever the two
+  vocabularies happened to collide.
+
+⚠ **The spelling list's LENGTH is a vocabulary size, not a missing mechanism** (13 x86_64 / 10
+arm64 today): an undeclared mnemonic is a precise diagnostic naming the target, so growing it is a
+config edit with no code change. What is genuinely NOT yet modelled is the **memory-operand
+grammar** — `disp(base,index,scale)` vs `[base, #off]` — which is real syntax rather than
+vocabulary and is the one place the two dialects need different *rules*. It is out of the minimal
+`.s` path (a function computing in registers and returning needs no memory operand) and must be
+anchored rather than assumed.
+
+</details>
 
 ★★★ **P5 CANNOT LAND WITHOUT ITS NEGATIVE PIN** (§D correctness-critical, silent-miscompile class): a program
 that **corrupts** a value iff the clobber list is ignored — hold a live value in eax across an asm block that
@@ -207,6 +339,36 @@ than it looks. **Assess this before P5.**
   P5 semantics) rather than left as parallel trackers. Both registry rows were updated 2026-08-12 to say the
   grammar half is done and the binding/CFG half is P5.
 
+### ✅ P2.5 DECIDED 2026-08-12 — `asmUnit` enters at a FOURTH tier, `encode`
+
+**Operator decision:** add a fourth tier rather than redefine `lir`. `PipelineTier` is now
+`{Hir, Mir, Lir, Encode}`; `lir` keeps its existing meaning (enter at **pre-regalloc, vreg-based**
+LIR) and `encode` means **the assembler's input**. Config spelling `"encode"`.
+
+★★ **THE QUESTION BELOW UNDERSTATED THE BOUNDARY, AND THE CORRECTION IS THE LOAD-BEARING PART.**
+It said `asmUnit` must enter *after register allocation*. ✔MEASURED in `compile_pipeline.cpp`, a
+`.s` must enter after **three** passes, not one — `allocateRegisters` (:956) reassigns the
+programmer's registers, `legalizeTwoAddress` (:971) rewrites the instruction forms, and
+`materializeCallingConvention` (:1008) **injects a prologue/epilogue over the one the programmer
+wrote**. `src/asm/asm.hpp:42-49` states both halves as the assembler's own input contract ("every
+vreg has been replaced by a physical register" AND "prologue/epilogue + frame_load/frame_store
+materialized"). An implementer who took the old wording literally would have entered one pass too
+early and had the callconv pass silently frame a hand-written function.
+
+★ **The name is not invented:** `substrate::CompilePhase` already partitions the back half into
+`LowerLir`, `Regalloc` ("liveness + allocation + rewrite + 2-addr legalize + callconv") and
+`Encode` ("assemble to bytes"). `lir` is the entry before `Regalloc`; `encode` is the entry after
+it. A tier with no real phase boundary behind it is a name that will start lying.
+
+⚠ **AND THE SHIPPED COMMENT SAID THE OPPOSITE.** `pipeline_entry_config.hpp:16-22` read *"a `.s` …
+is the post-register-allocation, physical-register machine tier THAT LIR MODELS"* — which
+`compile_pipeline.cpp:912` contradicts in its own first line ("MIR → LIR (vreg-based)"). It was
+never a live defect (`lir` was refused at load), but it sat exactly where P2.5's implementer would
+read it. Corrected in place with the measurement above. Same failure family as the `unistd.json`
+and UCRT-P5 cases: **a comment recording the full fact while the code uses half of it.**
+
+<details><summary>The question as originally posed (kept — the reasoning is still the record)</summary>
+
 ### ★★ P2.5 OPEN QUESTION — which pipeline tier does `asmUnit` enter at? (OPERATOR DECISION)
 
 The `pipelineEntry` mechanism itself LANDED with P1+P2 — `src/core/types/pipeline_entry_config.hpp`, declared
@@ -227,6 +389,8 @@ optimizing the block, one step further down, and precisely the failure `pipeline
 post-regalloc tier (and giving the pre-regalloc one another name) or by adding a **FOURTH tier name** is an
 **operator decision at P2.5**: it changes a closed, already-shipped vocabulary, so it is not an implementer's
 call to make quietly. Bring both options with their blast radius.
+
+</details>
 
 ### `asmLabel` deliberately REMAINS in `c-subset.lang.json` (decision, 2026-08-12)
 

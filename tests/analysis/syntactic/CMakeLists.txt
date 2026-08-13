@@ -8,4 +8,5 @@ dss_add_test(NAME analysis/syntactic/test_parser_cast_expr      SOURCES test_par
 # synthetic grammar (preferType vs requireKnownType, loader shapes, the
 # seeded-oracle channel under the strict polarity).
 dss_add_test(NAME analysis/syntactic/test_parser_commit_polarity SOURCES test_parser_commit_polarity.cpp)
+dss_add_test(NAME analysis/syntactic/test_significant_newline SOURCES test_significant_newline.cpp)
 dss_add_test(NAME analysis/syntactic/test_corpus                SOURCES test_corpus.cpp)
