@@ -17,7 +17,13 @@ unaffected — ✔verified, not assumed.
 ✅ **STATUS: GATE GREEN ON ALL THREE LEGS — the first cycle in four to manage it.**
 ✔ Windows ctest **851/851**, 0 failed · ✔ WSL x86_64 ctest **851/851**, 0 failed ·
 ✔ arm64 under qemu **594/594** with `DSS_STRICT_ARM_VERDICTS=1` and **zero skips**.
-✔ Anchor guard OK (1018 citations, 0 cell violations) · ✔ balance **983 → 983, net 0**.
+✔ Anchor guard OK (**1019** citations, 0 cell violations) · ✔ balance **983 → 983, net 0**.
+⚠ **`e42ae5a5`'s commit message says `1018` and that figure is STALE — do not re-quote it.** ✔MEASURED
+2026-08-13 after the push: the guard reports **1019** on the committed tree and **989** on its parent
+`730e642a`, so 1018 was true of neither endpoint — it was measured mid-cycle and carried into the
+message unrefreshed. No verdict moves (the guard printed OK at both points; the legs and the balance
+are untouched); a quoted number was wrong, not a result. Anchored on
+`D-PLANS-CLOSEOUT-GREEN-FIGURE-LEG-UNQUALIFIED`, which now demands **freshness as well as scope**.
 ★ The arm64 leg was proven, not assumed: with strict OFF a missing emulator is a WARNING and the suite still passes, so a green run alone would have been a partial run rounded up. The guard itself was exercised — qemu hidden with strict ON ⇒ 4/4 FAIL.
 
 ---
@@ -173,7 +179,8 @@ branch would red the gate until rebased — operator decision, not a cycle's.
 
 | Date | Commit | What shipped | Gate |
 |---|---|---|---|
-| 2026-08-13 | *pending* | **Unwind lands**: DWARF CFI + `.eh_frame` on ELF/Mach-O execs (gdb unwinds 4 DSS frames) and in ELF `.o` (round-tripped through system gcc, 9 frames vs 2 stripped) · 2 silent pe64 unwind miscompiles · interior labels end-to-end · arm64 32-bit bitwise widening + MOVZ W-form · `.section`/`.space` · config key gates · **2 false-green red-on-disable mechanisms found** · handoff created | **Win 851/851 · WSL 851/851 · arm64 594/594 strict** |
+| 2026-08-13 (post-push) | — | **Two findings after the cycle closed, neither moving a verdict.** (a) The WSL lane's build watcher span until killed **over a build that had SUCCEEDED** — its producer `tee -a`'d both FAILURE arms into the log but wrote `BUILD OK` to stdout only; this INVERTS `D-HARNESS-WSL-…-WATCHER-CANNOT-TELL`'s remedy, which assumed success was the observable one. (b) `e42ae5a5`'s message quotes **1018** anchor citations; the committed tree measures **1019**, its parent **989** — a mid-cycle figure carried into the message unrefreshed. | gates re-run: guard OK 1019 · balance 983→983 · line-endings OK |
+| 2026-08-13 | `e42ae5a5` | **Unwind lands**: DWARF CFI + `.eh_frame` on ELF/Mach-O execs (gdb unwinds 4 DSS frames) and in ELF `.o` (round-tripped through system gcc, 9 frames vs 2 stripped) · 2 silent pe64 unwind miscompiles · interior labels end-to-end · arm64 32-bit bitwise widening + MOVZ W-form · `.section`/`.space` · config key gates · **2 false-green red-on-disable mechanisms found** · handoff created | **Win 851/851 · WSL 851/851 · arm64 594/594 strict** |
 | 2026-08-13 | `75ca4034` | asm-anchor burn-down: net −4 anchors; closed 2 silent miscompiles shipped one cycle earlier; a `.s` calls libc and RUNS | Win 838/838 · ⚠ **WSL + arm64 NOT run** |
 | 2026-08-13 | `e5b60f6c` | Second assembly dialect (arm64). **Shipped 2 silent miscompiles** — negative scalars lost their sign; `[x29,#-8]` read as scale | Win 831/831 · ⚠ **1 leg of 3** |
 | 2026-08-12 | `4969e9e2` | Inline asm P1+P2 — assembly becomes its own source language | — |
