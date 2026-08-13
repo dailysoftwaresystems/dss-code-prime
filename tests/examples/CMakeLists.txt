@@ -50,6 +50,29 @@ if(NOT CMAKE_DISABLE_PRECOMPILE_HEADERS)
 endif()
 dss_pch_reproducible(dss_examples_runner)  # consumer must match producer's PCH flags
 
+# ★ THE -D THAT MAKES THE LINE ABOVE TRUE. This target is declared with a bare
+# `add_executable`, so it never passed through `dss_add_test`, which is where
+# every OTHER test binary picks up `DSS_TEST_REPO_ROOT` (tests/CMakeLists.txt).
+# It nonetheless REUSEs `dss_test_pch`, and the PRODUCER *is* built with that
+# definition — so the consumer's macro set differed from the producer's, which
+# is exactly the invariant the line above claims to be enforcing and the one
+# tests/CMakeLists.txt states outright: "GCC invalidates a precompiled header
+# whose consumer has a different -D set". ⚠ MEASURED on MSVC 19.51: a single
+# `warning C4651: '/DDSS_TEST_REPO_ROOT=...' specified for precompiled header
+# but not for current compile` — the ONLY warning in an 831-test Debug build,
+# which is how it was noticed at all.
+#
+# Not cosmetic, and the consequence differs per compiler, which is why the
+# warning was worth reading rather than filtering. `repo_root.hpp` resolves the
+# repo root through three candidates and (2) is `#ifdef DSS_TEST_REPO_ROOT`;
+# compiled without it, THIS binary silently loses candidate (2) and falls to
+# the directory walk — while every other test binary keeps it. The baked root
+# exists precisely so an out-of-tree build resolves config with NO environment
+# (see the `regression/out_of_tree_baked_root` arm), so the one runner that
+# spawns the whole example corpus was the one binary that could not use it.
+target_compile_definitions(dss_examples_runner PRIVATE
+    DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}")
+
 file(GLOB_RECURSE EXAMPLE_MANIFESTS
     CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/examples/*/*/expected.json")
