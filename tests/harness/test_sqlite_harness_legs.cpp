@@ -98,7 +98,7 @@ using dss::test::repoRoot;
 }
 
 // The interpreter. Resolved to a FULL PATH because `runBinary`'s Windows arm
-// passes it as CreateProcessA's lpApplicationName, which does not search PATH.
+// passes it as CreateProcessW's lpApplicationName, which does not search PATH.
 [[nodiscard]] std::string pythonPath() {
     for (char const* name : {"python3", "python"}) {
         auto const p = findOnPath(name);

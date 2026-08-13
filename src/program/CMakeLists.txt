@@ -5,6 +5,7 @@ add_library(program OBJECT
     cli_args.cpp
     input_resolver.cpp
     cross_validate_target_format.cpp
+    build_scripts.cpp
     dump_predefined_macros.cpp
 )
 

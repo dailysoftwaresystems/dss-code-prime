@@ -526,7 +526,7 @@ TEST(Reporter, NormalCodeSuppressedAlongsideUnsuppressableInSameReporter) {
 // naming the code as a STRING in language config and letting the name→code
 // resolver in `grammar_schema_json.cpp` bind it (MEASURED: `S_StaticStorageInForInit`
 // is declared that way in two `src/dss-config/` rows). This scan cannot see that
-// path. Today it costs nothing — MEASURED 2026-08-10, all 139 members have a
+// path. Today it costs nothing — MEASURED 2026-08-12, all 141 members have a
 // direct `DiagnosticCode::` site, so no member relies on it — but the day a
 // config-only-emitted code JOINS this table, direction A will red on a code that
 // is genuinely live. ★ THE FIX IS TO TEACH THE SCANNER THE CONFIG PATH (also walk
@@ -702,7 +702,7 @@ TEST(UnsuppressableCodes, EveryMemberHasAnEmitSiteOrIsMarkedRetired) {
     EXPECT_GE(marks.retired.size(), 5u)         // MEASURED 8
         << "the RETIRED-marker parse collapsed — direction C would then be "
            "vacuous and A's escape hatch unchecked";
-    ASSERT_GE(codes.size(), 120u)               // MEASURED 139
+    ASSERT_GE(codes.size(), 120u)               // MEASURED 141
         << "the closed table collapsed — nothing left to assert about";
 
     // ── CONTENT ANCHORS ─────────────────────────────────────────────────────

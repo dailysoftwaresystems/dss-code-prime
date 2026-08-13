@@ -23,7 +23,7 @@ namespace {
 // on-disk image), F_FfiIngest* architectural exclusions (silent
 // wrong-shape FfiMetadata for the wrong abiModel). The table grows
 // as new architectural surfaces close and SHRINKS when one is
-// retired (see the 144 → 139 note below — it does NOT grow
+// retired (see the 144 → 139 → 141 notes below — it does NOT grow
 // monotonically); each addition includes a one-line rationale
 // block alongside the entry, and each removal leaves that block
 // rewritten in place rather than deleted.
@@ -62,7 +62,34 @@ namespace {
 // branch to the wrong block, or no branch target at all, with a green build.
 // ⓘ The step before this one was 141 → 142 and went unrecorded here, which is
 // why the running total above stops at 141 while the array held 142.
-constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
+// ★ 139 → 141 (2026-08-12, AP5): the two build-lifecycle hook codes joined.
+// The AP5 cycle wrote the argument for membership at `program.cpp`'s
+// `D_PlanNotLanded` reject — "`--suppress` must not be able to convert this
+// loud reject back into the silent no-op it exists to replace" — and then did
+// not apply it to the hook codes, for which the same sentence is true
+// verbatim: `parse_diagnostic.hpp` describes `D_ScriptExitedNonZero`'s purpose
+// as keeping "precisely the silent-success class" out of the driver.
+// ✔MEASURED: `runBuildScripts` returns false whether or not its report
+// survived, and the driver turns that into `return 1` — so with the codes
+// suppressible there were TWO reachable ways to exit non-zero with an EMPTY
+// stderr, which is the worst diagnostic outcome in the codebase (an operator
+// is handed a failure with no statement of what failed):
+//   (a) `--suppress=D_ScriptExitedNonZero`, which `cli_args.cpp` accepts for
+//       any real code name — turning a documented VISIBILITY control into a
+//       silent BEHAVIOR control it cannot even fully exercise, since the build
+//       still fails, just mutely;
+//   (b) NO FLAGS AT ALL — `Config::maxDiagnostics` is 1000, so a large but
+//       SUCCESSFUL warning-heavy compile (the 189-TU sqlite manifest is
+//       exactly this shape) latches `hitCap_`, and a post-build hook failing
+//       after it has its diagnostic dropped by the cap.
+// Membership fixes both at once: it bypasses the suppress set AND the
+// cap/dedup/maxPerCode gates.
+constexpr std::array<DiagnosticCode, 145> kUnsuppressableCodes{{
+    // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
+    // that could not be spawned, or that ran and failed. Both abort the
+    // build; silencing either leaves a non-zero exit with nothing on stderr.
+    DiagnosticCode::D_ScriptSpawnFailed,
+    DiagnosticCode::D_ScriptExitedNonZero,
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the

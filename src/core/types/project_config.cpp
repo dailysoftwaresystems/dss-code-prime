@@ -1,9 +1,13 @@
 #include "core/types/project_config.hpp"
 
+#include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey + DSS_CHECK_KEY_VOCABULARY
 #include "core/types/parse_diagnostic.hpp"
+#include "program/platform_token.hpp"            // kRunOnPlatformTokens / isValidRunOnToken / runOnTokenList
 
 #include <nlohmann/json.hpp>
 
+#include <array>
+#include <cstddef>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -14,6 +18,56 @@ namespace dss {
 namespace {
 
 using json = nlohmann::json;
+
+// ── the CLOSED top-level key vocabulary ─────────────────────────────────────
+//
+// The ONE list. It is a `std::array<std::string_view, N>` (not a C array) so
+// it can carry `DSS_CHECK_KEY_VOCABULARY`, the shared compile-time guard from
+// `core/types/config_key_vocabulary.hpp`: a hand-written N that exceeds the
+// initializer count zero-fills the tail, and the check would then WHITELIST a
+// key of `""`; a duplicate entry inflates N so a genuinely missing key looks
+// accounted for. Both are silent without the static_assert.
+//
+// The human-readable "recognized fields" list in the diagnostic is DERIVED
+// from this array by `projectConfigKnownKeyList()` — see the header note. Do
+// not re-type it anywhere.
+constexpr std::array<std::string_view, 13> kKnownKeys = {
+    "language", "artifactProfile", "targets", "sources", "output",
+    "artifactName", "includes", "defines", "resolveLibraries",
+    "stackReserve", "preBuildScripts", "postBuildScripts", "dependsOn",
+};
+DSS_CHECK_KEY_VOCABULARY(kKnownKeys);
+
+// Comma-join a closed-key table for a diagnostic. ONE joiner for every table
+// in this file, so no message can list a key set by hand.
+template <std::size_t N>
+std::string joinKeys(std::array<std::string_view, N> const& keys) {
+    std::string out;
+    for (auto const& k : keys) {
+        if (!out.empty()) out += ", ";
+        out += k;
+    }
+    return out;
+}
+
+// The FIRST key of `obj` that is neither a `$`-documentation key nor a member
+// of `known`; nullopt when every key is recognized. The `$` carve-out is
+// `dss::detail::isDocumentationKey` — the codebase-wide predicate, not another
+// open-coded copy of `key.front() == '$'`.
+template <std::size_t N>
+std::optional<std::string> firstUnknownKey(
+    json const& obj, std::array<std::string_view, N> const& known) {
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        std::string const& key = it.key();
+        if (detail::isDocumentationKey(key)) continue;   // PROSE, never config
+        bool recognized = false;
+        for (auto const& k : known) {
+            if (k == key) { recognized = true; break; }
+        }
+        if (!recognized) return key;
+    }
+    return std::nullopt;
+}
 
 // Emit an Error-severity diagnostic into `rep` with a `<sourceLabel>: `
 // prefix so the user sees which project file failed.
@@ -227,20 +281,21 @@ bool readOptionalResolveLibraries(json const& doc,
 
         // Unknown keys inside the entry object reject, same rule + same
         // rationale as the top-level unknown-key gate: a mistyped member is a
-        // silent drop of the identity the entry exists to state.
-        static constexpr std::string_view kEntryKeys[] = {"path", "importName"};
-        for (auto it = e.begin(); it != e.end(); ++it) {
-            std::string const& k = it.key();
-            bool known = false;
-            for (auto const& known_k : kEntryKeys) {
-                if (known_k == k) { known = true; break; }
-            }
-            if (!known) {
-                emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
-                                 at + "has unknown member '" + k
-                                 + "' (recognized members: path, importName)");
-                return false;
-            }
+        // silent drop of the identity the entry exists to state. A
+        // `$`-prefixed member is PROSE and is skipped, and the recognized-list
+        // in the message is DERIVED from the table — both for the same reasons
+        // as the top-level check (see `kKnownKeys`); a nested key set that
+        // rejected `$comment` would just reinstate
+        // D-AP2-PROJECT-MANIFEST-REJECTS-COMMENT-KEY one level down.
+        static constexpr std::array<std::string_view, 2> kEntryKeys = {
+            "path", "importName"};
+        DSS_CHECK_KEY_VOCABULARY(kEntryKeys);
+        if (auto bad = firstUnknownKey(e, kEntryKeys)) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "has unknown member '" + *bad
+                             + "' (recognized members: " + joinKeys(kEntryKeys)
+                             + ")");
+            return false;
         }
 
         // `importName` is REQUIRED here: the object form exists SOLELY to
@@ -258,7 +313,303 @@ bool readOptionalResolveLibraries(json const& doc,
     return true;
 }
 
+// ── OPTIONAL `preBuildScripts` / `postBuildScripts` ─────────────────────────
+//
+// Read an OPTIONAL array of `{"run", "runOn"}` objects. Absent ⇒ empty + no
+// error; a present-but-empty `[]` ⇒ empty + no error (declaring no hooks is
+// not a mistake). Everything else fails loud `C_MalformedJson`.
+//
+// `run` is an ARGV VECTOR (`run[0]` is spawned directly), which is why it is
+// validated as an ARRAY of non-empty strings and never as a command STRING —
+// see the `ScriptEntry` note in the header for why a string would be both a
+// portability hole and an injection surface.
+//
+// `runOn` is OPTIONAL; when present it must be a NON-EMPTY array of tokens
+// from `kRunOnPlatformTokens`. An unrecognized token is the whole point of
+// this check: `"win32"`, `"macos"`, `"osx"` are the natural guesses, and a
+// loader that accepted them would produce a filter matching NO host — a
+// pre-build step that silently never runs, and a build that silently skips
+// generating its own inputs. So the message names BOTH the offending token
+// and the full recognized vocabulary (`runOnTokenList()`, derived from the
+// same array the predicate tests).
+//
+// `key` is the manifest field name (`preBuildScripts` / `postBuildScripts`),
+// quoted verbatim in every message so the user can see WHICH of the two script
+// arrays failed — one reader, two fields, no duplicated validation.
+bool readOptionalScripts(json const& doc,
+                         char const* key,
+                         std::vector<ScriptEntry>& out,
+                         std::string_view label,
+                         DiagnosticReporter& rep) {
+    out.clear();  // defensive: never inherit a caller's stale contents
+    if (!doc.contains(key)) {
+        return true;  // absent ⇒ empty; NEVER an error
+    }
+    json const& v = doc.at(key);
+    if (!v.is_array()) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         std::string{"field '"} + key
+                         + "' must be an array of {\"run\", \"runOn\"} objects");
+        return false;
+    }
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        json const& e = v[i];
+        std::string const at = std::string{"field '"} + key + "' entry ["
+                             + std::to_string(i) + "] ";
+        if (!e.is_object()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "must be an object {\"run\": [...], "
+                                  "\"runOn\": [...]}");
+            return false;
+        }
+
+        static constexpr std::array<std::string_view, 2> kScriptKeys = {
+            "run", "runOn"};
+        DSS_CHECK_KEY_VOCABULARY(kScriptKeys);
+        if (auto bad = firstUnknownKey(e, kScriptKeys)) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "has unknown member '" + *bad
+                             + "' (recognized members: " + joinKeys(kScriptKeys)
+                             + ")");
+            return false;
+        }
+
+        // Read one member as an array of non-empty strings. `what` completes
+        // the "must be an array of …" phrasing so each member explains ITSELF.
+        auto stringArrayMember = [&](char const* name, std::string const& what,
+                                     std::vector<std::string>& dst) -> bool {
+            json const& mv = e.at(name);
+            if (!mv.is_array()) {
+                emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                 at + "member '" + name
+                                 + "' must be an array of " + what);
+                return false;
+            }
+            for (std::size_t j = 0; j < mv.size(); ++j) {
+                json const& s = mv[j];
+                if (!s.is_string()) {
+                    emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                     at + "member '" + name + "' element ["
+                                     + std::to_string(j) + "] must be a string");
+                    return false;
+                }
+                std::string word = s.get<std::string>();
+                if (word.empty()) {
+                    emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                     at + "member '" + name + "' element ["
+                                     + std::to_string(j)
+                                     + "] must be a non-empty string");
+                    return false;
+                }
+                // AN EMBEDDED NUL PASSES EVERY CHECK ABOVE AND THEN CHANGES
+                // WHAT RUNS. JSON permits an escaped U+0000 and nlohmann stores
+                // the byte in the `std::string`, so `is_string()` is true and
+                // `empty()` is false: a `run` word carrying one was a VALID
+                // manifest here. The OS then reads an argv word as a
+                // NUL-TERMINATED C string: POSIX `execv` hands the child the
+                // word truncated at the NUL, and on Windows the NUL ends
+                // `lpCommandLine` outright, so every LATER argument disappears.
+                // The hook runs, plausibly exits 0, and the build reports
+                // success having executed something other than what the
+                // manifest says — the silent wrong-work class the rest of this
+                // reader exists to reject, with the additional twist that the
+                // offending byte is invisible in the author's editor.
+                //
+                // The word is NOT echoed. It is by definition unprintable, and
+                // a message carrying a raw NUL is a message that truncates in
+                // whatever reads it next; the two INDICES are what locates it
+                // in the file. (`runOn` goes through this helper too and is
+                // covered for free — a token containing a NUL matches no entry
+                // in the closed vocabulary, and rejecting it here keeps the
+                // unknown-token message below from quoting the byte.)
+                if (word.find('\0') != std::string::npos) {
+                    emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                     at + "member '" + name + "' element ["
+                                     + std::to_string(j)
+                                     + "] contains an embedded NUL byte (not "
+                                       "echoed — a NUL is unprintable). A "
+                                       "manifest word is read as a C string the "
+                                       "moment it is used: an argv word is "
+                                       "handed to the OS NUL-terminated, so "
+                                       "this word would reach the program "
+                                       "truncated on POSIX and would end the "
+                                       "whole command line on Windows, silently "
+                                       "dropping every argument after it.");
+                    return false;
+                }
+                dst.push_back(std::move(word));
+            }
+            return true;
+        };
+
+        ScriptEntry entry;
+
+        // `run` is REQUIRED: an entry with no command is not a hook.
+        if (!e.contains("run")) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "is missing required member 'run'");
+            return false;
+        }
+        if (!stringArrayMember(
+                "run",
+                "non-empty strings (an argv vector: run[0] is the executable, "
+                "spawned directly — never a shell command line)",
+                entry.run))
+            return false;
+        if (entry.run.empty()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "member 'run' must contain at least one "
+                                  "entry (run[0] is the executable to spawn)");
+            return false;
+        }
+
+        // `runOn` is OPTIONAL — absent ⇒ every platform. Present ⇒ non-empty
+        // and every token recognized.
+        if (e.contains("runOn")) {
+            if (!stringArrayMember("runOn",
+                                   "platform tokens (recognized: "
+                                   + runOnTokenList() + ")",
+                                   entry.runOn))
+                return false;
+            if (entry.runOn.empty()) {
+                emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                 at + "member 'runOn' must contain at least "
+                                      "one platform token when present — omit "
+                                      "the member to run on every platform");
+                return false;
+            }
+            for (std::size_t j = 0; j < entry.runOn.size(); ++j) {
+                if (!isValidRunOnToken(entry.runOn[j])) {
+                    emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                     at + "member 'runOn' element ["
+                                     + std::to_string(j)
+                                     + "] has unknown platform token '"
+                                     + entry.runOn[j] + "' (recognized: "
+                                     + runOnTokenList() + ")");
+                    return false;
+                }
+            }
+        }
+
+        out.push_back(std::move(entry));
+    }
+    return true;
+}
+
+// ── OPTIONAL `dependsOn` ────────────────────────────────────────────────────
+//
+// Read an OPTIONAL array of `{"path"} | {"git", "ref"?}` objects. Absent ⇒
+// empty + no error; a present-but-empty `[]` ⇒ empty + no error. Everything
+// else fails loud `C_MalformedJson` — see the `DependencyEntry` note in the
+// header for why BOTH sources, NEITHER source, and a `ref` with no `git` are
+// each a reject rather than a tolerated shape.
+//
+// Values are kept VERBATIM (no path resolution, no URL parsing, no filesystem)
+// exactly as `sources[]` is — a different lane resolves them.
+bool readOptionalDependsOn(json const& doc,
+                           char const* key,
+                           std::vector<DependencyEntry>& out,
+                           std::string_view label,
+                           DiagnosticReporter& rep) {
+    out.clear();  // defensive: never inherit a caller's stale contents
+    if (!doc.contains(key)) {
+        return true;  // absent ⇒ empty; NEVER an error
+    }
+    json const& v = doc.at(key);
+    if (!v.is_array()) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         std::string{"field '"} + key
+                         + "' must be an array of {\"path\"} or "
+                           "{\"git\", \"ref\"} objects");
+        return false;
+    }
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        json const& e = v[i];
+        std::string const at = std::string{"field '"} + key + "' entry ["
+                             + std::to_string(i) + "] ";
+        if (!e.is_object()) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "must be an object {\"path\": …} or "
+                                  "{\"git\": …, \"ref\": …}");
+            return false;
+        }
+
+        static constexpr std::array<std::string_view, 3> kDependencyKeys = {
+            "path", "git", "ref"};
+        DSS_CHECK_KEY_VOCABULARY(kDependencyKeys);
+        if (auto bad = firstUnknownKey(e, kDependencyKeys)) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "has unknown member '" + *bad
+                             + "' (recognized members: "
+                             + joinKeys(kDependencyKeys) + ")");
+            return false;
+        }
+
+        // Read one OPTIONAL non-empty string member into an optional.
+        auto optionalMember = [&](char const* name,
+                                  std::optional<std::string>& dst) -> bool {
+            if (!e.contains(name)) return true;   // absent ⇒ nullopt
+            json const& mv = e.at(name);
+            if (!mv.is_string()) {
+                emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                 at + "member '" + name + "' must be a string");
+                return false;
+            }
+            std::string s = mv.get<std::string>();
+            if (s.empty()) {
+                emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                                 at + "member '" + name
+                                 + "' must be a non-empty string");
+                return false;
+            }
+            dst = std::move(s);
+            return true;
+        };
+
+        DependencyEntry dep;
+        if (!optionalMember("path", dep.path)) return false;
+        if (!optionalMember("git", dep.git))   return false;
+        if (!optionalMember("ref", dep.ref))   return false;
+
+        // EXACTLY ONE source. Both ⇒ ambiguous, and silently preferring one
+        // would make the other a no-op the user cannot see. Neither ⇒ the
+        // entry names nothing at all.
+        if (dep.path && dep.git) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "states both 'path' and 'git' — a dependency "
+                                  "has exactly one source; use 'path' for a "
+                                  "local checkout or 'git' for a remote one");
+            return false;
+        }
+        if (!dep.path && !dep.git) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "states neither 'path' nor 'git' — a "
+                                  "dependency needs exactly one source");
+            return false;
+        }
+        // A `ref` pins a revision INSIDE a git remote. On a local `path` it
+        // has no meaning, so accepting it would silently ignore the pin the
+        // user wrote — the precise silent-drop class this loader rejects.
+        if (dep.ref && !dep.git) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                             at + "states 'ref' without 'git' — a ref names a "
+                                  "revision in a git remote and has no meaning "
+                                  "for a local 'path' dependency");
+            return false;
+        }
+
+        out.push_back(std::move(dep));
+    }
+    return true;
+}
+
 } // namespace
+
+std::span<std::string_view const> projectConfigKnownKeys() noexcept {
+    return std::span<std::string_view const>{kKnownKeys};
+}
+
+std::string projectConfigKnownKeyList() { return joinKeys(kKnownKeys); }
 
 std::optional<ProjectConfig>
 parseProjectConfig(std::string_view jsonText,
@@ -285,25 +636,37 @@ parseProjectConfig(std::string_view jsonText,
     // Checked BEFORE the field reads so a typo'd REQUIRED field surfaces
     // as "unknown field 'languag'" (points at the typo) rather than the
     // less-actionable "missing required field 'language'".
-    static constexpr std::string_view kKnownKeys[] = {
-        "language", "artifactProfile", "targets", "sources", "output",
-        "artifactName", "includes", "defines", "resolveLibraries",
-        "stackReserve",
-    };
-    for (auto it = doc.begin(); it != doc.end(); ++it) {
-        std::string const& key = it.key();
-        bool known = false;
-        for (auto const& k : kKnownKeys) {
-            if (k == key) { known = true; break; }
-        }
-        if (!known) {
-            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
-                             "unknown field '" + key + "' (recognized fields: "
-                             "language, artifactProfile, targets, sources, output, "
-                             "artifactName, includes, defines, resolveLibraries, "
-                             "stackReserve)");
-            return std::nullopt;
-        }
+    //
+    // TWO defects closed here, in the check that was about to grow by three
+    // keys:
+    //
+    // (1) DRIFT. The recognized-field list was written TWICE — the table and a
+    //     hand-typed string literal in the message — with nothing asserting
+    //     they agreed. The message is now DERIVED from the table
+    //     (`projectConfigKnownKeyList()`, the `registeredArtifactProfileList()`
+    //     pattern), and the table itself is a `std::array` under
+    //     `DSS_CHECK_KEY_VOCABULARY`, so an under-filled or duplicated table is
+    //     a COMPILE error rather than a whitelisted `""` key.
+    //
+    // (2) `$comment`. ✅ CLOSES D-AP2-PROJECT-MANIFEST-REJECTS-COMMENT-KEY.
+    //     ✔MEASURED before this change: a `--project` manifest carrying
+    //     `$comment` was REJECTED (`unknown field '$comment' (recognized
+    //     fields: …)`) while shipped FFI descriptors ACCEPT it and the
+    //     convention is documented for them — the same `$`-prefixed convention
+    //     blessed in one schema and required-absent in the sibling, with
+    //     nothing stating the difference, so a project manifest could not
+    //     carry its own provenance. `firstUnknownKey` now skips every
+    //     `$`-prefixed key via `dss::detail::isDocumentationKey`, the SAME
+    //     shared predicate the grammar / target / format loaders use — not a
+    //     one-off `$comment` special case, because a `$comment`-only carve-out
+    //     would still reject `$sourcesComment` and re-open the inconsistency
+    //     for the next annotation someone writes. The closed set is NOT
+    //     relaxed: a non-`$` typo still fails loud, exactly as before.
+    if (auto bad = firstUnknownKey(doc, kKnownKeys)) {
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                         "unknown field '" + *bad + "' (recognized fields: "
+                         + projectConfigKnownKeyList() + ")");
+        return std::nullopt;
     }
 
     ProjectConfig pc;
@@ -426,6 +789,25 @@ parseProjectConfig(std::string_view jsonText,
         }
         pc.stackReserveBytes = n;
     }
+
+    // The OPTIONAL build-lifecycle hooks + project prerequisites. All three
+    // ABSENT ⇒ EMPTY, never an error (the overwhelmingly common manifest
+    // declares none of them, and must stay silent); a present-but-empty `[]`
+    // is likewise fine. Every malformed ENTRY fails loud `C_MalformedJson` —
+    // a hook that silently never runs, or a dependency whose `ref` pin is
+    // silently ignored, is worse than a reject the user can act on.
+    //
+    // Shape only: this loader neither SPAWNS a script nor RESOLVES a
+    // dependency, and it keeps every argv word and path VERBATIM exactly as
+    // `sources[]` does (the pure-parser rule on `parseProjectConfig`).
+    if (!readOptionalScripts(doc, "preBuildScripts", pc.preBuildScripts,
+                             sourceLabel, rep))
+        return std::nullopt;
+    if (!readOptionalScripts(doc, "postBuildScripts", pc.postBuildScripts,
+                             sourceLabel, rep))
+        return std::nullopt;
+    if (!readOptionalDependsOn(doc, "dependsOn", pc.dependsOn, sourceLabel, rep))
+        return std::nullopt;
 
     return pc;
 }

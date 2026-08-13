@@ -43,15 +43,19 @@
 // every host in the matrix (Windows has no `cat`; a Mac has no `/proc`) and
 // makes the payload size a property of this file rather than of the machine.
 
+#include "byte_emit.hpp"
 #include "run_binary.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -148,6 +152,415 @@ TEST(RunBinaryCapture, ASmallChildStillRoundTripsItsBytes) {
     EXPECT_FALSE(r.timedOut) << r.diagnostic;
     EXPECT_EQ(r.capturedStdout, std::string(6, kFill) + kSentinel);
     EXPECT_EQ(r.exitCode, 0u);
+}
+
+// ── D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY — the sysroot-derivation pins ───────
+//
+// THE DEFECT, and it has now fired twice with an identical signature.
+// `qemu-aarch64` being on PATH does not mean it can RUN anything: a
+// dynamically linked guest ELF names its loader in PT_INTERP, qemu-user
+// resolves that path against the HOST filesystem, and without
+// QEMU_LD_PREFIX pointing at a guest sysroot every emulated arm dies at
+// exit 255 before the guest's first instruction. ✔MEASURED 2026-08-12 on the
+// WSL leg: raw `ctest` with the variable unset → 468 of 826 failing, all one
+// cause; with `QEMU_LD_PREFIX=/usr/aarch64-linux-gnu` exported and nothing
+// else changed → 826 of 826 passing. The failures read as `baseline
+// exit-code mismatch (expected=42; OS=255)`, i.e. as a compiler regression.
+//
+// WHY THESE PINS AND NOT THE END-TO-END RUN. The end-to-end proof needs an
+// x86_64 Linux host with qemu-user AND a cross sysroot installed, which is
+// one leg of the matrix; the Windows gate would never execute a line of it.
+// Every branch below is therefore driven through injected roots against a
+// synthesized guest ELF, so the derivation is gated on EVERY host — including
+// the one where the mechanism itself is dormant.
+//
+// STRICTNESS. The derivation pins assert exact strings, not "non-empty":
+// picking the WRONG sysroot is the failure mode that would otherwise pass,
+// and it is indistinguishable from picking the right one under a
+// nonempty-check. The diagnostic pin asserts on tokens rather than the whole
+// sentence only because the sentence embeds a per-run scratch path; it
+// requires the VARIABLE NAME and the interpreter path, which are the two
+// facts whose absence made 468 reds unattributable.
+
+namespace {
+
+using dss::test_support::ScratchDir;
+using dss::test_support::detail::decideQemuGuestSysroot;
+using dss::test_support::detail::elfInterpreterPath;
+using dss::test_support::detail::qemuUserGuestArch;
+
+// An interpreter path that must resolve on NO host in the matrix — used by
+// every fixture whose point is that the derivation finds nothing. A realistic
+// spelling (`/lib/ld-linux-aarch64.so.1`) would make these pins pass or fail
+// depending on whether the machine happens to have a cross sysroot installed,
+// which is precisely the ambient dependence this row exists to remove.
+constexpr char const* kUnresolvableInterp = "/lib/ld-dss-no-such-loader.so.9";
+
+// A guest loader spelling that is NOT derivable from the arch name — the
+// derivation must carry it through from the artifact's own bytes.
+constexpr char const* kGuestInterp = "/lib/ld-linux-aarch64.so.1";
+
+// A qemu-user launcher path. It deliberately does NOT exist on disk: the pins
+// that reach `runBinary` must be refused BEFORE the spawn, and if that
+// refusal ever regressed, a launcher that resolved to a real executable would
+// re-exec this very test binary with the fixture as its argument.
+constexpr char const* kFakeQemuLauncher = "/opt/definitely-absent/qemu-aarch64";
+
+// Minimal ELF64-LSB executable. PT_LOAD is emitted FIRST and PT_INTERP
+// second, so a reader that returns phdr[0] instead of scanning fails the pin
+// rather than passing on a one-entry fixture.
+void writeElf64(std::filesystem::path const& at, std::string const& interpreter) {
+    using namespace dss::test_support;
+    std::uint16_t const phnum = interpreter.empty() ? 1u : 2u;
+    std::size_t const interpOffset = 64u + 56u * static_cast<std::size_t>(phnum);
+
+    std::vector<std::uint8_t> bytes;
+    bytes.insert(bytes.end(), {0x7Fu, 'E', 'L', 'F', 2u, 1u, 1u, 0u});
+    bytes.resize(16u, 0u);          // EI_PAD
+    appU16(bytes, 2u);              // e_type    = ET_EXEC
+    appU16(bytes, 183u);            // e_machine = EM_AARCH64
+    appU32(bytes, 1u);              // e_version
+    appU64(bytes, 0x400000u);       // e_entry
+    appU64(bytes, 64u);             // e_phoff
+    appU64(bytes, 0u);              // e_shoff
+    appU32(bytes, 0u);              // e_flags
+    appU16(bytes, 64u);             // e_ehsize
+    appU16(bytes, 56u);             // e_phentsize
+    appU16(bytes, phnum);           // e_phnum
+    appU16(bytes, 64u);             // e_shentsize
+    appU16(bytes, 0u);              // e_shnum
+    appU16(bytes, 0u);              // e_shstrndx
+
+    auto phdr = [&bytes](std::uint32_t type, std::uint64_t offset,
+                         std::uint64_t size) {
+        appU32(bytes, type);
+        appU32(bytes, 4u);          // p_flags = PF_R
+        appU64(bytes, offset);      // p_offset
+        appU64(bytes, 0x400000u);   // p_vaddr
+        appU64(bytes, 0x400000u);   // p_paddr
+        appU64(bytes, size);        // p_filesz
+        appU64(bytes, size);        // p_memsz
+        appU64(bytes, 1u);          // p_align
+    };
+    phdr(/*PT_LOAD*/ 1u, 0u, 64u);
+    if (!interpreter.empty()) {
+        phdr(/*PT_INTERP*/ 3u, interpOffset, interpreter.size() + 1u);
+        bytes.insert(bytes.end(), interpreter.begin(), interpreter.end());
+        bytes.push_back(0u);
+    }
+
+    std::ofstream out{at, std::ios::binary | std::ios::trunc};
+    out.write(reinterpret_cast<char const*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+}
+
+void writeText(std::filesystem::path const& at, std::string_view text) {
+    std::ofstream out{at, std::ios::binary | std::ios::trunc};
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+}
+
+// A sysroot at `<root>/<name>` that provides `interpreter`, or — when
+// `provideLoader` is false — a same-named directory that does not, which is
+// how the pins tell a NAME match from a PROBE.
+void makeSysroot(std::filesystem::path const& root, std::string const& name,
+                 std::string const& interpreter, bool provideLoader) {
+    auto const sysroot = root / name;
+    std::filesystem::create_directories(sysroot);
+    if (!provideLoader) return;
+    auto const loader = sysroot / std::string{interpreter}.substr(1);
+    std::filesystem::create_directories(loader.parent_path());
+    writeText(loader, "not really a loader");
+}
+
+// QEMU_LD_PREFIX removed for the duration, then restored exactly.
+// `run_binary.hpp` snapshots the operator's value on the first EMULATED
+// spawn; every pin that can reach that snapshot holds this guard, so the
+// snapshot is empty no matter what the gate exported into this process.
+class QemuLdPrefixCleared {
+public:
+    QemuLdPrefixCleared() {
+        if (char const* const raw = std::getenv("QEMU_LD_PREFIX")) {
+            had_   = true;
+            saved_ = raw;
+        }
+        assign(nullptr);
+    }
+    ~QemuLdPrefixCleared() { assign(had_ ? saved_.c_str() : nullptr); }
+    QemuLdPrefixCleared(QemuLdPrefixCleared const&)            = delete;
+    QemuLdPrefixCleared& operator=(QemuLdPrefixCleared const&) = delete;
+
+    static void assign(char const* value) {
+#if defined(_WIN32)
+        // An empty value DELETES the variable on Windows; there is no
+        // `unsetenv`, and leaving it set-but-empty would read as "the operator
+        // set it" to the very code under test.
+        ::_putenv_s("QEMU_LD_PREFIX", value != nullptr ? value : "");
+#else
+        if (value != nullptr) ::setenv("QEMU_LD_PREFIX", value, 1);
+        else                  ::unsetenv("QEMU_LD_PREFIX");
+#endif
+    }
+
+private:
+    bool        had_ = false;
+    std::string saved_;
+};
+
+}  // namespace
+
+TEST(QemuGuestSysroot, GuestArchComesFromTheLauncherName) {
+    EXPECT_EQ(qemuUserGuestArch("/usr/bin/qemu-aarch64"), "aarch64");
+    EXPECT_EQ(qemuUserGuestArch("qemu-riscv64"), "riscv64");
+    EXPECT_EQ(qemuUserGuestArch("/usr/bin/qemu-x86_64"), "x86_64");
+    // `qemu-user-static`'s binfmt spelling — the suffix is packaging, not arch.
+    EXPECT_EQ(qemuUserGuestArch("/usr/bin/qemu-aarch64-static"), "aarch64");
+    // A `.exe` must not become part of the architecture.
+    EXPECT_EQ(qemuUserGuestArch("C:/msys64/usr/bin/qemu-arm.exe"), "arm");
+}
+
+TEST(QemuGuestSysroot, NonQemuUserLaunchersYieldNoArch) {
+    // The FULL-SYSTEM emulator boots a kernel and never reads QEMU_LD_PREFIX;
+    // handing it this remedy would attach a fix to an unrelated failure.
+    EXPECT_EQ(qemuUserGuestArch("/usr/bin/qemu-system-aarch64"), "");
+    EXPECT_EQ(qemuUserGuestArch("qemu-system-x86_64"), "");
+    EXPECT_EQ(qemuUserGuestArch("/usr/bin/qemu"), "");
+    EXPECT_EQ(qemuUserGuestArch("/usr/bin/wine"), "");
+    EXPECT_EQ(qemuUserGuestArch("/usr/bin/box64"), "");
+    EXPECT_EQ(qemuUserGuestArch(""), "");
+}
+
+TEST(QemuGuestSysroot, InterpreterIsReadOutOfTheGuestBytes) {
+    ScratchDir scratch{dss::test_support::Location::Temp, "qemu-ld-prefix"};
+    auto const dynamicElf = scratch.path() / "dynamic.elf";
+    auto const staticElf  = scratch.path() / "static.elf";
+    auto const notAnElf   = scratch.path() / "notelf.bin";
+    writeElf64(dynamicElf, kGuestInterp);
+    writeElf64(staticElf, "");
+    // Longer than the 64-byte header read, and NUL-free, so the reader reaches
+    // the magic check with a full header rather than bailing on a short file —
+    // and it opens `MZ`, because the artifact that must not be refused here is
+    // a real PE spawned under a launcher prefix, not a hypothetical.
+    writeText(notAnElf, "MZ this is a PE-shaped image, not an ELF, and it is "
+                        "deliberately longer than the sixty-four bytes the "
+                        "header read consumes.");
+
+    EXPECT_EQ(elfInterpreterPath(dynamicElf), kGuestInterp);
+    // No PT_INTERP: a static guest needs no sysroot and must not be refused.
+    EXPECT_EQ(elfInterpreterPath(staticElf), "");
+    EXPECT_EQ(elfInterpreterPath(notAnElf), "");
+    EXPECT_EQ(elfInterpreterPath(scratch.path() / "absent.elf"), "");
+}
+
+TEST(QemuGuestSysroot, DerivesTheSysrootThatActuallyCarriesTheLoader) {
+    ScratchDir scratch{dss::test_support::Location::Temp, "qemu-ld-prefix"};
+    auto const hostRoot   = scratch.path() / "root";
+    auto const searchRoot = scratch.path() / "usr";
+    std::filesystem::create_directories(hostRoot);
+    std::filesystem::create_directories(searchRoot);
+    // TWO name matches for this arch, and the one WITHOUT a loader sorts
+    // FIRST — `aarch64-elf` is the bare-metal cross toolchain, a real triple
+    // that ships headers and libs but no dynamic loader. Ordering is
+    // load-bearing in this fixture: with the decoy sorting second, a
+    // derivation that accepted the first NAME match would still land on the
+    // right answer and this pin would pass on a broken implementation
+    // (✔MEASURED — it did, until the decoy was renamed).
+    makeSysroot(searchRoot, "aarch64-elf", kGuestInterp,
+                /*provideLoader=*/false);
+    makeSysroot(searchRoot, "aarch64-linux-gnu", kGuestInterp,
+                /*provideLoader=*/true);
+    auto const guest = scratch.path() / "guest.elf";
+    writeElf64(guest, kGuestInterp);
+
+    auto const decision =
+        decideQemuGuestSysroot({"/usr/bin/qemu-aarch64"}, guest,
+                               /*operatorSuppliedPrefix=*/"", hostRoot,
+                               searchRoot);
+    EXPECT_EQ(decision.interpreter, kGuestInterp);
+    EXPECT_EQ(decision.sysroot,
+              (searchRoot / "aarch64-linux-gnu").generic_string());
+    EXPECT_EQ(decision.diagnostic, "");
+}
+
+// The arch filter, isolated from sort order: the ONLY tree on this host that
+// carries the loader belongs to a different guest. Running an aarch64 binary
+// against a riscv64 sysroot is not a near-miss, it is a different machine's
+// libc — the right answer is the refusal, not the nearest available directory.
+TEST(QemuGuestSysroot, AWrongArchSysrootIsNeverChosen) {
+    ScratchDir scratch{dss::test_support::Location::Temp, "qemu-ld-prefix"};
+    auto const hostRoot   = scratch.path() / "root";
+    auto const searchRoot = scratch.path() / "usr";
+    std::filesystem::create_directories(hostRoot);
+    std::filesystem::create_directories(searchRoot);
+    makeSysroot(searchRoot, "riscv64-linux-gnu", kGuestInterp,
+                /*provideLoader=*/true);
+    auto const guest = scratch.path() / "guest.elf";
+    writeElf64(guest, kGuestInterp);
+
+    auto const decision =
+        decideQemuGuestSysroot({"/usr/bin/qemu-aarch64"}, guest,
+                               /*operatorSuppliedPrefix=*/"", hostRoot,
+                               searchRoot);
+    EXPECT_EQ(decision.sysroot, "");
+    EXPECT_NE(decision.diagnostic.find("QEMU_LD_PREFIX"), std::string::npos)
+        << decision.diagnostic;
+}
+
+TEST(QemuGuestSysroot, NoSysrootAnywhereIsOneLegibleRefusalNamingTheVariable) {
+    ScratchDir scratch{dss::test_support::Location::Temp, "qemu-ld-prefix"};
+    auto const hostRoot   = scratch.path() / "root";
+    auto const searchRoot = scratch.path() / "usr";
+    std::filesystem::create_directories(hostRoot);
+    std::filesystem::create_directories(searchRoot);
+    auto const guest = scratch.path() / "guest.elf";
+    writeElf64(guest, kUnresolvableInterp);
+
+    auto const decision =
+        decideQemuGuestSysroot({"/usr/bin/qemu-aarch64"}, guest,
+                               /*operatorSuppliedPrefix=*/"", hostRoot,
+                               searchRoot);
+    EXPECT_EQ(decision.interpreter, kUnresolvableInterp);
+    EXPECT_EQ(decision.sysroot, "");
+    // The two facts whose absence made 468 reds unattributable.
+    EXPECT_NE(decision.diagnostic.find("QEMU_LD_PREFIX"), std::string::npos)
+        << decision.diagnostic;
+    EXPECT_NE(decision.diagnostic.find(kUnresolvableInterp), std::string::npos)
+        << decision.diagnostic;
+    EXPECT_NE(decision.diagnostic.find("qemu-aarch64"), std::string::npos)
+        << decision.diagnostic;
+}
+
+TEST(QemuGuestSysroot, EveryNothingToDoBranchLeavesTheSpawnAlone) {
+    ScratchDir scratch{dss::test_support::Location::Temp, "qemu-ld-prefix"};
+    auto const hostRoot   = scratch.path() / "root";
+    auto const searchRoot = scratch.path() / "usr";
+    std::filesystem::create_directories(searchRoot);
+    auto const guest = scratch.path() / "guest.elf";
+    writeElf64(guest, kUnresolvableInterp);
+    auto const staticGuest = scratch.path() / "static.elf";
+    writeElf64(staticGuest, "");
+
+    auto expectSilent = [&](dss::test_support::detail::QemuSysrootDecision const& d,
+                            char const* why) {
+        EXPECT_EQ(d.sysroot, "") << why;
+        EXPECT_EQ(d.diagnostic, "") << why;
+    };
+
+    // A native run: no launcher, so no loader to place.
+    expectSilent(decideQemuGuestSysroot({}, guest, "", hostRoot, searchRoot),
+                 "no launcher prefix");
+    // Somebody else's emulator, and the full-system one, are not this
+    // variable's business even though the guest cannot resolve its loader.
+    expectSilent(decideQemuGuestSysroot({"/usr/bin/wine"}, guest, "", hostRoot,
+                                        searchRoot),
+                 "non-qemu launcher");
+    expectSilent(decideQemuGuestSysroot({"/usr/bin/qemu-system-aarch64"}, guest,
+                                        "", hostRoot, searchRoot),
+                 "qemu-system is not qemu-user");
+    // A static guest asks for no interpreter; refusing it would break a shape
+    // that runs correctly today with no sysroot at all.
+    auto const staticDecision = decideQemuGuestSysroot(
+        {"/usr/bin/qemu-aarch64"}, staticGuest, "", hostRoot, searchRoot);
+    expectSilent(staticDecision, "static guest has no PT_INTERP");
+    EXPECT_EQ(staticDecision.interpreter, "");
+}
+
+TEST(QemuGuestSysroot, AnOperatorSuppliedPrefixIsLeftCompletelyAlone) {
+    ScratchDir scratch{dss::test_support::Location::Temp, "qemu-ld-prefix"};
+    auto const hostRoot   = scratch.path() / "root";
+    auto const searchRoot = scratch.path() / "usr";
+    std::filesystem::create_directories(searchRoot);
+    // A derivable sysroot IS present, so this pin fails if the operator's
+    // value is merely tie-broken against rather than honoured outright.
+    makeSysroot(searchRoot, "aarch64-linux-gnu", kGuestInterp,
+                /*provideLoader=*/true);
+    auto const guest = scratch.path() / "guest.elf";
+    writeElf64(guest, kGuestInterp);
+
+    auto const decision = decideQemuGuestSysroot(
+        {"/usr/bin/qemu-aarch64"}, guest,
+        /*operatorSuppliedPrefix=*/"/opt/my-own-sysroot", hostRoot, searchRoot);
+    EXPECT_EQ(decision.sysroot, "");
+    EXPECT_EQ(decision.diagnostic, "");
+    EXPECT_EQ(decision.interpreter, "");
+}
+
+TEST(QemuGuestSysroot, AHostRootThatAlreadyCarriesTheLoaderNeedsNoPrefix) {
+    ScratchDir scratch{dss::test_support::Location::Temp, "qemu-ld-prefix"};
+    auto const hostRoot   = scratch.path() / "root";
+    auto const searchRoot = scratch.path() / "usr";
+    std::filesystem::create_directories(searchRoot);
+    // The loader sits at the host root (the native-arch and multiarch-libc
+    // shapes), and a derivable sysroot also exists — narrowing the child's
+    // search to the sysroot would be a change, not a fix.
+    makeSysroot(scratch.path(), "root", kGuestInterp, /*provideLoader=*/true);
+    makeSysroot(searchRoot, "aarch64-linux-gnu", kGuestInterp,
+                /*provideLoader=*/true);
+    auto const guest = scratch.path() / "guest.elf";
+    writeElf64(guest, kGuestInterp);
+
+    auto const decision =
+        decideQemuGuestSysroot({"/usr/bin/qemu-aarch64"}, guest, "", hostRoot,
+                               searchRoot);
+    EXPECT_EQ(decision.interpreter, kGuestInterp);
+    EXPECT_EQ(decision.sysroot, "");
+    EXPECT_EQ(decision.diagnostic, "");
+}
+
+TEST(QemuGuestSysroot, TheDerivedSysrootIsActuallyExportedToTheChild) {
+    QemuLdPrefixCleared cleared;
+    ScratchDir scratch{dss::test_support::Location::Temp, "qemu-ld-prefix"};
+    auto const hostRoot   = scratch.path() / "root";
+    auto const searchRoot = scratch.path() / "usr";
+    std::filesystem::create_directories(hostRoot);
+    std::filesystem::create_directories(searchRoot);
+    makeSysroot(searchRoot, "aarch64-linux-gnu", kGuestInterp,
+                /*provideLoader=*/true);
+    auto const guest = scratch.path() / "guest.elf";
+    writeElf64(guest, kGuestInterp);
+
+    ASSERT_EQ(std::getenv("QEMU_LD_PREFIX"), nullptr);
+    EXPECT_EQ(dss::test_support::ensureQemuGuestSysroot(
+                  {"/usr/bin/qemu-aarch64"}, guest, hostRoot, searchRoot),
+              "");
+    char const* const exported = std::getenv("QEMU_LD_PREFIX");
+    ASSERT_NE(exported, nullptr)
+        << "the derivation decided on a sysroot but never exported it — the "
+           "child would inherit nothing and die in the loader exactly as "
+           "before";
+    EXPECT_EQ(std::string{exported},
+              (searchRoot / "aarch64-linux-gnu").generic_string());
+
+    // A native spawn must not touch the variable at all.
+    QemuLdPrefixCleared::assign(nullptr);
+    EXPECT_EQ(dss::test_support::ensureQemuGuestSysroot({}, guest, hostRoot,
+                                                        searchRoot),
+              "");
+    EXPECT_EQ(std::getenv("QEMU_LD_PREFIX"), nullptr);
+}
+
+// The call site, not just the decision. `runBinary` is where the refusal has
+// to happen — one legible sentence instead of a child that dies at exec time
+// and is reported as an exit-code mismatch. The launcher path does not exist,
+// so a regressed call site reaches the spawn and reports a spawn error
+// INSTEAD of naming the variable: this pin reds on the message, which is the
+// property the row is about.
+TEST(QemuGuestSysroot, RunBinaryRefusesTheSpawnAndSaysWhichVariableIsUnset) {
+    QemuLdPrefixCleared cleared;
+    ScratchDir scratch{dss::test_support::Location::Temp, "qemu-ld-prefix"};
+    auto const guest = scratch.path() / "guest.elf";
+    writeElf64(guest, kUnresolvableInterp);
+
+    auto const result = dss::test_support::runBinary(
+        guest, std::chrono::seconds{10}, /*captureStdout=*/false,
+        {kFakeQemuLauncher});
+
+    EXPECT_FALSE(result.spawned) << "nothing may be exec'd once the guest's "
+                                    "loader is known to be unreachable";
+    EXPECT_FALSE(result.timedOut);
+    EXPECT_NE(result.diagnostic.find("QEMU_LD_PREFIX"), std::string::npos)
+        << result.diagnostic;
+    EXPECT_NE(result.diagnostic.find(kUnresolvableInterp), std::string::npos)
+        << result.diagnostic;
 }
 
 // ── main: payload generator OR test runner ─────────────────────────────────

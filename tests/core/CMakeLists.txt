@@ -82,6 +82,22 @@ dss_add_test(NAME core/substrate/test_mint_monotonic_id SOURCES substrate/test_m
 dss_add_test(NAME core/substrate/test_large_stack_call  SOURCES substrate/test_large_stack_call.cpp)
 dss_add_test(NAME core/substrate/test_relocation_table  SOURCES substrate/test_relocation_table.cpp)
 target_link_libraries(dss_core_substrate_test_relocation_table PRIVATE nlohmann_json::nlohmann_json)
+# The process-spawn substrate (src/core/substrate/process_spawn.{hpp,cpp}) — the
+# compiler's FIRST process creation, and the home of the "NO SHELL, EVER"
+# contract every `{"run": [...]}` build step and every `git` invocation rides on.
+# ★ It defines its own `main` (the test executable IS the spawn fixture: it
+# re-invokes itself with `--dss-spawn-fixture` and records its own cwd + argv),
+# which is why it must stay a SEPARATE target from its siblings above — the same
+# reason tests/test_support/test_run_binary_capture.cpp is one.
+dss_add_test(NAME core/substrate/test_process_spawn     SOURCES substrate/test_process_spawn.cpp)
+if(WIN32)
+    # `CommandLineToArgvW` (<shellapi.h>, shell32) is the ROUND-TRIP ORACLE for
+    # buildWindowsCommandLine: the test parses its own output with the very
+    # parser the quoting algorithm targets, so a hand-computed expectation is
+    # not the only thing standing behind the pins. MSVC does not auto-link
+    # shell32 and MinGW's default set is a toolchain detail, so name it.
+    target_link_libraries(dss_core_substrate_test_process_spawn PRIVATE shell32)
+endif()
 target_include_directories(dss_core_substrate_test_arena_tag       PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_container PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_attribute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

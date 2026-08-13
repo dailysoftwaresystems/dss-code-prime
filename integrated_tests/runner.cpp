@@ -35,6 +35,19 @@
 // User invariant (2026-06-02): strict asserts on every observable
 // — exit codes EQ, no timeouts, no spawn failures. Wrong-value
 // breaks the run.
+//
+// PROJECT MODE (D-EXAMPLES-RUNNER-PROJECT-MANIFEST): a manifest may name a
+// `.dss-project.json` via the top-level `"project"` key INSTEAD of
+// `source`/`sources`, and this runner then drives `dss-code-prime --project`
+// instead of `--compile`. That is the only CLI mode which expands the
+// manifest's source GLOBS and runs its `preBuildScripts`/`postBuildScripts`
+// hooks, so it is the only way the corpus can witness a build script that
+// GENERATES the source it then compiles. Three things it changes, all handled
+// explicitly below: the project manifest's own `targets[]` is the build
+// authority (a corpus `spec` is a cross-checked MIRROR), the artifact lands
+// under a per-format subdirectory, and the COMPILE — not just the run — must
+// happen with `outDir` as the working directory. Every one of the three is
+// implemented identically in the in-process sibling.
 
 #include "arm_verdict_ledger.hpp"
 #include "run_binary.hpp"
@@ -79,6 +92,8 @@ using ::dss::test_support::currentHostArch;
 using ::dss::test_support::currentHostOs;
 using ::dss::test_support::DeclaredArm;
 using ::dss::test_support::findOnPath;
+using ::dss::test_support::qemuSysrootHint;
+using ::dss::test_support::specFormatName;
 using ::dss::test_support::specTargetArch;
 
 int passes  = 0;
@@ -278,6 +293,15 @@ struct ExpectedDiagnostic {
 
 struct ExampleManifest {
     std::string                language;
+    // D-EXAMPLES-RUNNER-PROJECT-MANIFEST: PROJECT MODE. Present ⇒ this example is
+    // built by `dss-code-prime --project <file>` from the named
+    // `.dss-project.json` (relative to the example dir) instead of by
+    // `--compile <sources>`. MUTUALLY EXCLUSIVE with `source`/`sources`; see the
+    // in-process examples_runner's copy of this field for the full rationale,
+    // including WHY the key is top-level and why the per-target `spec` becomes a
+    // cross-checked MIRROR rather than a driver (`Program::compileProject` takes
+    // no targets argument — the project manifest's own `targets[]` is authority).
+    std::optional<std::string> project;
     // Multi-CU (CU6): "sources":[...] makes each file its OWN CompilationUnit; the CLI's
     // `--compile a.c b.c` links them into one image (gcc/clang semantics — separate TUs,
     // the linker resolves cross-file references, LK11). The single "source":"x.c" form is
@@ -350,9 +374,46 @@ struct ExampleManifest {
         return false;
     }
     out.language = j.value("language", "");
-    // "sources":[...] (multi-CU, CU6) takes precedence over "source" (single file). Mirror
-    // the in-process examples_runner so BOTH corpus harnesses accept the same manifests.
-    if (j.contains("sources")) {
+
+    // ── WHAT DOES THIS EXAMPLE COMPILE? EXACTLY ONE SPELLING ANSWERS IT ─────
+    //
+    // `project` (a .dss-project.json build) / `sources` (multi-CU) / `source`
+    // (single file) — declaring two of them is a manifest DEFECT, not a
+    // precedence question. `sources` USED TO "take precedence over" `source`,
+    // i.e. silently drop one of them; MEASURED, zero of the 580 corpus
+    // manifests declare both, so the rule protected nothing and stood ready to
+    // swallow a rename typo. Mirrors the in-process examples_runner exactly —
+    // both runners must accept and REJECT the same manifests.
+    bool const hasSource  = j.contains("source");
+    bool const hasSources = j.contains("sources");
+    if (j.contains("project")) {
+        if (!j.at("project").is_string()
+            || j.at("project").get<std::string>().empty()) {
+            std::cerr << "  'project' must be a NON-EMPTY string naming a "
+                         ".dss-project.json relative to the example dir, in "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        if (hasSource || hasSources) {
+            std::cerr << "  manifest declares BOTH 'project' and '"
+                      << (hasSources ? "sources" : "source")
+                      << "'. A project build's inputs come from the "
+                         ".dss-project.json's own 'sources' (which a "
+                         "preBuildScripts hook may GENERATE), so the "
+                         "expected.json list would be silently ignored — delete "
+                         "one: " << path.generic_string() << "\n";
+            return false;
+        }
+        out.project = j.at("project").get<std::string>();
+    }
+    if (hasSource && hasSources) {
+        std::cerr << "  manifest declares BOTH 'source' and 'sources' — one "
+                     "names a single CU, the other a multi-CU list, and "
+                     "honoring either would silently discard the other. Delete "
+                     "one: " << path.generic_string() << "\n";
+        return false;
+    }
+    if (hasSources) {
         if (!j.at("sources").is_array() || j.at("sources").empty()) {
             std::cerr << "  'sources' must be a non-empty array of file names in "
                       << path.generic_string() << "\n";
@@ -367,10 +428,20 @@ struct ExampleManifest {
             out.sources.push_back(s.get<std::string>());
         }
         out.multiCu = true;
-    } else if (auto single = j.value("source", std::string{}); !single.empty()) {
-        out.sources = {single};
-    } else {
-        std::cerr << "  manifest requires 'source' (single CU) or 'sources' (multi-CU): "
+    } else if (hasSource) {
+        auto single = j.value("source", std::string{});
+        if (!j.at("source").is_string() || single.empty()) {
+            std::cerr << "  'source' must be a non-empty string in "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        out.sources = {std::move(single)};
+    } else if (!out.project.has_value()) {
+        // RELAXED, not deleted: a manifest naming NONE of the three still fails
+        // exactly as loudly. Only project mode is exempt, and only because its
+        // inputs live in the other file.
+        std::cerr << "  manifest requires 'source' (single CU), 'sources' "
+                     "(multi-CU), or 'project' (a .dss-project.json build): "
                   << path.generic_string() << "\n";
         return false;
     }
@@ -407,6 +478,20 @@ struct ExampleManifest {
             }
             out.expectDiagnostics.push_back(std::move(ed));
         }
+    }
+    // PROJECT MODE has no expect-error branch, and saying so LOUDLY is the
+    // point: `runErrorExampleViaCli` builds a `--compile <sources>` command line
+    // a project manifest never populates. Rejected in the PARSER, in BOTH
+    // runners, so the unsupported shape is named where the author can fix it.
+    if (out.project.has_value() && !out.expectDiagnostics.empty()) {
+        std::cerr << "  manifest declares BOTH 'project' and "
+                     "'expectDiagnostics'. The expect-error path compiles a "
+                     "single named source so a diagnostic's position is "
+                     "unambiguous; a project build has no such source. "
+                     "Implement the project-mode expect-error path in BOTH "
+                     "runners before declaring this pair: "
+                  << path.generic_string() << "\n";
+        return false;
     }
     if (j.contains("exitCode")) {
         if (!j.at("exitCode").is_number_integer()) {
@@ -463,6 +548,164 @@ struct ExampleManifest {
     }
     return true;
 }
+
+// ── PROJECT MODE support (mirrors tests/examples/examples_runner.cpp) ───────
+
+// The FORMAT half of a manifest spec ("x86_64:pe64-x86_64-windows-exec" →
+// "pe64-x86_64-windows-exec") — the subdirectory a PROJECT build routes its
+// artifact into, because `Program::compileProject` forces
+// `setPerFormatOutputSubdir(true)` (src/program/program.cpp:1760) even for a
+// single-target build. Empty ⇒ the spec has no ':' and the caller fails loud
+// rather than composing a wrong path.
+//
+// `specFormatName` is the shared `dss::test_support` helper beside its twin
+// `specTargetArch` (arm_verdict_ledger.hpp), imported with the sibling
+// using-declarations above. Both runners briefly carried byte-identical local
+// copies when project mode landed; folding them into the shared header keeps
+// one spec-splitting vocabulary, which is what that header is for.
+
+// The FACTS this harness needs out of a `.dss-project.json`. NOT a second
+// `parseProjectConfig` — the DRIVER owns that parse and fails loud on every
+// structural error in it. Two questions, each with a harness-side reason:
+// `targets[]`/`language` are what the expected.json entries MIRROR (and
+// `compileProject` takes no targets argument, so the mirror must be checked
+// somewhere), and each APPLICABLE build script's argv[0] is what decides
+// `SkippedBuildInputMissing` rather than letting an absent interpreter surface
+// as a source glob that matched nothing. Mirrors the in-process twin field for
+// field so both runners accept and reject the same project manifests.
+struct ProjectFacts {
+    std::string              language;
+    std::vector<std::string> targets;
+    std::vector<std::string> applicableScriptPrograms;  // argv[0]s for THIS host
+};
+
+[[nodiscard]] bool readProjectFacts(fs::path const& projectPath,
+                                    ProjectFacts&   out) {
+    std::ifstream in(projectPath);
+    if (!in) {
+        std::cerr << "  cannot open project manifest "
+                  << projectPath.generic_string() << "\n";
+        return false;
+    }
+    nlohmann::json j;
+    try { in >> j; }
+    catch (std::exception const& e) {
+        std::cerr << "  JSON parse failed for project manifest "
+                  << projectPath.generic_string() << ": " << e.what() << "\n";
+        return false;
+    }
+    if (!j.contains("language") || !j.at("language").is_string()) {
+        std::cerr << "  project manifest needs a string 'language': "
+                  << projectPath.generic_string() << "\n";
+        return false;
+    }
+    out.language = j.at("language").get<std::string>();
+    if (!j.contains("targets") || !j.at("targets").is_array()
+        || j.at("targets").empty()) {
+        std::cerr << "  project manifest needs a non-empty 'targets' array: "
+                  << projectPath.generic_string() << "\n";
+        return false;
+    }
+    for (auto const& t : j.at("targets")) {
+        if (!t.is_string()) {
+            std::cerr << "  project manifest 'targets' entries must be strings: "
+                      << projectPath.generic_string() << "\n";
+            return false;
+        }
+        out.targets.push_back(t.get<std::string>());
+    }
+    // BOTH hook arrays: a post-build script's interpreter is as absent as a
+    // pre-build one's, and both are build inputs the manifest asked for.
+    auto const host = currentHostOs();
+    for (char const* key : {"preBuildScripts", "postBuildScripts"}) {
+        if (!j.contains(key)) continue;
+        if (!j.at(key).is_array()) {
+            std::cerr << "  project manifest '" << key << "' must be an array: "
+                      << projectPath.generic_string() << "\n";
+            return false;
+        }
+        for (auto const& e : j.at(key)) {
+            if (!e.is_object() || !e.contains("run") || !e.at("run").is_array()
+                || e.at("run").empty() || !e.at("run").at(0).is_string()) {
+                std::cerr << "  project manifest '" << key << "' entries need a "
+                             "non-empty string array 'run': "
+                          << projectPath.generic_string() << "\n";
+                return false;
+            }
+            // ABSENT `runOn` ⇒ EVERY host (the driver's own default, see
+            // src/program/build_scripts.cpp `appliesToHost`). Reading absent as
+            // "matches nothing" would silently exempt every unfiltered hook.
+            bool applies = true;
+            if (e.contains("runOn")) {
+                if (!e.at("runOn").is_array()) {
+                    std::cerr << "  project manifest '" << key
+                              << "' entry 'runOn' must be an array: "
+                              << projectPath.generic_string() << "\n";
+                    return false;
+                }
+                applies = false;
+                for (auto const& o : e.at("runOn")) {
+                    if (o.is_string() && o.get<std::string>() == host) {
+                        applies = true;
+                    }
+                }
+            }
+            if (applies) {
+                out.applicableScriptPrograms.push_back(
+                    e.at("run").at(0).get<std::string>());
+            }
+        }
+    }
+    return true;
+}
+
+// Is a build script's argv[0] present on THIS machine? Mirrors the contract of
+// the driver's `dss::substrate::resolveExecutableOnPath` closely enough for a
+// PRESENCE probe: a name carrying a directory separator is taken AS A PATH (no
+// search), anything else is a PATH lookup through the SAME `findOnPath` the
+// emulator gate uses — so the two skip classes cannot disagree about what
+// "missing" means. The driver still spawns and still emits
+// `D_ScriptSpawnFailed` if this probe is wrong.
+[[nodiscard]] bool buildScriptProgramPresent(std::string const& argv0) {
+    if (argv0.find('/') != std::string::npos
+        || argv0.find('\\') != std::string::npos) {
+        std::error_code ec;
+        bool const there = fs::exists(fs::path{argv0}, ec);
+        return there && !ec;
+    }
+    return !findOnPath(argv0).empty();
+}
+
+// ── Scoped working-directory change ────────────────────────────────────────
+//
+// HOISTED out of `runSelectedTargetViaCli`, where it used to be declared inline
+// immediately before the RUN. It now has TWO users in that function — the
+// project-mode COMPILE and the run — and a type defined at the first use site
+// cannot serve the earlier one.
+//
+// SAFE HERE and stated so the next reader can check it: this runner walks
+// examples SEQUENTIALLY in one thread, so there is no concurrent arm whose
+// relative-path resolution a process-global chdir could disturb. The guard
+// RESTORES the previous directory because the runner resolves relative paths of
+// its own (the compiler path, the corpus root) between examples.
+struct CwdGuard {
+    fs::path saved;
+    bool     ok = false;
+    explicit CwdGuard(fs::path const& to) {
+        std::error_code ec;
+        saved = fs::current_path(ec);
+        if (ec) return;
+        fs::current_path(to, ec);
+        ok = !ec;
+    }
+    ~CwdGuard() {
+        if (!ok || saved.empty()) return;
+        std::error_code ec;
+        fs::current_path(saved, ec);
+    }
+    CwdGuard(CwdGuard const&) = delete;
+    CwdGuard& operator=(CwdGuard const&) = delete;
+};
 
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT + nested extension (CLI-subprocess mirror of
 // the in-process examples_runner's buildDependencyArtifact): build ONE
@@ -636,20 +879,152 @@ struct CliArmOutcome {
     // example passes ALL its sources here and the CLI links each as its own translation unit
     // (the driver routes >1 file to compileUnits — gcc/clang semantics). Each path is quoted
     // independently.
+    // ── PROJECT MODE: validate the manifest, then compile WITH `outDir` AS THE
+    //    WORKING DIRECTORY ────────────────────────────────────────────────────
+    //
+    // ★ THE CWD IS LOAD-BEARING HERE, and this runner did not have it. MEASURED:
+    // its ctest entry (integrated_tests/CMakeLists.txt) sets no
+    // WORKING_DIRECTORY, so the process cwd is `${CMAKE_BINARY_DIR}/
+    // integrated_tests`, and the `CwdGuard` wrapped only the RUN. A project
+    // manifest's relative `sources[]` globs expand against the PROCESS working
+    // directory (D-AP2-SOURCES-GLOB), and a `preBuildScripts` generator is
+    // spawned in that same directory — so without the guard the generator would
+    // write its source into the BUILD TREE while the glob searched it there too,
+    // scattering generated files outside the per-example scratch and defeating
+    // the neighbor staging entirely. The in-process sibling has always compiled
+    // with its scratch dir as the cwd (`ScratchDir::useAsCwd()`); this is what
+    // makes the two agree.
+    //
+    // Scoped to PROJECT MODE deliberately. A `--compile` invocation is handed
+    // ABSOLUTE source paths, so its behaviour does not depend on the cwd, and
+    // moving 580 existing examples' compiles onto a different working directory
+    // would be an unmeasured change riding along with this one.
+    bool const projectMode = m.project.has_value();
+    std::string projectArg;
+    if (projectMode) {
+        auto const projectPath = outDir / *m.project;
+        auto const present = fileExists(projectPath);
+        check(exampleName + ": project manifest staged at "
+                  + projectPath.generic_string(),
+              present.ok,
+              present.ok ? ""
+                         : present.why
+                               + " — the neighbor staging above copies the "
+                                 "example dir's IMMEDIATE files only, so a "
+                                 "project manifest in a SUBDIRECTORY needs that "
+                                 "loop (and its twin in tests/examples/"
+                                 "examples_runner.cpp) made recursive");
+        if (!present.ok) {
+            return {ArmVerdict::Poisoned, "project manifest: " + present.why};
+        }
+        ProjectFacts facts;
+        if (!readProjectFacts(projectPath, facts)) {
+            check(exampleName + ": project manifest is readable", false,
+                  "see the parse error above");
+            return {ArmVerdict::Poisoned, "project manifest unreadable"};
+        }
+        // THE MIRROR CHECK. `compileProject` takes NO targets argument, so this
+        // `spec` does not drive the build — it selects which of the project's
+        // OWN targets this arm runs, gates `runOn`/`emulator`, and names the
+        // artifact subdirectory. A spec the project never builds must fail HERE
+        // rather than three steps later as a baffling missing artifact.
+        bool const declared = std::find(facts.targets.begin(),
+                                        facts.targets.end(), target->spec)
+                            != facts.targets.end();
+        std::string declaredList;
+        for (auto const& s : facts.targets) {
+            declaredList += (declaredList.empty() ? "" : ", ") + s;
+        }
+        check(exampleName + ": target spec " + target->spec
+                  + " is declared by " + *m.project,
+              declared,
+              "the project builds only [" + declaredList + "], so this arm "
+              "would assert an artifact nothing was asked to produce");
+        if (!declared) {
+            return {ArmVerdict::Poisoned,
+                    "spec " + target->spec + " not in the project's targets"};
+        }
+        bool const langAgrees = m.language.empty()
+                             || m.language == facts.language;
+        check(exampleName + ": expected.json language mirrors " + *m.project,
+              langAgrees,
+              "expected.json says '" + m.language + "', the project manifest "
+              "says '" + facts.language + "'; in project mode the project "
+              "manifest is the authority and the mirror must agree");
+        if (!langAgrees) {
+            return {ArmVerdict::Poisoned, "language mirror disagrees"};
+        }
+        if (specFormatName(target->spec).empty()) {
+            check(exampleName + ": target spec has an '<arch>:<format>' separator",
+                  false,
+                  "without it the per-format artifact subdirectory a project "
+                  "build routes into cannot be derived");
+            return {ArmVerdict::Poisoned,
+                    "spec " + target->spec + " has no format half"};
+        }
+        // ENVIRONMENTAL, and the ONLY skip this mode may produce. A declared
+        // build script whose interpreter this machine lacks is a BUILD INPUT the
+        // manifest asked for and the machine could not supply — precisely
+        // `SkippedBuildInputMissing` (warned by default, a [FAIL] under
+        // DSS_STRICT_ARM_VERDICTS=1). Probed BEFORE the compile so the ledger
+        // says "this box has no <interpreter>" instead of letting the build fail
+        // on a source glob that matched nothing, which names the compiler for
+        // the machine's shortfall.
+        for (auto const& argv0 : facts.applicableScriptPrograms) {
+            if (buildScriptProgramPresent(argv0)) continue;
+            std::string const why = "build script program '" + argv0
+                + "' declared by '" + *m.project
+                + "' is not present on this machine (host=" + currentHostOs()
+                + ")";
+            std::cout << "  [SKIP] " << exampleName << " — " << why << "\n";
+            return {ArmVerdict::SkippedBuildInputMissing, why};
+        }
+        projectArg = quote(projectPath.string());
+    }
+
     std::string compileArgs;
     for (auto const& s : m.sources) {
         compileArgs += " " + quote((exampleDir / s).string());
     }
     auto const cliLog = outDir / "cli.log";
+    // PROJECT MODE carries language, targets and sources INSIDE the
+    // `.dss-project.json`, and the CLI accordingly requires neither
+    // `--language` nor `--target` for it (src/program/cli_args.cpp, the
+    // `Mode::Project` arm). Passing them would be inert at best and a second
+    // source of truth at worst. `--output` and `--resolve-library` still apply:
+    // the manifest MERGES its own `resolveLibraries` onto them.
     std::string cmd = quote(compiler)
-        + " --compile"   + compileArgs
-        + " --language " + m.language
-        + " --target "   + target->spec
+        + (projectMode
+               ? (" --project " + projectArg)
+               : (" --compile"   + compileArgs
+                  + " --language " + m.language
+                  + " --target "   + target->spec))
         + resolveArgs
         + " --output "   + quote(outDir.string())
         + " > " + quote(cliLog.string()) + " 2>&1";
 
-    int const sysRc = std::system(shellWrap(cmd).c_str());
+    // Reported SEPARATELY from the compile's rc so a chdir failure keeps its own
+    // cause: "compile rc=-1" would send the reader to the compiler for a problem
+    // that is entirely this harness's.
+    bool compileCwdOk = true;
+    int const sysRc = [&]() {
+        if (!projectMode) return std::system(shellWrap(cmd).c_str());
+        CwdGuard compileCwd{outDir};
+        // FAIL-CLOSED: a chdir that did not take would send the generated
+        // sources somewhere else and the failure would look like a DSS defect.
+        check(exampleName + ": compile cwd set to " + outDir.generic_string(),
+              compileCwd.ok,
+              compileCwd.ok ? "" : "chdir failed; a project manifest's relative "
+                                   "sources and its generated files would "
+                                   "resolve against the build tree instead");
+        compileCwdOk = compileCwd.ok;
+        if (!compileCwd.ok) return -1;
+        return std::system(shellWrap(cmd).c_str());
+    }();
+    if (!compileCwdOk) {
+        return {ArmVerdict::Poisoned, "could not chdir to the output dir for "
+                                      "the project-mode compile"};
+    }
 
     auto const compileOk = [&]() -> bool {
         if (sysRc == 0) return true;
@@ -665,7 +1040,17 @@ struct CliArmOutcome {
     check(exampleName + ": compile exits 0", true);
 
     // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: THE case this defect is about — these two are the checks a RED run reaches, and in their throwing form a failing example killed the runner rather than naming itself.
-    auto const artifactPath = outDir / target->artifact;
+    // D-AP2-OUTPUT-ROUTING: a PROJECT build forces `setPerFormatOutputSubdir(true)`
+    // (src/program/program.cpp:1760), so its artifact is at
+    // `<outDir>/<formatName>/<name><ext>`, NOT at `<outDir>/<artifact>`.
+    // COMPUTED EXPLICITLY rather than folded into the manifest string: spelling
+    // the target's `artifact` as `"pe64-x86_64-windows-exec/main.exe"` composes
+    // correctly through `fs::path`, and it would make `artifact` mean a FILENAME
+    // in the 1,930 target entries that carry it today and a PATH in project-mode
+    // ones, hiding the routing rule inside a string. One key, one meaning.
+    auto const artifactPath = projectMode
+        ? outDir / specFormatName(target->spec) / target->artifact
+        : outDir / target->artifact;
     auto const artifactPresent = fileExists(artifactPath);
     check(exampleName + ": artifact exists at "
           + artifactPath.generic_string(),
@@ -721,29 +1106,8 @@ struct CliArmOutcome {
     // the directory they were staged into — a program that opens
     // `./libfoo.so` resolves it against its CWD, not against its own path.
     // The in-process sibling achieves this with `ScratchDir::useAsCwd()`; this
-    // is the same move, scoped and restored, because the runner also resolves
-    // RELATIVE paths of its own (the compiler path, the corpus root) between
-    // examples. SAFE HERE and stated so the next reader can check it: this
-    // runner walks examples SEQUENTIALLY in one thread — there is no concurrent
-    // arm whose relative-path resolution this could disturb.
-    struct CwdGuard {
-        fs::path saved;
-        bool     ok = false;
-        explicit CwdGuard(fs::path const& to) {
-            std::error_code ec;
-            saved = fs::current_path(ec);
-            if (ec) return;
-            fs::current_path(to, ec);
-            ok = !ec;
-        }
-        ~CwdGuard() {
-            if (!ok || saved.empty()) return;
-            std::error_code ec;
-            fs::current_path(saved, ec);
-        }
-        CwdGuard(CwdGuard const&) = delete;
-        CwdGuard& operator=(CwdGuard const&) = delete;
-    };
+    // is the same move, scoped and restored (the `CwdGuard` hoisted above this
+    // function, which the project-mode COMPILE also uses).
     // FAIL-CLOSED: if the chdir did not take, an example that needs a staged
     // file would fail for a reason that looks like a DSS defect. Say which.
     auto const absArtifact = fs::absolute(artifactPath);
@@ -777,9 +1141,18 @@ struct CliArmOutcome {
         target->exitCodeOverride.has_value() ? *target->exitCodeOverride : m.exitCode;
     bool const exitMatches =
         static_cast<std::int64_t>(result.exitCode) == expectedExit;
+    // The qemu-sysroot remedy line is appended ONLY on the failing branch, and
+    // through the SAME shared helper the in-process runner uses
+    // (D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY item (2), first half). Pairing is the
+    // point: an arm that explains itself in one harness and stays mute in the
+    // other is the divergence `arm_verdict_ledger.hpp` exists to prevent, and
+    // this runner is the one whose 581-manifest sweep produces the failure en
+    // masse. On a pass the hint would be noise, so it never renders there.
     check(exampleName + ": OS exit code == "
           + std::to_string(expectedExit)
-          + " (got " + std::to_string(result.exitCode) + ")",
+          + " (got " + std::to_string(result.exitCode) + ")"
+          + (exitMatches ? std::string{}
+                         : qemuSysrootHint(target->spec, target->emulator)),
           exitMatches);
     // `Ran` means EXECUTED AND ASSERTED, not "asserted successfully" — the
     // `check` above already owns pass/fail. Conflating the two would let a

@@ -37,6 +37,88 @@ TEST(DiagnosticCode, SymbolicNameRoundtrip) {
     // F_* FFI band — binary readers (D-FF1-PARTIAL-CORRUPTION-LOUD).
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_BinaryReaderPartialCorruption),
               "F_BinaryReaderPartialCorruption");
+    // D_* driver band — `.dss-project.json` build hooks (`preBuildScripts` /
+    // `postBuildScripts`, 0xD017..0xD018) and project dependencies
+    // (`dependsOn`, 0xD019..0xD020).
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_ScriptSpawnFailed),
+              "D_ScriptSpawnFailed");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_ScriptExitedNonZero),
+              "D_ScriptExitedNonZero");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyManifestNotFound),
+              "D_DependencyManifestNotFound");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyCycle),
+              "D_DependencyCycle");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyArtifactProfileUnsupported),
+              "D_DependencyArtifactProfileUnsupported");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyLanguageMismatch),
+              "D_DependencyLanguageMismatch");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyGitNotFound),
+              "D_DependencyGitNotFound");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyGitAcquireFailed),
+              "D_DependencyGitAcquireFailed");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyGitFetchFallback),
+              "D_DependencyGitFetchFallback");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyGitNameCollision),
+              "D_DependencyGitNameCollision");
+}
+
+// The ten codes allocated for `.dss-project.json`'s `preBuildScripts` /
+// `postBuildScripts` and `dependsOn` features occupy a CONTIGUOUS run at the
+// top of the driver band, 0xD017..0xD020. Two things are pinned here that the
+// name round-trip above cannot see:
+//
+//   (1) the VALUES. `diagnosticCodeName` would keep answering correctly if a
+//       future edit renumbered one of these enumerators, but the number is
+//       the operator-visible identity (`error[D0019]`) and appears in docs /
+//       expected.json fixtures — so it is pinned literally, not derived.
+//
+//   (2) the nibble-boundary RENDERING. This run is the first to cross a hex
+//       DECADE inside the band (0xD019 → 0xD01A) and to reach 0xD020, whose
+//       low three nibbles (0x020) are easy to confuse with the 0xD002 slot
+//       when read quickly. `diagnosticCodePrefix` strips only the 0xF000
+//       family nibble (see the 0xD000u arm in parse_diagnostic.cpp), so the
+//       expected renderings are "D0017".."D0020" — NOT "D0017".."D0032"
+//       (decimal drift) and NOT "DD017" (unstripped nibble). Same property the
+//       X_* band pin asserts, checked at the one place the D_* band has
+//       actually grown.
+TEST(DiagnosticCode, ProjectScriptsAndDependsOnBandIsContiguousAndRenders) {
+    struct Row {
+        DiagnosticCode   code;
+        std::uint16_t    value;
+        std::string_view rendered;
+    };
+    // Order is the allocation order; `value` ascends by exactly 1 per row,
+    // which the contiguity check below relies on.
+    constexpr Row kRows[] = {
+        {DiagnosticCode::D_ScriptSpawnFailed,                    0xD017, "D0017"},
+        {DiagnosticCode::D_ScriptExitedNonZero,                  0xD018, "D0018"},
+        {DiagnosticCode::D_DependencyManifestNotFound,           0xD019, "D0019"},
+        {DiagnosticCode::D_DependencyCycle,                      0xD01A, "D001A"},
+        {DiagnosticCode::D_DependencyArtifactProfileUnsupported, 0xD01B, "D001B"},
+        {DiagnosticCode::D_DependencyLanguageMismatch,           0xD01C, "D001C"},
+        {DiagnosticCode::D_DependencyGitNotFound,                0xD01D, "D001D"},
+        {DiagnosticCode::D_DependencyGitAcquireFailed,           0xD01E, "D001E"},
+        {DiagnosticCode::D_DependencyGitFetchFallback,           0xD01F, "D001F"},
+        {DiagnosticCode::D_DependencyGitNameCollision,           0xD020, "D0020"},
+    };
+
+    int checked = 0;
+    std::uint16_t previous = 0xD016;  // D_SynthRecipeFamilyUnknown, the predecessor.
+    for (Row const& row : kRows) {
+        EXPECT_EQ(static_cast<std::uint16_t>(row.code), row.value)
+            << diagnosticCodeName(row.code) << " was renumbered";
+        // Contiguous, ascending, no gaps and no reuse.
+        EXPECT_EQ(row.value, static_cast<std::uint16_t>(previous + 1u))
+            << diagnosticCodeName(row.code) << " is not contiguous with its predecessor";
+        previous = row.value;
+        // Still inside the driver band (the 0xD000u arm of diagnosticCodePrefix).
+        ASSERT_EQ(row.value & 0xF000u, 0xD000u)
+            << diagnosticCodeName(row.code) << " escaped the D_* band";
+        EXPECT_EQ(diagnosticCodePrefix(row.code), row.rendered);
+        ++checked;
+    }
+    // Non-vacuity: a counter incremented in the loop, not sizeof the array.
+    EXPECT_EQ(checked, 10);
 }
 
 TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {

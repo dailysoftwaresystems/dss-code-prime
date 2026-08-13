@@ -1,12 +1,22 @@
 #include "core/types/grammar_schema.hpp"
+// The registered artifact-profile TABLE under test below (name + composition
+// verb), plus the shared closed-vocabulary well-formedness guard it is checked
+// with — the SAME `isWellFormedKeyVocabulary` every config loader uses, not a
+// third copy of the loop (`core/types/config_key_vocabulary.hpp`, TF-C74).
+#include "core/types/artifact_profile.hpp"
+#include "core/types/config_key_vocabulary.hpp"
 #include "repo_root.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -5992,10 +6002,14 @@ TEST(GrammarSchema, ShippedConfigsDeclareArtifactProfiles) {
     }
     {
         auto p = (*c)->artifactProfiles();
-        ASSERT_EQ(p.size(), 3u);
+        ASSERT_EQ(p.size(), 4u);
         EXPECT_EQ(p[0], "cli");
         EXPECT_EQ(p[1], "lib");
         EXPECT_EQ(p[2], "staticlib");
+        // `module` (SourceMerge) — c-subset is the only shipped language that
+        // declares it; toy and tsql-subset deliberately do NOT, which is what
+        // the two sibling blocks in this test pin.
+        EXPECT_EQ(p[3], "module");
     }
 
     auto t = GrammarSchema::loadShipped("tsql-subset");
@@ -6008,6 +6022,168 @@ TEST(GrammarSchema, ShippedConfigsDeclareArtifactProfiles) {
         EXPECT_EQ(p[0], "script");
         EXPECT_EQ(p[1], "sproc");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The registered artifact-profile TABLE (`core/types/artifact_profile.hpp`)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The vocabulary stopped being a flat name array when `dependsOn` needed a
+// per-dependency COMPOSITION decision: each row now carries a
+// `DependencyComposition` verb, and the engine switches on the VERB, never on
+// the profile NAME (the header's standing agnosticism veto, and the same rule
+// `program.cpp`'s archive fork obeys via the format `container`).
+//
+// A table the engine dispatches on is a table whose CONTENT is semantics, so
+// it is pinned here the way a config vocabulary is pinned — exactly, wholly,
+// and positionally:
+//
+//   (a) WELL-FORMEDNESS at compile time, through the SHARED
+//       `isWellFormedKeyVocabulary` guard (TF-C74) rather than a third
+//       hand-rolled duplicate/empty loop;
+//   (b) the ROW COUNT as a `static_assert` HERE in the test TU, so growing
+//       the vocabulary without updating these pins is a BUILD error, not a
+//       still-green test suite;
+//   (c) EVERY row's name AND verb, positionally — not a spot check. A wrong
+//       verb is a miscompile-class bug: a `cli` dependency that composed as
+//       `SourceMerge` would splice that dependency's `main()` into the
+//       consumer's translation set and the build would SUCCEED, wrongly.
+
+namespace {
+
+inline constexpr std::size_t kArtifactProfileRowCount =
+    std::size(kRegisteredArtifactProfiles);
+
+// (b) The row-count tripwire. Deliberately in the TEST TU: a `static_assert`
+// living in the header would break the header's own build on growth, which
+// says nothing about whether anybody re-pinned the verbs. Here, the tenth-
+// plus-one profile cannot be added without a human landing in this file and
+// answering for its composition verb below.
+static_assert(kArtifactProfileRowCount == 10,
+              "kRegisteredArtifactProfiles grew or shrank: update the exact "
+              "row pins in ArtifactProfileTable.* below (name AND "
+              "DependencyComposition verb) before bumping this number");
+
+// The table's NAME column, projected so the shared closed-vocabulary guard
+// applies verbatim. (a) is then the same compile-time check every
+// `kSomethingKeys` table gets: no empty entry, no duplicate name.
+[[nodiscard]] constexpr std::array<std::string_view, kArtifactProfileRowCount>
+artifactProfileNameColumn() {
+    std::array<std::string_view, kArtifactProfileRowCount> names{};
+    for (std::size_t i = 0; i < kArtifactProfileRowCount; ++i) {
+        names[i] = kRegisteredArtifactProfiles[i].name;
+    }
+    return names;
+}
+inline constexpr auto kArtifactProfileNameColumn = artifactProfileNameColumn();
+DSS_CHECK_KEY_VOCABULARY(kArtifactProfileNameColumn);
+
+// (c) The full expected table, written out INDEPENDENTLY of the header so the
+// comparison below is a pin and not a tautology.
+struct ExpectedArtifactProfileRow {
+    std::string_view      name;
+    DependencyComposition verb;
+};
+inline constexpr ExpectedArtifactProfileRow kExpectedArtifactProfileRows[] = {
+    {"cli",       DependencyComposition::NotConsumable},
+    {"gui",       DependencyComposition::NotConsumable},
+    {"lib",       DependencyComposition::ArtifactLink},
+    {"staticlib", DependencyComposition::ArtifactLink},
+    {"script",    DependencyComposition::NotConsumable},
+    {"sproc",     DependencyComposition::NotConsumable},
+    {"transpile", DependencyComposition::NotConsumable},
+    {"shader",    DependencyComposition::NotConsumable},
+    {"hdl",       DependencyComposition::NotConsumable},
+    {"module",    DependencyComposition::SourceMerge},
+};
+static_assert(std::size(kExpectedArtifactProfileRows) == kArtifactProfileRowCount,
+              "the expectation table and kRegisteredArtifactProfiles must "
+              "describe the same number of rows");
+
+// Human-readable verb name for failure messages only — a scoped enum prints as
+// an integer otherwise, and "expected 1, got 2" is a poor bug report for a
+// mis-declared composition.
+[[nodiscard]] std::string_view verbName(DependencyComposition v) {
+    switch (v) {
+        case DependencyComposition::SourceMerge:   return "SourceMerge";
+        case DependencyComposition::ArtifactLink:  return "ArtifactLink";
+        case DependencyComposition::NotConsumable: return "NotConsumable";
+    }
+    return "<unhandled DependencyComposition>";
+}
+
+} // namespace
+
+// (a)+(b) restated as a runtime assertion so the guarantee is visible in the
+// test report, not only in a compile that silently succeeded.
+TEST(ArtifactProfileTable, IsWellFormedAndExactlyTenRows) {
+    EXPECT_EQ(std::size(kRegisteredArtifactProfiles), 10u);
+    EXPECT_TRUE(dss::detail::isWellFormedKeyVocabulary(kArtifactProfileNameColumn))
+        << "every registered profile name must be non-empty and unique";
+    for (auto const& row : kRegisteredArtifactProfiles) {
+        EXPECT_FALSE(row.name.empty());
+    }
+}
+
+// (c) EVERY row, by exact name AND exact verb, in exact order. Order is
+// load-bearing: `registeredArtifactProfileList()` derives the user-facing
+// diagnostic list from this sequence in place.
+TEST(ArtifactProfileTable, EveryRowPinsItsNameAndCompositionVerb) {
+    ASSERT_EQ(std::size(kRegisteredArtifactProfiles), kArtifactProfileRowCount);
+    for (std::size_t i = 0; i < kArtifactProfileRowCount; ++i) {
+        auto const& got  = kRegisteredArtifactProfiles[i];
+        auto const& want = kExpectedArtifactProfileRows[i];
+        EXPECT_EQ(got.name, want.name) << "row " << i << " name drifted";
+        EXPECT_EQ(got.dependencyComposition, want.verb)
+            << "row " << i << " ('" << got.name << "') composes as "
+            << verbName(got.dependencyComposition) << ", expected "
+            << verbName(want.verb);
+    }
+}
+
+// The lookup the engine actually calls must agree with the table for EVERY
+// registered name — a row is only as good as the accessor that reads it.
+TEST(ArtifactProfileTable, LookupReturnsEveryRowsVerb) {
+    for (auto const& want : kExpectedArtifactProfileRows) {
+        auto const got = dependencyCompositionForProfile(want.name);
+        ASSERT_TRUE(got.has_value())
+            << "'" << want.name << "' is registered but has no composition verb";
+        EXPECT_EQ(*got, want.verb)
+            << "'" << want.name << "' composes as " << verbName(*got)
+            << ", expected " << verbName(want.verb);
+    }
+}
+
+// Fail-loud: an UNREGISTERED name yields no verb at all. `NotConsumable` would
+// be the tempting "safe" answer and is exactly wrong — it is a real
+// instruction ("this profile is terminal, reject the dependency"), so
+// returning it for a typo would make `"modul"` indistinguishable from `"cli"`
+// and produce the wrong diagnostic for the wrong reason.
+TEST(ArtifactProfileTable, UnregisteredProfileHasNoCompositionVerb) {
+    for (std::string_view bad : {"modul", "module ", "Module", "clii", "",
+                                 "sharedlib", "dll", "exe"}) {
+        EXPECT_FALSE(isRegisteredArtifactProfile(bad))
+            << "'" << bad << "' must not be a registered profile";
+        EXPECT_FALSE(dependencyCompositionForProfile(bad).has_value())
+            << "'" << bad << "' must not map to any composition verb";
+    }
+}
+
+// Membership matches the table exactly — every row in, nothing else in.
+TEST(ArtifactProfileTable, MembershipHoldsForEveryRow) {
+    for (auto const& want : kExpectedArtifactProfileRows) {
+        EXPECT_TRUE(isRegisteredArtifactProfile(want.name))
+            << "'" << want.name << "' is a table row but not registered";
+    }
+}
+
+// The diagnostic list is DERIVED from the table (never hand-typed) and its
+// text is user-visible, so it is pinned as one exact string — including the
+// separator and the append position of `module`.
+TEST(ArtifactProfileTable, RegisteredListIsExactAndDerivedInTableOrder) {
+    EXPECT_EQ(registeredArtifactProfileList(),
+              "cli, gui, lib, staticlib, script, sproc, transpile, shader, "
+              "hdl, module");
 }
 
 // ── HR10: hirLowering fail-loud config validation ──────────────────────────

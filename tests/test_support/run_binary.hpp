@@ -10,8 +10,14 @@
 // test that must touch the real loader."
 //
 // Platform arms:
-//   * Windows — `CreateProcessA` + `WaitForSingleObject` +
-//     `GetExitCodeProcess` (Stage 1 Slice C 2026-06-02).
+//   * Windows — `CreateProcessW` + `WaitForSingleObject` +
+//     `GetExitCodeProcess` (Stage 1 Slice C 2026-06-02; the call
+//     moved from the `A` to the `W` form when the argv quoting
+//     was shared with the compiler's own spawn substrate —
+//     D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED. The shared quoter
+//     produces a `std::wstring`, so `W` consumes it directly
+//     instead of round-tripping it back through UTF-8, and a path
+//     character outside the ANSI code page now survives.)
 //   * POSIX — `posix_spawn` + `waitpid` with `WNOHANG` poll loop
 //     for timeout (closes D-LK10-ENTRY-POSIX-RUN-HARNESS,
 //     2026-06-02). The poll loop sleeps in increments capped at
@@ -43,13 +49,37 @@
 // regression in ANY layer (FFI mangling, .idata layout, CRT
 // init, msvcrt's puts, file-descriptor wiring) trips the pin.
 
-#include <algorithm>  // std::min in the POSIX poll-loop arm
+// D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED — the MSVCRT / CommandLineToArgvW
+// argv quoter used by the Windows arm below. THE SAME ONE the shipped compiler
+// spawns with (`src/core/substrate/process_spawn.cpp`): this harness used to
+// carry a second, half-correct copy that escaped neither embedded quotes nor
+// trailing backslashes, and a test harness that silently mangles the argv a test
+// believes it sent is worse than no harness.
+//
+// INCLUDED BY RELATIVE PATH on purpose — the same reason, and the same shape, as
+// `arm_verdict_ledger.hpp`'s include of `src/program/platform_token.hpp`: this
+// header's consumers are targets with different include-path sets, and
+// `integrated_tests` (integrated_tests/CMakeLists.txt) carries ONLY
+// `tests/test_support`, no `src/`, and links NO DSS library — it drives the CLI
+// as a black-box subprocess. A quoted include resolves against the includer's
+// own directory first, so this one spelling works everywhere with no build-graph
+// change. The target it protects is why the quoter is header-only and
+// dependency-free in the first place (see that header's opening note); linking
+// `dss-code-prime-lib` into `integrated_tests` to borrow a string helper would
+// break the very boundary that target exists to hold. Included UNCONDITIONALLY,
+// not under `#if defined(_WIN32)`, so the pure transform is compile-checked on
+// every leg of the matrix rather than only where its output is used.
+#include "../../src/core/substrate/windows_command_line.hpp"
+
+#include <algorithm>  // std::min in the POSIX poll-loop arm; std::sort of sysroot candidates
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>    // setenv / _putenv_s (QEMU_STACK_SIZE bump)
+#include <cstdlib>    // setenv / _putenv_s (QEMU_STACK_SIZE + QEMU_LD_PREFIX), getenv
 #include <filesystem>
+#include <fstream>    // PT_INTERP read out of the guest artifact
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>     // launcherPrefix (emulator argv prefix)
 
@@ -135,6 +165,322 @@ inline void ensureGenerousSpawnStack() noexcept {
         return true;
     }();
     (void)done;
+}
+
+// ─── D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY, closing-work item (1) ─────────────
+//
+// The SECOND ambient-process-setup dependency of an emulated spawn, and the
+// sibling of `ensureGenerousSpawnStack` directly above: that one owns the
+// guest's STACK, this one owns the guest's LOADER SEARCH ROOT. Both are
+// properties of the child process that the harness — not the operator's shell
+// — is in a position to establish, and both are invisible in the failure text
+// when they are missing.
+//
+// WHAT GOES WRONG WITHOUT IT. `qemu-aarch64` being ON PATH is not the same
+// fact as `qemu-aarch64` being ABLE TO RUN a guest binary. A dynamically
+// linked guest ELF names its interpreter in PT_INTERP — DSS's arm64 output
+// asks for `/lib/ld-linux-aarch64.so.1` — and qemu-user resolves that path
+// against the HOST filesystem unless `QEMU_LD_PREFIX` points at a guest
+// sysroot. On an x86_64 box that path is not there, so EVERY emulated arm
+// dies at exit 255 before the guest's first instruction.
+//
+// ✔MEASURED 2026-08-12, this project's WSL leg: a raw `ctest` with
+// QEMU_LD_PREFIX unset reported 468 of 826 tests failing; with
+// `QEMU_LD_PREFIX=/usr/aarch64-linux-gnu` exported and NOTHING else changed,
+// 826 of 826 passed. Every one of those 468 was the same single cause —
+// `qemu-aarch64: Could not open '/lib/ld-linux-aarch64.so.1': No such file or
+// directory` on raw stderr — surfacing to the reader only as `baseline
+// exit-code mismatch (expected=42; OS=255)`. That is the SECOND recorded
+// occurrence of the identical signature (~450 failures on 2026-08-03), which
+// is what moved this from "operator error" to "harness defect": a 468-test
+// red whose one environmental cause appears nowhere in the failure text is a
+// DIAGNOSTIC failure, and documenting the variable in one more place had
+// already been tried.
+//
+// ★ THE DERIVATION IS FROM VOCABULARY, NOT FROM HOST IDENTITY, and that is
+// the constraint that shaped the whole mechanism — there is no
+// `if (arch == "aarch64")` ladder anywhere below, because the two inputs
+// already carry everything needed:
+//
+//   * the LAUNCHER's own name states the guest arch — `qemu-<arch>` is
+//     qemu-user's naming convention, so `qemu-aarch64` → `aarch64`;
+//   * the ARTIFACT's own PT_INTERP states the exact file the guest loader
+//     needs — read out of the bytes, never guessed from the arch (the
+//     loader's spelling is not derivable from the arch name:
+//     `ld-linux-aarch64.so.1` vs `ld-linux-x86-64.so.2` vs
+//     `ld-linux-armhf.so.3` is a table, and a table is the thing to avoid).
+//
+// The candidate sysroots are then the directories under `/usr` whose names
+// start with `<arch>-` (the Debian/Ubuntu multiarch cross layout puts them at
+// `/usr/<gnu-triple>`, e.g. `/usr/aarch64-linux-gnu`) — enumerated from the
+// FILESYSTEM rather than from a list in this file, and each one accepted only
+// if it actually contains the interpreter the artifact asked for. So the
+// answer to "is this a sysroot for this binary?" is always a probe, never an
+// assumption, and a host with its cross runtime somewhere else falls through
+// to the loud path rather than being silently mis-served.
+//
+// ★ NOTHING HERE CAN MASK A REAL CROSS-ARCH FAILURE. Every branch either
+// makes a correct binary run that would otherwise have died in the loader, or
+// refuses to spawn and says why. It never skips an arm, never suppresses an
+// exit code, and never changes what a spawned child is asked to do.
+
+namespace detail {
+
+// The guest architecture a qemu-user launcher emulates, taken from its own
+// file name; empty when the launcher is not qemu-user.
+//
+// TWO exclusions, both load-bearing:
+//   * `qemu-system-<arch>` is the FULL-SYSTEM emulator. It boots a kernel and
+//     never reads QEMU_LD_PREFIX, so deriving a sysroot for it would attach a
+//     remedy to a failure the variable has nothing to do with.
+//   * any launcher that is not `qemu-*` at all (`wine`, `box64`, an
+//     ssh-into-a-real-board wrapper) is somebody else's mechanism.
+//
+// `-static` is stripped because Debian's `qemu-user-static` package installs
+// the very same emulator as `qemu-<arch>-static` (that is the binfmt_misc
+// spelling, and the one a container image usually has); the suffix is part of
+// the PACKAGING, not of the guest arch.
+[[nodiscard]] inline std::string
+qemuUserGuestArch(std::string const& launcherPath) {
+    // `stem()` rather than `filename()` so a `.exe` on a Windows-hosted
+    // launcher does not become part of the derived architecture.
+    std::string const name =
+        std::filesystem::path{launcherPath}.filename().stem().string();
+    constexpr std::string_view kUserPrefix   = "qemu-";
+    constexpr std::string_view kSystemPrefix = "qemu-system-";
+    if (!name.starts_with(kUserPrefix))  return {};
+    if (name.starts_with(kSystemPrefix)) return {};
+    std::string arch = name.substr(kUserPrefix.size());
+    constexpr std::string_view kStaticSuffix = "-static";
+    if (arch.ends_with(kStaticSuffix)) {
+        arch.resize(arch.size() - kStaticSuffix.size());
+    }
+    return arch;
+}
+
+// The PT_INTERP string of an ELF64 little-endian image — i.e. the absolute
+// path the guest's loader will be looked up at — or empty.
+//
+// EMPTY IS A FULL ANSWER, not a failure to answer, and every caller treats it
+// as "this harness has no claim to make": a statically linked guest has no
+// interpreter to resolve and runs under qemu-user with no sysroot at all, so
+// the same empty return correctly means "nothing to arrange" for it as it
+// does for a PE, a Mach-O, an unreadable file, or a shape this reader does
+// not decode. Refusing to spawn on a no-claim answer would break the static
+// case, which works today.
+//
+// ELF64/LSB only — the one shape DSS emits for the emulated legs. A 32-bit or
+// big-endian image returns empty and is spawned unchanged, which is the
+// conservative direction: the emulator then reports its own error rather than
+// this harness inventing one from a header it did not parse.
+[[nodiscard]] inline std::string
+elfInterpreterPath(std::filesystem::path const& binaryPath) {
+    std::ifstream in{binaryPath, std::ios::binary};
+    if (!in) return {};
+
+    unsigned char header[64]{};
+    in.read(reinterpret_cast<char*>(header), sizeof(header));
+    if (in.gcount() != static_cast<std::streamsize>(sizeof(header))) return {};
+    if (!(header[0] == 0x7Fu && header[1] == 'E' && header[2] == 'L'
+          && header[3] == 'F')) {
+        return {};
+    }
+    if (header[4] != 2u) return {};  // EI_CLASS  != ELFCLASS64
+    if (header[5] != 1u) return {};  // EI_DATA   != ELFDATA2LSB
+
+    auto readLe = [](unsigned char const* at, std::size_t width) {
+        std::uint64_t value = 0;
+        for (std::size_t i = width; i-- > 0;) {
+            value = (value << 8) | static_cast<std::uint64_t>(at[i]);
+        }
+        return value;
+    };
+    std::uint64_t const phoff     = readLe(header + 0x20, 8);  // e_phoff
+    std::uint64_t const phentsize = readLe(header + 0x36, 2);  // e_phentsize
+    std::uint64_t const phnum     = readLe(header + 0x38, 2);  // e_phnum
+    constexpr std::uint64_t kPhdr64Size = 56;
+    if (phoff == 0 || phnum == 0 || phentsize < kPhdr64Size) return {};
+
+    constexpr std::uint32_t kPtInterp = 3;
+    for (std::uint64_t index = 0; index < phnum; ++index) {
+        unsigned char phdr[kPhdr64Size]{};
+        in.seekg(static_cast<std::streamoff>(phoff + index * phentsize),
+                 std::ios::beg);
+        if (!in) return {};
+        in.read(reinterpret_cast<char*>(phdr), kPhdr64Size);
+        if (in.gcount() != static_cast<std::streamsize>(kPhdr64Size)) return {};
+        if (readLe(phdr + 0, 4) != kPtInterp) continue;
+
+        std::uint64_t const offset = readLe(phdr + 8, 8);   // p_offset
+        std::uint64_t const size   = readLe(phdr + 32, 8);  // p_filesz
+        // A path longer than this is a corrupt header, not a loader; bound the
+        // read rather than trust a length field out of the file under test.
+        constexpr std::uint64_t kMaxInterpBytes = 4096;
+        if (size == 0 || size > kMaxInterpBytes) return {};
+        std::string interpreter(static_cast<std::size_t>(size), '\0');
+        in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!in) return {};
+        in.read(interpreter.data(), static_cast<std::streamsize>(size));
+        if (in.gcount() != static_cast<std::streamsize>(size)) return {};
+        // p_filesz counts the NUL terminator; anything at or past it is not
+        // part of the path.
+        if (auto const nul = interpreter.find('\0'); nul != std::string::npos) {
+            interpreter.resize(nul);
+        }
+        return interpreter;
+    }
+    return {};
+}
+
+// What this spawn needs QEMU_LD_PREFIX to be, decided WITHOUT touching the
+// environment or the clock, so every branch below is reachable from a test on
+// any host: the operator's value, the host root and the sysroot search root
+// are all parameters rather than ambient facts.
+struct QemuSysrootDecision {
+    std::string interpreter;  // the guest's PT_INTERP; empty ⇒ nothing to resolve
+    std::string sysroot;      // the prefix to export; empty ⇒ export nothing
+    std::string diagnostic;   // non-empty ⇒ refuse to spawn, and this says why
+};
+
+[[nodiscard]] inline QemuSysrootDecision
+decideQemuGuestSysroot(std::vector<std::string> const& launcherPrefix,
+                       std::filesystem::path const&    binaryPath,
+                       std::string const&              operatorSuppliedPrefix,
+                       std::filesystem::path const&    hostRoot,
+                       std::filesystem::path const&    sysrootSearchRoot) {
+    QemuSysrootDecision out;
+    if (launcherPrefix.empty()) return out;  // native run — no loader to place
+    std::string const guestArch = qemuUserGuestArch(launcherPrefix.front());
+    if (guestArch.empty()) return out;       // not qemu-user — not our variable
+    // An operator who set it OWNS it. Overwriting a deliberate value with a
+    // derived one would make this harness the reason a hand-built sysroot,
+    // a container mount or a bisect stopped being used.
+    if (!operatorSuppliedPrefix.empty()) return out;
+
+    out.interpreter = elfInterpreterPath(binaryPath);
+    if (out.interpreter.empty()) return out;  // static guest / not an ELF64
+
+    std::string interpRelative = out.interpreter;
+    while (!interpRelative.empty()
+           && (interpRelative.front() == '/' || interpRelative.front() == '\\')) {
+        interpRelative.erase(interpRelative.begin());
+    }
+    if (interpRelative.empty()) return out;
+
+    std::error_code ec;
+    // The host root may already carry the guest loader — a native run under
+    // qemu (same arch), or a machine with the foreign libc installed
+    // multiarch-style at `/`. Then the spawn works with no prefix at all and
+    // setting one would only narrow where the child may look.
+    if (std::filesystem::exists(hostRoot / interpRelative, ec)) return out;
+
+    std::vector<std::string> candidates;
+    if (std::filesystem::is_directory(sysrootSearchRoot, ec)) {
+        for (auto const& entry :
+             std::filesystem::directory_iterator(
+                 sysrootSearchRoot, std::filesystem::directory_options::
+                                        skip_permission_denied, ec)) {
+            auto const name = entry.path().filename().string();
+            if (!name.starts_with(guestArch + "-")) continue;
+            candidates.push_back(entry.path().generic_string());
+        }
+    }
+    // `directory_iterator` order is unspecified; a harness whose choice of
+    // sysroot depends on inode order is one whose failures cannot be
+    // reproduced from the message it printed.
+    std::sort(candidates.begin(), candidates.end());
+    for (auto const& candidate : candidates) {
+        if (std::filesystem::exists(
+                std::filesystem::path{candidate} / interpRelative, ec)) {
+            out.sysroot = candidate;
+            return out;
+        }
+    }
+
+    std::string searched;
+    for (auto const& candidate : candidates) {
+        if (!searched.empty()) searched += ", ";
+        searched += candidate;
+    }
+    if (searched.empty()) {
+        searched = "no '" + guestArch + "-*' directory under '"
+                 + sysrootSearchRoot.generic_string() + "'";
+    }
+    out.diagnostic =
+        "runBinary: refusing to spawn '" + binaryPath.generic_string()
+      + "' under '" + launcherPrefix.front() + "' — QEMU_LD_PREFIX is UNSET "
+        "and no guest sysroot on this host provides '" + out.interpreter
+      + "', the ELF interpreter this binary declares. qemu-user resolves that "
+        "path against the host filesystem, so it would exit 255 before the "
+        "guest's first instruction and the run would be reported as an "
+        "exit-code mismatch against the manifest rather than as the missing "
+        "package it is (D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY). Not found at '"
+      + (hostRoot / interpRelative).generic_string() + "'; searched: "
+      + searched
+      + ". Fix: install the guest's cross RUNTIME — on Debian/Ubuntu the "
+        "libc6-*-cross or gcc-" + guestArch + "-linux-gnu packages, which "
+        "populate /usr/" + guestArch + "-linux-gnu — or export "
+        "QEMU_LD_PREFIX=<guest sysroot> yourself.";
+    return out;
+}
+
+// The operator's QEMU_LD_PREFIX as it stood BEFORE this process wrote one.
+//
+// Snapshotted once because the alternative — re-reading the live variable —
+// cannot tell an operator's deliberate value from THIS harness's own earlier
+// write, and a process that spawns two different guest architectures would
+// then serve the second one the first one's sysroot. The snapshot is taken on
+// the first emulated spawn, which is strictly before any write below.
+[[nodiscard]] inline std::string const& operatorSuppliedQemuLdPrefix() {
+    static std::string const value = [] {
+        char const* const raw = std::getenv("QEMU_LD_PREFIX");
+        return (raw != nullptr) ? std::string{raw} : std::string{};
+    }();
+    return value;
+}
+
+}  // namespace detail
+
+// Establish QEMU_LD_PREFIX for an emulated spawn, or say — in one sentence
+// naming the variable — why the spawn must not happen.
+//
+// Returns EMPTY when the spawn may proceed, which covers four different
+// "nothing to do" answers as well as the one that did work: no launcher, a
+// launcher that is not qemu-user, an operator-supplied prefix, a guest with
+// no interpreter to resolve, and the derive-and-export path.
+//
+// Non-empty is a REFUSAL and the caller must not spawn. Refusing is the point:
+// the alternative is not a working run, it is the same failure 468 times over
+// with its one cause named nowhere in the text.
+//
+// `hostRoot` / `sysrootSearchRoot` are parameters so the derivation is
+// pinnable on a host that has no cross sysroot (and on one where creating
+// `/usr/<triple>` would need root). Production callers take the defaults.
+[[nodiscard]] inline std::string
+ensureQemuGuestSysroot(std::vector<std::string> const& launcherPrefix,
+                       std::filesystem::path const&    binaryPath,
+                       std::filesystem::path const&    hostRoot          = "/",
+                       std::filesystem::path const&    sysrootSearchRoot = "/usr") {
+    // Both checks run BEFORE the snapshot, so a spawn with nothing to do with
+    // qemu-user neither reads the environment nor freezes a value it will
+    // never use. `decideQemuGuestSysroot` repeats them because it is also
+    // called directly; here they exist to keep the snapshot's timing a
+    // property of the FIRST EMULATED spawn rather than of the first spawn.
+    if (launcherPrefix.empty()) return {};
+    if (detail::qemuUserGuestArch(launcherPrefix.front()).empty()) return {};
+
+    auto const decision = detail::decideQemuGuestSysroot(
+        launcherPrefix, binaryPath, detail::operatorSuppliedQemuLdPrefix(),
+        hostRoot, sysrootSearchRoot);
+    if (!decision.diagnostic.empty()) return decision.diagnostic;
+    if (decision.sysroot.empty())     return {};
+
+#if defined(_WIN32)
+    ::_putenv_s("QEMU_LD_PREFIX", decision.sysroot.c_str());
+#else
+    ::setenv("QEMU_LD_PREFIX", decision.sysroot.c_str(), /*overwrite=*/1);
+#endif
+    return {};
 }
 
 // ─── Timeout budgets (TF-C84) ──────────────────────────────────────────
@@ -255,10 +601,80 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     // before the first spawn). See ensureGenerousSpawnStack above.
     ensureGenerousSpawnStack();
 
+    // …and an emulated child needs a guest loader it can actually find. Both
+    // arms of the platform fork below are past the point where a missing
+    // sysroot could still be reported as anything but the child's own exit
+    // code, so the refusal has to happen HERE — before a handle exists, and
+    // before anything has been asked of the OS. See the
+    // D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY block above ensureQemuGuestSysroot.
+    if (std::string prerequisite =
+            ensureQemuGuestSysroot(launcherPrefix, binaryPath);
+        !prerequisite.empty()) {
+        out.diagnostic = std::move(prerequisite);
+        return out;  // spawned == false — the caller poisons the arm and prints this
+    }
+
 #if defined(_WIN32)
     auto const pathStr = binaryPath.string();
     if (pathStr.empty()) {
         out.diagnostic = "runBinary: empty path";
+        return out;
+    }
+
+    // ── D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED ──────────────────────────────
+    // ONE argv vector → ONE command line, through the SHARED quoter (see the
+    // include note at the top of this file). The vector is exactly the POSIX
+    // arm's `argStrings`: [launcherPrefix..., binary, programArgs...], so both
+    // arms now describe the child's argv the same way and differ only in how the
+    // OS is handed it.
+    //
+    // The path element is `u8string()`, NOT `string()`. The shared quoter takes
+    // UTF-8 by contract and decodes STRICTLY (it reports rather than
+    // transliterating), while `path::string()` is the host's NARROW encoding —
+    // UTF-8 under libstdc++, but the ANSI code page under MSVC, where a scratch
+    // directory under a non-ASCII user name (`C:\Users\José\AppData\...`, which
+    // `temp_directory_path()` really does produce) would arrive as bytes that are
+    // not valid UTF-8. `u8string()` is UTF-8 on every toolchain.
+    //
+    // Built HERE, before any handle exists, so a malformed-UTF-8 report is a
+    // plain early return with nothing to clean up.
+    auto const        pathU8 = binaryPath.u8string();
+    std::string const pathUtf8(reinterpret_cast<char const*>(pathU8.c_str()),
+                               pathU8.size());
+
+    std::vector<std::string> spawnArgv;
+    spawnArgv.reserve(launcherPrefix.size() + 1u + programArgs.size());
+    for (auto const& p : launcherPrefix) spawnArgv.push_back(p);
+    spawnArgv.push_back(pathUtf8);
+    for (auto const& a : programArgs) spawnArgv.push_back(a);
+
+    std::wstring cmdline;
+    std::string  encodeError;
+    if (!::dss::substrate::tryBuildWindowsCommandLine(spawnArgv, cmdline,
+                                                      encodeError)) {
+        // The reporting form, not the aborting one: this harness HAS a
+        // diagnostic channel, and a test that fed the child undecodable bytes
+        // should see that sentence rather than a dead process.
+        out.diagnostic = "runBinary: argv is not valid UTF-8 and cannot be "
+                         "encoded as a Windows command line ("
+                       + encodeError + ")";
+        return out;
+    }
+
+    // `lpApplicationName` — the emulator when there is a launcher prefix, else
+    // the binary itself (byte-identical routing to the pre-share code, which
+    // picked `launcherPrefix.front()` or `pathStr`). The binary's wide form
+    // comes straight off the `path`, so it needs no decode at all; the launcher
+    // is a caller-supplied `std::string` and goes through the SAME strict
+    // decoder as the command line, because two wide strings handed to one
+    // `CreateProcessW` call must not be produced by two different widenings.
+    std::wstring appName;
+    if (launcherPrefix.empty()) {
+        appName = binaryPath.wstring();
+    } else if (!::dss::substrate::decodeUtf8ToWide(launcherPrefix.front(),
+                                                   appName, encodeError)) {
+        out.diagnostic = "runBinary: launcher path '" + launcherPrefix.front()
+                       + "' is not valid UTF-8 (" + encodeError + ")";
         return out;
     }
 
@@ -300,7 +716,10 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     // failing a spawn we deliberately ignore the result of.
     HANDLE nulHandle = INVALID_HANDLE_VALUE;
 
-    STARTUPINFOA si{};
+    // STARTUPINFO*W* — the wide twin of the CreateProcessW below; same fields,
+    // and `CreateFileA("NUL", ...)` above is untouched because a HANDLE has no
+    // A/W flavour.
+    STARTUPINFOW si{};
     si.cb = sizeof(si);
     if (captureStdout) {
         si.dwFlags    = STARTF_USESTDHANDLES;
@@ -320,40 +739,15 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     }
     PROCESS_INFORMATION pi{};
 
-    // CreateProcessA's `lpCommandLine` is a writable buffer. Quote
-    // the path so spaces in the cwd (e.g. "C:\Users\First Last\..."
-    // on dev hosts; ScratchDir resolves under temp_directory_path()
-    // which is environment-dependent) don't cause CreateProcess to
-    // parse the first space-delimited token as argv[0] for the
-    // child. Code-reviewer M1 at Slice C audit fold.
-    // With a launcher prefix the emulator is argv[0] (lpApplicationName)
-    // and the binary becomes its trailing argument; without it the
-    // binary is launched directly (byte-identical to pre-V2-1).
-    std::string appName = pathStr;
-    std::string cmdline;
-    if (!launcherPrefix.empty()) {
-        appName = launcherPrefix.front();
-        for (auto const& a : launcherPrefix) {
-            cmdline += "\"" + a + "\" ";
-        }
-        cmdline += "\"" + pathStr + "\"";
-    } else {
-        cmdline = "\"" + pathStr + "\"";
-    }
-    // The program's own arguments. Each is QUOTED so an argument containing a
-    // SPACE arrives as ONE element -- which is exactly the case a test of the argv
-    // mechanism has to be able to pose. Embedded double quotes and trailing
-    // backslashes are NOT escaped here: no caller needs them, and a half-correct
-    // escaper is worse than an absent one, since it would silently mangle the
-    // input a test believes it sent. Add the full MSVCRT quoting algorithm the
-    // first time a caller genuinely needs it, with its own pin.
-    for (auto const& a : programArgs) {
-        cmdline += " \"" + a + "\"";
-    }
+    // `lpCommandLine` is WRITTEN THROUGH by CreateProcessW, so it must be a
+    // mutable, NUL-terminated buffer we own — never the `wstring`'s own storage
+    // on a const path. (`appName` / `cmdline` were built at the top of this arm.)
+    std::vector<wchar_t> commandBuffer(cmdline.begin(), cmdline.end());
+    commandBuffer.push_back(L'\0');
 
-    BOOL const ok = ::CreateProcessA(
+    BOOL const ok = ::CreateProcessW(
         appName.c_str(),
-        cmdline.data(),
+        commandBuffer.data(),
         /*lpProcessAttributes*/ nullptr,
         /*lpThreadAttributes*/  nullptr,
         /*bInheritHandles*/     TRUE,
@@ -370,7 +764,7 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
             ::CloseHandle(pipeWrite);
         }
         if (nulHandle != INVALID_HANDLE_VALUE) ::CloseHandle(nulHandle);
-        out.diagnostic = "CreateProcessA failed for '" + pathStr
+        out.diagnostic = "CreateProcessW failed for '" + pathStr
                        + "' (GetLastError=" + std::to_string(err) + ")";
         return out;
     }

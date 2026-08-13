@@ -79,6 +79,20 @@ scratchpad/
 # DSS CLI default output dir (target-spec-named subdirs of compiled binaries
 # from ad-hoc `dss-code-prime <src>` runs; not a build-system dir).
 target/
+# `.dss-project.json` `dependsOn` checkout cache. ★ THIS DIRECTORY BELONGS TO
+# THE PROJECT BEING COMPILED, NOT TO THIS COMPILER: dss-code-prime creates
+# `.dss-deps/<name>/` beside the CONSUMING project's own manifest — in the
+# user's repo, wherever their `.dss-project.json` lives — never in the
+# compiler's tree or in a shared/global location. A build of someone else's
+# project must never write inside this repo.
+#
+# The entry is here only because THIS repo also contains `.dss-project.json`
+# manifests of its own (examples/, real-examples/, and the runners' scratch
+# trees), so a `dependsOn` example compiled in place would drop the cache
+# inside our working tree. It is ACQUIRED content, never source: reproducible
+# from the manifest's pins, and committing it would vendor someone else's
+# history into this repo. (See docs/project-config-spec.md §2.6.)
+.dss-deps/
 !scripts/build/
 
 # CTest leftover when ctest is invoked from the repo root (e.g. inside

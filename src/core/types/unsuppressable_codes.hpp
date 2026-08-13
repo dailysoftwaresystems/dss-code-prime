@@ -113,8 +113,37 @@ namespace dss {
 // to also promote Info, or harden `unsuppressable_codes.cpp` with a
 // consteval check forbidding Info-severity members (requires
 // augmenting `kUnsuppressableCodes` into a `{code, severity}` table
-// so introspection is compile-time). Today (2026-06-01) no Info-
-// severity unsuppressable producer exists; the asymmetry is dormant.
+// so introspection is compile-time).
+//
+// ⛔ NO LONGER DORMANT — UPDATED 2026-08-12. The 2026-06-01 note here
+// read "no Info-severity unsuppressable producer exists; the asymmetry
+// is dormant". That is now FALSE in the way that matters:
+// `D_DependencyGitFetchFallback` (0xD01F) is a REAL Info-severity
+// producer whose ENTIRE PURPOSE is to NOT fail the build — a git
+// dependency's fetch failed, a usable `.dss-deps/<name>` checkout is
+// present and reused, and the build PROCEEDS on possibly-stale sources.
+// That is the offline-build guarantee (a laptop on a train; CI with a
+// flaky network); the Info line exists so "possibly stale" is never
+// silent. See its allocation block in `parse_diagnostic.hpp`.
+//
+// ⚠ PRECISION, because it decides which resolution is still open: that
+// code is NOT a member of `kUnsuppressableCodes`, so the trigger as
+// literally worded ("first Info-severity entry added to the closed
+// table") has not fired. But the RESOLUTION named above is what the
+// consumer bites on, because the elevation arm is CODE-AGNOSTIC —
+// `diagnostic_reporter.cpp` `applyPolicy` promotes every Warning to
+// Error under `--warnings-as-errors` with no per-code exemption and no
+// membership test at all.
+//
+// ⇒ ★ CLOSING THIS ANCHOR BY "EXTENDING THE ELEVATION GATE TO ALSO
+//   PROMOTE INFO" WOULD SILENTLY REGRESS THE OFFLINE-BUILD GUARANTEE:
+//   every project built with `--warnings-as-errors` would fail the
+//   moment the network did, which is the exact outcome 0xD01F exists to
+//   prevent. Whoever closes this must therefore take the OTHER
+//   resolution offered above (the consteval Info-membership check on the
+//   closed table), or explicitly carve 0xD01F out. An anchor with a live
+//   consumer is not free to be closed either way — the dependency is
+//   recorded in both directions on purpose.
 [[nodiscard]] DSS_EXPORT bool
 isUnsuppressable(DiagnosticCode code) noexcept;
 
