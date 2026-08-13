@@ -74,7 +74,8 @@
 #include <algorithm>  // std::min in the POSIX poll-loop arm; std::sort of sysroot candidates
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>    // setenv / _putenv_s (QEMU_STACK_SIZE + QEMU_LD_PREFIX), getenv
+#include <cstdio>     // AwakeClock's fatal path (the project's fputs+abort pattern)
+#include <cstdlib>    // setenv / _putenv_s (QEMU_STACK_SIZE + QEMU_LD_PREFIX), getenv, abort
 #include <filesystem>
 #include <fstream>    // PT_INTERP read out of the guest artifact
 #include <optional>
@@ -102,6 +103,7 @@
   #include <sys/resource.h>  // getrlimit/setrlimit RLIMIT_STACK (large-frame corpus)
   #include <sys/stat.h>
   #include <sys/wait.h>
+  #include <time.h>          // AwakeClock: clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
   #include <unistd.h>
 
   extern char** environ;
@@ -538,6 +540,94 @@ inline constexpr std::chrono::milliseconds kRunBudget{5000};
 // external, network-dependent cost that a slow or offline link can inflate
 // (CFNetwork's own per-request timeout is 3 s, and requests queue).
 inline constexpr std::chrono::milliseconds kAdmissionBudget{30000};
+
+// ─── D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-SUSPEND ───────────────────────
+//
+// EVERY BUDGET ABOVE IS A QUESTION ABOUT AWAKE TIME. "Has this child made
+// progress" cannot be answered on a clock that ran while the machine was
+// asleep: a suspended laptop is not the child's fault, and billing the child
+// for it SIGKILLs a program that was doing exactly the work it was asked to.
+//
+// ⚠ `std::chrono::steady_clock` IS NOT THAT CLOCK EVERYWHERE, and the two
+// platforms this project runs are OPPOSITE, so the name cannot be reasoned
+// from — only measured:
+//
+//   ✔MEASURED 2026-08-13, macOS 26.5.2 / Darwin 25.5.0 arm64, one process
+//     reading five clocks across a live nap: `wall=100.3 steady=100.3
+//     mach_absolute=92.4 CLOCK_MONOTONIC=100.3 CLOCK_UPTIME_RAW=92.4`. Darwin
+//     has TWO continuous monotonic clocks and one awake one, and a nap moves
+//     both continuous ones by the whole nap — six live naps caught by a 1 Hz
+//     watcher on this host, of which the largest: `wall=911.413
+//     CLOCK_MONOTONIC=911.413 CLOCK_MONOTONIC_RAW=911.445` against
+//     `CLOCK_UPTIME_RAW=1.010` and `time.monotonic=1.010`, i.e. one tick.
+//     Absolute readings, same host: `steady 174003.989923` vs
+//     `CLOCK_MONOTONIC_RAW 174003.989948` (25 ns apart) vs `CLOCK_MONOTONIC
+//     173995.163449` vs `CLOCK_UPTIME_RAW 27855.511944`.
+//     ⚠ SO libc++'s `steady_clock` HERE IS `CLOCK_MONOTONIC_RAW`, NOT
+//     `CLOCK_MONOTONIC` — the two are 8.8 s apart by NTP adjustment, and an
+//     earlier reading of this same defect named the wrong one because a
+//     nap-DELTA cannot tell them apart (both advance by the nap). It does not
+//     change the defect by one line: the clock `steady_clock` resolves to
+//     COUNTS SUSPEND, and `CLOCK_UPTIME_RAW` is 40 hours behind it on this
+//     laptop. The pin therefore asserts the PROPERTY against the kernel —
+//     steady_clock is one of the continuous ids and is not the awake one —
+//     rather than pinning a mapping libc++ is free to change.
+//   ✔CONSEQUENCE MEASURED, same host, same child: a run killed at `child timed
+//     out after 120000 ms` having taken 421710 ms of wall, because the child —
+//     CPython, bounded on `time.monotonic()`, which on Darwin is
+//     `mach_absolute_time` and does NOT count sleep — and this parent disagreed
+//     about what a second is by the length of the nap.
+//   ⓘ LINUX IS ALREADY CORRECT and needs no arm: its `CLOCK_MONOTONIC` EXCLUDES
+//     suspend (`CLOCK_BOOTTIME` is the one that includes it), and libstdc++'s
+//     `steady_clock` is `CLOCK_MONOTONIC`. ✔MEASURED the same day on the WSL2
+//     leg: both ids exist and are distinct (1 and 7), reading 91644.442731 and
+//     91644.442742 s — that VM has recorded zero suspend, so the difference is
+//     documented rather than witnessed there.
+//   ⚠ WINDOWS IS UNMEASURED, DELIBERATELY SAID RATHER THAN ASSUMED. The Windows
+//     arm does not use this clock at all — `WaitForSingleObject` does its own
+//     timing inside the kernel — and whether ITS timeout is charged for modern
+//     standby is not known, because inducing modern standby from a test run is
+//     not practical on the operator's own box. An honest "unmeasured" beats an
+//     invented table row; this project has paid for closed-vocabulary-by-
+//     assumption before. `AwakeClock` is still DEFINED there (it is
+//     `QueryPerformanceCounter`, whose own standby behaviour is equally
+//     unmeasured) so the pin compiles and states exactly that on every leg.
+//
+// ★ IT IS ITS OWN CLOCK TYPE ON PURPOSE. `time_point<AwakeClock>` will not
+// compare against a `time_point<steady_clock>`, so a future edit that computes
+// the deadline from `steady_clock::now()` again does not silently regress — it
+// fails to compile. That is the only binding available: a suspend cannot be
+// induced from inside a test, so the pin can assert WHICH CLOCK is selected
+// (tests/test_support/test_run_binary_deadline_clock.cpp) but never the killing
+// behaviour across a real nap.
+struct AwakeClock {
+    using duration   = std::chrono::nanoseconds;
+    using rep        = duration::rep;
+    using period     = duration::period;
+    using time_point = std::chrono::time_point<AwakeClock>;
+    static constexpr bool is_steady = true;
+
+    [[nodiscard]] static time_point now() noexcept {
+#if defined(__APPLE__)
+        // Returns 0 only on failure, and CLOCK_UPTIME_RAW has been served since
+        // 10.12. Aborting rather than falling back to steady_clock is the
+        // project's fatal pattern and the right direction here: a silent
+        // fallback would reinstate exactly the defect this type exists to
+        // remove, on the one platform that has it.
+        std::uint64_t const nanos = ::clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (nanos == 0u) {
+            std::fputs("dss::test_support::AwakeClock fatal: "
+                       "clock_gettime_nsec_np(CLOCK_UPTIME_RAW) failed\n",
+                       stderr);
+            std::abort();
+        }
+        return time_point{duration{static_cast<duration::rep>(nanos)}};
+#else
+        return time_point{std::chrono::duration_cast<duration>(
+            std::chrono::steady_clock::now().time_since_epoch())};
+#endif
+    }
+};
 
 // How the child's stdout/stderr are wired.
 enum class ChildStdio {
@@ -1039,7 +1129,11 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
         pipeFds[0] = -1;
     };
 
-    auto const start  = std::chrono::steady_clock::now();
+    // D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-SUSPEND — the deadline is spent on
+    // AWAKE time, not on elapsed time. See the AwakeClock block above for the
+    // per-OS measurements; the type is distinct from steady_clock so this pair
+    // cannot be recomputed from the wrong clock without a compile error.
+    auto const start    = AwakeClock::now();
     auto const deadline = start + timeout;
 
     int status = 0;
@@ -1084,7 +1178,7 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
             return out;
         }
         // w == 0 → child still running.
-        auto const now = std::chrono::steady_clock::now();
+        auto const now = AwakeClock::now();
         if (now >= deadline) {
             // Timeout — terminate the child with SIGKILL, reap it
             // so the parent doesn't leave a zombie, and report.

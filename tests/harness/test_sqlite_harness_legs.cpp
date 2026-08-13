@@ -60,8 +60,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -114,14 +117,16 @@ struct PyRun {
     std::string diagnostic;
 };
 
-// Run the resolver. `trailing` is the LAST argv element and must be a real,
-// existing file: `runBinary`'s POSIX arm chmods its `binaryPath` to 0755 before
-// spawning, so pointing it at a repo file would mutate a tracked mode bit. Every
-// call therefore ends in `--catalogue <scratch copy of legs.json>`, which also
-// means the resolver is exercised against a COPY of the shipped catalogue rather
-// than a fixture invented here.
-[[nodiscard]] PyRun runResolver(std::vector<std::string> const& args,
-                                fs::path const&                 catalogueCopy) {
+// Run the resolver under an EXPLICIT deadline. `trailing` is the LAST argv
+// element and must be a real, existing file: `runBinary`'s POSIX arm chmods its
+// `binaryPath` to 0755 before spawning, so pointing it at a repo file would
+// mutate a tracked mode bit. Every call therefore ends in
+// `--catalogue <scratch copy of legs.json>`, which also means the resolver is
+// exercised against a COPY of the shipped catalogue rather than a fixture
+// invented here.
+[[nodiscard]] PyRun spawnResolver(std::vector<std::string> const& args,
+                                  fs::path const&                 catalogueCopy,
+                                  std::chrono::milliseconds       deadline) {
     PyRun out;
     auto const py = pythonPath();
     if (py.empty()) {
@@ -137,12 +142,140 @@ struct PyRun {
     for (auto const& a : args) prefix.push_back(a);
     prefix.push_back("--catalogue");
     auto const res = dss::test_support::runBinary(
-        catalogueCopy, std::chrono::seconds{120}, /*captureStdout=*/true, prefix);
+        catalogueCopy, deadline, /*captureStdout=*/true, prefix);
     out.spawned    = res.spawned && !res.timedOut;
     out.exitCode   = res.exitCode;
     out.output     = res.capturedStdout;
     out.diagnostic = res.diagnostic;
     return out;
+}
+
+// ── THE DEADLINE THE SPAWNS BELOW RUN UNDER IS THE SCRIPT'S, NOT THIS FILE'S ─
+//
+// ANCHOR, ONE LINE, DO NOT WRAP:
+// D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-BUDGET
+//
+// Every spawn here used to be bounded by a `std::chrono::seconds{120}` typed
+// into the line above, while the subject of those spawns DERIVES the same
+// quantity from the catalogue's declared sample windows and hands it to its own
+// children (`harness_legs.py`: `kernel_probe_budget_seconds` =
+// `KERNEL_PROBE_ENTRY_ALLOWANCE_SECONDS + KERNEL_PROBE_SAMPLE_SLACK x window`,
+// under a comment reading "THE BUDGET IS DERIVED FROM THE DECLARED SAMPLE
+// WINDOWS, not a magic number"). Two numbers for one quantity, and the typed one
+// was SMALLER than the derived one for the shipped catalogue — 120 s against
+// 200 s — so the caller SIGKILLed a probe that was doing exactly the work the
+// catalogue asked for and reported `child timed out after 120000 ms`, which
+// reads as a defect in the measurement rather than in the caller's arithmetic.
+//
+// ⇒ THE SCRIPT IS ASKED. `--print-probe-budget` prints, without sampling
+// anything, what a `--probe-environment` run of those same probes may take. One
+// computation, one owner, and tightening a `sampleSeconds` retightens this
+// gate with no edit here at all.
+//
+// ★ ONE NUMBER FOR EVERY SPAWN IN THIS FILE, AND THAT IS THE POINT. Only ONE
+// case below actually samples; every other spawn lints, resolves or refuses.
+// Giving each call site the tighter budget its own argv deserves would put a
+// per-call-site judgement back in a file whose whole defect was a per-call-site
+// judgement — and the script's own arithmetic already proves the sampling
+// budget DOMINATES the non-sampling one (same function, a zero window), so one
+// number is an honest bound for all of them. `SetUpTestSuite` ASSERTS that
+// domination against the script's own two answers rather than assuming it.
+//
+// ★★ THE MARGIN IS 1.0 — the script's number, unmultiplied — and since a margin
+// is a judgement, here is the sentence. That budget is `120 s of KERNEL-ENTRY
+// ALLOWANCE + 4x the declared window`, and the allowance is money set aside for
+// ENTERING A COLD WSL DISTRO: work this spawn does not do, because it runs the
+// probe in this host's own kernel. The margin is therefore already inside the
+// number and it is large — 200 s against a probe measured at 20.3 s on the
+// slowest host in the matrix (macOS 26.5 arm64, 2026-08-13), i.e. ~10x, of which
+// 120 s is allowance that cannot be spent here at all. Multiplying it again
+// would layer a second slack factor on top of the one the script declares, and
+// two derivations of one quantity is the defect this anchor names.
+struct SpawnBudget {
+    std::chrono::milliseconds probeEnvironment{0};  // a run that SAMPLES
+    std::chrono::milliseconds noSample{0};          // one that does not
+};
+
+// The ONE deadline this file still owns, and the only one it can: a process
+// cannot ask a program how long it may take without first running it.
+//
+// It bounds `--print-probe-budget`, which loads one JSON document and prints two
+// floats — no sampling, no kernel entry, no dependence on the declared windows.
+// That last clause is what makes it unable to repeat the defect above: the
+// number it bounds cannot drift with the catalogue, because it does not read the
+// catalogue's windows for anything but arithmetic. ✔MEASURED 2026-08-13, both
+// ends of the matrix: 0.05 s on macOS 26.5 arm64 and a 0.154 s median (0.277 s
+// worst of five) on this Windows box, so 60 s is ~220x the worst observed cost
+// and ~9x the worst spawn-admission latency ever recorded in this repo (6841 ms
+// at 16-way concurrency, run_binary.hpp). It exists to stop a hang, not to
+// police a slow machine.
+inline constexpr std::chrono::milliseconds kBudgetQueryDeadline{60000};
+
+// Ask the script what a probe run of `catalogueCopy` may cost. `diagnostic` is
+// set (and the budget left zero) on any failure — a budget that could not be
+// fetched must never fall back to a number chosen here, which is the whole
+// defect one level up.
+[[nodiscard]] SpawnBudget askSpawnBudget(fs::path const& catalogueCopy,
+                                         std::string&    diagnostic) {
+    SpawnBudget out;
+    auto const r = spawnResolver({"--print-probe-budget"}, catalogueCopy,
+                                 kBudgetQueryDeadline);
+    if (!r.spawned) {
+        diagnostic = "could not ask harness_legs.py for its spawn budget: "
+                   + r.diagnostic;
+        return out;
+    }
+    if (r.exitCode != 0u) {
+        diagnostic = "harness_legs.py --print-probe-budget exited "
+                   + std::to_string(r.exitCode) + ":\n" + r.output;
+        return out;
+    }
+    auto const toMs = [](double seconds) {
+        return std::chrono::milliseconds{
+            static_cast<std::int64_t>(std::llround(seconds * 1000.0))};
+    };
+    try {
+        auto const doc = json::parse(r.output);
+        out.probeEnvironment =
+            toMs(doc.at("probeEnvironmentSeconds").get<double>());
+        out.noSample = toMs(doc.at("noSampleSeconds").get<double>());
+    } catch (std::exception const& exc) {
+        diagnostic = std::string{"harness_legs.py --print-probe-budget did not "
+                                 "answer with the two budgets ("}
+                   + exc.what() + "):\n" + r.output;
+        return out;
+    }
+    if (out.probeEnvironment <= std::chrono::milliseconds::zero()) {
+        diagnostic = "harness_legs.py --print-probe-budget answered a "
+                     "non-positive budget, which bounds nothing:\n" + r.output;
+    }
+    return out;
+}
+
+// Fetched ONCE by the fixture, before any other spawn. Zero until then, and
+// `runResolver` refuses to spawn under a zero rather than substituting one —
+// a spawn that ran before the budget arrived would be back under a deadline
+// nobody stated.
+[[nodiscard]] std::chrono::milliseconds& resolverDeadline() {
+    static std::chrono::milliseconds deadline{0};
+    return deadline;
+}
+
+[[nodiscard]] PyRun runResolver(std::vector<std::string> const& args,
+                                fs::path const&                 catalogueCopy) {
+    if (resolverDeadline() <= std::chrono::milliseconds::zero()) {
+        PyRun out;
+        out.diagnostic =
+            "the spawn deadline has not been fetched from harness_legs.py yet."
+            " Every spawn in this file runs under the budget the SCRIPT derives"
+            " from the catalogue's declared sample windows"
+            " (--print-probe-budget); there is no local number to fall back to,"
+            " because a local number is the defect"
+            " [D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-"
+            "DERIVED-BUDGET].";
+        return out;
+    }
+    return spawnResolver(args, catalogueCopy, resolverDeadline());
 }
 
 // One scratch copy of the shipped catalogue, made once and shared. A per-test
@@ -163,6 +296,21 @@ protected:
         std::error_code ec;
         fs::copy_file(src, catalogue_, fs::copy_options::overwrite_existing, ec);
         ASSERT_FALSE(ec) << "could not stage the catalogue: " << ec.message();
+        // …and then ask the script how long it may take, BEFORE any spawn that
+        // needs the answer. See the SpawnBudget block above for why the number
+        // is fetched rather than typed.
+        std::string why;
+        budget_ = askSpawnBudget(catalogue_, why);
+        ASSERT_TRUE(why.empty()) << why;
+        ASSERT_GE(budget_.probeEnvironment, budget_.noSample)
+            << "the script's budget for a run that SAMPLES came out below its"
+               " budget for one that samples nothing, so the single deadline"
+               " this file applies to every spawn is no longer an upper bound"
+               " for the cheap ones. Both come from kernel_probe_budget_seconds"
+               " — the sampling one at the catalogue's declared windows, the"
+               " other at a zero window — so this ordering is arithmetic, and"
+               " its failure means the derivation changed shape.";
+        resolverDeadline() = budget_.probeEnvironment;
     }
     static void TearDownTestSuite() {
         delete scratch_;
@@ -185,10 +333,12 @@ protected:
 
     static dss::test_support::ScratchDir* scratch_;
     static fs::path                       catalogue_;
+    static SpawnBudget                    budget_;
 };
 
 dss::test_support::ScratchDir* HarnessLegs::scratch_   = nullptr;
 fs::path                       HarnessLegs::catalogue_ = {};
+SpawnBudget                    HarnessLegs::budget_    = {};
 
 // One resolved leg out of a `--plan` document, by label. Returns an EMPTY object
 // when the label is absent rather than throwing, so a caller's ASSERT names the
@@ -2085,6 +2235,11 @@ TEST_F(HarnessLegs, AnInjectedProbeVerdictIsAnnouncedAndCannotRunACorpus) {
 // each threshold), and what only an end-to-end run can establish is that the CLI
 // really samples this machine and really publishes what it saw. A verdict with no
 // evidence beside it is the `earnedOn` defect again.
+//
+// ⚠ IT IS ALSO THE ONE SPAWN IN THIS FILE THAT SAMPLES, which is why the deadline
+// it runs under is asked of the script rather than typed here — see the
+// SpawnBudget block at the top. This case is where the old typed 120 s was spent
+// on a child the script had budgeted 200 s for.
 TEST_F(HarnessLegs, TheEnvironmentProbeReportsAVerdictWithItsEvidence) {
     auto const r = run({"--probe-environment"});
     ASSERT_TRUE(r.spawned) << r.diagnostic;
@@ -2110,6 +2265,87 @@ TEST_F(HarnessLegs, TheEnvironmentProbeReportsAVerdictWithItsEvidence) {
         EXPECT_GE(got.at("evidence").at("samples").get<int>(), 2)
             << "a decisive verdict from fewer than two samples: " << r.output;
     }
+}
+
+// THE DEADLINE THAT SPAWN RAN UNDER IS THE SCRIPT'S OWN, AND IT MOVES WHEN THE
+// DECLARED WINDOW MOVES.
+// [D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-BUDGET]
+//
+// ⓘ COSTS NOTHING — `--print-probe-budget` samples nothing, so all three spawns
+// here are ~0.1 s. That is deliberate: the property is "the number tracks the
+// declaration", and paying a sample window to observe it would make the pin too
+// expensive to keep.
+//
+// ★ THE SHAPE OF THE ASSERTION IS THE WHOLE POINT, so it is spelled out. It does
+// NOT re-state the formula — re-deriving `allowance + slack x window` here would
+// be the two-derivations defect in the file that names it. It states only what
+// no constant can satisfy: widen the declared window by `d` and the budget grows
+// by some g > 0; widen it by `2d` and the budget grows by EXACTLY `2g`. A
+// re-typed literal yields g == 0 and fails the first clause; anything that
+// tracks the declaration linearly passes both without this file knowing the
+// slope. And the zero-window budget must NOT move, because it prices the
+// invocations that sample nothing.
+//
+// RED-ON-REVERT (measured, numbers in the report): restore the typed
+// `std::chrono::seconds{120}` and this test fails at the first EXPECT — a
+// constant cannot grow.
+TEST_F(HarnessLegs, TheSpawnDeadlineIsTheScriptsOwnBudgetAndTracksTheWindow) {
+    auto const declaredWindow = [](json& doc) -> json& {
+        return doc.at("environmentProbes").at("clock-realtime-steps")
+                  .at("config").at("sampleSeconds");
+    };
+    std::string why;
+    auto const shipped = askSpawnBudget(catalogue_, why);
+    ASSERT_TRUE(why.empty()) << why;
+    // ★ THE DEADLINE THAT WAS ACTUALLY APPLIED, not merely one that could have
+    // been fetched. Everything below proves the SCRIPT's number tracks the
+    // declaration; this proves the number the spawns ran under IS that one. A
+    // literal put back in the fixture reds here and nowhere else.
+    EXPECT_EQ(resolverDeadline(), shipped.probeEnvironment)
+        << "every spawn in this file ran under " << resolverDeadline().count()
+        << " ms while the script's own budget for the heaviest of them is "
+        << shipped.probeEnvironment.count()
+        << " ms. A deadline the subject never agreed to is the whole of"
+           " D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-"
+           "BUDGET, and it kills a healthy child rather than a hung one.";
+    EXPECT_GT(shipped.probeEnvironment, shipped.noSample)
+        << "the shipped catalogue DECLARES a sample window, so a run that"
+           " measures it must be priced above one that measures nothing. Equal"
+           " budgets mean the declared window reached the arithmetic as zero.";
+
+    auto const base = json::parse(fileText(catalogue_))
+                          .at("environmentProbes").at("clock-realtime-steps")
+                          .at("config").at("sampleSeconds").get<double>();
+    // Both widenings are RAISES, which is the only direction the verb's
+    // `raiseOnly` floors permit — a narrowed window would be refused by the lint
+    // and would prove nothing about the budget.
+    MutatedCatalogue oneStep{catalogue_, "legs-window-1x"};
+    declaredWindow(oneStep.doc()) = base + 30.0;
+    auto const widened = askSpawnBudget(oneStep.commit(), why);
+    ASSERT_TRUE(why.empty()) << why;
+
+    MutatedCatalogue twoSteps{catalogue_, "legs-window-2x"};
+    declaredWindow(twoSteps.doc()) = base + 60.0;
+    auto const widenedTwice = askSpawnBudget(twoSteps.commit(), why);
+    ASSERT_TRUE(why.empty()) << why;
+
+    auto const grew = widened.probeEnvironment - shipped.probeEnvironment;
+    EXPECT_GT(grew, std::chrono::milliseconds::zero())
+        << "widening the DECLARED sample window by 30 s did not move the"
+           " deadline this gate spawns under, so the deadline is not derived"
+           " from the declaration at all — which is a number typed somewhere,"
+           " and it will be the wrong number the day the window is widened for"
+           " real.";
+    EXPECT_EQ(widenedTwice.probeEnvironment - shipped.probeEnvironment, 2 * grew)
+        << "the budget does not scale LINEARLY with the declared window (+30 s"
+           " bought " << grew.count() << " ms, +60 s bought "
+        << (widenedTwice.probeEnvironment - shipped.probeEnvironment).count()
+        << " ms), so it is tracking the declaration through something other"
+           " than the script's own arithmetic.";
+    EXPECT_EQ(widenedTwice.noSample, shipped.noSample)
+        << "the ZERO-window budget moved when a window was widened. It prices"
+           " the invocations that sample nothing — every lint and plan spawn in"
+           " this file — and a window has no business in it.";
 }
 
 // ── THE DOORS AROUND THAT INSTRUMENT ARE FAIL-CLOSED ────────────────────────
@@ -2154,6 +2390,14 @@ TEST_F(HarnessLegs, TheProbeMeasurementFlagsRefuseWhatTheyCannotAnswer) {
         {"measuring and forbidding measurement at once",
          {"--probe-environment", "--environment-probes", "skip"},
          "forbids measuring"},
+        // ★ AND THE DOOR THE BUDGET FLAG ADDED. One flag PRICES a measurement,
+        // the other PERFORMS it; answering both would hand a caller a number
+        // while it believed it had measured this kernel — the same
+        // "somebody else's answer under the name of a measurement" shape as
+        // the --probe-verdicts door above, one flag along.
+        {"pricing a measurement and performing it at once",
+         {"--probe-environment", "--print-probe-budget"},
+         "prices a measurement"},
     };
     for (auto const& c : cases) {
         auto const r = run(c.args);

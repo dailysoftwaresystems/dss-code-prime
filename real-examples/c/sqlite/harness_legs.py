@@ -1464,7 +1464,7 @@ def probe_verdict_honours(verdict):
     return verdict == "present"
 
 
-# The "nothing was injected" sentinel. `None` cannot do this job: `monotonic=None`
+# The "nothing was injected" sentinel. `None` cannot do this job: `awake=None`
 # is a REAL fixture — "this interpreter has no monotonic clock" — and the arm it
 # selects (INDETERMINATE) is one the self-test has to be able to drive. Reusing
 # None for both would make that arm permanently unreachable from a test, which is
@@ -1472,34 +1472,146 @@ def probe_verdict_honours(verdict):
 _PROBE_DEFAULT = object()
 
 
-def _measure_wall_clock_step(config, clock=None, monotonic=_PROBE_DEFAULT,
-                             sleeper=None):
-    """Does this machine's WALL CLOCK step, relative to its MONOTONIC clock?
+# ── THERE ARE TWO MONOTONIC CLOCKS AND THE NAME DOES NOT SAY WHICH ──────────
+#
+# [D-HARNESS-PROBE-READS-A-HOST-SUSPEND-AS-A-WALL-CLOCK-STEP]
+#
+# Every modern host keeps two, and they answer different questions:
+#
+#   AWAKE       time the machine spent RUNNING. Stops dead in a suspend.
+#   CONTINUOUS  time that ELAPSED. Counts the suspend, because the suspend
+#               really did happen.
+#
+# ⚠ WHICH SPELLING IS WHICH IS OPPOSITE ON THE TWO PLATFORMS THIS PROJECT RUNS,
+# so `CLOCK_MONOTONIC` may not be read as either one — getting it backwards
+# inverts the whole instrument:
+#
+#   ✔MEASURED 2026-08-13, macOS 26.5.2 / Darwin 25.5.0 arm64, one process, one
+#     breath: CLOCK_MONOTONIC 172000.715 s − CLOCK_UPTIME_RAW 27339.289 s =
+#     144661.427 s of host suspend this laptop has already served since boot. So
+#     DARWIN'S `CLOCK_MONOTONIC` IS THE CONTINUOUS ONE and CLOCK_UPTIME_RAW is
+#     the awake one. `time.monotonic()` there is `mach_absolute_time()` and
+#     tracks the AWAKE clock (0.510054 s over a 0.5 s sleep, exactly
+#     CLOCK_UPTIME_RAW's 0.510054 s).
+#   ✔MEASURED the same day, Ubuntu 24.04 under WSL2 / CPython 3.12.3:
+#     CLOCK_BOOTTIME (id 7) and CLOCK_MONOTONIC (id 1) are distinct ids reading
+#     91644.442742 and 91644.442731 s — this VM has recorded ZERO suspend, so
+#     their DIFFERENCE is unproven ON IT; Linux's documented split is the mirror
+#     image of Darwin's (CLOCK_MONOTONIC excludes suspend, CLOCK_BOOTTIME
+#     includes it).
+#   ✔MEASURED the same day, Windows 11 / CPython 3.14.3: `time.clock_gettime`
+#     DOES NOT EXIST and not one CLOCK_* id is exposed. `time.monotonic()` is
+#     QueryPerformanceCounter, whose behaviour across modern standby is
+#     UNMEASURED — inducing modern standby from a test run is not practical on
+#     the operator's own box, so the last arm below says so instead of guessing.
+#
+# ★ THE CHOICE IS THEREFORE DERIVED FROM THE VOCABULARY THE PLATFORM PUBLISHES,
+# never from its name: a platform that can tell the two states apart exposes a
+# SECOND id for whichever one its `CLOCK_MONOTONIC` is not. Linux's is awake, so
+# it adds CLOCK_BOOTTIME for elapsed; Darwin's is elapsed, so it adds
+# CLOCK_UPTIME_RAW for awake. A platform that publishes neither has not claimed
+# it can distinguish them, and gets an answer that SAYS the reference is
+# unmeasured rather than a silent guess in the dangerous direction.
+def _resolve_continuous_clock():
+    """(read, name, recordedSuspendSeconds) for the monotonic clock that KEEPS
+    COUNTING while this host is suspended.
+
+    `recordedSuspendSeconds` is the host's OWN corroboration of the choice — the
+    continuous clock minus the awake one, both read here, i.e. the suspend this
+    machine has already served since boot. `0.0` means it has not suspended yet
+    and the choice is unproven ON IT; `None` means the platform exposes no second
+    id to difference against and the fallback is in force. It is EVIDENCE and
+    never a gate: a probe that behaved differently on a machine that happened to
+    have napped would be two instruments wearing one name.
+
+    The pair is differenced through `clock_gettime` rather than against
+    `time.monotonic()`, whose ABSOLUTE value is not on the same epoch — ✔MEASURED
+    on Darwin, `time.monotonic()` read 0.017 s in the very process where
+    CLOCK_UPTIME_RAW read 27339.289 s."""
+    import time as _time
+    gettime = getattr(_time, "clock_gettime", None)
+    mono = getattr(_time, "CLOCK_MONOTONIC", None)
+    boot = getattr(_time, "CLOCK_BOOTTIME", None)
+    uptime = getattr(_time, "CLOCK_UPTIME_RAW", None)
+    candidate = None
+    if gettime is not None and mono is not None:
+        if boot is not None:
+            candidate = (boot, mono, "CLOCK_BOOTTIME")
+        elif uptime is not None:
+            candidate = (mono, uptime, "CLOCK_MONOTONIC")
+    if candidate is not None:
+        continuous_id, awake_id, name = candidate
+        try:
+            recorded = round(gettime(continuous_id) - gettime(awake_id), 3)
+        except (OSError, ValueError):
+            # An id the platform NAMES but cannot SERVE is not a clock. Falling
+            # through is the safe direction: the fallback reports itself as
+            # unmeasured, where using a half-working id would not.
+            pass
+        else:
+            return (lambda: gettime(continuous_id)), name, recorded
+    return _time.monotonic, "time.monotonic()", None
+
+
+def _measure_wall_clock_step(config, clock=None, awake=_PROBE_DEFAULT,
+                             reference=_PROBE_DEFAULT, sleeper=None):
+    """Does this machine's WALL CLOCK step, relative to REAL ELAPSED TIME?
 
     THE INSTRUMENT IS THE DIFFERENCE OF TWO CLOCKS, and that choice is the
     noise immunity. Sampling CLOCK_REALTIME alone would have to assume the sleep
     interval was honoured, so a descheduled process, a loaded box or a slow
-    filesystem would all read as "the clock jumped". Subtracting the monotonic
+    filesystem would all read as "the clock jumped". Subtracting the reference
     delta cancels every one of those: a scheduling delay inflates BOTH deltas
     equally and the difference stays ~0. What survives is a wall clock that
-    moved when monotonic time did not — which is the defect, and nothing else.
+    moved when real time did not — which is the defect, and nothing else.
+
+    ★ THE REFERENCE IS THE CONTINUOUS CLOCK, NOT THE AWAKE ONE, and that is the
+    whole of D-HARNESS-PROBE-READS-A-HOST-SUSPEND-AS-A-WALL-CLOCK-STEP. A host
+    suspend IS real elapsed time and a healthy wall clock is SUPPOSED to advance
+    across it, so differencing against an AWAKE clock scores a nap as a
+    wall-clock step of exactly the nap's length. ✔MEASURED 2026-08-13 on a
+    HEALTHY Mac whose clock was verified tracking: a 32.9 s nap produced `worst
+    per-tick drift 32.8999 s and offset spread 32.9004 s (need 5.000 s)` — it
+    CLEARED BOTH magnitude thresholds, and only `minStepsRequired: 2` stood
+    between it and a forged `present`, the false positive this registry calls
+    SILENT AND DANGEROUS. Against the continuous clock that same nap scores ~0,
+    while a genuine CLOCK_REALTIME step still scores its FULL magnitude because
+    the reference did not move: strictly sharper, nothing lost.
+
+    ⚠ TWO clocks, and they are NOT interchangeable. The WINDOW is bounded on the
+    AWAKE clock so a nap cannot eat the sample — the sample count, and therefore
+    all the detecting power, is exactly what it was before this change — while
+    the DRIFT is differenced against the CONTINUOUS one. `windowSeconds` is
+    consequently AWAKE seconds and may be far short of the wall time the run
+    took; that is the instrument working, not the defect.
 
     ✔THE SIGNATURE THIS IS CALIBRATED AGAINST (D-ENV-WSL2-CLOCK-REALTIME-STEPS-
     34S, MEASURED 2026-08-01, two independent instruments): CLOCK_REALTIME
     oscillates between two values ~34.47 s apart, flipping every ~5 s; 49 and 48
     steps observed; total spread 35.164 s. So a 20 s sample at 250 ms sees ~4
     flips, and `minStepSeconds: 5` sits ~7x below the real magnitude and ~4
-    orders of magnitude above scheduler noise.
+    orders of magnitude above scheduler noise. That defect moves CLOCK_REALTIME
+    against BOTH monotonic clocks, so this change leaves it fully visible.
 
     The clocks are INJECTED so the self-test drives every arm — present, absent,
-    indeterminate, and the boundary either side of each threshold — on any host,
-    in milliseconds, with no dependence on the machine running the test."""
+    indeterminate, the nap, and the boundary either side of each threshold — on
+    any host, in milliseconds, with no dependence on the machine running it."""
     import time as _time
     clock = clock or _time.time
-    if monotonic is _PROBE_DEFAULT:
-        monotonic = getattr(_time, "monotonic", None)
+    if awake is _PROBE_DEFAULT:
+        awake = getattr(_time, "monotonic", None)
+    if reference is _PROBE_DEFAULT:
+        reference, ref_name, ref_suspend = _resolve_continuous_clock()
+        ref_says = (
+            ("%s, which has already recorded %.3f s of host suspend on this "
+             "machine" % (ref_name, ref_suspend)) if ref_suspend is not None
+            else ("%s -- this interpreter exposes no clock id known to count a "
+                  "host suspend, so a suspend here is UNMEASURED" % ref_name))
+    else:
+        ref_name, ref_suspend, ref_says = (
+            "injected", None, "the injected reference clock")
     sleeper = sleeper or _time.sleep
-    if monotonic is None:
+    if awake is None:
         # NOT a failure of the box: a failure of the INSTRUMENT. Reported as
         # indeterminate (⇒ honoured as absent) rather than guessed either way.
         return "indeterminate", ("no monotonic clock on this interpreter, so a "
@@ -1511,26 +1623,26 @@ def _measure_wall_clock_step(config, clock=None, monotonic=_PROBE_DEFAULT,
     min_steps = int(config["minStepsRequired"])
     steps, worst, samples = 0, 0.0, 0
     lo = hi = None
-    m0 = monotonic()
-    prev_w, prev_m = clock(), m0
+    a0 = awake()
+    prev_w, prev_r = clock(), reference()
     try:
-        while monotonic() - m0 < window:
+        while awake() - a0 < window:
             sleeper(interval)
-            w, m = clock(), monotonic()
+            w, r = clock(), reference()
             samples += 1
-            # The wall clock's own drift over this tick, with real elapsed time
+            # The wall clock's own drift over this tick, with real ELAPSED time
             # taken out. |.| because the measured defect steps BOTH ways.
-            drift = abs((w - prev_w) - (m - prev_m))
+            drift = abs((w - prev_w) - (r - prev_r))
             if drift > worst:
                 worst = drift
             if drift >= min_step:
                 steps += 1
-            # The oscillation AMPLITUDE, monotonic time removed, so a clock that
+            # The oscillation AMPLITUDE, elapsed time removed, so a clock that
             # merely runs fast is not mistaken for one that jumps.
-            offset = w - m
+            offset = w - r
             lo = offset if lo is None else min(lo, offset)
             hi = offset if hi is None else max(hi, offset)
-            prev_w, prev_m = w, m
+            prev_w, prev_r = w, r
     except Exception as exc:                                # noqa: BLE001
         # A clock that cannot be read is an unmeasured machine, not a healthy one
         # and not a broken one. Said out loud, honoured as absent.
@@ -1541,7 +1653,13 @@ def _measure_wall_clock_step(config, clock=None, monotonic=_PROBE_DEFAULT,
     evidence = {"samples": samples, "steps": steps,
                 "worstDriftSeconds": round(worst, 4),
                 "spreadSeconds": round(spread, 4),
-                "windowSeconds": round(monotonic() - m0, 3)}
+                "windowSeconds": round(awake() - a0, 3),
+                # WHICH clock the numbers above were differenced against, and
+                # what this host's own suspend history says about that choice.
+                # A drift figure whose reference is unnamed is the ambiguity
+                # that produced the forgery in the first place.
+                "referenceClock": ref_name,
+                "referenceRecordedSuspendSeconds": ref_suspend}
     if samples < 2:
         return "indeterminate", ("only %d sample(s) in %.1f s — a step needs at "
                                  "least two intervals to be visible at all"
@@ -1551,16 +1669,18 @@ def _measure_wall_clock_step(config, clock=None, monotonic=_PROBE_DEFAULT,
     # spread with no per-tick step is a clock that drifts rather than jumps.
     if steps >= min_steps and spread >= min_step:
         return "present", (
-            "%d step(s) >= %d required; worst per-tick wall-vs-monotonic drift "
+            "%d step(s) >= %d required; worst per-tick wall-vs-reference drift "
             "%.3f s and total offset spread %.3f s, both >= %.3f s, over %.1f s "
-            "/ %d samples" % (steps, min_steps, worst, spread, min_step,
-                              evidence["windowSeconds"], samples)), evidence
+            "awake / %d samples against %s" % (steps, min_steps, worst, spread,
+                                               min_step,
+                                               evidence["windowSeconds"],
+                                               samples, ref_says)), evidence
     return "absent", (
         "%d step(s) (need %d) with worst per-tick drift %.4f s and offset spread "
-        "%.4f s (need %.3f s) over %.1f s / %d samples: this machine's wall clock "
-        "tracked its monotonic clock"
+        "%.4f s (need %.3f s) over %.1f s awake / %d samples: this machine's wall "
+        "clock tracked %s"
         % (steps, min_steps, worst, spread, min_step, evidence["windowSeconds"],
-           samples)), evidence
+           samples, ref_says)), evidence
 
 
 # THE CLOSED VERB TABLE. `configKeys` closes the config so a typo'd threshold is
@@ -1580,8 +1700,9 @@ def _measure_wall_clock_step(config, clock=None, monotonic=_PROBE_DEFAULT,
 ENVIRONMENT_PROBE_VERBS = {
     "wall-clock-step": {
         "measure": _measure_wall_clock_step,
-        "asks": "does this machine's CLOCK_REALTIME jump relative to its "
-                "monotonic clock?",
+        "asks": "does this machine's CLOCK_REALTIME jump relative to REAL "
+                "ELAPSED TIME — the monotonic clock that counts a host suspend, "
+                "not the one that stops with the machine?",
         "configKeys": ("sampleSeconds", "sampleIntervalMs", "minStepSeconds",
                        "minStepsRequired"),
         "floors": {"sampleSeconds": 15.0, "minStepsRequired": 2,
@@ -10882,37 +11003,51 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           _reg.get("clock-realtime-steps", {}).get("verb") in
           ENVIRONMENT_PROBE_VERBS, "got %r" % _reg.get("clock-realtime-steps"))
 
-    def _fake_clocks(step_at, step_by, interval):
-        """A monotonic clock that always advances by `interval`, and a wall clock
-        that advances with it EXCEPT on the ticks in `step_at`, where it jumps by
-        `step_by`. The two are handed to the verb separately, so the instrument
-        under test really is the DIFFERENCE of two clocks."""
-        state = {"n": 0, "mono": 0.0, "wall": 1_000_000.0}
+    def _fake_clocks(step_at, step_by, interval, nap_at=(), nap_by=0.0):
+        """THREE clocks off one sleeper, because a host suspend separates two
+        that a healthy machine keeps together:
+
+          awake      advances by `interval` a tick and NOT AT ALL during a nap
+          reference  the CONTINUOUS clock: `interval` a tick PLUS the whole nap
+          wall       tracks the reference, PLUS `step_by` on the ticks in
+                     `step_at` — the CLOCK_REALTIME defect, and only it
+
+        So `nap_at` moves wall and reference together (real time passed; the
+        machine did not run) while `step_at` moves wall alone. The verb is handed
+        all three separately, so the instrument under test really is the
+        DIFFERENCE of two clocks and the self-test decides WHICH two."""
+        state = {"n": 0, "awake": 0.0, "ref": 0.0, "wall": 1_000_000.0}
 
         def sleeper(_secs):
             state["n"] += 1
-            state["mono"] += interval
+            state["awake"] += interval
+            state["ref"] += interval
             state["wall"] += interval
+            if state["n"] in nap_at:
+                state["ref"] += nap_by
+                state["wall"] += nap_by
             if state["n"] in step_at:
                 state["wall"] += step_by
-        return (lambda: state["wall"], lambda: state["mono"], sleeper)
+        return (lambda: state["wall"], lambda: state["awake"],
+                lambda: state["ref"], sleeper)
 
     _cfg = dict(_reg["clock-realtime-steps"]["config"])
     _iv = float(_cfg["sampleIntervalMs"]) / 1000.0
 
-    def _measure(step_at, step_by, config=None, interval=None):
-        w, m, s = _fake_clocks(step_at, step_by, interval or _iv)
-        return _measure_wall_clock_step(config or _cfg, clock=w, monotonic=m,
-                                        sleeper=s)
-    # A HEALTHY clock: the wall clock tracks monotonic exactly.
+    def _measure(step_at, step_by, config=None, interval=None, nap_at=(),
+                 nap_by=0.0):
+        w, a, r, s = _fake_clocks(step_at, step_by, interval or _iv, nap_at,
+                                  nap_by)
+        return _measure_wall_clock_step(config or _cfg, clock=w, awake=a,
+                                        reference=r, sleeper=s)
+    # A HEALTHY clock: the wall clock tracks real elapsed time exactly.
     _v, _why, _ev = _measure(set(), 0.0)
-    check("a clock that tracks monotonic time measures ABSENT",
+    check("a clock that tracks elapsed time measures ABSENT",
           _v == "absent" and _ev["steps"] == 0, "%s / %r" % (_v, _ev))
     # ★ THE MEASURED SIGNATURE: ±34.47 s flipping every ~5 s. At 250 ms that is a
     # step every 20 ticks, in ALTERNATING directions — so this fixture also proves
     # the |.| is real and a negative step is not read as no step.
     _flips = {20: 1, 40: -1, 60: 1, 80: -1}
-    _w, _m, _s = _fake_clocks(set(), 0.0, _iv)
     _st = {"n": 0, "mono": 0.0, "wall": 1_000_000.0}
 
     def _osc_sleep(_secs):
@@ -10920,8 +11055,8 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         _st["mono"] += _iv
         _st["wall"] += _iv + (34.47 * _flips.get(_st["n"], 0))
     _v, _why, _ev = _measure_wall_clock_step(
-        _cfg, clock=lambda: _st["wall"], monotonic=lambda: _st["mono"],
-        sleeper=_osc_sleep)
+        _cfg, clock=lambda: _st["wall"], awake=lambda: _st["mono"],
+        reference=lambda: _st["mono"], sleeper=_osc_sleep)
     check("the MEASURED 34.47 s oscillation measures PRESENT",
           _v == "present" and _ev["steps"] == 4, "%s / %r / %s" % (_v, _ev, _why))
     check("...and the PRESENT verdict quotes its own evidence",
@@ -10935,6 +11070,47 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     _v, _, _ev = _measure({20, 40}, 34.47)
     check("...and TWO jumps measure PRESENT", _v == "present" and _ev["steps"] == 2,
           "%s / %r" % (_v, _ev))
+    check("...at FULL drift — the reference did not move, so the whole 34.47 s "
+          "survives the subtraction",
+          abs(_ev["worstDriftSeconds"] - 34.47) < 1e-3
+          and abs(_ev["spreadSeconds"] - 68.94) < 1e-3, "%r" % _ev)
+    # ★★★ THE HOST SUSPEND, WHICH IS NOT A CLOCK STEP AND MUST NEVER SCORE AS ONE.
+    # D-HARNESS-PROBE-READS-A-HOST-SUSPEND-AS-A-WALL-CLOCK-STEP: the wall clock and
+    # the CONTINUOUS reference both advance by the nap — real time passed, and a
+    # healthy wall clock is SUPPOSED to show it — while only the AWAKE clock stops.
+    # ✔THE MEASURED SHAPE, 2026-08-13 on a healthy Mac: a 32.9 s nap scored `worst
+    # per-tick drift 32.8999 s and offset spread 32.9004 s (need 5.000 s)`, i.e. it
+    # cleared BOTH magnitude thresholds; two of them in one window is the forged
+    # `present` that activates every requires-gated confound row.
+    _v, _why, _ev = _measure(set(), 0.0, nap_at={20, 40}, nap_by=32.9)
+    check("two 32.9 s HOST SUSPENDS measure ABSENT — a nap is not a clock step",
+          _v == "absent" and _ev["steps"] == 0
+          and _ev["worstDriftSeconds"] == 0.0 and _ev["spreadSeconds"] == 0.0,
+          "%s / %r / %s" % (_v, _ev, _why))
+    check("...and the nap did NOT eat the sampling window",
+          _ev["samples"] == 80 and _ev["windowSeconds"] == 20.0,
+          "the window is bounded on the AWAKE clock precisely so a suspend cannot "
+          "shorten the sample and weaken the detection; got %r" % _ev)
+    # ★★ AND THE FIXTURE REALLY IS NAP-SHAPED — hand the SAME three clocks the OLD
+    # reference (the awake one) and the identical nap forges a full-magnitude
+    # PRESENT. The defect, reproduced in milliseconds, one argument away.
+    _w, _a, _r, _s = _fake_clocks(set(), 0.0, _iv, {20, 40}, 32.9)
+    _v, _why, _ev = _measure_wall_clock_step(_cfg, clock=_w, awake=_a,
+                                             reference=_a, sleeper=_s)
+    check("...against the OLD awake reference that very nap forges PRESENT",
+          _v == "present" and _ev["steps"] == 2
+          and abs(_ev["worstDriftSeconds"] - 32.9) < 1e-3,
+          "if this arm ever says ABSENT the nap fixture has stopped being a nap "
+          "and the arm above proves nothing; got %s / %r" % (_v, _ev))
+    # ★★ THE ONE THAT SETTLES IT: a napping host that ALSO has the real defect.
+    # [[D-ENV-WSL2-CLOCK-REALTIME-STEPS-34S]] must stay fully visible through the
+    # naps, and EXACTLY the two real steps may be counted — not the naps too.
+    _v, _why, _ev = _measure({30, 60}, 34.47, nap_at={20, 40}, nap_by=32.9)
+    check("a REAL 34.47 s step survives two naps in the same window",
+          _v == "present" and _ev["steps"] == 2
+          and abs(_ev["worstDriftSeconds"] - 34.47) < 1e-3,
+          "the WSL2 clock defect this probe exists to catch must remain "
+          "detectable on a host that also suspends; got %s / %r" % (_v, _ev))
     # THE OTHER THRESHOLD: many small jumps, well under minStepSeconds, are
     # scheduler noise. A probe that fired on those would excuse the clock family on
     # every loaded machine in the world.
@@ -10945,14 +11121,55 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     def _boom(_secs):
         raise OSError("clock_gettime: EINVAL")
     _v, _why, _ = _measure_wall_clock_step(_cfg, clock=lambda: 0.0,
-                                           monotonic=lambda: 0.0,
+                                           awake=lambda: 0.0,
+                                           reference=lambda: 0.0,
                                            sleeper=_boom)
     check("a clock that cannot be sampled measures INDETERMINATE",
           _v == "indeterminate" and "cut short" in _why, "%s / %s" % (_v, _why))
     check("an interpreter with NO monotonic clock measures INDETERMINATE",
-          _measure_wall_clock_step(_cfg, clock=lambda: 0.0, monotonic=None,
+          _measure_wall_clock_step(_cfg, clock=lambda: 0.0, awake=None,
+                                   reference=lambda: 0.0,
                                    sleeper=lambda _s: None)[0]
           == "indeterminate")
+    # ── THE REFERENCE CLOCK THIS HOST ACTUALLY RESOLVES TO ──────────────────
+    # Not a fixture: the real selection, on the machine running the self-test, so
+    # a platform whose vocabulary this derivation does not cover is caught HERE
+    # rather than by a forged verdict months later.
+    _ref_read, _ref_name, _ref_suspend = _resolve_continuous_clock()
+    check("the continuous-clock resolution names a clock and it ticks",
+          bool(_ref_name) and all(ord(c) < 127 for c in _ref_name)
+          and _ref_read() > 0.0 and _ref_read() <= _ref_read(),
+          "got name=%r reading=%r" % (_ref_name, _ref_read()))
+    check("a clock that counts suspend can never be BEHIND the awake one",
+          _ref_suspend is None or _ref_suspend >= 0.0,
+          "%s reports %r s of recorded suspend since boot, which is impossible: "
+          "a suspend can only ADD to the continuous clock" % (_ref_name,
+                                                              _ref_suspend))
+    check("a host that exposes no second clock id says so instead of guessing",
+          (_ref_suspend is None) == (_ref_name == "time.monotonic()"),
+          "the fallback and the corroboration must agree about whether this "
+          "platform distinguishes awake time from elapsed time; got name=%r "
+          "recordedSuspend=%r" % (_ref_name, _ref_suspend))
+    # ★ THE REVERT GUARD, and the only arm that can catch one: every fixture
+    # above INJECTS its clocks, so restoring the pre-fix default would sail past
+    # them. This one asks the running interpreter what it publishes and refuses
+    # the fallback on any host that publishes the pair — vacuous on Windows,
+    # where the fallback is the honest answer, and load-bearing everywhere else.
+    # ⚠ It asks the INTERPRETER, not the resolver: a guard that read the fact
+    # off the thing it is guarding would be reverted along with it.
+    import time as _t_mod
+    _publishes_pair = (
+        hasattr(_t_mod, "clock_gettime") and hasattr(_t_mod, "CLOCK_MONOTONIC")
+        and (hasattr(_t_mod, "CLOCK_BOOTTIME")
+             or hasattr(_t_mod, "CLOCK_UPTIME_RAW")))
+    check("a host that DOES publish both clocks must not fall back to the "
+          "awake one",
+          (not _publishes_pair)
+          or (_ref_suspend is not None
+              and _ref_name in ("CLOCK_BOOTTIME", "CLOCK_MONOTONIC")),
+          "this interpreter names both an awake and an elapsed monotonic clock, "
+          "so resolving the reference to %r is the pre-fix behaviour that reads "
+          "a host suspend as a wall-clock step" % _ref_name)
     # ★★★ THE ASYMMETRY, ASSERTED. `indeterminate` must NOT honour a row.
     # ★★ EVERY ARM'S `why` IS ASCII, ASSERTED AT THE SOURCE. It is published into
     # the confound report, which the differential battery compares BYTE FOR BYTE
@@ -10960,12 +11177,28 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # REFUSED an em-dash that the ABSENT arm was emitting, which is the guard
     # firing one level below where it was written. Caught here too, so the next one
     # reds in the self-test rather than in a `--plan` on whichever host.
+    _real_ref = {"t": 0.0}
+
+    def _real_ref_tick(_secs):
+        _real_ref["t"] += float(_cfg["sampleSeconds"]) / 2.0
     _whys = [_measure(set(), 0.0)[1], _measure({20, 40}, 34.47)[1],
              _measure({20}, 34.47)[1],
-             _measure_wall_clock_step(_cfg, clock=lambda: 0.0, monotonic=None,
+             _measure(set(), 0.0, nap_at={20, 40}, nap_by=32.9)[1],
+             _measure_wall_clock_step(_cfg, clock=lambda: 0.0, awake=None,
+                                      reference=lambda: 0.0,
                                       sleeper=lambda _s: None)[1],
              _measure_wall_clock_step(_cfg, clock=lambda: 0.0,
-                                      monotonic=lambda: 0.0, sleeper=_boom)[1]]
+                                      awake=lambda: 0.0,
+                                      reference=lambda: 0.0, sleeper=_boom)[1],
+             # THE REAL RESOLUTION's own words, not a fixture's: the resolved
+             # reference clock's NAME reaches the report, so a non-ASCII spelling
+             # would break the byte-for-byte differential exactly like the em-dash
+             # did. Only `reference` is left to resolve; the wall clock is frozen
+             # and the awake clock is driven two ticks so the window closes at
+             # once, with no dependence on how fast this host is.
+             _measure_wall_clock_step(_cfg, clock=lambda: 1.0,
+                                      awake=lambda: _real_ref["t"],
+                                      sleeper=_real_ref_tick)[1]]
     # ── WHOSE KERNEL DID THE PROBE MEASURE? ─────────────────────────────────
     # D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE.
     # A launcher that crosses into another kernel gets a probe verdict about the
@@ -11459,6 +11692,33 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           "IS the kernel-entry allowance at a zero window; a second literal here "
           "is a number that stops tracking the one it was copied from; got %r"
           % RESOLVER_SPAWN_BUDGET_SECONDS)
+    # ★★ AND THE BUDGET IS PUBLISHABLE, because a caller OUTSIDE this process has
+    # to bound this script too and had been typing its own number.
+    # [D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-BUDGET]
+    # The property that matters is not the value but the TRACKING: widen a
+    # declared window and the published number must widen with it, by the slack
+    # the arithmetic states. A constant satisfies neither clause.
+    _wide = json.loads(json.dumps(_doc))
+    _wide["environmentProbes"]["clock-realtime-steps"]["config"][
+        "sampleSeconds"] += 30.0
+    check("the published budget TRACKS the declared window rather than sitting "
+          "at a constant",
+          kernel_probe_budget_seconds(_wide, ["clock-realtime-steps"])
+          - kernel_probe_budget_seconds(_doc, ["clock-realtime-steps"])
+          == KERNEL_PROBE_SAMPLE_SLACK * 30.0
+          and kernel_probe_budget_seconds(_wide, []) ==
+              kernel_probe_budget_seconds(_doc, []),
+          "a caller that bounds this script's spawn reads this number; if it "
+          "stops moving with the catalogue the caller kills a healthy child the "
+          "day a window is widened, and reports it as a defect in the probe")
+    check("...and a run that SAMPLES is priced above one that samples nothing, "
+          "so a caller may bound every invocation with the larger",
+          kernel_probe_budget_seconds(_doc, ["clock-realtime-steps"])
+          > kernel_probe_budget_seconds(_doc, []),
+          "the two published budgets are what a caller chooses between; if the "
+          "sampling one does not dominate, one deadline can no longer bound "
+          "both and the choice comes back to the caller - which is where the "
+          "typed number came from")
     # ★★★ THE DEADLINE WHERE IT IS *APPLIED*, AGAINST A REAL CHILD THAT OUTLIVES
     # IT. The two checks above assert the ARITHMETIC and that an INJECTED runner
     # receives the number; neither touches `_captured`, the only code that hands a
@@ -13827,6 +14087,19 @@ def main(argv=None):
                         "(`wsl.exe -e python3 harness_legs.py "
                         "--probe-environment`) to check what --plan concluded. "
                         "[D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]")
+    p.add_argument("--print-probe-budget", action="store_true",
+                   help="print, WITHOUT sampling anything, how many seconds a "
+                        "--probe-environment run of the SAME probes may take: "
+                        "{probeEnvironmentSeconds, noSampleSeconds} as JSON. ★ "
+                        "FOR A CALLER THAT HAS TO BOUND THIS SCRIPT'S OWN SPAWN. "
+                        "The budget is DERIVED from the catalogue's declared "
+                        "sample windows, so a caller that types its own number "
+                        "kills a healthy child the day a window is widened — and "
+                        "reports it as a defect in the probe. Honours "
+                        "--probe-only exactly as --probe-environment does, "
+                        "because the same lines compute both. "
+                        "[D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-"
+                        "THE-DERIVED-BUDGET]")
     p.add_argument("--probe-only", action="append", default=None, metavar="NAME",
                    help="restrict --probe-environment to these declared probes. "
                         "Repeatable. Used by --plan when it measures a kernel, so "
@@ -13924,8 +14197,9 @@ def main(argv=None):
             or args.stage_build or args.check_launcher or args.identify_binary
             or args.launcher_for_target
             or args.registry_controls or args.check_regions
-            or args.probe_environment):
+            or args.probe_environment or args.print_probe_budget):
         p.error("one of --verdict-vocabulary / --plan / --probe-environment / "
+                "--print-probe-budget / "
                 "--header-stages / "
                 "--config-stages / --stage-build / --lint "
                 "/ --self-test / --path-translations / --translate-path / "
@@ -14341,21 +14615,54 @@ def main(argv=None):
         # reading one branch. It is also, unchanged, the command an operator runs
         # by hand through `wsl.exe -e` to check a plan's conclusion against.
         # [D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE]
-        if args.probe_environment:
+        #
+        # ★★★ AND `--print-probe-budget` IS SERVED FROM INSIDE THIS SAME BRANCH,
+        # WHICH IS THE WHOLE POINT OF IT.
+        # [D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-BUDGET]
+        #
+        # A CALLER THAT SPAWNS THIS SCRIPT HAS TO BOUND IT, and the number it
+        # needs is one this file already computes: `kernel_probe_budget_seconds`
+        # is what --plan hands its OWN --probe-environment children. The C++ gate
+        # spawned the same child under a deadline typed into the test instead
+        # (120 000 ms), so the two could disagree — and did, on a Darwin host,
+        # where the caller SIGKILLed a probe that was doing exactly the work this
+        # catalogue asked for and reported it as `child timed out`, i.e. as a
+        # defect in the measurement rather than in the caller's arithmetic.
+        # ⇒ THE SCRIPT OWNS THE NUMBER AND THE CALLER ASKS FOR IT. One
+        # computation, one owner, and tightening a `sampleSeconds` retightens
+        # every caller's deadline with no second edit anywhere.
+        #
+        # ⚠ IT IS PRICED BY THE LINES THAT PERFORM IT, deliberately: the two
+        # doors, the catalogue load and the `only` narrowing below are shared, so
+        # the budget printed is the budget of THIS code path and cannot describe
+        # a different invocation than the one that runs. A separate arm computing
+        # `only` its own way would be the two-derivations defect one flag along.
+        if args.probe_environment or args.print_probe_budget:
+            if args.probe_environment and args.print_probe_budget:
+                # One PRICES the measurement, the other PERFORMS it. Answering
+                # both would print a number under the name of a measurement, and
+                # the caller asking for a deadline would get no verdicts while
+                # believing it had measured this kernel.
+                raise LegError(
+                    "--print-probe-budget prices a measurement and "
+                    "--probe-environment performs one. Ask for one of them: the "
+                    "budget first, then the measurement under it.")
             if args.environment_probes != "measure":
                 # A caller asking to measure and not to measure. Refused rather
                 # than silently answered one way.
                 raise LegError(
-                    "--probe-environment with --environment-probes skip asks for "
-                    "a measurement and forbids measuring. Drop one of them.")
+                    "--probe-environment / --print-probe-budget with "
+                    "--environment-probes skip asks for a measurement (or for "
+                    "its price) and forbids measuring. Drop one of them.")
             if args.probe_verdicts:
                 # Same refusal, the other door. Printing a FILE's contents from
                 # the flag whose whole meaning is "this machine, now" is how a
                 # replayed verdict gets mistaken for a measurement.
                 raise LegError(
-                    "--probe-environment MEASURES this kernel; --probe-verdicts "
-                    "READS a file. Asking for both would print somebody else's "
-                    "answer under the name of a measurement. "
+                    "--probe-environment MEASURES this kernel and "
+                    "--print-probe-budget prices that measurement; "
+                    "--probe-verdicts READS a file. Asking for both would print "
+                    "somebody else's answer under the name of a measurement. "
                     "[D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-"
                     "PRESENT]")
             doc = load_catalogue_doc(args.catalogue)
@@ -14373,6 +14680,21 @@ def main(argv=None):
                         % (", ".join(repr(n) for n in unknown),
                            ", ".join(sorted(declared)) or "<none>"))
                 only = set(args.probe_only)
+            if args.print_probe_budget:
+                # TWO NUMBERS, because a caller has two kinds of spawn to bound
+                # and deriving the second one itself is how the first got typed.
+                # `noSampleSeconds` is this same function at a ZERO window —
+                # identically RESOLVER_SPAWN_BUDGET_SECONDS, which --self-test
+                # asserts — and it is what EVERY invocation of this script that
+                # samples nothing may take. A caller that fetched only the
+                # sampling budget would still be typing the other one.
+                json.dump({"probeEnvironmentSeconds":
+                               kernel_probe_budget_seconds(doc, only),
+                           "noSampleSeconds":
+                               kernel_probe_budget_seconds(doc, [])},
+                          sys.stdout, indent=2, sort_keys=True)
+                sys.stdout.write("\n")
+                return 0
             json.dump(run_environment_probes(doc, only=only), sys.stdout,
                       indent=2, sort_keys=True)
             sys.stdout.write("\n")
