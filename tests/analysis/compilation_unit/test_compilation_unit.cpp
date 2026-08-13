@@ -5,6 +5,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/syntactic/parser.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -33,7 +34,7 @@ using dss::tests::tokenizeShipped;
 // builds a Tree directly (CU1-style addTree path) and doesn't inspect them.
 [[nodiscard]] Tree parseToyTree(std::string source) {
     auto h = tokenizeShipped("toy", std::move(source));
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     h.dismissLexerDiags();
     return std::move(result.tree);
@@ -102,7 +103,7 @@ TEST(CompilationUnit, BuildSingleTreeMatchesContract) {
     auto schema = loadToySchema();
     auto const* schemaRaw = schema.get();
 
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     auto const builderId = b.id();
     b.addTree(parseToyTree("var x : int = 1;"));
     auto cu = std::move(b).finish();
@@ -149,7 +150,7 @@ TEST(CompilationUnit, TFC115CollidingPredefineDiagnosesInsteadOfCrashing) {
     clash.kind  = PredefinedMacroKind::Constant;
     clash.value = "1";
 
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.setTargetPredefinedMacros({clash});
     // Reaching this line at all is the primary assertion: pre-fix the process
     // died inside `addInMemory` and no EXPECT below ever ran.
@@ -184,7 +185,7 @@ TEST(CompilationUnit, TFC115CollidingPredefineDiagnosesInsteadOfCrashing) {
 // parseAndAdd_'s non-preprocess arm → zero driver diagnostics → this fails.
 TEST(CompilationUnit, UserDefinesWithoutPreprocessBlockFailLoud) {
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.setUserDefines({"FOO=1"});
     b.addInMemory("var x : int = 1;", "<mem>");
     auto cu = std::move(b).finish();
@@ -199,7 +200,7 @@ TEST(CompilationUnit, UserDefinesWithoutPreprocessBlockFailLoud) {
 
 TEST(CompilationUnit, BuildMultipleTreesPreservesOrder) {
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addTree(parseToyTree("var a : int = 1;"));
     b.addTree(parseToyTree("var b : int = 2;"));
     b.addTree(parseToyTree("var c : int = 3;"));
@@ -217,7 +218,7 @@ TEST(CompilationUnit, EmptyCompilationUnitIsValid) {
     // Per CU1 plan §2.3: "a single-tree CU is the smallest valid CU" — but
     // an empty CU is also valid (degenerate case for tests / driver hot-path).
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     auto cu = std::move(b).finish();
 
     EXPECT_TRUE(cu.id().valid());
@@ -230,9 +231,9 @@ TEST(CompilationUnit, UniqueIdsAcrossBuilders) {
     // builders must produce three distinct CUs. Specific id values are
     // process-state-dependent — assert distinctness, not values.
     auto schema = loadToySchema();
-    UnitBuilder b1{schema};
-    UnitBuilder b2{schema};
-    UnitBuilder b3{schema};
+    UnitBuilder b1{schema, DiagnosticBudget::libraryDefault()};
+    UnitBuilder b2{schema, DiagnosticBudget::libraryDefault()};
+    UnitBuilder b3{schema, DiagnosticBudget::libraryDefault()};
     EXPECT_NE(b1.id(), b2.id());
     EXPECT_NE(b2.id(), b3.id());
     EXPECT_NE(b1.id(), b3.id());
@@ -248,7 +249,7 @@ TEST(CompilationUnit, NextIdIsMonotonic) {
 
 TEST(CompilationUnit, MoveTransfersOwnership) {
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addTree(parseToyTree("var x : int = 1;"));
     auto cu = std::move(b).finish();
     auto const originalId = cu.id();
@@ -260,11 +261,11 @@ TEST(CompilationUnit, MoveTransfersOwnership) {
 
 TEST(CompilationUnit, MoveAssignmentTransfersOwnership) {
     auto schema = loadToySchema();
-    UnitBuilder b1{schema};
+    UnitBuilder b1{schema, DiagnosticBudget::libraryDefault()};
     b1.addTree(parseToyTree("var a : int = 1;"));
     auto cu1 = std::move(b1).finish();
 
-    UnitBuilder b2{schema};
+    UnitBuilder b2{schema, DiagnosticBudget::libraryDefault()};
     b2.addTree(parseToyTree("var b : int = 2;"));
     b2.addTree(parseToyTree("var c : int = 3;"));
     auto cu2       = std::move(b2).finish();
@@ -282,7 +283,7 @@ TEST(CompilationUnit, CrossRefsEmptyForToy) {
     // a valid, intentional assertion. Cross-language population is exercised in
     // test_import_resolver.cpp.
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addTree(parseToyTree("var x : int = 1;"));
     auto cu = std::move(b).finish();
     EXPECT_TRUE(cu.crossRefs().empty());
@@ -312,7 +313,7 @@ TEST(CompilationUnit, TypeTraits) {
 TEST(CompilationUnitDeathTest, AddTreeAfterFinishAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     [[maybe_unused]] auto cu = std::move(b).finish();
     // `b` is non-movable; `std::move(b)` only casts to rvalue-ref. The
     // object's `finished_` latch is now true — addTree must abort.
@@ -323,7 +324,7 @@ TEST(CompilationUnitDeathTest, AddTreeAfterFinishAborts) {
 TEST(CompilationUnitDeathTest, DoubleFinishAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     [[maybe_unused]] auto cu = std::move(b).finish();
     // A second rvalue-qualified finish() on the same live builder object
     // is syntactically valid (std::move doesn't consume); the latch fires.
@@ -333,13 +334,17 @@ TEST(CompilationUnitDeathTest, DoubleFinishAborts) {
 
 TEST(CompilationUnitDeathTest, NullSchemaAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
-    EXPECT_DEATH({ UnitBuilder b{nullptr}; }, "schema is null");
+    // PAREN-init, not brace-init: the preprocessor groups on PARENTHESES only, so
+    // a `{a, b}` inside a macro argument splits it in two ("EXPECT_DEATH passed 3
+    // arguments"). Same ctor either way -- UnitBuilder has no initializer_list
+    // overload -- so this is a macro-arity workaround, not a semantic change.
+    EXPECT_DEATH({ UnitBuilder b(nullptr, DiagnosticBudget::libraryDefault()); }, "schema is null");
 }
 
 TEST(CompilationUnitDeathTest, ReadingSchemaOnMovedFromCuAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addTree(parseToyTree("var x : int = 1;"));
     auto cu = std::move(b).finish();
     CompilationUnit moved{std::move(cu)};
@@ -353,7 +358,7 @@ TEST(CompilationUnitDeathTest, ReadingSchemaOnMovedFromCuAborts) {
 
 TEST(CompilationUnitCU2, AddInMemoryParsesAndAdds) {
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory("var x : int = y;", "<mem>");   // identifier RHS — clean toy program
     auto cu = std::move(b).finish();
 
@@ -365,7 +370,7 @@ TEST(CompilationUnitCU2, AddInMemoryParsesAndAdds) {
 
 TEST(CompilationUnitCU2, AddMultipleInMemoryPreservesOrder) {
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory("var a : int = 1;", "a.toy");
     b.addInMemory("var b : int = 2;", "b.toy");
     b.addInMemory("var c : int = 3;", "c.toy");
@@ -378,7 +383,7 @@ TEST(CompilationUnitCU2, AddMultipleInMemoryPreservesOrder) {
 
 TEST(CompilationUnitCU2, AddInMemoryEmptyEmitsInfoButStillAdds) {
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory("", "<empty>");
     auto cu = std::move(b).finish();
 
@@ -396,7 +401,7 @@ TEST(CompilationUnitCU2, LexerDiagnosticsMergedIntoTree) {
     // merge it is visible via tree.diagnostics(). (The parser also emits
     // P_NoAlternativeMatched here; we assert specifically on the LEXER code.)
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory("var x : int = @;", "<mem>");
     auto cu = std::move(b).finish();
 
@@ -410,7 +415,7 @@ TEST(CompilationUnitCU2, LexerDiagnosticsMergedIntoTree) {
 TEST(CompilationUnitCU2, AddFileReadsParsesAndAdds) {
     TempFile f{"var x : int = y;"};
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addFile(f.path());
     auto cu = std::move(b).finish();
 
@@ -421,7 +426,7 @@ TEST(CompilationUnitCU2, AddFileReadsParsesAndAdds) {
 
 TEST(CompilationUnitCU2, AddFileMissingEmitsFileNotFoundAndContinues) {
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addFile("definitely/does/not/exist_a8f3.toy");   // → D_FileNotFound, skip
     b.addInMemory("var ok : int = 1;", "<mem>");             // continue: still added
     auto cu = std::move(b).finish();
@@ -433,7 +438,7 @@ TEST(CompilationUnitCU2, AddFileMissingEmitsFileNotFoundAndContinues) {
 TEST(CompilationUnitCU2, AddFileDuplicateEmitsWarningAndSkips) {
     TempFile f{"var x : int = y;"};
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addFile(f.path());
     b.addFile(f.path());   // same canonical path → skipped
     auto cu = std::move(b).finish();
@@ -448,7 +453,7 @@ TEST(CompilationUnitCU2, AddFileDuplicateViaDifferentSpellingSkips) {
     TempFile f{"var x : int = y;"};
     auto alt = f.path().parent_path() / "." / f.path().filename();
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addFile(f.path());
     b.addFile(alt);        // different spelling, same canonical target
     auto cu = std::move(b).finish();
@@ -461,7 +466,7 @@ TEST(CompilationUnitCU2, AddInMemorySameLabelTwiceAddsTwo) {
     // addInMemory does NOT dedup (labels may legitimately repeat) — both
     // sources are parsed and added; no D_DuplicateFile.
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory("var x : int = y;", "dup");
     b.addInMemory("var z : int = y;", "dup");
     auto cu = std::move(b).finish();
@@ -475,7 +480,7 @@ TEST(CompilationUnitCU2, MixedFileAndInMemoryPreservesOrder) {
     // preserves add-order (strictly increasing TreeIds).
     TempFile f{"var b : int = y;"};
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory("var a : int = y;", "a.toy");
     b.addFile(f.path());
     b.addInMemory("var c : int = y;", "c.toy");
@@ -489,7 +494,7 @@ TEST(CompilationUnitCU2, MixedFileAndInMemoryPreservesOrder) {
 TEST(CompilationUnitCU2DeathTest, AddInMemoryAfterFinishAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     [[maybe_unused]] auto cu = std::move(b).finish();
     EXPECT_DEATH({ b.addInMemory("var x : int = y;", "<mem>"); },
                  "addInMemory.*called after finish");
@@ -498,7 +503,7 @@ TEST(CompilationUnitCU2DeathTest, AddInMemoryAfterFinishAborts) {
 TEST(CompilationUnitCU2DeathTest, AddFileAfterFinishAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     auto schema = loadToySchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     [[maybe_unused]] auto cu = std::move(b).finish();
     // Exercises the addFile guard specifically (distinct from addInMemory).
     EXPECT_DEATH({ b.addFile("anything.toy"); },
@@ -536,7 +541,7 @@ TEST(CompilationUnitPPGate, FatalMacroNestingTruncationGatesParser) {
     for (int i = 0; i < kNest; ++i) src += ")";
     src += ";\n";
 
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory(std::move(src), "<deep-macro>");
     auto cu = std::move(b).finish();
 
@@ -562,7 +567,7 @@ TEST(CompilationUnitPPGate, FatalMacroNestingTruncationGatesParser) {
 // unresolved-include sibling case (below) would wrongly gate.
 TEST(CompilationUnitPPGate, OrdinaryMacroCompileIsNotGated) {
     auto schema = loadCSubsetSchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory("#define Z 0\nint main(void){ return Z; }\n", "<ok>");
     auto cu = std::move(b).finish();
     ASSERT_EQ(cu.trees().size(), 1u);
@@ -579,7 +584,7 @@ TEST(CompilationUnitPPGate, OrdinaryMacroCompileIsNotGated) {
 // would swallow the whole file on the include error).
 TEST(CompilationUnitPPGate, UnresolvedIncludeStillParsesRestOfFile) {
     auto schema = loadCSubsetSchema();
-    UnitBuilder b{schema};
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory("#include \"nonexistent_zzz.h\"\nint f(void){ return 0; }\n",
                   "<missing-inc>");
     auto cu = std::move(b).finish();

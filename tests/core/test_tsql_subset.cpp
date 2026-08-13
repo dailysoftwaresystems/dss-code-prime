@@ -1,4 +1,5 @@
 #include "analysis/syntactic/parser.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/lexer_mode.hpp"
 #include "core/types/operator_table.hpp"
@@ -181,7 +182,7 @@ TEST(TsqlSubset, ModeOpsParseCorrectly) {
 TEST(TsqlSubset, SimpleSelectStar) {
     auto h = tokenizeShipped("tsql-subset", "SELECT * FROM t;");
     ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
@@ -227,9 +228,9 @@ TEST(TsqlSubset, SelectFromQualifiedThreePartName) {
     auto schema = *loaded;
     const std::string sql = "SELECT a FROM db.schema.t;";
     auto src = SourceBuffer::fromString(sql, "test.sql");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{src, schema, std::move(stream)};
+    Parser p{src, schema, std::move(stream), DiagnosticBudget::libraryDefault()};
     Tree t = std::move(p).parse().tree;
     EXPECT_TRUE(t.diagnostics().all().empty());
 
@@ -297,9 +298,9 @@ TEST(TsqlSubset, SelectWithBracketIdentifier) {
     auto schema = *loaded;
     const std::string sql = "SELECT [Order Date] FROM [My Table];";
     auto src = SourceBuffer::fromString(sql, "test.sql");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{src, schema, std::move(stream)};
+    Parser p{src, schema, std::move(stream), DiagnosticBudget::libraryDefault()};
     Tree t = std::move(p).parse().tree;
     EXPECT_TRUE(t.diagnostics().all().empty());
 
@@ -324,7 +325,7 @@ TEST(TsqlSubset, SelectWithBracketIdentifier) {
 TEST(TsqlSubset, InsertIntoValues) {
     auto h = tokenizeShipped("tsql-subset", "INSERT INTO t (a, b) VALUES (1, 2);");
     ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
@@ -403,9 +404,9 @@ TEST(TsqlSubset, UpdateSetWhere) {
     auto schema = *loaded;
     const std::string sql = "UPDATE t SET a = 1 WHERE id = 5;";
     auto src = SourceBuffer::fromString(sql, "test.sql");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{src, schema, std::move(stream)};
+    Parser p{src, schema, std::move(stream), DiagnosticBudget::libraryDefault()};
     Tree t = std::move(p).parse().tree;
     EXPECT_TRUE(t.diagnostics().all().empty());
 
@@ -448,9 +449,9 @@ TEST(TsqlSubset, DeleteFromWhere) {
     auto schema = *loaded;
     const std::string sql = "DELETE FROM t WHERE id = 5;";
     auto src = SourceBuffer::fromString(sql, "test.sql");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{src, schema, std::move(stream)};
+    Parser p{src, schema, std::move(stream), DiagnosticBudget::libraryDefault()};
     Tree t = std::move(p).parse().tree;
     EXPECT_TRUE(t.diagnostics().all().empty());
 
@@ -482,7 +483,7 @@ TEST(TsqlSubset, DeleteFromWhere) {
 TEST(TsqlSubset, CreateTableWithTypes) {
     auto h = tokenizeShipped("tsql-subset", "CREATE TABLE t (id INT, name VARCHAR);");
     ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
@@ -551,7 +552,7 @@ TEST(TsqlSubset, ContextualKeywordDemotesToIdentifierInNamePosition) {
     // lexeme to Identifier at the qualifiedName position.
     auto h = tokenizeShipped("tsql-subset", "CREATE TABLE SELECT (id INT);");
     ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
@@ -610,7 +611,7 @@ TEST(TsqlSubset, ParsesMultipleStatements) {
     // root = repeat(statement). Exercise the repeat with two SELECTs.
     auto h = tokenizeShipped("tsql-subset", "SELECT * FROM t; SELECT * FROM u;");
     ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto buildSelectStar = [&] {
         auto stmt = b.open(h.schema->rules().find("statement"));
         auto sel  = b.open(h.schema->rules().find("selectStmt"));
@@ -656,9 +657,9 @@ TEST(TsqlSubset, OperatorPrecedenceConsumedInExpression) {
     auto schema = *loaded;
     const std::string sql = "UPDATE t SET a = b + c * d;";
     auto src = SourceBuffer::fromString(sql, "test.sql");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{src, schema, std::move(stream)};
+    Parser p{src, schema, std::move(stream), DiagnosticBudget::libraryDefault()};
     Tree t = std::move(p).parse().tree;
     EXPECT_TRUE(t.diagnostics().all().empty());
 
@@ -695,7 +696,7 @@ TEST(TsqlSubset, NotNullClauseInCreateTable) {
     // are positionally consumed today).
     auto h = tokenizeShipped("tsql-subset", "CREATE TABLE t (id INT NOT NULL);");
     ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));

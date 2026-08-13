@@ -2,6 +2,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/export.hpp"
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
@@ -59,6 +60,17 @@ namespace dss {
 // before). An `Aapcs64DualCursor` strategy fails loud at injection (FC12c).
 [[nodiscard]] DSS_EXPORT SemanticModel
 analyze(std::shared_ptr<CompilationUnit const> cu,
+        // ★ REQUIRED, and placed AHEAD of every defaulted parameter for the
+        // same reason `preprocess`'s `headerNameMatching` is: a parameter can
+        // only be un-defaultable when nothing before it is defaulted, and a
+        // defaulted budget is the library's 1000/50 re-entering invisibly at
+        // every call site -- the defect
+        // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE records. The model's
+        // own reporter is where the S_* family accumulates BEFORE the drain into
+        // the caller's reporter, and it is the tier MEASURED producing
+        // `reporter cap of 1000` under `--max-diagnostics=100000`. Callers with
+        // no operator budget pass `DiagnosticBudget::libraryDefault()`.
+        DiagnosticBudget budget,
         DataModel dataModel = DataModel::Lp64,
         std::optional<AggregateLayoutParams> aggregateLayout = std::nullopt,
         std::optional<VaListStrategy> vaListStrategy = std::nullopt,

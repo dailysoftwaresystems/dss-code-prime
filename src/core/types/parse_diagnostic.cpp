@@ -390,6 +390,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_DependencyGitAcquireFailed:   return "D_DependencyGitAcquireFailed";
         case DiagnosticCode::D_DependencyGitFetchFallback:   return "D_DependencyGitFetchFallback";
         case DiagnosticCode::D_DependencyGitNameCollision:   return "D_DependencyGitNameCollision";
+        case DiagnosticCode::D_SuppressRequestIgnored:       return "D_SuppressRequestIgnored";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";

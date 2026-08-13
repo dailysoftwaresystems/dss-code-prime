@@ -22,6 +22,51 @@ enum class DiagnosticSeverity : std::uint8_t {
 
 [[nodiscard]] DSS_EXPORT std::string_view severityName(DiagnosticSeverity s) noexcept;
 
+// ── DELIVERY: may the reporter's VOLUME controls drop this diagnostic? ──
+//
+// ★ THIS IS A SECOND, INDEPENDENT AXIS FROM SUPPRESSION, AND KEEPING THEM
+// APART IS THE WHOLE POINT. "the user must not be able to silence this"
+// (`--suppress`, answered by `kUnsuppressableCodes`) and "the reporter must
+// not be able to drop this" (the cap / dedup gates in
+// `DiagnosticReporter::report`) are different questions with different
+// answers. They were the same answer for one reason only: closed-table
+// membership happened to bypass BOTH, so a code needing the second had to
+// claim the first. That made membership a side-channel — every such code
+// had to argue a suppression criterion it did not meet in order to obtain
+// delivery, which loosens the one criterion that table has.
+//
+// ✔MEASURED, the pressure was already deforming the codebase in the other
+// direction too: `program.cpp`'s `reportArtifactWritten` deliberately routes
+// the build's statement of what it wrote AROUND the diagnostic system
+// entirely ("A diagnostic is DROPPABLE, through three independent gates …
+// Escaping all three would mean joining `kUnsuppressableCodes`"), i.e. a
+// plain `std::cout` line was preferred over a diagnostic because delivery
+// could not be requested without also claiming unsuppressability.
+//
+// So delivery is a property the diagnostic CARRIES, not a list somebody
+// maintains: there is no second table of code names to drift out of sync
+// with the first, and no hand-written size literal to forget to bump. Every
+// phase's codes use the same one field — nothing here is specific to any
+// band.
+enum class DiagnosticDelivery : std::uint8_t {
+    // The reporter's volume controls apply: the dedup window may collapse
+    // an exact repeat, the per-code cap may coalesce the Nth instance, and
+    // the global cap may drop it once the stream exceeds `maxDiagnostics`.
+    // Correct for the advisory bulk of the stream, and the default — a
+    // diagnostic asks for a delivery guarantee, it does not get one by
+    // omission.
+    Capped,
+    // The volume controls must NOT drop it: it reaches `all_` whatever the
+    // stream around it did. For a diagnostic that is the ONLY statement of
+    // its fact, where losing it leaves the operator with a build that
+    // failed (or silently did the wrong thing) and no text saying why.
+    //
+    // ⚠ It does NOT bypass `--suppress` / `overrides`. A user who names the
+    // code still silences it; that is the SUPPRESSION axis and it is
+    // answered by `isUnsuppressable`, deliberately not by this field.
+    Guaranteed,
+};
+
 // Stable, exhaustively-switchable diagnostic identity. Strings derive from
 // this in the formatter via diagnosticCodeText(). Prefixes group the
 // originating phase:
@@ -1771,6 +1816,57 @@ enum class DiagnosticCode : std::uint16_t {
     //   silently, exactly as a repeated `path` dependency does (see
     //   `D_DependencyCycle` 0xD01A on diamonds vs cycles).
     D_DependencyGitNameCollision = 0xD020,
+    // D_SuppressRequestIgnored: a `--suppress=<code>` request naming a
+    //   WELL-FORMED, REAL diagnostic code that is a member of
+    //   `kUnsuppressableCodes` — so the reporter will ignore the request and
+    //   emit that code anyway. The user asked for something and got nothing;
+    //   before this code existed they were also told nothing (`cli_args.cpp`
+    //   rejects only names resolving to `Unknown`/`None`, so a protected
+    //   code's name parses fine, lands in `policy.suppress`, and is then
+    //   discarded by `applyPolicy`'s `isUnsuppressable` gate). Warning
+    //   severity, and the BUILD CONTINUES — the request is refused, not the
+    //   compilation.
+    //
+    //   ★ WHY A WARNING AND NOT A PARSE-TIME REJECT — MEASURED, not assumed.
+    //   All three reference compilers were probed on the analogous input (a
+    //   silencing request that cannot be honoured) and NONE hard-rejects it:
+    //   gcc 13.2/13.3 (3 hosts, 2 arches) accepts `-Wno-<unknown>` rc=0
+    //   silently, deferring to a *note* only when the TU produced other
+    //   diagnostics; Apple clang 21 emits a real warning
+    //   (`-Wunknown-warning-option`) and compiles; MSVC 19.51 — the closest
+    //   analogue that exists, since `/wd2065` is a well-formed number naming
+    //   a real diagnostic `/wd` cannot silence — emits command-line warning
+    //   `D9014` and continues. Rejecting would make DSS strictly harsher than
+    //   all three on a flag whose whole purpose is to be script-driven, and
+    //   would break shared CI scripts on an INTERNAL DSS reclassification (a
+    //   code joining the closed table) with no change on the user's side.
+    //   The probe lives in-tree — `ReferenceCompilersDoNotRejectAnUnhonourable-
+    //   SilencingRequest` in `tests/program/`'s suppress-request suite — so the
+    //   conformance claim stays MEASURED rather than asserted in a comment. It
+    //   skips with a named verdict where a toolchain is absent, and each arm
+    //   runs a CONTROL compile with no extra flags so a broken toolchain
+    //   cannot be misread as a compiler that rejects the flag.
+    //
+    //   ⚠ THE `--suppress=0xFFFF` PRECEDENT DOES NOT GOVERN. That reject
+    //   (`parseSuppressCode`, silent-failure audit C1) refuses MALFORMED
+    //   input naming NO diagnostic. This is WELL-FORMED input naming a REAL
+    //   diagnostic. Refusing input that means nothing and refusing input that
+    //   means something the compiler declines to do are different decisions.
+    //
+    //   ★ AND THIS CODE IS DELIBERATELY *NOT* A MEMBER OF
+    //   `kUnsuppressableCodes`. It fails that table's written criterion in
+    //   both prongs: suppressing "your suppression request was ignored" ships
+    //   NO wrong bytes (the protected code it is about still emits, which is
+    //   the entire point), and it hides no build failure (the build was going
+    //   to continue either way). Its own suppressibility is therefore
+    //   CORRECT and consistent, not a leak — `--suppress=D_SuppressRequest-
+    //   Ignored` is an operator who has read the message and wants their
+    //   script quiet, exactly the advisory class `--suppress` is documented
+    //   to control. `--warnings-as-errors` promotes it like any other
+    //   Warning, which is how an operator who wants it fatal gets that
+    //   without the compiler deciding for them (the clang `-Werror,
+    //   -Wunknown-warning-option` posture, measured above).
+    D_SuppressRequestIgnored     = 0xD021,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
@@ -3376,6 +3472,14 @@ struct DSS_EXPORT RelatedLocation {
 struct DSS_EXPORT ParseDiagnostic {
     DiagnosticCode      code     = DiagnosticCode::None;
     DiagnosticSeverity  severity = DiagnosticSeverity::Error;
+
+    // Whether the reporter's cap / dedup gates may drop this diagnostic.
+    // See `DiagnosticDelivery` above for why this is a separate axis from
+    // suppression. Defaults to `Capped`: a delivery guarantee is asked for
+    // at the emit site, never acquired by omission. `forceReport` is the
+    // ergonomic spelling of `Guaranteed` for callers that would otherwise
+    // set the field and call `report` on the next line.
+    DiagnosticDelivery  delivery = DiagnosticDelivery::Capped;
 
     BufferId    buffer;             // primary buffer
     SourceSpan  span = SourceSpan::empty(0);

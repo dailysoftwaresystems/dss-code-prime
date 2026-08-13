@@ -295,7 +295,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
     std::optional<substrate::PhaseTimers::Scope> phase;
     phase.emplace(substrate::CompilePhase::Semantic);
     auto model = analyze(
-        std::move(borrowed), format.dataModel(), analyzeLayout, analyzeVaStrategy,
+        // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the operator's
+        // budget, carried on `opts` from `rep` -- NOT `reporter.config()`, which
+        // is the relaxed per-target scratch.
+        std::move(borrowed), opts.diagBudget,
+        format.dataModel(), analyzeLayout, analyzeVaStrategy,
         format.kind(),       // c8: the active object-format → per-target availability gate
         target.name(),       // plan 25: the active arch → per-target shipped-struct variant selector
         // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format-resolved `long double`

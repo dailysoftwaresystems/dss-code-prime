@@ -7,6 +7,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -48,7 +49,7 @@ namespace dss::sem_test {
 buildShippedUnit(std::string_view langName,
                  std::initializer_list<std::string> sources) {
     auto schema = loadShippedSchema(langName);
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     unsigned index = 0;
     for (auto const& src : sources) {
         builder.addInMemory(src, "<mem" + std::to_string(index++) + ">");
@@ -60,7 +61,7 @@ buildShippedUnit(std::string_view langName,
     std::string_view langName,
     std::initializer_list<std::string> sources) {
     auto cu = buildShippedUnit(langName, sources);
-    return analyze(cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault());
 }
 
 // Pre-emit a hint when a CU has tree-builder errors so the test author

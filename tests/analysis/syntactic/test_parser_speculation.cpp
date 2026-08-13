@@ -1,5 +1,6 @@
 #include "analysis/syntactic/parser.hpp"
 #include "core/substrate/large_stack_call.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -60,7 +61,7 @@ struct SpecHarness {
         << (loaded.has_value() ? "" : loaded.error()[0].message);
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString(std::move(source), "<spec>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     return SpecHarness{
         .src    = std::move(src),
@@ -132,9 +133,9 @@ TEST(ParserSpeculation, SpeculativeAltAcceptsTokenLeafBranches) {
     auto loaded = GrammarSchema::loadFromText(kMixedTokenAndRuleSchema);
     ASSERT_TRUE(loaded.has_value());
     auto src = SourceBuffer::fromString("A", "<mix>");
-    Tokenizer tk{src, *loaded};
+    Tokenizer tk{src, *loaded, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
-    Parser p{src, *loaded, std::move(stream)};
+    Parser p{src, *loaded, std::move(stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -212,9 +213,9 @@ TEST(ParserSpeculation, SpeculativeAltSurvivesInnerPostfixWrap) {
     // tripped the outer probe's `isDesynced` check via the wrap-induced
     // false-positive latch. Post-fix, the parse completes cleanly.
     auto src = SourceBuffer::fromString("(I());", "<spec>");
-    Tokenizer tk{src, *loaded};
+    Tokenizer tk{src, *loaded, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
-    Parser p{src, *loaded, std::move(stream)};
+    Parser p{src, *loaded, std::move(stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -237,9 +238,9 @@ TEST(ParserSpeculation, SpeculativeAltMixesTokenLeafAndRuleBranches) {
     auto loaded = GrammarSchema::loadFromText(kMixedTokenAndRuleSchema);
     ASSERT_TRUE(loaded.has_value());
     auto src = SourceBuffer::fromString("A B ;", "<mix>");
-    Tokenizer tk{src, *loaded};
+    Tokenizer tk{src, *loaded, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
-    Parser p{src, *loaded, std::move(stream)};
+    Parser p{src, *loaded, std::move(stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -253,7 +254,7 @@ TEST(ParserSpeculation, SpeculativeAltMixesTokenLeafAndRuleBranches) {
 
 TEST(ParserSpeculation, CommitsCaseAOnFirstBranchInput) {
     auto h = loadAndTokenize("A B ;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -273,7 +274,7 @@ TEST(ParserSpeculation, CommitsCaseBOnLaterBranchInput) {
     // that returns after the first probe failure (early-out instead
     // of try-next) would fail this test.
     auto h = loadAndTokenize("A C ;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -319,7 +320,7 @@ constexpr std::string_view kContextualSpecSchema = R"JSON({
         << (loaded.has_value() ? "" : loaded.error()[0].message);
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString(std::move(source), "<ctx>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     return SpecHarness{ .src    = std::move(src),
                         .schema = std::move(schema),
@@ -341,7 +342,7 @@ TEST(ParserSpeculation, ContextualKeywordInSpeculativePrefixNotMispruned) {
     // and commits. RED-on-disable: revert either half → this errors (verified by
     // disabling each independently during the cycle).
     auto h = loadCtx("A kw ;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -368,7 +369,7 @@ TEST(ParserSpeculation, HardKeywordInSpeculativePrefixStillPruned) {
     // (caseId) nor be AKind (caseKw) → no valid stmt, with OR without the fix.
     // Proves the prune stays precise (no over-broadening).
     auto h = loadCtx("A hk ;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_TRUE(t.diagnostics().hasErrors())
@@ -385,7 +386,7 @@ TEST(ParserSpeculation, BacktrackFailedAndRecoveryOnBogusInput) {
     // pinned contract: the parser terminates AND a loud error from the
     // replayed branch surfaces.
     auto h = loadAndTokenize("A X ;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -409,7 +410,8 @@ TEST(ParserSpeculation, MaxDepthCapEmitsAndStopsRecursion) {
     auto h = loadAndTokenize("A B ;");
     ParserConfig cfg;
     cfg.maxSpeculationDepth = 1;
-    Parser p{h.src, h.schema, std::move(h.stream), std::move(cfg)};
+    Parser p{h.src, h.schema, std::move(h.stream),
+             DiagnosticBudget::libraryDefault(), std::move(cfg)};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -430,7 +432,7 @@ TEST(ParserSpeculation, NoCommittableBranchTerminatesCleanly) {
     // machinery guarantees forward progress. The test asserts
     // termination (no hang) + a loud error.
     auto h = loadAndTokenize("A");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -446,7 +448,7 @@ TEST(ParserSpeculation, EmptyInputSkipsSpeculativeRepeat) {
     // AltChoice (the speculative one) is never entered. No
     // P_BacktrackFailed should fire on a no-input parse.
     auto h = loadAndTokenize("");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -513,9 +515,9 @@ TEST(ParserSpeculation, ProbeOrderIsDeclaredOrderNotInternerOrder) {
     // Parser-tier half: the DECLARED-first branch must be the one that
     // commits when both branches structurally succeed.
     auto src = SourceBuffer::fromString("A B ;", "<declorder>");
-    Tokenizer tk{src, *loaded};
+    Tokenizer tk{src, *loaded, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
-    Parser p{src, *loaded, std::move(stream)};
+    Parser p{src, *loaded, std::move(stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -637,12 +639,13 @@ namespace {
 timeDeepNestParse(std::shared_ptr<GrammarSchema const> const& schema,
                   std::size_t depth, std::size_t cap) {
     auto src = SourceBuffer::fromString(deepNestSource(depth), "<deep>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
 
     ParserConfig cfg;
     cfg.maxExpressionDepth = cap;
-    Parser p{src, schema, std::move(stream), std::move(cfg)};
+    Parser p{src, schema, std::move(stream),
+             DiagnosticBudget::libraryDefault(), std::move(cfg)};
 
     const auto t0 = std::chrono::steady_clock::now();
     auto result = std::move(p).parse();
@@ -764,7 +767,7 @@ TEST(ParserSpeculation, DeepNestCastVsParenIsLinear) {
 // direct-descent path (not a per-level probe) is what runs.
 TEST(ParserSpeculation, PrunesFirstBranchAtOffsetOneAndDirectDescends) {
     auto h = loadAndTokenize("A C ;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -839,9 +842,9 @@ TEST(ParserSpeculation, NullableStopElementDoesNotOverPrune) {
     // FIRST(nullableRule)={C}: the sub-rule is nullable, so B is a legitimate
     // offset-1 token for caseA.
     auto src = SourceBuffer::fromString("A B ;", "<nullstop>");
-    Tokenizer tk{src, *loaded};
+    Tokenizer tk{src, *loaded, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
-    Parser p{src, *loaded, std::move(stream)};
+    Parser p{src, *loaded, std::move(stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -907,9 +910,9 @@ struct FlatChainMetrics {
 flatChainParseMetrics(std::shared_ptr<GrammarSchema const> const& schema,
                       std::size_t additions) {
     auto src = SourceBuffer::fromString(flatChainSource(additions), "<flat>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{src, schema, std::move(stream)};
+    Parser p{src, schema, std::move(stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     EXPECT_FALSE(result.tree.diagnostics().hasErrors())
         << "flat chain of " << additions << " additions must parse clean";
@@ -1024,9 +1027,9 @@ constexpr std::string_view kSpecOptionalSchema = R"JSON({
     EXPECT_TRUE(loaded.has_value())
         << (loaded.has_value() ? "" : loaded.error()[0].message);
     auto src = SourceBuffer::fromString(std::move(source), "<specopt>");
-    Tokenizer tk{src, *loaded};
+    Tokenizer tk{src, *loaded, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
-    Parser p{src, *loaded, std::move(stream)};
+    Parser p{src, *loaded, std::move(stream), DiagnosticBudget::libraryDefault()};
     return std::move(p).parse().tree;
 }
 
@@ -1152,9 +1155,9 @@ constexpr std::string_view kSpecRepeatSeqAltSchema = R"JSON({
     EXPECT_TRUE(loaded.has_value())
         << (loaded.has_value() ? "" : loaded.error()[0].message);
     auto src = SourceBuffer::fromString(std::move(source), "<specrepeat>");
-    Tokenizer tk{src, *loaded};
+    Tokenizer tk{src, *loaded, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
-    Parser p{src, *loaded, std::move(stream)};
+    Parser p{src, *loaded, std::move(stream), DiagnosticBudget::libraryDefault()};
     return std::move(p).parse().tree;
 }
 

@@ -1,3 +1,4 @@
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/token.hpp"
@@ -86,7 +87,7 @@ std::size_t countCode(std::span<ParseDiagnostic const> all, DiagnosticCode code)
 TEST(TreeBuilder, HappyPathBuildsCleanTree) {
     auto h = Harness::make("var x;");
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         {
@@ -130,7 +131,7 @@ TEST(TreeBuilder, UnknownTokenInsertsErrorAndPropagatesHasError) {
     // Source contains a `@` that has no schema meaning anywhere.
     auto h = Harness::make("var x @");
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         {
@@ -157,7 +158,7 @@ TEST(TreeBuilder, UnknownTokenInsertsErrorAndPropagatesHasError) {
 TEST(TreeBuilder, ScopeStackCapturedOnDiagnostic) {
     auto h = Harness::make("@");
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushScope(ScopeKind::Block);
@@ -187,7 +188,7 @@ TEST(TreeBuilder, FinishSynthesizesMissingForUnclosedFrames) {
     // scope but their close() can be deferred to builder.finish() — we
     // deliberately leak them by moving into discarded variables so the
     // builder reaches finish() with frames still open.
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
 
     // Use a heap-held vector of guards. Drop the vector AFTER finish() so
     // RAII close happens on a moved-from (no-op) state — every guard
@@ -219,7 +220,7 @@ TEST(TreeBuilder, FinishSynthesizesMissingForUnclosedFrames) {
 TEST(TreeBuilder, EmptySpaceTokensCarryFlag) {
     auto h = Harness::make("var x ;");
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
@@ -263,7 +264,7 @@ TEST(TreeBuilder, AmbiguousMeaningsTieBreakOnFirstDeclared) {
     auto schema = *GrammarSchema::loadFromText(amb);
     auto src    = SourceBuffer::fromString("?", "<amb>");
 
-    TreeBuilder b{src, schema};
+    TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(schema->rules().find("root"));
         Token tok{
@@ -291,7 +292,7 @@ TEST(TreeBuilder, AmbiguousMeaningsTieBreakOnFirstDeclared) {
 TEST(TreeBuilder, PathologicalInputDoesNotStall) {
     auto h = Harness::make("@@@@@@@@@@");  // 10 unknown lexemes
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         for (std::size_t i = 0; i < 10; ++i) {
@@ -323,7 +324,7 @@ TEST(TreeBuilder, PathologicalInputDoesNotStall) {
 TEST(TreeBuilder, OpenScopeAutoClosesOnDestruction) {
     auto h = Harness::make("var x;");
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         {
@@ -341,7 +342,7 @@ TEST(TreeBuilder, OpenScopeAutoClosesOnDestruction) {
 TEST(TreeBuilder, OpenScopeCloseIsIdempotent) {
     auto h = Harness::make("");
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     root.close();           // explicit close
     root.close();           // idempotent: must NOT emit P_BuilderInvariant
@@ -354,7 +355,7 @@ TEST(TreeBuilder, OpenScopeCloseIsIdempotent) {
 
 TEST(TreeBuilder, PushTokenWithoutOpenFrameEmitsInvariant) {
     auto h = Harness::make("var");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     b.pushToken(h.tok("var", CoreTokenKind::Word));   // no open() called!
     Tree t = std::move(b).finish();
     EXPECT_EQ(countCode(t.diagnostics().all(),
@@ -363,7 +364,7 @@ TEST(TreeBuilder, PushTokenWithoutOpenFrameEmitsInvariant) {
 
 TEST(TreeBuilder, PopScopeUnderflowEmitsInvariant) {
     auto h = Harness::make("");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     b.popScope();   // scope stack is empty!
     root.close();
@@ -376,7 +377,7 @@ TEST(TreeBuilder, PopScopeUnderflowEmitsInvariant) {
 
 TEST(TreeBuilder, HasErrorPropagatesUpEntireParentChain) {
     auto h = Harness::make("var x @");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
@@ -400,7 +401,7 @@ TEST(TreeBuilder, HasErrorPropagatesUpEntireParentChain) {
 
 TEST(TreeBuilder, OpensScopeTokenMutatesScopeStack) {
     auto h = Harness::make("{}");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     EXPECT_EQ(b.openFrameCount(), 1u);
     EXPECT_TRUE(b.scopeStack().empty());
@@ -421,7 +422,7 @@ TEST(TreeBuilder, OpensScopeTokenMutatesScopeStack) {
 
 TEST(TreeBuilder, PushErrorEmitsUnexpectedTokenWithExpectedFields) {
     auto h = Harness::make("var x");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
@@ -450,7 +451,7 @@ TEST(TreeBuilder, PushErrorEmitsUnexpectedTokenWithExpectedFields) {
 
 TEST(TreeBuilder, PushErrorWithoutOpenFrameEmitsInvariant) {
     auto h = Harness::make("x");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     b.pushError(SourceSpan::of(0, 1), std::nullopt, std::nullopt, "stray");
     Tree t = std::move(b).finish();
     EXPECT_EQ(countCode(t.diagnostics().all(),
@@ -468,7 +469,7 @@ TEST(TreeBuilder, PushErrorWithoutOpenFrameEmitsInvariant) {
 // failure-mode invariants mirror `pushError`.
 TEST(TreeBuilder, PushErrorNodeInsertsLeafWithoutDiagnostic) {
     auto h = Harness::make("x");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushErrorNode(SourceSpan::of(0, 1));
@@ -491,7 +492,7 @@ TEST(TreeBuilder, PushErrorNodeInsertsLeafWithoutDiagnostic) {
 
 TEST(TreeBuilder, PushErrorNodeWithoutOpenFrameEmitsInvariant) {
     auto h = Harness::make("x");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     b.pushErrorNode(SourceSpan::of(0, 1));
     Tree t = std::move(b).finish();
     EXPECT_EQ(countCode(t.diagnostics().all(),
@@ -502,7 +503,7 @@ TEST(TreeBuilder, PushErrorNodeWithoutOpenFrameEmitsInvariant) {
 
 TEST(TreeBuilder, OutOfOrderCloseCascadesAndDoesNotDoubleDiagnose) {
     auto h = Harness::make("var x;");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
 
     auto root = b.open(h.schema->rules().find("root"));
     auto stmt = b.open(h.schema->rules().find("statement"));
@@ -527,7 +528,7 @@ TEST(TreeBuilder, OutOfOrderCloseCascadesAndDoesNotDoubleDiagnose) {
 
 TEST(TreeBuilder, OpenScopeMoveConstructorLeavesSourceInert) {
     auto h = Harness::make("");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto a = b.open(h.schema->rules().find("root"));
     EXPECT_TRUE(a.isOpen());
     auto moved = std::move(a);
@@ -544,7 +545,7 @@ TEST(TreeBuilder, OpenScopeMoveConstructorLeavesSourceInert) {
 
 TEST(TreeBuilder, OpenScopeMoveAssignClosesPriorFrame) {
     auto h = Harness::make("");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto a = b.open(h.schema->rules().find("root"));
     auto bb = b.open(h.schema->rules().find("statement"));
     // Move-assign over `a` — this should close `a`'s frame... but
@@ -562,7 +563,7 @@ TEST(TreeBuilder, OpenScopeMoveAssignClosesPriorFrame) {
 TEST(TreeBuilderDeathTest, DoubleFinishAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     auto h = Harness::make("");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     Tree t = std::move(b).finish();
     EXPECT_DEATH({ (void)std::move(b).finish(); },
                  "finish.*twice");
@@ -576,7 +577,7 @@ TEST(TreeBuilder, PriorityWinnerWithOpensScopeMutatesStack) {
     //   - LtOperator               priority=10
     // Lowest priority wins → GenericDefinitionOpener → pushes Generic.
     auto h = Harness::make("<");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     EXPECT_TRUE(b.scopeStack().empty());
 
@@ -595,7 +596,7 @@ TEST(TreeBuilder, PriorityWinnerWithOpensScopeMutatesStack) {
 
 TEST(TreeBuilder, CurrentRuleReturnsInvalidWhenNoFrameOpen) {
     auto h = Harness::make("");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     EXPECT_EQ(b.currentRule(), InvalidRule);
     auto root = b.open(h.schema->rules().find("root"));
     EXPECT_EQ(b.currentRule(), h.schema->rules().find("root"));
@@ -609,7 +610,7 @@ TEST(TreeBuilder, CurrentRuleReturnsInvalidWhenNoFrameOpen) {
 
 TEST(TreeBuilder, FinishWithoutAnyOpenProducesEmptyTree) {
     auto h = Harness::make("");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     Tree t = std::move(b).finish();
     EXPECT_EQ(t.root(), InvalidNode);
     EXPECT_EQ(t.nodeCount(), 0u);
@@ -640,7 +641,7 @@ TEST(TreeBuilder, PerMeaningValidScopesFiltersResolution) {
 
     // Without Block on the stack: no meaning matches → P_UnknownToken.
     {
-        TreeBuilder b{src, schema};
+        TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
         auto root = b.open(schema->rules().find("root"));
         b.pushToken(pct);
         root.close();
@@ -650,7 +651,7 @@ TEST(TreeBuilder, PerMeaningValidScopesFiltersResolution) {
     }
     // With Block on the stack: meaning matches → no diagnostic.
     {
-        TreeBuilder b{src, schema};
+        TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
         auto root = b.open(schema->rules().find("root"));
         b.pushScope(ScopeKind::Block);
         b.pushToken(pct);
@@ -706,7 +707,7 @@ TEST(TreeBuilder, SynthesizesMeaningForBuiltinLiteralKind) {
         .span       = SourceSpan::of(1, 2),
     };
 
-    TreeBuilder b{src, schema};
+    TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(schema->rules().find("root"));
         auto stmt = b.open(schema->rules().find("stmt"));
@@ -761,7 +762,7 @@ TEST(TreeBuilder, SynthesisExcludesErrorKindAndEmitsUnknownToken) {
         .span       = SourceSpan::of(0, 1),
     };
 
-    TreeBuilder b{src, schema};
+    TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(schema->rules().find("root"));
         b.pushToken(bad);
@@ -810,7 +811,7 @@ TEST(TreeBuilder, BodyDefaultKindsEmptyWhenSchemaHasNoBodyModes) {
         .span       = SourceSpan::of(0, 1),
     };
 
-    TreeBuilder b{src, schema};
+    TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(schema->rules().find("root"));
         auto stmt = b.open(schema->rules().find("stmt"));
@@ -861,7 +862,7 @@ TEST(TreeBuilder, BodyDefaultKindsUnionsAcrossLexerModes) {
     Token bTok{ .coreKind = CoreTokenKind::Punctuation, .schemaKind = bKind,
                 .span = SourceSpan::of(0, 0) };
 
-    TreeBuilder b{src, schema};
+    TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(schema->rules().find("root"));
         // Push BOTH body-default kinds. If only AKind made it into the
@@ -917,7 +918,7 @@ TEST(TreeBuilder, SynthesisHonorsIsTokenValidInScope) {
     Token close5 { .coreKind = CoreTokenKind::Punctuation, .schemaKind = {},
                    .span = SourceSpan::of(2, 3) };
 
-    TreeBuilder b{src, schema};
+    TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(schema->rules().find("root"));
         auto stmt = b.open(schema->rules().find("stmt"));
@@ -968,7 +969,7 @@ TEST(TreeBuilder, SynthesisAcceptsBuiltinLiteralOutsideForbidScope) {
     Token five{ .coreKind = CoreTokenKind::IntLiteral, .schemaKind = intLitKind,
                 .span = SourceSpan::of(0, 1) };
 
-    TreeBuilder b{src, schema};
+    TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(schema->rules().find("root"));
         b.pushToken(five);
@@ -1009,7 +1010,7 @@ TEST(TreeBuilder, WrapLastChildInFrameReparentsAndReorders) {
     const RuleId rootRule    = h.schema->rules().find("root");
     const RuleId wrapperRule = h.schema->rules().find("wrapper");
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(rootRule);
         b.pushToken(h.tok("x", CoreTokenKind::Word));
@@ -1042,7 +1043,7 @@ TEST(TreeBuilder, WrapLastChildInFrameWithNoChildrenIsInvariantViolation) {
     const RuleId rootRule    = h.schema->rules().find("root");
     const RuleId wrapperRule = h.schema->rules().find("wrapper");
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(rootRule);
         // No pushToken/open before wrap → no pending children.
@@ -1060,7 +1061,7 @@ TEST(TreeBuilder, WrapLastChildInFrameWithNoOpenFrameIsInvariantViolation) {
     auto h = dss::tests::ToyHarness::make("", kWrapConfig);
     const RuleId wrapperRule = h.schema->rules().find("wrapper");
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     // Never open the root frame.
     {
         auto wrap = b.wrapLastChildInFrame(wrapperRule);
@@ -1079,7 +1080,7 @@ TEST(TreeBuilder, WrapLastChildInFrameSpanStartsAtWrappedChild) {
     const RuleId rootRule    = h.schema->rules().find("root");
     const RuleId wrapperRule = h.schema->rules().find("wrapper");
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(rootRule);
         b.pushToken(h.tok("x", CoreTokenKind::Word));
@@ -1101,7 +1102,7 @@ TEST(TreeBuilderIngest, PreservesScopeStackVerbatim) {
     // emitDiagnostic_ does). A lexer diagnostic has no builder-scope context,
     // so routing it through emitDiagnostic_ would wrongly clobber it.
     auto h = Harness::make("var x = y;");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
 
     ParseDiagnostic ext;
     ext.code       = DiagnosticCode::P_DeprecatedSyntax;
@@ -1133,7 +1134,7 @@ TEST(TreeBuilderIngest, PreservesScopeStackVerbatim) {
 
 TEST(TreeBuilderIngest, EmptySpanDiagnosticReachesTheTree) {
     auto h = Harness::make("var x = y;");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
 
     ParseDiagnostic ext;
     ext.code     = DiagnosticCode::P_IllegalChar;

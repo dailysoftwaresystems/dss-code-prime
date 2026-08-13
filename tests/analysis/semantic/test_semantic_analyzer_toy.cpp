@@ -5,6 +5,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
+#include "core/types/diagnostic_budget.hpp"
 
 #include <gtest/gtest.h>
 
@@ -26,7 +27,7 @@ static_assert( std::is_move_constructible_v<SemanticModel>);
 TEST(SemanticAnalyzerToy, SingleVarDeclMintsOneSymbol) {
     auto cu = buildShippedUnit("toy", {"var x : int = x;"});
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // One variable symbol minted; no S_RedeclaredSymbol.
     EXPECT_EQ(model.symbols().size() - 1, 1u);   // -1 for the slot-0 sentinel
     EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol));
@@ -45,7 +46,7 @@ TEST(SemanticAnalyzerToy, RedeclarationEmitsS_RedeclaredSymbol) {
         "var x : int = y; var x : int = z;",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u);
     // Find the diagnostic and verify it carries a RelatedLocation.
     bool sawRelated = false;
@@ -67,7 +68,7 @@ TEST(SemanticAnalyzerToy, ForwardReferenceResolves) {
         "var x : int = y; var y : int = x;",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
     EXPECT_EQ(model.symbols().size() - 1, 2u);
 }
@@ -81,7 +82,7 @@ TEST(SemanticAnalyzerToy, UndeclaredUseEmitsExactlyOne) {
         "var x : int = x; var g : int = ghost;",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // The init `x` resolves to the just-minted symbol; `ghost` is the
     // sole unresolved reference.
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u);
@@ -105,7 +106,7 @@ TEST(SemanticAnalyzerToy, MultiTreeSymbolsAreIsolatedWithoutImports) {
     assertNoBuilderErrors(*cu);
     // No import edges between unrelated toy files.
     EXPECT_EQ(cu->crossRefs().size(), 0u);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // tree 1's `a` is unbound (the init of `var b = a;`); `b` itself and
     // tree 0's `a` self-init resolve. Exactly one undeclared use.
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u);
@@ -119,9 +120,9 @@ TEST(SemanticAnalyzerToy, MultiTreeSymbolsAreIsolatedWithoutImports) {
 // Empty CU (no in-memory sources) — no diagnostics, model is well-formed.
 TEST(SemanticAnalyzerToy, EmptyCuIsClean) {
     auto schema = loadShippedSchema("toy");
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(model.symbols().size() - 1, 0u);
 }
@@ -130,7 +131,7 @@ TEST(SemanticAnalyzerToy, EmptyCuIsClean) {
 // a different CompilationUnit — this is the SE1 cross-CU guard.
 TEST(SemanticAnalyzerToyDeathTest, ForeignNodeIdAborts) {
     auto cu = buildShippedUnit("toy", {"var x : int = x;"});
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // A NodeId tagged with a TreeId that doesn't belong to this CU's
     // trees triggers the UnitAttribute crossUnitFatal path.
     NodeId foreign{1, /*tag=*/0xDEAD'BEEF};

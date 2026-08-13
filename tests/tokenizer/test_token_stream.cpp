@@ -1,3 +1,4 @@
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/token.hpp"
@@ -26,7 +27,7 @@ struct H {
 
 [[nodiscard]] TokenStream stream(std::string text) {
     auto h = loadToy(std::move(text));
-    Tokenizer t{h.src, h.schema};
+    Tokenizer t{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     return std::move(std::move(t).tokenize().stream);
 }
 
@@ -161,7 +162,7 @@ TEST(TokenStreamDeath, MovedFromAdvanceAborts) {
 
 TEST(TokenStream, EmittedTokensHaveResolvedSchemaKind) {
     auto h = loadToy("var x;");
-    Tokenizer t{h.src, h.schema};
+    Tokenizer t{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto [s, reporter] = std::move(t).tokenize();
     EXPECT_TRUE(reporter->all().empty());
 

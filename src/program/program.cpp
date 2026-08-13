@@ -72,21 +72,12 @@ namespace {
     return server.run();
 }
 
-// Build a `DiagnosticReporter::Config` from the CLI's policy flags
-// (`--warnings-as-errors`, `--suppress=<code>`). The Config is
-// constructed at Program::run and passed into the policy-aware
-// compile* overloads — that lets the CLI policy apply uniformly to
-// the per-tier diagnostics drained into the run-wide reporter.
-// (D-LK10-7 closure: the policy knob arriving at Program::compileFiles
-// is the trigger that closes the D-LK10-7 anchor.)
-[[nodiscard]] DiagnosticReporter::Config buildReporterConfig(CliArgs const& args) {
-    DiagnosticReporter::Config cfg;
-    cfg.policy.warningsAsErrors = args.warningsAsErrors;
-    for (auto const code : args.suppress) {
-        cfg.policy.suppress.insert(code);
-    }
-    return cfg;
-}
+// `buildReporterConfig` (CLI flags → `DiagnosticReporter::Config`) MOVED to
+// `program/cli_args.{hpp,cpp}`, beside the parser that produces its input. It
+// is a pure projection of `CliArgs` with no Program state, and being reachable
+// from a test is what lets the `--max-diagnostics` pin drive argv → CliArgs →
+// Config through the SHIPPED projection rather than re-typing the config.
+// (D-LK10-7's policy knob still arrives here unchanged, at `Program::run`.)
 
 // Drain reporter diagnostics to stderr. The driver is the boundary
 // between in-memory diagnostic records and the operator's terminal;
@@ -1759,7 +1750,7 @@ int runCusToTargets(
         scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
         scratchCfg.dedupWindow    = 0;
         DiagnosticReporter scratch{scratchCfg};
-        CompileOptions compileOpts;
+        CompileOptions compileOpts{DiagnosticBudget{rep.config()}};
         compileOpts.config           = config;
         compileOpts.pipelineOverride = pipelineOverride;
         compileOpts.resolveLibraries = resolveLibraries;  // c162 (D-FF1-READER-CONSUMER)
@@ -1926,7 +1917,7 @@ int Program::compileProject(
     // `compileFiles`). `reporterConfig` threads `--warnings-as-errors`
     // + `--suppress=<code>` through every tier; the rep-taking overload
     // lets tests inspect the emitted code after return.
-    DiagnosticReporter rep{reporterConfig};
+    DiagnosticReporter rep = buildReporter(reporterConfig);
     return compileProject(projectFilePath, rep);
 }
 
@@ -2334,7 +2325,7 @@ int Program::transpile(
     // routes `--transpile <files>` here so the surface is parsable
     // and stable across plan 10's arrival. Policy-aware overload
     // (H2 fold): see compileProject for rationale.
-    DiagnosticReporter rep{reporterConfig};
+    DiagnosticReporter rep = buildReporter(reporterConfig);
     std::string detail =
         "transpile: source-to-source translation is not yet "
         "implemented — plan 10 (`*.map.json` + HIR pivot + target "
@@ -2423,7 +2414,7 @@ int Program::compileFiles(
     // D-CAP-MARKER-MULTI-TARGET-E2E-PIN). Existing CLI / Python
     // call sites that pass `Config` (or use the default-arg)
     // continue unchanged.
-    DiagnosticReporter rep{reporterConfig};
+    DiagnosticReporter rep = buildReporter(reporterConfig);
     return compileFiles(sourceFiles, languageName, targets, rep);
 }
 
@@ -2500,7 +2491,15 @@ int Program::compileFiles(
         -> std::vector<CompilationUnit> {
         auto cu = substrate::callOnLargeStack(
             substrate::kDeepRecursionStackBytes, [&] {
-                UnitBuilder builder{keyGrammar};
+                // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the
+                // operator's `--max-diagnostics` value crosses into the front
+                // end HERE, and `rep` is its only holder at this point (the
+                // Config overload is a thin wrapper that builds `rep` and
+                // forwards). Taken from `rep`, never from a per-target scratch
+                // -- those deliberately relax the volume axes to SIZE_MAX for
+                // the merge, so a budget derived from one would hand the front
+                // end no bound at all.
+                UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
                 applySystemDirs(builder, *keyGrammar);
                 if (key.format) builder.setActiveFormat(*key.format);
                 // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
@@ -2543,7 +2542,7 @@ int Program::compileUnits(
     const std::vector<std::string>& targets,
     DiagnosticReporter::Config const& reporterConfig
 ) {
-    DiagnosticReporter rep{reporterConfig};
+    DiagnosticReporter rep = buildReporter(reporterConfig);
     return compileUnits(sourceFiles, languageName, targets, rep);
 }
 
@@ -2609,7 +2608,9 @@ int Program::compileUnits(
             // expression parses without overflowing the host main stack.
             cus.push_back(substrate::callOnLargeStack(
                 substrate::kDeepRecursionStackBytes, [&] {
-                    UnitBuilder builder{keyGrammar};
+                    // Same budget hop as `compileFiles` above
+                    // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE).
+                    UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
                     applySystemDirs(builder, *keyGrammar);
                     if (key.format) builder.setActiveFormat(*key.format);
                     // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
@@ -2656,7 +2657,7 @@ int Program::compileDirectory(
     InputResolver::Mode mode,
     DiagnosticReporter::Config const& reporterConfig
 ) {
-    DiagnosticReporter rep{reporterConfig};
+    DiagnosticReporter rep = buildReporter(reporterConfig);
 
     // ── Which extensions does the scan collect? ───────────────────────────
     //

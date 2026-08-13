@@ -16,6 +16,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "lsp/document_store.hpp"
 #include "lsp_test_helpers.hpp"
 
@@ -333,8 +334,10 @@ TEST(LspSemantic, StaleSetSemanticModelIsDropped) {
 
     auto cuOld = buildShippedUnit("c-subset", {"int x;\n"});
     auto cuNew = buildShippedUnit("c-subset", {"int x;\n"});
-    auto modelOld = std::make_shared<dss::SemanticModel const>(dss::analyze(cuOld));
-    auto modelNew = std::make_shared<dss::SemanticModel const>(dss::analyze(cuNew));
+    auto modelOld = std::make_shared<dss::SemanticModel const>(
+        dss::analyze(cuOld, dss::DiagnosticBudget::libraryDefault()));
+    auto modelNew = std::make_shared<dss::SemanticModel const>(
+        dss::analyze(cuNew, dss::DiagnosticBudget::libraryDefault()));
     ASSERT_NE(modelOld.get(), modelNew.get());
 
     DocumentStore store;

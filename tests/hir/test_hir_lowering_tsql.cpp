@@ -10,6 +10,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -46,10 +47,10 @@ namespace {
 [[nodiscard]] SemanticModel analyzeTsql(std::string src) {
     auto loaded = GrammarSchema::loadShipped("tsql-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(tsql-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    return analyze(cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault());
 }
 
 [[nodiscard]] std::vector<std::string> symbolNames(SemanticModel const& m) {

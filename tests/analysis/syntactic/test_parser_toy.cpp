@@ -1,4 +1,5 @@
 #include "analysis/syntactic/parser.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -33,7 +34,7 @@ struct ToyHarness {
     EXPECT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString(std::move(source), "<toy>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     return ToyHarness{
         .src    = std::move(src),
@@ -97,16 +98,17 @@ void expectExactCodes(std::span<ParseDiagnostic const> diags,
 // ── lexer-diagnostic folding (08-compilation-unit-plan §2.6 C2-L1) ────────
 
 TEST(ParserToy, LexerDiagnosticsFoldedIntoTree) {
-    // The optional 5th Parser ctor arg folds the tokenizer's lexer
+    // The optional 6th Parser ctor arg folds the tokenizer's lexer
     // diagnostics into the produced Tree. `@` is an illegal char →
     // P_IllegalChar from the lexer, which must appear in the Tree.
     auto loaded = GrammarSchema::loadShipped("toy");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src = SourceBuffer::fromString("var x : int = @;", "<toy>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{src, schema, std::move(stream), {}, std::move(lexDiags)};
+    Parser p{src, schema, std::move(stream), DiagnosticBudget::libraryDefault(),
+             {}, std::move(lexDiags)};
     auto result = std::move(p).parse();
 
     EXPECT_GE(countCode(result.tree.diagnostics().all(),
@@ -121,7 +123,7 @@ TEST(ParserToy, NullLexerDiagsDoesNotFoldLexerErrors) {
     // in the Tree. Backward-compat for existing callers (LSP, tests). The
     // parser still emits its own P_NoAlternativeMatched at the `@`.
     auto h = loadAndTokenize("var x : int = @;");   // discards lexer diags
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
 
     EXPECT_EQ(countCode(result.tree.diagnostics().all(),
@@ -135,7 +137,7 @@ TEST(ParserToy, NullLexerDiagsDoesNotFoldLexerErrors) {
 
 TEST(ParserToy, HappyPath_SingleVarDecl) {
     auto h = loadAndTokenize("var x : int = y;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -149,7 +151,7 @@ TEST(ParserToy, HappyPath_FuncDef) {
     // The other top-level form; its body exercises a block, an expression
     // statement, and a return.
     auto h = loadAndTokenize("func f() -> int { x; return y; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -160,7 +162,7 @@ TEST(ParserToy, HappyPath_FuncDef) {
 
 TEST(ParserToy, HappyPath_MultipleStatements) {
     auto h = loadAndTokenize("var x : int = a; var w : int = b; func f() -> void { x; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -174,7 +176,7 @@ TEST(ParserToy, HappyPath_EmptySource) {
     // Toy root is `repeat topLevel`: nullable, so empty source must
     // parse cleanly with the root present but childless.
     auto h = loadAndTokenize("");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -193,7 +195,7 @@ TEST(ParserToy, BrokenPath_UnknownTokenInExpressionPosition) {
     // `pushError` (emitting P_UnexpectedToken) before the builder's
     // pushToken would have synthesized its own P_UnknownToken.
     auto h = loadAndTokenize("var x : int = @;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -213,7 +215,7 @@ TEST(ParserToy, BrokenPath_PrematureEofMidRule) {
     // emits P_MissingRequiredChild at each frame it has to close
     // without seeing the required body.
     auto h = loadAndTokenize("var x");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -230,7 +232,7 @@ TEST(ParserToy, BrokenPath_TokenNotInAnyFirstSet) {
     // P_UnexpectedToken should fire (that's a TokenLeaf mismatch
     // signal, not an AltChoice signal).
     auto h = loadAndTokenize(";");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -247,7 +249,7 @@ TEST(ParserToy, RuleLeafSkipNullable_DoesNotConsumeTokens) {
     // it does NOT emit any P_* diagnostic — skipping a nullable
     // branch is a clean path, not recovery.
     auto h = loadAndTokenize("");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     expectExactCodes(result.tree.diagnostics().all(), {});
 }
@@ -258,7 +260,7 @@ TEST(ParserToy, NullableBranchNegativePin_DoesNotFireOnFirstMatch) {
     // skip. `var x : int = y;` exercises the repeat's `innerStart`
     // branch (topLevel RuleLeaf) and must produce a top-level frame.
     auto h = loadAndTokenize("var x : int = y;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     EXPECT_GE(countChildRule(result.tree, result.tree.root(), "topLevel"), 1u)
         << "non-empty input must take the body branch, not the skip";
@@ -273,7 +275,7 @@ TEST(ParserToy, TriviaInteriorWhitespacePreservedAtAllSlots) {
     // (TokenLeaf), expression (RuleLeaf entry), and EndCommand
     // (TokenLeaf). Each trivia push must not affect dispatch state.
     auto h = loadAndTokenize("var   x  :  int  =   y ;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -288,7 +290,7 @@ TEST(ParserToy, LeadingAndTrailingTrivia) {
     // walker and a regression there could mis-align iteration 0's
     // watchdog seed.
     auto h = loadAndTokenize("\n\n  var x : int = y;\n\n  ");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -302,7 +304,7 @@ TEST(ParserToy, AllTriviaSource) {
     // everything; dispatch never runs a meaningful iteration; parse
     // terminates via root nullable-tail.
     auto h = loadAndTokenize("\n\n  \t\n  ");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -317,7 +319,8 @@ TEST(ParserToyDeath, NullSchemaAborts) {
     auto src = SourceBuffer::fromString("", "<x>");
     TokenStream empty;
     EXPECT_DEATH(
-        Parser(src, nullptr, std::move(empty)),
+        Parser(src, nullptr, std::move(empty),
+               DiagnosticBudget::libraryDefault()),
         "dss::Parser::Parser: schema is null");
 }
 
@@ -326,7 +329,8 @@ TEST(ParserToyDeath, NullSourceAborts) {
     ASSERT_TRUE(loaded.has_value());
     TokenStream empty;
     EXPECT_DEATH(
-        Parser(nullptr, *loaded, std::move(empty)),
+        Parser(nullptr, *loaded, std::move(empty),
+               DiagnosticBudget::libraryDefault()),
         "dss::Parser::Parser: source buffer is null");
 }
 
@@ -338,7 +342,8 @@ TEST(ParserToyDeath, ZeroSpeculationDepthAborts) {
     ParserConfig cfg;
     cfg.maxSpeculationDepth = 0;
     EXPECT_DEATH(
-        Parser(src, *loaded, std::move(empty), std::move(cfg)),
+        Parser(src, *loaded, std::move(empty),
+               DiagnosticBudget::libraryDefault(), std::move(cfg)),
         "maxSpeculationDepth must be >= 1");
 }
 
@@ -350,6 +355,7 @@ TEST(ParserToyDeath, ZeroExpressionDepthAborts) {
     ParserConfig cfg;
     cfg.maxExpressionDepth = 0;
     EXPECT_DEATH(
-        Parser(src, *loaded, std::move(empty), std::move(cfg)),
+        Parser(src, *loaded, std::move(empty),
+               DiagnosticBudget::libraryDefault(), std::move(cfg)),
         "maxExpressionDepth must be >= 1");
 }

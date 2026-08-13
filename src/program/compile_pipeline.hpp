@@ -4,6 +4,7 @@
 #include "asm/asm.hpp"  // AssembledModule (assembleUnit return + linkAndWrite span)
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"  // DataModel (CuMirModule member + lowerMergedToAssembly arg)
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"  // ExternImport (CuMirModule member)
 #include "core/types/grammar_schema.hpp"
@@ -144,6 +145,24 @@ effectiveLongDoubleFormat(TargetSchema const&       target,
 // (emitDebugInfo, ltoMode, inlineThreshold, ...) is a zero-signature-
 // churn struct-field addition.
 struct CompileOptions {
+    // ★ REQUIRED, hence the explicit constructor and the deleted default one:
+    // this is how the operator's `--max-diagnostics` value reaches the SEMANTIC
+    // tier. `compileOneTarget`'s `reporter` parameter cannot serve -- it is the
+    // per-target SCRATCH, deliberately relaxed to SIZE_MAX for the merge, so a
+    // budget read from it would give the semantic model no bound at all (that is
+    // design (A), which the operator declined). The budget must therefore travel
+    // beside the reporter, from `rep`, not be derived from it
+    // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE).
+    //
+    // Making it a required CONSTRUCTOR argument rather than a defaulted field is
+    // the point: `CompileOptions opts;` no longer compiles, so the three pipeline
+    // entry points that used to say `CompileOptions const& opts = {}` had to be
+    // updated deliberately instead of silently reinstating the library default.
+    explicit CompileOptions(DiagnosticBudget b) noexcept : diagBudget(b) {}
+    CompileOptions() = delete;
+
+    DiagnosticBudget diagBudget;
+
     // Selects the default optimizer pipeline when `pipelineOverride`
     // is null. Resolved via `resolvePipelineName` (a constexpr table
     // indexed by ordinal — NO `if (config == Release)` branches per
@@ -271,7 +290,7 @@ compileSingleUnit(CompilationUnit const&         cu,
                   std::uint16_t                  callingConventionIndex,
                   std::filesystem::path const&   outPath,
                   DiagnosticReporter&            reporter,
-                  CompileOptions const&          opts = {});
+                  CompileOptions const&          opts);
 
 // Assemble ONE CompilationUnit to its `AssembledModule` (the per-CU half of
 // `compileSingleUnit` — no link, no write). Returns nullopt on any tier failure
@@ -290,7 +309,7 @@ assembleUnit(CompilationUnit const&         cu,
              ObjectFormatSchema const&      format,
              std::uint16_t                  callingConventionIndex,
              DiagnosticReporter&            reporter,
-             CompileOptions const&          opts = {});
+             CompileOptions const&          opts);
 
 // ── assembleUnit's two halves (Cycle 24) ──────────────────────────────────────
 //
@@ -435,7 +454,7 @@ buildCuMir(CompilationUnit const&         cu,
            ObjectFormatSchema const&      format,
            std::uint16_t                  callingConventionIndex,
            DiagnosticReporter&            reporter,
-           CompileOptions const&          opts = {});
+           CompileOptions const&          opts);
 
 // Run the configured optimizer pipeline over `mir` in place. Resolves the pipeline
 // the same way `buildCuMir` always did: an explicit `opts.pipelineOverride` (the

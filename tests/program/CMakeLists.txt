@@ -6,6 +6,8 @@ dss_add_test(NAME program/test_target_spec
              SOURCES test_target_spec.cpp)
 dss_add_test(NAME program/test_compile_pipeline
              SOURCES test_compile_pipeline.cpp)
+dss_add_test(NAME program/test_max_diagnostics_reaches_every_tier
+             SOURCES test_max_diagnostics_reaches_every_tier.cpp)
 dss_add_test(NAME program/test_ffi_resolve_library
              SOURCES test_ffi_resolve_library.cpp)
 dss_add_test(NAME program/test_static_link
@@ -89,3 +91,17 @@ dss_add_test(NAME program/test_dump_predefined_macros
 # arguments, so `argc == 1` is the only observable it can produce).
 dss_add_test(NAME program/test_entry_argv_run
              SOURCES test_entry_argv_run.cpp)
+
+# `--suppress=<a code in kUnsuppressableCodes>` — the refused-request notice
+# (`D_SuppressRequestIgnored`). Driver tier because the defect lives in the seam
+# between the arg parser that ACCEPTS the flag and the reporter that IGNORES it:
+# `parseCliArgs` -> `buildReporterConfig` -> `buildReporter` is the projection
+# under test, and only this tier can drive all three.
+dss_add_test(NAME program/test_suppress_request_ignored
+             SOURCES test_suppress_request_ignored.cpp)
+
+# It REUSES tests/core/native_c_probe.hpp for the reference-compiler probe
+# rather than growing a second copy of host-compiler discovery, shell quoting
+# and output capture — the same reason tests/conformance adds this path.
+target_include_directories(dss_program_test_suppress_request_ignored
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/core)

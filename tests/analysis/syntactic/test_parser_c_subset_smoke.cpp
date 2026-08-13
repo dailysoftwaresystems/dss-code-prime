@@ -3,6 +3,7 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/syntactic/parser.hpp"
 #include "core/substrate/large_stack_call.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -38,7 +39,7 @@ struct CSubsetHarness {
     EXPECT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString(std::move(source), "<csubset-smoke>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     return CSubsetHarness{
         .src    = std::move(src),
@@ -110,7 +111,7 @@ struct CSubsetHarness {
 // paths work against the real grammar.
 TEST(ParserCSubsetSmoke, IntVarDeclWithLiteralInitializer) {
     auto h = loadAndTokenize("int x = 5;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -131,7 +132,7 @@ TEST(ParserCSubsetSmoke, IntVarDeclWithLiteralInitializer) {
 // the Pratt walker rather than the old flat-fold sequence.
 TEST(ParserCSubsetSmoke, FunctionBodyExpressionIsPrecedenceCorrect) {
     auto h = loadAndTokenize("int main() { a + b * c; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -162,7 +163,7 @@ TEST(ParserCSubsetSmoke, FunctionBodyExpressionIsPrecedenceCorrect) {
 // associativity fix).
 TEST(ParserCSubsetSmoke, TightLhsMulThenAddNestsMulOnLeft) {
     auto h = loadAndTokenize("int main() { a * b + c; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -191,7 +192,7 @@ TEST(ParserCSubsetSmoke, TightLhsMulThenAddNestsMulOnLeft) {
 // to 6 (instead of 8) before the wrap-in-place fix.
 TEST(ParserCSubsetSmoke, SamePrecSubAddChainNestsLeftward) {
     auto h = loadAndTokenize("int main() { a - b + c; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -218,7 +219,7 @@ TEST(ParserCSubsetSmoke, SamePrecSubAddChainNestsLeftward) {
 // be 10, not 100/(5/2) = 50.)
 TEST(ParserCSubsetSmoke, DivisionChainNestsLeftward) {
     auto h = loadAndTokenize("int main() { a / b / c; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -246,7 +247,7 @@ TEST(ParserCSubsetSmoke, DivisionChainNestsLeftward) {
 // (right ops keep recursing at their own precedence).
 TEST(ParserCSubsetSmoke, AssignmentChainNestsRightward) {
     auto h = loadAndTokenize("int main() { a = b = c; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -273,7 +274,7 @@ TEST(ParserCSubsetSmoke, AssignmentChainNestsRightward) {
 // ternary is the OUTER's else child (`a ? b : (c ? d : e)`).
 TEST(ParserCSubsetSmoke, TernaryChainExactRightNestedShape) {
     auto h = loadAndTokenize("int main() { a ? b : c ? d : e; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -309,7 +310,7 @@ TEST(ParserCSubsetSmoke, TernaryChainExactRightNestedShape) {
 // adopts it directly).
 TEST(ParserCSubsetSmoke, CallPlusCallMixesPostfixAndInfix) {
     auto h = loadAndTokenize("int main() { f(a) + g(b); }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -352,7 +353,7 @@ TEST(ParserCSubsetSmoke, CallPlusCallMixesPostfixAndInfix) {
 // places the trivia inside the wrapper before the operator token.
 TEST(ParserCSubsetSmoke, SpacedCallWrapsCalleeNotWhitespace) {
     auto h = loadAndTokenize("int main() { return f (40) + 2; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -386,7 +387,7 @@ TEST(ParserCSubsetSmoke, SpacedCallWrapsCalleeNotWhitespace) {
 TEST(ParserCSubsetSmoke, CommentTriviaInChainKeepsLeafOrder) {
     const std::string source = "int main() { a /*x*/ + b; }";
     auto h = loadAndTokenize(source);
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -406,7 +407,7 @@ TEST(ParserCSubsetSmoke, CommentTriviaInChainKeepsLeafOrder) {
 // mixfix shape (the ternary arm holds-then-places trivia like infix).
 TEST(ParserCSubsetSmoke, SpacedTernaryShapeMatchesCompactForm) {
     auto h = loadAndTokenize("int main() { a  ?  b  :  c ; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -430,7 +431,7 @@ TEST(ParserCSubsetSmoke, SpacedTernaryShapeMatchesCompactForm) {
 
 TEST(ParserCSubsetSmoke, TernaryParsesAsMixfix) {
     auto h = loadAndTokenize("int main() { a ? b : c; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -456,7 +457,7 @@ TEST(ParserCSubsetSmoke, TernaryParsesAsMixfix) {
 TEST(ParserCSubsetSmoke, TernaryIsRightAssociative) {
     // `a ? b : c ? d : e` → a ? b : (c ? d : e): the else branch nests.
     auto h = loadAndTokenize("int main() { a ? b : c ? d : e; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -481,7 +482,7 @@ TEST(ParserCSubsetSmoke, TernaryBindsLooserThanAssignmentRhs) {
     // `x = a ? b : c` → `x = (a ? b : c)`: ternary (prec 16) binds tighter than
     // the assignment RHS (prec 15), so the `=`'s RHS is the whole ternary.
     auto h = loadAndTokenize("int main() { x = a ? b : c; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -499,7 +500,7 @@ TEST(ParserCSubsetSmoke, TernaryAsCallArgument) {
     // `f(a ? b : c)` — ternary nested as an operand (call arg) exercises the
     // climb re-entry inside the argList body.
     auto h = loadAndTokenize("int main() { f(a ? b : c); }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     EXPECT_FALSE(result.tree.diagnostics().hasErrors());
     EXPECT_NE(findFirstNodeWithRule(result.tree, "ternaryExpr"), NodeId{});
@@ -509,7 +510,7 @@ TEST(ParserCSubsetSmoke, TernaryMissingColonRecovers) {
     // `a ? b ;` — missing `:` separator. The walker emits P_MissingRequiredChild
     // + an Error leaf (HasError on root), and recovers without hanging.
     auto h = loadAndTokenize("int main() { a ? b ; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
@@ -522,7 +523,7 @@ TEST(ParserCSubsetSmoke, TernaryMissingColonRecovers) {
 
 TEST(ParserCSubsetSmoke, FunctionCallParsesAsPostfix) {
     auto h = loadAndTokenize("int main() { f(a, b); }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -551,7 +552,7 @@ TEST(ParserCSubsetSmoke, FunctionCallParsesAsPostfix) {
 
 TEST(ParserCSubsetSmoke, EmptyArgumentCallParsesAsPostfix) {
     auto h = loadAndTokenize("int main() { f(); }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -574,7 +575,7 @@ TEST(ParserCSubsetSmoke, EmptyArgumentCallParsesAsPostfix) {
 
 TEST(ParserCSubsetSmoke, ArrayIndexParsesAsPostfix) {
     auto h = loadAndTokenize("int main() { a[0]; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -603,7 +604,7 @@ TEST(ParserCSubsetSmoke, ArrayIndexParsesAsPostfix) {
 // would be no `binaryExpr` for the nested `j * k`.
 TEST(ParserCSubsetSmoke, ArrayIndexBodyClimbsPrecedence) {
     auto h = loadAndTokenize("int main() { a[i + j * k]; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -642,7 +643,7 @@ TEST(ParserCSubsetSmoke, ArrayIndexBodyClimbsPrecedence) {
 // the parent dispatch so the `;` can still terminate the statement.
 TEST(ParserCSubsetSmoke, MissingCloserEmitsRecoveryDiag) {
     auto h = loadAndTokenize("int main() { f(a; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -658,7 +659,7 @@ TEST(ParserCSubsetSmoke, MissingCloserEmitsRecoveryDiag) {
 
 TEST(ParserCSubsetSmoke, PostfixIncParsesAsPostfix) {
     auto h = loadAndTokenize("int main() { i++; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -680,7 +681,7 @@ TEST(ParserCSubsetSmoke, PostfixIncParsesAsPostfix) {
 // position (operator-table arity).
 TEST(ParserCSubsetSmoke, PrefixDerefParsesAsUnary) {
     auto h = loadAndTokenize("int main() { *p; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -706,7 +707,7 @@ TEST(ParserCSubsetSmoke, PrefixDerefParsesAsUnary) {
 // nested-binaryExpr shape that distinguishes right from left assoc.
 TEST(ParserCSubsetSmoke, CompoundAssignmentParsesAsBinaryExpr) {
     auto h = loadAndTokenize("int main() { x += 1; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -732,7 +733,7 @@ TEST(ParserCSubsetSmoke, CompoundAssignmentParsesAsBinaryExpr) {
 // with an error). Pin the 3-char op as a single binaryExpr.
 TEST(ParserCSubsetSmoke, ShlCompoundAssignmentRespectsLongestMatch) {
     auto h = loadAndTokenize("int main() { x <<= 1; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -760,7 +761,7 @@ TEST(ParserCSubsetSmoke, ShlCompoundAssignmentRespectsLongestMatch) {
 // identically but produce a different nested shape here.
 TEST(ParserCSubsetSmoke, CompoundAssignmentIsRightAssociative) {
     auto h = loadAndTokenize("int main() { x += y += z; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -793,7 +794,7 @@ TEST(ParserCSubsetSmoke, CompoundAssignmentIsRightAssociative) {
 // form). Broken-path coverage in `test_parser_recovery.cpp`.
 TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
     auto h = loadAndTokenize("extern int printf(char x);");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -853,7 +854,7 @@ TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
 // externDeclTail's block arm -> this no longer parses (P0009).
 TEST(ParserCSubsetSmoke, ExternFunctionDefinitionParses) {
     auto h = loadAndTokenize("extern int f(void){ return 0; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -887,7 +888,7 @@ TEST(ParserCSubsetSmoke, ExternFunctionDefinitionParses) {
 // override lowering would no longer find it as a direct role child.
 TEST(ParserCSubsetSmoke, ExternImportLibraryOverrideParses) {
     auto h = loadAndTokenize("extern void* g(int) \"kernel32.dll\";");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -915,7 +916,7 @@ TEST(ParserCSubsetSmoke, ExternImportLibraryOverrideParses) {
 // single-declarator spine P0009's on the comma, so this test would not parse.
 TEST(ParserCSubsetSmoke, ExternMultiDeclaratorParses) {
     auto h = loadAndTokenize("extern int a, b;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -944,7 +945,7 @@ TEST(ParserCSubsetSmoke, ExternMultiDeclaratorParses) {
 // shared-head star (the retired `typeRef` spine) would apply to both.
 TEST(ParserCSubsetSmoke, ExternMultiDeclaratorPerDeclaratorPointerParses) {
     auto h = loadAndTokenize("extern int *a, b;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -968,7 +969,7 @@ TEST(ParserCSubsetSmoke, ExternMultiDeclaratorPerDeclaratorPointerParses) {
 
 TEST(ParserCSubsetSmoke, ExternVariableDeclParses) {
     auto h = loadAndTokenize("extern int errno;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1000,7 +1001,7 @@ TEST(ParserCSubsetSmoke, ExternVariableDeclParses) {
 // 'Identifier', 'ParenOpen', 'StarOp' or 'BracketOpen' -- got 'volatile'".
 TEST(ParserCSubsetSmoke, ExternTypedefNameTrailingQualifierParses) {
     auto h = loadAndTokenize("extern LONG volatile d;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1034,7 +1035,7 @@ TEST(ParserCSubsetSmoke, ExternTypedefNameTrailingQualifierParses) {
 // `headQualifier` AFTER the base `typeSpecifierSeq`. RED-ON-DISABLE: same revert.
 TEST(ParserCSubsetSmoke, ExternBuiltinTrailingQualifierParses) {
     auto h = loadAndTokenize("extern int volatile d;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1059,7 +1060,7 @@ TEST(ParserCSubsetSmoke, ExternBuiltinTrailingQualifierParses) {
 // at most the single leading `const`, so `volatile` P0009s.
 TEST(ParserCSubsetSmoke, ExternTrailingQualifierRunParses) {
     auto h = loadAndTokenize("extern LONG const volatile cv;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1085,7 +1086,7 @@ TEST(ParserCSubsetSmoke, ExternTrailingQualifierRunParses) {
 // revert -> P0009 in the field head.
 TEST(ParserCSubsetSmoke, StructMemberTrailingQualifierParses) {
     auto h = loadAndTokenize("struct S { int volatile x; };");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1121,7 +1122,7 @@ TEST(ParserCSubsetSmoke, TypeHeadQualifierOrderRegressionForms) {
              std::string_view{"LONG volatile h = 0;"},
          }) {
         auto h = loadAndTokenize(std::string{source});
-        Parser p{h.src, h.schema, std::move(h.stream)};
+        Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto result = std::move(p).parse();
         auto const& t = result.tree;
         ASSERT_NE(t.root(), InvalidNode) << source;
@@ -1137,7 +1138,7 @@ TEST(ParserCSubsetSmoke, TypeHeadQualifierOrderRegressionForms) {
 // suffix attachment points, plus the empty-suffix path `int x[];`.
 TEST(ParserCSubsetSmoke, TopLevelArrayDeclParses) {
     auto h = loadAndTokenize("int a[10];");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1184,7 +1185,7 @@ TEST(ParserCSubsetSmoke, EmptyArrayDeclSuffixParses) {
     // `int x[];` — empty bracket pair. The size expression in
     // `arrayDeclSuffix` is `optional`, so the brackets can be empty.
     auto h = loadAndTokenize("int x[];");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1202,7 +1203,7 @@ TEST(ParserCSubsetSmoke, EmptyArrayDeclSuffixParses) {
 
 TEST(ParserCSubsetSmoke, InnerArrayDeclParses) {
     auto h = loadAndTokenize("int main() { int buf[64]; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1249,7 +1250,7 @@ TEST(ParserCSubsetSmoke, ArrayDeclWithInitializerExpressionParses) {
     // size expression (and that the binaryExpr is positioned
     // INSIDE arrayDeclSuffix, not somewhere else in the tree).
     auto h = loadAndTokenize("int main() { int buf[n * 2]; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1279,7 +1280,7 @@ TEST(ParserCSubsetSmoke, ArrayDeclWithInitializerExpressionParses) {
 // layer.
 TEST(ParserCSubsetSmoke, PostfixChainNestsLeftToRight) {
     auto h = loadAndTokenize("int main() { f(a)[i]; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors());
@@ -1315,7 +1316,7 @@ TEST(ParserCSubsetSmoke, PostfixChainNestsLeftToRight) {
 // `return fib(n-1) + fib(n-2);` was the original reproducer.
 TEST(ParserCSubsetSmoke, PostfixCallThenInfixBindsCorrectly) {
     auto h = loadAndTokenize("int main() { return f(a) + g(b); }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1357,7 +1358,7 @@ TEST(ParserCSubsetSmoke, PostfixCallThenInfixBindsCorrectly) {
 // regression where the wraps land as siblings.
 TEST(ParserCSubsetSmoke, ThreeDeepArrayIndexChainNests) {
     auto h = loadAndTokenize("int main() { a[i][j][k]; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors());
@@ -1394,7 +1395,7 @@ TEST(ParserCSubsetSmoke, ThreeDeepArrayIndexChainNests) {
 // arg-bearing call. Full subtree pin.
 TEST(ParserCSubsetSmoke, FunctionCallChainNests) {
     auto h = loadAndTokenize("int main() { f()(g); }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors());
@@ -1427,7 +1428,7 @@ TEST(ParserCSubsetSmoke, FunctionCallChainNests) {
 // to the outer expression.
 TEST(ParserCSubsetSmoke, ParenWrappedPostfixChainNests) {
     auto h = loadAndTokenize("int main() { (f(a)[i]); }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors());
@@ -1472,7 +1473,7 @@ TEST(ParserCSubsetSmoke, ParenWrappedPostfixChainNests) {
 // propagate `HasError` to root, and not hang or stack-overflow.
 TEST(ParserCSubsetSmoke, BrokenPostfixChainEmitsDiagnostic) {
     auto h = loadAndTokenize("int main() { f(a)[i }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1492,7 +1493,7 @@ TEST(ParserCSubsetSmoke, BrokenPostfixChainEmitsDiagnostic) {
 // exprWorkStack push, not host recursion) consumes the full chain.
 TEST(ParserCSubsetSmoke, PrefixOverPostfixChainNests) {
     auto h = loadAndTokenize("int main() { *p[i]++; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors());
@@ -1523,7 +1524,7 @@ TEST(ParserCSubsetSmoke, PrefixOverPostfixChainNests) {
 // stack independent of the outer.
 TEST(ParserCSubsetSmoke, ParenGroupingForcesOuterPrecedence) {
     auto h = loadAndTokenize("int main() { (a + b) * c; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -1565,7 +1566,8 @@ TEST(ParserCSubsetSmoke, ParenGroupingForcesOuterPrecedence) {
 // presence assertion on the body-mode CharLiteral token kind.
 TEST(ParserCSubsetSmoke, CharLiteralParsesAsOperand) {
     auto harness = loadAndTokenize("int main() { return 'a'; }");
-    Parser parser{harness.src, harness.schema, std::move(harness.stream)};
+    Parser parser{harness.src, harness.schema, std::move(harness.stream),
+                  DiagnosticBudget::libraryDefault()};
     auto const result = std::move(parser).parse();
     auto const& tree = result.tree;
     EXPECT_FALSE(tree.diagnostics().hasErrors())
@@ -1602,7 +1604,7 @@ TEST(ParserCSubsetSmoke, TypedefNameStarCommitsDeclarationStatement) {
     auto h = loadAndTokenize(
         "typedef int MyP;\n"
         "int main() { MyP * p; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors());
@@ -1615,7 +1617,7 @@ TEST(ParserCSubsetSmoke, TypedefNameStarCommitsDeclarationStatement) {
 // multiplication.
 TEST(ParserCSubsetSmoke, ValueStarValueRollsBackToExpression) {
     auto h = loadAndTokenize("int main() { int a; int b; a * b; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors());
@@ -1633,7 +1635,7 @@ TEST(ParserCSubsetSmoke, ValueStarValueRollsBackToExpression) {
 // positioned S_UndeclaredIdentifier are the semantic-tier mirror.
 TEST(ParserCSubsetSmoke, UnknownStarUnknownRollsBackToExpression) {
     auto h = loadAndTokenize("int main() { u * v; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors());
@@ -1653,7 +1655,7 @@ TEST(ParserCSubsetSmoke, UnknownStarUnknownRollsBackToExpression) {
 // by some other reading).
 TEST(ParserCSubsetSmoke, AutoInferenceFormParsesIntoInferenceRule) {
     auto h = loadAndTokenize("int main() { auto x = 1; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors())
@@ -1671,7 +1673,7 @@ TEST(ParserCSubsetSmoke, AutoInferenceFormParsesIntoInferenceRule) {
 // inference-first branch order ever swallows the C89 form.
 TEST(ParserCSubsetSmoke, AutoWithTypeHeadStaysVarDecl) {
     auto h = loadAndTokenize("int main() { auto int x; }");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors())
@@ -1704,7 +1706,7 @@ TEST(ParserCSubsetSmoke, LongInitializerRidesTheStatementProbeBudget) {
     for (int i = 0; i < 599; ++i) src += ", 1";
     src += "); return x; }";
     auto h = loadAndTokenize(std::move(src));
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
     EXPECT_FALSE(t.diagnostics().hasErrors())
@@ -1737,7 +1739,7 @@ TEST(ParserCSubsetSmoke, LargeStructBodyMustNotHitSpeculationBudget) {
     // Control: 130 members (~390 body tokens) — far under the 4096 budget.
     {
         auto h = loadAndTokenize(structOf(130));
-        Parser p{h.src, h.schema, std::move(h.stream)};
+        Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto const r = std::move(p).parse();
         EXPECT_FALSE(r.tree.diagnostics().hasErrors())
             << "130-member struct (control) must parse clean";
@@ -1747,7 +1749,7 @@ TEST(ParserCSubsetSmoke, LargeStructBodyMustNotHitSpeculationBudget) {
     // body parse is no longer governed by the body-vs-ref speculation budget.
     {
         auto h = loadAndTokenize(structOf(1500));
-        Parser p{h.src, h.schema, std::move(h.stream)};
+        Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto const r = std::move(p).parse();
         EXPECT_FALSE(r.tree.diagnostics().hasErrors())
             << "1500-member struct must parse clean — the body-vs-ref "
@@ -1766,7 +1768,7 @@ TEST(ParserCSubsetSmoke, LargeUnionBodyMustNotHitSpeculationBudget) {
     for (int i = 0; i < 1500; ++i) s += "int a" + std::to_string(i) + ";";
     s += "};";
     auto h = loadAndTokenize(std::move(s));
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const r = std::move(p).parse();
     EXPECT_FALSE(r.tree.diagnostics().hasErrors())
         << "1500-member union must parse clean (c25 unified unionSpec)";
@@ -1777,7 +1779,7 @@ TEST(ParserCSubsetSmoke, LargeEnumBodyMustNotHitSpeculationBudget) {
     for (int i = 0; i < 1500; ++i) s += "A" + std::to_string(i) + ",";
     s += "};";
     auto h = loadAndTokenize(std::move(s));
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const r = std::move(p).parse();
     EXPECT_FALSE(r.tree.diagnostics().hasErrors())
         << "1500-enumerator enum must parse clean (c25 unified enumSpec)";
@@ -1803,7 +1805,7 @@ TEST(ParserCSubsetSmoke, MixedLargeStructBodyParsesCleanPastOldBudget) {
     }
     s += "};";
     auto h = loadAndTokenize(std::move(s));
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const r = std::move(p).parse();
     EXPECT_FALSE(r.tree.diagnostics().hasErrors())
         << "a large mixed struct (nested aggregates, fn-ptr, bitfield, "
@@ -1821,7 +1823,7 @@ TEST(ParserCSubsetSmoke, StructSpecBodyChildPresenceDiscriminatesDefineVsRef) {
     // DEFINITION head: a `structBody` child IS present.
     {
         auto h = loadAndTokenize("struct S { int x; } v;");
-        Parser p{h.src, h.schema, std::move(h.stream)};
+        Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto const r = std::move(p).parse();
         auto const& t = r.tree;
         ASSERT_FALSE(t.diagnostics().hasErrors());
@@ -1841,7 +1843,7 @@ TEST(ParserCSubsetSmoke, StructSpecBodyChildPresenceDiscriminatesDefineVsRef) {
     // REFERENCE head: NO `structBody` child (a bare `struct S` in a decl head).
     {
         auto h = loadAndTokenize("struct S v;");
-        Parser p{h.src, h.schema, std::move(h.stream)};
+        Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto const r = std::move(p).parse();
         auto const& t = r.tree;
         ASSERT_FALSE(t.diagnostics().hasErrors());
@@ -1907,7 +1909,8 @@ namespace {
             auto h = loadAndTokenize(std::move(source));
             ParserConfig cfg;
             cfg.maxExpressionDepth = cap;
-            Parser p{h.src, h.schema, std::move(h.stream), std::move(cfg)};
+            Parser p{h.src, h.schema, std::move(h.stream),
+             DiagnosticBudget::libraryDefault(), std::move(cfg)};
             return std::move(std::move(p).parse().tree);
         });
 }
@@ -2015,7 +2018,7 @@ namespace {
 
 [[nodiscard]] Tree parseCSubset(std::string source) {
     auto h = loadAndTokenize(std::move(source));
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     return std::move(p).parse().tree;
 }
 
@@ -2059,9 +2062,10 @@ namespace {
 [[nodiscard]] SemanticModel analyzeCSubset(std::string source) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     EXPECT_TRUE(loaded.has_value());
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(source), "<csubset-smoke>");
-    return analyze(std::make_shared<CompilationUnit>(std::move(builder).finish()));
+    return analyze(std::make_shared<CompilationUnit>(std::move(builder).finish()),
+                   DiagnosticBudget::libraryDefault());
 }
 
 // The Type-kind symbol named `name`, or nullptr.
@@ -2924,7 +2928,7 @@ TEST(ParserCSubsetSmoke, ExternHeadAttributeParses) {
              "extern __attribute__((weak)) _Thread_local int t2;",
              "extern __attribute__((weak)) int wfun(void) { return 1; }"}) {
         auto h = loadAndTokenize(src);
-        Parser p{h.src, h.schema, std::move(h.stream)};
+        Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto result = std::move(p).parse();
         EXPECT_FALSE(result.tree.diagnostics().hasErrors()) << src;
     }
@@ -2943,7 +2947,7 @@ TEST(ParserCSubsetSmoke, MidPositionAttributeParses) {
              "int main(void){ struct S { int a; } __attribute__((packed)) s; "
              "return s.a; }"}) {
         auto h = loadAndTokenize(src);
-        Parser p{h.src, h.schema, std::move(h.stream)};
+        Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto result = std::move(p).parse();
         EXPECT_FALSE(result.tree.diagnostics().hasErrors()) << src;
     }
@@ -2971,7 +2975,7 @@ TEST(ParserCSubsetSmoke, StdAttrStaysRejectedInBothNewSlots) {
              "extern [[deprecated]] int dg;",   // mode 1 slot
              "int [[deprecated]] gv;"}) {       // mode 2 slot
         auto h = loadAndTokenize(src);
-        Parser p{h.src, h.schema, std::move(h.stream)};
+        Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto result = std::move(p).parse();
         EXPECT_TRUE(result.tree.diagnostics().hasErrors())
             << src << " — real clang rejects this; admitting `stdAttr` into the "
@@ -2994,7 +2998,7 @@ TEST(ParserCSubsetSmoke, MidPositionAttributeNameCollidingWithATypedefParses) {
              "typedef long aligned;\nint main(void){ "
              "int __attribute__((aligned(4))) x = 1; return x; }"}) {
         auto h = loadAndTokenize(src);
-        Parser p{h.src, h.schema, std::move(h.stream)};
+        Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto result = std::move(p).parse();
         EXPECT_FALSE(result.tree.diagnostics().hasErrors()) << src;
     }
@@ -3009,7 +3013,7 @@ TEST(ParserCSubsetSmoke, MidPositionAttributeNameCollidingWithATypedefParses) {
 // is carved into its own anchor; until then it must stay a clean parse error.
 TEST(ParserCSubsetSmoke, AttributeBeforeExternKeywordStaysRejected) {
     auto h = loadAndTokenize("__attribute__((weak)) extern int g;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     EXPECT_TRUE(result.tree.diagnostics().hasErrors())
         << "an attribute before `extern` must stay LOUD — FIRST(externDecl) has "

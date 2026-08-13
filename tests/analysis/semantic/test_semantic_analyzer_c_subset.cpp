@@ -6,6 +6,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_visitor.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -40,7 +41,7 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
         "int main() { int x; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // main (function) + x (variable) + the 3 FC12a-core builtin TYPES
     // (`__va_list_tag` + `va_list` + the `__builtin_va_list` alias,
     // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME) injected into every c-subset CU's builtin
@@ -112,7 +113,7 @@ TEST(SemanticAnalyzerCSubset, ExternAggregateSpecifiersParse) {
         "extern struct SB { int w; } gB;\n"  // extern + struct DEFINITION (inline body form)
     });
     assertNoBuilderErrors(*cu);          // red-on-disable hook: every extern line above must parse
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto rec = [&](std::string_view n) -> SymbolRecord const* {
         for (std::size_t i = 1; i < model.symbols().size(); ++i)
             if (model.symbols()[i].name == n) return &model.symbols()[i];
@@ -145,7 +146,7 @@ TEST(SemanticAnalyzerCSubset, ExternMultiDeclaratorMintsPerDeclaratorSymbols) {
         "extern int *p, arr[3];\n"    // per-declarator pointer (p) + array (arr)
     });
     assertNoBuilderErrors(*cu);       // red-on-disable: the multi-declarator externs must parse
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto rec = [&](std::string_view n) -> SymbolRecord const* {
         for (std::size_t i = 1; i < model.symbols().size(); ++i)
             if (model.symbols()[i].name == n) return &model.symbols()[i];
@@ -185,7 +186,7 @@ TEST(SemanticAnalyzerCSubset, ExternFunctionDefinitionMintsDefiningFunction) {
         "static int sfd(int x){ return x + 1; }\n"   // static DEFINITION (contrast)
     });
     assertNoBuilderErrors(*cu);   // red-on-disable: the extern DEFINITION must parse
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto rec = [&](std::string_view n) -> SymbolRecord const* {
         for (std::size_t i = 1; i < model.symbols().size(); ++i)
             if (model.symbols()[i].name == n) return &model.symbols()[i];
@@ -230,7 +231,7 @@ TEST(SemanticAnalyzerCSubset, ComplexDeclTypedAsComplex) {
         "int main() { double _Complex z; float _Complex w; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* z = nullptr;
     SymbolRecord const* w = nullptr;
@@ -313,7 +314,7 @@ TEST(SemanticAnalyzerCSubset, ArrayDeclaratorTypedAsArray) {
         "int main() { int a[10]; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* aRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
@@ -341,7 +342,7 @@ TEST(SemanticAnalyzerCSubset, NonConstantArrayLengthEmitsDiagnostic) {
         "int g[n];\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u);
 }
@@ -352,7 +353,7 @@ TEST(SemanticAnalyzerCSubset, NonConstantArrayLengthEmitsDiagnostic) {
 TEST(SemanticAnalyzerCSubset, EmptyArrayLengthEmitsDiagnostic) {
     auto cu = buildShippedUnit("c-subset", { "int main() { int a[]; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u);
 }
@@ -368,7 +369,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmNonEmptyTemplateEmitsDiagnostic) {
         "int main(void){ __asm__(\"nop\"); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u);
 }
@@ -380,7 +381,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmWhitespaceTemplateEmitsDiagnostic) {
         "int main(void){ __asm__(\"  \"); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u);
 }
@@ -393,7 +394,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmEmptyTemplateAccepted) {
         "int main(void){ __asm__ volatile(\"\"); __asm__(\"\"); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InlineAsmNonEmptyTemplate), 0u);
     EXPECT_FALSE(model.hasErrors())
@@ -406,7 +407,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmEmptyTemplateAccepted) {
 TEST(SemanticAnalyzerCSubset, HexArrayLengthDecodes) {
     auto cu = buildShippedUnit("c-subset", { "int main() { int a[0x10]; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* aRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i)
@@ -424,7 +425,7 @@ TEST(SemanticAnalyzerCSubset, OutOfRangeArrayLengthEmitsDiagnostic) {
         "int main() { int a[0xFFFFFFFFFFFFFFFF]; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArrayLengthOutOfRange), 1u);
 }
@@ -449,7 +450,7 @@ findSym(SemanticModel const& m, std::string_view name) {
 TEST(SemanticAnalyzerCSubset, ArraySizeInferredFromStringInit) {
     auto cu = buildShippedUnit("c-subset", { "char x[] = \"abc\";\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 0u);
     auto const& ti = model.lattice().interner();
@@ -466,7 +467,7 @@ TEST(SemanticAnalyzerCSubset, ArraySizeInferredFromStringInit) {
 TEST(SemanticAnalyzerCSubset, ArraySizeInferredFromBraceInit) {
     auto cu = buildShippedUnit("c-subset", { "int a[] = {1, 2, 3};\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 0u);
     auto const& ti = model.lattice().interner();
@@ -485,7 +486,7 @@ TEST(SemanticAnalyzerCSubset, ArraySizeInferredFromInitLocal) {
     auto cu = buildShippedUnit("c-subset",
                                { "int main(void){ int a[] = {10, 20, 30}; return a[2]; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 0u);
     auto const& ti = model.lattice().interner();
@@ -503,7 +504,7 @@ TEST(SemanticAnalyzerCSubset, ExplicitArraySizeUnchangedByInference) {
     auto cu = buildShippedUnit("c-subset",
                                { "int a[3] = {1, 2, 3}; char x[8] = \"abc\";\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* a = findSym(model, "a");
     SymbolRecord const* x = findSym(model, "x");
@@ -545,7 +546,7 @@ TEST(SemanticAnalyzerCSubset, WideStringLiteralElementCorePerOpener) {
                            Case{"void f(){ \"AB\"; }",   TypeKind::Char, 3}}) {
         auto cu = buildShippedUnit("c-subset", { tc.src });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         ASSERT_FALSE(model.hasErrors()) << tc.src;
         auto const& ti = model.lattice().interner();
         TypeId const ty = firstStringLiteralType(model, *cu);
@@ -562,7 +563,7 @@ TEST(SemanticAnalyzerCSubset, WideStringLiteralElementCorePerOpener) {
 TEST(SemanticAnalyzerCSubset, WideStringBmpMultibyteCodeUnitCount) {
     auto cu = buildShippedUnit("c-subset", { "void f(){ u\"\xe2\x82\xac\"; }" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors());
     auto const& ti = model.lattice().interner();
     TypeId const ty = firstStringLiteralType(model, *cu);
@@ -582,7 +583,7 @@ TEST(SemanticAnalyzerCSubset, WideCharLiteralWidthIsFormatKeyed) {
     {
         auto cu = buildShippedUnit("c-subset", { "void f(){ L\"AB\"; }" });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         ASSERT_FALSE(model.hasErrors());
         auto const& ti = model.lattice().interner();
         TypeId const ty = firstStringLiteralType(model, *cu);
@@ -595,7 +596,7 @@ TEST(SemanticAnalyzerCSubset, WideCharLiteralWidthIsFormatKeyed) {
     {
         auto cu = buildShippedUnit("c-subset", { "void f(){ L\"AB\"; }" });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
                              ObjectFormatKind::Pe);
         ASSERT_FALSE(model.hasErrors());
         auto const& ti = model.lattice().interner();
@@ -641,7 +642,7 @@ TEST(SemanticAnalyzerCSubset, WideCharLiteralScalarCorePerPrefix) {
                            Case{"void f(){ u8'A'; }", TypeKind::U8}}) {
         auto cu = buildShippedUnit("c-subset", { tc.src });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         ASSERT_FALSE(model.hasErrors()) << tc.src;
         auto const& ti = model.lattice().interner();
         TypeId const ty = firstCharLiteralType(model, *cu);
@@ -659,7 +660,7 @@ TEST(SemanticAnalyzerCSubset, WideCharConstantWidthIsFormatKeyed) {
     {
         auto cu = buildShippedUnit("c-subset", { "void f(){ L'x'; }" });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         ASSERT_FALSE(model.hasErrors());
         auto const& ti = model.lattice().interner();
         TypeId const ty = firstCharLiteralType(model, *cu);
@@ -670,7 +671,7 @@ TEST(SemanticAnalyzerCSubset, WideCharConstantWidthIsFormatKeyed) {
     {
         auto cu = buildShippedUnit("c-subset", { "void f(){ L'x'; }" });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
                              ObjectFormatKind::Pe);
         ASSERT_FALSE(model.hasErrors());
         auto const& ti = model.lattice().interner();
@@ -691,7 +692,7 @@ TEST(SemanticAnalyzerCSubset, BadWideCharConstantLeavesBodyTokenUntyped) {
     {
         auto cu = buildShippedUnit("c-subset", { "void f(){ u8'\xce\xb2'; }" });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         TypeId const ty = firstCharLiteralType(model, *cu);
         EXPECT_FALSE(ty.valid())
             << "an out-of-range u8 char must be left untyped so sizeof fails loud";
@@ -700,7 +701,7 @@ TEST(SemanticAnalyzerCSubset, BadWideCharConstantLeavesBodyTokenUntyped) {
     {
         auto cu = buildShippedUnit("c-subset", { "void f(){ L'\xf0\x9f\x98\x80'; }" });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
                              ObjectFormatKind::Pe);
         TypeId const ty = firstCharLiteralType(model, *cu);
         EXPECT_FALSE(ty.valid())
@@ -710,7 +711,7 @@ TEST(SemanticAnalyzerCSubset, BadWideCharConstantLeavesBodyTokenUntyped) {
     {
         auto cu = buildShippedUnit("c-subset", { "void f(){ L'\xf0\x9f\x98\x80'; }" });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         ASSERT_FALSE(model.hasErrors());
         auto const& ti = model.lattice().interner();
         TypeId const ty = firstCharLiteralType(model, *cu);
@@ -726,7 +727,7 @@ TEST(SemanticAnalyzerCSubset, BadWideCharConstantLeavesBodyTokenUntyped) {
 TEST(SemanticAnalyzerCSubset, EmptyArrayNoInitNotSized) {
     auto cu = buildShippedUnit("c-subset", { "int main(void){ int a[]; return 0; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u);
     // The symbol's type must NOT be a sized array (it stays unresolved/incomplete).
@@ -748,7 +749,7 @@ TEST(SemanticAnalyzerCSubset, EmptyArrayNoInitNotSized) {
 TEST(SemanticAnalyzerCSubset, ArraySizeInferenceEmptyBraceFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "int a[] = {};\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_TRUE(model.hasErrors())
         << "`int a[] = {}` cannot infer a positive size — must fail loud, not hang";
     EXPECT_GT(countCode(model.diagnostics(),
@@ -769,7 +770,7 @@ TEST(SemanticAnalyzerCSubset, PointerDeclaratorTypedAsPtr) {
         "void f() { int *p; int **pp; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* p = nullptr;
     SymbolRecord const* pp = nullptr;
@@ -794,7 +795,7 @@ TEST(SemanticAnalyzerCSubset, PointerDeclaratorTypedAsPtr) {
 TEST(SemanticAnalyzerCSubset, VoidStarDeclaratorTypedAsPtrVoid) {
     auto cu = buildShippedUnit("c-subset", { "void f() { void *p; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* p = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
@@ -820,7 +821,7 @@ TEST(SemanticAnalyzerCSubset, CharStarToVoidStarArgImplicit) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // Strict countCode pin (replaces an earlier any-bool sawMismatch
     // loop that would have silently passed a wrong-code regression
     // — e.g., an S_ReturnTypeMismatch firing in place of S_TypeMismatch
@@ -865,7 +866,7 @@ TEST(SemanticAnalyzerCSubset, MultiParamCallAddressOfArgsNoStaleParamSpan) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // The call is well-typed (int*→void* implicit, int→int): no mismatch, no abort.
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u);
@@ -887,7 +888,7 @@ TEST(SemanticAnalyzerCSubset, VoidStarToCharStarArgImplicit) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "void* → const char* must be implicit in c-subset "
@@ -912,7 +913,7 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedPointersRemainMismatch) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // Pin EXACTLY ONE S_TypeMismatch (not duplicate cascade) AND
     // zero adjacent mismatch codes — replaces the loose any-bool
     // sawMismatch loop that would have admitted unrelated mismatch
@@ -941,7 +942,7 @@ TEST(SemanticAnalyzerCSubset, VoidStarReturnFromTypedPtrImplicit) {
         "void* f(int* p) { return p; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -955,7 +956,7 @@ TEST(SemanticAnalyzerCSubset, TypedPtrReturnFromVoidStarImplicit) {
         "int* f(void* p) { return p; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -969,7 +970,7 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedReturnRemainsMismatch) {
         "int* f(char* p) { return p; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ReturnTypeMismatch), 1u)
         << "char* → int* via return must NOT be implicit even in "
@@ -996,7 +997,7 @@ TEST(SemanticAnalyzerCSubset, PointerMinusArrayTypesAsPointerDifferenceInt) {
         "  return p + q + r; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "ptr-array and array-ptr subtraction must type as the ptrdiff int (the array "
@@ -1022,7 +1023,7 @@ TEST(SemanticAnalyzerCSubset, AssignStmtIntFromIncompatiblePointerFailsLoud) {
         "int sink(char* q) { int* p; p = q; return *p; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u)
         << "an int* <- char* assignment STATEMENT must fail loud with the same "
@@ -1042,7 +1043,7 @@ TEST(SemanticAnalyzerCSubset, AssignStmtAndInitRejectIncompatibleIdentically) {
         "int sink(char* q) { int* p = q; p = q; return *p; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 2u)
         << "the init site AND the assignment-statement site must each reject the "
@@ -1066,7 +1067,7 @@ TEST(SemanticAnalyzerCSubset, ValidAssignStmtsRemainClean) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "every valid assignment statement (int<-int, unsigned<-int gated, "
@@ -1094,7 +1095,7 @@ TEST(SemanticAnalyzerCSubset, ValidLvalueStoreAssignStmtsRemainClean) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "a deref store (*p=v), an array-element store (a[i]=v), and a member "
@@ -1115,7 +1116,7 @@ TEST(SemanticAnalyzerCSubset, CompoundAssignStmtNotCheckedAsPlainAssign) {
         "int main(void) { int x; int y; y = 1; x = 0; x += y; return x; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "a compound assignment (`x += y`) must not run the plain-assignment "
@@ -1135,7 +1136,7 @@ TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsVoidStarArg) {
         "int main() { f(0); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // F5 audit fix (6-agent 2nd-order, step 13.3a): pair the
     // countCode(target) pin with `!hasErrors()` so a future
     // wrong-code regression (e.g. a new S_NullPointerInvalid) can't
@@ -1153,7 +1154,7 @@ TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsTypedPointerArg) {
         "int main() { f(0); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // C §6.3.2.3.3: NULL pointer constant converts to ANY pointer type
     // (not just void*) without a cast. F5 audit fix: pair countCode
     // with !hasErrors so wrong-code regressions can't silently pass.
@@ -1169,7 +1170,7 @@ TEST(SemanticAnalyzerCSubset, NonZeroIntegerLiteralRejectsAsPointerArg) {
         "int main() { f(1); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // Negative pin: ONLY the literal `0` admits as null pointer
     // constant — `1` (or any non-zero int) must NOT silently convert.
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -1184,7 +1185,7 @@ TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsReturn) {
         "int* f() { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());  // F5 audit fix
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ReturnTypeMismatch), 0u)
@@ -1197,7 +1198,7 @@ TEST(SemanticAnalyzerCSubset, NullPointerConstantAdmitsAsInit) {
         "void f() { int* p = 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());  // F5 audit fix
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
@@ -1232,7 +1233,7 @@ TEST(SemanticAnalyzerCSubset, PtrInitFromAddressOfIncompatibleCharFailsLoud) {
         "int main(void) { long a; char *p = &a; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u)
         << "char* <- &long (incompatible object pointee) INITIALIZER must fail "
@@ -1248,7 +1249,7 @@ TEST(SemanticAnalyzerCSubset, PtrInitFromAddressOfIncompatibleIntFailsLoud) {
         "int main(void) { long a; int *p = &a; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u)
         << "int* <- &long (incompatible object pointee) INITIALIZER must fail loud";
@@ -1275,7 +1276,7 @@ TEST(SemanticAnalyzerCSubset, PtrInitFromAddressOfLegalFormsStayClean) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
@@ -1291,7 +1292,7 @@ TEST(SemanticAnalyzerCSubset, PtrInitFromStringLiteralStaysClean) {
         "int main(void) { char *p = \"hi\"; return p != 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
@@ -1315,7 +1316,7 @@ TEST(SemanticAnalyzerCSubset, PtrInitAddressOfAndPointerVarRejectIdentically) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 2u)
         << "the address-of initializer AND the pointer-variable initializer must "
@@ -1339,7 +1340,7 @@ TEST(SemanticAnalyzerCSubset, InfixArithmeticStillFiresMismatchAtCallArg) {
         "int main() { f(1+1); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u)
         << "int (from `1+1`) → char* must fire mismatch — the "
@@ -1363,7 +1364,7 @@ TEST(SemanticAnalyzerCSubset, NegativeZeroAdmitsAsNullPointerConstant) {
         "int main() { f(-0); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "`-0` folds to integer 0 → a null pointer constant (C §6.3.2.3p3)";
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -1380,7 +1381,7 @@ TEST(SemanticAnalyzerCSubset, FoldedZeroAdmitsAsPointerArg) {
         "int main() { f(1 - 1); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
@@ -1392,7 +1393,7 @@ TEST(SemanticAnalyzerCSubset, FoldedZeroAdmitsAsReturn) {
         "int* g() { return 1 - 1; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ReturnTypeMismatch), 0u)
@@ -1404,7 +1405,7 @@ TEST(SemanticAnalyzerCSubset, FoldedZeroAdmitsAsInit) {
         "void f() { int* p = 2 - 2; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
@@ -1428,7 +1429,7 @@ TEST(SemanticAnalyzerCSubset, FloatZeroRejectsAsPointerArg) {
         "int main() { f(1.5 - 1.5); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u)
         << "a float zero is NOT a null pointer constant — integer constant "
@@ -1450,7 +1451,7 @@ TEST(SemanticAnalyzerCSubset, FoldedNullMarkerIsTreeKeyedAcrossSources) {
         "int* b() { return 2 - 2; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "folded-zero null constants in two trees of one CU both admit, "
            "tree-keyed marker → no cross-tree contamination";
@@ -1477,7 +1478,7 @@ TEST(SemanticAnalyzerCSubset, MixedWidthBinaryArgTypedByUacNotLeaf) {
         "int f(int* a, int b) { return sink(a + b); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // `a + b` is `int*` (pointer arith); the `float` param cannot take a pointer
     // → one mismatch. The `int` leaf `b` alone WOULD be admitted (int→float), so
     // this isolates "typed by the unified binary type, not a leaf".
@@ -1500,7 +1501,7 @@ TEST(SemanticAnalyzerCSubset, ParenWrappedDistinctTypedPointersStillMismatch) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u)
         << "paren-wrapped char* → int* must still fire mismatch — "
@@ -1523,7 +1524,7 @@ TEST(SemanticAnalyzerCSubset, StructMemberAccessViaArrowOnBareRefIsClean) {
         "void f(struct S *p) { p->x = 1; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NotAPointer), 0u)
         << "p->x where p is Ptr<Struct> must NOT fire S_NotAPointer";
@@ -1538,7 +1539,7 @@ TEST(SemanticAnalyzerCSubset, ArrowAccessOnNonPointerFiresLoud) {
         "void f(int n) { n->x = 1; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NotAPointer), 1u)
         << "n->x where n is int must fire EXACTLY ONE S_NotAPointer "
@@ -1552,7 +1553,7 @@ TEST(SemanticAnalyzerCSubset, StructDotMemberAccessOnBareRefIsClean) {
         "void f() { struct S s; s.x = 1; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NotAPointer), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -1580,7 +1581,7 @@ TEST(SemanticAnalyzerCSubset, MemberAccessSizeofResolvesArrayDimension) {
     // aggregateLayout MUST be present for an array-dim sizeof to fold at all
     // (nullopt ⇒ deliberate fail-loud). The scalar `int` size (4) is dataModel-
     // driven, independent of these alignment params.
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 0u)
@@ -1613,7 +1614,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeofConditionFoldsTrue) {
         "int main(void){ return 42; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1626,7 +1627,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeofConditionFoldsFalseFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 1u)
@@ -1652,7 +1653,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeofVlaIsNotConstantFailsLoud) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 1u)
@@ -1670,7 +1671,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeofStructConditionFolds) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1685,7 +1686,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeof1ArgFolds) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u);
@@ -1731,7 +1732,7 @@ TEST(SemanticAnalyzerCSubset, SizeofAnonymousStructDefinitionFolds) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1748,7 +1749,7 @@ TEST(SemanticAnalyzerCSubset, SizeofAnonymousStructDefinitionWrongSizeFailsLoud)
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 2u)
@@ -1772,7 +1773,7 @@ TEST(SemanticAnalyzerCSubset, SizeofNamedCompositeTagStillResolvesAfterUnify) {
         "int main(void){ return (int)sizeof(struct S); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1797,7 +1798,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertAsStructMemberParses) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1826,7 +1827,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertFalseInStructMemberFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 3u)
@@ -1850,7 +1851,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertStructMemberMintsNoField) {
         "int main(void){ struct S s; s.a = 1; s.b = 2; return s.a + s.b; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1875,7 +1876,7 @@ TEST(SemanticAnalyzerCSubset, TclBoolWarningComposedFormHolds) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1894,7 +1895,7 @@ TEST(SemanticAnalyzerCSubset, TclBoolWarningComposedFormCatchesOversizedPointee)
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 1u)
@@ -1916,7 +1917,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertAlignofIntFoldsTrue) {
         "int main(void){ return 42; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1929,7 +1930,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertAlignofDoubleFoldsTrue) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1943,7 +1944,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertAlignofCharSpellingFoldsTrue) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1963,7 +1964,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignofSpellingsFoldLikeIsoSpelling) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -1981,7 +1982,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignofSpellingFoldsFalseFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 1u)
@@ -2000,7 +2001,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertAlignofStructFoldsToMaxMemberAlign) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
@@ -2013,7 +2014,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertAlignofFoldsFalseFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 1u)
@@ -2038,7 +2039,7 @@ constexpr AggregateLayoutParams kAlignasLayout{ScalarAlignmentRule::Natural, 16}
 TEST(SemanticAnalyzerCSubset, AlignasVariableValueFormParses) {
     auto cu = buildShippedUnit("c-subset", { "alignas(16) int x;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     SymbolRecord const* x = findSym(model, "x");
     ASSERT_NE(x, nullptr);
     EXPECT_TRUE(x->type.valid());
@@ -2050,7 +2051,7 @@ TEST(SemanticAnalyzerCSubset, AlignasVariableValueFormParses) {
 TEST(SemanticAnalyzerCSubset, AlignasVariableTypeFormParses) {
     auto cu = buildShippedUnit("c-subset", { "alignas(double) int y;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasWeakerThanNatural), 0u);
     SymbolRecord const* y = findSym(model, "y");
@@ -2065,7 +2066,7 @@ TEST(SemanticAnalyzerCSubset, AlignasStructMemberParses) {
     auto cu = buildShippedUnit("c-subset",
                                { "struct S { alignas(16) int a; char b; };\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     // No alignas constraint diagnostics at all for a valid raise.
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasInvalidContext), 0u);
@@ -2079,7 +2080,7 @@ TEST(SemanticAnalyzerCSubset, AlignasStructMemberParses) {
 TEST(SemanticAnalyzerCSubset, AlignasVariableStoresExplicitAlignment) {
     auto cu = buildShippedUnit("c-subset", { "alignas(32) int g;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     SymbolRecord const* g = findSym(model, "g");
     ASSERT_NE(g, nullptr);
     ASSERT_TRUE(g->explicitAlignment.has_value())
@@ -2091,7 +2092,7 @@ TEST(SemanticAnalyzerCSubset, AlignasVariableStoresExplicitAlignment) {
 TEST(SemanticAnalyzerCSubset, AlignasVariableConstExprOperandFolds) {
     auto cu = buildShippedUnit("c-subset", { "alignas(2*8) int g;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     SymbolRecord const* g = findSym(model, "g");
     ASSERT_NE(g, nullptr);
     ASSERT_TRUE(g->explicitAlignment.has_value());
@@ -2110,7 +2111,7 @@ TEST(SemanticAnalyzerCSubset, AlignasMemberRaisesStructAlignAndSizeEndToEnd) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
         << "alignas(16) on the sole char member must raise the struct to "
@@ -2129,7 +2130,7 @@ TEST(SemanticAnalyzerCSubset, AlignasMemberRaisesFollowingFieldLayout) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u);
 }
@@ -2145,7 +2146,7 @@ TEST(SemanticAnalyzerCSubset, AlignasUnionMemberRaisesAlignAndSizeEndToEnd) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u);
 }
@@ -2166,7 +2167,7 @@ TEST(SemanticAnalyzerCSubset, PackedStructGnuRemovesPaddingEndToEnd) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
         << "packed must remove padding: sizeof==5 AND _Alignof==1 end-to-end";
@@ -2182,7 +2183,7 @@ TEST(SemanticAnalyzerCSubset, PackedStructC23GnuPackedSpelling) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u);
 }
@@ -2195,7 +2196,7 @@ TEST(SemanticAnalyzerCSubset, PackedStructC23BarePackedSpelling) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u);
 }
@@ -2210,7 +2211,7 @@ TEST(SemanticAnalyzerCSubset, PackedStructMemberAlignasStillRaises) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
         << "a member alignas raises per-field even inside a packed struct";
@@ -2226,7 +2227,7 @@ TEST(SemanticAnalyzerCSubset, AlignasOneInsidePackedStructIsLegal) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasWeakerThanNatural), 0u)
         << "alignas(1) inside a packed struct is legal (baseline 1)";
@@ -2241,7 +2242,7 @@ TEST(SemanticAnalyzerCSubset, PackedUnionHasAlignmentOneEndToEnd) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u);
 }
@@ -2255,7 +2256,7 @@ TEST(SemanticAnalyzerCSubset, PackedStructFollowedByDeclaratorParses) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u);
     EXPECT_NE(findSym(model, "g"), nullptr);
@@ -2270,7 +2271,7 @@ TEST(SemanticAnalyzerCSubset, PackedBitfieldFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_PackedBitfieldUnsupported), 1u);
     EXPECT_TRUE(model.hasErrors());
@@ -2296,7 +2297,7 @@ TEST(SemanticAnalyzerCSubset, PragmaPackSharedMemberMacroAcrossCapsIsFine) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_PragmaPackAmbiguous), 0u)
         << "the composites are anchored on unambiguous `struct` keywords — "
@@ -2320,7 +2321,7 @@ TEST(SemanticAnalyzerCSubset, PragmaPackAmbiguousCompositeFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_PragmaPackAmbiguous), 2u)
         << "both P and Q land on an ambiguous layout key";
@@ -2336,7 +2337,7 @@ TEST(SemanticAnalyzerCSubset, UnknownGnuTypeAttributeFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 1u);
     EXPECT_TRUE(model.hasErrors());
@@ -2351,7 +2352,7 @@ TEST(SemanticAnalyzerCSubset, UnknownC23AttributeIsIgnored) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 0u);
     EXPECT_FALSE(model.hasErrors());
@@ -2429,7 +2430,7 @@ TEST(SemanticAnalyzerCSubset, PackedAfterKeywordTaggedIsHonoredNotSilentlyUnpack
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_FALSE(model.hasErrors())
         << "the after-keyword composite attribute position LANDED — it must parse "
            "and analyze cleanly (D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION, closed)";
@@ -2469,7 +2470,7 @@ TEST(SemanticAnalyzerCSubset, PackedAfterKeywordAnonymousIsHonoredNotSilentlyUnp
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_FALSE(model.hasErrors())
         << "anonymous after-keyword packed must parse + analyze cleanly";
     SymbolRecord const* v = findSym(model, "v");
@@ -2493,7 +2494,7 @@ TEST(SemanticAnalyzerCSubset, PackedAfterKeywordAnonymousIsHonoredNotSilentlyUnp
 TEST(SemanticAnalyzerCSubset, AlignasZeroIsNoOpNoOverride) {
     auto cu = buildShippedUnit("c-subset", { "alignas(0) int x;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasNotPowerOfTwo), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -2508,7 +2509,7 @@ TEST(SemanticAnalyzerCSubset, AlignasZeroIsNoOpNoOverride) {
 TEST(SemanticAnalyzerCSubset, AlignasNotPowerOfTwoFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "alignas(3) int x;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasNotPowerOfTwo), 1u);
 }
@@ -2518,7 +2519,7 @@ TEST(SemanticAnalyzerCSubset, AlignasNotPowerOfTwoFailsLoud) {
 TEST(SemanticAnalyzerCSubset, AlignasExceedsMaxFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "alignas(512) int x;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasExceedsMax), 1u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -2530,7 +2531,7 @@ TEST(SemanticAnalyzerCSubset, AlignasExceedsMaxFailsLoud) {
 TEST(SemanticAnalyzerCSubset, AlignasWeakerThanNaturalFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "alignas(1) double d;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasWeakerThanNatural), 1u);
 }
@@ -2540,7 +2541,7 @@ TEST(SemanticAnalyzerCSubset, AlignasNonConstantFailsLoud) {
     auto cu = buildShippedUnit("c-subset",
                                { "int nc; alignas(nc) int x;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasNonConstant), 1u);
 }
@@ -2553,7 +2554,7 @@ TEST(SemanticAnalyzerCSubset, AlignasNonConstantFailsLoud) {
 TEST(SemanticAnalyzerCSubset, AlignasNegativeFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "alignas(-4) int x;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
         << "alignas(-4) is a constraint violation, not a no-op — fail loud";
@@ -2566,7 +2567,7 @@ TEST(SemanticAnalyzerCSubset, AlignasNegativeFailsLoud) {
 TEST(SemanticAnalyzerCSubset, AlignasMultiDeclaratorEmitsExactlyOnce) {
     auto cu = buildShippedUnit("c-subset", { "alignas(3) int a, b;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
         << "a shared-prefix alignas error must be reported once, not per declarator";
@@ -2577,7 +2578,7 @@ TEST(SemanticAnalyzerCSubset, AlignasMultiDeclaratorEmitsExactlyOnce) {
 TEST(SemanticAnalyzerCSubset, AlignasMultiDeclaratorStoresOnAll) {
     auto cu = buildShippedUnit("c-subset", { "alignas(16) int a, b;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     SymbolRecord const* a = findSym(model, "a");
     SymbolRecord const* b = findSym(model, "b");
     ASSERT_NE(a, nullptr);
@@ -2593,7 +2594,7 @@ TEST(SemanticAnalyzerCSubset, AlignasOnFunctionFailsLoud) {
     auto cu = buildShippedUnit("c-subset",
                                { "alignas(16) int f(void);\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasInvalidContext), 1u);
 }
@@ -2603,7 +2604,7 @@ TEST(SemanticAnalyzerCSubset, AlignasOnBitFieldMemberFailsLoud) {
     auto cu = buildShippedUnit("c-subset",
                                { "struct S { alignas(8) int a : 3; };\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasInvalidContext), 1u);
 }
@@ -2612,7 +2613,7 @@ TEST(SemanticAnalyzerCSubset, AlignasOnBitFieldMemberFailsLoud) {
 TEST(SemanticAnalyzerCSubset, AlignasC11SpellingStores) {
     auto cu = buildShippedUnit("c-subset", { "_Alignas(64) int g;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     SymbolRecord const* g = findSym(model, "g");
     ASSERT_NE(g, nullptr);
     ASSERT_TRUE(g->explicitAlignment.has_value());
@@ -2630,7 +2631,7 @@ TEST(SemanticAnalyzerCSubset, AlignasEnumConstantOperandFolds) {
         "alignas(W) int g;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasNonConstant), 0u)
         << "an enum-constant alignas operand must roll back to the VALUE reading "
@@ -2646,7 +2647,7 @@ TEST(SemanticAnalyzerCSubset, AlignasEnumConstantOperandFolds) {
 TEST(SemanticAnalyzerCSubset, AlignasSizeofOperandFolds) {
     auto cu = buildShippedUnit("c-subset", { "alignas(sizeof(double)) int g;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     SymbolRecord const* g = findSym(model, "g");
     ASSERT_NE(g, nullptr);
     ASSERT_TRUE(g->explicitAlignment.has_value());
@@ -2666,7 +2667,7 @@ TEST(SemanticAnalyzerCSubset, TypeofUnqualStripsVolatile) {
         "typeof_unqual(volatile int) v;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* v = findSym(model, "v");
     ASSERT_NE(v, nullptr);
@@ -2684,7 +2685,7 @@ TEST(SemanticAnalyzerCSubset, TypeofPreservesVolatile) {
         "typeof(volatile int) v;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* v = findSym(model, "v");
     ASSERT_NE(v, nullptr);
@@ -2702,7 +2703,7 @@ TEST(SemanticAnalyzerCSubset, TypeofEnumConstantOperandResolvesAsValue) {
         "typeof(GREEN) v;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownType), 0u)
         << "an enum-constant typeof operand must roll back to the VALUE reading "
@@ -2720,7 +2721,7 @@ TEST(SemanticAnalyzerCSubset, TypeofExpressionFormResolvesToOperandType) {
         "typeof(x) y;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* y = findSym(model, "y");
     ASSERT_NE(y, nullptr);
@@ -2735,7 +2736,7 @@ TEST(SemanticAnalyzerCSubset, TypeofTypeNameFormResolvesPointer) {
         "typeof(int*) p;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* p = findSym(model, "p");
     ASSERT_NE(p, nullptr);
@@ -2751,7 +2752,7 @@ TEST(SemanticAnalyzerCSubset, SizeofTypeofFoldsInArrayDim) {
         "int a[sizeof(typeof(unsigned short))];\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     auto const& ti = model.lattice().interner();
     SymbolRecord const* a = findSym(model, "a");
     ASSERT_NE(a, nullptr);
@@ -2774,7 +2775,7 @@ TEST(SemanticAnalyzerCSubset, GnuTypeofSpellingsResolveLikeIsoSpelling) {
         "__typeof__(int*) p;\n",    // TYPE-NAME operand
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     for (char const* name : {"a", "b"}) {
         SymbolRecord const* s = findSym(model, name);
@@ -2805,7 +2806,7 @@ TEST(SemanticAnalyzerCSubset, GnuTypeofSpellingPreservesVolatile) {
         "__typeof(volatile int) w;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     for (char const* name : {"v", "w"}) {
         SymbolRecord const* s = findSym(model, name);
@@ -2828,7 +2829,7 @@ TEST(SemanticAnalyzerCSubset, TypeofBitfieldOperandFailsLoud) {
         "typeof(s.f) v;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeofBitfieldOperand), 1u)
         << "typeof of a bit-field member is a constraint violation";
@@ -2870,7 +2871,7 @@ TEST(SemanticAnalyzerCSubset, GenericSelectedBranchTypeIsResultType) {
         "long: 2, default: 0); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     auto [tid, gen] = firstGenericNode(*cu);
     ASSERT_TRUE(gen.valid()) << "a genericExpr node must exist";
@@ -2891,7 +2892,7 @@ TEST(SemanticAnalyzerCSubset, GenericNoMatchNoDefaultFailsLoud) {
         "int main(void){ double d = 0; return _Generic(d, int: 1, char: 2); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_GenericSelectionNoMatch), 1u)
         << "no typed match and no default is a constraint violation";
@@ -2906,7 +2907,7 @@ TEST(SemanticAnalyzerCSubset, GenericDefaultFallbackSelected) {
         "return _Generic(p, int: 1, double: 2, default: 7); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_GenericSelectionNoMatch), 0u)
         << "the default association must satisfy an otherwise-no-match selection";
@@ -2925,7 +2926,7 @@ TEST(SemanticAnalyzerCSubset, GenericValueInTypePositionFailsLoud) {
         "return _Generic(i, notAType: 1, default: 0); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownType), 1u)
         << "a value identifier in an association type position must fail loud";
@@ -2939,7 +2940,7 @@ TEST(SemanticAnalyzerCSubset, GenericAmbiguousMatchFailsLoud) {
         "return _Generic(i, int: 1, int: 2, default: 0); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_GenericSelectionAmbiguous), 1u)
         << "two associations of the same type is a constraint violation";
@@ -2955,7 +2956,7 @@ TEST(SemanticAnalyzerCSubset, GenericTypedefAssociationMatches) {
         "return _Generic(i, MyInt: 42, double: 3, default: 0); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_GenericSelectionNoMatch), 0u)
         << "a typedef alias in type position must match the underlying type";
@@ -2976,7 +2977,7 @@ TEST(SemanticAnalyzerCSubset, ForwardRefSizeofArrayDimensionStillRejected) {
         "int a[sizeof(b)]; int b;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u)
@@ -2994,7 +2995,7 @@ TEST(SemanticAnalyzerCSubset, BadFieldSizeofArrayDimensionRejected) {
         "int main() { struct S s; int a[sizeof(s.nope)]; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
     EXPECT_TRUE(model.hasErrors())
         << "sizeof(s.nope) — no such field — must fail loud, never fold a guess";
@@ -3016,7 +3017,7 @@ TEST(SemanticAnalyzerCSubset, SizeofVaListIs24UnderSysV) {
     });
     assertNoBuilderErrors(*cu);
     // SysVRegisterSave (the default/absent strategy): va_list = __va_list_tag[1].
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                          VaListStrategy::SysVRegisterSave);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -3039,7 +3040,7 @@ TEST(SemanticAnalyzerCSubset, SizeofVaListIs8UnderWin64) {
     });
     assertNoBuilderErrors(*cu);
     // HomogeneousPointer (Win64): va_list = char* (one pointer = 8B).
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                          VaListStrategy::HomogeneousPointer);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -3068,7 +3069,7 @@ TEST(SemanticAnalyzerCSubset, SizeofVaListIs32UnderAapcs64) {
     });
     assertNoBuilderErrors(*cu);
     // Aapcs64DualCursor: va_list = __va_list (the 5-field struct, 32B).
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                          VaListStrategy::Aapcs64DualCursor);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -3097,7 +3098,7 @@ TEST(SemanticAnalyzerCSubset, Aapcs64VariadicCalleeAnalyzesClean) {
         " int t = va_arg(ap, int); va_end(ap); return t; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                          VaListStrategy::Aapcs64DualCursor);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -3126,7 +3127,7 @@ TEST(SemanticAnalyzerCSubset, SizeofBuiltinVaListMatchesVaListUnderSysV) {
     });
     assertNoBuilderErrors(*cu);
     // SysVRegisterSave: __builtin_va_list = va_list = __va_list_tag[1] (24B).
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                          VaListStrategy::SysVRegisterSave);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -3151,7 +3152,7 @@ TEST(SemanticAnalyzerCSubset, SizeofBuiltinVaListMatchesVaListUnderWin64) {
     });
     assertNoBuilderErrors(*cu);
     // HomogeneousPointer (Win64 + Apple arm64): __builtin_va_list = char* (8B).
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                          VaListStrategy::HomogeneousPointer);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -3176,7 +3177,7 @@ TEST(SemanticAnalyzerCSubset, SizeofBuiltinVaListMatchesVaListUnderAapcs64) {
     });
     assertNoBuilderErrors(*cu);
     // Aapcs64DualCursor: __builtin_va_list = va_list = __va_list (32B struct).
-    auto model = analyze(cu, DataModel::Lp64,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                          VaListStrategy::Aapcs64DualCursor);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -3210,7 +3211,7 @@ TEST(SemanticAnalyzerCSubset, BuiltinVaListTypeIdIsIdenticalToVaListPerStrategy)
             "int main(void) { return 0; }\n",
         });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu, DataModel::Lp64,
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                              AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                              strat);
         // The builtin scope holds exactly one record per name in this plain TU.
@@ -3254,7 +3255,7 @@ TEST(SemanticAnalyzerCSubset, DarwinVaListTypedefChainShadowsBuiltinPerStrategy)
             "int a[sizeof(v)];\n",
         });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu, DataModel::Lp64,
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                              AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                              row.strat);
         EXPECT_EQ(countCode(model.diagnostics(),
@@ -3294,7 +3295,7 @@ TEST(SemanticAnalyzerCSubset, BuiltinVaListTypedefParamRoundTripsThroughVaArg) {
             "int f(int n, my_va ap) { return va_arg(ap, int); }\n",
         });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu, DataModel::Lp64,
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                              AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                              strat);
         EXPECT_EQ(countCode(model.diagnostics(),
@@ -3311,7 +3312,7 @@ TEST(SemanticAnalyzerCSubset, BuiltinVaListTypedefParamRoundTripsThroughVaArg) {
 TEST(SemanticAnalyzerCSubset, PointerParamInFnSig) {
     auto cu = buildShippedUnit("c-subset", { "void f(int *p) {}\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* f = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i)
@@ -3329,7 +3330,7 @@ TEST(SemanticAnalyzerCSubset, PointerParamInFnSig) {
 TEST(SemanticAnalyzerCSubset, GlobalArrayDeclaratorTypedAsArray) {
     auto cu = buildShippedUnit("c-subset", { "int g[10];\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* gRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i)
@@ -3352,7 +3353,7 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
         << "different blocks → different scopes → no shadow redecl";
     // main (function) + two distinct `x` symbols (one per block scope) + the 3
@@ -3382,7 +3383,7 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
         "int main() { x; int x; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 
     // main (function) + x (variable) + the 3 FC12a-core builtin TYPES
@@ -3433,7 +3434,7 @@ TEST(SemanticAnalyzerCSubset, LiteralsAreTyped) {
         "int main() { 42; 3.14; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
 
     bool sawI32Lit = false;
     bool sawF64Lit = false;
@@ -3453,7 +3454,7 @@ TEST(SemanticAnalyzerCSubset, SameBlockRedeclEmitsError) {
         "int main() { int x; int x; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u);
 }
 
@@ -3469,7 +3470,7 @@ TEST(SemanticAnalyzerCSubset, TopLevelGlobalsAndFunctionsMintSymbols) {
         "int f() { return g; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     SymbolRecord const* gRec = nullptr;
     SymbolRecord const* fRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
@@ -3490,7 +3491,7 @@ TEST(SemanticAnalyzerCSubset, ConstReassignmentEmitsConstViolation) {
         "int main() { const int x = 1; x = 2; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
     for (auto const& d : model.diagnostics().all()) {
         if (d.code == DiagnosticCode::S_ConstViolation) EXPECT_EQ(d.actual, "x");
@@ -3503,7 +3504,7 @@ TEST(SemanticAnalyzerCSubset, NonConstReassignmentIsClean) {
         "int main() { int x = 1; x = 2; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
 }
 
@@ -3519,7 +3520,7 @@ TEST(SemanticAnalyzerCSubset, CompoundAssignToConstEmitsConstViolation) {
         "int main() { const int x = 1; x += 2; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
     // `x` is the compound-assign LHS, which counts as a use — so the
     // varDeclHead `warnIfUnused:true` opt-in does NOT spuriously fire.
@@ -3536,7 +3537,7 @@ TEST(SemanticAnalyzerCSubset, CompoundStarAssignToConstEmitsConstViolation) {
         "int main() { const int x = 4; x *= 2; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
 }
@@ -3548,7 +3549,7 @@ TEST(SemanticAnalyzerCSubset, CompoundShlAssignToConstEmitsConstViolation) {
         "int main() { const int x = 1; x <<= 2; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
 }
@@ -3570,7 +3571,7 @@ TEST(SemanticAnalyzerCSubset, SiblingForInitSameNameHaveDistinctScopes) {
         "}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "the second for(int i)'s uses must resolve to its own for-scoped i";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
@@ -3586,7 +3587,7 @@ TEST(SemanticAnalyzerCSubset, ForInitVariableOutOfScopeAfterForRejects) {
         "int main(void){ for (int i = 0; i < 2; i++) {} return i; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
         << "`i` is scoped to the for-statement — a use after the loop must fail loud";
 }
@@ -3599,7 +3600,7 @@ TEST(SemanticAnalyzerCSubset, CompoundAssignToNonConstIsClean) {
         "int main() { int y = 1; y <<= 2; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
 }
@@ -3620,7 +3621,7 @@ TEST(SemanticAnalyzerCSubset, MutablePointerToConstParamIsClean) {
         "int f(const char *p){ p += 4; return (int)*p; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
 }
 TEST(SemanticAnalyzerCSubset, MutablePointerToConstEastIsClean) {
@@ -3628,7 +3629,7 @@ TEST(SemanticAnalyzerCSubset, MutablePointerToConstEastIsClean) {
         "int f(char const *p){ p += 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
 }
 
@@ -3638,7 +3639,7 @@ TEST(SemanticAnalyzerCSubset, ConstPointerParamEmitsConstViolation) {
         "int f(char * const p){ p += 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
 }
 
@@ -3648,7 +3649,7 @@ TEST(SemanticAnalyzerCSubset, ConstPointerToConstParamEmitsConstViolation) {
         "int f(const char * const p){ p += 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
 }
 
@@ -3659,7 +3660,7 @@ TEST(SemanticAnalyzerCSubset, MultiLevelInnerConstOuterMutableIsClean) {
         "int f(char * const *p){ p += 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
 }
 // `char ** const p` — OUTER pointer const → violates.
@@ -3668,7 +3669,7 @@ TEST(SemanticAnalyzerCSubset, MultiLevelOuterConstEmitsConstViolation) {
         "int f(char ** const p){ p += 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
 }
 // `const char **p` — pointee const, both pointers mutable → clean.
@@ -3677,7 +3678,7 @@ TEST(SemanticAnalyzerCSubset, MultiLevelHeadConstIsClean) {
         "int f(const char **p){ p += 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
 }
 
@@ -3688,7 +3689,7 @@ TEST(SemanticAnalyzerCSubset, MultiDeclaratorPointerCleanScalarViolates) {
         "int f(){ const int *p, x; p += 1; x = 2; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // exactly one violation — on `x` (the const scalar), NOT on `p`.
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
     for (auto const& d : model.diagnostics().all()) {
@@ -3703,7 +3704,7 @@ TEST(SemanticAnalyzerCSubset, VolatilePointeeConstPointerEmitsConstViolation) {
         "int f(volatile char * const p){ p += 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
 }
 // `const volatile char *p` — cv POINTEE, pointer object mutable → clean.
@@ -3712,7 +3713,7 @@ TEST(SemanticAnalyzerCSubset, ConstVolatilePointeeMutablePointerIsClean) {
         "int f(const volatile char *p){ p += 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
 }
 
@@ -3722,7 +3723,7 @@ TEST(SemanticAnalyzerCSubset, EastConstScalarStillEmitsConstViolation) {
         "int main() { int const x = 1; x = 2; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
 }
 
@@ -3740,7 +3741,7 @@ TEST(SemanticAnalyzerCSubset, GroupedConstPointerParamEmitsConstViolation) {
         "int f(char (* const p)){ p += 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
 }
 // `const char (*p)` ≡ `const char *p` — a MUTABLE pointer to const → `p += 1`
@@ -3753,7 +3754,7 @@ TEST(SemanticAnalyzerCSubset, GroupedPointerToConstParamIsClean) {
         "int f(const char (*p)){ p += 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
 }
 
@@ -3766,7 +3767,7 @@ TEST(SemanticAnalyzerCSubset, TypedefMintsTypeAliasSymbol) {
         "typedef int Foo;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     SymbolRecord const* fooRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "Foo") fooRec = &model.symbols()[i];
@@ -3787,7 +3788,7 @@ TEST(SemanticAnalyzerCSubset, TopLevelFunctionBuildsFnSig) {
         "int add(int a, int b) { return a; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& interner = model.lattice().interner();
     SymbolRecord const* addRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
@@ -3813,7 +3814,7 @@ TEST(SemanticAnalyzerCSubset, CorrectArityCallIsClean) {
         "int main() { f(1); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotCallable), 0u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ArgCountMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
@@ -3827,7 +3828,7 @@ TEST(SemanticAnalyzerCSubset, ExtraArgsEmitArgCountMismatch) {
         "int main() { f(1, 2, 3); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ArgCountMismatch), 1u);
 }
 
@@ -3839,7 +3840,7 @@ TEST(SemanticAnalyzerCSubset, CallingVariableEmitsNotCallable) {
         "int main() { x(1); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotCallable), 1u);
 }
 
@@ -3867,7 +3868,7 @@ TEST(SemanticAnalyzerCSubset, UnknownCalleeEmitsExactlyOneUndeclared) {
         "int main() { ggg(1); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     std::size_t gggCount = 0;
     ParseDiagnostic const* gggDiag = nullptr;
     for (auto const& d : model.diagnostics().all()) {
@@ -3897,7 +3898,7 @@ TEST(SemanticAnalyzerCSubset, PostfixIncrementIsNotACall) {
         "int main() { int i = 0; i++; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotCallable), 0u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ArgCountMismatch), 0u);
 }
@@ -3913,7 +3914,7 @@ TEST(SemanticAnalyzerCSubset, UnusedLocalEmitsWarning) {
         "int main(){ int unused; int used=1; return used; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 1u);
     ParseDiagnostic const* d = nullptr;
     for (auto const& diag : model.diagnostics().all()) {
@@ -3942,7 +3943,7 @@ TEST(SemanticAnalyzerCSubset, UnusedParamDoesNotWarn) {
         "int f(int unusedParam){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
         << "unused params are intentional — param decls do not opt in";
 }
@@ -3954,7 +3955,7 @@ TEST(SemanticAnalyzerCSubset, OneUnusedLocalAmongUsedWarnsOnlyForUnused) {
         "int main(){ int a=1; int b=2; return a; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // `a` is used; `b` is NOT — so exactly one warning, for `b`. Proves the
     // check fires per-symbol on the actual empty-use-set, not blanket.
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 1u);
@@ -3971,7 +3972,7 @@ TEST(SemanticAnalyzerCSubset, UnusedGlobalDoesNotWarn) {
         "int main(){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
         << "globals do not opt in to the unused-variable warning";
 }
@@ -3987,7 +3988,7 @@ TEST(SemanticAnalyzerCSubset, WriteOnlyLocalDoesNotWarn) {
         "int main(){ int x; x = 5; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
         << "an assignment LHS counts as a use — write-only stays for the optimizer";
 }
@@ -4000,7 +4001,7 @@ TEST(SemanticAnalyzerCSubset, ReturnMatchingTypeIsClean) {
         "int f() { return 1; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u);
 }
 
@@ -4011,7 +4012,7 @@ TEST(SemanticAnalyzerCSubset, BareReturnInNonVoidEmitsMismatch) {
         "int f() { return; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 1u);
 }
 
@@ -4023,7 +4024,7 @@ TEST(SemanticAnalyzerCSubset, ValueReturnInVoidEmitsMismatch) {
         "void g() { return 1; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 1u);
     // Layout: "void g() { return 1; }"
     //          0123456789012345678901
@@ -4044,7 +4045,7 @@ TEST(SemanticAnalyzerCSubset, BareReturnInVoidIsClean) {
         "void g() { return; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u);
 }
 
@@ -4061,7 +4062,7 @@ TEST(SemanticAnalyzerCSubset, CharParamReturnedAsIntIsClean) {
         "int f(char c) { return c; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u)
         << "char widens to int on return (C 6.3.1.1) — the bidirectional char arm";
 }
@@ -4075,7 +4076,7 @@ TEST(SemanticAnalyzerCSubset, ReturnAssignableParamIsClean) {
         "int f(int x) { return x; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u);
 }
 
@@ -4091,7 +4092,7 @@ TEST(SemanticAnalyzerCSubset, ReturnOfCallResultIsClean) {
         "int g() { return f(); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u)
         << "a call's result type — not its FnSig — must flow to the return check";
     // And the call resolved cleanly besides (no call-shape diagnostics).
@@ -4110,7 +4111,7 @@ TEST(SemanticAnalyzerCSubset, CharResultCallReturnedAsIntIsClean) {
         "int g() { return h(); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u)
         << "a Char-result call widens to int on return (C 6.3.1.1)";
 }
@@ -4127,7 +4128,7 @@ TEST(SemanticAnalyzerCSubset, CharLiteralIsTypedIntNotUntyped) {
         "int main() { f('c'); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
         << "'c' has type int (C 6.4.4.4) → passing it to an int* param is a mismatch";
 }
@@ -4144,7 +4145,7 @@ TEST(SemanticAnalyzerCSubset, StringLiteralIsTypedCharArrayNotUntyped) {
         "int main() { g(\"abc\"); return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
         << "\"abc\" is Array<Char,4> → an int* arg is an element mismatch (Char != int)";
 }
@@ -4164,7 +4165,7 @@ TEST(SemanticAnalyzerCSubset, AdjacentStringConcatTypesWholeCharArray) {
         "int main() { \"hello\" \" world\"; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     auto const& ti = model.lattice().interner();
     Tree const& tree = cu->trees()[0];
@@ -4216,7 +4217,7 @@ TEST(SemanticAnalyzerCSubset, AdjacentStringConcatTypesWholeCharArray) {
 TEST(SemanticAnalyzerCSubset, ConcatEffectivePrefixTypesWholeWideArray) {
     auto cu = buildShippedUnit("c-subset", { "void f(){ \"a\" L\"b\"; }" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors());
     auto const& ti = model.lattice().interner();
     TypeId const ty = firstStringLiteralType(model, *cu);
@@ -4232,7 +4233,7 @@ TEST(SemanticAnalyzerCSubset, ConcatEffectivePrefixTypesWholeWideArray) {
 TEST(SemanticAnalyzerCSubset, ConcatSamePrefixTypesU16) {
     auto cu = buildShippedUnit("c-subset", { "void f(){ u\"a\" u\"b\"; }" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors());
     auto const& ti = model.lattice().interner();
     TypeId const ty = firstStringLiteralType(model, *cu);
@@ -4248,7 +4249,7 @@ TEST(SemanticAnalyzerCSubset, ConcatSamePrefixTypesU16) {
 TEST(SemanticAnalyzerCSubset, ConcatConflictLeavesNodeUntypedAndEmits) {
     auto cu = buildShippedUnit("c-subset", { "void f(){ u\"a\" U\"b\"; }" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_TRUE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u);
@@ -4262,7 +4263,7 @@ TEST(SemanticAnalyzerCSubset, ConcatConflictLeavesNodeUntypedAndEmits) {
 TEST(SemanticAnalyzerCSubset, ConcatConflictSizeofFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "int f(){ return sizeof(u\"a\" U\"b\"); }" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_TRUE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u);
@@ -4279,9 +4280,9 @@ TEST(SemanticAnalyzerCSubset, ConcatConflictIsTokenKindNotCoreEvenOnPe) {
     for (bool pe : {false, true}) {
         auto cu = buildShippedUnit("c-subset", { "void f(){ u\"a\" L\"b\"; }" });
         assertNoBuilderErrors(*cu);
-        auto model = pe ? analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+        auto model = pe ? analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
                                   ObjectFormatKind::Pe)
-                        : analyze(cu);
+                        : analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_TRUE(model.hasErrors()) << (pe ? "pe" : "default");
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u)
@@ -4301,7 +4302,7 @@ TEST(SemanticAnalyzerCSubset, CharLiteralInitializesCharSlotCleanly) {
         "int main() { char x = 'c'; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
         << "an int literal initializing a char slot is legal C (the char↔int arm)";
 }
@@ -4316,7 +4317,7 @@ TEST(SemanticAnalyzerCSubset, NestedReturnChecksAgainstEnclosingFunction) {
         "void g() { if (1) { return 1; } }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 1u)
         << "a nested value-return in a void function must reach the enclosing result";
 }
@@ -4331,7 +4332,7 @@ TEST(SemanticAnalyzerCSubset, DuplicateParamNamesEmitRedecl) {
         "int f(int x, int x) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u);
     // FIX 8: the related-location must be present AND point at the FIRST `x`
     // param (deterministic). Layout: "int f(int x, int x) { return 0; }"
@@ -4499,7 +4500,7 @@ TEST(SemanticAnalyzerCSubset, BreakInsideLoopIsClean) {
         "int main() { while (1) { break; } return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ControlOutsideLoop), 0u);
 }
 
@@ -4510,7 +4511,7 @@ TEST(SemanticAnalyzerCSubset, BreakOutsideLoopEmitsDiagnostic) {
         "int main() { break; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ControlOutsideLoop), 1u);
     // Layout: "int main() { break; return 0; }"
     //          0123456789012345678901234567890
@@ -4534,7 +4535,7 @@ TEST(SemanticAnalyzerCSubset, BreakInsideSwitchIsClean) {
         "int main(){ switch(1){ case 1: break; } return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ControlOutsideLoop), 0u)
         << "switch is a configured break-context";
 }
@@ -4546,7 +4547,7 @@ TEST(SemanticAnalyzerCSubset, NestedLoopBreakIsClean) {
         "int main(){ while(1){ while(1){ break; } } return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ControlOutsideLoop), 0u);
 }
 
@@ -4559,7 +4560,7 @@ TEST(SemanticAnalyzerCSubset, BreakAfterLoopIsOutsideLoop) {
         "int main(){ while(1){ } break; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ControlOutsideLoop), 1u)
         << "a break after the loop closes is back at depth 0";
 }
@@ -4590,7 +4591,7 @@ TEST(SemanticAnalyzerCSubset, SpacedIncludeIsInlined) {
             << "int helper() { return 1; }\n";
     }
     auto schema = loadShippedSchema("c-subset");
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addIncludeDir(incDir.path());
     builder.addInMemory("# include \"x.h\"\nint main() { return helper(); }\n", "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -4635,7 +4636,7 @@ buildAngleDescriptorUnit(ScratchDir const& sysDir,
                          std::string const& mainSrc) {
     std::ofstream(sysDir.path() / descName, std::ios::binary) << descJson;
     auto schema = loadShippedSchema("c-subset");
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addInMemory(mainSrc, "main.c");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -4671,7 +4672,7 @@ TEST(SemanticAnalyzerCSubset, FF11AngleIncludeResolvesPutsViaDescriptor) {
     EXPECT_EQ(cu->shippedLibDescriptors().size(), 1u);
     assertNoBuilderErrors(*cu);
 
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // The use of `puts` resolved against the injected descriptor symbol.
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "puts must resolve via the injected descriptor extern";
@@ -4715,7 +4716,7 @@ TEST(SemanticAnalyzerCSubset, ShippedPerSymbolLibraryOverrideMergesOverDescripto
                  { "name": "plain", "signature": "fn() -> i32" } ] })JSON",
         "#include <tt.h>\nint main() { return over() + plain(); }\n");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "both descriptor symbols must resolve";
 
@@ -4756,7 +4757,7 @@ TEST(SemanticAnalyzerCSubset, ShippedConstantFoldsInArrayDimension) {
              "constants": [ { "name": "CHAR_BIT", "value": 8, "type": "i32" } ] })",
         "#include <limits.h>\nint main() { int a[CHAR_BIT]; return 0; }\n");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "CHAR_BIT must resolve to the injected descriptor constant";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NonConstantArrayLength), 0u)
@@ -4785,7 +4786,7 @@ TEST(SemanticAnalyzerCSubset, ShippedTypedefResolvesInTypePosition) {
              "typedefs": [ { "name": "my_int_t", "type": "i32" } ] })",
         "#include <mytypes.h>\nint main() { my_int_t x; x = 5; return x; }\n");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
         << "my_int_t must resolve via the injected descriptor typedef";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
@@ -4817,7 +4818,7 @@ TEST(SemanticAnalyzerCSubset, ShippedUnionFieldMemberResolves) {
         "int main(void) { Ent e; void *p = e.key.oneWordValue; char *q = e.key.str;"
         " return (p != 0) + (q != 0); }\n");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
         << "e.key (a union value) must have a member scope so .oneWordValue resolves";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
@@ -4840,7 +4841,7 @@ TEST(SemanticAnalyzerCSubset, ShippedUnknownUnionMemberFailsLoud) {
         "#include <hk2.h>\n"
         "int main(void) { KeyU u; void *p = u.noSuchMember; return p != 0; }\n");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
         << "KeyU IS a composite (union member scope registered) — not a non-composite miss";
     EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
@@ -4863,7 +4864,7 @@ TEST(SemanticAnalyzerCSubset, ShippedConstantUserDeclWins) {
         "#include <limits.h>\n"
         "int main() { return CHAR_BIT + WIDTH; }\n");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countSymbolsNamed(model, "CHAR_BIT"), 1u)
         << "the user's CHAR_BIT wins; the descriptor's is skipped (no double-bind)";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
@@ -4882,7 +4883,7 @@ TEST(SemanticAnalyzerCSubset, WriteToShippedConstantViolatesConst) {
              "constants": [ { "name": "CHAR_BIT", "value": 8, "type": "i32" } ] })",
         "#include <limits.h>\nint main() { CHAR_BIT = 5; return 0; }\n");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u)
         << "writing to a shipped constant must fail loud (it is not assignable)";
 }
@@ -4911,7 +4912,7 @@ TEST(SemanticAnalyzerCSubset, FF11AngleIncludePlusInlineExternUserDeclWins) {
     ASSERT_EQ(cu->trees().size(), 1u);
     assertNoBuilderErrors(*cu);
 
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // The user's decl is the SOLE `puts` — the descriptor symbol was skipped.
     EXPECT_EQ(countSymbolsNamed(model, "puts"), 1u)
         << "user decl wins — the descriptor's puts is skipped (no duplicate)";
@@ -4968,7 +4969,7 @@ TEST(SemanticAnalyzerCSubset, FF11SameDescriptorIncludedTwiceInjectsOnce) {
     EXPECT_EQ(cu->shippedLibDescriptors().size(), 1u);
     assertNoBuilderErrors(*cu);
 
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
     EXPECT_EQ(countSymbolsNamed(model, "puts"), 1u)
         << "the same descriptor twice injects puts ONCE — not per directive";
@@ -4994,7 +4995,7 @@ TEST(SemanticAnalyzerCSubset, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
     for (int i = 0; i < 4; ++i) writeDesc("s" + std::to_string(i), "s" + std::to_string(i));
 
     auto schema = loadShippedSchema("c-subset");
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     // <dup.h> is included TWICE (bracketing the others); each of dup,s0..s3 is
     // called so all five must resolve, and dup must be minted only once.
@@ -5017,7 +5018,7 @@ TEST(SemanticAnalyzerCSubset, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
     EXPECT_EQ(cu->shippedLibDescriptors().size(), 5u);
     assertNoBuilderErrors(*cu);
 
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "all five descriptor symbols must resolve";
     // Five distinct symbols, each minted EXACTLY once (dup not doubled).
@@ -5362,7 +5363,7 @@ TEST(SemanticAnalyzerCSubset, AbstractFnPtrCastTypesAsPtrToFnVoidInt) {
         "int main() { void* p; return ((int(*)(void))p) != 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     auto [tid, cast] = firstCastNode(*cu);
     ASSERT_TRUE(cast.valid());
@@ -5388,7 +5389,7 @@ TEST(SemanticAnalyzerCSubset, AbstractFnPtrCastWithParamTypesCorrectly) {
         "int main() { void* p; return ((int(*)(int))p) != 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     auto [tid, cast] = firstCastNode(*cu);
     ASSERT_TRUE(cast.valid());
@@ -5410,7 +5411,7 @@ TEST(SemanticAnalyzerCSubset, SizeofAbstractFnPtrResolvesCleanly) {
         "int main() { return (int)sizeof(int(*)(void)); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
@@ -5486,7 +5487,7 @@ TEST(SemanticAnalyzerCSubset, PostStarConstCastStripsToPlainPointer) {
         "  return (a == b); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     auto [tA, cA] = nthCastNode(*cu, 0);
     auto [tB, cB] = nthCastNode(*cu, 1);
@@ -5516,7 +5517,7 @@ TEST(SemanticAnalyzerCSubset, PostStarVolatileCastStripsPointerVolatile) {
         "int main() { void* p; return ((u32 * volatile)p) != 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     auto [tid, cast] = nthCastNode(*cu, 0);
     ASSERT_TRUE(cast.valid());
@@ -5544,7 +5545,7 @@ TEST(SemanticAnalyzerCSubset, PreStarVolatileCastKeepsPointeeVolatile) {
         "int main() { void* p; return ((volatile u32 *)p) != 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     auto [tid, cast] = nthCastNode(*cu, 0);
     ASSERT_TRUE(cast.valid());
@@ -5571,7 +5572,7 @@ TEST(SemanticAnalyzerCSubset, PreStarVolatileDoublePtrCastBuildsNestedPointee) {
         "int main() { void* p; return ((volatile u32 **)p) != 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     auto [tid, cast] = nthCastNode(*cu, 0);
     ASSERT_TRUE(cast.valid());
@@ -5600,7 +5601,7 @@ TEST(SemanticAnalyzerCSubset, AtomicQualifierResolvesAtomicQualified) {
         "_Atomic int x;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* x = findSym(model, "x");
     ASSERT_NE(x, nullptr);
@@ -5626,7 +5627,7 @@ TEST(SemanticAnalyzerCSubset, AtomicOnAggregateFailsLoudNonLockFree) {
         "_Atomic struct S x;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AtomicNonLockFree), 1u)
         << "_Atomic on an aggregate must fail loud (non-lock-free — deferred)";
@@ -5640,7 +5641,7 @@ TEST(SemanticAnalyzerCSubset, AtomicOnScalarNotRejectedNonLockFree) {
         "_Atomic int x;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AtomicNonLockFree), 0u)
         << "a lock-free scalar _Atomic must be accepted (the supported case)";
@@ -5679,7 +5680,7 @@ TEST(SemanticAnalyzerCSubset, AtomicOnWideIntegerFailsLoudNonLockFree) {
              Row{"_Atomic unsigned _BitInt(128) w;\n", "_Atomic unsigned _BitInt(128)"}}) {
         auto cu = buildShippedUnit("c-subset", {std::string{r.src}});
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_AtomicNonLockFree), 1u)
             << "\n" << r.what << " is memory-resident (multi-limb) — _Atomic on it must "
@@ -5697,7 +5698,7 @@ TEST(SemanticAnalyzerCSubset, AtomicOnLongDoubleNotRejectedNonLockFree) {
         "_Atomic long double z;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AtomicNonLockFree), 0u)
         << "MEASURED: _Atomic long double compiles with ZERO diagnostics — F80/F128 are "
@@ -5747,7 +5748,7 @@ TEST(SemanticAnalyzerCSubset, Int128ConstantExpressionFolds) {
         "_Static_assert(!((__uint128_t)-1 < 0), \"an unsigned one compares UNSIGNED\");\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
         << "a 128-bit integer constant expression must fold — the `_BitInt(128)` twin "
@@ -5768,7 +5769,7 @@ TEST(SemanticAnalyzerCSubset, Int128FalseConstantExpressionStillFailsAsAssertion
         "_Static_assert((__uint128_t)5 == 6, \"deliberately false\");\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const all = model.diagnostics().all();
     std::size_t saCount = 0;
     std::string text;
@@ -5820,7 +5821,7 @@ TEST(SemanticAnalyzerCSubset, Int128WideConstantNeverTruncatesIntoA64BitSlot) {
                  "the signed spelling refuses identically"}}) {
         auto cu = buildShippedUnit("c-subset", {std::string{r.src}});
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_NonConstantArrayLength), 1u)
             << "\n" << r.what;
@@ -5836,7 +5837,7 @@ TEST(SemanticAnalyzerCSubset, AtomicVolatileSetsBothQualifierBits) {
         "volatile _Atomic int b;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* a = findSym(model, "a");
     ASSERT_NE(a, nullptr);
@@ -5865,7 +5866,7 @@ TEST(SemanticAnalyzerCSubset, PlainVolatileIsNotAtomicQualified) {
         "volatile int v;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* v = findSym(model, "v");
     ASSERT_NE(v, nullptr);
@@ -5886,7 +5887,7 @@ TEST(SemanticAnalyzerCSubset, AtomicPointeeVsPointerObject) {
         "int * _Atomic q;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* p = findSym(model, "p");
     ASSERT_NE(p, nullptr);
@@ -6171,7 +6172,7 @@ TEST(SemanticAnalyzerCSubset, NamedVoidParamFiresInvalidVoidParamPositioned) {
         "int g(void x) { return 1; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InvalidVoidParam), 1u);
     for (auto const& d : model.diagnostics().all()) {
@@ -6262,7 +6263,7 @@ TEST(SemanticAnalyzerCSubset, UnknownStarUnknownStaysExpressionWithUndeclared) {
         "int main() {\n  u * v;\n  return 0;\n}\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UndeclaredIdentifier), 2u);
     bool sawU = false;
@@ -7815,7 +7816,7 @@ TEST(SemanticAnalyzerCSubset, NoreturnShippedDescriptorSymbolIsNoreturn) {
                           { "name": "plain", "signature": "fn() -> void" } ] })",
         "#include <boom.h>\nint main() { return 0; }\n");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors());
     bool sawBoom = false, sawPlain = false, boomNr = false, plainNr = false;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
@@ -8993,7 +8994,7 @@ TEST(SemanticAnalyzerCSubset, C25StructDefineMintsRefResolvesMemberTypes) {
         "int main() { struct S v; int y; y = v.x; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "define + reference + member access must be clean";
     auto const& ti = model.lattice().interner();
@@ -9029,7 +9030,7 @@ TEST(SemanticAnalyzerCSubset, C25ForwardTypedefThenDefinitionResolves) {
         "int main() { Foo v; int y; y = v.x; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "forward typedef + later definition + member access must resolve clean";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
@@ -9048,7 +9049,7 @@ TEST(SemanticAnalyzerCSubset, C25ForwardPointerFieldResolves) {
         "int main() { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "a pointer field to a forward-declared tag must resolve to its later definition";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
@@ -9066,7 +9067,7 @@ TEST(SemanticAnalyzerCSubset, C35UndefinedStructTagByValueFailsLoudIncompleteObj
         "int main() { struct Nope v; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_IncompleteTypeObject), 1u)
         << "a by-value `struct Nope v;` (undefined tag) is an incomplete object — "
@@ -9080,7 +9081,7 @@ TEST(SemanticAnalyzerCSubset, C25StructTagRedefinitionCollides) {
         "struct S { int y; };\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u)
         << "two definitions of tag S must collide exactly as before c25";
 }
@@ -9101,7 +9102,7 @@ TEST(SemanticAnalyzerCSubset, C35BareStructForwardDeclMintsIncompleteTag) {
         "struct S;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "`struct S;` (a forward declaration) must compile, minting an opaque tag";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
@@ -9193,7 +9194,7 @@ TEST(SemanticAnalyzerCSubset, C35SizeofOfIncompleteFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_TRUE(model.hasErrors())
         << "sizeof of an incomplete struct must fail loud";
 }
@@ -9223,7 +9224,7 @@ TEST(SemanticAnalyzerCSubset, C25AnonymousTypedefStructDefinesAndResolves) {
         "int main() { T v; int y; y = v.x; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "anonymous typedef struct define + alias use + member access clean";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
@@ -9238,7 +9239,7 @@ TEST(SemanticAnalyzerCSubset, C25NestedInlineBodyFieldComposes) {
         "struct Outer { struct Inner { int x; } in; };\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     auto const& ti = model.lattice().interner();
     TypeId const inner = composedAggregate(model, "Inner");
@@ -9257,7 +9258,7 @@ TEST(SemanticAnalyzerCSubset, C25UnionDefineMintsRefResolves) {
         "int main() { union U u; int y; y = u.i; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     auto const& ti = model.lattice().interner();
     TypeId const un = composedAggregate(model, "U");
@@ -9295,7 +9296,7 @@ TEST(SemanticAnalyzerCSubset, C25EnumDefineMintsEnumeratorsVisibleRefResolves) {
         "int main() { enum E e; int y; y = B; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "enum define + enumerator use (B) + bare `enum E` ref must be clean";
     // The enumerator `B` resolved (lifted to enclosing scope) — no undeclared id.
@@ -9347,7 +9348,7 @@ TEST(SemanticAnalyzerCSubset, C28LocalStructDefineNodeShapeAndType) {
         "y = v.a; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "a block-scoped struct definition + later ref + member access must be clean";
     auto const& ti = model.lattice().interner();
@@ -9407,7 +9408,7 @@ TEST(SemanticAnalyzerCSubset, C28LocalUnionAndEnumDefine) {
         "y = v.a; return 0; }\n",
     });
     assertNoBuilderErrors(*cuU);
-    auto mU = analyze(cuU);
+    auto mU = analyze(cuU, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(mU.hasErrors()) << "a block-scoped union definition + ref must be clean";
     TypeId const u = composedAggregate(mU, "U");
     ASSERT_TRUE(u.valid());
@@ -9418,7 +9419,7 @@ TEST(SemanticAnalyzerCSubset, C28LocalUnionAndEnumDefine) {
         "y = B; e = A; return 0; }\n",
     });
     assertNoBuilderErrors(*cuE);
-    auto mE = analyze(cuE);
+    auto mE = analyze(cuE, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(mE.hasErrors()) << "a block-scoped enum definition + ref must be clean";
     EXPECT_EQ(countCode(mE.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "the block-scoped enumerator B must resolve (liftToEnclosingScope)";
@@ -9444,7 +9445,7 @@ TEST(SemanticAnalyzerCSubset, C28LocalStructDoesNotLeakToOuterScope) {
         "int main(void){ { struct S { int a; }; } struct S w; w.a = 1; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_TRUE(model.hasErrors())
         << "the outer `struct S w;` must fail — S is block-local to the inner {}";
     EXPECT_GT(countCode(model.diagnostics(),
@@ -9466,7 +9467,7 @@ TEST(SemanticAnalyzerCSubset, C28InnerStructShadowsOuterDistinctType) {
         "(void)v; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "an inner same-name struct must shadow (not collide with) the outer";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
@@ -9563,7 +9564,7 @@ TEST(SemanticAnalyzerCSubset, C30LocalTypedefNodeShapeAndType) {
         "int main(void){ typedef int (*FN_t)(int); FN_t f; (void)f; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "a block-scoped fn-ptr typedef + later local var must be clean";
     // NODE SHAPE: a `typedefDecl` exists as a descendant of the function body `block`.
@@ -9606,7 +9607,7 @@ TEST(SemanticAnalyzerCSubset, C30LocalTypedefFrontierShape) {
         "LOGFUNC_t xLog; (void)xLog; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "the sqlite LOGFUNC_t block-scoped fn-ptr typedef must resolve clean";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
@@ -9659,7 +9660,7 @@ TEST(SemanticAnalyzerCSubset, C30InnerTypedefShadowsOuterDistinctType) {
         "int main(void){ typedef int MyT; MyT a; (void)a; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "an inner same-name typedef must shadow (not collide with) the outer";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
@@ -9772,7 +9773,7 @@ TEST(SemanticAnalyzerCSubset, NullptrInitsAndComparesPointer) {
         " return r + (nullptr == p); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 0u);
     EXPECT_FALSE(model.hasErrors());
@@ -9782,7 +9783,7 @@ TEST(SemanticAnalyzerCSubset, NullptrInitsAndComparesPointer) {
 TEST(SemanticAnalyzerCSubset, NullptrToIntFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "int f(void){ int x = nullptr; return x; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
 }
 
@@ -9795,7 +9796,7 @@ TEST(SemanticAnalyzerCSubset, NullptrToIntFailsLoud) {
 TEST(SemanticAnalyzerCSubset, NullptrToBoolConverts) {
     auto cu = buildShippedUnit("c-subset", { "int f(void){ bool b = nullptr; return 0; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
         << "nullptr -> bool converts to false (C23 6.3.2.3.2), no longer deferred";
     EXPECT_FALSE(model.hasErrors());
@@ -9808,7 +9809,7 @@ TEST(SemanticAnalyzerCSubset, NullptrToBoolConverts) {
 TEST(SemanticAnalyzerCSubset, ScalarZeroToBoolConverts) {
     auto cu = buildShippedUnit("c-subset", { "int f(void){ bool b = 0; return b; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
         << "scalar 0 -> bool converts to false (C 6.3.1.2)";
     EXPECT_FALSE(model.hasErrors());
@@ -9819,7 +9820,7 @@ TEST(SemanticAnalyzerCSubset, ScalarZeroToBoolConverts) {
 TEST(SemanticAnalyzerCSubset, NullptrArithmeticFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "void *f(void){ return nullptr + 1; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
 }
@@ -9829,7 +9830,7 @@ TEST(SemanticAnalyzerCSubset, NullptrArithmeticFailsLoud) {
 TEST(SemanticAnalyzerCSubset, NullptrRelationalFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "int f(void *p){ return nullptr < p; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
 }
@@ -9838,7 +9839,7 @@ TEST(SemanticAnalyzerCSubset, NullptrRelationalFailsLoud) {
 TEST(SemanticAnalyzerCSubset, NullptrEqualsIntFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "int f(void){ return nullptr == 5; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
 }
@@ -9850,7 +9851,7 @@ TEST(SemanticAnalyzerCSubset, NullptrPlainAssignNoFalsePositive) {
         "int f(void *p){ p = nullptr; return p == nullptr; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 0u);
     EXPECT_FALSE(model.hasErrors());
@@ -9860,7 +9861,7 @@ TEST(SemanticAnalyzerCSubset, NullptrPlainAssignNoFalsePositive) {
 TEST(SemanticAnalyzerCSubset, NullptrCompoundAssignFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "int f(void *p){ p += nullptr; return 0; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
 }
@@ -9869,7 +9870,7 @@ TEST(SemanticAnalyzerCSubset, NullptrCompoundAssignFailsLoud) {
 TEST(SemanticAnalyzerCSubset, NullptrUnaryNegFailsLoud) {
     auto cu = buildShippedUnit("c-subset", { "void *f(void){ return -nullptr; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
 }
@@ -9881,7 +9882,7 @@ TEST(SemanticAnalyzerCSubset, NullptrVariadicArgFailsLoud) {
         "int f(void){ return g(1, nullptr); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 1u);
 }
@@ -9894,7 +9895,7 @@ TEST(SemanticAnalyzerCSubset, NullptrTernaryTypesAsPointer) {
         "void *f(int c, void *p){ return c ? nullptr : p; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 0u);
     EXPECT_FALSE(model.hasErrors());
@@ -9910,7 +9911,7 @@ TEST(SemanticAnalyzerCSubset, NullptrComparedToDesignatorsAdmitted) {
         " if (nullptr == a) return 2; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 0u);
 }
@@ -9923,7 +9924,7 @@ TEST(SemanticAnalyzerCSubset, NullptrSizeofIsWellTyped) {
         "unsigned long f(void){ return sizeof(nullptr); }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
 }
 
@@ -9942,7 +9943,7 @@ TEST(SemanticAnalyzerCSubset, EnumExplicitUnderlyingTypeSetsScalars) {
         "int main(void) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "an explicit unsigned-char underlying enum must analyze clean";
     auto const& ti = model.lattice().interner();
@@ -9966,7 +9967,7 @@ TEST(SemanticAnalyzerCSubset, EnumUnderlyingTypeDistinctFromDefault) {
         "int main(void) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     auto const& ti = model.lattice().interner();
     TypeId wide{}, narrow{};
@@ -9988,7 +9989,7 @@ TEST(SemanticAnalyzerCSubset, EnumAnonymousWithExplicitUnderlying) {
         "int main(void) { return AY; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "an anonymous enum with an explicit underlying type must be clean";
     auto const& ti = model.lattice().interner();
@@ -12162,7 +12163,7 @@ namespace {
     std::initializer_list<std::string> sources, LongDoubleFormat axis) {
     auto cu = buildShippedUnit("c-subset", sources);
     assertNoBuilderErrors(*cu);
-    return analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+    return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, std::nullopt, std::nullopt,
                    std::nullopt, std::nullopt, axis);
 }
 } // namespace
@@ -12386,13 +12387,13 @@ namespace fs = std::filesystem;
                                               DataModel dataModel) {
     fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(shipped);
     builder.setActiveFormat(format);
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    return analyze(cu, dataModel, std::nullopt, std::nullopt, format, "x86_64");
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel, std::nullopt, std::nullopt, format, "x86_64");
 }
 
 // The 17-function × {float,double,int} matrix. Every float-column result is
@@ -12535,7 +12536,7 @@ TEST(SemanticAnalyzerCSubset, PackedMultiClauseUnknownAfterPackedFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     // Exactly ONE diagnostic, and it NAMES the offending clause — not a bare
     // count on a shared code, and not the whole `__attribute__((...))` blob.
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -12565,7 +12566,7 @@ TEST(SemanticAnalyzerCSubset, PackedMultiClauseUnknownBeforePackedFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 1u);
     for (auto const& d : model.diagnostics().all()) {
@@ -12587,7 +12588,7 @@ TEST(SemanticAnalyzerCSubset, PackedSingleClauseUnchangedByClauseEnumeration) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -12612,7 +12613,7 @@ TEST(SemanticAnalyzerCSubset, AttrArgIdentifierNeverMintsPhantomClause) {
         "__attribute__((format(printf,1,2)));\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 0u)
         << "`printf` is an ARGUMENT, not a clause name — minting a phantom clause "
@@ -12643,7 +12644,7 @@ TEST(SemanticAnalyzerCSubset, StdAttrMultiItemEmitsNoDuplicateDiagnostics) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownAttribute), 2u)
         << "[[a, b]] is TWO clauses — one warning each, never doubled";
@@ -12720,7 +12721,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedLeadingSetsObjectExplicitAlignment) {
     auto cu = buildShippedUnit("c-subset",
                                { "__attribute__((aligned(32))) int gv;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     SymbolRecord const* gv = findSym(model, "gv");
     ASSERT_NE(gv, nullptr);
     ASSERT_TRUE(gv->explicitAlignment.has_value())
@@ -12736,7 +12737,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedAfterDeclaratorSetsObjectAlignment) {
     auto cu = buildShippedUnit("c-subset",
                                { "int gv2 __attribute__((aligned(32)));\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     SymbolRecord const* gv2 = findSym(model, "gv2");
     ASSERT_NE(gv2, nullptr);
     ASSERT_TRUE(gv2->explicitAlignment.has_value());
@@ -12749,7 +12750,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedMaxFoldsWithAlignas) {
     auto cu = buildShippedUnit("c-subset",
                                { "alignas(8) int g __attribute__((aligned(64)));\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     SymbolRecord const* g = findSym(model, "g");
     ASSERT_NE(g, nullptr);
     ASSERT_TRUE(g->explicitAlignment.has_value());
@@ -12767,7 +12768,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedOnMemberRaisesLayoutEndToEnd) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
         << "a member `aligned(8)` must reach fieldAligns and change the layout";
@@ -12814,7 +12815,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedSharesTheAlignasValidationLadder) {
     {   // not a power of two — the SAME code alignas(3) emits
         auto cu = buildShippedUnit("c-subset",
                                    { "int x __attribute__((aligned(3)));\n" });
-        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
             << "aligned(3) must fail through the SHARED ladder, not silently";
@@ -12822,14 +12823,14 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedSharesTheAlignasValidationLadder) {
     {   // over the 256 cap — the SAME code alignas(512) emits
         auto cu = buildShippedUnit("c-subset",
                                    { "int x __attribute__((aligned(512)));\n" });
-        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_AlignasExceedsMax), 1u)
             << "aligned(512) must hit the SAME >256 cap alignas does";
     }
     {   // the alignas TWIN — proves the two spellings agree, code for code
         auto cu = buildShippedUnit("c-subset", { "alignas(3) int x;\n" });
-        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_AlignasNotPowerOfTwo), 1u);
     }
@@ -12855,7 +12856,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedSharesTheAlignasValidationLadder) {
 TEST(SemanticAnalyzerCSubset, GnuAlignedZeroIsTheSharedNoOp) {
     auto cu = buildShippedUnit("c-subset",
                                { "int z __attribute__((aligned(0)));\n" });
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasNotPowerOfTwo), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -12874,7 +12875,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedWithNoArgumentFailsLoud) {
     auto cu = buildShippedUnit("c-subset",
                                { "int bare __attribute__((aligned));\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 1u);
     bool named = false;
@@ -12897,7 +12898,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedOnFunctionFailsLoud) {
     auto cu = buildShippedUnit("c-subset",
                                { "__attribute__((aligned(16))) int f(void);\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasInvalidContext), 1u);
     for (auto const& d : model.diagnostics().all()) {
@@ -12917,7 +12918,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedTypedefStricterThanNaturalFailsLoud) {
     auto cu = buildShippedUnit("c-subset",
                                { "typedef int ti __attribute__((aligned(16)));\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasInvalidContext), 1u)
         << "aligned(16) on a typedef of int (natural 4) is a REAL drop — say so";
@@ -12935,7 +12936,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedTypedefWeakerThanNaturalIsSilent) {
     auto cu = buildShippedUnit("c-subset",
                                { "typedef int ts __attribute__((aligned(2)));\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasInvalidContext), 0u)
         << "aligned(2) on a typedef of int (natural 4) is ALREADY satisfied";
@@ -12970,7 +12971,7 @@ TEST(SemanticAnalyzerCSubset, TypedefUnknownStrictGnuAttributeFailsLoud) {
     auto cu = buildShippedUnit("c-subset",
                                { "typedef __attribute__((desprecated)) int T;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 1u)
         << "a typo'd GNU attribute on a typedef must not be silently unapplied";
@@ -12994,7 +12995,7 @@ TEST(SemanticAnalyzerCSubset, TypedefUnknownStrictGnuAttributeFailsLoud) {
 TEST(SemanticAnalyzerCSubset, TypedefUnknownC23AttributeStaysASuppressibleWarning) {
     auto cu = buildShippedUnit("c-subset", { "typedef int [[frobnicate]] T;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 0u)
         << "C23 forbids a fatal unknown standard attribute — the strict gate is "
@@ -13012,7 +13013,7 @@ TEST(SemanticAnalyzerCSubset, TypedefMiddleSlotAttributeIsReached) {
     auto cu = buildShippedUnit("c-subset",
                                { "typedef int __attribute__((aligned(16))) T;\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasInvalidContext), 1u)
         << "the typedef's MIDDLE attribute slot must be a scan root — silently "
@@ -13047,7 +13048,7 @@ TEST(SemanticAnalyzerCSubset, CompositePackedPlusAlignedRaisesWholeAggregate) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
         << "packed removes the padding, aligned(16) raises the aggregate: clang "
@@ -13070,7 +13071,7 @@ TEST(SemanticAnalyzerCSubset, CompositeAlignedAloneRaisesAlignAndSize) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u);
     EXPECT_FALSE(model.hasErrors());
@@ -13090,7 +13091,7 @@ TEST(SemanticAnalyzerCSubset, CompositeAlignedWeakerThanNaturalIsANoOp) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
         << "aligned(N) may only RAISE — a weaker request is a no-op, not a lowering";
@@ -13109,7 +13110,7 @@ TEST(SemanticAnalyzerCSubset, CompositeAlignedOnUnionRaisesAlignAndSize) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u);
     EXPECT_FALSE(model.hasErrors());
@@ -13140,7 +13141,7 @@ TEST(SemanticAnalyzerCSubset, CompositeAlignedComposesWithPackedAndMemberAlignas
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
         << "packed (baseline 1), member alignas (raises one field) and composite "
@@ -13159,7 +13160,7 @@ TEST(SemanticAnalyzerCSubset, CompositeAlignedNonPowerOfTwoFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
         << "a composite aligned(3) must reject for the same reason and with the "
@@ -13180,7 +13181,7 @@ TEST(SemanticAnalyzerCSubset, CompositeBareAlignedWithNoArgumentFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 1u);
     for (auto const& d : model.diagnostics().all()) {
@@ -13233,7 +13234,7 @@ TEST(SemanticAnalyzerCSubset, CompositeScanAccumulatesAcrossAdjacentAttrSpecifie
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 0u)
         << "the composite scan must examine EVERY attribute specifier on the "
@@ -13254,7 +13255,7 @@ TEST(SemanticAnalyzerCSubset, CompositeMisspelledAlignedStillFailsLoud) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 1u)
         << "a typo'd composite attribute must not be silently unapplied";
@@ -13291,7 +13292,7 @@ TEST(SemanticAnalyzerCSubset, MidPositionAlignedAppliesAtBlockScope) {
     auto cu = buildShippedUnit("c-subset", {
         "int main(void){ int __attribute__((aligned(32))) x = 1; return x; }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     SymbolRecord const* x = findSym(model, "x");
     ASSERT_NE(x, nullptr) << "the block-scope mid-position form must PARSE";
     ASSERT_TRUE(x->explicitAlignment.has_value())
@@ -13311,7 +13312,7 @@ TEST(SemanticAnalyzerCSubset, BlockScopeMidAndLeadingAlignedAgree) {
         auto cu = buildShippedUnit("c-subset", {
             std::string("int main(void){ ") + decl + " return x; }\n" });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
         SymbolRecord const* x = findSym(model, "x");
         ASSERT_NE(x, nullptr) << decl;
         ASSERT_TRUE(x->explicitAlignment.has_value()) << decl;
@@ -13330,7 +13331,7 @@ TEST(SemanticAnalyzerCSubset, BlockScopeMidPositionDoesNotHijackTheHeadType) {
         "int main(void){ int __attribute__((aligned(4))) x = 1; "
         "return (int)sizeof(x); }\n" });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_FALSE(model.hasErrors());
     SymbolRecord const* x = findSym(model, "x");
     ASSERT_NE(x, nullptr);
@@ -13840,12 +13841,12 @@ namespace {
 [[nodiscard]] SemanticModel analyzeWithRealShippedLibs(std::string mainSrc) {
     fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(shipped);
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    return analyze(cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault());
 }
 
 } // namespace
@@ -13890,7 +13891,7 @@ TEST(SemanticAnalyzerCSubset, TFC89ShippedTypedefSurvivesUserTypedefOfSameName) 
         "typedef short my16_t;\n"
         "int main(void) { my16_t v = 1; return (int)v; }\n");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countSymbolsNamed(model, "my16_t"), 2u)
         << "the shipped typedef is injected in the CU root AND the user's is "
            "bound in the tree root — a user TYPEDEF redeclaration must not "
@@ -13942,7 +13943,7 @@ TEST(SemanticAnalyzerCSubset, TFC89NonTypeUserDeclStillSuppressesShippedTypedef)
         "int my_int_t;\n"                       // a user OBJECT of that name
         "int main(void) { my_int_t = 5; return my_int_t; }\n");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countSymbolsNamed(model, "my_int_t"), 1u)
         << "a user OBJECT claim keeps the goal-2 skip: the descriptor typedef "
            "must NOT be injected alongside it";
@@ -14020,7 +14021,7 @@ TEST(SemanticAnalyzerCSubset, InlineFunctionTypedParamAdjustsToPointerToFunction
         "int main(void) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InvalidFunctionDeclarator), 0u)
         << "a function-typed PARAMETER is not a prototype — C 6.7.6.3p8 adjusts "
@@ -14057,7 +14058,7 @@ TEST(SemanticAnalyzerCSubset, FunctionTypedefParamAdjustsToPointerToFunction) {
         "int main(void) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InvalidFunctionDeclarator), 0u)
         << "the SDK's function-TYPEDEF parameter spelling must adjust, not reject";
@@ -14301,7 +14302,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertFailureAppendsFoldedOperandsForEqualit
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     std::string text;
     std::size_t n = 0;
     for (auto const& d : model.diagnostics().all()) {
@@ -14326,7 +14327,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertFoldedOperandSuffixIsVerbAgnostic) {
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     std::string text;
     for (auto const& d : model.diagnostics().all())
         if (d.code == DiagnosticCode::S_StaticAssertFailed) text = d.actual;
@@ -14346,7 +14347,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertFailuresSharingOneMessageAreDistinguis
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     std::vector<std::string> texts;
     for (auto const& d : model.diagnostics().all())
         if (d.code == DiagnosticCode::S_StaticAssertFailed)
@@ -14367,7 +14368,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertNonBinaryConditionEmitsWithoutOperandS
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     std::string text;
     std::size_t n = 0;
     for (auto const& d : model.diagnostics().all()) {
@@ -14393,7 +14394,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertNonConstantOperandRendersAsNonConstant
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     std::string text;
     for (auto const& d : model.diagnostics().all())
         if (d.code == DiagnosticCode::S_StaticAssertFailed) text = d.actual;
@@ -14513,7 +14514,7 @@ TEST(SemanticAnalyzerCSubset, SizeofIncompleteArrayTypedefFailsLoud) {
         "int main(void) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u)
         << "`sizeof(T)` on an incomplete array must REFUSE — folding it to 0 "
@@ -14558,7 +14559,7 @@ TEST(SemanticAnalyzerCSubset, IncompleteArrayTypedefTrailingMemberIsAFlexibleArr
         "int main(void) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_FALSE(model.hasErrors());
     auto const* v = findSym(model, "v");
     ASSERT_NE(v, nullptr);
@@ -14613,7 +14614,7 @@ TEST(SemanticAnalyzerCSubset, TrailingZeroLengthArrayMemberLeavesStructSizeUncha
         "int main(void) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArrayLengthOutOfRange), 0u)
         << "a TRAILING `int t[0];` member is the GNU zero-length array — admit "
@@ -14648,7 +14649,7 @@ TEST(SemanticAnalyzerCSubset, ZeroLengthAndAbsentBoundMembersLayOutIdentically) 
         "int main(void) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_FALSE(model.hasErrors());
     TypeInterner const& in = model.lattice().interner();
     auto const* z = findSym(model, "z");
@@ -14829,13 +14830,13 @@ namespace {
     DataModel dataModel) {
     fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(shipped);
     builder.setActiveFormat(format);
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    return analyze(cu, dataModel,
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel,
                    AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                    std::nullopt, format, arch);
 }
@@ -15019,7 +15020,7 @@ constexpr char const* kProbeTagSource =
     auto cu = buildAngleDescriptorUnit(sysDir, "probe.json", kProbeTagDescriptor,
                                        kProbeTagSource);
     assertNoBuilderErrors(*cu);
-    return analyze(cu, dataModel,
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel,
                    AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
 }
 } // namespace
@@ -15096,7 +15097,7 @@ TEST(SemanticAnalyzerCSubset, NoreturnOnStructMemberFunctionPointerReachesTheSin
         "};\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "the leading GNU member attribute must analyze cleanly";
 
@@ -15124,7 +15125,7 @@ TEST(SemanticAnalyzerCSubset, NoreturnOnFunctionPointerObjectReachesTheSink) {
         "void (*gp2)(int);\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors());
     SymbolRecord const* gp  = findSym(model, "gp");
     SymbolRecord const* gp2 = findSym(model, "gp2");
@@ -15149,7 +15150,7 @@ TEST(SemanticAnalyzerCSubset, NoreturnOnPlainDataObjectStaysInert) {
         "struct S { __attribute__((__noreturn__)) int m; };\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     SymbolRecord const* gv = findSym(model, "gv");
     SymbolRecord const* m  = findSym(model, "m");
     ASSERT_NE(gv, nullptr);
@@ -15169,7 +15170,7 @@ TEST(SemanticAnalyzerCSubset, StructMemberLeadingAlignedAttributeIsHonored) {
         "struct S { __attribute__((aligned(16))) int a; };\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_FALSE(model.hasErrors());
     SymbolRecord const* a = findSym(model, "a");
     ASSERT_NE(a, nullptr);
@@ -15188,7 +15189,7 @@ TEST(SemanticAnalyzerCSubset, StructMemberLeadingUnknownAttributeIsLoud) {
         "struct S { __attribute__((frobnicate)) int x; };\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_TRUE(model.hasErrors())
         << "an unknown GNU attribute name in the leading member position must "
            "fail loud, never be skipped";
@@ -15207,7 +15208,7 @@ TEST(SemanticAnalyzerCSubset, StructMemberLeadingNoinlineWarnsLikeTheTrailingSlo
              "struct S { int x __attribute__((noinline)); };\n"}) {
         auto cu = buildShippedUnit("c-subset", { std::string(src) });
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_AttributeIgnoredForDeclarationKind),
                   1u)
@@ -15223,7 +15224,7 @@ TEST(SemanticAnalyzerCSubset, StructMemberLeadingAlignasAndAttributeCompose) {
         "struct S { alignas(16) __attribute__((__noreturn__)) void (*p)(int); };\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_FALSE(model.hasErrors());
     SymbolRecord const* p = findSym(model, "p");
     ASSERT_NE(p, nullptr);
@@ -15272,13 +15273,13 @@ namespace {
                                              std::string_view arch) {
     fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
     auto schema = loadShippedSchema("c-subset");
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(shipped);
     builder.setActiveFormat(format);
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    return analyze(cu, dataModel, std::nullopt, std::nullopt, format, arch);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel, std::nullopt, std::nullopt, format, arch);
 }
 
 // The reproducer, verbatim: legal C that clang and GCC both accept, and the
@@ -15508,7 +15509,7 @@ TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingsQualifyLikeIsoSpelling) {
         "int plain;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* iso = findSym(model, "iso");
     ASSERT_NE(iso, nullptr);
@@ -15553,7 +15554,7 @@ TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingsInPointerQualifierPosition) {
         "int * __volatile pGnuShort;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* iso = findSym(model, "pIso");
     ASSERT_NE(iso, nullptr);
@@ -15589,7 +15590,7 @@ TEST(SemanticAnalyzerCSubset, GnuConstSpellingsMarkObjectsConst) {
         "int mut = 5;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     SymbolRecord const* iso = findSym(model, "iso");
     ASSERT_NE(iso, nullptr);
     ASSERT_TRUE(iso->isConst)
@@ -15647,7 +15648,7 @@ TEST(SemanticAnalyzerCSubset, GnuConstSpellingsInPointerQualifierPosition) {
         "int * __const pGnuShort = 0;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* iso = findSym(model, "pIso");
     ASSERT_NE(iso, nullptr);
@@ -15679,7 +15680,7 @@ TEST(SemanticAnalyzerCSubset, GnuSignedSpellingsResolveLikeIsoSpelling) {
         "unsigned char uC;\n",             // the mis-key's destination
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* iso = findSym(model, "isoC");
     ASSERT_NE(iso, nullptr);
@@ -15738,7 +15739,7 @@ TEST(SemanticAnalyzerCSubset, GnuComplexSpellingsResolveLikeIsoSpelling) {
         "__complex float gnuShortF;\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& ti = model.lattice().interner();
     SymbolRecord const* iso = findSym(model, "isoD");
     ASSERT_NE(iso, nullptr);
@@ -15824,7 +15825,7 @@ TEST(SemanticAnalyzerCSubset, GnuRestrictSpellingsMatchIsoIncludingWhereRefused)
         "void aGnuShort(int a[__restrict 4]);\n",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(model.hasErrors())
         << "every position ISO `restrict` is legal in must accept both GNU "
            "spellings — including the array-suffix modifier slot";
@@ -15909,7 +15910,7 @@ TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingReachesInlineAsmQualifierSlot) 
             "c-subset", {"int main(void){ __asm__ " + std::string(qual) +
                          " (\"\"); return 0; }\n"});
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_FALSE(model.hasErrors())
             << qual << ": the empty-template barrier must be accepted with "
                        "this qualifier spelling";

@@ -307,11 +307,11 @@ readCHeaderFromText(std::string_view    text,
     // so by the repo-wide case-collision guard, so no spelling it will ever see
     // depends on folding. Trigger to revisit: this reader gaining a target/
     // format parameter, or being pointed at a third-party SDK header tree.
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.setHeaderNameMatching(kDefaultHeaderNameMatching);
     builder.addInMemory(std::string{text}, std::string{headerPathLabel});
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
 
     for (auto const& d : model.diagnostics().all()) {
         reporter.report(d);

@@ -16,6 +16,7 @@
 // rather than "rule appears somewhere".
 
 #include "analysis/syntactic/parser.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
@@ -43,9 +44,10 @@ namespace {
     EXPECT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src = SourceBuffer::fromString(std::move(source), "<cast-expr-test>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
     Parser p{std::move(src), std::move(schema), std::move(stream),
+             DiagnosticBudget::libraryDefault(),
              std::move(config), std::move(lexDiags)};
     return std::move(p).parse();
 }
@@ -565,9 +567,10 @@ TEST(ParserCastExpr, BinderlessLanguageHasEmptySidecars) {
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src = SourceBuffer::fromString("print 1 + 2;", "<toy-sidecar>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
-    Parser p{std::move(src), std::move(schema), std::move(stream), {},
+    Parser p{std::move(src), std::move(schema), std::move(stream),
+             DiagnosticBudget::libraryDefault(), {},
              std::move(lexDiags)};
     auto r = std::move(p).parse();
     EXPECT_TRUE(r.typeNameCandidates.empty());

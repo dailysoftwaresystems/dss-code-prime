@@ -120,7 +120,12 @@ std::vector<PPToken> tokenizeToPP(
     std::shared_ptr<SourceBuffer> const& buffer,
     std::shared_ptr<GrammarSchema const> const& schema,
     DiagnosticReporter& rep) {
-    Tokenizer tk{buffer, schema};
+    // The tokenizer's own reporter is drained into `rep` on the very next
+    // lines, so its budget IS `rep`'s budget -- taken from the destination
+    // rather than re-supplied, which makes the two agree by construction
+    // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE). `DiagnosticBudget`
+    // reads only the volume axes, so `rep`'s policy is NOT re-applied here.
+    Tokenizer tk{buffer, schema, DiagnosticBudget{rep.config()}};
     auto result = std::move(tk).tokenize();
     if (result.diagnostics) {
         for (auto const& d : result.diagnostics->all()) rep.report(d);
@@ -6163,13 +6168,14 @@ PreprocessResult preprocessRun(
     std::shared_ptr<GrammarSchema const> schema,
     std::span<fs::path const>            includeDirs,
     HeaderNameMatching                   headerNameMatching,
+    DiagnosticBudget                     budget,
     std::span<fs::path const>            systemDirs,
     std::optional<ObjectFormatKind>      activeFormat,
     std::span<std::string const>         userDefines,
     std::span<PredefinedMacroDef const>  targetPredefinedMacros,
     std::span<PredefinedMacroDef const>  formatPredefinedMacros) {
     PreprocessResult result;
-    result.diagnostics = std::make_unique<DiagnosticReporter>();
+    result.diagnostics = std::make_unique<DiagnosticReporter>(budget.asConfig());
 
     // TF-C74 + TF-C97: merge the LANGUAGE, TARGET and FORMAT predefined-macro
     // lists ONCE, here, and apply the per-format filter ONCE while doing it.
@@ -6369,7 +6375,7 @@ PreprocessResult preprocessRun(
     // `#define` line / `#`-stringize / an uninvoked LIVE macro body still reports;
     // a survival oracle keyed on "did the Error token reach the parser" would
     // wrongly drop those).
-    DiagnosticReporter provisionalTokDiags;
+    DiagnosticReporter provisionalTokDiags{budget.asConfig()};
     auto ppToks = [&] {
         // D-PERF-1 sub-timing: the single tokenize of the synth buffer.
         substrate::PhaseTimers::Scope ppTok{
@@ -6556,12 +6562,13 @@ PreprocessResult preprocessRun(
 // the main buffer's name/id. It knows no language, no architecture and no
 // object format.
 void establishResultContract(PreprocessResult& result,
-                             std::shared_ptr<SourceBuffer> const& mainSourcePtr) {
+                             std::shared_ptr<SourceBuffer> const& mainSourcePtr,
+                             DiagnosticBudget                     budget) {
     SourceBuffer const& mainSource = *mainSourcePtr;
     // Every path reports through this; an abort before the run allocated one
     // would otherwise hand the caller a null `unique_ptr` it dereferences.
     if (!result.diagnostics) {
-        result.diagnostics = std::make_unique<DiagnosticReporter>();
+        result.diagnostics = std::make_unique<DiagnosticReporter>(budget.asConfig());
     }
     result.mainSourceId = mainSource.id();
     // The MAIN source is an origin buffer of every preprocess result, by
@@ -6612,6 +6619,7 @@ PreprocessResult preprocess(
     std::shared_ptr<GrammarSchema const> schema,
     std::span<fs::path const>            includeDirs,
     HeaderNameMatching                   headerNameMatching,
+    DiagnosticBudget                     budget,
     std::span<fs::path const>            systemDirs,
     std::optional<ObjectFormatKind>      activeFormat,
     std::span<std::string const>         userDefines,
@@ -6624,12 +6632,12 @@ PreprocessResult preprocess(
     }
     PreprocessResult result = preprocessRun(
         mainSource, std::move(schema), includeDirs, headerNameMatching,
-        systemDirs, activeFormat, userDefines, targetPredefinedMacros,
+        budget, systemDirs, activeFormat, userDefines, targetPredefinedMacros,
         formatPredefinedMacros);
     // ★ THE SINGLE EXIT. Its value is that it is not optional: a `return` added
     // anywhere inside `preprocessRun` — for a config fault nobody has thought
     // of yet — cannot bypass it.
-    establishResultContract(result, mainSource);
+    establishResultContract(result, mainSource, budget);
     return result;
 }
 

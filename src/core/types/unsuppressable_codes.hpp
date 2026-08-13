@@ -4,8 +4,33 @@
 #include "core/types/parse_diagnostic.hpp"
 
 #include <span>
+#include <string_view>
 
 namespace dss {
+
+// One row of the D-FF2-UNSUPP closed table: the protected code, and the
+// reason it is protected — AS DATA, not as a comment beside it.
+//
+// ★ WHY THE RATIONALE IS A FIELD. This table has always required a written
+// justification per entry, and always kept it in a comment. That was
+// sufficient while the only reader was the next maintainer. It stopped being
+// sufficient when `--suppress=<a protected code>` grew a diagnostic
+// (`D_SuppressRequestIgnored`): the operator whose request is being refused
+// is now a reader too, and a comment cannot be shown to them. Promoting the
+// user-facing sentence into the row means the text they see IS the recorded
+// justification — the two cannot drift, because there is only one of them.
+// This repo's recurring failure is "a comment that records the full fact
+// while the code uses half of it"; here the half the code needs is the half
+// the user needs, so it stops being a comment.
+//
+// `why` reads as the tail of "cannot be suppressed: <why>". It is never
+// empty — `kUnsuppressableEntriesAllExplainThemselves` in the .cpp is a
+// consteval check, so a member added without a reason is a BUILD failure,
+// not a blank line in somebody's terminal.
+struct UnsuppressableEntry {
+    DiagnosticCode   code;
+    std::string_view why;
+};
 
 // D-FF2-UNSUPP: closed-table of DiagnosticCodes whose emission MUST reach the
 // reporter regardless of any `--suppress` policy. These codes' emission
@@ -31,6 +56,20 @@ namespace dss {
 // dedup / maxPerCode / maxDiagnostics for unsuppressable codes — the
 // four silent-drop gates around applyPolicy would otherwise re-open the
 // surface even when policy correctly let the code through.
+//
+// ★ THAT BYPASS IS A CONSEQUENCE OF MEMBERSHIP, NOT A SERVICE MEMBERSHIP
+// OFFERS (2026-08-13). The two properties a member gets — "the user cannot
+// silence this" and "the reporter cannot drop this" — are different
+// questions, and for a while this table was the only way to obtain the
+// second. That made membership a side-channel: a code needing only
+// delivery had to argue a suppression criterion it did not meet, and the
+// criterion loosened every time one did. Delivery now has its own property
+// on the diagnostic (`DiagnosticDelivery` in `parse_diagnostic.hpp`), which
+// `DiagnosticReporter::report` consults through `mustDeliver` alongside
+// `isUnsuppressable`. ⇒ A code that needs the cap to leave it alone takes
+// `DiagnosticDelivery::Guaranteed` at its emit site and does NOT come here.
+// Membership is decided on the suppression criterion in
+// `unsuppressable_codes.cpp` and on nothing else.
 //
 // Membership tiers (informational — the closed-table at the .cpp is
 // the single source of truth):
@@ -139,17 +178,58 @@ namespace dss {
 //   PROMOTE INFO" WOULD SILENTLY REGRESS THE OFFLINE-BUILD GUARANTEE:
 //   every project built with `--warnings-as-errors` would fail the
 //   moment the network did, which is the exact outcome 0xD01F exists to
-//   prevent. Whoever closes this must therefore take the OTHER
-//   resolution offered above (the consteval Info-membership check on the
-//   closed table), or explicitly carve 0xD01F out. An anchor with a live
-//   consumer is not free to be closed either way — the dependency is
-//   recorded in both directions on purpose.
+//   prevent.
+//
+// ★ NARROWED 2026-08-13 — TWO OF THE THREE CANDIDATE RESOLUTIONS ARE NOW
+//   REFUTED, AND WHAT REMAINS IS SMALLER THAN THE ANCHOR IMPLIES.
+//   · "Extend elevation to promote Info" — refuted above, unchanged.
+//   · "Harden with a consteval check FORBIDDING Info-severity members" —
+//     also refuted, and by the same consumer. 0xD01F was judged against
+//     this table's suppression criterion on 2026-08-13 and QUALIFIES on
+//     prong (1): suppressed, a build that silently reused stale sources
+//     after a failed fetch reports SUCCESS, so the artifact ships green
+//     from a revision the operator did not choose. A rule forbidding Info
+//     members would therefore forbid a member that qualifies — it would
+//     resolve the anchor by outlawing its own use case.
+//   · What is left is the observation that dissolves most of it: for
+//     0xD01F the non-elevation of Info is not a gap, it is THE REQUIRED
+//     BEHAVIOUR. The anchor's premise — "strict mode would NOT fail-loud
+//     on its emission" — silently assumes fail-loud is wanted; for the
+//     offline-build guarantee it is precisely what must not happen. So
+//     Info-severity membership is admissible, and non-elevation is its
+//     correct semantics rather than an asymmetry to repair.
+//   ⇒ RESIDUAL QUESTION, and it is the only one still open: whether a
+//     FUTURE Info member could arrive that DOES want strict-mode
+//     fail-loud, which would need per-code elevation opt-in rather than
+//     the code-agnostic arm. No such producer exists, and inventing the
+//     mechanism before one does would ship an untested arm.
+//   ⇒ BLOCKED ON, precisely: 0xD01F has NO EMIT SITE yet (MEASURED
+//     2026-08-13), so it cannot join this table at all —
+//     `EveryMemberHasAnEmitSiteOrIsMarkedRetired` reds on a member
+//     nothing emits. The AP6 lane landing `dependency_resolver` /
+//     `git_acquire` is the trigger for BOTH the row and this anchor's
+//     final closure.
+//   ⓘ Note what is NO LONGER part of this question: 0xD01F also needs the
+//     reporter's cap to leave it alone, and that used to be a second
+//     reason to want membership. It is now a separate, independently
+//     grantable property (`DiagnosticDelivery::Guaranteed`), so the
+//     delivery need no longer applies any pressure to this decision.
 [[nodiscard]] DSS_EXPORT bool
 isUnsuppressable(DiagnosticCode code) noexcept;
 
 // Public view of the closed-table for introspection (tests, --help,
 // future diagnostic-policy validation at CLI parse time).
-[[nodiscard]] DSS_EXPORT std::span<DiagnosticCode const>
+[[nodiscard]] DSS_EXPORT std::span<UnsuppressableEntry const>
 unsuppressableCodes() noexcept;
+
+// The recorded reason `code` is protected, or an EMPTY view when `code` is
+// not a member. The empty return is the only correct answer for a non-member
+// — there is no reason, because there is no protection — and callers must
+// treat it as such rather than rendering a blank explanation:
+// `D_SuppressRequestIgnored` is only ever emitted for a code that
+// `isUnsuppressable` already answered true for, so the empty arm is
+// unreachable there by construction.
+[[nodiscard]] DSS_EXPORT std::string_view
+unsuppressableRationale(DiagnosticCode code) noexcept;
 
 } // namespace dss

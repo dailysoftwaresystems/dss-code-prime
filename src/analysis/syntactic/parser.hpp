@@ -3,6 +3,7 @@
 #include "analysis/syntactic/binder_sketch.hpp"
 #include "analysis/syntactic/pratt_walker.hpp"
 #include "core/export.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/source_buffer.hpp"
@@ -162,9 +163,19 @@ public:
     // owns lexer + parser diagnostics in one stream (08-compilation-unit-
     // plan §2.6 C2-L1). Defaulted to nullptr — existing callers are
     // unaffected.
+    // `budget` is REQUIRED and sits BEFORE the two defaulted parameters so a
+    // caller cannot reach them without stating it. The parser owns no reporter
+    // — it hands this straight to the `TreeBuilder` it builds in `parse()`,
+    // which owns the operator-visible parse+lex stream. Before this parameter
+    // existed, `TreeBuilder`'s own `diagConfig = {}` default was taken here and
+    // the tree capped at the library's 1000/50 whatever the operator
+    // configured (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE). Callers
+    // with no operator budget in scope pass
+    // `DiagnosticBudget::libraryDefault()`.
     Parser(std::shared_ptr<SourceBuffer>        src,
            std::shared_ptr<GrammarSchema const> schema,
            TokenStream                          tokens,
+           DiagnosticBudget                     budget,
            ParserConfig                         config = {},
            std::unique_ptr<DiagnosticReporter>  lexerDiagnostics = nullptr);
 

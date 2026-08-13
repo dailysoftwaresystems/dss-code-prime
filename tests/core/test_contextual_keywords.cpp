@@ -1,3 +1,4 @@
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -199,7 +200,7 @@ TEST(ContextualKeywords, AwaitDegradesWhenNotInExpectedSet) {
     auto h = make("int await", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(tokAt(*h.src, "int",   CoreTokenKind::Word));
@@ -229,7 +230,7 @@ TEST(ContextualKeywords, AwaitStaysKeywordWhenInExpectedSet) {
     auto h = make("await", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(tokAt(*h.src, "await", CoreTokenKind::Word));
@@ -256,7 +257,7 @@ TEST(ContextualKeywords, HardKeywordWinsRegardlessOfExpectedSet) {
     auto h = make("int if", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(tokAt(*h.src, "int", CoreTokenKind::Word));
@@ -289,7 +290,7 @@ TEST(ContextualKeywords, ContextualPolicyDemotesEveryKeywordOutOfExpectedSet) {
     auto h = make("select from", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(tokAt(*h.src, "select", CoreTokenKind::Word));
@@ -321,7 +322,7 @@ TEST(ContextualKeywords, InvalidCursorFallbackKeepsKeyword) {
     auto h = make("int int await", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(tokAt(*h.src, "int", CoreTokenKind::Word));            // consumes IntKw slot
@@ -387,7 +388,7 @@ TEST(ContextualKeywords, DemotedKeywordAdvancesCursorAsIdentifier) {
     auto h = make("int await x", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(tokAt(*h.src, "int",   CoreTokenKind::Word));
@@ -430,7 +431,7 @@ TEST(ContextualKeywords, CascadeCloseTripsOneShotDesync) {
     auto h = make("do", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root  = b.open(h.schema->rules().find("root"));
         // Open `root` again rather than `outer` — drives the cursor
@@ -464,7 +465,7 @@ TEST(ContextualKeywords, ContextualResolutionDiagnosticContentIsPinned) {
     ASSERT_NE(awaitOffset, std::string_view::npos);
 
     const RuleId rootRule = h.schema->rules().find("root");
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(rootRule);
         b.pushToken(tokAt(*h.src, "int",   CoreTokenKind::Word));
@@ -508,7 +509,7 @@ TEST(ContextualKeywords, ContextualDemotionAtNestedRuleLevel) {
     auto h = make("int await", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root  = b.open(h.schema->rules().find("root"));
         auto outer = b.open(h.schema->rules().find("outer"));
@@ -553,7 +554,7 @@ TEST(ContextualKeywords, CSubsetIntDeclEmitsNoContextualResolution) {
     auto schema = *loaded;
     auto src = SourceBuffer::fromString("int x;", "<csubset-smoke>");
 
-    TreeBuilder b{src, schema};
+    TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(schema->rules().find("root"));
         auto top  = b.open(schema->rules().find("topLevel"));

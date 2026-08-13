@@ -5,6 +5,7 @@
 // rather than copied per-file so the suites can't drift.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -113,7 +114,7 @@ private:
 // Build a CompilationUnit from one in-memory toy source per entry. Each source
 // must be a clean toy program so the resulting Tree has a valid root.
 [[nodiscard]] inline CompilationUnit makeToyUnit(std::initializer_list<std::string> sources) {
-    UnitBuilder builder{loadToySchema()};
+    UnitBuilder builder{loadToySchema(), DiagnosticBudget::libraryDefault()};
     unsigned index = 0;
     for (auto const& source : sources) {
         builder.addInMemory(source, "<mem" + std::to_string(index++) + ">");

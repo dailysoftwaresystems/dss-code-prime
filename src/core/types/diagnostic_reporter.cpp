@@ -65,18 +65,20 @@ std::size_t DiagnosticReporter::warningCount() const noexcept {
 
 DiagnosticReporter::Snapshot DiagnosticReporter::snapshotForRollback() const {
     Snapshot s;
-    s.allSize = all_.size();
-    s.perCode = perCode_;
-    s.recent  = recent_;
-    s.hitCap  = hitCap_;
+    s.allSize        = all_.size();
+    s.perCode        = perCode_;
+    s.recent         = recent_;
+    s.hitCap         = hitCap_;
+    s.droppedByCap   = droppedByCap_;
+    s.capMarkerIndex = capMarkerIndex_;
     return s;
 }
 
 void DiagnosticReporter::forceReport(ParseDiagnostic d) {
-    auto filtered = applyPolicy(std::move(d));
-    if (!filtered) return;
-    perCode_[filtered->code]++;
-    all_.push_back(std::move(*filtered));
+    // The property IS the mechanism — see `DiagnosticDelivery`. Writing the
+    // push here a second time is what let the two paths drift apart before.
+    d.delivery = DiagnosticDelivery::Guaranteed;
+    report(std::move(d));
 }
 
 void DiagnosticReporter::truncateTo(Snapshot const& snap) {
@@ -88,9 +90,11 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
     // CANNOT be back-truncated by size alone because pop_front during
     // speculation may have evicted original entries; only the full
     // snapshot is mathematically sound.
-    perCode_ = snap.perCode;
-    recent_  = snap.recent;
-    hitCap_  = snap.hitCap;
+    perCode_        = snap.perCode;
+    recent_         = snap.recent;
+    hitCap_         = snap.hitCap;
+    droppedByCap_   = snap.droppedByCap;
+    capMarkerIndex_ = snap.capMarkerIndex;
 }
 
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
@@ -165,6 +169,9 @@ std::uint64_t hashKey(ParseDiagnostic const& d) noexcept {
     // findings collide on the key — the deficiency UnitBuilder's driver reporter
     // sidesteps by disabling dedup wholesale.)
     h = fnv1a64Bytes(h, d.actual);
+    // d.delivery is INTENTIONALLY excluded: it is a routing decision about
+    // this REPORT, not a property of the fact being reported. Two emit sites
+    // describing the same fact at the same place must still collapse.
     // d.contextPrefix is INTENTIONALLY excluded — see ParseDiagnostic
     // field comment + D-MERGE-DEDUP-PREFIX-COLLISION fold. Multi-
     // target merge stamps a per-target prefix at the merge point; two
@@ -173,7 +180,110 @@ std::uint64_t hashKey(ParseDiagnostic const& d) noexcept {
     // duplicates-with-different-prefix.
     return h;
 }
+
+// THE delivery question, asked in exactly one place: may the reporter's
+// VOLUME controls (dedup window, per-code cap, global cap) drop this?
+//
+// Two independent sources say no, and they answer DIFFERENT questions:
+//   * `isUnsuppressable(code)` answers SUPPRESSION — "the user must not be
+//     able to silence this". Bypassing the volume gates is a CONSEQUENCE of
+//     what such a code is (its emission gates ok / errorCount, so it cannot
+//     be allowed to vanish by any route), not the reason it is a member.
+//   * `DiagnosticDelivery::Guaranteed` answers DELIVERY directly, for the
+//     diagnostics that need only that. Before it existed they had to join
+//     the closed table to obtain it, which used membership as a side-channel
+//     for a property the table was never defined to carry — and paid for it
+//     by loosening the table's one criterion.
+[[nodiscard]] bool mustDeliver(ParseDiagnostic const& d) noexcept {
+    return d.delivery == DiagnosticDelivery::Guaranteed
+        || isUnsuppressable(d.code);
+}
+
+// House-style fail-loud sink (see `lineSliceFatal` below). Unreachable by
+// construction — `capMarkerIndex_` is written only in the same block that
+// sets `hitCap_`, read only while `hitCap_` holds, and restored together
+// with it by `truncateTo` — so this exists to make a future edit that
+// breaks that pairing abort with its name on it, rather than write past the
+// end of `all_` and corrupt the diagnostic stream it was trying to explain.
+[[noreturn]] void capMarkerFatal(std::size_t index, std::size_t size) {
+    std::fputs("dss::DiagnosticReporter fatal: cap-marker index out of range "
+               "(hitCap_ is set but capMarkerIndex_ does not address a stored "
+               "diagnostic; this is a compiler bug, not a source error)\n",
+               stderr);
+    std::fprintf(stderr, "  capMarkerIndex = %zu, all_.size() = %zu\n",
+                 index, size);
+    std::abort();
+}
 } // namespace
+
+void DiagnosticReporter::noteCapDrop_() {
+    ++droppedByCap_;
+    if (capMarkerIndex_ >= all_.size()) {
+        capMarkerFatal(capMarkerIndex_, all_.size());
+    }
+    // ★ THE ELISION MUST STATE ITS OWN SIZE AND ITS OWN REMEDY.
+    // "further reports dropped" — the prose this replaced — tells an
+    // operator that they are missing something but not whether it is one
+    // diagnostic or ten thousand, and not what to change to see it. Those
+    // are the two facts that decide what they do next, and the count in
+    // particular cannot be recovered afterwards by anyone: a dropped
+    // diagnostic leaves nothing behind to count.
+    //
+    // Rewritten IN PLACE on every drop rather than computed once at the
+    // end, because there is no "end" — `all()` is readable at any moment
+    // and must never be observed carrying a stale number. `clear()` keeps
+    // the string's capacity, so once the count reaches its digit width this
+    // stops allocating entirely.
+    //
+    // ⚠ NAMES BOTH THE CLI FLAG AND THE CONFIG FIELD, AND THE ORDER IS THE
+    // POINT. An earlier revision of this block named only the field and said
+    // so explicitly, on the correct ground that `--max-diagnostics` DID NOT
+    // EXIST and that naming a flag which parses but changes nothing would be a
+    // worse defect than the one being fixed. The flag now exists and is wired
+    // end-to-end — `program/cli_args.cpp` parses it, `buildReporterConfig`
+    // writes it onto this Config, `Program::run` hands that Config to every
+    // compile-producing entry point — so the ground for the omission is gone,
+    // and leaving the old note in place would make this comment the lie.
+    //
+    // Why both, given `core/` sits BELOW the driver and is also consumed by the
+    // LSP and by embedders, for whom the flag means nothing:
+    //   * The flag comes FIRST because the reader is overwhelmingly an operator
+    //     at a terminal, and a remedy they cannot type is not a remedy.
+    //   * The field comes SECOND because it is true for EVERY consumer,
+    //     including the two the flag cannot serve. Each clause names its own
+    //     audience, so neither reads as false to the other's reader.
+    //   * The alternative — keep this string flag-agnostic and let the CLI
+    //     append the hint at its drain site — was rejected on measurement, not
+    //     taste: the marker inherits the tripping diagnostic's buffer/span, so
+    //     it renders through BOTH `format()` (positioned) and the driver's
+    //     buffer-less one-liner. Appending at the drain means composing the
+    //     operator-visible sentence in two tiers across two render routes, i.e.
+    //     re-creating the second source of truth this whole area exists to
+    //     remove, plus a per-code branch in the driver.
+    // This is a documentation claim, not a behavioural one: nothing here reads
+    // driver state or branches on a consumer identity.
+    //
+    // ⚠ PURE ASCII, deliberately, and this file already made the same call
+    // for the same reason: "ASCII pipes/arrows chosen over the box-drawing
+    // variants in the plan sketch for terminal-portability" (see the
+    // formatting preamble below). There is a second, sharper reason here —
+    // this exact string is byte-compared by a test, no `/utf-8` is passed to
+    // MSVC anywhere in the build (grep the CMake), and a non-ASCII literal
+    // whose encoding depends on the compiler's idea of the source charset is
+    // a cross-toolchain flake waiting for the next CI leg.
+    std::string& text = all_[capMarkerIndex_].actual;
+    text.clear();
+    std::format_to(std::back_inserter(text),
+                   "reporter cap of {} diagnostics reached; {} further {} "
+                   "dropped and NOT shown. Raise the cap above {} to see {}: "
+                   "pass --max-diagnostics=N on the command line, or set "
+                   "DiagnosticReporter::Config::maxDiagnostics when embedding.",
+                   cfg_.maxDiagnostics,
+                   droppedByCap_,
+                   droppedByCap_ == 1 ? "diagnostic was" : "diagnostics were",
+                   cfg_.maxDiagnostics,
+                   droppedByCap_ == 1 ? "it" : "them");
+}
 
 bool DiagnosticReporter::isRecentDuplicate(ParseDiagnostic const& d) const noexcept {
     if (cfg_.dedupWindow == 0) return false;
@@ -188,23 +298,28 @@ void DiagnosticReporter::report(ParseDiagnostic d) {
     auto filtered = applyPolicy(std::move(d));
     if (!filtered) return;
 
-    // D-FF2-UNSUPP CRITICAL: bypass ALL caps + dedup for unsuppressable
-    // codes. The closed-table contract: emission MUST reach `all_` so
-    // `errorCount()` correctly reflects the severity-gating diagnostic.
-    // Pre-fold the suppress/overrides/warningsAsErrors gates were
-    // bypassed in applyPolicy, but the FOUR cap/dedup gates here
-    // (hitCap_ / dedupWindow / maxPerCode / maxDiagnostics) each
-    // silently drop the diagnostic — re-opening the silent-failure
-    // surface every unsuppressable code was introduced to close.
-    // perCode_ is still incremented so accounting stays consistent;
-    // dedup/recent_ is skipped (we want every instance counted).
-    if (isUnsuppressable(filtered->code)) {
+    // THE DELIVERY GATE. Bypasses ALL FOUR volume gates below (hitCap_ /
+    // dedupWindow / maxPerCode / maxDiagnostics), each of which otherwise
+    // drops the diagnostic — re-opening the silent-failure surface that
+    // every unsuppressable code, and every Guaranteed-delivery emit site,
+    // exists to close. perCode_ is still incremented so accounting stays
+    // consistent; dedup/recent_ is skipped (we want every instance
+    // counted). See `mustDeliver` above for why the predicate has two
+    // arms and why they are not the same question.
+    if (mustDeliver(*filtered)) {
         ++perCode_[filtered->code];
         all_.push_back(std::move(*filtered));
         return;
     }
 
-    if (hitCap_) return;
+    if (hitCap_) {
+        // Counted, not merely discarded: this is the one path on which the
+        // information is lost forever, so it is the one path that has to
+        // leave a number behind. One increment plus an in-place rewrite on
+        // a path that was already throwing the diagnostic away.
+        noteCapDrop_();
+        return;
+    }
 
     if (isRecentDuplicate(*filtered)) {
         return;
@@ -224,12 +339,24 @@ void DiagnosticReporter::report(ParseDiagnostic d) {
         ParseDiagnostic marker{};
         marker.code     = DiagnosticCode::P_TooManyDiagnostics;
         marker.severity = DiagnosticSeverity::Error;
+        // Guaranteed for the same reason every other guaranteed diagnostic
+        // is: it is the ONLY statement of its fact. It is ALSO pushed
+        // directly rather than re-entered through `report`, which is what
+        // makes it un-`--suppress`-able — the notice that diagnostics were
+        // hidden must not itself be hideable, or the cap becomes silent
+        // again through the front door. The field is set so a reader of
+        // this record sees the same delivery contract every other
+        // guaranteed diagnostic carries, and so a future refactor that DOES
+        // route the marker through `report` keeps the guarantee.
+        marker.delivery = DiagnosticDelivery::Guaranteed;
         marker.buffer   = filtered->buffer;
         marker.span     = filtered->span;
-        marker.actual   = std::format(
-            "reporter cap of {} diagnostics reached; further reports dropped",
-            cfg_.maxDiagnostics);
+        capMarkerIndex_ = all_.size();
         all_.push_back(std::move(marker));
+        // The diagnostic that TRIPPED the cap is dropped too — the marker
+        // stands in its place, it is not stored alongside it — so it is the
+        // first thing the count counts.
+        noteCapDrop_();
         return;
     }
 

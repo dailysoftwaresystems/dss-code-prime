@@ -1,3 +1,4 @@
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -76,7 +77,7 @@ constexpr std::string_view kBasicCfg = R"JSON({
 TEST(Checkpoint, RollbackRestoresArenaSize) {
     auto h = make("a;", kBasicCfg);
     ASSERT_NE(h.schema, nullptr);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     {
         auto cp = b.checkpoint();
@@ -97,7 +98,7 @@ TEST(Checkpoint, RollbackRestoresArenaSize) {
 
 TEST(Checkpoint, RollbackRestoresOpenFrameStack) {
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     auto cp = b.checkpoint();
@@ -124,7 +125,7 @@ TEST(Checkpoint, RollbackRestoresOpenFrameStack) {
 
 TEST(Checkpoint, RollbackRestoresScopeStack) {
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     b.pushScope(ScopeKind::Block);
@@ -147,7 +148,7 @@ TEST(Checkpoint, RollbackRestoresScopeStack) {
 
 TEST(Checkpoint, RollbackDropsDiagnostics) {
     auto h = make("@", kBasicCfg);                     // '@' is unknown
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     {
         auto cp = b.checkpoint();
@@ -164,7 +165,7 @@ TEST(Checkpoint, RollbackDropsDiagnostics) {
 
 TEST(Checkpoint, CommitKeepsDiagnostics) {
     auto h = make("@", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     {
         auto cp = b.checkpoint();
@@ -185,7 +186,7 @@ TEST(Checkpoint, RollbackClearsHitCapLatch) {
     DiagnosticReporter::Config cfg;
     cfg.maxDiagnostics = 3;                            // tiny cap
     cfg.dedupWindow    = 0;                            // disable dedup
-    TreeBuilder b{h.src, h.schema, cfg};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget{cfg}};
     auto root = b.open(h.schema->rules().find("root"));
 
     auto cp = b.checkpoint();
@@ -209,13 +210,47 @@ TEST(Checkpoint, RollbackClearsHitCapLatch) {
         return d.code == DiagnosticCode::P_UnexpectedToken &&
                d.actual.find("real") != std::string::npos;
     }));
+
+    // ★ THE PRECONDITION THIS TEST NEVER STATED, AND WITHOUT WHICH EVERYTHING
+    // ABOVE PASSES VACUOUSLY. ✔MEASURED 2026-08-13 while threading
+    // `DiagnosticBudget`: replace this builder's `maxDiagnostics = 3` with the
+    // library's 1000 and ten `pushError`s trip no cap, no latch is ever set,
+    // there is nothing for `rollback` to clear — and the assertions above STILL
+    // PASS, because "a post-rollback diagnostic lands" is true whether or not
+    // the mechanism under test exists at all.
+    //
+    // The same flood WITHOUT the rollback is the control that fixes it: "real"
+    // must be SWALLOWED, which can only happen if the cap genuinely latched.
+    // `TreeBuilder` exposes no reporter accessor, so this is the only way to
+    // observe the latch through the public API — and it is the better pin
+    // anyway, since it asserts the SILENCING this test exists to prove
+    // `rollback` undoes. (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE)
+    {
+        auto h2 = make("a;", kBasicCfg);
+        TreeBuilder b2{h2.src, h2.schema, DiagnosticBudget{cfg}};
+        auto root2 = b2.open(h2.schema->rules().find("root"));
+        for (int i = 0; i < 10; ++i) {
+            b2.pushError(SourceSpan::of(0, 1), std::nullopt, std::nullopt, "noise");
+        }
+        b2.pushError(SourceSpan::of(0, 1), std::nullopt, std::nullopt, "real");
+        root2.close();
+        Tree t2 = std::move(b2).finish();
+        EXPECT_FALSE(std::ranges::any_of(t2.diagnostics().all(), [](auto const& d) {
+            return d.code == DiagnosticCode::P_UnexpectedToken &&
+                   d.actual.find("real") != std::string::npos;
+        }))
+            << "the speculative flood did NOT trip the cap, so the test above is "
+               "not exercising the latch it is named for — check that the tiny "
+               "maxDiagnostics budget is actually reaching this builder's "
+               "reporter";
+    }
 }
 
 // ── Nested checkpoints ──────────────────────────────────────────────────
 
 TEST(Checkpoint, NestedCommitInnerThenRollbackOuter) {
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     const auto preFrames = b.openFrameCount();
@@ -238,7 +273,7 @@ TEST(Checkpoint, NestedCommitInnerThenRollbackOuter) {
 
 TEST(Checkpoint, NestedRollbackInnerThenCommitOuter) {
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     auto cp1 = b.checkpoint();
@@ -265,7 +300,7 @@ TEST(Checkpoint, MaxSpeculationDepthEmitsExactlyOneDiagnostic) {
     auto h = make("a;", kBasicCfg);
     BuilderConfig bc;
     bc.maxSpeculationDepth = 3;
-    TreeBuilder b{h.src, h.schema, {}, bc};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault(), bc};
     auto root = b.open(h.schema->rules().find("root"));
 
     auto cp1 = b.checkpoint();
@@ -291,7 +326,7 @@ TEST(Checkpoint, MaxSpeculationDepthEmitsExactlyOneDiagnostic) {
 
 TEST(Checkpoint, UncommittedCheckpointDtorEmitsWarning) {
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     {
         auto cp = b.checkpoint();
@@ -304,7 +339,7 @@ TEST(Checkpoint, UncommittedCheckpointDtorEmitsWarning) {
 
 TEST(Checkpoint, UncommittedCheckpointStillRollsBack) {
     auto h = make("@", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     {
         auto cp = b.checkpoint();
@@ -390,7 +425,7 @@ TEST(Checkpoint, NoOpGuardAfterCapAcceptsCommitAndRollback) {
     auto h = make("a;", kBasicCfg);
     BuilderConfig bc;
     bc.maxSpeculationDepth = 1;
-    TreeBuilder b{h.src, h.schema, {}, bc};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault(), bc};
     auto root = b.open(h.schema->rules().find("root"));
 
     auto cp1 = b.checkpoint();
@@ -415,7 +450,7 @@ TEST(Checkpoint, ThousandTokensWithSpeculationUnder50ms) {
     for (int i = 0; i < 1000; ++i) source += "a;";
 
     auto h = make(std::move(source), kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -453,7 +488,7 @@ TEST(Checkpoint, RollbackRestoresPerCodeCap) {
     cfg.maxDiagnostics = 1000;
     cfg.maxPerCode     = 3;
     cfg.dedupWindow    = 0;
-    TreeBuilder b{h.src, h.schema, cfg};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget{cfg}};
     auto root = b.open(h.schema->rules().find("root"));
     {
         auto cp = b.checkpoint();
@@ -485,7 +520,7 @@ TEST(Checkpoint, RollbackRestoresDedupWindow) {
     DiagnosticReporter::Config cfg;
     cfg.maxDiagnostics = 1000;
     cfg.dedupWindow    = 4;
-    TreeBuilder b{h.src, h.schema, cfg};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget{cfg}};
     auto root = b.open(h.schema->rules().find("root"));
     {
         auto cp = b.checkpoint();
@@ -514,7 +549,7 @@ TEST(Checkpoint, RollbackRestoresCursorAndStack) {
     // Open a frame inside speculation (so cursorStack_ grows), leave it
     // open, roll back. After rollback the cursor stack must match pre-cp.
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     const auto preFrames = b.openFrameCount();
 
@@ -543,7 +578,7 @@ TEST(Checkpoint, RollbackRestoresCursorAndStack) {
 
 TEST(Checkpoint, RollbackRestoresClosedCookieSetAndNextCookie) {
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     auto cp = b.checkpoint();
@@ -578,7 +613,7 @@ TEST(Checkpoint, RollbackTruncatesPendingChildren) {
     // frame post-rollback and checking that the resulting subtree has
     // exactly the children we add, not stale speculative residue.
     auto h = make("aa;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     auto cp = b.checkpoint();
@@ -618,7 +653,7 @@ TEST(Checkpoint, InnerCommitThenOuterRollbackUndoesEverything) {
     // rollback silently no-op. The pair-vector + linear-search-by-id
     // fix makes this scenario work correctly.
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     const auto preNodeCount = b.openFrameCount();   // = 1
 
@@ -656,7 +691,7 @@ TEST(Checkpoint, StaleCheckpointIdEmitsBuilderInvariant) {
     // misbehaved caller could still trip it by hand-rolling. Verify
     // the guard fires.
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     {
@@ -681,7 +716,7 @@ TEST(Checkpoint, StaleCheckpointIdEmitsBuilderInvariant) {
 
 TEST(Checkpoint, OuterCommitWhileInnerPendingEmitsInvariant) {
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     auto cp1 = b.checkpoint();
@@ -706,7 +741,7 @@ TEST(Checkpoint, OuterCommitWhileInnerPendingEmitsInvariant) {
 
 TEST(Checkpoint, MoveCtorTransfersOwnership) {
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     auto cp1 = b.checkpoint();
@@ -723,7 +758,7 @@ TEST(Checkpoint, MoveCtorTransfersOwnership) {
 
 TEST(Checkpoint, MoveAssignOverPendingRollsBackTheOverwritten) {
     auto h = make("@", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
 
     auto cp1 = b.checkpoint();
@@ -749,7 +784,7 @@ TEST(Checkpoint, MaxDepthLatchResetsOnRollback) {
     auto h = make("a;", kBasicCfg);
     BuilderConfig bc;
     bc.maxSpeculationDepth = 1;
-    TreeBuilder b{h.src, h.schema, {}, bc};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault(), bc};
     auto root = b.open(h.schema->rules().find("root"));
 
     // Trip the cap inside speculation, then roll back the OUTER cp1.
@@ -884,7 +919,7 @@ TEST(Checkpoint, NestedFramesProduceContiguousChildIndex) {
     // invariant. Build a 3-deep nested tree and verify each parent's
     // children resolve correctly.
     auto h = make("a;", kBasicCfg);
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     auto stmt = b.open(h.schema->rules().find("stmt"));
     b.pushToken(tokAt(*h.src, "a", CoreTokenKind::Word));

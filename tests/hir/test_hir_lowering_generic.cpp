@@ -7,6 +7,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "hir/hir.hpp"
@@ -93,10 +94,10 @@ TEST(HirLoweringGeneric, SyntheticLanguageLowersWithoutNameDependence) {
     auto loaded = GrammarSchema::loadFromText(kSynthSchema);
     ASSERT_TRUE(loaded) << "synthetic schema failed to load";
 
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory("let a : int = 1 + 2;\nlet b : int = a + 3;\n", "<syn>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors()) << "synthetic program failed semantic analysis";
 
     DiagnosticReporter r;

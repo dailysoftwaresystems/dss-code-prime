@@ -7,6 +7,7 @@
 // listing the expected diagnostic codes) is the next step PA5/PA6 want.
 
 #include "analysis/syntactic/parser.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -91,13 +92,13 @@ void checkGoldenTree(Tree const& t, fs::path const& goldenPath) {
 
     const auto source = readFile(corpusFile);
     auto src = SourceBuffer::fromString(source, corpusFile.string());
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexerDiags] = std::move(tk).tokenize();
 
     EXPECT_TRUE(lexerDiags->all().empty())
         << "tokenizer must produce zero diagnostics on a clean corpus file";
 
-    Parser p{src, schema, std::move(stream)};
+    Parser p{src, schema, std::move(stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     return std::move(result.tree);
 }

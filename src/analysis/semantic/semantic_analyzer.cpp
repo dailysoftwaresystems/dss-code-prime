@@ -225,8 +225,9 @@ struct SchemaIndexes {
 
 // One transient per `analyze()` call. Consumed into the returned model.
 struct EngineState {
-    explicit EngineState(CompilationUnit const& cu)
-        : lattice{cu.id(), cu.compositeSourceLanguage()},
+    EngineState(CompilationUnit const& cu, DiagnosticBudget budget)
+        : reporter(budget.asConfig()),
+          lattice{cu.id(), cu.compositeSourceLanguage()},
           nodeToSymbol{cu},
           nodeToType{cu},
           nodeToSelectedExpr{cu},
@@ -13018,6 +13019,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // ~1 MB main stack at ~25 nesting levels (`D-PARSE-DEEP-FRONTEND-STACK`),
 // so `analyze` invokes this via `callOnLargeStack` on a 64 MiB stack.
 static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
+                                 DiagnosticBudget budget,
                                  DataModel dataModel,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
                                  std::optional<VaListStrategy> vaListStrategy,
@@ -13026,6 +13028,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  LongDoubleFormat longDoubleFormat);
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
+                      DiagnosticBudget budget,
                       DataModel dataModel,
                       std::optional<AggregateLayoutParams> aggregateLayout,
                       std::optional<VaListStrategy> vaListStrategy,
@@ -13052,13 +13055,14 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
         deepRecursionReserveBytes != 0 ? deepRecursionReserveBytes
                                        : dss::substrate::kDeepRecursionStackBytes;
     return dss::substrate::callOnLargeStack(reserveBytes, [&] {
-            return analyzeImpl(std::move(cu), dataModel, std::move(aggregateLayout),
+            return analyzeImpl(std::move(cu), budget, dataModel, std::move(aggregateLayout),
                                std::move(vaListStrategy), std::move(activeFormat),
                                std::move(activeTarget), longDoubleFormat);
         });
 }
 
 static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
+                                 DiagnosticBudget budget,
                                  DataModel dataModel,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
                                  std::optional<VaListStrategy> vaListStrategy,
@@ -13069,7 +13073,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
     }
-    EngineState s{*cu};
+    EngineState s{*cu, budget};
     s.dataModel = dataModel;
     s.longDoubleFormat = longDoubleFormat;
     s.aggregateLayout = aggregateLayout;

@@ -588,10 +588,10 @@ struct NumberScan {
 
 Tokenizer::Tokenizer(std::shared_ptr<SourceBuffer>        src,
                      std::shared_ptr<GrammarSchema const> schema,
-                     DiagnosticReporter::Config           diagConfig)
+                     DiagnosticBudget                     budget)
     : source_(std::move(src))
     , schema_(std::move(schema))
-    , reporter_(std::make_unique<DiagnosticReporter>(std::move(diagConfig))) {
+    , reporter_(std::make_unique<DiagnosticReporter>(budget.asConfig())) {
     if (!source_) tokenizerFatal("source is null");
     if (!schema_) tokenizerFatal("schema is null");
 }

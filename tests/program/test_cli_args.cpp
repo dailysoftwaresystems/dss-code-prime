@@ -12,6 +12,7 @@
 //   * Unknown flags produce CliArgsError::UnknownFlag.
 //   * Missing flag values fire CliArgsError::MissingFlagValue.
 
+#include "core/types/diagnostic_reporter.hpp"   // DiagnosticReporter::Config — the projection's target
 #include "core/types/parse_diagnostic.hpp"
 #include "program/cli_args.hpp"
 #include "program/input_resolver.hpp"
@@ -20,7 +21,12 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <format>
+#include <iostream>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -410,6 +416,7 @@ TEST(CliArgs, HelpTextContainsCoreFlags) {
     EXPECT_NE(text.find("--lsp"), std::string::npos);
     EXPECT_NE(text.find("--jobs"), std::string::npos);  // D-PERF-4-CU-PARALLELISM
     EXPECT_NE(text.find("--stack-reserve"), std::string::npos);  // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH
+    EXPECT_NE(text.find("--max-diagnostics"), std::string::npos);
 }
 
 // ── --transpile mode (plan 10 dispatch — fail-loud today) ────
@@ -784,6 +791,384 @@ TEST(CliArgs, StackReserveNotRangeCheckedAtCliTier) {
 TEST(CliArgs, InvalidStackReserveErrorNameRoundTrip) {
     EXPECT_EQ(cliArgsErrorName(CliArgsError::InvalidStackReserve),
               "InvalidStackReserve");
+}
+
+// ── --max-diagnostics <count> ───────────────────────────────────────────────
+//
+// The operator's half of the `P_TooManyDiagnostics` remedy. The marker names a
+// flag; these pins are what make that name true. Three axes beyond the usual
+// numeric-flag battery:
+//   * the value must REACH `DiagnosticReporter::Config::maxDiagnostics` through
+//     the SHIPPED projection, not through a config a test re-typed;
+//   * absence must leave the field UNWRITTEN, so the struct's own initializer
+//     stays the single source of truth for the default;
+//   * 0 is LEGAL here, unlike `--jobs 0` / `--stack-reserve 0`, and the reason
+//     is a property of `DiagnosticReporter::report` rather than a preference.
+
+TEST(CliArgs, MaxDiagnosticsDefaultsToNullopt) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_FALSE(r->maxDiagnostics.has_value())
+        << "absent --max-diagnostics -> nullopt, so buildReporterConfig leaves "
+           "the Config field untouched and its in-class default stands";
+}
+
+TEST(CliArgs, MaxDiagnosticsParsesEqualsForm) {   // RED-on-disable: drop the arm -> fails
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics=250"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_TRUE(r->maxDiagnostics.has_value());
+    EXPECT_EQ(*r->maxDiagnostics, std::size_t{250});
+}
+
+TEST(CliArgs, MaxDiagnosticsParsesSpaceForm) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics", "7"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_TRUE(r->maxDiagnostics.has_value());
+    EXPECT_EQ(*r->maxDiagnostics, std::size_t{7});
+}
+
+// ★ ZERO IS LEGAL — pinned, because it is the one place this flag departs from
+// its two numeric siblings and a well-meaning "reject 0 like the others" edit
+// would otherwise land silently. The justification is `report()`'s own gate,
+// `all_.size() >= cfg_.maxDiagnostics` on unsigned operands: at 0 the first
+// cap-eligible report trips the cap and is COUNTED, so the operator gets
+// exactly the marker and its running total and nothing else. That behaviour is
+// pinned at its own tier by
+// `Reporter.CapOfZeroStoresOnlyTheMarkerAndStillDeliversGuaranteed`.
+// The two siblings reject 0 for reasons that do not transfer: `--jobs 0` would
+// collide with the AUTO sentinel, and a zero-byte stack reserve cannot start a
+// program. Here 0 collides with nothing (absence is nullopt) and is a value the
+// library implements exactly.
+TEST(CliArgs, MaxDiagnosticsZeroIsLegalAndDistinctFromAbsent) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics=0"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_TRUE(r->maxDiagnostics.has_value())
+        << "0 must be STORED, not swallowed: absence is nullopt, so an "
+           "explicit 0 is distinguishable and must stay so";
+    EXPECT_EQ(*r->maxDiagnostics, std::size_t{0});
+}
+
+TEST(CliArgs, MaxDiagnosticsRejectsNonNumeric) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics=lots"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidMaxDiagnostics);
+    EXPECT_NE(r.error().detail.find("--max-diagnostics"), std::string::npos);
+}
+
+TEST(CliArgs, MaxDiagnosticsRejectsTrailingJunk) {   // "100x" must not silently become 100
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics=100x"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidMaxDiagnostics);
+}
+
+TEST(CliArgs, MaxDiagnosticsRejectsNegative) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics=-1"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value())
+        << "a negative count must fail loud rather than wrap to a huge cap "
+           "(from_chars on an unsigned type rejects the leading '-')";
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidMaxDiagnostics);
+}
+
+// OVERFLOW is its own pin because its failure mode is the nastiest one this
+// flag has: a wrapped parse turns "I want a huge cap" into a tiny one, and the
+// operator sees FEWER diagnostics than the default while believing they asked
+// for more. `from_chars` reports `result_out_of_range`; the arm must treat that
+// as an error, not as "parsed what it could".
+TEST(CliArgs, MaxDiagnosticsRejectsOverflow) {
+    std::string const tooBig =
+        std::to_string(std::numeric_limits<std::size_t>::max()) + "0";
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics=" + tooBig};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value()) << "SIZE_MAX*10 must not parse";
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidMaxDiagnostics);
+}
+
+// ...and the boundary directly below it round-trips EXACTLY. Pairs with the
+// overflow pin: together they say the reject fires at the right value rather
+// than merely somewhere.
+TEST(CliArgs, MaxDiagnosticsSizeMaxRoundTripsExactly) {
+    auto const limit = std::numeric_limits<std::size_t>::max();
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics=" + std::to_string(limit)};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    ASSERT_TRUE(r->maxDiagnostics.has_value());
+    EXPECT_EQ(*r->maxDiagnostics, limit);
+}
+
+TEST(CliArgs, MaxDiagnosticsMissingValueRejected) {   // `--max-diagnostics` as the last argv
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+TEST(CliArgs, MaxDiagnosticsEqualsEmptyRhsRejects) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics="};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
+TEST(CliArgs, MaxDiagnosticsAloneIsNoModeError) {
+    Argv a{"dss-code-prime", "--max-diagnostics", "10"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+}
+
+// The two modes that build NO capped reporter must refuse the flag rather than
+// discard it: `--lsp` returns from `Program::run` before the reporter config is
+// built, and `--dump-predefined-macros` deliberately uses no reporter at all.
+TEST(CliArgs, MaxDiagnosticsRejectedInLspMode) {
+    Argv a{"dss-code-prime", "--lsp", "--max-diagnostics=10"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+    EXPECT_NE(r.error().detail.find("--max-diagnostics"), std::string::npos);
+}
+
+TEST(CliArgs, MaxDiagnosticsRejectedInDumpPredefinedMacrosMode) {
+    Argv a{"dss-code-prime", "--dump-predefined-macros",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--max-diagnostics=10"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+}
+
+// ...and accepted in every mode that DOES build one. Asserted over all four
+// rather than one representative: a mode-gate written as a whitelist is exactly
+// the shape that silently omits a member.
+TEST(CliArgs, MaxDiagnosticsAcceptedInEveryCompilingMode) {
+    {
+        Argv a{"dss-code-prime", "--compile", "a.c",
+               "--language", "c-subset",
+               "--target", "x86_64:elf64-x86_64-linux",
+               "--max-diagnostics=10"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_TRUE(r.has_value()) << "compile: " << r.error().detail;
+        EXPECT_EQ(*r->maxDiagnostics, std::size_t{10});
+    }
+    {
+        Argv a{"dss-code-prime", "--transpile", "a.c",
+               "--language", "c-subset",
+               "--target", "x86_64:elf64-x86_64-linux",
+               "--max-diagnostics=10"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_TRUE(r.has_value()) << "transpile: " << r.error().detail;
+        EXPECT_EQ(*r->maxDiagnostics, std::size_t{10});
+    }
+    {
+        Argv a{"dss-code-prime", "--directory", "src",
+               "--language", "c-subset",
+               "--target", "x86_64:elf64-x86_64-linux",
+               "--max-diagnostics=10"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_TRUE(r.has_value()) << "directory: " << r.error().detail;
+        EXPECT_EQ(*r->maxDiagnostics, std::size_t{10});
+    }
+    {
+        Argv a{"dss-code-prime", "--project", "p.dss-project.json",
+               "--max-diagnostics=10"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_TRUE(r.has_value()) << "project: " << r.error().detail;
+        EXPECT_EQ(*r->maxDiagnostics, std::size_t{10});
+    }
+}
+
+TEST(CliArgs, InvalidMaxDiagnosticsErrorNameRoundTrip) {
+    EXPECT_EQ(cliArgsErrorName(CliArgsError::InvalidMaxDiagnostics),
+              "InvalidMaxDiagnostics");
+}
+
+// ★★ THE PIN THAT MATTERS: the value must REACH the reporter's Config, driven
+// through the SHIPPED path. `parseCliArgs` and `buildReporterConfig` are the
+// two functions `Program::run` itself calls, in that order, on the same
+// `CliArgs` object — so nothing here is re-typed or stubbed. A pin that
+// asserted `cfg.maxDiagnostics == 42` on a hand-built Config would be testing
+// the assignment it wrote, not the projection that ships.
+//
+// RED-ON-DISABLE: delete the `if (args.maxDiagnostics.has_value())` block in
+// `buildReporterConfig` and the first arm fails; the absent arm keeps working,
+// which is exactly why both arms are here.
+TEST(CliArgs, MaxDiagnosticsReachesReporterConfigThroughTheShippedProjection) {
+    {
+        Argv a{"dss-code-prime", "--compile", "a.c",
+               "--language", "c-subset",
+               "--target", "x86_64:elf64-x86_64-linux",
+               "--max-diagnostics=42"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+        auto const cfg = buildReporterConfig(*r);
+        EXPECT_EQ(cfg.maxDiagnostics, std::size_t{42})
+            << "the parsed count must land on the Config the driver hands to "
+               "every compile entry point";
+        // The neighbouring axes must be untouched — a projection that clobbers
+        // maxPerCode/dedupWindow while setting the cap would change behaviour
+        // nobody asked about.
+        EXPECT_EQ(cfg.maxPerCode, DiagnosticReporter::Config{}.maxPerCode);
+        EXPECT_EQ(cfg.dedupWindow, DiagnosticReporter::Config{}.dedupWindow);
+    }
+    {
+        // ★ THE SINGLE-SOURCE-OF-TRUTH ARM. Absent flag => the projection must
+        // leave the field alone, so what comes out is byte-identical to the
+        // struct's OWN in-class default. Compared against `Config{}` rather
+        // than against the literal 1000 on purpose: a test that spelled the
+        // number would become the third place it is written down, and would
+        // keep passing over exactly the drift it exists to catch.
+        Argv a{"dss-code-prime", "--compile", "a.c",
+               "--language", "c-subset",
+               "--target", "x86_64:elf64-x86_64-linux"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+        auto const cfg = buildReporterConfig(*r);
+        EXPECT_EQ(cfg.maxDiagnostics, DiagnosticReporter::Config{}.maxDiagnostics);
+    }
+    {
+        // 0 survives the projection intact — the arm most at risk from a
+        // `value_or` / truthiness rewrite, which would silently turn an
+        // explicit 0 back into the default.
+        Argv a{"dss-code-prime", "--compile", "a.c",
+               "--language", "c-subset",
+               "--target", "x86_64:elf64-x86_64-linux",
+               "--max-diagnostics=0"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+        EXPECT_EQ(buildReporterConfig(*r).maxDiagnostics, std::size_t{0});
+    }
+}
+
+// The other CLI policy flags must keep flowing through the projection after the
+// move out of program.cpp — a relocation that dropped one would be invisible to
+// every pin above.
+TEST(CliArgs, ReporterConfigProjectionStillCarriesWarningsAsErrorsAndSuppress) {
+    Argv a{"dss-code-prime", "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--warnings-as-errors",
+           "--suppress=D_FileNotFound"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    auto const cfg = buildReporterConfig(*r);
+    EXPECT_TRUE(cfg.policy.warningsAsErrors);
+    EXPECT_EQ(cfg.policy.suppress.size(), 1u);
+    EXPECT_EQ(cfg.policy.suppress.count(DiagnosticCode::D_FileNotFound), 1u);
+}
+
+// ★★★ THE END-TO-END WITNESS: real argv into `Program::run`, real stderr out.
+//
+// The projection pin above proves argv reaches the Config. It cannot prove that
+// `Program::run` then HANDS that Config to anything — a wiring regression there
+// (a dispatch arm rebuilding a default Config, say) leaves every pin above
+// green while the flag does nothing. This drives the shipped entry point and
+// reads the operator's actual terminal output.
+//
+// Deterministic without a fixture: at a cap of 0 the FIRST diagnostic the run
+// produces trips the cap, and a nonexistent source file is guaranteed to
+// produce one. No source file, no scratch dir, no ordering assumption.
+//
+// The CONTROL arm is the load-bearing half — without it the pin would pass over
+// an implementation that always caps, which is the mirror defect.
+TEST(CliArgs, MaxDiagnosticsCapAppearsOnRealStderrThroughProgramRun) {
+    auto const runCapturingStderr = [](Argv& a) {
+        std::ostringstream captured;
+        auto* const previous = std::cerr.rdbuf(captured.rdbuf());
+        Program program;
+        (void)program.run(a.argc(), a.argv());
+        std::cerr.rdbuf(previous);
+        return captured.str();
+    };
+
+    {
+        Argv a{"dss-code-prime",
+               "--compile", "no-such-file-for-the-max-diagnostics-pin.c",
+               "--language", "c-subset",
+               "--target", "x86_64:elf64-x86_64-linux",
+               "--max-diagnostics=0"};
+        auto const err = runCapturingStderr(a);
+        EXPECT_NE(err.find("reporter cap of 0 diagnostics reached"),
+                  std::string::npos)
+            << "the operator's cap must reach the run-wide reporter; stderr "
+               "was:\n" << err;
+        EXPECT_NE(err.find("--max-diagnostics"), std::string::npos)
+            << "and the notice must hand back the flag that raises it";
+    }
+    {
+        // CONTROL: same run, flag absent. The default cap is nowhere near
+        // tripping on one missing file, so no marker may appear.
+        Argv a{"dss-code-prime",
+               "--compile", "no-such-file-for-the-max-diagnostics-pin.c",
+               "--language", "c-subset",
+               "--target", "x86_64:elf64-x86_64-linux"};
+        auto const err = runCapturingStderr(a);
+        EXPECT_EQ(err.find("reporter cap of"), std::string::npos)
+            << "without the flag the default cap must stand untripped; stderr "
+               "was:\n" << err;
+    }
+}
+
+// The help text must document the flag AND state the real default — derived
+// from `DiagnosticReporter::Config`, never typed. If someone hard-codes the
+// number here and the struct's default later moves, this goes red instead of
+// the CLI quietly advertising a stale value.
+TEST(CliArgs, HelpTextDocumentsMaxDiagnosticsWithTheLiveDefault) {
+    auto const text = cliHelpText();
+    EXPECT_NE(text.find("--max-diagnostics <count>"), std::string::npos);
+    EXPECT_NE(text.find(std::format("(default: {})",
+                                    DiagnosticReporter::Config{}.maxDiagnostics)),
+              std::string::npos)
+        << "the help text must print the Config's own default, not a literal";
 }
 
 // ── --target=spec equals form ───────────────────────────────

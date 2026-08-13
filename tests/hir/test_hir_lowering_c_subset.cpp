@@ -10,6 +10,7 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/syntactic/parser.hpp"
 #include "core/substrate/large_stack_call.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -53,10 +54,10 @@ namespace {
 [[nodiscard]] SemanticModel analyzeCSubset(std::string src) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    return analyze(cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault());
 }
 
 // As `analyzeCSubset`, but under the PE object format — so `L'…'`/`L"…"` (wchar_t)
@@ -66,10 +67,11 @@ namespace {
 [[nodiscard]] SemanticModel analyzeCSubsetPe(std::string src) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    return analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+    return analyze(cu, DiagnosticBudget::libraryDefault(),
+                   DataModel::Llp64, std::nullopt, std::nullopt,
                    ObjectFormatKind::Pe);
 }
 
@@ -87,19 +89,20 @@ namespace {
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     std::shared_ptr<GrammarSchema const> schema = *loaded;
     auto srcBuf = SourceBuffer::fromString(std::move(src), "<deepmem>");
-    Tokenizer tk{srcBuf, schema};
+    Tokenizer tk{srcBuf, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
     ParserConfig cfg;
     cfg.maxExpressionDepth = cap;
-    Parser p{srcBuf, schema, std::move(stream), std::move(cfg), std::move(lexDiags)};
+    Parser p{srcBuf, schema, std::move(stream), DiagnosticBudget::libraryDefault(),
+             std::move(cfg), std::move(lexDiags)};
     ParseResult result = std::move(p).parse();
     if (result.tree.diagnostics().hasErrors()) {
         ADD_FAILURE() << "raised-cap parse produced errors (cap=" << cap << ")";
     }
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addTree(std::move(result.tree));
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    return analyze(cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault());
 }
 
 [[nodiscard]] std::vector<std::string> symbolNames(SemanticModel const& m) {
@@ -176,10 +179,10 @@ namespace {
         ADD_FAILURE() << "perturbed schema (shiftResult=" << verb << ") failed";
         std::abort();
     }
-    UnitBuilder builder{*schema};
+    UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory("void f(int a, long b) { a << b; }\n", "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     if (model.hasErrors()) {
         ADD_FAILURE() << "front-end errors under shiftResult=" << verb;
         std::abort();
@@ -2663,10 +2666,10 @@ namespace {
         ADD_FAILURE() << "perturbed schema failed to load (row " << nth << ")";
         return kBad;
     }
-    UnitBuilder builder{*schema};
+    UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(src, "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     if (model.hasErrors()) {
         ADD_FAILURE() << "front-end errors under the perturbed schema (row "
                       << nth << ")";
@@ -6484,13 +6487,13 @@ TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
     ASSERT_TRUE(loaded.has_value())
         << (loaded.error().empty() ? "" : loaded.error()[0].message);
 
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(
         "enum E { A, B, C };\n"
         "void f() { enum E e = A; }\n",
         "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
 
     bool foundUndecl = false;
     for (auto const& d : model.diagnostics().all()) {
@@ -6797,16 +6800,17 @@ TEST(HirLoweringCSubset, DeepNestedSwitchAnalyzesFlatOnNormalStack) {
         dss::substrate::kDeepRecursionStackBytes,
         [&]() -> std::shared_ptr<CompilationUnit const> {
             auto srcBuf = SourceBuffer::fromString(std::move(src), "<deepanalyze>");
-            Tokenizer tk{srcBuf, schema};
+            Tokenizer tk{srcBuf, schema, DiagnosticBudget::libraryDefault()};
             auto [stream, lexDiags] = std::move(tk).tokenize();
             ParserConfig pcfg;
             pcfg.maxExpressionDepth = static_cast<std::size_t>(kDepth) + 1000;
-            Parser p{srcBuf, schema, std::move(stream), std::move(pcfg),
+            Parser p{srcBuf, schema, std::move(stream),
+                     DiagnosticBudget::libraryDefault(), std::move(pcfg),
                      std::move(lexDiags)};
             ParseResult result = std::move(p).parse();
             if (result.tree.diagnostics().hasErrors())
                 ADD_FAILURE() << "deep nested-switch parse produced errors";
-            UnitBuilder builder{schema};
+            UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
             builder.addTree(std::move(result.tree));
             return std::make_shared<CompilationUnit>(std::move(builder).finish());
         });
@@ -6814,7 +6818,8 @@ TEST(HirLoweringCSubset, DeepNestedSwitchAnalyzesFlatOnNormalStack) {
     // Pre-fix (recursive resolveDeclTypes): overflows the bounded reserve at kDepth
     // → crash. Post-fix (flat driver): O(1) host stack → clean, error-free model.
     SemanticModel model =
-        analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt, std::nullopt,
+        analyze(cu, DiagnosticBudget::libraryDefault(),
+                DataModel::Lp64, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, LongDoubleFormat::None,
                 /*deepRecursionReserveBytes=*/kAnalyzeReserveBytes);
     EXPECT_FALSE(model.hasErrors())
@@ -8401,12 +8406,13 @@ namespace {
     fs::path const shipped = dss::test::configRoot() / "shippedLibs";
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(shipped);
     builder.setActiveFormat(format);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    return analyze(cu, dataModel, std::nullopt, std::nullopt, format, "x86_64");
+    return analyze(cu, DiagnosticBudget::libraryDefault(),
+                   dataModel, std::nullopt, std::nullopt, format, "x86_64");
 }
 
 // How many `externDecls` rows carry `name` — i.e. how many IMPORTS the lowering

@@ -7,6 +7,7 @@
 //   CompileConfig enumerator to a distinct shipped pipeline name.
 //   Out-of-range ordinals return nullopt (callers fail loud).
 
+#include "core/types/diagnostic_budget.hpp"
 #include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"
 
@@ -15,7 +16,7 @@
 using namespace dss;
 
 TEST(CompileOptions, DefaultsAreDebugAndNoOverride) {
-    CompileOptions opts;
+    CompileOptions opts{DiagnosticBudget::libraryDefault()};
     EXPECT_EQ(opts.config, CompileConfig::Debug);
     EXPECT_EQ(opts.pipelineOverride, nullptr);
 }

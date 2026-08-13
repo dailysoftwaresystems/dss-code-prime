@@ -20,6 +20,7 @@
 // honest C-like outcome for a non-typedef name in that position).
 
 #include "analysis/syntactic/parser.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
@@ -125,9 +126,10 @@ loadPolSchema(std::string_view guardJson) {
                                    ParserConfig config = {}) {
     auto schema = loadPolSchema(guardJson);
     auto src = SourceBuffer::fromString(std::move(source), "<pol-src>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
     Parser p{std::move(src), std::move(schema), std::move(stream),
+             DiagnosticBudget::libraryDefault(),
              std::move(config), std::move(lexDiags)};
     return std::move(p).parse();
 }

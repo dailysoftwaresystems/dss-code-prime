@@ -1,3 +1,4 @@
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -46,7 +47,7 @@ struct LexResult {
 };
 
 [[nodiscard]] LexResult lex(H h) {
-    Tokenizer t{h.src, h.schema};
+    Tokenizer t{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto [stream, reporter] = std::move(t).tokenize();
     LexResult out;
     while (!stream.isAtEnd()) out.tokens.push_back(stream.advance());
@@ -64,7 +65,7 @@ struct LexResult {
 
 TEST(Tokenizer, EmptySourceEmitsOnlyEof) {
     auto h = loadToy("");
-    Tokenizer t{h.src, h.schema};
+    Tokenizer t{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto [stream, reporter] = std::move(t).tokenize();
     EXPECT_EQ(stream.size(), 1u);
     EXPECT_EQ(stream.peek().coreKind, CoreTokenKind::Eof);
@@ -73,7 +74,7 @@ TEST(Tokenizer, EmptySourceEmitsOnlyEof) {
 
 TEST(Tokenizer, EofSpanIsZeroWidthAtEndOfBuffer) {
     auto h = loadToy("var");
-    Tokenizer t{h.src, h.schema};
+    Tokenizer t{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto [stream, reporter] = std::move(t).tokenize();
     while (!stream.isAtEnd()) (void)stream.advance();
     auto const eof = stream.advance();
@@ -501,7 +502,7 @@ TEST(Tokenizer, FractionFlagsDefaultFalseKeepsSplitLexing) {
     auto schema = *loaded;
     {
         auto src = SourceBuffer::fromString("1.", "<tsql>");
-        Tokenizer tk{src, schema};
+        Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
         auto [stream, _] = std::move(tk).tokenize();
         std::vector<Token> tokens;
         while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -512,7 +513,7 @@ TEST(Tokenizer, FractionFlagsDefaultFalseKeepsSplitLexing) {
     }
     {
         auto src = SourceBuffer::fromString(".5", "<tsql>");
-        Tokenizer tk{src, schema};
+        Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
         auto [stream, _] = std::move(tk).tokenize();
         std::vector<Token> tokens;
         while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -868,7 +869,7 @@ TEST(Tokenizer, AmbiguousMeaningsEmitWarningViaFastPath) {
     auto schema = *loaded;
     auto src = SourceBuffer::fromString("?", "<ambig>");
 
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto res = std::move(tk).tokenize();
     ASSERT_FALSE(res.stream.isAtEnd());
 
@@ -876,7 +877,7 @@ TEST(Tokenizer, AmbiguousMeaningsEmitWarningViaFastPath) {
     // (first declared on tie = MeaningA). Drive the token through
     // the builder; expect P_AmbiguousToken to fire via the fast-
     // path's same-priority scan.
-    TreeBuilder b{src, schema};
+    TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(schema->rules().find("root"));
         b.pushToken(res.stream.advance());
@@ -899,7 +900,7 @@ TEST(TokenStream, DefaultThenAssignedTokenStreamWorks) {
     TokenStream s;
     {
         auto h = loadToy("var");
-        Tokenizer t{h.src, h.schema};
+        Tokenizer t{h.src, h.schema, DiagnosticBudget::libraryDefault()};
         s = std::move(t).tokenize().stream;
     }
     // After move-assignment from a Tokenizer-produced stream, every
@@ -984,12 +985,12 @@ TEST(Tokenizer, SchemaKindsMatchExpectedForVarDecl) {
 
 namespace {
 void makeWithNullSource(std::shared_ptr<GrammarSchema const> schema) {
-    Tokenizer t{nullptr, std::move(schema)};
+    Tokenizer t{nullptr, std::move(schema), DiagnosticBudget::libraryDefault()};
     (void)t;
 }
 
 void makeWithNullSchema(std::shared_ptr<SourceBuffer> src) {
-    Tokenizer t{std::move(src), nullptr};
+    Tokenizer t{std::move(src), nullptr, DiagnosticBudget::libraryDefault()};
     (void)t;
 }
 } // namespace
@@ -2096,10 +2097,10 @@ TEST(Tokenizer, TokenFlags_PropagateToBuilderLeafFlags) {
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("(x)", "<flag-prop>");
 
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto tokenizeResult = std::move(tk).tokenize();
 
-    TreeBuilder b{src, schema};
+    TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(schema->rules().find("root"));
         while (!tokenizeResult.stream.isAtEnd()) {
@@ -2162,7 +2163,7 @@ TEST(Tokenizer, IdStartProbe_LongerGlobalLexemeBeatsIdRun) {
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("N'", "<idprobe>");
 
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto res = std::move(tk).tokenize();
     ASSERT_FALSE(res.stream.isAtEnd());
     const Token first = res.stream.advance();
@@ -2183,7 +2184,7 @@ TEST(Tokenizer, IdStartProbe_LongerIdRunBeatsShorterGlobalLexeme) {
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("Nxyz", "<idprobe>");
 
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto res = std::move(tk).tokenize();
     ASSERT_FALSE(res.stream.isAtEnd());
     const Token first = res.stream.advance();
@@ -2209,7 +2210,7 @@ TEST(Tokenizer, IdStartProbe_EqualLengthFavorsIdRun) {
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("N", "<idprobe>");
 
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto res = std::move(tk).tokenize();
     ASSERT_FALSE(res.stream.isAtEnd());
     const Token first = res.stream.advance();
@@ -2235,7 +2236,7 @@ TEST(Tokenizer, IdStartProbe_KeywordPrefixDoesNotSplitIdentifier) {
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("if_foo", "<idprobe>");
 
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto res = std::move(tk).tokenize();
     ASSERT_FALSE(res.stream.isAtEnd());
     const Token first = res.stream.advance();
@@ -2257,7 +2258,7 @@ TEST(Tokenizer, IdStartProbe_BareKeywordResolvesToKeywordKind) {
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("if", "<idprobe>");
 
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto res = std::move(tk).tokenize();
     ASSERT_FALSE(res.stream.isAtEnd());
     const Token first = res.stream.advance();
@@ -2298,7 +2299,7 @@ TEST(Tokenizer, IdStartProbe_RawStringOpenerPushesMode) {
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("r\"abc\"", "<rawstr>");
 
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto res = std::move(tk).tokenize();
     ASSERT_FALSE(res.stream.isAtEnd());
     const Token first = res.stream.advance();
@@ -2361,7 +2362,7 @@ TEST(Tokenizer, GenericNumberStyleHexPrefixDollar) {
         << (loaded.error().empty() ? "" : loaded.error()[0].message);
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("$ff", "<gen>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     std::vector<Token> tokens;
     while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -2375,7 +2376,7 @@ TEST(Tokenizer, GenericNumberStyleCustomExponentLetter) {
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("1.5^3", "<gen>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     std::vector<Token> tokens;
     while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -2389,7 +2390,7 @@ TEST(Tokenizer, GenericNumberStyleApostropheSeparator) {
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("1'000'000", "<gen>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     std::vector<Token> tokens;
     while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -2411,7 +2412,7 @@ TEST(Tokenizer, GenericSeparatorTrailingIsNotConsumed) {
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("1'000'", "<gen>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     std::vector<Token> tokens;
     while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -2428,7 +2429,7 @@ TEST(Tokenizer, GenericSeparatorMustBeFlankedByDigits) {
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("1''2", "<gen>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     std::vector<Token> tokens;
     while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -2454,7 +2455,7 @@ lexGeneric(std::string_view text, std::shared_ptr<SourceBuffer>& srcOut) {
     }
     auto schema = *loaded;
     srcOut      = SourceBuffer::fromString(std::string{text}, "<gen>");
-    Tokenizer tk{srcOut, schema};
+    Tokenizer tk{srcOut, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     std::vector<Token> tokens;
     while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -2514,7 +2515,7 @@ TEST(Tokenizer, GenericNumberStyleFloatSuffixPromotesKind) {
     auto schema = *loaded;
     // `42q` — q is a float suffix in this schema (NOT C-style).
     auto src    = SourceBuffer::fromString("42q", "<gen>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     std::vector<Token> tokens;
     while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -2641,7 +2642,7 @@ TEST(Tokenizer, NumberStyleSignOptionalFalseRejectsSign) {
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString("2^+3", "<sign>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     std::vector<Token> tokens;
     while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -2668,7 +2669,7 @@ TEST(Tokenizer, TsqlNumberStyleSmoke) {
     auto schema = *schemaR;
     {
         auto src = SourceBuffer::fromString("1.5e3", "<sql>");
-        Tokenizer tk{src, schema};
+        Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
         auto [stream, _] = std::move(tk).tokenize();
         std::vector<Token> tokens;
         while (!stream.isAtEnd()) tokens.push_back(stream.advance());
@@ -2678,7 +2679,7 @@ TEST(Tokenizer, TsqlNumberStyleSmoke) {
     }
     {
         auto src = SourceBuffer::fromString("0x10", "<sql>");
-        Tokenizer tk{src, schema};
+        Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
         auto [stream, _] = std::move(tk).tokenize();
         std::vector<Token> tokens;
         while (!stream.isAtEnd()) tokens.push_back(stream.advance());

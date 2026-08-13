@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/source_buffer.hpp"
@@ -40,9 +41,17 @@ struct DSS_EXPORT TokenizeResult {
 // scope stack, which the tokenizer doesn't track.
 class DSS_EXPORT Tokenizer {
 public:
+    // `budget` is REQUIRED and deliberately carries no default argument.
+    // It used to be a `DiagnosticReporter::Config diagConfig = {}`, and every
+    // one of the three production construction sites took that default — so
+    // the parameter existed, reached nothing, and the tokenizer capped at the
+    // library's 1000/50 no matter what the operator asked for
+    // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE). A caller with no
+    // operator budget in scope says so out loud with
+    // `DiagnosticBudget::libraryDefault()`.
     Tokenizer(std::shared_ptr<SourceBuffer>        src,
               std::shared_ptr<GrammarSchema const> schema,
-              DiagnosticReporter::Config           diagConfig = {});
+              DiagnosticBudget                     budget);
 
     Tokenizer(Tokenizer const&)            = delete;
     Tokenizer& operator=(Tokenizer const&) = delete;

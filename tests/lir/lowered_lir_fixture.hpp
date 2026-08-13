@@ -8,6 +8,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/target_schema.hpp"
@@ -48,7 +49,7 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
                   std::uint16_t mirCcIndex = 0) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
     if (target == nullptr) {
@@ -65,7 +66,8 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
         cc != nullptr && cc->vaListLayout.has_value()) {
         vaStrategy = cc->vaListLayout->strategy;
     }
-    auto model = analyze(cu, DataModel::Lp64, std::nullopt, vaStrategy);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
+                         DataModel::Lp64, std::nullopt, vaStrategy);
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
