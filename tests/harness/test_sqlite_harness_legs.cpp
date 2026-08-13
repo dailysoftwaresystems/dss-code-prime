@@ -476,9 +476,11 @@ TEST_F(HarnessLegs, TheLegCatalogueLintsClean) {
 // for its own good reasons, requires `--self-test` to be its ONLY argument, i.e.
 // the last element. Passing the flag as `binaryPath` "works" on Windows and fails
 // on Linux with a bare `spawned=false`, which is how it was found.
-// So the script rides last as the file the helper expects, and a one-line `-c`
-// shim forges the argv the gate wants. Do NOT "simplify" this back to putting the
-// flag last: the Windows arm will accept it and the Linux gate will not.
+// So a SCRATCH COPY of the script rides last as the file the helper expects (a
+// COPY, for the chmod reason spelled out at the staging step below), and a
+// one-line `-c` shim forges the argv the gate wants. Do NOT "simplify" this back
+// to putting the flag last: the Windows arm will accept it and the Linux gate
+// will not.
 TEST_F(HarnessLegs, TheCliSmokeGateSelfTestPasses) {
     auto const py = pythonPath();
     ASSERT_FALSE(py.empty())
@@ -487,12 +489,64 @@ TEST_F(HarnessLegs, TheCliSmokeGateSelfTestPasses) {
     auto const script = harnessDir() / "cli-smoke.py";
     ASSERT_TRUE(fs::exists(script))
         << "the sqlite3 CLI smoke gate is missing: " << script;
+    // ★★ THE GATE RUNS FROM A SCRATCH COPY, NEVER FROM THE REPO FILE.
+    // D-HARNESS-CLI-SMOKE-SELFTEST-CHMODS-TRACKED-SOURCE — CLOSED BY THIS BLOCK.
+    // `runBinary`'s POSIX arm `chmod`s its `binaryPath` to 0755 before spawning —
+    // it has to, because the linker writes emitted binaries 0644 and `execve`
+    // needs the bit. Handing it a path under `real-examples/` therefore MUTATES A
+    // TRACKED SOURCE FILE as a side effect of running the suite.
+    // First SEEN on macOS (a `cmake --build` + `ctest` run left
+    // `real-examples/c/sqlite/cli-smoke.py` at 100755 — mode only, zero content
+    // change — restored clean, re-run, dirty again).
+    // ✔MEASURED HERE 2026-08-12 on Linux, in a throwaway clone with
+    // `core.filemode=true`, as a two-armed control rather than a sighting:
+    //   arm 1, this call site UNFIXED — before: mode 644, `git status --porcelain`
+    //     empty; after `ctest -R harness/test_sqlite_harness_legs` (which PASSED):
+    //     mode 755 and ` M real-examples/c/sqlite/cli-smoke.py`;
+    //   arm 2, with the staging below — restore, rebuild, re-run: mode 644 and an
+    //     EMPTY porcelain, and then a FULL 826/826 suite left it empty too.
+    // A test run that edits the working tree makes
+    // `git status` lie, turns a clean CI checkout dirty, and on any
+    // `core.filemode=true` host (macOS/Linux) the bit is eventually committed by
+    // accident. It went unnoticed for so long because Windows — where this suite
+    // is usually driven — sets `core.filemode=false` and simply cannot see it.
+    // ⚠ The fix is NOT to commit the executable bit. That hides the mutation
+    // instead of removing it, and leaves the same code ready to chmod whatever it
+    // is pointed at next. The note above `runResolver` already named this trap and
+    // the two other `runBinary` call sites in this file already dodge it with a
+    // scratch copy; this was the ONE that did not.
+    dss::test_support::ScratchDir work{dss::test_support::Location::Temp,
+                                       "sqlite-cli-smoke-selftest"};
+    // Copied under its OWN NAME: the gate prints `cli-smoke.py --self-test: …`
+    // from a literal, but argv[0] and any traceback the self-test emits read as
+    // the real script only if the basename survives the staging.
+    auto const staged = work.path() / "cli-smoke.py";
+    std::error_code stageEc;
+    fs::copy_file(script, staged, fs::copy_options::overwrite_existing, stageEc);
+    ASSERT_FALSE(stageEc) << "could not stage the smoke gate at " << staged
+                          << ": " << stageEc.message();
+    auto const modeBefore = fs::status(script).permissions();
     static constexpr char const* kSelfTestShim =
         "import runpy,sys;p=sys.argv[1];sys.argv=[p,'--self-test'];"
         "runpy.run_path(p,run_name='__main__')";
     auto const res = dss::test_support::runBinary(
-        script, std::chrono::seconds{120}, /*captureStdout=*/true,
+        staged, std::chrono::seconds{120}, /*captureStdout=*/true,
         {py, "-c", kSelfTestShim});
+    // THE PIN, checked BEFORE the spawn assertion on purpose: a spawn that FAILED
+    // has already run the chmod, so gating this behind `res.spawned` would let the
+    // mutation through in exactly the case that also hides it. Reverting the
+    // staging above to `runBinary(script, …)` reds HERE on any POSIX host instead
+    // of silently dirtying the working tree. On Windows `permissions()` is
+    // synthesised from one attribute and is equal on both sides, so this neither
+    // fires nor false-fires there — the leg that CAN observe the defect is the leg
+    // that enforces it.
+    EXPECT_EQ(fs::status(script).permissions(), modeBefore)
+        << "running the smoke gate CHANGED THE MODE of the tracked repo file "
+        << script
+        << ". The suite must never mutate its own source tree: that makes"
+           " `git status` lie and eventually commits the bit by accident. Run the"
+           " script from a scratch copy — do not 'fix' this by committing the"
+           " executable bit.";
     ASSERT_TRUE(res.spawned && !res.timedOut) << res.diagnostic;
     EXPECT_EQ(res.exitCode, 0u) << res.capturedStdout;
     // CONTENT, not a count — and BOTH numbers, because either alone is

@@ -42,7 +42,9 @@
 // note above it for why that extraction had to happen.
 //
 // ★ NO SHELL, EVER. `argv[0]` is executed DIRECTLY — `CreateProcessW` on
-// Windows, `fork` + `execv` on POSIX. There is no `std::system`, no `popen`,
+// Windows, `posix_spawn` on macOS, `fork` + `execv` elsewhere on POSIX (the
+// .cpp's opening note says which host takes which and why). There is no
+// `std::system`, no `popen`,
 // no `cmd /c`, no `/bin/sh -c`, and no code path that can grow one. The
 // remaining elements of `argv` reach the child BYTE-IDENTICALLY: no glob
 // expansion, no `$VAR` / `%VAR%` substitution, no `&&` / `;` splitting, no
@@ -237,6 +239,14 @@ spawnAndWaitInherit(std::vector<std::string> const& argv,
 // descriptor, no syscall, no global state, no allocation beyond the message it
 // returns. It is `detail` and not surface — the "three functions" note at the
 // top of this file still describes what a consumer calls.
+//
+// ★ AND IT IS DECLARED ON EVERY POSIX HOST, INCLUDING ONES WITH NO CALLER.
+// macOS spawns through `posix_spawn`, which reports exec failure through its
+// return value and reads no pipe, so nothing in `src/` calls this there. The
+// declaration is NOT narrowed to the hosts that use it, because narrowing it
+// would force its pins to be narrowed identically — and a pin that quietly does
+// not run on one platform is the masked coverage this project treats as a
+// defect. The function is pure, so compiling it everywhere costs one symbol.
 #if !defined(_WIN32)
 
 namespace detail {

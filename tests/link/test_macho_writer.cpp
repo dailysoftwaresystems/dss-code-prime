@@ -3,7 +3,10 @@
 // Pins golden byte-level invariants of the emitted MH_OBJECT:
 //   * mach_header_64 magic = 0xFEEDFACF (MH_MAGIC_64).
 //   * cputype = 0x01000007 (CPU_TYPE_X86_64); filetype = MH_OBJECT (1).
-//   * ncmds = 2 (LC_SEGMENT_64 + LC_SYMTAB).
+//   * ncmds = 3 (LC_SEGMENT_64 + LC_BUILD_VERSION + LC_SYMTAB) for a
+//     shipped darwin object format, 2 for one that declares no
+//     `image.buildVersion` — the LC_BUILD_VERSION emission is gated on
+//     the schema, so both counts are pinned (D-LK10-ENTRY-MACHO-EXIT).
 //   * LC_SEGMENT_64 at byte 32; section_64 for `__text` immediately
 //     follows the segment command.
 //   * section_64.sectname = "__text"; segname = "__TEXT" (two-level
@@ -35,8 +38,10 @@
 
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -206,10 +211,11 @@ TEST(MachOWriter, MachHeader64IdentityBytesMatchAppleAbi) {
     EXPECT_EQ(readU32LE(bytes, 8), 3u);
     // filetype = MH_OBJECT = 1
     EXPECT_EQ(readU32LE(bytes, 12), 1u);
-    // ncmds = 2 (LC_SEGMENT_64 + LC_SYMTAB)
-    EXPECT_EQ(readU32LE(bytes, 16), 2u);
-    // sizeofcmds = 72 + 80*1 (segment+section) + 24 (symtab) = 176
-    EXPECT_EQ(readU32LE(bytes, 20), 176u);
+    // ncmds = 3 (LC_SEGMENT_64 + LC_BUILD_VERSION + LC_SYMTAB)
+    EXPECT_EQ(readU32LE(bytes, 16), 3u);
+    // sizeofcmds = 72 + 80*1 (segment+section) + 24 (build_version)
+    //            + 24 (symtab) = 200
+    EXPECT_EQ(readU32LE(bytes, 20), 200u);
     // flags = 0 (MH_SUBSECTIONS_VIA_SYMBOLS deliberately NOT set
     // because cycle 1 emits a flat __text without subsection markers;
     // anchored as D-LK3-2 for the future subsection-emit cycle)
@@ -272,13 +278,16 @@ TEST(MachOWriter, LcSymtabReferencesNlist64AndStringTable) {
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
-    // LC_SYMTAB starts at byte 32 + 72 + 80 = 184
-    EXPECT_EQ(readU32LE(bytes, 184), 0x02u);  // LC_SYMTAB
-    EXPECT_EQ(readU32LE(bytes, 188), 24u);    // cmdsize
-    std::uint32_t const symoff = readU32LE(bytes, 192);
-    std::uint32_t const nsyms = readU32LE(bytes, 196);
-    std::uint32_t const stroff = readU32LE(bytes, 200);
-    std::uint32_t const strsize = readU32LE(bytes, 204);
+    // LC_SYMTAB starts at byte 32 + 72 + 80 + 24 = 208 — the trailing +24 is
+    // LC_BUILD_VERSION, which the walker writes between the segment command
+    // (with its section_64 tail) and the symtab, matching clang's own `.o`
+    // command order (D-LK10-ENTRY-MACHO-EXIT).
+    EXPECT_EQ(readU32LE(bytes, 208), 0x02u);  // LC_SYMTAB
+    EXPECT_EQ(readU32LE(bytes, 212), 24u);    // cmdsize
+    std::uint32_t const symoff = readU32LE(bytes, 216);
+    std::uint32_t const nsyms = readU32LE(bytes, 220);
+    std::uint32_t const stroff = readU32LE(bytes, 224);
+    std::uint32_t const strsize = readU32LE(bytes, 228);
     EXPECT_EQ(nsyms, 1u);
     EXPECT_GT(symoff, 0u);
     EXPECT_LE(symoff + 16u, bytes.size());
@@ -335,9 +344,9 @@ TEST(MachOWriter, ObjectSymtabEmitsPipelineMangledNameVerbatimNoDoubleUnderscore
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
-    // Single-symbol layout matches the LcSymtab test: LC_SYMTAB at 184,
-    // stroff at 200; the name sits at strtab offset 1 (past the leading NUL).
-    std::uint32_t const stroff = readU32LE(bytes, 200);
+    // Single-symbol layout matches the LcSymtab test: LC_SYMTAB at 208,
+    // stroff at 224; the name sits at strtab offset 1 (past the leading NUL).
+    std::uint32_t const stroff = readU32LE(bytes, 224);
     std::string name;
     for (std::size_t p = stroff + 1; p < bytes.size() && bytes[p] != 0; ++p) {
         name.push_back(static_cast<char>(bytes[p]));
@@ -379,12 +388,12 @@ TEST(MachOWriter, ObjectNlistCouplesNameAndBindingStaticLocalDropsNExt) {
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
-    // LC_SYMTAB at byte 184; symoff @ +8, nsyms @ +12, stroff @ +16.
+    // LC_SYMTAB at byte 208; symoff @ +8, nsyms @ +12, stroff @ +16.
     // nlist_64 = n_strx(u32,+0) n_type(u8,+4) n_sect(u8,+5) n_desc(u16,+6)
     //            n_value(u64,+8) = 16 bytes.
-    std::uint32_t const symoff = readU32LE(bytes, 184 + 8);
-    std::uint32_t const stroff = readU32LE(bytes, 184 + 16);
-    ASSERT_EQ(readU32LE(bytes, 184 + 12), 2u);
+    std::uint32_t const symoff = readU32LE(bytes, 208 + 8);
+    std::uint32_t const stroff = readU32LE(bytes, 208 + 16);
+    ASSERT_EQ(readU32LE(bytes, 208 + 12), 2u);
 
     auto nameAt = [&](std::uint32_t i) {
         std::uint32_t const strx = readU32LE(bytes, symoff + i * 16 + 0);
@@ -536,6 +545,268 @@ TEST(MachOWriter, MachHeader64Arm64IdentityBytesMatchAppleAbi) {
     EXPECT_EQ(readU32LE(bytes, 24), 0u);            // flags = 0
 }
 
+// ── LC_BUILD_VERSION in a RELOCATABLE object (D-LK10-ENTRY-MACHO-EXIT) ──
+//
+// ✔MEASURED 2026-08-13, macOS 26.5.2 arm64, Apple `ld` PROJECT:ld-1267: an
+// MH_OBJECT with no platform load command makes ld64 print `ld: warning: no
+// platform load command found in '<tu>.o', assuming: macOS` for EVERY such
+// object, and Apple `clang -c` emits the command into every `.o` it writes
+// (LC_SEGMENT_64 / LC_BUILD_VERSION / LC_SYMTAB / LC_DYSYMTAB, in that order).
+
+namespace {
+constexpr std::uint32_t kLcBuildVersion = 0x32u;
+// PLATFORM_MACOS, and 11.0 in the on-wire (major<<16)|(minor<<8)|patch form
+// the schema loader produces from the JSON string "11.0".
+constexpr std::uint32_t kPlatformMacOs  = 1u;
+constexpr std::uint32_t kVersion11_0    = 0x000B0000u;
+} // namespace
+
+// ALL FOUR object-flavored darwin formats declare it, and the two `-staticlib`
+// rows are the ones that matter most: an `ar` archive carries no load commands
+// of its own, so the platform can only live in each MEMBER — and members are
+// written by this same MH_OBJECT walker reading the STATICLIB schema
+// (`linkAndWriteStaticArchive` hands it that format, not the bare relocatable
+// sibling). Omit the key there and every member of a `.a` draws the warning.
+// RED-ON-DISABLE: delete the `image` block from any one of the four files and
+// exactly that row fails.
+TEST(MachOFormatJson, AllRelocatableDarwinFormatsDeclareBuildVersion) {
+    for (char const* name : {"macho64-arm64-darwin",
+                             "macho64-x86_64-darwin",
+                             "macho64-arm64-darwin-staticlib",
+                             "macho64-x86_64-darwin-staticlib"}) {
+        auto f = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(f.has_value()) << name;
+        auto const& fmt = **f;
+        ASSERT_TRUE(fmt.macho().filetype == MachOObjectType::Object) << name;
+        auto const& bv = fmt.machoImage().buildVersion;
+        ASSERT_TRUE(bv.has_value())
+            << name << ": a darwin relocatable object must declare "
+                       "image.buildVersion or ld64 warns on every link";
+        EXPECT_EQ(static_cast<std::uint32_t>(bv->platform), kPlatformMacOs)
+            << name;
+        EXPECT_EQ(bv->minOs, kVersion11_0) << name;
+        EXPECT_EQ(bv->sdk, kVersion11_0) << name;
+    }
+}
+
+// The 24 emitted bytes, verbatim, AND the two header counters that must move
+// with them. ncmds/sizeofcmds are the single most likely way to get this
+// wrong: a load command the header does not count leaves ld64 walking off the
+// end of the command list, and a sizeofcmds that disagrees makes every
+// section_64.offset point into the wrong place.
+TEST(MachOWriter, Arm64ObjectEmitsBuildVersionAndCorrectedHeaderCounts) {
+    auto loaded = loadShippedArm64();
+    AssembledModule mod = makeTrivialModule({0xC0, 0x03, 0x5F, 0xD6}, 42);
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // Header counters. 3 = LC_SEGMENT_64 + LC_BUILD_VERSION + LC_SYMTAB;
+    // 200 = 72 + 80 (segment + one section_64) + 24 + 24.
+    EXPECT_EQ(readU32LE(bytes, 16), 3u);
+    EXPECT_EQ(readU32LE(bytes, 20), 200u);
+
+    // POSITION is part of the claim, not just presence: clang writes the
+    // command between the segment and the symtab, so pin the literal offset
+    // rather than only what `findLoadCommand` walks to.
+    auto const at = dss::macho::test::findLoadCommand(bytes, kLcBuildVersion);
+    ASSERT_TRUE(at.has_value())
+        << "the MH_OBJECT walker must emit LC_BUILD_VERSION when the schema "
+           "declares image.buildVersion";
+    EXPECT_EQ(*at, 32u + 72u + 80u)   // header + segment cmd + one section_64
+        << "LC_BUILD_VERSION sits after LC_SEGMENT_64 (+ its section_64 tail) "
+           "and before LC_SYMTAB, matching clang's own `.o` command order";
+
+    // build_version_command = 6 x u32: cmd / cmdsize / platform / minos /
+    // sdk / ntools. All six pinned exactly.
+    ASSERT_LE(*at + 24u, bytes.size());
+    EXPECT_EQ(readU32LE(bytes, *at + 0),  kLcBuildVersion);
+    EXPECT_EQ(readU32LE(bytes, *at + 4),  24u);
+    EXPECT_EQ(readU32LE(bytes, *at + 8),  kPlatformMacOs);
+    EXPECT_EQ(readU32LE(bytes, *at + 12), kVersion11_0);
+    EXPECT_EQ(readU32LE(bytes, *at + 16), kVersion11_0);
+    EXPECT_EQ(readU32LE(bytes, *at + 20), 0u)   // ntools
+        << "no trailing build_tool_version records are emitted";
+
+    // The counters are not merely plausible — they are CONSISTENT with the
+    // bytes. sizeofcmds must land exactly on the first section byte, which is
+    // where LC_SEGMENT_64.fileoff says the flat `.o` space begins.
+    EXPECT_EQ(readU64LE(bytes, 72), 32u + readU32LE(bytes, 20));
+}
+
+// THE GATE, not just the emission: a Mach-O object format that declares NO
+// `image.buildVersion` emits no LC_BUILD_VERSION and keeps the pre-change
+// layout byte for byte. Without this pin the walker could ignore the schema
+// and stamp the command unconditionally — which would be a hardcoded platform
+// wearing a config key's name.
+TEST(MachOWriter, ObjectWithoutSchemaBuildVersionEmitsNoLoadCommand) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-insensitive",
+      "format": {"name":"macho-obj-no-buildversion","kind":"macho"},
+      "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "object", "flags": 0 },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":4,"entrySize":0,"virtualAddress":0}]
+    })");
+    ASSERT_TRUE(format.has_value()) << rejectSummary(format);
+    ASSERT_FALSE((*format)->machoImage().buildVersion.has_value());
+
+    AssembledModule mod = makeTrivialModule({0xC0, 0x03, 0x5F, 0xD6}, 42);
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, **target, **format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    EXPECT_EQ(dss::macho::test::findLoadCommand(bytes, kLcBuildVersion),
+              std::nullopt)
+        << "no schema declaration ⇒ no LC_BUILD_VERSION";
+    EXPECT_EQ(readU32LE(bytes, 16), 2u);     // ncmds = segment + symtab
+    EXPECT_EQ(readU32LE(bytes, 20), 176u);   // sizeofcmds = 72 + 80 + 24
+    EXPECT_EQ(readU64LE(bytes, 72), 208u);   // fileoff = 32 + 176
+    EXPECT_EQ(readU32LE(bytes, 184), 0x02u); // LC_SYMTAB back at 184
+}
+
+// ★ THE PLATFORM IS DECLARED, NEVER ASSUMED. Same walker, same shipped arm64
+// target, an object schema that says `ios` — and the emitted u32 is
+// PLATFORM_IOS (2), not PLATFORM_MACOS (1). This is the assertion that would
+// go red if anything in the object path hardcoded macOS or treated it as an
+// implicit default, and it is the reason the vocabulary carries Apple's whole
+// PLATFORM_* set instead of one row.
+TEST(MachOWriter, ObjectBuildVersionPlatformComesFromTheSchemaNotAMacOsDefault) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-insensitive",
+      "format": {"name":"macho-obj-ios","kind":"macho"},
+      "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "object", "flags": 0 },
+      "image": { "buildVersion": { "platform": "ios", "minOs": "17.4", "sdk": "17.4" } },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":4,"entrySize":0,"virtualAddress":0}]
+    })");
+    ASSERT_TRUE(format.has_value()) << rejectSummary(format);
+
+    AssembledModule mod = makeTrivialModule({0xC0, 0x03, 0x5F, 0xD6}, 42);
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, **target, **format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    auto const at = dss::macho::test::findLoadCommand(bytes, kLcBuildVersion);
+    ASSERT_TRUE(at.has_value());
+    EXPECT_EQ(readU32LE(bytes, *at + 8), 2u)     // PLATFORM_IOS
+        << "the emitted platform must be whatever the format DECLARED";
+    EXPECT_EQ(readU32LE(bytes, *at + 12), 0x00110400u)   // 17.4.0
+        << "17.4 encodes as (17<<16)|(4<<8)|0";
+    EXPECT_EQ(readU32LE(bytes, *at + 16), 0x00110400u);
+}
+
+// The vocabulary itself. ✔MEASURED 2026-08-13 against the real header on the
+// operator's Mac — `grep 'define PLATFORM_' "$(xcrun --show-sdk-path)/usr/
+// include/mach-o/loader.h"` documents 1..24 with no conditional guard — and
+// every spelling below was fed to `ld -platform_version <name> 1.0 1.0` and
+// ACCEPTED by Apple `ld` PROJECT:ld-1267. The hyphens are Apple's, not this
+// project's: `iossimulator` is REJECTED by that same ld64 while
+// `ios-simulator` is accepted.
+TEST(MachOBuildVersionPlatform, TableIsAppleSPlatformSetAndRoundTrips) {
+    using Platform = MachOBuildVersion::Platform;
+    struct Row { std::uint32_t value; char const* name; };
+    // Apple's numbering, in Apple's order. The VALUE is written verbatim into
+    // build_version_command.platform, so a wrong number here is a wrong byte
+    // in a shipped file — this table is the ABI, not a convenience.
+    constexpr Row kApple[] = {
+        { 1,  "macos"                }, { 2,  "ios"                   },
+        { 3,  "tvos"                 }, { 4,  "watchos"               },
+        { 5,  "bridgeos"             }, { 6,  "mac-catalyst"          },
+        { 7,  "ios-simulator"        }, { 8,  "tvos-simulator"        },
+        { 9,  "watchos-simulator"    }, { 10, "driverkit"             },
+        { 11, "visionos"             }, { 12, "visionos-simulator"    },
+        { 13, "firmware"             }, { 14, "sepos"                 },
+        { 15, "macos-exclavecore"    }, { 16, "macos-exclavekit"      },
+        { 17, "ios-exclavecore"      }, { 18, "ios-exclavekit"        },
+        { 19, "tvos-exclavecore"     }, { 20, "tvos-exclavekit"       },
+        { 21, "watchos-exclavecore"  }, { 22, "watchos-exclavekit"    },
+        { 23, "visionos-exclavecore" }, { 24, "visionos-exclavekit"   },
+    };
+    ASSERT_EQ(kMachOBuildVersionPlatformTable.rows.size(),
+              std::size(kApple))
+        << "the shipped table must cover Apple's whole PLATFORM_* range";
+    for (auto const& row : kApple) {
+        auto const decoded = machoBuildVersionPlatformFromName(row.name);
+        ASSERT_TRUE(decoded.has_value()) << row.name;
+        EXPECT_EQ(static_cast<std::uint32_t>(*decoded), row.value) << row.name;
+        // Round-trip: the name a config author writes is the name the engine
+        // reports back, so a diagnostic can never rename a platform.
+        EXPECT_EQ(machoBuildVersionPlatformName(*decoded), row.name);
+    }
+    // PLATFORM_UNKNOWN (0) and PLATFORM_ANY (0xFFFFFFFF) are real macros and
+    // deliberately UNLISTED — a file that declares "unknown" is worse than one
+    // that declares nothing, and "any" is a matching wildcard, not a value a
+    // producer stamps. Their absence must be a decision, not an oversight, so
+    // it is pinned.
+    EXPECT_EQ(machoBuildVersionPlatformFromName("unknown"), std::nullopt);
+    EXPECT_EQ(machoBuildVersionPlatformFromName("any"), std::nullopt);
+    // And a typo still fails loud rather than silently picking row 0.
+    EXPECT_EQ(machoBuildVersionPlatformFromName("macosx"), std::nullopt);
+    static_assert(static_cast<std::uint32_t>(Platform::Ios) == 2u,
+                  "PLATFORM_IOS is 2 in <mach-o/loader.h>");
+}
+
+// The loader's MH_OBJECT rule changed shape: `image.buildVersion` is now
+// ACCEPTED on a relocatable object while every other `image` key stays
+// rejected. Both halves pinned in one place, because a change that only
+// relaxed the first half would be indistinguishable from one that deleted the
+// whole rule.
+TEST(MachOFormatJsonValidate, ObjAcceptsBuildVersionButStillRejectsOtherImageKeys) {
+    auto ok = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-insensitive",
+      "format": {"name":"macho-obj-bv-only","kind":"macho"},
+      "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "object", "flags": 0 },
+      "image": { "buildVersion": { "platform": "macos", "minOs": "11.0", "sdk": "11.0" } },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":4,"entrySize":0,"virtualAddress":0}]
+    })");
+    ASSERT_TRUE(ok.has_value()) << rejectSummary(ok);
+    ASSERT_TRUE((*ok)->machoImage().buildVersion.has_value());
+
+    // The same schema plus ONE forbidden key is refused, and the `/image`
+    // diagnostic is the sole reason — so the rejection is still driven by that
+    // key and not by the buildVersion sitting next to it.
+    auto bad = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-insensitive",
+      "format": {"name":"macho-obj-bv-plus-pagezero","kind":"macho"},
+      "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "object", "flags": 0 },
+      "image": { "buildVersion": { "platform": "macos", "minOs": "11.0", "sdk": "11.0" }, "pageZeroSize": 4294967296 },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":4,"entrySize":0,"virtualAddress":0}]
+    })");
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_EQ(errorCount(bad), 1u) << rejectSummary(bad);
+    EXPECT_EQ(countAtPath(bad, "/image"), 1u) << rejectSummary(bad);
+
+    // An unknown platform name still fails loud — the vocabulary grew, it did
+    // not open.
+    auto typo = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-insensitive",
+      "format": {"name":"macho-obj-bad-platform","kind":"macho"},
+      "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "object", "flags": 0 },
+      "image": { "buildVersion": { "platform": "macosx", "minOs": "11.0", "sdk": "11.0" } },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":4,"entrySize":0,"virtualAddress":0}]
+    })");
+    ASSERT_FALSE(typo.has_value());
+    EXPECT_EQ(countAtPath(typo, "/image/buildVersion/platform"), 1u)
+        << rejectSummary(typo);
+}
+
 // ── D-LK-OBJECT-EXTERN-CALL-MACHO: undefined extern carries its REAL name ──
 
 // The Mach-O analog of ElfWriter.ObjectExternCallEmitsUndefImportNameAndPlt32
@@ -581,10 +852,10 @@ TEST(MachOWriter, Arm64ObjectExternCallEmitsUndefImportRealName) {
         << "an MH_OBJECT with an extern-call import must encode";
 
     // LC_SYMTAB fields (single-segment/single-section MH_OBJECT layout, same
-    // as the LcSymtab pin): cmd@184, symoff@192, nsyms@196, stroff@200.
-    std::uint32_t const symoff = readU32LE(bytes, 192);
-    std::uint32_t const nsyms  = readU32LE(bytes, 196);
-    std::uint32_t const stroff = readU32LE(bytes, 200);
+    // as the LcSymtab pin): cmd@208, symoff@216, nsyms@220, stroff@224.
+    std::uint32_t const symoff = readU32LE(bytes, 216);
+    std::uint32_t const nsyms  = readU32LE(bytes, 220);
+    std::uint32_t const stroff = readU32LE(bytes, 224);
     ASSERT_EQ(nsyms, 2u) << "defined caller + undefined extern";
 
     // nlist_64[1] = the undefined extern (defined-then-undefined order).
@@ -651,8 +922,14 @@ TEST(MachOWriter, Arm64RelocationInfoPacksPage21) {
 //   fileoff@72, filesize@80, nsects@96) | section_64[0] __text @104
 //   (reloff@160, nreloc@164) | section_64[1] @184 (sectname@184,
 //   segname@200, addr@216, size@224, offset@232, align@236, reloff@240,
-//   nreloc@244, flags@248) | LC_SYMTAB @264 (symoff@272, nsyms@276,
-//   stroff@280) | section bytes @288 (= 32 + 72 + 2*80 + 24).
+//   nreloc@244, flags@248) | LC_BUILD_VERSION @264 | LC_SYMTAB @288
+//   (symoff@296, nsyms@300, stroff@304) | section bytes @312
+//   (= 32 + 72 + 2*80 + 24 + 24).
+//
+// ⚠ The section_64 offsets above are UNSHIFTED by LC_BUILD_VERSION and that
+// is not an oversight: the section records are the LC_SEGMENT_64 command's
+// own tail, so they precede every later load command. Only what follows the
+// segment command moved (D-LK10-ENTRY-MACHO-EXIT, MH_OBJECT arm).
 
 namespace {
 // Read a NUL-terminated name from the string table.
@@ -708,37 +985,39 @@ TEST(MachOWriter, Arm64ObjectRodataItemEmitsConstSectionAndDataSymbol) {
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
-    // Two sections: sizeofcmds = 72 + 2*80 + 24 = 256; nsects = 2.
-    EXPECT_EQ(readU32LE(bytes, 16), 2u);     // ncmds unchanged
-    EXPECT_EQ(readU32LE(bytes, 20), 256u);   // sizeofcmds
+    // Two sections: sizeofcmds = 72 + 2*80 + 24 (build_version) + 24 = 280;
+    // nsects = 2, ncmds = 3.
+    EXPECT_EQ(readU32LE(bytes, 16), 3u);     // ncmds
+    EXPECT_EQ(readU32LE(bytes, 20), 280u);   // sizeofcmds
     EXPECT_EQ(readU32LE(bytes, 96), 2u);     // nsects
     // Flat layout: text 4 bytes at addr 0; rodata at alignUp(4, 8) = 8
     // (schema floor 8 raw bytes), span 3. vmsize = filesize = 11.
     EXPECT_EQ(readU64LE(bytes, 64), 11u);    // vmsize
-    EXPECT_EQ(readU64LE(bytes, 72), 288u);   // fileoff (header+cmds)
+    EXPECT_EQ(readU64LE(bytes, 72), 312u);   // fileoff (header+cmds)
     EXPECT_EQ(readU64LE(bytes, 80), 11u);    // filesize (all file-backed)
 
-    // section_64[1] = __TEXT,__const.
+    // section_64[1] = __TEXT,__const. UNMOVED by LC_BUILD_VERSION — the
+    // section records are the segment command's own tail.
     EXPECT_TRUE(name16Equals(bytes, 184, "__const"));
     EXPECT_TRUE(name16Equals(bytes, 200, "__TEXT"));
     EXPECT_EQ(readU64LE(bytes, 216), 8u);    // addr (flat space)
     EXPECT_EQ(readU64LE(bytes, 224), 3u);    // size
-    EXPECT_EQ(readU32LE(bytes, 232), 296u);  // offset = 288 + addr 8
+    EXPECT_EQ(readU32LE(bytes, 232), 320u);  // offset = 312 + addr 8
     EXPECT_EQ(readU32LE(bytes, 236), 3u);    // align = log2(8)
     EXPECT_EQ(readU32LE(bytes, 240), 0u);    // reloff (no relocs)
     EXPECT_EQ(readU32LE(bytes, 244), 0u);    // nreloc
     EXPECT_EQ(readU32LE(bytes, 248), 0u);    // flags = S_REGULAR
     // The item's bytes land at the section's file offset.
-    ASSERT_GE(bytes.size(), 299u);
-    EXPECT_EQ(bytes[296], 'h');
-    EXPECT_EQ(bytes[297], 'i');
-    EXPECT_EQ(bytes[298], 0u);
+    ASSERT_GE(bytes.size(), 323u);
+    EXPECT_EQ(bytes[320], 'h');
+    EXPECT_EQ(bytes[321], 'i');
+    EXPECT_EQ(bytes[322], 0u);
 
-    // LC_SYMTAB @264: symoff = 288 + 11 (no relocs), nsyms = 2.
-    std::uint32_t const symoff = readU32LE(bytes, 272);
-    std::uint32_t const nsyms  = readU32LE(bytes, 276);
-    std::uint32_t const stroff = readU32LE(bytes, 280);
-    EXPECT_EQ(symoff, 299u);
+    // LC_SYMTAB @288: symoff = 312 + 11 (no relocs), nsyms = 2.
+    std::uint32_t const symoff = readU32LE(bytes, 296);
+    std::uint32_t const nsyms  = readU32LE(bytes, 300);
+    std::uint32_t const stroff = readU32LE(bytes, 304);
+    EXPECT_EQ(symoff, 323u);
     ASSERT_EQ(nsyms, 2u);
     // nlist[1] = the data symbol: real name, N_SECT|N_EXT, n_sect=2,
     // n_value = the FLAT address 8.
@@ -792,9 +1071,9 @@ TEST(MachOWriter, Arm64ObjectStaticDataItemDropsNExt) {
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
-    std::uint32_t const symoff = readU32LE(bytes, 272);
-    std::uint32_t const stroff = readU32LE(bytes, 280);
-    ASSERT_EQ(readU32LE(bytes, 276), 2u);   // nsyms = fn + data
+    std::uint32_t const symoff = readU32LE(bytes, 296);
+    std::uint32_t const stroff = readU32LE(bytes, 304);
+    ASSERT_EQ(readU32LE(bytes, 300), 2u);   // nsyms = fn + data
     std::size_t const n1 = symoff + 16;     // nlist[1] = the data symbol
     EXPECT_EQ(readStrtabName(bytes, stroff, readU32LE(bytes, n1)), "_sym_42")
         << "a static (Local) data item stays internal `_sym_<id>`";
@@ -890,14 +1169,14 @@ TEST(MachOWriter, Arm64ObjectRelRoFnPtrSlotEmitsUnsignedRelocAndInSlotAddend) {
     EXPECT_TRUE(name16Equals(bytes, 200, "__DATA"));
     EXPECT_EQ(readU64LE(bytes, 216), 8u);    // addr
     EXPECT_EQ(readU64LE(bytes, 224), 8u);    // size
-    EXPECT_EQ(readU32LE(bytes, 232), 296u);  // offset = 288 + 8
+    EXPECT_EQ(readU32LE(bytes, 232), 320u);  // offset = 312 + 8
     std::uint32_t const reloff = readU32LE(bytes, 240);
     std::uint32_t const nreloc = readU32LE(bytes, 244);
     ASSERT_EQ(nreloc, 1u)
         << "the relro section must carry its own relocation_info table "
            "(the .rela.data.rel.ro analog)";
-    // Reloc tables follow ALL file-backed section bytes: 288 + 16.
-    EXPECT_EQ(reloff, 304u);
+    // Reloc tables follow ALL file-backed section bytes: 312 + 16.
+    EXPECT_EQ(reloff, 328u);
     ASSERT_LE(reloff + 8u, bytes.size());
     // r_address = the slot's offset WITHIN its section.
     EXPECT_EQ(readU32LE(bytes, reloff + 0), 0u);
@@ -908,13 +1187,13 @@ TEST(MachOWriter, Arm64ObjectRelRoFnPtrSlotEmitsUnsignedRelocAndInSlotAddend) {
     EXPECT_EQ((rInfo >> 24) & 0x1u, 0u);     // r_pcrel = 0
     EXPECT_EQ(rInfo & 0x00FFFFFFu, 0u)       // r_symbolnum = f1's index
         << "the slot must target the DEFINED function's symtab entry";
-    // In-place addend: the 8-byte slot at file offset 296 carries 8.
-    EXPECT_EQ(readU64LE(bytes, 296), 8u)
+    // In-place addend: the 8-byte slot at file offset 320 carries 8.
+    EXPECT_EQ(readU64LE(bytes, 320), 8u)
         << "Mach-O has no RELA addend column — rel.addend must be written "
            "into the slot bytes (ld64 computes S + slot)";
     // The table's own symbol: nlist[1], n_sect=2, n_value=8.
-    std::uint32_t const symoff = readU32LE(bytes, 272);
-    ASSERT_EQ(readU32LE(bytes, 276), 2u);    // nsyms = f1 + tab
+    std::uint32_t const symoff = readU32LE(bytes, 296);
+    ASSERT_EQ(readU32LE(bytes, 300), 2u);    // nsyms = f1 + tab
     EXPECT_EQ(bytes[symoff + 16 + 5], 2u);
     EXPECT_EQ(readU64LE(bytes, symoff + 16 + 8), 8u);
 }
@@ -964,9 +1243,9 @@ TEST(MachOWriter, Arm64ObjectJumpTableBlockSymbolIsLocalDefinedNotUndef) {
         << "a jump-table slot targeting a block symbol must encode";
 
     // Symbol order: func(0) → BLOCK local(1) → data(2). No undefined extern.
-    std::uint32_t const symoff = readU32LE(bytes, 272);
-    std::uint32_t const nsyms  = readU32LE(bytes, 276);
-    std::uint32_t const stroff = readU32LE(bytes, 280);
+    std::uint32_t const symoff = readU32LE(bytes, 296);
+    std::uint32_t const nsyms  = readU32LE(bytes, 300);
+    std::uint32_t const stroff = readU32LE(bytes, 304);
     ASSERT_EQ(nsyms, 3u) << "func + block local + data symbol - and NO "
                             "fabricated undefined extern for the block";
     std::size_t const n1 = symoff + 16;      // the block symbol's nlist
@@ -1035,36 +1314,40 @@ TEST(MachOWriter, Arm64ObjectBssItemIsZeroFillWithVmsizeButNoFileBytes) {
     EXPECT_EQ(readU64LE(bytes, 224), 4u);    // size = reservedSize
     EXPECT_EQ(readU32LE(bytes, 232), 0u);    // offset = 0 (S_ZEROFILL)
     EXPECT_EQ(readU32LE(bytes, 248), 1u);    // flags = S_ZEROFILL (schema)
-    // symtab directly after text bytes (288 + 4) — bss stored nothing.
-    EXPECT_EQ(readU32LE(bytes, 272), 292u);
+    // symtab directly after text bytes (312 + 4) — bss stored nothing.
+    EXPECT_EQ(readU32LE(bytes, 296), 316u);
     // The bss symbol's n_value is its flat address.
-    std::uint32_t const symoff = readU32LE(bytes, 272);
+    std::uint32_t const symoff = readU32LE(bytes, 296);
     EXPECT_EQ(bytes[symoff + 16 + 5], 2u);
     EXPECT_EQ(readU64LE(bytes, symoff + 16 + 8), 8u);
 }
 
-// (4) A DATA-FREE module keeps the exact single-section layout (the
-// pre-c147 shape): ncmds/sizeofcmds/nsects/vmsize/filesize/symoff/stroff
-// all unchanged — the data-section machinery must be a no-op when no data
-// items exist (every historical LcSymtab/reloc pin hardcodes this layout).
+// (4) A DATA-FREE module keeps the exact SINGLE-SECTION layout:
+// ncmds/sizeofcmds/nsects/vmsize/filesize/symoff/stroff are what one
+// `__text` section derives, so the data-section machinery is a no-op when no
+// data items exist (every LcSymtab/reloc pin above hardcodes this layout).
+// ⚠ The figures are the SINGLE-SECTION ones, not the pre-c147 ones — the
+// data machinery still adds nothing here, but LC_BUILD_VERSION does, and
+// conflating "no data sections" with "unchanged since c147" is how a stale
+// constant survives a real layout change.
 TEST(MachOWriter, Arm64ObjectDataFreeModuleKeepsSingleSectionLayout) {
     auto loaded = loadShippedArm64();
     AssembledModule mod = makeTrivialModule({0xC0, 0x03, 0x5F, 0xD6}, 42);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
-    EXPECT_EQ(readU32LE(bytes, 16), 2u);     // ncmds
-    EXPECT_EQ(readU32LE(bytes, 20), 176u);   // sizeofcmds = 72 + 80 + 24
+    EXPECT_EQ(readU32LE(bytes, 16), 3u);     // ncmds (+ LC_BUILD_VERSION)
+    EXPECT_EQ(readU32LE(bytes, 20), 200u);   // sizeofcmds = 72 + 80 + 24 + 24
     EXPECT_EQ(readU32LE(bytes, 96), 1u);     // nsects = 1 (__text only)
     EXPECT_EQ(readU64LE(bytes, 64), 4u);     // vmsize = text only
-    EXPECT_EQ(readU64LE(bytes, 72), 208u);   // fileoff = 32 + 72 + 80 + 24
+    EXPECT_EQ(readU64LE(bytes, 72), 232u);   // fileoff = 32 + 72 + 80 + 24 + 24
     EXPECT_EQ(readU64LE(bytes, 80), 4u);     // filesize = text only
-    // LC_SYMTAB at 184; symtab right after text (208 + 4); strtab after
+    // LC_SYMTAB at 208; symtab right after text (232 + 4); strtab after
     // the single 16-byte nlist.
-    EXPECT_EQ(readU32LE(bytes, 184), 0x02u);
-    EXPECT_EQ(readU32LE(bytes, 192), 212u);  // symoff
-    EXPECT_EQ(readU32LE(bytes, 196), 1u);    // nsyms
-    EXPECT_EQ(readU32LE(bytes, 200), 228u);  // stroff
+    EXPECT_EQ(readU32LE(bytes, 208), 0x02u);
+    EXPECT_EQ(readU32LE(bytes, 216), 236u);  // symoff
+    EXPECT_EQ(readU32LE(bytes, 220), 1u);    // nsyms
+    EXPECT_EQ(readU32LE(bytes, 224), 252u);  // stroff
 }
 
 // (5) The shipped arm64 object format declares the four data-section rows
@@ -1163,9 +1446,9 @@ TEST(MachOWriter, Arm64ObjectDataRelocOnlyExternGetsUndefNlist) {
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a data-reloc-only extern must be covered by the undefined-"
            "extern scan (the ELF c145 mirror)";
-    std::uint32_t const symoff = readU32LE(bytes, 272);
-    std::uint32_t const nsyms  = readU32LE(bytes, 276);
-    std::uint32_t const stroff = readU32LE(bytes, 280);
+    std::uint32_t const symoff = readU32LE(bytes, 296);
+    std::uint32_t const nsyms  = readU32LE(bytes, 300);
+    std::uint32_t const stroff = readU32LE(bytes, 304);
     ASSERT_EQ(nsyms, 3u) << "f1 + table + undefined _puts";
     std::size_t const n2 = symoff + 2 * 16;
     EXPECT_EQ(readStrtabName(bytes, stroff, readU32LE(bytes, n2)), "_puts");
@@ -1267,8 +1550,9 @@ TEST(MachOWriter, Arm64ObjectAllFourDataSectionsOrderAndOrdinals) {
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
-    // 5 sections: sizeofcmds = 72 + 5*80 + 24 = 496; header+cmds = 528.
-    EXPECT_EQ(readU32LE(bytes, 20), 496u);
+    // 5 sections: sizeofcmds = 72 + 5*80 + 24 (build_version) + 24 = 520;
+    // header+cmds = 552.
+    EXPECT_EQ(readU32LE(bytes, 20), 520u);
     EXPECT_EQ(readU32LE(bytes, 96), 5u);
     // Flat addrs: text [0,4) → rodata [8,16) → data [16,24) → relro
     // [24,32) → bss [32,40). filesize = 32, vmsize = 40.
@@ -1278,11 +1562,12 @@ TEST(MachOWriter, Arm64ObjectAllFourDataSectionsOrderAndOrdinals) {
         char const* sect; char const* seg;
         std::uint64_t addr; std::uint32_t offset;
     };
-    // section_64[i] starts at 104 + i*80; fileoff base = 528.
+    // section_64[i] starts at 104 + i*80 (inside the segment command, so
+    // LC_BUILD_VERSION does not move them); fileoff base = 552.
     Expect const rows[] = {
-        {"__const", "__TEXT", 8, 536},
-        {"__data",  "__DATA", 16, 544},
-        {"__const", "__DATA", 24, 552},
+        {"__const", "__TEXT", 8, 560},
+        {"__data",  "__DATA", 16, 568},
+        {"__const", "__DATA", 24, 576},
         {"__bss",   "__DATA", 32, 0},
     };
     for (std::size_t i = 0; i < 4; ++i) {
@@ -1294,8 +1579,8 @@ TEST(MachOWriter, Arm64ObjectAllFourDataSectionsOrderAndOrdinals) {
     }
     // nlist n_sect ordinals: fn=1, rodata=2, data=3, relro=4, bss=5;
     // n_value = each item's flat address.
-    std::uint32_t const symoff = readU32LE(bytes, 32 + 72 + 5 * 80 + 8);
-    ASSERT_EQ(readU32LE(bytes, 32 + 72 + 5 * 80 + 12), 5u);   // nsyms
+    std::uint32_t const symoff = readU32LE(bytes, 32 + 72 + 5 * 80 + 24 + 8);
+    ASSERT_EQ(readU32LE(bytes, 32 + 72 + 5 * 80 + 24 + 12), 5u);   // nsyms
     std::uint8_t const expectSect[] = {1, 2, 3, 4, 5};
     std::uint64_t const expectValue[] = {0, 8, 16, 24, 32};
     for (std::size_t s = 0; s < 5; ++s) {
@@ -1524,9 +1809,9 @@ TEST(MachOWriter, MultiFunctionModuleEmitsSequentialTextBytesAndIndices) {
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
-    // symoff via LC_SYMTAB at byte 184; symoff field at +8 = 192.
-    std::uint32_t const symoff = readU32LE(bytes, 184 + 8);
-    std::uint32_t const nsyms  = readU32LE(bytes, 184 + 12);
+    // symoff via LC_SYMTAB at byte 208; symoff field at +8 = 216.
+    std::uint32_t const symoff = readU32LE(bytes, 208 + 8);
+    std::uint32_t const nsyms  = readU32LE(bytes, 208 + 12);
     ASSERT_EQ(nsyms, 2u);
 
     // Sym[0] = function `a`: n_value = 0.

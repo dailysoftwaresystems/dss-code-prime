@@ -22,15 +22,68 @@
     #include <sys/wait.h>
     #include <unistd.h>
 
-    // `pipe2(O_CLOEXEC)` sets close-on-exec IN THE KERNEL, i.e. atomically with
-    // the descriptors' creation. Linux (since 2.6.27) and FreeBSD have it;
-    // macOS does not offer it at all, which is why the `pipe` + `fcntl` pair
-    // below is kept rather than replaced. The `_GNU_SOURCE` half of the
-    // predicate is not decoration: glibc hides the declaration behind
-    // `__USE_GNU`, and a host that somehow compiles without it must take the
-    // fallback or it will not compile at all.
+    // ── Which POSIX process-creation mechanism this host gets, and why ───────
+    //
+    // The `fork` arm below learns whether `execv` happened through a self-pipe,
+    // and that pipe MUST be created with its close-on-exec flag already set: a
+    // sibling thread that forks between a bare `pipe` and a follow-up
+    // `fcntl(F_SETFD)` leaks the write end into an unrelated child, which then
+    // holds the pipe open so the parent's blocking `read` never reaches EOF —
+    // and this facility has NO TIMEOUT by design (`process_spawn.hpp`), so the
+    // observable failure is the compiler HANGING. The threading premise is this
+    // file's own: the async-signal-safety discipline further down exists because
+    // of the per-CU compile pool.
+    //
+    //   * `pipe2(O_CLOEXEC)` sets the flag IN THE KERNEL, atomically with the
+    //     descriptors' creation, so there is no window. Linux (since 2.6.27) and
+    //     FreeBSD have it. The `_GNU_SOURCE` half of the predicate is not
+    //     decoration: glibc hides the declaration behind `__USE_GNU`, and a host
+    //     that somehow compiles without it must take a different arm or it will
+    //     not compile at all.
+    //   * macOS has no `pipe2` in any spelling, so it takes `posix_spawn`
+    //     instead — which reports exec failure through its RETURN VALUE and
+    //     therefore needs no self-pipe at all. That is strictly stronger than an
+    //     atomic pipe: a descriptor that is never created cannot leak.
+    //   * Any other POSIX host falls through to the two-step `pipe` + `fcntl`
+    //     pair, which is the one arm where the window is genuinely open. No host
+    //     in this project's matrix reaches it (Linux and FreeBSD take `pipe2`,
+    //     macOS takes `posix_spawn`, Windows is a different function entirely);
+    //     it is the last-resort arm for a port to a host offering neither
+    //     mechanism, and such a port should wire up whichever one it does have
+    //     rather than settle for it.
     #if (defined(__linux__) && defined(_GNU_SOURCE)) || defined(__FreeBSD__)
         #define DSS_SPAWN_HAVE_PIPE2 1
+    #elif defined(__APPLE__)
+        #define DSS_SPAWN_USE_POSIX_SPAWN 1
+        #include <Availability.h>
+        #include <crt_externs.h>  // _NSGetEnviron
+        #include <spawn.h>
+
+        // ★ THE chdir FILE ACTION HAS TWO SPELLINGS AND EACH IS A WARNING ON
+        // THE OTHER'S HOST — this predicate picks the one that is neither
+        // deprecated nor unavailable, rather than silencing whichever fires.
+        // The action arrived as Apple's non-portable
+        // `posix_spawn_file_actions_addchdir_np` in macOS 10.15 and was
+        // DEPRECATED in macOS 26.0 in favour of the standard-spelled
+        // `posix_spawn_file_actions_addchdir`, which is `__API_AVAILABLE(macos(
+        // 26.0))` and therefore is not declared at all by an older SDK. Neither
+        // name is right everywhere, so neither is hardcoded:
+        //   * `__MAC_26_0` is only defined by an SDK that knows macOS 26 exists,
+        //     which is exactly the condition under which the standard spelling
+        //     is declared;
+        //   * `__MAC_OS_X_VERSION_MIN_REQUIRED` is the DEPLOYMENT TARGET, and
+        //     comparing against it is what keeps a new-SDK build aimed at an
+        //     older macOS on the `_np` name — where that name is not yet
+        //     deprecated, so nothing warns there either.
+        // MEASURED on Darwin 25.5 / Apple clang 21: `__MAC_26_0` = 260000 and
+        // `__MAC_OS_X_VERSION_MIN_REQUIRED` = 260000, i.e. this host takes the
+        // standard spelling and compiles clean.
+        #if defined(__MAC_26_0) && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) \
+            && __MAC_OS_X_VERSION_MIN_REQUIRED >= __MAC_26_0
+            #define DSS_SPAWN_ADDCHDIR ::posix_spawn_file_actions_addchdir
+        #else
+            #define DSS_SPAWN_ADDCHDIR ::posix_spawn_file_actions_addchdir_np
+        #endif
     #endif
 #endif
 
@@ -395,6 +448,18 @@ namespace detail {
 // inside the read loop below. Order matters and is not arbitrary: a read ERROR
 // disqualifies both clean outcomes before their byte counts are consulted,
 // because a count collected from a failed read describes nothing.
+//
+// ★ COMPILED ON EVERY POSIX HOST, INCLUDING THE ONES WITH NO CALLER. macOS now
+// spawns through `posix_spawn` and never reads an exec-status pipe, so on that
+// host nothing in `src/` calls this. It stays compiled — and its pins stay
+// ungated, which is the load-bearing half — because the alternative is a pin
+// that silently does not run on a platform, and this project treats masked
+// coverage as a defect in its own right. The function is pure: no descriptor, no
+// syscall, no global state, so keeping it costs one symbol and buys the same
+// branch coverage on the Apple leg that every other leg gets. Gating it would
+// also have to gate seven pins identically, and the day a `posix_spawn` host
+// needs the handshake back the tested decision would have to be rewritten from
+// nothing.
 HandshakeVerdict interpretExecHandshake(std::size_t         bytesRead,
                                         std::size_t         expectedBytes,
                                         int                 readErrno,
@@ -613,10 +678,14 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     ::CloseHandle(pi.hProcess);
     return out;
 #else
-    // Everything the child needs must be built BEFORE fork: between fork and
-    // exec only async-signal-safe calls are legal in a process that may have
-    // threads (and this one does — the per-CU compile pool). No allocation,
-    // no std::string construction, no locking happens after the fork below.
+    // Everything the child needs is built BEFORE the process is created. On the
+    // `fork` arm that is a hard requirement rather than tidiness: between fork
+    // and exec only async-signal-safe calls are legal in a process that may have
+    // threads (and this one does — the per-CU compile pool), so no allocation,
+    // no std::string construction and no locking may happen after the fork. The
+    // `posix_spawn` arm has no such window — none of our code ever runs in the
+    // child — but it consumes exactly these three values, so they are prepared
+    // once for both rather than duplicated into each.
     std::string const        exePath = exe->string();
     std::string const        cwdPath = cwd.empty() ? std::string{} : cwd.string();
     std::vector<std::string> storage = argv;
@@ -627,6 +696,128 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     }
     argvPtrs.push_back(nullptr);
 
+    // The process to wait on, whichever arm below created it. HOW a child comes
+    // into being is a host-API question; how it ENDED is not — so `waitpid` and
+    // the exit-status interpretation at the bottom of this function are SHARED
+    // by both arms. Forking that logic would give one platform its own idea of
+    // what "terminated by a signal" reports.
+    pid_t childPid = -1;
+
+#if defined(DSS_SPAWN_USE_POSIX_SPAWN)
+    // ── macOS: posix_spawn, and therefore NO SELF-PIPE AT ALL ────────────────
+    //
+    // ★ THE EXEC STATUS COMES BACK AS A RETURN VALUE. `posix_spawn` returns
+    // non-zero when the image could not be executed and zero once the child is
+    // running the program — which is exactly the distinction
+    // `SpawnResult::spawned` exists to make, obtained without creating a
+    // descriptor. So the entire handshake apparatus the `fork` arm needs (a
+    // pipe, a close-on-exec flag on it, a record written from the child, a read
+    // loop, an interpretation of a possibly torn record) is simply absent here.
+    //
+    // THAT ABSENCE IS THE FIX, not an incidental simplification. The window this
+    // arm exists to close is the one described at the top of this file: macOS
+    // has no `pipe2`, so the pipe would have to be made close-on-exec in a
+    // second step, and a sibling thread forking in between leaks the write end
+    // into an unrelated child that then holds the pipe open forever. A pipe that
+    // is never created cannot leak, so the race is ELIMINATED rather than
+    // narrowed — a stronger outcome than the atomic `pipe2` the other hosts get.
+    //
+    // `posix_spawn`, not `posix_spawnp`: `resolveDetailed` above already turned
+    // argv[0] into an absolute path against the CALLER's directory, and letting
+    // the spawn search again would re-open the "which git did we run" question
+    // this facility answers deliberately (and would resolve it against the
+    // CHILD's directory once the chdir action below has run).
+    //
+    // No `POSIX_SPAWN_CLOEXEC_DEFAULT`: that attribute closes every inherited
+    // descriptor INCLUDING 0/1/2, which would have to be re-inherited with three
+    // explicit `adddup2` file actions to keep the promise in this function's
+    // name. More moving parts to arrive back where the plain form already is —
+    // there is no pipe here whose leak it could prevent.
+    posix_spawn_file_actions_t fileActions;
+    int spawnStatus = ::posix_spawn_file_actions_init(&fileActions);
+    if (spawnStatus != 0) {
+        out.diagnostic = "spawnAndWaitInherit: posix_spawn_file_actions_init() "
+                         "failed (" + errnoText(spawnStatus) + ")";
+        return out;
+    }
+
+    // An EMPTY cwd means "inherit the caller's directory", the same sentinel the
+    // `fork` arm honours by skipping its `chdir` — so no action is installed at
+    // all rather than one naming the current directory, which would turn a
+    // relative-path caller into a subtly different question.
+    if (!cwdPath.empty()) {
+        // `DSS_SPAWN_ADDCHDIR` is the spelling this SDK and deployment target
+        // want; see the predicate at the top of this file. The diagnostic names
+        // the OPERATION rather than the symbol so it does not vary with that
+        // choice — and this branch is an allocation failure inside the file-
+        // actions object, so the symbol would tell an operator nothing anyway.
+        spawnStatus = DSS_SPAWN_ADDCHDIR(&fileActions, cwdPath.c_str());
+        if (spawnStatus != 0) {
+            ::posix_spawn_file_actions_destroy(&fileActions);
+            out.diagnostic = "spawnAndWaitInherit: could not add a chdir action "
+                             "for working directory '"
+                           + cwdPath + "' to the posix_spawn file actions ("
+                           + errnoText(spawnStatus) + ")";
+            return out;
+        }
+    }
+
+    // `*_NSGetEnviron()` rather than a bare `extern char** environ`, and the
+    // reason is a documented CONTRACT rather than an observed failure — which is
+    // worth writing down, because the observation points the other way. Darwin's
+    // `environ(7)` states that shared libraries and bundles have no direct
+    // access to `environ` (it is the linker's, when a whole program is being
+    // linked) and names `_NSGetEnviron()` from `<crt_externs.h>` as the way to
+    // reach it at runtime. This translation unit IS compiled into a shared
+    // library (`libdss-code-prime.dylib`). ⚠ MEASURED 2026-08-12 on Darwin 25.5
+    // / Apple clang 21: a trivial `-dynamiclib` referencing `extern char**
+    // environ` LINKS today, so the restriction is not enforced by this linker
+    // and a future reader who tests the direct spelling will find it "works".
+    // It is still not what the platform guarantees, and the documented API costs
+    // one include. A null `envp` is not an option either: it would hand the
+    // child an EMPTY environment, which is not what the `fork` arm's `execv`
+    // does (it keeps ours).
+    //
+    // stdio is inherited because NOTHING is said about it: with no `adddup2`
+    // action and no CLOEXEC-default attribute, descriptors 0/1/2 cross into the
+    // child untouched, which is the same "the child writes to our stdout"
+    // behaviour the `fork` arm gets by not touching them either.
+    pid_t spawnedPid = -1;
+    spawnStatus      = ::posix_spawn(&spawnedPid, exePath.c_str(), &fileActions,
+                                     /*attrp=*/nullptr, argvPtrs.data(),
+                                     *::_NSGetEnviron());
+    ::posix_spawn_file_actions_destroy(&fileActions);
+
+    if (spawnStatus != 0) {
+        // ★ `posix_spawn` RETURNS the error number and does NOT set `errno`;
+        // reporting `errno` here would print whatever unrelated call last
+        // failed. This is the single most common way to get this call wrong.
+        //
+        // ⚠ AND IT CANNOT SAY WHICH STEP FAILED. The `fork` arm distinguishes
+        // "could not enter the working directory" from "could not exec" because
+        // the child reports its own stage byte; `posix_spawn` performs the chdir
+        // action and the exec inside one call and surfaces ONE errno for the
+        // pair, with overlapping values (ENOENT, EACCES and ENOTDIR are all
+        // reachable from either). The honest report is therefore to name both
+        // candidates and say the platform does not separate them — inventing a
+        // stage by re-probing the directory from the parent would be reporting a
+        // guess as if the child had told us. Where no directory was requested
+        // there is no ambiguity to declare, and the message says exec plainly.
+        out.diagnostic = "spawnAndWaitInherit: posix_spawn('" + exePath
+                       + "') failed (" + errnoText(spawnStatus) + ")";
+        if (!cwdPath.empty()) {
+            out.diagnostic += " — the child was also asked to enter working "
+                              "directory '" + cwdPath
+                            + "' first, and posix_spawn reports ONE errno for "
+                              "the whole operation, so the platform does not "
+                              "say which of the two failed";
+        }
+        return out;
+    }
+
+    childPid    = spawnedPid;
+    out.spawned = true;
+#else
     // The classic exec-status self-pipe: CLOEXEC on both ends, so a
     // SUCCESSFUL exec closes the write end and the parent reads EOF (zero
     // bytes). Any byte that DOES arrive is the child telling us why it never
@@ -646,18 +837,15 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     // until some unrelated process happens to exit. `pipe2` closes the window
     // inside the kernel; there is nothing to race.
     //
-    // ⚠ D-SPAWN-CLOEXEC-RACE-OPEN-ON-MACOS: macOS offers no `pipe2`, so the
-    // `#else` arm below keeps the two-step form and the window stays OPEN on
-    // that platform. It is LATENT today — the only caller is single-threaded —
-    // and the registry row carries the trigger (a second concurrent consumer,
-    // which AP6's `git` acquisition is expected to be) together with why the
-    // `posix_spawn`/`POSIX_SPAWN_CLOEXEC_DEFAULT` rewrite is NOT being landed
-    // blind: no leg available to this loop executes macOS, so it would ship
-    // unexecuted. This is also the one defect in this file with no pin, and
-    // that is a property of the defect rather than an omission — a thread race
-    // has no deterministic trigger, and unlike the torn-handshake fall-through
-    // (closed by extracting `detail::interpretExecHandshake` and pinning every
-    // arm) there is no decision here to extract: the fix IS the syscall choice.
+    // ✅ D-SPAWN-CLOEXEC-RACE-OPEN-ON-MACOS — CLOSED. macOS used to reach the
+    // two-step `#else` below because it offers no `pipe2`, and the window was
+    // genuinely open there. It no longer reaches this code at all: it takes the
+    // `posix_spawn` arm above, which has no pipe to make close-on-exec, so the
+    // race is eliminated on every host this project builds for rather than
+    // merely closed on the two that have the atomic call. What remains under
+    // this `#else` is the last-resort arm for a POSIX port with neither
+    // mechanism; the note at the top of this file says so and says what such a
+    // port should do instead.
     int errorPipe[2] = {-1, -1};
 #if defined(DSS_SPAWN_HAVE_PIPE2)
     if (::pipe2(errorPipe, O_CLOEXEC) != 0) {
@@ -666,10 +854,10 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         return out;
     }
 #else
-    // macOS HAS NO `pipe2` — not as a legacy spelling, not behind a feature
-    // macro. The window above is therefore genuinely open on that host and
-    // cannot be closed with the API the platform offers, so this pair is the
-    // best available rather than an oversight left in place.
+    // The only arm where the window above is genuinely open, and no host in the
+    // matrix takes it. It is kept so a port to an unforeseen POSIX host compiles
+    // and runs rather than failing to build on a line it cannot see, but such a
+    // host should be given whichever atomic mechanism it does have instead.
     if (::pipe(errorPipe) != 0) {
         out.diagnostic = "spawnAndWaitInherit: pipe() failed ("
                        + errnoText(errno) + ")";
@@ -785,10 +973,12 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         return out;
     }
 
+    childPid    = pid;
     out.spawned = true;
+#endif  // DSS_SPAWN_USE_POSIX_SPAWN
 
     int status = 0;
-    while (::waitpid(pid, &status, 0) < 0) {
+    while (::waitpid(childPid, &status, 0) < 0) {
         if (errno == EINTR) {
             continue;
         }

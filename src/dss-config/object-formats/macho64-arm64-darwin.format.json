@@ -44,6 +44,15 @@
     "flags": 0
   },
 
+  "$buildVersionComment": "D-LK10-ENTRY-MACHO-EXIT, MH_OBJECT arm: LC_BUILD_VERSION in a RELOCATABLE object. ★ `image.*` here means THIS MACH-O FILE -- not 'a loadable image'. MH_OBJECT is a `filetype` exactly like MH_EXECUTE, and `build_version_command` is legal in both, which is why the key needs no new vocabulary to reach a `.o`. Apple's own toolchain settles it: ✔MEASURED 2026-08-13 on the operator's Apple Silicon Mac (macOS 26.5.2 / Darwin 25.5.0 arm64, Apple clang, `ld` PROJECT:ld-1267), `clang -c` emits into a plain `.o`, IN THIS ORDER, LC_SEGMENT_64 / LC_BUILD_VERSION (cmdsize 24, platform 1 = PLATFORM_MACOS, ntools 0) / LC_SYMTAB / LC_DYSYMTAB -- so the command sits between the segment and the symtab, which is where the MH_OBJECT walker writes it. WHAT IT FIXES, ✔MEASURED THE SAME DAY: without this key a DSS `.o` carried no platform command at all and ld64 printed, for EVERY object handed to it, `ld: warning: no platform load command found in '<tu>.o', assuming: macOS` (observed by tests/link/test_macho_ld64_local_collision.cpp's ld64 tier and recorded on D-LK-MACHO-STB-LOCAL-LD64-RUNTIME-WITNESS). The link succeeded and the binary ran, so this was fidelity + noise rather than breakage -- but a warning on every object trains readers to ignore linker warnings, can bury a real one, and an ld64 that ever hardens it to an error would break the link outright. minOs / sdk = 11.0 = the SAME floor the -exec and -dylib siblings declare, so a member `.o` never claims a NEWER deployment target than the image it links into. RED-ON-DISABLE, MEASURED by deleting this block: mach_header_64 ncmds falls 3 -> 2 and sizeofcmds drops by 24, reddening the byte pins in tests/link/test_macho_writer.cpp -- and the ld64 leg's no-warning assertion goes red on the Mac.",
+  "image": {
+    "buildVersion": {
+      "platform": "macos",
+      "minOs": "11.0",
+      "sdk": "11.0"
+    }
+  },
+
   "sections": [
     {
       "$comment": "Executable code. Mach-O two-level naming: section `__text` inside segment `__TEXT`. section_64.flags = S_REGULAR (0x0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign = 16 RAW BYTES (x86_64/arm64 code alignment). section_64.align is a LOG2 exponent and the walker converts (std::countr_zero), exactly as every other section row here is converted; this row used to carry the literal log2 4 and be written VERBATIM, which made one schema key mean two different things across the object and exec families (D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD), written VERBATIM by the walker (the data rows below use the raw-byte-floor convention instead; see their comments). PE's substrate `type` field repurposed for Mach-O section_64.flags. The x86_64-darwin object sibling stays text-only + leaf-only (no runtime leg to witness it); THIS arm64 file carries the data rows (D-LK-OBJECT-DATA-SECTION-RELOCATABLE, c147).",

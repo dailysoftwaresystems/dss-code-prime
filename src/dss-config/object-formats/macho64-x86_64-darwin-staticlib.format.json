@@ -41,6 +41,14 @@
     "filetype": "object",
     "flags": 0
   },
+  "$buildVersionComment": "D-LK10-ENTRY-MACHO-EXIT, MH_OBJECT arm — and THIS FILE MUST CARRY IT, which is the whole finding. An `ar` archive is not a Mach-O file: the `!<arch>` framing has no load commands and cannot hold a platform declaration, so in a real toolchain the platform lives in each MEMBER, because `ar` merely archives `.o` files that clang already stamped. DSS matches that by construction — `linkAndWriteStaticArchive` (src/program/compile_pipeline.cpp) links every member through the SAME `linker::link` -> `macho::encode` MH_OBJECT walker, handing it THIS schema, not the bare relocatable sibling's. So the walker's `image.buildVersion.has_value()` gate reads THIS file, and omitting the key here would ship an archive whose members each draw `ld: warning: no platform load command found` — the exact defect the sibling closes, surviving inside the `.a`. Members get the emitter for free; they do NOT get the declaration for free. Values are the sibling's verbatim (`macos` / 11.0 / 11.0) — the platform axis is per-OS, not per-CPU, so all four darwin object-flavored formats declare the identical block. ⛔ UNRUN, stated rather than implied: no DSS-emitted Mach-O `.a` has been fed to ld64, and the reachable Mac is Apple Silicon, so nothing here rests on an x86_64 probe — the claim is member-byte emission plus the mechanism above, the same honest boundary this file's `$supportedDataSectionsComment` draws.",
+  "image": {
+    "buildVersion": {
+      "platform": "macos",
+      "minOs": "11.0",
+      "sdk": "11.0"
+    }
+  },
   "sections": [
     {
       "$comment": "Executable code. Mach-O two-level naming: section `__text` inside segment `__TEXT`. section_64.flags = S_REGULAR (0x0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign = 16 RAW BYTES (x86_64/arm64 code alignment). section_64.align is a LOG2 exponent and the walker converts (std::countr_zero), exactly as every other section row here is converted; this row used to carry the literal log2 4 and be written VERBATIM, which made one schema key mean two different things across the object and exec families (D-MACHO-TEXT-SECTION-ALIGN-RAW-BYTES-INTO-LOG2-FIELD). PE's substrate `type` field repurposed for Mach-O section_64.flags.",

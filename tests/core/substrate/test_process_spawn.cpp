@@ -58,6 +58,7 @@
 
     #include <shellapi.h>  // CommandLineToArgvW — the round-trip ORACLE
 #else
+    #include <fcntl.h>   // open — the stdio-inheritance pin redirects fd 1 and 2
     #include <unistd.h>  // access(X_OK) — the permission-probe pin's own control
 #endif
 
@@ -92,6 +93,14 @@ constexpr std::string_view kFixtureFlag = "--dss-spawn-fixture";
 // signal-termination test sends it, and it is spelled distinctly enough that no
 // other payload could collide with it.
 constexpr std::string_view kRaiseSignalDirective = "--dss-fixture-raise-signal";
+
+// The second acting directive: write a fixed token to stdout and a DIFFERENT
+// one to stderr, so a parent that has redirected its own descriptors 1 and 2 can
+// prove the child wrote through THOSE. Two tokens rather than one because a
+// spawn that crossed the streams over would satisfy a single-token assertion.
+constexpr std::string_view kEchoStdioDirective = "--dss-fixture-echo-stdio";
+constexpr std::string_view kInheritedStdoutToken = "dss-fixture-wrote-stdout";
+constexpr std::string_view kInheritedStderrToken = "dss-fixture-wrote-stderr";
 #endif
 
 // Marker records are LENGTH-PREFIXED, not line-delimited: an argument the
@@ -298,6 +307,40 @@ std::string expectedErrnoText(int code) {
     char const* const message = std::strerror(code);
     return "errno=" + std::to_string(code) + ": "
          + (message != nullptr ? message : "<no message text for this errno>");
+}
+
+// What "the OS refused to execute this image" reads like on the POSIX arm this
+// host actually takes. The two arms create the process with DIFFERENT system
+// calls, so the failure is reported by whichever one made the attempt — `execv`
+// from inside the forked child, `posix_spawn` from the parent — and each host is
+// pinned against its OWN exact sentence rather than a shared substring. The test
+// that uses this RUNS on every POSIX leg; only the literal differs, so there is
+// no platform where it quietly proves nothing.
+//
+// The `posix_spawn` form carries one extra clause, and it is the honest half of
+// that arm's trade: the chdir file action and the exec happen inside one call
+// which hands back ONE errno for the pair, so when a working directory was
+// requested the platform genuinely does not say which step failed. The fork arm
+// learns the stage from the child's own record and never has to say it.
+std::string expectedImageFailureDiagnostic(std::string const& exePath,
+                                           std::string const& cwdPath,
+                                           int                code) {
+#if defined(__APPLE__)
+    std::string message = "spawnAndWaitInherit: posix_spawn('" + exePath
+                        + "') failed (" + expectedErrnoText(code) + ")";
+    if (!cwdPath.empty()) {
+        message += " — the child was also asked to enter working directory '"
+                 + cwdPath
+                 + "' first, and posix_spawn reports ONE errno for the whole "
+                   "operation, so the platform does not say which of the two "
+                   "failed";
+    }
+    return message;
+#else
+    (void)cwdPath;  // the fork arm's child chdir'd first and reports the stage
+    return "spawnAndWaitInherit: execv('" + exePath + "') failed ("
+         + expectedErrnoText(code) + ")";
+#endif
 }
 #endif
 
@@ -885,6 +928,161 @@ TEST(SpawnAndWaitInherit, ASignalKilledChildReportsTheSignalAndNamesIt) {
            "a signal' says nothing about the WIFSIGNALED arm";
 }
 
+// ★★ A FILE THAT RESOLVES AND STILL CANNOT BE EXECUTED — the last place
+// `spawned` can be got wrong, and the ONLY pin that reaches the macOS arm's
+// failure branch. Everything before this point succeeds: the path is taken as
+// given, the file is a regular file, the execute bit is set. The image is still
+// not runnable, and the OS says so at the moment of creation.
+//
+// The two POSIX arms learn that fact by different routes and the difference is
+// the whole reason this pin matters. The fork arm hears it from the child, over
+// the exec-status pipe. The `posix_spawn` arm hears it as the call's RETURN
+// VALUE — which is that arm's entire error channel, so an implementation that
+// dropped the check would set `spawned` for a process that was never created and
+// then hand `waitpid` a pid of -1, reaping some unrelated child of this process
+// and reporting ITS exit status as the build step's verdict.
+//
+// The errno is pinned exactly (ENOEXEC — "the file is not in an executable
+// format", which is what a text file with no `#!` line is on both hosts) rather
+// than accepted as "some failure": a diagnostic that named the wrong errno would
+// send the operator after the wrong problem, and `posix_spawn` returning its
+// code through the RETURN VALUE while leaving `errno` alone is the single most
+// common way to get this call wrong.
+//
+// POSIX-only because the two POSIX arms are what is under test. The Windows
+// counterpart already exists and makes the same statement about
+// `CreateProcessW`: `ANonAsciiArgv0ReachesCreateProcessRatherThanNotFound`.
+TEST(SpawnAndWaitInherit, AResolvableFileThatIsNotAnExecutableImageIsNotSpawned) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
+                                          "process-spawn-not-an-image"};
+    fs::path const tool = scratch.path() / "dss-not-an-executable-image";
+    {
+        std::ofstream file(tool, std::ios::binary);
+        ASSERT_TRUE(file.good());
+        // No `#!` and no magic number either host recognises. A shebang would
+        // make this a perfectly runnable script and the pin would prove nothing.
+        file << "this is not an executable image\n";
+    }
+    std::error_code ec;
+    fs::permissions(tool,
+                    fs::perms::owner_read | fs::perms::owner_write
+                        | fs::perms::owner_exec,
+                    fs::perm_options::replace, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    // The control: the resolver's own `access(X_OK)` probe must PASS here, or
+    // this would silently become the not-executable pin above wearing a
+    // different name and the spawn arm would never be reached at all.
+    ASSERT_EQ(::access(tool.c_str(), X_OK), 0)
+        << "the fixture is not executable, so resolution would fail before any "
+           "process creation was attempted";
+
+    auto const resolved = resolveExecutableOnPath(tool.string());
+    ASSERT_TRUE(resolved.has_value()) << tool.string();
+
+    auto const plain = spawnAndWaitInherit({tool.string(), "--x"});
+    EXPECT_FALSE(plain.spawned)
+        << "the OS refused the image, so there is no process whose exit code "
+           "could be reported: "
+        << plain.diagnostic;
+    EXPECT_EQ(plain.exitCode, 0);
+    EXPECT_EQ(plain.diagnostic,
+              expectedImageFailureDiagnostic(resolved->string(), "", ENOEXEC));
+
+    // The SAME failure with a working directory, which the two arms report
+    // differently on purpose: the fork arm's child chdir'd successfully and then
+    // failed at `execv`, so it can name the stage; `posix_spawn` performed both
+    // inside one call and cannot, so it says which two things the one errno
+    // covers instead of picking one.
+    fs::path const childDir = scratch.path() / "child cwd";
+    ASSERT_TRUE(fs::create_directory(childDir));
+    auto const withCwd = spawnAndWaitInherit({tool.string(), "--x"}, childDir);
+    EXPECT_FALSE(withCwd.spawned) << withCwd.diagnostic;
+    EXPECT_EQ(withCwd.diagnostic,
+              expectedImageFailureDiagnostic(resolved->string(),
+                                             childDir.string(), ENOEXEC));
+}
+
+// ★★ "INHERIT" IS IN THE FUNCTION'S NAME AND NOTHING CHECKED IT. The child is
+// supposed to write to the COMPILER'S OWN stdout and stderr — that is why a
+// build script's output appears live on the user's terminal instead of being
+// buffered and replayed — and both POSIX arms achieve it by saying NOTHING about
+// descriptors 0, 1 and 2. A property held by omission is precisely the kind a
+// refactor deletes without noticing: `POSIX_SPAWN_CLOEXEC_DEFAULT` on the macOS
+// arm would close all three unless each was re-inherited by an explicit `adddup2`
+// action, and a stray `dup2` file action on either arm would redirect them. In
+// both cases the child's output vanishes exactly when it is being captured, and
+// every other pin in this file — all of which read a marker FILE — stays green.
+//
+// So the parent redirects its own 1 and 2 to files, spawns, restores, and reads
+// what landed. The restore happens before the first assertion on purpose: a
+// failure message streamed into the redirect would be swallowed by the very
+// descriptors under test.
+//
+// POSIX-only because the descriptor is the unit of inheritance here. A Windows
+// child receives the process std HANDLES, which `_dup2` on a CRT descriptor does
+// not move, so the same test there would be exercising `SetStdHandle` rather
+// than the spawn; that arm inherits through `bInheritHandles=TRUE` with no
+// `STARTF_USESTDHANDLES`, which is a different mechanism and a different pin.
+TEST(SpawnAndWaitInherit, TheChildWritesToTheParentsOwnStdoutAndStderr) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
+                                          "process-spawn-stdio"};
+    fs::path const outPath = scratch.path() / "inherited-stdout";
+    fs::path const errPath = scratch.path() / "inherited-stderr";
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    int const savedOut = ::dup(1);
+    int const savedErr = ::dup(2);
+    ASSERT_GE(savedOut, 0);
+    ASSERT_GE(savedErr, 0);
+
+    int const outFd =
+        ::open(outPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int const errFd =
+        ::open(errPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    bool const redirected = outFd >= 0 && errFd >= 0 && ::dup2(outFd, 1) >= 0
+                         && ::dup2(errFd, 2) >= 0;
+
+    FixtureRun run;
+    if (redirected) {
+        run = runFixture(scratch.path() / "stdio.marker", 0,
+                         {std::string{kEchoStdioDirective}});
+    }
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    if (outFd >= 0) {
+        ::close(outFd);
+    }
+    if (errFd >= 0) {
+        ::close(errFd);
+    }
+    ::dup2(savedOut, 1);
+    ::dup2(savedErr, 2);
+    ::close(savedOut);
+    ::close(savedErr);
+
+    ASSERT_TRUE(redirected)
+        << "could not redirect this process's own stdio, so the pin could not "
+           "have observed anything";
+    ASSERT_TRUE(run.result.spawned) << run.result.diagnostic;
+    EXPECT_EQ(run.result.exitCode, 0);
+
+    auto const outBlob = readFileBinary(outPath);
+    auto const errBlob = readFileBinary(errPath);
+    ASSERT_TRUE(outBlob.has_value()) << outPath.string();
+    ASSERT_TRUE(errBlob.has_value()) << errPath.string();
+    // Exact equality, not a substring: the child writes these bytes and nothing
+    // else, so anything extra means something other than the fixture reached
+    // that descriptor.
+    EXPECT_EQ(*outBlob, std::string{kInheritedStdoutToken})
+        << "the child's stdout did not land in the descriptor this process had "
+           "on fd 1 — stdio was not inherited";
+    EXPECT_EQ(*errBlob, std::string{kInheritedStderrToken})
+        << "the child's stderr did not land in the descriptor this process had "
+           "on fd 2";
+}
+
 #endif  // !_WIN32
 
 // ★ AN EMBEDDED NUL IN AN ARGV ELEMENT IS REJECTED, AND NO CHILD IS CREATED.
@@ -1123,6 +1321,15 @@ TEST(SpawnAndWaitInherit, ArgumentsReachTheChildByteIdenticallyWithNoShell) {
 // POSIX-only because the handshake is: the Windows arm uses `CreateProcessW`
 // and has no pipe to interpret.
 //
+// ★ AND UNGATED ACROSS ALL OF POSIX, INCLUDING THE HOST WITH NO CALLER. macOS
+// spawns through `posix_spawn`, which reports exec failure through its return
+// value, so nothing in `src/` reads an exec-status pipe there. These pins still
+// run on that leg, deliberately: the function is pure and compiled everywhere
+// (see the header's note on why), and narrowing the pins to the hosts that call
+// it would be a pin that silently does not run on a platform — the masked
+// coverage this project treats as a defect. The rule is one-way and absolute:
+// the function and its pins are gated identically or not at all.
+//
 // `expectedBytes` is a PARAMETER, so these pins pass a stand-in record size and
 // do not depend on the real `sizeof(ChildFailure)` — they pin the decision, not
 // the layout.
@@ -1238,9 +1445,14 @@ TEST(InterpretExecHandshake, AMissingRecordNeverResolvesToSpawned) {
               "spawned rather than guessing that it ran.");
 }
 
-// The live path still routes through the same function: a real spawn that
-// succeeds reads EOF, which is the clean arm above. Without this the pure pins
-// could all pass while `spawnAndWaitInherit` had stopped calling them.
+// The live path still routes through the same function ON THE HOSTS THAT HAVE A
+// HANDSHAKE: a real spawn that succeeds reads EOF, which is the clean arm above,
+// and without this the pure pins could all pass while `spawnAndWaitInherit` had
+// stopped calling them. On macOS there is no pipe and no call, so there this
+// asserts the weaker — but still true, and still worth holding — statement that
+// a clean spawn reports `spawned` with an EMPTY diagnostic. Left ungated for the
+// same reason as the pins above it: which host runs which arm is stated here in
+// prose, not hidden in a preprocessor condition a reader has to reconstruct.
 TEST(InterpretExecHandshake, TheLiveSpawnPathAgreesWithTheCleanArm) {
     dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
                                           "process-spawn"};
@@ -1351,6 +1563,19 @@ int main(int argc, char** argv) {
             return 126;
         }
 #if !defined(_WIN32)
+        // Write through the descriptors the parent handed us, only AFTER the
+        // marker is on disk so the two facts stay independent. `fwrite` with an
+        // explicit length rather than `fputs`: a `string_view` is not obliged to
+        // be NUL-terminated, and the parent compares these bytes exactly.
+        if (argc >= 5 && std::string_view{argv[4]} == kEchoStdioDirective) {
+            std::fwrite(kInheritedStdoutToken.data(), 1,
+                        kInheritedStdoutToken.size(), stdout);
+            std::fflush(stdout);
+            std::fwrite(kInheritedStderrToken.data(), 1,
+                        kInheritedStderrToken.size(), stderr);
+            std::fflush(stderr);
+        }
+
         // Die by SIGNAL rather than by `return`, and do it only AFTER the
         // marker is closed on disk — the parent asserts both that the child
         // reached user code and how it ended, and a marker still sitting in a

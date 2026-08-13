@@ -357,6 +357,45 @@ if ($srcAnchors.Count -lt $AnchorFloor) {
 #   (2) Plans use a more specific anchor name (e.g.
 #       `D-LK6-14-INTEGRATION-GOT-SLOTS`) but src cites the parent
 #       (`D-LK6-14-INTEGRATION`) — both are "known" via the same row.
+#
+# ════════════════════════════════════════════════════════════════════════════
+# ★★ PAIRING DECISION, 2026-08-12: THE `.sh` TWIN'S PHASE-1 REWRITE AND ITS
+# `LC_ALL=C` PREFIXES ARE **DELIBERATELY NOT MIRRORED HERE**, AND THIS IS THE
+# REASON — recorded IN THE FILE because SKILL.md §2 requires a change to one
+# twin to land in the other OR to be explained, and because
+# `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` means nothing else will notice.
+#
+# WHAT HAPPENED ON THE OTHER SIDE. ✔MEASURED 2026-08-12 on the operator's Mac
+# (macOS 26.5.2 arm64, BSD grep 2.6.0-FreeBSD), matched content, same commit:
+# the `.sh` guard took 274.6 s / 317.6 s in `en_US.UTF-8` and 180.4 s / 153.4 s
+# in `LC_ALL=C`, against 0.17 s on Linux (GNU grep 3.11) and ~1.1 s in Git Bash
+# (GNU grep 3.0). `ps` caught it parked at 100% CPU inside
+# `grep -rhoF -f <950 patterns> .plans/` in BOTH locales. GNU grep compiles a
+# `-F -f` set into one Aho-Corasick automaton; BSD grep has no such matcher and
+# degrades toward (patterns x text). The `.sh` fix scans for the anchor PATTERN
+# instead of for the 950 anchor STRINGS, so its cost is (1 x text): the same
+# guard, same host, same content, went 270.6 s -> 4.3 s with a BYTE-IDENTICAL
+# verdict. For scale, THIS script measures ~3.5 s on the Windows leg, so after
+# the fix the two twins are finally in the same order of magnitude.
+#
+# WHY THIS FILE NEEDS NEITHER HALF OF THAT FIX:
+#   · There is NO `grep` here at all. The plan-side resolve below is a single
+#     in-memory `.Contains()` per anchor over one joined string — i.e. this twin
+#     was ALREADY doing the cheap thing, which the `.sh` has now caught up to
+#     from the slow side. There is no `-F -f` pattern set to degrade.
+#   · There is no `LC_ALL` equivalent to apply. `[regex]::Matches` and
+#     `String.Contains` are ORDINAL over UTF-16 for the ASCII-only character
+#     classes this guard uses; no collation table participates, so no locale can
+#     change either their result or their cost.
+# ⇒ The pair still agrees on the VERDICT, which is the only thing the pairing
+#   contract is about: the `.sh`'s phase 1/1b are a cheap PRE-FILTER whose only
+#   authority is to hand work to phase 3, and phase 3 asks the same question
+#   this line asks. What diverged is an implementation of a non-verdict-bearing
+#   filter on one platform, not a behaviour.
+# ⚠ If a `grep` ever appears in a `.sh`-side scan again, it needs `LC_ALL=C` and
+#   it must not be given a large `-f` pattern set. That constraint lives on that
+#   side; nothing here can enforce it.
+# ════════════════════════════════════════════════════════════════════════════
 $planFiles = Get-ChildItem -Path '.plans' -Recurse -File -Include '*.md'
 $allPlanText = ($planFiles | ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
 

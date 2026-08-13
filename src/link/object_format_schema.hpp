@@ -542,35 +542,158 @@ machoCodeSignatureHashAlgoFromName(std::string_view s) noexcept {
     return kMachOCodeSignatureHashAlgoTable.fromName(s);
 }
 
-// LC_BUILD_VERSION (`build_version_command`). Declares the executable's
-// target PLATFORM and minimum-OS / SDK versions. Modern dyld (macOS 11+ /
-// Apple Silicon, i.e. dyld4) identifies a main executable's platform from
-// this command; an executable carrying NO platform load command (neither
-// LC_BUILD_VERSION nor the legacy LC_VERSION_MIN_MACOSX) is rejected at
-// load — a distinct EBADMACHO-class blocker from segment misalignment.
-// `minOs`/`sdk` use the on-wire nibble encoding `(major<<16) |
-// (minor<<8) | patch` (e.g. 11.0.0 → 0x000B0000). Optional in the
-// schema (`image.buildVersion`) — absent → no LC_BUILD_VERSION emitted
-// (the pre-arm64 / MH_OBJECT behaviour, byte-identical). The platform is
-// a CLOSED enum (name → value) so a typo fails loud at load rather than
-// silently picking a platform. (D-LK10-ENTRY-MACHO-EXIT.)
+// LC_BUILD_VERSION (`build_version_command`). Declares the file's target
+// PLATFORM and minimum-OS / SDK versions. Two DIFFERENT consumers need it,
+// with different severities:
+//   * an IMAGE — modern dyld (macOS 11+ / Apple Silicon, i.e. dyld4)
+//     identifies a main executable's platform from this command, and an
+//     executable carrying no platform load command (neither LC_BUILD_VERSION
+//     nor the legacy LC_VERSION_MIN_MACOSX) is REJECTED at load, a distinct
+//     EBADMACHO-class blocker from segment misalignment;
+//   * a RELOCATABLE OBJECT — ld64 falls back to guessing and says so, once
+//     per input: `ld: warning: no platform load command found in '<tu>.o',
+//     assuming: macOS`. Not fatal, but real clang stamps every `.o`, so an
+//     object without it is a fidelity gap that puts a warning on every link.
+// `minOs`/`sdk` use the on-wire nibble encoding `(major<<16) | (minor<<8) |
+// patch` (e.g. 11.0.0 → 0x000B0000). Optional in the schema
+// (`image.buildVersion`) — absent → no LC_BUILD_VERSION emitted, by EVERY
+// walker that emits one, so a format that declares nothing is byte-identical
+// to the pre-LC_BUILD_VERSION layout. The platform is a CLOSED enum
+// (name → value) so a typo fails loud at load rather than silently picking a
+// platform. (D-LK10-ENTRY-MACHO-EXIT.)
+//
+// ── THE PLATFORM VOCABULARY IS COMPLETE, NOT macOS-ONLY ───────────────
+//
+// It shipped with ONE enumerator (`MacOs`), which made every non-macOS Apple
+// target — iOS above all — reachable only by editing C++, in a project whose
+// whole design premise is that a new target is a `.format.json` edit. The
+// mechanism was always agnostic (the loader decodes a NAME through this table
+// and `macho.cpp` writes `static_cast<uint32_t>(bv.platform)`; there is no
+// platform branch anywhere), so the defect was purely the vocabulary's
+// PARTIAL coverage of a CLOSED ABI enum.
+//
+// ⚠ THIS ADDS NO MECHANISM, and the distinction matters because the bar
+// forbids speculative machinery. There is no new code path, no branch, no
+// feature — the engine already walks this table generically and writes
+// whatever u32 it decodes. These are NAME ROWS for values Apple has already
+// fixed in its ABI, exactly like the registered artifact-profile set. Partial
+// coverage of a closed vocabulary is the defect; a table row is not a feature.
+//
+// ✔MEASURED 2026-08-13, both halves, on the operator's Apple Silicon Mac
+// (macOS 26.5.2, Xcode SDK MacOSX.sdk, Apple `ld` PROJECT:ld-1267):
+//   * THE VALUES come from `<mach-o/loader.h>` itself
+//     (`grep 'define PLATFORM_' "$(xcrun --show-sdk-path)/usr/include/mach-o/
+//     loader.h"`), which documents 1..24 unconditionally — 13..24 are NOT
+//     behind `__OPEN_SOURCE__` or any other guard. All 24 are carried, because
+//     stopping at 12 would re-create at a new boundary the exact partial-
+//     coverage defect this change exists to remove.
+//   * THE SPELLINGS are Apple's own `-platform_version` vocabulary, probed one
+//     by one rather than assumed: every name below was fed to
+//     `ld -platform_version <name> 1.0 1.0` and ACCEPTED. The hyphen is
+//     Apple's, not this project's — `iossimulator` is REJECTED
+//     (`ld: -platform_version unknown platform`) while `ios-simulator` is
+//     accepted. `maccatalyst` is accepted too; the hyphenated form is chosen
+//     so every multi-word row is uniform, which is also this repo's config
+//     spelling convention (`leading-underscore`, `case-insensitive`,
+//     `register-machine`).
+//
+// DELIBERATELY ABSENT, both of them real `PLATFORM_*` macros:
+//   * `PLATFORM_UNKNOWN` (0) — an LC_BUILD_VERSION that declares no platform
+//     is strictly worse than emitting no LC_BUILD_VERSION at all: it makes the
+//     file assert "unknown" instead of leaving ld64 to apply its documented
+//     assumption. Omitting `image.buildVersion` is the supported way to say
+//     nothing.
+//   * `PLATFORM_ANY` (0xFFFFFFFF) — a wildcard for MATCHING a platform, not
+//     for stamping one into a file a producer writes.
+// Neither can be reached by accident: an unlisted name fails loud at schema
+// load (C_MalformedJson at /image/buildVersion/platform).
 struct DSS_EXPORT MachOBuildVersion {
+    // Values ARE Apple's `PLATFORM_*` numbers and are written verbatim into
+    // `build_version_command.platform`, so the enumerator values (and the
+    // table row order below, which mirrors them) are ABI, not style.
     enum class Platform : std::uint32_t {
-        MacOs = 1,  // PLATFORM_MACOS
+        MacOs               = 1,   // PLATFORM_MACOS
+        Ios                 = 2,   // PLATFORM_IOS
+        TvOs                = 3,   // PLATFORM_TVOS
+        WatchOs             = 4,   // PLATFORM_WATCHOS
+        BridgeOs            = 5,   // PLATFORM_BRIDGEOS
+        MacCatalyst         = 6,   // PLATFORM_MACCATALYST
+        IosSimulator        = 7,   // PLATFORM_IOSSIMULATOR
+        TvOsSimulator       = 8,   // PLATFORM_TVOSSIMULATOR
+        WatchOsSimulator    = 9,   // PLATFORM_WATCHOSSIMULATOR
+        DriverKit           = 10,  // PLATFORM_DRIVERKIT
+        VisionOs            = 11,  // PLATFORM_VISIONOS
+        VisionOsSimulator   = 12,  // PLATFORM_VISIONOSSIMULATOR
+        Firmware            = 13,  // PLATFORM_FIRMWARE
+        SepOs               = 14,  // PLATFORM_SEPOS
+        MacOsExclaveCore    = 15,  // PLATFORM_MACOS_EXCLAVECORE
+        MacOsExclaveKit     = 16,  // PLATFORM_MACOS_EXCLAVEKIT
+        IosExclaveCore      = 17,  // PLATFORM_IOS_EXCLAVECORE
+        IosExclaveKit       = 18,  // PLATFORM_IOS_EXCLAVEKIT
+        TvOsExclaveCore     = 19,  // PLATFORM_TVOS_EXCLAVECORE
+        TvOsExclaveKit      = 20,  // PLATFORM_TVOS_EXCLAVEKIT
+        WatchOsExclaveCore  = 21,  // PLATFORM_WATCHOS_EXCLAVECORE
+        WatchOsExclaveKit   = 22,  // PLATFORM_WATCHOS_EXCLAVEKIT
+        VisionOsExclaveCore = 23,  // PLATFORM_VISIONOS_EXCLAVECORE
+        VisionOsExclaveKit  = 24,  // PLATFORM_VISIONOS_EXCLAVEKIT
     };
+    // ⚠ THE DEFAULT IS INERT, NOT A POLICY. `buildVersion` is an
+    // `std::optional` on the image, and every consumer gates on
+    // `has_value()`, so this member is only ever read after the loader has
+    // OVERWRITTEN it from the schema's declared `platform` (a required field
+    // — a `buildVersion` object without one fails loud). It is NOT an
+    // "assume macOS if unset" fallback: there is no unset-but-emitted state
+    // for it to cover. An iOS format gets iOS purely by declaring it.
     Platform      platform = Platform::MacOs;
     std::uint32_t minOs = 0;  // (major<<16)|(minor<<8)|patch
     std::uint32_t sdk   = 0;  // (major<<16)|(minor<<8)|patch
 };
 
-inline constexpr EnumNameTable<MachOBuildVersion::Platform, 1>
+inline constexpr EnumNameTable<MachOBuildVersion::Platform, 24>
 kMachOBuildVersionPlatformTable{{{
-    { MachOBuildVersion::Platform::MacOs, "macos" },
+    { MachOBuildVersion::Platform::MacOs,               "macos"                 },
+    { MachOBuildVersion::Platform::Ios,                 "ios"                   },
+    { MachOBuildVersion::Platform::TvOs,                "tvos"                  },
+    { MachOBuildVersion::Platform::WatchOs,             "watchos"               },
+    { MachOBuildVersion::Platform::BridgeOs,            "bridgeos"              },
+    { MachOBuildVersion::Platform::MacCatalyst,         "mac-catalyst"          },
+    { MachOBuildVersion::Platform::IosSimulator,        "ios-simulator"         },
+    { MachOBuildVersion::Platform::TvOsSimulator,       "tvos-simulator"        },
+    { MachOBuildVersion::Platform::WatchOsSimulator,    "watchos-simulator"     },
+    { MachOBuildVersion::Platform::DriverKit,           "driverkit"             },
+    { MachOBuildVersion::Platform::VisionOs,            "visionos"              },
+    { MachOBuildVersion::Platform::VisionOsSimulator,   "visionos-simulator"    },
+    { MachOBuildVersion::Platform::Firmware,            "firmware"              },
+    { MachOBuildVersion::Platform::SepOs,               "sepos"                 },
+    { MachOBuildVersion::Platform::MacOsExclaveCore,    "macos-exclavecore"     },
+    { MachOBuildVersion::Platform::MacOsExclaveKit,     "macos-exclavekit"      },
+    { MachOBuildVersion::Platform::IosExclaveCore,      "ios-exclavecore"       },
+    { MachOBuildVersion::Platform::IosExclaveKit,       "ios-exclavekit"        },
+    { MachOBuildVersion::Platform::TvOsExclaveCore,     "tvos-exclavecore"      },
+    { MachOBuildVersion::Platform::TvOsExclaveKit,      "tvos-exclavekit"       },
+    { MachOBuildVersion::Platform::WatchOsExclaveCore,  "watchos-exclavecore"   },
+    { MachOBuildVersion::Platform::WatchOsExclaveKit,   "watchos-exclavekit"    },
+    { MachOBuildVersion::Platform::VisionOsExclaveCore, "visionos-exclavecore"  },
+    { MachOBuildVersion::Platform::VisionOsExclaveKit,  "visionos-exclavekit"   },
 }}};
+
+// The table's row count IS the vocabulary's size, so it must equal Apple's
+// contiguous 1..24 range. Without this an enumerator added without its row
+// would compile, load nothing under its name, and silently fall back to row
+// 0 ("macos") in `name()` — a wrong platform stamped into a real file.
+static_assert(kMachOBuildVersionPlatformTable.rows.size()
+                  == static_cast<std::size_t>(
+                         MachOBuildVersion::Platform::VisionOsExclaveKit),
+              "every PLATFORM_* enumerator 1..24 must carry a name row; the "
+              "values are contiguous, so size == the largest enumerator");
 
 [[nodiscard]] constexpr std::optional<MachOBuildVersion::Platform>
 machoBuildVersionPlatformFromName(std::string_view s) noexcept {
     return kMachOBuildVersionPlatformTable.fromName(s);
+}
+[[nodiscard]] constexpr std::string_view
+machoBuildVersionPlatformName(MachOBuildVersion::Platform p) noexcept {
+    return kMachOBuildVersionPlatformTable.name(p);
 }
 
 // Default VM segment page size for Mach-O segment layout (the x86_64 /

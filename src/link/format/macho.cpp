@@ -1569,10 +1569,33 @@ encode(AssembledModule const&    module,
     // AND `LC_SEGMENT_64.cmdsize` AND `LC_SEGMENT_64.nsects` derivations —
     // a data-free module derives 1 and stays BYTE-IDENTICAL to the
     // pre-data-section layout (an explicit test pin).
-    std::size_t const headerAndCommands =
-        kMachHeader64Size
-        + kSegmentCommand64Size + numSections * kSection64Size
+    //
+    // LC_BUILD_VERSION in a RELOCATABLE object — D-LK10-ENTRY-MACHO-EXIT's
+    // MH_OBJECT arm, gated EXACTLY as the dynamic exec arm gates it, so a
+    // Mach-O `.o` format that does not declare `image.buildVersion` stays
+    // byte-identical (ncmds 2, sizeofcmds unchanged, every offset where it
+    // was). `image.*` names THIS MACH-O FILE, not "a loadable image":
+    // MH_OBJECT is a filetype exactly like MH_EXECUTE and
+    // `build_version_command` is legal in both — which is why this needs no
+    // new vocabulary and reuses `appendBuildVersionCommand` rather than a
+    // second emitter. ✔MEASURED 2026-08-13 (macOS 26.5.2 arm64, Apple `ld`
+    // PROJECT:ld-1267): an object WITHOUT it draws `ld: warning: no platform
+    // load command found in '<tu>.o', assuming: macOS` on every link, and
+    // Apple `clang -c` emits the command into every `.o` it writes.
+    auto const& im = fmt.machoImage();
+    bool const emitBuildVersion = im.buildVersion.has_value();
+    // ★ THE ONE OWNER of the load-command byte total. `mach_header_64.
+    // sizeofcmds` and the `textRawOffset` the whole file layout hangs off are
+    // the SAME number, and they were previously two copies of one expression;
+    // an extra load command counted in one and not the other yields a
+    // malformed object (ld64 reads sizeofcmds to find the section data), which
+    // is exactly the way this change could have gone wrong. Derived once here,
+    // read everywhere.
+    std::size_t const sizeOfCommands =
+        kSegmentCommand64Size + numSections * kSection64Size
+        + (emitBuildVersion ? kBuildVersionCommandSize : 0u)
         + kSymtabCommandSize;
+    std::size_t const headerAndCommands = kMachHeader64Size + sizeOfCommands;
 
     // File image of the flat section span: every file-backed section's
     // bytes sit at `textRawOffset + flatAddr` (so section_64.offset =
@@ -1636,11 +1659,11 @@ encode(AssembledModule const&    module,
     appendU32LE(bytes, id.cputype);
     appendU32LE(bytes, id.cpusubtype);
     appendU32LE(bytes, static_cast<std::uint32_t>(id.filetype));
-    appendU32LE(bytes, 2);  // ncmds: LC_SEGMENT_64 + LC_SYMTAB
-    appendU32LE(bytes,
-        static_cast<std::uint32_t>(kSegmentCommand64Size
-                                    + numSections * kSection64Size
-                                    + kSymtabCommandSize));
+    // ncmds: LC_SEGMENT_64 + [LC_BUILD_VERSION] + LC_SYMTAB. Counted from the
+    // SAME predicate `sizeOfCommands` is sized from — a command the header
+    // does not count leaves ld64 walking off the end of the command list.
+    appendU32LE(bytes, emitBuildVersion ? 3u : 2u);
+    appendU32LE(bytes, static_cast<std::uint32_t>(sizeOfCommands));
     appendU32LE(bytes, id.flags);
     appendU32LE(bytes, 0);  // reserved (64-bit padding)
 
@@ -1734,6 +1757,16 @@ encode(AssembledModule const&    module,
                             /*reloff=*/0, /*nreloc=*/0);
     }
 
+    // LC_BUILD_VERSION — AFTER the LC_SEGMENT_64 (with its section_64 tail)
+    // and BEFORE LC_SYMTAB, which is where Apple's own toolchain puts it:
+    // ✔MEASURED 2026-08-13, `xcrun clang -c` on macOS 26.5.2 arm64 produces
+    // LC_SEGMENT_64 / LC_BUILD_VERSION / LC_SYMTAB / LC_DYSYMTAB in that
+    // order. ld64 does not require an order; matching clang is the point,
+    // since the defect being closed is fidelity.
+    if (emitBuildVersion) {
+        appendBuildVersionCommand(bytes, *im.buildVersion);
+    }
+
     // LC_SYMTAB
     appendU32LE(bytes, LC_SYMTAB);
     appendU32LE(bytes, static_cast<std::uint32_t>(kSymtabCommandSize));
@@ -1741,6 +1774,24 @@ encode(AssembledModule const&    module,
     appendU32LE(bytes, numberOfSymbols);
     appendU32LE(bytes, static_cast<std::uint32_t>(stringTableOffset));
     appendU32LE(bytes, static_cast<std::uint32_t>(stringTableSize));
+
+    // Sanity: the emitted load-command block is exactly the size the header
+    // advertised and `textRawOffset` was derived from. Both exec arms carry
+    // this belt; the MH_OBJECT arm did not, and it is the arm where the
+    // failure is quietest — a miscount here does not crash the writer, it
+    // ships a `.o` whose section_64.offset points into the middle of a load
+    // command and leaves ld64 to read garbage.
+    if (bytes.size() != headerAndCommands) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encode (MH_OBJECT): emitted {} bytes of "
+                         "header + load commands but the layout derived {} "
+                         "(mach_header_64 {} + sizeofcmds {}) - "
+                         "substrate-invariant violation (a load command was "
+                         "emitted without being counted, or vice versa).",
+                         bytes.size(), headerAndCommands,
+                         kMachHeader64Size, sizeOfCommands));
+        return {};
+    }
 
     // section data (text + padded file-backed data sections)
     bytes.insert(bytes.end(), sectionData.begin(), sectionData.end());
