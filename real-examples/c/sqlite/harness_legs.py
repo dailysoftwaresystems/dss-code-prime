@@ -1516,9 +1516,11 @@ def _resolve_continuous_clock():
     """(read, name, recordedSuspendSeconds) for the monotonic clock that KEEPS
     COUNTING while this host is suspended.
 
-    `recordedSuspendSeconds` is the host's OWN corroboration of the choice — the
-    continuous clock minus the awake one, both read here, i.e. the suspend this
-    machine has already served since boot. `0.0` means it has not suspended yet
+    `recordedSuspendSeconds` is the host's OWN corroboration of the choice — a
+    continuous clock minus an awake one, both read here and both taken from the
+    SAME ADJUSTMENT DOMAIN (see the comment at the difference below; on Darwin
+    that is the `*_RAW` pair, which is NOT the pair used for the reading), i.e.
+    the suspend this machine has already served since boot. `0.0` means it has not suspended yet
     and the choice is unproven ON IT; `None` means the platform exposes no second
     id to difference against and the fallback is in force. It is EVIDENCE and
     never a gate: a probe that behaved differently on a machine that happened to
@@ -1531,6 +1533,7 @@ def _resolve_continuous_clock():
     import time as _time
     gettime = getattr(_time, "clock_gettime", None)
     mono = getattr(_time, "CLOCK_MONOTONIC", None)
+    mono_raw = getattr(_time, "CLOCK_MONOTONIC_RAW", None)
     boot = getattr(_time, "CLOCK_BOOTTIME", None)
     uptime = getattr(_time, "CLOCK_UPTIME_RAW", None)
     candidate = None
@@ -1541,8 +1544,29 @@ def _resolve_continuous_clock():
             candidate = (mono, uptime, "CLOCK_MONOTONIC")
     if candidate is not None:
         continuous_id, awake_id, name = candidate
+        # ★ THE CORROBORATION IS DIFFERENCED WITHIN ONE ADJUSTMENT DOMAIN, which
+        # is NOT always the pair used for the reading above. Suspend is not the
+        # only thing separating two monotonic ids: `CLOCK_MONOTONIC` is
+        # ADJUSTABLE (NTP slews it) while the `*_RAW` ids never are, so a
+        # cross-domain difference carries suspend PLUS an adjustment term whose
+        # sign is unbounded.
+        #   Linux  — CLOCK_BOOTTIME − CLOCK_MONOTONIC: both adjusted, and by the
+        #            SAME adjustment, so the difference is suspend alone.
+        #   Darwin — CLOCK_MONOTONIC − CLOCK_UPTIME_RAW mixes an ADJUSTED clock
+        #            with a RAW one. Use the raw pair instead.
+        # ⚠ MEASURED on the macos-latest CI runner, which is what caught this:
+        # the mixed pair reported **-0.496 s of recorded suspend** on a freshly
+        # booted VM that had never slept — ~650 ppm of slew over 764 s of uptime.
+        # It went unnoticed for as long as it did because the host it was written
+        # on carried 144661 s of real suspend, which buries a sub-second term.
+        # The self-test's `recordedSuspend >= 0` check stays STRICT, because with
+        # one domain on both sides the ordering is a genuine invariant again.
+        corroboration = (continuous_id, awake_id)
+        if boot is None and uptime is not None and mono_raw is not None:
+            corroboration = (mono_raw, uptime)
         try:
-            recorded = round(gettime(continuous_id) - gettime(awake_id), 3)
+            recorded = round(gettime(corroboration[0])
+                             - gettime(corroboration[1]), 3)
         except (OSError, ValueError):
             # An id the platform NAMES but cannot SERVE is not a clock. Falling
             # through is the safe direction: the fallback reports itself as

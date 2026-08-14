@@ -171,13 +171,41 @@ TEST(RunBinaryDeadlineClock, TheDeadlineIsSpentOnTheClockThatStopsWithTheMachine
                 || absDiff(steady, monotonicRaw) < kReadJitter)
         << "steady_clock matches neither of Darwin's continuous monotonic ids, "
            "so nothing here knows what it is any more";
-    ASSERT_GE(monotonic, uptimeRaw)
-        << "CLOCK_MONOTONIC read BEHIND CLOCK_UPTIME_RAW, which is impossible: "
-           "a suspend can only ADD to the clock that counts it";
+    // ★ SUSPEND IS MEASURED FROM TWO CLOCKS IN THE SAME ADJUSTMENT DOMAIN, and
+    // that is the whole correction. An earlier version asserted
+    // `monotonic >= uptimeRaw` "because a suspend can only ADD to the clock
+    // that counts it". The premise about suspend is true; the CONCLUSION does
+    // not follow, because suspend is not the only difference between those two
+    // ids. `CLOCK_MONOTONIC` is ADJUSTABLE — NTP slews it — while the two _RAW
+    // ids never are, so their difference carries suspend PLUS an adjustment
+    // term of unbounded sign. The comment a few lines above already recorded
+    // that term ("~8.8 s apart by NTP adjustment") without anyone noticing it
+    // refuted the assertion below it.
+    //
+    // ⚠ MEASURED on the macos-latest CI runner (Release), which is what caught
+    // it: CLOCK_MONOTONIC read 764359588000 ns against CLOCK_UPTIME_RAW's
+    // 764855952916 ns — 0.496 s BEHIND, i.e. "-0.496 s of recorded suspend",
+    // on a freshly booted VM that had never slept. That is ~650 ppm of slew
+    // over 764 s. The assertion survived every local run only because the host
+    // it was written on had 144661 s of real suspend, which buried a
+    // sub-second adjustment — the same shape as the defect this whole test
+    // exists to catch, one term hiding another.
+    //
+    // So: `CLOCK_MONOTONIC_RAW - CLOCK_UPTIME_RAW` — both raw, one epoch, one
+    // adjustment domain — is suspend AND NOTHING ELSE, and stays a STRICT
+    // assertion. No tolerance band is introduced, deliberately: a band would
+    // also have to admit the failure this arm is here to catch (the two ids
+    // being swapped), which shows up as a difference of HOURS, not milliseconds.
     ASSERT_GE(monotonicRaw, uptimeRaw)
-        << "CLOCK_MONOTONIC_RAW read BEHIND CLOCK_UPTIME_RAW, which is "
-           "impossible for the same reason";
-    auto const recordedSuspend = monotonic - uptimeRaw;
+        << "CLOCK_MONOTONIC_RAW read BEHIND CLOCK_UPTIME_RAW. Both are RAW, so "
+           "no adjustment can separate them and suspend can only ADD to the "
+           "one that counts it — this ordering is genuinely impossible unless "
+           "the two ids no longer mean what this test believes";
+    auto const recordedSuspend = monotonicRaw - uptimeRaw;
+    // CLOCK_MONOTONIC is still READ and still pinned above (it is one of the
+    // two ids `steady_clock` may resolve to), but it is deliberately NOT
+    // compared against an unadjusted clock any more.
+    (void)monotonic;
     std::cout << "[  CLOCK   ] Darwin: this host has recorded "
               << std::chrono::duration_cast<std::chrono::seconds>(
                      recordedSuspend)
