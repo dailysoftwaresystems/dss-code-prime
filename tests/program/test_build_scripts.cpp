@@ -143,7 +143,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/unsuppressable_codes.hpp"   // isUnsuppressable — the hook codes' membership
 #include "program/platform_token.hpp"
-#include "program/project_config.hpp"
+#include "core/types/project_config.hpp"
 
 #include "diagnostic_count.hpp"
 #include "scratch_dir.hpp"

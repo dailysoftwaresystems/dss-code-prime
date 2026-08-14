@@ -23,6 +23,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "asm/asm_text_to_lir.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/config_path_walk.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -203,7 +204,7 @@ lowerAsmTextWithTarget(nlohmann::json const& doc, std::string_view source,
     run->grammar = *grammarR;
     run->target  = std::move(target);
 
-    UnitBuilder builder{run->grammar};
+    UnitBuilder builder{run->grammar, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::string{source}, "<mem>.s");
     run->unit =
         std::make_unique<CompilationUnit>(std::move(builder).finish());

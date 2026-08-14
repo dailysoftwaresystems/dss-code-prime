@@ -12381,7 +12381,7 @@ namespace fs = std::filesystem;
 // and `format` as the ACTIVE object-format — required by the fabs/ldexp macro
 // `variants` (format-keyed splice, the setjmp.json precedent) and the
 // fabsf/ldexpf per-symbol availability gate. Mirrors the production driver's
-// per-format CU build (UnitBuilder::setActiveFormat + analyze(activeFormat)).
+// per-format CU build (UnitBuilder::setActiveFormat + analyze(activeFormat, DiagnosticBudget::libraryDefault())).
 [[nodiscard]] SemanticModel analyzeRealTgmath(std::string mainSrc,
                                               ObjectFormatKind format,
                                               DataModel dataModel) {
@@ -12945,7 +12945,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedTypedefWeakerThanNaturalIsSilent) {
 
 // ARM 3 — ★ layout params ABSENT ⇒ STAY SILENT. This deliberately diverges from
 // the alignas precedent (which fails loud when it cannot compute an alignment).
-// `src/lsp/lsp_server.cpp:429` calls `dss::analyze(cu)` with NO layout params, so
+// `src/lsp/lsp_server.cpp:429` calls `dss::analyze(cu, DiagnosticBudget::libraryDefault())` with NO layout params, so
 // failing loud here would put a red squiggle under every real SDK typedef in the
 // editor while the same source compiles clean from the CLI.
 // CANNOT-DETERMINE MUST NOT BECOME CANNOT-COMPILE.
@@ -15928,7 +15928,7 @@ TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingReachesInlineAsmQualifierSlot) 
     EXPECT_EQ(countBuilderErrors(*cu), 0u)
         << "P1 admits the extended form at the PARSE tier on purpose — a parse "
            "error here would be the pre-P1 unrecovered cascade coming back";
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u)
         << "GNU EXTENDED inline asm (a `:` operand list) is a separate OPEN gap "
@@ -16013,7 +16013,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmExtendedRefusalCostsOneDiagnosticAndParse
     EXPECT_EQ(countBuilderErrors(*cu), 0u)
         << "the extended form must PARSE; the refusal is semantic";
 
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
 
     // (b) EXACTLY ONE diagnostic in the whole unit, and it is the right one.
     // ⚠ NOT `ASSERT_EQ` ON THE COUNT, AND THAT IS DELIBERATE. An ASSERT here
@@ -16094,7 +16094,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmEmptySectionFormsAreAccepted) {
             "c-subset",
             {"int main(void){ __asm__ " + std::string(form) + "; return 0; }\n"});
         EXPECT_EQ(countBuilderErrors(*cu), 0u) << form << ": must PARSE";
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(model.diagnostics().all().size(), 0u)
             << form << ": accepted by gcc and clang and RUN — DSS must emit "
                        "nothing at all. Got: " << allMessages(model.diagnostics());
@@ -16108,7 +16108,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmEmptySectionFormsAreAccepted) {
             "c-subset",
             {"int main(void){ __asm__ " + mutant + "; return 0; }\n"});
         EXPECT_EQ(countBuilderErrors(*mutCu), 0u) << mutant << ": must PARSE";
-        auto mutModel = analyze(mutCu);
+        auto mutModel = analyze(mutCu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(countCode(mutModel.diagnostics(),
                             DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u)
             << mutant << ": the inline-asm gate must VISIT this shape — "
@@ -16120,7 +16120,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmEmptySectionFormsAreAccepted) {
     auto cu = buildShippedUnit(
         "c-subset", {"int main(void){ __asm__ __volatile__ (\"\"); return 0; }\n"});
     EXPECT_EQ(countBuilderErrors(*cu), 0u);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(model.diagnostics().all().size(), 0u)
         << "`__asm__ __volatile__ (\"\")` is the form real headers write. Got: "
         << allMessages(model.diagnostics());
@@ -16129,7 +16129,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmEmptySectionFormsAreAccepted) {
         "c-subset",
         {"int main(void){ __asm__ __volatile__ (\"hlt\"); return 0; }\n"});
     EXPECT_EQ(countBuilderErrors(*dunderMut), 0u);
-    auto dunderModel = analyze(dunderMut);
+    auto dunderModel = analyze(dunderMut, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(dunderModel.diagnostics(),
                         DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u)
         << "the dunder-qualifier shape must reach the gate too. Got: "
@@ -16215,7 +16215,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmLabelSectionWithoutGotoIsRefused) {
         EXPECT_EQ(sawLabelsPlain, !form.labelsFused)
             << form.text << ": labels boundary took the wrong arm";
 
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto), 1u)
             << form.text << ": a fourth `:` group without `goto` is ill-formed "
@@ -16234,7 +16234,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmLabelSectionWithoutGotoIsRefused) {
     auto cu = buildShippedUnit("c-subset", {
         "int main(void){ __asm__ goto (\"\" : : : : lbl); lbl: return 0; }\n"});
     EXPECT_EQ(countBuilderErrors(*cu), 0u);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto), 0u)
         << "WITH `goto` the label section is legal — reporting the constraint "
@@ -16266,7 +16266,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmDuplicateQualifierIsRefusedByKindNotSpell
             "c-subset", {"int main(void){ __asm__ " + std::string(quals) +
                          " (\"\"); return 0; }\n"});
         EXPECT_EQ(countBuilderErrors(*cu), 0u) << quals << ": must PARSE";
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_InlineAsmDuplicateQualifier), 1u)
             << quals << ": a repeated qualifier is rejected by gcc, clang and "
@@ -16300,7 +16300,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmDuplicateQualifierIsRefusedByKindNotSpell
         "c-subset", {"int main(void){ __asm__ goto volatile (\"\" : : : : l); "
                      "l: return 0; }\n"});
     EXPECT_EQ(countBuilderErrors(*cu), 0u);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InlineAsmDuplicateQualifier), 0u)
         << "`goto volatile` is two distinct qualifiers in a free-order run — "
@@ -16328,7 +16328,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmNonEmptyTemplateStillRefusedUnderP1) {
     auto cu = buildShippedUnit(
         "c-subset", {"int main(void){ __asm__ (\"hlt\"); return 0; }\n"});
     EXPECT_EQ(countBuilderErrors(*cu), 0u);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u)
         << "real asm TEXT is still a per-target deferral "
@@ -16359,7 +16359,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmQualifierScanStopsAtTemplateAndIgnoresOpe
         "  __asm__ (\"\" : : \"r\"(*(volatile int*)&p));\n"
         "  return 0; }\n"});
     EXPECT_EQ(countBuilderErrors(*cu), 0u);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InlineAsmDuplicateQualifier), 0u)
         << "the `volatile` inside the operand's CAST is not a qualifier of the "

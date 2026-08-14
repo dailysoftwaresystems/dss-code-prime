@@ -31,6 +31,7 @@
 // (see the anchor row).
 
 #include "analysis/syntactic/parser.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/tree.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -87,7 +88,7 @@ namespace {
 [[nodiscard]] std::vector<Token> lex(std::shared_ptr<GrammarSchema> schema,
                                      std::string source) {
     auto src = SourceBuffer::fromString(std::move(source), "<nl-src>");
-    Tokenizer tk{src, std::move(schema)};
+    Tokenizer tk{src, std::move(schema), DiagnosticBudget::libraryDefault()};
     auto [stream, diags] = std::move(tk).tokenize();
     (void)diags;
     std::vector<Token> out;
@@ -98,10 +99,11 @@ namespace {
 [[nodiscard]] ParseResult parse(std::shared_ptr<GrammarSchema> schema,
                                 std::string source) {
     auto src = SourceBuffer::fromString(std::move(source), "<nl-src>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
     Parser p{std::move(src), std::move(schema), std::move(stream),
-             ParserConfig{}, std::move(lexDiags)};
+             DiagnosticBudget::libraryDefault(), ParserConfig{},
+             std::move(lexDiags)};
     return std::move(p).parse();
 }
 

@@ -26,6 +26,7 @@
 // across test tiers is how the halves drift.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -424,7 +425,7 @@ TEST(AsmDialectPerTarget, TwoRegisteredLanguagesClaimingOneExtensionFailLoud) {
     ASSERT_TRUE(att.has_value());
     ASSERT_TRUE(gas.has_value());
 
-    UnitBuilder builder{*att};
+    UnitBuilder builder{*att, DiagnosticBudget::libraryDefault()};
     builder.registerSchema(*gas);
     builder.addFile(src);
     auto cu = std::move(builder).finish();
@@ -462,7 +463,7 @@ TEST(AsmDialectPerTarget, OneRegisteredClaimantStillRoutesByExtension) {
     ASSERT_TRUE(c.has_value());
     ASSERT_TRUE(att.has_value());
 
-    UnitBuilder builder{*c};
+    UnitBuilder builder{*c, DiagnosticBudget::libraryDefault()};
     builder.registerSchema(*att);
     builder.addFile(src);
     auto cu = std::move(builder).finish();

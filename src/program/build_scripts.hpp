@@ -2,7 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
-#include "program/project_config.hpp"  // ScriptEntry (the parsed, already-validated manifest row)
+#include "core/types/project_config.hpp"  // ScriptEntry (the parsed, already-validated manifest row)
 
 #include <filesystem>
 #include <vector>
