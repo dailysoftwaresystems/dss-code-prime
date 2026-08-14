@@ -159,9 +159,17 @@ inline constexpr std::uint32_t kMaxClaimAttempts = 1000;
 // what C++23's `std::ios::noreplace` is specified to mean, taken from the layer
 // that actually implements it (D-LINK-WRITER-NOREPLACE-WIDE-PATH-UNSUPPORTED).
 // The two arms reach that ONE semantic by DIFFERENT primitives and the wording
-// must not imply otherwise: Windows uses `_wfopen(…, L"wbx")` (the C11 "x"
-// mode), POSIX uses `open(O_CREAT|O_EXCL)` + `fdopen` and never calls `fopen`
-// at all. See writer.cpp for why that asymmetry is deliberate.
+// must not imply otherwise: Windows uses `_wfopen(…, L"wbxN")` (the C11 "x"
+// mode), POSIX uses `open(O_CREAT|O_EXCL|O_CLOEXEC)` + `fdopen` and never calls
+// `fopen` at all. See writer.cpp for why that asymmetry is deliberate.
+//
+// The trailing `N` / `O_CLOEXEC` are a SECOND, independent guard and not part
+// of the exclusivity: they keep the claimed handle from being inherited by a
+// process the compiler spawns (`core/substrate/process_spawn.cpp`), which on
+// Windows would otherwise make the commit rename fail with
+// ERROR_SHARING_VIOLATION and on POSIX would hand a build hook a writable
+// descriptor onto the staged artifact. Both measurements are at the definition
+// site; the pin is `AClaimedStagingTempNeverCrossesIntoASpawnedChild`.
 //
 // That exclusivity is load-bearing twice over, and neither consequence is
 // observable through `writeBytes`: it makes the staging-temp claim race-free

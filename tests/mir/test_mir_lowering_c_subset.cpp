@@ -7,6 +7,7 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "core/substrate/large_stack_call.hpp"
 #include "core/types/call_payload.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -78,7 +79,7 @@ struct Lowered {
                                    std::string formatName = {}) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
     // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): thread the selected CC's va_list
@@ -91,7 +92,8 @@ struct Lowered {
             vaStrategy = cc->vaListLayout->strategy;
         }
     }
-    auto model = analyze(cu, dataModel, std::nullopt, vaStrategy, std::nullopt,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
+                         dataModel, std::nullopt, vaStrategy, std::nullopt,
                          std::nullopt, ldf);
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
@@ -524,12 +526,13 @@ namespace {
 
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     // Active elf/x86_64 (harmless — atomic_int carries no per-format variant).
-    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
+                         DataModel::Lp64, std::nullopt, std::nullopt,
                          ObjectFormatKind::Elf, "x86_64");
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
@@ -592,12 +595,13 @@ namespace {
     })JSON";
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.setActiveFormat(ObjectFormatKind::Elf);
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
+                         DataModel::Lp64, std::nullopt, std::nullopt,
                          ObjectFormatKind::Elf, "x86_64");
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
@@ -4851,14 +4855,14 @@ TEST(MirLoweringCSubset, ForwardReferenceCallResolvesViaPrePass) {
 TEST(MirLoweringCSubset, SyntheticGlobalSymbolsRespectSemanticFloor) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(loaded.has_value());
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(
         "typedef struct opaqueTag opaqueTag;\n"   // a type-only record in the table
         "static opaqueTag *keep;\n"
         "char const *g(void) { keep = 0; return \"alias-floor\"; }\n",
         "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    auto model = analyze(cu, DataModel::Lp64);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64);
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter hirRep;
     auto hir = lowerToHir(model, hirRep);
@@ -12733,14 +12737,15 @@ constexpr char const* kSetjmpRoundTripSrc =
 
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
 
     // Pass the ACTIVE target/format so the jmp_buf {arch:x86_64,format:elf} variant is
     // selected (nullopt would inject no variant typedef → `jmp_buf` undefined).
-    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
+                         DataModel::Lp64, std::nullopt, std::nullopt,
                          ObjectFormatKind::Elf, "x86_64");
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);

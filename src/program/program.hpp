@@ -64,6 +64,23 @@ public:
     /// `--warnings-as-errors` + `--suppress=<code>` through every tier.
     /// (LK10 cycle 3 post-fold #2: overload pair collapsed to single
     /// signature with default — code-simplifier REQUIRED.)
+    ///
+    /// BUILD LIFECYCLE, in the order the seams run (see the dense notes at
+    /// each seam in `program.cpp` for the reasoning):
+    ///   0. `dependsOn` non-empty ⇒ REFUSE the build (`D_PlanNotLanded`) —
+    ///      resolution has not landed, and accept-and-ignore would report
+    ///      success for an artifact missing a declared prerequisite;
+    ///   1. load + the AP2 language / AP3 format artifact-profile gates, the
+    ///      flag-array merges, artifactName / per-format subdir, stackReserve;
+    ///   2. `preBuildScripts` — spawned BEFORE the `sources[]` glob expansion,
+    ///      so a hook that GENERATES sources composes with a pattern that
+    ///      matches them (expansion is fail-loud on zero matches);
+    ///   3. glob expansion, cross-entry dedup, and the multi-vs-single-CU route;
+    ///   4. `postBuildScripts` — ONLY when the compile returned 0. A failing
+    ///      post-build hook makes the overall result non-zero even though the
+    ///      artifact exists and is kept.
+    /// Both hook lists run in the PROCESS working directory — the same base
+    /// relative `sources[]` entries and globs resolve against.
     int compileProject(
         const std::string& projectFilePath,
         DiagnosticReporter::Config const& reporterConfig = {}

@@ -215,6 +215,149 @@ TEST(UnsuppressableCodes, ThreadLocalRejectsAreUnsuppressable) {
            "table — membership is what made it read as load-bearing.";
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// THE BUILD-HOOK CODES: ADMITTED ON THE SUPPRESSION CRITERION, RE-EXAMINED.
+//
+// ★ WHY THIS IS RE-ARGUED RATHER THAN INHERITED. When 0xD017/0xD018 joined
+// (AP5, 2026-08-12) the rationale gave TWO reasons, and one of them was that
+// membership also buys immunity from the reporter's diagnostic cap. That is a
+// side-channel: it makes the cap's behaviour a reason to widen a table whose
+// criterion is about `--suppress`, and the criterion is what gets loosened to
+// pay for it. Delivery now has its own property (`DiagnosticDelivery`), so the
+// cap half is answered elsewhere and membership has to stand on suppression
+// alone.
+//
+// ✔ IT DOES, ON PRONG (2) OF THE TABLE'S CRITERION — "the build fails with
+// nothing said". MEASURED at `program/build_scripts.cpp`: `runBuildScripts`
+// returns false whether or not its report survived, and the driver turns that
+// into `return 1`. So no wrong artifact ships (prong (1) does not apply, and
+// claiming it would be the loosening this cycle removed), but suppression
+// converts a documented VISIBILITY control into a mute-the-failure control:
+// a pre-build hook fails before any compilation begins, so there is no other
+// diagnostic in the stream and stderr is empty EXACTLY. That is a purer
+// instance of prong (2) than the S_* members that established it.
+TEST(UnsuppressableCodes, BuildHookFailuresAreRefusedBySuppressAndKeepTheirText) {
+    for (auto const code : {DiagnosticCode::D_ScriptSpawnFailed,
+                            DiagnosticCode::D_ScriptExitedNonZero}) {
+        EXPECT_TRUE(isUnsuppressable(code))
+            << diagnosticCodeName(code)
+            << ": suppressing a build-hook failure leaves a non-zero exit "
+               "with nothing on stderr saying which hook failed";
+
+        // The refusal is observable at the reporter, which is where it
+        // matters: the user named the code and the diagnostic lands anyway.
+        DiagnosticReporter::Config cfg;
+        cfg.policy.suppress.insert(code);
+        DiagnosticReporter r{cfg};
+        auto d   = makeDiag(code);
+        d.actual = "build script 'python' ran and exited with status 3";
+        r.report(std::move(d));
+
+        ASSERT_EQ(r.all().size(), 1u)
+            << diagnosticCodeName(code) << " was silenced by --suppress";
+        // ★ THE TEXT, not just the code. A code with its prose stripped is
+        // the same empty-explanation shape by a different route — the
+        // operator still cannot tell which hook failed or why.
+        EXPECT_EQ(r.all()[0].actual,
+                  "build script 'python' ran and exited with status 3")
+            << "the delivered diagnostic must still NAME what failed";
+        EXPECT_EQ(r.errorCount(), 1u)
+            << "and must still count toward the exit-code gate";
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE NEGATIVE, so the per-code verdicts are PINNED rather than assumed.
+//
+// The four `dependsOn` git codes were judged individually on 2026-08-13 (see
+// the verdict block beside the D_Script* rows in `unsuppressable_codes.cpp`).
+// Each one QUALIFIES on the criterion, and NONE was added, for a reason that
+// is a hard property of this file rather than caution: none of them has an
+// emit site yet, and `EveryMemberHasAnEmitSiteOrIsMarkedRetired` below reds on
+// a member nothing emits — that guard exists because five members once
+// outlived their emit sites and asserted nothing.
+//
+// Without this negative the deferral would be invisible: a future batch-sweep
+// could add all four (or, worse, three of four) and nothing would notice the
+// verdicts were never re-read. Asserting the absence makes the row-and-pin
+// land together or not at all.
+TEST(UnsuppressableCodes, DependsOnGitCodesStaySuppressableUntilTheyAreEmitted) {
+    for (auto const code : {DiagnosticCode::D_DependencyGitNotFound,
+                            DiagnosticCode::D_DependencyGitAcquireFailed,
+                            DiagnosticCode::D_DependencyGitFetchFallback,
+                            DiagnosticCode::D_DependencyGitNameCollision}) {
+        EXPECT_FALSE(isUnsuppressable(code))
+            << diagnosticCodeName(code)
+            << " became a closed-table member. If its emit site has landed "
+               "that may well be correct — the recorded verdict says it "
+               "qualifies — but the row and this pin must move together: "
+               "re-read the verdict against what the site ACTUALLY does "
+               "(0xD020 in particular flips prong depending on whether it "
+               "stops the build or picks a repo), then move the code out of "
+               "this list. 0xD01F additionally needs "
+               "`delivery = DiagnosticDelivery::Guaranteed` at its emit site: "
+               "it is Info-severity, nothing downstream re-reports it, and "
+               "membership must not be the thing that buys it cap-immunity.";
+
+        // ...and "suppressable" is a live behaviour, not just a predicate.
+        DiagnosticReporter::Config cfg;
+        cfg.policy.suppress.insert(code);
+        DiagnosticReporter r{cfg};
+        r.report(makeDiag(code));
+        EXPECT_EQ(r.all().size(), 0u)
+            << diagnosticCodeName(code)
+            << " is not a member, so --suppress must still silence it";
+    }
+}
+
+// The split the whole cycle is about, pinned as a property of the two
+// mechanisms rather than of any one code: membership must not be reachable as
+// a way to obtain cap-immunity, because the property that grants cap-immunity
+// exists on its own and grants nothing else.
+TEST(UnsuppressableCodes, DeliveryAndSuppressionAreIndependentAxes) {
+    // Delivery without membership: a plain suppressable code, guaranteed.
+    ASSERT_FALSE(isUnsuppressable(DiagnosticCode::P_DeprecatedSyntax));
+    {
+        DiagnosticReporter::Config cfg;
+        cfg.maxDiagnostics = 1;
+        cfg.dedupWindow    = 0;
+        DiagnosticReporter r{cfg};
+        r.report(makeDiag(DiagnosticCode::P_UnexpectedToken));
+        auto filler = makeDiag(DiagnosticCode::P_UnknownToken);
+        filler.span = SourceSpan::of(5, 6);
+        r.report(std::move(filler));
+        ASSERT_TRUE(r.hitCap());
+
+        auto d     = makeDiag(DiagnosticCode::P_DeprecatedSyntax,
+                              DiagnosticSeverity::Info);
+        d.span     = SourceSpan::of(9, 10);
+        d.delivery = DiagnosticDelivery::Guaranteed;
+        r.report(std::move(d));
+
+        bool landed = false;
+        for (auto const& kept : r.all()) {
+            landed = landed || kept.code == DiagnosticCode::P_DeprecatedSyntax;
+        }
+        EXPECT_TRUE(landed)
+            << "cap-immunity must be obtainable WITHOUT joining the closed "
+               "table — that reachability is what made membership a "
+               "side-channel for a property it never carried";
+    }
+    // Membership without a delivery request: the axes do not need each
+    // other in either direction.
+    {
+        DiagnosticReporter::Config cfg;
+        cfg.policy.suppress.insert(DiagnosticCode::H_ExternHasInitializer);
+        DiagnosticReporter r{cfg};
+        auto d = makeDiag(DiagnosticCode::H_ExternHasInitializer);
+        ASSERT_EQ(d.delivery, DiagnosticDelivery::Capped);
+        r.report(std::move(d));
+        EXPECT_EQ(r.all().size(), 1u)
+            << "a member is still un-silenceable with delivery left at its "
+               "default; membership answers suppression on its own";
+    }
+}
+
 TEST(UnsuppressableCodes, ListSelfConsistent) {
     // Every member of the public closed-table view must report
     // unsuppressable; no member duplicated; every entry must be a
@@ -224,7 +367,8 @@ TEST(UnsuppressableCodes, ListSelfConsistent) {
     auto const codes = unsuppressableCodes();
     EXPECT_GT(codes.size(), 0u);
     std::unordered_set<DiagnosticCode> seen;
-    for (auto c : codes) {
+    for (auto const& e : codes) {
+        auto const c = e.code;
         EXPECT_TRUE(isUnsuppressable(c))
             << "code " << diagnosticCodeName(c)
             << " is in the closed-table list but isUnsuppressable returns false";
@@ -526,7 +670,7 @@ TEST(Reporter, NormalCodeSuppressedAlongsideUnsuppressableInSameReporter) {
 // naming the code as a STRING in language config and letting the name→code
 // resolver in `grammar_schema_json.cpp` bind it (MEASURED: `S_StaticStorageInForInit`
 // is declared that way in two `src/dss-config/` rows). This scan cannot see that
-// path. Today it costs nothing — MEASURED 2026-08-10, all 139 members have a
+// path. Today it costs nothing — MEASURED 2026-08-12, all 141 members have a
 // direct `DiagnosticCode::` site, so no member relies on it — but the day a
 // config-only-emitted code JOINS this table, direction A will red on a code that
 // is genuinely live. ★ THE FIX IS TO TEACH THE SCANNER THE CONFIG PATH (also walk
@@ -702,7 +846,7 @@ TEST(UnsuppressableCodes, EveryMemberHasAnEmitSiteOrIsMarkedRetired) {
     EXPECT_GE(marks.retired.size(), 5u)         // MEASURED 8
         << "the RETIRED-marker parse collapsed — direction C would then be "
            "vacuous and A's escape hatch unchecked";
-    ASSERT_GE(codes.size(), 120u)               // MEASURED 139
+    ASSERT_GE(codes.size(), 120u)               // MEASURED 141
         << "the closed table collapsed — nothing left to assert about";
 
     // ── CONTENT ANCHORS ─────────────────────────────────────────────────────
@@ -723,8 +867,45 @@ TEST(UnsuppressableCodes, EveryMemberHasAnEmitSiteOrIsMarkedRetired) {
            "needs refusing again, un-retire the code deliberately (marker off, "
            "table row back, doc comment describing ONLY the refused shape)";
 
+    // ★ THE `dependsOn` VERDICTS, MADE SELF-FIRING RATHER THAN REMEMBERED.
+    // Four codes were judged against the suppression criterion on 2026-08-13
+    // and all four QUALIFY; none could be added, because a member with no emit
+    // site reds direction A above. `DependsOnGitCodesStaySuppressableUntil-
+    // TheyAreEmitted` pins the other half — that they are NOT members and ARE
+    // still suppressable — but that assertion describes the STATUS QUO, so it
+    // stays green forever if the AP6 lane lands the emit sites and nobody
+    // remembers the verdicts. The obligation would then rest entirely on a
+    // human reading a registry row, which is the failure mode this file's own
+    // direction-A guard exists to prevent (five members once outlived their
+    // emit sites while every test passed).
+    //
+    // This is the missing half: it reds on the EVENT that should trigger the
+    // work — an emit site appearing — rather than on someone acting on it.
+    // Same mechanism as 0xE052 directly above, pointed the other way in time:
+    // that one guards a code that HAD a site and must not regain one, this one
+    // guards codes that have no site YET and whose arrival is a decision point.
+    for (auto const* name : {"D_DependencyGitNotFound",
+                             "D_DependencyGitAcquireFailed",
+                             "D_DependencyGitFetchFallback",
+                             "D_DependencyGitNameCollision"}) {
+        EXPECT_FALSE(scan.siteOf.contains(name))
+            << name
+            << " GAINED AN EMIT SITE, so its recorded verdict is now actionable"
+               " and must be acted on in the same commit. Read the verdict "
+               "block beside the D_Script* rows in `unsuppressable_codes.cpp`: "
+               "all four qualify, so add this code to the closed table and move"
+               " it out of the list in "
+               "`DependsOnGitCodesStaySuppressableUntilTheyAreEmitted`. TWO "
+               "verdicts must be RE-READ against the site rather than taken on "
+               "trust — 0xD020 flips prong depending on whether it stops the "
+               "build or picks a repo, and 0xD01F additionally needs `delivery ="
+               " DiagnosticDelivery::Guaranteed` AT the site, because it is "
+               "Info-severity and membership must not be what buys it "
+               "cap-immunity.";
+    }
+
     // ── A: a live member must be emittable ──────────────────────────────────
-    for (auto const c : codes) {
+    for (auto const& [c, why] : codes) {
         std::string const name{diagnosticCodeName(c)};
         if (marks.retired.contains(name)) continue;   // direction B reports it
         EXPECT_TRUE(scan.siteOf.contains(name))
@@ -740,7 +921,7 @@ TEST(UnsuppressableCodes, EveryMemberHasAnEmitSiteOrIsMarkedRetired) {
     }
 
     // ── B: a retired code must not be a member ──────────────────────────────
-    for (auto const c : codes) {
+    for (auto const& [c, why] : codes) {
         std::string const name{diagnosticCodeName(c)};
         EXPECT_FALSE(marks.retired.contains(name))
             << name << " is marked RETIRED at its declaration yet is still a "

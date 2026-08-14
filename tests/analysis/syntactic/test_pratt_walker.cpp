@@ -8,6 +8,7 @@
 
 #include "analysis/syntactic/parser.hpp"
 #include "core/substrate/large_stack_call.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -210,7 +211,7 @@ struct PrattHarness {
         << (loaded.has_value() ? "" : loaded.error()[0].message);
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString(std::move(source), "<pratt>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     return PrattHarness{
         .src    = std::move(src),
@@ -221,7 +222,7 @@ struct PrattHarness {
 
 [[nodiscard]] Tree parse(std::string_view schemaText, std::string source) {
     auto h = loadAndTokenize(schemaText, std::move(source));
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     return std::move(result.tree);
 }
@@ -828,7 +829,8 @@ TEST(PrattWalker, AltChoiceScanRoutesExprRuleThroughWalker) {
     auto h = loadAndTokenize(schemaText, std::move(source));
     ParserConfig cfg;
     cfg.maxExpressionDepth = cap;
-    Parser p{h.src, h.schema, std::move(h.stream), std::move(cfg)};
+    Parser p{h.src, h.schema, std::move(h.stream),
+             DiagnosticBudget::libraryDefault(), std::move(cfg)};
     auto result = std::move(p).parse();
     return std::move(result.tree);
 }

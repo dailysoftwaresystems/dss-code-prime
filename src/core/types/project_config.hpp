@@ -98,6 +98,62 @@ namespace dss {
 //   The three flag arrays MERGE (append) onto the Program's current state in
 //   `Program::compileProject` — they ADD to any CLI-provided flags, never
 //   replace them. A present-but-empty `[]` is allowed (⇒ empty list).
+
+// ── OPTIONAL build-lifecycle script entry (`preBuildScripts` /
+//    `postBuildScripts`) ─────────────────────────────────────────────────────
+//
+// One command to run around the build, declared in the manifest so it travels
+// with the project rather than with an invocation.
+//
+// `run` is an ARGV VECTOR, not a shell command line: `run[0]` is the
+// executable and is SPAWNED DIRECTLY, the remaining elements are its arguments
+// passed one-for-one. This is a deliberate type choice, not a convenience —
+// a single command STRING would have to be split by somebody, and every
+// splitter is a different quoting dialect (`cmd.exe` vs POSIX `sh`), which is
+// both a portability hole (the same manifest means two different things on two
+// hosts) and an injection surface (a path containing a space or a `;` becomes
+// executable text). An argv vector has exactly ONE meaning on every host.
+//
+// `runOn` is the OPTIONAL platform filter, over the `kRunOnPlatformTokens`
+// vocabulary in `program/platform_token.hpp` (the single source of truth for
+// the token set, shared with `currentHostOs()` so the manifest's spelling and
+// the host probe's spelling cannot drift). ABSENT ⇒ the script runs on EVERY
+// platform — the unfiltered default. PRESENT ⇒ it must list at least one
+// token: an empty `[]` would mean "run nowhere", which is what DELETING the
+// entry says, more clearly, so the degenerate spelling rejects rather than
+// aliasing (same rule + rationale as the `resolveLibraries` object form).
+//
+// The LOADER neither spawns nor resolves anything — see the pure-parser note
+// on `parseProjectConfig`. It parses and validates the SHAPE only.
+struct DSS_EXPORT ScriptEntry {
+    std::vector<std::string> run;     // argv; run[0] is the executable
+    std::vector<std::string> runOn;   // empty ⇒ member absent ⇒ every platform
+    friend bool operator==(ScriptEntry const&, ScriptEntry const&) = default;
+};
+
+// ── OPTIONAL project dependency entry (`dependsOn`) ──────────────────────────
+//
+// One prerequisite project, named by EXACTLY ONE source:
+//   * `path` — a LOCAL checkout, e.g. `"../libfoo"`;
+//   * `git`  — a REMOTE, e.g. `"git@github.com:org/bar.git"`, optionally
+//              pinned to a `ref` (branch / tag / commit).
+// Both stated ⇒ reject (two sources for one dependency is ambiguous, and
+// silently preferring one would make the other a no-op the user cannot see).
+// Neither stated ⇒ reject (an entry naming nothing is noise).
+// `ref` without `git` ⇒ reject: a ref names a revision inside a git remote and
+// has no meaning for a local path, so accepting it would silently ignore the
+// pin the user wrote — the exact class of silent drop this loader exists to
+// prevent.
+//
+// `path` is kept VERBATIM, exactly as `sources[]` is: no filesystem access, no
+// normalization, no resolution here (a different lane resolves them).
+struct DSS_EXPORT DependencyEntry {
+    std::optional<std::string> path;  // nullopt iff the member is absent
+    std::optional<std::string> git;   // nullopt iff the member is absent
+    std::optional<std::string> ref;   // nullopt iff the member is absent
+    friend bool operator==(DependencyEntry const&, DependencyEntry const&) = default;
+};
+
 struct DSS_EXPORT ProjectConfig {
     std::string              language;
     std::string              artifactProfile;
@@ -130,6 +186,14 @@ struct DSS_EXPORT ProjectConfig {
     // convention, and it is the only rule that lets a user probe a different
     // reserve without editing (and risking committing) the manifest.
     std::optional<std::uint64_t> stackReserveBytes;
+    // OPTIONAL build-lifecycle hooks + project prerequisites. ALL THREE are
+    // absent ⇒ EMPTY, never an error — a manifest that declares no scripts and
+    // no dependencies is the overwhelmingly common case and must stay silent.
+    // Shape-validated here only; SPAWNING the scripts and RESOLVING the
+    // dependencies belong to their own lanes (this loader is a pure parser).
+    std::vector<ScriptEntry>     preBuildScripts;   // run BEFORE the build
+    std::vector<ScriptEntry>     postBuildScripts;  // run AFTER the build
+    std::vector<DependencyEntry> dependsOn;         // prerequisite projects
 };
 
 // Parse a project config from JSON text. `sourceLabel` names the input
@@ -140,13 +204,49 @@ struct DSS_EXPORT ProjectConfig {
 //   * any field with the wrong JSON type, or an
 //     empty string where a non-empty one is
 //     required, or an empty array entry           → C_MalformedJson
+//   * an UNKNOWN top-level key                    → C_MalformedJson
+//   * a malformed `preBuildScripts` /
+//     `postBuildScripts` / `dependsOn` entry      → C_MalformedJson
 // Returns nullopt on the FIRST error (a diagnostic was emitted); the
 // user fixes and re-runs. Spec-format / path-existence checks are NOT
 // done here — they belong to the delegated compile path.
+//
+// A top-level key beginning with `$` (`$comment`, `$…Comment`) is PROSE and is
+// SKIPPED by the unknown-key check — the codebase-wide documentation-key
+// convention, via `dss::detail::isDocumentationKey`. This CLOSES
+// D-AP2-PROJECT-MANIFEST-REJECTS-COMMENT-KEY; see the note at the check itself.
+//
+// ★ PURE JSON PARSER. This function touches NO filesystem, spawns NO process,
+// and resolves NO path. Globs, script argv words, and dependency paths are
+// kept VERBATIM exactly as `sources[]` already is; the lanes that expand,
+// spawn, and resolve them own those decisions with the context (working
+// directory, host OS, output dir) that this function deliberately lacks.
 [[nodiscard]] DSS_EXPORT std::optional<ProjectConfig>
 parseProjectConfig(std::string_view jsonText,
                    std::string_view sourceLabel,
                    DiagnosticReporter& rep);
+
+// ── the CLOSED top-level key vocabulary, exported ────────────────────────────
+//
+// The recognized top-level manifest keys, in the order the unknown-key
+// diagnostic lists them, and that same list comma-joined for a message.
+//
+// WHY THESE ARE EXPORTED AT ALL: the recognized-field list used to be
+// hand-written TWICE — once as the `kKnownKeys` table the check loops over and
+// once as a literal string inside the "unknown field" message — with nothing
+// asserting the two agreed. That is a drift hazard with a nasty failure mode:
+// the SILENT direction is a key present in the table but missing from the
+// message, which leaves a user staring at a reject whose remediation list omits
+// the very field they need. `projectConfigKnownKeyList()` now DERIVES the
+// message text from the table (the `registeredArtifactProfileList()` pattern in
+// `core/types/artifact_profile.hpp`), so the two cannot disagree, and
+// `projectConfigKnownKeys()` lets the test pin the message against the REAL
+// table instead of a re-typed copy — re-typing the list in a test would just
+// recreate the drift one layer out.
+[[nodiscard]] DSS_EXPORT std::span<std::string_view const>
+projectConfigKnownKeys() noexcept;
+
+[[nodiscard]] DSS_EXPORT std::string projectConfigKnownKeyList();
 
 // Read + parse a project config from a file path. Emits D_FileNotFound
 // if the file cannot be opened, else delegates to parseProjectConfig.

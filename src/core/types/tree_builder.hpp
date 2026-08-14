@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -122,9 +123,18 @@ public:
     };
 
     // ── construction ──
+    // `budget` is REQUIRED and deliberately carries no default argument — it
+    // used to be `DiagnosticReporter::Config diagConfig = {}`, and the ONE
+    // production construction site (`Parser::parse`) took that default, so the
+    // tree's reporter capped at the library's 1000/50 whatever the operator
+    // configured (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE). This is
+    // the tier that owns the operator-visible parse+lex stream, including
+    // everything `ingestDiagnostics` replays into it from the preprocessor.
+    // A caller with no operator budget in scope says so with
+    // `DiagnosticBudget::libraryDefault()`.
     TreeBuilder(std::shared_ptr<SourceBuffer>        src,
                 std::shared_ptr<GrammarSchema const> schema,
-                DiagnosticReporter::Config           diagConfig    = {},
+                DiagnosticBudget                     budget,
                 BuilderConfig                        builderConfig = {});
 
     // Process-wide monotonic allocator. Public so test helpers that

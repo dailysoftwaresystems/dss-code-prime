@@ -1,3 +1,4 @@
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/source_buffer.hpp"
@@ -55,7 +56,7 @@ struct Harness : public ToyHarness {
 // leaves, in this exact textual order. Tests below rely on this
 // specific shape; the helper below makes the dependency explicit.
 Tree buildSampleTree(Harness& h) {
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     auto stmt = b.open(h.schema->rules().find("statement"));
     auto vd   = b.open(h.schema->rules().find("varDecl"));
@@ -148,7 +149,7 @@ TEST(TreeCursor, AstSkipsEmptySpaceChildren) {
 
 TEST(TreeCursor, AstGotoFirstChildSkipsLeadingEmptySpace) {
     auto h = Harness::make(" var x = y;");   // leading space
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     auto stmt = b.open(h.schema->rules().find("statement"));
     auto vd   = b.open(h.schema->rules().find("varDecl"));
@@ -320,7 +321,7 @@ TEST(TreeCursor, AstGotoLastChildSkipsTrailingEmptySpace) {
     // Tree with EmptySpace as the LAST child — gotoLastChild in AST must
     // walk backward past it to the previous visible sibling.
     auto h = Harness::make("var x = y; ");   // trailing space
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     auto stmt = b.open(h.schema->rules().find("statement"));
     auto vd   = b.open(h.schema->rules().find("varDecl"));
@@ -350,7 +351,7 @@ TEST(TreeCursor, AstGotoLastChildSkipsTrailingEmptySpace) {
 
 TEST(TreeCursor, GotoPrevSiblingFromFirstVisibleAstChildFails) {
     auto h = Harness::make(" var x = y;");   // leading whitespace
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     auto stmt = b.open(h.schema->rules().find("statement"));
     auto vd   = b.open(h.schema->rules().find("varDecl"));

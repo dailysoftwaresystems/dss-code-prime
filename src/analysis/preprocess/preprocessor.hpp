@@ -64,6 +64,7 @@
 // -- never a silent pass-through or miscompile.
 
 #include "core/export.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
@@ -463,6 +464,14 @@ struct DSS_EXPORT TranslationTimestamp {
     // `kDefaultHeaderNameMatching` EXPLICITLY, which makes that decision
     // greppable instead of invisible.
     HeaderNameMatching                   headerNameMatching,
+    // ★ REQUIRED, AND IN THE REQUIRED BLOCK FOR THE SAME REASON AS
+    // `headerNameMatching` ABOVE. The operator's diagnostic volume budget,
+    // handed to `result.diagnostics`, to `provisionalTokDiags`, and through
+    // `tokenizeToPP` to the synth-buffer `Tokenizer`. Defaulting it would put
+    // the library's 1000/50 back at every call site invisibly, which is the
+    // defect D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE records. A
+    // caller with no operator budget passes `DiagnosticBudget::libraryDefault()`.
+    DiagnosticBudget                     budget,
     std::span<std::filesystem::path const> systemDirs = {},
     std::optional<ObjectFormatKind>      activeFormat = std::nullopt,
     std::span<std::string const>         userDefines  = {},

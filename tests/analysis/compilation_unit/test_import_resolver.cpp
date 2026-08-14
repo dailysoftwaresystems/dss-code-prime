@@ -4,6 +4,7 @@
 // table-name matching, table-vs-column position, unresolved).
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_span.hpp"
@@ -67,7 +68,7 @@ using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 // ── toy: identity ───────────────────────────────────────────────────────────
 
 TEST(ImportResolver, ToyProducesNoCrossRefs) {
-    UnitBuilder b{loadShippedSchema("toy")};
+    UnitBuilder b{loadShippedSchema("toy"), DiagnosticBudget::libraryDefault()};
     b.addInMemory("var x = y;", "a.toy");
     b.addInMemory("var z = y;", "b.toy");
     auto cu = std::move(b).finish();
@@ -92,7 +93,7 @@ TEST(ImportResolver, CSubsetQuoteIncludeIsInlinedByPreprocessor) {
     auto main = dir.write("main.c", "#include \"helper.h\"\nint main() { return helper(); }\n");
     dir.write("helper.h", "int helper() { return 1; }\n");
 
-    UnitBuilder b{loadShippedSchema("c-subset")};
+    UnitBuilder b{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     b.addFile(main);
     auto cu = std::move(b).finish();
 
@@ -116,7 +117,7 @@ TEST(ImportResolver, CSubsetTransitiveQuoteIncludeInlinesChain) {
     dir.write("b.h", "#include \"c.h\"\nint b() { return 0; }\n");
     dir.write("c.h", "int c() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addFile(a);
     auto cu = std::move(builder).finish();
 
@@ -152,7 +153,7 @@ TEST(ImportResolver, CSubsetUnguardedQuoteIncludeCycleTerminatesAndIsRefused) {
     auto a = dir.write("a.h", "#include \"b.h\"\nint a() { return 0; }\n");
     dir.write("b.h", "#include \"a.h\"\nint b() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addFile(a);
     auto cu = std::move(builder).finish();
 
@@ -188,7 +189,7 @@ TEST(ImportResolver, CSubsetGuardedQuoteIncludeCycleIsNotAnError) {
               "#ifndef B_H\n#define B_H\n#include \"a.h\"\n"
               "int b() { return 0; }\n#endif\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addFile(a);
     auto cu = std::move(builder).finish();
 
@@ -219,7 +220,7 @@ TEST(ImportResolver, CSubsetMissingQuoteIncludeEmitsDiagnosticAndContinues) {
     TempDir dir;
     auto main = dir.write("main.c", "#include \"ghost.h\"\nint main() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
@@ -250,7 +251,7 @@ TEST(ImportResolver, CSubsetQuoteIncludeResolvesAcrossDirectories) {
     auto main = srcDir.write("main.c", "#include \"shared.h\"\nint main() { return shared(); }\n");
     incDir.write("shared.h", "int shared() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addIncludeDir(incDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -285,7 +286,7 @@ TEST(ImportResolver, CSubsetAngleIncludeResolvesToDescriptorOnSystemDir) {
         R"({ "library": { "pe": "lib.dll" },
              "symbols": [ { "name": "use", "signature": "fn() -> i32" } ] })");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());       // the system (shippedLibDirs) path
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -328,7 +329,7 @@ TEST(ImportResolver, CSubsetSubdirAngleIncludeResolvesDistinctFromTopLevel) {
     auto const want = sysDir.write("sys/time.json",
         R"({ "header": "sys/time.h", "typedefs": [ { "name": "suseconds_t", "type": "i64" } ] })");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -351,7 +352,7 @@ TEST(ImportResolver, CSubsetAngleIncludeMissIsHardError) {
     auto main = srcDir.write("main.c",
         "#include <nope.h>\nint main() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -384,7 +385,7 @@ TEST(ImportResolver, CSubsetAngleIncludeRecordsTransitiveDescriptorRefs) {
         R"({ "header": "child.h",
              "symbols": [ { "name": "cfn", "signature": "fn() -> i32" } ] })");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -420,7 +421,7 @@ TEST(ImportResolver, CSubsetAngleIncludeUnresolvedTransitiveIsHardError) {
         R"({ "header": "parent.h", "includes": ["stdioo.h"],
              "symbols": [ { "name": "pfn", "signature": "fn() -> i32" } ] })");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -449,7 +450,7 @@ TEST(ImportResolver, CSubsetAngleIncludeCyclicTransitiveTerminates) {
         R"({ "header": "pb.h", "includes": ["pa.h"],
              "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ] })");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -476,7 +477,7 @@ TEST(ImportResolver, CSubsetAngleAndQuotePathsAreDistinct) {
         "#include \"sysonly.h\"\nint main() { return 0; }\n");
     sysDir.write("sysonly.h", "extern int s();\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());   // declared as SYSTEM, not include
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -517,7 +518,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackResolves) {
         "#include <foo.h>\nint main() { return foo(); }\n");
     incDir.write("foo.h", "int foo(void) { return 7; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addIncludeDir(incDir.path());   // -I: the angle source-fallback path
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -555,7 +556,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackDescriptorFirst) {
     // so a wrong source-first splice would surface loudly as a tree error.
     incDir.write("baz.h", "@@@ this is not valid c and must never be inlined @@@\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addIncludeDir(incDir.path());
     builder.addFile(main);
@@ -589,7 +590,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackDoesNotSearchIncludingDir) {
             "#include <qux.h>\nint main() { return qux(); }\n");
         srcDir.write("qux.h", "int qux(void) { return 1; }\n");  // self-dir ONLY
 
-        UnitBuilder builder{loadShippedSchema("c-subset")};
+        UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
         // NO addIncludeDir -> the angle form has no -I on which to find qux.h.
         builder.addFile(main);
         auto cu = std::move(builder).finish();
@@ -605,7 +606,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackDoesNotSearchIncludingDir) {
             "#include \"qux.h\"\nint main() { return qux(); }\n");
         srcDir.write("qux.h", "int qux(void) { return 1; }\n");
 
-        UnitBuilder builder{loadShippedSchema("c-subset")};
+        UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
         builder.addFile(main);
         auto cu = std::move(builder).finish();
 
@@ -628,7 +629,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackTotalMissHardError) {
         "#include <none.h>\nint main() { return 0; }\n");
     incDir.write("other.h", "int other(void);\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addIncludeDir(incDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -641,7 +642,7 @@ TEST(ImportResolver, CSubsetAngleSourceFallbackTotalMissHardError) {
 // ── tsql-subset: cross-statement table-name matching ─────────────────────────
 
 TEST(ImportResolver, TsqlTableReferenceResolvesAcrossFiles) {
-    UnitBuilder builder{loadShippedSchema("tsql-subset")};
+    UnitBuilder builder{loadShippedSchema("tsql-subset"), DiagnosticBudget::libraryDefault()};
     builder.addInMemory("CREATE TABLE Users (id INT, name VARCHAR);", "schema.sql");
     builder.addInMemory("SELECT name FROM Users;", "data.sql");
     auto cu = std::move(builder).finish();
@@ -664,7 +665,7 @@ TEST(ImportResolver, TsqlTableReferenceResolvesAcrossFiles) {
 }
 
 TEST(ImportResolver, TsqlQualifiedReferenceMatchesByTableName) {
-    UnitBuilder builder{loadShippedSchema("tsql-subset")};
+    UnitBuilder builder{loadShippedSchema("tsql-subset"), DiagnosticBudget::libraryDefault()};
     builder.addInMemory("CREATE TABLE Orders (id INT);", "schema.sql");
     builder.addInMemory("DELETE FROM dbo.Orders;", "ops.sql");   // db-qualified ref
     auto cu = std::move(builder).finish();
@@ -675,7 +676,7 @@ TEST(ImportResolver, TsqlQualifiedReferenceMatchesByTableName) {
 }
 
 TEST(ImportResolver, TsqlUnknownTableEmitsUnresolved) {
-    UnitBuilder builder{loadShippedSchema("tsql-subset")};
+    UnitBuilder builder{loadShippedSchema("tsql-subset"), DiagnosticBudget::libraryDefault()};
     builder.addInMemory("SELECT * FROM Ghosts;", "q.sql");
     auto cu = std::move(builder).finish();
 
@@ -684,7 +685,7 @@ TEST(ImportResolver, TsqlUnknownTableEmitsUnresolved) {
 }
 
 TEST(ImportResolver, TsqlSameFileReferenceIsNotACrossRef) {
-    UnitBuilder builder{loadShippedSchema("tsql-subset")};
+    UnitBuilder builder{loadShippedSchema("tsql-subset"), DiagnosticBudget::libraryDefault()};
     builder.addInMemory("CREATE TABLE T (id INT); SELECT * FROM T;", "all.sql");
     auto cu = std::move(builder).finish();
 
@@ -695,7 +696,7 @@ TEST(ImportResolver, TsqlSameFileReferenceIsNotACrossRef) {
 }
 
 TEST(ImportResolver, TsqlInsertAndUpdateAreTablePositions) {
-    UnitBuilder builder{loadShippedSchema("tsql-subset")};
+    UnitBuilder builder{loadShippedSchema("tsql-subset"), DiagnosticBudget::libraryDefault()};
     builder.addInMemory("CREATE TABLE Acct (id INT);", "schema.sql");
     builder.addInMemory("INSERT INTO Acct VALUES (1);", "ins.sql");
     builder.addInMemory("UPDATE Acct SET id = 2;", "upd.sql");
@@ -721,7 +722,7 @@ TEST(ImportResolver, CSubsetEmptyIncludePathIsReported) {
     // one tree results.
     auto main = dir.write("main.c", "#include \"\"\nint main() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
@@ -739,7 +740,7 @@ TEST(ImportResolver, CSubsetExplicitlyAddedIncludeTargetIsNotReloaded) {
     auto main   = dir.write("main.c", "#include \"helper.h\"\nint main() { return 0; }\n");
     auto helper = dir.write("helper.h", "int helper() { return 1; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addFile(main);
     builder.addFile(helper);   // also added explicitly
     auto cu = std::move(builder).finish();
@@ -760,7 +761,7 @@ TEST(ImportResolver, CSubsetSharedHeaderIsInlinedIntoEachIncluder) {
     auto b = dir.write("b.c", "#include \"common.h\"\nint b() { return 0; }\n");
     dir.write("common.h", "int common() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addFile(a);
     builder.addFile(b);
     auto cu = std::move(builder).finish();
@@ -783,7 +784,7 @@ TEST(ImportResolver, CSubsetInMemoryIncludeResolvesViaIncludeDir) {
     // FC13: an in-memory source's quote include is resolved by the
     // preprocessor against declared include dirs and INLINED -> one tree,
     // zero cross-refs, header text present.
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addIncludeDir(incDir.path());
     builder.addInMemory("#include \"dep.h\"\nint main() { return dep(); }\n", "main.c");
     auto cu = std::move(builder).finish();
@@ -796,7 +797,7 @@ TEST(ImportResolver, CSubsetInMemoryIncludeResolvesViaIncludeDir) {
 }
 
 TEST(ImportResolver, CSubsetInMemoryIncludeWithoutIncludeDirIsUnresolved) {
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addInMemory("#include \"dep.h\"\nint main() { return 0; }\n", "main.c");
     auto cu = std::move(builder).finish();
 
@@ -831,7 +832,7 @@ TEST(ImportResolver, CSubsetInMemoryLabelDoesNotDedupAgainstTextualInclude) {
     auto mainPath   = dir.write("main.c",
         "#include \"helper.h\"\nint main() { return 0; }\n");
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addInMemory("int mem_helper() { return 1; }\n", helperPath.string());
     builder.addFile(mainPath);
     auto cu = std::move(builder).finish();
@@ -882,7 +883,7 @@ TEST(ImportResolver, QuoteIncludeInliningIsDrivenByConfigNotLanguageName) {
     auto main = dir.write("main.c", "#include \"helper.h\"\nint main() { return helper(); }\n");
     dir.write("helper.h", "int helper() { return 1; }\n");
 
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addFile(main);
     auto cu = std::move(builder).finish();
 
@@ -915,7 +916,7 @@ TEST(ImportResolver, NameMatchingIsDrivenByConfigNotLanguageName) {
     EXPECT_EQ(schema->name(), "MadeUpDb");
     EXPECT_EQ(schema->imports().strategy, ImportStrategy::NameMatching);
 
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory("CREATE TABLE Users (id INT, name VARCHAR);", "schema.sql");
     builder.addInMemory("SELECT name FROM Users;", "data.sql");
     auto cu = std::move(builder).finish();
@@ -946,7 +947,7 @@ TEST(ImportResolver, AngleIncludeCaseFollowsFormatPolicyNotHostFilesystem) {
             R"({ "library": { "pe": "kernel32.dll" },
                  "symbols": [ { "name": "Sleep", "signature": "fn(i32) -> void" } ] })");
 
-        UnitBuilder builder{loadShippedSchema("c-subset")};
+        UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
         builder.addSystemDir(sysDir.path());
         builder.setHeaderNameMatching(insensitive
                                           ? HeaderNameMatching::CaseInsensitive
@@ -989,7 +990,7 @@ TEST(ImportResolver, AngleIncludeExactSpellingResolvesUnderBothCasePolicies) {
             R"({ "library": { "pe": "kernel32.dll" },
                  "symbols": [ { "name": "Sleep", "signature": "fn(i32) -> void" } ] })");
 
-        UnitBuilder builder{loadShippedSchema("c-subset")};
+        UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
         builder.addSystemDir(sysDir.path());
         builder.setHeaderNameMatching(m);
         builder.addFile(main);
@@ -1072,7 +1073,7 @@ TEST(ImportResolver, AngleDescriptorFoldCollisionFailsLoudAndNamesCandidates) {
                         "case-sensitive leg";
     }
 
-    UnitBuilder builder{loadShippedSchema("c-subset")};
+    UnitBuilder builder{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.setHeaderNameMatching(HeaderNameMatching::CaseInsensitive);
     builder.addFile(main);

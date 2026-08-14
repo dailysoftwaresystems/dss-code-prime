@@ -1,11 +1,19 @@
 #include "program/cli_args.hpp"
 
 #include "core/types/ascii_case.hpp"
+#include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/unsuppressable_codes.hpp"
 
+#include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
+#include <format>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -133,6 +141,7 @@ std::string_view cliArgsErrorName(CliArgsError e) noexcept {
         case CliArgsError::InvalidJobs:          return "InvalidJobs";
         case CliArgsError::InvalidStackReserve:  return "InvalidStackReserve";
         case CliArgsError::InvalidResolveLibrary: return "InvalidResolveLibrary";
+        case CliArgsError::InvalidMaxDiagnostics: return "InvalidMaxDiagnostics";
     }
     return "Unknown";
 }
@@ -238,7 +247,28 @@ std::string cliHelpText() {
         "Diagnostic options:\n"
         "  --warnings-as-errors   promote every Warning to Error\n"
         "  --suppress=<code>      suppress a specific diagnostic code "
-            "(repeatable; accepts D_FileNotFound or 0xD001)\n"
+            "(repeatable; accepts D_FileNotFound or 0xD001). A few codes are "
+            "PROTECTED because silencing them would let a wrong artifact ship "
+            "green, or a build fail with nothing said; naming one is refused "
+            "with a warning saying which and why, and the build continues "
+            "normally.\n"
+        // The operator half of the `P_TooManyDiagnostics` remedy sentence. The
+        // DEFAULT IS FORMATTED FROM `DiagnosticReporter::Config` rather than
+        // typed here: a hard-coded `1000` in this string would be the second
+        // place that number lives, and a help text that confidently states a
+        // stale default is worse than one that states none.
+        + std::format(
+        "  --max-diagnostics <count>  cap the run-wide diagnostic stream at "
+            "<count> reports (default: {}). Past the cap nothing further is "
+            "SHOWN, but nothing is hidden in silence: one P_TooManyDiagnostics "
+            "marker carries the limit and a RUNNING count of everything "
+            "dropped. A count of 0 is legal and means show none, just count "
+            "them. Guaranteed-delivery and unsuppressable codes bypass the cap "
+            "at every value, 0 included. Meaningless (and so REFUSED) in --lsp "
+            "and --dump-predefined-macros, which build no capped reporter. The "
+            "`=`-form is also accepted.\n",
+            DiagnosticReporter::Config{}.maxDiagnostics)
+        +
         "  --time                 print the compilation wall-clock time to "
             "stderr after the compile finishes\n"
         "\n"
@@ -748,6 +778,51 @@ parseCliArgs(int argc, char* argv[]) {
             }
         }
         {
+            // `--max-diagnostics <count>` / `--max-diagnostics=<count>` — the
+            // run-wide global cap (`DiagnosticReporter::Config::maxDiagnostics`).
+            // Mirrors the `--stack-reserve` arm above verbatim in shape: one
+            // `valueFlag` call covering both spellings, `from_chars` on an
+            // UNSIGNED type so a leading '-' is rejected as invalid_argument
+            // with no separate branch, `ec` covering non-numeric AND
+            // result_out_of_range (a count above SIZE_MAX must not wrap into a
+            // small cap), and `p != end` covering trailing junk so `100x`
+            // cannot silently become 100.
+            //
+            // ★ AND `n == 0` IS DELIBERATELY *ABSENT* FROM THE REJECT
+            // CONDITION, which is the one place this arm departs from its two
+            // siblings. `--jobs 0` and `--stack-reserve 0` both reject zero,
+            // and for reasons that do not transfer: for `--jobs`, 0 IS the AUTO
+            // sentinel in `CliArgs`, so accepting it would silently reinterpret
+            // an explicit request as "decide for me"; for `--stack-reserve`, a
+            // zero-byte reserve cannot start a program. Here 0 is neither. It
+            // is a value `DiagnosticReporter::report` implements exactly (the
+            // gate is an unsigned `all_.size() >= cfg_.maxDiagnostics`, so the
+            // first cap-eligible report trips the cap and is counted), it
+            // cannot collide with absence (that is `nullopt`), and it cannot
+            // silence a guaranteed or unsuppressable diagnostic. Rejecting it
+            // would make this parser a narrower and disagreeing second source
+            // of truth about a domain the library already defines — see the
+            // `CliArgs::maxDiagnostics` docblock.
+            auto m = valueFlag(a, i, "--max-diagnostics");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                std::string const& v = **m;
+                std::size_t n = 0;
+                auto const [p, ec] = std::from_chars(
+                    v.data(), v.data() + v.size(), n);
+                if (ec != std::errc{} || p != v.data() + v.size()) {
+                    return std::unexpected(make_error(
+                        CliArgsError::InvalidMaxDiagnostics,
+                        std::string{"--max-diagnostics: '"} + v
+                        + "' is not a non-negative integer diagnostic count "
+                          "(e.g. --max-diagnostics 5000; 0 is legal and means "
+                          "show none, just count them)"));
+                }
+                out.maxDiagnostics = n;
+                continue;
+            }
+        }
+        {
             auto m = valueFlag(a, i, "--suppress");
             if (!m) return std::unexpected(m.error());
             if (m->has_value()) {
@@ -820,6 +895,67 @@ parseCliArgs(int argc, char* argv[]) {
             "--directory / --project). Transpile emits source and --lsp "
             "emits nothing, so the request would be silently discarded."));
     }
+    // ── DIAGNOSTIC-POLICY FLAGS IN A MODE THAT BUILDS NO REPORTER ─────────
+    // `--max-diagnostics`, `--suppress` and `--warnings-as-errors` ALL
+    // configure the run-wide reporter the compile dispatch builds
+    // (`buildReporterConfig` / `buildReporter` below). Two modes build no such
+    // reporter at all, so any of them would land nowhere:
+    //   * `--lsp` returns from `Program::run` BEFORE the reporter config is
+    //     built; the language server owns its own per-request diagnostics and
+    //     maps `ParseDiagnostic`s through `src/lsp/diagnostic_translator.cpp`,
+    //     which consults no `DiagnosticPolicy`.
+    //   * `--dump-predefined-macros` is dispatched from `main.cpp` before
+    //     `Program::run` is entered AT ALL, and deliberately uses NO
+    //     `DiagnosticReporter` — see the docblock at the top of
+    //     `dump_predefined_macros.cpp`, which explains that a droppable
+    //     diagnostic is the wrong instrument for an inventory that must be
+    //     complete.
+    // Accepting any of them there would silently discard the operator's
+    // request, which is the same silent-drop these flags exist to close.
+    // Mirrors the `--schema-dir` / `--stack-reserve` mode gates and reuses
+    // their error kind. Mode::None is EXCLUDED for the same reason
+    // `--stack-reserve` excludes it: the generic no-mode guard below has the
+    // better message.
+    //
+    // ★ ALL THREE, NOT JUST THE CAP — and the widening is the point. The gate
+    // originally covered `--max-diagnostics` alone, so ✔MEASURED,
+    // `--lsp --suppress=<any code>` and `--lsp --warnings-as-errors` were
+    // ACCEPTED and then silently thrown away. That is the identical defect the
+    // cap's own gate was written to close, surviving in its two siblings
+    // because the gate was written per-FLAG instead of per-CLASS. The class is
+    // "a diagnostic-policy flag in a mode with no reporter to apply it to";
+    // enumerating one member of it is how the next member gets missed.
+    //
+    // ⓘ THIS IS NOT IN TENSION WITH `D_SuppressRequestIgnored`'s warn-and-
+    // continue posture, which governs a DIFFERENT question. There, a
+    // well-formed request names a protected code in a mode that HONOURS the
+    // flag, and the request can be declined per-code while the build proceeds.
+    // Here the flag reaches no reporter whatsoever, so there is nothing to
+    // decline and nothing to warn through — the reporter that would carry the
+    // warning is the very thing that does not exist. Refusing at parse time is
+    // the only fail-loud option available, which is why the sibling flags
+    // already do it.
+    if (mode == Mode::Lsp || mode == Mode::DumpPredefinedMacros) {
+        std::string offenders;
+        auto const note = [&offenders](std::string_view flag) {
+            if (!offenders.empty()) offenders += ", ";
+            offenders += flag;
+        };
+        if (out.maxDiagnostics.has_value()) note("--max-diagnostics");
+        if (!out.suppress.empty())          note("--suppress");
+        if (out.warningsAsErrors)           note("--warnings-as-errors");
+        if (!offenders.empty()) {
+            return std::unexpected(make_error(
+                CliArgsError::NoModeSelected,
+                offenders
+                + " configures the DiagnosticReporter a COMPILE builds, so it "
+                  "is only meaningful for a mode that compiles (--compile / "
+                  "--transpile / --directory / --project). --lsp serves its "
+                  "own per-request diagnostics and --dump-predefined-macros "
+                  "uses no reporter at all, so the request would be silently "
+                  "discarded."));
+        }
+    }
     if (out.helpMode || out.lspMode) {
         // Help + LSP modes don't need compile options.
         return out;
@@ -842,6 +978,9 @@ parseCliArgs(int argc, char* argv[]) {
          // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve without a
          // mode flag would silently discard the request.
          || out.stackReserveBytes.has_value()
+         // --max-diagnostics without a mode flag would silently discard the
+         // requested cap (no compile, so no reporter is ever built from it).
+         || out.maxDiagnostics.has_value()
          || out.config != CompileConfig::Debug
          || out.directoryMode != InputResolver::Mode::Recursive;
         if (hasOptions) {
@@ -922,6 +1061,70 @@ parseCliArgs(int argc, char* argv[]) {
             "--transpile mode requires at least one source file"));
     }
     return out;
+}
+
+DiagnosticReporter::Config buildReporterConfig(CliArgs const& args) {
+    DiagnosticReporter::Config cfg;
+    cfg.policy.warningsAsErrors = args.warningsAsErrors;
+    for (auto const code : args.suppress) {
+        cfg.policy.suppress.insert(code);
+    }
+    // ★ WRITTEN ONLY WHEN THE OPERATOR ASKED. The absent arm does NOT read
+    // `Config{}.maxDiagnostics` and assign it back — leaving the field alone is
+    // what keeps the struct's in-class initializer the one and only place the
+    // default is written down. An `= args.maxDiagnostics.value_or(...)` here
+    // would compile, behave identically today, and quietly re-create the second
+    // source of truth this flag was added to eliminate.
+    if (args.maxDiagnostics.has_value()) {
+        cfg.maxDiagnostics = *args.maxDiagnostics;
+    }
+    return cfg;
+}
+
+DiagnosticReporter buildReporter(DiagnosticReporter::Config const& cfg) {
+    DiagnosticReporter rep{cfg};
+    // ORDER IS DETERMINISTIC ON PURPOSE. `policy.suppress` is an
+    // `unordered_set`, so iterating it directly would emit these lines in an
+    // order that varies with the hash seed and the insertion history — and a
+    // diagnostic stream that reorders between runs is one no test can pin
+    // with full-sequence equality and no operator can diff between two
+    // builds. Sorting by the code's numeric value gives one stable order
+    // that is also meaningful (band letter, then ordinal).
+    std::vector<DiagnosticCode> refused;
+    for (auto const code : cfg.policy.suppress) {
+        if (isUnsuppressable(code)) refused.push_back(code);
+    }
+    std::ranges::sort(refused, {}, [](DiagnosticCode c) {
+        return static_cast<std::uint16_t>(c);
+    });
+
+    for (auto const code : refused) {
+        auto const name = diagnosticCodeName(code);
+        // The rationale comes from the TABLE ROW, never from a string
+        // composed here. `unsuppressableRationale` returns the `why` field
+        // recorded beside the entry, so this message cannot drift from the
+        // justification the table requires — and it cannot be empty either,
+        // because `kUnsuppressableEntriesAllExplainThemselves` is a consteval
+        // check on that table (a member without a reason is a build failure).
+        ParseDiagnostic d;
+        // ★ THE CODE CARRIED IS `D_SuppressRequestIgnored`, NEVER `code`
+        // itself. The notice is ABOUT a protected code; it is not one. Giving
+        // it `code` would hand it that code's unsuppressable membership —
+        // routing it through the very `isUnsuppressable` bypass whose effect
+        // it exists to announce, and making it un-silenceable as a
+        // side-effect of what it is reporting on. It takes the ordinary code
+        // and, through `report()`, the ordinary policy/cap/dedup path.
+        d.code     = DiagnosticCode::D_SuppressRequestIgnored;
+        d.severity = DiagnosticSeverity::Warning;
+        d.actual   = std::format(
+            "--suppress={0} had no effect: {0} is a protected diagnostic and "
+            "cannot be suppressed: {1}. It will still be reported; the build "
+            "continues. Use --suppress=D_SuppressRequestIgnored to silence "
+            "this notice, or --warnings-as-errors to make it fatal.",
+            name, unsuppressableRationale(code));
+        rep.report(std::move(d));
+    }
+    return rep;
 }
 
 } // namespace dss

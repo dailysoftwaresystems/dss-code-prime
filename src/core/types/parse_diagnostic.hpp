@@ -22,6 +22,51 @@ enum class DiagnosticSeverity : std::uint8_t {
 
 [[nodiscard]] DSS_EXPORT std::string_view severityName(DiagnosticSeverity s) noexcept;
 
+// ── DELIVERY: may the reporter's VOLUME controls drop this diagnostic? ──
+//
+// ★ THIS IS A SECOND, INDEPENDENT AXIS FROM SUPPRESSION, AND KEEPING THEM
+// APART IS THE WHOLE POINT. "the user must not be able to silence this"
+// (`--suppress`, answered by `kUnsuppressableCodes`) and "the reporter must
+// not be able to drop this" (the cap / dedup gates in
+// `DiagnosticReporter::report`) are different questions with different
+// answers. They were the same answer for one reason only: closed-table
+// membership happened to bypass BOTH, so a code needing the second had to
+// claim the first. That made membership a side-channel — every such code
+// had to argue a suppression criterion it did not meet in order to obtain
+// delivery, which loosens the one criterion that table has.
+//
+// ✔MEASURED, the pressure was already deforming the codebase in the other
+// direction too: `program.cpp`'s `reportArtifactWritten` deliberately routes
+// the build's statement of what it wrote AROUND the diagnostic system
+// entirely ("A diagnostic is DROPPABLE, through three independent gates …
+// Escaping all three would mean joining `kUnsuppressableCodes`"), i.e. a
+// plain `std::cout` line was preferred over a diagnostic because delivery
+// could not be requested without also claiming unsuppressability.
+//
+// So delivery is a property the diagnostic CARRIES, not a list somebody
+// maintains: there is no second table of code names to drift out of sync
+// with the first, and no hand-written size literal to forget to bump. Every
+// phase's codes use the same one field — nothing here is specific to any
+// band.
+enum class DiagnosticDelivery : std::uint8_t {
+    // The reporter's volume controls apply: the dedup window may collapse
+    // an exact repeat, the per-code cap may coalesce the Nth instance, and
+    // the global cap may drop it once the stream exceeds `maxDiagnostics`.
+    // Correct for the advisory bulk of the stream, and the default — a
+    // diagnostic asks for a delivery guarantee, it does not get one by
+    // omission.
+    Capped,
+    // The volume controls must NOT drop it: it reaches `all_` whatever the
+    // stream around it did. For a diagnostic that is the ONLY statement of
+    // its fact, where losing it leaves the operator with a build that
+    // failed (or silently did the wrong thing) and no text saying why.
+    //
+    // ⚠ It does NOT bypass `--suppress` / `overrides`. A user who names the
+    // code still silences it; that is the SUPPRESSION axis and it is
+    // answered by `isUnsuppressable`, deliberately not by this field.
+    Guaranteed,
+};
+
 // Stable, exhaustively-switchable diagnostic identity. Strings derive from
 // this in the formatter via diagnosticCodeText(). Prefixes group the
 // originating phase:
@@ -1580,6 +1625,248 @@ enum class DiagnosticCode : std::uint16_t {
     //   `unsuppressable_codes.cpp`): a suppressed table drift would let the
     //   recipe fall out of both passes and ship a silently-undefined shim.
     D_SynthRecipeFamilyUnknown = 0xD016,
+    // ── Project-manifest build hooks: `preBuildScripts` / `postBuildScripts`
+    // (0xD017..0xD018) ──
+    // Script entries are argv VECTORS spawned DIRECTLY — there is no shell
+    // between the manifest and the process, by design: a shell would make the
+    // manifest's meaning host-dependent (cmd.exe vs /bin/sh quoting, glob
+    // expansion, `&&` chaining) and re-open an injection surface through a
+    // file that is routinely fetched with a dependency. The two failure modes
+    // below are REMEDIATION-DISTINCT, which is why they are two codes and not
+    // one "script failed": the first is "the tool isn't there" (fix the
+    // environment / the `argv[0]` spelling), the second is "the tool ran and
+    // said no" (fix whatever the script is complaining about). Collapsing them
+    // would make the common CI failure — a missing interpreter — indis-
+    // tinguishable from a genuine script reject.
+    //
+    // D_ScriptSpawnFailed: a `preBuildScripts`/`postBuildScripts` entry could
+    //   not be SPAWNED AT ALL — `argv[0]` is not on PATH, is not executable, or
+    //   the OS process-creation call otherwise refused before the child ever
+    //   ran. No exit status exists in this state, so there is nothing to
+    //   report but the spawn failure itself. Distinct from
+    //   `D_ScriptExitedNonZero` (0xD018): there the child DID run. Also
+    //   distinct from `D_DependencyGitNotFound` (0xD01D), which is the same
+    //   physical condition ("a program is not on PATH") for the ONE program
+    //   the driver itself invokes rather than one the manifest names — the
+    //   operator's fix differs (install git / fix the manifest's argv), and
+    //   the git case can name its remedy concretely.
+    D_ScriptSpawnFailed          = 0xD017,
+    // D_ScriptExitedNonZero: a `preBuildScripts`/`postBuildScripts` entry
+    //   spawned successfully and terminated with a NON-ZERO status. The build
+    //   hook contract is the POSIX one every build system already assumes:
+    //   zero means proceed, non-zero means stop. Fail-loud rather than
+    //   fail-soft — a pre-build codegen step that silently failed would let the
+    //   compile proceed against STALE generated sources and produce a green
+    //   build of the wrong bytes, which is precisely the silent-success class
+    //   `D_CompileUnitNullNoDiagnostic` (0xD014) exists to keep out of the
+    //   driver. The status value belongs in the diagnostic's `actual` so the
+    //   operator does not have to re-run the script to learn it. (Abnormal
+    //   termination — a signal / structured exception — is reported through
+    //   this same code: from the driver's side "did not exit 0" is one
+    //   decision, and the spawn layer's status prose discriminates.)
+    D_ScriptExitedNonZero        = 0xD018,
+
+    // ── Project dependencies: `dependsOn` (0xD019..0xD020) ──
+    // A `dependsOn` entry names either a RELATIVE PATH to another project
+    // directory or a GIT URL cloned into `.dss-deps/<name>`. Resolution is
+    // recursive (a dependency may itself declare `dependsOn`), so the failure
+    // surface splits into three groups, each with its own remediation and
+    // therefore its own codes:
+    //   * manifest/graph structure — 0xD019, 0xD01A;
+    //   * consumability of a RESOLVED dependency — 0xD01B, 0xD01C;
+    //   * git acquisition — 0xD01D..0xD020.
+    // Every one of these is a DRIVER-band (`D_`) code because the decision is
+    // made at project-load time, before any grammar/CU exists to hang a source
+    // span on — the same placement argument that put `D_ArtifactProfile-
+    // NotSupported` (0xD010) here rather than deep in codegen.
+    //
+    // D_DependencyManifestNotFound: a `path` dependency's directory exists but
+    //   has NO `.dss-project.json` at its root. Remediation-distinct from
+    //   `D_FileNotFound` (0xD001): that is "the thing you named is not there";
+    //   this is "the thing you named IS there but is not a DSS project", which
+    //   is overwhelmingly a wrong-level path (`../lib/src` instead of
+    //   `../lib`). Naming the manifest the resolver looked for — and the
+    //   absolute path it looked at — is what turns this from a guessing game
+    //   into a one-edit fix, so both belong in the diagnostic prose.
+    D_DependencyManifestNotFound = 0xD019,
+    // D_DependencyCycle: recursive `dependsOn` resolution reached a manifest
+    //   that is ALREADY ON THE DFS STACK — i.e. the dependency graph contains a
+    //   cycle (A → B → A, or any longer ring). Fail loud rather than
+    //   "break the back-edge and continue": a silently-broken cycle makes the
+    //   resolved dependency set depend on which node the walk happened to start
+    //   from, so two targets in the same build could legitimately see DIFFERENT
+    //   source sets — a non-determinism that would surface much later as an
+    //   inexplicable link error. Detection keys on the RESOLVED CANONICAL
+    //   manifest path (lexically-normalized / symlink-resolved), not on the
+    //   manifest's spelling in the parent, so `../lib` and `../../proj/lib`
+    //   naming the same directory are correctly one node. The cycle path
+    //   itself (the stack from the repeated node back around to it) is the
+    //   diagnostic's payload — a bare "cycle detected" on a deep graph is
+    //   nearly unactionable. Distinct from a REVISITED-but-not-on-stack
+    //   manifest, which is a diamond (a legitimate shared dependency) and must
+    //   NOT diagnose at all — the memo table answers it.
+    D_DependencyCycle            = 0xD01A,
+    // D_DependencyArtifactProfileUnsupported: a resolved dependency's
+    //   `artifactProfile` is not CONSUMABLE as a dependency (e.g. it declares
+    //   an executable profile — an artifact a consumer cannot link against or
+    //   merge sources from). Note the axis: this is neither of the two existing
+    //   artifact-profile rejects. `D_ArtifactProfileNotSupported` (0xD010) is
+    //   "the LANGUAGE does not declare this profile" and
+    //   `D_ArtifactProfileFormatMismatch` (0xD011) is "the FORMAT does not
+    //   produce this profile"; this third one is "the profile is perfectly
+    //   valid FOR ITSELF, but is not a thing another project can depend ON".
+    //   Three different files to edit (`.lang.json`, the target/format, the
+    //   dependency's own manifest or the `dependsOn` edge) ⇒ three codes. Fail
+    //   CLOSED on an unrecognized/absent profile, matching AP1's trajectory: a
+    //   dependency whose consumability cannot be established is not silently
+    //   assumed consumable.
+    D_DependencyArtifactProfileUnsupported = 0xD01B,
+    // D_DependencyLanguageMismatch: a SOURCE-MERGE dependency declares a
+    //   `language` different from the consumer's. Scoped deliberately to the
+    //   source-merge shape: merging another project's sources into this
+    //   project's compilation means they are parsed by THIS project's grammar,
+    //   so a language difference is not a preference mismatch but a guaranteed
+    //   parse failure — one that would otherwise surface as a pile of
+    //   `P_UnexpectedToken`s pointing into a file the user never wrote and may
+    //   not know is in the build. Rejecting at resolve time names the actual
+    //   cause once. This code makes NO claim about binary-artifact
+    //   dependencies: cross-language linking against a built artifact is the
+    //   whole point of the FFI surface and must stay legal, so that shape must
+    //   not route here.
+    D_DependencyLanguageMismatch = 0xD01C,
+    // D_DependencyGitNotFound: a `dependsOn` entry names a GIT URL but `git`
+    //   is not on PATH, so no acquisition is possible. Split out from
+    //   `D_DependencyGitAcquireFailed` (0xD01E) because the remediation is
+    //   environmental and completely concrete ("install git / put it on PATH")
+    //   whereas an acquire failure is about the URL, the network, or
+    //   credentials. Split out from `D_ScriptSpawnFailed` (0xD017) for the
+    //   reason recorded there: that code covers programs the MANIFEST names;
+    //   this covers the one program the DRIVER itself reaches for. Emitted
+    //   once per build, not once per git dependency — N copies of "git is not
+    //   installed" is noise, and the reporter's per-code cap must not be the
+    //   thing that hides it.
+    D_DependencyGitNotFound      = 0xD01D,
+    // D_DependencyGitAcquireFailed: FIRST acquisition of a git dependency
+    //   failed and there is NO existing checkout to fall back to — the clone
+    //   did not produce a usable `.dss-deps/<name>`. This is a HARD failure:
+    //   the dependency's sources/artifact simply do not exist on this machine,
+    //   so continuing would compile against a hole. Its twin
+    //   `D_DependencyGitFetchFallback` (0xD01F) is the SAME network failure
+    //   with a usable checkout present, and is deliberately NOT an error — see
+    //   the severity note there. The discriminator is exactly "is there a
+    //   usable checkout", nothing else; do not let the two codes' emit sites
+    //   drift into keying on the git exit status or the operation name
+    //   (clone vs fetch), which would make an offline build's outcome depend
+    //   on whether git happened to report the failure the same way.
+    D_DependencyGitAcquireFailed = 0xD01E,
+    // D_DependencyGitFetchFallback: a git dependency's fetch/update FAILED but
+    //   an existing `.dss-deps/<name>` checkout is present and is REUSED — the
+    //   build PROCEEDS, deliberately, on possibly-stale sources. This is the
+    //   offline-build guarantee: a laptop on a train, or CI with a flaky
+    //   network, must still build from what it already has. The notice exists
+    //   so "possibly stale" is never silent.
+    //
+    //   ★ SEVERITY IS A DECIDED DESIGN POINT — THIS IS EMITTED AT
+    //   `DiagnosticSeverity::Info`, NOT Warning. Do not "tidy" it up to
+    //   Warning. MEASURED (`diagnostic_reporter.cpp`, `applyPolicy`): the
+    //   `--warnings-as-errors` arm promotes EVERY Warning to Error
+    //   code-agnostically — `if (cfg_.policy.warningsAsErrors && d.severity ==
+    //   DiagnosticSeverity::Warning) d.severity = DiagnosticSeverity::Error;`
+    //   — with no per-code exemption anywhere in the codebase. Membership in
+    //   `kUnsuppressableCodes` explicitly does NOT exempt a code from that
+    //   elevation (it gates SILENCING only; see the "elevation is universal"
+    //   contract in `unsuppressable_codes.hpp`), and `--suppress` is the wrong
+    //   instrument entirely — it would silence the staleness notice rather
+    //   than preserve the build. At Warning severity, therefore, any project
+    //   built with `--warnings-as-errors` would FAIL the moment the network
+    //   did, which is the exact requirement this code exists to uphold.
+    //   Info is not promoted by that arm, and Info does not count toward
+    //   `errorCount()`, so the build proceeds and the operator still sees the
+    //   line (MEASURED: `program.cpp`'s `drainDiagnosticsToStderr` renders
+    //   EVERY diagnostic in `rep.all()` to stderr with no severity filter and
+    //   no verbosity gate — the CLI has no `--quiet`/`--verbose` flag at all —
+    //   and it is called unconditionally on the SUCCESS path, so an Info
+    //   diagnostic is visible at default verbosity).
+    //
+    //   ★ THIS CODE IS A REAL CONSUMER OF THE ANCHORED GAP
+    //   `D-FF2-UNSUPP-INFO-WAE-ASYMMETRY` (unsuppressable_codes.hpp): that
+    //   anchor records that the elevation arm does not promote Info, and lists
+    //   as a candidate resolution "extend the elevation gate to also promote
+    //   Info". Closing it THAT way would silently regress the offline-build
+    //   guarantee documented above — a network failure with a usable checkout
+    //   would once again break `--warnings-as-errors` builds. Whoever closes
+    //   that anchor must therefore take the OTHER resolution it offers (the
+    //   consteval Info-membership check on the closed table), or explicitly
+    //   carve this code out. The dependency is recorded in both directions on
+    //   purpose: an anchor with a live consumer is not free to be closed
+    //   either way.
+    D_DependencyGitFetchFallback = 0xD01F,
+    // D_DependencyGitNameCollision: two DISTINCT git URLs derive the same
+    //   `.dss-deps/<name>` directory (e.g. `https://host-a/x.git` and
+    //   `https://host-b/x.git`, or the ssh and https spellings of two genuinely
+    //   different repos). Whichever one is acquired second would either clobber
+    //   the first or be silently skipped in favour of it — and the build would
+    //   then compile against a dependency it did not ask for, with no
+    //   indication anything substituted. Fail loud. Note the ordering
+    //   obligation this implies at the emit site: the collision must be
+    //   detected on the DERIVED NAMES before acquisition, not discovered when a
+    //   clone lands on a non-empty directory, or the first repo's working tree
+    //   is already damaged by the time we complain. The SAME url appearing
+    //   twice is NOT a collision — that is the diamond case, and it dedups
+    //   silently, exactly as a repeated `path` dependency does (see
+    //   `D_DependencyCycle` 0xD01A on diamonds vs cycles).
+    D_DependencyGitNameCollision = 0xD020,
+    // D_SuppressRequestIgnored: a `--suppress=<code>` request naming a
+    //   WELL-FORMED, REAL diagnostic code that is a member of
+    //   `kUnsuppressableCodes` — so the reporter will ignore the request and
+    //   emit that code anyway. The user asked for something and got nothing;
+    //   before this code existed they were also told nothing (`cli_args.cpp`
+    //   rejects only names resolving to `Unknown`/`None`, so a protected
+    //   code's name parses fine, lands in `policy.suppress`, and is then
+    //   discarded by `applyPolicy`'s `isUnsuppressable` gate). Warning
+    //   severity, and the BUILD CONTINUES — the request is refused, not the
+    //   compilation.
+    //
+    //   ★ WHY A WARNING AND NOT A PARSE-TIME REJECT — MEASURED, not assumed.
+    //   All three reference compilers were probed on the analogous input (a
+    //   silencing request that cannot be honoured) and NONE hard-rejects it:
+    //   gcc 13.2/13.3 (3 hosts, 2 arches) accepts `-Wno-<unknown>` rc=0
+    //   silently, deferring to a *note* only when the TU produced other
+    //   diagnostics; Apple clang 21 emits a real warning
+    //   (`-Wunknown-warning-option`) and compiles; MSVC 19.51 — the closest
+    //   analogue that exists, since `/wd2065` is a well-formed number naming
+    //   a real diagnostic `/wd` cannot silence — emits command-line warning
+    //   `D9014` and continues. Rejecting would make DSS strictly harsher than
+    //   all three on a flag whose whole purpose is to be script-driven, and
+    //   would break shared CI scripts on an INTERNAL DSS reclassification (a
+    //   code joining the closed table) with no change on the user's side.
+    //   The probe lives in-tree — `ReferenceCompilersDoNotRejectAnUnhonourable-
+    //   SilencingRequest` in `tests/program/`'s suppress-request suite — so the
+    //   conformance claim stays MEASURED rather than asserted in a comment. It
+    //   skips with a named verdict where a toolchain is absent, and each arm
+    //   runs a CONTROL compile with no extra flags so a broken toolchain
+    //   cannot be misread as a compiler that rejects the flag.
+    //
+    //   ⚠ THE `--suppress=0xFFFF` PRECEDENT DOES NOT GOVERN. That reject
+    //   (`parseSuppressCode`, silent-failure audit C1) refuses MALFORMED
+    //   input naming NO diagnostic. This is WELL-FORMED input naming a REAL
+    //   diagnostic. Refusing input that means nothing and refusing input that
+    //   means something the compiler declines to do are different decisions.
+    //
+    //   ★ AND THIS CODE IS DELIBERATELY *NOT* A MEMBER OF
+    //   `kUnsuppressableCodes`. It fails that table's written criterion in
+    //   both prongs: suppressing "your suppression request was ignored" ships
+    //   NO wrong bytes (the protected code it is about still emits, which is
+    //   the entire point), and it hides no build failure (the build was going
+    //   to continue either way). Its own suppressibility is therefore
+    //   CORRECT and consistent, not a leak — `--suppress=D_SuppressRequest-
+    //   Ignored` is an operator who has read the message and wants their
+    //   script quiet, exactly the advisory class `--suppress` is documented
+    //   to control. `--warnings-as-errors` promotes it like any other
+    //   Warning, which is how an operator who wants it fatal gets that
+    //   without the compiler deciding for them (the clang `-Werror,
+    //   -Wunknown-warning-option` posture, measured above).
+    D_SuppressRequestIgnored     = 0xD021,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
@@ -3185,6 +3472,14 @@ struct DSS_EXPORT RelatedLocation {
 struct DSS_EXPORT ParseDiagnostic {
     DiagnosticCode      code     = DiagnosticCode::None;
     DiagnosticSeverity  severity = DiagnosticSeverity::Error;
+
+    // Whether the reporter's cap / dedup gates may drop this diagnostic.
+    // See `DiagnosticDelivery` above for why this is a separate axis from
+    // suppression. Defaults to `Capped`: a delivery guarantee is asked for
+    // at the emit site, never acquired by omission. `forceReport` is the
+    // ergonomic spelling of `Guaranteed` for callers that would otherwise
+    // set the field and call `report` on the next line.
+    DiagnosticDelivery  delivery = DiagnosticDelivery::Capped;
 
     BufferId    buffer;             // primary buffer
     SourceSpan  span = SourceSpan::empty(0);

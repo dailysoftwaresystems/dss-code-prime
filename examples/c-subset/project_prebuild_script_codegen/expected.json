@@ -1,0 +1,24 @@
+{
+  "$comment": "PROJECT MODE (the top-level `project` key): the build is driven by .dss-project.json through Program::compileProject / `dss-code-prime --project`, which is the ONLY driver entry point that expands a manifest's source globs and runs its preBuildScripts hooks. Exit 42 = 7+11+13+11, summed at RUNTIME through a non-inlined call over a file-scope array that the pre-build script wrote moments earlier; nothing in git contains that array. The spec/artifact/runOn entries below keep their usual job -- gating the run and naming the artifact -- but they do NOT drive the build: compileProject takes no targets argument, so each `spec` is a MIRROR of one of the project manifest's own targets and both runners fail loud if it names a target the project never builds.",
+  "$commentNoOptimizedArm": "NO `optimizedPipelines` ARM, and that is a decision rather than an omission. `optimizedPipelines` is read by the in-process runner ONLY -- integrated_tests/runner.cpp passes no `--config` and knows nothing of shipped pipelines (MEASURED: zero occurrences of `--config` / `shippedPipeline` / `optimizedPipelines` in that file) -- so a release arm here would be exercised in ONE of the two corpus runners. This example exists to honour the rule that a capability must land in BOTH runners; declaring an arm only one of them can see would break that rule in the very manifest that demonstrates it. Add the release arm the day the CLI runner grows `--config`, and note that the feature under test here is a DRIVER/build-lifecycle one whose observable does not depend on the optimizer.",
+  "language": "c-subset",
+  "project": ".dss-project.json",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "prebuild_codegen.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "prebuild_codegen",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "prebuild_codegen",
+      "runOn": ["darwin"]
+    }
+  ]
+}

@@ -29,6 +29,56 @@ cd "${REPO_ROOT}"
 # treated as informal; the registry contract enforces ≥3 segments.
 ANCHOR_REGEX='\<D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
 
+# ── EVERY **GREP** IN THIS FILE RUNS IN THE BYTE LOCALE (`LC_ALL=C`) ─────────
+# (The awk passes are deliberately NOT prefixed — see the end of this note.)
+# The anchor grammar above is pure ASCII by construction, so byte semantics ARE
+# the correct semantics for it — this is not a speed hack that trades away
+# meaning. The plans and the registry are full of UTF-8 (★, ✔, —, arrows), but
+# none of it can ever be part of an anchor, and the verdict was proved unchanged
+# by DIFFING this script's whole stdout + exit code between the two locales
+# rather than by asserting it (see the macOS measurements at PHASE 1 below:
+# identical sha256 across `en_US.UTF-8` and `C`, on both the OK and the FAIL
+# path).
+# ★ THE ONE SEMANTIC RISK WAS PROBED DIRECTLY RATHER THAN ARGUED AWAY. `\<` is
+# defined against the locale's word characters, so a MULTIBYTE LETTER sitting
+# immediately before an anchor is the case where a byte locale and a UTF-8
+# locale could legitimately disagree about whether a boundary exists — the byte
+# locale seeing two non-word bytes where the UTF-8 locale sees one letter.
+# ✔MEASURED 2026-08-12 by injecting a real `é` (bytes 0xC3 0xA9) directly
+# against an anchor name and running both locales: the reports were BYTE-
+# IDENTICAL (sha b150af36b8e4afd4) and BOTH found the anchor, so BSD grep does
+# not in fact diverge here. Had it diverged, the byte locale is the FAIL-LOUD
+# direction anyway (it finds MORE anchors, all of which must then resolve).
+# ⚠ WHY THIS IS PER-COMMAND AND NOT ONE `export LC_ALL=C` AT THE TOP. A global
+# export would also re-collate the two `sort -u` calls that order `SRC_ANCHORS`,
+# and THAT is verdict-visible: the FAIL report lists missing anchors in
+# SRC_ANCHORS order, so byte-vs-culture collation of `-` against `_` would
+# reorder the report. Prefixing the SCANS leaves every `sort` exactly as it was,
+# which makes the "output is unchanged" claim true by construction for ordering
+# and measured for content. If a future scan is added here, prefix it too.
+# ⓘ SIZE OF THE EFFECT, SO NOBODY OVER-CREDITS IT. On GNU grep the locale costs
+# nothing either way (✔MEASURED: Linux 0.145 s vs 0.179 s, Git-Bash 1.0-1.5 s —
+# indistinguishable). On the BSD grep macOS ships it is worth about **1.2x**
+# (✔MEASURED on the fixed script: 4.288 s in `C` against 5.168 s in
+# `en_US.UTF-8`), and the regex scan PHASE 1 now uses is locale-INSENSITIVE
+# outright (0.245 s vs 0.219 s — the byte locale was marginally the SLOWER of
+# the two there, i.e. inside the noise).
+# ⚠ So `LC_ALL=C` is NOT what fixed this guard, and an earlier hypothesis that
+# it would buy 10-100x was REFUTED by measurement before any of it was written.
+# It is kept because it is free and semantically right, not because it is the
+# cure; the cure is the algorithmic change PHASE 1 documents.
+# ⓘ THE `awk` PASSES ARE LEFT UNPREFIXED, DELIBERATELY AND AS AN UNMEASURED
+# NON-CHANGE. After the PHASE 1 fix the whole guard costs 4.288 s on the Mac, of
+# which the greps account for 0.365 s (0.245 phase 1 + 0.120 collection) — so
+# the cell-width awk is most of the remainder. It is very likely it would also
+# be cheaper in the byte locale. It is NOT prefixed because the saving is a
+# couple of seconds on a run that is already fast, and because prefixing it
+# would change the locale under `gsub(/[^ -~]/, ...)` and `substr()` — the two
+# operations `display()` above argues are byte/char-identical — without that
+# argument having been re-verified end-to-end. A measured 2 s is not worth an
+# unmeasured change to the one function whose output the two twins are diffed
+# on. If someone wants it, MEASURE the twins' outputs against each other first.
+
 # ════════════════════════════════════════════════════════════════════════════
 # CHECK 2 of 2 — MARKDOWN TABLE CELL-WIDTH PROPERTY
 # `D-PLANS-REGISTRY-ROWS-WITH-EXTRA-CELLS-STILL-LIVE` (registry) — CLOSED BY
@@ -398,7 +448,7 @@ do
         _scan_failed=1; continue
     fi
     _inc=(); for _g in ${_globs}; do _inc+=(--include="${_g}"); done
-    _hits="$(grep -rEoh "${ANCHOR_REGEX}" "${_root}/" "${_inc[@]}" 2>/dev/null | sort -u || true)"
+    _hits="$(LC_ALL=C grep -rEoh "${ANCHOR_REGEX}" "${_root}/" "${_inc[@]}" 2>/dev/null | sort -u || true)"
     _n="$(printf '%s' "${_hits}" | grep -c . || true)"
     if [[ "${_n}" -lt "${_floor}" ]]; then
         echo "anchor-registry: FAIL — root '${_root}' yielded only ${_n} anchors, below its floor of ${_floor}." >&2
@@ -433,13 +483,22 @@ _anchor_count="$(printf '%s' "${SRC_ANCHORS}" | grep -c . || true)"
 # into one string and calls `.Contains()` per anchor in memory), which is why its
 # clean run measured 9.6 s against this script's 14.7 s. This closes that gap
 # from the slow side rather than making the fast side sloppier.
+# ⚠ THOSE 2026-08-10 FIGURES ARE LINUX-ONLY AND THAT WAS THE DEFECT. The phase-1
+# form they justified (`grep -F -f` with the whole anchor list as patterns) is
+# ~1500x slower on the BSD grep macOS ships; see the macOS numbers and the
+# rewrite at PHASE 1 below. The three-phase STRUCTURE survived that rewrite
+# unchanged — only phase 1's matcher changed — which is why these numbers are
+# kept rather than deleted: they are still the reason the structure exists.
 # ★ WHY PHASE 3 CANNOT BE DROPPED, measured rather than reasoned about: with
-# `-o -F -f`, grep reports the LONGEST match at a position, so an anchor that is
-# a PREFIX of a longer anchor in the same text is swallowed and never emitted.
-# ✔MEASURED: 905 patterns, 812 emitted, **93 unemitted — every one of them a
-# prefix**. Phase 1b recovers exactly those by substring-closing over the emitted
-# set (if `a` is a substring of a token that DOES occur, then `a` occurs), which
-# took all 93 to 0. Phase 3 then exists for the case neither phase covers, and it
+# `-o`, grep reports the LONGEST match at a position, so an anchor that is a
+# PREFIX of a longer anchor in the same text is swallowed and never emitted under
+# its own name. ✔MEASURED on the `-F -f` form: 905 patterns, 812 emitted, **93
+# unemitted — every one of them a prefix**. Phase 1b recovers exactly those by
+# substring-closing over the emitted set (if `a` is a substring of a token that
+# DOES occur, then `a` occurs), which took all 93 to 0. The same swallowing
+# applies to the pattern-scan form that replaced it — MORE so, since it emits
+# only whole anchor tokens — so the closure is now load-bearing by design rather
+# than as a rescue. Phase 3 then exists for the case neither phase covers, and it
 # is the ONLY phase allowed to conclude "missing".
 # ⚠ Phase 1 failing wholesale is FAIL-SLOW, never fail-wrong: every anchor
 # becomes a phase-3 candidate and the guard is merely as slow as it used to be.
@@ -453,13 +512,55 @@ _anchor_count="$(printf '%s' "${SRC_ANCHORS}" | grep -c . || true)"
 _plan_pat="$(mktemp)";  _tmps+=("${_plan_pat}")
 _plan_hit="$(mktemp)";  _tmps+=("${_plan_hit}")
 _plan_cand="$(mktemp)"; _tmps+=("${_plan_cand}")
-# Blank lines are stripped: a blank line in a `grep -F -f` pattern file matches
-# EVERY line, which would resolve every anchor and green the guard silently.
+# Blank lines are stripped. They are no longer the catastrophe they were while
+# this list was a `grep -F -f` pattern file (a blank pattern matches EVERY line,
+# which would resolve every anchor and green the guard silently), but PHASE 3
+# still greps each entry, so an empty one would still match everything — hence
+# both this filter and the `[[ -z ]]` guard in the phase-3 loop.
 { printf '%s\n' "${SRC_ANCHORS}" | grep . || true; } > "${_plan_pat}"
-# PHASE 1 — ONE pass over `.plans/`, emitting each anchor string that occurs.
+# PHASE 1 — ONE pass over `.plans/`, emitting the plan-side anchor VOCABULARY.
 # `.plans/` (all files), not `.plans/**/*.md`, to keep this script's documented
 # scope — the `.ps1` reads only `*.md`, and that divergence is recorded there.
-{ grep -rhoF -f "${_plan_pat}" .plans/ 2>/dev/null || true; } \
+#
+# ★★ THIS SCANS FOR THE ANCHOR PATTERN, NOT FOR THE 950 SRC ANCHORS. That is a
+# deliberate reversal, and it is what makes this guard usable on macOS.
+# D-GATE-ANCHOR-GUARD-PHASE1-QUADRATIC-ON-BSD-GREP — CLOSED BY THIS BLOCK.
+# ✔MEASURED 2026-08-12 on the operator's Mac (macOS 26.5.2 arm64, BSD grep
+# 2.6.0-FreeBSD), matched content against Linux at the same commit:
+#     BEFORE, whole guard, en_US.UTF-8, fresh clone   274.6 s
+#     BEFORE, whole guard, en_US.UTF-8, warm          317.6 s
+#     BEFORE, whole guard, LC_ALL=C,    warm    180.4 s / 153.4 s / 270.6 s
+#     AFTER,  whole guard, LC_ALL=C                     4.288 s
+#     AFTER,  whole guard, en_US.UTF-8                  5.168 s
+#     this phase alone: 0.245 s, against >4 min for the form it replaced
+#     the same script on Linux (GNU grep 3.11) 0.17 s, Git-Bash (GNU 3.0) ~1.1 s
+# ⇒ ~63x on the macOS leg, with the verdict BYTE-IDENTICAL (same sha256 across
+# before/after and across both locales, on the OK path AND on an injected-
+# missing-anchor FAIL path).
+# — and `ps` caught the run parked at 100% CPU inside `grep -rhoF -f <950
+# patterns> .plans/` in BOTH locales. THREE hypotheses died on those numbers:
+# it is not tree size (this Mac's scanned roots are SMALLER than the Linux
+# tree's), it is not a cold page cache (the WARM run was the SLOWER of the two,
+# and grep was CPU-bound at 100%, never blocked on I/O), and it is not the
+# locale (worth ~1.2x; see the note under ANCHOR_REGEX).
+# The cause is algorithmic: GNU grep compiles a `-F -f` pattern set into ONE
+# Aho-Corasick/Commentz-Walter automaton and scans the text once, while BSD grep
+# has no such matcher and degrades toward (patterns x text) — here 950 x 7.2 MB.
+# ⚠ So PHASE 1 was a Linux OPTIMISATION that is a macOS PESSIMISATION, and it
+# was landed measured on ONE platform. Scanning for the PATTERN instead makes the
+# cost (1 x text) on every grep, which is the same shape as the three collection
+# greps above that were always fast everywhere.
+#
+# WHAT CHANGES SEMANTICALLY, STATED PLAINLY: `_plan_hit` used to hold "src
+# anchors seen verbatim in the plans" and now holds "anchor-shaped tokens the
+# plans contain". PHASE 1b consumes it exactly the same way — `index(planToken,
+# srcAnchor)` — so an anchor resolves when the plans cite it, or cite a MORE
+# SPECIFIC name containing it, which is the documented contract above and
+# unchanged. Anything this pass cannot settle still falls through to PHASE 3,
+# which remains the ONLY phase allowed to conclude "missing". That is why the
+# reversal is safe rather than merely faster: it can only move work between
+# phase 1b and phase 3, never turn a MISSING into a RESOLVED.
+{ LC_ALL=C grep -rhoE "${ANCHOR_REGEX}" .plans/ 2>/dev/null || true; } \
     | LC_ALL=C sort -u > "${_plan_hit}"
 # PHASE 1b — substring closure, then everything left over is a phase-3 candidate.
 # ⚠ The first-file test is `FILENAME == hitf`, NOT `FNR == NR`: with an EMPTY
@@ -480,7 +581,7 @@ FILENAME == hitf { n++; R[n] = $0; next }
 MISSING=()
 while IFS= read -r src_a; do
     [[ -z "${src_a}" ]] && continue
-    if ! grep -qrF -- "${src_a}" .plans/ 2>/dev/null; then
+    if ! LC_ALL=C grep -qrF -- "${src_a}" .plans/ 2>/dev/null; then
         MISSING+=("${src_a}")
     fi
 done < "${_plan_cand}"
@@ -528,9 +629,9 @@ echo ""
 # finds nothing is a NORMAL outcome here, never an error. Hoisting the greps out
 # of the loop does not retire that hazard — it still applies to this ONE run.
 _locator_tmp="$(mktemp)"; _tmps+=("${_locator_tmp}")
-{ grep -rEo "${ANCHOR_REGEX}" src/ examples/ \
+{ LC_ALL=C grep -rEo "${ANCHOR_REGEX}" src/ examples/ \
     --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' 2>/dev/null || true; \
-  grep -rEo "${ANCHOR_REGEX}" real-examples/ \
+  LC_ALL=C grep -rEo "${ANCHOR_REGEX}" real-examples/ \
     --include='*.sh' --include='*.ps1' --include='*.py' 2>/dev/null || true; } \
     > "${_locator_tmp}"
 # The missing list goes through a file too, so an anchor containing a shell

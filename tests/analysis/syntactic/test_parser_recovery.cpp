@@ -8,6 +8,7 @@
 //      recovery diagnostic for the broken region.
 
 #include "analysis/syntactic/parser.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -49,7 +50,7 @@ struct Harness {
     }
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString(std::move(source), "<recovery>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     return Harness{std::move(src), std::move(schema), std::move(stream)};
 }
@@ -64,7 +65,7 @@ struct Harness {
     }
     auto schema = *loaded;
     auto src    = SourceBuffer::fromString(std::move(source), "<recovery>");
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
     return Harness{std::move(src), std::move(schema), std::move(stream)};
 }
@@ -84,7 +85,7 @@ struct Harness {
 // the tree.
 TEST(ParserRecovery, ScansToSyncTokenAndResumes) {
     auto h = loadShipped("toy", "var x : int = @ noise more; var y : int = z;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -112,7 +113,7 @@ TEST(ParserRecovery, ScansToSyncTokenAndResumes) {
 // non-stmt-FIRST token rather than dispatching to recovery.
 TEST(ParserRecovery, BadTokensBeforeSyncDoNotPreventNextStmt) {
     auto h = loadShipped("toy", "var x : int = @ noise more; var y : int = z;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -138,7 +139,7 @@ TEST(ParserRecovery, BadTokensBeforeSyncDoNotPreventNextStmt) {
 // downstream `appendExpectedActual` does `expected 'X' or 'Y' — got 'Z'`).
 TEST(ParserRecovery, EmittedDiagnosticHasExpectedListPopulated) {
     auto h = loadShipped("toy", "var x : int = @;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -161,7 +162,7 @@ TEST(ParserRecovery, EmittedDiagnosticHasExpectedListPopulated) {
 // not a raw integer kind id.
 TEST(ParserRecovery, EmittedDiagnosticActualIsQuotedLexeme) {
     auto h = loadShipped("toy", "var x : int = @;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -183,7 +184,7 @@ TEST(ParserRecovery, EmittedDiagnosticActualIsQuotedLexeme) {
 // symptoms and excluded from the count.
 TEST(ParserRecovery, SingleErrorCascadeBoundedAtThreeX) {
     auto h = loadShipped("toy", "var x : int = @ noise more stuff; var y : int = z;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& diags = result.tree.diagnostics().all();
 
@@ -226,7 +227,8 @@ TEST(ParserRecovery, SyncScanRespectsMaxCap) {
     auto h = loadInline(kSyncCapSchema, "x x x x x x x x x ;");
     ParserConfig cfg;
     cfg.maxSyncScanTokens = 3;
-    Parser p{h.src, h.schema, std::move(h.stream), std::move(cfg)};
+    Parser p{h.src, h.schema, std::move(h.stream),
+             DiagnosticBudget::libraryDefault(), std::move(cfg)};
     auto result = std::move(p).parse();
 
     // At least one P_UnexpectedToken (the cursor expects `;`, sees `x`);
@@ -253,14 +255,15 @@ TEST(ParserRecovery, BothStrategiesCompleteOnBrokenInput) {
         auto h = loadShipped("toy", source);
         ParserConfig cfg;
         cfg.recoveryStrategy = RecoveryStrategy::SingleToken;
-        Parser p{h.src, h.schema, std::move(h.stream), std::move(cfg)};
+        Parser p{h.src, h.schema, std::move(h.stream),
+             DiagnosticBudget::libraryDefault(), std::move(cfg)};
         auto t = std::move(p).parse();
         EXPECT_NE(t.tree.root(), InvalidNode);
         EXPECT_TRUE(t.tree.diagnostics().hasErrors());
     }
     {
         auto h = loadShipped("toy", source);
-        Parser p{h.src, h.schema, std::move(h.stream)};
+        Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto t = std::move(p).parse();
         EXPECT_NE(t.tree.root(), InvalidNode);
         EXPECT_TRUE(t.tree.diagnostics().hasErrors());
@@ -272,7 +275,7 @@ TEST(ParserRecovery, BothStrategiesCompleteOnBrokenInput) {
 // EOF without scanning past the cap and without hanging.
 TEST(ParserRecovery, PanicModeTerminatesAtEofWithNoSyncToken) {
     auto h = loadShipped("toy", "var x : int = @ @ @ @");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -304,7 +307,7 @@ TEST(ParserRecovery, BodyCodepointsDoNotMultiplyDiagnostics) {
     // explode.
     auto h = loadShipped("tsql-subset",
         "SELECT @bad 'abcdefg' garbage FROM t;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -346,7 +349,7 @@ TEST(ParserRecovery, BodyCodepointsDoNotMultiplyDiagnostics) {
 TEST(ParserRecovery, BodyCodepointsAbsorbedCleanlyOnHappyPath) {
     auto h = loadShipped("tsql-subset",
         "SELECT * FROM t WHERE name = 'a long string value';");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -368,7 +371,7 @@ TEST(ParserRecovery, BodyCodepointsAbsorbedCleanlyOnHappyPath) {
 // through every happy-path corpus test.
 TEST(ParserRecovery, ExternTailUnexpectedTokenIsDiagnosed) {
     auto h = loadShipped("c-subset", "extern int foo bar;");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
 
@@ -391,7 +394,8 @@ TEST(ParserRecoveryDeath, ZeroSyncScanCapAborts) {
     ParserConfig cfg;
     cfg.maxSyncScanTokens = 0;
     EXPECT_DEATH(
-        Parser(src, schema, std::move(empty), std::move(cfg)),
+        Parser(src, schema, std::move(empty),
+               DiagnosticBudget::libraryDefault(), std::move(cfg)),
         "maxSyncScanTokens must be >= 1");
 }
 
@@ -427,7 +431,7 @@ namespace {
 TEST(ParserRecovery, MissingInitializerExpressionRecoversCleanly) {
     auto h = loadShipped("c-subset",
         "int main() {\n    int x = ;\n    return undefined_thing;\n}\n");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t     = result.tree;
     auto const& diags = t.diagnostics().all();
@@ -466,7 +470,7 @@ TEST(ParserRecovery, MissingInitializerExpressionRecoversCleanly) {
 TEST(ParserRecovery, MissingInitDiagnosticsAreNotSuppressedAcrossCleanParse) {
     auto h = loadShipped("c-subset",
         "int main() {\n    int x = ;\n    int y = ;\n    return 0;\n}\n");
-    Parser p{h.src, h.schema, std::move(h.stream)};
+    Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& diags = result.tree.diagnostics().all();
 

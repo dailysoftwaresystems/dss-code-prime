@@ -377,6 +377,20 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_CompileUnitNullNoDiagnostic:  return "D_CompileUnitNullNoDiagnostic";
         case DiagnosticCode::D_ArtifactNameEscapesOutputDir: return "D_ArtifactNameEscapesOutputDir";
         case DiagnosticCode::D_SynthRecipeFamilyUnknown:     return "D_SynthRecipeFamilyUnknown";
+        // Project-manifest build hooks (`preBuildScripts` / `postBuildScripts`).
+        case DiagnosticCode::D_ScriptSpawnFailed:            return "D_ScriptSpawnFailed";
+        case DiagnosticCode::D_ScriptExitedNonZero:          return "D_ScriptExitedNonZero";
+        // Project dependencies (`dependsOn`).
+        case DiagnosticCode::D_DependencyManifestNotFound:   return "D_DependencyManifestNotFound";
+        case DiagnosticCode::D_DependencyCycle:              return "D_DependencyCycle";
+        case DiagnosticCode::D_DependencyArtifactProfileUnsupported:
+            return "D_DependencyArtifactProfileUnsupported";
+        case DiagnosticCode::D_DependencyLanguageMismatch:   return "D_DependencyLanguageMismatch";
+        case DiagnosticCode::D_DependencyGitNotFound:        return "D_DependencyGitNotFound";
+        case DiagnosticCode::D_DependencyGitAcquireFailed:   return "D_DependencyGitAcquireFailed";
+        case DiagnosticCode::D_DependencyGitFetchFallback:   return "D_DependencyGitFetchFallback";
+        case DiagnosticCode::D_DependencyGitNameCollision:   return "D_DependencyGitNameCollision";
+        case DiagnosticCode::D_SuppressRequestIgnored:       return "D_SuppressRequestIgnored";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";

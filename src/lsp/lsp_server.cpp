@@ -693,13 +693,13 @@ void LspServer::enqueueParse_(std::string uri) {
         // the LSP learns the workspace's `<target>:<format>` pair, all three
         // light up together. Anchored as
         // `D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE`.
-        dss::UnitBuilder builder{snap.schema};
+        dss::UnitBuilder builder{snap.schema, dss::DiagnosticBudget::libraryDefault()};
         builder.setHeaderNameMatching(dss::kDefaultHeaderNameMatching);
         builder.addInMemory(snap.text, uri);
         auto cu = std::make_shared<dss::CompilationUnit>(
             std::move(builder).finish());
         auto model = std::make_shared<dss::SemanticModel const>(
-            dss::analyze(cu));
+            dss::analyze(cu, dss::DiagnosticBudget::libraryDefault()));
 
         // Union the per-tree parse diagnostics (lexer + parser, folded by
         // UnitBuilder) with the semantic diagnostics for publishing.

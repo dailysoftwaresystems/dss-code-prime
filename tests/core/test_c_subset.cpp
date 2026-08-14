@@ -1,3 +1,4 @@
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/operator_table.hpp"
@@ -40,7 +41,7 @@ TEST(CSubsetEndToEnd, TopLevelVarDeclWithIntInitializer) {
     auto h = tokenizeShipped("c-subset", "int x = 5;");
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto top  = b.open(h.schema->rules().find("topLevel"));
@@ -109,7 +110,7 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
     auto h = tokenizeShipped("c-subset", "int main(void) { if (x) { return x; } }");
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto top  = b.open(h.schema->rules().find("topLevel"));
@@ -306,7 +307,7 @@ TEST(CSubsetEndToEnd, SwitchStmtParsesAllArmKinds) {
                              "switch (x) { case 1: break; default: break; }");
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));

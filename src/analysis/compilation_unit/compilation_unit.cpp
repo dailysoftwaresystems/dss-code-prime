@@ -164,7 +164,8 @@ GrammarSchema const& CompilationUnit::schema() const noexcept {
 }
 
 // ── UnitBuilder ───────────────────────────────────────────────────────────
-UnitBuilder::UnitBuilder(std::shared_ptr<GrammarSchema const> schema)
+UnitBuilder::UnitBuilder(std::shared_ptr<GrammarSchema const> schema,
+                         DiagnosticBudget                     budget)
     : id_(CompilationUnit::nextId())
     , schema_(std::move(schema))
     // Driver diagnostics are keyed by PATH, not by source span — every
@@ -173,16 +174,19 @@ UnitBuilder::UnitBuilder(std::shared_ptr<GrammarSchema const> schema)
     // collapse N distinct missing files into one message. Disable dedup on
     // this reporter so each bad path surfaces. (Per-tree reporters keep
     // their dedup; this disables it only for the CU's driver-level stream.)
-    , driverDiagnostics_(DiagnosticReporter::Config{.dedupWindow = 0}) {
+    , budget_(budget)
+    , driverDiagnostics_(budget.withoutDedup().asConfig()) {
     if (!schema_) {
         cuFatal("UnitBuilder: schema is null");
     }
     schemas_.push_back(schema_);   // primary is also the sole registry entry
 }
 
-UnitBuilder::UnitBuilder(std::vector<std::shared_ptr<GrammarSchema const>> schemas)
+UnitBuilder::UnitBuilder(std::vector<std::shared_ptr<GrammarSchema const>> schemas,
+                         DiagnosticBudget                                   budget)
     : id_(CompilationUnit::nextId())
-    , driverDiagnostics_(DiagnosticReporter::Config{.dedupWindow = 0}) {
+    , budget_(budget)
+    , driverDiagnostics_(budget.withoutDedup().asConfig()) {
     if (schemas.empty()) {
         cuFatal("UnitBuilder: schema registry is empty");
     }
@@ -267,7 +271,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         std::optional<substrate::PhaseTimers::Scope> phase;
         phase.emplace(substrate::CompilePhase::Preprocess);
         PreprocessResult pp = preprocess(src, schema, includeDirs_,
-                                         headerNameMatching_, systemDirs_,
+                                         headerNameMatching_, budget_, systemDirs_,
                                          activeFormat_, userDefines_,
                                          targetPredefinedMacros_,
                                          formatPredefinedMacros_);
@@ -344,8 +348,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
             std::unordered_set<std::string> seen;
             for (std::filesystem::path const& desc :
                  pp.resolvedShippedDescriptors) {
-                DiagnosticReporter scratch{
-                    DiagnosticReporter::Config{.dedupWindow = 0}};
+                DiagnosticReporter scratch{budget_.withoutDedup().asConfig()};
                 if (auto names =
                         ffi::readShippedLibTypedefNames(desc, scratch)) {
                     for (auto& n : *names) {
@@ -356,7 +359,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                 }
             }
         }
-        Parser p{synth, schema, std::move(stream), std::move(cfg),
+        Parser p{synth, schema, std::move(stream), budget_, std::move(cfg),
                  std::move(pp.diagnostics)};
         ParseResult result = std::move(p).parse();
         phase.reset();
@@ -406,10 +409,10 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
     }
     std::optional<substrate::PhaseTimers::Scope> phase;
     phase.emplace(substrate::CompilePhase::Tokenize);
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, budget_};
     auto [stream, lexDiags] = std::move(tk).tokenize();
     phase.emplace(substrate::CompilePhase::Parse);
-    Parser p{src, schema, std::move(stream), parserConfigFor(*schema),
+    Parser p{src, schema, std::move(stream), budget_, parserConfigFor(*schema),
              std::move(lexDiags)};
     ParseResult result = std::move(p).parse();
     phase.reset();
@@ -772,8 +775,7 @@ CompilationUnit UnitBuilder::finish() && {
             // reporter so a malformed descriptor is reported ONCE by the semantic
             // read (readShippedLibDescriptor), never double-reported here.
             for (auto const& ref : shippedLibDescriptors) {
-                DiagnosticReporter scratch{
-                    DiagnosticReporter::Config{.dedupWindow = 0}};
+                DiagnosticReporter scratch{budget_.withoutDedup().asConfig()};
                 if (auto names = ffi::readShippedLibTypedefNames(ref.path, scratch)) {
                     for (auto& n : *names) oracle.insert(std::move(n));
                 }
@@ -856,15 +858,15 @@ CompilationUnit UnitBuilder::finish() && {
                         TokenStream stream =
                             TokenStream::fromTokens(sc.ppTokens);
                         Parser p{sc.source, sc.schema, std::move(stream),
-                                 std::move(cfg), nullptr};
+                                 budget_, std::move(cfg), nullptr};
                         ParseResult r = std::move(p).parse();
                         if (sc.ppRemap) r.tree.remapDiagnostics(sc.ppRemap);
                         return r;
                     }
-                    Tokenizer tk{sc.source, sc.schema};
+                    Tokenizer tk{sc.source, sc.schema, budget_};
                     auto [stream, lexDiags] = std::move(tk).tokenize();
                     Parser p{sc.source, sc.schema, std::move(stream),
-                             std::move(cfg), std::move(lexDiags)};
+                             budget_, std::move(cfg), std::move(lexDiags)};
                     return std::move(p).parse();
                 }();
                 trees_[i]          = std::move(result.tree);
@@ -885,8 +887,7 @@ CompilationUnit UnitBuilder::finish() && {
                 // canonical path), so the edge SET is the same — only the
                 // ids are refreshed.
                 crossRefs.clear();
-                DiagnosticReporter scratchDiags{
-                    DiagnosticReporter::Config{.dedupWindow = 0}};
+                DiagnosticReporter scratchDiags{budget_.withoutDedup().asConfig()};
                 std::vector<ShippedDescriptorRef> scratchDescriptors;
                 ResolutionContext recontext{
                     trees_,

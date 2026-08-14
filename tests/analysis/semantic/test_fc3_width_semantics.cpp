@@ -17,6 +17,7 @@
 #include "analysis/semantic/semantic_test_fixture.hpp"
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_visitor.hpp"
@@ -55,7 +56,7 @@ namespace {
                                            DataModel dm = DataModel::Lp64) {
     auto cu = buildShippedUnit("c-subset", {std::move(src)});
     assertNoBuilderErrors(*cu);
-    return analyze(cu, dm);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dm);
 }
 
 // The SOURCE TEXT of each `_Generic`'s SELECTED result expression, in source
@@ -145,13 +146,13 @@ namespace {
         ADD_FAILURE() << "perturbed schema failed to load";
         std::abort();
     }
-    UnitBuilder builder{*schema};
+    UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
     // aggregateLayout MUST be present for an array-dim sizeof to fold (nullopt
     // ⇒ deliberate fail-loud) — the probe folds `sizeof(EXPR)` into a dimension.
-    return analyze(cu, dm,
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dm,
                    AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
 }
 
@@ -325,7 +326,7 @@ void expectLiteralTypes(std::string const& literal, TypeKind want,
     auto cu = buildShippedUnit(
         "c-subset", {std::string{"int main() { "} + literal + "; return 0; }\n"});
     assertNoBuilderErrors(*cu);
-    auto m = analyze(cu, dm);
+    auto m = analyze(cu, DiagnosticBudget::libraryDefault(), dm);
     EXPECT_FALSE(m.hasErrors()) << literal << " should analyze without error";
     // Locate the IntLiteral leaf by its token spelling. The `return 0;`
     // epilogue uses a distinct `0` token, so the match is unique for every
@@ -506,9 +507,9 @@ TEST(Fc3WidthSemantics, ToyTypingIsDataModelInvariantAndUnchanged) {
     // the pre-FC3 shape (int → I32 via the literalTypes token map).
     char const* src = "var x : int = 3;";
     auto cuA = buildShippedUnit("toy", {src});
-    auto a = analyze(cuA, DataModel::Lp64);
+    auto a = analyze(cuA, DiagnosticBudget::libraryDefault(), DataModel::Lp64);
     auto cuB = buildShippedUnit("toy", {src});
-    auto b = analyze(cuB, DataModel::Llp64);
+    auto b = analyze(cuB, DiagnosticBudget::libraryDefault(), DataModel::Llp64);
     ASSERT_EQ(a.symbols().size(), b.symbols().size());
     for (std::size_t i = 1; i < a.symbols().size(); ++i) {
         TypeKind const ka = a.symbols()[i].type.valid()
@@ -524,9 +525,9 @@ TEST(Fc3WidthSemantics, ToyTypingIsDataModelInvariantAndUnchanged) {
 TEST(Fc3WidthSemantics, TsqlTypingIsDataModelInvariantAndUnchanged) {
     char const* src = "CREATE TABLE t (id INT NOT NULL, flag BIT);";
     auto cuA = buildShippedUnit("tsql-subset", {src});
-    auto a = analyze(cuA, DataModel::Lp64);
+    auto a = analyze(cuA, DiagnosticBudget::libraryDefault(), DataModel::Lp64);
     auto cuB = buildShippedUnit("tsql-subset", {src});
-    auto b = analyze(cuB, DataModel::Llp64);
+    auto b = analyze(cuB, DiagnosticBudget::libraryDefault(), DataModel::Llp64);
     ASSERT_EQ(a.symbols().size(), b.symbols().size());
     for (std::size_t i = 1; i < a.symbols().size(); ++i) {
         TypeKind const ka = a.symbols()[i].type.valid()

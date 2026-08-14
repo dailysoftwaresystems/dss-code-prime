@@ -72,11 +72,14 @@ public:
     DiagnosticReporter() noexcept = default;
     explicit DiagnosticReporter(Config cfg) noexcept;
 
-    // Append a diagnostic. May be silently dropped (suppress), demoted/
-    // promoted (overrides + warningsAsErrors), deduped against the recent
-    // window, or coalesced beyond maxPerCode. Once maxDiagnostics is hit
-    // the reporter is "capped" and only the single P_TooManyDiagnostics
-    // marker is appended; further report() calls are no-ops.
+    // Append a diagnostic. May be dropped (suppress), demoted/promoted
+    // (overrides + warningsAsErrors), deduped against the recent window, or
+    // coalesced beyond maxPerCode. Once maxDiagnostics is hit the reporter is
+    // "capped": further Capped-delivery reports do not land, but they are
+    // COUNTED and the count is carried in the P_TooManyDiagnostics marker's
+    // text (see `noteCapDrop_`), so the elision is never silent about its
+    // size. `DiagnosticDelivery::Guaranteed` diagnostics — and members of
+    // `kUnsuppressableCodes` — bypass the cap/dedup gates entirely.
     void report(ParseDiagnostic d);
 
     [[nodiscard]] std::span<ParseDiagnostic const> all() const noexcept;
@@ -84,6 +87,14 @@ public:
     [[nodiscard]] std::size_t warningCount() const noexcept;
     [[nodiscard]] bool        hasErrors()    const noexcept { return errorCount() > 0; }
     [[nodiscard]] bool        hitCap()       const noexcept { return hitCap_; }
+
+    // How many diagnostics the GLOBAL cap has discarded. Zero until the cap
+    // trips; from then on it counts every report the cap ate, INCLUDING the
+    // one whose arrival tripped it (that diagnostic is replaced by the
+    // marker, not stored). This is the number the marker's prose carries —
+    // exposed as well because a caller that wants to say "and N more" in its
+    // own summary should not have to parse the marker's text back out.
+    [[nodiscard]] std::size_t droppedByCap() const noexcept { return droppedByCap_; }
 
     [[nodiscard]] Config const& config() const noexcept { return cfg_; }
 
@@ -100,6 +111,13 @@ public:
         std::unordered_map<DiagnosticCode, std::size_t>   perCode;
         std::deque<std::uint64_t>                         recent;
         bool                                              hitCap      = false;
+        // The cap's two derived fields travel with `hitCap` because they
+        // are only meaningful together. `capMarkerIndex` in particular is
+        // an index INTO `all_`, which `truncateTo` shrinks — restoring
+        // `hitCap` without it would leave the marker index dangling past
+        // the end and the next cap drop would write out of bounds.
+        std::size_t                                       droppedByCap    = 0;
+        std::size_t                                       capMarkerIndex  = 0;
     };
     [[nodiscard]] Snapshot snapshotForRollback() const;
     void                   truncateTo(Snapshot const& snap);
@@ -110,6 +128,13 @@ public:
     // notifications). `policy` (suppress/override/warningsAsErrors)
     // still applies — bypass concerns only the cap, not the user's
     // explicit filtering choices. Per-code counters still increment.
+    //
+    // This is `DiagnosticDelivery::Guaranteed` under a caller-friendly
+    // name, and it is now implemented as exactly that rather than as a
+    // second body that pushes to `all_` on its own. The duplicate body was
+    // a standing hazard: it was the SECOND place the "policy applies,
+    // volume controls do not" rule was written down, so the two could
+    // disagree and only one of them would be the one a given caller hit.
     void forceReport(ParseDiagnostic d);
 
     // Rewrite the (buffer, span) of EVERY accumulated diagnostic through
@@ -141,11 +166,22 @@ private:
 
     [[nodiscard]] bool isRecentDuplicate(ParseDiagnostic const& d) const noexcept;
 
+    // Record that the global cap ate one more diagnostic, and REWRITE the
+    // marker's prose so it always states the running total. The rewrite is
+    // in place into the marker's existing string, so after the first few
+    // drops it reallocates nothing — which is what makes "count on the
+    // already-dropping path" affordable enough to do unconditionally
+    // instead of leaving the number to be recovered later (it cannot be:
+    // once a diagnostic is dropped there is nothing left to count).
+    void noteCapDrop_();
+
     Config                                  cfg_{};
     std::vector<ParseDiagnostic>            all_;
     std::unordered_map<DiagnosticCode, std::size_t> perCode_;
     std::deque<std::uint64_t>               recent_;      // hash of (code, buffer, span, rule, actual) sliding window
     bool                                    hitCap_ = false;
+    std::size_t                             droppedByCap_   = 0;
+    std::size_t                             capMarkerIndex_ = 0;  // index into all_; valid only while hitCap_
 };
 
 // Ergonomic free function for the common "construct a ParseDiagnostic

@@ -27,6 +27,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "asm/asm.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -157,11 +158,11 @@ struct Schemas {
 [[nodiscard]] std::optional<AssembledModule>
 assembleFromSource(std::string src, std::string label, Schemas const& s,
                    ObjectFormatSchema const& format, DiagnosticReporter& rep) {
-    UnitBuilder builder{s.grammar};
+    UnitBuilder builder{s.grammar, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), std::move(label));
     CompilationUnit cu = std::move(builder).finish();
     std::uint16_t const cc = ccIndexFor(*s.target, format, rep);
-    return assembleUnit(cu, *s.grammar, *s.target, format, cc, rep);
+    return assembleUnit(cu, *s.grammar, *s.target, format, cc, rep, CompileOptions{DiagnosticBudget::libraryDefault()});
 }
 
 // DSS writes a `.a` from N (source, memberName) pairs: assemble each source to a

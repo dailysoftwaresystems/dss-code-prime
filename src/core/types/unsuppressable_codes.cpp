@@ -13,17 +13,55 @@ namespace {
 // table — still faster than hash lookup at this size + needs no
 // static-init dance.
 //
-// Membership rule: a code is unsuppressable when its surface is a
-// load-bearing structural invariant whose silent re-opening (via
-// `--suppress=<code>`) would let a miscompile / wrong-bytes /
-// undefined-extern artifact ship green. Examples in shipped
+// ★ MEMBERSHIP RULE — AND IT IS ABOUT SUPPRESSION, NOTHING ELSE.
+// This table answers exactly one question: may `--suppress=<code>` silence
+// this? It does NOT answer "may the reporter's cap drop this" — that is the
+// DELIVERY question, it now has its own property (`DiagnosticDelivery` on
+// `ParseDiagnostic`), and a code that needs only delivery must take the
+// property and stay OUT of here. Joining this table to obtain cap-immunity
+// uses membership as a side-channel for something it was never defined to
+// carry, and pays for it by loosening the one criterion the table has.
+// (Membership does still bypass the cap — that is a consequence of what a
+// member IS, not a service it offers.)
+//
+// A code is a member when suppressing it would produce EITHER of two
+// outcomes. Both prongs are stated because both are ALREADY APPLIED here,
+// and a rule that describes only half of its own table is a rule the next
+// reader will mis-apply:
+//
+//   (1) WRONG ARTIFACT SHIPS GREEN. Its surface is a load-bearing
+//       structural invariant whose silent re-opening would let a
+//       miscompile / wrong-bytes / undefined-extern artifact ship with a
+//       successful-looking build. This is the majority of the table.
+//
+//   (2) THE BUILD FAILS WITH NOTHING SAID. The build still fails without
+//       the diagnostic — so no wrong bytes ship — but the diagnostic is
+//       the ONLY statement of why, and suppressing it leaves a non-zero
+//       exit with an empty explanation. `--suppress` is documented as a
+//       VISIBILITY control; under prong (2) it would become a mute-the-
+//       failure control instead. Members admitted on this ground SAY SO in
+//       their own blocks: S_TypeNameDeclaratorNotAbstract ("suppressing
+//       this ships NO wrong bytes … closed here so the failure is never
+//       SILENT"), S_StaticAssertFailed, S_GenericSelection{NoMatch,
+//       Ambiguous}, the five S_Alignas*, H_ConflictingStringLiteral-
+//       Prefixes.
+//
+// Prong (2) is narrow, and its narrowness is what keeps it honest: it
+// requires that the failure STILL HAPPENS and that this diagnostic is the
+// only thing explaining it. A code whose suppression merely hides advice
+// while the build proceeds fails both prongs and must stay suppressable —
+// see P_PreprocessorWarningDirective, S_UnknownAttribute,
+// S_DeprecatedSymbolUsed, S_NodiscardResultDiscarded,
+// S_AsmLabelOnAutomaticVariable below, each pinned as a NEGATIVE.
+//
+// Examples in shipped
 // closed-table: D-LK6-8.2 split codes (silent ABI mismatch ⇒
 // SIGILL at user runtime), I_* verifier invariants (SSA / CFG
 // violations sailing through), K_ImageWrite* (silently truncated
 // on-disk image), F_FfiIngest* architectural exclusions (silent
 // wrong-shape FfiMetadata for the wrong abiModel). The table grows
 // as new architectural surfaces close and SHRINKS when one is
-// retired (see the 144 → 139 note below — it does NOT grow
+// retired (see the 144 → 139 → 141 notes below — it does NOT grow
 // monotonically); each addition includes a one-line rationale
 // block alongside the entry, and each removal leaves that block
 // rewritten in place rather than deleted.
@@ -62,17 +100,341 @@ namespace {
 // branch to the wrong block, or no branch target at all, with a green build.
 // ⓘ The step before this one was 141 → 142 and went unrecorded here, which is
 // why the running total above stops at 141 while the array held 142.
-constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
+// ★ 139 → 141 (2026-08-12, AP5): the two build-lifecycle hook codes joined.
+// The AP5 cycle wrote the argument for membership at `program.cpp`'s
+// `D_PlanNotLanded` reject — "`--suppress` must not be able to convert this
+// loud reject back into the silent no-op it exists to replace" — and then did
+// not apply it to the hook codes, for which the same sentence is true
+// verbatim: `parse_diagnostic.hpp` describes `D_ScriptExitedNonZero`'s purpose
+// as keeping "precisely the silent-success class" out of the driver.
+//
+// ⚠ THAT ENTRY ORIGINALLY GAVE TWO REASONS AND ONE OF THEM WAS WRONG. It
+// listed (a) the `--suppress` route and (b) "NO FLAGS AT ALL — the global cap
+// latches on a warning-heavy compile and eats the hook's diagnostic", and
+// called membership the fix for both. (b) is a CAP argument, and answering it
+// with membership is precisely the side-channel the rule above now forbids:
+// it made the cap's behaviour a reason to weaken a suppression table. (b) is
+// REAL — it is measured, and it is why `DiagnosticDelivery` exists — but it is
+// not this table's business, and a code whose ONLY problem was (b) must take
+// the property instead of a row here.
+//
+// ✔RE-EXAMINED 2026-08-13 UNDER THE SUPPRESSION CRITERION ALONE — BOTH STILL
+// QUALIFY, ON PRONG (2), AND THE MEASUREMENT IS THE SAME ONE: `runBuildScripts`
+// (`program/build_scripts.cpp`) returns false whether or not its report
+// survived, and the driver turns that into `return 1`. So suppression does NOT
+// ship a wrong artifact — the build still fails, which is why prong (1) does
+// not apply — but it makes the build fail MUTELY: `--suppress=D_ScriptExited-
+// NonZero`, which `cli_args.cpp` accepts for any real code name, turns a
+// documented VISIBILITY control into a silence-the-reason control it cannot
+// even fully exercise. And the hook case is a PURER prong-(2) instance than
+// the S_* members that established the prong: a pre-build hook fails before
+// any compilation has begun, so there is no other diagnostic in the stream to
+// partially explain the exit — stderr is empty, exactly.
+// ── PER-ENTRY RATIONALE, AS DATA ─────────────────────────────────────────
+// The user-facing half of every prose block below, promoted OUT of the
+// comment and INTO the row — because a rationale that exists only in a
+// comment cannot be shown to the operator whose `--suppress` this table
+// refuses. `D_SuppressRequestIgnored` renders this text verbatim, so what
+// the user reads IS the justification recorded beside the entry, not a
+// second copy of it composed in a message string.
+//
+// ★ THE GRANULARITY IS THE ONE THE TABLE ALREADY HAS, AND THAT IS MEASURED,
+// NOT ASSUMED: the 141 members carry 62 distinct rationale blocks (36
+// singletons; the rest group-level, up to 14 codes under one argument).
+// Where N codes share ONE argument they share ONE constant — splitting it
+// into N near-copies would manufacture exactly the drift this promotion
+// exists to remove. A code needing a different reason takes a new constant;
+// a member added without one does not compile past
+// `kUnsuppressableEntriesAllExplainThemselves` below.
+//
+// ⚠ AND THE PROSE COULD NOT HAVE BEEN LIFTED MECHANICALLY. ✔MEASURED while
+// writing these: FIVE blocks OPEN with de-listing notes about RETIRED
+// NON-members (`F_FfiNoImportLibraryForFormat` /
+// `F_FfiResolveLibrarySymbolAbsent` above `F_BinaryReaderPartialCorruption`;
+// `S_VolatilePointeeNotSupported` above `S_IncompleteTypeMember`; the two
+// retired `S_BitInt*` above `S_BitIntWideFloatConvUnsupported`; the
+// `S_UnknownAttribute` NEGATIVE pins above `P_PreprocessorErrorDirective`;
+// the `dependsOn` git verdicts above the `D_*` driver band) — so "take the
+// comment above the entry" would have shown a user suppressing a LIVE code
+// the reasoning for a DEAD one, which is a fresh instance of the very class
+// this promotion exists to close, delivered straight to the operator. Every
+// string below was written by reading its own block.
+//
+// Style: reads as the tail of "cannot be suppressed: <text>". Present
+// tense, no anchor ids, no dates, no cross-references — those stay in the
+// prose, which remains the internal record this text is drawn from.
+constexpr std::string_view kWhyBuildHook =
+    "a failed build hook already aborts the build; silenced, it aborts "
+    "with nothing on stderr saying which hook failed or why";
+constexpr std::string_view kWhyPlanNotLanded =
+    "it announces a mode whose engine has not landed; silenced, the run "
+    "fails with no statement that the feature does not exist yet";
+constexpr std::string_view kWhyTargetAbi =
+    "silenced, a mismatched target spec dispatches the wrong backend and "
+    "the emitted image executes wrong machine code at user runtime";
+constexpr std::string_view kWhySynthRecipe =
+    "silenced, the shim recipe falls out of every synthesis pass and its "
+    "symbol goes undefined, breaking the binary LOAD rather than the "
+    "build";
+constexpr std::string_view kWhyFfiIngest =
+    "silenced, FFI ingest builds wrong-shape metadata for an abiModel it "
+    "does not support, or shadows every row under an empty canonical name";
+constexpr std::string_view kWhyBinaryReaderPartial =
+    "translation continues on the salvaged part of an input the reader "
+    "could not fully decode; silenced, that build ships green with "
+    "nothing saying so";
+constexpr std::string_view kWhyShippedHeaderNotFound =
+    "silenced, a program that calls an undeclared shipped-library symbol "
+    "compiles clean";
+constexpr std::string_view kWhyShippedLibDescriptor =
+    "silenced, the lowering synthesizes no externs and a program whose "
+    "system-header symbols resolve to nothing compiles clean";
+constexpr std::string_view kWhyShippedHeaderTarget =
+    "silenced, the header symbols, structs and typedefs are injected on a "
+    "platform its own descriptor says does not have them";
+constexpr std::string_view kWhyShippedSymbolTarget =
+    "silenced, a symbol unknown to this object format binds to the "
+    "format-default library, links clean, and dies at LOAD";
+constexpr std::string_view kWhyHeaderNameCase =
+    "silenced, the resolver picks one of several case-folded matches, and "
+    "which one it picks differs by build host";
+constexpr std::string_view kWhyShippedStructVariant =
+    "silenced, an under-specified per-target variant picks the first "
+    "match, giving a wrong struct layout for the active target";
+constexpr std::string_view kWhyShippedVariant =
+    "silenced, an under-specified per-target variant picks the first "
+    "match, giving a wrong constant value, typedef width or macro "
+    "replacement";
+constexpr std::string_view kWhyTypeIdentityConflict =
+    "silenced, two descriptors declaring one tag as different types "
+    "resolve first-wins by name, giving include-order-dependent member "
+    "access";
+constexpr std::string_view kWhyHirStructural =
+    "a HIR lowering / verifier structural invariant; silenced, the module "
+    "reaches codegen violating a contract every downstream tier assumes";
+constexpr std::string_view kWhyWideLiteral =
+    "silenced, a code point that does not fit the requested element width "
+    "ships as a wrong or truncated code unit";
+constexpr std::string_view kWhyConflictingStringPrefixes =
+    "silenced, a mixed-prefix literal concatenation fails the build with "
+    "nothing shown, or is typed as a plain narrow array";
+constexpr std::string_view kWhyShimSignature =
+    "silenced, the build goes green and emits a call to a synthesized "
+    "shim under a different ABI than the caller made it";
+constexpr std::string_view kWhyMirVerifier =
+    "a frozen-module MIR-verifier invariant; silenced, an SSA, CFG, "
+    "dominance or type violation sails past the verifier into codegen";
+constexpr std::string_view kWhyVlaAllocaOperand =
+    "silenced, a runtime-sized alloca with a malformed operand shape "
+    "ships a mis-sized stack slot";
+constexpr std::string_view kWhyAtomicNotLowered =
+    "silenced, a plain load or store of _Atomic memory performs a "
+    "NON-atomic access, the exact miscompile _Atomic exists to prevent";
+constexpr std::string_view kWhyCallSignature =
+    "silenced, a call whose operands do not match its resolved callee "
+    "signature ships green with the arguments in the wrong slots";
+constexpr std::string_view kWhyLinkerImage =
+    "silenced, errorCount() reads zero while the image on disk is "
+    "refused, empty, missing or truncated";
+constexpr std::string_view kWhyNoMatchingObjectFormat =
+    "silenced, the linker dispatches the wrong format walker and writes a "
+    "corrupted artifact";
+constexpr std::string_view kWhyFormatLacksImportSupport =
+    "silenced, an extern goes unresolved in a dynamic image whose format "
+    "cannot carry imports at all";
+constexpr std::string_view kWhyRelocationKindMismatch =
+    "silenced, a relocation kind the format does not support is applied "
+    "anyway, putting wrong bytes in the image";
+constexpr std::string_view kWhyWalkerInputContract =
+    "silenced, malformed linker-driver input propagates through the "
+    "format walker undetected";
+constexpr std::string_view kWhyEntryResolvesToExtern =
+    "silenced, the loader jumps to unrelocated import-stub bytes at "
+    "process entry, a fault with no diagnostic trail";
+constexpr std::string_view kWhyAssembledData =
+    "silenced, a producer ships two data items at one symbol "
+    "(last-write-wins) or a bss item carrying bytes that silently drop";
+constexpr std::string_view kWhyStackReserve =
+    "silenced, the build reports success while emitting an image whose "
+    "stack is not the size the program asked for";
+constexpr std::string_view kWhyEntryTrampoline =
+    "silenced, the image entry points at the wrong code and the program "
+    "runs the wrong entry, or falls off it, from a green build";
+constexpr std::string_view kWhyProgramEntry =
+    "silenced, entry resolution proceeds on a wrong, absent or ambiguous "
+    "candidate and the binary faults at startup from a green build";
+constexpr std::string_view kWhyExternImportConflict =
+    "silenced, two CUs declaring one external name under different "
+    "binding models merge first-wins and half the calls bind wrong";
+constexpr std::string_view kWhyLirStructural =
+    "a LIR verifier / lowering structural invariant; silenced, the "
+    "violation reaches the assembler and miscompiles through the LIR "
+    "layer";
+constexpr std::string_view kWhyVlaDynamicAlloca =
+    "silenced, a runtime-sized alloca falls to the fixed-slot path and "
+    "emits a one-slot scalar for the whole VLA";
+constexpr std::string_view kWhyTerminatorSuccessors =
+    "the terminator's recorded successors and its own BlockRef operands "
+    "disagree; silenced, the encoder takes a branch displacement from an "
+    "operand list the CFG no longer matches -- a branch to the wrong block, "
+    "or none at all";
+constexpr std::string_view kWhyAsmTextUnsupported =
+    "an unrecognized `.s` construct; silenced, the assembler emits a binary "
+    "that omits an instruction the programmer wrote";
+constexpr std::string_view kWhyInlineAsmExtended =
+    "a GNU extended inline-asm statement lowers to a 0-child barrier that "
+    "discards its operand list; silenced, the asm executes and clobbers "
+    "registers the allocator still believes it owns, while the declared "
+    "outputs keep their prior values";
+constexpr std::string_view kWhyInlineAsmLabelSection =
+    "a label section without the `goto` qualifier; silenced, the statement "
+    "reaches the extended-asm gate mis-sectioned, so which colon delimited "
+    "which operand role becomes a guess";
+constexpr std::string_view kWhyVlaNonLeafFrame =
+    "silenced, a non-leaf VLA frame places outgoing call arguments inside "
+    "the VLA region, an ABI break";
+constexpr std::string_view kWhyRegallocInvariant =
+    "a register-allocation calling-convention / class invariant; "
+    "silenced, allocation proceeds with no convention or class to honour";
+constexpr std::string_view kWhyEncodingBytes =
+    "an assembler bytes-on-disk invariant; silenced, the encoder emits "
+    "wrong machine code";
+constexpr std::string_view kWhyImmediateRange =
+    "silenced, a too-wide immediate is truncated into a wrong "
+    "machine-code constant, a wrong syscall number for instance";
+constexpr std::string_view kWhyIncompleteType =
+    "silenced, an object or member of an incomplete composite folds its "
+    "size to zero, a wrong-bytes layout";
+constexpr std::string_view kWhySilentConstraint =
+    "the build already fails on this constraint violation; silenced, it "
+    "fails with ZERO diagnostics shown and no statement of why";
+constexpr std::string_view kWhyPackedBitfield =
+    "silenced, a packed struct carrying a bit-field is laid out padded "
+    "instead, the wrong ABI";
+constexpr std::string_view kWhyNullptrOperand =
+    "silenced, nullptr lowers through the integer-0 null constant and "
+    "`nullptr + 1` compiles as `0 + 1`";
+constexpr std::string_view kWhyEnumUnderlying =
+    "silenced, the enum is laid out at the default width instead, or an "
+    "out-of-range enumerator wraps into a wrong constant";
+constexpr std::string_view kWhyTypeofBitfield =
+    "silenced, the typeof resolves to the bit-field declared (widened) "
+    "type, a wrong type in the declaration it specifies";
+constexpr std::string_view kWhyConstexpr =
+    "silenced, constexpr degrades to plain const and an object that "
+    "cannot deliver a translation-time value compiles quietly";
+constexpr std::string_view kWhyAutoInference =
+    "silenced, the declaration adopts its initializer type and compiles "
+    "the very form the constraint forbids";
+constexpr std::string_view kWhyThreadLocal =
+    "silenced, thread storage lowers wrong: a per-call automatic, a split "
+    "binding, or a link-time tpoff bit-cast into a data slot";
+constexpr std::string_view kWhyBitIntWidth =
+    "silenced, the _BitInt(N) type has no computable width and masking "
+    "and layout pick a garbage N";
+constexpr std::string_view kWhyBitIntFloatConv =
+    "silenced, wide _BitInt float conversion takes the naive scalar path, "
+    "emitting the wrong sign and dropping the upper limbs";
+constexpr std::string_view kWhyVlaStorage =
+    "silenced, a runtime-sized array is carried into the static-local "
+    "lowering, whose layout has no static size";
+constexpr std::string_view kWhyVlaSize =
+    "silenced, a non-integer VLA bound truncates to a garbage element "
+    "count, or a null bound gives a silent 0-byte array";
+constexpr std::string_view kWhyArrayParamQualifier =
+    "silenced, the illegal array-declarator decoration is dropped and a "
+    "mis-typed or mis-sized object ships";
+constexpr std::string_view kWhyInlineAsmTemplate =
+    "silenced, a non-empty asm template lowers to a no-op barrier and its "
+    "instructions simply vanish";
+constexpr std::string_view kWhyBitfieldMutation =
+    "silenced, the mutation falls to a full-unit store that clobbers "
+    "packed neighbours and skips truncation";
+constexpr std::string_view kWhyErrorDirective =
+    "an #error the author wrote to stop exactly this configuration; "
+    "silenced, the build they declared invalid is built, and reports "
+    "success";
+constexpr std::string_view kWhyPragmaUnhonored =
+    "silenced, a pragma that changes memory layout is ignored without a "
+    "word and composites are laid out at the wrong size";
+constexpr std::string_view kWhyPragmaPackAmbiguous =
+    "silenced, a composite with two candidate layouts of different size "
+    "and offsets simply gets one of them, unannounced";
+constexpr std::string_view kWhyAsmLabel =
+    "silenced, the intended symbol name is not restored: a C-mangled or "
+    "synthetic name ships and the build stays green all the way to link";
+constexpr std::string_view kWhyOperatorNameNotDefinable =
+    "silenced, __has_include(<h>) answers 0 while #include <h> still "
+    "splices the header, so the guard and the include disagree";
+
+constexpr std::array<UnsuppressableEntry, 145> kUnsuppressableCodes{{
+    // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
+    // that could not be spawned, or that ran and failed. PRONG (2), and only
+    // prong (2): both already abort the build with or without the diagnostic
+    // (MEASURED at `runBuildScripts`), so suppression ships no wrong bytes —
+    // it leaves a non-zero exit with nothing on stderr saying which hook
+    // failed or why. Their cap-immunity is NOT the reason they are here; that
+    // is `DiagnosticDelivery`'s job, and these two would still need delivery
+    // if they were not members.
+    {DiagnosticCode::D_ScriptSpawnFailed, kWhyBuildHook},
+    {DiagnosticCode::D_ScriptExitedNonZero, kWhyBuildHook},
+    // ── `dependsOn` git acquisition (0xD01D..0xD020) — VERDICTS RECORDED,
+    // MEMBERSHIP DEFERRED, ONE TRIGGER ────────────────────────────────────
+    // Judged individually 2026-08-13, because a four-code family is exactly
+    // the shape that gets swept in as a batch (the 2-of-3 inline-asm split
+    // below is this table's evidence that the criterion gets APPLIED). Each
+    // verdict is per-code:
+    //   * D_DependencyGitNotFound (0xD01D) — PRONG (2). `git` is absent, so
+    //     no acquisition is possible and the build cannot proceed; suppressed,
+    //     it fails with no statement that the missing tool was the cause, and
+    //     the remediation ("install git") is the single most concretely
+    //     actionable line the resolver can print.
+    //   * D_DependencyGitAcquireFailed (0xD01E) — PRONG (2). A hard failure
+    //     with no usable checkout: the dependency's sources do not exist on
+    //     this machine, so continuing "would compile against a hole" and the
+    //     build stops. Suppressed, it stops mutely.
+    //   * D_DependencyGitFetchFallback (0xD01F) — ★ PRONG (1), the strongest
+    //     of the four and the only one that reaches prong (1) at all. This is
+    //     the notice that the build DELIBERATELY PROCEEDED on possibly-stale
+    //     sources after a failed fetch. Suppressed, the build compiles sources
+    //     the operator did not intend and reports SUCCESS — an artifact built
+    //     from the wrong revision, shipping green, with the one line that
+    //     would have said so removed. Note the asymmetry that makes it the
+    //     strongest case: for the other three, suppression removes an
+    //     explanation of a failure; for this one it removes the only evidence
+    //     distinguishing a correct build from a stale one.
+    //   * D_DependencyGitNameCollision (0xD020) — PRONG (2) on the emit shape
+    //     its allocation note specifies ("Fail loud", detected on the derived
+    //     names BEFORE acquisition, so the build stops). If the emit site
+    //     instead proceeds with one of the two repos it becomes prong (1) —
+    //     "the build would then compile against a dependency it did not ask
+    //     for" — so this verdict must be re-read against the landed site, not
+    //     assumed.
+    // ⛔ NOT ADDED, and the reason is a hard property of this file, not
+    // caution: none of the four has an emit site (MEASURED 2026-08-13 —
+    // `DiagnosticCode::D_DependencyGit*` appears only in the enum, the name
+    // switch, and test name-pins). `EveryMemberHasAnEmitSiteOrIsMarkedRetired`
+    // in `tests/core/test_unsuppressable_codes.cpp` REDS on any member without
+    // one, and it exists because five members once outlived their emit sites
+    // and asserted nothing. A row added now would be that bug on purpose.
+    // ⇒ TRIGGER: the AP6 cycle that lands `dependency_resolver` / `git_acquire`
+    // emit sites adds the rows in the same commit as the sites, re-reading
+    // 0xD020's verdict against what its site actually does. 0xD01F ALSO needs
+    // `delivery = DiagnosticDelivery::Guaranteed` at its emit site — it is
+    // Info-severity and its whole purpose is to not fail the build, so nothing
+    // downstream re-reports it and the cap would otherwise be free to eat it.
+    // That pairing is the point of the split: 0xD01F needs BOTH properties and
+    // now has to ask for each one separately, on its own merits.
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
     // D-LK6-8.2 split codes that close the SIGILL surface
     // (suppressing either would let `--target=arm64:elf64-x86_64...`
     // or schema-typo'd `machine` dispatch wrong PLT-stub emitter).
-    DiagnosticCode::D_PlanNotLanded,
-    DiagnosticCode::D_TargetAbiModelUnsupportedByDriver,
-    DiagnosticCode::D_TargetMachineCodeMismatch,
-    DiagnosticCode::D_TargetAbiModelMismatch,
+    {DiagnosticCode::D_PlanNotLanded, kWhyPlanNotLanded},
+    {DiagnosticCode::D_TargetAbiModelUnsupportedByDriver, kWhyTargetAbi},
+    {DiagnosticCode::D_TargetMachineCodeMismatch, kWhyTargetAbi},
+    {DiagnosticCode::D_TargetAbiModelMismatch, kWhyTargetAbi},
     // D_SynthRecipeFamilyUnknown (D-CSUBSET-C11-THREADS-HEADER /
     // D-FFI-PE-CRT-UCRT-MIGRATION, 2026-07-25): the driver's shim-synthesis
     // seam found a `synthesize` recipe id belonging to no known shim family
@@ -85,13 +447,13 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // borrow of the linker-band `K_NoMatchingObjectFormat`, itself a member
     // below — so this entry PRESERVES the non-suppressible property rather
     // than granting a new one.
-    DiagnosticCode::D_SynthRecipeFamilyUnknown,
+    {DiagnosticCode::D_SynthRecipeFamilyUnknown, kWhySynthRecipe},
 
     // F_* FFI band — architectural exclusions on the FF5 ingest path
     // (WASM/SPIR-V abiModels don't take FF4 mangling; empty canonical
     // names would silently shadow `bySymbol[""]` rows).
-    DiagnosticCode::F_FfiIngestAbiModelUnsupported,
-    DiagnosticCode::F_FfiIngestEmptyCanonical,
+    {DiagnosticCode::F_FfiIngestAbiModelUnsupported, kWhyFfiIngest},
+    {DiagnosticCode::F_FfiIngestEmptyCanonical, kWhyFfiIngest},
     // UCRT-P4 Decision 1 RETIRED F_FfiNoImportLibraryForFormat, and TF-C66
     // RETIRED F_FfiResolveLibrarySymbolAbsent; both were DE-LISTED here
     // 2026-08-10 by the EveryMemberHasAnEmitSite property below, which is what
@@ -105,15 +467,25 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // unemittable code cannot be suppressed, so membership asserted nothing
     // while making dead codes read as load-bearing (0xE025 precedent).
     // F_BinaryReaderPartialCorruption (silent-failure-hunter
-    // 2nd-order audit on 9dbdc8e): the Warning's stated intent is
-    // "operators must see this signal". Without unsuppressable
-    // membership, the four cap/dedup gates at report() could
-    // silently drop it under multi-target cap saturation —
-    // re-opening the very silent-skip surface the commit closed.
-    // The closed-table's invariant is "must reach `all_` regardless
-    // of policy", which is independent of severity; Warning members
-    // are admissible when their visibility is load-bearing.
-    DiagnosticCode::F_BinaryReaderPartialCorruption,
+    // 2nd-order audit on 9dbdc8e): a binary input was read only
+    // PARTIALLY because some of it did not decode. PRONG (1): this is a
+    // Warning, so `hasErrors()` is untouched and translation CONTINUES
+    // on the salvaged part — suppressing it therefore ships a GREEN
+    // build over an input the compiler itself could not fully parse,
+    // with the one line saying so removed. Warning-severity members are
+    // admissible: the criterion is about what suppression lets ship,
+    // not about the producer's severity.
+    //
+    // ⚠ REWRITTEN 2026-08-13, and the rewrite is the point. This block
+    // used to argue from the CAP — "without membership the four
+    // cap/dedup gates could silently drop it under multi-target cap
+    // saturation". That is the side-channel the membership rule at the
+    // top of this file now forbids: it makes the reporter's cap
+    // behaviour a reason to widen a SUPPRESSION table. The cap concern
+    // was real, and it is now answered where it belongs, by
+    // `DiagnosticDelivery`. What is left here is the argument this
+    // table actually adjudicates, and the row stands on it alone.
+    {DiagnosticCode::F_BinaryReaderPartialCorruption, kWhyBinaryReaderPartial},
     // F_ShippedHeaderNotFound (FF11, 2026-06-05): a `#include <h>`
     // SYSTEM header not found on any `shippedLibDirs` search dir. A
     // missing system header is a HARD error in C (unlike a local
@@ -121,7 +493,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // it would let a program that calls an undeclared shipped-library
     // symbol compile SILENTLY, exactly the silent-miscompile this
     // fail-loud closes. The closed-table membership pins it.
-    DiagnosticCode::F_ShippedHeaderNotFound,
+    {DiagnosticCode::F_ShippedHeaderNotFound, kWhyShippedHeaderNotFound},
     // F_ShippedLibDescriptorMalformed / F_ShippedLibUnsupportedType
     // (neutral shipped-lib descriptor, 2026-06-06): the LANGUAGE-NEUTRAL
     // shipped-library JSON descriptor read by
@@ -135,8 +507,8 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // exactly the silent dropped-import surface these fail-louds close.
     // The CRITICAL invariant is that a signature that does not decode
     // MUST NOT reach `makeExternFunction` with InvalidType.
-    DiagnosticCode::F_ShippedLibDescriptorMalformed,
-    DiagnosticCode::F_ShippedLibUnsupportedType,
+    {DiagnosticCode::F_ShippedLibDescriptorMalformed, kWhyShippedLibDescriptor},
+    {DiagnosticCode::F_ShippedLibUnsupportedType, kWhyShippedLibDescriptor},
     // F_ShippedHeaderUnavailableForTarget (p18 Cluster G c8, 2026-06-25):
     // a `#include <h>` whose shipped descriptor declares the header is NOT
     // available on the active target's object-format (POSIX <sys/time.h> on
@@ -144,7 +516,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // gate and INJECT the header's symbols/structs/typedefs on the wrong
     // platform — the exact wrong-platform silent miscompile this fail-loud
     // closes. A direct sibling of the three shipped-header surfaces above.
-    DiagnosticCode::F_ShippedHeaderUnavailableForTarget,
+    {DiagnosticCode::F_ShippedHeaderUnavailableForTarget, kWhyShippedHeaderTarget},
     // F_ShippedSymbolUnavailableForTarget (D-FFI-SHIPPED-SYMBOL-ORACLE-IGNORES-OBJECT-FORMATS,
     // 2026-07-30): the per-SYMBOL sibling of the header gate directly above. The
     // `--resolve-library` oracle judged a name KNOWN on a format its descriptors
@@ -153,7 +525,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // elf-only `fdatasync` on a macho build → exit 255). Suppressing this would
     // restore exactly that silent loader death — the class this fail-loud exists
     // to convert into a compile-time error.
-    DiagnosticCode::F_ShippedSymbolUnavailableForTarget,
+    {DiagnosticCode::F_ShippedSymbolUnavailableForTarget, kWhyShippedSymbolTarget},
     // F_HeaderNameCaseAmbiguous (D-PP-HEADER-CASE-INSENSITIVE-PE, 2026-08-04): an
     // `#include` name fold-matched TWO OR MORE distinct files under a
     // case-INSENSITIVE format's header-name convention. Suppressing it would
@@ -161,7 +533,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // NTFS or default APFS at all, the pick would differ by BUILD HOST. That is
     // the precise host-dependence the `headerNameMatching` axis removes, so a
     // suppressible form of this code would reinstate the defect one layer down.
-    DiagnosticCode::F_HeaderNameCaseAmbiguous,
+    {DiagnosticCode::F_HeaderNameCaseAmbiguous, kWhyHeaderNameCase},
     // F_ShippedStructVariantAmbiguous (p18 Cluster G, plan 25, 2026-06-26): a
     // shipped `structs` entry's per-target `variants` had MORE THAN ONE match the
     // active (arch, format). The selection contract is exactly-one-matches;
@@ -170,7 +542,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // x86_64-elf and x86_64-pe → the linux struct layout used on windows). A
     // direct sibling of the four shipped-lib surfaces above — its invariant is the
     // SAME class (a wrong-bytes import must never ship green).
-    DiagnosticCode::F_ShippedStructVariantAmbiguous,
+    {DiagnosticCode::F_ShippedStructVariantAmbiguous, kWhyShippedStructVariant},
     // F_ShippedConstantVariantAmbiguous / F_ShippedTypedefVariantAmbiguous /
     // F_ShippedMacroVariantAmbiguous (p18 Cluster G, plan 25 extension,
     // 2026-06-26): the per-target `variants` mechanism extended from `structs` to
@@ -182,9 +554,9 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // the first → a wrong constant value / typedef width / macro replacement on
     // this target. Suppressing any would re-open that "pick the first" wrong-value
     // surface — so all three are members like F_ShippedStructVariantAmbiguous.
-    DiagnosticCode::F_ShippedConstantVariantAmbiguous,
-    DiagnosticCode::F_ShippedTypedefVariantAmbiguous,
-    DiagnosticCode::F_ShippedMacroVariantAmbiguous,
+    {DiagnosticCode::F_ShippedConstantVariantAmbiguous, kWhyShippedVariant},
+    {DiagnosticCode::F_ShippedTypedefVariantAmbiguous, kWhyShippedVariant},
+    {DiagnosticCode::F_ShippedMacroVariantAmbiguous, kWhyShippedVariant},
     // F_ShippedTypeIdentityConflict (D-LANG-TYPE-IDENTITY-VOCABULARY,
     // 2026-07-20): two descriptors resolved for the SAME target declare one
     // struct/union TAG (or typedef NAME) as DIFFERENT types, or a descriptor's
@@ -196,7 +568,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // phantom type matching no `_Generic` arm). Suppressing it would restore
     // exactly that silent first-wins. Same class as the five shipped surfaces
     // above: a wrong-bytes / unreachable-member import must never ship green.
-    DiagnosticCode::F_ShippedTypeIdentityConflict,
+    {DiagnosticCode::F_ShippedTypeIdentityConflict, kWhyTypeIdentityConflict},
 
     // H_* HIR-lowering / verifier band — structural invariants (cannot
     // reach MIR codegen without violating downstream contracts). Post-
@@ -204,18 +576,18 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // `H_ExternHasInitializer` MUST be here — they are the two arms
     // of the H2 split, both terminate lowering with `return
     // errorNode(node)` + gate ok via errorCount.
-    DiagnosticCode::H_TypeUnresolved,
-    DiagnosticCode::H_VerifierFailure,
-    DiagnosticCode::H_UnsupportedLoweringForKind,
-    DiagnosticCode::H_ExternHasInitializer,
-    DiagnosticCode::H_ExternDeclMalformed,
+    {DiagnosticCode::H_TypeUnresolved, kWhyHirStructural},
+    {DiagnosticCode::H_VerifierFailure, kWhyHirStructural},
+    {DiagnosticCode::H_UnsupportedLoweringForKind, kWhyHirStructural},
+    {DiagnosticCode::H_ExternHasInitializer, kWhyHirStructural},
+    {DiagnosticCode::H_ExternDeclMalformed, kWhyHirStructural},
     // H_WideCharSurrogateUnsupported (C11/C23 6.4.5, wide/UTF string literals):
     // a code point that cannot be represented in the requested element width
     // without truncation (astral under a 16-bit element, ill-formed UTF-8, or
     // cp > U+10FFFF). Same silent-miscompile class as H_UnsupportedLoweringForKind
     // — suppressing it would let a wrong/truncated code unit ship green. Emits an
     // Error HIR node + fails the gate via errorCount.
-    DiagnosticCode::H_WideCharSurrogateUnsupported,
+    {DiagnosticCode::H_WideCharSurrogateUnsupported, kWhyWideLiteral},
     // H_Utf8CharLiteralOutOfRange + H_WideCharValueUnrepresentable (C11/C23 6.4.4.4,
     // wide/UTF CHARACTER constants): a `u8'…'` code point > U+007F, or a wide/UTF
     // char that does not denote exactly one representable code unit (astral under a
@@ -223,16 +595,16 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // silent-miscompile class as H_WideCharSurrogateUnsupported — suppressing either
     // would let a wrong/truncated code unit ship green. Emits an Error HIR node +
     // fails the gate via errorCount.
-    DiagnosticCode::H_Utf8CharLiteralOutOfRange,
-    DiagnosticCode::H_WideCharValueUnrepresentable,
+    {DiagnosticCode::H_Utf8CharLiteralOutOfRange, kWhyWideLiteral},
+    {DiagnosticCode::H_WideCharValueUnrepresentable, kWhyWideLiteral},
     // H_InvalidUniversalCharacterName (C11/C23 6.4.3, Cycle C) + H_WideByteEscapeUnsupported
     // (6.4.5, D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a malformed/invalid `\u`/`\U`
     // universal character name, and a `\x`/octal byte escape in a wide/UTF literal.
     // Same silent-miscompile class as the wide/UTF codes above — suppressing either
     // would let a wrong/CESU-8/collapsed code unit ship green. Both emit an Error HIR
     // node + fail the gate via errorCount.
-    DiagnosticCode::H_InvalidUniversalCharacterName,
-    DiagnosticCode::H_WideByteEscapeUnsupported,
+    {DiagnosticCode::H_InvalidUniversalCharacterName, kWhyWideLiteral},
+    {DiagnosticCode::H_WideByteEscapeUnsupported, kWhyWideLiteral},
     // H_ConflictingStringLiteralPrefixes (C11/C23 6.4.5p5, Cycle D): a run of adjacent
     // string literals mixing TWO DIFFERENT non-narrow encoding prefixes (`u"a" U"b"`).
     // It is a silent-failure REASON code (like S_GenericSelectionNoMatch below): on the
@@ -244,7 +616,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // alone, re-open the silent MISCOMPILE the explicit fail-loud closes (a plain
     // `u"a" U"b";` statement typed Array<Char,3> "ab"). Closed here so a mixed-prefix
     // concat is never silent.
-    DiagnosticCode::H_ConflictingStringLiteralPrefixes,
+    {DiagnosticCode::H_ConflictingStringLiteralPrefixes, kWhyConflictingStringPrefixes},
     // H_ShippedShimSignatureMismatch (TF-C112, D-FFI-PE-CRT-UCRT-MIGRATION): a
     // user prototype re-declares a shipped row realized as a compiler-synthesized
     // SHIM with a signature that is not the row's. Unlike its H_* neighbours this
@@ -255,7 +627,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // build goes GREEN and emits a wrong-ABI call. It also guards the surface the
     // whole cycle exists to close: the alternative realization for that symbol is a
     // raw `ucrtbase.dll` import, which does not load at all (0xC0000139).
-    DiagnosticCode::H_ShippedShimSignatureMismatch,
+    {DiagnosticCode::H_ShippedShimSignatureMismatch, kWhyShimSignature},
 
     // I_* MIR-verifier band — frozen-module invariants. A suppressed
     // violation here would let a miscompile sail past the verifier.
@@ -263,51 +635,51 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // invariants in the same band as I_VerifierFailure/I_NoEntryBlock;
     // pre-fold only 5 were listed — the gap let `--suppress=I_NotDominated`
     // (or any other I_* code) re-open the SSA / CFG miscompile surface.
-    DiagnosticCode::I_VerifierFailure,
-    DiagnosticCode::I_NoEntryBlock,
-    DiagnosticCode::I_MultipleEntryBlocks,
-    DiagnosticCode::I_EntryBlockNotFirst,
-    DiagnosticCode::I_BlockNotTerminated,
-    DiagnosticCode::I_PhiPredNotInCfg,
-    DiagnosticCode::I_NotDominated,
-    DiagnosticCode::I_TerminatorTypeMismatch,
-    DiagnosticCode::I_ArgIndexOutOfRange,
-    DiagnosticCode::I_ArgPositionDuplicate,
-    DiagnosticCode::I_ExtensionTypeInMir,
-    DiagnosticCode::I_NullptrTypeInMir,
-    DiagnosticCode::I_StructCfMismatch,
-    DiagnosticCode::I_UnreachableBlock,
+    {DiagnosticCode::I_VerifierFailure, kWhyMirVerifier},
+    {DiagnosticCode::I_NoEntryBlock, kWhyMirVerifier},
+    {DiagnosticCode::I_MultipleEntryBlocks, kWhyMirVerifier},
+    {DiagnosticCode::I_EntryBlockNotFirst, kWhyMirVerifier},
+    {DiagnosticCode::I_BlockNotTerminated, kWhyMirVerifier},
+    {DiagnosticCode::I_PhiPredNotInCfg, kWhyMirVerifier},
+    {DiagnosticCode::I_NotDominated, kWhyMirVerifier},
+    {DiagnosticCode::I_TerminatorTypeMismatch, kWhyMirVerifier},
+    {DiagnosticCode::I_ArgIndexOutOfRange, kWhyMirVerifier},
+    {DiagnosticCode::I_ArgPositionDuplicate, kWhyMirVerifier},
+    {DiagnosticCode::I_ExtensionTypeInMir, kWhyMirVerifier},
+    {DiagnosticCode::I_NullptrTypeInMir, kWhyMirVerifier},
+    {DiagnosticCode::I_StructCfMismatch, kWhyMirVerifier},
+    {DiagnosticCode::I_UnreachableBlock, kWhyMirVerifier},
     // I_VlaAllocaOperandInvalid (VLA C1a, D-CSUBSET-VLA): the runtime-sized-Alloca
     // operand↔payload invariant (a VLA alloca carries exactly one size operand +
     // zero payload; a fixed alloca carries none). A member like every I_* verifier
     // invariant — a suppressed violation would let a mis-sized stack slot sail past.
-    DiagnosticCode::I_VlaAllocaOperandInvalid,
+    {DiagnosticCode::I_VlaAllocaOperandInvalid, kWhyVlaAllocaOperand},
     // I_AtomicAccessNotLowered (FC17.9(d) 1b, D-CSUBSET-ATOMIC): the atomic-lowering
     // belt — a plain Load/Store still carrying an `_Atomic`-qualified accessed type
     // is a missed funnel site that would SILENTLY perform a non-atomic access. A
     // member like every I_* verifier invariant; a suppressed violation would let a
     // non-atomic access to atomic memory sail past (the exact miscompile `_Atomic`
     // exists to prevent).
-    DiagnosticCode::I_AtomicAccessNotLowered,
+    {DiagnosticCode::I_AtomicAccessNotLowered, kWhyAtomicNotLowered},
     // I_CallSignatureMismatch (TF-C112, D-MIR-VERIFIER-NO-CALLSITE-SIGNATURE-CHECK):
     // the call-site signature belt — a MIR `Call` whose operands do not match its
     // statically-resolved callee's FnSig (arity, or the type at a POSITION). A
     // member like every I_* verifier invariant; suppressed, a mis-wired synthesis
     // shim would call the C runtime with arguments in the wrong slots and ship
     // green — a wrong-BYTES miscompile with no other build-time symptom.
-    DiagnosticCode::I_CallSignatureMismatch,
+    {DiagnosticCode::I_CallSignatureMismatch, kWhyCallSignature},
 
     // K_* linker band — image refused / undefined extern + the LK10
     // image-write contract codes. Suppressing any K_ImageWrite* code
     // would let `errorCount() == 0` while the image is missing/truncated
     // on disk — exactly the silent-failure LK10 cycle 1 closed.
-    DiagnosticCode::K_SymbolUndefined,
-    DiagnosticCode::K_ImageNotOk,
-    DiagnosticCode::K_ImageWriteParentMissing,
-    DiagnosticCode::K_ImageWriteOpenFailed,
-    DiagnosticCode::K_ImageWriteShort,
-    DiagnosticCode::K_ImageWriteCloseFailed,
-    DiagnosticCode::K_ImageEmpty,
+    {DiagnosticCode::K_SymbolUndefined, kWhyLinkerImage},
+    {DiagnosticCode::K_ImageNotOk, kWhyLinkerImage},
+    {DiagnosticCode::K_ImageWriteParentMissing, kWhyLinkerImage},
+    {DiagnosticCode::K_ImageWriteOpenFailed, kWhyLinkerImage},
+    {DiagnosticCode::K_ImageWriteShort, kWhyLinkerImage},
+    {DiagnosticCode::K_ImageWriteCloseFailed, kWhyLinkerImage},
+    {DiagnosticCode::K_ImageEmpty, kWhyLinkerImage},
     // Post-fold #12 D-FF2-UNSUPP-FULL-SWEEP additions:
     // K_NoMatchingObjectFormat — format-walker dispatch invariant
     //   (suppressing → wrong walker / corrupted artifact)
@@ -319,16 +691,16 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // K_WalkerInputContractViolation — walker received malformed input
     //   from the linker driver (suppressing → upstream corruption
     //   propagates downstream silently)
-    DiagnosticCode::K_NoMatchingObjectFormat,
-    DiagnosticCode::K_FormatLacksImportSupport,
-    DiagnosticCode::K_RelocationKindMismatch,
-    DiagnosticCode::K_WalkerInputContractViolation,
+    {DiagnosticCode::K_NoMatchingObjectFormat, kWhyNoMatchingObjectFormat},
+    {DiagnosticCode::K_FormatLacksImportSupport, kWhyFormatLacksImportSupport},
+    {DiagnosticCode::K_RelocationKindMismatch, kWhyRelocationKindMismatch},
+    {DiagnosticCode::K_WalkerInputContractViolation, kWhyWalkerInputContract},
     // K_EntryPointResolvesToExtern — extern-named-as-entry is a
     // schema misconfiguration that produces a runnable binary
     // pointing at a stub IAT slot. Suppressing → the loader jumps
     // to unrelocated import-stub bytes at process entry → SEGV with
     // no diagnostic trail.
-    DiagnosticCode::K_EntryPointResolvesToExtern,
+    {DiagnosticCode::K_EntryPointResolvesToExtern, kWhyEntryResolvesToExtern},
     // K_DuplicateDataSymbol / K_BssDataHasBytes — producer-side
     // AssembledData invariant violations caught by
     // `validateAssembledData()`. Suppressing either would let a
@@ -338,8 +710,8 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // image or silently drop. Both are substrate-shape violations
     // that must not be silently accepted. 3rd-order audit fold
     // (D-LK4-RODATA-BSS-INVARIANT).
-    DiagnosticCode::K_DuplicateDataSymbol,
-    DiagnosticCode::K_BssDataHasBytes,
+    {DiagnosticCode::K_DuplicateDataSymbol, kWhyAssembledData},
+    {DiagnosticCode::K_BssDataHasBytes, kWhyAssembledData},
     // K_FormatLacksStackReserveControl / K_InvalidStackReserveRequest
     // (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH) — the per-program stack-reserve
     // request gate. Suppressing either restores EXACTLY the silent drop the
@@ -347,8 +719,8 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // emitting an image whose stack is NOT the size the program asked for,
     // and the failure surfaces later as a stack overflow at a recursion depth
     // with no diagnostic trail back to the dropped request.
-    DiagnosticCode::K_FormatLacksStackReserveControl,
-    DiagnosticCode::K_InvalidStackReserveRequest,
+    {DiagnosticCode::K_FormatLacksStackReserveControl, kWhyStackReserve},
+    {DiagnosticCode::K_InvalidStackReserveRequest, kWhyStackReserve},
     // K_FormatLacksProcessExit / K_ExecEntryNotTrampolined (D-LK10-ENTRY §2.13)
     // — the entry-trampoline contract, the same format-capability shape as the
     // two codes above. They are TWO codes because their predicates DISAGREE on
@@ -369,8 +741,8 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // lose it — a code absent from this table is droppable by the reporter's
     // dedup window and per-code cap, so membership is part of CREATING the
     // code, not a follow-up.
-    DiagnosticCode::K_FormatLacksProcessExit,
-    DiagnosticCode::K_ExecEntryNotTrampolined,
+    {DiagnosticCode::K_FormatLacksProcessExit, kWhyEntryTrampoline},
+    {DiagnosticCode::K_ExecEntryNotTrampolined, kWhyEntryTrampoline},
     // The PROGRAM-ENTRY RESOLUTION family (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE,
     // 2026-08-10) — four codes, one rule, and the rule is that EVERY outcome of
     // entry resolution other than "exactly one candidate" must be undroppable.
@@ -396,10 +768,10 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     //   * K_EntryVerbUnmaterializable — the decided verb and the MIR signature
     //     disagree. Suppressed, the materializer reads past the end of the
     //     parameter list.
-    DiagnosticCode::S_EntryShapeNotDeclared,
-    DiagnosticCode::K_ProgramEntryUndefined,
-    DiagnosticCode::K_ProgramEntryAmbiguous,
-    DiagnosticCode::K_EntryVerbUnmaterializable,
+    {DiagnosticCode::S_EntryShapeNotDeclared, kWhyProgramEntry},
+    {DiagnosticCode::K_ProgramEntryUndefined, kWhyProgramEntry},
+    {DiagnosticCode::K_ProgramEntryAmbiguous, kWhyProgramEntry},
+    {DiagnosticCode::K_EntryVerbUnmaterializable, kWhyProgramEntry},
 
     // The extern-import dedup fold (D-LK11-EXTERN-IMPORT-DEDUP) at BOTH merge
     // tiers — linker.cpp `mergeModules` and mir_merge.cpp — collapses N CUs'
@@ -415,7 +787,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // per-code cap, so on a link the size of the 103-TU SQLite CLI the
     // diagnostic can vanish with NO flag and no trace. That is why membership
     // here is part of creating the code, not a follow-up.
-    DiagnosticCode::K_ExternImportAttributeConflict,
+    {DiagnosticCode::K_ExternImportAttributeConflict, kWhyExternImportConflict},
 
     // L_* LIR verifier / lowering band — structural invariants
     // (cannot reach assembler-tier codegen without violating
@@ -435,44 +807,38 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // the indirect-callee regalloc rules — suppressing it would turn
     // a callee-clobbered-by-arg-setup regression back into a SILENT
     // garbage jump through an argument value.
-    DiagnosticCode::L_UnsupportedLoweringForOpcode,
-    DiagnosticCode::L_RequiredLirOpcodeMissing,
-    DiagnosticCode::L_VirtualRegInPostRegalloc,
-    DiagnosticCode::L_MemOperandMalformed,
-    DiagnosticCode::L_PhysRegOrdinalOutOfRange,
-    DiagnosticCode::L_InvalidSpillSlotSentinel,
-    DiagnosticCode::L_MoveCycleUnsupported,
-    DiagnosticCode::L_IndirectCallUnsupported,
-    DiagnosticCode::L_IndirectCalleeClobberedByArgSetup,
-    DiagnosticCode::L_StackPassedArgUnsupported,
-    DiagnosticCode::L_CcRegLookupFailed,
+    {DiagnosticCode::L_UnsupportedLoweringForOpcode, kWhyLirStructural},
+    {DiagnosticCode::L_RequiredLirOpcodeMissing, kWhyLirStructural},
+    {DiagnosticCode::L_VirtualRegInPostRegalloc, kWhyLirStructural},
+    {DiagnosticCode::L_MemOperandMalformed, kWhyLirStructural},
+    {DiagnosticCode::L_PhysRegOrdinalOutOfRange, kWhyLirStructural},
+    {DiagnosticCode::L_InvalidSpillSlotSentinel, kWhyLirStructural},
+    {DiagnosticCode::L_MoveCycleUnsupported, kWhyLirStructural},
+    {DiagnosticCode::L_IndirectCallUnsupported, kWhyLirStructural},
+    {DiagnosticCode::L_IndirectCalleeClobberedByArgSetup, kWhyLirStructural},
+    {DiagnosticCode::L_StackPassedArgUnsupported, kWhyLirStructural},
+    {DiagnosticCode::L_CcRegLookupFailed, kWhyLirStructural},
     // L_VlaDynamicAllocaUnsupported (VLA C1a→C1b boundary, D-CSUBSET-VLA): a runtime-
     // sized `Alloca` reached `lowerAlloca` (the dynamic `sub rsp,<size>` is the named
     // C1b cycle). A member: suppressed, the alloca would fall through to the fixed-
     // slot path and silently emit a `lea` of a 1-slot scalar for the whole VLA — a
     // stack miscompile (MINOR-3). Same load-bearing-boundary class as the L_ band.
-    DiagnosticCode::L_VlaDynamicAllocaUnsupported,
+    {DiagnosticCode::L_VlaDynamicAllocaUnsupported, kWhyVlaDynamicAlloca},
     // L_VlaNonLeafFrameUnsupported (VLA C1b LEAF gate, D-CSUBSET-VLA-NONLEAF-CALL-FRAME):
     // a VLA function that ALSO calls / uses va_start. A member: suppressed, a non-leaf
     // VLA would place outgoing call args INSIDE the VLA region under the moved SP (an
     // ABI break — a silent stack miscompile). Same load-bearing-boundary class.
-    DiagnosticCode::L_VlaNonLeafFrameUnsupported,
-    // L_TerminatorSuccessorMismatch (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED):
-    // the terminator's two CFG channels (recorded successors vs. its own BlockRef
-    // operands) disagree. A member: suppressed, the encoder would take its branch
-    // displacement from an operand list that no longer matches the CFG — a branch
-    // to the wrong block, or (the shape that minted the code) no displacement at
-    // all. Same structural-invariant class as the rest of the L_ band.
-    DiagnosticCode::L_TerminatorSuccessorMismatch,
+    {DiagnosticCode::L_VlaNonLeafFrameUnsupported, kWhyVlaNonLeafFrame},
+    {DiagnosticCode::L_TerminatorSuccessorMismatch, kWhyTerminatorSuccessors},
 
     // R_* regalloc band — calling-convention / class invariants.
     // R_SpilledDueToPressure + R_SpilledDueToCrossCallExhaustion
     // are Info-severity (intentional informational signal) and stay
     // OUT of the table; only the Error-severity gating codes are
     // members.
-    DiagnosticCode::R_NoCallingConventions,
-    DiagnosticCode::R_CallingConventionLookupFailed,
-    DiagnosticCode::R_VRegHasNoClass,
+    {DiagnosticCode::R_NoCallingConventions, kWhyRegallocInvariant},
+    {DiagnosticCode::R_CallingConventionLookupFailed, kWhyRegallocInvariant},
+    {DiagnosticCode::R_VRegHasNoClass, kWhyRegallocInvariant},
 
     // A_* assembler / encoding band — bytes-on-disk invariants
     // (suppressing → wrong machine code emitted). The
@@ -481,20 +847,17 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // the round-trip self-test; A_NoEncodingDeclared /
     // A_NoEncodingShapeWalker / A_LirToMirSizeMismatch are
     // pipeline-shape invariants.
-    DiagnosticCode::A_LirToMirSizeMismatch,
-    DiagnosticCode::A_NoMatchingEncodingVariant,
-    DiagnosticCode::A_RoundTripMismatch,
-    DiagnosticCode::A_NoEncodingDeclared,
-    DiagnosticCode::A_NoEncodingShapeWalker,
+    {DiagnosticCode::A_LirToMirSizeMismatch, kWhyEncodingBytes},
+    {DiagnosticCode::A_NoMatchingEncodingVariant, kWhyEncodingBytes},
+    {DiagnosticCode::A_RoundTripMismatch, kWhyEncodingBytes},
+    {DiagnosticCode::A_NoEncodingDeclared, kWhyEncodingBytes},
+    {DiagnosticCode::A_NoEncodingShapeWalker, kWhyEncodingBytes},
     // D-LK10-ENTRY-ARM64 (v0.0.2 V2-1): a too-wide immediate that
     // can't fit a fixed32 immediate slot must never be silently
     // truncated to a wrong machine-code constant (e.g. wrong syscall
     // number). Same bytes-on-disk-invariant band as the others above.
-    DiagnosticCode::A_ImmediateOperandOutOfRange,
-    // plan 29 P4: an unrecognized .s construct. Suppressing it would mean
-    // building a binary that silently omits an instruction the programmer
-    // wrote — the one thing an assembler may never do.
-    DiagnosticCode::A_AsmTextUnsupported,
+    {DiagnosticCode::A_ImmediateOperandOutOfRange, kWhyImmediateRange},
+    {DiagnosticCode::A_AsmTextUnsupported, kWhyAsmTextUnsupported},
 
     // S_* semantic band — silent-MISCOMPILE guards.
     // c27 (D-CSUBSET-VOLATILE-POINTEE, 2026-06-27) RETIRED
@@ -515,7 +878,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // 0 (the incomplete composite has no layout) — a silent wrong-bytes layout.
     // Same silent-miscompile-guard class as the entries above; a pointer-to-
     // incomplete (`struct N *`) is legal and is NOT rejected.
-    DiagnosticCode::S_IncompleteTypeMember,
+    {DiagnosticCode::S_IncompleteTypeMember, kWhyIncompleteType},
     // S_IncompleteTypeObject (c35, D-CSUBSET-FORWARD-STRUCT-DECLARATION,
     // 2026-06-28): a by-VALUE OBJECT (local/global) of an INCOMPLETE composite —
     // `struct S v;` where `struct S` is forward-declared but never defined. c35's
@@ -525,7 +888,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // silent wrong-bytes object. Same silent-miscompile-guard class as
     // S_IncompleteTypeMember (the by-value MEMBER case); a pointer-to-incomplete is
     // legal and is NOT rejected.
-    DiagnosticCode::S_IncompleteTypeObject,
+    {DiagnosticCode::S_IncompleteTypeObject, kWhyIncompleteType},
     // S_TypeNameDeclaratorNotAbstract (c26, D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME,
     // 2026-06-27): a TYPE-NAME (cast / sizeof / compound-literal) whose abstract
     // declarator illegally carries a NAME (`(int x)expr`). NOTE — unlike the
@@ -534,7 +897,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // fails. It is closed here so the failure is never SILENT — a suppressed
     // constraint violation would otherwise fail the build with zero diagnostics
     // shown (a confusing silent failure REASON), which the closed table forbids.
-    DiagnosticCode::S_TypeNameDeclaratorNotAbstract,
+    {DiagnosticCode::S_TypeNameDeclaratorNotAbstract, kWhySilentConstraint},
     // S_StaticAssertFailed (FC16, D-CSUBSET-STATIC-ASSERT, 2026-07-07): a
     // `_Static_assert(cond[, "msg"]);` whose condition is non-constant or folds
     // to zero. Same posture as S_TypeNameDeclaratorNotAbstract above —
@@ -543,7 +906,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // fail the build with ZERO diagnostics shown — a confusing silent failure
     // REASON the closed table forbids. Closed here so a false static_assert is
     // never silent.
-    DiagnosticCode::S_StaticAssertFailed,
+    {DiagnosticCode::S_StaticAssertFailed, kWhySilentConstraint},
     // S_GenericSelectionNoMatch / S_GenericSelectionAmbiguous (FC16,
     // D-CSUBSET-GENERIC-SELECTION, 2026-07-07): a `_Generic` whose controlling
     // type matched no typed association (and had no `default`), or matched more
@@ -554,8 +917,8 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // would fail the build with ZERO diagnostics shown, a confusing silent
     // failure REASON the closed table forbids. Closed here so an unselectable
     // `_Generic` is never silent.
-    DiagnosticCode::S_GenericSelectionNoMatch,
-    DiagnosticCode::S_GenericSelectionAmbiguous,
+    {DiagnosticCode::S_GenericSelectionNoMatch, kWhySilentConstraint},
+    {DiagnosticCode::S_GenericSelectionAmbiguous, kWhySilentConstraint},
     // S_Alignas* (C11/C23 6.7.5, D-CSUBSET-ALIGNAS, 2026-07-07): the five
     // `_Alignas`/`alignas` constraint violations — not-power-of-two, exceeds-max,
     // weaker-than-natural, invalid-context (typedef/function/parameter/bit-field),
@@ -565,11 +928,11 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // applied), but a SUPPRESSED constraint violation would fail the build with
     // ZERO diagnostics shown, the confusing silent-failure REASON the closed table
     // forbids. Closed here so an invalid alignas is never silent.
-    DiagnosticCode::S_AlignasNotPowerOfTwo,
-    DiagnosticCode::S_AlignasExceedsMax,
-    DiagnosticCode::S_AlignasWeakerThanNatural,
-    DiagnosticCode::S_AlignasInvalidContext,
-    DiagnosticCode::S_AlignasNonConstant,
+    {DiagnosticCode::S_AlignasNotPowerOfTwo, kWhySilentConstraint},
+    {DiagnosticCode::S_AlignasExceedsMax, kWhySilentConstraint},
+    {DiagnosticCode::S_AlignasWeakerThanNatural, kWhySilentConstraint},
+    {DiagnosticCode::S_AlignasInvalidContext, kWhySilentConstraint},
+    {DiagnosticCode::S_AlignasNonConstant, kWhySilentConstraint},
     // S_PackedBitfieldUnsupported (FC16, D-CSUBSET-PACKED, 2026-07-08): a `packed`
     // struct/union that ALSO carries a bit-field member — an UNSUPPORTED combination
     // (bit-granular packed packing is a distinct, deferred algorithm). Unlike the
@@ -580,14 +943,14 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // (S_UnknownTypeAttribute is deliberately NOT a member — it mirrors the suppressible
     // H_UnknownLinkageSpecifier typo diagnostic, and the build still fails via
     // hasErrors when it fires unsuppressed.)
-    DiagnosticCode::S_PackedBitfieldUnsupported,
+    {DiagnosticCode::S_PackedBitfieldUnsupported, kWhyPackedBitfield},
     // S_NullptrInvalidOperand (FC17, D-CSUBSET-NULLPTR): `nullptr` used as an
     // invalid operator operand (`nullptr + 1`, `nullptr < p`, `-nullptr`). Unlike a
     // plain type mismatch, suppressing THIS would ship a SILENT MISCOMPILE: the HIR
     // lowering turns `nullptr` into the integer-0 null constant, so a suppressed
     // diagnostic would leave `nullptr + 1` compiled as `0 + 1 == 1` — ill-formed C
     // silently accepted. Closed here so nullptr misuse is never silently lowered.
-    DiagnosticCode::S_NullptrInvalidOperand,
+    {DiagnosticCode::S_NullptrInvalidOperand, kWhyNullptrOperand},
     // S_InvalidEnumUnderlyingType / S_EnumeratorValueOutOfRange (FC17,
     // D-CSUBSET-ENUM-UNDERLYING-TYPE, C23 6.7.2.2): the explicit enum
     // underlying-type constraint violations — a non-integer underlying type
@@ -599,8 +962,8 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // silent-miscompile-guard class as S_PackedBitfieldUnsupported above. (The
     // default-int enum path never emits either, so unsuppressing changes nothing
     // for existing enums.)
-    DiagnosticCode::S_InvalidEnumUnderlyingType,
-    DiagnosticCode::S_EnumeratorValueOutOfRange,
+    {DiagnosticCode::S_InvalidEnumUnderlyingType, kWhyEnumUnderlying},
+    {DiagnosticCode::S_EnumeratorValueOutOfRange, kWhyEnumUnderlying},
     // S_TypeofBitfieldOperand (FC17, D-CSUBSET-TYPEOF, C23 6.7.2.5): the operand
     // of a `typeof`/`typeof_unqual` is a bit-field member access. Same
     // silent-miscompile-guard class as the enum/nullptr entries above: on the
@@ -609,7 +972,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // violation would silently resolve the typeof to the bit-field's declared
     // (widened) type, a wrong type in the declaration it specifies. Closed here so
     // a bit-field typeof is never silently mistyped.
-    DiagnosticCode::S_TypeofBitfieldOperand,
+    {DiagnosticCode::S_TypeofBitfieldOperand, kWhyTypeofBitfield},
     // S_Constexpr* (FC17, D-CSUBSET-CONSTEXPR, C23 6.7.1): the five constexpr
     // OBJECT constraint violations — non-constant initializer, missing
     // initializer, unsupported (aggregate) object type, constexpr-on-a-function,
@@ -621,11 +984,11 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // INTERNAL linkage (the file-scope constexpr linkage row would apply to a
     // function the object-only feature never validated). Closed here so an
     // invalid constexpr is never silent.
-    DiagnosticCode::S_ConstexprNonConstantInitializer,
-    DiagnosticCode::S_ConstexprMissingInitializer,
-    DiagnosticCode::S_ConstexprUnsupportedType,
-    DiagnosticCode::S_ConstexprFunctionNotSupported,
-    DiagnosticCode::S_ConstexprInvalidQualifier,
+    {DiagnosticCode::S_ConstexprNonConstantInitializer, kWhyConstexpr},
+    {DiagnosticCode::S_ConstexprMissingInitializer, kWhyConstexpr},
+    {DiagnosticCode::S_ConstexprUnsupportedType, kWhyConstexpr},
+    {DiagnosticCode::S_ConstexprFunctionNotSupported, kWhyConstexpr},
+    {DiagnosticCode::S_ConstexprInvalidQualifier, kWhyConstexpr},
     // S_Auto* (FC17.5, D-CSUBSET-AUTO-TYPE-INFERENCE, C23 6.7.9): the four
     // initializer-inference constraint violations — multi-declarator, a
     // derived (non-plain-identifier) declarator, a missing initializer, and
@@ -639,10 +1002,10 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // forbids (`static x = 5;` as implicit-int, `auto a = 1, b = 2;`
     // per-declarator, a NullptrT-typed object headed for the 0xA014 MIR
     // tripwire). Closed here so a rejected inference never compiles quietly.
-    DiagnosticCode::S_AutoRequiresSingleDeclarator,
-    DiagnosticCode::S_AutoRequiresPlainIdentifier,
-    DiagnosticCode::S_AutoRequiresInitializer,
-    DiagnosticCode::S_AutoInferenceInvalid,
+    {DiagnosticCode::S_AutoRequiresSingleDeclarator, kWhyAutoInference},
+    {DiagnosticCode::S_AutoRequiresPlainIdentifier, kWhyAutoInference},
+    {DiagnosticCode::S_AutoRequiresInitializer, kWhyAutoInference},
+    {DiagnosticCode::S_AutoInferenceInvalid, kWhyAutoInference},
     // S_ThreadLocal* (TLS C1, D-CSUBSET-THREAD-LOCAL, C11/C23 6.7.1 + 6.6p9):
     // the five thread-storage constraint violations — thread_local on a
     // function, a block-scope object without static/extern, a same-TU
@@ -655,19 +1018,19 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // whose resolved value is a link-time tpoff bit-cast into a data slot (a
     // silent garbage pointer — the arc's CRIT-1). Closed here so an invalid
     // thread_local never compiles quietly.
-    DiagnosticCode::S_ThreadLocalOnFunction,
-    DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern,
-    DiagnosticCode::S_ThreadLocalRedeclarationMismatch,
-    DiagnosticCode::S_ThreadLocalAddressNotConstant,
-    DiagnosticCode::S_ThreadLocalInvalidCombination,
+    {DiagnosticCode::S_ThreadLocalOnFunction, kWhyThreadLocal},
+    {DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern, kWhyThreadLocal},
+    {DiagnosticCode::S_ThreadLocalRedeclarationMismatch, kWhyThreadLocal},
+    {DiagnosticCode::S_ThreadLocalAddressNotConstant, kWhyThreadLocal},
+    {DiagnosticCode::S_ThreadLocalInvalidCombination, kWhyThreadLocal},
     // S_BitInt* (D-CSUBSET-BITINT, C23 6.2.5/6.7.2): the `_BitInt(N)` width gates.
     // UNSUPPRESSABLE — a suppressed width violation would leave the type with no
     // computable / representable width and the masking + layout would silently pick
     // a garbage N (or reach codegen with no multi-limb lowering for the N>64 gate).
-    DiagnosticCode::S_BitIntWidthNotConstant,
-    DiagnosticCode::S_BitIntWidthNotPositive,
-    DiagnosticCode::S_BitIntSignedWidthTooSmall,
-    DiagnosticCode::S_BitIntWidthExceedsMax,
+    {DiagnosticCode::S_BitIntWidthNotConstant, kWhyBitIntWidth},
+    {DiagnosticCode::S_BitIntWidthNotPositive, kWhyBitIntWidth},
+    {DiagnosticCode::S_BitIntSignedWidthTooSmall, kWhyBitIntWidth},
+    {DiagnosticCode::S_BitIntWidthExceedsMax, kWhyBitIntWidth},
     // S_BitIntWidthAboveC1Limit (the C1 N>64 gate, RETIRED in C2) and
     // S_BitIntWideMulDivUnsupported (the C2 `* / %` boundary, RETIRED in C3
     // 2026-07-12) were DE-LISTED here 2026-08-10. Both surfaces LOWER now —
@@ -681,7 +1044,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // deferred (a correct multi-limb FP<->limbs path is a later cycle). UNSUPPRESSABLE:
     // suppressed, the naive scalar path emits the wrong sign + drops the upper limbs
     // (a wide `(_BitInt(128))1.5` / `(double)wide`) and silently miscompiles.
-    DiagnosticCode::S_BitIntWideFloatConvUnsupported,
+    {DiagnosticCode::S_BitIntWideFloatConvUnsupported, kWhyBitIntFloatConv},
     // S_VlaWithStaticStorage (VLA C1a, D-CSUBSET-VLA, C99/C11 §6.7.6.2): a
     // block-scope static/extern VLA (a VLA needs automatic storage). Suppressed it
     // ships a WRONG type — a runtime-sized `vlaArray` carried into the
@@ -695,18 +1058,18 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // shape that IS still refused (`typedef int R[5]; R a[n];`) is owned at the MIR
     // tier under H0009, positioned and named. 0xE025 precedent; found by the
     // EveryMemberHasAnEmitSite property below.
-    DiagnosticCode::S_VlaWithStaticStorage,
+    {DiagnosticCode::S_VlaWithStaticStorage, kWhyVlaStorage},
     // S_VlaSizeNotInteger (C11 §6.7.6.2p1): a non-integer VLA size (float / nullptr /
     // pointer). Suppressed, it ships a bogus VLA — a float bound FPToSI-truncates to
     // a garbage element count, a nullptr bound is a silent 0-byte array. Same
     // silent-miscompile-guard class as the S_Vla* siblings above.
-    DiagnosticCode::S_VlaSizeNotInteger,
+    {DiagnosticCode::S_VlaSizeNotInteger, kWhyVlaSize},
     // S_ArrayParamQualifierNonParameter (VLA C4c, D-CSUBSET-VLA, C99 §6.7.6.2/
     // 6.7.6.3): a `static` / cv-qualifier / `*` inside an array declarator's `[ ]`
     // outside a function parameter. Suppressed, it ships the decorated array with
     // the illegal decoration silently dropped (a mis-typed / mis-sized object) —
     // the same silent-miscompile-guard class as the S_Vla* siblings above.
-    DiagnosticCode::S_ArrayParamQualifierNonParameter,
+    {DiagnosticCode::S_ArrayParamQualifierNonParameter, kWhyArrayParamQualifier},
     // S_InlineAsmNonEmptyTemplate (FC17.9(i), D-CSUBSET-INLINE-ASM): an `__asm__`
     // statement whose template is not strictly empty (non-empty / whitespace-only /
     // malformed-escape). Cycle-1 emits only the empty-template optimizer barrier;
@@ -714,54 +1077,16 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // D-CSUBSET-INLINE-ASM-TEXT). Suppressed, a dropped `asm("hlt")` would lower to
     // a silent no-op barrier — the instructions vanish, a miscompile. Same silent-
     // miscompile-guard class as the S_Vla* / S_AtomicNonLockFree siblings above.
-    DiagnosticCode::S_InlineAsmNonEmptyTemplate,
-    // ★★ S_InlineAsmExtendedUnsupported (inline-asm P1,
-    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): a GNU EXTENDED inline-asm
-    // statement — outputs, inputs, clobbers, a label section, or `goto`.
-    // NAME THE MISCOMPILE, since that is the membership criterion: suppressed,
-    // `__asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));` PARSES, the
-    // diagnostic is dropped, and `cst_to_hir`'s `InlineAsm` arm lowers the
-    // statement to a 0-child barrier leaf — the operand list is discarded by
-    // construction. The emitted program then (i) executes `rdtsc`, which writes
-    // `eax`/`edx` while the register allocator still believes those registers
-    // hold whatever it last put there, and (ii) leaves `lo`/`hi` holding their
-    // PRIOR values, because nothing ever moved the results into them. Both halves
-    // are wrong bytes with a clean build log. The clobber list is the same story
-    // one step out: `: : : "memory"` suppressed lets the optimizer keep a load
-    // hoisted across a statement that invalidates it.
-    // ⛔ THIS IS THE `accept-and-ignore` OUTCOME THE WHOLE P1 ARC EXISTS TO
-    // PREVENT, so it must not be reachable through a flag either. Same
-    // silent-miscompile-guard class as S_InlineAsmNonEmptyTemplate above — that
-    // code guards a dropped INSTRUCTION, this one guards a dropped OPERAND
-    // BINDING.
-    DiagnosticCode::S_InlineAsmExtendedUnsupported,
-    // S_InlineAsmLabelSectionRequiresGoto (inline-asm P1,
-    // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): a label section without the
-    // `goto` qualifier (`asm("" ::::)`). Suppressed, the statement continues to
-    // the extended-asm gate with its colon boundaries MIS-SECTIONED: a group the
-    // author wrote as labels is the only reading a fourth section has, and with
-    // the qualifier absent there is no such reading — so whatever the binder
-    // eventually makes of that group is a guess about which colon meant what.
-    // Suppressing a section-boundary constraint is suppressing the frame the
-    // operand roles are read in, so it must not be droppable ahead of the P5
-    // binder that will consume those roles. (It is also ill-formed in gcc, clang
-    // and MSVC alike — ✔MEASURED — so no conforming program depends on it.)
-    DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto,
-    // ⓘ S_InlineAsmDuplicateQualifier (the third P1 code) is deliberately NOT a
-    // member, on this file's own criterion — "suppression ships no wrong bytes and
-    // hides no build failure". `__asm__ volatile volatile ("")` suppressed compiles
-    // to EXACTLY what `volatile` means: the repeat is redundant, not ambiguous, so
-    // there is no second candidate lowering for silence to pick. It remains an
-    // Error by default (✔MEASURED: gcc, clang and MSVC all hard-error), which is
-    // the `S_AsmLabelOnAutomaticVariable` posture — loud about a written-but-
-    // meaningless token, never load-bearing for the emitted bytes.
+    {DiagnosticCode::S_InlineAsmNonEmptyTemplate, kWhyInlineAsmTemplate},
+    {DiagnosticCode::S_InlineAsmExtendedUnsupported, kWhyInlineAsmExtended},
+    {DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto, kWhyInlineAsmLabelSection},
     // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-
     // RESIDUAL): a bit-field compound/inc-dec/value mutation through an anonymous-
     // member or array-arrow base. Suppressed, the mutation falls to the generic
     // via-ptr path whose full-unit store CLOBBERS packed neighbours + skips
     // truncation — a silent miscompile. Same silent-miscompile-guard class as the
     // S_Vla* / S_InlineAsmNonEmptyTemplate siblings above.
-    DiagnosticCode::S_BitfieldMutationUnsupportedBase,
+    {DiagnosticCode::S_BitfieldMutationUnsupportedBase, kWhyBitfieldMutation},
     // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
     // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
     // members — the same suppressible posture as S_UnknownTypeAttribute above.
@@ -792,7 +1117,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // translation continues, no wrong bytes ship, no build failure is hidden, and
     // `--suppress` must stay able to silence exactly that advisory class — the
     // same posture as S_DeprecatedSymbolUsed / S_UnknownAttribute above.
-    DiagnosticCode::P_PreprocessorErrorDirective,
+    {DiagnosticCode::P_PreprocessorErrorDirective, kWhyErrorDirective},
     // TF-C82 (D-PP-PRAGMA-REGISTRY): a REACHED pragma DSS does not implement, or
     // one whose operand it cannot honour. Same argument as its `#error` neighbour
     // above, arrived at from the other direction: the author did not write this
@@ -805,12 +1130,12 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // match a `pragmaEffects` row that says, in config the user reads, why
     // ignoring them is true — so membership costs nothing on conforming input.
     // Reachability-gated identically (a pragma in a dead `#if` branch is silent).
-    DiagnosticCode::P_PreprocessorPragma,
+    {DiagnosticCode::P_PreprocessorPragma, kWhyPragmaUnhonored},
     // TF-C82: the semantic-tier half of the same guarantee. A composite whose
     // layout key is ambiguous has TWO candidate layouts with different sizes and
     // different offsets; suppressing the refusal does not remove the ambiguity,
     // it just picks one of them without saying so.
-    DiagnosticCode::S_PragmaPackAmbiguous,
+    {DiagnosticCode::S_PragmaPackAmbiguous, kWhyPragmaPackAmbiguous},
     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): a label the compiler
     // cannot turn into an
     // assembler name, and a declarator carrying two of them. Both are RENAMES —
@@ -823,8 +1148,8 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // S_AsmLabelOnAutomaticVariable is deliberately NOT a member: it is a
     // WARNING about a construct clang also ignores, translation continues, and no
     // wrong symbol ships — the S_DeprecatedSymbolUsed posture.
-    DiagnosticCode::S_AsmLabelInvalid,
-    DiagnosticCode::S_AsmLabelDuplicate,
+    {DiagnosticCode::S_AsmLabelInvalid, kWhyAsmLabel},
+    {DiagnosticCode::S_AsmLabelDuplicate, kWhyAsmLabel},
     // TF-C86 (D-CSUBSET-STDARG-F001A): a `#define`/`#undef` of a
     // conditional-inclusion OPERATOR name (`__has_include` and siblings).
     // Suppressing it does not make the shadowing harmless — it lets the
@@ -838,7 +1163,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
     // defect). The universal `#ifndef __has_include` shim never reaches this
     // code (its guard is dead once the operator is `defined`), so membership
     // costs conforming input nothing.
-    DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
+    {DiagnosticCode::P_PreprocessorOperatorNameNotDefinable, kWhyOperatorNameNotDefinable},
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the
@@ -850,7 +1175,7 @@ constexpr std::array<DiagnosticCode, 143> kUnsuppressableCodes{{
 consteval bool kUnsuppressableCodesAreUnique() {
     for (std::size_t i = 0; i < kUnsuppressableCodes.size(); ++i) {
         for (std::size_t j = i + 1; j < kUnsuppressableCodes.size(); ++j) {
-            if (kUnsuppressableCodes[i] == kUnsuppressableCodes[j]) return false;
+            if (kUnsuppressableCodes[i].code == kUnsuppressableCodes[j].code) return false;
         }
     }
     return true;
@@ -867,8 +1192,8 @@ static_assert(kUnsuppressableCodesAreUnique(),
 // the resulting `None` slot at COMPILE time (the uniqueness check above does
 // not — a single `None` is "unique"). It also rejects an intentional `None`.
 consteval bool kUnsuppressableCodesHaveNoNone() {
-    for (auto const c : kUnsuppressableCodes) {
-        if (c == DiagnosticCode::None) return false;
+    for (auto const& e : kUnsuppressableCodes) {
+        if (e.code == DiagnosticCode::None) return false;
     }
     return true;
 }
@@ -877,15 +1202,42 @@ static_assert(kUnsuppressableCodesHaveNoNone(),
               "None slot means the array size was bumped without adding the "
               "intended code.");
 
+// The rationale-as-data promotion's own guard, and it is deliberately the
+// SAME SHAPE as the two checks above: a member that explains nothing is
+// caught at COMPILE time, not by a test and not by an operator reading a
+// diagnostic with an empty tail. It is what makes "every entry carries its
+// reason" a property of the table rather than a convention someone has to
+// remember — the short-initializer hazard `kUnsuppressableCodesHaveNoNone`
+// exists for applies identically here (a row written `{DiagnosticCode::X}`
+// value-initializes `why` to an empty view and compiles fine otherwise).
+consteval bool kUnsuppressableEntriesAllExplainThemselves() {
+    for (auto const& e : kUnsuppressableCodes) {
+        if (e.why.empty()) return false;
+    }
+    return true;
+}
+static_assert(kUnsuppressableEntriesAllExplainThemselves(),
+              "every kUnsuppressableCodes entry must carry a non-empty `why` — "
+              "the text is what `D_SuppressRequestIgnored` shows the operator "
+              "whose --suppress request this table refuses, so a member "
+              "without one refuses silently.");
+
 } // namespace
 
 bool isUnsuppressable(DiagnosticCode code) noexcept {
-    return std::ranges::find(kUnsuppressableCodes, code)
+    return std::ranges::find(kUnsuppressableCodes, code,
+                             &UnsuppressableEntry::code)
          != kUnsuppressableCodes.end();
 }
 
-std::span<DiagnosticCode const> unsuppressableCodes() noexcept {
+std::span<UnsuppressableEntry const> unsuppressableCodes() noexcept {
     return kUnsuppressableCodes;
+}
+
+std::string_view unsuppressableRationale(DiagnosticCode code) noexcept {
+    auto const it = std::ranges::find(kUnsuppressableCodes, code,
+                                      &UnsuppressableEntry::code);
+    return it == kUnsuppressableCodes.end() ? std::string_view{} : it->why;
 }
 
 } // namespace dss

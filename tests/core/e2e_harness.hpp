@@ -10,6 +10,7 @@
 // tokenizer diagnostics surfaces on every test that wasn't told to
 // expect them.
 
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/source_buffer.hpp"
@@ -84,7 +85,7 @@ private:
     }
     auto src    = SourceBuffer::fromString(std::move(sourceText), "<e2e>");
     auto schema = *loaded;
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, reporter] = std::move(tk).tokenize();
     return E2EHarness{
         std::move(src),

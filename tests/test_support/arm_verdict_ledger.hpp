@@ -50,6 +50,18 @@
 
 #include "host_native_target.hpp"
 
+// The host-OS token vocabulary. INCLUDED BY RELATIVE PATH on purpose: this
+// header's consumers are three targets with three different include-path sets,
+// and `integrated_tests` (integrated_tests/CMakeLists.txt) carries ONLY
+// `tests/test_support` — no `src/` — because it links no DSS library at all,
+// driving the compiler as a subprocess instead. A quoted include resolves
+// against the includer's own directory first, so this one form works for every
+// consumer with no build-graph change; `#include "program/platform_token.hpp"`
+// would compile in the two gtest targets and break the CLI runner. The header
+// is header-only and dependency-free precisely so this costs nothing (see its
+// "SELF-CONTAINED ON PURPOSE" note).
+#include "../../src/program/platform_token.hpp"
+
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -72,16 +84,31 @@ namespace dss::test_support {
 // header comment: the same host-detection ladder was fixed once and its
 // duplicate was not, twice). One copy, here.
 
+// The host OS, spelled in the `runOn` vocabulary. FORWARDS to
+// `dss::currentHostOs()` (src/program/platform_token.hpp) — the private `#ifdef`
+// ladder that used to sit here is gone.
+//
+// It moved because the vocabulary stopped being test-only: `.dss-project.json`
+// build-script entries are gated on the same three tokens, so the DRIVER now
+// has to spell them too, and "one copy" (this block's own demand, above) has to
+// mean one copy across the whole repo, not one copy per tier. The driver header
+// is where the shared definition belongs — see its placement note for why that
+// is `src/program/` and emphatically not `src/core/`.
+//
+// The name and namespace are unchanged so every existing caller in both corpus
+// runners compiles untouched, and it still returns `std::string` by value:
+// callers store it in `std::string` and pass it to interfaces taking
+// `std::string const&`, and handing them an owning copy keeps every one of
+// those uses correct with no lifetime question to re-audit.
+//
+// ONE BEHAVIOUR CHANGE, DELIBERATE: the old `#else` returned `"unknown"`, a
+// token no manifest's `runOn` can contain, so an unsupported host would have
+// marked the ENTIRE corpus `SkippedByRunOn` — the structural class, which is
+// counted and never failed, not even under DSS_STRICT_ARM_VERDICTS=1. That is
+// precisely the "silently skipped and counted as passes" shape this file exists
+// to close. The shared ladder makes it a compile error instead.
 [[nodiscard]] inline std::string currentHostOs() noexcept {
-#if defined(_WIN32)
-    return "windows";
-#elif defined(__APPLE__)
-    return "darwin";
-#elif defined(__linux__)
-    return "linux";
-#else
-    return "unknown";
-#endif
+    return std::string{::dss::currentHostOs()};
 }
 
 // The host ARCH, returning the SAME identifier strings the target configs use
@@ -104,6 +131,71 @@ namespace dss::test_support {
 [[nodiscard]] inline std::string specTargetArch(std::string const& spec) {
     auto const colon = spec.find(':');
     return colon == std::string::npos ? spec : spec.substr(0, colon);
+}
+
+// The OBJECT-FORMAT portion of the same split ("arm64:elf64-aarch64-linux-exec"
+// → "elf64-aarch64-linux-exec"), i.e. `specTargetArch`'s twin. Empty when the
+// spec carries no `:` — a project-mode arm turns that into a loud manifest
+// error rather than composing a wrong artifact path, because the format name IS
+// the per-platform output subdirectory a project build routes through
+// (`setPerFormatOutputSubdir`, program.cpp).
+//
+// ★ IT LIVES HERE, BESIDE ITS TWIN, FOR THE REASON THE WHOLE HEADER EXISTS. It
+// arrived as two byte-identical locals — one per runner — when project mode
+// landed, because `tests/test_support/**` was outside that change's write
+// scope; both copies carried a ⚠ naming this fold as the fix. One
+// spec-splitting vocabulary, one definition: the two harnesses must not be able
+// to disagree about how a spec splits, which is exactly the divergence class
+// `D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT` cost us once already.
+[[nodiscard]] inline std::string specFormatName(std::string const& spec) {
+    auto const colon = spec.find(':');
+    return colon == std::string::npos ? std::string{} : spec.substr(colon + 1);
+}
+
+// D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY, closing-work item (2), first half: the
+// remedy line to append to a FAILING run's message when that run went through
+// qemu-user with `QEMU_LD_PREFIX` unset. Empty in every other case, so a native
+// arm's failure text is never padded with an irrelevant environment lecture.
+//
+// ★ IT LIVES HERE, BESIDE `specTargetArch` AND `findOnPath`, FOR THE REASON THE
+// WHOLE HEADER EXISTS — and it is here from the FIRST commit that has it rather
+// than after the usual two-copies-then-fold detour. It was written as a local
+// helper in `examples_runner.cpp`, and the pairing rule (SKILL.md §2: a
+// capability added to one harness is added to the other) was caught by review,
+// not by the author. A hint that fires in the in-process runner and stays
+// silent in the subprocess runner would mean the SAME failing arm explains
+// itself on one path and not the other — the divergence class this header was
+// created to end.
+//
+// ⚠ This does NOT classify the failure or quote the loader line, so it is only
+// HALF of item (2) and the registry row stays open for the rest. It is the
+// cheap half on purpose: the arm still runs and still reds, because masking a
+// cross-arch failure is the workaround the bar forbids. It only makes the red
+// say what is most likely wrong.
+[[nodiscard]] inline std::string qemuSysrootHint(std::string const& spec,
+                                                 std::string const& emulator) {
+    std::string const targetArch = specTargetArch(spec);
+    if (targetArch.empty() || targetArch == currentHostArch()) {
+        return {};   // native — no launcher was involved at all
+    }
+    // Only qemu-user reads QEMU_LD_PREFIX. Another launcher's failure has
+    // nothing to do with it and must not be handed a misleading remedy.
+    if (!emulator.starts_with("qemu-")) {
+        return {};
+    }
+    char const* const prefix = std::getenv("QEMU_LD_PREFIX");
+    if (prefix != nullptr && *prefix != '\0') {
+        return {};   // the operator already owns the setting
+    }
+    return "\nNOTE: this arm ran under '" + emulator
+         + "' with QEMU_LD_PREFIX unset. When qemu-user cannot find the guest "
+           "ELF interpreter it exits 255 for EVERY binary, however correct — "
+           "look for \"Could not open '/lib/ld-linux-*.so'\" in the output "
+           "above, and if it is there export QEMU_LD_PREFIX=<guest sysroot> "
+           "(Debian/Ubuntu: /usr/<arch>-linux-gnu, from the "
+           "libc6-<arch>-cross or gcc-<arch>-linux-gnu package) and re-run. "
+           "MEASURED 2026-08-12 on the WSL leg: 468 of 826 tests failed "
+           "without it, 826 of 826 passed with it and nothing else changed.";
 }
 
 // Resolve an executable name against $PATH (e.g. "qemu-aarch64"), returning

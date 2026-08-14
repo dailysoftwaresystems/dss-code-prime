@@ -6,6 +6,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
+#include "core/types/diagnostic_budget.hpp"
 
 #include <gtest/gtest.h>
 
@@ -57,7 +58,7 @@ TEST(SemanticAnalyzerTsql, CreateTableMintsTableSymbol) {
         "CREATE TABLE Customers (Id INT NOT NULL, Name VARCHAR);",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(tableSymbolCount(model), 1u);
     EXPECT_EQ(userSymbolCount(model), 3u) << "1 table + 2 columns (Id, Name)";
     SymbolRecord const* rec = singleTable(model);
@@ -76,7 +77,7 @@ TEST(SemanticAnalyzerTsql, ColumnTypesResolveViaBuiltinTypes) {
         "CREATE TABLE t (a INT, b BIT, c VARCHAR);",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& interner = model.lattice().interner();
 
     SymbolRecord const* aRec = nullptr;
@@ -114,7 +115,7 @@ TEST(SemanticAnalyzerTsql, LastIdentifierMatcherExtractsRightmost) {
         "CREATE TABLE dbo.Orders (Id INT);",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(tableSymbolCount(model), 1u);
     SymbolRecord const* rec = singleTable(model);
     ASSERT_NE(rec, nullptr);
@@ -130,7 +131,7 @@ TEST(SemanticAnalyzerTsql, CrossStatementTableReferenceResolves) {
         "SELECT * FROM Orders;",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 }
 
@@ -148,7 +149,7 @@ TEST(SemanticAnalyzerTsql, CrossFileTableReferenceResolvesViaImportEdge) {
     // (the SELECT's `Orders` reference → the CREATE's `Orders` definition).
     ASSERT_EQ(cu->crossRefs().size(), 1u)
         << "tsql name-matching must produce exactly one cross-file edge";
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "the import edge injects Orders into the referencing tree";
 }
@@ -166,7 +167,7 @@ TEST(SemanticAnalyzerTsql, CrossFileSameNameTablesDoNotCollide) {
     assertNoBuilderErrors(*cu);
     // Neither file references the other → no cross-tree edge.
     EXPECT_EQ(cu->crossRefs().size(), 0u);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // Per-tree-root isolation: NOT a redeclaration.
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u);
     // Two independent table symbols minted in two distinct tree-root scopes
@@ -184,7 +185,7 @@ TEST(SemanticAnalyzerTsql, DuplicateCreateTableEmitsRedecl) {
         "CREATE TABLE Orders (Id INT);",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u);
     bool sawRelated = false;
     for (auto const& d : model.diagnostics().all()) {
@@ -205,7 +206,7 @@ TEST(SemanticAnalyzerTsql, CoalesceBuiltinIsVariadicCallable) {
         "SELECT COALESCE(a, a, a) FROM T;",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotCallable), 0u)
         << "COALESCE must resolve to a callable builtin FnSig";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ArgCountMismatch), 0u)
@@ -221,7 +222,7 @@ TEST(SemanticAnalyzerTsql, CallingTableSymbolIsNotCallable) {
         "SELECT T(a) FROM T;",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotCallable), 1u);
 }
 
@@ -233,7 +234,7 @@ TEST(SemanticAnalyzerTsql, MissingTableEmitsUndeclared) {
         "SELECT * FROM Ghosts;",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u);
     for (auto const& d : model.diagnostics().all()) {
         if (d.code == DiagnosticCode::S_UndeclaredIdentifier) {
@@ -253,7 +254,7 @@ TEST(SemanticAnalyzerTsql, UnresolvedColumnInExpressionStaysSoft) {
         "SELECT * FROM T WHERE Ghost = 1;",   // Ghost is a column, not in scope
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "an unresolved relational column must not emit S_UndeclaredIdentifier";
 }
@@ -266,7 +267,7 @@ TEST(SemanticAnalyzerTsql, HardTableErrorsWhileColumnsStaySoft) {
         "SELECT Ghost FROM Missing WHERE Other = 1;",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
         << "exactly the table (hard) errors; the two columns (soft) do not";
     for (auto const& d : model.diagnostics().all())
@@ -279,12 +280,12 @@ TEST(SemanticAnalyzerTsql, HardTableErrorsWhileColumnsStaySoft) {
 TEST(SemanticAnalyzerTsql, MissingTableInUpdateAndDeleteErrors) {
     auto upd = buildShippedUnit("tsql-subset", { "UPDATE Missing SET a = 1;" });
     assertNoBuilderErrors(*upd);
-    EXPECT_EQ(countCode(analyze(upd).diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+    EXPECT_EQ(countCode(analyze(upd, DiagnosticBudget::libraryDefault()).diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
         << "UPDATE on a missing table (hard target) must error";
 
     auto del = buildShippedUnit("tsql-subset", { "DELETE FROM Missing WHERE a = 1;" });
     assertNoBuilderErrors(*del);
-    EXPECT_EQ(countCode(analyze(del).diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+    EXPECT_EQ(countCode(analyze(del, DiagnosticBudget::libraryDefault()).diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
         << "DELETE on a missing table (hard target) must error";
 }
 
@@ -302,7 +303,7 @@ TEST(SemanticAnalyzerTsql, UnknownFunctionCallEmitsUndeclared) {
         "SELECT BOGUS(a) FROM T;",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     std::size_t bogusCount = 0;
     ParseDiagnostic const* bogusDiag = nullptr;
     for (auto const& d : model.diagnostics().all()) {
@@ -338,7 +339,7 @@ TEST(SemanticAnalyzerTsql, BracketIdentifierMintsAndResolves) {
         "CREATE TABLE [Orders] (id INT); SELECT * FROM [Orders];",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // The table symbol minted with the bracketed name (brackets stripped).
     EXPECT_EQ(tableSymbolCount(model), 1u);
     SymbolRecord const* rec = singleTable(model);
@@ -356,7 +357,7 @@ TEST(SemanticAnalyzerTsql, BracketIdentifierUnknownTableEmitsUndeclared) {
         "SELECT * FROM [Unknown];",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u);
     for (auto const& d : model.diagnostics().all()) {
         if (d.code == DiagnosticCode::S_UndeclaredIdentifier) {
@@ -378,7 +379,7 @@ TEST(SemanticAnalyzerTsql, BracketIdDoubledDelimiterMintsAndResolves) {
         "CREATE TABLE [Ord]]ers] (id INT); SELECT * FROM [Ord]]ers];",
     });
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(tableSymbolCount(model), 1u);
     SymbolRecord const* rec = singleTable(model);
     ASSERT_NE(rec, nullptr);
@@ -400,7 +401,7 @@ TEST(SemanticAnalyzerTsql, BracketIdDoubledDelimiterCrossFileResolves) {
     assertNoBuilderErrors(*cu);
     ASSERT_EQ(cu->crossRefs().size(), 1u)
         << "both files decode the escaped bracket-id to the same name → one edge";
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 }
 
@@ -417,6 +418,6 @@ TEST(SemanticAnalyzerTsql, BracketIdentifierCrossFileResolvesViaImportEdge) {
     // edge — assert equality, not a lower bound.
     ASSERT_EQ(cu->crossRefs().size(), 1u)
         << "bracket-id name-matching must produce exactly one cross-file edge";
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 }

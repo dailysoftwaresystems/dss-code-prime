@@ -21,6 +21,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "core/substrate/large_stack_call.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -107,7 +108,7 @@ namespace {
     auto cu = dss::substrate::callOnLargeStack(
         dss::substrate::kDeepRecursionStackBytes,
         [&]() -> std::shared_ptr<CompilationUnit> {
-            UnitBuilder builder{*loaded};
+            UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
             builder.addInMemory(source, sourceFile.filename().string());
             return std::make_shared<CompilationUnit>(std::move(builder).finish());
         });
@@ -134,7 +135,7 @@ namespace {
             lines.push_back(renderDiagnostic(d, bufs));
         }
     }
-    SemanticModel const model = analyze(cu);
+    SemanticModel const model = analyze(cu, DiagnosticBudget::libraryDefault());
     for (auto const& d : model.diagnostics().all()) {
         lines.push_back(renderDiagnostic(d, bufs));
     }

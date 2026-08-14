@@ -540,13 +540,32 @@ public:
                         };
                         MachOBuildVersion ver;
                         bool ok = true;
+                        // The accepted spellings are RENDERED FROM THE TABLE,
+                        // never typed into the message. Both strings here used
+                        // to say `"macos"` was the only one, which was true
+                        // when the vocabulary had one row and became a lie the
+                        // moment it grew — the classic rotted-error-message
+                        // shape, and the worst place for it, since this is the
+                        // text a config author reads to learn what to write.
+                        auto acceptedPlatforms = [] {
+                            std::string out;
+                            for (auto const& row :
+                                     kMachOBuildVersionPlatformTable.rows) {
+                                if (!out.empty()) out += ", ";
+                                out += '"';
+                                out += row.second;
+                                out += '"';
+                            }
+                            return out;
+                        };
                         // platform (closed enum; required).
                         if (!bv.contains("platform")
                          || !bv.at("platform").is_string()) {
                             coll.emit(DiagnosticCode::C_MalformedJson,
                                       "/image/buildVersion/platform",
-                                      "'platform' is required and must be a "
-                                      "string (\"macos\").");
+                                      std::format("'platform' is required and "
+                                                  "must be one of: {}.",
+                                                  acceptedPlatforms()));
                             ok = false;
                         } else {
                             auto const s =
@@ -558,8 +577,10 @@ public:
                                           "/image/buildVersion/platform",
                                           std::format("unknown buildVersion "
                                                       "platform '{}' — "
-                                                      "accepted: \"macos\" "
-                                                      "(PLATFORM_MACOS).", s));
+                                                      "accepted: {} (Apple's "
+                                                      "PLATFORM_* set from "
+                                                      "<mach-o/loader.h>).",
+                                                      s, acceptedPlatforms()));
                                 ok = false;
                             } else {
                                 ver.platform = *p;
@@ -753,6 +774,26 @@ public:
             // the reject fires only on `bindNow == false`. The
             // `bindNow == true` case is structurally a no-op (the
             // default) on .o paths.
+            // ★ `buildVersion` IS THE ONE MEMBER OF THIS BLOCK AN MH_OBJECT
+            // MAY DECLARE, and it is deliberately absent from the disjunction
+            // below (D-LK10-ENTRY-MACHO-EXIT, MH_OBJECT arm). Every OTHER key
+            // here describes how a LOADABLE IMAGE is mapped — a zero page, a
+            // dynamic linker, libraries to bind, a signature the kernel
+            // validates — none of which a relocatable input to a later link
+            // has. `LC_BUILD_VERSION` is not that kind of field: it states
+            // which PLATFORM the file was built for, and Mach-O makes it legal
+            // in an MH_OBJECT exactly as in an MH_EXECUTE. ✔MEASURED
+            // 2026-08-13 on macOS 26.5.2 arm64: Apple `clang -c` emits it into
+            // every plain `.o` (LC_SEGMENT_64 / LC_BUILD_VERSION / LC_SYMTAB /
+            // LC_DYSYMTAB), and ld64 (PROJECT:ld-1267) warns `no platform load
+            // command found in '<tu>.o', assuming: macOS` once per object that
+            // omits it. The `image.*` naming means "this Mach-O FILE", not "a
+            // loadable image" — filetype is the axis that decides loadability,
+            // and it is read directly above.
+            //
+            // The message keeps naming ONLY the rejected keys, so it stays a
+            // true statement of what fired rather than a list that has to be
+            // read against an exception.
             bool const anySet = mi.pageZeroSize != 0
                 || mi.segmentPageSize != kDefaultMachoSegmentPageSize
                 || !mi.dylinkerPath.empty()
@@ -760,8 +801,7 @@ public:
                 || !mi.installName.empty()
                 || !mi.bindNow
                 || mi.codeSignatureSize != 0
-                || mi.codeSignature.has_value()
-                || mi.buildVersion.has_value();
+                || mi.codeSignature.has_value();
             if (anySet) {
                 fail("/image",
                      "Mach-O MH_OBJECT format must NOT declare an "
@@ -769,7 +809,10 @@ public:
                      "dylinkerPath / loadDylibs / installName / bindNow / "
                      "codeSignatureSize / codeSignature live only in "
                      "MH_EXECUTE / MH_DYLIB images. Set macho.filetype = 2 "
-                     "(MH_EXECUTE) if this schema describes an executable.");
+                     "(MH_EXECUTE) if this schema describes an executable. "
+                     "('image.buildVersion' is the ONE exception — "
+                     "LC_BUILD_VERSION is legal in a relocatable object and "
+                     "the MH_OBJECT walker emits it.)");
             }
         } else {
             // Image flavors: MH_EXECUTE and MH_DYLIB (c153, D-LK3-3).

@@ -10,6 +10,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -65,10 +66,10 @@ struct Lowered {
         std::shared_ptr<TargetSchema> customTarget = nullptr) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
@@ -6243,7 +6244,7 @@ TEST(MirToLir, F128SoftcallDoesNotClobberDoubleLiveAcrossCall) {
 TEST(MirToLir, LongDoubleComplexArithmeticLowersOnX87Axis) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(loaded.has_value());
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(
         "long double _Complex ga;\n"
         "long double _Complex gb;\n"
@@ -6252,7 +6253,8 @@ TEST(MirToLir, LongDoubleComplexArithmeticLowersOnX87Axis) {
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     // The X87_80 long-double axis (elf-x86_64) — the typeSpecifiers row resolves
     // `long double _Complex` to complex(F80).
-    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
+                         DataModel::Lp64, std::nullopt, std::nullopt,
                          std::nullopt, std::nullopt, LongDoubleFormat::X87_80);
     ASSERT_FALSE(model.hasErrors())
         << "the DECLARATION tier must accept long double _Complex on the x87 axis: "

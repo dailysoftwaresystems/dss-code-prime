@@ -32,6 +32,7 @@
                                           // note on why it lives in `core`)
 #include "link/object_format_schema.hpp"  // ObjectFormatSchema::loadShipped (AP3 format-gate integration)
 #include "program/program.hpp"          // Program, routesToMultiUnit
+#include "host_native_target.hpp"       // hostNativeTarget (build-and-spawn on EVERY leg)
 #include "run_binary.hpp"               // runBinary (behavioral exit-code proof)
 #include "scratch_dir.hpp"
 
@@ -39,8 +40,11 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>                       // std::snprintf (JSON control-char escaping)
+#include <cstdlib>                      // std::atoi (the build-hook fixture's exit-code arg)
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <optional>
 #include <span>
 #include <string>
@@ -685,6 +689,735 @@ TEST(ProjectConfigLoader, UnknownKeyStillRejectedAndMessageNamesStackReserve) {
         << "the message must quote the offending typo; got: " << m;
     EXPECT_NE(m.find("stackReserve"), std::string::npos)
         << "the recognized-fields list must name the new key; got: " << m;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// LOADER TIER — OPTIONAL `preBuildScripts` / `postBuildScripts` / `dependsOn`,
+// the `$`-documentation carve-out, and the drift-proof recognized-field pin.
+//
+// Scope note: these are PARSER pins only. The loader spawns nothing, resolves
+// nothing, and touches no filesystem — argv words and dependency paths are
+// kept VERBATIM exactly as `sources[]` is. The lanes that spawn/resolve own
+// those behaviours and their own tests.
+//
+// Every fail-loud path below carries the SAME three-sided assertion:
+//   (a) the expected code is present EXACTLY once,
+//   (b) the other plausible code (C_MissingField — these are all *Malformed*
+//       shapes, not absent required fields) is ABSENT, and
+//   (c) the TOTAL error count is exactly one — no diagnostic noise, and no
+//       second reject riding along that would mask a wrong first one.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── `preBuildScripts` / `postBuildScripts` — happy paths ────────────────────
+
+// FULL STRUCT EQUALITY, not "it parsed": the argv words must survive in ORDER
+// and VERBATIM (a loader that re-split, trimmed, or shell-quoted them would
+// still "parse"), and `runOn` must be empty exactly when the member is absent.
+// RED-ON-DISABLE for the whole feature: delete the two readOptionalScripts
+// calls in parseProjectConfig and this pin goes red on empty vectors.
+TEST(ProjectConfigLoader, ScriptArraysPopulatedParseToExactStructs) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
+      "preBuildScripts": [
+        {"run": ["bash", "gen.sh"], "runOn": ["linux", "darwin"]},
+        {"run": ["python3", "-c", "one argv word, spaces and all"]}
+      ],
+      "postBuildScripts": [
+        {"run": ["pwsh", "-File", "pack.ps1"], "runOn": ["windows"]}
+      ]
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    std::vector<ScriptEntry> const expectedPre = {
+        ScriptEntry{{"bash", "gen.sh"}, {"linux", "darwin"}},
+        // `runOn` ABSENT ⇒ empty ⇒ runs on EVERY platform (the unfiltered
+        // default). The argv element containing spaces and quotes must arrive
+        // as ONE word — the whole reason `run` is a vector and not a string.
+        ScriptEntry{{"python3", "-c", "one argv word, spaces and all"}, {}},
+    };
+    EXPECT_EQ(pc->preBuildScripts, expectedPre);
+
+    std::vector<ScriptEntry> const expectedPost = {
+        ScriptEntry{{"pwsh", "-File", "pack.ps1"}, {"windows"}},
+    };
+    EXPECT_EQ(pc->postBuildScripts, expectedPost);
+}
+
+// All three new fields ABSENT ⇒ EMPTY, never an error. This is the shape of
+// essentially every manifest in the tree, so it must stay perfectly silent.
+TEST(ProjectConfigLoader, ScriptAndDependencyFieldsAbsentAreEmptyNotAnError) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(kValidJson, "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(pc->preBuildScripts, std::vector<ScriptEntry>{});
+    EXPECT_EQ(pc->postBuildScripts, std::vector<ScriptEntry>{});
+    EXPECT_EQ(pc->dependsOn, std::vector<DependencyEntry>{});
+}
+
+// A present-but-empty `[]` ⇒ empty, NO diagnostic — declaring no hooks and no
+// dependencies explicitly is not a mistake (same allowance as the flag arrays).
+TEST(ProjectConfigLoader, ScriptAndDependencyEmptyBracketsAllowedNoDiagnostic) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": [], "postBuildScripts": [], "dependsOn": []
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(pc->preBuildScripts, std::vector<ScriptEntry>{});
+    EXPECT_EQ(pc->postBuildScripts, std::vector<ScriptEntry>{});
+    EXPECT_EQ(pc->dependsOn, std::vector<DependencyEntry>{});
+}
+
+// ── `preBuildScripts` / `postBuildScripts` — fail-loud paths ────────────────
+
+// A hook with no command is not a hook. RED-ON-DISABLE: drop the
+// `e.contains("run")` guard and this parses to an entry that spawns nothing.
+TEST(ProjectConfigLoader, ScriptEntryMissingRunFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": [{"runOn": ["linux"]}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' entry [0] is missing required "
+              "member 'run'");
+}
+
+// `"run": []` is shape-legal JSON but names no executable — rejected rather
+// than normalized to a silent no-op entry.
+TEST(ProjectConfigLoader, ScriptEntryEmptyRunArrayFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": [{"run": []}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' entry [0] member 'run' must "
+              "contain at least one entry (run[0] is the executable to spawn)");
+}
+
+// A number where an argv WORD belongs. The element index is in the message —
+// with a long argv, "somewhere in run" is not actionable.
+TEST(ProjectConfigLoader, ScriptEntryNonStringRunElementFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": [{"run": ["bash", 7]}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' entry [0] member 'run' element "
+              "[1] must be a string");
+}
+
+// An EMPTY argv word is never meaningful: as run[0] it spawns nothing, and as
+// an argument it hands the child a blank parameter it will almost certainly
+// misread. Rejected, never silently dropped from the vector.
+TEST(ProjectConfigLoader, ScriptEntryEmptyStringRunElementFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": [{"run": ["bash", ""]}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' entry [0] member 'run' element "
+              "[1] must be a non-empty string");
+}
+
+// ── THE UNPRINTABLE WORD ───────────────────────────────────────────────────
+//
+// JSON permits an escaped U+0000 and nlohmann stores the resulting byte in the
+// `std::string`, so `is_string()` is true and the non-empty check above passes
+// it: until the loader grew a NUL guard, a `run` word carrying one was a VALID
+// manifest. ✔MEASURED by reverting that guard (see RED-ON-DISABLE below):
+// the parse succeeds and the entry lands with the NUL sitting inside the word.
+//
+// What the OS then does with that word is not what the file says. An argv word
+// crosses the exec boundary as a NUL-TERMINATED C string, so POSIX `execv`
+// truncates it and Windows ends the whole command line at the NUL — silently
+// discarding EVERY LATER ARGUMENT. The hook still runs, plausibly exits 0, and
+// the build goes green having executed something other than what was declared.
+// That is the failure shape with no diagnostic attached to it anywhere.
+//
+// The JSON below is a NON-raw C++ literal precisely so the DOUBLED backslash
+// reaches the parser as the six-character JSON escape: the subject is what the
+// LOADER does with a NUL, not what the C++ compiler does with one.
+//
+// RED-ON-DISABLE: delete the NUL guard in `stringArrayMember` and this parses
+// CLEAN — `pc.has_value()` true, zero diagnostics.
+TEST(ProjectConfigLoader, ScriptEntryRunWordWithEmbeddedNulFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(
+        "{\"language\": \"c-subset\", \"artifactProfile\": \"cli\","
+        " \"targets\": [\"t:f\"], \"sources\": [\"a.c\"],"
+        " \"preBuildScripts\": [{\"run\": [\"gen\", \"--out=a\\u0000b\"]}]}",
+        "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+
+    std::string const m =
+        firstMessageForCode(rep, DiagnosticCode::C_MalformedJson);
+    EXPECT_EQ(m,
+              "p.json: field 'preBuildScripts' entry [0] member 'run' element "
+              "[1] contains an embedded NUL byte (not echoed — a NUL is "
+              "unprintable). A manifest word is read as a C string the moment "
+              "it is used: an argv word is handed to the OS NUL-terminated, so "
+              "this word would reach the program truncated on POSIX and would "
+              "end the whole command line on Windows, silently dropping every "
+              "argument after it.");
+    // Stated apart from the equality because it is the contract, not the
+    // wording: the message must not carry the offending byte. A diagnostic
+    // holding a raw NUL truncates in whatever reads it next, so the two
+    // INDICES are the entire locator the author is left with.
+    EXPECT_EQ(m.find('\0'), std::string::npos)
+        << "the diagnostic echoed the unprintable word back at the user";
+}
+
+// `run[0]` is the PROGRAM, and there a NUL does not mangle an argument — it
+// selects a DIFFERENT EXECUTABLE, because the name resolves as its prefix, so
+// the build would spawn a program the manifest does not name. Pinned on the
+// SECOND field as well, which must name ITSELF: one reader serves both.
+TEST(ProjectConfigLoader, ScriptEntryRunProgramWithEmbeddedNulFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(
+        "{\"language\": \"c-subset\", \"artifactProfile\": \"cli\","
+        " \"targets\": [\"t:f\"], \"sources\": [\"a.c\"],"
+        " \"postBuildScripts\": [{\"run\": [\"pack\\u0000-signed\"]}]}",
+        "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'postBuildScripts' entry [0] member 'run' element "
+              "[0] contains an embedded NUL byte (not echoed — a NUL is "
+              "unprintable). A manifest word is read as a C string the moment "
+              "it is used: an argv word is handed to the OS NUL-terminated, so "
+              "this word would reach the program truncated on POSIX and would "
+              "end the whole command line on Windows, silently dropping every "
+              "argument after it.");
+}
+
+// The CLOSED entry key set. A mistyped `"runon"` would otherwise silently
+// discard the platform filter and run a linux-only script on Windows.
+TEST(ProjectConfigLoader, ScriptEntryUnknownMemberFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": [{"run": ["bash", "gen.sh"], "runon": ["linux"]}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' entry [0] has unknown member "
+              "'runon' (recognized members: run, runOn)");
+}
+
+// `"runOn": []` means "run nowhere" — which is what DELETING the entry says,
+// more clearly. The degenerate spelling rejects rather than aliasing, and the
+// message states the ACTUAL way to mean "everywhere" (omit the member).
+TEST(ProjectConfigLoader, ScriptEntryEmptyRunOnArrayFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": [{"run": ["bash", "gen.sh"], "runOn": []}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' entry [0] member 'runOn' must "
+              "contain at least one platform token when present — omit the "
+              "member to run on every platform");
+}
+
+// THE headline guard. `"macos"` is the natural guess and matches NO host, so
+// an accepting loader yields a post-build step that silently never runs. The
+// message must name BOTH the offending token AND the full vocabulary — a
+// reject that does not say the right spelling just moves the guessing.
+// RED-ON-DISABLE: drop the isValidRunOnToken loop and this parses clean.
+TEST(ProjectConfigLoader, ScriptEntryInvalidRunOnTokenFailsLoudNamingTokenAndVocabulary) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "postBuildScripts": [{"run": ["pack.sh"], "runOn": ["linux", "macos"]}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    std::string const m =
+        firstMessageForCode(rep, DiagnosticCode::C_MalformedJson);
+    // Full equality — the index, the token, and the vocabulary, all pinned.
+    EXPECT_EQ(m,
+              "p.json: field 'postBuildScripts' entry [0] member 'runOn' "
+              "element [1] has unknown platform token 'macos' (recognized: "
+              "windows, linux, darwin)");
+    // Stated separately because these two are the CONTRACT, independent of any
+    // future rewording around them.
+    EXPECT_NE(m.find("'macos'"), std::string::npos)
+        << "the message must name the offending token; got: " << m;
+    EXPECT_NE(m.find("windows, linux, darwin"), std::string::npos)
+        << "the message must list runOnTokenList(); got: " << m;
+}
+
+// A non-string `runOn` element cannot be a token at all — caught before the
+// token check, with its own message.
+TEST(ProjectConfigLoader, ScriptEntryNonStringRunOnElementFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": [{"run": ["gen.sh"], "runOn": [true]}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' entry [0] member 'runOn' "
+              "element [0] must be a string");
+}
+
+// `"run"` as a shell STRING is the single most likely authoring mistake, and
+// it must reject rather than be split by this loader — see the ScriptEntry
+// header note (two quoting dialects, one manifest).
+TEST(ProjectConfigLoader, ScriptEntryRunAsShellStringFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": [{"run": "bash gen.sh"}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' entry [0] member 'run' must be "
+              "an array of non-empty strings (an argv vector: run[0] is the "
+              "executable, spawned directly — never a shell command line)");
+}
+
+// `runOn` as a bare string (rather than an array of tokens).
+TEST(ProjectConfigLoader, ScriptEntryRunOnAsBareStringFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": [{"run": ["gen.sh"], "runOn": "linux"}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' entry [0] member 'runOn' must "
+              "be an array of platform tokens (recognized: windows, linux, "
+              "darwin)");
+}
+
+// The FIELD itself is not an array.
+TEST(ProjectConfigLoader, NonArrayPreBuildScriptsFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "preBuildScripts": "gen.sh"
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' must be an array of "
+              "{\"run\", \"runOn\"} objects");
+}
+
+// The SECOND script field is wired to the SAME validation and names ITSELF in
+// the diagnostic — a reader shared by two fields must not report the wrong one.
+TEST(ProjectConfigLoader, NonArrayPostBuildScriptsFailsLoudNamingItsOwnField) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "postBuildScripts": 42
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'postBuildScripts' must be an array of "
+              "{\"run\", \"runOn\"} objects");
+}
+
+// An ENTRY that is not an object at all (a bare command string in the array —
+// the other natural authoring shortcut).
+TEST(ProjectConfigLoader, ScriptEntryNonObjectFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "preBuildScripts": ["gen.sh"]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'preBuildScripts' entry [0] must be an object "
+              "{\"run\": [...], \"runOn\": [...]}");
+}
+
+// ── `dependsOn` — happy path ────────────────────────────────────────────────
+
+// FULL STRUCT EQUALITY across all three legal shapes: local path, git with a
+// pinned ref, git without one. Values are kept VERBATIM — a loader that
+// normalized `"../libfoo"` or parsed the URL would fail this.
+TEST(ProjectConfigLoader, DependsOnPopulatedParsesToExactStructs) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
+      "dependsOn": [
+        {"path": "../libfoo"},
+        {"git": "git@github.com:org/bar.git", "ref": "v1.2.0"},
+        {"git": "https://example.invalid/baz.git"}
+      ]
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    std::vector<DependencyEntry> const expected = {
+        DependencyEntry{std::string{"../libfoo"}, std::nullopt, std::nullopt},
+        DependencyEntry{std::nullopt, std::string{"git@github.com:org/bar.git"},
+                        std::string{"v1.2.0"}},
+        DependencyEntry{std::nullopt,
+                        std::string{"https://example.invalid/baz.git"},
+                        std::nullopt},
+    };
+    EXPECT_EQ(pc->dependsOn, expected);
+}
+
+// ── `dependsOn` — fail-loud paths ───────────────────────────────────────────
+
+// EXACTLY ONE source. Two sources for one dependency is ambiguous, and
+// silently preferring one makes the other a no-op the user cannot see.
+TEST(ProjectConfigLoader, DependsOnBothPathAndGitFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "dependsOn": [{"path": "../libfoo", "git": "git@github.com:org/bar.git"}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'dependsOn' entry [0] states both 'path' and "
+              "'git' — a dependency has exactly one source; use 'path' for a "
+              "local checkout or 'git' for a remote one");
+}
+
+// An entry naming no source at all is noise, not a dependency.
+TEST(ProjectConfigLoader, DependsOnNeitherPathNorGitFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "dependsOn": [{}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'dependsOn' entry [0] states neither 'path' nor "
+              "'git' — a dependency needs exactly one source");
+}
+
+// A `ref` on a local `path` has no meaning. Accepting it would SILENTLY IGNORE
+// the revision pin the user wrote — the exact silent-drop class this loader
+// exists to prevent. RED-ON-DISABLE: delete the `dep.ref && !dep.git` branch
+// and this parses clean with the pin discarded.
+TEST(ProjectConfigLoader, DependsOnRefWithoutGitFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "dependsOn": [{"path": "../libfoo", "ref": "v1.2.0"}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'dependsOn' entry [0] states 'ref' without 'git' "
+              "— a ref names a revision in a git remote and has no meaning for "
+              "a local 'path' dependency");
+}
+
+// The CLOSED entry key set: `"url"` is the natural guess for a remote and
+// would otherwise leave an entry that resolves nothing.
+TEST(ProjectConfigLoader, DependsOnUnknownMemberFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "dependsOn": [{"url": "https://example.invalid/baz.git"}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'dependsOn' entry [0] has unknown member 'url' "
+              "(recognized members: path, git, ref)");
+}
+
+// A non-string member value.
+TEST(ProjectConfigLoader, DependsOnNonStringMemberFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "dependsOn": [{"path": ["../libfoo"]}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'dependsOn' entry [0] member 'path' must be a "
+              "string");
+}
+
+// An EMPTY string is present-but-says-nothing: it would slip past the
+// exactly-one-source rule while naming no dependency. Rejected at the member.
+TEST(ProjectConfigLoader, DependsOnEmptyStringMemberFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "dependsOn": [{"git": "git@github.com:org/bar.git", "ref": ""}]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'dependsOn' entry [0] member 'ref' must be a "
+              "non-empty string");
+}
+
+// The FIELD itself is not an array.
+TEST(ProjectConfigLoader, NonArrayDependsOnFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "dependsOn": {"path": "../libfoo"}
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'dependsOn' must be an array of {\"path\"} or "
+              "{\"git\", \"ref\"} objects");
+}
+
+// An ENTRY that is not an object (a bare path string — the natural shortcut,
+// deliberately NOT accepted: unlike `resolveLibraries`, a bare string here
+// could not distinguish a local path from a git URL).
+TEST(ProjectConfigLoader, DependsOnNonObjectEntryFailsLoud) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "dependsOn": ["../libfoo"]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: field 'dependsOn' entry [0] must be an object "
+              "{\"path\": …} or {\"git\": …, \"ref\": …}");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ✅ D-AP2-PROJECT-MANIFEST-REJECTS-COMMENT-KEY — CLOSED here.
+//
+// ✔MEASURED before the fix: a `--project` manifest carrying `$comment` was
+// REJECTED with `unknown field '$comment' (recognized fields: …)`, while
+// shipped FFI descriptors ACCEPT `$comment` and the convention is documented
+// for them — the same `$`-prefixed convention blessed in one schema and
+// required-absent in its sibling. The cost was that a project manifest could
+// not carry its own provenance.
+//
+// The fix routes the top-level (and every nested) closed-key check through
+// `dss::detail::isDocumentationKey`, the SHARED `$`-prefix predicate the
+// grammar / target / format loaders already use — deliberately broader than a
+// `$comment`-only carve-out, which would still reject `$sourcesComment` and
+// re-open the inconsistency for the next annotation someone writes.
+// ════════════════════════════════════════════════════════════════════════════
+
+// The closure pin: `$`-prefixed documentation keys parse CLEAN, at the top
+// level, and the real fields around them are unaffected.
+// RED-ON-DISABLE: remove the `isDocumentationKey` skip in `firstUnknownKey`
+// and this immediately reds with C_MalformedJson on `$comment`.
+TEST(ProjectConfigLoader, DollarPrefixedDocumentationKeysParseClean) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "$comment": "these CLI builds are --project builds, not harness-leg builds",
+      "language": "c-subset",
+      "artifactProfile": "cli",
+      "$sourcesComment": "pinned sqlite vintage 3.45.0",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"],
+      "sources": ["main.c"],
+      "output": "dist/myprog"
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // The prose keys are SKIPPED, not absorbed — every real field still lands.
+    EXPECT_EQ(pc->language, "c-subset");
+    EXPECT_EQ(pc->artifactProfile, "cli");
+    EXPECT_EQ(pc->targets, std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"});
+    EXPECT_EQ(pc->sources, std::vector<std::string>{"main.c"});
+    ASSERT_TRUE(pc->output.has_value());
+    EXPECT_EQ(*pc->output, "dist/myprog");
+}
+
+// The carve-out is a WIDENING BY ONE CONVENTION, not a relaxation: a plain
+// (non-`$`) typo still fails loud, exactly as before. This is the guard that
+// stops the anchor closure from becoming an open key set.
+TEST(ProjectConfigLoader, NonDollarTypoStillFailsLoudAfterCommentCarveOut) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "comment": "no leading $ — this is an ordinary unknown key",
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"]
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_NE(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson)
+                  .find("unknown field 'comment'"),
+              std::string::npos);
+}
+
+// The same carve-out reaches every NESTED closed key set in this loader. A
+// nested set that still rejected `$comment` would just reinstate the anchor
+// one level down — the annotation a user most wants to write is next to the
+// entry it explains, not only at the root.
+TEST(ProjectConfigLoader, DollarPrefixedKeysAlsoAcceptedInsideEveryNestedEntry) {
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"],
+      "resolveLibraries": [
+        {"$comment": "stand-in; real soname stated below",
+         "path": "libfoo.so", "importName": "libfoo.so.1"}
+      ],
+      "preBuildScripts": [
+        {"$comment": "regenerates the amalgamation", "run": ["bash", "gen.sh"]}
+      ],
+      "dependsOn": [
+        {"$comment": "sibling checkout during development", "path": "../libfoo"}
+      ]
+    })", "p.json", rep);
+    ASSERT_TRUE(pc.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(pc->resolveLibraries.size(), 1u);
+    EXPECT_EQ(pc->resolveLibraries[0].path, "libfoo.so");
+    EXPECT_EQ(pc->resolveLibraries[0].declaredImportName, "libfoo.so.1");
+    EXPECT_EQ(pc->preBuildScripts,
+              (std::vector<ScriptEntry>{ScriptEntry{{"bash", "gen.sh"}, {}}}));
+    EXPECT_EQ(pc->dependsOn,
+              (std::vector<DependencyEntry>{DependencyEntry{
+                  std::string{"../libfoo"}, std::nullopt, std::nullopt}}));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// THE DRIFT-PROOF PIN.
+//
+// The recognized-field list used to be hand-written TWICE — the `kKnownKeys`
+// table the check loops over, and a string literal inside the "unknown field"
+// message — with NOTHING asserting the two agreed. The silent direction is the
+// dangerous one: a key added to the table but not to the message leaves a user
+// staring at a reject whose remediation list omits the field they need.
+//
+// The message is now DERIVED from the table, and this test reads the REAL
+// table through `projectConfigKnownKeys()` rather than re-typing it —
+// re-typing the list here would simply recreate the drift one layer out.
+// ════════════════════════════════════════════════════════════════════════════
+TEST(ProjectConfigLoader, UnknownKeyMessageIsDerivedFromTheRealKnownKeyTable) {
+    // (1) The joined list is EXACTLY the exported table, joined. Built by
+    //     iterating the accessor — no literal list anywhere in this test.
+    std::string expectedList;
+    for (std::string_view k : projectConfigKnownKeys()) {
+        if (!expectedList.empty()) expectedList += ", ";
+        expectedList += k;
+    }
+    EXPECT_EQ(projectConfigKnownKeyList(), expectedList);
+
+    // (2) Non-degeneracy. Without this, an accessor returning an EMPTY span
+    //     would satisfy (1) and (3) trivially while the message listed nothing.
+    //     Bumping this number is the intended, visible cost of adding a key.
+    EXPECT_EQ(projectConfigKnownKeys().size(), 13u);
+    for (std::string_view k : projectConfigKnownKeys()) {
+        EXPECT_FALSE(k.empty()) << "a zero-filled table entry would whitelist "
+                                   "the empty key (DSS_CHECK_KEY_VOCABULARY)";
+    }
+
+    // (3) The diagnostic is that list, verbatim — FULL equality, not a
+    //     substring probe. A key present in the table but missing from the
+    //     message (the old silent drift) reds here.
+    DiagnosticReporter rep;
+    auto pc = parseProjectConfig(R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["t:f"], "sources": ["a.c"], "preBuildScript": []
+    })", "p.json", rep);
+    EXPECT_FALSE(pc.has_value());
+    ASSERT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 0u);
+    EXPECT_EQ(rep.errorCount(), 1u);
+    EXPECT_EQ(firstMessageForCode(rep, DiagnosticCode::C_MalformedJson),
+              "p.json: unknown field 'preBuildScript' (recognized fields: "
+                  + expectedList + ")");
 }
 
 // ── Predicate: artifactProfileSupported ─────────────────────────
@@ -2430,3 +3163,623 @@ TEST(CompileProjectGlob, OverlappingLiteralAndGlobDedupByNormalizedPath) {
         << "the deduped union (main.c once + other.c once) links + runs → 42";
 }
 #endif  // host-native exec (Windows or Linux-x86_64)
+
+// ════════════════════════════════════════════════════════════════════════════
+// BUILD-LIFECYCLE HOOKS + `dependsOn`, at the `compileProject` SEAM TIER
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `tests/program/test_build_scripts.cpp` already pins the RUNNER — no shell,
+// manifest order, stop-at-first-failure, the `runOn` host filter, and the two
+// remediation-distinct failure codes. NONE of that is re-tested here. What this
+// section pins is the thing the runner cannot know about itself: WHERE IN
+// `Program::compileProject` IT IS CALLED, and what the driver does with the
+// answer. Every defect in that wiring is invisible to a runner-tier test and
+// most of them are invisible to a diagnostic-counting test too:
+//
+//   * PRE-BUILD HOOKS CALLED BELOW THE GLOB EXPANSION. Every existing pin stays
+//     green — the hook still runs, the codes are still right — while the single
+//     most common use of the feature (generate the sources, then compile them)
+//     becomes impossible, because expansion is fail-loud on zero matches and
+//     would kill the build one statement before the generator ran. Only a test
+//     that GENERATES a source and then RUNS the resulting program can tell the
+//     two orderings apart.
+//   * POST-BUILD HOOKS RUN AFTER A FAILED COMPILE. The build already returns
+//     non-zero, so an rc assertion cannot see it. Only the ABSENCE of the
+//     hook's marker file distinguishes "skipped" from "ran and was ignored" —
+//     and the difference is a deploy step firing on a build that failed.
+//   * A POST-BUILD FAILURE SWALLOWED INTO exit 0. The artifact exists, the
+//     compile really did succeed, and every artifact-existence assertion passes;
+//     only the rc says the packaging step failed. CI reads the rc.
+//   * `dependsOn` ACCEPTED AND IGNORED. The greenest possible failure: the
+//     manifest declares a prerequisite, the loader validates it, the driver
+//     never reads it, and the build reports success for an artifact missing the
+//     thing its author said it needs.
+//
+// ── THE FIXTURE MECHANISM: SELF-SPAWN ───────────────────────────────────────
+//
+// These pins need a hook program that (a) exits with a chosen status and
+// (b) optionally CREATES A FILE AT A PATH RELATIVE TO ITS OWN WORKING
+// DIRECTORY. The repo's established answer to "a test needs a fixture program"
+// is to re-exec the TEST BINARY ITSELF with a private flag its `main`
+// intercepts ahead of gtest — `tests/test_support/test_run_binary_capture.cpp`
+// and `tests/program/test_build_scripts.cpp` both do it, and the reasoning is
+// recorded at length in the latter: no external dependency (Windows has no
+// `/bin/echo`), no new build target (hence no `$<TARGET_FILE:…>` define, no
+// `add_dependencies` edge, and no row in the two `tools/check-orphan-tests`
+// twins), and an EXACT path via `argv[0]`.
+//
+// The RELATIVE write path is not a convenience — it is half the subject. A
+// pre-build hook that writes `generated/main.c` and a manifest that reads
+// `generated/*.c` agree only if the hook's working directory is the same base
+// the glob resolves against. Handing the fixture an absolute path would make
+// the test pass under a driver that spawned hooks in any directory at all.
+//
+// The protocol is POSITIONAL: `argv[1]` is the exit-code flag (and is what
+// `main` recognises to enter fixture mode), `argv[2]` the optional write-path
+// flag, `argv[3]` the file's contents. A scan would let a payload that happens
+// to start with a flag prefix be swallowed.
+
+namespace {
+
+constexpr std::string_view kHookExitFlag  = "--dss-project-hook-exit=";
+constexpr std::string_view kHookWriteFlag = "--dss-project-hook-write=";
+
+// Fixture-side protocol violations return codes in the 90s so a broken FIXTURE
+// can never be mistaken for the SUBJECT misbehaving: each surfaces as a
+// `D_ScriptExitedNonZero` naming the status, and no pin below expects one.
+constexpr int kHookMalformedExit  = 90;
+constexpr int kHookMalformedWrite = 91;
+constexpr int kHookMissingContent = 92;
+constexpr int kHookMkdirFailed    = 93;
+constexpr int kHookWriteFailed    = 94;
+
+// FIXTURE MODE. Optionally writes `argv[3]` to the path in `argv[2]` —
+// RESOLVED AGAINST THIS PROCESS'S OWN WORKING DIRECTORY, which is the property
+// under test — then exits with the status in `argv[1]`.
+int runHookFixture(int argc, char** argv) {
+    std::string const exitText{
+        std::string_view{argv[1]}.substr(kHookExitFlag.size())};
+    if (exitText.empty()) return kHookMalformedExit;
+    for (char const c : exitText) {
+        if (c < '0' || c > '9') return kHookMalformedExit;
+    }
+    int const requestedExit = std::atoi(exitText.c_str());
+
+    if (argc >= 3) {
+        std::string_view const writeArg{argv[2]};
+        if (writeArg.substr(0, kHookWriteFlag.size()) != kHookWriteFlag) {
+            return kHookMalformedWrite;
+        }
+        std::filesystem::path const target{
+            std::string{writeArg.substr(kHookWriteFlag.size())}};
+        if (target.empty()) return kHookMalformedWrite;
+        if (argc < 4) return kHookMissingContent;
+
+        // A real generator creates its own output directory; so does this one,
+        // which is why `generated/` need not pre-exist in the manifest's tree.
+        if (!target.parent_path().empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(target.parent_path(), ec);
+            if (ec) return kHookMkdirFailed;
+        }
+        std::ofstream out{target, std::ios::binary | std::ios::trunc};
+        if (!out) return kHookWriteFailed;
+        out << argv[3];
+        out.flush();
+        if (!out) return kHookWriteFailed;
+    }
+    return requestedExit;
+}
+
+// This test executable as an ABSOLUTE path, in GENERIC (forward-slash) form.
+// Generic matters twice over: the string is interpolated into JSON, where a
+// Windows `\` would be read as an escape introducer, and `CreateProcess`
+// accepts forward slashes in a path just as happily as backslashes.
+std::string selfExecutableForJson() {
+    auto const& argvs = ::testing::internal::GetArgvs();
+    if (argvs.empty()) return {};
+    std::error_code ec;
+    std::filesystem::path const abs =
+        std::filesystem::absolute(std::filesystem::path{argvs[0]}, ec);
+    return (ec ? std::filesystem::path{argvs[0]} : abs).generic_string();
+}
+
+// JSON string quoting. Three classes of character have to be handled and ALL
+// THREE occur in the payloads below, which is why this is not the two-line
+// version it looks like it should be:
+//   * `\` — a Windows path interpolated into the manifest (the self-executable
+//     is emitted in generic form, but a temp root can still surprise us);
+//   * `"` — defensive; no current payload carries one;
+//   * CONTROL CHARACTERS, and specifically `\n`. The generated C source ends in
+//     a newline, and a RAW newline inside a JSON string is ILL-FORMED (RFC 8259
+//     §7 excludes U+0000–U+001F). Omitting this arm does not produce a subtly
+//     wrong manifest — it produces one the loader rejects outright, so every
+//     hook pin would red with `C_MalformedJson` instead of the behaviour under
+//     test, and the message would point at the test's own scaffolding.
+//     ✔MEASURED: caught exactly that way, by round-tripping these manifests
+//     through a strict JSON parser before trusting them.
+std::string jsonQuote(std::string_view s) {
+    std::string out = "\"";
+    for (char const c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20u) {
+                    // Any other control byte, spelled the one way JSON allows.
+                    char buf[7];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned>(
+                                      static_cast<unsigned char>(c)));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+                break;
+        }
+    }
+    out += '"';
+    return out;
+}
+
+// One `preBuildScripts` / `postBuildScripts` entry spawning this binary in
+// fixture mode. `writeTarget` empty ⇒ the hook only exits.
+std::string hookEntryJson(int exitCode,
+                          std::string_view writeTarget = {},
+                          std::string_view contents    = {}) {
+    std::string json = "{\"run\": [" + jsonQuote(selfExecutableForJson())
+                     + ", " + jsonQuote(std::string{kHookExitFlag}
+                                        + std::to_string(exitCode));
+    if (!writeTarget.empty()) {
+        json += ", " + jsonQuote(std::string{kHookWriteFlag}
+                                 + std::string{writeTarget});
+        json += ", " + jsonQuote(contents);
+    }
+    json += "]}";
+    return json;
+}
+
+// A manifest with the OPTIONAL keys emitted only when non-empty — an omitted
+// key and a present `[]` are two distinct inputs, and both are pinned below.
+std::string hookManifest(std::string_view targetSpec,
+                         std::string_view sourcesArrayJson,
+                         std::string_view preArrayJson       = {},
+                         std::string_view postArrayJson      = {},
+                         std::string_view dependsOnArrayJson = {}) {
+    std::string m = "{\n  \"language\": \"c-subset\",\n";
+    m += "  \"artifactProfile\": \"cli\",\n";
+    m += "  \"targets\": [" + jsonQuote(targetSpec) + "],\n";
+    m += "  \"sources\": " + std::string{sourcesArrayJson};
+    if (!preArrayJson.empty()) {
+        m += ",\n  \"preBuildScripts\": " + std::string{preArrayJson};
+    }
+    if (!postArrayJson.empty()) {
+        m += ",\n  \"postBuildScripts\": " + std::string{postArrayJson};
+    }
+    if (!dependsOnArrayJson.empty()) {
+        m += ",\n  \"dependsOn\": " + std::string{dependsOnArrayJson};
+    }
+    m += "\n}";
+    return m;
+}
+
+// The format half of a `<target>:<format>` spec — the `<outputDir>/<format>/`
+// subdir a PROJECT build always routes its artifact through.
+std::string formatOf(std::string_view targetSpec) {
+    auto const colon = targetSpec.find(':');
+    return std::string{targetSpec.substr(colon + 1)};
+}
+
+// A fixed cross-target used by every pin that does NOT spawn its output. DSS
+// cross-emits, so these stay live on every leg of the matrix.
+constexpr std::string_view kHookElfSpec = "x86_64:elf64-x86_64-linux-exec";
+
+}  // namespace
+
+// ── 0. The fixture itself, so a fixture failure names itself ────────────────
+// Without this, a lost `argv[0]` turns every pin below into a
+// `D_ScriptSpawnFailed`, which reads as "the driver cannot spawn hooks" when
+// the truth is "the test could not find its own fixture".
+TEST(CompileProjectHooks, TheHookFixtureIsThisExecutable) {
+    auto const self = selfExecutableForJson();
+    ASSERT_FALSE(self.empty()) << "could not recover argv[0] from gtest";
+    ASSERT_TRUE(std::filesystem::path{self}.is_absolute())
+        << "argv[0] was not made absolute: " << self;
+    ASSERT_TRUE(std::filesystem::exists(self))
+        << "argv[0] does not resolve to a file: " << self;
+}
+
+// ── 1. ★ THE LOAD-BEARING PIN: a pre-build hook GENERATES the source ────────
+//
+// The manifest names NO source that exists when the build starts: `sources` is
+// `["generated/*.c"]` and `generated/` is not even a directory yet. The
+// pre-build hook creates `generated/main.c` — at a path relative to ITS OWN
+// working directory — and only then does expansion have anything to match.
+// The produced binary is SPAWNED and its exit code compared against the one
+// the generated source returns, so nothing short of "the generated bytes were
+// compiled and executed" can satisfy this.
+//
+// Built for the HOST's native target (`host_native_target.hpp`) so the pin
+// stays LIVE on every leg rather than being `#if`-ed out on three of them —
+// a test that spawns its own output must build for the machine it runs on.
+//
+// RED-ON-DISABLE, and this is THE seam-ORDER lever: move the
+// `runBuildScripts(pc.preBuildScripts, …)` call in `Program::compileProject`
+// to BELOW the glob-expansion block (or delete it) and this test reds at the
+// `ASSERT_EQ(rc, 0)` with `D_FileNotFound` — "glob pattern 'generated/*.c'
+// matched no files" — because the generator never ran. No other pin in this
+// file or in `test_build_scripts.cpp` notices that move.
+TEST(CompileProjectHooks, PreBuildScriptGeneratesSourceThatCompilesAndRuns) {
+    using dss::test_support::hostNativeTarget;
+    using dss::test_support::Location;
+    using dss::test_support::runBinary;
+    using dss::test_support::ScratchDir;
+
+    // A DISTINCTIVE status — not 0 (which a do-nothing binary also returns) and
+    // not 42 (the value every other pin in this file uses, so a copy-paste
+    // could not have produced it by accident).
+    constexpr std::uint32_t kGeneratedExit = 57;
+    // Derived from the constant, never re-typed: a hand-written `57` in the
+    // source could drift from the asserted value and turn the strongest pin in
+    // this file into one that compares two unrelated numbers.
+    std::string const generatedSource =
+        "int main(void){ return " + std::to_string(kGeneratedExit) + "; }\n";
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    std::string const spec{hostNativeTarget().execTarget};
+
+    std::string const manifest = hookManifest(
+        spec,
+        R"(["generated/*.c"])",
+        "[" + hookEntryJson(0, "generated/main.c", generatedSource) + "]");
+    auto const proj = dir / "gen.dss-project.json";
+    writeText(proj, manifest);
+
+    // The hook's `generated/main.c` and the manifest's `generated/*.c` are BOTH
+    // relative — they name the same file only if the hook is spawned in the
+    // process working directory, which is what `useAsCwd` makes the scratch dir.
+    scratch.useAsCwd();
+    ASSERT_FALSE(std::filesystem::exists(dir / "generated"))
+        << "the generated tree must NOT exist before the build — otherwise the "
+           "hook has nothing to prove";
+
+    Program prog;
+    prog.setOutputDir(dir);
+    DiagnosticReporter rep;
+    int const rc = prog.compileProject(proj.string(), rep);
+    ASSERT_EQ(rc, 0)
+        << "the pre-build hook must run BEFORE the sources[] glob is expanded, "
+           "so the source it generates is there to be matched";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 0u)
+        << "a zero-match glob here means the hook ran too late (or not at all)";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ScriptSpawnFailed), 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ScriptExitedNonZero), 0u);
+
+    ASSERT_TRUE(std::filesystem::exists(dir / "generated" / "main.c"))
+        << "the hook did not write its source where the manifest looks for it";
+
+    auto const exe = dir / formatOf(spec)
+                   / dss::test_support::hostExeArtifact("main");
+    ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
+    auto const r = runBinary(exe);
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_FALSE(r.timedOut) << r.diagnostic;
+    EXPECT_EQ(r.exitCode, kGeneratedExit)
+        << "the GENERATED source returns 57 — this exit code is the proof that "
+           "the bytes the hook wrote are the bytes that were compiled and run";
+}
+
+// ── 2. Ordering proof, NEGATIVE direction (host-agnostic) ───────────────────
+//
+// The mirror of pin 1, and it needs no compiler backend at all, so it holds the
+// seam-order line on every leg including the ones pin 1's spawn depends on.
+// The manifest is doubly broken: the pre-build hook FAILS, and `sources` names
+// a glob that matches nothing. Exactly one of those two can be reported first,
+// and WHICH one identifies the seam order unambiguously.
+//
+// THREE-SIDED on purpose: the script code exactly once, `D_FileNotFound`
+// exactly zero times, and a non-zero rc. Counting only the script code would
+// pass under a driver that reported BOTH.
+//
+// RED-ON-DISABLE: move the pre-build call below the expansion → the counts
+// swap (D_FileNotFound 1, D_ScriptExitedNonZero 0) and both EXPECTs red.
+TEST(CompileProjectHooks, FailingPreBuildScriptReportsBeforeGlobExpansion) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    std::string const manifest = hookManifest(
+        kHookElfSpec,
+        R"(["never-generated/*.c"])",          // a glob that matches nothing
+        "[" + hookEntryJson(3) + "]");         // a hook that fails
+    auto const proj = dir / "order.dss-project.json";
+    writeText(proj, manifest);
+    scratch.useAsCwd();
+
+    Program prog;
+    prog.setOutputDir(dir);
+    DiagnosticReporter rep;
+    EXPECT_EQ(prog.compileProject(proj.string(), rep), 1);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ScriptExitedNonZero), 1u)
+        << "the pre-build hook runs first, so ITS failure is the one reported";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 0u)
+        << "the zero-match glob must never be reached — reporting it would mean "
+           "the expansion ran ahead of the hook";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ScriptSpawnFailed), 0u)
+        << "the fixture IS spawnable; a spawn failure here is a broken fixture";
+}
+
+// ── 3. A post-build hook RUNS after a successful compile ────────────────────
+//
+// The positive half, and pin 4 is VACUOUS without it: "the hook did not run
+// when the compile failed" is trivially satisfied by a driver that never runs
+// post-build hooks at all. Host-agnostic (a cross-emitted ELF, never spawned).
+TEST(CompileProjectHooks, PostBuildScriptRunsAfterSuccessfulCompile) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "main.c", "int main(void){ return 0; }\n");
+    std::string const manifest = hookManifest(
+        kHookElfSpec, R"(["main.c"])", /*pre=*/{},
+        "[" + hookEntryJson(0, "post-ran.txt", "ran\n") + "]");
+    auto const proj = dir / "post-ok.dss-project.json";
+    writeText(proj, manifest);
+    scratch.useAsCwd();
+
+    Program prog;
+    prog.setOutputDir(dir);
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0);
+    EXPECT_TRUE(std::filesystem::exists(dir / formatOf(kHookElfSpec) / "main"));
+    EXPECT_TRUE(std::filesystem::exists(dir / "post-ran.txt"))
+        << "a successful compile must be followed by the post-build hooks";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ScriptExitedNonZero), 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ScriptSpawnFailed), 0u);
+}
+
+// ── 4. A FAILING post-build hook fails the build — and KEEPS the artifact ───
+//
+// BOTH assertions carry weight and neither can be dropped:
+//   * `rc == 1` is the one that CI reads. A driver that reported the diagnostic
+//     and returned the compile's 0 would look identical in every other respect,
+//     and the next pipeline stage would ship an unpackaged build.
+//   * `exists(artifact)` is what proves the compile genuinely SUCCEEDED before
+//     the hook ran. Without it this test would also pass if the post-build hook
+//     had somehow run after a failed compile — i.e. it would be measuring
+//     nothing about the gate at all.
+//
+// RED-ON-DISABLE: `return rc;` unconditionally (drop the post-build result) →
+// the rc assertion reds while the artifact assertion stays green.
+TEST(CompileProjectHooks, PostBuildScriptFailureFailsBuildButKeepsArtifact) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "main.c", "int main(void){ return 0; }\n");
+    std::string const manifest = hookManifest(
+        kHookElfSpec, R"(["main.c"])", /*pre=*/{},
+        "[" + hookEntryJson(5) + "]");     // ran, said no
+    auto const proj = dir / "post-fail.dss-project.json";
+    writeText(proj, manifest);
+    scratch.useAsCwd();
+
+    Program prog;
+    prog.setOutputDir(dir);
+    DiagnosticReporter rep;
+    EXPECT_EQ(prog.compileProject(proj.string(), rep), 1)
+        << "a failing post-build hook must fail the BUILD — exit 0 here would "
+           "tell CI the project is ready to ship";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ScriptExitedNonZero), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ScriptSpawnFailed), 0u);
+    EXPECT_TRUE(std::filesystem::exists(dir / formatOf(kHookElfSpec) / "main"))
+        << "the artifact is KEPT: the compile really did succeed, and its bytes "
+           "are still correct — its presence is what proves the hook ran AFTER "
+           "a successful build rather than instead of one";
+}
+
+// ── 5. Post-build hooks do NOT run when the compile FAILED ──────────────────
+//
+// The marker file's ABSENCE is the whole test. The hook here exits 0, so it
+// would add no diagnostic and change no rc if it ran — a build that packaged
+// and deployed the previous run's binary would look, from every other angle,
+// exactly like this one.
+//
+// RED-ON-DISABLE: drop the `rc == 0 &&` guard → the marker appears.
+TEST(CompileProjectHooks, PostBuildScriptSkippedWhenCompileFails) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    // Real source, real compile, real failure: `nosuchtype` is undeclared.
+    writeText(dir / "main.c", "int main(void){ return nosuchtype; }\n");
+    std::string const manifest = hookManifest(
+        kHookElfSpec, R"(["main.c"])", /*pre=*/{},
+        "[" + hookEntryJson(0, "post-ran.txt", "ran\n") + "]");
+    auto const proj = dir / "post-skip.dss-project.json";
+    writeText(proj, manifest);
+    scratch.useAsCwd();
+
+    Program prog;
+    prog.setOutputDir(dir);
+    DiagnosticReporter rep;
+    EXPECT_NE(prog.compileProject(proj.string(), rep), 0)
+        << "the source does not compile — the build must fail";
+    EXPECT_FALSE(std::filesystem::exists(dir / "post-ran.txt"))
+        << "a post-build hook must NOT run after a failed compile: packaging or "
+           "deploying here would operate on a stale or absent artifact";
+    EXPECT_FALSE(std::filesystem::exists(dir / formatOf(kHookElfSpec) / "main"))
+        << "sanity: the failed compile emitted no artifact";
+}
+
+// ── 6. `dependsOn` non-empty FAILS LOUD ─────────────────────────────────────
+//
+// Exact code, exact count, no artifact — and, additionally, the pre-build hook
+// must NOT have run: a build the driver is about to refuse must not first write
+// files into the author's tree. That third assertion is what pins the reject
+// AHEAD of the hook seam rather than merely somewhere before the compile.
+//
+// RED-ON-DISABLE: delete the `if (!pc.dependsOn.empty())` block → the build
+// proceeds, the count goes to 0, the marker appears and the artifact is emitted
+// — i.e. the silent no-op this reject exists to prevent, caught three ways.
+TEST(CompileProjectHooks, NonEmptyDependsOnFailsLoudBeforeAnythingRuns) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "main.c", "int main(void){ return 0; }\n");
+    std::string const manifest = hookManifest(
+        kHookElfSpec, R"(["main.c"])",
+        "[" + hookEntryJson(0, "pre-ran.txt", "ran\n") + "]",
+        /*post=*/{},
+        R"([{"path": "../libfoo"}])");
+    auto const proj = dir / "deps.dss-project.json";
+    writeText(proj, manifest);
+    scratch.useAsCwd();
+
+    Program prog;
+    prog.setOutputDir(dir);
+    DiagnosticReporter rep;
+    EXPECT_EQ(prog.compileProject(proj.string(), rep), 1)
+        << "a declared dependency the driver cannot resolve must REFUSE the "
+           "build, not silently build without it";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_PlanNotLanded), 1u);
+    EXPECT_FALSE(std::filesystem::exists(dir / formatOf(kHookElfSpec) / "main"))
+        << "nothing may be produced for a refused build";
+    EXPECT_FALSE(std::filesystem::exists(dir / "pre-ran.txt"))
+        << "the reject precedes the pre-build hooks — a build that cannot "
+           "happen must not have side effects on the way to saying so";
+}
+
+// The message must be ACTIONABLE, not just coded: it names the feature key and
+// says outright that driver support has not landed. (red-on-disable: reword the
+// diagnostic to bare prose and the finds fail.)
+TEST(CompileProjectHooks, DependsOnRejectMessageNamesTheFeature) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "main.c", "int main(void){ return 0; }\n");
+    writeText(dir / "deps-msg.dss-project.json",
+              hookManifest(kHookElfSpec, R"(["main.c"])", {}, {},
+                           R"([{"git": "git@example.invalid:org/bar.git"}])"));
+    scratch.useAsCwd();
+
+    Program prog;
+    prog.setOutputDir(dir);
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(
+                  (dir / "deps-msg.dss-project.json").string(), rep), 1);
+    ASSERT_EQ(countCode(rep, DiagnosticCode::D_PlanNotLanded), 1u);
+    std::string const m = firstMessageForCode(rep, DiagnosticCode::D_PlanNotLanded);
+    EXPECT_NE(m.find("dependsOn"), std::string::npos)
+        << "the message must name the manifest key; got: " << m;
+    EXPECT_NE(m.find("git@example.invalid:org/bar.git"), std::string::npos)
+        << "the message must name the offending entry; got: " << m;
+}
+
+// ── 7. An EMPTY or ABSENT `dependsOn` is exactly the old behavior ───────────
+//
+// The other polarity, and it is not decoration: a reject implemented as "the
+// key is present" rather than "the list is non-empty" would break every
+// manifest carrying a documented `"dependsOn": []`, and a reject that fired
+// unconditionally would break every project in the corpus. Both spellings must
+// produce a REAL, successful build — not merely "no D_PlanNotLanded".
+TEST(CompileProjectHooks, EmptyAndAbsentDependsOnBuildNormally) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    // (a) present but EMPTY.
+    {
+        ScratchDir scratch{Location::InsideRepo, "program"};
+        auto const dir = scratch.path();
+        writeText(dir / "main.c", "int main(void){ return 0; }\n");
+        writeText(dir / "empty-deps.dss-project.json",
+                  hookManifest(kHookElfSpec, R"(["main.c"])", {}, {}, "[]"));
+        scratch.useAsCwd();
+        Program prog;
+        prog.setOutputDir(dir);
+        DiagnosticReporter rep;
+        ASSERT_EQ(prog.compileProject(
+                      (dir / "empty-deps.dss-project.json").string(), rep), 0)
+            << R"("dependsOn": [] declares no prerequisite — it must build)";
+        EXPECT_EQ(countCode(rep, DiagnosticCode::D_PlanNotLanded), 0u);
+        EXPECT_TRUE(
+            std::filesystem::exists(dir / formatOf(kHookElfSpec) / "main"));
+    }
+    // (b) ABSENT — the overwhelmingly common manifest.
+    {
+        ScratchDir scratch{Location::InsideRepo, "program"};
+        auto const dir = scratch.path();
+        writeText(dir / "main.c", "int main(void){ return 0; }\n");
+        writeText(dir / "no-deps.dss-project.json",
+                  hookManifest(kHookElfSpec, R"(["main.c"])"));
+        scratch.useAsCwd();
+        Program prog;
+        prog.setOutputDir(dir);
+        DiagnosticReporter rep;
+        ASSERT_EQ(prog.compileProject(
+                      (dir / "no-deps.dss-project.json").string(), rep), 0);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::D_PlanNotLanded), 0u);
+        EXPECT_TRUE(
+            std::filesystem::exists(dir / formatOf(kHookElfSpec) / "main"));
+    }
+}
+
+// ── 8. NO hooks declared ⇒ byte-for-byte the pre-hook behavior ──────────────
+//
+// The regression floor for the whole feature: a manifest with none of the three
+// keys must reach exactly the same outcome it did before the seams existed —
+// a successful build, an artifact on disk, and NOT ONE diagnostic from any of
+// the new codes. `runBuildScripts` returns true vacuously on an empty list, so
+// the only way this reds is a seam that fabricated work out of an empty vector.
+TEST(CompileProjectHooks, NoHooksDeclaredLeavesTheBuildUnchanged) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "main.c", "int main(void){ return 0; }\n");
+    writeText(dir / "plain.dss-project.json",
+              hookManifest(kHookElfSpec, R"(["main.c"])"));
+    scratch.useAsCwd();
+
+    Program prog;
+    prog.setOutputDir(dir);
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(
+                  (dir / "plain.dss-project.json").string(), rep), 0);
+    EXPECT_TRUE(std::filesystem::exists(dir / formatOf(kHookElfSpec) / "main"));
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ScriptSpawnFailed), 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ScriptExitedNonZero), 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_PlanNotLanded), 0u);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "a hook-less project build must emit nothing at all";
+}
+
+// ── The fixture-mode entry point ────────────────────────────────────────────
+//
+// `argv[1]` is inspected BEFORE `InitGoogleTest`, which would otherwise reject
+// the unknown flag. The check is on the FIRST argument only (the protocol is
+// positional), so no gtest invocation and no payload argument can be mistaken
+// for it. Defining `main` here suppresses the `GTest::gtest_main` archive
+// member entirely — the same arrangement `tests/program/test_build_scripts.cpp`
+// uses, for the same reason.
+int main(int argc, char** argv) {
+    if (argc >= 2 && std::string_view{argv[1]}.substr(0, kHookExitFlag.size())
+                         == kHookExitFlag) {
+        return runHookFixture(argc, argv);
+    }
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

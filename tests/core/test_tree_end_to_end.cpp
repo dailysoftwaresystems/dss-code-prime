@@ -1,3 +1,4 @@
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -148,7 +149,7 @@ TEST(TreeEndToEnd, HappyPath_SingleVarDecl_PrintsExpectedTree) {
     auto h = tokenizeShipped("var x : int = y;");
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         driveVarDecl(b, h.stream, *h.schema);
@@ -185,7 +186,7 @@ TEST(TreeEndToEnd, HappyPath_FuncDef_PrintsExpectedTree) {
     auto h = tokenizeShipped("func f() -> int { y; }");
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         driveFuncDef(b, h.stream, *h.schema);
@@ -224,7 +225,7 @@ TEST(TreeEndToEnd, HappyPath_MultipleStatements_PrintsExpectedTree) {
     auto h = tokenizeShipped("var x : int = a; func f() -> int { y; } var w : int = b;");
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         driveVarDecl(b, h.stream, *h.schema);
@@ -304,7 +305,7 @@ TEST(TreeEndToEnd, HappyPath_DirectRuleLookupResolvesOnRealParse) {
     auto h = tokenizeShipped("var x : int = a; func f() -> int { y; } var w : int = b;");
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         driveVarDecl(b, h.stream, *h.schema);
@@ -360,7 +361,7 @@ TEST(TreeEndToEnd, BrokenPath_UnknownTokenRecovered) {
     ASSERT_NE(h.schema, nullptr);
     h.dismissLexerDiags();   // `@` triggers P_IllegalChar on purpose
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
@@ -396,7 +397,7 @@ TEST(TreeEndToEnd, BrokenPath_UnclosedScopesAtEof) {
     auto h = tokenizeShipped("var x");
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
 
     // Guards held in a heap vector and dropped after finish() — otherwise
     // their destructors would close the frames before finish() sees them.
@@ -419,7 +420,7 @@ TEST(TreeEndToEnd, BrokenPath_TruncatedAfterKeyword) {
     auto h = tokenizeShipped("var");
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto guards = std::make_unique<std::vector<TreeBuilder::OpenScope>>();
     guards->push_back(b.open(h.schema->rules().find("root")));
     guards->push_back(b.open(h.schema->rules().find("statement")));
@@ -447,7 +448,7 @@ TEST(TreeEndToEnd, BrokenPath_PushErrorRecovered) {
     ASSERT_NE(h.schema, nullptr);
     h.dismissLexerDiags();   // `?` triggers P_IllegalChar on purpose
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         auto stmt = b.open(h.schema->rules().find("statement"));
@@ -501,7 +502,7 @@ TEST(TreeEndToEnd, BrokenPath_PopScopeUnderflow) {
     auto h = tokenizeShipped("}");
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(h.stream.advance());

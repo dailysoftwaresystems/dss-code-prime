@@ -6,6 +6,7 @@
                                                 // with the manifest surface)
 #include "program/input_resolver.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -195,6 +196,55 @@ struct DSS_EXPORT CliArgs {
     bool                          warningsAsErrors = false;
     std::vector<DiagnosticCode>   suppress;
 
+    // `--max-diagnostics <count>` / `--max-diagnostics=<count>`: the run-wide
+    // GLOBAL diagnostic cap — `DiagnosticReporter::Config::maxDiagnostics`.
+    // Once the reporter has accumulated this many, it stops accumulating and
+    // starts COUNTING: one `P_TooManyDiagnostics` marker carries the limit and
+    // the running dropped total (`DiagnosticReporter::noteCapDrop_`). This flag
+    // is the operator's half of that marker's remedy sentence — before it
+    // existed the notice could only name a C++ field no CLI user can reach.
+    //
+    // ★ std::optional, and the nullopt arm is the WHOLE POINT: absent means
+    // "do not write the field at all", so `DiagnosticReporter::Config`'s own
+    // in-class initializer stays the SINGLE source of truth for the default.
+    // Spelling the default here — as a literal, or even as a copy of
+    // `Config{}.maxDiagnostics` — would create the second place it is written
+    // down, which is the exact drift this flag exists to make visible. The
+    // `--help` text derives the number it prints from `Config{}` for the same
+    // reason. Mirrors `stackReserveBytes` above (absent = the downstream
+    // default stands).
+    //
+    // ★ ZERO IS LEGAL, and that is a decision about what `report()` DOES, not
+    // a matter of taste. The gate is `all_.size() >= cfg_.maxDiagnostics` on
+    // unsigned operands, so at 0 the first cap-eligible report trips the cap,
+    // is counted, and is replaced by the marker — no crash, no fatal path
+    // (`noteCapDrop_` pushes the marker BEFORE it counts, so its
+    // `capMarkerIndex_ >= all_.size()` guard holds), and no undefined corner.
+    // The result is coherent and otherwise unobtainable: "print no diagnostics,
+    // just tell me how many there were". Nor can 0 silence what must never be
+    // silenced — `DiagnosticDelivery::Guaranteed` and `kUnsuppressableCodes`
+    // bypass the cap at EVERY value, 0 included. And 0 is not a sentinel for
+    // anything here (absence is nullopt), which is precisely the difference
+    // from `--jobs 0`: there 0 IS the AUTO sentinel, so accepting it would
+    // silently reinterpret an explicit request, and that is why THAT flag
+    // rejects it. Rejecting 0 here would instead make the CLI a narrower,
+    // disagreeing source of truth about a domain the library already defines.
+    //
+    // ⚠ CONSEQUENCE THE OPERATOR SHOULD KNOW, inherent to the cap at any finite
+    // value rather than to 0: the `P_TooManyDiagnostics` marker is ERROR
+    // severity, so a cap small enough to trip turns an otherwise-clean run into
+    // a failing one. That is the cap working — the run genuinely cannot be
+    // certified clean once its own report of the elision is the loudest thing
+    // in the stream — not a defect of this flag.
+    //
+    // ✔MEASURED, so the docblock does not overstate the reach: this value lands
+    // on the run-wide AGGREGATION reporter only. Every compile phase runs
+    // against a scratch reporter whose cap `runCusToTargets` / `compileOneTarget`
+    // explicitly relax to SIZE_MAX, so `--max-diagnostics` does NOT change what
+    // `HirVerifier` / `MirVerifier` observe through `hitCap()` — their reporters
+    // are uncappable by construction on every CLI path.
+    std::optional<std::size_t>    maxDiagnostics;
+
     // `--time` prints the compilation's wall-clock duration to stderr after the
     // compile finishes (any compile-producing mode). Diagnostic-neutral, off by
     // default; `--time` with no mode flag is a hard NoModeSelected error.
@@ -266,6 +316,15 @@ enum class CliArgsError : std::uint8_t {
                                 // an empty name would record an unresolvable
                                 // DT_NEEDED. A value with NO `=` at all is the
                                 // plain form and is NOT an error.
+    InvalidMaxDiagnostics = 16, // --max-diagnostics with a non-numeric value,
+                                // trailing junk, or a count that overflows
+                                // std::size_t. ZERO IS NOT AN ERROR — see the
+                                // `CliArgs::maxDiagnostics` docblock for why
+                                // `report()` defines it. Deliberately its OWN
+                                // enumerator rather than InvalidSuppressCode:
+                                // the two share only the word "diagnostic",
+                                // and the remediation differs completely
+                                // ("write a number" vs "spell the code name").
 };
 
 [[nodiscard]] DSS_EXPORT std::string_view
@@ -291,5 +350,65 @@ parseCliArgs(int argc, char* argv[]);
 // here so the test harness can pin its content stable across CLI
 // extensions.
 [[nodiscard]] DSS_EXPORT std::string cliHelpText();
+
+// Project a parsed `CliArgs` onto the `DiagnosticReporter::Config` the driver
+// hands to every compile-producing entry point (`compileProject` /
+// `transpile` / `compileDirectory` / `compileFiles` / `compileUnits`). Carries
+// `--warnings-as-errors`, `--suppress=<code>` and `--max-diagnostics=<count>`.
+//
+// Lives HERE, beside the parser that produces its input, rather than as a
+// file-local helper in `program.cpp` where it started. It is a pure projection
+// of `CliArgs` — no Program state, no I/O, no ordering — and being reachable
+// is what lets a test drive argv → CliArgs → Config through the SHIPPED code
+// instead of re-typing the config by hand, which would be a pin over a stub
+// rather than over the projection.
+//
+// Absent `--max-diagnostics` deliberately leaves `Config::maxDiagnostics`
+// UNWRITTEN so the struct's own in-class initializer supplies the default;
+// there is no second spelling of that number anywhere in the driver.
+[[nodiscard]] DSS_EXPORT DiagnosticReporter::Config
+buildReporterConfig(CliArgs const& args);
+
+// Build the run's `DiagnosticReporter` from that projection — and, in the
+// same breath, TELL THE OPERATOR about any `--suppress=<code>` request the
+// reporter is about to ignore (`D_SuppressRequestIgnored`, one per refused
+// code, carrying the code's recorded rationale). The build then proceeds
+// normally: the request is refused, not the compilation.
+//
+// ★ WHY THIS FUNCTION EXISTS AT ALL — the emit site is forced, and the
+// forcing is worth writing down because two closer-looking sites are wrong.
+//
+//   * NOT `parseSuppressCode` / `parseCliArgs`. There is no reporter there
+//     and there cannot be one: `parseCliArgs` returns
+//     `std::unexpected(error)` and runs to completion BEFORE any
+//     `DiagnosticReporter` exists. A warning emitted at parse time would
+//     need an arg-parser-private channel or a bespoke `std::cerr` write —
+//     i.e. a second diagnostic system, exempt from `--suppress`,
+//     `--warnings-as-errors`, the cap and the dedup window. The whole point
+//     of this diagnostic is that it is ORDINARY.
+//
+//   * NOT `DiagnosticReporter`'s constructor, which looks like the perfect
+//     chokepoint and is a trap. ✔MEASURED: `program.cpp` builds per-target
+//     and per-pair SCRATCH reporters by CLONING the live config
+//     (`auto scratchCfg = rep.config();`, likewise `pairCfg`), and
+//     `compilation_unit.cpp` does the same per CU. Emitting from the
+//     constructor would therefore re-announce the same refusal once per
+//     target × per CU — and those clones deliberately set `dedupWindow = 0`
+//     and an unbounded `maxPerCode`, so nothing would collapse the
+//     duplicates and `mergeWithTargetContext` would carry every one of them
+//     into the run-wide reporter. On a 100-TU build that is a hundred copies
+//     of one line.
+//
+// So the emit belongs where a reporter is FIRST built FROM the CLI's own
+// projection, exactly once per invocation. That is here — the five
+// `Config`-taking entry-point overloads in `program.cpp` (`compileProject`,
+// `transpile`, `compileDirectory`, `compileFiles`, `compileUnits`) exist
+// precisely to turn a `Config` into a reporter, and they are the ONLY way
+// `--suppress` reaches one; their `DiagnosticReporter&`-taking siblings take
+// a reporter the caller already owns and never see a `Config`. Routing all
+// five through this one function keeps the emit single-sited while covering
+// every path that honours `--suppress`.
+[[nodiscard]] DSS_EXPORT DiagnosticReporter
+buildReporter(DiagnosticReporter::Config const& cfg);
 
 } // namespace dss

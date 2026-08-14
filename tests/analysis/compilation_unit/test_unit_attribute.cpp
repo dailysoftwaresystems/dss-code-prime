@@ -6,6 +6,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/compilation_unit/unit_attribute.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree.hpp"
@@ -304,7 +305,7 @@ TEST(UnitAttributeDeathTest, DuplicateTreeIdInUnitAborts) {
         return std::move(builder).finish(root);
     };
 
-    UnitBuilder unitBuilder{cu_test::loadToySchema()};
+    UnitBuilder unitBuilder{cu_test::loadToySchema(), DiagnosticBudget::libraryDefault()};
     unitBuilder.addTree(makeTaggedTree());
     unitBuilder.addTree(makeTaggedTree());   // both carry TreeId{777}
     auto cu = std::move(unitBuilder).finish();

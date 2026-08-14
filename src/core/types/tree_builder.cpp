@@ -139,11 +139,11 @@ TreeId TreeBuilder::nextTreeId() noexcept {
 
 TreeBuilder::TreeBuilder(std::shared_ptr<SourceBuffer>        src,
                         std::shared_ptr<GrammarSchema const> schema,
-                        DiagnosticReporter::Config           diagConfig,
+                        DiagnosticBudget                     budget,
                         BuilderConfig                        builderConfig)
     : source_(std::move(src))
     , schema_(std::move(schema))
-    , reporter_(std::make_unique<DiagnosticReporter>(std::move(diagConfig)))
+    , reporter_(std::make_unique<DiagnosticReporter>(budget.asConfig()))
     , treeId_(nextTreeId())
     , arena_(treeId_)   // emplaces the slot-0 sentinel; stamps treeId_ on every id
     // walker_ embeds the SchemaWalker state machine. The `[this]`-

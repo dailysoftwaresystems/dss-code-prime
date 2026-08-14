@@ -23,6 +23,24 @@ dss_add_test(NAME link/test_crosscu_link_formats SOURCES test_crosscu_link_forma
 dss_add_test(NAME link/test_elf_writer           SOURCES test_elf_writer.cpp)
 dss_add_test(NAME link/test_pe_writer            SOURCES test_pe_writer.cpp)
 dss_add_test(NAME link/test_macho_writer         SOURCES test_macho_writer.cpp)
+
+# D-LK-MACHO-STB-LOCAL-LD64-RUNTIME-WITNESS — the ld64 half of
+# D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION. Two DSS-emitted
+# Mach-O relocatable objects, each defining the SAME internal-linkage `_sym_7`,
+# linked by Apple's own linker and RUN. `test_macho_writer.cpp`'s n_type pin
+# proves DSS writes bare N_SECT; only ld64 can prove ld64 accepts it, and the
+# exit code (20 from TU A's helper + 22 from TU B's) additionally discriminates
+# "kept module-private" from "silently folded into one".
+#
+# TWO TIERS IN ONE FILE, deliberately sharing one object builder: a
+# host-independent nlist+relocation structural pin that runs on EVERY leg (the
+# always-on guard, the `test_macho_arm64_exit` precedent) plus the Darwin-only
+# runtime witness. The runtime tier never skips silently — it records an
+# `ArmVerdict` (structural off-Darwin, ENVIRONMENTAL when a Mac has no linker,
+# which DSS_STRICT_ARM_VERDICTS=1 promotes to a red) and prints the ledger line
+# on every host.
+dss_add_test(NAME link/test_macho_ld64_local_collision
+             SOURCES test_macho_ld64_local_collision.cpp)
 dss_add_test(NAME link/test_macho_chained_fixups SOURCES test_macho_chained_fixups.cpp)
 dss_add_test(NAME link/test_string_table         SOURCES test_string_table.cpp)
 dss_add_test(NAME link/test_elf_exec_writer      SOURCES test_elf_exec_writer.cpp)

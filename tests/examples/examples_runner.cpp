@@ -7,6 +7,18 @@
 // artifact, spawn-failure, timeout, or wrong-exit-code all break
 // the test loud.
 //
+// PROJECT MODE (D-EXAMPLES-RUNNER-PROJECT-MANIFEST): a manifest may name a
+// `.dss-project.json` via the top-level `"project"` key INSTEAD of
+// `source`/`sources`, and the build then goes through
+// `Program::compileProject` — the only driver entry point that expands the
+// manifest's source GLOBS and runs its `preBuildScripts`/`postBuildScripts`
+// hooks. Three consequences are handled explicitly and are documented at their
+// sites: the project manifest's own `targets[]` is the build authority (a
+// corpus target's `spec` is a MIRROR, cross-checked); the artifact lands under
+// a per-format subdirectory; and the compile must run with the mirrored scratch
+// dir as the PROCESS working directory, because that is what a generated source
+// resolves against. The CLI-subprocess sibling implements the same three.
+//
 // User invariant (verbatim, 2026-06-02): "please don't forget to
 // perform strict asserts on the example harness run results....
 // this is important". Hence ASSERT_EQ on every observable, never
@@ -77,6 +89,7 @@ using ::dss::test_support::ArmVerdictLedger;
 using ::dss::test_support::currentHostArch;
 using ::dss::test_support::currentHostOs;
 using ::dss::test_support::findOnPath;
+using ::dss::test_support::qemuSysrootHint;
 using ::dss::test_support::specTargetArch;
 
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): one PREREQUISITE artifact a
@@ -182,6 +195,35 @@ struct ExpectedDiagnostic {
 struct ExampleManifest {
     std::string                  language;
     std::string                  source;
+    // D-EXAMPLES-RUNNER-PROJECT-MANIFEST: PROJECT MODE. Present ⇒ this example is
+    // built by `Program::compileProject` from the named `.dss-project.json` (a
+    // path relative to the example dir) instead of by `compileFiles`/
+    // `compileUnits` over `source`/`sources`. MUTUALLY EXCLUSIVE with both of
+    // those (readManifest fails loud on the ambiguity) because the two spellings
+    // answer the same question — WHAT DOES THIS EXAMPLE COMPILE — and a manifest
+    // that answers it twice has one answer silently ignored.
+    //
+    // ★ WHY THE KEY IS TOP-LEVEL AND THE PER-TARGET `spec` BECOMES A MIRROR.
+    // `Program::compileProject` takes NO targets argument: the
+    // `.dss-project.json`'s own `targets[]` is the authority, so a corpus
+    // target's `spec` CANNOT drive a project build. Two shapes were available:
+    //   (a) ONE project manifest per corpus target, named from the target entry.
+    //       Each would carry a single-element `targets[]`, and the drive/mirror
+    //       problem disappears — but an example would then ship N near-identical
+    //       manifests that re-state the language, the sources and every build
+    //       script N times. `.dss-project.json` is a USER-FACING artifact and a
+    //       real project ships exactly ONE listing all its targets; N copies
+    //       would make the example a demonstration of a harness workaround
+    //       rather than of the feature, and would let the N copies drift.
+    //   (b) ONE project manifest for the example, listing every target, with the
+    //       corpus target entries keeping their existing job — declaring
+    //       `runOn` / `emulator` / `artifact` / per-target overrides for the RUN.
+    // (b) is what this implements. Its one cost is that `spec` no longer drives,
+    // and that cost is paid off rather than tolerated: the runner CROSS-CHECKS
+    // every corpus `spec` against the project manifest's own `targets[]` and
+    // fails loud on a miss, so a stale mirror is caught AT the mirror instead of
+    // surfacing three steps later as a baffling missing artifact.
+    std::optional<std::string>   project;
     // Multi-CU (CU6): "sources":[...] makes each file its OWN CompilationUnit, and the
     // linker MERGES them into one image (Program::compileUnits). The single "source":"x.c"
     // form stays one CU5 multi-file unit (compileFiles). `sources` is the canonical file
@@ -273,8 +315,53 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
     ExampleManifest m;
     m.language = j.value("language", "");
     m.source   = j.value("source", "");
-    // "sources":[...] (multi-CU, CU6) takes precedence over "source" (single CU5 unit).
-    if (j.contains("sources")) {
+
+    // ── WHAT DOES THIS EXAMPLE COMPILE? EXACTLY ONE SPELLING ANSWERS IT ─────
+    //
+    // Three keys can answer, and declaring two of them is a manifest DEFECT,
+    // not a precedence question:
+    //   * `project`  — a `.dss-project.json` drives the build (PROJECT MODE);
+    //   * `sources`  — an array, one CompilationUnit per file (multi-CU, CU6);
+    //   * `source`   — the single-file form.
+    //
+    // ★ `sources` USED TO "TAKE PRECEDENCE OVER" `source`, which is the polite
+    // spelling of SILENTLY DROPPING ONE OF THEM. MEASURED over the corpus: ZERO
+    // of the 580 manifests declare both, so the precedence rule protected
+    // nothing and only stood ready to swallow a future typo — the author who
+    // renames `source` to `sources` and forgets to delete the old key gets a
+    // green suite compiling a file they no longer meant to compile. Both
+    // runners now reject the pair.
+    bool const hasSource  = j.contains("source");
+    bool const hasSources = j.contains("sources");
+    if (j.contains("project")) {
+        if (!j.at("project").is_string()
+            || j.at("project").get<std::string>().empty()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " 'project' must be a NON-EMPTY string naming a"
+                             " .dss-project.json relative to the example dir";
+            return m;
+        }
+        if (hasSource || hasSources) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " declares BOTH 'project' and '"
+                          << (hasSources ? "sources" : "source")
+                          << "'. A project build's inputs come from the"
+                             " .dss-project.json's own 'sources' (which a"
+                             " preBuildScripts hook may GENERATE), so the"
+                             " expected.json list would be silently ignored —"
+                             " delete one.";
+            return m;
+        }
+        m.project = j.at("project").get<std::string>();
+    }
+    if (hasSource && hasSources) {
+        ADD_FAILURE() << "manifest " << path.generic_string()
+                      << " declares BOTH 'source' and 'sources' — one names a"
+                         " single CU, the other a multi-CU list, and honoring"
+                         " either would silently discard the other. Delete one.";
+        return m;
+    }
+    if (hasSources) {
         if (!j.at("sources").is_array() || j.at("sources").empty()) {
             ADD_FAILURE() << "manifest " << path.generic_string()
                           << " 'sources' must be a non-empty array of file names";
@@ -289,11 +376,20 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
             m.sources.push_back(s.get<std::string>());
         }
         m.multiCu = true;
-    } else if (!m.source.empty()) {
+    } else if (hasSource) {
+        if (!j.at("source").is_string() || m.source.empty()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " 'source' must be a non-empty string";
+            return m;
+        }
         m.sources = {m.source};  // single-CU: the one "source" file
-    } else {
+    } else if (!m.project.has_value()) {
+        // RELAXED, not deleted: a manifest that names NONE of the three still
+        // fails exactly as loudly as it always did. Only the project-mode case
+        // is exempt, and only because its inputs live in the other file.
         ADD_FAILURE() << "manifest " << path.generic_string()
-                      << " requires 'source' (single CU) or 'sources' (multi-CU)";
+                      << " requires 'source' (single CU), 'sources' (multi-CU),"
+                         " or 'project' (a .dss-project.json build)";
         return m;
     }
     // V2-4 Part C: parse the expect-error diagnostics FIRST — their
@@ -330,6 +426,21 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
             }
             m.expectDiagnostics.push_back(std::move(ed));
         }
+    }
+    // PROJECT MODE has no expect-error branch, and saying so LOUDLY is the
+    // point: `runErrorTarget` reads `m.sources.front()`, which a project
+    // manifest never populates. Rejecting the combination in the PARSER means
+    // the unsupported shape is named where the author can fix it, rather than
+    // reaching an assertion on an empty vector.
+    if (m.project.has_value() && !m.expectDiagnostics.empty()) {
+        ADD_FAILURE() << "manifest " << path.generic_string()
+                      << " declares BOTH 'project' and 'expectDiagnostics'."
+                         " The expect-error path compiles a single named source"
+                         " so a diagnostic's offset maps unambiguously; a"
+                         " project build has no such source. Implement the"
+                         " project-mode expect-error path in BOTH runners"
+                         " before declaring this pair.";
+        return m;
     }
     // exitCode: required for a run example; not for an expect-error one.
     if (j.contains("exitCode")) {
@@ -463,6 +574,155 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
         }
     }
     return m;
+}
+
+// ── PROJECT MODE support ───────────────────────────────────────────────────
+
+// The FORMAT half of a manifest spec ("x86_64:pe64-x86_64-windows-exec" →
+// "pe64-x86_64-windows-exec"). Empty ⇒ the spec carries no ':' and the caller
+// must fail loud rather than compose a wrong path.
+//
+// This is the SUBDIRECTORY a project build routes its artifact into:
+// `Program::compileProject` forces `setPerFormatOutputSubdir(true)`
+// (src/program/program.cpp:1760), so a project artifact lands at
+// `<outDir>/<formatName>/<name><ext>` even for a single-target build, where a
+// `--compile` build would have put it flat at `<outDir>/<name><ext>`.
+//
+// `specFormatName` is the shared `dss::test_support` helper beside its twin
+// `specTargetArch` (arm_verdict_ledger.hpp) — reached via the `using namespace`
+// above. It was briefly duplicated here and in `integrated_tests/runner.cpp`
+// when project mode landed; both copies were folded into the shared header so
+// the two runners cannot disagree about how a spec splits.
+
+// The FACTS this harness needs out of a `.dss-project.json`.
+//
+// ★ DELIBERATELY NOT A SECOND `parseProjectConfig`. The DRIVER owns that parse
+// and fails loud on every structural error in it; a harness that re-validated
+// the file would grow a second opinion about a shape it does not own, and the
+// two would drift. Three questions only, each with a harness-side reason:
+//
+//   * `language` + `targets[]` — what the expected.json entries MIRROR.
+//     `Program::compileProject` takes NO targets argument, so a corpus target's
+//     `spec` cannot DRIVE a project build; cross-checking it here is what keeps
+//     the mirror honest. Without the check, a spec that names a target the
+//     project never builds surfaces three steps later as "artifact missing",
+//     which reads like a codegen defect.
+//   * argv[0] of every APPLICABLE build script — so an absent interpreter is
+//     `SkippedBuildInputMissing` (named, ledgered, and a hard failure under
+//     DSS_STRICT_ARM_VERDICTS=1) rather than a `D_FileNotFound` on a source
+//     glob that matched nothing, which also reads like a compiler defect.
+//
+// Anything malformed here fires ADD_FAILURE and returns nullopt: the caller
+// poisons the arm. A project manifest this harness cannot read is a corpus
+// defect, never a skip.
+struct ProjectFacts {
+    std::string              language;
+    std::vector<std::string> targets;
+    // argv[0] of each pre/post-build script whose `runOn` admits THIS host.
+    std::vector<std::string> applicableScriptPrograms;
+};
+
+[[nodiscard]] std::optional<ProjectFacts>
+readProjectFacts(fs::path const& projectPath) {
+    std::ifstream in(projectPath);
+    if (!in) {
+        ADD_FAILURE() << "cannot open project manifest "
+                      << projectPath.generic_string();
+        return std::nullopt;
+    }
+    nlohmann::json j;
+    try {
+        in >> j;
+    } catch (std::exception const& e) {
+        ADD_FAILURE() << "project manifest " << projectPath.generic_string()
+                      << " JSON parse failed: " << e.what();
+        return std::nullopt;
+    }
+    ProjectFacts f;
+    if (!j.contains("language") || !j.at("language").is_string()) {
+        ADD_FAILURE() << "project manifest " << projectPath.generic_string()
+                      << " needs a string 'language'";
+        return std::nullopt;
+    }
+    f.language = j.at("language").get<std::string>();
+    if (!j.contains("targets") || !j.at("targets").is_array()
+        || j.at("targets").empty()) {
+        ADD_FAILURE() << "project manifest " << projectPath.generic_string()
+                      << " needs a non-empty 'targets' array";
+        return std::nullopt;
+    }
+    for (auto const& t : j.at("targets")) {
+        if (!t.is_string()) {
+            ADD_FAILURE() << "project manifest " << projectPath.generic_string()
+                          << " 'targets' entries must be strings";
+            return std::nullopt;
+        }
+        f.targets.push_back(t.get<std::string>());
+    }
+    // BOTH hook arrays: a post-build script's interpreter is as absent as a
+    // pre-build one's, and a build that runs the compile and then fails to run
+    // its post step is the same environmental fact.
+    auto const host = currentHostOs();
+    for (char const* key : {"preBuildScripts", "postBuildScripts"}) {
+        if (!j.contains(key)) continue;
+        if (!j.at(key).is_array()) {
+            ADD_FAILURE() << "project manifest " << projectPath.generic_string()
+                          << " '" << key << "' must be an array";
+            return std::nullopt;
+        }
+        for (auto const& e : j.at(key)) {
+            if (!e.is_object() || !e.contains("run") || !e.at("run").is_array()
+                || e.at("run").empty() || !e.at("run").at(0).is_string()) {
+                ADD_FAILURE() << "project manifest "
+                              << projectPath.generic_string() << " '" << key
+                              << "' entries need a non-empty string array 'run'";
+                return std::nullopt;
+            }
+            // An ABSENT `runOn` means EVERY host (the driver's own default —
+            // src/program/build_scripts.cpp `appliesToHost`). Reading absent as
+            // "matches nothing" would invert the default and silently exempt
+            // every unfiltered hook from this probe.
+            bool applies = true;
+            if (e.contains("runOn")) {
+                if (!e.at("runOn").is_array()) {
+                    ADD_FAILURE() << "project manifest "
+                                  << projectPath.generic_string() << " '" << key
+                                  << "' entry 'runOn' must be an array";
+                    return std::nullopt;
+                }
+                applies = false;
+                for (auto const& o : e.at("runOn")) {
+                    if (o.is_string() && o.get<std::string>() == host) {
+                        applies = true;
+                    }
+                }
+            }
+            if (applies) {
+                f.applicableScriptPrograms.push_back(
+                    e.at("run").at(0).get<std::string>());
+            }
+        }
+    }
+    return f;
+}
+
+// Is a build script's argv[0] present on THIS machine?
+//
+// Mirrors the contract of the driver's own
+// `dss::substrate::resolveExecutableOnPath` closely enough for a PRESENCE
+// probe: a name carrying a directory separator is taken AS A PATH (no search),
+// anything else is a PATH lookup through the SAME `findOnPath` the emulator
+// gate uses — so the two skip classes cannot disagree about what "missing"
+// means. This is a probe, not a re-implementation: the driver still spawns, and
+// still emits `D_ScriptSpawnFailed` if it is wrong.
+[[nodiscard]] bool buildScriptProgramPresent(std::string const& argv0) {
+    if (argv0.find('/') != std::string::npos
+        || argv0.find('\\') != std::string::npos) {
+        std::error_code ec;
+        bool const there = fs::exists(fs::path{argv0}, ec);
+        return there && !ec;
+    }
+    return !findOnPath(argv0).empty();
 }
 
 // Resolve a list of pass-name strings into an OptPipeline. Fails the
@@ -668,6 +928,92 @@ compileAndRunArm(fs::path const& exampleDir,
     scratch.useAsCwd();
     auto const outDir = scratch.path() / "out";
 
+    // ── PROJECT MODE: resolve + validate the `.dss-project.json` ────────────
+    //
+    // The scratch dir is ALREADY the process cwd (the `useAsCwd()` above), and
+    // that is load-bearing for a project build rather than incidental: the
+    // manifest's `sources[]` globs expand against the PROCESS working directory
+    // (Program::compileProject, D-AP2-SOURCES-GLOB), and a `preBuildScripts`
+    // hook that GENERATES a source writes it into the directory the driver
+    // spawns it in. Both must be this scratch dir, or the generator writes into
+    // one tree and the glob searches another. The CLI-subprocess sibling had to
+    // GROW this (its CwdGuard wrapped only the RUN) — see the note there.
+    fs::path projectPath;
+    if (m.project.has_value()) {
+        projectPath = scratch.path() / *m.project;
+        if (!fs::exists(projectPath)) {
+            ADD_FAILURE() << "manifest 'project' file '" << *m.project
+                          << "' not found in example dir "
+                          << exampleDir.generic_string()
+                          << " — the mirror above copies the example dir's"
+                             " IMMEDIATE files only, so a project manifest in a"
+                             " SUBDIRECTORY needs that loop (and its twin in"
+                             " integrated_tests/runner.cpp) made recursive in"
+                             " the same change";
+            armResult.verdict = ArmVerdict::Poisoned;
+            return armResult;
+        }
+        auto const facts = readProjectFacts(projectPath);
+        if (!facts.has_value()) {  // ADD_FAILURE already fired
+            armResult.verdict = ArmVerdict::Poisoned;
+            return armResult;
+        }
+        // THE MIRROR CHECK. `compileProject` takes no targets argument, so this
+        // `spec` does not drive the build — it declares which of the project's
+        // OWN targets this arm runs, gates `runOn`/`emulator`, and names the
+        // artifact subdirectory. A spec the project never builds must fail HERE.
+        if (std::find(facts->targets.begin(), facts->targets.end(), t.spec)
+            == facts->targets.end()) {
+            std::ostringstream declared;
+            for (auto const& s : facts->targets) declared << "\n    " << s;
+            ADD_FAILURE() << "target spec '" << t.spec
+                          << "' is not declared by the project manifest '"
+                          << *m.project << "'. A project build's targets come"
+                             " from that file, so this arm would assert an"
+                             " artifact nothing was asked to produce."
+                             " The project declares:" << declared.str();
+            armResult.verdict = ArmVerdict::Poisoned;
+            return armResult;
+        }
+        if (!m.language.empty() && m.language != facts->language) {
+            ADD_FAILURE() << "expected.json declares language '" << m.language
+                          << "' but the project manifest '" << *m.project
+                          << "' declares '" << facts->language
+                          << "'. In project mode the project manifest is the"
+                             " authority; the expected.json copy is a mirror and"
+                             " must agree with it.";
+            armResult.verdict = ArmVerdict::Poisoned;
+            return armResult;
+        }
+        if (specFormatName(t.spec).empty()) {
+            ADD_FAILURE() << "target spec '" << t.spec
+                          << "' has no '<arch>:<format>' separator, so the"
+                             " per-format artifact subdirectory a project build"
+                             " routes into cannot be derived";
+            armResult.verdict = ArmVerdict::Poisoned;
+            return armResult;
+        }
+        // ENVIRONMENTAL, and the ONLY skip this mode may produce. A declared
+        // build script whose interpreter this machine does not have is a BUILD
+        // INPUT the manifest asked for and the machine could not supply —
+        // exactly `SkippedBuildInputMissing`. Probed BEFORE the compile so the
+        // ledger says "this box has no <interpreter>" instead of letting the
+        // build fail with a source glob that matched nothing, which names the
+        // compiler for the machine's shortfall.
+        for (auto const& argv0 : facts->applicableScriptPrograms) {
+            if (buildScriptProgramPresent(argv0)) continue;
+            std::ostringstream why;
+            why << "build script program '" << argv0 << "' declared by '"
+                << *m.project << "' is not present on this machine (host="
+                << currentHostOs() << ")";
+            GTEST_LOG_(INFO) << "spec=" << t.spec << " arm=" << armLabel
+                             << ' ' << why.str() << " — skipping build";
+            armResult.verdict = ArmVerdict::SkippedBuildInputMissing;
+            armResult.detail  = why.str();
+            return armResult;
+        }
+    }
+
     // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build each
     // prerequisite LIBRARY artifact FIRST (into the same out dir), recursively
     // building any nested `dependsOn` before it, then thread their paths into
@@ -695,10 +1041,23 @@ compileAndRunArm(fs::path const& exampleDir,
     if (pipelineOverride != nullptr) {
         prog.setOptimizerPipelineOverride(*pipelineOverride);
     }
-    // Multi-CU example → compileUnits (one CU per file, merged at link); single → compileFiles.
-    int const rc = m.multiCu
-        ? prog.compileUnits(srcPaths, m.language, {t.spec}, rep)
-        : prog.compileFiles(srcPaths, m.language, {t.spec}, rep);
+    // PROJECT MODE → compileProject (the manifest supplies language, targets,
+    // sources, flags AND the build-lifecycle hooks — this is the ONLY driver
+    // entry point that runs them). Otherwise: multi-CU example → compileUnits
+    // (one CU per file, merged at link); single → compileFiles.
+    //
+    // ⚠ `{t.spec}` is deliberately NOT passed in the project branch, and there
+    // is nowhere to pass it: `compileProject` has no targets parameter. The arm
+    // therefore builds EVERY target the project declares and asserts only the
+    // one this arm owns — which is why the mirror check above is mandatory. A
+    // pipeline override still applies (it is Program state, read by the
+    // delegated compileFiles/compileUnits), so an `optimizedPipelines` arm
+    // remains meaningful in project mode.
+    int const rc = m.project.has_value()
+        ? prog.compileProject(projectPath.generic_string(), rep)
+        : (m.multiCu
+               ? prog.compileUnits(srcPaths, m.language, {t.spec}, rep)
+               : prog.compileFiles(srcPaths, m.language, {t.spec}, rep));
 
     // Strict compile-side checks. EXPECT_ (not ASSERT_) because the
     // helper is non-void and must hand control back to the caller's
@@ -722,7 +1081,21 @@ compileAndRunArm(fs::path const& exampleDir,
         return armResult;
     }
 
-    auto const artifactPath = outDir / t.artifact;
+    // D-AP2-OUTPUT-ROUTING: a PROJECT build forces `setPerFormatOutputSubdir(true)`
+    // (src/program/program.cpp:1760), so its artifact is at
+    // `<outDir>/<formatName>/<name><ext>`, NOT at `<outDir>/<artifact>`.
+    //
+    // COMPUTED EXPLICITLY rather than absorbed into the manifest string. Writing
+    // the target's `artifact` as `"pe64-x86_64-windows-exec/main.exe"` composes
+    // correctly through `fs::path` and was the cheaper edit — and it would make
+    // `artifact` mean a FILENAME in the 1,930 target entries that carry it today
+    // and a PATH in the project-mode ones, with the routing rule hidden inside a
+    // string that no reader of the manifest can connect to
+    // `setPerFormatOutputSubdir`. One key, one meaning; the runner owns the
+    // routing rule because the runner is what has to know it.
+    auto const artifactPath = m.project.has_value()
+        ? outDir / specFormatName(t.spec) / t.artifact
+        : outDir / t.artifact;
     if (!fs::exists(artifactPath)) {
         ADD_FAILURE() << "artifact missing at " << artifactPath.generic_string()
                       << " (arm=" << armLabel << ")";
@@ -811,6 +1184,45 @@ compileAndRunArm(fs::path const& exampleDir,
         }
         launcherPrefix.push_back(emuPath);
     }
+
+    // ── D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY, closing-work item (2), first half ──
+    //
+    // ⚠ This is a PARTIAL discharge of an OPEN row, not its closure. That row
+    // asks for two things: (1) the harness DERIVES the guest sysroot instead of
+    // inheriting it ambiently, and (2) an exit-255 under an emulator is
+    // CLASSIFIED as an environment failure and quotes the loader line rather
+    // than being presented as an exit-code mismatch. What follows is the cheap,
+    // no-masking half of (2): the mismatch is still reported as a mismatch, but
+    // it now carries the remedy. Full classification still owes the row.
+    //
+    // Being on PATH is not the same as being ABLE TO RUN, and the gap between
+    // those two facts costs an operator an afternoon. `qemu-aarch64` resolves
+    // the guest's ELF interpreter (`/lib/ld-linux-aarch64.so.1`) against the
+    // HOST filesystem unless `QEMU_LD_PREFIX` points at a guest sysroot. On a
+    // box with qemu installed but no sysroot on that path, EVERY emulated arm
+    // dies at exit 255 before the guest's first instruction — so a perfectly
+    // correct binary reds, and it reds ~450 times at once, which reads as a
+    // catastrophic compiler regression rather than a missing package.
+    //
+    // ✔MEASURED 2026-08-12 on this project's WSL leg: a raw `ctest` with
+    // QEMU_LD_PREFIX unset reported 468 of 826 failing; with
+    // `QEMU_LD_PREFIX=/usr/aarch64-linux-gnu` exported, 826 of 826 passed. The
+    // repo already knew — `real-examples/c/sqlite/build-and-test.sh` sets it
+    // per-leg and its own comment says "without it qemu cannot find the guest
+    // loader and EVERY exec dies at exit 255, which would read as 14 DSS
+    // failures on a binary that is completely fine", and notes the variable
+    // "lived for months as an operational workaround rather than as a checked
+    // prerequisite". The ctest corpus runner never got that treatment.
+    //
+    // ★ THIS DELIBERATELY DOES NOT SKIP, SUPPRESS OR AUTO-SET ANYTHING. The
+    // arm still runs and still reds — masking a cross-arch failure is exactly
+    // the workaround the bar forbids, and guessing a sysroot path would be a
+    // host-identity assumption in a harness that has none. It only makes the
+    // red SAY what is most likely wrong. Turning this into a proper
+    // `SkippedLauncherPrerequisiteMissing` verdict needs the guest's PT_INTERP
+    // read out of the artifact and probed; that is the registry row's work.
+    // The remedy text this condition earns is attached where the mismatch is
+    // ASSERTED, in `runOneTarget` — see `qemuSysrootHint` below.
 
     // Model 3: capture stdout when EITHER the manifest-level pin OR this target's
     // override is present (so a per-target override alone still routes the pipe).
@@ -901,7 +1313,8 @@ void runOneTarget(fs::path const&        exampleDir,
     // Baseline strict pins against the manifest (per-target override applied).
     ASSERT_EQ(static_cast<std::int64_t>(baseline.exitCode), effectiveExit)
         << "baseline exit-code mismatch (expected=" << effectiveExit
-        << "; OS=" << baseline.exitCode << ")";
+        << "; OS=" << baseline.exitCode << ")"
+        << qemuSysrootHint(t.spec, t.emulator);
     if (effectiveStdout.has_value()) {
         ASSERT_EQ(baseline.capturedStdout, *effectiveStdout)
             << "baseline stdout mismatch (expected=" << effectiveStdout->size()

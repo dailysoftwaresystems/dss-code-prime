@@ -1,5 +1,7 @@
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/source_buffer.hpp"
+#include "core/types/unsuppressable_codes.hpp"
 // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the caret-width pin below drives a REAL
 // literal through the tokenizer + parser rather than a hand-built span. See the
 // comment on `CaretWidthOverRealStringLiteralCoversTheClosingQuote`.
@@ -11,10 +13,12 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace dss;
 
@@ -195,6 +199,506 @@ TEST(Reporter, GlobalCapEmitsMarkerAndStops) {
     EXPECT_EQ(r.all().size(), 6u);                    // 5 + 1 marker
     EXPECT_TRUE(r.hitCap());
     EXPECT_EQ(r.all().back().code, DiagnosticCode::P_TooManyDiagnostics);
+    // 5 of the 10 never landed: the 6th (which the marker stands in for)
+    // plus reports 7-10. Exact, not a floor — an off-by-one in which
+    // diagnostic the marker replaces is precisely what this catches.
+    EXPECT_EQ(r.droppedByCap(), 5u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE CAP MUST NOT BE ABLE TO TRUNCATE IN SILENCE.
+//
+// ★ WHAT "SILENT" MEANT HERE, because the marker already existed and the
+// defect survived it anyway. The old notice read, in full:
+//
+//     reporter cap of 1000 diagnostics reached; further reports dropped
+//
+// It announces the elision and names the limit, and it is still useless for
+// the decision the operator has to make, because it omits the only two facts
+// that decide it: HOW MANY diagnostics went missing (one? ten thousand?) and
+// WHAT TO CHANGE to see them. Worse, the count is the one number nobody can
+// recover afterwards — a dropped diagnostic leaves nothing behind to count,
+// so if the reporter does not tally at the moment it discards, the
+// information is gone for good. `hitCap_` short-circuited every later report
+// without tallying anything.
+//
+// RED-ON-DISABLE: restore the old one-line `marker.actual` format string and
+// drop the `noteCapDrop_()` calls — the count assertions below fail, and the
+// remedy-substring assertions fail, on the pin's own matchers.
+TEST(Reporter, CapNoticeStatesHowManyWereDroppedAndHowToRaiseTheLimit) {
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 2;
+    cfg.maxPerCode     = 100;
+    cfg.dedupWindow    = 0;
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+
+    // 2 land, the 3rd is replaced by the marker, 4th-10th are eaten.
+    for (uint32_t i = 0; i < 10; ++i) {
+        r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error,
+                          b, i * 10, i * 10 + 1));
+    }
+
+    ASSERT_EQ(r.all().size(), 3u);
+    ASSERT_EQ(r.all().back().code, DiagnosticCode::P_TooManyDiagnostics);
+    EXPECT_EQ(r.droppedByCap(), 8u);
+
+    // ★ THE PIN: the notice's own text, which is what an operator reads.
+    // Full equality, not a substring probe — the count, the limit and the
+    // remedy are all load-bearing and a partial match would let any one of
+    // them regress unnoticed.
+    EXPECT_EQ(r.all().back().actual,
+              "reporter cap of 2 diagnostics reached; 8 further diagnostics "
+              "were dropped and NOT shown. Raise the cap above 2 to see them: "
+              "pass --max-diagnostics=N on the command line, or set "
+              "DiagnosticReporter::Config::maxDiagnostics when embedding.")
+        << "the elision must state its size and its remedy; \"further "
+           "reports dropped\" states neither";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE REMEDY MUST BE ONE THE READER CAN ACT ON.
+//
+// The pin above is byte-exact and therefore already covers this — but it
+// covers it INCIDENTALLY, as one of forty-odd characters in a sentence, so a
+// future rewording that drops the flag while adjusting the same literal in
+// this file would move both together and stay green. This test asserts the
+// PROPERTY separately: whoever the reader is, the notice hands them something
+// they can type or set.
+//
+// Both clauses, because the marker has two audiences and only one of them has
+// a command line: an OPERATOR (the CLI's `--max-diagnostics`, by far the most
+// likely reader) and an EMBEDDER or the LSP (the C++ config field, true for
+// every consumer). Naming only the field was the pre-existing defect — it is a
+// remedy no CLI user can reach; naming only the flag would be the mirror
+// defect for the LSP.
+//
+// RED-ON-DISABLE: drop either clause from `noteCapDrop_`'s format string.
+TEST(Reporter, CapNoticeRemedyNamesBothTheCliFlagAndTheConfigField) {
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 1;
+    cfg.maxPerCode     = 100;
+    cfg.dedupWindow    = 0;
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+
+    r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 0, 1));
+    r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 10, 11));
+    ASSERT_TRUE(r.hitCap());
+
+    auto const& text = r.all().back().actual;
+    EXPECT_NE(text.find("--max-diagnostics"), std::string::npos)
+        << "the remedy must name the CLI flag: an operator at a terminal "
+           "cannot set a C++ config field, and they are the likeliest reader";
+    EXPECT_NE(text.find("DiagnosticReporter::Config::maxDiagnostics"),
+              std::string::npos)
+        << "and it must still name the field: the LSP and embedders have no "
+           "command line, and this string is core-tier";
+
+    // PURE ASCII is a hard constraint, not a preference: no `/utf-8` reaches
+    // MSVC anywhere in this build, so a non-ASCII byte in this literal is a
+    // cross-toolchain encoding flake. Asserted on the produced string rather
+    // than trusted of the source file.
+    for (unsigned char const ch : text) {
+        ASSERT_LT(static_cast<unsigned>(ch), 0x80u)
+            << "cap-notice text must be pure ASCII; got byte value "
+            << static_cast<unsigned>(ch);
+    }
+}
+
+// The count is a RUNNING total, not the value it happened to have when the
+// cap tripped. Pinned separately because the failure mode is specific and
+// invisible to the test above: a rewrite that formats the marker ONCE (at
+// trip time) reports "1 further diagnostic was dropped" no matter how many
+// thousands follow, and every other assertion still passes.
+TEST(Reporter, CapNoticeCountTracksLaterDropsNotJustTheTriggeringOne) {
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 1;
+    cfg.maxPerCode     = 100;
+    cfg.dedupWindow    = 0;
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+
+    r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 0, 1));
+    ASSERT_FALSE(r.hitCap());
+
+    // The report that trips the cap. Singular prose is part of the contract:
+    // "1 further diagnostics were dropped" is the tell of a count spliced
+    // into a fixed sentence.
+    r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 10, 11));
+    ASSERT_TRUE(r.hitCap());
+    EXPECT_EQ(r.droppedByCap(), 1u);
+    EXPECT_EQ(r.all().back().actual,
+              "reporter cap of 1 diagnostics reached; 1 further diagnostic "
+              "was dropped and NOT shown. Raise the cap above 1 to see it: "
+              "pass --max-diagnostics=N on the command line, or set "
+              "DiagnosticReporter::Config::maxDiagnostics when embedding.");
+
+    for (uint32_t i = 2; i < 42; ++i) {
+        r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error,
+                          b, i * 10, i * 10 + 1));
+    }
+    EXPECT_EQ(r.droppedByCap(), 41u);
+    EXPECT_NE(r.all().back().actual.find("41 further diagnostics were dropped"),
+              std::string::npos)
+        << "the marker's count must still be accurate after the drops that "
+           "followed it; a format-once implementation is frozen at 1";
+    // And exactly one marker, however many reports the cap ate.
+    std::size_t markers = 0;
+    for (auto const& d : r.all()) {
+        if (d.code == DiagnosticCode::P_TooManyDiagnostics) ++markers;
+    }
+    EXPECT_EQ(markers, 1u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A CAP OF ZERO IS A DEFINED VALUE, AND THIS IS THE DEFINITION.
+//
+// `--max-diagnostics=0` is accepted by the CLI, and that acceptance is an
+// argument about what `report()` DOES rather than a matter of taste — so the
+// behaviour it rests on is pinned here, at the tier that implements it, and not
+// left as prose in the parser's docblock. The gate is
+// `all_.size() >= cfg_.maxDiagnostics` on unsigned operands: at 0 it is
+// satisfied before anything is stored, so the FIRST cap-eligible report trips
+// the cap, is counted, and is replaced by the marker. No crash, and in
+// particular no `capMarkerFatal` — `noteCapDrop_` pushes the marker BEFORE it
+// counts, so its `capMarkerIndex_ >= all_.size()` guard holds at index 0.
+//
+// The value is therefore coherent and otherwise unobtainable: "show me none,
+// just tell me how many there were". And it is not a hole in the guarantees —
+// `DiagnosticDelivery::Guaranteed` bypasses the cap at 0 exactly as at every
+// other value, which is the half that makes 0 safe to expose at all.
+//
+// RED-ON-DISABLE: change the gate to `>` (or add a `maxDiagnostics == 0` early
+// return) and the size / count / bypass assertions below fail.
+TEST(Reporter, CapOfZeroStoresOnlyTheMarkerAndStillDeliversGuaranteed) {
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 0;
+    cfg.maxPerCode     = 100;
+    cfg.dedupWindow    = 0;
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+
+    for (uint32_t i = 0; i < 5; ++i) {
+        r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error,
+                          b, i * 10, i * 10 + 1));
+    }
+
+    // EXACTLY one entry, and it is the marker. Not zero — the elision must
+    // still announce itself, or a cap of 0 would be the silent truncation the
+    // whole mechanism exists to forbid.
+    ASSERT_EQ(r.all().size(), 1u);
+    EXPECT_EQ(r.all()[0].code, DiagnosticCode::P_TooManyDiagnostics);
+    EXPECT_TRUE(r.hitCap());
+    EXPECT_EQ(r.droppedByCap(), 5u);
+    EXPECT_EQ(r.all()[0].actual,
+              "reporter cap of 0 diagnostics reached; 5 further diagnostics "
+              "were dropped and NOT shown. Raise the cap above 0 to see them: "
+              "pass --max-diagnostics=N on the command line, or set "
+              "DiagnosticReporter::Config::maxDiagnostics when embedding.");
+
+    // ★ The half that makes 0 safe: a cap of 0 still cannot swallow a
+    // diagnostic whose delivery is guaranteed.
+    auto guaranteed = makeDiag(DiagnosticCode::P_DeprecatedSyntax,
+                               DiagnosticSeverity::Info, b, 999, 1000,
+                               "guaranteed past a zero cap");
+    guaranteed.delivery = DiagnosticDelivery::Guaranteed;
+    r.report(std::move(guaranteed));
+
+    ASSERT_EQ(r.all().size(), 2u);
+    EXPECT_EQ(r.all()[1].actual, "guaranteed past a zero cap");
+    EXPECT_EQ(r.droppedByCap(), 5u)
+        << "a guaranteed diagnostic bypasses the cap; it must not be counted "
+           "as dropped";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AN ERROR EATEN BY THE CAP MUST NOT PRODUCE AN EMPTY EXPLANATION.
+//
+// This is the shape the whole cycle exists to forbid: a build that exits
+// non-zero while stderr says nothing about why. The driver
+// (`program.cpp::drainDiagnosticsToStderr`) renders a buffer-LESS diagnostic
+// as `<severity>[<code>] <actual>` and a buffer-bearing one through
+// `format()`; this pins BOTH renderings directly, so a regression is caught
+// at the boundary the operator actually reads rather than at an internal
+// count.
+TEST(Reporter, ErrorPastTheCapStillProducesNonEmptyExplanatoryOutput) {
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 2;
+    cfg.maxPerCode     = 100;
+    cfg.dedupWindow    = 0;
+    DiagnosticReporter r{cfg};
+
+    BufferRegistry bufs;
+    auto buf = SourceBuffer::fromString("int x = 1;\n", "<inline>");
+    bufs.add(buf);
+
+    r.report(makeDiag(DiagnosticCode::P_DeprecatedSyntax, DiagnosticSeverity::Warning,
+                      buf->id(), 0, 1));
+    r.report(makeDiag(DiagnosticCode::P_DeprecatedSyntax, DiagnosticSeverity::Warning,
+                      buf->id(), 2, 3));
+    ASSERT_FALSE(r.hitCap());
+
+    // The Error arrives after the budget is spent and is itself dropped.
+    r.report(makeDiag(DiagnosticCode::D_FileNotFound, DiagnosticSeverity::Error,
+                      buf->id(), 4, 5, "'missing.h'"));
+    ASSERT_TRUE(r.hitCap());
+
+    // Honest about what happened: the error's own text is gone.
+    for (auto const& d : r.all()) {
+        EXPECT_NE(d.code, DiagnosticCode::D_FileNotFound);
+    }
+
+    // ★ But the build still FAILS — the marker is Error-severity, so the
+    // exit-code gate cannot read green on a run that threw an error away.
+    EXPECT_TRUE(r.hasErrors());
+    EXPECT_EQ(r.errorCount(), 1u);
+
+    // ★ And stderr is not empty, and not uninformative. Route 1: the
+    // positioned renderer.
+    auto const positioned = r.formatAll(bufs);
+    EXPECT_FALSE(positioned.empty());
+    EXPECT_NE(positioned.find("1 further diagnostic was dropped"),
+              std::string::npos)
+        << "the rendered stream must say that something was dropped AND how "
+           "much; this is the empty-stderr shape the cycle closes";
+    EXPECT_NE(positioned.find("DiagnosticReporter::Config::maxDiagnostics"),
+              std::string::npos)
+        << "...and what to change to see it";
+
+    // Route 2: the driver's buffer-less one-liner shape, reproduced exactly
+    // as `drainDiagnosticsToStderr` composes it.
+    auto const& marker = r.all().back();
+    ASSERT_EQ(marker.code, DiagnosticCode::P_TooManyDiagnostics);
+    std::string const oneLiner = std::string{severityName(marker.severity)} + "["
+                               + std::string{diagnosticCodeName(marker.code)} + "] "
+                               + marker.contextPrefix + marker.actual;
+    EXPECT_FALSE(oneLiner.empty());
+    EXPECT_NE(oneLiner.find("1 further diagnostic was dropped"), std::string::npos);
+    EXPECT_NE(oneLiner.find("DiagnosticReporter::Config::maxDiagnostics"),
+              std::string::npos);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELIVERY IS ITS OWN PROPERTY, AND IT IS NOT SUPPRESSION.
+//
+// `DiagnosticDelivery::Guaranteed` exists so a diagnostic that must survive
+// the reporter's volume controls does not have to join `kUnsuppressableCodes`
+// to get there — membership answers whether the USER may silence a code, and
+// borrowing it for cap-immunity loosens that criterion every time. These pins
+// hold the two axes apart in both directions.
+TEST(Reporter, GuaranteedDeliverySurvivesACapExceedingRun) {
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 2;
+    cfg.maxPerCode     = 100;
+    cfg.dedupWindow    = 0;
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+
+    for (uint32_t i = 0; i < 20; ++i) {
+        r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error,
+                          b, i * 10, i * 10 + 1));
+    }
+    ASSERT_TRUE(r.hitCap());
+
+    // A SUPPRESSABLE code — deliberately not a closed-table member — asking
+    // for delivery on its own merits. Info severity, so it is also not
+    // riding any "errors are special" shortcut.
+    auto d = makeDiag(DiagnosticCode::P_DeprecatedSyntax, DiagnosticSeverity::Info,
+                      b, 999, 1000, "the build reused a stale checkout");
+    d.delivery = DiagnosticDelivery::Guaranteed;
+    r.report(std::move(d));
+
+    ASSERT_FALSE(isUnsuppressable(DiagnosticCode::P_DeprecatedSyntax))
+        << "test setup: this must NOT be a closed-table member, or the pin "
+           "proves membership rather than the delivery property";
+
+    // ★ THE MESSAGE, not merely the code: a diagnostic reduced to a code
+    // with no prose is not delivery, it is a tally.
+    bool found = false;
+    for (auto const& kept : r.all()) {
+        if (kept.code == DiagnosticCode::P_DeprecatedSyntax) {
+            found = true;
+            EXPECT_EQ(kept.actual, "the build reused a stale checkout");
+            EXPECT_EQ(kept.severity, DiagnosticSeverity::Info);
+        }
+    }
+    EXPECT_TRUE(found)
+        << "a Guaranteed-delivery diagnostic must reach `all_` past the "
+           "global cap without being a member of kUnsuppressableCodes";
+    // ...and it is renderable, i.e. it reaches the operator's terminal.
+    BufferRegistry bufs;
+    EXPECT_NE(r.formatAll(bufs).find("the build reused a stale checkout"),
+              std::string::npos);
+}
+
+TEST(Reporter, GuaranteedDeliveryDoesNotDefeatSuppress) {
+    // The other direction, and the one that keeps the two axes honest: a
+    // delivery guarantee must NOT smuggle a code past the user's explicit
+    // `--suppress`. If it did, the new property would be a second, weaker
+    // unsuppressable table — exactly what it exists to avoid.
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::P_DeprecatedSyntax);
+    DiagnosticReporter r{cfg};
+
+    auto d = makeDiag(DiagnosticCode::P_DeprecatedSyntax, DiagnosticSeverity::Warning,
+                      BufferId{1});
+    d.delivery = DiagnosticDelivery::Guaranteed;
+    r.report(std::move(d));
+
+    EXPECT_EQ(r.all().size(), 0u)
+        << "delivery answers the CAP, not the user's suppress policy; a "
+           "Guaranteed diagnostic the user named must still be silenced";
+}
+
+TEST(Reporter, DefaultDeliveryIsCappedSoGuaranteesAreAskedForNotInherited) {
+    // A delivery guarantee is a commitment; acquiring one by omission would
+    // make the property meaningless within a release or two. Pinned as a
+    // default-value invariant so a "helpful" flip of the default reds here.
+    ParseDiagnostic const fresh{};
+    EXPECT_EQ(fresh.delivery, DiagnosticDelivery::Capped);
+
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 1;
+    cfg.dedupWindow    = 0;
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+    r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 0, 1));
+    r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 5, 6));
+    ASSERT_TRUE(r.hitCap());
+    r.report(makeDiag(DiagnosticCode::P_AmbiguousToken, DiagnosticSeverity::Error, b, 9, 10));
+    for (auto const& d : r.all()) {
+        EXPECT_NE(d.code, DiagnosticCode::P_AmbiguousToken)
+            << "an ordinary diagnostic must still be capped by default";
+    }
+}
+
+TEST(Reporter, ForceReportIsTheDeliveryPropertyUnderAnotherName) {
+    // `forceReport` used to be a SECOND body that applied policy and pushed
+    // on its own — the same rule ("policy applies, volume controls do not")
+    // written down twice, free to drift, with only one of the two on any
+    // given caller's path. It is now `delivery = Guaranteed; report(...)`.
+    // This pin holds the two spellings observably equivalent so a future
+    // edit to one is an edit to both.
+    auto run = [](bool viaForce) {
+        DiagnosticReporter::Config cfg;
+        cfg.maxDiagnostics = 1;
+        cfg.dedupWindow    = 0;
+        DiagnosticReporter r{cfg};
+        BufferId b{1};
+        r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 0, 1));
+        r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 5, 6));
+        auto d = makeDiag(DiagnosticCode::P_BuilderInvariant, DiagnosticSeverity::Warning,
+                          b, 20, 21, "uncommitted checkpoint");
+        if (viaForce) {
+            r.forceReport(std::move(d));
+        } else {
+            d.delivery = DiagnosticDelivery::Guaranteed;
+            r.report(std::move(d));
+        }
+        std::vector<std::pair<DiagnosticCode, std::string>> out;
+        for (auto const& kept : r.all()) out.emplace_back(kept.code, kept.actual);
+        return out;
+    };
+    auto const viaForce    = run(true);
+    auto const viaProperty = run(false);
+
+    // ★ THE ABSOLUTE ASSERTION COMES FIRST, AND IT IS THE POINT.
+    // MEASURED during red-on-disable: with only the equality check below,
+    // deleting the delivery arm from `mustDeliver` left this test GREEN —
+    // both spellings then dropped the diagnostic, and comparing two broken
+    // runs to each other proves nothing. An equivalence pin needs a
+    // behavioural anchor or it degrades into a tautology the moment the
+    // shared implementation regresses.
+    for (auto const& stream : {viaForce, viaProperty}) {
+        bool landed = false;
+        for (auto const& [code, actual] : stream) {
+            if (code == DiagnosticCode::P_BuilderInvariant) {
+                landed = true;
+                EXPECT_EQ(actual, "uncommitted checkpoint");
+            }
+        }
+        EXPECT_TRUE(landed)
+            << "both spellings must actually DELIVER past the global cap";
+    }
+    EXPECT_EQ(viaForce, viaProperty)
+        << "forceReport must be exactly `delivery = Guaranteed` — same "
+           "landed stream, same prose, same order";
+}
+
+TEST(Reporter, RollbackRestoresTheCapAccountingWithTheStream) {
+    // `capMarkerIndex_` is an index INTO `all_`, and `truncateTo` shrinks
+    // `all_`. Restoring `hitCap_` without it would leave the index pointing
+    // past the end, and the next cap drop would write out of bounds — a
+    // memory fault produced by the machinery that exists to explain faults.
+    // Pinned because the failure is silent until it is catastrophic.
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 2;
+    cfg.dedupWindow    = 0;
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+
+    r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 0, 1));
+    auto const snap = r.snapshotForRollback();
+    ASSERT_FALSE(r.hitCap());
+    ASSERT_EQ(r.droppedByCap(), 0u);
+
+    // Speculate past the cap, then roll the whole thing back.
+    for (uint32_t i = 1; i < 8; ++i) {
+        r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error,
+                          b, i * 10, i * 10 + 1));
+    }
+    ASSERT_TRUE(r.hitCap());
+    ASSERT_GT(r.droppedByCap(), 0u);
+
+    r.truncateTo(snap);
+    EXPECT_EQ(r.all().size(), 1u);
+    EXPECT_FALSE(r.hitCap());
+    EXPECT_EQ(r.droppedByCap(), 0u)
+        << "the drop tally is part of the cap's state and must roll back "
+           "with it, or a committed parse inherits a speculative count";
+
+    // Re-drive past the cap on the restored reporter: the marker must land
+    // at the CURRENT end of the stream and carry the CURRENT count. Of the
+    // four reports below, one fills the restored budget (1 of 2), the second
+    // trips the cap, and the last two are eaten -> 3.
+    for (uint32_t i = 1; i < 5; ++i) {
+        r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error,
+                          b, i * 100, i * 100 + 1));
+    }
+    ASSERT_TRUE(r.hitCap());
+    ASSERT_EQ(r.all().size(), 3u);
+    ASSERT_EQ(r.all().back().code, DiagnosticCode::P_TooManyDiagnostics);
+    EXPECT_EQ(r.droppedByCap(), 3u)
+        << "the count must restart from the restored state, not resume the "
+           "speculative tally";
+    EXPECT_NE(r.all().back().actual.find("3 further diagnostics were dropped"),
+              std::string::npos);
+}
+
+TEST(Reporter, CapNoticeItselfCannotBeSuppressed) {
+    // The notice that diagnostics were hidden must not itself be hideable,
+    // or the cap goes silent again through the front door. Today this holds
+    // STRUCTURALLY — the marker is pushed straight to `all_` rather than
+    // re-entered through `report`, so it never meets `applyPolicy` — and
+    // nothing asserted it. An accidental "tidy the marker through report()"
+    // refactor would hand `--suppress=P_TooManyDiagnostics` the power to
+    // erase the record of an elision.
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 1;
+    cfg.dedupWindow    = 0;
+    cfg.policy.suppress.insert(DiagnosticCode::P_TooManyDiagnostics);
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+
+    r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 0, 1));
+    r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 5, 6));
+
+    ASSERT_EQ(r.all().size(), 2u);
+    EXPECT_EQ(r.all().back().code, DiagnosticCode::P_TooManyDiagnostics)
+        << "--suppress must not be able to remove the truncation notice";
+    EXPECT_NE(r.all().back().actual.find("1 further diagnostic was dropped"),
+              std::string::npos);
 }
 
 TEST(Reporter, PolicySuppressDropsSilently) {
@@ -358,9 +862,9 @@ TEST(ReporterFormat, CaretWidthOverRealStringLiteralCoversTheClosingQuote) {
     const std::string source = "int x = \"abc\";\n";
     auto src = SourceBuffer::fromString(source, "<inline>");
 
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
-    Parser p{src, schema, std::move(stream)};
+    Parser p{src, schema, std::move(stream), DiagnosticBudget::libraryDefault()};
     Tree t = std::move(p).parse().tree;
     ASSERT_NE(t.root(), InvalidNode);
 
@@ -420,9 +924,9 @@ TEST(ReporterFormat, CaretWidthOverRealCharLiteralCoversTheClosingQuote) {
     const std::string source = "int x = 'c';\n";
     auto src = SourceBuffer::fromString(source, "<inline>");
 
-    Tokenizer tk{src, schema};
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, _] = std::move(tk).tokenize();
-    Parser p{src, schema, std::move(stream)};
+    Parser p{src, schema, std::move(stream), DiagnosticBudget::libraryDefault()};
     Tree t = std::move(p).parse().tree;
     ASSERT_NE(t.root(), InvalidNode);
 

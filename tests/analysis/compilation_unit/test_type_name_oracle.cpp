@@ -25,6 +25,7 @@
 // commits the cast inline.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/tree.hpp"
@@ -119,7 +120,7 @@ TEST(TypeNameOracle, CrossFileTypedefCastResolvesInline) {
         "int main() { return (MyT)-1; }\n");
     dir.write("types.h", "typedef int MyT;\n");
 
-    UnitBuilder b{loadShippedSchema("c-subset")};
+    UnitBuilder b{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     b.addFile(main);
     auto cu = std::move(b).finish();
 
@@ -146,7 +147,7 @@ TEST(TypeNameOracle, NoCandidatesMeansNoReparse) {
         "int main() { return (MyT)1 + (int)2; }\n");
     dir.write("types.h", "typedef int MyT;\n");
 
-    UnitBuilder b{loadShippedSchema("c-subset")};
+    UnitBuilder b{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     b.addFile(main);
     auto cu = std::move(b).finish();
 
@@ -165,7 +166,7 @@ TEST(TypeNameOracle, UnresolvedCandidateKeepsValueReading) {
         "main.c",
         "int main() { int x; return (zzz)-x; }\n");
 
-    UnitBuilder b{loadShippedSchema("c-subset")};
+    UnitBuilder b{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     b.addFile(main);
     auto cu = std::move(b).finish();
 
@@ -190,7 +191,7 @@ TEST(TypeNameOracle, TransitiveIncludeTypedefResolvesInline) {
     dir.write("outer.h", "#include \"inner.h\"\nint helper() { return 0; }\n");
     dir.write("inner.h", "typedef int DeepT;\n");
 
-    UnitBuilder b{loadShippedSchema("c-subset")};
+    UnitBuilder b{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     b.addFile(main);
     auto cu = std::move(b).finish();
 
@@ -219,7 +220,7 @@ TEST(TypeNameOracle, BothDirectionsResolveInlineInOneBuffer) {
               "typedef int HelpT;\n"
               "int helper(int v) { return (MainT)-v; }\n");
 
-    UnitBuilder b{loadShippedSchema("c-subset")};
+    UnitBuilder b{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     b.addFile(main);
     auto cu = std::move(b).finish();
 
@@ -253,7 +254,7 @@ TEST(TypeNameOracle, ParenNameTypedefIsNotSelfSeeded) {
         "typedef int (G);\n"               // bare paren name
         "int main(void) { return 0; }\n");
 
-    UnitBuilder b{loadShippedSchema("c-subset")};
+    UnitBuilder b{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     b.addFile(main);
     auto cu = std::move(b).finish();
 
@@ -285,7 +286,7 @@ TEST(TypeNameOracle, ParenNameTypedefThenCastUseNeedsNoReparse) {
         "typedef int (F);\n"
         "int main(void) { return (F)0; }\n");
 
-    UnitBuilder b{loadShippedSchema("c-subset")};
+    UnitBuilder b{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     b.addFile(main);
     auto cu = std::move(b).finish();
 
@@ -327,7 +328,7 @@ TEST(TypeNameOracle, ShippedTypedefCastSeededOnFirstParseNoReparse) {
         R"({ "header": "mydefs.h",
              "typedefs": [ { "name": "MyT", "type": "i32" } ] })");
 
-    UnitBuilder b{loadShippedSchema("c-subset")};
+    UnitBuilder b{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     b.addSystemDir(sysDir.path());
     b.addFile(main);
     auto cu = std::move(b).finish();
@@ -363,7 +364,7 @@ TEST(TypeNameOracle, SeededFirstParseCastMatchesReparseCast) {
         "mydefs.json",
         R"({ "header": "mydefs.h",
              "typedefs": [ { "name": "MyT", "type": "i32" } ] })");
-    UnitBuilder seedB{loadShippedSchema("c-subset")};
+    UnitBuilder seedB{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     seedB.addSystemDir(seedSys.path());
     seedB.addFile(seedMain);
     auto seedCu = std::move(seedB).finish();
@@ -376,7 +377,7 @@ TEST(TypeNameOracle, SeededFirstParseCastMatchesReparseCast) {
         "main.c",
         "int f() { return (MyT)(0); }\n"
         "typedef int MyT;\n");
-    UnitBuilder reparseB{loadShippedSchema("c-subset")};
+    UnitBuilder reparseB{loadShippedSchema("c-subset"), DiagnosticBudget::libraryDefault()};
     reparseB.addFile(reparseMain);
     auto reparseCu = std::move(reparseB).finish();
 

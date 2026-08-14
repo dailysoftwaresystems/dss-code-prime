@@ -10,6 +10,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_visitor.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -92,7 +93,7 @@ constexpr char kSyntheticSchemaText[] = R"JSON({
 
 [[nodiscard]] std::shared_ptr<CompilationUnit const> buildSynthCu(std::string source) {
     auto schema = loadSyntheticSchema();
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(source), "<synth-mem>");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
 }
@@ -131,7 +132,7 @@ constexpr char kSyntheticSchemaText[] = R"JSON({
 TEST(SemanticAnalyzerGenericity, SyntheticSchemaDrivesBindAndUse) {
     auto cu = buildSynthCu("let aa = bb;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_EQ(model.symbols().size() - 1, 1u);
     EXPECT_EQ(model.symbols()[1].name, "aa");
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u);
@@ -147,7 +148,7 @@ TEST(SemanticAnalyzerGenericity, SyntheticSchemaDrivesBindAndUse) {
 TEST(SemanticAnalyzerGenericity, SyntheticRedeclaration) {
     auto cu = buildSynthCu("let aa = aa; let aa = aa;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u);
 }
 
@@ -158,7 +159,7 @@ TEST(SemanticAnalyzerGenericity, SyntheticRedeclaration) {
 TEST(SemanticAnalyzerGenericity, SyntheticForwardReferenceBindsExactSymbol) {
     auto cu = buildSynthCu("let aa = bb; let bb = aa;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
     ASSERT_EQ(model.symbols().size() - 1, 2u);
 
@@ -186,7 +187,7 @@ TEST(SemanticAnalyzerGenericity, SyntheticForwardReferenceBindsExactSymbol) {
 TEST(SemanticAnalyzerGenericity, SyntheticInnerScopeShadows) {
     auto cu = buildSynthCu("let aa = aa; { let aa = aa; aa; }");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
 
     // Two `aa` symbols minted: outer (scope=tree root) and inner (scope=block).
     SymbolId outer{}, inner{};
@@ -218,7 +219,7 @@ TEST(SemanticAnalyzerGenericity, SyntheticTypeMismatchOnNarrowingInit) {
     // I8 (narrowing), so exactly one S_TypeMismatch.
     auto cu = buildSynthCu("wide aa = aa; narrow bb = aa;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
 
     // The declared types propagate to the decl name leaves.
@@ -239,7 +240,7 @@ TEST(SemanticAnalyzerGenericity, SyntheticWideningInitIsClean) {
     // I8 widens into I32, so ZERO S_TypeMismatch.
     auto cu = buildSynthCu("narrow aa = aa; wide bb = aa;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
@@ -314,7 +315,7 @@ constexpr char kSpecPrefixSchemaText[] = R"JSON({
         ADD_FAILURE() << "spec-prefix schema failed to load; codes: " << codes;
         std::abort();
     }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(source), "<specsynth-mem>");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
 }
@@ -328,7 +329,7 @@ constexpr char kSpecPrefixSchemaText[] = R"JSON({
 TEST(SemanticAnalyzerGenericity, SpecifierPrefixStrippedFromPositionalIndices) {
     auto cu = buildSpecPrefixCu("stat wide aa = aa;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_EQ(model.symbols().size() - 1, 1u);
     EXPECT_EQ(model.symbols()[1].name, "aa")
         << "name:1 resolves to the identifier AFTER the stripped specifier prefix";
@@ -345,7 +346,7 @@ TEST(SemanticAnalyzerGenericity, SpecifierPrefixStrippedFromPositionalIndices) {
 TEST(SemanticAnalyzerGenericity, SpecifierPrefixAbsentResolvesNormally) {
     auto cu = buildSpecPrefixCu("wide cc = cc;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_EQ(model.symbols().size() - 1, 1u);
     EXPECT_EQ(model.symbols()[1].name, "cc");
     auto const& interner = model.lattice().interner();
@@ -384,7 +385,7 @@ TEST(SemanticAnalyzerGenericity, SpecifierPrefixUnknownRuleRejectedAtLoad) {
 TEST(SemanticAnalyzerGenericity, SpecifierPrefixStrippedFromEnumeratorValue) {
     auto cu = buildSpecPrefixCu("en EE { stat FOO = 5 }");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantEnumeratorValue), 0u)
         << "with the strip, init:2 resolves to the IntLiteral value, not the "
@@ -524,7 +525,7 @@ constexpr char kSynth2SchemaText[] = R"JSON({
         ADD_FAILURE() << "synth2 schema failed to load";
         std::abort();
     }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(source), "<synth2-mem>");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
 }
@@ -540,14 +541,14 @@ constexpr char kSynth2SchemaText[] = R"JSON({
 TEST(SemanticAnalyzerGenericity, Synth2ConstViolationFromConfig) {
     auto cu = buildSynth2Cu("var lock i32 aa = aa; aa = aa;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(cnt(model, DiagnosticCode::S_ConstViolation), 1u);
 }
 
 TEST(SemanticAnalyzerGenericity, Synth2NonConstReassignIsClean) {
     auto cu = buildSynth2Cu("var i32 aa = aa; aa = aa;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(cnt(model, DiagnosticCode::S_ConstViolation), 0u);
 }
 
@@ -558,7 +559,7 @@ TEST(SemanticAnalyzerGenericity, Synth2TypedefAliasResolvesToAliasedType) {
     // alias `aa` → i32; then `aa bb = bb;` declares bb with alias type.
     auto cu = buildSynth2Cu("type aa = i32; var aa bb = bb;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& interner = model.lattice().interner();
     SymbolRecord const* bbRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
@@ -574,7 +575,7 @@ TEST(SemanticAnalyzerGenericity, Synth2TypedefAliasResolvesToAliasedType) {
 TEST(SemanticAnalyzerGenericity, Synth2UnknownAliasEmitsUnknownType) {
     auto cu = buildSynth2Cu("var cc bb = bb;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(cnt(model, DiagnosticCode::S_UnknownType), 1u);
 }
 
@@ -583,7 +584,7 @@ TEST(SemanticAnalyzerGenericity, Synth2UnknownAliasEmitsUnknownType) {
 TEST(SemanticAnalyzerGenericity, Synth2FunctionDeclBuildsFnSig) {
     auto cu = buildSynth2Cu("fn ff(i32 aa, i8 bb) { aa; }");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& interner = model.lattice().interner();
     SymbolRecord const* ffRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
@@ -603,7 +604,7 @@ TEST(SemanticAnalyzerGenericity, Synth2FunctionDeclBuildsFnSig) {
 TEST(SemanticAnalyzerGenericity, Synth2CorrectCallIsClean) {
     auto cu = buildSynth2Cu("fn ff(i32 aa) { aa; } var i32 bb = bb; ff(bb);");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(cnt(model, DiagnosticCode::S_NotCallable), 0u);
     EXPECT_EQ(cnt(model, DiagnosticCode::S_ArgCountMismatch), 0u);
     EXPECT_EQ(cnt(model, DiagnosticCode::S_TypeMismatch), 0u);
@@ -613,7 +614,7 @@ TEST(SemanticAnalyzerGenericity, Synth2CorrectCallIsClean) {
 TEST(SemanticAnalyzerGenericity, Synth2WrongArgCount) {
     auto cu = buildSynth2Cu("fn ff(i32 aa) { aa; } var i32 bb = bb; ff(bb, bb);");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(cnt(model, DiagnosticCode::S_ArgCountMismatch), 1u);
 }
 
@@ -621,7 +622,7 @@ TEST(SemanticAnalyzerGenericity, Synth2WrongArgCount) {
 TEST(SemanticAnalyzerGenericity, Synth2CallNonFunction) {
     auto cu = buildSynth2Cu("var i32 aa = aa; aa(aa);");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(cnt(model, DiagnosticCode::S_NotCallable), 1u);
 }
 
@@ -633,7 +634,7 @@ TEST(SemanticAnalyzerGenericity, Synth2CallNonFunction) {
 TEST(SemanticAnalyzerGenericity, Synth2MultiLevelAliasChainResolves) {
     auto cu = buildSynth2Cu("type aa = i32; type bb = aa; var bb cc = cc;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& interner = model.lattice().interner();
     SymbolRecord const* ccRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
@@ -663,7 +664,7 @@ TEST(SemanticAnalyzerGenericity, Synth2MutualAliasCycleDoesNotHang) {
     // The act of analyzing must terminate (no infinite loop) — death by
     // hang would manifest as a test-suite timeout, but the assertion
     // here is simply that we reach this line.
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // The alias-in-use-site emits S_UnknownType because the cycle leaves
     // both aliases with no valid type.
     // Source `type aa = bb; type bb = aa; var aa cc = cc;` contains THREE
@@ -749,7 +750,7 @@ constexpr char kSynth3SchemaText[] = R"JSON({
                                                 : loaded.error()[0].message);
         std::abort();
     }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(source), "<synth3-mem>");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
 }
@@ -761,7 +762,7 @@ TEST(SemanticAnalyzerGenericity, Synth3KindByChildDiscriminatesVariableVsFunctio
     // Variable and `ff` Function with a FnSig.
     auto cu = buildSynth3Cu("wide aa; wide ff(wide bb) { }");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& interner = model.lattice().interner();
     SymbolRecord const* aaRec = nullptr;
     SymbolRecord const* ffRec = nullptr;
@@ -857,7 +858,7 @@ constexpr char kSynth3BadParamsPathSchemaText[] = R"JSON({
                                                 : loaded.error()[0].message);
         std::abort();
     }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(source), "<synth3b-mem>");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
 }
@@ -871,7 +872,7 @@ TEST(SemanticAnalyzerGenericity, Synth3KindByChildOutOfRangePathsNoOpsCleanly) {
     auto cu = buildSynth3BadCu("wide ff(wide bb) { }");
     assertNoBuilderErrors(*cu);
     // Must terminate (no crash, no hang) — reaching the next line proves it.
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& interner = model.lattice().interner();
     SymbolRecord const* ffRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
@@ -977,7 +978,7 @@ constexpr char kSynth4SchemaText[] = R"JSON({
                                                 : loaded.error()[0].message);
         std::abort();
     }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(source), "<synth4-mem>");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
 }
@@ -989,13 +990,13 @@ TEST(SemanticAnalyzerGenericity, Synth4ReturnRulesFromConfig) {
     {   // non-void function, bare return → mismatch
         auto cu = buildSynth4Cu("wide ff() { ret; }");
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(cnt(model, DiagnosticCode::S_ReturnTypeMismatch), 1u);
     }
     {   // void function, bare return → clean
         auto cu = buildSynth4Cu("vd ff() { ret; }");
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(cnt(model, DiagnosticCode::S_ReturnTypeMismatch), 0u);
     }
 }
@@ -1011,7 +1012,7 @@ TEST(SemanticAnalyzerGenericity, Synth4ReturnRulesFromConfig) {
 TEST(SemanticAnalyzerGenericity, Synth4ValueReturnInVoidIsMismatch) {
     auto cu = buildSynth4Cu("vd ff() { ret aa; }");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(cnt(model, DiagnosticCode::S_ReturnTypeMismatch), 1u);
 }
 
@@ -1021,13 +1022,13 @@ TEST(SemanticAnalyzerGenericity, Synth4LoopControlsFromConfig) {
     {   // inside the loop → clean
         auto cu = buildSynth4Cu("vd ff() { spin { halt; } }");
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(cnt(model, DiagnosticCode::S_ControlOutsideLoop), 0u);
     }
     {   // outside any loop → one diagnostic
         auto cu = buildSynth4Cu("vd ff() { halt; }");
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(cnt(model, DiagnosticCode::S_ControlOutsideLoop), 1u);
     }
 }
@@ -1041,14 +1042,14 @@ TEST(SemanticAnalyzerGenericity, Synth4MultipleLoopControlsFromConfig) {
     {   // both controls inside the loop → clean
         auto cu = buildSynth4Cu("vd ff() { spin { halt; next; } }");
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(cnt(model, DiagnosticCode::S_ControlOutsideLoop), 0u)
             << "both halt and next are valid inside the loop context";
     }
     {   // both controls outside any loop → one diagnostic EACH (two total)
         auto cu = buildSynth4Cu("vd ff() { halt; next; }");
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(cnt(model, DiagnosticCode::S_ControlOutsideLoop), 2u)
             << "each of the two loopControls fires outside a loop — proving "
                "multi-entry loopControls works, not just the first entry";
@@ -1062,13 +1063,13 @@ TEST(SemanticAnalyzerGenericity, Synth4MultipleLoopControlsFromConfig) {
 TEST(SemanticAnalyzerGenericity, Synth4BracketIdentifierResolves) {
     auto cu = buildSynth4Cu("wide ff() { [ff]; ret; }");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // `[ff]` resolves to the function symbol `ff` (bracket text stripped).
     EXPECT_EQ(cnt(model, DiagnosticCode::S_UndeclaredIdentifier), 0u);
     // A bracket-id reference to an unknown name IS loud.
     auto cu2 = buildSynth4Cu("wide ff() { [bb]; ret; }");
     assertNoBuilderErrors(*cu2);
-    auto model2 = analyze(cu2);
+    auto model2 = analyze(cu2, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(cnt(model2, DiagnosticCode::S_UndeclaredIdentifier), 1u);
 }
 
@@ -1079,20 +1080,20 @@ TEST(SemanticAnalyzerGenericity, Synth2BuiltinFunctionArity) {
     {
         auto cu = buildSynth2Cu("var i32 aa = aa; SUM(aa, aa);");
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(cnt(model, DiagnosticCode::S_NotCallable), 0u);
         EXPECT_EQ(cnt(model, DiagnosticCode::S_ArgCountMismatch), 0u);
     }
     {
         auto cu = buildSynth2Cu("var i32 aa = aa; SUM(aa);");
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(cnt(model, DiagnosticCode::S_ArgCountMismatch), 1u);
     }
     {   // variadic ANY accepts 0..N args.
         auto cu = buildSynth2Cu("var i32 aa = aa; ANY(aa, aa, aa);");
         assertNoBuilderErrors(*cu);
-        auto model = analyze(cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(cnt(model, DiagnosticCode::S_ArgCountMismatch), 0u);
         EXPECT_EQ(cnt(model, DiagnosticCode::S_NotCallable), 0u);
     }
@@ -1152,7 +1153,7 @@ constexpr char kSynth5SchemaText[] = R"JSON({
                                                 : loaded.error()[0].message);
         std::abort();
     }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(source), "<synth5-mem>");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
 }
@@ -1164,7 +1165,7 @@ constexpr char kSynth5SchemaText[] = R"JSON({
 TEST(SemanticAnalyzerGenericity, Synth5UnusedVariableFromConfig) {
     auto cu = buildSynth5Cu("loc aa; loc bb; bb;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     // `aa` unused → one warning; `bb` used → none.
     EXPECT_EQ(cnt(model, DiagnosticCode::S_UnusedVariable), 1u);
     ParseDiagnostic const* d = nullptr;
@@ -1183,7 +1184,7 @@ TEST(SemanticAnalyzerGenericity, Synth5UnusedVariableFromConfig) {
 TEST(SemanticAnalyzerGenericity, Synth5NonOptedInDeclDoesNotWarn) {
     auto cu = buildSynth5Cu("slot cc;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(cnt(model, DiagnosticCode::S_UnusedVariable), 0u)
         << "a declaration form that does not opt in never warns";
 }
@@ -1239,7 +1240,7 @@ constexpr char kSynth6SchemaText[] = R"JSON({
                                                 : loaded.error()[0].message);
         std::abort();
     }
-    UnitBuilder builder{*loaded};
+    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(source), "<synth6-mem>");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
 }
@@ -1253,7 +1254,7 @@ constexpr char kSynth6SchemaText[] = R"JSON({
 TEST(SemanticAnalyzerGenericity, Synth6ExtensionBuiltinTypeResolves) {
     auto cu = buildSynth6Cu("cash aa;");
     assertNoBuilderErrors(*cu);
-    auto model = analyze(cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     auto const& interner = model.lattice().interner();
 
     SymbolId aaSym{};

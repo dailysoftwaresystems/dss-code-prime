@@ -31,11 +31,18 @@
 // `createExclusiveBinary` are genuinely DIFFERENT CODE and one measurement
 // cannot cover both (the TF-C104 lesson recurring: one library's behaviour is
 // not another's):
-//   * Windows: `::_wfopen(p.c_str(), L"wbx")` -> `L"wb"`.
+//   * Windows: `::_wfopen(p.c_str(), L"wbxN")` -> `L"wbN"`.
 //   * POSIX:   drop `O_EXCL` from
-//              `::open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666)`.
+//              `::open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666)`.
 // There is no `"wbx"` on the POSIX arm to swap, so a Windows-only
 // `"wbx"` -> `"wb"` run says NOTHING about the POSIX leg, and vice versa.
+//
+// ★ THE MODE CARRIES A SECOND, INDEPENDENT GUARD, with its own disable lever:
+// the `N` (Windows `_O_NOINHERIT`) and the `O_CLOEXEC` (POSIX) that keep the
+// claimed handle from crossing into a spawned child. Dropping EITHER leaves
+// exclusivity perfectly intact and every test above green — which is exactly
+// why it gets its own pin at the bottom of this file. See
+// `AClaimedStagingTempNeverCrossesIntoASpawnedChild`.
 //
 // ★ WHAT RED-ON-DISABLE ACTUALLY COVERS, PER HOST. Do not over-read these pins
 // on POSIX — and do not under-read them either. Each bullet below was MEASURED
@@ -95,6 +102,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -107,10 +115,23 @@
 // `getpid` — the SAME seed `writer.cpp`'s `processSeed()` draws, so the last
 // test can reconstruct the exact staging-temp names `writeBytes` will try in
 // THIS process. A HOST include split (the `scratch_dir.hpp` precedent), never a
-// target/format/language one, and it gates no test.
+// target/format/language one, and it gates no test. The second half of each arm
+// is the handle-inheritance probe: `_get_osfhandle` + `GetHandleInformation` on
+// Windows, `fcntl(F_GETFD)` on POSIX — the same "ask the OS what it actually
+// did" shape, spelled in each host's own vocabulary.
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <io.h>
 #include <process.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -432,6 +453,83 @@ TEST(LinkWriterExclusiveClaim, TheSamePathIsClaimableAgainOnceTheOccupantIsGone)
         << "the path became permanently unclaimable after its occupant was "
            "removed — the primitive is not testing EXISTENCE, so every "
            "refusal asserted above proves nothing";
+}
+
+// ── The staging temp must not cross an exec ────────────────────────────────
+//
+// ★ A SECOND GUARD LIVES IN THE SAME MODE STRING, and nothing above touches it.
+// `writeBytes` holds this handle open across its `fwrite`, and the compiler
+// creates processes (`core/substrate/process_spawn.cpp` — a user build hook
+// today, `git` acquisition arriving). On Windows that spawn passes
+// `bInheritHandles=TRUE`, which is correct and deliberate there (the child must
+// inherit the parent's stdio, with NO `STARTF_USESTDHANDLES`), so an
+// INHERITABLE staging-temp handle is duplicated into the child and held for its
+// lifetime. The commit rename then hits the target's own "is anyone holding
+// this" check and FAILS — MEASURED, `MoveFileExW` -> `GetLastError=32`
+// ERROR_SHARING_VIOLATION — and `writeBytes` reports it as "the target is
+// currently open/running", pointing the operator at some other process.
+//
+// The POSIX consequence is different and must not be described as the same one:
+// `rename(2)` does not care that a file is open (MEASURED: returns 0 either
+// way). What leaks there is the DESCRIPTOR — the child gets a writable fd onto
+// the compiler's staged artifact, which the spawn substrate's security note
+// forbids handing to a consumer that interpolates user-supplied text.
+//
+// ★ WHY THE PROPERTY IS ASSERTED ON THE HANDLE RATHER THAN THROUGH A SPAWN.
+// A spawn-and-observe test would need a child that OUTLIVES the parent's
+// rename attempt, i.e. a timing window, and would make a deterministic
+// statement depend on one. The inheritance bit is the cause and it is directly
+// readable, so it is read directly: `GetHandleInformation` / `fcntl(F_GETFD)`,
+// one call, no race. The end-to-end consequence was measured out of tree (both
+// modes, both hosts) and is recorded at the definition site in `writer.cpp`.
+//
+// RED ON DISABLE, per arm and independent of every other pin here: drop the `N`
+// and the Windows half goes red with `HANDLE_FLAG_INHERIT` set; drop the
+// `O_CLOEXEC` and the POSIX half goes red with `FD_CLOEXEC` clear. Neither
+// disturbs exclusivity, so this is the only test in the file that moves.
+TEST(LinkWriterExclusiveClaim, AClaimedStagingTempNeverCrossesIntoASpawnedChild) {
+    ScratchDir scratch{Location::Temp, "link-writer-claim-noinherit"};
+    auto const slot = scratch.path() / "noinherit.dsstmp";
+
+    Claimed f = claim(slot);
+    ASSERT_NE(f.get(), nullptr)
+        << "the claim failed, so there is no handle whose inheritance could be "
+           "examined";
+
+#ifdef _WIN32
+    auto const handle =
+        reinterpret_cast<HANDLE>(::_get_osfhandle(::_fileno(f.get())));
+    ASSERT_NE(handle, INVALID_HANDLE_VALUE)
+        << "the CRT stream carries no OS handle — the probe below would be "
+           "reading nothing";
+    DWORD flags = 0;
+    ASSERT_NE(::GetHandleInformation(handle, &flags), 0)
+        << "GetHandleInformation failed (" << ::GetLastError()
+        << "), so this test cannot observe the bit it exists to assert";
+    EXPECT_EQ(flags & HANDLE_FLAG_INHERIT, DWORD{0})
+        << "the staging-temp handle is INHERITABLE. `_wfopen` marks it so "
+           "unless the mode contains `N` (_O_NOINHERIT), and "
+           "`spawnAndWaitInherit` creates children with bInheritHandles=TRUE — "
+           "so a build hook or `git` receives a duplicate of this handle and "
+           "holds it for its lifetime, after which the commit rename fails with "
+           "ERROR_SHARING_VIOLATION and blames an unrelated process.";
+    // The whole flags word, not just the one bit: HANDLE_FLAG_PROTECT_FROM_CLOSE
+    // has no business being set on a stream we `fclose` ourselves, and pinning
+    // the word catches anything else a future mode string switches on.
+    EXPECT_EQ(flags, DWORD{0}) << "unexpected handle flags 0x" << std::hex
+                               << flags;
+#else
+    int const fd = ::fileno(f.get());
+    ASSERT_GE(fd, 0) << "the stream carries no descriptor";
+    int const fdFlags = ::fcntl(fd, F_GETFD);
+    ASSERT_GE(fdFlags, 0)
+        << "fcntl(F_GETFD) failed, so this test cannot observe the flag it "
+           "exists to assert";
+    EXPECT_EQ(fdFlags & FD_CLOEXEC, FD_CLOEXEC)
+        << "the staging-temp descriptor is NOT close-on-exec. `O_CLOEXEC` is "
+           "missing from the `open` flags, so a spawned build hook or `git` "
+           "inherits a WRITABLE descriptor onto the compiler's staged artifact.";
+#endif
 }
 
 // ── The EMPTY-SPAN commit path ─────────────────────────────────────────────

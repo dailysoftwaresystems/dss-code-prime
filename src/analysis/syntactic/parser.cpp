@@ -188,6 +188,13 @@ struct Parser::Impl {
     std::shared_ptr<SourceBuffer>        src;
     std::shared_ptr<GrammarSchema const> schema;
     TokenStream                          tokens;
+    // The operator's diagnostic volume budget, handed straight to the
+    // `TreeBuilder` this parser constructs. The parser owns no reporter of its
+    // own — it is a pass-through, and it exists on this struct only because
+    // `TreeBuilder` is built in `parse()`, not in the ctor
+    // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE). Declared BEFORE
+    // `config` so the member-init order matches the ctor's init list.
+    DiagnosticBudget                     budget;
     ParserConfig                         config;
 
     // Cached well-known kinds — looked up once per parse instead of
@@ -341,10 +348,12 @@ struct Parser::Impl {
     Impl(std::shared_ptr<SourceBuffer>        s,
          std::shared_ptr<GrammarSchema const> sc,
          TokenStream                          ts,
-         ParserConfig                         cfg)
+         ParserConfig                         cfg,
+         DiagnosticBudget                     bdg)
         : src(std::move(s))
         , schema(std::move(sc))
         , tokens(std::move(ts))
+        , budget(bdg)
         , config{
             cfg.maxSpeculationDepth,
             cfg.maxExpressionDepth,
@@ -2130,6 +2139,7 @@ static_assert(!std::is_move_constructible_v<Parser::Impl>,
 Parser::Parser(std::shared_ptr<SourceBuffer>        src,
                std::shared_ptr<GrammarSchema const> schema,
                TokenStream                          tokens,
+               DiagnosticBudget                     budget,
                ParserConfig                         config,
                std::unique_ptr<DiagnosticReporter>  lexerDiagnostics) {
     // Fail-fast preconditions: a null schema or source means the
@@ -2152,7 +2162,8 @@ Parser::Parser(std::shared_ptr<SourceBuffer>        src,
     impl_ = std::make_unique<Impl>(std::move(src),
                                    std::move(schema),
                                    std::move(tokens),
-                                   std::move(config));
+                                   std::move(config),
+                                   budget);
     impl_->lexerDiagnostics = std::move(lexerDiagnostics);
     impl_->outer = this;
 }
@@ -2164,7 +2175,7 @@ Parser::~Parser() = default;
 ParseResult Parser::parse() && {
     auto& I = *impl_;
 
-    I.builder = std::make_unique<TreeBuilder>(I.src, I.schema);
+    I.builder = std::make_unique<TreeBuilder>(I.src, I.schema, I.budget);
 
     // Fold the tokenizer's lexer diagnostics into the builder's reporter
     // before the walk, so the finished Tree owns lexer + parser diagnostics

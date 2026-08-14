@@ -14,6 +14,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -65,7 +66,7 @@ TEST(HirLoweringMultiLang, MixedCuLowersToOneModule) {
     auto sql = shipped("tsql-subset");
 
     // c-subset is the primary; tsql is registered as a second language.
-    UnitBuilder ub{c};
+    UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
     ub.addInMemory(std::string(kCProgram),   "add.c",   c);
     ub.addInMemory(std::string(kSqlProgram), "query.sql", sql);
@@ -76,7 +77,7 @@ TEST(HirLoweringMultiLang, MixedCuLowersToOneModule) {
     EXPECT_EQ(cu->trees()[1].schema().name(), "TsqlSubset");
 
     // Multi-schema semantic analysis: each tree analyzed with its OWN config.
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors());
 
     DiagnosticReporter r;
@@ -111,7 +112,7 @@ TEST(HirLoweringMultiLang, AddFileRoutesByExtension) {
     { std::ofstream o{cFile,   std::ios::binary}; o << kCProgram; }
     { std::ofstream o{sqlFile, std::ios::binary}; o << kSqlProgram; }
 
-    UnitBuilder ub{c};
+    UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
     ub.addFile(cFile);
     ub.addFile(sqlFile);
@@ -121,7 +122,7 @@ TEST(HirLoweringMultiLang, AddFileRoutesByExtension) {
     EXPECT_EQ(cu->trees()[0].schema().name(), "CSubset")   << ".c must route to c-subset";
     EXPECT_EQ(cu->trees()[1].schema().name(), "TsqlSubset") << ".sql must route to tsql-subset";
 
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
@@ -136,12 +137,13 @@ TEST(HirLoweringMultiLang, MultiSchemaCtorAndDeclOrderFollowsTreeOrder) {
 
     // Multi-schema ctor with sql FIRST (primary); add sql then c. Decl order in
     // the one module must follow tree-add order, not schema-registration order.
-    UnitBuilder ub{std::vector<std::shared_ptr<GrammarSchema const>>{sql, c}};
+    UnitBuilder ub{std::vector<std::shared_ptr<GrammarSchema const>>{sql, c},
+                   DiagnosticBudget::libraryDefault()};
     ub.addInMemory(std::string(kSqlProgram), "q.sql", sql);
     ub.addInMemory(std::string(kCProgram),   "a.c",   c);
     auto cu = std::make_shared<CompilationUnit>(std::move(ub).finish());
 
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
@@ -164,7 +166,7 @@ TEST(HirLoweringMultiLang, UnknownExtensionIsLoudInMultiLanguageCu) {
     fs::path const py = scratch.path() / "script.py";
     { std::ofstream o{py, std::ios::binary}; o << "print(1)\n"; }
 
-    UnitBuilder ub{c};
+    UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
     ub.addFile(py);
     auto cu = std::make_shared<CompilationUnit>(std::move(ub).finish());
@@ -185,13 +187,13 @@ TEST(HirLoweringMultiLang, ExplicitInMemorySchemaNeedNotBePreRegistered) {
     // pre-registered set.
     auto c   = shipped("c-subset");
     auto sql = shipped("tsql-subset");
-    UnitBuilder ub{c};                                    // only c registered
+    UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};  // only c registered
     ub.addInMemory(std::string(kCProgram), "a.c", c);
     ub.addInMemory(std::string(kSqlProgram), "q.sql", sql);  // sql NOT pre-registered
     auto cu = std::make_shared<CompilationUnit>(std::move(ub).finish());
 
     ASSERT_EQ(cu->trees().size(), 2u);
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors())
         << "the un-pre-registered sql tree must analyze under its own schema";
     DiagnosticReporter r;
@@ -207,14 +209,14 @@ TEST(HirLoweringMultiLang, BothLanguagesBuiltinsAndExtensionsCoexist) {
     // verify-on-load (res->ok) is the proof.
     auto c   = shipped("c-subset");
     auto sql = shipped("tsql-subset");
-    UnitBuilder ub{c};
+    UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
     ub.addInMemory("int f(int x) { return x; }\n", "f.c", c);
     ub.addInMemory("CREATE TABLE T (a INT);\n"
                    "SELECT COALESCE(a, 0) FROM T;\n", "q.sql", sql);
     auto cu = std::make_shared<CompilationUnit>(std::move(ub).finish());
 
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
@@ -237,7 +239,7 @@ TEST(HirLoweringMultiLang, SameLanguageCrossTreeResolvesAroundInterleavedOtherLa
     // resolver must produce no spurious edge.
     auto c   = shipped("c-subset");
     auto sql = shipped("tsql-subset");
-    UnitBuilder ub{c};
+    UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
     ub.addInMemory("CREATE TABLE Users (Id INT, Name VARCHAR);\n", "users.sql", sql); // tree 0 (def)
     ub.addInMemory("int add(int a, int b) { return a + b; }\n",    "add.c",     c);   // tree 1 (c)
@@ -253,7 +255,7 @@ TEST(HirLoweringMultiLang, SameLanguageCrossTreeResolvesAroundInterleavedOtherLa
     // No unresolved-reference diagnostic (the c tree was skipped, not mis-scanned).
     EXPECT_EQ(countCode(cu->driverDiagnostics(), DiagnosticCode::D_UnresolvedReference), 0u);
 
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
@@ -265,7 +267,7 @@ TEST(HirLoweringMultiLang, DuplicateRegisterSchemaDoesNotDoubleResolve) {
     // SchemaId — so registering tsql twice must NOT double-append the cross-ref.
     auto c   = shipped("c-subset");
     auto sql = shipped("tsql-subset");
-    UnitBuilder ub{c};
+    UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
     ub.registerSchema(sql);   // duplicate — must not cause double resolution
     ub.addInMemory("CREATE TABLE Users (Id INT);\n",      "users.sql", sql);
@@ -282,13 +284,13 @@ TEST(HirLoweringMultiLang, BuiltinsDoNotLeakAcrossLanguages) {
     // builtin scopes enforce this: the c tree only sees c's (empty) builtins.
     auto c   = shipped("c-subset");
     auto sql = shipped("tsql-subset");
-    UnitBuilder ub{c};
+    UnitBuilder ub{c, DiagnosticBudget::libraryDefault()};
     ub.registerSchema(sql);
     ub.addInMemory("int f(int x) { return COALESCE(x, 0); }\n", "f.c", c);   // c calls a tsql builtin
     ub.addInMemory("CREATE TABLE T (a INT);\n", "t.sql", sql);
     auto cu = std::make_shared<CompilationUnit>(std::move(ub).finish());
 
-    SemanticModel model = analyze(cu);
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "a c-subset tree must NOT resolve tsql's COALESCE builtin";
 }

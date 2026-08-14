@@ -39,3 +39,12 @@ dss_add_test(NAME test_support/test_arm_verdict_ledger
 # argv), which is why it must stay a SEPARATE target from its siblings above.
 dss_add_test(NAME test_support/test_run_binary_capture
              SOURCES test_run_binary_capture.cpp)
+# D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-SUSPEND. The same chokepoint's
+# DEADLINE: it used to be spent on `steady_clock`, which on Darwin counts host
+# suspend, so a napping laptop was billed to the child. Pins which clock is
+# selected (against a clock id read from the kernel here) and that the deadline
+# still kills a hanging child, its budget stated in AWAKE seconds.
+# ★ Its `main` spawns THIS executable as its own hanging child, so — like its
+# sibling above — it must stay a SEPARATE target.
+dss_add_test(NAME test_support/test_run_binary_deadline_clock
+             SOURCES test_run_binary_deadline_clock.cpp)

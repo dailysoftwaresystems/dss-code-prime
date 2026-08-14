@@ -1,3 +1,4 @@
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -403,7 +404,7 @@ TEST(ScopeRequire, ForbidRejectsWhenScopeOnStack) {
     auto h = make("<", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushScope(ScopeKind::Generic);                       // <Generic>
@@ -433,7 +434,7 @@ TEST(ScopeRequire, ForbidAllowsWhenScopeAbsent) {
     auto h = make("<", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(tokAt(*h.src, "<"));                       // no Generic on stack
@@ -464,7 +465,7 @@ TEST(ScopeRequire, MultiMeaningSurvivorMirror) {
     auto h = make("<", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(tokAt(*h.src, "<"));                       // no scopes pushed
@@ -496,7 +497,7 @@ TEST(ScopeRequire, TopMustBeRejectsWhenInnermostMismatch) {
     auto h = make("case", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushScope(ScopeKind::Block);
@@ -527,7 +528,7 @@ TEST(ScopeRequire, TopMustBeAcceptsWhenInnermostMatches) {
     auto h = make("case", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushScope(ScopeKind::Block);
@@ -556,7 +557,7 @@ TEST(ScopeRequire, TopMustBeRejectsOnEmptyStack) {
     auto h = make("+", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(tokAt(*h.src, "+"));                       // empty scope stack
@@ -583,7 +584,7 @@ TEST(ScopeRequire, OutermostRejectsWhenBottomMismatch) {
     auto h = make("+", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushScope(ScopeKind::Block);                         // Block at bottom, not Root
@@ -608,7 +609,7 @@ TEST(ScopeRequire, OutermostAcceptsWhenBottomMatches) {
     auto h = make("+", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushScope(ScopeKind::Root);
@@ -637,7 +638,7 @@ TEST(ScopeRequire, OutermostRejectsOnEmptyStack) {
     auto h = make("+", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushToken(tokAt(*h.src, "+"));                       // empty scope stack
@@ -668,7 +669,7 @@ TEST(ScopeRequire, AllFourConstraintsAndedAcceptCase) {
     auto h = make("@", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushScope(ScopeKind::Root);
@@ -704,7 +705,7 @@ TEST(ScopeRequire, AllFourConstraintsAndedRejectOnOutermostMismatch) {
     auto h = make("@", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushScope(ScopeKind::Block);                         // no Root at bottom
@@ -733,7 +734,7 @@ TEST(ScopeRequire, ForbidAndAnyOfBothMustHold) {
     auto h = make("+", kCfg);
     ASSERT_NE(h.schema, nullptr);
 
-    TreeBuilder b{h.src, h.schema};
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     {
         auto root = b.open(h.schema->rules().find("root"));
         b.pushScope(ScopeKind::Block);

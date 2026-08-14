@@ -26,6 +26,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/substrate/phase_timers.hpp"   // c97: per-phase --time pin
 #include "core/substrate/thread_pool.hpp"    // D-PERF-4: executor injection (pool vs synchronous)
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -1545,7 +1546,7 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
 
     // The exact cross_cu_call corpus: main calls extern add5; helper defines it.
     auto buildCu = [&](std::string src, std::string label) {
-        UnitBuilder builder{grammar};
+        UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
         builder.addInMemory(std::move(src), std::move(label));
         return std::move(builder).finish();
     };
@@ -1555,9 +1556,9 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
         buildCu("int add5(int x) { return x + 5; }\n", "helper.c");
 
     // LOOP 1 (driver-parity): build each CU's MIR.
-    auto mirMain = buildCuMir(cuMain, *grammar, **targetR, **formatR, ccIndex, rep);
+    auto mirMain = buildCuMir(cuMain, *grammar, **targetR, **formatR, ccIndex, rep, CompileOptions{DiagnosticBudget::libraryDefault()});
     ASSERT_TRUE(mirMain.has_value()) << "errorCount=" << rep.errorCount();
-    auto mirHelper = buildCuMir(cuHelper, *grammar, **targetR, **formatR, ccIndex, rep);
+    auto mirHelper = buildCuMir(cuHelper, *grammar, **targetR, **formatR, ccIndex, rep, CompileOptions{DiagnosticBudget::libraryDefault()});
     ASSERT_TRUE(mirHelper.has_value()) << "errorCount=" << rep.errorCount();
 
     // MergeCuInputs (constructed exactly as `compileOneTarget`'s N>1 arm does).
@@ -1693,7 +1694,7 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         std::distance(ccSpan.data(), abi->cc));
 
     auto buildCu = [&](std::string src, std::string label) {
-        UnitBuilder builder{grammar};
+        UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
         builder.addInMemory(std::move(src), std::move(label));
         return std::move(builder).finish();
     };
@@ -1708,9 +1709,9 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         CompilationUnit cuHelper =
             buildCu("int add5(int x) { return x + 5; }\n", "helper.c");
 
-        auto mirMain = buildCuMir(cuMain, *grammar, **targetR, **formatR, ccIndex, rep);
+        auto mirMain = buildCuMir(cuMain, *grammar, **targetR, **formatR, ccIndex, rep, CompileOptions{DiagnosticBudget::libraryDefault()});
         if (!mirMain.has_value()) return std::nullopt;
-        auto mirHelper = buildCuMir(cuHelper, *grammar, **targetR, **formatR, ccIndex, rep);
+        auto mirHelper = buildCuMir(cuHelper, *grammar, **targetR, **formatR, ccIndex, rep, CompileOptions{DiagnosticBudget::libraryDefault()});
         if (!mirHelper.has_value()) return std::nullopt;
 
         // `cuMirs` + `inputs` must stay alive through `mergeCuMirs` (the merge reads each
@@ -1768,7 +1769,7 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
         opt::OptPipeline inlining{"inlining", {opt::PassId::Inlining}};
-        CompileOptions opts;
+        CompileOptions opts{DiagnosticBudget::libraryDefault()};
         opts.pipelineOverride = &inlining;
         auto const before = rep.errorCount();
         ASSERT_TRUE(optimizeModule(merged->mir, **targetR,
@@ -1789,7 +1790,7 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
         opt::OptPipeline identity{"identity", {opt::PassId::Identity}};
-        CompileOptions opts;
+        CompileOptions opts{DiagnosticBudget::libraryDefault()};
         opts.pipelineOverride = &identity;
         ASSERT_TRUE(optimizeModule(merged->mir, **targetR,
                                    merged->host.interner(), opts, rep));
@@ -1843,13 +1844,13 @@ namespace {
 
     ScratchDir sysDir{Location::InsideRepo, "model3-libresolve"};
     std::ofstream(sysDir.path() / "stdio.json", std::ios::binary) << descJson;
-    UnitBuilder builder{grammar};
+    UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addInMemory("#include <stdio.h>\nint main() { puts(\"hi\"); return 0; }\n",
                         "main.c");
     CompilationUnit cu = std::move(builder).finish();
 
-    auto cuMir = buildCuMir(cu, *grammar, **targetR, **formatR, ccIndex, rep);
+    auto cuMir = buildCuMir(cu, *grammar, **targetR, **formatR, ccIndex, rep, CompileOptions{DiagnosticBudget::libraryDefault()});
     EXPECT_TRUE(cuMir.has_value()) << formatName << " errorCount=" << rep.errorCount();
     EXPECT_EQ(rep.errorCount(), 0u) << formatName;
     if (!cuMir) return {};
@@ -1877,14 +1878,14 @@ namespace {
         std::distance(ccSpan.data(), abi->cc));
     ScratchDir sysDir{Location::InsideRepo, "model3-libresolve"};
     std::ofstream(sysDir.path() / "stdio.json", std::ios::binary) << descJson;
-    UnitBuilder builder{grammar};
+    UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(sysDir.path());
     builder.addInMemory(R"(#include <stdio.h>
 int main() { puts("hi"); return 0; }
 )",
                         "main.c");
     CompilationUnit cu = std::move(builder).finish();
-    auto cuMir = buildCuMir(cu, *grammar, **targetR, **formatR, ccIndex, rep);
+    auto cuMir = buildCuMir(cu, *grammar, **targetR, **formatR, ccIndex, rep, CompileOptions{DiagnosticBudget::libraryDefault()});
     return !cuMir.has_value() && rep.errorCount() > 0;
 }
 } // namespace

@@ -34,6 +34,7 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
 #include "core/types/data_model.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -66,7 +67,7 @@ namespace {
     LongDoubleFormat ldf = LongDoubleFormat::X87_80) {
     auto cu = buildShippedUnit("c-subset", {std::move(src)});
     assertNoBuilderErrors(*cu);
-    return analyze(cu, dm, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dm, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                    ldf);
 }
 
@@ -163,13 +164,13 @@ void expectGenericClean(SemanticModel const& m) {
 [[nodiscard]] SemanticModel analyzeWithShippedHeaders(
     std::string src, DataModel dm, ObjectFormatKind fmt, std::string_view arch) {
     auto schema = loadShippedSchema("c-subset");
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(findShippedLibDir());
     builder.setActiveFormat(fmt);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    return analyze(cu, dm, std::nullopt, std::nullopt, fmt, arch);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dm, std::nullopt, std::nullopt, fmt, arch);
 }
 
 // The (dataModel, objectFormat, arch) triples the shipped descriptors are
@@ -223,13 +224,13 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
     std::ofstream(sysDir.path() / "ffiwide.json", std::ios::binary)
         << kFfiWideDescriptorJson;
     auto build = [&](auto const& schema) {
-        UnitBuilder builder{schema};
+        UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
         builder.addSystemDir(sysDir.path());
         builder.setActiveFormat(ax.fmt);
         builder.addInMemory(mainSrc, "main.c");
         auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
         assertNoBuilderErrors(*cu);
-        return analyze(cu, ax.dm, std::nullopt, std::nullopt, ax.fmt, ax.arch);
+        return analyze(cu, DiagnosticBudget::libraryDefault(), ax.dm, std::nullopt, std::nullopt, ax.fmt, ax.arch);
     };
     if (flagOn) return build(loadShippedSchema("c-subset"));
     nlohmann::json doc = loadShippedCSubsetJson();
@@ -1373,10 +1374,10 @@ TEST(TypeIdentityVocabulary, MalformedInactiveSignatureOverrideFailsOnEveryTarge
         EXPECT_TRUE(patched);
         auto schema = GrammarSchema::loadFromText(doc.dump(), "<override-probe>");
         EXPECT_TRUE(schema.has_value());
-        UnitBuilder builder{*schema};
+        UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
         builder.addInMemory("int f(void){ return 0; }\n", "<mem>");
         auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-        return analyze(cu, dm);
+        return analyze(cu, DiagnosticBudget::libraryDefault(), dm);
     };
     // The LLP64 override is malformed. Under LLP64 it is the ACTIVE one...
     EXPECT_TRUE(analyzeWithOverride("fn(ptr<", DataModel::Llp64).hasErrors());

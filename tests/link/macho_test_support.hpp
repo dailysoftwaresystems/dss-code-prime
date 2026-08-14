@@ -92,6 +92,21 @@ findSegment(std::span<std::uint8_t const> bytes, std::string_view name) {
 // Locate a section_64 record by (segment name, section name).
 // Returns the byte offset of the section_64 record (NOT the
 // containing LC_SEGMENT_64), or nullopt.
+//
+// ⚠ IMAGE-SHAPED ONLY — it resolves the SEGMENT through `findSegment`, i.e. by
+// the name on the LC_SEGMENT_64 COMMAND. That is right for an MH_EXECUTE /
+// MH_DYLIB (`__TEXT`, `__DATA_CONST`, …) and CANNOT work for an MH_OBJECT: a
+// relocatable object carries ONE anonymous catch-all segment whose segname is
+// the empty string (`macho.cpp`: `appendName16(bytes, "")  // segname empty for
+// MH_OBJECT`), and the two-level naming lives in each section_64's OWN
+// `segname` field instead. So `findSection(obj, "__TEXT", "__text")` returns
+// nullopt for an object that plainly has that section — a silent
+// not-found, not an error. MEASURED 2026-08-13 (it cost a debug cycle in
+// tests/link/test_macho_ld64_local_collision.cpp, which now carries the
+// object-shaped `findObjectSection` that matches on the section record's own
+// pair). Left UNCHANGED here on purpose: teaching this one to fall back to the
+// section's segname would make an exec test that names the WRONG segment pass
+// anyway, and that is the assertion those callers are paying for.
 [[nodiscard]] inline std::optional<std::size_t>
 findSection(std::span<std::uint8_t const> bytes,
             std::string_view segment, std::string_view section) {

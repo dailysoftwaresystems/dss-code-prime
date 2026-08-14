@@ -27,6 +27,7 @@
 #include "analysis/semantic/semantic_test_fixture.hpp"
 #include "core/raw_tree_builder.hpp"
 #include "core/types/declarator_walk.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -130,7 +131,7 @@ constexpr char kDeclSchemaText[] = R"JSON({
 [[nodiscard]] std::shared_ptr<CompilationUnit const>
 buildDeclCu(std::string source) {
     auto schema = loadDeclSchema();
-    UnitBuilder builder{schema};
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(source), "<decl-mem>");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
 }
@@ -443,7 +444,7 @@ namespace {
 [[nodiscard]] SemanticModel analyzeDecl(std::string source) {
     auto cu = buildDeclCu(std::move(source));
     assertNoBuilderErrors(*cu);
-    return analyze(cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault());
 }
 
 } // namespace
@@ -607,7 +608,7 @@ TEST(DeclaratorInversion, AbstractParamContributesTypeMintsNoSymbol) {
 TEST(DeclaratorInversion, ZeroArrayLengthFailsLoud) {
     auto cu = buildDeclCu("base x[0];");
     assertNoBuilderErrors(*cu);
-    auto m = analyze(cu);
+    auto m = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_ArrayLengthOutOfRange), 1u);
     EXPECT_FALSE(typeOf(m, "x").valid());
@@ -625,7 +626,7 @@ TEST(DeclaratorInversion, ZeroArrayLengthFailsLoud) {
 TEST(DeclaratorInversion, SameNameTwiceTentativeDefinitionsMerge) {
     auto cu = buildDeclCu("base x, x;");
     assertNoBuilderErrors(*cu);
-    auto m = analyze(cu);
+    auto m = analyze(cu, DiagnosticBudget::libraryDefault());
     // No collision: the two tentatives MERGE (one binding survives, the other is
     // absorbed). Both records are still minted — the absorbed one carries no HIR —
     // so the symbol-table count is unchanged; the contract is the ABSENCE of the
@@ -639,7 +640,7 @@ TEST(DeclaratorInversion, SameNameTwiceTentativeDefinitionsMerge) {
 TEST(GatedMarkers, MarkerTokenFiresDeclaredCodeAtTokenSpan) {
     auto cu = buildDeclCu("vol base x;");
     assertNoBuilderErrors(*cu);
-    auto m = analyze(cu);
+    auto m = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_VolatileNotSupported), 1u);
     for (auto const& d : m.diagnostics().all()) {
@@ -657,7 +658,7 @@ TEST(GatedMarkers, MarkerTokenFiresDeclaredCodeAtTokenSpan) {
 TEST(GatedMarkers, AbsentMarkerFiresNothing) {
     auto cu = buildDeclCu("base x;");
     assertNoBuilderErrors(*cu);
-    auto m = analyze(cu);
+    auto m = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_VolatileNotSupported), 0u);
 }
@@ -665,7 +666,7 @@ TEST(GatedMarkers, AbsentMarkerFiresNothing) {
 TEST(GatedMarkers, OneDiagnosticPerDeclarationEvenWithListDecl) {
     auto cu = buildDeclCu("vol base x, y;\nvol base z;");
     assertNoBuilderErrors(*cu);
-    auto m = analyze(cu);
+    auto m = analyze(cu, DiagnosticBudget::libraryDefault());
     // One per DECLARATION (two declarations carry `vol`), not per symbol.
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_VolatileNotSupported), 2u);

@@ -38,7 +38,15 @@ function Import-DssSecrets([string]$File) {
 $conf = Import-DssSecrets (Join-Path $PSScriptRoot '..\.secrets\arm64-vps.env')
 if (-not $VpsHost) { $VpsHost = if ($env:DSS_VPS_HOST) { $env:DSS_VPS_HOST } else { $conf['DSS_VPS_HOST'] } }
 if (-not $VpsUser) { $VpsUser = if ($env:DSS_VPS_USER) { $env:DSS_VPS_USER } else { $conf['DSS_VPS_USER'] } }
-if (-not $KeyPath) { $KeyPath = $env:DSS_VPS_KEY }
+# ★ THE CONFIG FALLBACK IS NOT OPTIONAL HERE, and its absence was a SECOND pair
+# break found alongside the sourcing one. This line used to read the key from the
+# environment ONLY, so a `.secrets\arm64-vps.env` carrying DSS_VPS_KEY — the exact
+# file the error message below tells you to create — left $KeyPath empty. The two
+# halves of the pair then behaved DIFFERENTLY on identical config: `.sh` requires
+# the key and exits 3 saying so, while this script silently omitted `-i` and let
+# ssh fall back to whatever default identity it could find, which under
+# BatchMode=yes fails much later and blames the host. Matches `ssh-macos.ps1`.
+if (-not $KeyPath) { $KeyPath = if ($env:DSS_VPS_KEY) { $env:DSS_VPS_KEY } else { $conf['DSS_VPS_KEY'] } }
 
 if (-not $VpsHost -or -not $VpsUser) {
     Write-Error "ssh-arm64-vps: connection data missing. Create .secrets\arm64-vps.env with DSS_VPS_HOST, DSS_VPS_USER, DSS_VPS_KEY (a key PATH), or pass -VpsHost/-VpsUser."

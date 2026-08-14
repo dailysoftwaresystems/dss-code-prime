@@ -24,6 +24,7 @@
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/transport.hpp"
+#include "program/build_scripts.hpp"  // runBuildScripts — the manifest's pre/post build hooks
 #include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"
 #include "program/cross_validate_target_format.hpp"
@@ -71,21 +72,12 @@ namespace {
     return server.run();
 }
 
-// Build a `DiagnosticReporter::Config` from the CLI's policy flags
-// (`--warnings-as-errors`, `--suppress=<code>`). The Config is
-// constructed at Program::run and passed into the policy-aware
-// compile* overloads — that lets the CLI policy apply uniformly to
-// the per-tier diagnostics drained into the run-wide reporter.
-// (D-LK10-7 closure: the policy knob arriving at Program::compileFiles
-// is the trigger that closes the D-LK10-7 anchor.)
-[[nodiscard]] DiagnosticReporter::Config buildReporterConfig(CliArgs const& args) {
-    DiagnosticReporter::Config cfg;
-    cfg.policy.warningsAsErrors = args.warningsAsErrors;
-    for (auto const code : args.suppress) {
-        cfg.policy.suppress.insert(code);
-    }
-    return cfg;
-}
+// `buildReporterConfig` (CLI flags → `DiagnosticReporter::Config`) MOVED to
+// `program/cli_args.{hpp,cpp}`, beside the parser that produces its input. It
+// is a pure projection of `CliArgs` with no Program state, and being reachable
+// from a test is what lets the `--max-diagnostics` pin drive argv → CliArgs →
+// Config through the SHIPPED projection rather than re-typing the config.
+// (D-LK10-7's policy knob still arrives here unchanged, at `Program::run`.)
 
 // Drain reporter diagnostics to stderr. The driver is the boundary
 // between in-memory diagnostic records and the operator's terminal;
@@ -119,9 +111,22 @@ namespace {
 // (see `runCusToTargets`). Pre-parse error sites (no CUs yet) pass an
 // empty registry — their diagnostics are all buffer-less, so the split
 // keeps them on the code-only path regardless.
+// `firstIndex` exists for the ONE call site that drains a reporter somebody
+// else already drained. `rep.all()` is a span and this function RENDERS rather
+// than CONSUMES — nothing is cleared, so a second unqualified call reprints
+// everything. The post-build hook seam is exactly that shape: the compile
+// delegate drains on its way out (`runCusToTargets`), and a hook failing
+// afterwards must report ITS diagnostic without replaying the whole successful
+// compile's output ahead of it — which would bury the one line explaining the
+// non-zero exit under a duplicate dump, and would re-render every
+// buffer-bearing diagnostic through the EMPTY registry of the one-argument
+// overload, printing the bogus `<unknown-buffer:0>` line this helper's routing
+// exists to avoid. Callers that own the whole stream keep the default 0.
 void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
-                              BufferRegistry const&     bufs) {
-    for (auto const& d : rep.all()) {
+                              BufferRegistry const&     bufs,
+                              std::size_t const         firstIndex = 0) {
+    auto const all = rep.all();
+    for (auto const& d : all.subspan(std::min(firstIndex, all.size()))) {
         if (d.buffer.valid()) {
             std::cerr << rep.format(d, bufs);
         } else {
@@ -138,9 +143,10 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 // renders them code-only via the routing above. Keeps the 13 early-error
 // sites a one-token change while the 2 post-parse sites (in
 // `runCusToTargets`, which owns the CUs) pass the real registry.
-void drainDiagnosticsToStderr(DiagnosticReporter const& rep) {
+void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
+                              std::size_t const         firstIndex = 0) {
     static BufferRegistry const kEmpty;
-    drainDiagnosticsToStderr(rep, kEmpty);
+    drainDiagnosticsToStderr(rep, kEmpty, firstIndex);
 }
 
 // ── THE BUILD'S STATEMENT OF RECORD ABOUT WHAT IT PRODUCED ─────────────────
@@ -842,12 +848,16 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // to every DEFINITION merge-key (nameOf below) AND the entry-name set, so definitions
     // match the externs' already-mangled `mangledName` on macho (identity on elf/pe). Both
     // the def↔extern resolution and the `main` entry match key on this same convention.
-    ObjectFormatKind const fmtKind = (*formatR)->kind();
     // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN (step C4): the C-symbol decoration
     // rule is now READ FROM THE SCHEMA rather than looked up in a C++ table keyed
-    // on `fmtKind`. Both merge rails below (`nameOf` for definitions, the entry-name
-    // set) take THIS one value, so they cannot diverge — and `validate()` guarantees
-    // it is a real scheme, never the `Unspecified` sentinel.
+    // on the format KIND. Both merge rails below (`nameOf` for definitions, the
+    // entry-name set) take THIS one value, so they cannot diverge — and
+    // `validate()` guarantees it is a real scheme, never the `Unspecified`
+    // sentinel. (The `ObjectFormatKind fmtKind` local that fed the retired table
+    // outlived its last reader and is removed here — MEASURED as the only
+    // `warning C4189` this translation unit produces under /W4, i.e. a dead
+    // schema read that every reader of the paragraph above would reasonably
+    // assume still drove something.)
     CSymbolDecorationScheme const cSymDecor =
         (*formatR)->cSymbolDecoration().scheme;
     std::vector<MergeCuInput> mergeInputs;
@@ -1740,7 +1750,7 @@ int runCusToTargets(
         scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
         scratchCfg.dedupWindow    = 0;
         DiagnosticReporter scratch{scratchCfg};
-        CompileOptions compileOpts;
+        CompileOptions compileOpts{DiagnosticBudget{rep.config()}};
         compileOpts.config           = config;
         compileOpts.pipelineOverride = pipelineOverride;
         compileOpts.resolveLibraries = resolveLibraries;  // c162 (D-FF1-READER-CONSUMER)
@@ -1907,7 +1917,7 @@ int Program::compileProject(
     // `compileFiles`). `reporterConfig` threads `--warnings-as-errors`
     // + `--suppress=<code>` through every tier; the rep-taking overload
     // lets tests inspect the emitted code after return.
-    DiagnosticReporter rep{reporterConfig};
+    DiagnosticReporter rep = buildReporter(reporterConfig);
     return compileProject(projectFilePath, rep);
 }
 
@@ -1935,6 +1945,72 @@ int Program::compileProject(
         return 1;
     }
     ProjectConfig const& pc = *pcOpt;
+
+    // ── `dependsOn`: DECLARED-BUT-UNRESOLVED IS A LOUD REJECT, NOT A NO-OP ──
+    //
+    // The loader parses and shape-validates `dependsOn` (path-xor-git, `ref`
+    // only with `git`, no unknown members). RESOLUTION — walking to the named
+    // manifest, acquiring a git remote into `.dss-deps/<name>`, cycle
+    // detection, and merging the dependency's sources or linking its artifact —
+    // is a separate lane that has NOT landed in this driver. The codes that
+    // lane will emit are already allocated and documented (0xD019..0xD020 in
+    // `core/types/parse_diagnostic.hpp`); NONE of them fits here, because every
+    // one of them describes an OUTCOME of a resolution attempt ("that directory
+    // holds no manifest", "the graph has a cycle", "git is not on PATH"), and
+    // this is the prior condition: no attempt is made at all.
+    //
+    // ★ WHY THIS IS A HARD REJECT RATHER THAN AN IGNORED FIELD. Accept-and-
+    // ignore is the single worst behaviour available: the manifest states a
+    // prerequisite, the build reports success, and the artifact is missing
+    // exactly the thing the author declared it needs. The failure then surfaces
+    // as an undefined symbol at link — or, far worse, as a link against a STALE
+    // copy of the dependency that happens to be lying around — with nothing
+    // anywhere pointing back at the key that was silently dropped. Rejecting
+    // the key outright costs the author one line of diff and tells them the
+    // truth; ignoring it costs them a debugging session and tells them a lie.
+    //
+    // ★ WHY `D_PlanNotLanded` (0xD009) AND NOT A NEW CODE. Its allocation note
+    // defines it as "an entry point reached an arm whose backing plan substrate
+    // is not yet shipped ... Future plan-gated arms re-use this code", and
+    // distinguishes it from `D_TargetAbiModelUnsupportedByDriver` (a PERMANENT
+    // architectural exclusion) — a distinction `ffi/ingest.cpp` also turns on
+    // when it declines to reuse this code. Dependency resolution is squarely
+    // the pending-arrival case: the feature is coming, the surface is stable,
+    // and only the engine behind it is absent. Minting a fourth "not landed
+    // yet" code would say nothing 0xD009 does not already say, and would leave
+    // a dead ordinal behind the day the lane lands. It is also a member of
+    // `kUnsuppressableCodes`, which is load-bearing here: `--suppress` must not
+    // be able to convert this loud reject back into the silent no-op it exists
+    // to replace.
+    //
+    // Placed FIRST — ahead of the profile gates, the flag merges and (crucially)
+    // the pre-build scripts — because a build that cannot happen must not have
+    // side effects on the way to saying so: running the author's codegen hook
+    // for a build we are about to refuse writes files into their tree for
+    // nothing.
+    if (!pc.dependsOn.empty()) {
+        DependencyEntry const& first = pc.dependsOn.front();
+        std::string const firstName =
+            first.path.has_value()
+                ? ("path '" + *first.path + "'")
+                : (first.git.has_value() ? ("git '" + *first.git + "'")
+                                         : std::string{"<unnamed>"});
+        emitDriver(rep, DiagnosticCode::D_PlanNotLanded,
+                   "project 'dependsOn': dependency RESOLUTION is not yet "
+                   "implemented in this driver — the manifest declares "
+                   + std::to_string(pc.dependsOn.size())
+                   + " dependency entr" + (pc.dependsOn.size() == 1 ? "y" : "ies")
+                   + " (first: " + firstName
+                   + "), and the driver cannot resolve, acquire or build any of "
+                     "them. The build is REFUSED rather than run without them: "
+                     "compiling as if the key were absent would report success "
+                     "for an artifact that is missing a declared prerequisite. "
+                     "Remove the 'dependsOn' key (and build the prerequisite "
+                     "separately, wiring it in via 'resolveLibraries' or an "
+                     "explicit source entry) until dependency resolution lands.");
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
 
     // Load the language grammar to read its declared `artifactProfiles`.
     // The delegated `compileFiles`/`compileUnits` re-loads it by name;
@@ -2058,6 +2134,51 @@ int Program::compileProject(
         setStackReserveBytes(pc.stackReserveBytes);
     }
 
+    // ── PRE-BUILD HOOKS — AND THE ONE THING THAT FIXES THEIR POSITION ──────
+    //
+    // `runBuildScripts` spawns every APPLICABLE `preBuildScripts` entry in
+    // manifest order, stopping at the first failure, and emits exactly one
+    // remediation-distinct diagnostic when it does (`D_ScriptSpawnFailed` if the
+    // OS never created the process, `D_ScriptExitedNonZero` if it ran and said
+    // no). `false` means abandon the build — the `[[nodiscard]]` on the
+    // declaration exists so that abandoning cannot be forgotten, since a
+    // forgotten check is precisely a green compile of the STALE sources a failed
+    // codegen step did not regenerate.
+    //
+    // ★ THIS MUST SIT ABOVE THE GLOB EXPANSION, AND THAT ORDER IS THE FEATURE.
+    // The overwhelmingly common reason to declare a pre-build hook is to
+    // GENERATE sources — a parser generator, a `*.in` substitution, a version
+    // stamp — and the manifest then names those outputs with a pattern like
+    // `"generated/*.c"`. Expansion is deliberately FAIL-LOUD on zero matches
+    // (see the block below), so running the hooks after it would make the very
+    // case the feature exists for the one case it cannot serve: the glob would
+    // match nothing, the build would die naming a pattern that was about to
+    // become correct, and the hook would never run at all. Anything that moves
+    // this call below the expansion breaks generated-source projects outright;
+    // `tests/program/test_project_config.cpp`'s
+    // `PreBuildScriptGeneratesSourceThatCompilesAndRuns` is the pin that
+    // catches it, and it catches it by RUNNING the produced binary.
+    //
+    // CWD — the child starts in the PROCESS working directory, which is the
+    // same base a relative `sources[]` entry and every relative glob already
+    // resolve against (see the expansion block below and
+    // `docs/project-config-spec.md`). A hook that writes `generated/main.c` and
+    // a manifest that reads `generated/*.c` must mean the same directory, or the
+    // feature does not compose with itself. The empty path IS that instruction:
+    // `substrate::spawnAndWaitInherit` documents `cwd` empty as "inherit the
+    // caller's current directory". It is passed as the sentinel rather than a
+    // materialized `fs::current_path()` on purpose — materializing introduces a
+    // failure mode (a deleted cwd) whose only honest handling is a diagnostic
+    // for a condition under which nothing else in this function works either,
+    // and it would let the two answers drift apart. (A DEPENDENCY manifest's
+    // hooks must run in THAT dependency's directory instead — which is why
+    // `runBuildScripts` takes `cwd` as a parameter at all; that caller does not
+    // exist yet, see the `dependsOn` reject above.)
+    if (!runBuildScripts(pc.preBuildScripts, fs::path{}, rep)) {
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+
     // D-AP2-SOURCES-GLOB: expand any glob pattern in `sources[]` into its
     // matching files BEFORE the multi-vs-single-CU routing count is taken — so a
     // `"src/**/*.c"` entry routes EXACTLY as if its matches had been listed
@@ -2136,9 +2257,59 @@ int Program::compileProject(
     // single-CU path (`compileFiles`). The delegate validates each
     // `<targetName>:<formatName>` spec (D_InvalidTargetSpec) and drains `rep` at
     // its end (runCusToTargets), so we do NOT drain here.
-    return routesToMultiUnit(expandedSources.size())
+    //
+    // The delegate's result is CAPTURED rather than returned directly — the
+    // post-build hooks below need to know how the build went, and they need to
+    // run after it.
+    int const rc = routesToMultiUnit(expandedSources.size())
         ? compileUnits(expandedSources, pc.language, pc.targets, rep)
         : compileFiles(expandedSources, pc.language, pc.targets, rep);
+
+    // ── POST-BUILD HOOKS — GATED ON A SUCCESSFUL COMPILE, AND ASYMMETRIC ────
+    //
+    // TWO decisions live here, and they point in opposite directions on
+    // purpose.
+    //
+    // (1) THE HOOKS RUN ONLY WHEN `rc == 0`. A post-build step packages,
+    // signs, copies, installs or deploys the artifact — every one of those is
+    // an operation ON a thing the failed build did not produce, or worse, on a
+    // STALE copy of it left behind by an earlier successful run. Running them
+    // after a failed compile therefore either fails with a confusing second
+    // error that buries the real one, or SUCCEEDS at shipping yesterday's
+    // binary. This is also what every build system the author already knows
+    // does: `make` stops the recipe at the first failing command, cargo's
+    // post-build work never runs for a failed crate, and a CMake
+    // `POST_BUILD` custom command is attached to a target that did not build.
+    //
+    // (2) A POST-BUILD FAILURE STILL FAILS THE WHOLE BUILD (`rc = 1`) EVEN
+    // THOUGH THE ARTIFACT EXISTS ON DISK. The hook is part of what the author
+    // declared "building this project" to mean; a packaging step that failed
+    // means the project is not built, and reporting exit 0 with a diagnostic on
+    // stderr invites every CI system on earth to proceed to the next stage. The
+    // artifact deliberately stays where it is rather than being deleted — the
+    // compile genuinely succeeded, the bytes are genuinely correct, and
+    // unwinding a successful compile because a deploy script's credentials
+    // expired would destroy work the operator can otherwise re-use after fixing
+    // the hook. So: artifact present, exit non-zero, one diagnostic naming the
+    // script. (`tests/program/test_project_config.cpp`'s
+    // `PostBuildScriptFailureFailsBuildButKeepsArtifact` asserts BOTH halves —
+    // the existence check is what proves the compile really did run first.)
+    //
+    // Same cwd sentinel and the same fail-loud codes as the pre-build call.
+    //
+    // `rep` was already drained by the delegate on its way out, and the drain
+    // helper RENDERS rather than CONSUMES — so the post-build diagnostic is
+    // drained FROM A MARK taken before the hooks run. Draining unqualified
+    // here would reprint every diagnostic the successful compile produced
+    // (warnings and notes survive `rc == 0`) and leave the single line naming
+    // the failed hook at the bottom of a duplicated dump. The mark is taken
+    // outside the `&&` because `runBuildScripts` is what appends to `rep`.
+    std::size_t const preHookDiagnostics = rep.all().size();
+    if (rc == 0 && !runBuildScripts(pc.postBuildScripts, fs::path{}, rep)) {
+        drainDiagnosticsToStderr(rep, preHookDiagnostics);
+        return 1;
+    }
+    return rc;
 }
 
 int Program::transpile(
@@ -2154,7 +2325,7 @@ int Program::transpile(
     // routes `--transpile <files>` here so the surface is parsable
     // and stable across plan 10's arrival. Policy-aware overload
     // (H2 fold): see compileProject for rationale.
-    DiagnosticReporter rep{reporterConfig};
+    DiagnosticReporter rep = buildReporter(reporterConfig);
     std::string detail =
         "transpile: source-to-source translation is not yet "
         "implemented — plan 10 (`*.map.json` + HIR pivot + target "
@@ -2243,7 +2414,7 @@ int Program::compileFiles(
     // D-CAP-MARKER-MULTI-TARGET-E2E-PIN). Existing CLI / Python
     // call sites that pass `Config` (or use the default-arg)
     // continue unchanged.
-    DiagnosticReporter rep{reporterConfig};
+    DiagnosticReporter rep = buildReporter(reporterConfig);
     return compileFiles(sourceFiles, languageName, targets, rep);
 }
 
@@ -2320,7 +2491,15 @@ int Program::compileFiles(
         -> std::vector<CompilationUnit> {
         auto cu = substrate::callOnLargeStack(
             substrate::kDeepRecursionStackBytes, [&] {
-                UnitBuilder builder{keyGrammar};
+                // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the
+                // operator's `--max-diagnostics` value crosses into the front
+                // end HERE, and `rep` is its only holder at this point (the
+                // Config overload is a thin wrapper that builds `rep` and
+                // forwards). Taken from `rep`, never from a per-target scratch
+                // -- those deliberately relax the volume axes to SIZE_MAX for
+                // the merge, so a budget derived from one would hand the front
+                // end no bound at all.
+                UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
                 applySystemDirs(builder, *keyGrammar);
                 if (key.format) builder.setActiveFormat(*key.format);
                 // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
@@ -2363,7 +2542,7 @@ int Program::compileUnits(
     const std::vector<std::string>& targets,
     DiagnosticReporter::Config const& reporterConfig
 ) {
-    DiagnosticReporter rep{reporterConfig};
+    DiagnosticReporter rep = buildReporter(reporterConfig);
     return compileUnits(sourceFiles, languageName, targets, rep);
 }
 
@@ -2429,7 +2608,9 @@ int Program::compileUnits(
             // expression parses without overflowing the host main stack.
             cus.push_back(substrate::callOnLargeStack(
                 substrate::kDeepRecursionStackBytes, [&] {
-                    UnitBuilder builder{keyGrammar};
+                    // Same budget hop as `compileFiles` above
+                    // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE).
+                    UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
                     applySystemDirs(builder, *keyGrammar);
                     if (key.format) builder.setActiveFormat(*key.format);
                     // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
@@ -2476,7 +2657,7 @@ int Program::compileDirectory(
     InputResolver::Mode mode,
     DiagnosticReporter::Config const& reporterConfig
 ) {
-    DiagnosticReporter rep{reporterConfig};
+    DiagnosticReporter rep = buildReporter(reporterConfig);
 
     // ── Which extensions does the scan collect? ───────────────────────────
     //

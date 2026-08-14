@@ -29,8 +29,26 @@ set -uo pipefail
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 CONF=$REPO/.secrets/macos.env
+
+# ★ ENV MUST WIN OVER THE CONFIG FILE, AND THAT TAKES DELIBERATE CODE. `.` sources
+# the file INTO THIS SHELL, so a bare `. "$CONF"` OVERWRITES whatever the caller put
+# in the environment — the exact reverse of the precedence stated at the top of this
+# file. ⚠ MEASURED 2026-08-13: `DSS_MACOS_HOST=<ip> tools/ssh-macos.sh` was silently
+# ignored, and the script still tried to resolve the `.local` name from the config.
+# That is the single worst place for this bug to live: the override it defeats is the
+# one THIS SCRIPT'S OWN resolve-failure message instructs you to use ("Put a literal
+# IP in DSS_MACOS_HOST"), on the WSL path where the same message says mDNS is expected
+# to fail. So the documented workaround for the documented failure could not work.
+# The PowerShell sibling always had this right (`if ($env:DSS_MACOS_HOST) {...} else
+# {$conf[...]}`) — this is the CAPABILITY PAIR having drifted, which is precisely what
+# the header's pairing note exists to prevent.
+_envHost=${DSS_MACOS_HOST:-} ; _envUser=${DSS_MACOS_USER:-} ; _envKey=${DSS_MACOS_KEY:-}
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
+if [ -n "$_envHost" ]; then DSS_MACOS_HOST=$_envHost ; fi
+if [ -n "$_envUser" ]; then DSS_MACOS_USER=$_envUser ; fi
+if [ -n "$_envKey"  ]; then DSS_MACOS_KEY=$_envKey   ; fi
+unset _envHost _envUser _envKey
 
 : "${DSS_MACOS_HOST:=}" ; : "${DSS_MACOS_USER:=}" ; : "${DSS_MACOS_KEY:=}"
 DSS_MACOS_KEY=$(eval printf '%s' "\"$DSS_MACOS_KEY\"")

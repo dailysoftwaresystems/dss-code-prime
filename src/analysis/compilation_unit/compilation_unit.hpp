@@ -15,6 +15,7 @@
 
 #include "analysis/syntactic/binder_sketch.hpp"   // AmbiguousTypeNameCandidate (FC2 sidecar)
 #include "core/export.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
@@ -225,12 +226,23 @@ public:
     // Single-language builder: the one schema is the CU's primary (the
     // `CompilationUnit::schema()` convenience) AND the only entry in the schema
     // registry, so `addFile` always routes to it. Every CU1-CU4 caller uses this.
-    explicit UnitBuilder(std::shared_ptr<GrammarSchema const> schema);
+    // `budget` is REQUIRED at both ctors and has no default argument. This is
+    // the tier boundary the operator's `--max-diagnostics` value crosses into
+    // the front end: the builder hands it to its own driver reporter, to every
+    // `Tokenizer` it constructs, to the `Preprocessor`, and through `Parser`
+    // to the tree's `TreeBuilder`. Before it existed, all of those built
+    // themselves from `DiagnosticReporter::Config`'s in-class initializers and
+    // capped at 1000/50 whatever the operator asked for
+    // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE). Callers with no
+    // operator budget in scope pass `DiagnosticBudget::libraryDefault()`.
+    UnitBuilder(std::shared_ptr<GrammarSchema const> schema,
+                DiagnosticBudget                     budget);
 
     // Multi-language builder (HR11/CU5): `schemas` is the registry `addFile`
     // routes against by file extension; `schemas[0]` is the CU's primary. Must
     // be non-empty.
-    explicit UnitBuilder(std::vector<std::shared_ptr<GrammarSchema const>> schemas);
+    UnitBuilder(std::vector<std::shared_ptr<GrammarSchema const>> schemas,
+                DiagnosticBudget                                   budget);
 
     // Register an additional source language so `addFile` can route a path to it
     // by matching the extension against each registered schema's
@@ -440,6 +452,11 @@ private:
     std::shared_ptr<GrammarSchema const> schema_;        // primary (= schemas_[0])
     std::vector<std::shared_ptr<GrammarSchema const>> schemas_;  // registry, by extension
     std::vector<Tree>                    trees_;
+    // The operator's volume budget, held so every reporter this builder
+    // creates downstream (tokenizer, preprocessor, tree) is built from the
+    // SAME number rather than from `Config`'s in-class initializers
+    // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE).
+    DiagnosticBudget                     budget_;
     DiagnosticReporter                   driverDiagnostics_;
     std::unordered_set<std::string>      seenPaths_;   // weakly-canonical, for addFile dedup
     // Weakly-canonical path → index into trees_, for include-following dedup
