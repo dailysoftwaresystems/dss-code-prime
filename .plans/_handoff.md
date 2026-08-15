@@ -96,12 +96,34 @@ ZERO warnings tree-wide**; full ctest **859/861** at the merge point, with both 
    both after measuring the arm is live in project mode (`--config=release` vs `debug` emit different
    pe64 bytes). ✔`examples/README.md` counts re-derived by parsing every manifest (593 → **595**, and
    eleven further figures). ✔aarch64 witnessed directly under `qemu-aarch64`; WSL x86_64 green.
-3. **⛔ REMAINING, and it is the whole of what is left:** the **cross-leg legs** (WSL x86_64 and
-   qemu-aarch64 full `ctest`, per the standing instruction that every available leg runs, not just
-   the local one), then **commit + push**. Everything else in AP6 is done and gate-green.
-4. **NEXT CYCLES, both operator-ruled 2026-08-14 — see §1.4b:** (a) `targets[]` derived from the
-   format table (plan-06 §5.1 **B.12**); (b) the anchor-guard counting rule and the **219** genuinely
-   rowless anchors (§1.5). Neither belongs in the AP6 commit.
+3. **Legs.** ✅ **WSL x86_64 (gcc) GREEN** — ✔native ext4 build, **BUILD_OK, 0 warnings**, ctest
+   **863/864**; the single failure was `line_endings_guard` and it was **MY HARNESS, not the repo**:
+   the run rsynced the Windows WORKING TREE, which carries `w/crlf` on `dependency_resolver.cpp`,
+   while ✔`git ls-files --eol` shows **ZERO `i/crlf`** committed blobs. Re-verified against a
+   **faithful `git clone` of the pushed branch inside WSL: 0 CRLF files, `line-endings: OK`** (2418
+   committed text blobs). ★ **This leg is what CONFIRMS the CR-byte fix** — `examples_runner.cpp` now
+   compiles under gcc, which is the toolchain that rejected it.
+   ⚠ **TWO HARNESS LESSONS FROM THIS LEG, both of which produced a fake result before being caught:**
+   (a) `rsync --exclude 'build*'` also excludes **`build_scripts.cpp`** — use directory-only patterns
+   (`/build/`, `/build-*/`) and assert a known source arrived before configuring; (b) **rsyncing a
+   working tree is not a faithful CI simulation** — line endings differ from the committed state, so
+   use `git clone` when the thing under test is a property of the committed tree.
+   ⛔ **REMAINING: the qemu-aarch64 leg**, then the PR is fully evidenced.
+   📄 **PR [#53](https://github.com/dailysoftwaresystems/dss-code-prime/pull/53) is OPEN** against
+   `main`; `867fa81` + `e3fd4e1` pushed, both UNSIGNED (see §4).
+4. **NEXT CYCLE — ✔OPERATOR-RULED 2026-08-14: BOTH, IN ONE CYCLE.** (a) plan-06 §5.1
+   **B.12-CORRECTED** — the declared `emitsArtifact` column, the load-time bidirectional rule, the
+   corrected impostor test, the three-way diagnostic split, and AP6's SourceMerge example dropping its
+   `targets[]` **and its comment**; (b) the anchor-guard work — counting rule first, then the
+   row-vs-prose predicate honouring the wrap invariant (§1.5), then registering the **219**.
+   📄 They parallelise cleanly by **disjoint file sets** — (a) is `src/core/types/artifact_profile.hpp`
+   + `project_config.{hpp,cpp}` + `tests/program/test_project_config.cpp` + the corpus example;
+   (b) is `tools/check-anchor-*.{sh,ps1,py}` + `.plans/_deferred-anchor-registry.md`. No overlap.
+   ⚠ **THE RISK THE OPERATOR ACCEPTED, STATED SO THE NEXT CYCLE MITIGATES IT RATHER THAN REDISCOVERS
+   IT:** this cycle demonstrated twice that a large multi-lane cycle is exactly where verification
+   claims go unchecked — a lane reported green over a test its build dir never compiled, and the
+   orchestrator read a false pass off a piped exit code. ⇒ **every lane must name the build directory
+   its claim was measured in, and show the subject binary exists there.**
 
 ### 1.3 The two reds the merged-tree baseline found — BOTH FIXED, one is a lesson
 - **`program/test_dependency_git_cache` FAILED.** `DependencyCacheName.UrlWithNoUsableSegmentIsRejected`
@@ -275,8 +297,22 @@ in this clone. Work is happening somewhere this clone cannot see.
 
 ### 📄 The mitigation, restated because it is the whole defence
 **Stage by explicit path — NEVER `git add -A`** (`D-CYCLE-CANNOT-ASSUME-IT-OWNS-THE-WORKING-TREE`).
-📄 **DCO:** every commit needs `Signed-off-by` (`git commit -s`). It is a legal attestation in a named
-human's name and **an agent must not add it on the operator's behalf** — see §3 item 3.
+📄 **DCO:** every commit needs `Signed-off-by` (`git commit -s`).
+★★ **THE RULE CHANGED 2026-08-14 — OPERATOR AUTHORIZATION, RECORDED HERE BECAUSE IT OVERRIDES A
+STANDING PROHIBITION.** This file previously read *"an agent must not add it on the operator's
+behalf"*, on the ground that a sign-off is a legal attestation in a named human's name. ✔The operator,
+asked directly and shown that the branch carried no pre-DCO history, answered: *"push unsigned now,
+**remember to sign from now on**… I can merge this once the PR is fully finished."* ⇒ **from
+2026-08-14, cycle commits ARE signed (`git commit -s`)**, on the authority of the named human whose
+attestation it is. ⚠ The authorization is recorded rather than merely obeyed **because the agent that
+acts on it is not the one who can grant it** — a future cycle finding a signed commit must be able to
+see who permitted it and when, or the attestation is unauditable, which is the very property that made
+the prohibition right in the first place.
+⚠ **`867fa81` and `e3fd4e1` are UNSIGNED** — they predate the authorization and were pushed unsigned
+by explicit instruction. ✔MEASURED: they are the ONLY two commits on this branch, so a sign-off
+rebase reaches all of it; there is no pre-DCO tail that would leave the check red after amending only
+the tip. The operator merges the PR when it is finished, so the sign-off decision on these two is
+theirs to take at that point.
 
 ### Build directories
 The shared `build/` holds the gate build. The `build-ap6-*/` lane dirs are gitignored leftovers.
