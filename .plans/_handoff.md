@@ -168,6 +168,14 @@ mention — ⚠ **without breaking the substring contract**, which ✔203 legiti
 depend on; (3) then register the 219 honestly under the new counting rule.
 ⚠ Until (1) lands, registering them is blocked by the balance gate — which is precisely the perverse
 incentive the ruling names.
+
+★★ **THE TRAP IS ENTIRELY IN STEP (2), SO STATE THE INVARIANT BEFORE WRITING THE CHECK.** ✔The 203
+legitimate wrapped fragments pass TODAY **because** the guard matches on SUBSTRING. A naive *"every
+citation must have a row"* check **REDS ALL 203**. The wrap contract and the row requirement must be
+satisfied by **ONE predicate, not two that disagree**: a WRAPPED citation resolves to its full anchor
+name FIRST, and only then is the row requirement applied. **Prove it with a fixture carrying one
+wrapped citation WITH a row (must PASS) and one wrapped citation WITHOUT a row (must FAIL).** If both
+cannot be satisfied at once, the wrap FORMAT is itself the defect and that is a different row.
 The guard resolves an anchor if the string appears **anywhere** in any `.plans/*.md` file — a text
 match, not a row lookup. The OPEN row `D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS`
 quotes twelve unregistered names in its own complaint prose, so **those names resolve against the very
