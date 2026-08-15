@@ -235,6 +235,19 @@ std::string errnoText(int code) {
                 : "<no message text for this errno>");
 }
 
+// One byte as REAL hex. `"0x" + std::to_string(b)` renders DECIMAL behind a hex
+// prefix and can print `0x200` for a value no byte can hold — the same mistake
+// `windows_command_line.hpp` calls out over its lead-byte report, avoided the
+// same way. Used only by the unrecognised-stage arm below, which is the one
+// place this facility has to print a byte it cannot interpret.
+std::string hexByte(unsigned char value) {
+    char const* const digits = "0123456789abcdef";
+    std::string       out    = "0x";
+    out.push_back(digits[(value >> 4) & 0x0F]);
+    out.push_back(digits[value & 0x0F]);
+    return out;
+}
+
 #endif
 
 // ── PATH resolution ────────────────────────────────────────────────────────
@@ -513,6 +526,72 @@ std::optional<fs::path> resolveDetailed(std::string const& command,
     return std::nullopt;
 }
 
+#if defined(_WIN32)
+
+// ── Handing our OWN stdin/stderr on when the child's stdout is redirected ───
+//
+// ★ `STARTF_USESTDHANDLES` IS ALL-OR-NOTHING, WHICH IS THE WHOLE PROBLEM WITH
+// IT. The moment that flag is set, `CreateProcessW` stops passing the parent's
+// console and redirections through implicitly and uses ONLY the three handles
+// in `STARTUPINFOW`. So redirecting stdout means explicitly RE-SUPPLYING the
+// other two, and a call that left them zeroed would hand the child a closed
+// stderr — a build tool's error text would vanish exactly when the compiler
+// started capturing its output, i.e. at the moment it matters most, and the
+// caller would see an empty capture and a plausible exit code.
+//
+// ★ AND A RE-SUPPLIED HANDLE MUST BE INHERITABLE, WHICH THE PARENT'S OWN NEED
+// NOT BE. Only handles carrying `HANDLE_FLAG_INHERIT` cross into the child, even
+// with `bInheritHandles=TRUE`; what `GetStdHandle` returns is whatever this
+// process was launched with, and nothing guarantees the flag — a handle
+// installed later by `SetStdHandle` in particular carries only what its creator
+// asked for. So each is DUPLICATED with `bInheritHandle=TRUE` and the DUPLICATE
+// is what travels. `SetHandleInformation` on the original would be two lines
+// shorter and wrong twice over: it mutates process-global state that outlives
+// this call, and it races a concurrent spawn reading the same handle.
+//
+// A parent that genuinely HAS no such handle (a GUI process, a service, a child
+// launched with the handle closed) yields `nullptr` — which is precisely what
+// such a child inherits today without the flag. An absent handle is passed on as
+// absent rather than invented; only a real `DuplicateHandle` failure is one.
+bool duplicateStdHandleInheritable(DWORD which, HANDLE& out, DWORD& failure) {
+    out = nullptr;
+    HANDLE const source = ::GetStdHandle(which);
+    if (source == nullptr || source == INVALID_HANDLE_VALUE) {
+        return true;
+    }
+    HANDLE duplicate = nullptr;
+    if (::DuplicateHandle(::GetCurrentProcess(), source, ::GetCurrentProcess(),
+                          &duplicate, /*dwDesiredAccess*/ 0,
+                          /*bInheritHandle*/ TRUE, DUPLICATE_SAME_ACCESS)
+        == 0) {
+        failure = ::GetLastError();
+        return false;
+    }
+    out = duplicate;
+    return true;
+}
+
+// Cleanup is not free of consequences here: Win32 makes no promise that a
+// SUCCEEDING call leaves the thread's last error alone, so a close performed
+// between a failed API call and the `GetLastError` that reports it can replace
+// the real code with ERROR_SUCCESS — and the operator is then told a spawn that
+// failed "completed successfully". Every caller below captures the error FIRST
+// and closes second; this helper exists so the closing half is one call and
+// cannot drift out of that order.
+void closeStdioHandles(HANDLE redirect, HANDLE childStdin, HANDLE childStderr) {
+    if (redirect != INVALID_HANDLE_VALUE) {
+        ::CloseHandle(redirect);
+    }
+    if (childStdin != nullptr) {
+        ::CloseHandle(childStdin);
+    }
+    if (childStderr != nullptr) {
+        ::CloseHandle(childStderr);
+    }
+}
+
+#endif  // _WIN32
+
 } // namespace
 
 // ── Public surface ─────────────────────────────────────────────────────────
@@ -545,29 +624,72 @@ namespace detail {
 // also have to gate seven pins identically, and the day a `posix_spawn` host
 // needs the handshake back the tested decision would have to be rewritten from
 // nothing.
-HandshakeVerdict interpretExecHandshake(std::size_t         bytesRead,
-                                        std::size_t         expectedBytes,
-                                        int                 readErrno,
-                                        ChildFailure const* failure,
-                                        std::string const&  exePath,
-                                        std::string const&  cwdPath) {
+HandshakeVerdict interpretExecHandshake(std::size_t             bytesRead,
+                                        std::size_t             expectedBytes,
+                                        int                     readErrno,
+                                        ChildFailure const*     failure,
+                                        HandshakeContext const& context) {
     if (readErrno == 0 && bytesRead == 0) {
         return HandshakeVerdict{true, std::string{}};
     }
+
+    // The entry point the CALLER actually invoked, not the one this code was
+    // first written for. Both public spawns share this child and this pipe, and
+    // a message that always said `spawnAndWaitInherit` would send a reader to a
+    // function that was never called.
+    std::string const self = context.entryPoint + ": ";
+
     if (readErrno == 0 && bytesRead == expectedBytes && failure != nullptr) {
-        return HandshakeVerdict{
-            false,
-            failure->stage == 'C'
-                ? "spawnAndWaitInherit: the child could not enter working "
-                  "directory '" + cwdPath + "' (" + errnoText(failure->error)
-                      + ")"
-                : "spawnAndWaitInherit: execv('" + exePath + "') failed ("
-                      + errnoText(failure->error) + ")"};
+        switch (failure->stage) {
+            case 'C':
+                return HandshakeVerdict{
+                    false,
+                    self + "the child could not enter working directory '"
+                        + context.cwdPath + "' (" + errnoText(failure->error)
+                        + ")"};
+            case 'D':
+                // ★ THE CHILD DECLINED TO RUN THE PROGRAM, AND THAT REFUSAL IS
+                // THE FEATURE. A child that failed to install the redirection
+                // and exec'd anyway would write the tool's output to the
+                // COMPILER's stdout and exit however the tool exits — handing
+                // the caller a clean verdict and an empty file, i.e. a wrong
+                // answer instead of an error. Saying so in the message keeps a
+                // future reader from "fixing" the strictness.
+                return HandshakeVerdict{
+                    false,
+                    self + "the child could not redirect its stdout to '"
+                        + context.stdoutPath + "' ("
+                        + errnoText(failure->error) + "), so it did NOT execute '"
+                        + context.exePath
+                        + "' — running the program with the compiler's own "
+                          "stdout attached would have produced an exit code "
+                          "that looked clean and a file with nothing in it"};
+            case 'X':
+                return HandshakeVerdict{
+                    false,
+                    self + "execv('" + context.exePath + "') failed ("
+                        + errnoText(failure->error) + ")"};
+            default:
+                // A WHOLE record with a stage nobody wrote. "The handshake
+                // broke" would be false — every byte arrived — and mapping it
+                // onto the nearest known stage would print a guess in the voice
+                // of the child. Report the byte and stop interpreting.
+                return HandshakeVerdict{
+                    false,
+                    self + "the child of '" + context.exePath
+                        + "' reported failure stage "
+                        + hexByte(static_cast<unsigned char>(failure->stage))
+                        + ", which this version does not recognise ("
+                        + errnoText(failure->error)
+                        + "); reporting it as not spawned, because a record "
+                          "whose stage cannot be read is not a record saying "
+                          "the program ran."};
+        }
     }
     return HandshakeVerdict{
         false,
-        "spawnAndWaitInherit: the exec-status handshake with the child of '"
-            + exePath + "' broke — " + std::to_string(bytesRead) + " of "
+        self + "the exec-status handshake with the child of '" + context.exePath
+            + "' broke — " + std::to_string(bytesRead) + " of "
             + std::to_string(expectedBytes) + " bytes were read"
             + (readErrno != 0 ? " (" + errnoText(readErrno) + ")"
                               : std::string{})
@@ -579,13 +701,37 @@ HandshakeVerdict interpretExecHandshake(std::size_t         bytesRead,
 
 #endif  // !_WIN32
 
-SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
-                                fs::path const&                 cwd) {
+namespace {
+
+// ── The ONE spawn, with the ONE thing the two entry points disagree about ──
+//
+// `stdoutFile` empty = the child writes to our stdout (the inheriting spawn);
+// non-empty = the child's stdout goes to that file and nothing else moves.
+// `entryPoint` is the public function's own name, threaded through every
+// diagnostic so a message names the call the caller made.
+//
+// ★ WHY ONE BODY AND NOT TWO. Everything a spawn has to get right — the
+// embedded-NUL guard, the UTF-8 decode of argv[0], validating `cwd` before any
+// process exists, resolving argv[0] against the CALLER's directory, the
+// CLOEXEC exec-status handshake, the `WIFSIGNALED` reporting, the exact
+// `spawned` / `exitCode` discrimination — is IDENTICAL for both, and every one
+// of those is a defect this file already had once. A second copy would be a
+// second place for each of them to come back, and only the copy with a pin on
+// it would stay fixed. The redirection is four decisions (open the file, name
+// its failure, install it in the child, close our handles) and they are the
+// only branches below that ask about `stdoutFile`.
+SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
+                             fs::path const&                 cwd,
+                             fs::path const&                 stdoutFile,
+                             char const*                     entryPoint) {
     SpawnResult out;
 
+    // Every message this function can produce opens with it. Built once so the
+    // two entry points cannot drift into naming each other.
+    std::string const self = std::string{entryPoint} + ": ";
+
     if (argv.empty()) {
-        out.diagnostic =
-            "spawnAndWaitInherit: empty argv — there is no program to run";
+        out.diagnostic = self + "empty argv — there is no program to run";
         return out;
     }
 
@@ -610,7 +756,7 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     // echoing it would truncate the diagnostic at the same byte.
     for (std::size_t index = 0; index < argv.size(); ++index) {
         if (argv[index].find('\0') != std::string::npos) {
-            out.diagnostic = "spawnAndWaitInherit: argv[" + std::to_string(index)
+            out.diagnostic = self + "argv[" + std::to_string(index)
                            + "] contains an embedded NUL byte, which no process "
                              "argument can carry — the child would silently "
                              "receive something other than what was asked for";
@@ -629,8 +775,7 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         std::wstring probe;
         std::string  decodeError;
         if (!decodeUtf8ToWide(argv[0], probe, decodeError)) {
-            out.diagnostic = "spawnAndWaitInherit: argv[0] is not valid UTF-8 ("
-                           + decodeError
+            out.diagnostic = self + "argv[0] is not valid UTF-8 (" + decodeError
                            + "), so it cannot name a program on this host";
             return out;
         }
@@ -643,8 +788,8 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     if (!cwd.empty()) {
         std::error_code ec;
         if (!fs::is_directory(cwd, ec) || ec) {
-            out.diagnostic = "spawnAndWaitInherit: working directory '"
-                           + cwd.string() + "' is not a directory"
+            out.diagnostic = self + "working directory '" + cwd.string()
+                           + "' is not a directory"
                            + (ec ? ": " + ec.message() : std::string{});
             return out;
         }
@@ -666,8 +811,7 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     auto const  exe = resolveDetailed(argv[0], &notExecutable);
     if (!exe.has_value()) {
         out.diagnostic =
-            "spawnAndWaitInherit: '" + argv[0]
-            + "' was not found as an executable"
+            self + "'" + argv[0] + "' was not found as an executable"
             + (notExecutable.empty()
                    ? std::string{". "}
                    : ": '" + notExecutable
@@ -684,8 +828,9 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     std::wstring cmdLine;
     std::string  decodeError;
     if (!tryBuildWindowsCommandLine(argv, cmdLine, decodeError)) {
-        out.diagnostic = "spawnAndWaitInherit: argv is not valid UTF-8 and "
-                         "cannot be encoded as a Windows command line ("
+        out.diagnostic = self
+                       + "argv is not valid UTF-8 and cannot be encoded as a "
+                         "Windows command line ("
                        + decodeError + ")";
         return out;
     }
@@ -698,15 +843,86 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     std::wstring const exePath = exe->wstring();
     std::wstring const cwdPath = cwd.empty() ? std::wstring{} : cwd.wstring();
 
-    // NO STARTF_USESTDHANDLES: the child inherits the parent's stdio exactly
-    // as-is. `bInheritHandles=TRUE` is required for that to hold when the
-    // parent's own stdout is a pipe or a file (which it is under ctest and
-    // under any `dss-code-prime ... > log` invocation) — with FALSE, only a
-    // console-attached parent would pass its output on, so the child's
-    // diagnostics would vanish precisely when they are being captured.
+    // With NO redirection, NO STARTF_USESTDHANDLES: the child inherits the
+    // parent's stdio exactly as-is. `bInheritHandles=TRUE` is required for that
+    // to hold when the parent's own stdout is a pipe or a file (which it is
+    // under ctest and under any `dss-code-prime ... > log` invocation) — with
+    // FALSE, only a console-attached parent would pass its output on, so the
+    // child's diagnostics would vanish precisely when they are being captured.
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
+
+    // The three handles the child gets when stdout IS redirected. Held out here
+    // so the single cleanup below covers every exit path.
+    HANDLE redirectHandle = INVALID_HANDLE_VALUE;
+    HANDLE childStdin     = nullptr;
+    HANDLE childStderr    = nullptr;
+
+    if (!stdoutFile.empty()) {
+        // ★ INHERITABLE AT CREATION, not made so afterwards. The child receives
+        // this handle by inheritance, so the flag has to be on it before
+        // `CreateProcessW` looks — and `SECURITY_ATTRIBUTES::bInheritHandle` is
+        // the only spelling with no window between the two.
+        //
+        // CREATE_ALWAYS is truncate-or-create, matching the POSIX arm's
+        // `O_TRUNC` and the contract in the header: a stale capture from a
+        // previous run must not survive under a shorter one and be read back as
+        // this run's answer.
+        //
+        // FILE_SHARE_READ and no FILE_SHARE_WRITE: an observer may look, but a
+        // second WRITER would interleave into the capture the caller is about to
+        // parse. The child does not need the write share — it inherits THIS
+        // handle rather than opening the path again.
+        SECURITY_ATTRIBUTES inheritable{};
+        inheritable.nLength              = sizeof(inheritable);
+        inheritable.lpSecurityDescriptor = nullptr;
+        inheritable.bInheritHandle       = TRUE;
+        redirectHandle = ::CreateFileW(stdoutFile.c_str(), GENERIC_WRITE,
+                                       FILE_SHARE_READ, &inheritable,
+                                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                       nullptr);
+        if (redirectHandle == INVALID_HANDLE_VALUE) {
+            out.diagnostic = self + "could not create the stdout redirect file '"
+                           + stdoutFile.string() + "' ("
+                           + windowsErrorText(::GetLastError())
+                           + "), so '" + exe->string() + "' was not started — "
+                             "running it with our own stdout attached would "
+                             "have left nothing to read and no error to see";
+            return out;
+        }
+
+        // See `duplicateStdHandleInheritable` for why these are duplicated
+        // rather than passed straight through, and why an absent handle is
+        // `nullptr` rather than a failure. Both are attempted so the diagnostic
+        // can name whichever one broke.
+        DWORD       dupError = 0;
+        char const* dupWhich = nullptr;
+        if (!duplicateStdHandleInheritable(STD_INPUT_HANDLE, childStdin,
+                                           dupError)) {
+            dupWhich = "stdin";
+        } else if (!duplicateStdHandleInheritable(STD_ERROR_HANDLE, childStderr,
+                                                  dupError)) {
+            dupWhich = "stderr";
+        }
+        if (dupWhich != nullptr) {
+            closeStdioHandles(redirectHandle, childStdin, childStderr);
+            out.diagnostic =
+                self + "could not hand this process's own " + dupWhich
+                + " on to the child of '" + exe->string() + "' ("
+                + windowsErrorText(dupError)
+                + "). STARTF_USESTDHANDLES supplies all three descriptors or "
+                  "none, so the child would have run with that stream closed "
+                  "while stdout went to '"
+                + stdoutFile.string() + "'";
+            return out;
+        }
+
+        si.dwFlags    = STARTF_USESTDHANDLES;
+        si.hStdInput  = childStdin;
+        si.hStdOutput = redirectHandle;
+        si.hStdError  = childStderr;
+    }
 
     // lpApplicationName is the RESOLVED image; lpCommandLine carries argv[0]
     // as the CALLER wrote it, matching execv's semantics on the POSIX arm
@@ -720,13 +936,23 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         /*lpEnvironment*/       nullptr,
         /*lpCurrentDirectory*/  cwd.empty() ? nullptr : cwdPath.c_str(),
         &si, &pi);
+
+    // ★ CAPTURE THE ERROR BEFORE CLEANING UP. Win32 does not promise that a
+    // succeeding call preserves the thread's last error, so reading
+    // `GetLastError()` after the closes below can report "The operation
+    // completed successfully" about a spawn that just failed. The closes
+    // themselves cannot wait: the child owns its own copies from this point, and
+    // ours must be gone before the wait so the file has exactly one writer and
+    // is complete the moment the child exits.
+    DWORD const createError = ::GetLastError();
+    closeStdioHandles(redirectHandle, childStdin, childStderr);
+
     if (created == 0) {
         // Includes the honest PATHEXT edge documented in the header: a
         // `.BAT`/`.CMD` hit resolves as a file but is not an executable
         // image, and lands here as ERROR_BAD_EXE_FORMAT with real text.
-        out.diagnostic = "spawnAndWaitInherit: CreateProcessW failed for '"
-                       + exe->string() + "' ("
-                       + windowsErrorText(::GetLastError()) + ")";
+        out.diagnostic = self + "CreateProcessW failed for '" + exe->string()
+                       + "' (" + windowsErrorText(createError) + ")";
         return out;
     }
     out.spawned = true;
@@ -738,8 +964,8 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         // exit code we never obtained. -1 plus a loud diagnostic beats 0,
         // which would read as a clean success.
         out.exitCode   = -1;
-        out.diagnostic = "spawnAndWaitInherit: WaitForSingleObject did not "
-                         "signal completion for '"
+        out.diagnostic = self
+                       + "WaitForSingleObject did not signal completion for '"
                        + exe->string() + "' ("
                        + windowsErrorText(::GetLastError()) + ")";
         ::CloseHandle(pi.hThread);
@@ -750,9 +976,8 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     DWORD exitCode = 0;
     if (::GetExitCodeProcess(pi.hProcess, &exitCode) == 0) {
         out.exitCode   = -1;
-        out.diagnostic = "spawnAndWaitInherit: GetExitCodeProcess failed for '"
-                       + exe->string() + "' ("
-                       + windowsErrorText(::GetLastError()) + ")";
+        out.diagnostic = self + "GetExitCodeProcess failed for '" + exe->string()
+                       + "' (" + windowsErrorText(::GetLastError()) + ")";
     } else {
         // Windows exit codes are DWORD; the struct exposes `int` so that the
         // POSIX 0..255 range and the Windows range share one field. The cast
@@ -808,6 +1033,8 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     // made to rest on a call-graph accident.
     std::string const        exePath = exe->string();
     std::string const        cwdPath = cwd.empty() ? std::string{} : cwd.string();
+    std::string const        outPath =
+        stdoutFile.empty() ? std::string{} : stdoutFile.string();
     std::vector<std::string> storage = argv;
     std::vector<char*>       argvPtrs;
     argvPtrs.reserve(storage.size() + 1);
@@ -815,6 +1042,97 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         argvPtrs.push_back(element.data());
     }
     argvPtrs.push_back(nullptr);
+
+    // ── The stdout redirect, opened by the PARENT ──────────────────────────
+    //
+    // ★ OPENED HERE AND NOT IN THE CHILD, because only here is there a
+    // diagnostic channel. `posix_spawn_file_actions_addopen` would be one call
+    // shorter and would fold "the file could not be created" into the single
+    // errno `posix_spawn` returns for the whole operation — the same collapse
+    // that arm already apologises for over chdir-vs-exec, made worse by adding a
+    // third candidate. Opening first means a bad path is reported as a bad path,
+    // by name, before any process exists.
+    //
+    // The path therefore resolves against the CALLER's directory, which is the
+    // documented behaviour and the same rule `resolveDetailed` applies to
+    // argv[0]: a caller that computed this path must be able to find the file
+    // afterwards, and `cwd` moves the CHILD, not us.
+    //
+    // ★ O_CLOEXEC, even though the whole point is for the child to have it. The
+    // descriptor reaches the child's stdout through `dup2`, and `dup2` CLEARS
+    // close-on-exec on the descriptor it creates — so fd 1 survives the exec
+    // while this original does not. That is exactly the wanted shape: the
+    // program gets its stdout and no stray extra descriptor, and in the window
+    // before exec the descriptor cannot leak into an unrelated concurrent
+    // fork+exec (the hazard "THE THREADING PREMISE" above keeps this file
+    // disciplined about).
+    //
+    // 0644 rather than 0600: this is a build artifact the operator will read,
+    // possibly as another user in CI, and it carries a tool's stdout — not a
+    // secret this layer knows anything about. The process umask still applies.
+    int stdoutFd = -1;
+    if (!outPath.empty()) {
+        stdoutFd = ::open(outPath.c_str(),
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (stdoutFd < 0) {
+            int const saved = errno;
+            out.diagnostic  = self + "could not create the stdout redirect file '"
+                           + outPath + "' (" + errnoText(saved) + "), so '"
+                           + exePath
+                           + "' was not started — running it with our own "
+                             "stdout attached would have left nothing to read "
+                             "and no error to see";
+            return out;
+        }
+
+        // ★★ AND IT MUST NOT LAND ON 0, 1 OR 2 — A CASE THAT SILENTLY UNDOES
+        // THE WHOLE REDIRECT. `open` returns the LOWEST free descriptor, so a
+        // process that has already closed its own stdout gets descriptor 1 back
+        // here. `dup2(1, 1)` is then defined as a NO-OP: POSIX has it return
+        // immediately WITHOUT clearing FD_CLOEXEC, precisely the opposite of
+        // the normal case this arm depends on. The exec that follows would
+        // therefore close the descriptor the program was meant to write
+        // through, and the tool would run with NO stdout — an empty capture and
+        // a clean exit code, which is the exact silent degradation the rest of
+        // this arm is built to refuse, arriving through an allocator detail.
+        //
+        // Re-homing above descriptor 2 makes the case UNREACHABLE once, in one
+        // place, instead of leaving each spawn arm to special-case it — and
+        // `F_DUPFD_CLOEXEC` is what keeps the replacement close-on-exec, which
+        // a plain `dup` would silently drop.
+        //
+        // (`posix_spawn_file_actions_adddup2` has a standard exemption for the
+        // equal-descriptor case and would survive it; the `fork` arm's plain
+        // `dup2` has none. Normalising here means neither arm has to know.)
+        if (stdoutFd <= STDERR_FILENO) {
+            int const rehomed =
+                ::fcntl(stdoutFd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+            if (rehomed < 0) {
+                int const saved = errno;
+                ::close(stdoutFd);
+                out.diagnostic =
+                    self + "the stdout redirect file '" + outPath
+                    + "' opened as descriptor " + std::to_string(stdoutFd)
+                    + ", which the child's own stdout must occupy, and it could "
+                      "not be moved out of the way (" + errnoText(saved)
+                    + "); '" + exePath
+                    + "' was not started rather than run with no stdout at all";
+                return out;
+            }
+            ::close(stdoutFd);
+            stdoutFd = rehomed;
+        }
+    }
+
+    // Closes the redirect descriptor on any path that leaves before the child
+    // owns its own copy, and once more after the child has it. A `close` on -1
+    // is a no-op by construction, so callers need not ask whether there is one.
+    auto const closeRedirect = [&stdoutFd] {
+        if (stdoutFd >= 0) {
+            ::close(stdoutFd);
+            stdoutFd = -1;
+        }
+    };
 
     // The process to wait on, whichever arm below created it. HOW a child comes
     // into being is a host-API question; how it ENDED is not — so `waitpid` and
@@ -856,8 +1174,9 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     posix_spawn_file_actions_t fileActions;
     int spawnStatus = ::posix_spawn_file_actions_init(&fileActions);
     if (spawnStatus != 0) {
-        out.diagnostic = "spawnAndWaitInherit: posix_spawn_file_actions_init() "
-                         "failed (" + errnoText(spawnStatus) + ")";
+        closeRedirect();
+        out.diagnostic = self + "posix_spawn_file_actions_init() failed ("
+                       + errnoText(spawnStatus) + ")";
         return out;
     }
 
@@ -874,10 +1193,47 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         spawnStatus = DSS_SPAWN_ADDCHDIR(&fileActions, cwdPath.c_str());
         if (spawnStatus != 0) {
             ::posix_spawn_file_actions_destroy(&fileActions);
-            out.diagnostic = "spawnAndWaitInherit: could not add a chdir action "
-                             "for working directory '"
+            closeRedirect();
+            out.diagnostic = self
+                           + "could not add a chdir action for working "
+                             "directory '"
                            + cwdPath + "' to the posix_spawn file actions ("
                            + errnoText(spawnStatus) + ")";
+            return out;
+        }
+    }
+
+    // ── The stdout redirect as a file action ───────────────────────────────
+    //
+    // `adddup2` onto descriptor 1, then `addclose` of the original so the
+    // program does not start life holding a second, nameless handle on its own
+    // output. Actions run in the order added, inside the child, after the fork
+    // and before the exec — which is why the `dup2` here needs no EINTR loop
+    // (the fork arm's does: it is our code running in the child, and a signal
+    // can land on it).
+    //
+    // The `addclose` needs no equal-descriptor guard: the open above re-homes
+    // any descriptor that landed on 0/1/2, so `stdoutFd` is always > 2 here and
+    // closing it can never shut the stdout the dup2 just established. That
+    // invariant is stated at the open rather than re-derived here, because it is
+    // the fork arm — which has no standard exemption for `dup2(n, n)` — that
+    // makes it load-bearing.
+    if (stdoutFd >= 0) {
+        spawnStatus =
+            ::posix_spawn_file_actions_adddup2(&fileActions, stdoutFd,
+                                               STDOUT_FILENO);
+        if (spawnStatus == 0) {
+            spawnStatus =
+                ::posix_spawn_file_actions_addclose(&fileActions, stdoutFd);
+        }
+        if (spawnStatus != 0) {
+            ::posix_spawn_file_actions_destroy(&fileActions);
+            closeRedirect();
+            out.diagnostic = self
+                           + "could not add the stdout redirection to '"
+                           + outPath + "' to the posix_spawn file actions ("
+                           + errnoText(spawnStatus) + "), so '" + exePath
+                           + "' was not started";
             return out;
         }
     }
@@ -898,15 +1254,21 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     // child an EMPTY environment, which is not what the `fork` arm's `execv`
     // does (it keeps ours).
     //
-    // stdio is inherited because NOTHING is said about it: with no `adddup2`
-    // action and no CLOEXEC-default attribute, descriptors 0/1/2 cross into the
-    // child untouched, which is the same "the child writes to our stdout"
-    // behaviour the `fork` arm gets by not touching them either.
+    // stdio is inherited because NOTHING is said about it: absent the one
+    // `adddup2` installed above for a redirected stdout, and with no
+    // CLOEXEC-default attribute, descriptors 0/1/2 cross into the child
+    // untouched — which is the same "the child writes to our stdout" behaviour
+    // the `fork` arm gets by not touching them either, and the reason stdin and
+    // stderr keep inheriting on the redirect path with nothing said about them.
     pid_t spawnedPid = -1;
     spawnStatus      = ::posix_spawn(&spawnedPid, exePath.c_str(), &fileActions,
                                      /*attrp=*/nullptr, argvPtrs.data(),
                                      *::_NSGetEnviron());
     ::posix_spawn_file_actions_destroy(&fileActions);
+    // The child holds its own descriptor 1 from here on (or never will), so
+    // ours is done either way — and the file must have exactly one writer while
+    // the caller waits.
+    closeRedirect();
 
     if (spawnStatus != 0) {
         // ★ `posix_spawn` RETURNS the error number and does NOT set `errno`;
@@ -923,14 +1285,28 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         // stage by re-probing the directory from the parent would be reporting a
         // guess as if the child had told us. Where no directory was requested
         // there is no ambiguity to declare, and the message says exec plainly.
-        out.diagnostic = "spawnAndWaitInherit: posix_spawn('" + exePath
-                       + "') failed (" + errnoText(spawnStatus) + ")";
+        out.diagnostic = self + "posix_spawn('" + exePath + "') failed ("
+                       + errnoText(spawnStatus) + ")";
         if (!cwdPath.empty()) {
             out.diagnostic += " — the child was also asked to enter working "
                               "directory '" + cwdPath
                             + "' first, and posix_spawn reports ONE errno for "
                               "the whole operation, so the platform does not "
                               "say which of the two failed";
+        }
+        if (!outPath.empty()) {
+            // A third candidate under the same single errno. Named rather than
+            // omitted: the file already existed and was truncated by the time
+            // this line runs, so an operator who finds it EMPTY must be told
+            // that the redirection itself is one of the things that may have
+            // failed — not left to conclude the program ran and printed
+            // nothing.
+            out.diagnostic += (cwdPath.empty() ? std::string{" — "}
+                                               : std::string{"; "})
+                            + "the child was also asked to redirect its stdout "
+                              "to '" + outPath
+                            + "', which is another file action inside that "
+                              "same one-errno call";
         }
         return out;
     }
@@ -974,8 +1350,10 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     int errorPipe[2] = {-1, -1};
 #if defined(DSS_SPAWN_HAVE_PIPE2)
     if (::pipe2(errorPipe, O_CLOEXEC) != 0) {
-        out.diagnostic = "spawnAndWaitInherit: pipe2(O_CLOEXEC) failed ("
-                       + errnoText(errno) + ")";
+        int const saved = errno;
+        closeRedirect();
+        out.diagnostic =
+            self + "pipe2(O_CLOEXEC) failed (" + errnoText(saved) + ")";
         return out;
     }
 #else
@@ -984,8 +1362,9 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     // and runs rather than failing to build on a line it cannot see, but such a
     // host should be given whichever atomic mechanism it does have instead.
     if (::pipe(errorPipe) != 0) {
-        out.diagnostic = "spawnAndWaitInherit: pipe() failed ("
-                       + errnoText(errno) + ")";
+        int const saved = errno;
+        closeRedirect();
+        out.diagnostic = self + "pipe() failed (" + errnoText(saved) + ")";
         return out;
     }
     for (int fd : {errorPipe[0], errorPipe[1]}) {
@@ -994,8 +1373,9 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
             int const saved = errno;
             ::close(errorPipe[0]);
             ::close(errorPipe[1]);
-            out.diagnostic = "spawnAndWaitInherit: fcntl(FD_CLOEXEC) failed ("
-                           + errnoText(saved) + ")";
+            closeRedirect();
+            out.diagnostic =
+                self + "fcntl(FD_CLOEXEC) failed (" + errnoText(saved) + ")";
             return out;
         }
     }
@@ -1010,8 +1390,8 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         int const saved = errno;
         ::close(errorPipe[0]);
         ::close(errorPipe[1]);
-        out.diagnostic =
-            "spawnAndWaitInherit: fork() failed (" + errnoText(saved) + ")";
+        closeRedirect();
+        out.diagnostic = self + "fork() failed (" + errnoText(saved) + ")";
         return out;
     }
 
@@ -1019,13 +1399,44 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         // ── CHILD. Async-signal-safe calls ONLY from here to _exit. ──
         ::close(errorPipe[0]);
         ChildFailure failure{'X', 0};
+        bool         ready = true;
         if (!cwdPath.empty() && ::chdir(cwdPath.c_str()) != 0) {
             failure.stage = 'C';
             failure.error = errno;
-        } else {
-            // No file actions at all: stdin/stdout/stderr are simply the
-            // parent's, which IS the inheritance the header promises. On
-            // success this never returns.
+            ready         = false;
+        }
+        if (ready && stdoutFd >= 0) {
+            // ★ THE REDIRECT, AND THE ONE PLACE THIS CHILD MAY NOT BE
+            // BEST-EFFORT. If the `dup2` fails and we exec anyway, the program
+            // runs with the COMPILER's stdout: the caller gets a clean exit
+            // code and an empty file — a wrong ANSWER rather than an error, and
+            // the tool's output scattered across the user's terminal. So a
+            // failure here reports stage 'D' and the exec is never attempted.
+            //
+            // `dup2` is on the short list of calls POSIX allows to fail with
+            // EINTR, and this is our code running in a freshly forked child
+            // where a signal can legitimately land — so it is retried rather
+            // than treated as a redirect failure. The loop is async-signal-safe
+            // (one syscall, one comparison, no allocation).
+            //
+            // No explicit close of `stdoutFd` afterwards: it was opened
+            // O_CLOEXEC, so the exec below closes it, while the descriptor
+            // `dup2` created has that flag CLEARED and survives as stdout.
+            int duped = -1;
+            while ((duped = ::dup2(stdoutFd, STDOUT_FILENO)) < 0
+                   && errno == EINTR) {
+            }
+            if (duped < 0) {
+                failure.stage = 'D';
+                failure.error = errno;
+                ready         = false;
+            }
+        }
+        if (ready) {
+            // Beyond that one `dup2`, no file actions at all:
+            // stdin/stdout/stderr are simply the parent's, which IS the
+            // inheritance the header promises — and is why stderr and stdin
+            // still inherit on the redirect path. On success this never returns.
             ::execv(exePath.c_str(), argvPtrs.data());
             failure.stage = 'X';
             failure.error = errno;
@@ -1058,6 +1469,9 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
 
     // ── PARENT ──
     ::close(errorPipe[1]);
+    // The child has its own copy (or died before making one), so this one is
+    // done — and the capture file must have exactly one writer while we wait.
+    closeRedirect();
     ChildFailure failure{'\0', 0};
     std::size_t  filled         = 0;
     int          handshakeErrno = 0;  // non-zero once `read` failed for real
@@ -1085,7 +1499,8 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
     // decision back out into unpinnable code, and the function's contract is
     // that it reads the record only when the record is whole.
     detail::HandshakeVerdict verdict = detail::interpretExecHandshake(
-        filled, sizeof(failure), handshakeErrno, &failure, exePath, cwdPath);
+        filled, sizeof(failure), handshakeErrno, &failure,
+        detail::HandshakeContext{entryPoint, exePath, cwdPath, outPath});
 
     if (!verdict.spawned) {
         // Reap the corpse so it is not left a zombie. Shared by both
@@ -1109,8 +1524,8 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         }
         int const saved = errno;
         out.exitCode    = -1;
-        out.diagnostic  = "spawnAndWaitInherit: waitpid() failed for '"
-                       + exePath + "' (" + errnoText(saved) + ")";
+        out.diagnostic  = self + "waitpid() failed for '" + exePath + "' ("
+                       + errnoText(saved) + ")";
         return out;
     }
 
@@ -1123,20 +1538,50 @@ SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
         // read as "exited 139 on purpose".
         int const signo = WTERMSIG(status);
         out.exitCode    = 128 + signo;
-        out.diagnostic  = "spawnAndWaitInherit: '" + exePath
-                       + "' was terminated by signal " + std::to_string(signo)
-                       + " (reported as exit code " + std::to_string(128 + signo)
-                       + ")";
+        out.diagnostic  = self + "'" + exePath + "' was terminated by signal "
+                       + std::to_string(signo) + " (reported as exit code "
+                       + std::to_string(128 + signo) + ")";
     } else {
         // Neither exited nor signalled with WUNTRACED/WCONTINUED unset should
         // be unreachable; say so rather than silently reporting 0.
         out.exitCode   = -1;
-        out.diagnostic = "spawnAndWaitInherit: '" + exePath
+        out.diagnostic = self + "'" + exePath
                        + "' produced an unrecognised wait status "
                        + std::to_string(status);
     }
     return out;
 #endif
+}
+
+} // namespace
+
+SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
+                                fs::path const&                 cwd) {
+    return spawnAndWaitImpl(argv, cwd, /*stdoutFile=*/{},
+                            "spawnAndWaitInherit");
+}
+
+SpawnResult spawnAndWaitRedirectStdout(std::vector<std::string> const& argv,
+                                       fs::path const&                 cwd,
+                                       fs::path const& stdoutFile) {
+    // ★ THE EMPTY PATH IS REFUSED, NOT REINTERPRETED. Internally an empty
+    // `stdoutFile` is the sentinel for "inherit", and letting it through here
+    // would make the ONE function whose purpose is to capture output silently
+    // produce none — returning a clean exit code and a file the caller never
+    // created, with the tool's real answer on the user's terminal. That is the
+    // silent degradation this whole arm is built to refuse, arriving through
+    // the front door instead of from a failed syscall.
+    if (stdoutFile.empty()) {
+        SpawnResult out;
+        out.diagnostic =
+            "spawnAndWaitRedirectStdout: no stdout file was named. This entry "
+            "point exists to CAPTURE the child's output, so an empty path "
+            "cannot mean 'inherit' — call spawnAndWaitInherit when inheriting "
+            "is what is wanted.";
+        return out;
+    }
+    return spawnAndWaitImpl(argv, cwd, stdoutFile,
+                            "spawnAndWaitRedirectStdout");
 }
 
 } // namespace dss::substrate

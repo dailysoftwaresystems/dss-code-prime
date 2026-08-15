@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
+#include "ffi/binary_reader.hpp"    // BinaryReadError (readImportsForTargetFormat)
 #include "ffi/c_header_parser.hpp"  // HeaderReadError
 #include "ffi/import_surface.hpp"
 #include "hir/hir.hpp"
@@ -157,6 +158,92 @@ struct DSS_EXPORT BinaryLibrarySource {
 recordedImportIdentity(std::string_view declaredImportName,
                        std::string_view embeddedSoname,
                        std::string_view readerLibraryPath);
+
+// ★★★ THE TARGET-AWARE READ — the ONE place a `--resolve-library` binary's own
+// object format is compared against the format the build is emitting.
+// (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL, TF-C116.)
+//
+// ── WHY A GUARD IS NEEDED AT ALL, AND WHY THE OLD ONE WAS AN ACCIDENT ───────
+// ✔MEASURED (the row's own probe P5): feeding a PE `.dll` to `--resolve-library`
+// on a Mach-O target already failed loud — rc=1, 50 × F_MangleMissingExpectedPrefix.
+// But it failed through the `_`-DECORATION gate, not through any format check:
+// Mach-O demands a leading underscore and PE exports carry none, so the two
+// formats disagreed about SPELLING and the mismatch was caught as a side effect.
+// ELF and PE are BOTH UNDECORATED, so that accident covers neither direction of
+// the elf↔pe pair: the export names match verbatim, every extern binds, and the
+// artifact records a DT_NEEDED / import-descriptor naming a library of the wrong
+// format — a LOAD-time death with no build-time signal, the exact silent shape
+// this project converts to compile-time errors everywhere else.
+//
+// ── WHY IT IS ONE FUNCTION AND NOT A CHECK AT EACH BINDER ───────────────────
+// ✔MEASURED: TWO independent binders reach `ffi::readImports` — `ingest()`'s
+// `readSource` (the C/HIR path) and `bindAsmExternImports` in
+// `program/compile_pipeline.cpp` (the `encode`/`.s` path, which calls the reader
+// DIRECTLY, with no `ingest()` in between). That surface has ALREADY paid for
+// duplication once: the asm binder RESTATES `ingest()`'s ELF symbol-version
+// policy clause for clause under a comment admitting it is a copy. A guard
+// written twice is a guard that will be updated once, so this is the same
+// remedy `recordedImportIdentity` above applies to the identity ranking — ONE
+// function, two callers. Neither binder may call `ffi::readImports` for a
+// `--resolve-library` input; both call this.
+//
+// ── AGNOSTIC BY CONSTRUCTION ────────────────────────────────────────────────
+// Both sides of the comparison are DECLARED DATA in closed vocabularies. The
+// left is `ffi::guessFormat` — the FF1 dispatcher's own magic-byte classifier,
+// the facility the row observed "the reader ALREADY knows the format it
+// detected". The right is `ObjectFormatSchema::kind()`, resolved from the
+// format JSON's backend. Nothing here compares a format NAME, an extension, or
+// a target string; adding a fourth object format adds one row to one table.
+//
+// Behaviour, in order:
+//   * The file's magic classifies to an object-format kind that DIFFERS from
+//     `format.kind()` → REJECT LOUD (`F_UnsupportedBinaryFormat`, the code the
+//     ELF/COFF/Mach-O relocatable readers already use for "this input is not
+//     the format this consumer needs"), naming the path, what the file IS, and
+//     what the target needs. Nothing is read.
+//   * Kinds agree, or the magic classifies to no single object format (an `ar`
+//     CONTAINER, or unrecognised bytes) → delegate verbatim to `readImports`,
+//     which keeps every existing failure mode and message intact (FileEmpty,
+//     UnknownFormat, the Mach-O FAT `lipo -thin` remediation, CorruptedBinary…).
+//     An `ar` archive declares no object format of its OWN — its MEMBERS do —
+//     and the static-archive path checks them one tier down where the member
+//     bytes are in hand (`elf/pe/macho::readRelocatableObject` reject a foreign
+//     member's magic loud); pre-empting that here with a container-level guess
+//     would be the name-matching this function exists to avoid.
+//   * The file cannot be opened / is empty → indistinguishable from
+//     "unclassifiable" here, so it also delegates and `readImports` reports
+//     F_FileOpenFailed / F_FileEmpty exactly as before. Fail-closed is not the
+//     right posture for a probe whose failure is already loudly handled two
+//     lines later.
+[[nodiscard]] DSS_EXPORT
+std::expected<std::vector<ImportSurface>, BinaryReadError>
+readImportsForTargetFormat(std::filesystem::path const& libraryPath,
+                           ObjectFormatSchema const&    format,
+                           DiagnosticReporter&          reporter);
+
+// The COMPARISON on its own, extracted so that the sentence above has exactly
+// ONE author no matter how many places need to make it.
+//
+// `nullopt` = NO OBJECTION: the formats agree, or the leading bytes name no
+// single object format (an `ar` container, unrecognised bytes, an unopenable or
+// empty file — all deferred, see above). Engaged = REJECTED, with
+// `F_UnsupportedBinaryFormat` ALREADY REPORTED; the returned `BinaryReadError`
+// carries the same detail for a caller that propagates a structured error.
+//
+// ★ WHY THIS IS SEPARATE FROM THE READ, rather than the read being the only
+// door. `compile_pipeline`'s step 2.5-pre runs an EAGER, UNCONDITIONAL probe
+// over every `--resolve-library` entry, precisely because the reader is reached
+// only through `ingest()` and a TU with no binary-governed externs never routes
+// there — the flag would otherwise be validated only by luck of what the TU
+// happens to reference. That probe already fails a MISSING path loud on exactly
+// that argument; a library of the WRONG FORMAT is the same species of operator
+// (or, since AP6's `setResolveLibraryAdditionsByTarget`, MACHINE) mistake, and
+// it is knowable from 8 bytes without reading the library at all. So the probe
+// asks this function, and the check keeps one owner instead of two.
+[[nodiscard]] DSS_EXPORT std::optional<BinaryReadError>
+checkLibraryMatchesTargetFormat(std::filesystem::path const& libraryPath,
+                                ObjectFormatSchema const&    format,
+                                DiagnosticReporter&          reporter);
 
 struct DSS_EXPORT CHeaderSource {
     std::filesystem::path path;

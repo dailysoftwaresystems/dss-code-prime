@@ -49,8 +49,12 @@
 #include "core/types/source_buffer.hpp"
 #include "opt/optimizer.hpp"
 #include "program/program.hpp"
+#include "repo_root.hpp"   // the single-definition-site lint reads BOTH runners
+                           // and the shared header off disk
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
+#include "stage_tree.hpp"  // recursive corpus staging — ONE copy, shared with
+                           // integrated_tests/runner.cpp
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -67,6 +71,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>  // std::error_code (do not rely on a transitive
+                         // include from <filesystem>)
 #include <vector>
 
 #if !defined(_WIN32)
@@ -883,6 +889,16 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
     return depArtifact;
 }
 
+// The corpus neighbour-staging primitive now lives ONCE, in
+// `tests/test_support/stage_tree.hpp`, and this runner and its CLI-subprocess
+// sibling both include it (see the ★★ hoist note at the top of that header).
+// It used to sit here duplicated VERBATIM — ✔MEASURED 14,765 bytes between the
+// twin markers, `cmp`-identical against the sibling's copy — and was
+// held together by a run-time byte-compare lint that the hoist deleted along
+// with the duplication it guarded. What guards the shared home now is
+// `ExamplesCorpusLint.StagingPrimitiveLivesOnlyInTheSharedHeader` below, which
+// reds if a copy comes BACK into either runner.
+
 [[nodiscard]] ArmResult
 compileAndRunArm(fs::path const& exampleDir,
                  ExampleManifest const& m,
@@ -893,22 +909,33 @@ compileAndRunArm(fs::path const& exampleDir,
     ArmResult armResult;
     ScratchDir scratch{Location::InsideRepo, "examples"};
     // Mirror the EXAMPLE DIR's file neighborhood into the scratch dir
-    // (every regular file except the manifest) — not just the declared
+    // (every file except the top-level manifest) — not just the declared
     // sources. The CLI-subprocess runner (integrated_tests) compiles IN
     // the example dir, where a quote include resolves against the
     // includer's directory; the in-process scratch must offer the same
     // neighbor files or an include-bearing example (e.g.
     // include_typedef_cast's myint.h) false-fails here only. The entry
-    // files passed to the driver stay exactly `m.sources`. CONTRACT: the
-    // mirror is the IMMEDIATE dir only (no subdirectories) — an example
-    // whose includes live in a subdir needs this loop made recursive
-    // (recreating relative paths) in the same change.
-    for (auto const& entry : fs::directory_iterator(exampleDir)) {
-        if (!entry.is_regular_file()) continue;
-        if (entry.path().filename() == "expected.json") continue;
-        fs::copy_file(entry.path(),
-                      scratch.path() / entry.path().filename(),
-                      fs::copy_options::overwrite_existing);
+    // files passed to the driver stay exactly `m.sources`.
+    //
+    // CONTRACT, and it is now the RECURSIVE one: the mirror carries whole
+    // SUBDIRECTORIES across, relative subpaths intact. It used to be the
+    // immediate dir only, with a `continue` on every non-regular entry — so
+    // an example whose dependency lives in `<example>/dep_module/` had that
+    // directory dropped in silence and then died on a missing-file error
+    // naming the manifest. The walk is `stageExampleTree` from the shared
+    // `tests/test_support/stage_tree.hpp` — the SAME function the CLI sibling
+    // calls, not a copy held equal to it — so the two runners cannot stage
+    // different trees.
+    if (std::string const err = stageExampleTree(exampleDir, scratch.path());
+        !err.empty()) {
+        // A staging failure POISONS the arm rather than falling through to a
+        // compile: the sources are simply not on disk, so every diagnostic the
+        // driver would then emit describes the harness, not the example.
+        ADD_FAILURE() << "staging the neighbor files of "
+                      << exampleDir.generic_string() << " into "
+                      << scratch.path().generic_string() << " failed: " << err;
+        armResult.verdict = ArmVerdict::Poisoned;
+        return armResult;
     }
     // Every DECLARED source must have been among the copied files — a
     // manifest typo fails loud here, not as a confusing driver error.
@@ -945,11 +972,11 @@ compileAndRunArm(fs::path const& exampleDir,
             ADD_FAILURE() << "manifest 'project' file '" << *m.project
                           << "' not found in example dir "
                           << exampleDir.generic_string()
-                          << " — the mirror above copies the example dir's"
-                             " IMMEDIATE files only, so a project manifest in a"
-                             " SUBDIRECTORY needs that loop (and its twin in"
-                             " integrated_tests/runner.cpp) made recursive in"
-                             " the same change";
+                          << " — the mirror above is RECURSIVE and preserves"
+                             " relative subpaths, so a project manifest in a"
+                             " SUBDIRECTORY does reach the scratch tree; an"
+                             " absent one now means the path is wrong in"
+                             " expected.json, not that the staging dropped it";
             armResult.verdict = ArmVerdict::Poisoned;
             return armResult;
         }
@@ -1591,7 +1618,9 @@ TEST(RunHarnessStack, GenerousSpawnStackBumpIsWired) {
 
 // ── D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR: the corpus emulator lint ───
 //
-// Registered as ONE extra ctest entry (`examples/manifest-emulator-lint`)
+// Registered inside the ONE extra ctest entry (`examples/corpus-lints`, which
+// was named `examples/manifest-emulator-lint` until AP6 renamed it for the
+// SUITE once the suite outgrew this one lint)
 // rather than running inside all 558 per-example entries: the question is
 // corpus-wide, the answer is identical for every entry, and re-deriving it 558
 // times would cost the suite a corpus re-walk per test for no new information.
@@ -1654,4 +1683,144 @@ TEST(ExamplesCorpusLint, EveryArmAgreesWithItsSiblingsOnTheEmulator) {
         << findings.size() << " manifest emulator finding(s) over "
         << manifestCount << " manifests / " << arms.size()
         << " declared (arm x runOn) pairs:" << report.str();
+}
+
+// ── Recursive neighbour staging: the BEHAVIOURAL pin ───────────────────────
+//
+// Filed in the `ExamplesCorpusLint` suite, which is the ONE suite the
+// per-example ctest entries exclude by `--gtest_filter` and the single
+// `examples/corpus-lints` entry selects. The question this asks is
+// corpus-wide and its answer identical for every entry, so it runs ONCE rather
+// than 581 times — the same reasoning the emulator lint above records.
+//
+// ⚠ RUN THIS SUITE THROUGH ctest, NOT the bare `dss_examples_runner.exe`.
+// This pin itself is cwd-independent — it plants its own fixture in a temp
+// sandbox — but its sibling below resolves the repo through `repo_root.hpp`,
+// whose candidate (3) is a 12-hop walk UP from the PROCESS cwd, and the
+// compiles this binary drives resolve shipped config the same way
+// (`core/types/config_path_walk.cpp`). A bare invocation started somewhere
+// else can therefore walk into a DIFFERENT tree and assert confidently against
+// it. Only the ctest entry pins the answer: it sets `WORKING_DIRECTORY
+// ${CMAKE_SOURCE_DIR}` and the target bakes `DSS_TEST_REPO_ROOT` (see the ★ -D
+// note in tests/examples/CMakeLists.txt, which exists because this binary was
+// the ONE test target that had silently lost the baked root).
+//
+// The assertions live in `stageExampleTreeSelfTest`, in the shared header, so
+// that the CLI-subprocess runner executes THE SAME checks from THE SAME code —
+// which is what the hoist bought: "character-identical" used to be a property a
+// lint had to keep re-proving, and is now a property of there being one copy.
+// All this wrapper adds is a scratch sandbox and the GTest reporting.
+TEST(ExamplesCorpusLint, StagesNestedSubdirectoriesWithContentIntact) {
+    // `Location::Temp`, not `InsideRepo`: this pin drives no schema loader, so
+    // it needs no cwd-rooted config walk, and keeping its fixture out of the
+    // repo means a crashed run cannot leave a stray `dep_module/` where the
+    // corpus glob might later meet it.
+    ScratchDir sandbox{Location::Temp, "stage-tree-pin"};
+    std::string const findings =
+        stageExampleTreeSelfTest(sandbox.path() / "stage-tree");
+    EXPECT_TRUE(findings.empty()) << findings;
+}
+
+// ── The primitive has exactly ONE definition site: the STRUCTURAL pin ──────
+//
+// ★★ THIS PIN REPLACES `StagingTwinsAreCharacterIdentical`, WHICH THE HOIST
+// DELETED. That lint read both runners off disk and compared the 14,765 bytes
+// between two twin markers, because `stageExampleTree` +
+// `stageExampleTreeSelfTest` were duplicated VERBATIM in the two files. It was
+// a good guard over a bad situation, and once the block moved to
+// `tests/test_support/stage_tree.hpp` it could never fail again — there was no
+// longer a second copy to differ from. A pin that cannot fail is worse than no
+// pin, because it reads as coverage; so it was removed in the same change that
+// removed its subject, and this one took its place.
+//
+// WHAT CAN STILL REGRESS, and is therefore what this pins: a copy coming BACK.
+// That is not hypothetical here — this repo has paid for exactly that drift
+// twice (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT,
+// D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS), both times by someone adding a
+// local copy rather than reaching for the shared header. The three clauses are
+// the three ways the single-definition property dies: the header stops
+// defining it, a runner starts defining it, or a runner stops including it.
+//
+// It is deliberately NOT mirrored into the sibling runner, and the distinction
+// is worth restating because the house rule cuts the other way: a CAPABILITY
+// must land in both harnesses, but this is not a capability — it is a statement
+// ABOUT the pair, true or false exactly once, and a second copy would itself
+// need a third pin to keep the two copies of the comparison honest.
+TEST(ExamplesCorpusLint, StagingPrimitiveLivesOnlyInTheSharedHeader) {
+    // ⚠ EVERY NEEDLE IS ASSEMBLED AT RUN TIME, and that is load-bearing rather
+    // than stylistic: this pin reads the very file it is compiled from. A whole
+    // literal here would be a match in `examples_runner.cpp` no matter what the
+    // rest of the file said — so the "no definition in a runner" clause would
+    // red on the pin itself, and worse, the "runner includes the header" clause
+    // would go GREEN off the pin's own text even if the real `#include` were
+    // deleted. That is the exact self-measuring failure the lint this replaces
+    // warned about in its own comment.
+    std::string const defPrimitive =
+        std::string{"std::string stageExample"} + "Tree(fs::path const&";
+    std::string const defSelfTest =
+        std::string{"std::string stageExample"} + "TreeSelfTest(fs::path const&";
+    std::string const includeLine =
+        std::string{"#include \"stage_"} + "tree.hpp\"";
+
+    char const* const kHeader = "tests/test_support/stage_tree.hpp";
+    char const* const kRunners[] = {
+        "tests/examples/examples_runner.cpp",
+        "integrated_tests/runner.cpp",
+    };
+    // Throws with `repoRootDiagnostic()` — which names all three resolution
+    // sources and the cwd — rather than failing as a puzzling absent file.
+    fs::path const root = ::dss::test::repoRoot();
+
+    auto const slurp = [&root](char const* rel) -> std::string {
+        fs::path const p = root / rel;
+        std::ifstream in(p, std::ios::binary);
+        EXPECT_TRUE(in.good())
+            << "cannot read " << p.generic_string()
+            << " — this pin must never pass because it failed to look";
+        std::string text{std::istreambuf_iterator<char>(in),
+                         std::istreambuf_iterator<char>{}};
+        // CR stripped so a checkout with `core.autocrlf=true` matches the same
+        // needles this LF tree does.
+        text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+        return text;
+    };
+
+    // CLAUSE 1 — the shared header really is the definition site. Checked FIRST
+    // and with a size floor, because clauses 2 and 3 are both satisfied by an
+    // EMPTY header: no runner defines the primitive if nobody does, and an
+    // `#include` of a blank file is still an `#include`. Without this the pin
+    // would report the strongest possible green over a deleted implementation.
+    std::string const header = slurp(kHeader);
+    EXPECT_GT(header.size(), 8000u)
+        << kHeader << " is implausibly small (" << header.size()
+        << " bytes) — the staging primitive and its self-test should both be"
+           " here";
+    EXPECT_NE(header.find(defPrimitive), std::string::npos)
+        << kHeader << " does not DEFINE the staging primitive, so the two"
+                      " runners have no shared implementation to agree on";
+    EXPECT_NE(header.find(defSelfTest), std::string::npos)
+        << kHeader << " does not DEFINE the staging self-test, so the two"
+                      " runners cannot be running the same assertions";
+
+    for (auto const* rel : kRunners) {
+        std::string const text = slurp(rel);
+        // CLAUSE 2 — no runner may carry its own copy. This is the one that
+        // catches the relapse: a second definition compiles perfectly (the
+        // local one simply wins unqualified lookup) and the suite stays green
+        // while the two harnesses silently stage different trees again.
+        EXPECT_EQ(text.find(defPrimitive), std::string::npos)
+            << rel << " DEFINES the staging primitive again. It belongs in "
+            << kHeader << " and nowhere else — a per-runner copy is how the"
+               " 14,765-byte duplication this pin replaced came about, and it"
+               " is invisible at the call site.";
+        EXPECT_EQ(text.find(defSelfTest), std::string::npos)
+            << rel << " DEFINES the staging self-test again; both harnesses"
+                      " must run the assertions from "
+            << kHeader << ", or one of them is pinning its own copy.";
+        // CLAUSE 3 — and it must actually reach the shared one. Without this a
+        // runner could satisfy clause 2 by dropping the capability entirely.
+        EXPECT_NE(text.find(includeLine), std::string::npos)
+            << rel << " does not include " << kHeader
+            << ", so whatever staging it performs is not the shared one.";
+    }
 }

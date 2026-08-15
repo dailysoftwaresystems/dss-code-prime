@@ -161,8 +161,23 @@ bool globMatch(std::string_view pattern, std::string_view path) {
 
 bool expandGlob(std::string_view pattern,
                 std::vector<std::string>& out,
-                std::error_code& ec) {
+                std::error_code& ec,
+                fs::path const& baseDir) {
     ec.clear();
+
+    // AP6 M4/B.3 — RE-BASE A RELATIVE PATTERN, AND ONLY A RELATIVE ONE. An
+    // ABSOLUTE base already states where it starts, so `baseDir` must not touch
+    // it (re-rooting would silently relocate a pattern that was already exact).
+    // An EMPTY `baseDir` leaves the path untouched, which is what makes every
+    // pre-AP6 call byte-identical: `fs::path{"src"}` is walked verbatim, i.e.
+    // against the process cwd, exactly as before.
+    auto rebase = [&baseDir](fs::path p) {
+        if (baseDir.empty() || p.is_absolute()) return p;
+        // `baseDir / "."` would leave a "." component that `lexically_relative`
+        // below then has to reason about; the bare `baseDir` is the same
+        // directory with no such component, so say it directly.
+        return p == fs::path{"."} ? baseDir : (baseDir / p);
+    };
 
     // Split the pattern at the LAST '/' at or before its first metacharacter: the
     // part up to that slash is the LITERAL base directory to walk; the remainder
@@ -172,10 +187,14 @@ bool expandGlob(std::string_view pattern,
     std::size_t const metaPos = pattern.find_first_of("*?[");
     if (metaPos == std::string_view::npos) {
         // No metacharacter — the caller guards on `hasGlobMetacharacters`, so this
-        // is defensive: treat the whole thing as a single literal path.
+        // is defensive: treat the whole thing as a single literal path. It is
+        // re-based like every other relative spelling, so this arm cannot become
+        // the one place a `baseDir` build silently probes the wrong tree.
         std::error_code fec;
-        if (fs::exists(fs::path{std::string{pattern}}, fec) && !fec) {
-            out.push_back(std::string{pattern});
+        auto const lit = rebase(fs::path{std::string{pattern}});
+        if (fs::exists(lit, fec) && !fec) {
+            out.push_back(baseDir.empty() ? std::string{pattern}
+                                          : lit.generic_string());
         }
         return true;
     }
@@ -190,7 +209,7 @@ bool expandGlob(std::string_view pattern,
         if (baseStr.empty()) baseStr = "/";               // pattern rooted at '/'
         tail = std::string{pattern.substr(lastSlash + 1)};
     }
-    fs::path const base{baseStr};
+    fs::path const base = rebase(fs::path{baseStr});
 
     // A base that does not exist / is not a directory ⇒ ZERO matches (NOT an I/O
     // error): the caller owns the zero-match fail-loud. A genuine access error on

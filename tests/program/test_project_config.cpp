@@ -32,6 +32,7 @@
                                           // note on why it lives in `core`)
 #include "link/object_format_schema.hpp"  // ObjectFormatSchema::loadShipped (AP3 format-gate integration)
 #include "program/program.hpp"          // Program, routesToMultiUnit
+#include "program/project_sources.hpp"  // AP6 M4: expandAndDedupProjectSources
 #include "host_native_target.hpp"       // hostNativeTarget (build-and-spawn on EVERY leg)
 #include "run_binary.hpp"               // runBinary (behavioral exit-code proof)
 #include "scratch_dir.hpp"
@@ -3620,17 +3621,31 @@ TEST(CompileProjectHooks, PostBuildScriptSkippedWhenCompileFails) {
         << "sanity: the failed compile emitted no artifact";
 }
 
-// ── 6. `dependsOn` non-empty FAILS LOUD ─────────────────────────────────────
+// ── 6. `dependsOn` IS RESOLVED, AND A FAILING RESOLUTION HAS NO SIDE EFFECTS ─
 //
-// Exact code, exact count, no artifact — and, additionally, the pre-build hook
-// must NOT have run: a build the driver is about to refuse must not first write
-// files into the author's tree. That third assertion is what pins the reject
-// AHEAD of the hook seam rather than merely somewhere before the compile.
+// ★ WHAT THIS PIN USED TO BE, AND WHY IT CHANGED RATHER THAN BEING DELETED.
+// Until the AP6 resolver landed, a non-empty `dependsOn` was REFUSED with
+// `D_PlanNotLanded`, emitted FIRST — ahead of the profile gates and the
+// pre-build hooks — so a build that could not happen had no side effects on the
+// way to saying so. The refusal is gone; the PROPERTY it was protecting is not,
+// and it is what this pin now asserts. A dependency the resolver cannot resolve
+// (here: a `path` naming nothing) must still fail the build, still emit
+// nothing but a real resolution diagnostic, and still leave the AUTHOR'S TREE
+// UNTOUCHED — the root's pre-build hook must not have run.
 //
-// RED-ON-DISABLE: delete the `if (!pc.dependsOn.empty())` block → the build
-// proceeds, the count goes to 0, the marker appears and the artifact is emitted
-// — i.e. the silent no-op this reject exists to prevent, caught three ways.
-TEST(CompileProjectHooks, NonEmptyDependsOnFailsLoudBeforeAnythingRuns) {
+// The third assertion is the one that pins the SEAM ORDER: resolution sits
+// above the root's hooks. Without it, a driver that resolved after running the
+// author's codegen step would look identical from the rc and the code alone.
+//
+// ⚠ `D_PlanNotLanded == 0` IS NOT ASSERTED ALONE — that is worthless by itself
+// (it is also true of a driver that ignored the key entirely). It is paired
+// with the POSITIVE that a real resolution diagnostic fired, which is what
+// distinguishes "resolved and failed" from "never looked".
+//
+// RED-ON-DISABLE: move the `resolveProjectDependencies` call below the
+// `runBuildScripts(pc.preBuildScripts, …)` call in `Program::compileProject`
+// and the marker assertion reds while the rc and code assertions stay green.
+TEST(CompileProjectHooks, UnresolvableDependsOnFailsWithoutRunningRootHooks) {
     using dss::test_support::Location;
     using dss::test_support::ScratchDir;
 
@@ -3641,7 +3656,7 @@ TEST(CompileProjectHooks, NonEmptyDependsOnFailsLoudBeforeAnythingRuns) {
         kHookElfSpec, R"(["main.c"])",
         "[" + hookEntryJson(0, "pre-ran.txt", "ran\n") + "]",
         /*post=*/{},
-        R"([{"path": "../libfoo"}])");
+        R"([{"path": "../no-such-dependency-directory"}])");
     auto const proj = dir / "deps.dss-project.json";
     writeText(proj, manifest);
     scratch.useAsCwd();
@@ -3650,42 +3665,64 @@ TEST(CompileProjectHooks, NonEmptyDependsOnFailsLoudBeforeAnythingRuns) {
     prog.setOutputDir(dir);
     DiagnosticReporter rep;
     EXPECT_EQ(prog.compileProject(proj.string(), rep), 1)
-        << "a declared dependency the driver cannot resolve must REFUSE the "
+        << "a declared dependency the driver cannot resolve must FAIL the "
            "build, not silently build without it";
-    EXPECT_EQ(countCode(rep, DiagnosticCode::D_PlanNotLanded), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 1u)
+        << "the resolver reports the real reason — the path names no directory";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_PlanNotLanded), 0u)
+        << "resolution has LANDED; the pending-plan refusal must be gone";
     EXPECT_FALSE(std::filesystem::exists(dir / formatOf(kHookElfSpec) / "main"))
-        << "nothing may be produced for a refused build";
+        << "nothing may be produced for a build that could not resolve";
     EXPECT_FALSE(std::filesystem::exists(dir / "pre-ran.txt"))
-        << "the reject precedes the pre-build hooks — a build that cannot "
-           "happen must not have side effects on the way to saying so";
+        << "resolution precedes the ROOT's pre-build hooks — a build that "
+           "cannot happen must not write into the author's tree on the way to "
+           "saying so";
 }
 
-// The message must be ACTIONABLE, not just coded: it names the feature key and
-// says outright that driver support has not landed. (red-on-disable: reword the
-// diagnostic to bare prose and the finds fail.)
-TEST(CompileProjectHooks, DependsOnRejectMessageNamesTheFeature) {
+// A `dependsOn` entry that DOES resolve builds normally — the positive polarity
+// of the pin above, and the one that proves the refusal was replaced by a
+// working mechanism rather than by nothing at all. The dependency is a `module`
+// (source-merge), so its success is observable as a link that resolved a symbol
+// the root's own sources do not define.
+TEST(CompileProjectHooks, ResolvableDependsOnBuildsAndContributesItsSources) {
     using dss::test_support::Location;
     using dss::test_support::ScratchDir;
 
     ScratchDir scratch{Location::InsideRepo, "program"};
     auto const dir = scratch.path();
-    writeText(dir / "main.c", "int main(void){ return 0; }\n");
-    writeText(dir / "deps-msg.dss-project.json",
-              hookManifest(kHookElfSpec, R"(["main.c"])", {}, {},
-                           R"([{"git": "git@example.invalid:org/bar.git"}])"));
+    auto const dep = dir / "helpermod";
+    // This file's `writeText` does NOT create parent directories, and the
+    // dependency lives in one of its own — without this the manifest would name
+    // a directory that is not there and the pin would measure `D_FileNotFound`
+    // instead of the resolution it exists to prove.
+    std::error_code mkEc;
+    std::filesystem::create_directories(dep, mkEc);
+    ASSERT_FALSE(mkEc) << "could not create the dependency directory: "
+                       << mkEc.message();
+    writeText(dep / "helper.c", "int helper_answer(void){ return 11; }\n");
+    writeText(dep / ".dss-project.json",
+              R"({"language":"c-subset","artifactProfile":"module",)"
+              R"("targets":[")" + std::string{kHookElfSpec}
+                  + R"("],"sources":["helper.c"]})");
+    writeText(dir / "main.c",
+              "extern int helper_answer(void);\n"
+              "int main(void){ return helper_answer(); }\n");
+    auto const proj = dir / "ok-deps.dss-project.json";
+    writeText(proj, hookManifest(kHookElfSpec, R"(["main.c"])", {}, {},
+                                 R"([{"path": "helpermod"}])"));
     scratch.useAsCwd();
 
     Program prog;
     prog.setOutputDir(dir);
     DiagnosticReporter rep;
-    ASSERT_EQ(prog.compileProject(
-                  (dir / "deps-msg.dss-project.json").string(), rep), 1);
-    ASSERT_EQ(countCode(rep, DiagnosticCode::D_PlanNotLanded), 1u);
-    std::string const m = firstMessageForCode(rep, DiagnosticCode::D_PlanNotLanded);
-    EXPECT_NE(m.find("dependsOn"), std::string::npos)
-        << "the message must name the manifest key; got: " << m;
-    EXPECT_NE(m.find("git@example.invalid:org/bar.git"), std::string::npos)
-        << "the message must name the offending entry; got: " << m;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+        << "a resolvable `dependsOn` must BUILD — the source-merge dependency "
+           "supplies the definition `main` calls";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_PlanNotLanded), 0u);
+    EXPECT_TRUE(std::filesystem::exists(dir / formatOf(kHookElfSpec) / "main"))
+        << "the artifact is named from the ROOT's own first source (M4b), and "
+           "its existence is what proves the dependency's sources were merged "
+           "rather than dropped";
 }
 
 // ── 7. An EMPTY or ABSENT `dependsOn` is exactly the old behavior ───────────
@@ -3765,6 +3802,461 @@ TEST(CompileProjectHooks, NoHooksDeclaredLeavesTheBuildUnchanged) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_PlanNotLanded), 0u);
     EXPECT_EQ(rep.errorCount(), 0u)
         << "a hook-less project build must emit nothing at all";
+}
+
+// ════════════════════════════════════════════════════════════════
+// AP6 M4 — `expandAndDedupProjectSources`: the base directory, the LITERAL
+// half, and the dedup key
+//
+// The `sources[]` resolution moved out of `Program::compileProject` into
+// `program/project_sources.hpp` so a DEPENDENCY manifest — which declares its
+// sources relative to ITS OWN directory, not to whatever cwd the consumer's
+// compiler is running in — can be resolved by the same code and the same
+// policy. The pins below are the three things that extraction had to get right.
+// ════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A source list resolved with NO base — the pre-AP6 contract, which every
+// existing caller (including the root manifest) still uses.
+std::vector<std::string> resolveNoBase(std::vector<std::string> const& entries,
+                                       DiagnosticReporter& rep) {
+    auto r = expandAndDedupProjectSources(entries, std::filesystem::path{}, rep);
+    return r.has_value() ? *r : std::vector<std::string>{};
+}
+
+// RAII cwd pin — a copy of the one in `test_system_dirs_cwd_independent.cpp`,
+// for the tests below whose whole point is that the answer must NOT depend on
+// the process working directory. `ScratchDir::useAsCwd` cannot serve them: it
+// moves cwd to the SAME directory the sources live in, which is exactly the
+// coincidence that would make a cwd-based resolution look correct.
+class ScopedCwd {
+public:
+    explicit ScopedCwd(std::filesystem::path const& to)
+        : prev_(std::filesystem::current_path()) {
+        std::filesystem::current_path(to);
+    }
+    ~ScopedCwd() {
+        std::error_code ec;
+        std::filesystem::current_path(prev_, ec);  // a dtor must not throw
+    }
+    ScopedCwd(ScopedCwd const&)            = delete;
+    ScopedCwd& operator=(ScopedCwd const&) = delete;
+private:
+    std::filesystem::path prev_;
+};
+
+}  // namespace
+
+// ── An EMPTY base is byte-for-byte the pre-AP6 behaviour ────────────────
+// The literal is kept with its EXACT characters — `./` and all — because the
+// dedup contract downstream ("first occurrence keeps its original string")
+// and every existing test's expectations rest on it.
+TEST(ProjectSources, EmptyBaseKeepsLiteralEntriesCharacterForCharacter) {
+    DiagnosticReporter rep;
+    auto const out = resolveNoBase({"./main.c", "src/sub/other.c"}, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0], "./main.c")
+        << "an empty base must not normalize, absolutize or otherwise touch a "
+           "literal entry — pre-AP6 callers are byte-identical";
+    EXPECT_EQ(out[1], "src/sub/other.c");
+}
+
+// ── ★ THE DEFECT: a LITERAL entry re-bases too ──────────────────────────
+// ✔MEASURED before the fix: an entry with no glob metacharacter was pushed
+// VERBATIM and later opened by `UnitBuilder::addFile` — i.e. against the
+// PROCESS cwd. Re-basing only the glob expansion would leave `"src/lib.c"` (the
+// overwhelmingly common form) resolving inside the CONSUMER's tree.
+//
+// The test is built so that cwd-resolution cannot pass by accident: BOTH
+// directories contain a `src/lib.c`, cwd is the DECOY, and the base is the
+// other one. A resolution that consults cwd returns the decoy and this test
+// fails on the path it returns — it does not merely "find nothing".
+//
+// RED-ON-DISABLE (`src/program/project_sources.cpp`, the literal arm): make
+// the literal arm push `entry` unconditionally, and the returned path is the
+// DECOY's — `EXPECT_EQ(out[0], …)` reports the wrong directory, and the
+// `decoy` guard below reports it a second time by name.
+TEST(ProjectSources, BaseDirRebasesLiteralEntriesNotJustGlobs) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir consumerScratch{Location::InsideRepo, "program"};
+    ScratchDir depScratch{Location::InsideRepo, "program"};
+    auto const decoy = consumerScratch.path();
+    auto const base  = depScratch.path();
+    std::filesystem::create_directories(decoy / "src");
+    std::filesystem::create_directories(base / "src");
+    writeText(decoy / "src" / "lib.c", "int consumer_copy(void){return 1;}\n");
+    writeText(base  / "src" / "lib.c", "int dependency_copy(void){return 2;}\n");
+
+    ScopedCwd const cwd{decoy};   // the wrong answer is reachable from here
+    DiagnosticReporter rep;
+    auto const r = expandAndDedupProjectSources({"src/lib.c"}, base, rep);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ(std::filesystem::path{(*r)[0]}.lexically_normal(),
+              (base / "src" / "lib.c").lexically_normal())
+        << "a LITERAL relative entry must resolve against the manifest's base "
+           "directory, not the process working directory";
+    EXPECT_NE(std::filesystem::path{(*r)[0]}.lexically_normal(),
+              (decoy / "src" / "lib.c").lexically_normal())
+        << "the cwd copy of the same relative path must never be chosen";
+}
+
+// ── The GLOB half re-bases, and only the RELATIVE half of it ────────────
+// An ABSOLUTE pattern already states its base; re-rooting it would be a silent
+// relocation. Both arms in one test so the two cannot drift apart.
+TEST(ProjectSources, BaseDirRebasesRelativeGlobsAndLeavesAbsoluteOnesAlone) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir baseScratch{Location::InsideRepo, "program"};
+    ScratchDir elsewhereScratch{Location::InsideRepo, "program"};
+    auto const base      = baseScratch.path();
+    auto const elsewhere = elsewhereScratch.path();
+    std::filesystem::create_directories(base / "src");
+    writeText(base / "src" / "a.c", "int a(void){return 0;}\n");
+    writeText(elsewhere / "far.c", "int far(void){return 0;}\n");
+
+    ScopedCwd const cwd{elsewhere};
+    DiagnosticReporter rep;
+    auto const r = expandAndDedupProjectSources(
+        {"src/*.c", (elsewhere / "*.c").generic_string()}, base, rep);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(r->size(), 2u);
+    EXPECT_EQ(std::filesystem::path{(*r)[0]}.lexically_normal(),
+              (base / "src" / "a.c").lexically_normal())
+        << "a RELATIVE glob walks the base directory";
+    EXPECT_EQ(std::filesystem::path{(*r)[1]}.lexically_normal(),
+              (elsewhere / "far.c").lexically_normal())
+        << "an ABSOLUTE glob keeps its own base — `baseDir` must not re-root it";
+}
+
+// ── An ABSOLUTE literal is likewise left where it points ────────────────
+TEST(ProjectSources, AbsoluteLiteralEntryIsNeverRebased) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir baseScratch{Location::InsideRepo, "program"};
+    ScratchDir otherScratch{Location::InsideRepo, "program"};
+    auto const base  = baseScratch.path();
+    auto const other = otherScratch.path();
+    writeText(other / "abs.c", "int abs_src(void){return 0;}\n");
+
+    DiagnosticReporter rep;
+    auto const r = expandAndDedupProjectSources(
+        {(other / "abs.c").generic_string()}, base, rep);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ(std::filesystem::path{(*r)[0]}.lexically_normal(),
+              (other / "abs.c").lexically_normal())
+        << "an absolute entry states its own base; joining `baseDir` onto it "
+           "would silently relocate a path that was already exact";
+}
+
+// ── SF4: ABSOLUTE-vs-RELATIVE spellings of ONE file collapse ────────────
+// The predecessor key (`lexically_normal`) explicitly conceded this pair as an
+// "accepted un-caught extreme edge". Once one manifest contributes absolute
+// paths and another relative ones, it is the NORMAL case — and its consequence
+// is a DUPLICATE CU and a duplicate-symbol link error nothing can tie back to a
+// manifest. `weakly_canonical` is what closes it.
+//
+// RED-ON-DISABLE (`src/program/project_sources.cpp`, the dedup key): key on
+// `fs::path{s}.lexically_normal().generic_string()` instead and the relative
+// spelling never matches the absolute one, so `r->size()` is 2, not 1.
+TEST(ProjectSources, AbsoluteAndRelativeSpellingsOfOneFileDedupToOne) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "shared.c", "int shared(void){return 0;}\n");
+
+    ScopedCwd const cwd{dir};
+    DiagnosticReporter rep;
+    // Entry 1 is RELATIVE (resolved against cwd, no base); entry 2 is the SAME
+    // file spelled ABSOLUTELY. Lexical normalization cannot see through this —
+    // it never learns the cwd.
+    auto const r = expandAndDedupProjectSources(
+        {"shared.c", (dir / "shared.c").generic_string()},
+        std::filesystem::path{}, rep);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(r->size(), 1u)
+        << "the same file under two spellings must compile ONCE — two CUs would "
+           "be a duplicate-symbol link error two tiers from its cause";
+    EXPECT_EQ((*r)[0], "shared.c")
+        << "first occurrence wins AND keeps its original spelling";
+}
+
+// ── ORDER IS LOAD-BEARING (AP6 M4b, the artifact-name hazard) ───────────
+// The artifact takes its name from the stem of `[0]` when no `artifactName` is
+// stated, and archive member names follow it too. So the resolution must
+// preserve MANIFEST order across entries even when a later entry sorts earlier;
+// only the matches WITHIN one glob are sorted.
+TEST(ProjectSources, ManifestOrderIsPreservedAcrossEntries) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "zeta.c",  "int z(void){return 0;}\n");
+    std::filesystem::create_directories(dir / "sub");
+    writeText(dir / "sub" / "alpha.c", "int a1(void){return 0;}\n");
+    writeText(dir / "sub" / "beta.c",  "int b1(void){return 0;}\n");
+
+    DiagnosticReporter rep;
+    auto const r = expandAndDedupProjectSources(
+        {(dir / "zeta.c").generic_string(),
+         (dir / "sub" / "*.c").generic_string()},
+        std::filesystem::path{}, rep);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 3u);
+    EXPECT_EQ(std::filesystem::path{(*r)[0]}.filename().string(), "zeta.c")
+        << "the FIRST manifest entry stays first — it is what names the "
+           "artifact, so re-ordering this list renames the emitted binary";
+    EXPECT_EQ(std::filesystem::path{(*r)[1]}.filename().string(), "alpha.c")
+        << "matches WITHIN one glob are sorted (deterministic CU order)";
+    EXPECT_EQ(std::filesystem::path{(*r)[2]}.filename().string(), "beta.c");
+}
+
+// ── The zero-match refusal NAMES the base it searched ───────────────────
+// "matched no files" without saying WHERE it looked is unactionable the moment
+// the base stops being the cwd — the author's next question is exactly which
+// directory was searched.
+TEST(ProjectSources, ZeroMatchFailsLoudNamingTheBaseItSearched) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const base = scratch.path();
+
+    DiagnosticReporter rep;
+    auto const r = expandAndDedupProjectSources({"src/*.zzz"}, base, rep);
+    EXPECT_FALSE(r.has_value()) << "a pattern that matches nothing is an error";
+    ASSERT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 1u);
+    auto const msg = firstMessageForCode(rep, DiagnosticCode::D_FileNotFound);
+    EXPECT_NE(msg.find("src/*.zzz"), std::string::npos)
+        << "the message must name the pattern; got: " << msg;
+    EXPECT_NE(msg.find(base.generic_string()), std::string::npos)
+        << "and the BASE it searched, or the author cannot tell where to look; "
+           "got: " << msg;
+}
+
+// The no-base spelling of the same refusal still says "the working directory"
+// rather than an empty string — an error message must describe something.
+TEST(ProjectSources, ZeroMatchWithNoBaseNamesTheWorkingDirectory) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    ScopedCwd const cwd{scratch.path()};
+    DiagnosticReporter rep;
+    auto const r = resolveNoBase({"*.zzz"}, rep);
+    EXPECT_TRUE(r.empty());
+    ASSERT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 1u);
+    EXPECT_NE(firstMessageForCode(rep, DiagnosticCode::D_FileNotFound)
+                  .find("the working directory"),
+              std::string::npos);
+}
+
+// ════════════════════════════════════════════════════════════════
+// AP6 — `Program::artifactPaths()`: the driver states what it wrote
+// ════════════════════════════════════════════════════════════════
+
+// ── Index-parallel, engaged, and EQUAL to the real file on disk ─────────
+// Two targets whose `formatName` DIFFERS, so the `<formatName>` component of
+// the convention is actually exercised (one target could not prove it).
+//
+// RED-ON-DISABLE (`src/program/program.cpp`, the per-target loop): stop
+// assigning `artifactsOut[i]` and the vector is all-`nullopt` — every
+// `ASSERT_TRUE(paths[i].has_value())` fails while the build still returns 0,
+// which is precisely the "the value exists but reaches nobody" shape.
+TEST(ProgramArtifactPaths, IndexParallelToTargetsAndEqualToTheFilesOnDisk) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "twoway.c", "int main(void){ return 0; }\n");
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"x86_64:elf64-x86_64-linux-exec\", "
+          "\"x86_64:pe64-x86_64-windows-exec\"],\n"
+        + "  \"sources\": [\"" + (dir / "twoway.c").generic_string() + "\"]\n}";
+    auto const proj = dir / "twoway.dss-project.json";
+    writeText(proj, manifest);
+
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0);
+
+    auto const& paths = prog.artifactPaths();
+    ASSERT_EQ(paths.size(), 2u)
+        << "one entry per target of the run, in the manifest's target order";
+    ASSERT_TRUE(paths[0].has_value());
+    ASSERT_TRUE(paths[1].has_value());
+    EXPECT_EQ(paths[0]->lexically_normal(),
+              (dir / "out" / "elf64-x86_64-linux-exec" / "twoway")
+                  .lexically_normal())
+        << "index 0 is the FIRST target's artifact, `<formatName>` included";
+    EXPECT_EQ(paths[1]->lexically_normal(),
+              (dir / "out" / "pe64-x86_64-windows-exec" / "twoway.exe")
+                  .lexically_normal())
+        << "index 1 carries the SECOND format's own extension — the two entries "
+           "differ in both directory and suffix, so a broadcast of one answer "
+           "to both targets cannot pass";
+    EXPECT_TRUE(std::filesystem::exists(*paths[0]))
+        << "the reported path must be the file that was actually written";
+    EXPECT_TRUE(std::filesystem::exists(*paths[1]));
+}
+
+// ── A FAILED target reports `nullopt`, not a path ───────────────────────
+// The half that makes the contract fail-closed: a consumer must not be handed a
+// path for an artifact that was never written. Driven by the format-capability
+// gate — ✔MEASURED, only the three `*-exec` PE/Mach-O formats declare
+// `stackReserveControl`, so ONE request refuses on ELF and succeeds on PE
+// inside a single run.
+//
+// RED-ON-DISABLE (`src/program/program.cpp`, the per-target loop): assign
+// `artifactsOut[i]` unconditionally from `compileOneTarget`'s result and the
+// ELF entry stops being `nullopt` — `EXPECT_FALSE(paths[1].has_value())` fails
+// while the build's own non-zero rc is unchanged.
+TEST(ProgramArtifactPaths, FailedTargetLeavesNulloptWhileItsSiblingSucceeds) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "halffail.c", "int main(void){ return 0; }\n");
+
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    prog.setStackReserveBytes(std::uint64_t{8u * 1024u * 1024u});
+    DiagnosticReporter rep;
+    // PE first, ELF second: PE declares stackReserveControl, ELF does not.
+    int const rc = prog.compileFiles(
+        {(dir / "halffail.c").generic_string()}, "c-subset",
+        {"x86_64:pe64-x86_64-windows-exec", "x86_64:elf64-x86_64-linux-exec"},
+        rep);
+    EXPECT_NE(rc, 0) << "the ELF target must refuse the reserve it cannot carry";
+    ASSERT_EQ(countCode(rep, DiagnosticCode::K_FormatLacksStackReserveControl), 1u)
+        << "exactly one target failed, and for the reason this test intends";
+
+    auto const& paths = prog.artifactPaths();
+    ASSERT_EQ(paths.size(), 2u)
+        << "index-parallelism survives a partial failure";
+    ASSERT_TRUE(paths[0].has_value())
+        << "the target that succeeded still reports its artifact";
+    EXPECT_TRUE(std::filesystem::exists(*paths[0]));
+    EXPECT_FALSE(paths[1].has_value())
+        << "a target that wrote nothing must report nothing — a path here would "
+           "let a consumer link an artifact that does not exist";
+}
+
+// ── `--output` ABSENT ⇒ the base is `<cwd>/target/<formatName>` ─────────
+// Previously an implicit `else` branch; it is now half of a returned contract,
+// so it is stated and pinned. cwd is moved into the scratch dir so the
+// convention's `<cwd>` component is a directory this test owns.
+TEST(ProgramArtifactPaths, WithoutOutputDirTheBaseIsCwdSlashTarget) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "defaulted.c", "int main(void){ return 0; }\n");
+    scratch.useAsCwd();
+
+    Program prog;   // deliberately NO setOutputDir
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileFiles({"defaulted.c"}, "c-subset",
+                                {"x86_64:elf64-x86_64-linux-exec"}, rep), 0);
+    auto const& paths = prog.artifactPaths();
+    ASSERT_EQ(paths.size(), 1u);
+    ASSERT_TRUE(paths[0].has_value());
+    EXPECT_EQ(paths[0]->lexically_normal(),
+              (dir / "target" / "elf64-x86_64-linux-exec" / "defaulted")
+                  .lexically_normal())
+        << "with no --output the artifacts land under <cwd>/target/<formatName>";
+    EXPECT_TRUE(std::filesystem::exists(*paths[0]));
+}
+
+// ── The vector describes THE LAST RUN ───────────────────────────────────
+// A second call that is rejected before any target is reached must not leave
+// the first call's artifacts readable — a consumer would link a binary this
+// invocation never built.
+TEST(ProgramArtifactPaths, ARejectedSecondRunClearsThePreviousRunsPaths) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "once.c", "int main(void){ return 0; }\n");
+
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    DiagnosticReporter rep1;
+    ASSERT_EQ(prog.compileFiles({(dir / "once.c").generic_string()}, "c-subset",
+                                {"x86_64:elf64-x86_64-linux-exec"}, rep1), 0);
+    ASSERT_EQ(prog.artifactPaths().size(), 1u);
+    ASSERT_TRUE(prog.artifactPaths()[0].has_value());
+
+    DiagnosticReporter rep2;
+    EXPECT_NE(prog.compileFiles({}, "c-subset",
+                                {"x86_64:elf64-x86_64-linux-exec"}, rep2), 0);
+    EXPECT_TRUE(prog.artifactPaths().empty())
+        << "a run that never reached a target reports NO artifacts — stale "
+           "paths from the previous run would be read as this run's output";
+}
+
+// ════════════════════════════════════════════════════════════════
+// AP6 M4b — the artifact NAME follows the ROOT's OWN first source
+// ════════════════════════════════════════════════════════════════
+
+// ✔MEASURED: `sourceStem = fs::path{sourceFiles.front()}.stem()` names the
+// artifact whenever the manifest states no `artifactName`, and names archive
+// members too. Once merged dependency sources join the list, WHICHEVER SOURCE
+// IS FIRST decides the binary's name — so a lane that prepends, appends-then-
+// sorts, or otherwise re-orders the union silently RENAMES the output.
+//
+// The manifest below lists its sources in NON-alphabetical order on purpose:
+// `zeta.c` is first and `alpha.c` second, so "the first entry wins" and "the
+// lexicographically smallest wins" give DIFFERENT answers and the pin can tell
+// them apart.
+//
+// RED-ON-DISABLE (`src/program/project_sources.cpp`): sort the returned list
+// before returning it and the artifact becomes `alpha` — the `zeta` existence
+// assertion fails, `artifactPaths()[0]` reports the `alpha` name, and the
+// `alpha` non-existence assertion fails as well.
+TEST(CompileProjectArtifactName, FollowsTheManifestsOwnFirstSourceNotSortOrder) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    std::string const target = "x86_64:elf64-x86_64-linux-exec";
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    writeText(dir / "zeta.c",
+              "int helper(void);\nint main(void){ return helper(); }\n");
+    writeText(dir / "alpha.c", "int helper(void){ return 0; }\n");
+    std::string const manifest =
+        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        + "  \"artifactProfile\": \"cli\",\n"
+        + "  \"targets\": [\"" + target + "\"],\n"
+        + "  \"sources\": [\"" + (dir / "zeta.c").generic_string() + "\", \""
+        + (dir / "alpha.c").generic_string() + "\"]\n}";   // NOT alphabetical
+    auto const proj = dir / "named.dss-project.json";
+    writeText(proj, manifest);
+
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0);
+
+    auto const outDir = dir / "out" / "elf64-x86_64-linux-exec";
+    EXPECT_TRUE(std::filesystem::exists(outDir / "zeta"))
+        << "the artifact is named from the stem of the manifest's FIRST source";
+    EXPECT_FALSE(std::filesystem::exists(outDir / "alpha"))
+        << "sorting the source list would rename the binary to 'alpha' — the "
+           "silent rename a merged dependency source must never cause";
+    auto const& paths = prog.artifactPaths();
+    ASSERT_EQ(paths.size(), 1u);
+    ASSERT_TRUE(paths[0].has_value());
+    EXPECT_EQ(paths[0]->stem().string(), "zeta")
+        << "and the driver's own report of what it wrote agrees";
 }
 
 // ── The fixture-mode entry point ────────────────────────────────────────────

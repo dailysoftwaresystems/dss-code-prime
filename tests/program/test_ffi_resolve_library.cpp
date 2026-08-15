@@ -1318,3 +1318,412 @@ TEST(FfiResolveLibraryRoundTrip, ElfMixedBareSystemExternAndOwnLibraryExitFortyT
         << "puts must print 'hi'; got: [" << r.capturedStdout << "]";
 }
 #endif  // __linux__
+
+// ══ AP6 — THE PER-TARGET `--resolve-library` ADDITIONS CHANNEL ════════════
+//
+// `Program::setResolveLibraries` is ONE program-wide list broadcast to EVERY
+// target (`program.cpp`, `compileOpts.resolveLibraries` inside the per-target
+// loop). That is right for the CLI and the manifest — both are statements about
+// the program. It is wrong for a DEPENDENCY: a dependency is built once per
+// CONSUMER TARGET, so the artifact that must be linked into an x86_64 image is a
+// DIFFERENT FILE from the one for an arm64 image, and broadcasting the union
+// would hand each target the other's binaries.
+//
+// `setResolveLibraryAdditionsByTarget` is that channel, and it has NO production
+// consumer until the dependency resolver lands — so it carries its own direct
+// pin, right here. This also closes a coverage gap that predates AP6: ✔MEASURED,
+// NO test anywhere combined `--resolve-library` with TWO targets in one
+// invocation.
+//
+// THE SHAPE. One `main.c` compiled for TWO targets in ONE `compileFiles` call.
+// Each target is given its OWN library — same exported symbol, DIFFERENT file
+// and different recorded import identity — and each emitted image must record
+// EXACTLY its own. The two targets differ in ARCHITECTURE and share an object
+// format, so the images are directly comparable through the same ELF reader and
+// the only thing that can distinguish them is the channel.
+//
+// RED-ON-DISABLE — TWO INDEPENDENT LEVERS, both inside `program.cpp`'s
+// additions pass:
+//   * drop the merge (leave every target with the program-wide list): the list
+//     is EMPTY here, so `dss_lib_answer` becomes a genuinely-unknown extern and
+//     BOTH builds fail loud — the `ASSERT_EQ(..., 0)` on the two-target compile
+//     goes red;
+//   * broadcast the UNION instead of per-target: each image then records BOTH
+//     libraries and the four `== 0u` "and NOT the other one's" assertions go
+//     red, while the build still returns 0.
+// Neither lever is a line count, and neither can be satisfied by the other.
+TEST(FfiResolveLibraryPerTarget, EachTargetLinksOnlyItsOwnAddedLibraries) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-per-target-libs"};
+    auto const dir = scratch.path();
+    // Two libraries with the SAME export and DIFFERENT names, one per arch.
+    auto const libXSrc = writeSrc(dir, "dsslibx.c", kLibSrc);
+    auto const libASrc = writeSrc(dir, "dssliba.c", kLibSrc);
+    auto const mainSrc = writeSrc(dir, "pertgt.c", kMainSrc);
+
+    constexpr char const* kX64Exec = "x86_64:elf64-x86_64-linux-exec";
+    constexpr char const* kArmExec = "arm64:elf64-aarch64-linux-exec";
+
+    DiagnosticReporter libXRep;
+    ASSERT_EQ(buildOne(dir, {}, libXSrc.string(),
+                       "x86_64:elf64-x86_64-linux-dyn", libXRep), 0)
+        << (libXRep.all().empty() ? "" : libXRep.all().front().actual);
+    DiagnosticReporter libARep;
+    ASSERT_EQ(buildOne(dir, {}, libASrc.string(),
+                       "arm64:elf64-aarch64-linux-dyn", libARep), 0)
+        << (libARep.all().empty() ? "" : libARep.all().front().actual);
+    auto const libXPath = dir / "dsslibx.so";
+    auto const libAPath = dir / "dssliba.so";
+    ASSERT_TRUE(fs::exists(libXPath));
+    ASSERT_TRUE(fs::exists(libAPath));
+
+    // The channel: NOTHING program-wide, everything per target.
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    prog.setResolveLibraryAdditionsByTarget({
+        {kX64Exec, {ResolveLibrarySpec{libXPath, "dsslibx.so"}}},
+        {kArmExec, {ResolveLibrarySpec{libAPath, "dssliba.so"}}},
+    });
+    ASSERT_TRUE(prog.resolveLibraries().empty())
+        << "the program-wide list stays EMPTY — anything either image records "
+           "can only have come through the per-target channel";
+
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileFiles({mainSrc.string()}, "c-subset",
+                                {kX64Exec, kArmExec}, rep), 0)
+        << (rep.all().empty() ? "" : rep.all().front().actual);
+
+    // Two targets ⇒ the per-format subdir disambiguates the two `pertgt`s.
+    auto const x64Image = dir / "out" / "elf64-x86_64-linux-exec"  / "pertgt";
+    auto const armImage = dir / "out" / "elf64-aarch64-linux-exec" / "pertgt";
+    ASSERT_TRUE(fs::exists(x64Image)) << x64Image.string();
+    ASSERT_TRUE(fs::exists(armImage)) << armImage.string();
+
+    auto const x64Deps =
+        ::dss::test_support::elfNeededLibraries(readWholeBinary(x64Image));
+    auto const armDeps =
+        ::dss::test_support::elfNeededLibraries(readWholeBinary(armImage));
+
+    EXPECT_EQ(::dss::test_support::dependencyOccurrences(x64Deps, "dsslibx.so"), 1u)
+        << "the x86_64 image must record ITS library. got ["
+        << ::dss::test_support::joinDependencies(x64Deps) << "]";
+    EXPECT_EQ(::dss::test_support::dependencyOccurrences(x64Deps, "dssliba.so"), 0u)
+        << "and must NOT record the arm64 target's library — a broadcast union "
+           "is exactly this. got ["
+        << ::dss::test_support::joinDependencies(x64Deps) << "]";
+    EXPECT_EQ(::dss::test_support::dependencyOccurrences(armDeps, "dssliba.so"), 1u)
+        << "the arm64 image must record ITS library. got ["
+        << ::dss::test_support::joinDependencies(armDeps) << "]";
+    EXPECT_EQ(::dss::test_support::dependencyOccurrences(armDeps, "dsslibx.so"), 0u)
+        << "and must NOT record the x86_64 target's library. got ["
+        << ::dss::test_support::joinDependencies(armDeps) << "]";
+}
+
+// An addition keyed to a target this build does not compile must be REFUSED,
+// not dropped: its libraries would reach no link at all, and the undefined
+// symbol that follows names neither the key nor the target. Fail-closed on the
+// one mistake the keyed form still admits.
+//
+// RED-ON-DISABLE (`program.cpp`, the unmatched-key pass): delete the pass and
+// the build returns 0 with ZERO diagnostics — `EXPECT_NE(rc, 0)` and the
+// `D_InvalidTargetSpec` count both fail, and the message assertions with them.
+TEST(FfiResolveLibraryPerTarget, AdditionKeyedToAnUnbuiltTargetFailsLoud) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-per-target-libs"};
+    auto const dir = scratch.path();
+    auto const libSrc  = writeSrc(dir, "dsslib.c", kLibSrc);
+    auto const mainSrc = writeSrc(dir, "stray.c", kMainSrc);
+
+    constexpr char const* kBuiltSpec  = "x86_64:elf64-x86_64-linux-exec";
+    constexpr char const* kAbsentSpec = "arm64:elf64-aarch64-linux-exec";
+
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir, {}, libSrc.string(),
+                       "x86_64:elf64-x86_64-linux-dyn", libRep), 0);
+    auto const libPath = dir / "dsslib.so";
+
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    prog.setResolveLibraryAdditionsByTarget({
+        {kBuiltSpec,  {ResolveLibrarySpec{libPath, "dsslib.so"}}},
+        {kAbsentSpec, {ResolveLibrarySpec{libPath, "dsslib.so"}}},
+    });
+    DiagnosticReporter rep;
+    int const rc = prog.compileFiles({mainSrc.string()}, "c-subset",
+                                     {kBuiltSpec}, rep);
+    EXPECT_NE(rc, 0)
+        << "additions for a target the build never compiles must abandon the "
+           "build, not be silently discarded";
+    ASSERT_EQ(countCode(rep, DiagnosticCode::D_InvalidTargetSpec), 1u)
+        << "exactly one unmatched key ⇒ exactly one refusal";
+    auto const msg = messageForCode(rep, DiagnosticCode::D_InvalidTargetSpec);
+    EXPECT_NE(msg.find(kAbsentSpec), std::string::npos)
+        << "the refusal must NAME the unmatched spec; got: " << msg;
+    EXPECT_EQ(msg.find(kBuiltSpec), std::string::npos)
+        << "and must not accuse the spec that IS being built; got: " << msg;
+    EXPECT_TRUE(prog.artifactPaths().empty())
+        << "the build was abandoned before any target — no artifact is reported";
+}
+
+// ══ D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL ════════════════
+//
+// A `--resolve-library` binary of the WRONG OBJECT FORMAT used to be caught by
+// ACCIDENT or not at all. ✔MEASURED (the row's probe P5): a PE `.dll` fed to a
+// Mach-O target failed rc=1 with 50 × F_MangleMissingExpectedPrefix — through
+// the `_`-DECORATION gate, because Mach-O demands a leading underscore and PE
+// exports carry none. That accident covers exactly the format pairs that
+// disagree about decoration, and elf↔pe is not one of them: BOTH are
+// undecorated, the export names match VERBATIM, every extern binds, and the
+// artifact records a DT_NEEDED / PE import descriptor naming a library of the
+// wrong format — a load-time death with no build-time signal.
+//
+// The three tests below pin the elf↔pe pair specifically (a pin on the
+// PE→Mach-O case would only re-prove the mangling gate), and they pin it at
+// each of the three places a `--resolve-library` entry is validated. All three
+// go through ONE comparison — `ffi::checkLibraryMatchesTargetFormat` — so a
+// site added later inherits the guard instead of re-deriving it.
+
+namespace {
+
+// A `.s` is written BINARY on purpose: `writeSrc` above opens in text mode, and
+// on Windows that turns every '\n' into CRLF before the assembly frontend sees
+// it. The C sources above are unaffected (the preprocessor eats it); a
+// line-oriented assembler dialect is not worth the gamble.
+fs::path writeBinaryFile(fs::path const& dir, std::string_view name,
+                         std::string_view text) {
+    auto const p = dir / std::string{name};
+    std::ofstream f(p, std::ios::binary);
+    f << text;
+    return p;
+}
+
+// `call dss_lib_answer` — the encode-tier twin of `kMainSrc`. An UNDEFINED name
+// in a `.s` becomes an `ExternImport`, which is what routes this unit through
+// `bindAsmExternImports`, the SECOND binder that reaches the FF1 reader.
+// Undecorated on purpose: elf and pe both spell it exactly this way, which is
+// the whole reason the decoration gate cannot see this mistake.
+constexpr std::string_view kAsmCallsLibAnswer =
+    "\t.text\n"
+    "\t.globl\tmain\n"
+    "\t.type\tmain, @function\n"
+    "main:\n"
+    "\tsubq\t$40, %rsp\n"
+    "\tcall\tdss_lib_answer\n"
+    "\taddq\t$40, %rsp\n"
+    "\tret\n";
+
+constexpr std::string_view kAttLanguage = "asm-x86_64-att";
+
+constexpr char const* kElfDyn  = "x86_64:elf64-x86_64-linux-dyn";
+constexpr char const* kElfExec = "x86_64:elf64-x86_64-linux-exec";
+constexpr char const* kPeDll   = "x86_64:pe64-x86_64-windows-dll";
+constexpr char const* kPeExec  = "x86_64:pe64-x86_64-windows-exec";
+
+// Build BOTH an ELF `.so` and a PE `.dll` from the same one-function source, in
+// one scratch dir, and assert the property the whole row rests on: the two
+// export tables spell the symbol IDENTICALLY. DSS is a cross-compiler with no
+// external toolchain, so this runs on every host — nothing here is executed.
+struct ElfAndPeLibraries {
+    fs::path elf;
+    fs::path pe;
+};
+[[nodiscard]] ElfAndPeLibraries buildElfAndPeLibraries(fs::path const& dir) {
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    DiagnosticReporter elfRep;
+    EXPECT_EQ(buildOne(dir, {}, libSrc.string(), kElfDyn, elfRep), 0)
+        << "DSS must build the ELF stand-in library";
+    DiagnosticReporter peRep;
+    EXPECT_EQ(buildOne(dir, {}, libSrc.string(), kPeDll, peRep), 0)
+        << "DSS must build the PE stand-in library";
+    return {dir / "dsslib.so", dir / "dsslib.dll"};
+}
+
+}  // namespace
+
+// ── (1) THE DECISIVE PIN: elf↔pe, BOTH DIRECTIONS, on the C/HIR binder ─────
+//
+// The two negative arms are the case the row says is currently uncaught. The
+// two positive arms are what stops a blanket-reject regression from passing:
+// the SAME source, the SAME libraries, matched up correctly, must still build.
+//
+// The assertion that `F_MangleMissingExpectedPrefix` is ABSENT is load-bearing
+// rather than decorative — it is what proves the refusal came from the format
+// check and not from the decoration accident that already existed.
+//
+// ── RED-ON-DISABLE (measured, see the report) ──────────────────────────────
+// In `ffi::checkLibraryMatchesTargetFormat` (src/ffi/ingest.cpp) discard the
+// probe's answer — keep the `peekObjectFormatKind` call, then bind
+// `detected` to a `std::nullopt` — and the guard reports nothing: both
+// negative arms build CLEAN (rc 0), `F_UnsupportedBinaryFormat` never appears,
+// and the emitted PE image records `dsslib.so` as an import. That is the silent
+// load-time death this pin exists to prevent.
+TEST(FfiResolveLibraryWrongFormat, ElfPeCrossFeedingIsRefusedInBothDirections) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-format"};
+    auto const dir  = scratch.path();
+    auto const libs = buildElfAndPeLibraries(dir);
+    ASSERT_TRUE(fs::exists(libs.elf)) << libs.elf.string();
+    ASSERT_TRUE(fs::exists(libs.pe))  << libs.pe.string();
+
+    // ★ THE PRECONDITION THAT MAKES THIS THE RIGHT PAIR. Both libraries export
+    // the symbol under the SAME undecorated spelling, and NEITHER carries the
+    // Mach-O `_` prefix — so `unapplyCManglingStrict` has nothing to object to
+    // in either direction and the decoration gate is provably out of the
+    // picture before a single cross-feed is attempted.
+    ASSERT_TRUE(libraryExportsSymbol(libs.elf, "dss_lib_answer"));
+    ASSERT_TRUE(libraryExportsSymbol(libs.pe,  "dss_lib_answer"));
+    ASSERT_FALSE(libraryExposesName(libs.elf, "_dss_lib_answer"));
+    ASSERT_FALSE(libraryExposesName(libs.pe,  "_dss_lib_answer"));
+
+    auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+
+    // ── NEGATIVE A: an ELF `.so` handed to a PE build ──────────────────────
+    {
+        DiagnosticReporter rep;
+        int const rc = buildOne(dir / "out-elf-into-pe", {libs.elf},
+                                mainSrc.string(), kPeExec, rep);
+        EXPECT_NE(rc, 0)
+            << "an elf shared object cannot serve a pe link — accepting it "
+               "binds every extern and records a DT_NEEDED-shaped nonsense "
+               "import that only fails at LOAD";
+        ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u)
+            << "the refusal must be the FORMAT check";
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_MangleMissingExpectedPrefix), 0u)
+            << "elf and pe are both UNDECORATED — if this fires, the pin is "
+               "measuring the decoration accident instead of the new guard";
+        auto const msg =
+            messageForCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat);
+        EXPECT_NE(msg.find("dsslib.so"), std::string::npos)
+            << "the message must NAME the library; got: " << msg;
+        EXPECT_NE(msg.find("this file's object format is elf"),
+                  std::string::npos)
+            << "…what it IS; got: " << msg;
+        EXPECT_NE(msg.find("(kind pe)"), std::string::npos)
+            << "…and what the target needs; got: " << msg;
+        EXPECT_FALSE(fs::exists(dir / "out-elf-into-pe" / "main.exe"))
+            << "a refused build must emit no artifact";
+    }
+
+    // ── NEGATIVE B: a PE `.dll` handed to an ELF build ─────────────────────
+    {
+        DiagnosticReporter rep;
+        int const rc = buildOne(dir / "out-pe-into-elf", {libs.pe},
+                                mainSrc.string(), kElfExec, rep);
+        EXPECT_NE(rc, 0)
+            << "and the mirror direction, which no decoration rule separates "
+               "either";
+        ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_MangleMissingExpectedPrefix), 0u);
+        auto const msg =
+            messageForCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat);
+        EXPECT_NE(msg.find("dsslib.dll"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("this file's object format is pe"),
+                  std::string::npos) << msg;
+        EXPECT_NE(msg.find("(kind elf)"), std::string::npos) << msg;
+    }
+
+    // ── POSITIVE CONTROLS: the matched pairings still build ────────────────
+    {
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildOne(dir / "out-elf-ok", {libs.elf}, mainSrc.string(),
+                           kElfExec, rep), 0)
+            << "the guard must not reject the pairing it exists to protect"
+            << (rep.all().empty() ? "" : "\n" + rep.all().front().actual);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 0u);
+    }
+    {
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildOne(dir / "out-pe-ok", {libs.pe}, mainSrc.string(),
+                           kPeExec, rep), 0)
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 0u);
+    }
+}
+
+// ── (2) THE SECOND BINDER — the `encode` / `.s` tier ───────────────────────
+//
+// ✔MEASURED: `bindAsmExternImports` (src/program/compile_pipeline.cpp) reaches
+// `ffi::readImports` DIRECTLY, with no `ingest()` in between, and it has
+// already been caught RESTATING `ingest()`'s ELF symbol-version policy clause
+// for clause under a comment admitting it is a copy. A guard added at "the
+// `--resolve-library` boundary" that landed on only one binder would leave the
+// other on the old silent behaviour — so this test exists to prove the funnel,
+// not merely the check. It shares nothing with test (1) except the chokepoint.
+//
+// This unit never enters `buildCuMir`, so the eager step-2.5-pre probe cannot
+// account for the refusal: the only thing that can report here is the binder's
+// own call into `ffi::readImportsForTargetFormat`.
+//
+// RED-ON-DISABLE: the same mutation as (1) — one function, and this arm goes
+// green-and-silent with it.
+TEST(FfiResolveLibraryWrongFormat, EncodeTierAsmBinderRefusesTheWrongFormat) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-format-asm"};
+    auto const dir = scratch.path();
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir, {}, libSrc.string(), kElfDyn, libRep), 0);
+    auto const elfLib = dir / "dsslib.so";
+    ASSERT_TRUE(libraryExportsSymbol(elfLib, "dss_lib_answer"));
+
+    auto const asmSrc = writeBinaryFile(dir, "callit.s", kAsmCallsLibAnswer);
+
+    DiagnosticReporter rep;
+    Program prog;
+    prog.setOutputDir(dir / "out-asm");
+    prog.setResolveLibraries(std::vector<fs::path>{elfLib});
+    int const rc = prog.compileFiles({asmSrc.generic_string()},
+                                     std::string{kAttLanguage},
+                                     {std::string{kPeExec}}, rep);
+    EXPECT_NE(rc, 0)
+        << "the encode-tier binder must refuse an elf library on a pe target "
+           "exactly as the C path does — two binders, one rule";
+    ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u)
+        << "…and by the FORMAT check, reached through the shared chokepoint";
+    auto const msg =
+        messageForCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat);
+    EXPECT_NE(msg.find("dsslib.so"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("this file's object format is elf"), std::string::npos)
+        << msg;
+    EXPECT_NE(msg.find("(kind pe)"), std::string::npos) << msg;
+}
+
+// ── (3) THE UNCONDITIONAL ARM — a TU that routes NOTHING to the reader ─────
+//
+// `int main(void){ return 7; }` declares no extern, so nothing reaches
+// `ingest()` and the read chokepoint is never called. A guard living ONLY on
+// the read would therefore accept a mis-targeted library in silence and fail
+// only on whichever TU later happened to reference one — the same
+// luck-of-the-TU silence the eager open-probe was added to remove for a MISSING
+// path. Since AP6 fills these entries MACHINE-side
+// (`Program::setResolveLibraryAdditionsByTarget`, one artifact per target), a
+// mis-routed artifact must be caught on the first TU compiled, not the first
+// one that happens to call into it.
+//
+// RED-ON-DISABLE: same one-function mutation; rc becomes 0 and the build
+// produces an artifact while pointed at a library it can never load.
+TEST(FfiResolveLibraryWrongFormat, WrongFormatIsRefusedEvenWithNoExternsAtAll) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-format-noextern"};
+    auto const dir = scratch.path();
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir, {}, libSrc.string(), kElfDyn, libRep), 0);
+    auto const elfLib = dir / "dsslib.so";
+
+    auto const mainSrc = writeSrc(dir, "noextern.c", kNoExternSrc);
+    DiagnosticReporter rep;
+    int const rc = buildOne(dir / "out-noextern", {elfLib}, mainSrc.string(),
+                            kPeExec, rep);
+    EXPECT_NE(rc, 0)
+        << "a --resolve-library entry of the wrong format must fail the build "
+           "whether or not this TU references anything in it";
+    ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+    auto const msg =
+        messageForCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat);
+    EXPECT_NE(msg.find("this file's object format is elf"), std::string::npos)
+        << msg;
+    EXPECT_NE(msg.find("(kind pe)"), std::string::npos) << msg;
+
+    // The matched pairing of the same shape stays green — the unconditional
+    // probe must not turn every extern-free TU into a build failure.
+    DiagnosticReporter okRep;
+    EXPECT_EQ(buildOne(dir / "out-noextern-ok", {elfLib}, mainSrc.string(),
+                       kElfExec, okRep), 0)
+        << (okRep.all().empty() ? "" : okRep.all().front().actual);
+}

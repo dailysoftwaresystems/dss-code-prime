@@ -1643,3 +1643,64 @@ TEST(CliArgs, DefineFlagEmptyNameRejected) {
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, CliArgsError::InvalidDefine);
 }
+
+// ── AP6 / B.4: `--force-git-cache` ──────────────────────────────────────────
+//
+// The flag re-fetches a project's git `dependsOn` entries even when the cache
+// is valid. Three properties are pinned, and each has its own silent failure.
+
+TEST(CliArgs, ForceGitCacheParsesInProjectMode) {
+    Argv a{"dss-code-prime", "--project", "app.dss-project.json",
+           "--force-git-cache"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+    EXPECT_TRUE(r->forceGitCache);
+    // The DEFAULT is what every existing invocation gets, so it is pinned in
+    // the same breath: a flag that defaulted on would silently re-fetch every
+    // dependency of every build and destroy the offline guarantee.
+    Argv b{"dss-code-prime", "--project", "app.dss-project.json"};
+    auto s = parseCliArgs(b.argc(), b.argv());
+    ASSERT_TRUE(s.has_value());
+    EXPECT_FALSE(s->forceGitCache);
+}
+
+TEST(CliArgs, ForceGitCacheIsRefusedOutsideProjectMode) {
+    // Only `--project` reads a `.dss-project.json`, so the flag would reach no
+    // resolver in any other mode and the request would be SILENTLY DISCARDED —
+    // the same defect the `--schema-dir` / `--stack-reserve` mode gates close.
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--force-git-cache"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+    EXPECT_NE(r.error().detail.find("--force-git-cache"), std::string::npos)
+        << "the message must name the flag it is refusing; got: "
+        << r.error().detail;
+}
+
+TEST(CliArgs, ForceGitCacheWithNoModeFlagIsRefused) {
+    // Without a mode flag nothing is compiled at all, so the request lands
+    // nowhere. Reaches the generic no-mode guard, whose message is the better
+    // one there.
+    Argv a{"dss-code-prime", "--force-git-cache"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
+}
+
+TEST(CliArgs, HelpTextGlossesForceGitCacheImperatively) {
+    // ★ THE GLOSS IS THE WHOLE MITIGATION FOR THE NAME. `--force-git-cache`
+    // reads as "force USE of the cache" and means "force a REFRESH of it"; the
+    // operator chose the spelling, so the help text has to say what it DOES
+    // before the reader's reading of the name settles. Pin the SENTENCE, not
+    // merely the flag's presence — a help entry that named the flag and
+    // described it backwards would satisfy any weaker assertion.
+    auto const text = cliHelpText();
+    EXPECT_NE(text.find("--force-git-cache"), std::string::npos);
+    EXPECT_NE(text.find("re-fetch git dependencies even when the cache is valid"),
+              std::string::npos)
+        << "the imperative gloss is missing — without it the flag's name is the "
+           "only documentation, and it reads as the opposite of what it does";
+}

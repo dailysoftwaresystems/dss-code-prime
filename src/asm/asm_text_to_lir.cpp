@@ -3357,7 +3357,13 @@ private:
                                  p.spelling, p.name, pairSuffix()));
                 return false;
             }
-            symbolForAddressedLabel(p.labelIndex);
+            // ★ THE RETURN IS DELIBERATELY UNUSED, AND THE DISCARD IS SPELLED
+            // rather than implicit: pass 3b re-reads `labels_[…].symbol` when
+            // it writes the relocation, so what this call is FOR is the mint
+            // itself — which, per M1 above, is the act that marks the block
+            // address-taken. `[[nodiscard]]` stays on the function because the
+            // OTHER caller (`sourceOperandForSymbol`) does consume the id.
+            (void)symbolForAddressedLabel(p.labelIndex);
         }
         return ok_;
     }

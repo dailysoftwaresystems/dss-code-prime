@@ -60,6 +60,15 @@ TEST(DiagnosticCode, SymbolicNameRoundtrip) {
               "D_DependencyGitFetchFallback");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyGitNameCollision),
               "D_DependencyGitNameCollision");
+    // The same feature CONTINUED at 0xD022 after 0xD021 landed in between; see
+    // the band-continuation pin below for why the gap is kept rather than
+    // closed.
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyTargetFormatUnresolvable),
+              "D_DependencyTargetFormatUnresolvable");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyTargetFormatAmbiguous),
+              "D_DependencyTargetFormatAmbiguous");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyDerivedNameInvalid),
+              "D_DependencyDerivedNameInvalid");
 }
 
 // The ten codes allocated for `.dss-project.json`'s `preBuildScripts` /
@@ -119,6 +128,59 @@ TEST(DiagnosticCode, ProjectScriptsAndDependsOnBandIsContiguousAndRenders) {
     }
     // Non-vacuity: a counter incremented in the loop, not sizeof the array.
     EXPECT_EQ(checked, 10);
+}
+
+// ★ THE SAME FEATURE, CONTINUED AT 0xD022 — AND THE GAP AT 0xD021 IS PINNED
+// DELIBERATELY, NOT TOLERATED. AP6's consumer-driven format derivation added
+// three more `dependsOn` codes, but `D_SuppressRequestIgnored` (0xD021) had
+// already taken the next slot, so this topic is NO LONGER one contiguous run.
+// That is the correct outcome and this pin exists to stop someone "tidying" it:
+// the number is the OPERATOR-VISIBLE identity (`error[D0022]`), it appears in
+// docs and in `expected.json` fixtures, and renumbering an allocated code to
+// close a cosmetic gap would rewrite a published name. A gap inside a topic's
+// range is cheap; a moved number is not.
+//
+// So this asserts two different things from the run above: the three values
+// themselves, AND that their predecessor is 0xD021 rather than 0xD020 — i.e.
+// the gap is where it is supposed to be. A future code appended at 0xD025 must
+// extend this pin, not the one above.
+TEST(DiagnosticCode, DependsOnBandContinuationAfterTheSuppressSlot) {
+    struct Row {
+        DiagnosticCode   code;
+        std::uint16_t    value;
+        std::string_view rendered;
+    };
+    constexpr Row kRows[] = {
+        {DiagnosticCode::D_DependencyTargetFormatUnresolvable, 0xD022, "D0022"},
+        {DiagnosticCode::D_DependencyTargetFormatAmbiguous,    0xD023, "D0023"},
+        {DiagnosticCode::D_DependencyDerivedNameInvalid,       0xD024, "D0024"},
+    };
+
+    // The predecessor is the SUPPRESS slot, not the last `dependsOn` code —
+    // asserted explicitly so the discontinuity is a stated fact rather than an
+    // accident someone later "corrects".
+    ASSERT_EQ(static_cast<std::uint16_t>(DiagnosticCode::D_SuppressRequestIgnored),
+              0xD021)
+        << "the slot this run continues after moved";
+    ASSERT_EQ(static_cast<std::uint16_t>(DiagnosticCode::D_DependencyGitNameCollision),
+              0xD020)
+        << "the earlier dependsOn run moved; both pins must agree";
+
+    int           checked  = 0;
+    std::uint16_t previous = 0xD021;
+    for (Row const& row : kRows) {
+        EXPECT_EQ(static_cast<std::uint16_t>(row.code), row.value)
+            << diagnosticCodeName(row.code) << " was renumbered";
+        EXPECT_EQ(row.value, static_cast<std::uint16_t>(previous + 1u))
+            << diagnosticCodeName(row.code) << " is not contiguous with its predecessor";
+        previous = row.value;
+        ASSERT_EQ(row.value & 0xF000u, 0xD000u)
+            << diagnosticCodeName(row.code) << " escaped the D_* band";
+        EXPECT_EQ(diagnosticCodePrefix(row.code), row.rendered);
+        ++checked;
+    }
+    // Non-vacuity: a counter incremented in the loop, not sizeof the array.
+    EXPECT_EQ(checked, 3);
 }
 
 TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {

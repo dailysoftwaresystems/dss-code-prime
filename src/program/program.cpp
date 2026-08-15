@@ -6,7 +6,6 @@
 #include "core/substrate/thread_pool.hpp"       // D-PERF-4-CU-PARALLELISM: per-CU build pool
 #include "core/types/config_path_walk.hpp"      // findShippedConfigDir — shared src/dss-config/<dir> resolver
 #include "core/types/diagnostic_reporter.hpp"
-#include "core/types/glob_match.hpp"  // D-AP2-SOURCES-GLOB: expand sources[] patterns
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -28,7 +27,10 @@
 #include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"
 #include "program/cross_validate_target_format.hpp"
+#include "program/dependency_resolver.hpp"  // AP6: `dependsOn` resolution
+#include "program/git_acquire.hpp"          // SystemGitRunner — the default git seam
 #include "program/input_resolver.hpp"
+#include "program/project_sources.hpp"  // D-AP2-SOURCES-GLOB + AP6 M4: sources[] → files
 #include "program/target_spec.hpp"
 
 #include <algorithm>
@@ -343,16 +345,62 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     return std::min<std::size_t>(autoWidth, ceiling);
 }
 
+// The DIRECTORY one target's artifact is written into — BOTH arms stated in one
+// place, because the second one used to be implicit.
+//
+// `--output <dir>` given ⇒ `<dir>` (flat) or `<dir>/<formatName>` when the build
+// has several targets, or when the caller forces the per-format subdir (every
+// PROJECT build does, D-AP2-OUTPUT-ROUTING). `--output` ABSENT ⇒ the base is
+// `<cwd>/target`, ALWAYS per-format-subdir'd. `formatName` already encodes
+// machine+OS, so no separate `<targetName>` component is added (redundant +
+// bloats the path).
+//
+// ★ WHY THIS IS A NAMED FUNCTION AND NOT FOUR LINES INLINE (AP6). It is now half
+// of `compileOneTarget`'s RETURN VALUE — a contract another build tier reads —
+// and "when `--output` is absent the artifacts are under `<cwd>/target`" was a
+// fact you could only learn by finding the `else` branch. A caller that must
+// state where a build's outputs will land (AP6's dependency artifacts) needs the
+// rule to be nameable, and a rule with a name has exactly one definition. Pure:
+// no filesystem effect, no diagnostics — the mkdir + containment check stay at
+// the call site, where the reporter is.
+[[nodiscard]] fs::path resolveArtifactOutputDir(
+    std::optional<std::filesystem::path> const& outputDir,
+    std::string const&                          formatName,
+    bool                                        multiTargetBuild,
+    bool                                        perFormatOutputSubdir) {
+    if (outputDir.has_value()) {
+        return (multiTargetBuild || perFormatOutputSubdir)
+                 ? (*outputDir / formatName)
+                 : *outputDir;
+    }
+    return fs::current_path() / "target" / formatName;
+}
+
 // Compile one resolved (CU, target, format) triple to one artifact.
-// Returns true on success; emits via `reporter` on failure.
+// Returns THE ARTIFACT'S PATH on success; `std::nullopt` on failure,
+// with the reason already emitted via `reporter`.
+//
+// ★ WHY A PATH AND NOT A `bool` (AP6). The final on-disk path is
+// computed HERE and nowhere else — from `outputDir`, the
+// single-vs-multi-target rule, `perFormatOutputSubdir`, the format's
+// own extension, and `artifactName.value_or(sourceStem)`. A consumer
+// that needs to know what was built (AP6 threads a built dependency's
+// artifact into the build that depends on it) would otherwise have to
+// RE-DERIVE that formula, giving the repo a second copy of a fact that
+// can drift from the first — the failure mode this codebase rejects
+// everywhere. Returning it makes the producer the only source.
+// `std::optional` rather than an out-parameter for a reason the type
+// enforces: an out-parameter can be READ after a failed call, and the
+// value it would hold is the path of an artifact that was never
+// written. A disengaged optional cannot be misread that way.
 //
 // `outputDir` (D-LK10-ENTRY Slice C companion): when set, the
 // emitted binary lands at `<outputDir>/<name><ext>` for
 // single-target builds, or `<outputDir>/<formatName>/<name><ext>`
 // for multi-target builds (the multi-target qualifier disambiguates
-// same-named outputs across formats). When unset, the legacy
-// `<cwd>/target/<formatName>/<name><ext>` convention applies —
-// keeps existing call sites unchanged.
+// same-named outputs across formats). When unset, the base is
+// `<cwd>/target` — see `resolveArtifactOutputDir`, which states both
+// arms in one place rather than leaving the fallback implicit.
 //
 // The artifact base `<name>` = `artifactName.value_or(sourceStem)`: a
 // project manifest's `artifactName` overrides the source stem; nullopt
@@ -362,7 +410,8 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
 // PROJECT build sets it so every platform's artifact is consistently
 // per-platform-subdir'd; the CLI path leaves it false, so `--compile`
 // single-target output stays flat (byte-identical).
-[[nodiscard]] bool compileOneTarget(std::span<CompilationUnit const> cus,
+[[nodiscard]] std::optional<std::filesystem::path>
+compileOneTarget(                   std::span<CompilationUnit const> cus,
                                     GrammarSchema const&   grammar,
                                     std::string const&     sourceStem,
                                     std::string const&     targetSpecStr,
@@ -392,20 +441,20 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     if (!parsed) {
         emitDriver(reporter, DiagnosticCode::D_InvalidTargetSpec,
                    targetSpecErrorMessage(targetSpecStr, parsed.error()));
-        return false;
+        return std::nullopt;
     }
 
     auto targetR = TargetSchema::loadShipped(parsed->targetName);
     if (!targetR.has_value()) {
         emitTargetSchemaLoadFailed(reporter, targetR.error(),
                                    parsed->targetName);
-        return false;
+        return std::nullopt;
     }
     auto formatR = ObjectFormatSchema::loadShipped(parsed->formatName);
     if (!formatR.has_value()) {
         emitObjectFormatSchemaLoadFailed(reporter, formatR.error(),
                                          parsed->formatName);
-        return false;
+        return std::nullopt;
     }
 
     // D-LK6-8.2 cross-validation: confirm the (target, format) pair's
@@ -414,7 +463,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // silently dispatch the linker to the wrong PLT-stub emitter,
     // producing SIGILL at runtime with no driver diagnostic.
     if (!crossValidateTargetFormat(**targetR, **formatR, reporter)) {
-        return false;
+        return std::nullopt;
     }
 
     // D-FF3-3 (commit 9440143): resolve the (target, format) calling
@@ -426,7 +475,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // LirFuncAllocation::callingConventionIndex field that
     // materializeCallingConvention reads downstream.
     auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, reporter);
-    if (!abi) return false;
+    if (!abi) return std::nullopt;
 
     // Post-fold-#5 silent-failure CRITICAL-1: operand-stack (WASM)
     // and result-id (SPIR-V) abi-models return cc=nullptr from
@@ -456,7 +505,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                        + "' — register-machine LIR pipeline does not "
                          "lower it. Plan 17 (SPIR-V) / plan 18 (WASM) "
                          "own this lowering.");
-        return false;
+        return std::nullopt;
     }
     auto const span = (*targetR)->callingConventions();
     std::uint16_t const ccIndex = static_cast<std::uint16_t>(
@@ -477,14 +526,8 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // (unchanged). `formatName` already encodes machine+OS, so we don't add a
     // separate `<targetName>` subdir (redundant + bloats the path).
     auto const ext = parsed->outputExtension(**formatR);
-    fs::path outDir;
-    if (outputDir.has_value()) {
-        outDir = (multiTargetBuild || perFormatOutputSubdir)
-                   ? (*outputDir / parsed->formatName)
-                   : *outputDir;
-    } else {
-        outDir = fs::current_path() / "target" / parsed->formatName;
-    }
+    fs::path const outDir = resolveArtifactOutputDir(
+        outputDir, parsed->formatName, multiTargetBuild, perFormatOutputSubdir);
     std::error_code ec;
     fs::create_directories(outDir, ec);
     if (ec) {
@@ -497,7 +540,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         emitDriver(reporter, DiagnosticCode::D_OutputDirCreateFailed,
                    "failed to create output directory '"
                    + outDir.generic_string() + "': " + ec.message());
-        return false;
+        return std::nullopt;
     }
     auto const outPath =
         outDir / (artifactName.value_or(sourceStem) + std::string{ext});
@@ -523,7 +566,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                    + outDir.generic_string()
                    + "' — it must be a bare file name (no path separators, no "
                      "drive/root prefix, and not '.' or '..').");
-        return false;
+        return std::nullopt;
     }
 
     // D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118):
@@ -534,9 +577,16 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // the line cannot be printed for a write that failed. Every `return` of a
     // link/write result below goes through here; a route added later that does
     // not is a route whose artifact goes unreported, which is the whole defect.
-    auto const reported = [&](bool wrote) {
-        if (wrote) reportArtifactWritten(targetSpecStr, outPath);
-        return wrote;
+    // It is ALSO the one place the success return value is minted (AP6): the
+    // path is returned exactly when the write succeeded, by the same `wrote`
+    // that decides whether to print the report line. Two facts, one predicate —
+    // a route that returned a path without reporting (or reported without
+    // returning) would need to bypass this lambda, which is the same bypass the
+    // note above already forbids.
+    auto const reported = [&](bool wrote) -> std::optional<std::filesystem::path> {
+        if (!wrote) return std::nullopt;
+        reportArtifactWritten(targetSpecStr, outPath);
+        return outPath;
     };
 
     // c165 (D-LK-STATIC-LINK): partition `--resolve-library` into DYNAMIC
@@ -632,7 +682,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                            "a multi-CU standalone-assembly build is not yet "
                            "lowered — each unit's symbol space would have to be "
                            "namespaced before the modules merge");
-                return false;
+                return std::nullopt;
             }
             // D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY: the WHOLE format schema
             // and the WHOLE per-CU options, by the same route `buildCuMir`
@@ -648,7 +698,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
             if (!mod) {
                 emitNullNoDiagnostic("the assembly unit build "
                                      "(assembleAsmUnit)");
-                return false;
+                return std::nullopt;
             }
             // D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER, the STATIC
             // half: this route used to call `linkAndWrite` directly, so a `.a` /
@@ -671,7 +721,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                        "driver has no route for — refused rather than silently "
                        "taking the full pipeline, which would run the "
                        "construct through tiers it asked to skip");
-            return false;
+            return std::nullopt;
         }
     }
 
@@ -682,7 +732,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                                        ccIndex, reporter, perCuOpts);
             if (!cuMirSlots[0]) {              // front-half tier failure already reported
                 emitNullNoDiagnostic("per-CU build (buildCuMir)");
-                return false;
+                return std::nullopt;
             }
         }
     } else {
@@ -739,7 +789,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         }
         if (!allBuilt) {
             emitNullNoDiagnostic("a per-CU build (buildCuMir)");
-            return false;  // ≥1 front-half tier failure — all diagnostics reported
+            return std::nullopt;  // ≥1 front-half tier failure — all diagnostics reported
         }
     }
 
@@ -775,7 +825,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                                             (*formatR)->sehPersonality(),
                                             (*formatR)->name(),
                                             (*formatR)->kind(), reporter);
-            if (!mod) return false;  // back-half tier failure already reported
+            if (!mod) return std::nullopt;  // back-half tier failure already reported
             members.push_back(std::move(*mod));
             // Member file name: distinct + valid `ar` name. The armap
             // (symbol → member index) drives a linker's member selection, so
@@ -803,7 +853,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
             auto extracted = extractStaticArchiveMembers(
                 std::span<std::filesystem::path const>{staticArchives},
                 **targetR, **formatR, reporter);
-            if (!extracted) return false;  // fail-loud already reported
+            if (!extracted) return std::nullopt;  // fail-loud already reported
             members.reserve(members.size() + extracted->modules.size());
             memberNames.reserve(memberNames.size() + extracted->names.size());
             for (std::size_t i = 0; i < extracted->modules.size(); ++i) {
@@ -827,7 +877,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                                         (*formatR)->kind(), reporter);
         if (!mod) {              // back-half tier failure already reported via `reporter`
             emitNullNoDiagnostic("back-half lower (lowerCuMirToAssembly)");
-            return false;
+            return std::nullopt;
         }
         // c165 (D-LK-STATIC-LINK): link against any `ar` static archives named on
         // `--resolve-library` (pull the referenced members + merge them in). With
@@ -952,7 +1002,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     bool entryOk = true;
     auto const resolvedEntry = resolveProgramEntry(
         cands, (*formatR)->entryVerbs(), (*formatR)->name(), reporter, entryOk);
-    if (!entryOk) return false;   // undefined / ambiguous entry — already reported.
+    if (!entryOk) return std::nullopt;   // undefined / ambiguous entry — already reported.
 
     // The winning name, MANGLED to the merge's DEFINITION-KEY convention.
     //
@@ -990,7 +1040,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         std::move(host),
         std::span<std::string const>{entryNames.data(), entryNames.size()},
         reporter);
-    if (!merged) return false;  // merge failure (conflict / verify) already reported.
+    if (!merged) return std::nullopt;  // merge failure (conflict / verify) already reported.
 
     // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
     // MATERIALIZE the resolved entry's arguments per its verb × the format's declared
@@ -1016,7 +1066,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                            merged->userEntrySymbol, merged->externImports,
                            entryVerb, (*formatR)->processArgs(), cSymDecor,
                            (*formatR)->name(), reporter)) {
-        return false;  // unusable mechanism — fail-loud already reported.
+        return std::nullopt;  // unusable mechanism — fail-loud already reported.
     }
 
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): whole-program
@@ -1082,7 +1132,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                                 "have rejected an unknown recipe id at read time "
                                 "(isKnownSynthesizeRecipe)",
                                 bare, symV));
-                return false;
+                return std::nullopt;
             }
             switch (*family) {
             case dss::ffi::ShimFamily::Threads: mergedThreadsRecipes.emplace(symV, bare); break;
@@ -1092,7 +1142,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         if (!synthesizeThreadsShim(merged->mir, merged->host.interner(),
                                    mergedThreadsRecipes, (*formatR)->librarySynthesis(),
                                    cSymDecor, merged->externImports, reporter)) {
-            return false;  // internal invariant breach (vocab/switch drift) — reported.
+            return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
         }
         // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —
         // see `synth_stdio_shim.hpp` for the full contract. A clean no-op when
@@ -1114,7 +1164,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
         if (!synthesizeStdioShim(merged->mir, merged->host.interner(),
                                  mergedStdioRecipes, vaListLayout,
                                  merged->externImports, reporter)) {
-            return false;  // recipe/helper-import/va-strategy mismatch — reported.
+            return std::nullopt;  // recipe/helper-import/va-strategy mismatch — reported.
         }
     }
 
@@ -1137,7 +1187,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     // still optimize per-CU) and the redundant per-CU pass is correctness-neutral.
     if (!optimizeModule(merged->mir, **targetR, merged->host.interner(),
                         compileOpts, reporter)) {
-        return false;  // optimize / verify failure already reported via `reporter`
+        return std::nullopt;  // optimize / verify failure already reported via `reporter`
     }
 
     // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
@@ -1149,7 +1199,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                                merged->externImports,
                                (*formatR)->sehPersonality(), cSymDecor,
                                (*formatR)->name(), sehScopes, reporter)) {
-        return false;  // unsupported SEH shape (c116b frontier) — fail-loud reported.
+        return std::nullopt;  // unsupported SEH shape (c116b frontier) — fail-loud reported.
     }
 
     // D-FFI-EXTERN-CALL-DISPATCH: the merged module compiles to ONE
@@ -1185,7 +1235,7 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                                      std::move(sehScopes),
                                      std::move(wideFloatSoftcallLibrary),
                                      reporter);
-    if (!mod) return false;  // back-half tier failure already reported via `reporter`
+    if (!mod) return std::nullopt;  // back-half tier failure already reported via `reporter`
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links
     // against any `ar` static archives named on `--resolve-library` the same way
     // the single-CU path does (pull referenced members + merge). No archives =>
@@ -1439,6 +1489,22 @@ int runCusToTargets(
     CompileConfig                               config,
     ::dss::opt::OptPipeline const*              pipelineOverride,
     std::vector<ResolveLibrarySpec> const&      resolveLibraries,
+    // AP6: the PER-TARGET ADDITIONS channel — extra `ResolveLibrarySpec`s for
+    // ONE target spec, MERGED with (never replacing) the program-wide list
+    // above. Keyed by the `<targetName>:<formatName>` string, EMPTY ⇒ nothing
+    // added anywhere, which is byte-identical to the pre-AP6 broadcast. See
+    // `Program::setResolveLibraryAdditionsByTarget` for why the channel is
+    // keyed rather than index-parallel, and why it is internal-only.
+    std::map<std::string, std::vector<ResolveLibrarySpec>> const&
+                                                resolveLibraryAdditionsByTarget,
+    // AP6: index-parallel to `targets` — entry i is the artifact
+    // `compileOneTarget` wrote for `targets[i]`, `nullopt` if that target
+    // failed. CLEARED and re-sized here, so a caller reading it after a run
+    // reads THIS run. Left EMPTY when the function returns before the
+    // per-target loop (a bad spec, an unloadable schema, a parse failure) —
+    // i.e. "no target was reached", which is distinct from "a target was
+    // reached and produced nothing".
+    std::vector<std::optional<std::filesystem::path>>& artifactsOut,
     // D-PERF-4-CU-PARALLELISM: the per-CU build executor (nullptr ⇒ internal
     // pool) + the `--jobs` override, threaded verbatim to `compileOneTarget`.
     substrate::IExecutor*                       executor,
@@ -1646,6 +1712,75 @@ int runCusToTargets(
         return 1;
     }
 
+    // ── AP6: the PER-TARGET `--resolve-library` ADDITIONS, resolved into the
+    //    THIRD index-parallel vector ─────────────────────────────────────────
+    //
+    // `resolveLibraries` is ONE program-wide list broadcast to every target
+    // (below, at `compileOpts.resolveLibraries`). That is right for the CLI and
+    // the manifest, which are both program-wide statements. It is NOT right for
+    // AP6: a dependency is built ONCE PER CONSUMER TARGET, so the artifact that
+    // must be linked into `x86_64:elf64-…` is a DIFFERENT FILE from the one for
+    // `arm64:macho64-…`. Broadcasting the union would hand every target every
+    // other target's binaries — the wrong-format cross-feed that binds SILENTLY
+    // today (registry `D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL`).
+    //
+    // MERGE, NEVER REPLACE: program-wide entries first, this target's additions
+    // after. An empty map contributes nothing to anyone, so the vector below is
+    // a per-target copy of `resolveLibraries` and the build is byte-identical to
+    // the pre-AP6 broadcast.
+    //
+    // ★ KEYED BY SPEC STRING, INDEX-PARALLEL ONLY IN HERE. An index-parallel
+    // channel across the API boundary would add an invariant the caller can
+    // break — `additions.size() == targets.size()` — whose breach is a
+    // MIS-ALIGNMENT: target 0 silently linking target 1's libraries. Keying on
+    // the spec the producer already derives against removes that invariant
+    // instead of diagnosing it, and the derived per-index vector below (the
+    // third sibling of `grammarPerTarget` / `keyPerTarget`) is built HERE, so it
+    // cannot be the wrong length. The one mistake the key form still admits —
+    // naming a target this build does not have — is caught right below rather
+    // than dropped, because a dependency silently NOT linked is a link error
+    // several tiers from its cause.
+    std::vector<std::vector<ResolveLibrarySpec>> resolveLibsPerTarget;
+    resolveLibsPerTarget.reserve(targets.size());
+    for (auto const& spec : targets) {
+        std::vector<ResolveLibrarySpec> libs = resolveLibraries;
+        auto const it = resolveLibraryAdditionsByTarget.find(spec);
+        if (it != resolveLibraryAdditionsByTarget.end()) {
+            libs.reserve(libs.size() + it->second.size());
+            libs.insert(libs.end(), it->second.begin(), it->second.end());
+        }
+        resolveLibsPerTarget.push_back(std::move(libs));
+    }
+    // FAIL LOUD on an addition keyed to a target this build never compiles: its
+    // libraries would reach no link at all, and the resulting undefined symbol
+    // would name neither the key nor the target. Reported for EVERY unmatched
+    // key in one pass (the same all-reasons-in-one-run discipline the target /
+    // format / pair pre-flight above follows), and `std::map`'s ordering makes
+    // the report deterministic. `D_InvalidTargetSpec` is the driver-band code
+    // for "the caller's invocation names a target that cannot be honoured" —
+    // the same code, and the same class of complaint, as this file's existing
+    // "targets list is empty" rejects; it is a target-spec problem, not a
+    // library problem, so it must not route an operator to the library.
+    {
+        std::set<std::string_view> const built{targets.begin(), targets.end()};
+        bool unmatched = false;
+        for (auto const& [spec, libs] : resolveLibraryAdditionsByTarget) {
+            if (built.count(spec) != 0) continue;
+            unmatched = true;
+            emitDriver(rep, DiagnosticCode::D_InvalidTargetSpec,
+                       "per-target resolve-library additions name target spec '"
+                       + spec + "', which is not among this build's "
+                       + std::to_string(targets.size())
+                       + " target(s) — its " + std::to_string(libs.size())
+                       + " librar(y/ies) would reach no link. Use one of the "
+                         "build's own '<targetName>:<formatName>' specs.");
+        }
+        if (unmatched) {
+            drainDiagnosticsToStderr(rep);
+            return 1;
+        }
+    }
+
     // c9 + TF-C74 (b): build the front-end ONCE PER DISTINCT `CuBuildKey`. A
     // language WITHOUT a preprocess pass produces identical CUs for every
     // target (both `activeFormat` and the target predefines are inert) → the
@@ -1737,6 +1872,10 @@ int runCusToTargets(
     }
 
     int exitCode = 0;
+    // AP6: sized ONCE, here — every entry starts disengaged, so a target whose
+    // build fails leaves `nullopt` rather than a stale or invented path, and the
+    // vector stays index-parallel to `targets` for the ones that succeeded.
+    artifactsOut.assign(targets.size(), std::nullopt);
     for (std::size_t i = 0; i < targets.size(); ++i) {
         std::string const& spec = targets[i];
         // Route this target to the CUs built for its object-format-kind (c9).
@@ -1753,18 +1892,28 @@ int runCusToTargets(
         CompileOptions compileOpts{DiagnosticBudget{rep.config()}};
         compileOpts.config           = config;
         compileOpts.pipelineOverride = pipelineOverride;
-        compileOpts.resolveLibraries = resolveLibraries;  // c162 (D-FF1-READER-CONSUMER)
+        // c162 (D-FF1-READER-CONSUMER) + AP6: THIS target's list — the
+        // program-wide entries plus whatever was added for this spec, resolved
+        // in the pass above. Identical to `resolveLibraries` when no additions
+        // were supplied, which is every caller outside AP6.
+        compileOpts.resolveLibraries = resolveLibsPerTarget[i];
         // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the grammar THIS target's
         // CU was parsed under — never the invocation's, which no longer
         // exists as a single value.
-        bool const ok = compileOneTarget(
+        auto artifact = compileOneTarget(
             std::span<CompilationUnit const>{cus.data(), cus.size()},
             *grammarPerTarget[i], sourceStem, spec, scratch,
             outputDir, /*multiTargetBuild*/ targets.size() > 1u,
             artifactName, perFormatOutputSubdir, compileOpts,
             executor, jobsOverride, imageRequest);
         mergeWithTargetContext(scratch, spec, rep);
-        if (!ok || scratch.hasErrors()) exitCode = 1;
+        // AP6: a target counts as having produced an artifact only if it BOTH
+        // wrote one and reported no error — the same conjunction the exit code
+        // uses. A scratch error alongside a written file means the build is
+        // failing, and handing a consumer that file would let a failed
+        // dependency be linked into something that then "succeeds".
+        if (!artifact || scratch.hasErrors()) exitCode = 1;
+        else                                  artifactsOut[i] = std::move(artifact);
     }
 
     drainDiagnosticsToStderr(rep, bufs);
@@ -1807,6 +1956,11 @@ int Program::run(int argc, char* argv[]) {
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
     setCompileConfig(args.config);
     setJobs(args.jobs);  // D-PERF-4-CU-PARALLELISM: --jobs N per-CU build pool width
+    // AP6 / B.4: `--force-git-cache` — bypass the `.dss-deps` cache-hit
+    // short-circuit. Stamped before the dispatch fork like every other global;
+    // only `compileProject` has a `dependsOn` list to apply it to, which is
+    // what the parser's mode gate already enforces.
+    setForceGitCache(args.forceGitCache);
     // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `--stack-reserve <bytes>` — the
     // per-PROGRAM stack reserve the emitted image should carry. Stamped HERE,
     // before the dispatch fork, so it applies to EVERY compile-producing mode.
@@ -1946,71 +2100,20 @@ int Program::compileProject(
     }
     ProjectConfig const& pc = *pcOpt;
 
-    // ── `dependsOn`: DECLARED-BUT-UNRESOLVED IS A LOUD REJECT, NOT A NO-OP ──
+    // ── `dependsOn` IS NOW RESOLVED, NOT REFUSED (AP6) ──────────────────────
     //
-    // The loader parses and shape-validates `dependsOn` (path-xor-git, `ref`
-    // only with `git`, no unknown members). RESOLUTION — walking to the named
-    // manifest, acquiring a git remote into `.dss-deps/<name>`, cycle
-    // detection, and merging the dependency's sources or linking its artifact —
-    // is a separate lane that has NOT landed in this driver. The codes that
-    // lane will emit are already allocated and documented (0xD019..0xD020 in
-    // `core/types/parse_diagnostic.hpp`); NONE of them fits here, because every
-    // one of them describes an OUTCOME of a resolution attempt ("that directory
-    // holds no manifest", "the graph has a cycle", "git is not on PATH"), and
-    // this is the prior condition: no attempt is made at all.
-    //
-    // ★ WHY THIS IS A HARD REJECT RATHER THAN AN IGNORED FIELD. Accept-and-
-    // ignore is the single worst behaviour available: the manifest states a
-    // prerequisite, the build reports success, and the artifact is missing
-    // exactly the thing the author declared it needs. The failure then surfaces
-    // as an undefined symbol at link — or, far worse, as a link against a STALE
-    // copy of the dependency that happens to be lying around — with nothing
-    // anywhere pointing back at the key that was silently dropped. Rejecting
-    // the key outright costs the author one line of diff and tells them the
-    // truth; ignoring it costs them a debugging session and tells them a lie.
-    //
-    // ★ WHY `D_PlanNotLanded` (0xD009) AND NOT A NEW CODE. Its allocation note
-    // defines it as "an entry point reached an arm whose backing plan substrate
-    // is not yet shipped ... Future plan-gated arms re-use this code", and
-    // distinguishes it from `D_TargetAbiModelUnsupportedByDriver` (a PERMANENT
-    // architectural exclusion) — a distinction `ffi/ingest.cpp` also turns on
-    // when it declines to reuse this code. Dependency resolution is squarely
-    // the pending-arrival case: the feature is coming, the surface is stable,
-    // and only the engine behind it is absent. Minting a fourth "not landed
-    // yet" code would say nothing 0xD009 does not already say, and would leave
-    // a dead ordinal behind the day the lane lands. It is also a member of
-    // `kUnsuppressableCodes`, which is load-bearing here: `--suppress` must not
-    // be able to convert this loud reject back into the silent no-op it exists
-    // to replace.
-    //
-    // Placed FIRST — ahead of the profile gates, the flag merges and (crucially)
-    // the pre-build scripts — because a build that cannot happen must not have
-    // side effects on the way to saying so: running the author's codegen hook
-    // for a build we are about to refuse writes files into their tree for
-    // nothing.
-    if (!pc.dependsOn.empty()) {
-        DependencyEntry const& first = pc.dependsOn.front();
-        std::string const firstName =
-            first.path.has_value()
-                ? ("path '" + *first.path + "'")
-                : (first.git.has_value() ? ("git '" + *first.git + "'")
-                                         : std::string{"<unnamed>"});
-        emitDriver(rep, DiagnosticCode::D_PlanNotLanded,
-                   "project 'dependsOn': dependency RESOLUTION is not yet "
-                   "implemented in this driver — the manifest declares "
-                   + std::to_string(pc.dependsOn.size())
-                   + " dependency entr" + (pc.dependsOn.size() == 1 ? "y" : "ies")
-                   + " (first: " + firstName
-                   + "), and the driver cannot resolve, acquire or build any of "
-                     "them. The build is REFUSED rather than run without them: "
-                     "compiling as if the key were absent would report success "
-                     "for an artifact that is missing a declared prerequisite. "
-                     "Remove the 'dependsOn' key (and build the prerequisite "
-                     "separately, wiring it in via 'resolveLibraries' or an "
-                     "explicit source entry) until dependency resolution lands.");
-        drainDiagnosticsToStderr(rep);
-        return 1;
-    }
+    // Until the resolver landed this seam held a `D_PlanNotLanded` reject,
+    // placed FIRST so a build that could not happen had no side effects on the
+    // way to saying so. The resolver replaces the reject, and the placement
+    // argument SURVIVES INVERTED: resolution is itself the most side-effecting
+    // thing this function does — it clones remotes, runs each dependency's
+    // pre-build hooks in that dependency's own tree, and BUILDS artifacts — so
+    // it must sit BELOW the cheap gates that can refuse this manifest outright
+    // (a bad profile, an unloadable grammar) and ABOVE the ROOT's own pre-build
+    // hooks, which are the first thing that writes into the AUTHOR's tree. A
+    // resolution that fails therefore still leaves the root's tree untouched,
+    // which is the property `NonEmptyDependsOnFailsLoud…`'s successor pins.
+    // See the call site further down, after the gates and the flag merges.
 
     // Load the language grammar to read its declared `artifactProfiles`.
     // The delegated `compileFiles`/`compileUnits` re-loads it by name;
@@ -2134,6 +2237,65 @@ int Program::compileProject(
         setStackReserveBytes(pc.stackReserveBytes);
     }
 
+    // ── `dependsOn` RESOLUTION (AP6) ────────────────────────────────────────
+    //
+    // ★ THE PLACEMENT IS THREE STATEMENTS, AND EACH IS LOAD-BEARING.
+    //
+    // (1) BELOW the two profile gates and the manifest merges. Resolution is
+    // the most side-effecting thing this function does — it clones remotes,
+    // spawns every dependency's pre-build hooks in that dependency's own tree,
+    // and BUILDS artifacts — so a manifest this driver is going to refuse
+    // outright (a profile its language does not declare, a target whose format
+    // does not serve it) must be refused BEFORE any of that happens. This is
+    // the same argument that placed the reject it replaces FIRST, applied to a
+    // seam whose cost went from zero to "the whole dependency graph".
+    //
+    // (2) ABOVE the ROOT's own pre-build hooks. Those are the first thing that
+    // writes into the AUTHOR's tree, and a build that cannot resolve its
+    // prerequisites must not have run the author's codegen step on the way to
+    // saying so. It is also the only correct order for the other direction: a
+    // dependency is a PREREQUISITE, so a root hook that consumes one has it.
+    //
+    // (3) ABOVE the root's `sources[]` expansion, because the merged list this
+    // produces is joined to the root's own — and M4(b) makes that JOIN's order
+    // load-bearing (see the join below).
+    //
+    // The git seam is INJECTED when a caller supplied one and a real
+    // `SystemGitRunner` otherwise. It is constructed unconditionally because it
+    // is inert until used — no PATH scan happens until an operation asks — so
+    // a manifest with no git dependency pays nothing for its existence, and
+    // `resolveProjectDependencies` returns immediately on an empty `dependsOn`
+    // without touching it at all.
+    SystemGitRunner systemGit;
+    DependencyResolveRequest depRequest;
+    // The ROOT manifest's canonical directory is where the ONE `.dss-deps` for
+    // the whole graph lives (M2) and is the first cycle-detection key.
+    // `ProjectConfig` carries no path of its own, which is why the resolver
+    // takes the manifest path rather than deriving anything.
+    depRequest.rootManifestPath = fs::path{projectFilePath};
+    depRequest.targets          = pc.targets;
+    // U-9's base, stated rather than left implicit: `--output` when given, and
+    // `<cwd>/target` when not — the same rule `resolveArtifactOutputDir`
+    // applies to this build's own artifact, so a dependency's artifacts land
+    // beside the consumer's rather than in a second convention.
+    depRequest.artifactOutputBase =
+        outputDir().has_value() ? *outputDir() : (fs::current_path() / "target");
+    depRequest.compileConfig  = compileConfig();
+    depRequest.jobs           = jobs();
+    depRequest.executor       = executor();
+    depRequest.forceGitCache  = forceGitCache();
+    auto resolved = resolveProjectDependencies(
+        pc, depRequest, gitRunner() != nullptr ? *gitRunner() : systemGit, rep);
+    if (!resolved) {
+        drainDiagnosticsToStderr(rep);
+        return 1;
+    }
+    // The per-target ADDITIONS channel — the reason
+    // `setResolveLibraryAdditionsByTarget` exists. An empty map (the
+    // no-`ArtifactLink`-dependency case) adds nothing to anyone, so every
+    // existing build stays byte-identical.
+    setResolveLibraryAdditionsByTarget(std::move(resolved->libraryAdditionsByTarget));
+
     // ── PRE-BUILD HOOKS — AND THE ONE THING THAT FIXES THEIR POSITION ──────
     //
     // `runBuildScripts` spawns every APPLICABLE `preBuildScripts` entry in
@@ -2179,76 +2341,65 @@ int Program::compileProject(
         return 1;
     }
 
-    // D-AP2-SOURCES-GLOB: expand any glob pattern in `sources[]` into its
-    // matching files BEFORE the multi-vs-single-CU routing count is taken — so a
-    // `"src/**/*.c"` entry routes EXACTLY as if its matches had been listed
-    // literally (a 2-match glob ⇒ 2 concrete sources ⇒ count 2 ⇒ `compileUnits`).
-    // A driver pre-pass, NOT the loader: `parseProjectConfig` stays a pure JSON
-    // parser (it holds the raw pattern), the filesystem side lives here.
-    //   * LITERAL entry (no `* ? [` metacharacter) — kept VERBATIM (unchanged
-    //     behavior; a missing literal still fails DOWNSTREAM at CU build, and is
-    //     NOT newly rejected here).
-    //   * GLOB entry — expanded against the filesystem (base = the process
-    //     working directory, the same base a literal source uses; an absolute
-    //     pattern resolves directly). Matches are sorted (deterministic CU order).
-    //     ZERO matches is a FAIL-LOUD error (`D_FileNotFound` naming the pattern)
-    //     — a source pattern that names nothing is a mistake, not an empty no-op.
-    //     A mid-expansion filesystem I/O error fails loud (`D_DirectoryScanFailed`).
-    // The delegate then drains `rep` (runCusToTargets), so these early fail-loud
-    // sites drain here and return, mirroring the gate sites above.
-    std::vector<std::string> expandedSources;
-    expandedSources.reserve(pc.sources.size());
-    for (auto const& entry : pc.sources) {
-        if (!hasGlobMetacharacters(entry)) {
-            expandedSources.push_back(entry);  // literal — verbatim, unchanged
-            continue;
-        }
-        std::error_code ec;
-        std::size_t const before = expandedSources.size();
-        if (!expandGlob(entry, expandedSources, ec)) {
-            emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
-                       "project sources: filesystem error expanding glob pattern '"
-                       + entry + "': " + ec.message());
-            drainDiagnosticsToStderr(rep);
-            return 1;
-        }
-        if (expandedSources.size() == before) {
-            emitDriver(rep, DiagnosticCode::D_FileNotFound,
-                       "project sources: glob pattern '" + entry
-                       + "' matched no files (relative to the working directory) "
-                         "— a source pattern that matches nothing is an error; "
-                         "check the pattern and that the files exist.");
-            drainDiagnosticsToStderr(rep);
-            return 1;
-        }
+    // D-AP2-SOURCES-GLOB + AP6 M4: `sources[]` entries → the concrete, deduped
+    // file list, resolved by `expandAndDedupProjectSources`
+    // (`program/project_sources.hpp`, which carries the whole policy docblock:
+    // expansion, the zero-match / I-O fail-loud rules, the `weakly_canonical`
+    // dedup key, and why ORDER is load-bearing). It runs BEFORE the
+    // multi-vs-single-CU routing count is taken, so a `"src/**/*.c"` entry routes
+    // EXACTLY as if its matches had been listed literally.
+    //
+    // ★ THE BASE IS EMPTY HERE, AND THAT IS A STATEMENT, NOT AN OMISSION. The
+    // ROOT manifest's entries resolve against the PROCESS working directory —
+    // the same base its `preBuildScripts` run in (see the hook call above) and
+    // the same base every relative CLI input uses — so a hook that writes
+    // `generated/main.c` and a manifest that reads `generated/*.c` mean the same
+    // directory. Passing the manifest's OWN directory here would be a silent
+    // behaviour change for every existing project whose cwd is not its manifest's
+    // directory. The non-empty base is for a DEPENDENCY manifest, which declares
+    // its sources relative to itself and has no other way to mean them.
+    //
+    // The helper reports its own fail-loud diagnostic and leaves draining to us,
+    // matching the gate sites above; the delegate below drains the rest
+    // (runCusToTargets).
+    auto expandedSourcesOpt =
+        expandAndDedupProjectSources(pc.sources, fs::path{}, rep);
+    if (!expandedSourcesOpt) {
+        drainDiagnosticsToStderr(rep);
+        return 1;
     }
+    std::vector<std::string> expandedSources = *std::move(expandedSourcesOpt);
 
-    // Cross-entry de-duplication: a file matched by TWO overlapping entries — two
-    // overlapping globs (`src/*.c` + `src/**/*.c`), or a literal alongside a glob
-    // that also matches it — must compile ONCE, not once per entry. Without this,
-    // `compileUnits` would build a DUPLICATE CU per repeat ⇒ a duplicate-symbol
-    // LINK error the diagnostic can't tie back to the manifest. A redundant
-    // overlap should just work — the UNION of unique files, each compiled once —
-    // matching build-system expectations. Dedup on a NORMALIZED key
-    // (`lexically_normal().generic_string()`) because a literal is kept verbatim
-    // (`./main.c`) while glob output is already normalized (`main.c`) — the SAME
-    // file via different strings, which a plain string-dedup would miss. FIRST
-    // occurrence wins (deterministic order) and keeps its ORIGINAL string (a
-    // literal stays verbatim; only later duplicates are dropped). Absolute-vs-
-    // relative spellings of the same file is an accepted un-caught extreme edge —
-    // `lexically_normal` covers the realistic `./` / `..` / literal-vs-glob cases.
-    {
-        std::vector<std::string> deduped;
-        deduped.reserve(expandedSources.size());
-        std::unordered_set<std::string> seen;
-        seen.reserve(expandedSources.size());
-        for (auto& s : expandedSources) {
-            std::string key = fs::path{s}.lexically_normal().generic_string();
-            if (seen.insert(std::move(key)).second) {
-                deduped.push_back(std::move(s));
-            }
+    // ── M4(b): THE ROOT'S OWN SOURCES COME FIRST, AND THAT IS NOT COSMETIC ──
+    //
+    // ✔MEASURED: `sourceStem = fs::path{sourceFiles.front()}.stem()` NAMES THE
+    // ARTIFACT whenever the manifest states no `artifactName`, and it names the
+    // members of a static archive too. So appending a `module` dependency's
+    // sources AHEAD of the root's would silently RENAME the emitted binary —
+    // the build stays green, every diagnostic count stays zero, and the file
+    // the operator was looking for is simply not there under that name.
+    //
+    // The de-dup key is `weakly_canonical`, matching
+    // `expandAndDedupProjectSources`'s own, and it has to: the two lists come
+    // from two manifests resolved against two different bases, so ONE file
+    // spelled relatively by the root and absolutely by a dependency is the
+    // NORMAL case here rather than an exotic edge — and its consequence is a
+    // duplicate CU and a duplicate-symbol link error that names no manifest.
+    // FIRST occurrence wins, keeping its own spelling, exactly as within a
+    // single manifest.
+    if (!resolved->mergedSources.empty()) {
+        std::set<std::string> seen;
+        auto const key = [](std::string const& s) {
+            std::error_code ec;
+            fs::path const c = fs::weakly_canonical(fs::path{s}, ec);
+            return (ec ? fs::path{s}.lexically_normal() : c).generic_string();
+        };
+        for (auto const& s : expandedSources) seen.insert(key(s));
+        expandedSources.reserve(expandedSources.size()
+                                + resolved->mergedSources.size());
+        for (auto const& s : resolved->mergedSources) {
+            if (seen.insert(key(s)).second) expandedSources.push_back(s);
         }
-        expandedSources = std::move(deduped);
     }
 
     // Route by the EXPANDED source COUNT via the shared `routesToMultiUnit`
@@ -2424,6 +2575,11 @@ int Program::compileFiles(
     const std::vector<std::string>& targets,
     DiagnosticReporter&             rep
 ) {
+    // AP6: `artifactPaths()` describes THE LAST RUN. Clear before anything can
+    // return, or a rejected second call would still be answering with the first
+    // call's artifacts — a consumer would then link a binary this invocation
+    // never built.
+    artifactPaths_.clear();
     if (sourceFiles.empty()) {
         emitDriver(rep, DiagnosticCode::D_EmptyInput,
                    "compileFiles: source file list is empty.");
@@ -2530,7 +2686,8 @@ int Program::compileFiles(
         buildCus, grammar, sourceFiles, sourceStem, targets, rep,
         outputDir_, artifactName_, perFormatOutputSubdir_, compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
-        resolveLibraries_, executor_, jobs_,
+        resolveLibraries_, resolveLibraryAdditionsByTarget_, artifactPaths_,
+        executor_, jobs_,
         // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the CLI/manifest stack-reserve
         // request (nullopt = the format default stands).
         ImageRequest{stackReserveBytes_});
@@ -2552,6 +2709,8 @@ int Program::compileUnits(
     const std::vector<std::string>& targets,
     DiagnosticReporter&             rep
 ) {
+    // AP6: same last-run contract as `compileFiles` — see there.
+    artifactPaths_.clear();
     if (sourceFiles.empty()) {
         emitDriver(rep, DiagnosticCode::D_EmptyInput,
                    "compileUnits: source file list is empty.");
@@ -2637,7 +2796,8 @@ int Program::compileUnits(
         targets, rep, outputDir_, artifactName_, perFormatOutputSubdir_,
         compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
-        resolveLibraries_, executor_, jobs_,
+        resolveLibraries_, resolveLibraryAdditionsByTarget_, artifactPaths_,
+        executor_, jobs_,
         // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: the CLI/manifest stack-reserve
         // request (nullopt = the format default stands).
         ImageRequest{stackReserveBytes_});

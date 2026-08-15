@@ -250,6 +250,30 @@ struct DSS_EXPORT CliArgs {
     // default; `--time` with no mode flag is a hard NoModeSelected error.
     bool                          time = false;
 
+    // AP6 (`.plans/06-artifact-profile-plan` §5.1 B.4): `--force-git-cache`
+    // bypasses the `.dss-deps` cache-HIT short-circuit and re-fetches every git
+    // `dependsOn` entry, even one whose recorded commit still matches. Threaded
+    // to `Program::setForceGitCache`.
+    //
+    // ⚠ THE NAME MEANS "FORCE A REFRESH OF THE CACHE", NOT "FORCE USE OF THE
+    // CACHE" — it reads naturally as the second and does the first. The
+    // OPERATOR CHOSE IT; it ships as spelled, and the mitigation is the
+    // imperative gloss in `--help` ("re-fetch git dependencies even when the
+    // cache is valid"), never a rename. B.4's own implementer note says so in
+    // as many words, so this comment exists to stop the rename being
+    // re-proposed by the next reader who notices.
+    //
+    // WHAT IT DOES **NOT** CHANGE: every other rule of the cache machine. A
+    // fetch that fails with a usable checkout present still emits
+    // `D_DependencyGitFetchFallback` at Info and still BUILDS — so
+    // `--force-git-cache` on an offline machine with a checkout is not an
+    // error, which is the whole offline-build guarantee holding under the flag.
+    //
+    // U-10: a silent NO-OP when the project declares no git dependency,
+    // consistent with an empty `preBuildScripts`. That is a property of the
+    // resolver opening its cache lazily, not of a check here.
+    bool                          forceGitCache = false;
+
     // `--jobs N` / `--jobs=N` (D-PERF-4-CU-PARALLELISM): worker-thread count for
     // the per-CU build pool (the multi-TU `compileUnits` path builds each CU's
     // MIR concurrently). 0 (the default / absent) = AUTO = min(hardware_

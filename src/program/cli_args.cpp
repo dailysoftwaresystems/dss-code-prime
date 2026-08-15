@@ -272,6 +272,21 @@ std::string cliHelpText() {
         "  --time                 print the compilation wall-clock time to "
             "stderr after the compile finishes\n"
         "\n"
+        "Project dependency options (--project):\n"
+        // ★ THE GLOSS IS IMPERATIVE, AND IT IS THE WHOLE MITIGATION. The name
+        // reads naturally as "force USE of the cache" and means "force a
+        // REFRESH of it". That was the operator's choice and it ships as
+        // spelled, so the help text has to say what it DOES in the first
+        // clause, before the reader's reading of the name settles.
+        "  --force-git-cache      re-fetch git dependencies even when the "
+            "cache is valid. Without it a `dependsOn` git entry whose recorded "
+            "commit still matches is used with NO network access at all, so a "
+            "branch dependency is as reproducible as a tag; this forces the "
+            "pull. It changes nothing else: a fetch that fails while a usable "
+            "checkout is present still reports the staleness and still builds, "
+            "so it is safe on an offline machine. No git dependency declared "
+            "means nothing to re-fetch, and the flag does nothing.\n"
+        "\n"
         "LSP / server mode:\n"
         "  --lsp                  run as a Language Server (stdio)\n"
         "  --schema-dir=<path>    path to additional shipped configs\n"
@@ -713,6 +728,16 @@ parseCliArgs(int argc, char* argv[]) {
             out.time = true;
             continue;
         }
+        // AP6 / B.4. A GLOBAL flag, not a subcommand's: ✔MEASURED there is no
+        // `build` subcommand in this CLI at all (the modes are `--compile` /
+        // `--directory` / `--project` / `--transpile` / `--lsp` /
+        // `--dump-predefined-macros`), so B.4's "on the `build` command" has no
+        // surface to land on and the flag is parsed like every other global.
+        // The mode gate below refuses it where it would land nowhere.
+        if (a == "--force-git-cache") {
+            out.forceGitCache = true;
+            continue;
+        }
         {
             // D-PERF-4-CU-PARALLELISM: `--jobs N` / `--jobs=N` — worker count for
             // the per-CU build pool. Must be a positive integer (>= 1); a non-
@@ -895,6 +920,31 @@ parseCliArgs(int argc, char* argv[]) {
             "--directory / --project). Transpile emits source and --lsp "
             "emits nothing, so the request would be silently discarded."));
     }
+    // AP6: `--force-git-cache` acts on a `.dss-project.json`'s `dependsOn`
+    // list, which ONLY `--project` reads. Every other mode has no manifest at
+    // all — `--compile` / `--directory` take file paths, `--transpile` writes
+    // source, `--lsp` serves a protocol — so the flag would reach no resolver
+    // and the operator's request would be silently discarded. That is the
+    // identical defect the `--schema-dir` / `--stack-reserve` / diagnostic-
+    // policy gates above exist to close, so it takes the same shape and the
+    // same error kind rather than a fourth spelling of the same rule.
+    //
+    // ⚠ NOT IN TENSION WITH U-10 ("silent no-op when no git dependency
+    // exists"), which is a DIFFERENT question with a different answer. There
+    // the flag reaches the resolver and there is simply nothing to re-fetch —
+    // an empty list, exactly like an empty `preBuildScripts`. Here there is no
+    // resolver to reach at all.
+    //
+    // Mode::None is EXCLUDED for the reason its two neighbours exclude it: the
+    // generic no-mode guard below has the better message.
+    if (out.forceGitCache && mode != Mode::None && mode != Mode::Project) {
+        return std::unexpected(make_error(
+            CliArgsError::NoModeSelected,
+            "--force-git-cache re-fetches the git dependencies a project "
+            "manifest declares in 'dependsOn', so it is only meaningful with "
+            "--project. No other mode reads a `.dss-project.json`, so the "
+            "request would be silently discarded."));
+    }
     // ── DIAGNOSTIC-POLICY FLAGS IN A MODE THAT BUILDS NO REPORTER ─────────
     // `--max-diagnostics`, `--suppress` and `--warnings-as-errors` ALL
     // configure the run-wide reporter the compile dispatch builds
@@ -974,6 +1024,9 @@ parseCliArgs(int argc, char* argv[]) {
          || !out.resolveLibraries.empty()  // c162 (D-FF1-READER-CONSUMER)
          || out.warningsAsErrors
          || out.time
+         // AP6: --force-git-cache without a mode flag would silently discard
+         // the request (no manifest is ever read).
+         || out.forceGitCache
          || out.jobs != 0  // D-PERF-4: --jobs supplied without a mode flag
          // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve without a
          // mode flag would silently discard the request.

@@ -1,0 +1,9 @@
+{
+  "$comment": "AP6 — the DEPENDENCY manifest, and the reason this example ships a SUBDIRECTORY. A `path` dependency must have a `.dss-project.json` AT THE ROOT of the named directory or the build fails loud with D_DependencyManifestNotFound (0xD019); there is no upward search and no 'bag of sources' fallback. `sources` is relative and re-bases against THIS directory (plan 06 §5.1 B.3), so `scale.c` is found here and never in the consumer's tree.",
+  "$commentProfile": "`module` is the profile whose composition verb is SourceMerge (core/types/artifact_profile.hpp) — the dependency produces NO artifact of its own; its sources are compiled WITH the consumer's. c-subset declares `module` in its own artifactProfiles list, which is the dependency's OWN language gate (a language that did not declare it would be rejected here, not in the consumer).",
+  "$commentTargetsAreNotConsulted": "★ `targets[]` IS REQUIRED BY THE LOADER AND IS DELIBERATELY NOT ONE OF THE CONSUMER'S SPECS. Plan 06 §5.1 B.10: a dependency's own `targets[]` is NOT consulted when it is built as a dependency — it states the platforms the project builds FOR ITSELF, which is a different statement from 'which platforms this code can support'. The spec below (`x86_64:macho64-x86_64-darwin-exec`) is named by NO consumer target, so a resolver that regressed to consulting it could not stay green here. ⚠ MEASURED 2026-08-15 over all 24 `src/dss-config/object-formats/*.format.json`: ZERO formats serve the `module` profile (cli 7, lib 5, staticlib 5, none 7), so NO value of this key can name a target a `module` project could actually build standalone. The key is required and, for this profile, necessarily inert — reported as a finding rather than papered over.",
+  "language": "c-subset",
+  "artifactProfile": "module",
+  "targets": ["x86_64:macho64-x86_64-darwin-exec"],
+  "sources": ["scale.c"]
+}

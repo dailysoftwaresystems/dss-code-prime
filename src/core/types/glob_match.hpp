@@ -12,6 +12,7 @@
 
 #include "core/export.hpp"
 
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -42,11 +43,25 @@ namespace dss {
 
 // Expand a glob `pattern` against the filesystem, APPENDING every matching
 // REGULAR file to `out` (SORTED lexicographically + de-duplicated — a
-// deterministic, reproducible order across platforms). A RELATIVE pattern
-// resolves against the process working directory (the same base a literal source
-// uses); an ABSOLUTE pattern resolves directly. Only the filesystem subtree under
-// the pattern's literal leading prefix is walked, and a non-`**` pattern prunes
-// the walk at its fixed depth — so `src/**/*.c` never scans a sibling `build/`.
+// deterministic, reproducible order across platforms). Only the filesystem
+// subtree under the pattern's literal leading prefix is walked, and a non-`**`
+// pattern prunes the walk at its fixed depth — so `src/**/*.c` never scans a
+// sibling `build/`.
+//
+// `baseDir` — WHAT A RELATIVE PATTERN IS RELATIVE TO (AP6 M4/B.3). EMPTY (the
+// default) ⇒ the process working directory, i.e. every pre-AP6 call site is
+// byte-identical: the parameter is not consulted at all on that path. NON-EMPTY
+// ⇒ a RELATIVE pattern resolves against `baseDir` and the appended matches are
+// spelled `baseDir`-rooted, so the caller can open them from any cwd. An
+// ABSOLUTE pattern ignores `baseDir` entirely under BOTH settings — it already
+// states its own base, and re-rooting it would be a silent relocation.
+//
+// The parameter exists because a manifest read from ANOTHER directory (a
+// dependency's) declares its sources relative to ITSELF, never to whatever
+// directory the consumer's compiler happens to be running in. Threading the base
+// is the only way that manifest can mean what it says; without it the expansion
+// silently searches the consumer's tree and matches nothing (or, worse, matches
+// the consumer's OWN same-named files).
 //
 // Returns false and sets `ec` ONLY on a genuine filesystem I/O error (a directory
 // that cannot be read during the walk — FAIL LOUD). A pattern that simply matches
@@ -57,6 +72,7 @@ namespace dss {
 // convention.
 [[nodiscard]] DSS_EXPORT bool expandGlob(std::string_view pattern,
                                          std::vector<std::string>& out,
-                                         std::error_code& ec);
+                                         std::error_code& ec,
+                                         std::filesystem::path const& baseDir = {});
 
 } // namespace dss

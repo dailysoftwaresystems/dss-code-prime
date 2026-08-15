@@ -3,9 +3,9 @@
 # registry CI guard. Mirrors the bash variant; same contract.
 #
 # Contract: every `D-*` identifier cited in a SCANNED ROOT (`src/`, `examples/`,
-# `real-examples/` - see the roots table below) MUST resolve to a row
-# in `.plans/_deferred-anchor-registry.md` OR a citation in any
-# `.plans/*.md` file.
+# `tests/`, `integrated_tests/`, `real-examples/` - see the roots table below)
+# MUST resolve to a row in `.plans/_deferred-anchor-registry.md` OR a citation
+# in any `.plans/*.md` file.
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -14,9 +14,29 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $RepoRoot  = Split-Path -Parent $ScriptDir
 Set-Location $RepoRoot
 
-# Anchor regex: word-boundary `\b` before `D-` prevents the regex from
-# capturing the substring `D-32-BIT-WORD` out of `FIXED-32-BIT-WORD`
-# (an in-comment phrase, not an anchor).
+# Anchor regex: the word-boundary `\b` before `D-` is what stops the regex from
+# reaching INSIDE a longer hyphenated word and lifting a false anchor out of its
+# tail. The live case is the phrase `FIXED-32-BIT-WORD` at
+# `src/asm/format/fixed32.hpp:19` — an in-comment phrase whose tail is
+# anchor-SHAPED but is not an anchor. `\b` fails there because the `D` is
+# preceded by `E`, another word character, so the phrase is correctly skipped;
+# without `\b` it would red this guard forever and could only be silenced by
+# editing unrelated source. (`.sh` spells the same protection `\<`.)
+#
+# ⚠⚠ DO NOT WRITE THAT TAIL OUT HERE AS A STANDALONE LITERAL. THIS COMMENT DID,
+# FROM TF-C111 UNTIL AP6 (2026-08-14), AND IT WAS A LIVE BOOBY-TRAP.
+# Spelled on its own and preceded by a non-word character (a backtick will do),
+# the tail stops being a quoted fragment and becomes a CITATION — of an anchor
+# with no registry row, sitting in the one file the guard reads to decide what an
+# anchor even is. It survived only because `tools/` is unscanned; the moment this
+# root is added, that line reds the guard on the guard's own prose.
+# ✔MEASURED at the AP6 widening: it was the ONLY dangling anchor under `tools/`
+# and `scripts/`, so rewording it is what makes those roots addable.
+# ⇒ A placeholder for illustration must stay UNDER the threshold the regex
+# demands: `D-XX-EXAMPLE` is safe (one hyphen-segment after the head, the pattern
+# below requires two or more), while any three-segment spelling is not.
+# See D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS, which is the row
+# that predicted this and stays open for the `tools/` + `scripts/` half.
 $AnchorRegex = '\bD-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
 
 function Get-Anchors([string]$Path, [string[]]$Filters) {
@@ -311,31 +331,83 @@ if (-not (Test-Path -LiteralPath $CellWidthRoot -PathType Container)) {
 # NOTHING; this script's `Get-ChildItem -ErrorAction SilentlyContinue` has the same
 # shape — a renamed root yields an empty set and a silently smaller scan. A guard that
 # reports success while checking nothing is the worst defect a guard can have.
-foreach ($_root in @('src', 'examples', 'real-examples')) {
-    if (-not (Test-Path -LiteralPath $_root -PathType Container)) {
-        Write-Host "anchor-registry: FAIL - scan root '$_root' does not exist. A missing root would silently shrink coverage; refusing to report a partial scan as a pass."
-        exit 2
-    }
-}
-$AnchorFileFilters     = @('*.cpp', '*.hpp', '*.json', '*.c')
+$AnchorFileFilters     = @('*.cpp', '*.hpp', '*.json', '*.c',
+                           '*.s', '*.inc', '*.probes', 'CMakeLists.txt', '*.md')
 $HarnessFileFilters    = @('*.sh', '*.ps1', '*.py')
-$srcAnchors = (Get-Anchors 'src'           $AnchorFileFilters) +
-              (Get-Anchors 'examples'      $AnchorFileFilters) +
-              (Get-Anchors 'real-examples' $HarnessFileFilters)
-$srcAnchors = $srcAnchors | Sort-Object -Unique
 
-# The floor. Same reasoning as the `.sh`: "no match" is not distinguishable from "scan
-# collapsed" by status alone, so a COUNT is the only signal that separates them. Kept
-# far below the live count (800 at time of writing) so ordinary churn never trips it —
-# this catches collapse, not drift. Both scripts MUST use the same value or the pairing
-# is decorative.
-$AnchorFloor = 100
-if ($srcAnchors.Count -lt $AnchorFloor) {
-    Write-Host "anchor-registry: FAIL - only $($srcAnchors.Count) anchors found across src/ examples/ real-examples/, below the floor of $AnchorFloor."
-    Write-Host "  This does NOT mean the tree is clean - it means the SCAN COLLAPSED (an unreadable root, a broken regex, or a filter that matches nothing)."
-    Write-Host "  Refusing to report a pass. Fix the scan; do not lower the floor."
-    exit 2
+# ── tests/ + integrated_tests/ ADDED 2026-08-14 (AP6),
+# D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS. Mirrors the `.sh`
+# sibling in the same commit; that file carries the full rationale, and per the
+# ★★ note further down this one restates the load-bearing half rather than
+# pointing at it, because a twin that only points at its sibling is how the pair
+# drifts. ✔MEASURED at the widening: 709 distinct anchors under `tests/`, 18
+# under `integrated_tests/` — the guard's promise was true only of the subtree
+# it looked at, and the corpus HARNESSES live in the subtree it did not.
+# ⚠ The MATCHER was deliberately not touched: the wrapped-across-two-lines
+# citation the widening was expected to strand is already handled by the
+# SUBSTRING resolve below (a wrapped fragment is a PREFIX, hence a substring),
+# measured at 4 unresolved names over both roots and not one of them wrapped.
+# ⚠ The FILE FILTERS were widened at the same time, `CMakeLists.txt` above all:
+# ctest ENTRY NAMES live there and closed registry rows cite them as landed
+# evidence, so a rename could silently invalidate a row. `real-examples` keeps
+# the driver-only set — it contains ZERO files of any added type, so widening it
+# would be the silent no-op version of a fix.
+#
+# ★★ PER-ROOT FLOORS, REPLACING A SINGLE GLOBAL ONE — a twin divergence found
+# and closed by this change, not a new feature. The `.sh` moved to per-root
+# floors in TF-C112 after an audit MEASURED that a global floor catches no
+# single-root collapse (losing all of `src/` still left enough anchors to pass);
+# this script was never updated and still carried `$AnchorFloor = 100` against a
+# live total near 1,150. Adding two roots to a global floor would have made that
+# worse: `integrated_tests` contributes 18 anchors, so its total disappearance
+# could never move a global total past any useful threshold. The pairing
+# contract is about BEHAVIOUR, and "both scripts have a floor" was pairing by
+# existence. Floors below MUST stay identical to the `.sh` table.
+#
+# ★ ONE TABLE, READ BY BOTH THE COLLECTION SCAN AND THE FAIL-PATH LOCATOR — the
+# locator below spelled the roots and filters a second time, so adding a root to
+# the scan alone would have left it unable to attribute a `cited in:` line for
+# that root. Derived from this array now, so a root cannot be half-added.
+$RootSpecs = @(
+    @{ Root = 'src';              Floor = 400; Filters = $AnchorFileFilters  }
+    @{ Root = 'examples';         Floor = 150; Filters = $AnchorFileFilters  }
+    @{ Root = 'tests';            Floor = 300; Filters = $AnchorFileFilters  }
+    @{ Root = 'integrated_tests'; Floor = 8;   Filters = $AnchorFileFilters  }
+    @{ Root = 'real-examples';    Floor = 10;  Filters = $HarnessFileFilters }
+)
+
+# ★★ FAIL-CLOSED. Every root must EXIST and must independently CLEAR ITS FLOOR.
+# `Get-ChildItem -ErrorAction SilentlyContinue` turns a renamed root into an
+# empty set and a silently smaller scan; a guard that reports success while
+# checking nothing is the worst defect a guard can have.
+# ★ Every failing root is reported before exiting (mirroring the `.sh`'s
+# `_scan_failed` accumulator) rather than exiting on the first: a guard that
+# aborts after the first problem makes the reader re-run it N times to learn N
+# things.
+$scanFailed = $false
+$srcAnchorSet = @{}
+foreach ($spec in $RootSpecs) {
+    if (-not (Test-Path -LiteralPath $spec.Root -PathType Container)) {
+        Write-Host "anchor-registry: FAIL - scan root '$($spec.Root)' does not exist. A missing root would silently shrink coverage; refusing to report a partial scan as a pass."
+        $scanFailed = $true
+        continue
+    }
+    # @() forces an array even for the 0- and 1-anchor cases: under
+    # `Set-StrictMode -Version Latest` a `$null.Count` from an empty root is a
+    # terminating error, i.e. the collapse case would die with a PowerShell
+    # stack trace instead of the sentence that says what happened.
+    $rootAnchors = @(Get-Anchors $spec.Root $spec.Filters)
+    if ($rootAnchors.Count -lt $spec.Floor) {
+        Write-Host "anchor-registry: FAIL - root '$($spec.Root)' yielded only $($rootAnchors.Count) anchors, below its floor of $($spec.Floor)."
+        Write-Host "  This does NOT mean that root is clean - it means ITS scan collapsed (unreadable files, a drifted -Include filter, or a moved subtree)."
+        Write-Host "  Refusing to report a pass. Fix the scan; do not lower the floor."
+        $scanFailed = $true
+        continue
+    }
+    foreach ($a in $rootAnchors) { $srcAnchorSet[$a] = $true }
 }
+if ($scanFailed) { exit 2 }
+$srcAnchors = @($srcAnchorSet.Keys | Sort-Object)
 
 # ⚠ KNOWN PAIRING DIVERGENCES, extension-case half — documented 2026-08-03 (TF-C112),
 # adding to the three already listed above. `Get-ChildItem -Include '*.sh'` matches
@@ -413,7 +485,7 @@ if ($missing.Count -eq 0) {
 }
 
 Write-Host "anchor-registry: FAIL - the following anchors are cited in a SCANNED ROOT"
-Write-Host "(src/, examples/, real-examples/ - NOT src/ alone) but"
+Write-Host "(src/, examples/, tests/, integrated_tests/, real-examples/ - NOT src/ alone) but"
 Write-Host "have no matching row/citation in any .plans/*.md file:"
 Write-Host ""
 # ★★ THE TREE IS WALKED ONCE — NOT ONCE PER MISSING ANCHOR.
@@ -437,10 +509,15 @@ Write-Host ""
 #     documents and relies on, so dropping it would silently shrink the report.
 # ★ Paths are recorded in ENUMERATION order and replayed in that order, so the
 # report's line order is identical to the old nested loop's.
-$locFiles = @(Get-ChildItem -Path 'src', 'examples' -Recurse -File `
-                            -Include $AnchorFileFilters  -ErrorAction SilentlyContinue) +
-            @(Get-ChildItem -Path 'real-examples'  -Recurse -File `
-                            -Include $HarnessFileFilters -ErrorAction SilentlyContinue)
+# ★ DERIVED FROM `$RootSpecs`, never respelled — see the note on that table.
+# Enumerated one root at a time (not one call over all roots) because the
+# filters differ per root, which is the same reason the collection loop is
+# per-root.
+$locFiles = @()
+foreach ($spec in $RootSpecs) {
+    $locFiles += @(Get-ChildItem -Path $spec.Root -Recurse -File `
+                                 -Include $spec.Filters -ErrorAction SilentlyContinue)
+}
 $locRx     = [regex]::new($AnchorRegex, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
 $locTokens = [System.Collections.ArrayList]::new()   # distinct tokens, first-seen order
 $locPaths  = @{}                                     # token -> ordered path list

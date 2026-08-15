@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <format>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -20,6 +21,11 @@
 namespace dss::substrate { class IExecutor; }
 
 namespace dss {
+
+// AP6: the `dependsOn` git-acquisition seam, forward-declared for the same
+// reason `substrate::IExecutor` above is — the injection surface is a bare
+// pointer member, so no consumer of `program.hpp` inherits `git_acquire.hpp`.
+class IGitRunner;
 
 // Route decision for a list of source files — the SINGLE source of
 // truth for the multi-vs-single-CU threshold, shared by the CLI
@@ -288,6 +294,105 @@ public:
     [[nodiscard]] std::vector<ResolveLibrarySpec> const&
     resolveLibraries() const noexcept { return resolveLibraries_; }
 
+    /// AP6 — the PER-TARGET `--resolve-library` ADDITIONS channel: extra
+    /// `ResolveLibrarySpec`s for ONE `<targetName>:<formatName>` spec, MERGED
+    /// with (never replacing) the program-wide `setResolveLibraries` list at
+    /// the per-target build. An EMPTY map (the default) adds nothing to
+    /// anyone, so every existing build is byte-identical.
+    ///
+    /// ★ INTERNAL, AND DELIBERATELY NOT USER-FACING. There is no manifest
+    /// field and no CLI flag behind this, and there must not be: the
+    /// dependency resolver is the ONLY producer of per-target libraries, so a
+    /// user-facing per-target declaration would be a mechanism with no
+    /// consumer. The manifest and the CLI stay PROGRAM-WIDE — both are
+    /// statements about the program, and neither author knows which target a
+    /// dependency artifact will be built for.
+    ///
+    /// ★ WHY IT EXISTS AT ALL. A dependency is built ONCE PER CONSUMER TARGET
+    /// (the U-2 consumer-driven derivation), so the artifact to link for
+    /// `x86_64:elf64-…` is a DIFFERENT FILE from the one for `arm64:macho64-…`.
+    /// Broadcasting the union through the program-wide list would hand every
+    /// target every other target's binaries — an ELF fed to a PE link, which
+    /// binds SILENTLY today (registry
+    /// `D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL`).
+    ///
+    /// ★ WHY KEYED BY SPEC STRING RATHER THAN INDEX-PARALLEL TO `targets`. An
+    /// index-parallel channel adds an invariant the caller can break —
+    /// `additions.size() == targets.size()` — and its breach is a
+    /// MIS-ALIGNMENT, i.e. target 0 quietly linking target 1's libraries. The
+    /// key is the same spec string the resolver already derives against, so
+    /// the invariant does not exist to be broken; the index-parallel form is
+    /// derived INSIDE `runCusToTargets`, where it cannot be the wrong length.
+    /// A key naming a target the build does not compile is refused LOUD
+    /// (`D_InvalidTargetSpec`) rather than dropped.
+    ///
+    /// Source / target / format agnostic: the key is opaque spec TEXT compared
+    /// for equality against this build's own specs — never parsed, never
+    /// matched against any language, CPU or object-format identity.
+    void setResolveLibraryAdditionsByTarget(
+        std::map<std::string, std::vector<ResolveLibrarySpec>> byTarget) {
+        resolveLibraryAdditionsByTarget_ = std::move(byTarget);
+    }
+    [[nodiscard]] std::map<std::string, std::vector<ResolveLibrarySpec>> const&
+    resolveLibraryAdditionsByTarget() const noexcept {
+        return resolveLibraryAdditionsByTarget_;
+    }
+
+    /// AP6 — WHAT THE LAST BUILD ACTUALLY WROTE. Index-parallel to the
+    /// `targets` argument of the most recent `compileFiles` / `compileUnits`
+    /// call (including the one `compileProject` delegates to): entry i is the
+    /// artifact path for `targets[i]`, or `nullopt` if that target failed.
+    ///
+    /// EMPTY means the run never reached the per-target loop (an unparseable
+    /// spec, an unloadable schema, a front-end failure) — distinct from a
+    /// sized vector of `nullopt`, which means targets were attempted and none
+    /// produced an artifact. Cleared and re-sized by each run, so it always
+    /// describes the latest one.
+    ///
+    /// ★ WHY THE DRIVER HANDS THIS BACK INSTEAD OF LETTING CALLERS COMPUTE IT.
+    /// The path is the join of `outputDir` (or `<cwd>/target` when absent),
+    /// the single-vs-multi-target rule, the forced per-format subdir, the
+    /// format's declared extension, and `artifactName.value_or(sourceStem)`.
+    /// AP6 must thread a built dependency's artifact into the build that
+    /// depends on it; re-deriving that formula at the consumer would create a
+    /// second copy of a fact that drifts the first time any part of the
+    /// convention changes. The producer answers, once.
+    [[nodiscard]] std::vector<std::optional<std::filesystem::path>> const&
+    artifactPaths() const noexcept { return artifactPaths_; }
+
+    /// AP6 — inject the `git` acquisition surface `dependsOn` resolution uses.
+    /// nullptr (the default) ⇒ `compileProject` uses a `SystemGitRunner`, i.e.
+    /// real `git` on PATH.
+    ///
+    /// ★ WHY IT IS INJECTABLE AT ALL, which `git_acquire.hpp` argues at length:
+    /// B.4's cache machine has FOUR outcomes and TWO of them are network
+    /// FAILURES. A test driving real git can reach the first two on a good day
+    /// and NEITHER of the last two deterministically — you cannot ask a working
+    /// network to fail on cue — so the state machine is exercised against a
+    /// scripted fake with zero network and zero dependence on `git` being
+    /// installed.
+    ///
+    /// NON-OWNING: the caller owns the runner's lifetime across the call
+    /// (mirrors `setExecutor`). Propagated verbatim onto the fresh `Program`
+    /// each dependency is built on, so a fake injected at the root reaches
+    /// every node of the graph.
+    void setGitRunner(IGitRunner* g) noexcept { gitRunner_ = g; }
+    [[nodiscard]] IGitRunner* gitRunner() const noexcept { return gitRunner_; }
+
+    /// AP6 — `--force-git-cache`: bypass the `.dss-deps` cache-hit
+    /// short-circuit and re-fetch every git dependency, even one whose
+    /// recorded commit still matches. It forces a REFRESH; it does not force
+    /// USE of the cache (the name reads the other way, which is why `--help`
+    /// carries an imperative gloss). Every other rule of B.4 is unchanged by
+    /// it — a fetch that fails with a usable checkout present still emits
+    /// `D_DependencyGitFetchFallback` and still builds.
+    ///
+    /// U-10: a silent no-op when the project declares no git dependency,
+    /// consistent with an empty `preBuildScripts`. That falls out of the cache
+    /// being opened LAZILY rather than from a check anybody has to remember.
+    void setForceGitCache(bool on) noexcept { forceGitCache_ = on; }
+    [[nodiscard]] bool forceGitCache() const noexcept { return forceGitCache_; }
+
     /// D-PERF-4-CU-PARALLELISM: inject an executor for the per-CU build loop.
     /// The N>1 path (`compileUnits`) builds every CU's MIR concurrently; each
     /// `buildCuMir` is a pure per-CU function (own interner/arenas/SemanticModel
@@ -339,7 +444,17 @@ private:
     std::vector<std::string>               userDefines_;  // c105: --define
     std::vector<std::string>               includeDirs_;  // -I<dir> quote-include search path
     std::vector<ResolveLibrarySpec>        resolveLibraries_;  // c162: --resolve-library
+    // AP6: per-target ADDITIONS to the line above, keyed by target spec
+    // (internal channel — no CLI / manifest surface), and the artifact paths
+    // the last run produced (index-parallel to that run's `targets`).
+    std::map<std::string, std::vector<ResolveLibrarySpec>>
+                                           resolveLibraryAdditionsByTarget_;
+    std::vector<std::optional<std::filesystem::path>> artifactPaths_;
     substrate::IExecutor*                  executor_ = nullptr;  // D-PERF-4 (non-owning; tests inject)
+    // AP6: the `dependsOn` git seam (non-owning; tests inject a scripted fake)
+    // and `--force-git-cache`.
+    IGitRunner*                            gitRunner_     = nullptr;
+    bool                                   forceGitCache_ = false;
     unsigned                               jobs_     = 0;         // D-PERF-4: --jobs (0 = auto)
     // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve / manifest
     // `stackReserve` (nullopt = the format's declared default).

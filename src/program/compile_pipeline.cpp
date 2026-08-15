@@ -331,8 +331,20 @@ static std::optional<CuMirModule> buildCuMirImpl(
     //      which the partition may skip). Fail loud `F_FileOpenFailed`,
     //      honoring the documented contract ("opened + read at compile time,
     //      fails loud on a missing/unreadable file"). A readable file's
-    //      binary validity is checked later by the reader when a governed
-    //      extern actually routes to it.
+    //      STRUCTURAL validity (sections, offsets, symbol tables) is still
+    //      checked later by the reader when a governed extern actually routes
+    //      to it -- that needs the whole file.
+    //
+    //      ★ THE PROBE ALSO ANSWERS "IS THIS THE RIGHT FORMAT AT ALL", on the
+    //      SAME unconditional argument (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-
+    //      GUARD-IS-INCIDENTAL). A library whose object format is not this
+    //      target's can never bind correctly, the fact is knowable from the
+    //      first 8 bytes without reading it, and the alternative is a check
+    //      that only fires when this particular TU happens to reference a
+    //      binary-governed extern -- i.e. the same luck-of-the-TU silence the
+    //      open-probe exists to remove. The COMPARISON is not restated here:
+    //      `ffi::checkLibraryMatchesTargetFormat` is the one author of it and
+    //      of its message, shared with the read chokepoint both binders use.
     if (!opts.resolveLibraries.empty()) {
         auto const probeEntry = reporter.errorCount();
         for (auto const& lib : opts.resolveLibraries) {
@@ -347,7 +359,14 @@ static std::optional<CuMirModule> buildCuMirImpl(
                     "compile time). Check the path.",
                     lib.path.generic_string());
                 reporter.report(std::move(d));
+                continue;  // unopenable: nothing to classify, one message is enough
             }
+            probe.close();
+            // Reports F_UnsupportedBinaryFormat itself when it objects; the
+            // discarded return is the structured twin, which this site (a
+            // reporter-driven probe) has no use for.
+            (void)ffi::checkLibraryMatchesTargetFormat(lib.path, format,
+                                                       reporter);
         }
         if (!tierClean(reporter, probeEntry)) return std::nullopt;
     }
@@ -2414,12 +2433,23 @@ namespace {
         // documented rule for a symbol two libraries both export.
         std::unordered_map<std::string, BoundIdentity> bySymbol;
         for (auto const& lib : opts.resolveLibraries) {
-            auto surface = ffi::readImports(lib.path, reporter);
-            // `readImports` reports its own failure LOUD (`emitAndReturn`
-            // names the path and the structural cause), so this refuses
-            // WITHOUT a second diagnostic — the same contract `ingest()`'s
-            // source loop honours. What must not happen is continuing with
-            // the flag quietly ineffective, which is the anchor.
+            // ★ THE TARGET-AWARE READ, NOT THE BARE READER. This binder and
+            // `ingest()`'s `readSource` are the TWO paths a `--resolve-library`
+            // binary reaches FF1 by, and a wrong-FORMAT library must be refused
+            // on both — elf↔pe cross-feeding is caught by nothing else, since
+            // both formats are undecorated and the export names match verbatim
+            // (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL). It is
+            // ONE shared function rather than a check restated here, for the
+            // reason the version policy below is a standing warning about:
+            // duplicated policy on this surface is how a site gets missed.
+            auto surface =
+                ffi::readImportsForTargetFormat(lib.path, format, reporter);
+            // The chokepoint reports its own failure LOUD (`emitAndReturn`
+            // names the path and the structural cause — a wrong format, an
+            // unreadable file, a corrupted section), so this refuses WITHOUT a
+            // second diagnostic — the same contract `ingest()`'s source loop
+            // honours. What must not happen is continuing with the flag quietly
+            // ineffective, which is the anchor.
             if (!surface.has_value()) return false;
             std::string const basename = lib.path.filename().string();
             for (auto const& row : *surface) {

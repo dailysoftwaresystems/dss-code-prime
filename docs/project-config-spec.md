@@ -3,7 +3,7 @@
 > The **project config** points the driver (`Program::compileProject`) at *what to build*:
 > which language, which artifact profile, which targets, which sources. It is the
 > file-driven counterpart to the `dss-code-prime` CLI flags. Owned by plan 06
-> (`artifactProfile`, AP2/AP3/AP5) + the `program/` driver layer.
+> (`artifactProfile`, AP2/AP3/AP5/AP6) + the `program/` driver layer.
 >
 > Companion spec: the per-**language** declaration of which profiles a language *supports*
 > lives in [`language-config-spec.md` §11.6](./language-config-spec.md) (`artifactProfiles[]`).
@@ -27,7 +27,7 @@
   "preBuildScripts":  [{ "run": ["bash", "gen.sh"] }],  // optional — argv hooks run BEFORE the build; see §2.5
   "postBuildScripts": [{ "run": ["./sign.sh"],          // optional — argv hooks run AFTER a SUCCESSFUL build; see §2.5
                          "runOn": ["linux", "darwin"] }],
-  "dependsOn":        [],                               // optional — prerequisite projects; PARSED but NOT resolved (§2.6)
+  "dependsOn":        [{ "path": "../libfoo" }],        // optional — prerequisite projects, RESOLVED and composed in (§2.6)
 
   "$comment":         "prose — every `$`-prefixed key is documentation (§2.7)"
 }
@@ -45,7 +45,7 @@ delegates to the existing compile path — routing by source **count** (§5).
 | `language` | **yes** | non-empty string | The shipped language to compile (`src/dss-config/sources/<language>.lang.json`). |
 | `artifactProfile` | **yes** | non-empty string | The **single** output shape to produce (§3). Singular — the language declares a *set*, the project picks *one*. |
 | `targets` | **yes** | non-empty array of non-empty strings | Each entry is a `"<targetName>:<formatName>"` spec (e.g. `"x86_64:elf64-x86_64-linux-exec"`). One artifact is produced per target. |
-| `sources` | **yes** | non-empty array of non-empty strings | The source files — each entry is a literal path **or a glob pattern** (`D-AP2-SOURCES-GLOB`, see §2.1). Resolved relative to the process working directory (an absolute entry resolves directly). |
+| `sources` | **yes** | non-empty array of non-empty strings | The source files — each entry is a literal path **or a glob pattern** (`D-AP2-SOURCES-GLOB`, see §2.1). In the **root** manifest, relative entries resolve against the process working directory; in a manifest reached through `dependsOn`, against **that manifest's own directory** (§2.6). An absolute entry resolves directly under either. |
 | `output` | no | non-empty string when present | A user output hint. **Parsed + type-validated, but its path routing is not yet wired** (`D-AP2-OUTPUT-ROUTING`) — artifacts currently land at the per-target convention (§5). |
 | `artifactName` | no | non-empty string when present, **no path separators** | The base **name** for the emitted binary (no extension). Absent ⇒ the source stem (unchanged). A project build routes each target's artifact to `<output-dir>/<formatName>/<artifactName-or-stem><ext>`; the base dir is the `--output` flag (or the default `<cwd>/target`). It is a bare *name*, not a path — a value with `/` or `\` fails loud at load (`C_MalformedJson`), and the router additionally rejects any name that would resolve **outside** the output dir (a `..` component, or a drive/root prefix) with a fail-loud `D_ArtifactNameEscapesOutputDir` (§5), so a bare name can never escape `--output`. The name + per-platform-subdir half of `D-AP2-OUTPUT-ROUTING` (§5, §7). |
 | `includes` | no | array of non-empty strings | Quote-include search dirs (C 6.10.2). The file-driven form of the CLI `-I <dir>` (`Program::setIncludeDirs`). |
@@ -54,7 +54,7 @@ delegates to the existing compile path — routing by source **count** (§5).
 | `stackReserve` | no | JSON **unsigned** integer > 0 | The per-**program** stack reserve, in **bytes**. The file-driven twin of the CLI `--stack-reserve <bytes>`. Unlike the three arrays this is a **scalar** and therefore cannot merge — the **CLI wins** (§2.4). Absent ⇒ the object format's declared default stands. |
 | `preBuildScripts` | no | array of `{"run","runOn"}` objects | Commands run **before** the build. `run` is an **argv vector**, spawned directly — never a shell. See §2.5. |
 | `postBuildScripts` | no | array of `{"run","runOn"}` objects | Commands run **after** a build that **succeeded**. Same entry shape as `preBuildScripts`. See §2.5. |
-| `dependsOn` | no | array of `{"path"}` **or** `{"git","ref"?}` objects | Prerequisite projects. **Parsed and shape-validated only — resolution has not landed; a non-empty value fails loud.** See §2.6. |
+| `dependsOn` | no | array of `{"path"}` **or** `{"git","ref"?}` objects | Prerequisite projects, **resolved recursively** and folded into this build by the composition verb the *dependency's* `artifactProfile` declares (§3). See §2.6. |
 
 **The three flag arrays mirror the CLI flags and *merge* with them.** Each is **optional** and defaults to
 empty; an **absent** field and a **present-but-empty `[]`** both mean "no entries" (no error). A present value
@@ -131,9 +131,13 @@ agnostic — pure path-text matching + a filesystem walk).
     `a/x/b`, `a/x/y/b`; `**/*.c` matches `x.c` *and* `sub/x.c`);
   - `?` — exactly one character within a segment;
   - `[...]` — a character class (ranges `a-z`, negation `[!...]` / `[^...]`).
-- **Base directory.** Patterns resolve relative to the **process working directory** (the same base a
-  literal source uses); an **absolute** pattern resolves directly. Only the subtree under the pattern's
-  literal leading prefix is walked (`src/**/*.c` never scans a sibling `build/`).
+- **Base directory.** In the **root** manifest, patterns resolve relative to the **process working
+  directory** (the same base a literal source uses); an **absolute** pattern resolves directly. Only
+  the subtree under the pattern's literal leading prefix is walked (`src/**/*.c` never scans a sibling
+  `build/`). A manifest reached through `dependsOn` uses **its own directory** as that base instead,
+  for both halves — literal *and* glob (§2.6). One function answers "which files does this manifest
+  name" for both cases (`src/program/project_sources.hpp`), so the two bases cannot drift into two
+  policies.
 - **Determinism.** Matches are **sorted lexicographically**, so the compilation-unit order is stable
   and reproducible across platforms.
 - **Overlap composes.** Entries that overlap — two globs matching a shared file, or a literal alongside
@@ -267,13 +271,15 @@ exactly one is emitted per run — the one belonging to the entry that stopped i
   is** rather than being deleted: the compile genuinely succeeded and the bytes are genuinely
   correct, so unwinding it because a deploy script's credentials expired would destroy re-usable
   work.
-- **Working directory** = the **process working directory**, the same base `sources[]` globs and
-  literal sources resolve against (§2.1) — a hook that writes `generated/main.c` and a manifest that
-  reads `generated/*.c` must mean the same directory, or the feature would not compose with itself.
-  (The driver passes the *empty-path sentinel*, which `spawnAndWaitInherit` documents as "inherit the
-  caller's current directory", rather than a materialized `current_path()`: materializing would add a
-  failure mode and let the two answers drift. The runner takes cwd as a *parameter* at all because a
-  future `dependsOn` dependency's hooks must run in **that dependency's own** directory — §2.6.)
+- **Working directory** = the base that manifest's own `sources[]` resolve against (§2.1), because a
+  hook that writes `generated/main.c` and a manifest that reads `generated/*.c` must mean the same
+  directory or the feature would not compose with itself. For the **root** manifest that is the
+  **process working directory** — the driver passes the *empty-path sentinel*, which
+  `spawnAndWaitInherit` documents as "inherit the caller's current directory", rather than a
+  materialized `current_path()`: materializing would add a failure mode and let the two answers drift.
+  For a manifest reached through `dependsOn` it is **that dependency's own directory** (§2.6), which
+  is why the runner takes cwd as a *parameter* rather than reading the process cwd — one runner, one
+  policy, no caller-kind branch.
 
 **No timeout, no output capture.** A pre-build script is arbitrary user work — a code generator, a
 submodule sync, a download — and there is no defensible number of seconds after which the compiler
@@ -283,39 +289,22 @@ timeout are the right instruments. The child **inherits** this process's stdio, 
 error text stream to your terminal live and interleaved with the build rather than being buffered
 until it finishes.
 
-**Ordering against the rest of the build.** `Program::compileProject` runs, in order: the
-`dependsOn` refusal (§2.6) → the two profile gates (§4) → the CLI/manifest flag merges → the
-pre-build hooks → `sources[]` glob expansion (§2.1) → routing + compile → the post-build hooks. Two
+**Ordering against the rest of the build.** Within one manifest, `Program::compileProject` runs the
+two profile gates (§4) and the CLI/manifest flag merges **before any hook**, then the pre-build
+hooks → `sources[]` glob expansion (§2.1) → routing + compile → the post-build hooks. Two
 consequences worth stating: a build that is going to be **refused** never runs your codegen hook (a
 refused build must not write files into your tree on its way to saying no), and a **profile
-mismatch** is caught before any hook runs.
+mismatch** is caught before any hook runs. `dependsOn` resolution (§2.6) precedes this manifest's own
+compile by necessity — a `SourceMerge` dependency contributes sources this build then compiles, and
+an `ArtifactLink` dependency contributes an artifact this build then links — and each resolved
+dependency runs **its own** hooks, in its own directory, under the rule stated here (§2.6).
 
-### 2.6 `dependsOn` — parsed, **not** resolved
+### 2.6 `dependsOn` — prerequisite projects, resolved
 
-`dependsOn` declares prerequisite projects. **This cycle ships the manifest surface only.** The
-entries are read and shape-validated; **nothing is resolved, acquired, built or merged.**
-
-> ★ **A non-empty `dependsOn` REFUSES the build — `D_PlanNotLanded` (`D009`), emitted before
-> anything else `compileProject` does.** Accept-and-ignore is the single worst behaviour available
-> here: the manifest states a prerequisite, the build reports success, and the artifact is missing
-> exactly the thing its author declared it needs — surfacing later as an undefined symbol at link,
-> or far worse as a link against a *stale* copy of the dependency that happened to be lying around,
-> with nothing pointing back at the key that was silently dropped. The message names how many
-> entries were declared and the first one, and tells you the interim route: remove the key, build
-> the prerequisite separately, and wire it in via `resolveLibraries` or an explicit `sources[]`
-> entry.
->
-> Three details are deliberate. **(a)** `D_PlanNotLanded` rather than a new code — its allocation
-> defines it as "an entry point reached an arm whose backing plan substrate is not yet shipped", and
-> future plan-gated arms re-use it; a fourth "not landed yet" ordinal would say nothing new and
-> would be dead the day the resolver lands. It is distinct from
-> `D_TargetAbiModelUnsupportedByDriver`, which is a *permanent* architectural exclusion. **(b)** It
-> is a member of `kUnsuppressableCodes`, which is load-bearing: `--suppress` must not be able to
-> convert this loud reject back into the silent no-op it exists to replace. **(c)** None of the
-> eight `D_Dependency*` codes fits, because every one of them describes an *outcome of a resolution
-> attempt*; this is the prior condition — no attempt is made at all.
-
-Resolution is the next cycle (plan 06 §B).
+`dependsOn` declares the projects this one needs. The driver **resolves** them: it finds each
+dependency's own `.dss-project.json`, walks *its* `dependsOn` recursively, and folds every resolved
+dependency into this build according to the **composition verb** that dependency's `artifactProfile`
+declares (§3) — contributing sources, or building a separate artifact this build links against.
 
 An entry names **exactly one** source:
 
@@ -341,8 +330,120 @@ tolerant reading would silently discard something the author wrote:
 - `ref` **without** `git` — a ref names a revision inside a git remote and has no meaning for a
   local path, so accepting it would silently ignore the pin.
 
-**Acquisition cache — `.dss-deps/` (decided, not yet built).** A `git` dependency is checked out to
-`.dss-deps/<name>/`, with `{url, ref, resolvedCommit}` recorded as cache state.
+**A `path` dependency must be a DSS project, or the build fails loud.** The resolver looks for a
+`.dss-project.json` **at the root of the named directory**; there is no search upward, no default
+manifest name, and no "treat the directory as a bag of sources" fallback. A directory with no
+manifest at its root is `D_DependencyManifestNotFound` (`D019`), and the message names both the
+manifest that was looked for and the **absolute path** it was looked at.
+
+> ★ **The distinction this code exists for is the whole reason it is not `D_FileNotFound`.** A `path`
+> naming a directory that **does not exist** is `D_FileNotFound` — the ordinary "the thing you named
+> is not there". `D019` is the *other* fact: the thing you named **is** there and is not a DSS
+> project. That is overwhelmingly a wrong-**level** path — `../lib/src` written for `../lib` — and
+> the two have different fixes, which is the split rule this codebase allocates codes by. Collapsing
+> them would send a reader hunting for a missing directory that is sitting right where they put it.
+
+**Composition is dispatched on the DEPENDENCY's own `artifactProfile`, through the verb.** Never on
+a profile **name**, and never on the *consumer's* profile — the consumer's profile says what *this*
+project produces, which has no bearing on how somebody else's product folds in. Each registered
+profile's row carries the verb (§3), so the fork has exactly three arms no matter how many profiles
+are registered:
+
+| Dependency's verb | Profiles as shipped | What the driver does | Reject |
+|---|---|---|---|
+| `SourceMerge` | `module` | The dependency's expanded sources join **this** project's compilation and are lowered with them. It produces no artifact of its own. | **Same `language` required** — `D_DependencyLanguageMismatch` (`D01C`). |
+| `ArtifactLink` | `lib`, `staticlib` | The dependency is **built to its own artifact**, and that artifact is threaded into this target's `resolveLibraries`. The two builds stay separate. | — (see the format derivation below for `D022` / `D023`.) |
+| `NotConsumable` | every other registered profile | **Fail loud** — the profile is a terminal deliverable. | `D_DependencyArtifactProfileUnsupported` (`D01B`). |
+
+Two asymmetries in that table are deliberate and are not oversights:
+
+- **`SourceMerge` requires the same `language`; `ArtifactLink` makes no language claim at all.**
+  Merged sources are parsed by **the consumer's** grammar, so a language difference is not a
+  preference mismatch but a guaranteed parse failure — one that would otherwise arrive as a pile of
+  `P_UnexpectedToken`s pointing into a file the reader never wrote and may not know is in the build.
+  Rejecting at resolve time names the actual cause once. An `ArtifactLink` dependency is consumed as
+  a **built binary**, so its source language is irrelevant to the consumer: **cross-language linking
+  is the entire point of the FFI surface** and must stay legal.
+- **`NotConsumable` fails CLOSED, and an *unregistered* profile name is a different complaint.**
+  Absorbing a `cli` dependency as sources would splice its `main()` into the consumer, and "linking"
+  one is not something the profile can offer. But a profile name that is not registered at all (a
+  typo — `"modul"`) reports the unknown **name** with the registered list
+  (`C_UnknownArtifactProfile`), never the terminal-profile complaint: `dependencyCompositionForProfile()`
+  returns an empty optional for an unregistered name precisely so the two stay distinguishable
+  (`core/types/artifact_profile.hpp`). Every verb is a valid *instruction*, `NotConsumable` included;
+  "no verb" is the absence, and the absence must not be reported as an instruction.
+
+**Relative paths get two different bases, and that is correct.** The **root** manifest resolves its
+relative `sources[]` and hook paths against the **process working directory** — unchanged, shipped
+behaviour (§2.1), and it stays unchanged. A manifest reached through `dependsOn` resolves against
+**its own directory**. Anything else would make a dependency's meaning depend on where the *depender*
+happened to be invoked from — the same manifest would name different files on two machines.
+
+> ★ **The LITERAL half of that rule matters exactly as much as the glob half, and it is the half that
+> is easy to get wrong.** ✔MEASURED and recorded at `src/program/project_sources.hpp`: a `sources[]`
+> entry with no glob metacharacter used to be kept verbatim and opened later against the **process**
+> cwd. `"sources": ["src/lib.c"]` is the overwhelmingly common form, so re-basing only the glob
+> expansion would have left the half everybody writes pointing at the wrong tree — and it would fail
+> by **reading the consumer's own `src/lib.c`**, if it has one, rather than by failing loud. That is
+> a silent miscompile, not a missing input. Both halves re-base together, through one function, or
+> neither does.
+
+**Which platforms a dependency is built for: the CONSUMER's, derived.** A dependency's own `targets[]`
+is **not consulted** when it is built as a dependency. It still governs a standalone build of that
+project; it simply does not participate here.
+
+> ★ **The reason, because the verdict alone reverses what a reader would assume.** `targets[]` states
+> *the platforms a project builds for itself*. *"Which platforms this code can support"* is a
+> **different statement**. Reading the first as the second makes a dependency whose source is
+> perfectly portable — but whose manifest simply has not listed arm64 — **reject an arm64 consumer**:
+> the tool refuses work that would have succeeded, with a message that reads as a capability verdict
+> while it is actually reporting a bookkeeping gap. That is a false negative carrying a confidently
+> misleading diagnostic, and it sends the reader to the wrong place. A dependency that *genuinely*
+> cannot serve a platform still fails — as a compile error **inside itself**, pointing at the actual
+> unsupported construct. Neither behaviour is silent, so fail-loud does not decide between them; the
+> diagnostic's **truthfulness** does. A late true negative beats an early false one. (A dependency
+> that wants to decline a platform *deliberately* is designed and deliberately unbuilt — §7.)
+
+For each consumer target spec `<targetName>:<consumerFormat>`, the dependency's object format is the
+**unique** format `F` satisfying all three clauses:
+
+1. `F`'s **format kind** equals the consumer format's — `elf` / `pe` / `macho`, a **declared** field;
+2. the **dependency's** `artifactProfile` is in `F`'s served set (`artifactProfiles[]`, §3);
+3. `crossValidateTargetFormat(target, F)` passes — the **existing** validator
+   (`src/program/cross_validate_target_format.hpp`), never a parallel one.
+
+**No format NAME is parsed anywhere** in that derivation: every clause reads a declared field, which
+is what keeps it agnostic. It **fails closed** at both ends — **zero** candidates is
+`D_DependencyTargetFormatUnresolvable` (`D022`), naming the consumer target, the dependency's profile
+and the format kind; **two or more** is `D_DependencyTargetFormatAmbiguous` (`D023`), naming the
+target and **every** candidate. Never a silent first match, and never a sort-order tiebreak — a
+tiebreak is a policy nobody declared, invisible in the config, that would make the emitted artifact
+depend on directory-iteration order. The **consumability gate (`D01B`) runs before this derivation**,
+and the order is a correctness dependency rather than a convenience — §6.1 records why.
+
+**The graph: diamonds are fine, cycles are not, and depth is capped.**
+
+- **A cycle fails loud** — `D_DependencyCycle` (`D01A`), with the cycle **path** as its payload,
+  because a bare "cycle detected" on a deep graph is nearly unactionable. Detection keys on the
+  **resolved canonical** manifest path, so `../lib` and `../../proj/lib` naming one directory are
+  correctly one node. Breaking the back edge and continuing was rejected: it would make the resolved
+  dependency set depend on which node the walk started from, so two targets in one build could
+  legitimately see **different** source sets.
+- **A diamond is not a cycle and must not diagnose.** A manifest revisited but **not on the DFS
+  stack** is a legitimate shared dependency; the memo table answers it and nothing is reported. The
+  same is true of a repeated `path` entry, and of the same git URL at the same `ref` — those dedup
+  silently.
+- **A deep acyclic graph is caught by a recursion depth cap that fails loud.** Cycle detection
+  catches cycles and **nothing else**: a legal, acyclic, very deep chain would otherwise exhaust the
+  stack, and per this repo's standing note that failure class is CI-invisible — it surfaces on a
+  local MSVC-Debug build, not on the Release/MinGW legs — with a failure mode of *process death and
+  no diagnostic at all*. ✔MEASURED, the cap is **64** (`kMaxDependencyDepth`,
+  `src/program/dependency_resolver.hpp`). The number is a **budget, not a measurement of the C++
+  stack**: no real project nests prerequisites 64 deep, so a graph that does is either generated or
+  wrong, and either way the operator needs telling rather than crashing at.
+
+**Git dependencies and the `.dss-deps/` cache.** A `git` dependency is checked out to
+`.dss-deps/<name>/`, and `{url, ref, resolvedCommit}` is recorded in the cache's lockfile.
 
 ★ **WHERE IT IS CREATED, because this is a correctness rule and not a convention: `.dss-deps/` belongs
 to YOUR project.** It is created beside **your** `.dss-project.json`, inside the repository being
@@ -355,20 +456,176 @@ own invalidation and concurrency design, which this is explicitly not. (`.dss-de
 the dss-code-prime repository's own `.gitignore`, but only because that repository contains example
 manifests of its own under `examples/` and `real-examples/`.)
 
-The cache is keyed on the **resolved commit**, and a hit is *total*: an existing checkout whose
-`HEAD` matches the recorded commit for that `(url, ref)` means the build performs **no network
-access at all** — not a conditional request, not an `ls-remote`. So a branch dependency is as
-reproducible as a tag; you get the commit you got last time. Re-fetching is an explicit opt-in,
-**`--force-git-cache`** on the `build` command, which forces the pull even when the cache is valid.
-`.dss-deps/` is git-ignored: it is acquired content reproducible from the manifest's pins, never
-source. Offline behavior is a guarantee, not an accident — a network failure **with** a usable
-checkout reuses it and proceeds (`D01F`, Info); a network failure with **no** checkout fails loud
-(`D01E`). None of this is implemented yet; it is recorded here because the cross-references above
-point at it, and the full rule set with its rationale is plan 06 §5.1 B.4.
+★ **There is ONE `.dss-deps` per BUILD — at the ROOT consumer's manifest directory — not one per
+node.** Stated rather than left to be inferred, because the obvious reading of "beside the consuming
+project's manifest" is "beside *each* consuming manifest", and that reading breaks on the first
+`path` dependency whose tree is **read-only** (a vendored checkout, a CI cache mount, somebody else's
+repo). The whole graph's checkouts and the one lockfile live under the root's directory. The cache
+takes that directory as an explicit argument rather than deriving it, so the process working
+directory is never consulted (`src/program/dependency_cache.hpp`).
 
-The eight `D_Dependency*` diagnostics (`D019`–`D020`) are **allocated with their semantics fixed**
-(§6) but have **no emit site yet** — they are the resolver's vocabulary, reserved now so the code
-space is decided once rather than per-lane.
+**Four outcomes, and the discriminator between the last two is not what you would guess:**
+
+| Outcome | Condition | What happens |
+|---|---|---|
+| **Hit** | A checkout exists, the lockfile records this exact `(url, ref)`, and `HEAD` equals the recorded commit. | **No network access at all** — not a conditional request, not an `ls-remote`, nothing. Exactly one `git` invocation runs: the `rev-parse` that validated the claim. |
+| **Miss** | No checkout, or no matching lock entry. | Clone → checkout → `rev-parse` → record. A `--force-git-cache` refresh reports **Miss** too: the flag bypasses the hit short-circuit and nothing else, so everything after it *is* the miss path. |
+| **Fetch fallback** | Clone/fetch failed **and** a usable checkout is present. | `D_DependencyGitFetchFallback` (`D01F`) at **Info**, and the build **proceeds** on what it has. This is the offline guarantee. |
+| **Acquire failed** | Clone/fetch failed **and** there is no usable checkout. | `D_DependencyGitAcquireFailed` (`D01E`), Error. The sources do not exist on this machine, so continuing would compile against a hole. |
+
+The discriminator between the last two is exactly **"is there a usable checkout"** — never the git
+exit status and never the operation name (clone vs fetch), or an offline build's outcome would depend
+on how git happened to phrase the failure. "Usable" is answered by asking git (`rev-parse`), not by
+`is_directory`: a clone interrupted halfway leaves a directory that is not a repository, and reading
+that as a checkout would route a later failure to the "proceed on possibly-stale sources" arm over a
+tree that has no sources at all.
+
+**`git` itself is a hard requirement, not a capability probe.** If a manifest declares **any** git
+dependency and `git` is absent from `PATH`, the build fails loud with `D_DependencyGitNotFound`
+(`D01D`) — **once per build**, however many git dependencies asked, because N copies of "git is not
+installed" is noise. There is **no degraded git-less mode**: even a cache *hit* needs git, since the
+hit is validated by `rev-parse` and a stale-but-unnoticed checkout is the silent-miscompile direction.
+
+**The `.dss-deps/<name>` derivation is part of the spec, not an implementation detail** — because
+name **collisions** are a diagnostic (`D020`), and a diagnostic about a derived value is meaningless
+unless the derivation is pinned. The rule: take the **last non-empty `/`-separated segment**, strip
+**one** trailing `.git`, compare **case-sensitively**. So `…/org/bar.git` and `…/org/bar/` both give
+`bar`; `…/org/Bar.git` gives `Bar`, a **different** name and not a collision; `…/x.git.git` gives
+`x.git`, because exactly one suffix is stripped and not repeatedly. A derived name containing a
+character outside `[A-Za-z0-9._-]`, or one that cannot be used as a directory under the cache root,
+is `D_DependencyDerivedNameInvalid` (`D024`) — the message shows the URL, the derived name **and**
+the offending character, because the name appears nowhere in the manifest and a message quoting only
+the URL leaves the reader to run the derivation in their head.
+
+> ⓘ **An honest edge, stated rather than quietly widened.** The rule splits on `/` only, so an
+> scp-style URL with no path separator after the host (`git@host:bar.git`) derives `git@host:bar` and
+> is **rejected** for its `@` and `:`. The common scp spelling (`git@github.com:org/bar.git`) has a
+> slash and derives `bar` normally. Teaching the splitter about `:` would be inventing a rule the
+> spec does not state, in the one function whose exact behaviour a user-visible diagnostic quotes;
+> the remediation the reject already carries — re-spell the URL, e.g. `ssh://git@host/bar.git` —
+> resolves it in one edit. The character set is a **conservative intersection**, not a host
+> capability test: deriving legality from the host would make one manifest resolve on one machine and
+> fail on another.
+
+**Collisions are detected on the DERIVED NAMES, before anything is fetched.** Two git entries that
+derive the same `.dss-deps/<name>` are `D_DependencyGitNameCollision` (`D020`) — and the
+discriminator is the full **`(url, ref)` pair**, not the URL alone (see §6.1 for both shapes). The
+ordering is mandatory, not merely preferable: the second entry's checkout target already exists and
+reads as a cache hit, so post-acquisition detection cannot see the same-URL-different-`ref` shape at
+all, and would in the other shape complain only after the first repo's working tree was already
+damaged.
+
+**`dss-lock.json` is the cache's one state of record** — machine-written, machine-read, **never
+hand-edited** (the document carries a `$comment` saying so). It lives inside `.dss-deps/` with the
+checkouts it describes, and it holds the whole graph: there is deliberately **no per-dependency state
+file**, because the same fact in two places is the drift hazard this codebase rejects everywhere else.
+The only other piece of state is the checkout's own `HEAD`, which is git's file and is read rather
+than written. **Absent and unparseable are different facts**: an absent lockfile is an empty one with
+**no** diagnostic (a first build has no lockfile and a miss is definitional), while a **present but
+unparseable** lockfile is `C_MalformedJson` and the build **abandons** — treating it as a miss would
+silently re-acquire everything, overwrite the damaged file, and never say that the state it was asked
+to reproduce was unreadable. The remediation ("delete it; it is a regenerable cache") is in the
+message.
+
+**Re-fetching is an explicit opt-in: `--force-git-cache`, a global flag.** ✔MEASURED against
+`src/program/cli_args.cpp`: the CLI has **no `build` subcommand** — its modes are flags
+(`--compile` / `--transpile` / `--directory` / `--project` / …) and a bare positional argument is
+rejected — so this is a global flag like every other, usable with `--project`. Its `--help` gloss is
+imperative and says what it *does*: **"re-fetch git dependencies even when the cache is valid"**.
+
+> ⚠ **The name reads as "force *use of* the cache" while it means "force *refresh of* the cache".**
+> That is known; the spelling was chosen deliberately and is not up for renaming. The gloss above is
+> the mitigation — read it as the definition, not the name.
+
+The flag bypasses the **cache-hit short-circuit and nothing else**. Every other rule is unchanged by
+it: `--force-git-cache` on an offline machine with an existing checkout still takes the fetch-fallback
+arm, still emits `D01F` at Info, and still builds. It is a **silent no-op** when the manifest declares
+no git dependency at all, consistent with an empty `preBuildScripts`. Without it, a **branch**
+dependency is as reproducible as a tag: you get the commit you got last time.
+
+`.dss-deps/` is **git-ignored** — it is *acquired* content, reproducible from the manifest's pins,
+never source, and committing it would vendor someone else's history into your repository.
+
+> ★ **Why `D01F` is `Info` and not `Warning`** is a decided design point with a one-line failure
+> mode; the measurement and the reasoning are in §6.1. The short version: `--warnings-as-errors`
+> promotes every Warning **code-agnostically**, so at Warning severity every project built with that
+> flag would fail the moment the network did — the exact outcome the code exists to prevent.
+
+**Hooks run for dependencies too, and the rule mirrors the root's.** `preBuildScripts` run for
+**every** resolved dependency; `postBuildScripts` run **only** for an `ArtifactLink` dependency whose
+own build returned 0 — the same "only when the compile succeeded" rule the root follows (§2.5). Each
+dependency's hooks run with **that dependency's own directory** as their working directory. This is
+written down rather than left implicit because *"the hooks silently didn't run"* is otherwise
+unobservable: there is no output to be missing and no diagnostic to be absent.
+
+**Where a dependency's artifact lands.** An `ArtifactLink` dependency's product is emitted under the
+**consumer's** output base, at:
+
+```
+<consumer output base>/deps/<derived-dep-name>/<formatName>/<artifact>
+```
+
+The base is the `--output` directory when given, else the default `<cwd>/target` — the **same** rule
+the consumer's own artifact follows (§5), and ✔MEASURED one function owns it
+(`resolveArtifactOutputDir`, `src/program/program.cpp`), so the path a dependency is written to and
+the path the consumer links against cannot be derived twice and drift. The layout is collision-free
+by construction, and it **never writes into the dependency's own tree**, which may be read-only for
+exactly the reasons the single-`.dss-deps` rule above gives.
+
+**An empty `dependsOn` costs nothing.** A manifest with no dependencies — or with the key absent —
+resolves to an empty result **having touched nothing**: no `.dss-deps` directory, no lockfile, no
+`git` probe, no filesystem write of any kind. The overwhelmingly common manifest pays nothing for
+this feature existing, and the cache is opened lazily, which is where the `--force-git-cache` no-op
+above falls out of rather than being a special case somebody remembered to write.
+
+**How far an artifact travels: up to the nearest enclosing build that can ABSORB it.** Transitive
+`ArtifactLink` artifacts propagate upward, and a `SourceMerge` node is not a build at all, so they
+pass straight through it. **Absorption**, not mere enclosure, is what stops the propagation — and
+absorption is a **container** property the repo already dispatches on, never a profile name. An
+archive absorbs archives: their members are bundled into it. It **cannot** absorb a shared library —
+an `ar` archive records no import — so a shared-library artifact keeps travelling past that archive
+to the root, where the final link resolves it. Stopping at the nearest enclosing build regardless of
+what it can hold is the version of this rule that looks right and is wrong for exactly one of the
+four shapes (a `staticlib` depending on a `lib`), and its symptom is an undefined symbol whose cause
+is two hops away.
+
+**Merged source order: the ROOT's own sources come FIRST.** When `artifactName` is absent, the
+emitted binary is named from the **stem of `sources[0]`** (§5) — and archive member names follow the
+same list. So if a `SourceMerge` dependency's files were prepended, adding a `module` dependency
+would silently **rename the output binary**. Order is otherwise preserved exactly: manifest positions
+are kept, each glob's own matches are sorted lexicographically, and the first occurrence of a
+duplicate wins. Cross-manifest de-duplication normalizes with `weakly_canonical`, because once a
+build draws sources from two manifests — one contributing absolute paths, the other relative ones —
+the absolute-vs-relative spelling of one file stops being an exotic edge and becomes the normal case,
+whose consequence is a duplicate compilation unit and a duplicate-symbol link error that no
+diagnostic could tie back to a manifest.
+
+**No per-target `resolveLibraries` vocabulary is added anywhere.** A dependency is built once per
+consumer target, so the artifact linked into `x86_64:elf64-…` is a different file from the one for
+`arm64:macho64-…` — but that is answered by an **internal** per-target channel in the driver, not by
+new manifest or CLI syntax. `resolveLibraries` (§2.3) and `--resolve-library` stay **program-wide**
+with their existing merge semantics: program-wide entries first, the resolver's per-target additions
+after. A user-facing per-target declaration would be a mechanism with no consumer.
+
+★ **THERE ARE TWO DIFFERENT `dependsOn` KEYS IN THIS REPOSITORY, AND THEY ARE NOT THE SAME FEATURE.**
+This one — `dependsOn` in a `.dss-project.json` — is the **product** feature described above: a
+user's project declaring the projects it needs. The corpus test harness has a key of the same name in
+its `expected.json` manifests (`examples/README.md`), and that one builds a **test fixture**: a
+prerequisite artifact the example runner stages so an arm has something to compile against. Two
+files, two loaders, two audiences.
+
+> ★ **They must stay independent, and that is the load-bearing half.** If the corpus's fixture path
+> went through *this* resolver, a resolver bug would turn examples red that have nothing to do with
+> dependencies, and the corpus would lose the one staging path that does **not** depend on the
+> feature under test. A rename was considered and **rejected** (2026-08-12): the harness key appears
+> in only two manifests, so renaming it was cheap, and renaming the product key was priced across
+> loader, tests, spec, plan and the `D_Dependency*` code names — the decision was **neither**. Both
+> keep the name; the distinction is carried by **documentation alone**, which is why it is written
+> here and in `examples/README.md` rather than left to be re-derived. An undocumented duplicate name
+> is how the wrong one gets deleted.
+
+The `D_Dependency*` diagnostics are listed with their semantics in §6.1; the full rule set with its
+rationale is plan 06 §5.1 (B.1–B.10).
 
 ### 2.7 `$`-prefixed documentation keys
 
@@ -475,6 +732,16 @@ passes AP2 and is caught by AP3 for **every** target.
 An empty declared/served set ⇒ **reject** (fail-closed): a language or format that claims no profiles
 is not project-buildable.
 
+> ★ **A DEPENDENCY runs its own AP2 language gate, but not AP3 against its own `targets[]`.** Both
+> gates above are about a manifest the user asked to build. A manifest reached through `dependsOn`
+> still has its own `artifactProfile ∈` its own language's declared set checked — otherwise a `toy`
+> manifest declaring `"module"` (which `toy` does not declare, §4's table) would be source-merged
+> with no gate anywhere. What it does **not** get is AP3 against the targets *it* lists: its object
+> format is **derived from the consumer's** target instead (§2.6), and clause (2) of that derivation
+> — the dependency's profile must be in the candidate format's served set — *is* the format gate,
+> applied to the format that will actually be used rather than to a list the dependency wrote for its
+> own standalone build.
+
 ---
 
 ## 5. Routing & output
@@ -511,20 +778,33 @@ is not project-buildable.
 
 | Code | When |
 |---|---|
-| `D_FileNotFound` | the project file can't be opened, or a hard I/O error occurs mid-read; **or** a `sources[]` **glob** pattern matched no files (§2.1) — the message names the unmatched pattern. |
+| `D_FileNotFound` | the project file can't be opened, or a hard I/O error occurs mid-read; **or** a `sources[]` **glob** pattern matched no files (§2.1) — the message names the unmatched pattern; **or** a `dependsOn` `path` names a directory that **does not exist** (§2.6 — a directory that exists but holds no manifest is `D019` instead, and the split is deliberate). |
 | `D_DirectoryScanFailed` | a directory could not be read while expanding a `sources[]` glob pattern (§2.1). |
-| `C_MalformedJson` | invalid JSON; non-object root; an **unknown** top-level key (`$`-prefixed keys excepted, §2.7); a field of the wrong type; a non-string / empty array entry; an empty `output` string; an empty `artifactName`, or one containing a path separator (`/` or `\`); a `stackReserve` that is not a positive unsigned integer (§2.4); any malformed `preBuildScripts` / `postBuildScripts` entry — unknown member, missing/empty `run`, empty `runOn`, unrecognized `runOn` token (§2.5); any malformed `dependsOn` entry — unknown member, both/neither of `path`+`git`, or `ref` without `git` (§2.6). |
+| `C_MalformedJson` | invalid JSON; non-object root; an **unknown** top-level key (`$`-prefixed keys excepted, §2.7); a field of the wrong type; a non-string / empty array entry; an empty `output` string; an empty `artifactName`, or one containing a path separator (`/` or `\`); a `stackReserve` that is not a positive unsigned integer (§2.4); any malformed `preBuildScripts` / `postBuildScripts` entry — unknown member, missing/empty `run`, empty `runOn`, unrecognized `runOn` token (§2.5); any malformed `dependsOn` entry — unknown member, both/neither of `path`+`git`, or `ref` without `git` (§2.6). Also the one **non-manifest** file this list covers: a `.dss-deps/dss-lock.json` that is present but unparseable, which **abandons** the build rather than being treated as a cache miss (§2.6). |
 | `C_MissingField` | a required field (`language` / `artifactProfile` / `targets` / `sources`) is absent, an empty string, or an empty array. |
 | `D_ArtifactProfileNotSupported` (`D0010`) | the language gate (§4). |
 | `D_ArtifactProfileFormatMismatch` (`D0011`) | the format gate (§4). |
 | `D_ArtifactNameEscapesOutputDir` (`D0015`) | a project `artifactName` resolved to a path **outside** the routed output directory (a `..` component, or a drive/root prefix) — the routing containment boundary (§5). Remediation-distinct from `D_OutputDirCreateFailed` (mkdir I/O): fix the `artifactName` to a plain filename. |
 | `D_InvalidTargetSpec` / `D_SchemaLoadFailed` | a `targets[]` entry that doesn't parse as `<name>:<format>`, or names a format that won't load — emitted by the delegated compile (the gates skip such a target rather than double-report). |
 
-### 6.1 Build-lifecycle + dependency codes (`D017`–`D020`)
+### 6.1 Build-lifecycle + dependency codes (`D017`–`D024`)
 
-Ten codes allocated for `preBuildScripts` / `postBuildScripts` (§2.5) and `dependsOn` (§2.6). All are
-**driver-band** (`D_`) because the decision is made at project-load time, before any grammar or
-compilation unit exists to hang a source span on — the same placement argument that put
+The codes for `preBuildScripts` / `postBuildScripts` (§2.5) and `dependsOn` (§2.6). The build-lifecycle
+pair is `D_ScriptSpawnFailed` / `D_ScriptExitedNonZero`; the dependency surface is every `D_Dependency*`
+code, spanning **`D019`–`D024`** — the table below is the list, and
+`core/types/parse_diagnostic.hpp` is the source of truth for both.
+
+> ⚠ **The surface is named and ranged here, never counted.** A hand-maintained cardinal ("the eight
+> `D_Dependency*` codes") is precisely the sentence that rots the next time a slot is allocated — and
+> this one already did, having said *eight* while the band grew past it. If you need a count, derive
+> it from the rows below or from the enum; do not write one down. Note also that the range is **not**
+> contiguous by topic: `D021` (`D_SuppressRequestIgnored`) is a reporter-policy code that landed
+> between the two halves of the dependency band, and the gap was kept rather than closed because the
+> number is the operator-visible identity (`error[D0020]`) and renumbering an allocated code rewrites
+> a published name.
+
+All are **driver-band** (`D_`) because the decision is made at project-load time, before any grammar
+or compilation unit exists to hang a source span on — the same placement argument that put
 `D_ArtifactProfileNotSupported` here. Every split below is a **remediation** split: two conditions
 share a code only when they share a fix.
 
@@ -532,17 +812,30 @@ share a code only when they share a fix.
 |---|---|---|---|
 | `D_ScriptSpawnFailed` (`D017`) | Error | A script entry could **not be spawned at all** — `run[0]` is not on PATH, is not executable, or the OS process-creation call refused before the child ever ran. No exit status exists in this state. | ✅ emitted |
 | `D_ScriptExitedNonZero` (`D018`) | Error | A script entry spawned and terminated with a **non-zero** status (abnormal termination — signal / structured exception — reports here too; the spawn layer's prose discriminates). Fail-loud, never fail-soft: a pre-build codegen step that silently failed would let the compile proceed against **stale** generated sources and produce a green build of the wrong bytes. | ✅ emitted |
-| `D_DependencyManifestNotFound` (`D019`) | Error | A `path` dependency's directory **exists but has no `.dss-project.json` at its root**. Remediation-distinct from `D_FileNotFound`: that is "the thing you named is not there"; this is "it *is* there but is not a DSS project" — overwhelmingly a wrong-level path (`../lib/src` instead of `../lib`). | reserved |
-| `D_DependencyCycle` (`D01A`) | Error | Recursive resolution reached a manifest **already on the DFS stack** (A → B → A, or any longer ring). Keyed on the **resolved canonical** manifest path, so two spellings of one directory are one node. A revisited-but-not-on-stack manifest is a **diamond** — a legitimate shared dependency — and must not diagnose at all. | reserved |
-| `D_DependencyArtifactProfileUnsupported` (`D01B`) | Error | A resolved dependency's `artifactProfile` is **not consumable as a dependency** (§3's `NotConsumable` verb). A third axis, distinct from both existing profile rejects: `D0010` is "the *language* does not declare it", `D0011` is "the *format* does not produce it", this is "the profile is valid for itself but is not a thing another project can depend **on**". Fail-closed on an unrecognized/absent profile. | reserved |
-| `D_DependencyLanguageMismatch` (`D01C`) | Error | A **source-merge** dependency declares a `language` different from the consumer's. Scoped deliberately to that shape: merged sources are parsed by *this* project's grammar, so a language difference is a guaranteed parse failure that would otherwise surface as a pile of `P_UnexpectedToken`s in a file the user never wrote. Makes **no** claim about binary-artifact dependencies — cross-language linking is the whole point of the FFI surface and stays legal. | reserved |
-| `D_DependencyGitNotFound` (`D01D`) | Error | A `dependsOn` entry names a git URL but **`git` is not on PATH**. Split from `D01E` because the remediation is environmental and concrete ("install git"); split from `D017` because that code covers programs the **manifest** names while this covers the one program the **driver** reaches for. Emitted **once per build**, not once per git dependency. | reserved |
-| `D_DependencyGitAcquireFailed` (`D01E`) | Error | **First** acquisition failed and there is **no existing checkout** to fall back to. Hard failure — the dependency's sources simply do not exist on this machine, so continuing would compile against a hole. | reserved |
-| `D_DependencyGitFetchFallback` (`D01F`) | **Info** | The same network failure **with a usable checkout present**, which is **reused** — the build **proceeds** on possibly-stale sources. This is the offline-build guarantee (a laptop on a train; CI with a flaky network); the notice exists so "possibly stale" is never silent. The discriminator against `D01E` is exactly "is there a usable checkout", never the git exit status or the operation name. **★ Info is a decided design point, not an oversight — see the note below. Do not "tidy" it to Warning.** | reserved |
-| `D_DependencyGitNameCollision` (`D020`) | Error | Two **distinct** git URLs derive the same `.dss-deps/<name>` directory. Whichever is acquired second would clobber the first or be silently skipped, and the build would compile against a dependency it did not ask for. Detected on the **derived names before acquisition**, so no working tree is damaged by the time it complains. The **same** URL twice is not a collision — that is the diamond case and dedups silently. | reserved |
+| `D_DependencyManifestNotFound` (`D019`) | Error | A `path` dependency's directory **exists but has no `.dss-project.json` at its root**. Remediation-distinct from `D_FileNotFound`: that is "the thing you named is not there"; this is "it *is* there but is not a DSS project" — overwhelmingly a wrong-level path (`../lib/src` instead of `../lib`). | ✅ emitted |
+| `D_DependencyCycle` (`D01A`) | Error | Recursive resolution reached a manifest **already on the DFS stack** (A → B → A, or any longer ring). Keyed on the **resolved canonical** manifest path, so two spellings of one directory are one node. A revisited-but-not-on-stack manifest is a **diamond** — a legitimate shared dependency — and must not diagnose at all. | ✅ emitted |
+| `D_DependencyArtifactProfileUnsupported` (`D01B`) | Error | A resolved dependency's `artifactProfile` is **not consumable as a dependency** (§3's `NotConsumable` verb). A third axis, distinct from both existing profile rejects: `D0010` is "the *language* does not declare it", `D0011` is "the *format* does not produce it", this is "the profile is valid for itself but is not a thing another project can depend **on**". Fail-closed on an unrecognized/absent profile. | ✅ emitted |
+| `D_DependencyLanguageMismatch` (`D01C`) | Error | A **source-merge** dependency declares a `language` different from the consumer's. Scoped deliberately to that shape: merged sources are parsed by *this* project's grammar, so a language difference is a guaranteed parse failure that would otherwise surface as a pile of `P_UnexpectedToken`s in a file the user never wrote. Makes **no** claim about binary-artifact dependencies — cross-language linking is the whole point of the FFI surface and stays legal. | ✅ emitted |
+| `D_DependencyGitNotFound` (`D01D`) | Error | A `dependsOn` entry names a git URL but **`git` is not on PATH**. Split from `D01E` because the remediation is environmental and concrete ("install git"); split from `D017` because that code covers programs the **manifest** names while this covers the one program the **driver** reaches for. Emitted **once per build**, not once per git dependency. | ✅ emitted |
+| `D_DependencyGitAcquireFailed` (`D01E`) | Error | **First** acquisition failed and there is **no existing checkout** to fall back to. Hard failure — the dependency's sources simply do not exist on this machine, so continuing would compile against a hole. | ✅ emitted |
+| `D_DependencyGitFetchFallback` (`D01F`) | **Info** | The same network failure **with a usable checkout present**, which is **reused** — the build **proceeds** on possibly-stale sources. This is the offline-build guarantee (a laptop on a train; CI with a flaky network); the notice exists so "possibly stale" is never silent. The discriminator against `D01E` is exactly "is there a usable checkout", never the git exit status or the operation name. **★ Info is a decided design point, not an oversight — see the note below. Do not "tidy" it to Warning.** | ✅ emitted |
+| `D_DependencyGitNameCollision` (`D020`) | Error | Two git entries deriving the same `.dss-deps/<name>` — either two **distinct** URLs, or the **same** URL declared twice with **different** `ref`s. Whichever is acquired second would clobber the first or be silently skipped, and the build would compile against a dependency it did not ask for. Detected on the **derived names before acquisition**, so no working tree is damaged by the time it complains — and for the same-URL-different-`ref` shape that ordering is *mandatory*, since after acquisition the second entry's checkout target already exists and reads as a cache hit. The same URL with the **same** ref is not a collision — that is the diamond case and dedups silently. The discriminator is the full `(url, ref)` pair. | ✅ emitted |
+| `D_DependencyTargetFormatUnresolvable` (`D022`) | Error | For one of the **consumer's** target specs, **no** shipped object format can produce the **dependency's** artifact — zero candidates from the three-clause derivation (§2.6). Names all three coordinates the search ran over: the consumer target, the dependency's `artifactProfile`, and the format **kind**. Remediation-distinct from `D0011`, which is "the format *you named* does not serve the profile *you declared*": here the format was **derived**, so the user never named it and cannot see it — the fix is to ship or declare the missing backend for that kind, or drop the unservable target from the consumer. | ✅ emitted |
+| `D_DependencyTargetFormatAmbiguous` (`D023`) | Error | The same derivation returned **two or more** candidate formats for one consumer target. Fails **closed**, naming the target and **every** candidate — never a silent first match, and never a sort-order tiebreak, which would be an undeclared policy that made the emitted artifact depend on directory-iteration order. | ✅ emitted — **no shipped config can produce it** (see below) |
+| `D_DependencyDerivedNameInvalid` (`D024`) | Error | A git dependency's **derived** cache directory name is unusable — a character outside `[A-Za-z0-9._-]`, no non-empty last segment at all, or a name that cannot be a directory under the cache root. Fails loud rather than transliterating: folding the offending characters to `_` would manufacture a **second, invisible** collision source on top of the one `D020` exists to catch, and the resulting report would look like a compiler bug rather than a manifest problem. The message shows the URL, the derived name **and** the offending character, because the name appears nowhere in the manifest (§2.6). | ✅ emitted |
 
-**"reserved"** = the code and its semantics are allocated (`core/types/parse_diagnostic.hpp`), but no
-emit site exists yet — `dependsOn` resolution is next cycle (§2.6).
+> ⓘ **`D023` is a fail-closed guard, not dead code, and that distinction is worth keeping.**
+> ✔MEASURED at the code's own allocation (`core/types/parse_diagnostic.hpp`) over all 24 shipped
+> object formats × the 2 shipped targets: there are ten reachable
+> `(kind, target, ArtifactLink profile)` triples and **each has exactly one** qualifying format — ten
+> triples, ten unique answers — so no shipped configuration can produce two candidates today. The
+> guard is allocated **before** it can fire on purpose: the alternative is a derivation with no ≥2
+> branch — i.e. one that silently takes `candidates[0]` the day someone adds a format — and that
+> defect would otherwise ship in the same commit that creates the possibility. Recorded at the same
+> site and load-bearing here: uniqueness is **not** a property of the format set on its own. `cli` has two ELF candidates per arch (`…-exec` and
+> `…-pie`, same `machine`, both declaring `cli`), so the triple (elf, cli, x86_64) genuinely has two
+> answers — it never reaches the derivation only because `cli` is `NotConsumable` and `D01B` rejects
+> it first. **The order of those two gates is a correctness dependency, not a convenience.**
 
 > ★ **Why `D_DependencyGitFetchFallback` is `Info` and not `Warning`.** MEASURED in
 > `src/core/types/diagnostic_reporter.cpp` (`applyPolicy`): the `--warnings-as-errors` arm promotes
@@ -570,8 +863,9 @@ does not over-promise:
 | `D-AP2-OUTPUT-ROUTING` | **Partially addressed.** The `artifactName` field (binary base name) **and** the per-platform `<formatName>/` subdir for project builds are now wired (§5). Still deferred: the **`output` field as an output directory** — it is parsed + validated but does not yet redirect the base dir; use `--output` to set it. |
 | `D-AP2-TARGET-NAME-DEFAULT-FORMAT` | `targets[]` require the explicit `:<formatName>` half; bare names (`"linux-x86_64"`) with an inferred default format aren't resolved yet. |
 | `D-AP2-COMPILATION-CONTEXT` | the resolved profile is **not** threaded to codegen (entry-symbol / subsystem / extension); deferred until a profile drives a codegen difference its `(target:format)` doesn't already encode (e.g. `gui`). |
-| plan 06 §B (`dependsOn` resolution) | `dependsOn` is parsed and shape-validated; **resolution has not landed**, so a non-empty value **refuses the build** with `D_PlanNotLanded` (§2.6). The `.dss-deps/` cache rules, the composition-verb dispatch, and the eight `D_Dependency*` codes (§6.1) are decided but unbuilt. |
-| plan 06 §B (dependency hooks) | `runBuildScripts` takes its working directory as a **parameter** so a dependency manifest's hooks can run in that dependency's own tree; the driver has only the ROOT caller today, which passes the inherit-cwd sentinel (§2.5). |
+| plan 06 §B (`dependsOn` resolution) | **Realized** (§2.6). The resolver, both composition arms, git acquisition, the `.dss-deps/` cache and its lockfile, `--force-git-cache`, and every `D_Dependency*` code (§6.1) are built; the `D_PlanNotLanded` refusal this row used to describe is gone. |
+| plan 06 §B (dependency hooks) | **Realized** (§2.6). `runBuildScripts` takes its working directory as a **parameter**, and the dependency caller now passes that dependency's own directory; the root caller still passes the inherit-cwd sentinel (§2.5). |
+| `D-DEPS-DEPENDENCY-CANNOT-DECLINE-A-TARGET` | A dependency has no way to **decline** a platform it genuinely cannot serve: builds are consumer-driven (§2.6), so such a dependency fails as a compile error inside itself rather than as a clean resolve-time reject. Designed and **deliberately unbuilt** — no shipped dependency needs it, and a mechanism with no consumer is the defect in the other direction. **Trigger:** the first real dependency that must decline a target. The fix when it fires is a declared **constraint** (not a target list) on axes the config already carries — format kind, container, artifact profile — checked through `crossValidateTargetFormat`; **absent constraint ⇒ build whatever is asked**, so the common case keeps zero bookkeeping and cannot drift. |
 
 ---
 
@@ -613,3 +907,23 @@ on a successful Windows build:
   "preBuildScripts":  [{ "run": ["python", "tools/gen.py", "--out", "src/gen"] }],
   "postBuildScripts": [{ "run": ["pwsh", "-File", "scripts/sign.ps1"], "runOn": ["windows"] }] }
 ```
+
+Both composition arms in one manifest (§2.6) — the `module` dependency contributes **sources** to
+this compilation, the `staticlib` one is **built separately** and linked in:
+
+```jsonc
+{ "language": "c-subset", "artifactProfile": "cli",
+  "targets": ["arm64:elf64-aarch64-linux-exec"],
+  "sources": ["main.c"],                       // ← the ROOT's own sources come FIRST in the merged
+                                               //   list: `main` names the binary, and prepending a
+                                               //   dependency's files would silently rename it
+  "dependsOn": [
+    { "path": "../shared_helpers" },           // artifactProfile "module"    → SourceMerge
+    { "path": "../libmath" },                  // artifactProfile "staticlib" → ArtifactLink
+    { "git": "https://github.com/org/bar.git", "ref": "v1.2.0" }
+  ] }
+```
+
+Note what is **not** written there: no target list for the dependencies. Each is built for **this**
+manifest's `arm64:elf64-aarch64-linux-exec`, with its object format derived — `../libmath` may list
+only x86-64 in its own `targets[]` and still serves this build (§2.6).

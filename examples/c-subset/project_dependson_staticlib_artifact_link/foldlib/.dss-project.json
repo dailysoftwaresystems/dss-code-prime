@@ -1,0 +1,9 @@
+{
+  "$comment": "AP6 — the DEPENDENCY manifest for the ArtifactLink arm. A `path` dependency must carry a `.dss-project.json` at the root of the named directory or the build fails loud with D_DependencyManifestNotFound (0xD019); `sources` is relative and re-bases against THIS directory (plan 06 §5.1 B.3), never the process cwd.",
+  "$commentProfile": "`staticlib`'s composition verb is ArtifactLink (core/types/artifact_profile.hpp): the dependency gets its OWN build, and the resulting archive is threaded into the consumer's resolveLibraries. The two builds stay separate — this is the arm that is more likely to be used in practice and the one B.6.2 refused to leave without a runtime witness. Unlike SourceMerge, ArtifactLink makes NO language claim: a built archive is consumed as a binary, so cross-language linking stays legal.",
+  "$commentTargetsAreNotConsulted": "★ THIS LIST IS DELIBERATELY NARROWER THAN THE CONSUMER'S, AND THE EXAMPLE IS GREEN ANYWAY — that is plan 06 §5.1 B.10's headline decision under runtime test. `targets[]` states the platforms a project builds FOR ITSELF; it is NOT consulted when the project is built as a dependency. So a windows or darwin or aarch64 consumer builds this archive for ITS OWN platform even though only elf64-x86_64 is listed here. The rejected alternative (require the dependency's targets to be a superset of the consumer's) would have refused every one of those — including on the corpus's own Windows gate — with a message that reads as a capability claim while reporting a bookkeeping gap. The dependency's object format is DERIVED instead: the unique format whose kind matches the consumer's, whose artifactProfiles[] serves `staticlib`, and which passes crossValidateTargetFormat.",
+  "language": "c-subset",
+  "artifactProfile": "staticlib",
+  "targets": ["x86_64:elf64-x86_64-linux-staticlib"],
+  "sources": ["fold.c"]
+}
