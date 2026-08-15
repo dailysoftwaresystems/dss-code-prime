@@ -215,6 +215,79 @@ TEST(UnsuppressableCodes, ThreadLocalRejectsAreUnsuppressable) {
            "table — membership is what made it read as load-bearing.";
 }
 
+// Inline-asm P5 operand binding (D-CSUBSET-INLINE-ASM-OPERANDS +
+// D-CSUBSET-INLINE-ASM-TEXT, 0xE065..0xE06B). All seven are members on PRONG
+// (1): each refuses a construct that has a SECOND CANDIDATE LOWERING a silenced
+// compiler would take unannounced — an unbound operand, an alternative the
+// binder chose itself, a full-width register where a narrow view was written, a
+// dropped clobber, a vanished template, a placeholder dropped or emitted raw.
+// Named per-code pins, because `ListSelfConsistent` would still pass if any one
+// row were dropped from the table.
+//
+// ★ THE RATIONALE IS ASSERTED NON-EMPTY PER CODE, not just membership. `why` is
+// the text `D_SuppressRequestIgnored` shows the operator whose --suppress is
+// being refused; a member with an empty one refuses SILENTLY, which is the
+// shape this whole table exists to forbid. The consteval
+// `kUnsuppressableEntriesAllExplainThemselves` catches an empty literal at
+// build time — this catches a row wired to the wrong constant, which that check
+// cannot see.
+TEST(UnsuppressableCodes, InlineAsmOperandBindingCodesAreUnsuppressable) {
+    int checked = 0;
+    for (auto const code :
+         {DiagnosticCode::S_InlineAsmConstraintLetterUndeclared,
+          DiagnosticCode::S_InlineAsmConstraintUnsupportedForm,
+          DiagnosticCode::S_InlineAsmOperandModifierUnsupported,
+          DiagnosticCode::S_InlineAsmClobberUnknown,
+          DiagnosticCode::S_InlineAsmTemplateUnparsable,
+          DiagnosticCode::S_InlineAsmPlaceholderOutOfRange,
+          DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate}) {
+        EXPECT_TRUE(isUnsuppressable(code))
+            << diagnosticCodeName(code)
+            << ": suppressed, the operand binding silently takes its second "
+               "candidate lowering and the build ships wrong bytes green";
+        EXPECT_FALSE(unsuppressableRationale(code).empty())
+            << diagnosticCodeName(code)
+            << " is a member with no recorded reason, so a --suppress request "
+               "naming it would be refused with an empty explanation";
+
+        // ...and the refusal is a live reporter behaviour, not just a
+        // predicate: the user names the code and the diagnostic lands anyway,
+        // still carrying its text and still counting toward the exit gate.
+        DiagnosticReporter::Config cfg;
+        cfg.policy.suppress.insert(code);
+        DiagnosticReporter r{cfg};
+        auto d   = makeDiag(code);
+        d.actual = "constraint letter 'a' is not declared by target 'arm64'";
+        r.report(std::move(d));
+
+        ASSERT_EQ(r.all().size(), 1u)
+            << diagnosticCodeName(code) << " was silenced by --suppress";
+        EXPECT_EQ(r.all()[0].actual,
+                  "constraint letter 'a' is not declared by target 'arm64'")
+            << "the delivered diagnostic must still NAME the offending "
+               "construct";
+        EXPECT_EQ(r.errorCount(), 1u)
+            << "and must still count toward the exit-code gate";
+        ++checked;
+    }
+    // Non-vacuity: a counter incremented in the loop, not the list's length.
+    EXPECT_EQ(checked, 7);
+
+    // ★ THE NEGATIVE THAT KEEPS THE SEVEN HONEST. The arc's EIGHTH code is
+    // deliberately NOT a member, and it is the same one P1 left out:
+    // `volatile volatile` suppressed compiles to exactly what `volatile`
+    // means, so there is no second candidate reading to pick silently. Pinned
+    // rather than merely omitted, so a future batch-sweep that adds "the
+    // inline-asm codes" as a family reds here instead of quietly loosening the
+    // criterion the other seven were admitted under.
+    EXPECT_FALSE(isUnsuppressable(DiagnosticCode::S_InlineAsmDuplicateQualifier))
+        << "0xE064 became a closed-table member. Membership is decided on the "
+           "suppression criterion per code, not per arc: a repeated qualifier "
+           "is redundant, not ambiguous, so suppressing it ships no wrong "
+           "bytes and hides no build failure. Read its block in "
+           "`parse_diagnostic.hpp` before changing this.";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // THE BUILD-HOOK CODES: ADMITTED ON THE SUPPRESSION CRITERION, RE-EXAMINED.
 //

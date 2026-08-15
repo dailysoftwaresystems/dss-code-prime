@@ -477,8 +477,18 @@ TEST(LanguageReferences, HostInheritsAsmSemanticInlineAsmFacet) {
     EXPECT_EQ(asmCfg.labelsTailRuleName,        "asmLabelsTail");
     EXPECT_EQ(asmCfg.labelsTailFusedRuleName,   "asmLabelsTailFused");
     EXPECT_EQ(asmCfg.operandListRuleName,       "asmOperandList");
+    EXPECT_EQ(asmCfg.operandRuleName,           "asmOperand");
     EXPECT_EQ(asmCfg.clobberListRuleName,       "asmClobberList");
     EXPECT_EQ(asmCfg.gotoLabelListRuleName,     "asmGotoLabelList");
+
+    // ★★ THE TWO NON-REGISTER CLOBBER SPELLINGS ARRIVE AS *DATA*, WHICH IS THE
+    // WHOLE POINT OF THEM BEING HERE. They are GNU-asm vocabulary, so a host
+    // that wrote no `semantics` block at all now knows that `"memory"` and
+    // `"cc"` are the two clobbers naming no register — and it knows it because
+    // the asm document said so, not because `semantic_analyzer.cpp` contains
+    // those two bytes.
+    EXPECT_EQ(asmCfg.memoryClobber,             "memory");
+    EXPECT_EQ(asmCfg.conditionCodeClobber,      "cc");
 
     // The two facet fields that name a HOLE resolve to the HOST's names — the
     // facet was rebound, not copied.
@@ -495,10 +505,66 @@ TEST(LanguageReferences, HostInheritsAsmSemanticInlineAsmFacet) {
     EXPECT_TRUE(asmCfg.labelsTailRule.valid());
     EXPECT_TRUE(asmCfg.labelsTailFusedRule.valid());
     EXPECT_TRUE(asmCfg.operandListRule.valid());
+    EXPECT_TRUE(asmCfg.operandRule.valid());
     EXPECT_TRUE(asmCfg.clobberListRule.valid());
     EXPECT_TRUE(asmCfg.gotoLabelListRule.valid());
     EXPECT_TRUE(asmCfg.gotoQualifierToken.valid());
     EXPECT_EQ(asmCfg.rule.v, schema->rules().find("asmStmt").v);
+}
+
+// ★★★ THE SINGLE-OPERAND RULE ARRIVES *COMPILED*, AND REBOUND TO THIS HOST'S
+// ALIEN KINDS — NOT MERELY INTERNED. `operandRule` is the first facet field
+// that names a rule the semantic tier will walk INTO rather than merely test
+// for presence, so "the name resolved" is not the property that matters: a
+// `RuleId` can be valid for a rule that was interned with no body, and every
+// EXPECT above would still be green while the walk matched nothing.
+//
+// ★★ THE TEST IS THEREFORE THE FIRST SET, TWICE OVER. Non-empty proves a body
+// was compiled (`computeFirstAndNullable` produces nothing otherwise); and the
+// KINDS in it are asserted to be THIS host's — `BraceOpen` for the optional
+// `[name]` prefix and `TickText` for the constraint string, neither of which
+// `c-subset` spells. A facet that merged as text rather than as grammar would
+// pass a name check and fail both of these.
+TEST(LanguageReferences, InheritedOperandRuleIsCompiledAndReboundToTheHostsKinds) {
+    auto schema = loadOk(makeHostDoc(HostVariant::WithReference));
+    ASSERT_NE(schema, nullptr);
+
+    auto const& asmCfg = schema->semantics().inlineAsm;
+    ASSERT_TRUE(asmCfg.operandRule.valid())
+        << "the facet named no single-operand rule — a walker would have to "
+           "recover operand boundaries by counting separator tokens, which the "
+           "comma OPERATOR inside an operand's parens makes ambiguous";
+    ASSERT_EQ(asmCfg.operandRule.v, schema->rules().find("asmOperand").v);
+
+    auto const first = schema->firstSetOf(asmCfg.operandRule);
+    ASSERT_FALSE(first.empty())
+        << "'asmOperand' is interned but has NO FIRST set — it arrived as a "
+           "name, not as a grammar, and the walk this RuleId exists for would "
+           "match nothing while every name assertion stayed green";
+
+    // `asmOperand` = `{optional [ symbolicNameOpen symbolName symbolicNameClose ]}`
+    // then the constraint. So it predicts on the host's BraceOpen (the optional
+    // prefix) AND on whatever the host bound `templateText` to.
+    const auto braceOpen = schema->schemaTokens().find("BraceOpen");
+    const auto tickText  = schema->schemaTokens().find("TickText");
+    ASSERT_TRUE(braceOpen.valid());
+    ASSERT_TRUE(tickText.valid());
+    EXPECT_TRUE(schema->firstSetContains(asmCfg.operandRule, braceOpen))
+        << "asmOperand does not predict on the host's symbolicNameOpen kind — "
+           "the `[name]` prefix did not rebind";
+    EXPECT_TRUE(schema->firstSetContains(asmCfg.operandRule, tickText))
+        << "asmOperand does not predict on the host's constraint-string kind — "
+           "the `templateText` hole did not rebind inside the operand";
+
+    // ⚠ AND *ONLY* THOSE TWO. A containment pair stays green over a FIRST set
+    // that also carries an unsubstituted role kind — which is exactly what a
+    // half-applied merge produces — so the SIZE is asserted too. Update it
+    // deliberately if `asmOperand` grows an arm; never to make this pass.
+    // (That the host's vocabulary is not C's is pinned separately by
+    // `AsmHostProbeIsNotCShaped`.)
+    EXPECT_EQ(first.size(), 2u)
+        << "asmOperand predicts on " << first.size()
+        << " kinds, not the two its `{optional [name]}` + constraint shape has";
 }
 
 TEST(LanguageReferences, HostInheritsAsmHirLoweringRow) {
@@ -898,9 +964,12 @@ private:
           "labelsTailRule": "gatePayload",
           "labelsTailFusedRule": "gatePayload",
           "operandListRule": "gatePayload",
+          "operandRule": "gatePayload",
           "clobberListRule": "gatePayload",
           "gotoLabelListRule": "gatePayload",
-          "gotoQualifierToken": "LeapWord"
+          "gotoQualifierToken": "LeapWord",
+          "memoryClobber": "memory",
+          "conditionCodeClobber": "cc"
         }
       }
     })");
@@ -1272,4 +1341,129 @@ TEST(LanguageReferenceRefusals, InlineAsmFacetWithASkipLoweringRowFailsLoud) {
                   DiagnosticCode::C_InvalidHirLowering,
                   {"gateStmt", "Skip", "InlineAsm"},
                   "an inline-asm facet whose rule lowers to something else");
+}
+
+// ─── 5.4 battery D: the P5 wave-2 facet rows, red-on-disable ──────────────
+//
+// ★★★ EVERY ONE OF THESE ARMS IS A REFUSAL THIS CYCLE ADDED, EXERCISED RATHER
+// THAN READ. The ALL-OR-NOTHING claim on `semantics.inlineAsm` is only worth
+// the diagnostics that enforce it, and three new keys means three new ways to
+// half-configure the facet. Each arm below mutates the SAME base that
+// `InlineAsmGateBaseLoadsClean` pins as loading clean, so a green arm can never
+// mean "the base was broken all along".
+//
+// ★★ FAIL-CLOSED BY CONSTRUCTION, exactly like every other battery here: the
+// mutant is a SECOND JSON VALUE built in this process and handed to
+// `loadFromText`. No file is written, nothing must be restored, and there is no
+// build flag or environment variable that could skip an arm. `loadExpectingRefusal`
+// itself ADD_FAILUREs on a clean load, so "the mutation never reached the check"
+// is reported as a failure rather than passing quietly.
+
+namespace {
+// The clean base, with ONE key mutated. Returning the whole document keeps each
+// arm a true differential over a single key.
+[[nodiscard]] nlohmann::json gateHostWithoutKey(char const* key) {
+    auto doc = gateHostJson(std::string{"InlineAsm"});
+    doc["semantics"]["inlineAsm"].erase(key);
+    return doc;
+}
+[[nodiscard]] nlohmann::json gateHostWithKey(char const* key,
+                                             nlohmann::json value) {
+    auto doc = gateHostJson(std::string{"InlineAsm"});
+    doc["semantics"]["inlineAsm"][key] = std::move(value);
+    return doc;
+}
+} // namespace
+
+TEST(LanguageReferenceRefusals, InlineAsmFacetMissingOperandRuleFailsLoud) {
+    // Omit it and a walker has no node to key an operand on, so it falls back to
+    // counting separator commas — which the comma OPERATOR inside an operand's
+    // parens (`"r"(a, b)`, accepted by gcc 13.3.0 AND clang 18.1.3) makes
+    // ambiguous. The wrong operand would bind to `%0`, silently.
+    expectRefusal(loadExpectingRefusal(gateHostWithoutKey("operandRule"),
+                                       "facet without operandRule"),
+                  DiagnosticCode::C_MissingField,
+                  {"operandRule", "ALL-OR-NOTHING"},
+                  "an inline-asm facet missing 'operandRule'");
+}
+
+TEST(LanguageReferenceRefusals, InlineAsmFacetMissingClobberSpellingsFailsLoud) {
+    // ⚠ BOTH DIRECTIONS, because a check that only fired for one key would let
+    // the other be the silently-omitted one.
+    for (char const* key : {"memoryClobber", "conditionCodeClobber"}) {
+        expectRefusal(loadExpectingRefusal(gateHostWithoutKey(key),
+                                           "facet without a clobber spelling"),
+                      DiagnosticCode::C_MissingField,
+                      {key, "ALL-OR-NOTHING", "VOCABULARY"},
+                      "an inline-asm facet missing a clobber spelling");
+    }
+}
+
+TEST(LanguageReferenceRefusals, InlineAsmFacetWithANonStringClobberSpellingFailsLoud) {
+    // Present-but-wrong-typed must land on the SAME refusal as absent: a
+    // `true`/`42`/`null` value would otherwise read as "declared" while
+    // supplying nothing to compare against.
+    for (auto value : {nlohmann::json(42), nlohmann::json(true),
+                       nlohmann::json(nullptr),
+                       nlohmann::json(nlohmann::json::array())}) {
+        expectRefusal(loadExpectingRefusal(gateHostWithKey("memoryClobber", value),
+                                           "non-string clobber spelling"),
+                      DiagnosticCode::C_MissingField,
+                      {"memoryClobber", "must be a string"},
+                      "a non-string clobber spelling");
+    }
+}
+
+TEST(LanguageReferenceRefusals, InlineAsmFacetWithAnEmptyClobberSpellingFailsLoud) {
+    // ★ EMPTY IS A DIFFERENT DEFECT FROM ABSENT AND NEEDS ITS OWN ARM. `""`
+    // satisfies "is a string" and then matches no clobber any source can write,
+    // so the check it feeds is permanently, silently false — a disarmed guard
+    // reached by a typo rather than by an omission. Both keys, both directions.
+    for (char const* key : {"memoryClobber", "conditionCodeClobber"}) {
+        expectRefusal(loadExpectingRefusal(gateHostWithKey(key, nlohmann::json("")),
+                                           "empty clobber spelling"),
+                      DiagnosticCode::C_InvalidSemantics,
+                      {key, "EMPTY"},
+                      "an EMPTY clobber spelling");
+    }
+}
+
+TEST(LanguageReferenceRefusals, InlineAsmFacetWithTwoEqualClobberSpellingsFailsLoud) {
+    // ★ THE COPY-PASTE ARM. Declared equal, one of the two checks can never
+    // fire and nothing downstream could tell which — the silent
+    // half-configuration this whole facet is all-or-nothing to prevent, reached
+    // without omitting anything at all.
+    expectRefusal(loadExpectingRefusal(
+                      gateHostWithKey("conditionCodeClobber",
+                                      nlohmann::json("memory")),
+                      "two equal clobber spellings"),
+                  DiagnosticCode::C_ConflictingField,
+                  {"memoryClobber", "conditionCodeClobber", "memory"},
+                  "two EQUAL clobber spellings");
+}
+
+TEST(LanguageReferenceRefusals, InlineAsmFacetOperandRuleNamingNoShapeFailsLoud) {
+    // The name half: a row naming a shape that does not exist would resolve to
+    // an invalid RuleId and the walk would silently match nothing.
+    expectRefusal(loadExpectingRefusal(
+                      gateHostWithKey("operandRule",
+                                      nlohmann::json("noSuchShape")),
+                      "operandRule naming no shape"),
+                  DiagnosticCode::C_UnknownShape,
+                  {"operandRule", "noSuchShape"},
+                  "an 'operandRule' naming no declared shape");
+}
+
+// ★★ AND THE POSITIVE CONTROL FOR THE WHOLE BATTERY: the two spellings the
+// SHIPPED asm document declares are exactly the two GNU-asm clobbers that name
+// no register. Asserted against the real file (reached through the reference
+// merge, not read as text) so a rename in `asm.lang.json` cannot pass unnoticed
+// while every refusal arm above stays green.
+TEST(LanguageReferences, ShippedAsmDeclaresTheTwoNonRegisterClobberSpellings) {
+    auto schema = loadOk(makeHostDoc(HostVariant::WithReference));
+    ASSERT_NE(schema, nullptr);
+    auto const& asmCfg = schema->semantics().inlineAsm;
+    EXPECT_EQ(asmCfg.memoryClobber, "memory");
+    EXPECT_EQ(asmCfg.conditionCodeClobber, "cc");
+    EXPECT_NE(asmCfg.memoryClobber, asmCfg.conditionCodeClobber);
 }

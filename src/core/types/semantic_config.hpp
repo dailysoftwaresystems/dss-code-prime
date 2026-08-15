@@ -1900,6 +1900,54 @@ struct DSS_EXPORT InlineAsmConfig {
     RuleId operandListRule{};       std::string operandListRuleName;
     RuleId clobberListRule{};       std::string clobberListRuleName;
     RuleId gotoLabelListRule{};     std::string gotoLabelListRuleName;
+    // ONE operand inside `operandListRule` — `[name] "constraint" (expr)`.
+    //
+    // ★ THE LIST RULE IS NOT ENOUGH AND THE DIFFERENCE IS NOT COSMETIC. Every
+    // question above is "is this section present / non-empty", which a list node
+    // answers by existing. Binding an operand is the first question about ONE
+    // operand: which constraint string goes with which host expression, and
+    // WHICH INDEX it carries (`%0` names the first operand of the outputs+inputs
+    // concatenation — GCC 6.47.2.3). A walker that had only the list rule would
+    // have to recover operand boundaries by counting separator TOKENS, which is
+    // the token archaeology this whole facet exists to avoid — and it would get
+    // it wrong on the very form `asmOperand`'s own $comment measures, because the
+    // comma OPERATOR is legal inside an operand's parens (`"r"(a, b)` is accepted
+    // by gcc 13.3.0 and clang 18.1.3), so separator commas and operator commas
+    // are indistinguishable at the token.
+    RuleId operandRule{};           std::string operandRuleName;
+
+    // ── the two NON-REGISTER clobber spellings (GCC 6.47.2.5) ──
+    //
+    // ★★★ THEY ARE SPELLINGS, NOT ROLES, AND THAT IS WHY THEY ARE STRINGS RATHER
+    // THAN RuleIds. A clobber list holds string literals; `"memory"` and `"cc"`
+    // are the two entries that name NO register — `"memory"` says the asm reads
+    // or writes memory the compiler cannot see, `"cc"` says it clobbers the
+    // condition flags. Everything else in the list is a per-TARGET register name,
+    // which this facet must never enumerate (that is `.target.json`'s vocabulary
+    // and the reason `asmClobberList` declares none).
+    //
+    // ★★ WHY THEY LIVE IN THE ASM LANGUAGE DOCUMENT AND NOT IN C++ STRING
+    // LITERALS. They are GNU-ASM vocabulary — a property of the assembly surface
+    // being embedded, not of the host language embedding it — exactly like
+    // `gotoQualifierToken` beside them. Hard-coded in `semantic_analyzer.cpp`
+    // they would be an `if (spelling == "memory")` in shared substrate: the
+    // analyzer would be asserting a fact about ONE embeddable language while
+    // claiming to be language-agnostic, and a second embedded language with a
+    // different barrier spelling could not be expressed at all.
+    //
+    // ⚠ THEY ARE NOT DERIVABLE FROM THE TARGET, which is the test this project
+    // applies before adding any config knob. `.target.json` owns REGISTER names;
+    // neither of these is a register on any target (that is precisely what
+    // distinguishes them), so there is nothing for a dialect knob to disagree
+    // with and no second source of truth is created.
+    //
+    // Both are REQUIRED whenever the object is present, on the same
+    // all-or-nothing grounds as every field above: a missing `memoryClobber`
+    // would make `__asm__("" ::: "memory")` look like a REGISTER clobber, and
+    // the analyzer would then try to resolve `memory` against the target's
+    // register file and refuse a barrier every reference compiler accepts.
+    std::string memoryClobber;
+    std::string conditionCodeClobber;
     // The `goto` QUALIFIER token kind. A token, not a rule: it is the same
     // keyword the `goto` statement uses, and the check is "does this kind occur
     // among the statement's pre-template tokens".

@@ -59,6 +59,20 @@ dss_add_test(NAME asm/test_asm_text_to_lir    SOURCES test_asm_text_to_lir.cpp)
 target_link_libraries(dss_asm_test_asm_text_to_lir
     PRIVATE nlohmann_json::nlohmann_json)
 
+# Plan 29 P5: the EMBEDDED template path (`lowerAsmTemplateToLirRun`) — the
+# SECOND caller of the one text->LIR engine. Drives the SHIPPED dialects and
+# the SHIPPED targets unmutated, and pins BYTES rather than opcodes, because a
+# template that elected the right opcode and the wrong encoding variant is the
+# silent-miscompile class this subsystem exists to refuse.
+# WARNING: its byte pins are config-level (they read the shipped `.lang.json`
+# and `.target.json`), so it MUST run through ctest -- `dss_add_test` sets
+# DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever
+# tree the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_template_to_lir
+             SOURCES test_asm_template_to_lir.cpp)
+target_link_libraries(dss_asm_test_asm_template_to_lir
+    PRIVATE nlohmann_json::nlohmann_json)
+
 # The SHIPPED dialect documents, UNMUTATED. Its sibling above replaces
 # `assembly.directives` with the rows each test needs, which is right for
 # testing the ENGINE but leaves every one of those tests green whether or not
@@ -80,7 +94,8 @@ foreach(t test_asm_substrate test_asm_x86_variable test_asm_x86_binaryops
           test_asm_arm64_binops test_lir_2addr_legalize test_asm_roundtrip
           test_asm_pipeline test_asm_width_axis test_asm_x86_tls
           test_asm_arm64_tls test_asm_text_to_lir test_asm_shipped_dialects
-          test_asm_arm64_bitwise_w test_asm_arm64_movz_w)
+          test_asm_arm64_bitwise_w test_asm_arm64_movz_w
+          test_asm_template_to_lir)
     target_include_directories(dss_asm_${t}
         PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
 endforeach()

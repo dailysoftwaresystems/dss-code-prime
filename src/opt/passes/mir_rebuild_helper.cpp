@@ -418,6 +418,24 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         return;
     }
 
+    // Inline-asm P5: an `InlineAsm`'s payload indexes the SOURCE module's
+    // descriptor pool, and this rebuild is building a DIFFERENT module whose pool
+    // starts empty -- forwarding the index below would name the wrong descriptor
+    // or none, i.e. silently drop the template and the clobber list. Re-add the
+    // descriptor to the destination instead. `MirBuilder::addInst` REFUSES the
+    // opcode, so deleting this arm aborts rather than miscompiling.
+    if (op == MirOpcode::InlineAsm) {
+        auto const asmOps = src_.instOperands(oldId);
+        std::vector<MirInstId> newAsmOps;
+        newAsmOps.reserve(asmOps.size());
+        for (auto a : asmOps) newAsmOps.push_back(mapOperand(a));
+        MirInstId const newId = dst_.addInlineAsm(src_.asmDescriptor(oldId), newAsmOps,
+                                                  src_.instType(oldId),
+                                                  src_.instFlags(oldId));
+        rewrite_.emplace(oldId.v, newId);
+        return;
+    }
+
     // Verbatim copy with operand-level substitution applied.
     auto const oldOps = src_.instOperands(oldId);
     std::vector<MirInstId> newOps;
@@ -533,6 +551,24 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             MirInstId const newId = dst_.addSehTryBegin(
                 mapSucc(oldSucc[0]), mapSucc(oldSucc[1]),
                 src_.instPayload(oldId));
+            remember(newId);
+            return;
+        }
+        case MirOpcode::InlineAsmGoto: {
+            // Inline-asm P5. The result pieces live at the heads of the successor
+            // blocks, which the rebuilder clones as ORDINARY blocks -- so the edge
+            // structure comes across through `mapSucc` and nothing needs to be
+            // re-placed. `cloneInlineAsmGoto` (not `addInlineAsmGoto`) is what says
+            // that: re-running the placement rule here would interpose a second
+            // landing block on every optimizer pass.
+            std::vector<MirInstId> newOps;
+            newOps.reserve(oldOps.size());
+            for (MirInstId const a : oldOps) newOps.push_back(mapOperand(a));
+            std::vector<MirBlockId> succs;
+            succs.reserve(oldSucc.size());
+            for (MirBlockId const sB : oldSucc) succs.push_back(mapSucc(sB));
+            MirInstId const newId = dst_.cloneInlineAsmGoto(
+                src_.asmDescriptor(oldId), newOps, succs, src_.instFlags(oldId));
             remember(newId);
             return;
         }

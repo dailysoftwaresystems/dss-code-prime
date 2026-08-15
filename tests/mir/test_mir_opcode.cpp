@@ -15,11 +15,17 @@ constexpr std::uint32_t kOpcodeCount = static_cast<std::uint32_t>(MirOpcode::Cou
 
 bool isOneOfTheTerminators(MirOpcode op) {
     // D-CSUBSET-COMPUTED-GOTO added IndirectBr (the 6th terminator); c115 SEH
-    // (D-WIN64-SEH-FUNCLETS) added SehTryBegin + SehFilterReturn (7th, 8th).
+    // (D-WIN64-SEH-FUNCLETS) added SehTryBegin + SehFilterReturn (7th, 8th);
+    // inline-asm P5 added InlineAsmGoto (the 9th) -- `asm goto`, whose
+    // successors are the label list. This list is a CLOSED CENSUS on purpose:
+    // adding a terminator obliges a clone arm in every MIR rebuild path, so it
+    // must be a deliberate edit here rather than something a row change does
+    // quietly.
     return op == MirOpcode::Br || op == MirOpcode::CondBr || op == MirOpcode::Switch
         || op == MirOpcode::Return || op == MirOpcode::Unreachable
         || op == MirOpcode::IndirectBr
-        || op == MirOpcode::SehTryBegin || op == MirOpcode::SehFilterReturn;
+        || op == MirOpcode::SehTryBegin || op == MirOpcode::SehFilterReturn
+        || op == MirOpcode::InlineAsmGoto;
 }
 
 } // namespace
@@ -39,7 +45,7 @@ TEST(MirOpcode, EveryOpcodeHasADescriptorWithAMnemonic) {
     }
 }
 
-TEST(MirOpcode, ExactlyEightTerminators) {
+TEST(MirOpcode, ExactlyNineTerminators) {
     int terminatorCount = 0;
     for (std::uint32_t i = 0; i < kOpcodeCount; ++i) {
         auto const op = static_cast<MirOpcode>(i);
@@ -52,8 +58,9 @@ TEST(MirOpcode, ExactlyEightTerminators) {
         }
     }
     // Br, CondBr, Switch, Return, Unreachable + IndirectBr (D-CSUBSET-COMPUTED-GOTO)
-    // + SehTryBegin, SehFilterReturn (c115 SEH, D-WIN64-SEH-FUNCLETS).
-    EXPECT_EQ(terminatorCount, 8);
+    // + SehTryBegin, SehFilterReturn (c115 SEH, D-WIN64-SEH-FUNCLETS)
+    // + InlineAsmGoto (inline-asm P5).
+    EXPECT_EQ(terminatorCount, 9);
 }
 
 TEST(MirOpcode, OnlyPhiUsesThePhiPool) {

@@ -50,10 +50,20 @@ public:
     using TagType = LirModuleId;
 
     Lir() noexcept = default;
+    // ⚠ The two module-level SIDE STRUCTURES (`literalPool`,
+    // `regConstraintPool`) are trailing ctor parameters rather than
+    // optional-with-default deliberately: a third side structure added
+    // with a default would be silently omitted by `LirBuilder::finish()`,
+    // which is the same class of drop this pair's verifier rules exist to
+    // catch. `LirBuilder::finish()` is the only caller (✔MEASURED
+    // 2026-08-14: `grep -rn "Lir{" src/ tests/` finds one construction
+    // site plus one `Lir{}` empty-result sentinel), so the cost of
+    // keeping them mandatory is one call site.
     Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
         FuncArena funcArena, std::vector<LirOperand> operandPool,
         std::vector<LirBlockId> succPool,
-        LirLiteralPool literalPool) noexcept;
+        LirLiteralPool literalPool,
+        LirRegConstraintPool regConstraintPool) noexcept;
 
     Lir(Lir const&)            = delete;
     Lir& operator=(Lir const&) = delete;
@@ -79,6 +89,27 @@ public:
     [[nodiscard]] std::uint32_t            instPayload(LirInstId id) const { return instArena_.at(id).payload; }
     [[nodiscard]] std::span<LirOperand const> instOperands(LirInstId id) const;
 
+    // ── per-instruction register constraints (inline-asm carrier) ──
+    //
+    // The RAW handle: `kLirNoRegConstraints` (0) when the instruction
+    // declares none, otherwise a 1-based index into `regConstraintPool()`.
+    // Exposed unresolved for the verifier + the `.dsslir` codec, which
+    // must be able to SEE a dangling handle rather than abort on it.
+    [[nodiscard]] std::uint32_t instRegConstraintHandle(LirInstId id) const {
+        return instArena_.at(id).regConstraints;
+    }
+    // Resolved: `nullptr` when the instruction declares no
+    // per-instruction constraints. Mirrors `TargetSchema::opcodeInfo`'s
+    // nullptr-for-absent convention. Aborts on a DANGLING handle (a
+    // producer bug — `LirRegConstraintPool::at`'s contract), which is why
+    // `verifyLirSideStructures` reports it as a diagnostic first.
+    [[nodiscard]] ImplicitRegisterConstraint const*
+    instRegConstraints(LirInstId id) const {
+        std::uint32_t const h = instRegConstraintHandle(id);
+        if (h == kLirNoRegConstraints) return nullptr;
+        return &regConstraintPool_.at(lirRegConstraintIndexForHandle(h));
+    }
+
     // ── block accessors ──
     [[nodiscard]] std::uint32_t                blockInstCount(LirBlockId id) const { return blockArena_.at(id).instCount; }
     [[nodiscard]] LirFuncId                    blockFunc(LirBlockId id) const;
@@ -103,6 +134,11 @@ public:
     }
     [[nodiscard]] LirLiteralPool const& literalPool() const noexcept { return literalPool_; }
 
+    // ── register-constraint pool (inline-asm carrier) ──
+    [[nodiscard]] LirRegConstraintPool const& regConstraintPool() const noexcept {
+        return regConstraintPool_;
+    }
+
 private:
     TargetSchemaId            target_{};
     InstArena                 instArena_;
@@ -111,6 +147,7 @@ private:
     std::vector<LirOperand>   operandPool_;
     std::vector<LirBlockId>   succPool_;
     LirLiteralPool            literalPool_;
+    LirRegConstraintPool      regConstraintPool_;
 };
 
 static_assert(substrate::Arena<Lir>,
@@ -229,6 +266,62 @@ public:
     // 8-byte operand POD's `immInt32` arm.
     [[nodiscard]] std::uint32_t literalPoolAdd(LirLiteralValue value);
 
+    // ── per-instruction register constraints ──────────────────────
+    //
+    // Append a constraint set to the module's pool; returns its INDEX
+    // (feed it straight to `setInstRegConstraints`). The builder RESOLVES
+    // every register name through the active target schema and overwrites
+    // the ordinal arrays from that resolution:
+    //
+    // ★ the caller supplies NAMES ONLY and cannot desynchronise the two
+    // representations. `ImplicitRegisterConstraint` carries names AND
+    // parallel ordinals precisely because the JSON loader validates one
+    // into the other; a second producer that filled both by hand would be
+    // free to fill them INCONSISTENTLY, and a name/ordinal disagreement
+    // is invisible to every consumer (regalloc reads ordinals, diagnostics
+    // and the `.dsslir` codec read names — they would simply describe
+    // different registers). Resolving here makes that state unreachable.
+    // An unresolvable name ABORTS: it is the same schema-misconfiguration
+    // the loader fails loud on, and the builder has no reporter — the same
+    // contract every other `LirBuilder` guard uses (invalid opcode,
+    // cross-module block id, unterminated block).
+    //
+    // ⚠ THEREFORE A PRODUCER FED BY *USER* TEXT MUST PRE-VALIDATE. An
+    // `asm("" ::: "nosuchreg")` carries a register name the user chose, and
+    // a bad name in user code must be a DIAGNOSTIC, never a compiler
+    // crash. Resolve every name through `schema.registerByName` and report
+    // before you get here; `lir_text.cpp`'s `constraintNamesResolve` is the
+    // reference implementation of exactly that guard, written for the same
+    // reason (a malformed `.dsslir` may not kill the process).
+    [[nodiscard]] std::uint32_t
+    regConstraintPoolAdd(ImplicitRegisterConstraint constraint);
+
+    // How many constraint sets the pool holds so far. Exposed for the
+    // `.dsslir` reader, which must range-check a handle it read from text
+    // and REPORT rather than abort — `setInstRegConstraints`'s out-of-
+    // range guard is a producer contract (it aborts), and a malformed
+    // input file must never kill the process.
+    [[nodiscard]] std::size_t regConstraintPoolSize() const noexcept {
+        return regConstraintPool_.size();
+    }
+
+    // Attach a pool entry to an already-appended instruction. Separated
+    // from `addInst` on purpose: threading a 7th parameter through the
+    // six `add*` entrypoints would put an optional-with-default on every
+    // one of them, and a defaulted "no constraints" is exactly the silent
+    // drop this carrier has to survive. `inst` must belong to this
+    // builder and `poolIndex` must be in range — both abort otherwise
+    // (builder-contract discipline, same as `beginBlock`'s guards).
+    void setInstRegConstraints(LirInstId inst, std::uint32_t poolIndex);
+
+    // The most recently appended instruction. Exists so a pass can carry
+    // side data onto a terminator: the terminator emitters return an id,
+    // but the SHARED dispatch `lir_pass_util::emitTerminator` returns a
+    // bool (it routes to one of five builder entrypoints), so its callers
+    // otherwise have no handle on what it just emitted. Aborts if nothing
+    // has been appended yet.
+    [[nodiscard]] LirInstId lastInst() const;
+
     // Consume the builder, returning the frozen Lir module. Aborts
     // on any contract violation (open function with no terminated
     // block; created-but-never-opened block; etc.) — same discipline
@@ -249,6 +342,7 @@ private:
     std::vector<LirOperand> operandPool_;
     std::vector<LirBlockId> succPool_;
     LirLiteralPool          literalPool_;
+    LirRegConstraintPool    regConstraintPool_;
 
     // Per-function state, reset by `addFunction`.
     LirFuncId  openFunc_{};

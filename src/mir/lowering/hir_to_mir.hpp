@@ -9,6 +9,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"
+#include "hir/hir_inline_asm.hpp"   // HirInlineAsmPool (inline-asm P5 descriptors)
 #include "hir/hir_literal_pool.hpp"
 #include "mir/mir.hpp"
 
@@ -329,6 +330,23 @@ lowerToMir(Hir const&               hir,
            // existed. Read here to stamp `MirFunc.noSanitizeThread`, which
            // `mir_text` surfaces as `nosanitizethread`. Keyed on the same
            // declaration node as the four maps above and read at the same site.
-           HirNoSanitizeThreadMap const* noSanitizeThreadMap = nullptr);
+           HirNoSanitizeThreadMap const* noSanitizeThreadMap = nullptr,
+           // ★★★ Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): the per-CU
+           // descriptor pool an `InlineAsm` node's `payload` HANDLE names —
+           // the template text, the resolved per-operand constraints and the
+           // clobber list. Supplied by the driver as
+           // `&CstToHirResult::inlineAsmPool`.
+           //
+           // ⚠ `nullptr` IS NOT "NO ASM" AND MUST NOT BE READ AS IT. It means
+           // the CALLER did not thread the pool. A node still carries its
+           // handle, so lowering one without the pool would have to invent a
+           // descriptor — an asm block with no operands and no clobbers, which
+           // is precisely the silent miscompile this arc exists to prevent.
+           // ⇒ an `InlineAsm` node whose payload is a REAL handle, reached with
+           // no pool, is a loud `H_UnsupportedLoweringForKind`, never a barrier.
+           // The BARE-BARRIER form (`payload == kNoInlineAsmDescriptor`) needs
+           // no pool by construction and keeps lowering exactly as before, so
+           // every existing pool-free caller is unaffected.
+           HirInlineAsmPool const*  inlineAsmPool = nullptr);
 
 } // namespace dss

@@ -162,6 +162,35 @@ enum class MirOpcode : std::uint16_t {
     // return-register ordinal (≥1 — piece 0 is the Call's own result). Result =
     // the piece's register type (I64/F64). The caller-side mirror of `Arg`.
     ReturnPiece,
+    // ── embedded assembly (inline-asm P5, plan 29 §4.4) ──
+    //
+    // An `__asm__` block whose template is opaque TEXT: operands [inputs...]
+    // (NO callee — which is the one place the row deviates from `Call`'s, see
+    // its opcodeInfo row), payload = an index into the module's
+    // `MirAsmDescriptorPool`. Result Optional: output 0, when the block has
+    // one, IS the instruction's own value; outputs 1..N-1 are `ReturnPiece`
+    // reads anchored to it, exactly as a struct-returning Call's eightbytes are.
+    //
+    // ★★★ ZERO NEW VALUE-PRODUCING OPCODES (the operator's one-fact test).
+    // `ReturnPiece` encodes "this value is result k of the producer I am
+    // anchored to" and nothing else — the only call-specific thing about it is
+    // the word `Return` in its name. A second piece opcode would encode ONE
+    // fact twice, and every consumer (verifier, regalloc, 2addr legalization,
+    // mem2reg, DCE, scheduler, lir_text) would carry both arms forever.
+    //
+    // hasSideEffects + `opcodeClobbersMemory` membership: a template is opaque
+    // text, so no pass may prove it writes nothing, moves nothing, or is dead.
+    InlineAsm,
+    // `asm goto` — the TERMINATOR form. Same operands + payload as `InlineAsm`;
+    // successors = the label list (out-of-band in the succ pool, the
+    // `Switch`/`IndirectBr` shape, ≥1). Result `None`, NOT Optional, and that is
+    // structural rather than a restriction: piece capture requires a piece to
+    // IMMEDIATELY FOLLOW its producer (`lir_callconv.cpp:2255`, `:2522-2529`,
+    // where broken adjacency is already fail-loud) and a terminator has nothing
+    // after it in its block. ⇒ EVERY output of an `asm goto`, output 0 included,
+    // is a `ReturnPiece` at a SUCCESSOR block's head — see
+    // `MirBuilder::addInlineAsmGoto`, which owns the edge-placement rule.
+    InlineAsmGoto,
     // FC7 C3 (AAPCS64/Apple x8 sret). The CALLEE-side entry read of the indirect-
     // result-register (x8): the incoming address of the caller-allocated result
     // storage for a >16-byte by-value RETURN. A leaf value-origin like `Arg`, but
@@ -523,6 +552,15 @@ struct MirOpcodeInfo {
         // effecting so DCE can't drop it and no pass hoists it above its Call (it
         // reads a physical return register valid only immediately post-call).
         case MirOpcode::ReturnPiece:   return {1, 1, 0, 0, R::Value, false, true, false, "returnpiece"};
+        // Inline-asm P5: `Call`'s row SHAPE with ONE deviation, and the deviation
+        // is measured rather than assumed — `Call` is `{1, N}` because its
+        // minimum operand is the CALLEE, and an asm block has no callee, so an
+        // input-less `__asm__("nop")` needs `{0, N}`. Everything else is Call's:
+        // Optional result, side-effecting, non-terminator, and (below)
+        // `opcodeClobbersMemory`. The goto form differs only in being a
+        // terminator with `Switch`'s unbounded successor range and NO result.
+        case MirOpcode::InlineAsm:     return {0, N, 0, 0, R::Optional, false, true, false, "inlineasm"};
+        case MirOpcode::InlineAsmGoto: return {0, N, 1, S, R::None,     true,  true, false, "inlineasmgoto"};
         // ReadIndirectResult: a leaf value-origin (reads x8 at entry) — mirror of
         // Arg; side-effecting so it pins to entry and DCE can't drop it.
         case MirOpcode::ReadIndirectResult:  return {0, 0, 0, 0, R::Value, false, true, false, "readindirectresult"};
@@ -703,6 +741,17 @@ struct MirOpcodeInfo {
         // stack. The conservative full-memory barrier (audit fix #4).
         case MirOpcode::StackSave:
         case MirOpcode::StackRestore:
+        // Inline-asm P5: an assembly template is opaque TEXT. Nothing in the
+        // pipeline can prove it writes no memory an independent Load could
+        // alias, so both forms are unconditional full barriers — the `Call`
+        // argument ("an opaque callee may write anything reachable") with the
+        // opacity moved from the callee body to the template. ⚠ This is NOT the
+        // source's `"memory"` clobber (`MirAsmDescriptor::clobbersMemory`): that
+        // records what the programmer DECLARED; this is what the compiler can
+        // PROVE, and it is nothing. Omitting either form here would let CSE/LICM
+        // move loads across an asm block, silently.
+        case MirOpcode::InlineAsm:
+        case MirOpcode::InlineAsmGoto:
             return true;
         default:
             return false;

@@ -18,6 +18,13 @@ dss_add_test(NAME analysis/semantic/test_semantic_analyzer_c_subset
 dss_add_test(NAME analysis/semantic/test_semantic_analyzer_tsql
              SOURCES test_semantic_analyzer_tsql.cpp)
 
+# Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): the front-end CAPTURE — the
+# per-operand NodeIds, the constraint-string split, and the seven P5 refusals.
+dss_add_test(NAME analysis/semantic/test_inline_asm_capture
+             SOURCES test_inline_asm_capture.cpp)
+target_include_directories(dss_analysis_semantic_test_inline_asm_capture
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 dss_add_test(NAME analysis/semantic/test_semantic_analyzer_genericity
              SOURCES test_semantic_analyzer_genericity.cpp)
 

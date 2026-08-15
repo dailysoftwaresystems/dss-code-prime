@@ -123,17 +123,55 @@ bool emitTerminator(LirBuilder& b, std::uint16_t op,
 }
 
 void
-copyLiteralPool(Lir const& src, LirBuilder& dst) {
+copyModuleSideStructures(Lir const& src, LirBuilder& dst) {
     // Append every source pool entry in index order. The destination
-    // builder is freshly constructed (empty pool), so `literalPoolAdd`
-    // returns 0, 1, 2, ... — reproducing the source indices that the
-    // copied `LiteralIndex` operands reference. (No dedup: the pool is a
-    // by-index store, not a value set; preserving identity is the whole
-    // point.)
-    auto const& pool = src.literalPool();
-    for (std::uint32_t i = 0; i < pool.size(); ++i) {
-        (void)dst.literalPoolAdd(pool.at(i));
+    // builder is freshly constructed (empty pools), so the `*Add` calls
+    // return 0, 1, 2, ... — reproducing the source indices that the
+    // copied `LiteralIndex` operands and `regConstraints` handles
+    // reference. (No dedup in either pool: they are by-index stores, not
+    // value sets; preserving identity is the whole point.)
+    auto const& literals = src.literalPool();
+    for (std::uint32_t i = 0; i < literals.size(); ++i) {
+        (void)dst.literalPoolAdd(literals.at(i));
     }
+    // ⚠ The re-add goes through `regConstraintPoolAdd`, which RE-RESOLVES
+    // every register name against the destination builder's schema. That
+    // is deliberate rather than a raw copy: a pass rebuilding a module
+    // under a schema whose register table disagrees with the one the
+    // constraints were authored against is a real (if today unreachable)
+    // configuration error, and re-resolution turns it into the loud abort
+    // the authoring path already has instead of a silently stale ordinal.
+    // The ordinals are recomputed, never trusted from the source.
+    auto const& constraints = src.regConstraintPool();
+    for (std::uint32_t i = 0; i < constraints.size(); ++i) {
+        (void)dst.regConstraintPoolAdd(constraints.at(i));
+    }
+}
+
+void
+carryInstSideData(Lir const& src, LirInstId srcInst,
+                  LirBuilder& dst, LirInstId dstInst) {
+    std::uint32_t const handle = src.instRegConstraintHandle(srcInst);
+    if (handle == kLirNoRegConstraints) return;
+    // The pools were copied index-preservingly by
+    // `copyModuleSideStructures`, so the SOURCE index is also the
+    // destination index. `setInstRegConstraints` range-checks it anyway —
+    // if a caller skipped the pool copy, that guard is what turns the
+    // mistake into an abort at build time instead of a dangling handle
+    // that reaches the allocator.
+    dst.setInstRegConstraints(
+        dstInst, lirRegConstraintIndexForHandle(handle));
+}
+
+void
+carryInstSideData(Lir const& src, LirInstId srcInst, LirBuilder& dst) {
+    // Deliberately does NOT short-circuit on "no constraints" before
+    // calling `lastInst()`: a caller that has appended nothing is a
+    // caller whose pairing is wrong, and it should abort on the empty
+    // module rather than only on the modules that happen to carry
+    // constraints (the "exercise the failure arm" rule — a guard that
+    // only fires on the rare input is a guard nobody ever runs).
+    carryInstSideData(src, srcInst, dst, dst.lastInst());
 }
 
 } // namespace dss::lir_pass_util

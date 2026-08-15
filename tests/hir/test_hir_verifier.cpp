@@ -16,6 +16,7 @@
 #include "hir/hir_attrs.hpp"
 #include "hir/hir_node.hpp"
 #include "hir/hir_op.hpp"
+#include "hir/hir_inline_asm.hpp"
 #include "hir/hir_verifier.hpp"
 #include "diagnostic_count.hpp"
 
@@ -29,6 +30,13 @@
 #include <type_traits>
 
 using dss::CompilationUnitId;
+// Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): checkInlineAsm's vocabulary.
+using dss::childArity;
+using dss::HirInlineAsmDescriptor;
+using dss::HirInlineAsmPool;
+using dss::InvalidType;
+using dss::kNoInlineAsmDescriptor;
+using dss::kUnboundedArity;
 using dss::DiagnosticCode;
 using dss::DiagnosticReporter;
 using dss::DiagnosticSeverity;
@@ -1268,4 +1276,105 @@ TEST(HirVerifier, ShaderReachingARecursiveHelperFires) {
     EXPECT_FALSE(HirVerifier{h}.verify(reporter));
     // helper (direct recursion) AND main (reaches the cycle) are both reported.
     EXPECT_EQ(countCode(reporter, DiagnosticCode::H_ShaderViolation), 2u);
+}
+
+// ── inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS) ───────────────────────────
+
+namespace {
+
+// A module whose single statement is one InlineAsm node with `childCount`
+// children and the given payload.
+[[nodiscard]] Hir asmModule(std::uint32_t payload, std::size_t childCount,
+                            TypeInterner& in) {
+    TypeId const i64 = in.primitive(TypeKind::I64);
+    HirBuilder b{"c-subset"};
+    std::vector<HirNodeId> kids;
+    for (std::size_t i = 0; i < childCount; ++i)
+        kids.push_back(b.makeRef(i64, static_cast<std::uint32_t>(i + 2)));
+    HirNodeId const asmN =
+        kids.empty() ? b.addLeaf(HirKind::InlineAsm, InvalidType, payload)
+                     : b.addParent(HirKind::InlineAsm, kids, InvalidType, payload);
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
+    return std::move(b).finish(b.makeModule(std::vector<HirNodeId>{body}));
+}
+
+} // namespace
+
+// (a) THE POOL-FREE HALF. A node with no descriptor must have no children: a
+// leaf-with-children reaches MIR's CompilerBarrier arm and has its operands
+// DROPPED with no diagnostic, which is the exact silent miscompile this arc
+// exists to close. Checked WITHOUT a pool, because it needs none.
+TEST(HirVerifier, InlineAsmWithChildrenButNoDescriptorIsRejected) {
+    TypeInterner in{CompilationUnitId{1}};
+    Hir const bad = asmModule(kNoInlineAsmDescriptor, /*childCount=*/2, in);
+    DiagnosticReporter r;
+    HirVerifier v{bad};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_GT(countCode(r, DiagnosticCode::H_VerifierFailure), 0u);
+
+    // POSITIVE CONTROL: the same node with ZERO children is the legitimate
+    // bare barrier and must verify clean.
+    TypeInterner in2{CompilationUnitId{2}};
+    Hir const good = asmModule(kNoInlineAsmDescriptor, /*childCount=*/0, in2);
+    DiagnosticReporter r2;
+    HirVerifier v2{good};
+    EXPECT_TRUE(v2.verify(r2));
+}
+
+// (b) THE POOL-DEPENDENT HALF: a dangling handle, and a descriptor whose
+// operand count disagrees with the child list.
+TEST(HirVerifier, InlineAsmDescriptorHandleMustResolveAndAgreeWithTheChildren) {
+    TypeInterner in{CompilationUnitId{1}};
+    HirInlineAsmPool pool;
+    HirInlineAsmDescriptor d;
+    d.templateText = "nop";
+    d.operands.resize(2);
+    std::uint32_t const handle = pool.add(std::move(d));
+
+    // AGREEING: 2 operands, 2 children -> clean.
+    Hir const ok = asmModule(handle, /*childCount=*/2, in);
+    DiagnosticReporter r0;
+    HirVerifier v0{ok, nullptr, nullptr, &pool};
+    EXPECT_TRUE(v0.verify(r0));
+
+    // DISAGREEING: 2 operands, 1 child -> the constraint for operand 1 would be
+    // applied to the wrong value, or to none.
+    TypeInterner in2{CompilationUnitId{2}};
+    Hir const mismatch = asmModule(handle, /*childCount=*/1, in2);
+    DiagnosticReporter r1;
+    HirVerifier v1{mismatch, nullptr, nullptr, &pool};
+    EXPECT_FALSE(v1.verify(r1));
+    EXPECT_GT(countCode(r1, DiagnosticCode::H_VerifierFailure), 0u);
+
+    // DANGLING: a handle past the end of the pool.
+    TypeInterner in3{CompilationUnitId{3}};
+    Hir const dangling = asmModule(handle + 99, /*childCount=*/2, in3);
+    DiagnosticReporter r2;
+    HirVerifier v2{dangling, nullptr, nullptr, &pool};
+    EXPECT_FALSE(v2.verify(r2));
+
+    // !! AND THE UNASKED ARM, pinned so "no pool" never becomes "assumed good"
+    // by accident in one direction while looking harmless in the other: with NO
+    // pool the dangling handle is NOT reported (it cannot be), but the
+    // pool-FREE rule above still runs. That is a deliberate split, not a hole.
+    DiagnosticReporter r3;
+    HirVerifier v3{dangling};
+    EXPECT_TRUE(v3.verify(r3))
+        << "with no pool the handle is unresolvable and must be left unjudged";
+}
+
+// The `InlineAsm` arity itself: widening it must not have widened its former
+// case-group neighbours. `test_hir_node.cpp` pins this at COMPILE time; this is
+// the behavioural half, and it exists because the first attempt at the widening
+// DID silently widen Break/Continue/Unreachable.
+TEST(HirVerifier, WideningInlineAsmArityDidNotWidenItsFormerCaseGroupNeighbours) {
+    EXPECT_EQ(childArity(HirKind::InlineAsm).min, 0u);
+    EXPECT_EQ(childArity(HirKind::InlineAsm).max, kUnboundedArity);
+    for (HirKind k : {HirKind::BreakStmt, HirKind::ContinueStmt,
+                      HirKind::Unreachable}) {
+        EXPECT_EQ(childArity(k).min, 0u);
+        EXPECT_EQ(childArity(k).max, 0u)
+            << "a fall-through case group made these share InlineAsm's arity; "
+               "they are leaves and must stay {0,0}";
+    }
 }

@@ -5,7 +5,9 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -20,19 +22,45 @@ namespace {
 
 } // namespace
 
+// ── LirRegConstraintPool ─────────────────────────────────────────
+//
+// Byte-for-byte the shape of `LirLiteralPool` (append-only, by-index,
+// abort-on-out-of-range) — see the docblock in `lir_node.hpp` for why
+// the two side structures are deliberately the same shape. It lives in
+// this TU rather than a header-inline definition so the fatal path
+// keeps `<cstdio>`/`<cstdlib>` out of the widely-included
+// `lir_node.hpp`.
+
+std::uint32_t LirRegConstraintPool::add(ImplicitRegisterConstraint c) {
+    auto const idx = static_cast<std::uint32_t>(pool_.size());
+    pool_.push_back(std::move(c));
+    return idx;
+}
+
+ImplicitRegisterConstraint const&
+LirRegConstraintPool::at(std::uint32_t index) const {
+    if (index >= pool_.size()) {
+        lirFatal("LirRegConstraintPool::at: index out of range (a "
+                 "register-constraint handle outlived its pool)");
+    }
+    return pool_[index];
+}
+
 // ── Lir ──────────────────────────────────────────────────────────
 
 Lir::Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
          FuncArena funcArena, std::vector<LirOperand> operandPool,
          std::vector<LirBlockId> succPool,
-         LirLiteralPool literalPool) noexcept
+         LirLiteralPool literalPool,
+         LirRegConstraintPool regConstraintPool) noexcept
     : target_(target),
       instArena_(std::move(instArena)),
       blockArena_(std::move(blockArena)),
       funcArena_(std::move(funcArena)),
       operandPool_(std::move(operandPool)),
       succPool_(std::move(succPool)),
-      literalPool_(std::move(literalPool)) {
+      literalPool_(std::move(literalPool)),
+      regConstraintPool_(std::move(regConstraintPool)) {
     // Cross-arena module-id check — all four arenas must share one tag.
     if (instArena_.id() != blockArena_.id()
      || instArena_.id() != funcArena_.id()) {
@@ -341,6 +369,102 @@ std::uint32_t LirBuilder::literalPoolAdd(LirLiteralValue value) {
     return literalPool_.add(std::move(value));
 }
 
+namespace {
+
+// Resolve one register NAME through the active schema, or abort naming
+// the offender. Shared by the three positional arrays and the two role
+// maps so every arm fails identically — a per-arm resolution would be
+// free to diverge, which is how `unistd.json`'s alias set ended up half-
+// applied.
+[[nodiscard]] std::uint16_t
+resolveConstraintReg(TargetSchema const& schema, std::string const& name,
+                     char const* what) {
+    auto const ord = schema.registerByName(name);
+    if (!ord.has_value()) {
+        std::fputs("dss::Lir fatal: LirBuilder::regConstraintPoolAdd: ", stderr);
+        std::fputs(what, stderr);
+        std::fputs(" register name '", stderr);
+        std::fputs(name.c_str(), stderr);
+        std::fputs("' is not in the target schema's register table\n", stderr);
+        std::abort();
+    }
+    return *ord;
+}
+
+void resolveConstraintArray(TargetSchema const& schema,
+                            std::vector<std::string> const& names,
+                            std::vector<std::uint16_t>& ordinals,
+                            char const* what) {
+    ordinals.clear();
+    ordinals.reserve(names.size());
+    for (auto const& n : names) {
+        ordinals.push_back(resolveConstraintReg(schema, n, what));
+    }
+}
+
+void resolveConstraintRoles(
+    TargetSchema const& schema,
+    std::vector<std::pair<std::string, std::string>> const& roleNames,
+    std::vector<std::pair<std::string, std::uint16_t>>& roleOrdinals,
+    char const* what) {
+    roleOrdinals.clear();
+    roleOrdinals.reserve(roleNames.size());
+    for (auto const& [role, reg] : roleNames) {
+        roleOrdinals.emplace_back(role, resolveConstraintReg(schema, reg, what));
+    }
+}
+
+} // namespace
+
+std::uint32_t
+LirBuilder::regConstraintPoolAdd(ImplicitRegisterConstraint constraint) {
+    // ★ The caller's ordinal arrays (if any) are OVERWRITTEN, never
+    // merged or checked-against. See the header docblock: names are the
+    // authored source of truth in `ImplicitRegisterConstraint`'s own
+    // contract, so re-deriving is what makes "the names and the ordinals
+    // name the same registers" true by construction rather than by
+    // review. The target's register table is the only vocabulary
+    // consulted — the pool stores ORDINALS and never learns which CPU
+    // this is.
+    resolveConstraintArray(target_, constraint.inputNames,
+                           constraint.inputOrdinals, "implicit-input");
+    resolveConstraintArray(target_, constraint.outputNames,
+                           constraint.outputOrdinals, "implicit-output");
+    resolveConstraintArray(target_, constraint.clobberedNames,
+                           constraint.clobberedOrdinals, "clobbered");
+    resolveConstraintRoles(target_, constraint.inputRoleNames,
+                           constraint.inputRoleOrdinals, "input-role");
+    resolveConstraintRoles(target_, constraint.outputRoleNames,
+                           constraint.outputRoleOrdinals, "output-role");
+    return regConstraintPool_.add(std::move(constraint));
+}
+
+void LirBuilder::setInstRegConstraints(LirInstId inst,
+                                       std::uint32_t poolIndex) {
+    if (inst.arenaTag != moduleId_.v) {
+        lirFatal("LirBuilder::setInstRegConstraints: cross-module inst id");
+    }
+    if (poolIndex >= regConstraintPool_.size()) {
+        lirFatal("LirBuilder::setInstRegConstraints: pool index out of range "
+                 "(call regConstraintPoolAdd first)");
+    }
+    // `ArenaBuilder::at` re-validates the id against the arena bounds +
+    // tag, so an id from a DIFFERENT builder of the same module (there is
+    // no such thing today, but the guard is free) still cannot land here.
+    instArena_.at(inst).regConstraints =
+        lirRegConstraintHandleForIndex(poolIndex);
+}
+
+LirInstId LirBuilder::lastInst() const {
+    // Slot 0 is the arena's reserved sentinel, so `size() <= 1` means
+    // "nothing appended".
+    if (instArena_.size() <= 1) {
+        lirFatal("LirBuilder::lastInst: no instruction has been appended");
+    }
+    return LirInstId{static_cast<std::uint32_t>(instArena_.size() - 1),
+                     moduleId_.v};
+}
+
 Lir LirBuilder::finish() && {
     if (openFunc_.valid()) closeFunction_();
     return Lir{
@@ -351,6 +475,7 @@ Lir LirBuilder::finish() && {
         std::move(operandPool_),
         std::move(succPool_),
         std::move(literalPool_),
+        std::move(regConstraintPool_),
     };
 }
 

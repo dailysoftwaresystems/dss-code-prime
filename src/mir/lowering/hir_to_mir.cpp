@@ -147,6 +147,12 @@ struct Lowerer {
     // lowers to `GlobalAddr(sym)` (the callee is defined later by the synth pass, which
     // MirVerifier tolerates) instead of failing loud "HIR Ref to unbound symbol".
     std::unordered_map<std::uint32_t, std::string> const* synthRecipeMap = nullptr;
+    // Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): the per-CU descriptor pool an
+    // `InlineAsm` node's payload HANDLE names. nullptr ⇒ the caller did not thread
+    // it, which is NOT the same as "this CU has no asm" — a descriptor-carrying node
+    // reached without it fails loud rather than lowering to a barrier that would
+    // silently drop the operands, the clobbers and the template.
+    HirInlineAsmPool const*  inlineAsmPool = nullptr;
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -7608,8 +7614,18 @@ struct Lowerer {
             std::uint32_t const ord =
                 (p.cls == AbiPieceClass::Fpr) ? fprRet++ : gprRet++;
             if (k == 0) { pieceVals.push_back(call); continue; }
+            // Plan 29 §4.4.5: the piece's register CLASS is now CARRIED, not
+            // re-derived downstream from `pieceType(p)`. The ABI classifier
+            // already decided it — `p.cls` is the same fact the `ord` counter
+            // above is selected by — so passing it here is the class reaching
+            // its consumer instead of being discarded and guessed back. For a
+            // Call the two agree by construction (that is why the old inference
+            // worked); for an asm output constraint they do not.
             MirInstId const rp =
-                mir.addReturnPiece(call, ord, pieceType(p));
+                mir.addReturnPiece(call, ord,
+                                   (p.cls == AbiPieceClass::Fpr) ? TargetRegClass::FPR
+                                                                 : TargetRegClass::GPR,
+                                   pieceType(p));
             if (!rp.valid()) return InvalidMirInst;
             pieceVals.push_back(rp);
         }
@@ -9232,6 +9248,260 @@ struct Lowerer {
     // the expression driver's SeqExpr arm) call this driver; each spins up its
     // OWN local work-stack, so a for-init/SeqExpr statement subtree drains fully
     // before its caller resumes — identical ordering to the recursive nesting.
+    // ★★★ INLINE-ASM P5 (D-CSUBSET-INLINE-ASM-OPERANDS) — THE HIR→MIR SEAM.
+    //
+    // `HirKind::InlineAsm` carries a `HirInlineAsmPool` HANDLE in its payload and its
+    // operand VALUE EXPRESSIONS as children (outputs first, then inputs — the `%N`
+    // index space, GNU 6.47.2.3). This translates that into the MIR carriage the
+    // second operator ruling fixed (plan 29 §4.4): a `MirAsmDescriptor` in the
+    // module's pool, the INPUTS as ordinary MIR operands, and each OUTPUT as a
+    // `ReturnPiece` anchored to the asm instruction — `Call`'s row shape and
+    // `Call`'s piece mechanism, reused verbatim. ZERO new value-producing opcodes.
+    //
+    // ⚠ EVERY FAILURE BELOW IS A REFUSAL, NEVER A PARTIAL BUILD. A descriptor
+    // missing one operand is worse than no descriptor: it would hand the allocator a
+    // clobber promise for a block whose inputs it cannot see. This mirrors
+    // `cst_to_hir.cpp`'s own rule at the tier above.
+    [[nodiscard]] bool lowerInlineAsm(HirNodeId node) {
+        std::uint32_t const handle = hir.payload(node);
+
+        // SHAPE 1 — the bare barrier. No descriptor, no operands, no clobbers, and
+        // no pool needed by construction. Byte-identical to the pre-P5 emit, which
+        // is what keeps every pool-free caller (and `examples/c-subset/c_inline_asm`,
+        // nine barrier spellings) unchanged.
+        if (handle == kNoInlineAsmDescriptor) {
+            mir.addInst(MirOpcode::CompilerBarrier, {}, InvalidType);
+            return true;
+        }
+
+        // SHAPE 2 — a descriptor-carrying statement. From here on the pool is
+        // load-bearing: without it the operands, the template and the clobber list
+        // are all unreachable, and the ONLY alternative to failing is inventing an
+        // empty descriptor — the silent miscompile itself.
+        if (inlineAsmPool == nullptr || !inlineAsmPool->contains(handle)) {
+            unsupported(node, std::format(
+                "inline-asm statement carries descriptor handle {} but the "
+                "HirInlineAsmPool {} — the operands, clobbers and template cannot be "
+                "read, and lowering a barrier here would silently drop all three "
+                "(D-CSUBSET-INLINE-ASM-OPERANDS)",
+                handle,
+                inlineAsmPool == nullptr ? "was not threaded into lowerToMir"
+                                         : "does not resolve it"));
+            return false;
+        }
+        HirInlineAsmDescriptor const& src = inlineAsmPool->at(handle);
+
+        // The children ARE the operand values and the pool entry describes them, so a
+        // count mismatch means the two halves disagree about what this statement is.
+        // `HirVerifier::checkInlineAsm` pins children == operands, but this lowering
+        // must not DEPEND on the verifier having run: `test_mir_lowering_c_subset`'s
+        // `lowerCSubset` reaches here with no verifier and no semantic gate, and that
+        // is deliberate so a lowering bug cannot hide behind another tier's refusal.
+        auto const kids = hir.children(node);
+        if (kids.size() != src.operands.size()) {
+            unsupported(node, std::format(
+                "inline-asm descriptor declares {} operand(s) but the HIR node has {} "
+                "child value expression(s) — the two halves of one statement disagree "
+                "(D-CSUBSET-INLINE-ASM-OPERANDS)",
+                src.operands.size(), kids.size()));
+            return false;
+        }
+        if (src.outputCount > src.operands.size()) {
+            unsupported(node, std::format(
+                "inline-asm descriptor claims {} output(s) out of {} operand(s) "
+                "(D-CSUBSET-INLINE-ASM-OPERANDS)",
+                src.outputCount, src.operands.size()));
+            return false;
+        }
+
+        // ── translate the descriptor ────────────────────────────────────────────
+        // The register CLASS and the pinned register NAME were resolved ONCE by the
+        // front end against the target's register table (`HirInlineAsmOperand`'s
+        // "TARGET half"). This tier copies them; it never re-resolves a letter and
+        // never enumerates a register name — that is what keeps the constraint
+        // vocabulary a property of the `.target.json` and not of this file.
+        //
+        // ⚠ AN UNRESOLVED CLASS IS A REFUSAL, NOT A GPR DEFAULT. `regClassResolved`
+        // is false exactly when no target was in scope at analysis; guessing GPR here
+        // would file an `"=x"` operand in the integer pool and silently index the
+        // wrong register bank (plan 29 §4.4.5 — GPR is the else-branch default of
+        // every downstream two-way test, so the wrong answer is the quiet one).
+        MirAsmDescriptor desc;
+        desc.templateText           = src.templateText;
+        // ⚠ FOUND IN PASSING, HANDLED CONSERVATIVELY, NOT WALKED PAST:
+        // `HirInlineAsmDescriptor` has NO `isVolatile` member — ✔MEASURED
+        // 2026-08-15, the `volatile` qualifier is PARSED (it is one arm of the
+        // order-free qualifier run) and then not carried into the descriptor, so
+        // the source's word is unavailable at this tier. The two honest options
+        // are to refuse every asm statement or to pick the direction that can
+        // only ever forbid motion the source permitted, never permit motion it
+        // forbade. `true` is that direction.
+        //
+        // The practical delta today is ZERO and that is measured, not assumed:
+        // `MirOpcode::InlineAsm`/`InlineAsmGoto` are BOTH `hasSideEffects` and
+        // both members of the opcode memory-clobber set unconditionally
+        // (`mir_opcode.hpp:562-563`, `:754`), so the four optimizer gates already
+        // refuse to move or elide the block regardless of this bit — the field's
+        // own docblock says it "records the SOURCE's word; it is not the
+        // optimizer's only defence". The bit becomes load-bearing the moment a
+        // pass keys elision of an unused-output asm off it, which is why this is
+        // reported as a front-end gap rather than left as a silent `false`.
+        desc.isVolatile             = true;
+        desc.clobbers               = src.clobbers;
+        desc.clobbersMemory         = src.clobbersMemory;
+        desc.clobbersConditionCodes = src.clobbersConditionCodes;
+
+        for (std::size_t i = 0; i < src.operands.size(); ++i) {
+            HirInlineAsmOperand const& o = src.operands[i];
+            if (!o.regClassResolved) {
+                unsupported(node, std::format(
+                    "inline-asm operand {} (constraint \"{}\") has no resolved "
+                    "register class — the constraint letter was never bound to a "
+                    "processor, and choosing one here would pick a register bank the "
+                    "source did not ask for (D-CSUBSET-INLINE-ASM-OPERANDS)",
+                    i, o.constraint.raw));
+                return false;
+            }
+            MirAsmOperand mo;
+            mo.constraint     = o.constraint.raw;
+            mo.regClass       = static_cast<TargetRegClass>(o.regClass);
+            mo.fixedRegister  = o.fixedRegister;
+            mo.isReadWrite    = o.constraint.isReadWrite;
+            mo.isEarlyClobber = o.constraint.earlyClobber;
+            if (i < src.outputCount) desc.outputs.push_back(std::move(mo));
+            else                     desc.inputs.push_back(std::move(mo));
+        }
+
+        // ── lower the operand value expressions ─────────────────────────────────
+        // Outputs are LVALUES: the asm writes a register and the piece is stored back
+        // through the lvalue's ADDRESS. Taking the address here (rather than after the
+        // asm) keeps the address computation OUT of the producer→piece adjacency
+        // window that `lir_callconv` requires — the same reason `emitStructReturningCall`
+        // hoists its Geps into a second pass.
+        //
+        // ★ EVERY ADDRESS AND EVERY INPUT IS COMPUTED BEFORE THE ASM IS EMITTED, and
+        // the whole batch is validated before ANY of it is used. A mid-loop bail-out
+        // after the asm instruction existed would leave a producer with a partial
+        // piece set — the shape `mir_to_lir.cpp:4944-4950` names as drowning the root
+        // cause.
+        std::vector<MirInstId> outAddrs;
+        outAddrs.reserve(src.outputCount);
+        for (std::size_t k = 0; k < src.outputCount; ++k) {
+            MirInstId const addr = lowerLvalueAddress(kids[k]);
+            if (!addr.valid()) return false;
+            outAddrs.push_back(addr);
+        }
+        std::vector<MirInstId> inputs;
+        inputs.reserve(src.operands.size() - src.outputCount);
+        for (std::size_t j = src.outputCount; j < src.operands.size(); ++j) {
+            MirInstId const v = lowerExpr(kids[j]);
+            if (!v.valid()) return false;
+            inputs.push_back(v);
+        }
+
+        // Output k's piece type is the type of the lvalue the source bound to it —
+        // the C type of `out` in `"=r"(out)`. The register CLASS is the CONSTRAINT's
+        // and is carried separately on the piece; the two are independent facts and
+        // conflating them is the §4.4.5 defect.
+        auto pieceTypeFor = [&](std::size_t k) { return hir.typeId(kids[k]); };
+
+        // The per-output register CLASSES, snapshotted BEFORE `desc` is moved into
+        // the builder. `MirBuilder` deliberately exposes no descriptor reader — the
+        // pool is private and only the finished `Mir` can resolve a payload — so the
+        // classes must be carried out of the descriptor while it is still ours.
+        std::vector<TargetRegClass> outClasses;
+        outClasses.reserve(desc.outputs.size());
+        for (auto const& o : desc.outputs) outClasses.push_back(o.regClass);
+
+        // ── emit ────────────────────────────────────────────────────────────────
+        // ⚠ `addInlineAsm` / `addInlineAsmGoto` are DEDICATED builders and `addInst`
+        // REFUSES both opcodes: the descriptor must be re-added to the destination
+        // module's pool on every rebuild, so a copy site that forwards a raw payload
+        // index aborts instead of naming a different entry (or none) in an empty pool.
+        // ⚠ `isGoto` IS NOT THE SAME QUESTION AS "ARE THERE LABELS", and conflating
+        // them ABORTS THE COMPILER on a legal program. ✔MEASURED 2026-08-15:
+        // `MirBuilder::addInlineAsmGoto` (`mir.cpp:887-891`) calls `std::abort()` on an
+        // empty label span, because `opcodeInfo` requires `InlineAsmGoto` to have >= 1
+        // successor. But clang 18.1.3/19.1.1 ACCEPT `asm goto` with an EMPTY label
+        // section (gcc 13.3 rejects it) and the operator ruled to follow clang — the
+        // `HirInlineAsmDescriptor::isGoto` docblock records exactly that — so a
+        // goto-qualified statement with zero labels is a program DSS must compile.
+        //
+        // With no labels there are no extra successors, so such a statement is not a
+        // terminator at all: it is an ordinary asm block that merely carries a
+        // qualifier. Routing it to the non-terminator path is the semantically exact
+        // answer, not an evasion — and it is what keeps the abort unreachable from
+        // source rather than merely unlikely.
+        if (src.isGoto && !src.labelOrdinals.empty()) {
+            std::vector<MirBlockId> labels;
+            labels.reserve(src.labelOrdinals.size());
+            for (std::uint32_t ord : src.labelOrdinals)
+                labels.push_back(getOrCreateLabelBlock(ord));
+
+            auto const res = mir.addInlineAsmGoto(std::move(desc), inputs, labels);
+            if (!res.terminator.valid()) return false;
+
+            // THE EDGE-PLACEMENT RULE (plan 29 §4.5, `mir.hpp:600-631`). A terminator
+            // has nothing after it in its block, so an `asm goto` with outputs places
+            // its pieces at the head of every SUCCESSOR. The builder interposed a
+            // single-predecessor landing block on each edge; fill each one, then
+            // branch on to the label the source named. A split block left unopened is
+            // caught by `finish()`'s fill+terminate sweep, so a forgotten edge cannot
+            // ship.
+            for (auto const& e : res.edges) {
+                if (!e.split) continue;
+                mir.beginBlock(e.successor);
+                for (std::size_t k = 0; k < src.outputCount; ++k) {
+                    MirInstId const rp = mir.addReturnPiece(
+                        res.terminator, static_cast<std::uint32_t>(k),
+                        outClasses[k], pieceTypeFor(k));
+                    if (!rp.valid()) return false;
+                    std::array<MirInstId, 2> st{rp, outAddrs[k]};
+                    mir.addInst(MirOpcode::Store, st);
+                }
+                mir.addBr(e.label);
+            }
+            // An `asm goto` SEALS its block. Open a fresh dead block for anything the
+            // statement list still holds, exactly as the other terminator arms do; the
+            // mandatory unreachable-prune (D-MIR-UNREACHABLE-PRUNE-NORMALIZE) drops it.
+            if (mir.openBlockHasTerminator()) {
+                MirBlockId const dead = mir.createBlock(StructCfMarker::Linear);
+                mir.beginBlock(dead);
+            }
+            return true;
+        }
+
+        // The non-terminator form. `resultType` is output 0's type (the instruction's
+        // own result IS piece 0 — `Call`'s rule) or InvalidType when there are none.
+        TypeId const resultType =
+            src.outputCount > 0 ? pieceTypeFor(0) : InvalidType;
+        MirInstId const asmInst =
+            mir.addInlineAsm(std::move(desc), inputs, resultType);
+        if (!asmInst.valid()) return false;
+
+        // Pass 1 — capture pieces 1..N-1 IMMEDIATELY after the producer. Nothing may
+        // intervene: `lir_callconv.cpp:2615-2632` fails loud on a piece that is not
+        // adjacent to its producer, because a non-adjacent read would take a register
+        // the asm block has already overwritten. Piece 0 is `asmInst` itself.
+        std::vector<MirInstId> pieceVals;
+        pieceVals.reserve(src.outputCount);
+        for (std::size_t k = 0; k < src.outputCount; ++k) {
+            if (k == 0) { pieceVals.push_back(asmInst); continue; }
+            MirInstId const rp = mir.addReturnPiece(
+                asmInst, static_cast<std::uint32_t>(k),
+                outClasses[k], pieceTypeFor(k));
+            if (!rp.valid()) return false;
+            pieceVals.push_back(rp);
+        }
+        // Pass 2 — store each captured piece back through its lvalue address. Only
+        // now, with the adjacency window closed, may Stores appear.
+        for (std::size_t k = 0; k < src.outputCount; ++k) {
+            std::array<MirInstId, 2> st{pieceVals[k], outAddrs[k]};
+            mir.addInst(MirOpcode::Store, st);
+        }
+        return true;
+    }
+
     [[nodiscard]] bool lowerStmt(HirNodeId node) {
         std::vector<StmtFrame> work;
         // `enterStmt` ALWAYS assigns `ok` for a delegated node, and every pushed
@@ -9841,6 +10111,15 @@ struct Lowerer {
                 return lowerDiscardedExpr(hir.exprStmtExpr(node));
             }
             case HirKind::InlineAsm:
+                // ★★★ TWO SHAPES, ONE KIND — and the discriminator is the PAYLOAD,
+                // never the child count. `cst_to_hir.cpp` builds a 0-child leaf with
+                // `payload == kNoInlineAsmDescriptor` for the bare barrier and a
+                // descriptor-carrying node for everything else; a descriptor-carrying
+                // node may ALSO have zero children (`__asm__("nop" ::: "eax")` binds
+                // no operands but does promise a clobber), so keying on children would
+                // route exactly the statements that carry a clobber list back into the
+                // barrier arm and drop the promise.
+                //
                 // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm statement
                 // `__asm__ [volatile] ("")` is a pure compiler reordering + full-
                 // memory fence — semantically IDENTICAL to _ReadWriteBarrier. Reuse
@@ -9849,13 +10128,22 @@ struct Lowerer {
                 // move/elide across it), which lowers to ZERO target instructions on
                 // every target (mir_to_lir.cpp CompilerBarrier → return). This is
                 // byte-for-byte the _ReadWriteBarrier emit (hir_to_mir BuiltinLowering::
-                // Barrier). The semantic tier already rejected any non-empty template
-                // (S_InlineAsmNonEmptyTemplate) before codegen, so only the provably-
-                // inert empty form reaches here. The non-empty per-target text arc
-                // (D-CSUBSET-INLINE-ASM-TEXT) will introduce its own template-carrying
-                // lowering; the empty case need never use it.
-                mir.addInst(MirOpcode::CompilerBarrier, {}, InvalidType);
-                return true;
+                // Barrier).
+                //
+                // ⚠⚠ THIS ARM USED TO BE UNCONDITIONAL, AND THAT WAS A LIVE SILENT
+                // MISCOMPILE (D-CSUBSET-INLINE-ASM-OPERANDS). ✔MEASURED 2026-08-15
+                // through the real CLI at x86_64:elf64-x86_64-linux, BEFORE this fix:
+                //   int main(void){ int out=7;
+                //     __asm__("movl $42,%%eax\n\tmovl %%eax,%0":"=r"(out)::"eax");
+                //     return out; }
+                // compiled at rc=0 with a clean log, and `objdump -d` showed the asm
+                // block emitting ZERO instructions — the program stored 7, loaded 7 and
+                // returned 7 where the source says 42, while the `eax` clobber was
+                // ignored outright. The comment that used to sit here claimed the
+                // semantic tier had already rejected every non-empty template; the
+                // front-end lane's operand capture made that false, and the stale
+                // premise is exactly what let the drop ship silently.
+                return lowerInlineAsm(node);
             case HirKind::VarDecl: {
                 // Allocate the local's slot on the current block. The declared
                 // type drives the alloca's pointer result type via the lattice.
@@ -12363,7 +12651,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirNoInlineMap const*    noInlineMap,
                           HirAlwaysInlineMap const* alwaysInlineMap,
                           HirNoOptimizeMap const*  noOptimizeMap,
-                          HirNoSanitizeThreadMap const* noSanitizeThreadMap) {
+                          HirNoSanitizeThreadMap const* noSanitizeThreadMap,
+                          HirInlineAsmPool const*  inlineAsmPool) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -12391,6 +12680,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .sizeofVlaSymMap = sizeofVlaSymMap,
         .typedefVlaOriginMap = typedefVlaOriginMap,
         .synthRecipeMap = synthRecipeMap,   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
+        .inlineAsmPool = inlineAsmPool,     // inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS)
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

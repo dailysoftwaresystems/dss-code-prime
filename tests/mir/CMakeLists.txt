@@ -10,6 +10,12 @@ dss_add_test(NAME mir/test_mir_dom          SOURCES test_mir_dom.cpp)
 dss_add_test(NAME mir/test_mir_struct_markers SOURCES test_mir_struct_markers.cpp)
 dss_add_test(NAME mir/test_mir_text         SOURCES test_mir_text.cpp)
 
+# Inline-asm P5 (plan 29 §4.4) — the MIR carriage: opcode rows, the ReturnPiece
+# payload split, the dedicated-builder refusals, and the `asm goto` edge
+# placement. Its own binary because it carries DEATH tests (the structural
+# backstops), which gtest runs by forking the whole executable.
+dss_add_test(NAME mir/test_mir_inline_asm SOURCES test_mir_inline_asm.cpp)
+
 # ML2 lowering tests.
 dss_add_test(NAME mir/test_mir_lowering_c_subset SOURCES test_mir_lowering_c_subset.cpp)
 

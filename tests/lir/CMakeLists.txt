@@ -13,6 +13,11 @@ dss_add_test(NAME lir/test_lir_regalloc  SOURCES test_lir_regalloc.cpp)
 # mutate_target_schema.hpp.
 target_link_libraries(dss_lir_test_lir_regalloc PRIVATE nlohmann_json::nlohmann_json)
 dss_add_test(NAME lir/test_lir_rewrite   SOURCES test_lir_rewrite.cpp)
+# D-LIR-PER-INST-REG-CONSTRAINTS: the module side-structure
+# carry-across (both pools, all four rebuild passes) and the verifier rules
+# that make a forgotten carry loud instead of a silent miscompile.
+dss_add_test(NAME lir/test_lir_pass_util SOURCES test_lir_pass_util.cpp)
+dss_add_test(NAME lir/test_lir_verifier  SOURCES test_lir_verifier.cpp)
 dss_add_test(NAME lir/test_lir_text      SOURCES test_lir_text.cpp)
 dss_add_test(NAME lir/test_mir_to_lir    SOURCES test_mir_to_lir.cpp)
 # FC1 (V2-4.X): the role-contract red-on-disable levers strip

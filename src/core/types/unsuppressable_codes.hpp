@@ -116,7 +116,7 @@ struct UnsuppressableEntry {
 //     K_NoMatchingObjectFormat, K_FormatLacksImportSupport,
 //     K_RelocationKindMismatch, K_WalkerInputContractViolation
 //     (format-walker dispatch / extern / reloc invariants).
-//   - LIR verifier / lowering structural invariants (14 L_* codes):
+//   - LIR verifier / lowering structural invariants (17 L_* codes):
 //     L_UnsupportedLoweringForOpcode (MIR→LIR coverage-gap fail-loud),
 //     L_RequiredLirOpcodeMissing, L_VirtualRegInPostRegalloc,
 //     L_MemOperandMalformed, L_PhysRegOrdinalOutOfRange,
@@ -128,7 +128,12 @@ struct UnsuppressableEntry {
 //     L_VlaNonLeafFrameUnsupported,
 //     L_TerminatorSuccessorMismatch (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-
 //     DROPPED — the terminator's recorded successors and its own BlockRef
-//     operands disagree).
+//     operands disagree),
+//     L_SideStructureIndexDangling, L_SideStructurePoolShrank,
+//     L_SideStructureReferenceLost (D-LIR-PER-INST-REG-CONSTRAINTS — the
+//     literal pool and the per-instruction register-constraint pool are
+//     referenced BY INDEX from the instruction stream that four passes
+//     rebuild; every way that carry can fail is silent).
 //     ⚠ THIS ENUMERATION WAS STALE AND SAID "11" WHILE THE ARRAY HELD 13:
 //     the two VLA codes were appended to `kUnsuppressableCodes` without
 //     being named here, so the header under-reported the band by two for

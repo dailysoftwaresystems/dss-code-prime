@@ -11,6 +11,7 @@
 #include "core/types/tree_visitor.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
+#include "analysis/semantic/inline_asm_facts.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
@@ -358,32 +359,34 @@ TEST(SemanticAnalyzerCSubset, EmptyArrayLengthEmitsDiagnostic) {
                         DiagnosticCode::S_NonConstantArrayLength), 1u);
 }
 
-// FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template `__asm__ volatile("")` optimizer
-// barrier is ACCEPTED (it lowers to a CompilerBarrier fence — pinned in the MIR tests);
-// a NON-EMPTY template carries real per-target instructions cycle-1 cannot emit, so it
-// FAILS LOUD S_InlineAsmNonEmptyTemplate rather than silently lowering to a no-op barrier
-// (a miscompile: `__asm__("hlt")` would vanish). The template PARSES (the grammar admits
-// any string literal); the reject is SEMANTIC.
-TEST(SemanticAnalyzerCSubset, InlineAsmNonEmptyTemplateEmitsDiagnostic) {
-    auto cu = buildShippedUnit("c-subset", {
-        "int main(void){ __asm__(\"nop\"); return 0; }\n",
-    });
-    assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u);
-}
-
-// A whitespace-only template is NOT provably inert (we do not parse asm) → also rejects.
-// The conservative strictly-empty predicate is the only provably-inert template.
-TEST(SemanticAnalyzerCSubset, InlineAsmWhitespaceTemplateEmitsDiagnostic) {
-    auto cu = buildShippedUnit("c-subset", {
-        "int main(void){ __asm__(\"  \"); return 0; }\n",
-    });
-    assertNoBuilderErrors(*cu);
-    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u);
+// ⚠⚠ REWRITTEN BY INLINE-ASM P5, AND THE OLD PIN IS KEPT AS PROSE BECAUSE ITS
+// PREMISE EXPIRED RATHER THAN BEING WRONG. Until P5 these two tests asserted
+// `__asm__("nop")` and `__asm__("  ")` each cost one
+// S_InlineAsmNonEmptyTemplate: cycle-1 could not EMIT a non-empty template, so
+// refusing it was the only alternative to dropping the instructions. P5 carries
+// the template into the HIR descriptor, so a non-empty template is now the
+// ORDINARY case and refusing it would be the divergence — every reference
+// compiler accepts `__asm__("nop")`.
+//
+// ★ WHAT 0xE057 STILL MEANS, and why the code did not become dead: its
+// surviving arm is "no template child of the configured shape was found", a
+// CONFIG/GRAMMAR disagreement rather than a statement about DSS's maturity.
+// That arm is unreachable from a well-formed shipped grammar, which is exactly
+// why it must stay — it is the fail-loud for a config edit that breaks the
+// locator (`decodeAdjacentStringBodies` returns "" for a mis-picked node, so a
+// silent locator failure would look like an EMPTY template and pass).
+TEST(SemanticAnalyzerCSubset, InlineAsmNonEmptyTemplateIsNoLongerRefused) {
+    for (char const* src : {"int main(void){ __asm__(\"nop\"); return 0; }\n",
+                            "int main(void){ __asm__(\"  \"); return 0; }\n"}) {
+        auto cu = buildShippedUnit("c-subset", {src});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_InlineAsmNonEmptyTemplate), 0u)
+            << src << ": gcc and clang both accept this; refusing it is the "
+                      "divergence now";
+        EXPECT_FALSE(model.hasErrors()) << src;
+    }
 }
 
 // The strictly-empty template (with OR without `volatile`) is accepted — no reject, no
@@ -15915,11 +15918,16 @@ TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingReachesInlineAsmQualifierSlot) 
             << qual << ": the empty-template barrier must be accepted with "
                        "this qualifier spelling";
     }
-    // THE RESIDUE, still loud: sqlite's src/hwtime.h:43 shape. The SPELLING
-    // passes and the OPERAND LIST is still refused — now as one precise SEMANTIC
-    // diagnostic instead of an unrecovered parse cascade. A green here would mean
-    // operand lists were silently accepted and dropped, which is a miscompile,
-    // not progress.
+    // ★★★ THE RESIDUE IS GONE, AND THAT IS THE HEADLINE OF INLINE-ASM P5.
+    // This block used to assert that sqlite's `src/hwtime.h:43` shape still
+    // failed loud, on the grounds that accepting an operand list without
+    // BINDING it would be a miscompile. That reasoning was right and it is now
+    // satisfied the other way: P5 CAPTURES both operands — constraint,
+    // symbolic name and value-expression NodeId — into the HIR descriptor, so
+    // there is nothing being dropped and nothing left to refuse.
+    // ⚠ A REFUSAL HERE IS NOW THE REGRESSION. If S0062 comes back for this
+    // shape, the front end has stopped capturing and the arc's exit criterion
+    // has gone with it.
     auto cu = buildShippedUnit("c-subset", {
         "unsigned long long hw(void){ unsigned int lo, hi;\n"
         "  __asm__ __volatile__ (\"rdtsc\" : \"=a\" (lo), \"=d\" (hi));\n"
@@ -15930,16 +15938,11 @@ TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingReachesInlineAsmQualifierSlot) 
            "error here would be the pre-P1 unrecovered cascade coming back";
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u)
-        << "GNU EXTENDED inline asm (a `:` operand list) is a separate OPEN gap "
-           "(D-CSUBSET-INLINE-ASM-OPERANDS / "
-           "D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED). It must still fail "
-           "LOUD — the `__volatile__` row moved this failure from the spelling to "
-           "the operand list, it did not close it, and sqlite's --scanstatus stays "
-           "off until it does";
-    EXPECT_EQ(model.diagnostics().all().size(), 1u)
-        << "and it must cost EXACTLY that one message — no cascade, no second "
-           "opinion about the same statement";
+                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 0u)
+        << "sqlite's `src/hwtime.h:43` shape is what P5 exists to compile";
+    EXPECT_EQ(model.diagnostics().all().size(), 0u)
+        << "and it must cost NO messages at all — no cascade, no residual "
+           "refusal, no second opinion about the same statement";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -16015,35 +16018,26 @@ TEST(SemanticAnalyzerCSubset, InlineAsmExtendedRefusalCostsOneDiagnosticAndParse
 
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
 
-    // (b) EXACTLY ONE diagnostic in the whole unit, and it is the right one.
-    // ⚠ NOT `ASSERT_EQ` ON THE COUNT, AND THAT IS DELIBERATE. An ASSERT here
-    // returns from the test, so a mutation that broke the COUNT would abort
-    // before half (d) below ever ran — and (d) is the load-bearing half. The
-    // red-on-disable harness measured exactly that: the pre-P1 grammar mutant
-    // reproduced the historical 53 parse errors and the test stopped at this
-    // line, leaving the recovery assertions unexercised and therefore unproven.
-    // Every half is an EXPECT so one broken property cannot mask another; the
-    // only guard that must not proceed is the [0] indexing, which is why the
-    // code is asserted through `countCode` instead of through a subscript.
-    EXPECT_EQ(model.diagnostics().all().size(), 1u)
-        << "a construct the compiler cannot support must cost exactly ONE "
-           "message, and that count must not scale with the four functions "
-           "written after it (the pre-P1 cascade produced 53 for this shape). "
-           "Got: " << allMessages(model.diagnostics());
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u)
-        << "and it must be the extended-asm refusal specifically. Got: "
+    // (b) ⚠⚠ THE VERDICT FLIPPED IN INLINE-ASM P5 AND THE TEST FLIPPED WITH IT.
+    // This used to assert exactly ONE S_InlineAsmExtendedUnsupported. `rdtsc`
+    // with `"=a"(lo), "=d"(hi)` is sqlite's own `src/hwtime.h:43` and is the
+    // arc's exit criterion — P5 CAPTURES it (both operands, both value
+    // expressions, into the HIR descriptor) instead of refusing it, so ZERO
+    // diagnostics is now the correct answer.
+    // ★ THE COUNT ASSERTION IS THE PART THAT SURVIVES UNCHANGED IN SPIRIT: the
+    // property was never "one refusal", it was "this construct costs a BOUNDED
+    // number of messages that does not scale with file length" — the pre-P1
+    // cascade produced 53 for this shape. Zero satisfies that strictly better.
+    EXPECT_EQ(model.diagnostics().all().size(), 0u)
+        << "P5 binds this statement; it must cost NO messages, and in "
+           "particular the count must not scale with the four functions written "
+           "after it (the pre-P1 cascade produced 53). Got: "
         << allMessages(model.diagnostics());
-
-    // (c) the message INVENTORIES the constraint strings it refused. P1 quotes
-    //     text it does not interpret; that inventory is what P5 scopes against.
-    //     Asserting content rather than a count is what keeps the payload walk
-    //     (decodeShallowestStrings over the outputs list) from silently dying.
-    std::string const msg = firstMessageWithCode(
-        model.diagnostics(), DiagnosticCode::S_InlineAsmExtendedUnsupported);
-    EXPECT_NE(msg.find("outputs: \"=a\", \"=d\""), std::string::npos)
-        << "the refusal must quote the ACTUAL constraint strings, in source "
-           "order, labelled by role — got: " << msg;
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 0u)
+        << "S0062 is the RESIDUAL refusal now — it fires only when the CAPTURE "
+           "itself could not complete, never on a shape that captured cleanly. "
+           "Got: " << allMessages(model.diagnostics());
 
     // (d) ★ RECOVERY, ASSERTED POSITIVELY AND BY EXACT NAME. Both the function
     //     and a variable declared INSIDE its body: the pair distinguishes "the
@@ -16099,18 +16093,27 @@ TEST(SemanticAnalyzerCSubset, InlineAsmEmptySectionFormsAreAccepted) {
             << form << ": accepted by gcc and clang and RUN — DSS must emit "
                        "nothing at all. Got: " << allMessages(model.diagnostics());
 
-        // THE ANCHOR: the SAME shape with a non-empty template. One character of
-        // payload is the whole difference, so a refusal here proves the gate
-        // reaches this exact form.
+        // THE ANCHOR, WITHOUT WHICH THE ZERO-DIAGNOSTIC CLAIM ABOVE IS VACUOUS.
+        // ⚠ IT HAD TO CHANGE IN P5: it used to be `"hlt"` earning
+        // S_InlineAsmNonEmptyTemplate, and a non-empty template is now
+        // ACCEPTED, so that anchor would have gone quietly inert — a pin whose
+        // mutant stopped being a mutant, which is precisely the vacuity this
+        // project keeps catching. The replacement is a template that is still
+        // refused for a reason PROPERTY OF THIS SHAPE: `%0` in a statement with
+        // no operands. If the analyzer ever stops visiting these forms, the
+        // anchor goes green and reds the test.
         std::string mutant{form};
-        mutant.replace(mutant.find("\"\""), 2, "\"hlt\"");
+        mutant.replace(mutant.find("\"\""), 2, "\"m %0\"");
         auto mutCu = buildShippedUnit(
             "c-subset",
             {"int main(void){ __asm__ " + mutant + "; return 0; }\n"});
         EXPECT_EQ(countBuilderErrors(*mutCu), 0u) << mutant << ": must PARSE";
         auto mutModel = analyze(mutCu, DiagnosticBudget::libraryDefault());
         EXPECT_EQ(countCode(mutModel.diagnostics(),
-                            DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u)
+                            DiagnosticCode::S_InlineAsmPlaceholderOutOfRange)
+                      + countCode(mutModel.diagnostics(),
+                                  DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate),
+                  1u)
             << mutant << ": the inline-asm gate must VISIT this shape — "
                          "otherwise the zero-diagnostic assertion above is "
                          "satisfied by nothing running. Got: "
@@ -16124,14 +16127,14 @@ TEST(SemanticAnalyzerCSubset, InlineAsmEmptySectionFormsAreAccepted) {
     EXPECT_EQ(model.diagnostics().all().size(), 0u)
         << "`__asm__ __volatile__ (\"\")` is the form real headers write. Got: "
         << allMessages(model.diagnostics());
-    // ...and its anchor, for the same reason.
+    // ...and its anchor, for the same reason and with the same P5 change.
     auto dunderMut = buildShippedUnit(
         "c-subset",
-        {"int main(void){ __asm__ __volatile__ (\"hlt\"); return 0; }\n"});
+        {"int main(void){ __asm__ __volatile__ (\"m %0\"); return 0; }\n"});
     EXPECT_EQ(countBuilderErrors(*dunderMut), 0u);
     auto dunderModel = analyze(dunderMut, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(dunderModel.diagnostics(),
-                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u)
+                        DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate), 1u)
         << "the dunder-qualifier shape must reach the gate too. Got: "
         << allMessages(dunderModel.diagnostics());
 }
@@ -16228,11 +16231,18 @@ TEST(SemanticAnalyzerCSubset, InlineAsmLabelSectionWithoutGotoIsRefused) {
     }
     // NEGATIVE CONTROL — without it the three assertions above are satisfiable by
     // a gate that fires on any asm at all. `asm goto` with the SAME fourth
-    // section and a real label is NOT a constraint violation: it is a supported-
-    // in-principle construct DSS has not implemented, so it must land on the
-    // OTHER code, and the message must inventory the label and the qualifier.
+    // section and a real label is NOT a constraint violation, so S0063 must NOT
+    // fire on it.
+    // ⚠ THE ANCHOR HALF HAD TO CHANGE IN P5, AND THE REASON IS THE SAME ONE
+    // THAT MADE THIS TEST WORTH KEEPING. It used to anchor on
+    // S_InlineAsmExtendedUnsupported firing once and inventorying `labels: lbl`
+    // / `qualifier: goto`. `asm goto` is now ACCEPTED (operator ruling: follow
+    // clang), so that anchor would have gone quietly inert — a mutant that
+    // stopped being a mutant, which is exactly the vacuity the anchor exists to
+    // prevent. The replacement anchors on a refusal that is a property of THIS
+    // shape and still stands: `%0` in a statement whose operand count is zero.
     auto cu = buildShippedUnit("c-subset", {
-        "int main(void){ __asm__ goto (\"\" : : : : lbl); lbl: return 0; }\n"});
+        "int main(void){ __asm__ goto (\"m %0\" : : : : lbl); lbl: return 0; }\n"});
     EXPECT_EQ(countBuilderErrors(*cu), 0u);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -16240,11 +16250,38 @@ TEST(SemanticAnalyzerCSubset, InlineAsmLabelSectionWithoutGotoIsRefused) {
         << "WITH `goto` the label section is legal — reporting the constraint "
            "violation here would refuse valid C";
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u);
-    std::string const msg = firstMessageWithCode(
-        model.diagnostics(), DiagnosticCode::S_InlineAsmExtendedUnsupported);
-    EXPECT_NE(msg.find("labels: lbl"), std::string::npos) << msg;
-    EXPECT_NE(msg.find("qualifier: goto"), std::string::npos) << msg;
+                        DiagnosticCode::S_InlineAsmPlaceholderOutOfRange), 1u)
+        << "the POSITIVE anchor: the inline-asm tier must VISIT this shape. Got: "
+        << allMessages(model.diagnostics());
+
+    // ...and the LABEL and QUALIFIER facts, asserted against the CAPTURE rather
+    // than against a refusal message that no longer exists. Strictly stronger:
+    // the old form could only observe them through the text of a diagnostic.
+    auto plain = buildShippedUnit("c-subset", {
+        "int main(void){ __asm__ goto (\"\" : : : : lbl); lbl: return 0; }\n"});
+    auto plainModel = analyze(plain, DiagnosticBudget::libraryDefault());
+    EXPECT_FALSE(plainModel.hasErrors())
+        << "`asm goto` with a real label is accepted by clang 18/19 and the "
+           "operator ruled to follow clang. Got: "
+        << allMessages(plainModel.diagnostics());
+    auto const& gia = plain->schema().semantics().inlineAsm;
+    bool sawGoto = false;
+    for (auto const& tr : plain->trees()) {
+        walkPreOrder(tr, [&](TreeCursor const& cursor) {
+            NodeId const n = cursor.current();
+            if (tr.kind(n) != NodeKind::Internal) return;
+            if (!gia.rule.valid() || tr.rule(n).v != gia.rule.v) return;
+            sawGoto = true;
+            auto const f = gatherInlineAsmFacts(
+                tr, n, gia, plain->schema().semantics().identifierToken,
+                plain->schema().hirLowering().stringBodyToken);
+            EXPECT_TRUE(f.hasGotoQualifier);
+            EXPECT_EQ(f.gotoQualifierText, "goto");
+            ASSERT_EQ(f.labels.size(), 1u);
+            EXPECT_EQ(f.labels[0].name, "lbl");
+        });
+    }
+    EXPECT_TRUE(sawGoto);
 }
 
 // ── REJECT parity (2): a duplicated qualifier, BY KIND not by spelling ─────
@@ -16296,8 +16333,12 @@ TEST(SemanticAnalyzerCSubset, InlineAsmDuplicateQualifierIsRefusedByKindNotSpell
     // S_InlineAsmExtendedUnsupported exactly once, with the label inventoried.
     // If the inline-asm tier ever stops visiting this shape, that arm goes red
     // where the two zeros below would stay green.
+    // ⚠ SAME P5 ANCHOR CHANGE as its twin thirty lines up, for the same reason:
+    // `asm goto` is accepted now, so anchoring on S_InlineAsmExtendedUnsupported
+    // would assert nothing. `%0` with zero operands is a refusal that IS a
+    // property of this shape.
     auto cu = buildShippedUnit(
-        "c-subset", {"int main(void){ __asm__ goto volatile (\"\" : : : : l); "
+        "c-subset", {"int main(void){ __asm__ goto volatile (\"m %0\" : : : : l); "
                      "l: return 0; }\n"});
     EXPECT_EQ(countBuilderErrors(*cu), 0u);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
@@ -16306,17 +16347,13 @@ TEST(SemanticAnalyzerCSubset, InlineAsmDuplicateQualifierIsRefusedByKindNotSpell
         << "`goto volatile` is two distinct qualifiers in a free-order run — "
            "not a duplicate. Got: " << allMessages(model.diagnostics());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u)
-        << "the POSITIVE anchor: this statement IS refused, by the extended-asm "
-           "code, exactly once — without it the two zeros above are satisfied "
-           "by a qualifier scan that never ran. Got: "
+                        DiagnosticCode::S_InlineAsmPlaceholderOutOfRange), 1u)
+        << "the POSITIVE anchor: this statement IS visited by the inline-asm "
+           "tier, exactly once — without it the zero above is satisfied by a "
+           "qualifier scan that never ran. Got: "
         << allMessages(model.diagnostics());
     EXPECT_EQ(model.diagnostics().all().size(), 1u)
         << "exactly one message. Got: " << allMessages(model.diagnostics());
-    std::string const ctrlMsg = firstMessageWithCode(
-        model.diagnostics(), DiagnosticCode::S_InlineAsmExtendedUnsupported);
-    EXPECT_NE(ctrlMsg.find("labels: l"), std::string::npos)
-        << "the refusal must inventory the goto label — got: " << ctrlMsg;
 }
 
 // ── REJECT parity (3): the cycle-1 non-empty-template refusal is UNCHANGED ──
@@ -16324,21 +16361,30 @@ TEST(SemanticAnalyzerCSubset, InlineAsmDuplicateQualifierIsRefusedByKindNotSpell
 // per-target instructions; lowering it to a no-op barrier would DELETE them.
 // This pins that P1's new gates did not shadow the older one — a bare non-empty
 // template has no sections, so it must fall through gates (1) and (2) into (3).
-TEST(SemanticAnalyzerCSubset, InlineAsmNonEmptyTemplateStillRefusedUnderP1) {
+// ⚠ RENAMED AND INVERTED BY P5. It was `…StillRefusedUnderP1` and asserted that
+// `__asm__("hlt")` cost one S_InlineAsmNonEmptyTemplate. The template is now
+// CARRIED into the HIR descriptor, so that refusal is gone — but the SECOND
+// half of the old test was never about the refusal at all, and it is the half
+// worth keeping: a SECTIONLESS statement must not be reported as EXTENDED asm.
+// That separation is what stops 0xE057 and 0xE062 collapsing into each other,
+// and it is MORE at risk now that 0xE062 has become a residual catch-all.
+TEST(SemanticAnalyzerCSubset, ASectionlessAsmIsNotReportedAsExtended) {
     auto cu = buildShippedUnit(
         "c-subset", {"int main(void){ __asm__ (\"hlt\"); return 0; }\n"});
     EXPECT_EQ(countBuilderErrors(*cu), 0u);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u)
-        << "real asm TEXT is still a per-target deferral "
-           "(D-CSUBSET-INLINE-ASM-TEXT). Got: "
-        << allMessages(model.diagnostics());
-    EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InlineAsmExtendedUnsupported), 0u)
-        << "a sectionless statement is not EXTENDED asm — the two refusals must "
-           "not collapse into each other";
-    EXPECT_EQ(model.diagnostics().all().size(), 1u);
+        << "a sectionless statement is not EXTENDED asm — and 0xE062 is now the "
+           "RESIDUAL refusal, so it must not become the place unclassified "
+           "statements land. Got: " << allMessages(model.diagnostics());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 0u)
+        << "a non-empty BASIC template is the commonest inline asm there is and "
+           "every reference compiler accepts it. Got: "
+        << allMessages(model.diagnostics());
+    EXPECT_EQ(model.diagnostics().all().size(), 0u)
+        << allMessages(model.diagnostics());
 }
 
 // ── ★ THE QUALIFIER SCAN'S BOUND: it stops at the template ─────────────────
@@ -16365,16 +16411,37 @@ TEST(SemanticAnalyzerCSubset, InlineAsmQualifierScanStopsAtTemplateAndIgnoresOpe
         << "the `volatile` inside the operand's CAST is not a qualifier of the "
            "asm statement — an unbounded qualifier scan would refuse valid C "
            "here. Got: " << allMessages(model.diagnostics());
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_InlineAsmExtendedUnsupported), 1u);
-    EXPECT_EQ(model.diagnostics().all().size(), 1u)
-        << "exactly one message. Got: " << allMessages(model.diagnostics());
-    std::string const msg = firstMessageWithCode(
-        model.diagnostics(), DiagnosticCode::S_InlineAsmExtendedUnsupported);
-    EXPECT_NE(msg.find("inputs: \"r\""), std::string::npos)
-        << "the operand must still be inventoried under the INPUTS role — got: "
-        << msg;
-    // The `volatile` cast must not be mistaken for a clobber or an output either.
-    EXPECT_EQ(msg.find("outputs:"), std::string::npos) << msg;
-    EXPECT_EQ(msg.find("clobbers:"), std::string::npos) << msg;
+    EXPECT_EQ(model.diagnostics().all().size(), 0u)
+        << "P5 captures this statement; it must cost no messages. Got: "
+        << allMessages(model.diagnostics());
+
+    // ★★ THE ROLE ASSERTIONS MOVED FROM A MESSAGE TO THE CAPTURE ITSELF, which
+    // is strictly stronger. They used to read the refusal's inventory text
+    // (`inputs: "r"`, and NO `outputs:` / `clobbers:`) — there is no refusal
+    // now, and a test that only checked "zero diagnostics" would have silently
+    // stopped asserting that the `volatile` cast is read as an INPUT operand
+    // rather than as an output, a clobber, or a qualifier. So the same three
+    // claims are made against `gatherInlineAsmFacts` directly.
+    auto const& ia = cu->schema().semantics().inlineAsm;
+    bool checked = false;
+    for (auto const& tree : cu->trees()) {
+        walkPreOrder(tree, [&](TreeCursor const& cursor) {
+            NodeId const n = cursor.current();
+            if (tree.kind(n) != NodeKind::Internal) return;
+            if (!ia.rule.valid() || tree.rule(n).v != ia.rule.v) return;
+            checked = true;
+            auto const f = gatherInlineAsmFacts(
+                tree, n, ia, cu->schema().semantics().identifierToken,
+                cu->schema().hirLowering().stringBodyToken);
+            ASSERT_EQ(f.operands.size(), 1u);
+            EXPECT_EQ(f.operands[0].constraint, "r");
+            EXPECT_FALSE(f.operands[0].isOutput)
+                << "the operand is in the INPUTS section";
+            EXPECT_EQ(f.outputCount, 0u);
+            EXPECT_TRUE(f.clobbers.empty())
+                << "the `volatile` cast must not be mistaken for a clobber";
+            EXPECT_TRUE(f.operands[0].valueExpr.valid());
+        });
+    }
+    EXPECT_TRUE(checked) << "the fixture must contain one asmStmt";
 }

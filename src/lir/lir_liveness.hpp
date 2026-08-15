@@ -22,7 +22,21 @@
 // each instruction gets TWO position slots (early/late half-steps) so
 // uses (read at the early half) and defs (written at the late half)
 // at the same instruction don't collide. Position `p` for the N-th
-// instruction in RPO order: `early = 2*N`, `late = 2*N + 1`. The
+// instruction in RPO order: `early = 2*N`, `late = 2*N + 1`.
+//
+// ★ THE ONE EXCEPTION, and it is the whole mechanism behind inline asm's
+// `"=&r"`: an instruction carrying `kLirInstFlagEarlyClobberResult` has its
+// def recorded at the EARLY slot instead. Its result range then overlaps the
+// slot at which the instruction's inputs are read, so no input expires under
+// it and the allocator cannot reuse an input's register for the result. Every
+// documented invariant below is unaffected — position numbering,
+// `positionToInst` pairing and the sort are untouched; only which of an
+// instruction's own two slots the def lands on changes. The
+// use-before-def-within-an-instruction discipline of the block-level USE/DEF
+// sets is likewise unchanged (uses are still recorded first, so an input is
+// still upward-exposed).
+//
+// The
 // substrate ships flat single-interval ranges per vreg today; the
 // allocator co-designs split-aware sub-intervals with this substrate
 // — see plan 12 §3.1 ML6 deferral D-ML6-1.1.

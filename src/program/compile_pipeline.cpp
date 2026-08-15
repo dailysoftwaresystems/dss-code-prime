@@ -30,6 +30,7 @@
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
+#include "lir/lir_verifier.hpp"           // LirVerifier — the LIR tier's own invariant checks
 #include "lir/lir_wide_call_args.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
@@ -305,7 +306,18 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format-resolved `long double`
         // axis — drives the coreByLongDoubleFormat row overrides; None (wasm/
         // spirv) leaves `long double` rows unrealized (loud on use).
-        effectiveLongDoubleFormat(target, format));
+        effectiveLongDoubleFormat(target, format),
+        // ★ Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): THE ACTIVE TARGET.
+        // Without it `analyze` runs with `target == nullptr`, and its two
+        // target-dependent asm checks — `S_InlineAsmConstraintLetterUndeclared`
+        // (0xE065) and `S_InlineAsmClobberUnknown` (0xE068) — correctly decline
+        // to guess and DO NOT RUN. ✔MEASURED before this argument existed: a
+        // `"=Zq"` constraint and a `"notaregister"` clobber BOTH compiled to a
+        // clean `.o` at rc=0 through this very pipeline. A diagnostic that fires
+        // only in a unit test that passes its own schema is not a shipped
+        // diagnostic. `target` is the driver's own long-lived schema and
+        // outlives `model`, which is the lifetime the parameter requires.
+        &target);
     phase.reset();
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
@@ -798,7 +810,15 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           &hir->noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE)
                           &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
                           &hir->noOptimizeMap,   // TF-C85 (#pragma optimize region)
-                          &hir->noSanitizeThreadMap);   // TF-C92 (no_sanitize_thread)
+                          &hir->noSanitizeThreadMap,   // TF-C92 (no_sanitize_thread)
+                          // ★ Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): the
+                          // descriptor pool an `InlineAsm` node's payload HANDLE
+                          // names. Without it a descriptor-carrying asm statement
+                          // cannot be lowered at all and fails loud — which is the
+                          // point: this is the argument whose absence used to make
+                          // the whole statement lower to a bare barrier, dropping
+                          // the template, the operands and the clobber list.
+                          &hir->inlineAsmPool);
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
@@ -990,6 +1010,34 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
+    // 4a. THE WHOLE-MODULE STRUCTURAL CHECK, on the module MIR→LIR just
+    // produced and BEFORE any pass rebuilds it — so a violation is
+    // attributed to the lowering that minted it rather than to whichever
+    // later pass happened to copy it forward.
+    //
+    // This is the ONE verifier entrypoint that gets the MIR cross-reference
+    // (`lir.lirToMir`), so it is the only place the type-agreement rules can
+    // run at all: a `store` whose value operand's register class disagrees
+    // with the MIR pointee type, a result vreg whose class disagrees with its
+    // MIR result type, an `intrinsic_call` whose result presence disagrees
+    // with its MIR Void-ness. Each of those is a silent wrong-register-file
+    // encode downstream, not a crash. The three later checkpoints
+    // (`verifyLirRebuild` ×4, `verifyLirPostRegalloc` ×2) are rebuild- and
+    // allocation-shaped and cannot see any of it.
+    //
+    // ⚠ IT COULD NOT BE CALLED HERE UNTIL 2026-08-15, and the reason is worth
+    // keeping: Rule 1 (`checkMemOperandPairing`) demanded that every
+    // `load`/`store`/`lea` operand list end with a `MemBase`+`MemOffset`
+    // pair, while the shipped lowering also emits a symbol-addressed form
+    // (`lea r, [@sym]` for every `&global`, the TLS address blocks, a
+    // jump-table base) carrying no base/offset pair at all — so enabling the
+    // call reddened the examples corpus while the COMPILER was correct and
+    // the VERIFIER was wrong (D-LIR-VERIFY-MEM-OPERAND-PAIRING-RULE-IS-FALSE,
+    // closed by teaching the rule both addressing modes and asserting them
+    // disjoint).
+    if (!verifyLir(lir.lir, mir, interner, target, lir.lirToMir, reporter).ok) {
+        return std::nullopt;
+    }
 
     // 4b. Wide-call arg materialization (D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT,
     //     option E): BEFORE regalloc, split each Call's scalar arguments beyond
@@ -1002,6 +1050,21 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     auto wideLir = lowerWideCallArgs(lir.lir, target, callingConventionIndex,
                                      reporter);
     if (!wideLir.ok || !tierClean(reporter, wideEntry)) {
+        return std::nullopt;
+    }
+    // ★★ THE PAIRED REBUILD CHECK, PASS 1 OF 4
+    // (D-LIR-PER-INST-REG-CONSTRAINTS). Each of the four passes below
+    // rebuilds the module into a FRESH `LirBuilder`, and both side structures
+    // — the wide-literal pool and the per-instruction register-constraint
+    // pool — are referenced BY INDEX from the instruction stream that the
+    // rebuild re-creates. A dropped reference is structurally invisible
+    // (nothing dangles, no pool shrank, the handle reads as the perfectly
+    // legal "no constraints") and its consequence is a SILENT MISCOMPILE: the
+    // clobbers vanish and the allocator reuses a register the instruction
+    // destroys. The before/after pair is the only place the loss shows up, so
+    // it is checked HERE, per pass, rather than once at the end — a drop in
+    // pass 1 restored by luck in pass 4 reads as green.
+    if (!verifyLirRebuild(lir.lir, wideLir.lir, "wide-call-args", reporter)) {
         return std::nullopt;
     }
 
@@ -1023,11 +1086,26 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     if (!rewritten.ok || !tierClean(reporter, rewriteEntry)) {
         return std::nullopt;
     }
+    // Paired rebuild check, pass 2 of 4 — plus the POST-REGALLOC rules
+    // (`lir_rewrite.hpp` has told its callers to run `verifyLirPostRegalloc`
+    // since ML6 and no caller did): no virtual register may survive anywhere,
+    // and every `frame_load`/`frame_store` must carry a non-zero spill-slot
+    // payload. A virtual register reaching the assembler encodes as whatever
+    // its vreg id happens to alias — a physical register nobody allocated.
+    if (!verifyLirRebuild(wideLir.lir, rewritten.lir, "rewrite", reporter)
+        || !verifyLirPostRegalloc(rewritten.lir, target, reporter)) {
+        return std::nullopt;
+    }
 
     // 8. Two-address legalize (post-regalloc).
     auto const legalEntry = reporter.errorCount();
     auto legal = legalizeTwoAddress(rewritten.lir, target, reporter);
     if (!legal.ok() || !tierClean(reporter, legalEntry)) {
+        return std::nullopt;
+    }
+    // Paired rebuild check, pass 3 of 4.
+    if (!verifyLirRebuild(rewritten.lir, legal.lir, "two-address-legalize",
+                          reporter)) {
         return std::nullopt;
     }
     // TF-C58 bisect (env-gated, zero-cost when unset): the loop-carried-update check
@@ -1067,6 +1145,15 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                                            sehFuncletParents,
                                            funcLocalAligns);
     if (!cc.ok() || !tierClean(reporter, ccEntry)) {
+        return std::nullopt;
+    }
+    // Paired rebuild check, pass 4 of 4 — the LAST checkpoint before the
+    // module turns into bytes. `verifyLirPostRegalloc` runs again here for the
+    // same reason: callconv materializes the frame ops and the arg/return
+    // moves, so it is the pass with the most opportunities to mint a register
+    // operand, and after `assemble()` there is no LIR left to check.
+    if (!verifyLirRebuild(legal.lir, cc.lir, "callconv", reporter)
+        || !verifyLirPostRegalloc(cc.lir, target, reporter)) {
         return std::nullopt;
     }
 

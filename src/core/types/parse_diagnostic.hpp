@@ -1429,6 +1429,202 @@ enum class DiagnosticCode : std::uint16_t {
     // reading every reader already assumes. Renders error[S0064].
     S_InlineAsmDuplicateQualifier = 0xE064,
 
+    // ── inline-asm P5: OPERAND BINDING (0xE065..0xE06B) ───────────────────
+    // P1 parsed the extended form and refused it whole (0xE062). P5 binds it,
+    // and binding is where a statement stops being one refusable construct and
+    // becomes SEVEN independently wrong things: a letter, a constraint shape,
+    // an operand modifier, a clobber, a template, a placeholder index, and a
+    // placeholder in a template that has no operands. Each gets its own code
+    // because each has a DIFFERENT ANSWER — read the target's declared set,
+    // rewrite the constraint, wait for a facet, fix a spelling, open the
+    // dialect document, renumber the operands, drop the `%`. A tool that
+    // routes on the code (and an author who reads only the first line) cannot
+    // recover that from one shared "unsupported inline asm".
+    //
+    // ★ ALL SEVEN ARE UNSUPPRESSABLE, and the criterion is `unsuppressable_
+    // codes.cpp`'s own prong (1) rather than a family sweep: every one of them
+    // has a SECOND candidate lowering that a silenced compiler would pick —
+    // an unbound operand, a chosen alternative, a full-width register view, a
+    // dropped clobber, a vanished template, a raw placeholder. Their sibling
+    // `S_InlineAsmDuplicateQualifier` (0xE064) stays SUPPRESSABLE for exactly
+    // the reason stated in its own block: `volatile volatile` has no second
+    // candidate reading. Two postures inside one arc is the evidence the
+    // criterion was applied per code.
+
+    // D-CSUBSET-INLINE-ASM-OPERANDS (inline-asm P5): a constraint LETTER this
+    // TARGET does not declare — `"=a"(x)` compiled for arm64, `"=w"(x)` for
+    // x86_64. Resolution is `TargetSchema::asmConstraint`, which returns
+    // nullptr on a miss and whose own docblock states the rule this code
+    // enforces: the caller must turn the miss into a diagnostic naming the
+    // letter AND the target, "never into a fallback guess".
+    //
+    // ★ THE MESSAGE RENDERS THE DECLARED SET, through
+    // `TargetSchema::declaredAsmConstraintLetters()` rather than a list typed
+    // here. There IS no correct list to type: the letters are per-CPU — the
+    // whole reason `asmConstraints` is a `.target.json` facet — so a
+    // hand-written "valid letters are …" tail would be a target-identity leak
+    // in shared substrate AND would go stale the first time a target declares
+    // one more. ✔MEASURED (recorded at the facet, gcc 13.3.0 `-O2 -S`, three
+    // competing `"r"` operands live so a lucky allocation cannot be mistaken
+    // for a pin): `"=a"` lands in `%rax` on x86_64 and is rejected outright on
+    // AArch64 ("impossible constraint in 'asm'"), so refusing here MATCHES the
+    // reference rather than being stricter than it.
+    //
+    // ⚠ THE LOOKUP KEY IS THE LETTER, NOT THE CONSTRAINT STRING. `=`/`+`/`&`/
+    // `%` are GNU-asm grammar owned by the front end and the loader refuses to
+    // store them, so the modifiers must be stripped before the lookup; a raw
+    // `"=&a"` always misses and would emit this diagnostic about a letter the
+    // target does declare. UNSUPPRESSABLE: silenced, the operand binds to
+    // nothing and the asm runs with whatever the allocator happened to leave
+    // in place — the silent miscompile 0xE062 exists to prevent, reached one
+    // letter at a time. Renders error[S0065].
+    S_InlineAsmConstraintLetterUndeclared = 0xE065,
+
+    // D-CSUBSET-INLINE-ASM-OPERANDS (inline-asm P5): a constraint STRING whose
+    // SHAPE is not implemented — as distinct from a letter that is not
+    // declared (0xE065 above). Three shapes reach it:
+    //   * MULTI-ALTERNATIVE — `"=r,m"` (GNU 6.47.2.4): comma-separated
+    //     alternatives ask the allocator to CHOOSE a binding, not to honour
+    //     one.
+    //   * MULTI-LETTER — two letters in one constraint (`"rm"`): the same
+    //     choice written without the comma.
+    //   * an unrecognised MODIFIER — a leading character outside the four the
+    //     front end owns (`=` output, `+` in-out, `&` earlyclobber,
+    //     `%` commutative).
+    // The message NAMES which of the three fired and quotes the constraint
+    // verbatim, because "unsupported constraint" leaves the author unable to
+    // tell a typo from a deferral.
+    //
+    // ★ IT IS ITS OWN CODE RATHER THAN A SECOND MESSAGE ON 0xE065 because the
+    // ANSWER differs: an undeclared letter is answered by reading this
+    // target's declared set, a refused FORM by rewriting the constraint down
+    // to one alternative. UNSUPPRESSABLE: silenced, the binder must pick an
+    // alternative itself, and picking one unannounced is precisely the
+    // accept-and-ignore outcome this whole family is closed against.
+    // Renders error[S0066].
+    S_InlineAsmConstraintUnsupportedForm = 0xE066,
+
+    // D-CSUBSET-INLINE-ASM-OPERANDS (inline-asm P5): an operand MODIFIER
+    // placeholder — `%w0`, `%k0`, `%b0` — which asks for a narrower VIEW of
+    // the register the operand was bound to (arm64's `w0` half of `x0`; x86's
+    // `%k`/`%b`/`%h` width letters) rather than for the operand itself.
+    //
+    // ★ WHY A REFUSAL AND NOT A LOWERING: the view a modifier letter selects
+    // is per-TARGET vocabulary of exactly the kind `asmConstraints` already
+    // is, and NO shipped `.target.json` declares it. Implementing it in C++
+    // would put `if (letter == 'w')` — an arm64 fact — into shared substrate,
+    // the agnosticism break the bar vetoes outright. ⇒ the FACET is owed, and
+    // until it is declared this refuses by name and quotes the modifier.
+    // ⚠ NO REGISTRY ROW EXISTS FOR THAT FACET YET (measured 2026-08-14): it
+    // belongs to D-CSUBSET-INLINE-ASM-OPERANDS' deferral tail. Do not read
+    // this comment as a pointer to a row that can be looked up.
+    //
+    // UNSUPPRESSABLE: silenced, `%w0` falls back to the FULL register — `x0`
+    // where the source wrote `w0` — so a 32-bit operation executes 64-bit.
+    // That is not a hypothetical failure mode for this arc: the standalone
+    // arm64 dialect shipped exactly it once (a `mov w0, w1` that encoded
+    // 64-bit) and it was found by execution, not by review.
+    // Renders error[S0067].
+    S_InlineAsmOperandModifierUnsupported = 0xE067,
+
+    // D-CSUBSET-INLINE-ASM-OPERANDS (inline-asm P5): a clobber-list entry that
+    // is neither configured non-register spelling and no register this target
+    // declares. Resolution order, entirely config-driven:
+    //   1. `semantics.inlineAsm.memoryClobber` / `.conditionCodeClobber` — the
+    //      two GNU-asm entries that name no register (`"memory"`, `"cc"`,
+    //      GCC 6.47.2.5). They live in the ASM language document because they
+    //      are a property of the assembly surface rather than of the host
+    //      embedding it, and the loader refuses them empty and refuses them
+    //      EQUAL;
+    //   2. `TargetSchema::registerByName` — every other clobber names a
+    //      per-target REGISTER, which the asm language must never enumerate.
+    // A miss on both is this code. The message quotes the spelling and names
+    // the target, because a `"cc"` that does not resolve is a CONFIG question
+    // and a misspelled register is a SOURCE one, and the reader has to be able
+    // to tell which they are holding.
+    //
+    // UNSUPPRESSABLE, and this is the plainest case in the family: a clobber
+    // is a promise to the ALLOCATOR that a register's value does not survive
+    // the statement. Silenced, the entry is dropped, a live value stays parked
+    // in a register the asm overwrites, and the wrong value is read AFTER the
+    // statement — with nothing in the build log. Renders error[S0068].
+    S_InlineAsmClobberUnknown = 0xE068,
+
+    // D-CSUBSET-INLINE-ASM-TEXT (inline-asm P5): the asm DIALECT grammar
+    // refused the template. The template is NOT opaque at P5 — it is parsed by
+    // the same text→LIR engine the standalone `.s` path uses (plan 29 §4.6:
+    // one engine, two callers) — so an embedded template can fail for every
+    // reason a `.s` line can: an undeclared mnemonic, a register spelling this
+    // target does not declare, an operand form the dialect has no rule for.
+    //
+    // ★ THE MESSAGE CARRIES THE DIALECT NAME AND THE INNER DIAGNOSTIC, and the
+    // pair is what makes it actionable — WHICH OF TWO CONFIG DOCUMENTS to open
+    // is the question a template refusal actually raises, and the standalone
+    // path already answers it in this exact shape (`asm_text_to_lir.cpp`'s
+    // `pairSuffix`: "(assembly dialect '…', target '…')"). A refusal quoting
+    // only the text sends the reader to the `.c` file when the answer is in a
+    // `.asm.lang.json`.
+    //
+    // ⚠ IT IS A SEMANTIC-TIER CODE THOUGH THE INNER FAILURE IS THE
+    // ASSEMBLER'S (`A_AsmTextUnsupported`): the construct being refused is a C
+    // statement, so the position, the recovery and the exit-code semantics
+    // belong to the C compilation. The inner diagnostic is CARRIED AS TEXT,
+    // never re-reported, so the operator sees ONE refusal and not two.
+    // UNSUPPRESSABLE: silenced, an unparsable template lowers to nothing and
+    // the instructions the programmer wrote simply vanish — the
+    // `S_InlineAsmNonEmptyTemplate` (0xE057) failure mode exactly, arrived at
+    // from the other side. Renders error[S0069].
+    S_InlineAsmTemplateUnparsable = 0xE069,
+
+    // D-CSUBSET-INLINE-ASM-OPERANDS (inline-asm P5): a `%N` placeholder naming
+    // an operand that was never declared — `%3` where two exist. The index
+    // space is the OUTPUTS-THEN-INPUTS CONCATENATION (GCC 6.47.2.3), so `%0`
+    // is the first OUTPUT when the statement has one and the first INPUT when
+    // it does not; the bound is therefore the JOINED count and never either
+    // section's own, and a check written against one section would accept `%2`
+    // on a one-output-one-input statement while rejecting a legal `%1`.
+    //
+    // The message states the index the template asked for AND the count that
+    // exists, because an off-by-one here is nearly always a section the author
+    // edited without renumbering. UNSUPPRESSABLE: silenced, expansion has
+    // nothing to substitute, so it either drops the placeholder or emits it
+    // LITERALLY for the assembler to read as a register spelling — and both
+    // ship an instruction operating on the wrong thing. Renders error[S006A].
+    S_InlineAsmPlaceholderOutOfRange = 0xE06A,
+
+    // D-CSUBSET-INLINE-ASM-OPERANDS (inline-asm P5): a `%` form — `%0` or the
+    // `%%` escape — in a BASIC template, one whose statement has no operand
+    // sections at all. ✔MEASURED 2026-08-14 on gcc 13.3.0 (source fed as
+    // base64 to stdin so no shell quoting could confound it; plan 29 §4.6): in
+    // BASIC asm `%` is LITERAL — `__asm__("xorl %eax, %eax")` emits `xorl
+    // %eax, %eax` unchanged — while the SAME text inside an EXTENDED statement
+    // is an error ("operand number missing after %-letter"). The two templates
+    // lex DIFFERENTLY, so the basic/extended discriminator is load-bearing at
+    // the LEXER and not only at the semantic gate.
+    //
+    // ★ THIS CODE IS THE FAIL-LOUD HALF OF THAT MEASUREMENT, and it exists
+    // because the tempting implementation is wrong in the DANGEROUS direction:
+    // a design that unescapes `%%`→`%` into a buffer and then lexes
+    // placeholders silently binds `%%0` to operand 0 — a miscompile gcc does
+    // NOT have (the same source table records `"A%%0B"` emitting `A%0B`, the
+    // emitted `%0` deliberately NOT re-read).
+    //
+    // ⚠ THE ACCEPTANCE CLAIM THIS CODE MUST NOT BREAK, stated as the INFERENCE
+    // it currently is: under [[feedback_reference_compilers_are_the_spec]] the
+    // rule is bidirectional, so refusing a program the reference TOOLCHAIN
+    // builds would itself be the defect. INFERRED, and owed a measurement
+    // before the consumer lands: gcc emits the `%0` verbatim and the ASSEMBLER
+    // then refuses it as a register spelling, so the program fails either way
+    // and this code only moves the refusal to the one place that knows how
+    // many operands were declared. If a measurement shows the emitted text
+    // ASSEMBLES, this is a divergence and must be narrowed or withdrawn — not
+    // kept because it is already written.
+    //
+    // UNSUPPRESSABLE: silenced, the `%` form is either bound (wrong — there is
+    // no operand list to bind against) or passed through raw, and the two
+    // differ in the machine code that ships. Renders error[S006B].
+    S_InlineAsmPlaceholderInBasicTemplate = 0xE06B,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -2919,6 +3115,48 @@ enum class DiagnosticCode : std::uint16_t {
     //   UNSUPPRESSABLE: suppressed, this is a wrong-target branch with a green
     //   build. Red-on-disable via the `.dsslir` CondBr round-trip pins.
     L_TerminatorSuccessorMismatch  = 0xB00F,
+
+    // ── module SIDE-STRUCTURE integrity ───────────────────────────────
+    //    Anchor: D-LIR-PER-INST-REG-CONSTRAINTS
+    //
+    // A `Lir` module carries two by-index side structures next to the
+    // instruction stream — the wide-literal pool (referenced by
+    // `LiteralIndex` OPERANDS) and the per-instruction register-
+    // constraint pool (referenced by `detail::LirInst::regConstraints`).
+    // FOUR passes rebuild the module into a fresh builder and must carry
+    // both across. Every failure of that carry is SILENT by nature: the
+    // module stays structurally well-formed and the loss shows up as
+    // wrong bytes, so these three codes exist to make the loss loud at
+    // the verifier tier instead.
+    //
+    // L_SideStructureIndexDangling: a reference points OUTSIDE its pool —
+    //   a `litIndex` past the literal pool, or a non-zero
+    //   `regConstraints` handle past the constraint pool. Reaching the
+    //   encoder, the first aborts inside `LirLiteralPool::at` and the
+    //   second aborts inside `LirRegConstraintPool::at`; the verifier
+    //   names the instruction first.
+    // L_SideStructurePoolShrank: the module produced by a rebuild has
+    //   FEWER entries in a pool than the module that went in — the
+    //   signature of a forgotten `copyModuleSideStructures`. Checked
+    //   before the dangling rule because it explains it.
+    // L_SideStructureReferenceLost: a pool entry that NOTHING references,
+    //   or (on the paired rebuild check) a rebuild that ends with fewer
+    //   references than it started with. ★ This is the rule that catches
+    //   the per-instruction carrier's real failure mode: a pass that
+    //   drops `regConstraints` leaves the handle at 0, which is the
+    //   perfectly legal "declares no constraints" — no index dangles and
+    //   no pool shrinks. What DOES change is that the copied pool entry
+    //   becomes unreachable, and that is detectable from the rebuilt
+    //   module alone.
+    //   ⚠ It fires on a legitimately DELETED constraint-bearing
+    //   instruction too. That is intended, not a false positive: an
+    //   instruction that declared registers destroyed does not vanish
+    //   without the deleting pass having a position on those registers.
+    // All three UNSUPPRESSABLE: suppressed, each is a wrong-register
+    // codegen with a green build.
+    L_SideStructureIndexDangling   = 0xB010,
+    L_SideStructurePoolShrank      = 0xB011,
+    L_SideStructureReferenceLost   = 0xB012,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

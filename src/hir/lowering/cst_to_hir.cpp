@@ -20,6 +20,12 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/string_literal_decode.hpp" // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE string-body chokepoint)
+// Inline-asm P5: the SHARED capture (`gatherInlineAsmFacts`) the semantic
+// analyzer validates and this tier turns into a descriptor — one walk, two
+// callers, so "what the statement said" cannot differ between them.
+#include "analysis/semantic/inline_asm_facts.hpp"
+#include "core/types/target_schema.hpp"   // asmConstraint / registerByName (the letter half)
+#include "hir/hir_inline_asm.hpp"
 #include "core/types/wide_string_encode.hpp"     // C 6.4.5: encodeWideString (wide/UTF code units, shared with semantic)
 #include "core/types/tree.hpp"
 #include "core/types/tree_node.hpp"             // isEmptySpace
@@ -190,6 +196,10 @@ struct Lowerer {
     DiagnosticReporter&      reporter;
     HirBuilder&              builder;    // shared across all per-schema Lowerers
     HirLiteralPool&          literals;   // shared
+    // Inline-asm P5: the per-CU descriptor pool, shared across every per-schema
+    // Lowerer exactly as `literals` is — one CU, one pool, and an `InlineAsm`
+    // node's `payload` is a handle into it.
+    HirInlineAsmPool&        inlineAsm;
     Tree const*              t_ = nullptr;
 
     // pendingSpans (shared): applied to the result's HirSourceMap after finish().
@@ -1083,7 +1093,8 @@ struct Lowerer {
 
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
             NumberStyle const* ns, DiagnosticReporter& r, HirBuilder& b,
-            HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp,
+            HirLiteralPool& lits, HirInlineAsmPool& asmPool,
+            std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp,
             std::vector<HirExternRecord>& ed,
             std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
@@ -1100,7 +1111,8 @@ struct Lowerer {
             std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOrigin,
             std::vector<std::pair<std::uint32_t, std::string>>& synthRecipe)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
-          reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
+          reporter(r), builder(b), literals(lits), inlineAsm(asmPool),
+          spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), noInlineAcc(noinl),
           alwaysInlineAcc(alwinl), noOptimizeAcc(noopt),
           noSanitizeThreadAcc(nosanthr),
@@ -1193,47 +1205,12 @@ struct Lowerer {
     }
     [[nodiscard]] bool isToken(NodeId n) const { return tree().kind(n) == NodeKind::Token; }
 
-    // inline-asm P1 (D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): the FIRST
-    // descendant of an inline-asm statement that carries extended-asm payload —
-    // an operand list, a clobber list or a goto-label list — or an invalid NodeId
-    // when the statement is the bare barrier form. The three rules are exactly
-    // the payload-carrying shapes `semantics.inlineAsm` declares (see
-    // `InlineAsmConfig`), so "none of the three" is a COMPLETE test for "there is
-    // nothing here to drop", not a sampling of likely cases.
-    //
-    // Config-resolved RuleIds only — no rule name, no keyword, no language check.
-    // A clean probe (no node, not truncated) is returned immediately when the
-    // language declares no inline-asm facet (toy/tsql, or any grammar whose asm
-    // statement is template-only): there is then no payload shape to find.
-    //
-    // `scanTruncated` is reported SEPARATELY rather than folded into "no payload":
-    // a walk that did not finish has not shown the statement is clean, and the
-    // whole point of this backstop is that "we did not see a problem" and "there
-    // is no problem" are different claims. Both outcomes fail loud at the caller.
-    struct InlineAsmPayloadProbe { NodeId node{}; bool scanTruncated = false; };
-    [[nodiscard]] InlineAsmPayloadProbe inlineAsmPayloadProbe(NodeId asmNode) const {
-        auto const& ia = sem.inlineAsm;
-        if (!ia.operandListRule.valid() && !ia.clobberListRule.valid()
-            && !ia.gotoLabelListRule.valid())
-            return {};
-        std::vector<NodeId> stack{asmNode};
-        // The subtree is a TREE, so termination needs no guard; the guard is a
-        // malformed-graph backstop, sized far above any real asm statement.
-        for (int guard = 0; !stack.empty(); ++guard) {
-            if (guard > (1 << 20)) return {.node = {}, .scanTruncated = true};
-            NodeId const cur = stack.back();
-            stack.pop_back();
-            if (tree().kind(cur) == NodeKind::Internal && cur.v != asmNode.v) {
-                std::uint32_t const r = tree().rule(cur).v;
-                if ((ia.operandListRule.valid()   && r == ia.operandListRule.v)
-                    || (ia.clobberListRule.valid()   && r == ia.clobberListRule.v)
-                    || (ia.gotoLabelListRule.valid() && r == ia.gotoLabelListRule.v))
-                    return {.node = cur, .scanTruncated = false};
-            }
-            for (NodeId c : visible(cur)) stack.push_back(c);
-        }
-        return {};
-    }
+    // ⓘ `inlineAsmPayloadProbe` LIVED HERE AND IS DELETED (inline-asm P5). It was
+    // a PRESENCE test — "does this statement carry an operand / clobber / label
+    // list?" — whose only answer was a refusal, and P5 replaced the refusal with
+    // a CAPTURE: the `InlineAsm` arm now runs the SHARED `gatherInlineAsmFacts`
+    // and builds a descriptor. Keeping a second, weaker walk beside it is exactly
+    // the two-answers-one-grammar drift the shared gatherer exists to end.
 
     // ── declaration-specifier prefix (D-DECL-SPECIFIER-PREFIX-SUBSTRATE consumer)
     // The c-subset's `static`/`__attribute__` prefix rides as an OPTIONAL leading
@@ -5639,74 +5616,210 @@ struct Lowerer {
             if (k == "ReturnStmt")  { stmtResult = lowerReturn(n); return; }
             if (k == "BreakStmt")    { stmtResult = track(builder.makeBreak(0), n); return; }
             if (k == "ContinueStmt") { stmtResult = track(builder.makeContinue(0), n); return; }
-            // ★★ FC17.9(i) + inline-asm P1 (D-CSUBSET-INLINE-ASM /
-            // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED): the bare, empty-template
-            // `__asm__ [volatile] ("")` statement lowers to a 0-child InlineAsm leaf
-            // → MirOpcode::CompilerBarrier. It carries NO payload by construction —
-            // and the assertion below is what makes "by construction" true here
-            // rather than merely true somewhere else.
+            // ★★ FC17.9(i) + inline-asm P5 (D-CSUBSET-INLINE-ASM /
+            // D-CSUBSET-INLINE-ASM-OPERANDS): the GNU inline-asm statement.
             //
-            // ★ WHY THE ASSERTION EXISTS — AND IT *CAN* FIRE: see the TEST TIER
-            // paragraph below, which is the correction to this heading's earlier
-            // wording ("…EVEN THOUGH IT CANNOT FIRE TODAY"). That claim was false
-            // of the third caller, and a heading twelve lines above its own
-            // retraction is read as the fact — a block is read top-first, which is
-            // why the correction lives here rather than only below
-            // ([[D-CONFIG-COMMENT-CLAIM-ROT]] (g2)). This arm
-            // used to lower UNCONDITIONALLY, justified by "the gate lives in the
-            // semantic tier". That was SOUND while `asmStmt` could carry only a
-            // template — there was nothing to drop. P1 taught the grammar the full
-            // GNU extended form, so the node can now carry operand / clobber / label
-            // subtrees, and an unconditional leaf would discard them SILENTLY BY
-            // CONSTRUCTION: exactly one gate, no second line of defence, on exactly
-            // the failure the P1 arc exists to prevent (`"=a"(lo)` dropped ⇒ `rdtsc`
-            // clobbers eax/edx with the allocator uninformed and `lo` never written).
-            // ✔MEASURED that the semantic gate does hold: `compile_pipeline.cpp:303`
-            // and `c_header_parser.cpp:313` both bail on `hasErrors()` before
-            // lowering, so a refused asm never reaches here in a correct build.
-            // ★ UNREACHABLE FROM THE DRIVER, REACHABLE FROM THE TEST TIER — AND
-            // HERE IS THE TEST. An earlier revision of this comment said flatly
-            // "unreachable today", which was true of the two driver entry points
-            // above and FALSE of the third caller: `tests/mir/
-            // test_mir_lowering_c_subset.cpp`'s `lowerCSubset` calls `lowerToHir`
-            // with NO `hasErrors()` guard, deliberately, so a lowering bug cannot
-            // hide behind a semantic diagnostic. `MirLoweringCSubset.
-            // ExtendedInlineAsmReachingHirLoweringIsRefusedNotDropped` now drives
-            // exactly that path and pins the diagnostic — the project's own rule
-            // is to EXERCISE the failure arm rather than read it, and an arm
-            // believed unreachable is the one that most needs the run. The arm
-            // also remains the thing that stays true if someone later reorders
-            // those bails, relaxes the semantic gate, or adds a fourth lowering
-            // entry point: a silent drop must cost a diagnostic, not a code review.
+            // TWO SHAPES, ONE KIND. `__asm__ [volatile] ("")` with no sections is
+            // a 0-child leaf with `payload == kNoInlineAsmDescriptor` → MIR's
+            // CompilerBarrier, unchanged. Anything else becomes an `InlineAsm`
+            // node whose CHILDREN are the operand value expressions (outputs
+            // first, then inputs — the `%N` index space, GNU 6.47.2.3) and whose
+            // `payload` is a handle into the per-CU `HirInlineAsmPool`.
             //
-            // Payload is tested over the THREE payload-carrying rules the config
-            // names (`operandListRule` / `clobberListRule` / `gotoLabelListRule`) —
-            // config-resolved RuleIds, no rule names and no keyword spellings — and
-            // those three are the only rules in the asm grammar that can hold
-            // anything to bind, clobber-track or branch to, so the scan is complete.
+            // ⛔ ACCEPT-AND-IGNORE IS STILL THE FORBIDDEN OUTCOME, and the guard
+            // that used to enforce it by REFUSING now enforces it by CARRYING.
+            // The operands ARE the contract: `"=a"(lo)` says this statement writes
+            // `eax` and `lo` receives it. Building a leaf and dropping them would
+            // clobber registers the allocator still believes live AND leave
+            // `lo`/`hi` untouched — a silent miscompile with a clean build log.
+            // ⇒ every refusal below is a REFUSAL, never a partial build: a
+            // descriptor missing one operand is worse than no descriptor.
+            //
+            // ★ THE CAPTURE IS THE SEMANTIC TIER'S, NOT A SECOND WALK.
+            // `gatherInlineAsmFacts` is shared with `semantic_analyzer.cpp`, so
+            // "which operands does this statement have" has exactly one answer.
+            // What this tier adds is the parts that need the HIR: the value
+            // expressions LOWERED, and the `asm goto` labels resolved to the same
+            // per-function ordinals `GotoStmt`/`LabelStmt` use.
+            //
+            // ★ UNREACHABLE-FROM-THE-DRIVER IS NOT UNREACHABLE. ✔MEASURED that the
+            // semantic gate holds — `compile_pipeline.cpp` and `c_header_parser.cpp`
+            // both bail on `hasErrors()` before lowering — but a THIRD caller,
+            // `tests/mir/test_mir_lowering_c_subset.cpp`'s `lowerCSubset`, calls
+            // `lowerToHir` with NO such guard, deliberately, so a lowering bug
+            // cannot hide behind a semantic diagnostic. That is why the refusals
+            // here are real diagnostics rather than assertions, and why they stay
+            // true if someone later reorders those bails or adds a fourth entry
+            // point.
             if (k == "InlineAsm") {
-                auto const probe = inlineAsmPayloadProbe(n);
-                if (probe.node.valid()) {
-                    // The `reportedError` idiom used by the block-scope-extern guard
-                    // above: a loud error node, never a silent drop.
-                    stmtResult = reportedError(probe.node,
-                        "extended inline-asm reached HIR lowering with an operand / "
-                        "clobber / label section still attached — the semantic tier "
-                        "must have refused it (S_InlineAsmExtendedUnsupported, "
-                        "D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED). Lowering it to "
-                        "a bare barrier would DROP the operand binding: a silent "
-                        "miscompile");
+                auto const& ia = sem.inlineAsm;
+                if (!ia.rule.valid()) {
+                    // The host bound an `InlineAsm` lowering row without declaring
+                    // `semantics.inlineAsm`. Nothing can be read from the node, so
+                    // a leaf here would be a guess that it carries nothing.
+                    stmtResult = reportedError(n,
+                        "this language maps a rule to HirKind::InlineAsm but "
+                        "declares no `semantics.inlineAsm` block, so the "
+                        "statement's template, operands and clobbers cannot be "
+                        "located — refusing rather than lowering it to an empty "
+                        "barrier on an unverified assumption");
                     return;
                 }
-                if (probe.scanTruncated) {
+                auto const f = gatherInlineAsmFacts(tree(), n, ia,
+                                                    sem.identifierToken,
+                                                    cfg.stringBodyToken);
+                if (f.scanTruncated) {
                     stmtResult = reportedError(n,
                         "inline-asm payload scan did not finish (node budget "
-                        "exhausted), so this statement has NOT been shown to be the "
-                        "bare barrier form — refusing rather than lowering it to a "
-                        "0-child leaf on an unverified assumption");
+                        "exhausted), so this statement has NOT been shown to carry "
+                        "only what was captured — refusing rather than building a "
+                        "descriptor on an unverified assumption");
                     return;
                 }
-                stmtResult = track(builder.addLeaf(HirKind::InlineAsm), n);
+                // The BARE BARRIER: no sections at all AND an empty template.
+                // `payload` stays `kNoInlineAsmDescriptor`, so every existing
+                // consumer (MIR's CompilerBarrier arm, `hir_text`'s bare
+                // `inline_asm` line) is byte-for-byte unaffected.
+                bool const emptyTemplate =
+                    f.templateText.has_value() && f.templateText->empty();
+                if (!f.hasPayload() && emptyTemplate) {
+                    stmtResult = track(builder.addLeaf(HirKind::InlineAsm), n);
+                    return;
+                }
+                if (!f.templateText.has_value()) {
+                    stmtResult = reportedError(n,
+                        "the inline-asm template could not be located or decoded, "
+                        "so there is no assembly text to carry (the semantic tier "
+                        "reports this as S_InlineAsmNonEmptyTemplate or "
+                        "S_InlineAsmTemplateUnparsable) — refusing rather than "
+                        "lowering an unreadable template to a no-op");
+                    return;
+                }
+
+                HirInlineAsmDescriptor desc;
+                desc.templateText = *f.templateText;
+                desc.outputCount  = f.outputCount;
+                desc.isGoto       = f.hasGotoQualifier;
+                desc.isExtended   = f.isExtended;
+
+                // ── the operands: value expression → CHILD, constraint → pool ──
+                std::vector<HirNodeId> children;
+                children.reserve(f.operands.size());
+                bool refused = false;
+                for (auto const& op : f.operands) {
+                    if (op.malformed) {
+                        stmtResult = reportedError(
+                            op.operandNode.valid() ? op.operandNode : n,
+                            "an inline-asm operand could not be decomposed into a "
+                            "constraint and a value expression (" + op.malformedDetail
+                            + ") — refusing rather than binding the operands that "
+                              "WERE read and dropping this one");
+                        refused = true;
+                        break;
+                    }
+                    HirInlineAsmOperand rec;
+                    rec.symbolicName = op.symbolicName;
+                    rec.isOutput     = op.isOutput;
+                    auto const parsed = parseAsmConstraint(op.constraint);
+                    if (!parsed.ok()) {
+                        stmtResult = reportedError(
+                            op.constraintNode.valid() ? op.constraintNode : n,
+                            "inline-asm constraint \"" + op.constraint
+                            + "\" could not be split into modifiers and a machine "
+                              "letter ("
+                            + std::string{asmConstraintDefectDescription(parsed.defect)}
+                            + ") — the semantic tier reports this as "
+                              "S_InlineAsmConstraintUnsupportedForm");
+                        refused = true;
+                        break;
+                    }
+                    rec.constraint = parsed.value;
+                    // ── the TARGET half, resolved ONCE, here ──
+                    // ★ The class comes from the CONSTRAINT, never from the
+                    // expression's TYPE: `"=x"` on an integer lvalue is legal and
+                    // means SSE (plan 29 §4.4.3). Deriving it from the type would
+                    // file the operand in the GPR pool — silently.
+                    // ⚠ Left UNRESOLVED when no target is in scope. Not a guess,
+                    // and not a silent hole: the tier that BINDS the operand
+                    // cannot function without the class and fails loud there.
+                    if (TargetSchema const* target = model.target();
+                        target != nullptr) {
+                        if (auto const* c = target->asmConstraint(parsed.value.letter);
+                            c != nullptr) {
+                            switch (c->binds) {
+                                case AsmConstraintBinding::RegisterClass:
+                                    if (c->registerClass.has_value()) {
+                                        rec.regClassResolved = true;
+                                        rec.regClass = static_cast<std::uint8_t>(
+                                            *c->registerClass);
+                                    }
+                                    break;
+                                case AsmConstraintBinding::Register:
+                                    if (c->registerOrdinal.has_value()) {
+                                        if (auto const* r = target->registerInfo(
+                                                *c->registerOrdinal);
+                                            r != nullptr) {
+                                            rec.fixedRegister = r->name;
+                                            rec.regClassResolved = true;
+                                            rec.regClass = static_cast<std::uint8_t>(
+                                                r->regClass);
+                                        }
+                                    }
+                                    break;
+                                case AsmConstraintBinding::OperandKind:
+                                    // `"i"` / `"m"` bind an operand FORM, not a
+                                    // register. No class to record, and recording a
+                                    // default one would claim a register binding
+                                    // this constraint never asked for.
+                                    break;
+                            }
+                        }
+                    }
+                    desc.operands.push_back(std::move(rec));
+
+                    E const value = lowerExpr(op.valueExpr);
+                    children.push_back(value.id);
+                }
+                if (refused) return;
+
+                // ── the clobbers: the two configured spellings hoisted to flags ──
+                // ⚠ `"memory"` / `"cc"` are NEVER C++ literals here — they are
+                // `semantics.inlineAsm.memoryClobber` / `.conditionCodeClobber`,
+                // GNU-ASM vocabulary owned by the embedded language's document.
+                for (auto const& c : f.clobbers) {
+                    if (!ia.memoryClobber.empty() && c.text == ia.memoryClobber) {
+                        desc.clobbersMemory = true;
+                        continue;
+                    }
+                    if (!ia.conditionCodeClobber.empty()
+                        && c.text == ia.conditionCodeClobber) {
+                        desc.clobbersConditionCodes = true;
+                        continue;
+                    }
+                    desc.clobbers.push_back(c.text);
+                }
+
+                // ── the `asm goto` labels → the SHARED per-function ordinals ──
+                // Resolved through the SAME `labelOrdinals_` map `lowerGoto` uses,
+                // so an asm-goto edge and a plain `goto` to the same label carry
+                // the same ordinal and the MIR tier needs no second namespace.
+                for (auto const& l : f.labels) {
+                    auto it = labelOrdinals_.find(l.name);
+                    if (it == labelOrdinals_.end()) {
+                        emitH(DiagnosticCode::S_UndefinedLabel, l.node,
+                              std::format("`asm goto` target label '{}' is not "
+                                          "defined in this function", l.name));
+                        stmtResult = errorNode(n);
+                        return;
+                    }
+                    desc.labelOrdinals.push_back(it->second);
+                }
+
+                std::uint32_t const handle = inlineAsm.add(std::move(desc));
+                stmtResult = track(
+                    builder.addParent(HirKind::InlineAsm, children, InvalidType,
+                                      handle),
+                    n);
                 return;
             }
             // Switch is a DEEP form: its arm-grouping re-enters the driver for each
@@ -10325,6 +10438,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     auto const trees = model.unit().trees();
     HirBuilder builder{model.unit().compositeSourceLanguage()};
     HirLiteralPool literals;
+    // Inline-asm P5: the per-CU inline-asm descriptor pool. Created and moved
+    // into the result beside `literals` — the same lifetime, the same handoff.
+    HirInlineAsmPool inlineAsmPool;
     std::vector<std::pair<HirNodeId, HirSourceLoc>> spans;
     // FF6 Slice 2 (2026-06-02): shared accumulator for source-
     // declared externs across every per-schema Lowerer. Moved
@@ -10392,7 +10508,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         if (lowerers.contains(sch.schemaId().v)) continue;
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
-            reporter, builder, literals, spans, externDecls, linkage,
+            reporter, builder, literals, inlineAsmPool, spans, externDecls, linkage,
             mutability, noInlineAcc, alwaysInlineAcc, noOptimizeAcc,
             noSanitizeThreadAcc,
             threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
@@ -10482,7 +10598,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     Hir hir = std::move(builder).finish(root);
     lowerers.clear();   // drop the Lowerers (their builder ref is now moved-from)
 
-    auto result = std::make_unique<CstToHirResult>(std::move(hir), std::move(literals));
+    auto result = std::make_unique<CstToHirResult>(std::move(hir), std::move(literals),
+                                                  std::move(inlineAsmPool));
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
     for (auto& [id, attr] : noInlineAcc)   // TF-C78 (D-CSUBSET-NOINLINE)
@@ -10511,7 +10628,12 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.
-    HirVerifier verifier{result->hir, &result->sourceMap, &model.lattice().interner()};
+    HirVerifier verifier{result->hir, &result->sourceMap,
+                         &model.lattice().interner(),
+                         // Inline-asm P5: verify-on-load resolves every
+                         // descriptor handle against the pool this same
+                         // lowering just filled.
+                         &result->inlineAsmPool};
     (void)verifier.verify(reporter);
 
     result->ok = reporter.errorCount() == errBefore;

@@ -6,6 +6,7 @@
 #include "core/types/type_lattice/type_interner.hpp" // TypeInterner (by-value in the parse result)
 #include "hir/hir.hpp"                              // Hir
 #include "hir/hir_attrs.hpp"                        // the five HirAttribute<T> side-table aliases
+#include "hir/hir_inline_asm.hpp"                   // HirInlineAsmPool (inline-asm descriptors)
 #include "hir/hir_literal_pool.hpp"                 // HirLiteralPool (literal values)
 
 #include <memory>
@@ -74,6 +75,15 @@ struct DSS_EXPORT HirTextContext {
     // The lowering supplies `&CstToHirResult::literalPool`.
     HirLiteralPool const* literalPool = nullptr;
 
+    // Inline-asm P5: the descriptors an `InlineAsm` node's `payload` HANDLE
+    // names. The lowering supplies `&CstToHirResult::inlineAsmPool`.
+    // !! NULL IS NOT A HARMLESS DEGRADATION HERE, unlike `literalPool`. A `lit`
+    // with no pool still renders as `lit #3` and is recognisably a literal; an
+    // `inline_asm` with no pool would render as a BARE BARRIER, which is a
+    // different program. The writer therefore emits an explicit `#<handle>`
+    // form AND reports a diagnostic rather than degrading quietly.
+    HirInlineAsmPool const* inlineAsmPool = nullptr;
+
     // The five side-tables to serialize. Null = nothing of that kind is emitted.
     HirSourceMap     const* sourceMap     = nullptr;
     HirFfiMap        const* ffiMap        = nullptr;
@@ -113,6 +123,10 @@ struct DSS_EXPORT HirParseResult {
     // Literal values rebuilt from the text's inline `lit <value>` forms (empty
     // when the source used the bare `#<index>` form). Indexed by `payload`.
     HirLiteralPool   literalPool;
+    // Inline-asm P5: descriptors rebuilt from the text's inline `inline_asm ...`
+    // form (empty when the source used the bare `#<handle>` form). Indexed by an
+    // `InlineAsm` node's `payload`, 1-based.
+    HirInlineAsmPool inlineAsmPool;
 
     // True iff neither the parse nor the verify-on-load pass emitted an
     // Error-severity diagnostic (computed by delta on the reporter, so prior

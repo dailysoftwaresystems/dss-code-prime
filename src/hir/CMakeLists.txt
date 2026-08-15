@@ -3,6 +3,7 @@ add_library(hir OBJECT
     cst_const_eval.cpp
     hir.cpp
     hir_cursor.cpp
+    hir_inline_asm.cpp
     hir_intrinsic_registry.cpp
     hir_kind_registry.cpp
     hir_literal_pool.cpp

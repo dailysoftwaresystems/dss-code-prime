@@ -7,6 +7,9 @@
 //   * per-function isolation in multi-function modules
 //   * reserved registers (rsp / rflags) never allocated
 //   * FPR-class allocation for floating-point arithmetic
+//   * D-LIR-PER-INST-REG-CONSTRAINTS: the three-site forbidden-ordinal
+//     chokepoint, each site pinned INDIVIDUALLY, and the early-clobber
+//     (`"=&r"`) result rule with its matched plain-`"=r"` control
 
 #include "core/types/call_payload.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -14,7 +17,9 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_liveness.hpp"
+#include "lir/lir_node.hpp"
 #include "lir/lir_regalloc.hpp"
+#include "lir/lir_rewrite.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "lowered_lir_fixture.hpp"
 #include "mir/mir.hpp"
@@ -28,6 +33,8 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -1800,4 +1807,553 @@ TEST(LirRegAlloc, Aapcs64PressuredIndirectStructReturnCalleeExcludesX8) {
     EXPECT_TRUE(sawPhysAssignedCallee)
         << "no indirect struct-returning callee was register-allocated — the "
            "pin would be vacuous";
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// D-LIR-PER-INST-REG-CONSTRAINTS — THE THREE-SITE CHOKEPOINT
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Fixed-register semantics reach the allocator through TWO carriers: the
+// per-OPCODE `TargetOpcodeInfo::implicitRegisters` (target JSON) and the
+// per-INSTRUCTION `Lir::instRegConstraints` pool (an inline-asm statement).
+// ✔MEASURED 2026-08-15: the `inputs ∪ clobbered` union was hand-rolled at
+// THREE sites and every one of them read ONLY the opcode carrier —
+//
+//   1. `collectImplicitClobberPositions`  (lir_regalloc.cpp) — keeps a vreg
+//      whose range COVERS the instruction off its forbidden ordinals;
+//   2. the `requires2Address` result exclusion (lir_regalloc.cpp) — keeps the
+//      instruction's own RESULT off them, which site 1 structurally cannot do
+//      (the result's range starts at the LATE slot, the clobber sits at the
+//      EARLY slot, so `position < start` skips it);
+//   3. the spill-scratch forbid (lir_rewrite.cpp) — keeps a transient RELOAD
+//      SCRATCH off them.
+//
+// All three now call `effectiveForbiddenOrdinals`, which reads both carriers.
+//
+// ★ §A.5: A GREEN SUITE OVER A SUBSET OF THE SITES IS NOT PROOF. Each pin
+// below drives ONE site and must go RED when only THAT site's call is
+// reverted — otherwise three copies of one rule silently become two plus a
+// bug. The pins are SELF-CALIBRATING, and that is what makes them
+// discriminating rather than merely present: each runs the module twice, once
+// with NO constraint to OBSERVE the ordinal the allocator naturally picks, and
+// once with a per-instruction constraint naming EXACTLY that ordinal. A
+// hard-coded register name would be an arch opinion and would also silently
+// stop discriminating the day the free-list order changed; observing the
+// natural pick cannot. No register name, no mnemonic list, no `if (arch == …)`
+// appears in any assertion.
+//
+// Site 3's pin lives in this file rather than beside the rewriter because the
+// three arms of one chokepoint belong together — reading them apart is exactly
+// how the third copy drifted in the first place.
+namespace {
+
+// Ordinal → the canonical name a constraint must spell, WITH THE ROUND TRIP
+// PINNED. ★ GUARD ON THE GUARD: every pin below observes an ordinal and then
+// forbids it BY NAME. If `registerByName` did not invert
+// `registerInfo(...)->name` — a sub-register spelling would not, since `eax`
+// and `rax` are separate table rows — the constraint would forbid a DIFFERENT
+// register than the one just observed, the allocator would happily hand out
+// the observed one again, and EVERY pin in this section would pass while
+// asserting nothing.
+[[nodiscard]] std::string forbidNameForOrdinal(TargetSchema const& schema,
+                                               std::uint16_t ordinal) {
+    auto const* info = schema.registerInfo(ordinal);
+    EXPECT_NE(info, nullptr) << "ordinal " << ordinal
+                            << " has no register-table row";
+    if (info == nullptr) return {};
+    auto const back = schema.registerByName(info->name);
+    EXPECT_TRUE(back.has_value()) << info->name;
+    EXPECT_EQ(back.value_or(0xFFFFu), ordinal)
+        << "ordinal->name->ordinal is not the identity for '" << info->name
+        << "' — the per-instruction constraint would forbid a DIFFERENT "
+           "register than the one just observed, making these pins vacuous";
+    return info->name;
+}
+
+// A per-instruction constraint in the shape an `asm` statement produces.
+// Register NAMES only — `LirBuilder::regConstraintPoolAdd` derives the
+// ordinals, so the two representations cannot disagree.
+[[nodiscard]] ImplicitRegisterConstraint constraintClobbering(std::string n) {
+    ImplicitRegisterConstraint c;
+    c.clobberedNames = {std::move(n)};
+    return c;
+}
+[[nodiscard]] ImplicitRegisterConstraint constraintReading(std::string n) {
+    ImplicitRegisterConstraint c;
+    c.inputNames = {std::move(n)};
+    return c;
+}
+
+// The physical ordinal the allocator gave `vregId`, or nullopt if it spilled.
+[[nodiscard]] std::optional<std::uint16_t>
+physOrdinalOf(LirFuncAllocation const& alloc, std::uint32_t vregId) {
+    auto const* a = alloc.forVReg(vregId);
+    if (a == nullptr || a->isSpilled()) return std::nullopt;
+    return static_cast<std::uint16_t>(a->physReg().id);
+}
+
+[[nodiscard]] LirAllocation allocateOn(Lir const& lir,
+                                       TargetSchema const& schema,
+                                       DiagnosticReporter& rep) {
+    LirLiveness const lv = analyzeLiveness(lir);
+    return allocateRegisters(lir, schema, lv, /*ccIndex=*/0, rep);
+}
+
+} // namespace
+
+// ── SITE 1: a range COVERING a per-instruction-constrained instruction ──
+//
+// `f() { vLive = mov #1 ; nop ; vUse = mov vLive ; ret }` — the `nop` at
+// position 2 carries the constraint, and `vLive`'s range [1,5) COVERS it. The
+// hazard is the mid-op one `implicitClobbersCrossedBy` was built for: a value
+// parked in a register the instruction destroys is gone by the time the
+// instruction after it reads the value. Nothing about that reasoning cares
+// which carrier declared the register.
+//
+// Site 2 cannot mask this: `mov` is not `requires2Address`, so the site-2 arm
+// is never entered.
+TEST(LirRegAlloc, PerInstConstraintKeepsCoveringRangeOffTheForbiddenOrdinal) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    auto const nopOp = (*target)->opcodeByMnemonic("nop");
+    auto const retOp = (*target)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value());
+    ASSERT_TRUE(nopOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+
+    struct Built { Lir lir; std::uint32_t liveVReg; };
+    auto build = [&](std::optional<std::string> const& forbidName) -> Built {
+        LirBuilder b{**target};
+        std::optional<std::uint32_t> handle;
+        if (forbidName.has_value()) {
+            handle = b.regConstraintPoolAdd(constraintReading(*forbidName));
+        }
+        (void)b.addFunction(SymbolId{1});
+        LirBlockId const entry = b.createBlock();
+        b.beginBlock(entry);
+        LirReg const vLive = b.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const seed{LirOperand::makeImmInt32(1)};
+        (void)b.addInst(*movOp, vLive, seed);                  // inst 0 — pos 0
+        LirInstId const subject =
+            b.addInst(*nopOp, InvalidLirReg,
+                      std::span<LirOperand const>{});          // inst 1 — pos 2
+        if (handle.has_value()) b.setInstRegConstraints(subject, *handle);
+        LirReg const vUse = b.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const use{LirOperand::makeReg(vLive)};
+        (void)b.addInst(*movOp, vUse, use);                    // inst 2 — pos 4
+        b.addReturn(*retOp, std::span<LirOperand const>{});
+        return Built{std::move(b).finish(), vLive.id};
+    };
+
+    // CONTROL — observe the natural pick.
+    Built const control = build(std::nullopt);
+    DiagnosticReporter cRep;
+    LirAllocation const cAlloc = allocateOn(control.lir, **target, cRep);
+    ASSERT_TRUE(cAlloc.ok());
+    ASSERT_EQ(cAlloc.perFunc.size(), 1u);
+    auto const natural = physOrdinalOf(cAlloc.perFunc[0], control.liveVReg);
+    ASSERT_TRUE(natural.has_value())
+        << "the covering vreg spilled in an unpressured 3-instruction "
+           "function — the pin would assert nothing";
+    std::string const forbidName = forbidNameForOrdinal(**target, *natural);
+    ASSERT_FALSE(forbidName.empty());
+
+    // SUBJECT — forbid exactly that ordinal, per-INSTRUCTION.
+    Built const subject = build(forbidName);
+    DiagnosticReporter sRep;
+    LirAllocation const sAlloc = allocateOn(subject.lir, **target, sRep);
+    ASSERT_TRUE(sAlloc.ok());
+    auto const constrained = physOrdinalOf(sAlloc.perFunc[0], subject.liveVReg);
+    ASSERT_TRUE(constrained.has_value());
+    EXPECT_NE(*constrained, *natural)
+        << "a live range COVERING an instruction that declares '" << forbidName
+        << "' as a per-INSTRUCTION implicit register was still allocated to "
+           "it. The instruction destroys that register mid-op, so the value "
+           "is gone before its next reader runs — a silent miscompile. "
+           "collectImplicitClobberPositions is reading only the per-OPCODE "
+           "carrier.";
+    expectAllocationInvariants(sAlloc.perFunc[0]);
+}
+
+// ── SITE 2: the RESULT of a `requires2Address` instruction ──────────────
+//
+// `vR = add vA, vB` where the `add` carries a per-instruction constraint, and
+// vA/vB are kept live PAST the add so the allocator's natural pick for vR is a
+// fresh register rather than a just-freed operand — that separation is what
+// makes site 2 the only thing standing between vR and the forbidden ordinal.
+//
+// ★ Site 1 structurally CANNOT cover this, and that is the point: the clobber
+// sits at the add's EARLY slot (pos 4) while vR's range starts at its LATE
+// slot (pos 5), so `implicitClobbersCrossedBy`'s `position < start` test
+// skips it. Reverting site 2 alone therefore reds this pin and nothing else.
+TEST(LirRegAlloc, PerInstConstraintKeepsTwoAddressResultOffTheForbiddenOrdinal) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    auto const addOp = (*target)->opcodeByMnemonic("add");
+    auto const retOp = (*target)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value());
+    ASSERT_TRUE(addOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+    // Non-vacuity: the pin's whole subject is the `requires2Address` arm.
+    auto const* addInfo = (*target)->opcodeInfo(*addOp);
+    ASSERT_NE(addInfo, nullptr);
+    ASSERT_TRUE(addInfo->requires2Address)
+        << "the shipped `add` stopped being 2-address — this pin no longer "
+           "exercises the site it names";
+
+    struct Built { Lir lir; std::uint32_t resultVReg; };
+    auto build = [&](std::optional<std::string> const& forbidName) -> Built {
+        LirBuilder b{**target};
+        std::optional<std::uint32_t> handle;
+        if (forbidName.has_value()) {
+            handle = b.regConstraintPoolAdd(constraintClobbering(*forbidName));
+        }
+        (void)b.addFunction(SymbolId{1});
+        LirBlockId const entry = b.createBlock();
+        b.beginBlock(entry);
+        LirReg const vA = b.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const seedA{LirOperand::makeImmInt32(1)};
+        (void)b.addInst(*movOp, vA, seedA);                    // inst 0 — pos 0
+        LirReg const vB = b.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const seedB{LirOperand::makeImmInt32(2)};
+        (void)b.addInst(*movOp, vB, seedB);                    // inst 1 — pos 2
+        LirReg const vR = b.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 2> const addOps{LirOperand::makeReg(vA),
+                                               LirOperand::makeReg(vB)};
+        LirInstId const subject = b.addInst(*addOp, vR, addOps); // inst 2 — pos 4
+        if (handle.has_value()) b.setInstRegConstraints(subject, *handle);
+        // Keep vA and vB live PAST the add — without this they expire at the
+        // add and vR's natural pick is one of their freed registers, which
+        // makes the constrained ordinal unreachable and the pin vacuous.
+        LirReg const vKeepA = b.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const useA{LirOperand::makeReg(vA)};
+        (void)b.addInst(*movOp, vKeepA, useA);                 // inst 3 — pos 6
+        LirReg const vKeepB = b.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const useB{LirOperand::makeReg(vB)};
+        (void)b.addInst(*movOp, vKeepB, useB);                 // inst 4 — pos 8
+        LirReg const vKeepR = b.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const useR{LirOperand::makeReg(vR)};
+        (void)b.addInst(*movOp, vKeepR, useR);                 // inst 5 — pos 10
+        b.addReturn(*retOp, std::span<LirOperand const>{});
+        return Built{std::move(b).finish(), vR.id};
+    };
+
+    Built const control = build(std::nullopt);
+    DiagnosticReporter cRep;
+    LirAllocation const cAlloc = allocateOn(control.lir, **target, cRep);
+    ASSERT_TRUE(cAlloc.ok());
+    ASSERT_EQ(cAlloc.perFunc.size(), 1u);
+    auto const natural = physOrdinalOf(cAlloc.perFunc[0], control.resultVReg);
+    ASSERT_TRUE(natural.has_value())
+        << "the 2-address result spilled — the pin would assert nothing";
+    std::string const forbidName = forbidNameForOrdinal(**target, *natural);
+    ASSERT_FALSE(forbidName.empty());
+
+    Built const subject = build(forbidName);
+    DiagnosticReporter sRep;
+    LirAllocation const sAlloc = allocateOn(subject.lir, **target, sRep);
+    ASSERT_TRUE(sAlloc.ok());
+    auto const constrained =
+        physOrdinalOf(sAlloc.perFunc[0], subject.resultVReg);
+    ASSERT_TRUE(constrained.has_value());
+    EXPECT_NE(*constrained, *natural)
+        << "the RESULT of a 2-address instruction declaring '" << forbidName
+        << "' as a per-INSTRUCTION implicit register was allocated to it. The "
+           "2-address legalize emits `mov result, ops[0]` BEFORE the "
+           "instruction, so the result register is a live conduit across the "
+           "instruction's implicit read — the shift-by-CL count clobber, one "
+           "carrier over. The covered-position exclusion cannot see this "
+           "(the result's range starts at the LATE slot).";
+    expectAllocationInvariants(sAlloc.perFunc[0]);
+}
+
+// ── SITE 3: the rewriter's transient reload SCRATCH, for a SPILLED operand ──
+//
+// `lir_rewrite.cpp`'s own docblock names the miscompile: *"a spilled idiv
+// DIVISOR reloads into rax and clobbers the dividend the idiv still needs — a
+// SILENT miscompile (121 not 160)"*. The allocator keeps vreg HOMES off those
+// ordinals; the rewriter's scratch pool is a SEPARATE pool needing the same
+// exclusion, and it too read only the per-opcode carrier.
+//
+// The operand is GENUINELY SPILLED: the real allocator runs first, then ONE
+// assignment is overridden to a spill slot. That is deliberate rather than a
+// shortcut — driving a spill through register pressure would leave WHICH vreg
+// spills up to the heuristic, and a pin whose subject is chosen by the code
+// under test is the "decorative pressure" shape this project has already been
+// bitten by. Everything the rewriter reads (the scratch pool, the per-inst
+// cursor, the forbid) is exercised exactly as in a pressured function.
+TEST(LirRegAlloc,
+     PerInstConstraintKeepsSpillReloadScratchOffTheForbiddenOrdinal) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    auto const retOp = (*target)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+
+    struct Built { Lir lir; LirReg spillMe; };
+    auto build = [&](std::optional<std::string> const& forbidName) -> Built {
+        LirBuilder b{**target};
+        std::optional<std::uint32_t> handle;
+        if (forbidName.has_value()) {
+            handle = b.regConstraintPoolAdd(constraintClobbering(*forbidName));
+        }
+        (void)b.addFunction(SymbolId{1});
+        LirBlockId const entry = b.createBlock();
+        b.beginBlock(entry);
+        LirReg const vIn = b.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const seed{LirOperand::makeImmInt32(7)};
+        (void)b.addInst(*movOp, vIn, seed);
+        LirReg const vOut = b.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const use{LirOperand::makeReg(vIn)};
+        LirInstId const subject = b.addInst(*movOp, vOut, use);
+        if (handle.has_value()) b.setInstRegConstraints(subject, *handle);
+        b.addReturn(*retOp, std::span<LirOperand const>{});
+        return Built{std::move(b).finish(), vIn};
+    };
+
+    // The reload scratch the rewriter picked for the SPILLED operand: the
+    // rewritten `mov` whose operand is a register (the seeding `mov`'s operand
+    // is an immediate, so this identifies the subject without counting
+    // instructions).
+    auto scratchOrdinal = [&](Lir const& rewritten)
+        -> std::optional<std::uint16_t> {
+        LirFuncId const fn = rewritten.funcAt(0);
+        for (std::uint32_t bi = 0; bi < rewritten.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = rewritten.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < rewritten.blockInstCount(blk);
+                 ++ii) {
+                LirInstId const inst = rewritten.blockInstAt(blk, ii);
+                if (rewritten.instOpcode(inst) != *movOp) continue;
+                auto const ops = rewritten.instOperands(inst);
+                if (ops.size() != 1) continue;
+                if (ops[0].kind != LirOperandKind::Reg) continue;
+                return static_cast<std::uint16_t>(ops[0].reg.id);
+            }
+        }
+        return std::nullopt;
+    };
+
+    auto runRewrite = [&](Built const& built) -> std::optional<std::uint16_t> {
+        DiagnosticReporter allocRep;
+        LirAllocation alloc = allocateOn(built.lir, **target, allocRep);
+        EXPECT_TRUE(alloc.ok());
+        if (alloc.perFunc.size() != 1) return std::nullopt;
+        // Force the operand to a stack slot.
+        auto& fa = alloc.perFunc[0];
+        EXPECT_LT(built.spillMe.id, fa.assignments.size());
+        fa.assignments[built.spillMe.id] =
+            LirRegAssignment::makeSpill(built.spillMe, LirSpillSlot{1});
+        fa.numSpillSlots = 1;
+        DiagnosticReporter rewriteRep;
+        LirRewriteResult const rw =
+            rewriteWithAllocation(built.lir, **target, alloc, rewriteRep);
+        EXPECT_TRUE(rw.ok);
+        if (!rw.ok) return std::nullopt;
+        return scratchOrdinal(rw.lir);
+    };
+
+    Built const control = build(std::nullopt);
+    auto const natural = runRewrite(control);
+    ASSERT_TRUE(natural.has_value())
+        << "no scratch-reloaded register operand found in the rewritten "
+           "module — the pin never reached its subject";
+    std::string const forbidName = forbidNameForOrdinal(**target, *natural);
+    ASSERT_FALSE(forbidName.empty());
+
+    Built const subject = build(forbidName);
+    auto const constrained = runRewrite(subject);
+    ASSERT_TRUE(constrained.has_value());
+    EXPECT_NE(*constrained, *natural)
+        << "a SPILLED operand of an instruction declaring '" << forbidName
+        << "' as a per-INSTRUCTION implicit register reloaded INTO that "
+           "register. The instruction destroys it, so the reloaded value is "
+           "gone before the instruction consumes it — the 121-not-160 "
+           "miscompile the rewriter's forbid exists to prevent, one carrier "
+           "over.";
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// EARLY-CLOBBER (`kLirInstFlagEarlyClobberResult`) — GNU inline asm's `&`
+// ═══════════════════════════════════════════════════════════════════════
+//
+// ★★★ THE MATCHED CONTROL IS THE TEST. A pin that only checks that `"=&r"`
+// yields distinct registers passes on an allocator that never shares anything
+// at all, and would therefore prove nothing about the mechanism. The PAIR
+// does: the plain arm must be SEEN to share the very register the
+// early-clobber arm is then seen to avoid.
+//
+// The single-instruction shape is deliberate — it is the only shape where the
+// hazard exists (a later instruction's late slot is already past every
+// input's use), and it is the shape of sqlite's arm64 `hwtime.h` arm.
+//
+// ✔MEASURED against the reference compilers: with a plain `"=r"` output and
+// one input, gcc and clang give `%0` and `%1` the SAME register on x86_64
+// (`%eax`/`%eax`) and on aarch64 (`x0`/`x0`); `"=&r"` makes them distinct.
+// Sharing is therefore the CORRECT default, not a bug to be fixed away.
+namespace {
+
+// `f() { vIn = mov #7 ; vOut = mov vIn ; vSink = mov vOut ; ret }`.
+// Instruction 1 is the SUBJECT. vIn's LAST use is the subject, so in the plain
+// arm vIn's register is freed exactly as vOut is allocated.
+struct EarlyClobberProbe {
+    Lir           lir;
+    std::uint32_t inVReg  = 0;
+    std::uint32_t outVReg = 0;
+};
+
+[[nodiscard]] EarlyClobberProbe
+buildOneInputProbe(TargetSchema const& schema, std::uint8_t subjectFlags) {
+    auto const movOp = schema.opcodeByMnemonic("mov");
+    auto const retOp = schema.opcodeByMnemonic("ret");
+    EXPECT_TRUE(movOp.has_value());
+    EXPECT_TRUE(retOp.has_value());
+    LirBuilder b{schema};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const vIn = b.newVReg(LirRegClass::GPR);
+    std::array<LirOperand, 1> const seed{LirOperand::makeImmInt32(7)};
+    (void)b.addInst(*movOp, vIn, seed);
+    LirReg const vOut = b.newVReg(LirRegClass::GPR);
+    std::array<LirOperand, 1> const use{LirOperand::makeReg(vIn)};
+    (void)b.addInst(*movOp, vOut, use, /*payload=*/0, subjectFlags);
+    LirReg const vSink = b.newVReg(LirRegClass::GPR);
+    std::array<LirOperand, 1> const useOut{LirOperand::makeReg(vOut)};
+    (void)b.addInst(*movOp, vSink, useOut);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    return EarlyClobberProbe{std::move(b).finish(), vIn.id, vOut.id};
+}
+
+} // namespace
+
+TEST(LirRegAlloc, EarlyClobberResultIsDistinctFromItsInputWhilePlainShares) {
+    // BOTH shipped targets. The mechanism is a `flags` bit consumed by a
+    // target-blind liveness analysis; a divergence between the two would mean
+    // something in the path had grown a target opinion.
+    for (char const* targetName : {"x86_64", "arm64"}) {
+        auto target = TargetSchema::loadShipped(targetName);
+        ASSERT_TRUE(target.has_value()) << targetName;
+
+        EarlyClobberProbe const plain = buildOneInputProbe(**target, 0);
+        EarlyClobberProbe const early =
+            buildOneInputProbe(**target, kLirInstFlagEarlyClobberResult);
+
+        DiagnosticReporter pRep;
+        LirAllocation const pAlloc = allocateOn(plain.lir, **target, pRep);
+        ASSERT_TRUE(pAlloc.ok()) << targetName;
+        ASSERT_EQ(pAlloc.perFunc.size(), 1u) << targetName;
+        DiagnosticReporter eRep;
+        LirAllocation const eAlloc = allocateOn(early.lir, **target, eRep);
+        ASSERT_TRUE(eAlloc.ok()) << targetName;
+        ASSERT_EQ(eAlloc.perFunc.size(), 1u) << targetName;
+
+        auto const pIn  = physOrdinalOf(pAlloc.perFunc[0], plain.inVReg);
+        auto const pOut = physOrdinalOf(pAlloc.perFunc[0], plain.outVReg);
+        auto const eIn  = physOrdinalOf(eAlloc.perFunc[0], early.inVReg);
+        auto const eOut = physOrdinalOf(eAlloc.perFunc[0], early.outVReg);
+        ASSERT_TRUE(pIn.has_value())  << targetName;
+        ASSERT_TRUE(pOut.has_value()) << targetName;
+        ASSERT_TRUE(eIn.has_value())  << targetName;
+        ASSERT_TRUE(eOut.has_value()) << targetName;
+
+        // ── THE CONTROL. Without it the subject assertion is unfalsifiable.
+        EXPECT_EQ(*pOut, *pIn)
+            << targetName << ": a PLAIN result did NOT share its dying "
+               "input's register. That is what gcc and clang do for `\"=r\"` "
+               "(x86_64 %eax/%eax, aarch64 x0/x0), and it is the premise the "
+               "early-clobber arm below is testing against — if the allocator "
+               "no longer shares here, that arm proves nothing and this pin "
+               "must be redesigned rather than deleted.";
+
+        // ── THE SUBJECT.
+        EXPECT_NE(*eOut, *eIn)
+            << targetName << ": an EARLY-CLOBBER result shares a register "
+               "with the instruction's input. A template that writes its "
+               "output before reading that input destroys its own input — a "
+               "silent miscompile, and exactly what `&` exists to prevent.";
+        // The input's own allocation is untouched: the flag constrains the
+        // RESULT, it does not move the inputs around.
+        EXPECT_EQ(*eIn, *pIn) << targetName;
+    }
+}
+
+// The two-address sibling, and it reaches further than the one above: on a
+// `requires2Address` opcode the allocator DELIBERATELY permits the result to
+// alias operand[0] (the coalesce case where the legalize emits no `mov` at
+// all) while excluding operand[1..N]. An early-clobber result must be off
+// BOTH — so the plain control here shares with operand[0] specifically, and
+// the subject must avoid every operand.
+TEST(LirRegAlloc, EarlyClobberTwoAddressResultAvoidsOperandZeroToo) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const movOp = (*target)->opcodeByMnemonic("mov");
+    auto const addOp = (*target)->opcodeByMnemonic("add");
+    auto const retOp = (*target)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(movOp.has_value());
+    ASSERT_TRUE(addOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+    auto const* addInfo = (*target)->opcodeInfo(*addOp);
+    ASSERT_NE(addInfo, nullptr);
+    ASSERT_TRUE(addInfo->requires2Address)
+        << "the shipped `add` stopped being 2-address — this pin no longer "
+           "exercises the operand[0]-alias rule it names";
+
+    struct Built { Lir lir; std::uint32_t a, b, r; };
+    auto build = [&](std::uint8_t subjectFlags) -> Built {
+        LirBuilder bld{**target};
+        (void)bld.addFunction(SymbolId{1});
+        LirBlockId const entry = bld.createBlock();
+        bld.beginBlock(entry);
+        LirReg const vA = bld.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const seedA{LirOperand::makeImmInt32(1)};
+        (void)bld.addInst(*movOp, vA, seedA);
+        LirReg const vB = bld.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const seedB{LirOperand::makeImmInt32(2)};
+        (void)bld.addInst(*movOp, vB, seedB);
+        LirReg const vR = bld.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 2> const addOps{LirOperand::makeReg(vA),
+                                               LirOperand::makeReg(vB)};
+        (void)bld.addInst(*addOp, vR, addOps, /*payload=*/0, subjectFlags);
+        LirReg const vSink = bld.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const useR{LirOperand::makeReg(vR)};
+        (void)bld.addInst(*movOp, vSink, useR);
+        bld.addReturn(*retOp, std::span<LirOperand const>{});
+        return Built{std::move(bld).finish(), vA.id, vB.id, vR.id};
+    };
+
+    Built const plain = build(0);
+    Built const early = build(kLirInstFlagEarlyClobberResult);
+    DiagnosticReporter pRep;
+    LirAllocation const pAlloc = allocateOn(plain.lir, **target, pRep);
+    ASSERT_TRUE(pAlloc.ok());
+    ASSERT_EQ(pAlloc.perFunc.size(), 1u);
+    DiagnosticReporter eRep;
+    LirAllocation const eAlloc = allocateOn(early.lir, **target, eRep);
+    ASSERT_TRUE(eAlloc.ok());
+    ASSERT_EQ(eAlloc.perFunc.size(), 1u);
+
+    auto const pA = physOrdinalOf(pAlloc.perFunc[0], plain.a);
+    auto const pR = physOrdinalOf(pAlloc.perFunc[0], plain.r);
+    auto const eA = physOrdinalOf(eAlloc.perFunc[0], early.a);
+    auto const eB = physOrdinalOf(eAlloc.perFunc[0], early.b);
+    auto const eR = physOrdinalOf(eAlloc.perFunc[0], early.r);
+    ASSERT_TRUE(pA.has_value());
+    ASSERT_TRUE(pR.has_value());
+    ASSERT_TRUE(eA.has_value());
+    ASSERT_TRUE(eB.has_value());
+    ASSERT_TRUE(eR.has_value());
+
+    EXPECT_EQ(*pR, *pA)
+        << "a PLAIN 2-address result did not alias operand[0] — that alias is "
+           "the coalesce case the allocator deliberately permits, and it is "
+           "the premise the early-clobber arm is measured against";
+    EXPECT_NE(*eR, *eA)
+        << "an EARLY-CLOBBER 2-address result still aliases operand[0]. `&` "
+           "outranks the coalesce preference: the result is written before "
+           "operand[0] has finished being read.";
+    EXPECT_NE(*eR, *eB)
+        << "an EARLY-CLOBBER 2-address result aliases operand[1]";
 }

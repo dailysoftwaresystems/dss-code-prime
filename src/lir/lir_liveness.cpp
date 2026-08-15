@@ -357,7 +357,31 @@ LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
                 auto& s = state[r.id];
                 s.everSeen = true;
                 s.cls      = r.regClass();
-                if (latePos < s.firstDef) s.firstDef = latePos;
+                // ── EARLY-CLOBBER (`kLirInstFlagEarlyClobberResult`) ──
+                // An ordinary instruction reads every operand before it
+                // writes anything, so its def belongs at the LATE slot:
+                // the inputs' ranges end at `earlyPos + 1 == latePos`,
+                // they expire exactly as the result is allocated, and the
+                // result may reuse an input's register. That reuse IS the
+                // reference-compiler behaviour for a plain `"=r"`.
+                // An EARLY-CLOBBER result may be written before the inputs
+                // have all been read, so its range must OVERLAP the slot at
+                // which they are read: record the def at `earlyPos`. Nothing
+                // then expires under it and the linear scan cannot hand the
+                // result an input's register — no second exclusion list, no
+                // allocator special case.
+                // ⚠ The slot is the discriminating variable, NOT which
+                // instruction of an expansion carries the def: for the
+                // single-instruction shape (the one inline asm actually
+                // needs) the def is already on the first instruction.
+                // Range well-formedness is preserved: the emission below
+                // computes `end = max(lastUse + 1, start + 1)`, so
+                // `LirLiveRange::make`'s `start < end` holds even when the
+                // result is never used.
+                std::uint32_t const defPos =
+                    lirInstResultIsEarlyClobber(lir.instFlags(inst))
+                        ? earlyPos : latePos;
+                if (defPos < s.firstDef) s.firstDef = defPos;
             }
         });
         // Vregs live-out of this block extend their `lastUse` to the

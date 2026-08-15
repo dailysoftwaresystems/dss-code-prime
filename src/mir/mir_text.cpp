@@ -1441,6 +1441,21 @@ private:
             return;
         }
         MirOpcode const op = *opOpt;
+        // Inline-asm P5: an asm block's payload indexes the module's
+        // `MirAsmDescriptorPool`, and this text format has no syntax for the
+        // descriptor — the template, the constraint list and the clobber list are
+        // simply not in the `.dssir` grammar yet. Accepting the mnemonic would
+        // build an instruction whose payload names a pool slot that does not
+        // exist, and `MirBuilder::addInst` would ABORT the process on the way
+        // there. Refuse it as a parse diagnostic instead: a refusal that crashes
+        // is not a refusal (D-LIR-TEXT-PARSE-UNSEALED-BLOCK-ABORT's class).
+        if (op == MirOpcode::InlineAsm || op == MirOpcode::InlineAsmGoto) {
+            emitMalformed(std::format(
+                "opcode '{}' cannot be read from MIR text: an inline-asm block "
+                "carries a descriptor (template + constraints + clobbers) that "
+                "this format does not yet spell", mnemonic));
+            return;
+        }
         TypeId resultType = InvalidType;
         if (lex_.peek().kind == TokKind::Colon) {
             lex_.take();

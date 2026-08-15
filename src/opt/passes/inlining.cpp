@@ -614,6 +614,16 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
     for (MirInstId const o : cops) {
         newOps.push_back(mapCalleeOperand(src, o, local, callee));
     }
+    // Inline-asm P5: the descriptor must be RE-ADDED to the destination module's
+    // pool -- forwarding the payload would index the caller module's pool, where
+    // that slot holds a different asm block's template and clobber list (or does
+    // not exist). `MirBuilder::addInst` REFUSES the opcode, so deleting this arm
+    // aborts rather than dropping the clobbers silently.
+    if (cop == MirOpcode::InlineAsm) {
+        local.emplace(cid.v, dst.addInlineAsm(src.asmDescriptor(cid), newOps,
+                                              src.instType(cid), src.instFlags(cid)));
+        return;
+    }
     local.emplace(cid.v, dst.addInst(cop, newOps, src.instType(cid),
                                      src.instPayload(cid), src.instFlags(cid),
                                      // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry
@@ -1038,6 +1048,14 @@ private:
         std::vector<MirInstId> newOps;
         newOps.reserve(ops.size());
         for (MirInstId const o : ops) newOps.push_back(mapCallerValue(o, id));
+        // Inline-asm P5 (third of the three verbatim-copy sites): re-add the
+        // descriptor to the destination pool. See emitCalleeInst's arm.
+        if (op == MirOpcode::InlineAsm) {
+            rewrite_.emplace(id.v, dst_.addInlineAsm(src_.asmDescriptor(id), newOps,
+                                                     src_.instType(id),
+                                                     src_.instFlags(id)));
+            return;
+        }
         rewrite_.emplace(id.v, dst_.addInst(op, newOps, src_.instType(id),
                                             src_.instPayload(id),
                                             src_.instFlags(id),
@@ -1093,6 +1111,21 @@ private:
                 rvs.reserve(oldOps.size());
                 for (MirInstId const o : oldOps) rvs.push_back(mapCallerValue(o, id));
                 dst_.addReturnMulti(rvs);
+                return;
+            }
+            case MirOpcode::InlineAsmGoto: {
+                // Inline-asm P5: successors (including any result-piece landing
+                // blocks, which are ordinary blocks here) map through mapSucc;
+                // the descriptor is re-added. `cloneInlineAsmGoto`, never
+                // `addInlineAsmGoto` -- the placement rule already ran.
+                std::vector<MirInstId> newOps;
+                newOps.reserve(oldOps.size());
+                for (MirInstId const o : oldOps) newOps.push_back(mapCallerValue(o, id));
+                std::vector<MirBlockId> succs;
+                succs.reserve(oldSucc.size());
+                for (MirBlockId const sB : oldSucc) succs.push_back(mapSucc(sB));
+                dst_.cloneInlineAsmGoto(src_.asmDescriptor(id), newOps, succs,
+                                        src_.instFlags(id));
                 return;
             }
             case MirOpcode::Unreachable:
@@ -1386,6 +1419,20 @@ private:
                 }
                 dst_.addSwitch(mapCalleeOperand(src_, cops[0], local, callee),
                                cases, mapCalleeSucc(cSucc[ncases]));
+                return;
+            }
+            case MirOpcode::InlineAsmGoto: {
+                // Inline-asm P5, callee-body clone. Same rule as the host arm.
+                std::vector<MirInstId> newOps;
+                newOps.reserve(cops.size());
+                for (MirInstId const o : cops) {
+                    newOps.push_back(mapCalleeOperand(src_, o, local, callee));
+                }
+                std::vector<MirBlockId> succs;
+                succs.reserve(cSucc.size());
+                for (MirBlockId const sB : cSucc) succs.push_back(mapCalleeSucc(sB));
+                dst_.cloneInlineAsmGoto(src_.asmDescriptor(cid), newOps, succs,
+                                        src_.instFlags(cid));
                 return;
             }
             case MirOpcode::Unreachable:

@@ -819,7 +819,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // guard would reject every shipped target on its first load.
     //
     // Every name here is a key the loader genuinely reads.
-    static constexpr std::array<std::string_view, 15> kTargetDocumentKeys{
+    static constexpr std::array<std::string_view, 16> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
@@ -827,6 +827,22 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // which SOURCE LANGUAGE document spells this processor's assembly
         // (a NAME — D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET)
         "defaultAssemblyLanguage",
+        // Which GNU inline-asm constraint LETTER means which register /
+        // register class / operand form on this processor.
+        //
+        // ⚠⚠ THE FACET'S SINGLE HIGHEST-RISK LINE, AND ITS FAILURE MODE IS
+        // ✔MEASURED RATHER THAN ASSUMED. Deleting this one entry (with the
+        // array size dropped to 15 so it still compiles) was built and run:
+        // both shipped targets FAIL TO LOAD with `/asmConstraints: unknown
+        // top-level key 'asmConstraints' (typo discriminator)`, and the
+        // blast radius is **683 of 855 tests red**, including SEGFAULTs in
+        // the lir/asm suites whose consumers deref a schema that never
+        // loaded. ⇒ omitting it is LOUD, not silent — which is exactly what
+        // TF-C74's closed root-key vocabulary buys. Before that vocabulary
+        // existed the same omission would have silently no-op'd the whole
+        // facet, leaving a knob that lies. `ShippedTargetsDeclareAsm-
+        // Constraints` pins that the key is genuinely consumed.
+        "asmConstraints",
         // machine description
         "opcodes", "registers", "registerClassOps", "relocations",
         "condCodeEncoding",
@@ -2008,6 +2024,355 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;  // skip push_back so vector & index stay in sync
                 }
                 data.registers.push_back(std::move(info));
+            }
+        }
+    }
+
+    // ── asmConstraints (GNU inline-asm constraint letters — optional) ──
+    //
+    // Which LETTER means which register / register class / operand form on
+    // THIS processor. See `TargetAsmConstraint` in the header for why this is
+    // target vocabulary rather than a C++ table keyed on architecture, and
+    // for the line that separates it from the reverted `asmSyntax` block
+    // ([[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]]).
+    //
+    // ★ PARSED AFTER `registers` ON PURPOSE — a `binds: "register"` row
+    // resolves its NAME to an ORDINAL right here, so a dangling name is a
+    // load error rather than a lookup that fails much later at a site with no
+    // target in hand. Same precedent as the `implicitRegisters` roles and the
+    // wide-float softcall registers.
+    //
+    // OPTIONAL. A target declaring none refuses every constraint letter by
+    // name, which is the correct answer for a processor whose inline-asm
+    // binding has not been described — not a malformed document.
+    if (doc.contains("asmConstraints")) {
+        // Rendered FROM THE TABLE at each use, never re-typed. The comment on
+        // `kKnownImplicitRegisterRoles` records what re-typing costs: a
+        // diagnostic that told the reader their valid role was invalid.
+        auto const renderNames = [](auto const& table) {
+            std::string out;
+            for (auto const& row : table.rows) {
+                if (!out.empty()) out += ", ";
+                out += '\'';
+                out += row.second;
+                out += '\'';
+            }
+            return out;
+        };
+        if (!doc.at("asmConstraints").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/asmConstraints",
+                      "'asmConstraints' must be an array of constraint-letter "
+                      "rows");
+        } else {
+            auto const& rows = doc.at("asmConstraints");
+            data.asmConstraints.reserve(rows.size());
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                auto const& r = rows[i];
+                auto const path = std::format("/asmConstraints/{}", i);
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "asmConstraints entry must be an object");
+                    continue;
+                }
+                // ★ THE PAYLOAD KEYS ARE THE `binds` SPELLINGS. Adding an
+                // axis to `kAsmConstraintBindingTable` therefore adds its key
+                // here too — the allowlist cannot fall behind the vocabulary.
+                static constexpr std::array<std::string_view, 5>
+                    kAsmConstraintKeys{"letter", "binds", "registerClass",
+                                       "register", "operandKind"};
+                DSS_CHECK_KEY_VOCABULARY(kAsmConstraintKeys);
+                static_assert(kAsmConstraintKeys.size()
+                                  == kAsmConstraintBindingTable.rows.size() + 2,
+                              "every `binds` spelling must also be an accepted "
+                              "payload key (plus 'letter' and 'binds' "
+                              "themselves) — a new axis whose key is missing "
+                              "here would be rejected as unknown at the exact "
+                              "moment it was first used");
+                rejectUnknownKeys(r, kAsmConstraintKeys, path,
+                                  "an asmConstraints row", coll);
+
+                TargetAsmConstraint entry;
+
+                // ── letter ────────────────────────────────────────────
+                if (!r.contains("letter") || !r.at("letter").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/letter", path),
+                              "missing or non-string 'letter' — a constraint "
+                              "row must name the spelling it binds");
+                    continue;
+                }
+                entry.letter = r.at("letter").get<std::string>();
+                if (entry.letter.empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/letter", path),
+                              "'letter' must not be empty — omit the ROW to "
+                              "declare that this target binds nothing");
+                    continue;
+                }
+                // ⚠⚠ THE ONE MISTAKE A HUMAN ACTUALLY MAKES HERE, AND THE
+                // ONE THIS FACET EXISTS TO KEEP OUT. `=`/`+`/`&`/`%` are GNU
+                // *asm grammar* — output, in-out, earlyclobber, commutative —
+                // and they mean the same thing on every processor, so the C
+                // front end owns them. Storing `"=a"` as a letter would put a
+                // grammar fact in the target file, which is precisely how the
+                // reverted `asmSyntax` block got in. It would ALSO silently
+                // never match, because a front end that strips modifiers
+                // before looking up (the only sane order) would search for
+                // `a`. A silent never-match is the worst of the two, so this
+                // is a hard reject with the split spelled out.
+                {
+                    constexpr std::string_view kModifiers = "=+&%";
+                    auto const bad = entry.letter.find_first_of(kModifiers);
+                    if (bad != std::string::npos) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/letter", path),
+                            std::format(
+                                "constraint letter '{}' contains the modifier "
+                                "'{}' — modifiers ({}) are GNU-asm GRAMMAR "
+                                "owned by the source language and are the "
+                                "same on every processor; declare the LETTER "
+                                "alone (e.g. \"a\", not \"=a\") and let the "
+                                "front end strip modifiers before it asks "
+                                "this target",
+                                entry.letter, entry.letter[bad], kModifiers));
+                        continue;
+                    }
+                }
+                // A sigil is dialect grammar too, and whitespace is always a
+                // typo. ⚠ `%` is DELIBERATELY NOT LISTED HERE even though it
+                // is a sigil in AT&T: it is also the commutative-operand
+                // modifier, so the check above already consumed it and a
+                // second listing would describe a branch this line can never
+                // reach — the "comment records a fact the code does not use"
+                // failure, one layer down.
+                if (entry.letter.find_first_of(" \t$#") != std::string::npos) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/letter", path),
+                              std::format("constraint letter '{}' contains "
+                                          "whitespace or a sigil — sigils are "
+                                          "DIALECT grammar (AT&T writes `$7` "
+                                          "where Intel writes `7`, ONE CPU) "
+                                          "and never appear in target "
+                                          "vocabulary",
+                                          entry.letter));
+                    continue;
+                }
+                // ★ Duplicate letters are rejected rather than
+                // last-writer-wins: two rows for `a` is an ambiguity the
+                // consumer cannot see, and silently picking one is how a
+                // config key stops meaning anything. CASE-SENSITIVE —
+                // ✔MEASURED, x86_64 `d` is %rdx and `D` is %rdi.
+                {
+                    bool dup = false;
+                    for (auto const& prior : data.asmConstraints) {
+                        if (prior.letter == entry.letter) { dup = true; break; }
+                    }
+                    if (dup) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/letter", path),
+                                  std::format("duplicate constraint letter "
+                                              "'{}' — one letter binds one "
+                                              "thing; the second row would be "
+                                              "silently unreachable",
+                                              entry.letter));
+                        continue;
+                    }
+                }
+
+                // ── binds (closed discriminator) ──────────────────────
+                if (!r.contains("binds") || !r.at("binds").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/binds", path),
+                              std::format("constraint '{}': missing or "
+                                          "non-string 'binds' — a letter must "
+                                          "say WHICH AXIS it binds ({})",
+                                          entry.letter,
+                                          renderNames(
+                                              kAsmConstraintBindingTable)));
+                    continue;
+                }
+                auto const bindsStr = r.at("binds").get<std::string>();
+                auto const binds = asmConstraintBindingFromName(bindsStr);
+                if (!binds.has_value()) {
+                    coll.emit(
+                        DiagnosticCode::C_MalformedJson,
+                        std::format("{}/binds", path),
+                        std::format("constraint '{}': unknown binding axis "
+                                    "'{}' — declared axes are {} (the "
+                                    "three axes constraint letters actually "
+                                    "split across; a new one needs core "
+                                    "vocabulary, not a free-form string)",
+                                    entry.letter, bindsStr,
+                                    renderNames(kAsmConstraintBindingTable)));
+                    continue;
+                }
+                entry.binds = *binds;
+
+                // ── exactly the payload `binds` names, and no other ───
+                // ⚠ The OTHER arms must be ABSENT, not merely ignored. A row
+                // carrying both `register` and `registerClass` has two
+                // answers and the loader would silently use one; the operator
+                // who wrote the second one would never learn it was dead.
+                auto const wantKey = asmConstraintBindingName(entry.binds);
+                if (!r.contains(wantKey)) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/{}", path, wantKey),
+                              std::format("constraint '{}': binds '{}' but "
+                                          "carries no '{}' key — the payload "
+                                          "key IS the axis name",
+                                          entry.letter, bindsStr, wantKey));
+                    continue;
+                }
+                {
+                    bool extra = false;
+                    for (auto const& row : kAsmConstraintBindingTable.rows) {
+                        if (row.second == wantKey) continue;
+                        if (!r.contains(row.second)) continue;
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/{}", path, row.second),
+                            std::format("constraint '{}': binds '{}', so the "
+                                        "'{}' key is a second answer that "
+                                        "would be silently discarded — a row "
+                                        "carries exactly the payload its "
+                                        "'binds' names",
+                                        entry.letter, bindsStr, row.second));
+                        extra = true;
+                    }
+                    if (extra) continue;
+                }
+
+                json const& payload = r.at(wantKey);
+                if (!payload.is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/{}", path, wantKey),
+                              std::format("constraint '{}': '{}' must be a "
+                                          "string naming the bound {}",
+                                          entry.letter, wantKey, wantKey));
+                    continue;
+                }
+                auto const payloadStr = payload.get<std::string>();
+
+                switch (entry.binds) {
+                case AsmConstraintBinding::RegisterClass: {
+                    auto const cls = targetRegClassFromName(payloadStr);
+                    if (!cls.has_value()) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/registerClass", path),
+                            std::format("constraint '{}': '{}' is not a "
+                                        "register class — declared classes "
+                                        "are {}",
+                                        entry.letter, payloadStr,
+                                        renderNames(kTargetRegClassTable)));
+                        continue;
+                    }
+                    // `none` is a spelling in the table but not a class a
+                    // letter can usefully bind: it means "no register file",
+                    // so the constraint would match nothing while LOOKING
+                    // declared. Reject rather than ship a dead letter.
+                    if (*cls == TargetRegClass::None) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/registerClass", path),
+                            std::format("constraint '{}': binding to class "
+                                        "'{}' declares a letter that can "
+                                        "never match a register — omit the "
+                                        "row instead",
+                                        entry.letter,
+                                        targetRegClassName(*cls)));
+                        continue;
+                    }
+                    // ★ THE CLASS MUST ACTUALLY BE POPULATED ON THIS TARGET.
+                    // ✔MEASURED: x86_64 declares 0 `vr` registers and arm64
+                    // declares 0 `flags` registers, so a letter bound to an
+                    // empty class is a knob that resolves to the empty set —
+                    // it loads clean, reads as support, and allocates
+                    // nothing. Checked against the register table that was
+                    // parsed immediately above, never against a hardcoded
+                    // per-architecture expectation.
+                    {
+                        bool populated = false;
+                        for (auto const& reg : data.registers) {
+                            if (reg.regClass == *cls) { populated = true; break; }
+                        }
+                        if (!populated) {
+                            coll.emit(
+                                DiagnosticCode::C_MalformedJson,
+                                std::format("{}/registerClass", path),
+                                std::format("constraint '{}': class '{}' is "
+                                            "declared by no register in this "
+                                            "target's 'registers' table, so "
+                                            "the letter would resolve to the "
+                                            "empty set while reading as "
+                                            "supported",
+                                            entry.letter, payloadStr));
+                            continue;
+                        }
+                    }
+                    entry.registerClass = *cls;
+                    break;
+                }
+                case AsmConstraintBinding::Register: {
+                    auto it = data.registerIndex.find(payloadStr);
+                    if (it == data.registerIndex.end()) {
+                        // ⚠ The valid list is NOT rendered here, and that is
+                        // a deliberate departure from the small-vocabulary
+                        // diagnostics above: ✔MEASURED, this target's table
+                        // holds 65 (x86_64) / 129 (arm64) names, and pasting
+                        // them turns the message into noise. Nothing is
+                        // hand-typed either way — what IS rendered is the
+                        // count and, when it explains the failure, the
+                        // sigil-stripped name, which catches the exact
+                        // grammar-into-vocabulary mistake this facet guards.
+                        std::string hint;
+                        if (!payloadStr.empty()
+                            && std::string_view{"%$#"}.find(payloadStr.front())
+                                   != std::string_view::npos
+                            && data.registerIndex.find(payloadStr.substr(1))
+                                   != data.registerIndex.end()) {
+                            hint = std::format(
+                                " — did you mean '{}'? a sigil is DIALECT "
+                                "grammar and never appears in target "
+                                "vocabulary", payloadStr.substr(1));
+                        }
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/register", path),
+                            std::format("constraint '{}': names register "
+                                        "'{}', which is not one of the {} "
+                                        "registers this target declares{}",
+                                        entry.letter, payloadStr,
+                                        data.registers.size(), hint));
+                        continue;
+                    }
+                    entry.registerOrdinal =
+                        static_cast<std::uint16_t>(it->second);
+                    break;
+                }
+                case AsmConstraintBinding::OperandKind: {
+                    auto const kind = operandKindFilterFromName(payloadStr);
+                    if (!kind.has_value()) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/operandKind", path),
+                            std::format("constraint '{}': '{}' is not an "
+                                        "operand kind — declared kinds are "
+                                        "{} (the same closed vocabulary the "
+                                        "encoding variant guards use; the "
+                                        "JSON names carry historical width "
+                                        "labels)",
+                                        entry.letter, payloadStr,
+                                        renderNames(kOperandKindFilterTable)));
+                        continue;
+                    }
+                    entry.operandKind = *kind;
+                    break;
+                }
+                }
+
+                data.asmConstraints.push_back(std::move(entry));
             }
         }
     }

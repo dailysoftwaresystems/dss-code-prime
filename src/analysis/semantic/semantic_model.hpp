@@ -37,6 +37,13 @@
 
 namespace dss {
 
+// Inline-asm P5: the model carries a NON-OWNING pointer to the active target
+// (see `SemanticModel::target()`). Forward-declared rather than included: this
+// header is reached by the whole front end and `target_schema.hpp` is 3.4k
+// lines for one pointer — the trade `mir_asm_descriptor.hpp` makes for the same
+// type one tier down.
+class TargetSchema;
+
 // C 6.2.3 name spaces. C puts struct/union/enum TAGS (`struct Foo`) in a
 // namespace SEPARATE from ordinary identifiers (objects, functions, typedef
 // names, enumerators) — so `typedef struct Pair { … } Pair;` is legal (the
@@ -760,7 +767,10 @@ public:
                   std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
                   DataModel                              dataModel,
-                  LongDoubleFormat                       longDoubleFormat) noexcept
+                  LongDoubleFormat                       longDoubleFormat,
+                  // Inline-asm P5: see `target()`. Last, and defaulted, because
+                  // every existing caller is target-less by construction.
+                  TargetSchema const*                    target = nullptr) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -776,7 +786,8 @@ public:
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
-          longDoubleFormat_(longDoubleFormat) {}
+          longDoubleFormat_(longDoubleFormat),
+          target_(target) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -928,6 +939,30 @@ public:
         return longDoubleFormat_;
     }
 
+    // Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): the ACTIVE TARGET this
+    // analysis ran under, or `nullptr` when none was in scope.
+    //
+    // ★★★ WHY A TARGET REACHES THE FRONT END AT ALL, WHICH LOOKS LIKE AN
+    // AGNOSTICISM BREAK AND IS THE OPPOSITE. A GNU asm constraint splits in two
+    // (`target_schema.hpp`'s `asmConstraints` facet states the split): the
+    // MODIFIERS are grammar the front end owns, and the LETTER is a MACHINE
+    // FACT — ✔MEASURED, `"=a"` is `%rax` on x86_64 and "impossible constraint
+    // in 'asm'" on AArch64. Resolving a letter therefore REQUIRES the target,
+    // and the only alternative to reading `.target.json` here is a letter table
+    // in C++ keyed on architecture — the break no grep catches until the second
+    // architecture's inline asm arrives. The analyzer still branches on NO
+    // target identity: it asks the schema a question and reports the answer.
+    // This is the `dataModel()` / `longDoubleFormat()` discipline — the model
+    // CARRIES what analysis ran under so the HIR lowering reads the SAME value
+    // and the two tiers cannot diverge.
+    //
+    // ⚠ `nullptr` IS A LEGITIMATE STATE, not a defect: the LSP, the FFI header
+    // parser and every direct-API unit test analyze with no target. It is NOT a
+    // licence to guess a letter's meaning — the target-dependent constraint and
+    // clobber checks simply do not run, and the tier that BINDS the operand
+    // (which cannot function without resolving the letter) fails loud there.
+    [[nodiscard]] TargetSchema const* target() const noexcept { return target_; }
+
 private:
     std::shared_ptr<CompilationUnit const> cu_;
     TypeLattice                            lattice_;
@@ -970,6 +1005,10 @@ private:
     // FC17.9(e): the analysis-time long-double axis (see `longDoubleFormat()`).
     LongDoubleFormat                                       longDoubleFormat_ =
         LongDoubleFormat::None;
+    // Inline-asm P5: the analysis-time target (see `target()`). A NON-OWNING
+    // pointer — the schema is owned by the driver and outlives the model, the
+    // same lifetime contract `analyze()`'s `aggregateLayout` already has.
+    TargetSchema const*                                    target_ = nullptr;
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

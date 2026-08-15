@@ -26,6 +26,10 @@
 
 namespace dss {
 
+// Inline-asm P5: forward-declared for the `target` parameter below — a pointer
+// needs no definition, and this header is included by every front-end consumer.
+class TargetSchema;
+
 // FC3 c1: `dataModel` is the ACTIVE FORMAT's declared width triple
 // (plan 23 — the format schema's REQUIRED `dataModel` field), threaded
 // by the driver (`buildCuMir` passes `format.dataModel()`); semantic
@@ -97,6 +101,26 @@ analyze(std::shared_ptr<CompilationUnit const> cu,
         // CARRIES the axis (`SemanticModel::longDoubleFormat()`) so the HIR
         // lowering reads the SAME value — the dataModel two-tier discipline.
         LongDoubleFormat longDoubleFormat = LongDoubleFormat::None,
+        // Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): the ACTIVE TARGET, so
+        // a GNU asm constraint LETTER can be resolved against the processor
+        // that declares it. Non-owning; must outlive the returned model, which
+        // republishes it as `SemanticModel::target()` for the HIR lowering (the
+        // `dataModel` two-tier discipline — one source, both tiers).
+        //
+        // ★ WHY IT IS A `TargetSchema` AND NOT THE ARCH NAME ALREADY THREADED
+        // ABOVE. `activeTarget` is an IDENTITY string; keying constraint
+        // meaning off it would be `if (arch == "x86_64")` in shared substrate.
+        // The schema is a QUESTION-ANSWERING object: `asmConstraint('a')`
+        // returns what THIS processor declares, and the analyzer never learns
+        // which processor that is.
+        //
+        // ⚠ `nullptr` (the default, and every direct-API / LSP / header-parser
+        // caller) ⇒ the target-dependent constraint and clobber checks DO NOT
+        // RUN. That is not a silently-disabled check: resolving the letter is
+        // unavoidable for the tier that BINDS the operand, so the refusal still
+        // happens — later, and with the target in hand. Guessing here would be
+        // the only unsafe option.
+        TargetSchema const* target = nullptr,
         // The worker-thread stack RESERVE for the deep-recursion analysis stage
         // (`analyze` runs `analyzeImpl` on a dedicated large stack so a deeply-
         // nested-but-legal tree does not overflow the host's ~1 MB main stack —

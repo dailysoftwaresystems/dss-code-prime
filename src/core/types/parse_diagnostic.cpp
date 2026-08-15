@@ -77,6 +77,21 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_InlineAsmLabelSectionRequiresGoto";
         case DiagnosticCode::S_InlineAsmDuplicateQualifier:
             return "S_InlineAsmDuplicateQualifier";
+        // Inline-asm P5 operand binding, 0xE065..0xE06B.
+        case DiagnosticCode::S_InlineAsmConstraintLetterUndeclared:
+            return "S_InlineAsmConstraintLetterUndeclared";
+        case DiagnosticCode::S_InlineAsmConstraintUnsupportedForm:
+            return "S_InlineAsmConstraintUnsupportedForm";
+        case DiagnosticCode::S_InlineAsmOperandModifierUnsupported:
+            return "S_InlineAsmOperandModifierUnsupported";
+        case DiagnosticCode::S_InlineAsmClobberUnknown:
+            return "S_InlineAsmClobberUnknown";
+        case DiagnosticCode::S_InlineAsmTemplateUnparsable:
+            return "S_InlineAsmTemplateUnparsable";
+        case DiagnosticCode::S_InlineAsmPlaceholderOutOfRange:
+            return "S_InlineAsmPlaceholderOutOfRange";
+        case DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate:
+            return "S_InlineAsmPlaceholderInBasicTemplate";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -336,6 +351,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_VlaDynamicAllocaUnsupported:  return "L_VlaDynamicAllocaUnsupported";
         case DiagnosticCode::L_VlaNonLeafFrameUnsupported:   return "L_VlaNonLeafFrameUnsupported";
         case DiagnosticCode::L_TerminatorSuccessorMismatch:  return "L_TerminatorSuccessorMismatch";
+        case DiagnosticCode::L_SideStructureIndexDangling:   return "L_SideStructureIndexDangling";
+        case DiagnosticCode::L_SideStructurePoolShrank:      return "L_SideStructurePoolShrank";
+        case DiagnosticCode::L_SideStructureReferenceLost:   return "L_SideStructureReferenceLost";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";

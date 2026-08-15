@@ -429,6 +429,49 @@
       }
     },
     {
+      "$comment": "No-operation. ✔MEASURED (gcc 13.3.0, `gcc -c` + objdump on a `.s` containing a bare `nop`): ONE byte, 0x90, no ModR/M, no REX, no operands. The x86 encoder auto-emits REX only when an operand demands it, and this form has none.\n★ `hasSideEffects: true` IS THE LOAD-BEARING FIELD, not decoration. A `nop` produces no result (`result: none`), so a pure declaration would make it dead by definition and a dead-code pass would be RIGHT to delete it — deleting the one instruction whose entire purpose is to occupy bytes (alignment padding, a patch point, an `__asm__(\"nop\")` the programmer wrote on purpose). ⚠ HONEST SCOPE OF THAT CLAIM: today's CSE/DCE/LICM read the MIR-tier flag (`src/opt/passes/{cse.cpp:84,dce.cpp:52,licm.cpp:93}`), not this LIR-tier one, so `true` here is a correct DECLARATION rather than a currently-live guard — and it is the value that stays correct when a LIR-tier DCE lands.",
+      "mnemonic":      "nop",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [144] }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Read Time-Stamp Counter. ✔MEASURED (gcc 13.3.0, objdump): `0f 31`, TWO bytes, no ModR/M, no operands — and NO REX.W, because RDTSC always writes EDX:EAX regardless of operand size (a REX.W form does not exist). sqlite's own `hwtime.h` is the client: `__asm__ volatile(\"rdtsc\" : \"=a\"(lo), \"=d\"(hi))`, which is why the `a` and `d` rows in `asmConstraints` above are not hypothetical.\n★ THE RESULT IS NOT A RESULT — it is a REGISTER PAIR. `result: none` plus implicitRegisters, exactly like `cqo`/`mul_high`: the value arrives in EDX:EAX, which no single result slot can name. `outputs ⊆ clobbered` is the schema-loader invariant (regalloc builds its forbidden set from `clobbered`), so both registers appear in both arrays.\n★ THE ROLES ARE REUSED, NOT MINTED. `high`/`low` already exist in `kKnownImplicitRegisterRoles` — added for the 128-bit MUL projection, where they mean exactly what they mean here: the two halves of one wide value split across two registers. A new `tscHigh`/`tscLow` pair would have been a per-instruction verb set for a shape the vocabulary already had. Roles matter because a reorder of the positional arrays can otherwise silently swap which half a consumer captures — and swapping RDTSC's halves multiplies every measured interval by 2^32.\n★ `hasSideEffects: true`, and here it guards a REAL miscompile rather than a hypothetical one: RDTSC is not a function of its (empty) operand list — two reads must return two values. A pure declaration invites CSE to fold two reads into one, at which point EVERY elapsed-time measurement in the program is exactly ZERO, and invites LICM to hoist the read out of the loop being timed. ⚠ Same honest scope as `nop`: the live CSE/DCE/LICM read the MIR-tier flag today.",
+      "mnemonic":      "rdtsc",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "outputs":     ["rax", "rdx"],
+        "clobbered":   ["rax", "rdx"],
+        "outputRoles": { "low": "rax", "high": "rdx" }
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "opcode": [15, 49] }
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-CSUBSET-DIVISION-OP-CODEGEN — signed-divide single op (cycle 10r split). IDIV r/m64 divides RDX:RAX by operand 0 (modrm.rm), placing quotient in RAX + remainder in RDX. Encoder auto-computes REX with W=1 + B=(operand 0's high bit), correctly handling R8-R15 operands. Cycle 10r split from the prior compound encoding to fix REX-prefix overlap silent-miscompile (see cqo $comment). implicitRegisters: inputs=[rax,rdx] (IDIV reads RDX:RAX as 128-bit dividend); outputs=[rax,rdx] (quotient + remainder); clobbered=[rax,rdx] (both prior values destroyed — required by the schema-loader `outputs ⊆ clobbered` invariant added in the 10r 7-agent review fold, since regalloc consumes `clobbered` to build its forbidden set). inputRoles/outputRoles (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT, 2026-06-10): the MIR→LIR div/mod lowering pins the dividend + captures the quotient (SDiv) or remainder (SMod) BY ROLE — a reorder of the positional arrays can no longer silently flip the projected register.",
       "mnemonic":      "idiv_op",
       "result":        "none",
@@ -2399,6 +2442,26 @@
     { "name": "r13b", "class": "gpr", "widthBytes": 1, "subOf": "r13",  "hwEncoding": 13 },
     { "name": "r14b", "class": "gpr", "widthBytes": 1, "subOf": "r14",  "hwEncoding": 14 },
     { "name": "r15b", "class": "gpr", "widthBytes": 1, "subOf": "r15",  "hwEncoding": 15 }
+  ],
+  "$asmConstraintsComment": "★★★ WHICH GNU INLINE-ASM CONSTRAINT LETTER MEANS WHICH REGISTER IS TARGET VOCABULARY, AND THEREFORE LIVES HERE. `\"=a\"(o)` means RAX; nothing in the C standard says so, and a C++ table keyed on architecture would be an agnosticism break that no grep catches until arm64 inline asm arrives — at which point the table is load-bearing.\n★★ THE LINE AGAINST [[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]], WHICH REVERTED AN `asmSyntax` BLOCK ON THIS FILE. That block died because `registerPrefix`/`immediatePrefix`/comment chars/operand order are (target, DIALECT) facts — ✔MEASURED, AT&T `movq %rsi, (%rdi)` vs Intel `mov QWORD PTR [rdi], rsi`, ONE CPU. Constraint letters take the same test and PASS it: `=a` means RAX under AT&T and under Intel, in ELF and in PE. The letter names a REGISTER; a register is a property of the processor. ⇒ no sigils, no operand order, no mnemonic spellings may ever enter this array. The MODIFIERS `= + & %` are GNU-asm grammar owned by the source language and the loader REJECTS a letter containing one.\n★ THREE AXES, ALL BOUND TO VOCABULARY THAT ALREADY EXISTED — no fourth axis, no `AsmConstraint*` verb set: `registerClass` → TargetRegClass, `register` → this file's own `registers[].name` (the `implicitRegisters` name-resolution precedent, resolved to an ordinal AT LOAD), `operandKind` → OperandKindFilter, the same closed set the encoding variant guards use.\n✔MEASURED, gcc 13.3.0 x86_64, `-O2 -S`, WITH THREE COMPETING LIVE `\"r\"` OPERANDS so a lucky allocation cannot be mistaken for a pin: r→%rax, a→%rax, b→%rbx, c→%rcx, d→%rdx, S→%rsi, D→%rdi, x→%xmm0; `\"m\"(*p)`→`(%rdi)`; `\"i\"(7)`→`$7`. ⚠ CASE IS LOAD-BEARING: `d` is %rdx and `D` is %rdi — two different registers, one letter apart.\n★★ `q` IS DECLARED AND `Q` IS NOT, AND THE DIFFERENCE WAS MEASURED AFTER AN EARLIER DRAFT OF THIS VERY COMMENT ASSERTED IT WRONGLY. That draft grouped `q` with `Q` as 'the byte-addressable subclass' and refused both — asserted from the letter's NAME, never probed. ✔THE PROBE, which counts how many SIMULTANEOUS live operands each letter admits (the register-set size, read off the point where gcc says 'impossible constraints'): **r=15, q=15, Q=4, x=16, a=1**. So on THIS target `q` admits exactly the registers `r` does — REX makes every GPR byte-addressable, so the i386 subclass {a,b,c,d} that the letter's name remembers does not exist here — and `q`→`gpr` is EXACT, not an approximation. `Q`=4 is a genuine subset and stays out. ⚠ The lesson generalizes past this row: a constraint letter's MEANING is per-target, so its register set must be measured per-target and never inferred from what the letter means somewhere else. `a`=1 is the control that shows the probe can see a single-register pin.\n⚠ DELIBERATELY NOT DECLARED: `Q`. ✔MEASURED 4 registers ({rax,rbx,rcx,rdx}); `TargetRegClass` cannot express a SUBSET of a class, and declaring it as plain `gpr` would be a knob that LIES — it would load clean, read as support, and hand the allocator 11 registers gcc forbids. A letter this file cannot describe EXACTLY is a letter it refuses by name.\n★ THE DEFERRAL, stated here because it has no registry row yet (the lane that owns .plans must add it, and this sentence is the handover): expressing a register SUBCLASS needs a FOURTH binding axis — an explicit list of register names — which is deliberately NOT built. Trigger: the first client corpus whose inline asm actually uses a subclass letter. ✔MEASURED that none does today — sqlite's src/hwtime.h, the only inline asm in the corpus, uses exactly `\"=a\"`, `\"=d\"` and `\"=r\"`. Building the axis before that trigger fires would be a speculative build with no consumer, so the honest state is: refuse the letter loudly, and let the refusal be the thing that fires when a client needs it.\n✔MEASURED `x`→%xmm0, and its register set is **16** by the same simultaneous-operand probe, which is exactly the 16 `fpr` rows this file declares (xmm0-xmm15) ⇒ `x`→`fpr` is EXACT here. ★ THE SAME LETTER IS *NOT* EXACT ON AARCH64 — there `x` measures 16 out of a 32-register V file, i.e. the V0-V15 SUBCLASS — so arm64.target.json refuses it while this file declares it. One letter, two processors, opposite decisions, both measured: that is the facet earning its existence.",
+  "asmConstraints": [
+    { "$comment": "The general-register class. ✔%rax with three competing \"r\" operands live — an allocation, not a pin, which is exactly what a CLASS binding means.",
+      "letter": "r", "binds": "registerClass", "registerClass": "gpr"  },
+    { "$comment": "★ THE PIN THAT PROVES A CLASS IS NOT ENOUGH: given three competing \"r\" operands the `\"=a\"` output STILL landed in %rax. sqlite's own hwtime.h reads the TSC with `\"=a\"(lo),\"=d\"(hi)`, which is unencodable without these two rows.",
+      "letter": "a", "binds": "register",      "register":      "rax"  },
+    { "letter": "b", "binds": "register",      "register":      "rbx"  },
+    { "letter": "c", "binds": "register",      "register":      "rcx"  },
+    { "letter": "d", "binds": "register",      "register":      "rdx"  },
+    { "$comment": "UPPERCASE S and D — the string-instruction source/destination registers. Distinct from lowercase `d` (%rdx) by CASE ALONE; the loader is case-sensitive and a test pins it.",
+      "letter": "S", "binds": "register",      "register":      "rsi"  },
+    { "letter": "D", "binds": "register",      "register":      "rdi"  },
+    { "letter": "x", "binds": "registerClass", "registerClass": "fpr"  },
+    { "$comment": "The byte-addressable general registers. ✔MEASURED to admit 15 simultaneous live operands — the SAME count as `r` — because REX makes every GPR byte-addressable on x86_64; the i386 {a,b,c,d} subclass the letter's name remembers does not exist on this target, so `gpr` is EXACT here and not an approximation. Contrast `Q` (4), which is why that one is absent.",
+      "letter": "q", "binds": "registerClass", "registerClass": "gpr"  },
+    { "$comment": "Operand FORM, not a register: `m` accepts a memory reference. Bound to `membase` — the HEAD of the (membase, memoffset) pair a LIR memory reference is built from; the displacement rides in the paired memoffset slot and needs no letter of its own. ✔MEASURED `\"m\"(*p)` → `(%rdi)`.",
+      "letter": "m", "binds": "operandKind",   "operandKind":   "membase" },
+    { "$comment": "✔MEASURED `\"i\"(7)` → `$7`. `imm32` is the JSON-side historical width label for OperandKindFilter::ImmInt — the SAME spelling the encoding variant guards use, deliberately reused rather than re-minted.",
+      "letter": "i", "binds": "operandKind",   "operandKind":   "imm32"   }
   ],
   "$registerClassOpsComment": "FC2 Part B: per-register-class move/load/store mnemonics. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (a GPR mov against an XMM hwEncoding assembles to valid-looking-but-WRONG bytes — the class-blind silent miscompile this table kills). fpr's `store` landed with its FIRST consumer (trigger discipline honored): the ms_x64 prologue saved-reg spill — Win64 callee-saved xmm6-15 + regalloc's callee-saved-first policy put the first FPR vreg in a callee-saved xmm, and classOpHandle failed loud L_RequiredLirOpcodeMissing until movsd_store was declared.",
   "registerClassOps": [

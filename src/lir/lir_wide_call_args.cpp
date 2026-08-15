@@ -88,11 +88,18 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                                                    payload, flags, srcToDst,
                                                    "widecall", reporter))
                     return false;
+                // D-LIR-PER-INST-REG-CONSTRAINTS: `emitTerminator` is the last
+                // thing this arm appends, so `lastInst()` IS the rebuilt
+                // terminator (the emit succeeded — the arm above returned
+                // otherwise).
+                lir_pass_util::carryInstSideData(src, inst, b);
                 continue;
             }
 
             if (info == nullptr || !info->isCall) {
-                b.addInst(op, result, newOps, payload, flags);
+                LirInstId const dstInst =
+                    b.addInst(op, result, newOps, payload, flags);
+                lir_pass_util::carryInstSideData(src, inst, b, dstInst);
                 continue;
             }
 
@@ -184,7 +191,12 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 std::array<LirOperand, 1> so{LirOperand::makeReg(s.value)};
                 b.addInst(storeOutgoingOp, InvalidLirReg, so, s.slot, /*flags=*/0);
             }
-            b.addInst(op, result, keepOps, payload, flags);
+            // D-LIR-PER-INST-REG-CONSTRAINTS: 1 → N `store_outgoing_arg`
+            // carriers + 1 shrunken Call. The side data belongs to the CALL —
+            // the carriers are this pass's own outgoing-arg plumbing.
+            LirInstId const dstCall =
+                b.addInst(op, result, keepOps, payload, flags);
+            lir_pass_util::carryInstSideData(src, inst, b, dstCall);
         }
     }
     return true;
@@ -215,9 +227,12 @@ lowerWideCallArgs(Lir const& src, TargetSchema const& schema,
     }
 
     LirBuilder b{schema};
-    // Carry the wide-literal pool across the rebuild (LiteralIndex operands
-    // reference it by index) — same discipline as rewrite/callconv.
-    lir_pass_util::copyLiteralPool(src, b);
+    // Carry every module side structure across the rebuild in one call — the
+    // wide-literal pool (LiteralIndex operands reference it by index) and the
+    // register-constraint pool. Same discipline as rewrite/callconv; the
+    // per-instruction handles into the second pool ride `carryInstSideData`
+    // inside `lowerOneFunc`.
+    lir_pass_util::copyModuleSideStructures(src, b);
     std::size_t const funcCount = src.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
         LirFuncId const fn = src.funcAt(fi);

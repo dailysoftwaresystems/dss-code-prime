@@ -1185,8 +1185,15 @@
         "format":   "fixed32",
         "variants": [
           {
-            "guard":      { "operandKinds": [] },
+            "$comment": "width 64 — `CSET Xd, <cc>` (0x9A9F07E0, sf=1). ★ THE `width` KEY IS NEW BESIDE THE width-32 SIBLING BELOW AND IS NOT OPTIONAL: `variantMatchesInst` reads an ABSENT width as MATCH-ANY, so a match-any variant beside a width-keyed one either shadows it (if first) or silently absorbs the widths it does not declare (if last) — `validateTargetSchema`'s convergence-fix D refuses the mix outright (D-CSUBSET-32BIT-ALU-FORMS), which is why this key and the sibling below arrive together or not at all. ⓘ IT CHANGES NOTHING FOR THE COMPILER'S OWN PATH: every LIR `setcc` the C front-end emits comes from `lowerICmp`/`lowerFCmp`, which pass NO width flags, so `lirInstWidthBits(0)` = 64 and this guard is exactly what they already matched.",
+            "guard":      { "operandKinds": [], "width": 64 },
             "template":   { "fixedWord": 2594113504, "condCodeFromPayload": true, "condBitPos": 12, "condInvert": true },
+            "resultSlot": "rd"
+          },
+          {
+            "$comment": "width 32 — `CSET Wd, <cc>` = CSINC Wd, WZR, WZR, invert(cc), fixed word 0x1A9F07E0 (446629856): the 64-bit word with sf CLEARED, and a genuinely DIFFERENT instruction rather than a spelling of the same one (the W-write zeroes bits 63:32 of the X register). ✔MEASURED 2026-08-15, `aarch64-linux-gnu-as` 2.42 + `aarch64-linux-gnu-objdump -d`, both widths in one file so the pair is read off ONE assembler run: `cset x0, eq` 9a9f17e0 / `cset w0, eq` 1a9f17e0 · `cset x1, ne` 9a9f07e1 / `cset w1, ne` 1a9f07e1 · `cset x0, ls` 9a9f87e0 / `cset w0, ls` 1a9f87e0. ⚠⚠ `condCodeFromPayload`/`condBitPos`/`condInvert` ARE REPEATED HERE ON PURPOSE AND ARE NOT REDUNDANT WITH THE ROW ABOVE: the inversion is a property of the CSET IDIOM (`CSET Xd,cc` IS `CSINC Xd,XZR,XZR,invert(cc)`), not of the operand width, so a 32-bit variant that omitted `condInvert` would encode the COMPLEMENT of every condition — green build, wrong branch taken. D-ASM-ARM64-SETCC-W-FORM-UNDECLARED.",
+            "guard":      { "operandKinds": [], "width": 32 },
+            "template":   { "fixedWord": 446629856, "condCodeFromPayload": true, "condBitPos": 12, "condInvert": true },
             "resultSlot": "rd"
           }
         ]
@@ -1636,6 +1643,45 @@
           {
             "guard":      { "operandKinds": [] },
             "template":   { "fixedWord": 3577466944 },
+            "resultSlot": "rd"
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "No-operation. ✔MEASURED (aarch64-linux-gnu-gcc 13.3.0, `-c` + aarch64-linux-gnu-objdump on a `.s` containing a bare `nop`): `d503201f` = 0xD503201F = 3573751839, one fixed word, no operands, no result — the canonical HINT #0 encoding.\n★ `hasSideEffects: true` is load-bearing for the same reason as x86_64's `nop`: an instruction with no result and no declared effect is dead BY DEFINITION, and deleting it deletes the only thing it was ever for (alignment padding, a patch point, an `__asm__(\"nop\")` written on purpose). ⚠ Honest scope: today's CSE/DCE/LICM read the MIR-tier flag (`src/opt/passes/{cse.cpp:84,dce.cpp:52,licm.cpp:93}`), so this is a correct declaration rather than a currently-live guard.",
+      "mnemonic":         "nop",
+      "result":           "none",
+      "hasSideEffects":   true,
+      "minOperands":      0,
+      "maxOperands":      0,
+      "minSuccessors":    0,
+      "maxSuccessors":    0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":    { "operandKinds": [] },
+            "template": { "fixedWord": 3573751839 }
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Read the Counter-timer Virtual Count register — AArch64's answer to x86's RDTSC, and the instruction sqlite's own `hwtime.h` uses on this CPU (`__asm__ volatile(\"mrs %0, cntvct_el0\" : \"=r\"(cnt))`, the `\"=r\"` that the `asmConstraints` `r` row above binds).\n✔MEASURED, aarch64-linux-gnu-gcc 13.3.0 + objdump, four destination registers assembled to separate the fixed word from the Rd field: `mrs x0` → d53be040, `x1` → d53be041, `x7` → d53be047, `x30` → d53be05e. ⇒ fixedWord = 0xD53BE040 = 3577471040, with Rd in bits 0..4 — the STANDARD `rd` slot, ZERO new slot vocabulary, structurally identical to the `tlsbase` row directly above (which measured d53bd040 for TPIDR_EL0 in the same run, confirming the two differ only in CRm: 13 vs 14).\n★★ WHY THIS ROW IS NOT CALLED `mrs`, WHICH IS WHAT THE MACHINE MNEMONIC SAYS. `tlsbase` is ALSO an MRS (TPIDR_EL0). A row named `mrs` would therefore be the second MRS in this file and the FIRST one to claim the generic name, while encoding exactly one hardcoded system register and offering no slot in which to name another — `opcodeByMnemonic(\"mrs\")` would resolve to something that can only ever read CNTVCT_EL0. This file names opcodes for the VALUE THEY PRODUCE (`tlsbase`, not `tpidr`), which keeps `mrs` free for a genuine general MRS if a system-register slot is ever justified by a consumer.\n⚠ IT IS NOT A CYCLE COUNTER, and the name says so deliberately. CNTVCT_EL0 is a fixed-frequency system counter (typically ~24 MHz, scaled by CNTFRQ_EL0), NOT a per-cycle tick like the TSC. Calling it `cyclecounter` would have been the plausible wrong name; code that divides it by the CPU clock is wrong on this target.\n★ `hasSideEffects: true`, and unlike `nop` this one guards a real silent miscompile: the counter is not a function of its (empty) operand list, so two reads must return two values. Declared pure, CSE folds the pair into one read and EVERY elapsed-time measurement becomes exactly zero, while LICM hoists the read out of the loop being timed. ⚠ NOTE THE CONTRAST WITH `tlsbase` ABOVE, which is correctly `false`: the TLS base is invariant for a thread, so folding two reads of it is a legitimate optimization. The two rows are otherwise the same instruction, and the flag is the only thing that distinguishes a value you may cache from one you may not.",
+      "mnemonic":      "cntvct",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": [] },
+            "template":   { "fixedWord": 3577471040 },
             "resultSlot": "rd"
           }
         ]
@@ -2579,6 +2625,15 @@
     { "name": "w29",  "class": "gpr", "widthBytes": 4, "subOf": "x29",  "hwEncoding": 29 },
     { "name": "w30",  "class": "gpr", "widthBytes": 4, "subOf": "x30",  "hwEncoding": 30 },
     { "name": "wzr", "class": "gpr", "widthBytes": 4, "subOf": "xzr", "hwEncoding": 31 }
+  ],
+  "$asmConstraintsComment": "★★★ WHICH GNU INLINE-ASM CONSTRAINT LETTER MEANS WHICH REGISTER IS TARGET VOCABULARY — see the twin block in x86_64.target.json for the full rationale and for the [[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]] line this facet is drawn on. What THIS file adds is the proof that the mapping is config and not code.\n★★ THIS TARGET IS THE COUNTER-EXAMPLE THAT MAKES THE FACET NECESSARY. ✔MEASURED, aarch64-linux-gnu-gcc 13.3.0 `-O2 -S`: `\"=a\"` here is `error: impossible constraint in 'asm'` — and so are `b`, `c`, `d`, `D` and `q`, every one of which x86_64 declares. A shared C++ table would have had to branch on the architecture to say that; this file says it by SAYING NOTHING, and the consumer's refusal renders the valid list from whichever target it was handed.\n✔MEASURED with three competing live `\"r\"` operands: r→x0, w→v0, `\"m\"(*p)`→`[x0]`, `\"i\"(7)`→`7`. ⚠ NOTE `i` → `7` with NO sigil while x86_64 emits `$7`: the sigil is DIALECT grammar, which is exactly why the operandKind (`imm32`) is identical on both targets and the printing is not this file's business.\n★ `w` → `vr`, NOT `fpr`, AND THE MEASUREMENT SETTLES IT RATHER THAN INTUITION. gcc's `w` is the V register file; the natural guess is that a `double` bound with `\"=w\"` should be `d0`. ✔MEASURED: `double dw(double a){ __asm__(\"# W %0 %1\" : \"=w\"(o) : \"w\"(a)); }` emits `# W v0 v0` — gcc's DEFAULT print for a `w` operand is the V-register name regardless of the C type. The `d0`/`s0` narrow spellings come from the `%d0`/`%s0` operand MODIFIERS, which are dialect grammar and live with the dialect. So `vr` is the exact answer and `fpr` would have been the plausible wrong one.\n⚠ DELIBERATELY NOT DECLARED: `x` and `y`. Both bind V registers here (✔MEASURED x→v0, y→v0), and the restriction is MEASURED, not taken from the letter's documented meaning — the probe pushes N simultaneous live operands through one asm and reads the largest N that still compiles: **r=30, w=30, x=16, y=8**. ★ READ THOSE CAREFULLY: 30 is the ALLOCATOR CEILING, not a set size — `r` and `w` both stop there, and this target declares 65 gpr / 32 vr rows — so `w` is only proven to be ≥30 and is taken as the full V file. `x`=16 and `y`=8 sit BELOW that ceiling, which is what makes them genuine subclass measurements (V0-V15 and V0-V7) rather than 'too many operands'. The `w` control clinches it: it COMPILES the identical 18-operand asm that `x` refuses, printing `v0 v1 v2 v3 v4 v5 v6 v7 v16 v17 v18 v19 v20 v21 v22 v23 v24 v25`. TargetRegClass cannot express a SUBSET, so declaring `x` or `y` as plain `vr` would load clean, read as support, and hand the allocator registers gcc forbids ⇒ the same refusal x86_64 applies to `Q`, and the deferral is stated in full in that file's twin comment (a FOURTH binding axis — an explicit register-name list — deliberately not built; trigger: the first client whose inline asm uses a subclass letter, which ✔MEASURED none does today).\n⚠ Also absent: `k` (the stack pointer). ✔MEASURED in BOTH directions — `\"=k\"` as an output AND `\"k\"` as an input are each `error: inconsistent operand constraints in an 'asm'` — so there is no measured binding to declare. The two-direction check matters: an earlier note asserted only the output half, which would have left the input half an untested guess sitting inside a sentence that read as a measurement.",
+  "asmConstraints": [
+    { "$comment": "The general-register class. ✔x0 — and x86_64's SAME letter `r` resolves into a register set that contains rax and no x0. One letter, two targets, disjoint registers: the operator-required proof that this mapping is config, not code.",
+      "letter": "r", "binds": "registerClass", "registerClass": "gpr" },
+    { "letter": "w", "binds": "registerClass", "registerClass": "vr"  },
+    { "$comment": "✔MEASURED `\"m\"(*p)` → `[x0]` — a DIFFERENT printed form from x86_64's `(%rdi)` for the identical `membase` binding, which is the vocabulary/grammar split visible in one line.",
+      "letter": "m", "binds": "operandKind",   "operandKind":   "membase" },
+    { "letter": "i", "binds": "operandKind",   "operandKind":   "imm32"   }
   ],
   "$registerClassOpsComment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): per-register-class move/load/store mnemonics — the same FC2 Part B table x86_64 declares. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (L_RequiredLirOpcodeMissing), because the class-blind alternative is a silent miscompile (a GPR ORR/LDUR against a D-register hwEncoding assembles to valid-looking words that move the WRONG register file). fpr: move=FMOV(D), load=LDUR(D), store=STUR(D).",
   "registerClassOps": [

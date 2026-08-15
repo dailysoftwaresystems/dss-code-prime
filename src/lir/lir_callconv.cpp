@@ -1517,20 +1517,113 @@ returnReg(TargetSchema const&            schema,
           std::uint32_t                  ordinal,
           std::string_view               contextLabel,
           DiagnosticReporter&            reporter) {
-    auto const& pool = (cls == LirRegClass::FPR) ? cc.returnFprs : cc.returnGprs;
-    if (ordinal >= pool.size()) {
+    // *** THE POOL IS SELECTED PER CLASS, AND THE SELECTION USED TO BE TWO-WAY.
+    // A latent shipped defect, fixed here rather than walked past (plan 29
+    // §4.4.5's "AND A LATENT BUG FOUND IN PASSING"). `cc.returnVrs` was declared in
+    // `TargetCallingConvention` (target_schema.hpp) and populated by the loader
+    // since the binary128 work, and this function never read it -- it was
+    // `(cls == FPR) ? returnFprs : returnGprs`, so a VR-class result took the
+    // GPR branch through the ELSE, indexed the integer pool, and produced a
+    // wrong-file capture with no diagnostic anywhere. Same else-branch-default
+    // shape as the discarded piece class this cycle also fixed.
+    //
+    // The class-to-pool map is now total and EXHAUSTIVE: every enumerator is
+    // named, and the two that can never hold a value (`None`, `Flags`) fail loud
+    // rather than falling into somebody's pool. Adding a sixth register class
+    // now fails to compile here instead of silently becoming an integer.
+    std::vector<std::string> const* pool     = nullptr;
+    char const*                     poolName = nullptr;
+    switch (cls) {
+        case LirRegClass::GPR:   pool = &cc.returnGprs; poolName = "GPR";   break;
+        case LirRegClass::FPR:   pool = &cc.returnFprs; poolName = "FPR";   break;
+        case LirRegClass::VR:    pool = &cc.returnVrs;  poolName = "VR";    break;
+        case LirRegClass::None:
+        case LirRegClass::Flags: break;
+    }
+    if (pool == nullptr) {
+        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+               DiagnosticSeverity::Error,
+               std::format("{}: a result of register class '{}' has no "
+                           "result-register pool in calling convention '{}' -- "
+                           "only gpr/fpr/vr results can be returned in registers",
+                           contextLabel, lirRegClassName(cls), cc.name));
+        return std::nullopt;
+    }
+    if (ordinal >= pool->size()) {
         report(reporter, DiagnosticCode::L_CcRegLookupFailed,
                DiagnosticSeverity::Error,
                std::format("{}: calling convention '{}' has only {} {} return "
-                           "register(s) but a {} result needs return-register "
+                           "register(s) but a result needs {} return-register "
                            "ordinal {}",
-                           contextLabel, cc.name, pool.size(),
-                           (cls == LirRegClass::FPR) ? "FPR" : "GPR",
-                           (cls == LirRegClass::FPR) ? "float" : "integer",
-                           ordinal));
+                           contextLabel, cc.name, pool->size(), poolName,
+                           poolName, ordinal));
         return std::nullopt;
     }
-    return resolveCcReg(schema, pool[ordinal], cls, contextLabel, reporter);
+    return resolveCcReg(schema, (*pool)[ordinal], cls, contextLabel, reporter);
+}
+
+// *** WHERE DO THIS PRODUCER'S RESULT PIECES LIVE? (plan 29 4.4.1 / 4.4.6)
+//
+// Piece capture used to answer this with a callconv constant, inferred from
+// "the producer is a Call". That inference is the only call-specific thing left
+// in the piece machinery, and it is wrong for any producer that puts its results
+// somewhere else -- an inline-asm block leaves them in the registers its OUTPUT
+// CONSTRAINTS name, not in the cc's return registers.
+//
+// *** KEYED ON DERIVABILITY, NEVER ON PRODUCER IDENTITY. The question asked is
+// "does this instruction DECLARE where its results live?", and the answer is a
+// property of the instruction, not of its opcode: `Lir::instRegConstraints`
+// returns the per-INSTRUCTION contract, whose `outputOrdinals` mean exactly
+// "registers this instruction implicitly WRITES". An instruction that declares
+// them answers for itself; one that does not falls back to the convention. No
+// consumer branches on what kind of thing the producer is, so the next
+// multi-result producer needs no arm here.
+//
+// 4.4.6 was measured before this was written: `LirRegConstraintPool` ALREADY
+// carries `outputNames` / `outputOrdinals` with a builder, a resolver, a
+// rebuild-carry and a `.dsslir` round trip -- and had ZERO consumers. This is
+// the consumer. No second carrier was built.
+//
+// *** BYTE-IDENTICAL WITH NO ASM IN THE SOURCE, BY CONSTRUCTION rather than by
+// measurement-and-hope: the per-instruction handle defaults to
+// `kLirNoRegConstraints` on every instruction ever built, so with no producer
+// declaring outputs the `nullptr` arm is the ONLY reachable one and the call
+// below is the pre-change code path, unchanged. (The gate was run anyway.)
+[[nodiscard]] std::optional<LirReg>
+resultPieceReg(Lir const&                     src,
+               LirInstId                      producer,
+               TargetSchema const&            schema,
+               TargetCallingConvention const& cc,
+               LirRegClass                    cls,
+               std::uint32_t                  ordinal,
+               std::string_view               contextLabel,
+               DiagnosticReporter&            reporter) {
+    ImplicitRegisterConstraint const* declared = src.instRegConstraints(producer);
+    if (declared == nullptr || declared->outputOrdinals.empty()) {
+        return returnReg(schema, cc, cls, ordinal, contextLabel, reporter);
+    }
+    // Bounded on `outputNames`, which is the array indexed two lines down.
+    // `outputOrdinals` is its validator-populated parallel (empty iff the names
+    // are), and the emptiness test above already used that — but bounding one
+    // array and indexing another is how a parallel-array pair drifts into an
+    // out-of-range read, so both are named.
+    if (ordinal >= declared->outputNames.size()
+        || ordinal >= declared->outputOrdinals.size()) {
+        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+               DiagnosticSeverity::Error,
+               std::format("{}: instruction {} declares {} output register(s) but "
+                           "result piece ordinal {} was requested",
+                           contextLabel, producer.v,
+                           declared->outputOrdinals.size(), ordinal));
+        return std::nullopt;
+    }
+    // The ordinals were resolved against the target's register table at load /
+    // build time, so the name is re-resolved here only to reach `resolveCcReg`'s
+    // shared class check -- which is the point: a producer that declares an FPR
+    // register for a GPR-class piece is refused by the SAME rule a misdeclared
+    // calling convention is.
+    return resolveCcReg(schema, declared->outputNames[ordinal], cls,
+                        contextLabel, reporter);
 }
 
 // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): one `dst <- src` register copy in
@@ -2310,6 +2403,38 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 static_cast<std::uint32_t>(outCfiFn.ops.size());
         }
 
+        // ── D-LIR-PER-INST-REG-CONSTRAINTS: where the per-INSTRUCTION side
+        //    data rides through THIS pass, and where it deliberately does not.
+        //
+        // The arms below split into two kinds, and the difference is not a
+        // convenience — it is what the constraint set can mean:
+        //
+        //   (a) arms that RE-EMIT the source opcode — the `isCall` arm, the
+        //       terminator arm, and the general `addInst` fall-through at the
+        //       bottom. Each calls `lir_pass_util::carryInstSideData` with the
+        //       id of the instruction it just appended. Every instruction a
+        //       PRODUCER of constraint sets can mint (an inline-asm statement
+        //       lowers to ordinary target opcodes) lands in one of these three.
+        //
+        //   (b) arms that MATERIALIZE a virtual op into a DIFFERENT opcode —
+        //       `arg` → mov/frame_load, `alloca`/`lea_frame_slot`/`va_*` → lea,
+        //       `frame_load`/`frame_store`/`store_outgoing_arg` → the class-
+        //       routed memory op, `ret_piece` → consumed by its call. These
+        //       carry nothing, because for several of them there is no single
+        //       correspondent to carry ONTO: `maybeMov` emits ZERO instructions
+        //       when regalloc already picked the source register, and a
+        //       consumed `ret_piece` emits none by design. These opcodes are
+        //       minted by MIR→LIR for its own plumbing and no producer attaches
+        //       a constraint set to one.
+        //
+        // ⚠ (b) IS FAIL-LOUD, NOT SILENT — and that is the whole reason it is
+        // an acceptable boundary. `copyModuleSideStructures` carries the POOL
+        // unconditionally, so a handle dropped by a (b) arm leaves a pool entry
+        // that no instruction references, and `verifyLirRebuild` (wired into
+        // `compile_pipeline.cpp` after this pass) reports it as
+        // `L_SideStructureReferenceLost` naming this pass. A new (b)-shaped arm
+        // for an opcode that CAN carry constraints therefore fails the compile
+        // with a real diagnostic instead of silently deleting a clobber set.
         std::uint32_t const instN = src.blockInstCount(srcBlock);
         for (std::uint32_t i = 0; i < instN; ++i) {
             LirInstId const inst = src.blockInstAt(srcBlock, i);
@@ -3635,8 +3760,19 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // FF 15-via-extern), a Reg callee matches `["reg"]`
                 // (indirect FF /2 / BLR — FC4 c2).
                 std::array<LirOperand, 1> callOps{calleeOp};
-                b.addInst(op, InvalidLirReg, callOps,
-                          payload, src.instFlags(inst));
+                // D-LIR-PER-INST-REG-CONSTRAINTS: the source `call` is
+                // re-emitted HERE, in the MIDDLE of this arm's expansion (arg
+                // moves before it, the return-value capture move after it), so
+                // its per-instruction side data rides the id `addInst` returns
+                // — which binds the carry to the INSTRUCTION rather than to
+                // this position in the arm. ✔MEASURED: written as the
+                // `lastInst()` overload at the END of this arm, the clobber
+                // set lands on the capture move, the reference census still
+                // counts 1, and only the ordering pin in
+                // `tests/lir/test_lir_pass_util.cpp` goes red.
+                LirInstId const dstCall = b.addInst(op, InvalidLirReg, callOps,
+                                                    payload, src.instFlags(inst));
+                lir_pass_util::carryInstSideData(src, inst, b, dstCall);
                 // Capture the call's return register(s) into their result
                 // vreg(s). For a scalar call that is a single move of the primary
                 // return register. For a by-value struct return (FC7 C1c) the
@@ -3657,9 +3793,9 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                            inst.v));
                         return false;
                     }
-                    auto const rr = returnReg(schema, cc, result.regClass(), 0,
-                                              "materializeOneFunc: call result",
-                                              reporter);
+                    auto const rr =
+                        resultPieceReg(src, inst, schema, cc, result.regClass(), 0,
+                                       "materializeOneFunc: call result", reporter);
                     if (!rr.has_value()) return false;
                     retMoves.push_back({result, *rr});
                 }
@@ -3678,9 +3814,9 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             return false;
                         }
                         auto const rr =
-                            returnReg(schema, cc, rpRes.regClass(),
-                                      src.instPayload(rp),
-                                      "materializeOneFunc: ret_piece", reporter);
+                            resultPieceReg(src, inst, schema, cc, rpRes.regClass(),
+                                           src.instPayload(rp),
+                                           "materializeOneFunc: ret_piece", reporter);
                         if (!rr.has_value()) return false;
                         retMoves.push_back({rpRes, *rr});
                         consumedRetPieces.insert(rp.v);
@@ -3890,8 +4026,14 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                                    "callconv", reporter)) {
                     return false;
                 }
+                // D-LIR-PER-INST-REG-CONSTRAINTS: the ret-value moves and the
+                // epilogue are emitted BEFORE the terminator, so the emit
+                // above is this arm's last append.
+                lir_pass_util::carryInstSideData(src, inst, b);
             } else {
-                b.addInst(op, result, newOps, payload, src.instFlags(inst));
+                LirInstId const dstInst =
+                    b.addInst(op, result, newOps, payload, src.instFlags(inst));
+                lir_pass_util::carryInstSideData(src, inst, b, dstInst);
             }
         }
     }
@@ -3966,9 +4108,12 @@ materializeCallingConvention(Lir const&           src,
     for (auto const& fp : sehFuncletParents) sehParentSymbols.insert(fp.parentSymbol.v);
 
     LirBuilder b{schema};
-    // D-CSUBSET-BITFIELD-WIDE-UNIT: carry the wide-literal pool across
-    // the rebuild (LiteralIndex operands reference it by index).
-    lir_pass_util::copyLiteralPool(src, b);
+    // Carry every module side structure across the rebuild in one call — the
+    // wide-literal pool (D-CSUBSET-BITFIELD-WIDE-UNIT: LiteralIndex operands
+    // reference it by index) and the register-constraint pool
+    // (D-LIR-PER-INST-REG-CONSTRAINTS; its per-instruction handles ride
+    // `carryInstSideData` inside `materializeOneFunc`).
+    lir_pass_util::copyModuleSideStructures(src, b);
     std::size_t const fnCount = src.moduleFuncCount();
     out.perFunc.reserve(fnCount);
 

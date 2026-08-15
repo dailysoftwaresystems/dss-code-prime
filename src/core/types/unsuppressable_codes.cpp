@@ -93,6 +93,16 @@ namespace {
 // which is this table's whole membership criterion. Two out of three is the
 // evidence the criterion was applied rather than the codes swept in as a batch.
 //
+// 148 → 155 (inline-asm P5 wave 2, D-CSUBSET-INLINE-ASM-OPERANDS): the seven
+// operand-binding codes 0xE065..0xE06B join, with the P1 verdict on
+// `S_InlineAsmDuplicateQualifier` left standing — see the block beside the
+// rows themselves. ⚠ THE 148 IS MEASURED AT THE ARRAY, NOT READ OFF THE
+// RUNNING TOTALS ABOVE, and it had to be: those totals contradict each other
+// (a "141 → 144" and a "★ 139 → 141" both claim to be steps of the same
+// sequence, and one step was never recorded at all, as the note below admits).
+// A count in this file is only ever trustworthy if it was counted from
+// `kUnsuppressableCodes` at the commit that carries it.
+//
 // 142 → 143 (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED):
 // `L_TerminatorSuccessorMismatch` joins — a terminator whose recorded successors
 // and whose own BlockRef operands disagree. Suppressed, the encoder takes its
@@ -292,6 +302,10 @@ constexpr std::string_view kWhyLirStructural =
     "a LIR verifier / lowering structural invariant; silenced, the "
     "violation reaches the assembler and miscompiles through the LIR "
     "layer";
+constexpr std::string_view kWhySideStructureIntegrity =
+    "a module side structure (literal pool / per-instruction register-"
+    "constraint pool) is referenced by index from the instruction stream; "
+    "silenced, a rebuild that loses the reference miscompiles silently";
 constexpr std::string_view kWhyVlaDynamicAlloca =
     "silenced, a runtime-sized alloca falls to the fixed-slot path and "
     "emits a one-slot scalar for the whole VLA";
@@ -369,6 +383,35 @@ constexpr std::string_view kWhyArrayParamQualifier =
 constexpr std::string_view kWhyInlineAsmTemplate =
     "silenced, a non-empty asm template lowers to a no-op barrier and its "
     "instructions simply vanish";
+// ── inline-asm P5 operand binding ─────────────────────────────────────────
+// SEVEN reasons rather than one shared string, because the second candidate
+// lowering differs per code and the reason is what the operator is SHOWN when
+// their --suppress is refused. A shared "inline asm cannot be suppressed"
+// would tell them which table refused them and nothing about what would have
+// happened.
+constexpr std::string_view kWhyAsmConstraintLetter =
+    "silenced, an operand whose constraint letter this target does not "
+    "declare binds to nothing, and the asm runs on whatever the allocator "
+    "left in place";
+constexpr std::string_view kWhyAsmConstraintForm =
+    "silenced, a multi-alternative or multi-letter constraint makes the "
+    "binder pick one alternative on its own, unannounced";
+constexpr std::string_view kWhyAsmOperandModifier =
+    "silenced, a width-view modifier falls back to the full register, so a "
+    "32-bit operation executes 64-bit";
+constexpr std::string_view kWhyAsmClobberUnknown =
+    "silenced, the clobber is dropped, a live value stays parked in a "
+    "register the asm overwrites, and the wrong value is read after it";
+constexpr std::string_view kWhyAsmTemplateUnparsable =
+    "silenced, a template the dialect could not parse lowers to nothing and "
+    "the instructions the programmer wrote vanish";
+constexpr std::string_view kWhyAsmPlaceholderRange =
+    "silenced, a placeholder past the last declared operand is dropped or "
+    "emitted raw, and the instruction operates on the wrong thing";
+constexpr std::string_view kWhyAsmPlaceholderInBasic =
+    "silenced, a % form in a template with no operand sections is either "
+    "bound against an operand list that does not exist or passed through "
+    "raw, and the two ship different machine code";
 constexpr std::string_view kWhyBitfieldMutation =
     "silenced, the mutation falls to a full-unit store that clobbers "
     "packed neighbours and skips truncation";
@@ -394,7 +437,11 @@ constexpr std::string_view kWhyOperatorNameNotDefinable =
 // explicit count rather than a deduced `[]`, so adding a row without thinking
 // about it is a COMPILE ERROR rather than a silent append; ✔it caught this
 // very addition. Raise it by hand, exactly once per row.
-constexpr std::array<UnsuppressableEntry, 151> kUnsuppressableCodes{{
+// ⓘ EXTENT 151 → 161 (2026-08-18, rebase of Cycle P5 onto AP6): the two
+// branches raised this independently — AP6 by 1 and P5 by 5 — so the rebase
+// had to RECONCILE rather than pick a side. Taking either number would have
+// dropped the other branch's rows silently past this guard.
+constexpr std::array<UnsuppressableEntry, 161> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -922,7 +969,11 @@ constexpr std::array<UnsuppressableEntry, 151> kUnsuppressableCodes{{
 
     // L_* LIR verifier / lowering band — structural invariants
     // (cannot reach assembler-tier codegen without violating
-    // downstream contracts). All 11 codes fire from arms that gate
+    // downstream contracts). ✔MEASURED 2026-08-14: 17 L_* rows in the
+    // array below (the band grew by the three side-structure codes).
+    // Count it, never re-quote it — the header's own enumeration of this
+    // band has already gone stale twice. Every one of them fires from an
+    // arm that gates
     // the producer's ok() / return value. Suppressing any → silent
     // miscompile through the LIR layer.
     //
@@ -961,6 +1012,20 @@ constexpr std::array<UnsuppressableEntry, 151> kUnsuppressableCodes{{
     // ABI break — a silent stack miscompile). Same load-bearing-boundary class.
     {DiagnosticCode::L_VlaNonLeafFrameUnsupported, kWhyVlaNonLeafFrame},
     {DiagnosticCode::L_TerminatorSuccessorMismatch, kWhyTerminatorSuccessors},
+
+    // Module SIDE-STRUCTURE integrity (D-LIR-PER-INST-REG-CONSTRAINTS).
+    // The literal pool and the per-instruction register-
+    // constraint pool are referenced BY INDEX from the instruction stream,
+    // and four passes rebuild that stream into a fresh builder. Every way
+    // the carry can fail is silent — the module stays well-formed and the
+    // loss surfaces as wrong bytes. Suppressed, `IndexDangling` becomes an
+    // abort deep in a pool accessor with no instruction named,
+    // `PoolShrank` becomes a dangling reference one pass later, and
+    // `ReferenceLost` becomes a vanished clobber set that lets the
+    // allocator reuse a register the instruction destroys.
+    {DiagnosticCode::L_SideStructureIndexDangling, kWhySideStructureIntegrity},
+    {DiagnosticCode::L_SideStructurePoolShrank, kWhySideStructureIntegrity},
+    {DiagnosticCode::L_SideStructureReferenceLost, kWhySideStructureIntegrity},
 
     // R_* regalloc band — calling-convention / class invariants.
     // R_SpilledDueToPressure + R_SpilledDueToCrossCallExhaustion
@@ -1211,6 +1276,34 @@ constexpr std::array<UnsuppressableEntry, 151> kUnsuppressableCodes{{
     {DiagnosticCode::S_InlineAsmNonEmptyTemplate, kWhyInlineAsmTemplate},
     {DiagnosticCode::S_InlineAsmExtendedUnsupported, kWhyInlineAsmExtended},
     {DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto, kWhyInlineAsmLabelSection},
+    // Inline-asm P5 operand binding, 0xE065..0xE06B (D-CSUBSET-INLINE-ASM-
+    // OPERANDS + D-CSUBSET-INLINE-ASM-TEXT). SEVEN codes, all admitted on
+    // PRONG (1), and the prong is met the same way in each: the construct has
+    // a SECOND CANDIDATE LOWERING that a silenced compiler would take without
+    // saying so — an unbound operand, an alternative the binder chose itself,
+    // a full-width register where a narrow view was written, a dropped
+    // clobber, a vanished template, a placeholder dropped or emitted raw. In
+    // every case the build stays GREEN and the bytes are wrong, which is this
+    // table's majority class and exactly what 0xE062 (their P1 ancestor,
+    // already a member) was closed against.
+    //
+    // ⓘ THE ARC'S OTHER CODE IS DELIBERATELY STILL OUT.
+    // `S_InlineAsmDuplicateQualifier` (0xE064) is an Error by default and is
+    // NOT a member: `volatile volatile` suppressed compiles to what `volatile`
+    // means, so there is no second candidate to pick. Eight codes in one arc,
+    // seven members, and the odd one out is the same one P1 left out — the
+    // criterion is being applied per code rather than per arc.
+    //
+    // ⚠ MEMBERSHIP HERE IS ABOUT SUPPRESSION ONLY. None of the seven is here
+    // for cap-immunity; a refusal aborts the compilation before codegen, so
+    // none of them needs `DiagnosticDelivery::Guaranteed` to be seen.
+    {DiagnosticCode::S_InlineAsmConstraintLetterUndeclared, kWhyAsmConstraintLetter},
+    {DiagnosticCode::S_InlineAsmConstraintUnsupportedForm, kWhyAsmConstraintForm},
+    {DiagnosticCode::S_InlineAsmOperandModifierUnsupported, kWhyAsmOperandModifier},
+    {DiagnosticCode::S_InlineAsmClobberUnknown, kWhyAsmClobberUnknown},
+    {DiagnosticCode::S_InlineAsmTemplateUnparsable, kWhyAsmTemplateUnparsable},
+    {DiagnosticCode::S_InlineAsmPlaceholderOutOfRange, kWhyAsmPlaceholderRange},
+    {DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate, kWhyAsmPlaceholderInBasic},
     // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-
     // RESIDUAL): a bit-field compound/inc-dec/value mutation through an anonymous-
     // member or array-arrow base. Suppressed, the mutation falls to the generic

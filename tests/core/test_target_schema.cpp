@@ -24,7 +24,9 @@
 
 namespace {
 
+using ::dss::AsmConstraintBinding;
 using ::dss::DiagnosticCode;
+using ::dss::OperandKindFilter;
 using ::dss::TargetRegClass;
 using ::dss::TargetSchema;
 using ::dss::EncodingSlotKind;
@@ -777,18 +779,29 @@ TEST(TargetSchema, ShippedX86_64ImplicitRegistersConsumerCount) {
     // declares inputs/outputs/clobbered=[rax], inputRoles={comparand: rax},
     // outputRoles={old: rax} — the AtomicCas lowering pins the comparand into
     // RAX and captures the observed-original from it.
-    ASSERT_EQ(mnemonicsWithConstraint.size(), 9u)
-        << "expected exactly 9 implicit-register-bearing opcodes "
+    // `rdtsc`: the tenth consumer, and it landed exactly as this pin was
+    // written to make it land — the ratchet fired, the new opcode was named
+    // here on purpose, and neither half of the assertion was loosened. It
+    // declares outputs/clobbered=[rax,rdx] with outputRoles={low: rax,
+    // high: rdx}, REUSING the high/low roles c103 added for the 128-bit MUL
+    // rather than minting tsc-specific ones: both instructions split one wide
+    // value across two registers, which is exactly what the roles mean. The
+    // roles are what stop a reorder of the positional arrays from silently
+    // swapping RDTSC's halves — a swap that multiplies every measured
+    // interval by 2^32 while still producing a plausible-looking number.
+    ASSERT_EQ(mnemonicsWithConstraint.size(), 10u)
+        << "expected exactly 10 implicit-register-bearing opcodes "
            "(cqo + idiv_op + xor_rdx_zero + div_op from cycle 10r "
            "split; shl + shr_l + shr_a from FC3.5 shifts; umul_op "
-           "from c103 __umulh; lock_cmpxchg from c104 AtomicCas); "
+           "from c103 __umulh; lock_cmpxchg from c104 AtomicCas; "
+           "rdtsc from the inline-asm constraint cycle); "
            "update this count when a new consumer lands.";
     std::set<std::string> const observedSet(
         mnemonicsWithConstraint.begin(),
         mnemonicsWithConstraint.end());
     std::set<std::string> const expectedSet{
         "cqo", "idiv_op", "xor_rdx_zero", "div_op",
-        "shl", "shr_l", "shr_a", "umul_op", "lock_cmpxchg"};
+        "shl", "shr_l", "shr_a", "umul_op", "lock_cmpxchg", "rdtsc"};
     EXPECT_EQ(observedSet, expectedSet);
 
     // FLAG 1 discrimination: the four ops carry DIFFERENT implicit-
@@ -3075,4 +3088,769 @@ TEST(TargetSchema, ShippedTargetsLoadCleanUnderEveryContainerGate) {
             << name << ".target.json must load clean under EVERY closed "
                        "container-key vocabulary, not just the root one";
     }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// GNU inline-asm constraint letters — the `asmConstraints` facet
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The facet declares WHICH LETTER MEANS WHICH REGISTER on this processor.
+// ✔MEASURED with gcc 13.3.0 (`-O2 -S`, native x86_64 + aarch64-linux-gnu
+// cross), with THREE competing live `"r"` operands so a lucky allocation
+// cannot be mistaken for a pin: x86_64 r→%rax a→%rax b→%rbx c→%rcx d→%rdx
+// S→%rsi D→%rdi x→%xmm0, `"m"(*p)`→`(%rdi)`, `"i"(7)`→`$7`; aarch64 r→x0
+// w→v0, `"m"(*p)`→`[x0]`, `"i"(7)`→`7`, and a/b/c/d/D/q are every one of
+// them `error: impossible constraint in 'asm'`.
+//
+// The three axes bind to vocabulary that already existed (`TargetRegClass`,
+// `registers[].name`, `OperandKindFilter`) — see `TargetAsmConstraint` for
+// why this is target vocabulary and the reverted `asmSyntax` block was not.
+
+namespace {
+
+// A minimal target carrying a register file, so a constraint row has
+// something to resolve against. `rax` is ordinal 0 and `xmm0` ordinal 1 —
+// ordinal 0 being VALID is exactly why the payload arms are `optional`.
+constexpr char const* kConstraintFixturePrefix =
+    R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "opcodes":[{"mnemonic":"invalid","result":"none"}],
+        "registers":[
+          {"name":"rax","class":"gpr","widthBytes":8,"hwEncoding":0},
+          {"name":"xmm0","class":"fpr","widthBytes":16,"hwEncoding":0}
+        ],
+        "asmConstraints":)";
+
+// Build a one-target document whose `asmConstraints` array is `rows`.
+std::string constraintDoc(std::string_view rows) {
+    return std::string{kConstraintFixturePrefix} + std::string{rows} + "}";
+}
+
+// One constraint row wrapped in that document — the negative tests differ
+// only in the row, so the fixture noise stays out of each assertion.
+std::string oneConstraintRow(std::string_view row) {
+    return constraintDoc(std::string{"["} + std::string{row} + "]");
+}
+
+// Every register name in `cls`, as a set — the "what does this letter
+// actually resolve to" projection the operator-required test compares.
+std::set<std::string> registersInClass(TargetSchema const& s,
+                                       TargetRegClass cls) {
+    std::set<std::string> out;
+    for (auto const& r : s.registers()) {
+        if (r.regClass == cls) out.insert(r.name);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(TargetSchema, AsmConstraintsAbsentIsEmptyNotAnError) {
+    // A processor whose inline-asm binding has not been described is a real
+    // state, not a malformed document — it simply refuses every letter by
+    // name. Rejecting absence would force the key onto every target file.
+    auto r = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->asmConstraintCount(), 0u);
+    EXPECT_EQ((*r)->asmConstraint("r"), nullptr);
+    EXPECT_TRUE((*r)->declaredAsmConstraintLetters().empty());
+}
+
+TEST(TargetSchema, AsmConstraintsNonArrayRejected) {
+    auto r = TargetSchema::loadFromText(
+        constraintDoc(R"({"r":"gpr"})"), "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "an object keyed by letter would silently drop duplicates "
+           "(nlohmann keeps the last) — the array shape is what makes a "
+           "duplicate letter detectable at all";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, AsmConstraintRoundTripsThroughEveryAxis) {
+    auto r = TargetSchema::loadFromText(
+        constraintDoc(R"([
+            {"letter":"r","binds":"registerClass","registerClass":"gpr"},
+            {"letter":"a","binds":"register","register":"rax"},
+            {"letter":"i","binds":"operandKind","operandKind":"imm32"}
+        ])"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    auto const& s = **r;
+    ASSERT_EQ(s.asmConstraintCount(), 3u);
+
+    auto const* cr = s.asmConstraint("r");
+    ASSERT_NE(cr, nullptr);
+    EXPECT_EQ(cr->binds, AsmConstraintBinding::RegisterClass);
+    ASSERT_TRUE(cr->registerClass.has_value());
+    EXPECT_EQ(*cr->registerClass, TargetRegClass::GPR);
+    // ★ THE ARMS `binds` DID NOT NAME MUST BE `nullopt`, never a plausible
+    // zero. Ordinal 0 IS `rax` in this fixture and `OperandKindFilter::Reg`
+    // is 0 too, so a zero-initialized arm would answer a consumer that
+    // forgot to switch with a real-looking register and a real-looking
+    // operand kind — the silent-wrong-answer shape.
+    EXPECT_FALSE(cr->registerOrdinal.has_value());
+    EXPECT_FALSE(cr->operandKind.has_value());
+
+    auto const* ca = s.asmConstraint("a");
+    ASSERT_NE(ca, nullptr);
+    EXPECT_EQ(ca->binds, AsmConstraintBinding::Register);
+    ASSERT_TRUE(ca->registerOrdinal.has_value());
+    ASSERT_NE(s.registerInfo(*ca->registerOrdinal), nullptr);
+    EXPECT_EQ(s.registerInfo(*ca->registerOrdinal)->name, "rax");
+    EXPECT_FALSE(ca->registerClass.has_value());
+    EXPECT_FALSE(ca->operandKind.has_value());
+
+    auto const* ci = s.asmConstraint("i");
+    ASSERT_NE(ci, nullptr);
+    EXPECT_EQ(ci->binds, AsmConstraintBinding::OperandKind);
+    ASSERT_TRUE(ci->operandKind.has_value());
+    EXPECT_EQ(*ci->operandKind, OperandKindFilter::ImmInt);
+    EXPECT_FALSE(ci->registerOrdinal.has_value());
+    EXPECT_FALSE(ci->registerClass.has_value());
+
+    EXPECT_EQ(s.declaredAsmConstraintLetters(), "'r', 'a', 'i'");
+}
+
+// ★★ THE LINE THIS FACET IS DRAWN ON, PINNED. The modifiers are GNU-asm
+// GRAMMAR — they mean the same thing on every processor — so storing them
+// here would put a grammar fact in the target file, which is exactly how
+// the reverted `asmSyntax` block got in. Such a letter would ALSO silently
+// never match: a front end strips modifiers before looking up, so it
+// searches for the bare letter. A silent never-match is worse than a reject.
+TEST(TargetSchema, AsmConstraintLetterCarryingAModifierIsRejected) {
+    for (std::string_view letter : {"=a", "+a", "&a", "%a"}) {
+        auto r = TargetSchema::loadFromText(
+            oneConstraintRow(std::string{R"({"letter":")"} +
+                             std::string{letter} +
+                             R"(","binds":"register","register":"rax"})"),
+            "<inline>");
+        ASSERT_FALSE(r.has_value())
+            << letter
+            << " carries a GNU-asm modifier — grammar owned by the source "
+               "language, never target vocabulary";
+        EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    }
+}
+
+TEST(TargetSchema, AsmConstraintLetterCarryingASigilOrSpaceIsRejected) {
+    for (std::string_view letter : {"$a", "#a", "a ", " a"}) {
+        auto r = TargetSchema::loadFromText(
+            oneConstraintRow(std::string{R"({"letter":")"} +
+                             std::string{letter} +
+                             R"(","binds":"register","register":"rax"})"),
+            "<inline>");
+        ASSERT_FALSE(r.has_value())
+            << letter << " is dialect grammar or a typo, not a letter";
+        EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    }
+}
+
+TEST(TargetSchema, AsmConstraintEmptyLetterIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(
+            R"({"letter":"","binds":"register","register":"rax"})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "an empty letter is a half-filled row — omit the ROW to declare "
+           "that this target binds nothing";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// Two rows for one letter is an ambiguity the consumer cannot see, and
+// silently keeping one of them is how a config key stops meaning anything.
+TEST(TargetSchema, AsmConstraintDuplicateLetterIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        constraintDoc(R"([
+            {"letter":"a","binds":"register","register":"rax"},
+            {"letter":"a","binds":"registerClass","registerClass":"gpr"}
+        ])"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ★ CASE IS LOAD-BEARING AND MUST NOT BE FOLDED: ✔MEASURED, x86_64 `d` is
+// %rdx and `D` is %rdi. A case-insensitive letter table would bind one to
+// the other's register — a wrong register, not a diagnostic.
+TEST(TargetSchema, AsmConstraintLetterIsCaseSensitive) {
+    auto r = TargetSchema::loadFromText(
+        constraintDoc(R"([
+            {"letter":"a","binds":"register","register":"rax"},
+            {"letter":"A","binds":"registerClass","registerClass":"fpr"}
+        ])"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value())
+        << "'a' and 'A' are DIFFERENT letters — folding case here would "
+           "report a false duplicate and lose one of them";
+    ASSERT_NE((*r)->asmConstraint("a"), nullptr);
+    ASSERT_NE((*r)->asmConstraint("A"), nullptr);
+    EXPECT_EQ((*r)->asmConstraint("a")->binds, AsmConstraintBinding::Register);
+    EXPECT_EQ((*r)->asmConstraint("A")->binds,
+              AsmConstraintBinding::RegisterClass);
+}
+
+TEST(TargetSchema, AsmConstraintUnknownBindingAxisIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(R"({"letter":"r","binds":"registerFile",
+                             "registerClass":"gpr"})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a free-form axis string would let a typo declare a letter that "
+           "binds nothing; a new axis needs core vocabulary, not a string";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, AsmConstraintMissingThePayloadItsAxisNamesIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(R"({"letter":"a","binds":"register"})"), "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
+// ⚠ A SECOND PAYLOAD IS A SECOND ANSWER. Accepting it would silently
+// discard one, and the operator who wrote the discarded key would never
+// learn it was dead.
+TEST(TargetSchema, AsmConstraintCarryingASecondPayloadIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(R"({"letter":"a","binds":"register","register":"rax",
+                             "registerClass":"gpr"})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, AsmConstraintUnknownRegisterNameIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(
+            R"({"letter":"b","binds":"register","register":"rbx"})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a dangling name must fail at LOAD, where the target is in hand — "
+           "not at some later lookup site with no target to name";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// The sigil-in-a-register-name mistake is the same grammar-into-vocabulary
+// error the letter guard catches, one field over.
+TEST(TargetSchema, AsmConstraintSigilPrefixedRegisterNameIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(
+            R"({"letter":"a","binds":"register","register":"%rax"})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "`%rax` is the AT&T PRINTING of the register named `rax`; a "
+           "target file names registers, never their dialect spellings";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, AsmConstraintUnknownRegisterClassIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(R"({"letter":"r","binds":"registerClass",
+                             "registerClass":"general"})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, AsmConstraintUnknownOperandKindIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(R"({"letter":"i","binds":"operandKind",
+                             "operandKind":"immediate"})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "`imm32` is the declared JSON spelling of OperandKindFilter::"
+           "ImmInt — the SAME closed vocabulary the encoding variant guards "
+           "use, deliberately reused instead of re-minted";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// ★ A LETTER BOUND TO A CLASS THIS TARGET POPULATES WITH NOTHING IS A KNOB
+// THAT LIES: it loads clean, reads as support, and resolves to the empty
+// set. ✔MEASURED that this is reachable in practice and not a hypothetical
+// — x86_64 declares ZERO `vr` registers and arm64 declares ZERO `flags`.
+TEST(TargetSchema, AsmConstraintBoundToAnEmptyClassIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(R"({"letter":"v","binds":"registerClass",
+                             "registerClass":"vr"})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "the fixture declares gpr + fpr registers and no vr — a letter "
+           "bound to vr would allocate nothing while reading as supported";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, AsmConstraintBoundToClassNoneIsRejected) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(R"({"letter":"z","binds":"registerClass",
+                             "registerClass":"none"})"),
+        "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "`none` is a spelling in the class table but not a class a letter "
+           "can match — a declared-but-dead letter is worse than no letter";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// The INVERSE-FAILURE pin every closed key vocabulary in this file has had
+// to earn: `$`-prefixed keys are prose and must survive the rejector. Not
+// decorative — every shipped constraint row carries its gcc measurement.
+TEST(TargetSchema, AsmConstraintsAcceptDollarPrefixedProse) {
+    auto r = TargetSchema::loadFromText(
+        oneConstraintRow(R"({"$comment":"measured with gcc -O2 -S",
+                             "letter":"a","binds":"register",
+                             "register":"rax"})"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value())
+        << "the carve-out must be the `$`-PREFIX predicate, never a literal "
+           "\"$comment\" compare";
+    EXPECT_EQ((*r)->asmConstraintCount(), 1u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// The facet against the SHIPPED targets — and the red-on-disable that
+// proves the shipped bytes were actually READ.
+// ═══════════════════════════════════════════════════════════════════════
+//
+// ⚠⚠ THESE RUN THROUGH `loadShipped` / `mutateShippedTargetSchemaDoc`,
+// WHICH REACH `findShippedConfig` — it reads `DSS_CONFIG_ROOT` and
+// otherwise WALKS THE CWD. `dss_add_test` sets that variable, so these
+// assertions are only about the intended config tree when the binary runs
+// under ctest. A bare `.exe` invocation silently reads whichever tree the
+// shell happens to stand in.
+
+TEST(TargetSchema, ShippedTargetsDeclareAsmConstraints) {
+    // ⚠⚠ THE SINGLE HIGHEST-RISK LINE IN THE FACET IS THE ROOT-KEY ALLOWLIST
+    // ENTRY, and this is the test that makes forgetting it impossible to
+    // miss: without `"asmConstraints"` in `kTargetDocumentKeys` the shipped
+    // documents would not load at all, and with the entry but no loader the
+    // counts below would be zero. Both halves are asserted.
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(x86.has_value());
+    ASSERT_TRUE(arm.has_value());
+
+    // ✔MEASURED against gcc 13.3.0 — see this file's section header for the
+    // probe. The counts are a ratchet: a letter added or dropped updates
+    // this deliberately, never silently.
+    EXPECT_EQ((*x86)->asmConstraintCount(), 11u);
+    EXPECT_EQ((*arm)->asmConstraintCount(), 4u);
+    EXPECT_EQ((*x86)->declaredAsmConstraintLetters(),
+              "'r', 'a', 'b', 'c', 'd', 'S', 'D', 'x', 'q', 'm', 'i'");
+    EXPECT_EQ((*arm)->declaredAsmConstraintLetters(), "'r', 'w', 'm', 'i'");
+
+    // ★★ `q` IS PRESENT AND `Q` IS ABSENT, AND THE ASYMMETRY IS A
+    // MEASUREMENT, NOT A READING OF THE LETTERS' NAMES — an earlier draft of
+    // this facet refused BOTH, on the strength of `q` being "the
+    // byte-addressable subclass" on i386. ✔THE PROBE counts how many
+    // SIMULTANEOUS live operands each letter admits, i.e. the size of its
+    // register set, read off where gcc says "impossible constraints":
+    // r=15, q=15, Q=4, a=1. On x86_64 REX makes every GPR byte-addressable,
+    // so `q` and `r` are the same set and `q`→`gpr` is EXACT; `Q`=4 is a
+    // genuine subset that `TargetRegClass` cannot express, so it is refused
+    // by name rather than approximated as `gpr` (which would hand the
+    // allocator 11 registers gcc forbids). `a`=1 is the control proving the
+    // probe can see a single-register pin.
+    auto const* q = (*x86)->asmConstraint("q");
+    ASSERT_NE(q, nullptr);
+    ASSERT_TRUE(q->registerClass.has_value());
+    EXPECT_EQ(*q->registerClass, TargetRegClass::GPR);
+    EXPECT_EQ((*x86)->asmConstraint("Q"), nullptr)
+        << "`Q` names 4 registers; declaring it `gpr` would be a knob that "
+           "lies, and a letter this file cannot describe EXACTLY is one it "
+           "refuses by name";
+    EXPECT_EQ((*arm)->asmConstraint("x"), nullptr)
+        << "aarch64 `x` is V0-V15 — ✔MEASURED, it fails at 18 simultaneous "
+           "operands where `w` compiles the same 18; a subset `vr` cannot "
+           "express";
+    EXPECT_EQ((*arm)->asmConstraint("y"), nullptr)
+        << "aarch64 `y` is V0-V7 — ✔MEASURED, it fails at 10";
+
+    // The row sqlite's own `hwtime.h` needs: `__asm__("rdtsc" : "=a"(lo),
+    // "=d"(hi))`. ✔MEASURED to PIN — with three competing live `"r"`
+    // operands the `"=a"` output still landed in %rax.
+    auto const* a = (*x86)->asmConstraint("a");
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->binds, AsmConstraintBinding::Register);
+    ASSERT_TRUE(a->registerOrdinal.has_value());
+    EXPECT_EQ((*x86)->registerInfo(*a->registerOrdinal)->name, "rax");
+
+    auto const* d = (*x86)->asmConstraint("d");
+    ASSERT_NE(d, nullptr);
+    ASSERT_TRUE(d->registerOrdinal.has_value());
+    EXPECT_EQ((*x86)->registerInfo(*d->registerOrdinal)->name, "rdx");
+
+    // ★ CASE, ON THE REAL CONFIG: `d` is %rdx and `D` is %rdi.
+    auto const* dUpper = (*x86)->asmConstraint("D");
+    ASSERT_NE(dUpper, nullptr);
+    ASSERT_TRUE(dUpper->registerOrdinal.has_value());
+    EXPECT_EQ((*x86)->registerInfo(*dUpper->registerOrdinal)->name, "rdi");
+    EXPECT_NE(*d->registerOrdinal, *dUpper->registerOrdinal)
+        << "one letter of case apart, two different registers — a "
+           "case-folding lookup would silently bind rdx traffic to rdi";
+
+    // arm64's `w` is the V file, NOT the D file. ✔MEASURED and it is the
+    // non-obvious half: gcc prints `v0` for a `w`-constrained DOUBLE, so
+    // `fpr` would have been the plausible wrong answer. The `d0`/`s0`
+    // spellings come from the `%d`/`%s` operand modifiers, which are
+    // dialect grammar and do not live in this file.
+    auto const* w = (*arm)->asmConstraint("w");
+    ASSERT_NE(w, nullptr);
+    ASSERT_TRUE(w->registerClass.has_value());
+    EXPECT_EQ(*w->registerClass, TargetRegClass::VR);
+}
+
+// ★★★ THE OPERATOR-REQUIRED TEST: THE SAME LETTER RESOLVES TO DIFFERENT
+// REGISTERS UNDER TWO TARGETS, WHICH IS ONLY POSSIBLE IF THE MAPPING IS
+// CONFIG AND NOT CODE. A C++ table would have to branch on the
+// architecture to produce these two answers.
+TEST(TargetSchema, SameAsmConstraintLetterResolvesDifferentlyPerTarget) {
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(x86.has_value());
+    ASSERT_TRUE(arm.has_value());
+
+    // ── half one: `r` is declared by BOTH and resolves to DISJOINT sets ──
+    auto const* rx = (*x86)->asmConstraint("r");
+    auto const* ra = (*arm)->asmConstraint("r");
+    ASSERT_NE(rx, nullptr);
+    ASSERT_NE(ra, nullptr);
+    ASSERT_TRUE(rx->registerClass.has_value());
+    ASSERT_TRUE(ra->registerClass.has_value());
+
+    auto const xRegs = registersInClass(**x86, *rx->registerClass);
+    auto const aRegs = registersInClass(**arm, *ra->registerClass);
+    EXPECT_TRUE(xRegs.contains("rax"));
+    EXPECT_FALSE(xRegs.contains("x0"));
+    EXPECT_TRUE(aRegs.contains("x0"));
+    EXPECT_FALSE(aRegs.contains("rax"));
+
+    std::vector<std::string> shared;
+    std::ranges::set_intersection(xRegs, aRegs, std::back_inserter(shared));
+    EXPECT_TRUE(shared.empty())
+        << "letter 'r' must resolve to two disjoint register sets; "
+           << shared.size() << " name(s) appear in both, which would mean "
+              "one of the targets is describing the other's register file";
+
+    // ── half two: `a` is declared by ONE of them, and the other REFUSES ──
+    // ✔MEASURED: aarch64-linux-gnu-gcc rejects `"=a"` with `error:
+    // impossible constraint in 'asm'`. That asymmetry is what a shared
+    // C++ table could not express without an `if (arch == ...)`.
+    ASSERT_NE((*x86)->asmConstraint("a"), nullptr);
+    EXPECT_EQ((*arm)->asmConstraint("a"), nullptr)
+        << "arm64 has no `a` constraint — declaring one would be inventing "
+           "a binding gcc says does not exist";
+    EXPECT_NE((*x86)->declaredAsmConstraintLetters().find("'a'"),
+              std::string::npos);
+    EXPECT_EQ((*arm)->declaredAsmConstraintLetters().find("'a'"),
+              std::string::npos)
+        << "the consumer's refusal diagnostic renders its valid list from "
+           "whichever target it was handed — there is no correct constant "
+           "to hand-type, which is the point";
+
+    // ── half three: an axis they AGREE on, so the divergence above is a
+    // measurement and not an artefact of the two files being unrelated ──
+    auto const* ix = (*x86)->asmConstraint("i");
+    auto const* ia = (*arm)->asmConstraint("i");
+    ASSERT_NE(ix, nullptr);
+    ASSERT_NE(ia, nullptr);
+    EXPECT_EQ(ix->operandKind, ia->operandKind)
+        << "`i` is an operand FORM on both processors — ✔MEASURED `$7` vs "
+           "`7`, and the sigil is dialect grammar, not a different binding";
+}
+
+// ★★★ RED-ON-DISABLE AT CONFIG LEVEL, WITH THE MUTANT PROVEN TO HAVE BEEN
+// READ. All five fail-closed clauses are discharged here:
+//   1. UNIQUE witness — the loader rejects duplicate letters, so exactly
+//      one row declares `a` and `asmConstraint("a")` cannot be ambiguous.
+//   2. The mutant DIFFERS BYTE-WISE — `mutateShippedTargetSchemaDoc`
+//      compares `doc.dump()` before and after and THROWS on a no-op. Not a
+//      line or row count: a same-length substitution is exactly this
+//      mutation's shape.
+//   3. The witness is ABSENT FROM THE MUTANT BY THE SAME MATCHER THE PIN
+//      USES — the identical `asmConstraint("a")` call, not a re-derived one.
+//   4. The mutant STILL PARSES — asserted, so the red cannot be a parse
+//      error dressed up as a facet failure.
+//   5. THE MUTATED BYTES WERE READ — and this is the clause a "the pin went
+//      red" test would leave undischarged. The observed value TRACKS the
+//      mutation: after re-pointing `a` at `rbx` the loaded schema answers
+//      `rbx`. A stale, ignored or hardcoded table cannot produce the
+//      mutant's own new value; only reading those bytes can.
+TEST(TargetSchema, ShippedAsmConstraintRegisterIsReadFromTheDocument) {
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto const* baseline = (*shipped)->asmConstraint("a");
+    ASSERT_NE(baseline, nullptr);
+    ASSERT_TRUE(baseline->registerOrdinal.has_value());
+    ASSERT_EQ((*shipped)->registerInfo(*baseline->registerOrdinal)->name,
+              "rax");
+
+    bool repointed = false;
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [&repointed](nlohmann::json& doc) {
+            if (!doc.contains("asmConstraints")) return;
+            for (auto& row : doc.at("asmConstraints")) {
+                if (row.value("letter", std::string{}) == "a") {
+                    row["register"] = "rbx";
+                    repointed = true;
+                }
+            }
+        });
+    ASSERT_TRUE(repointed)
+        << "no shipped x86_64 constraint row declares letter 'a' — the "
+           "mutation was a no-op and this pin would assert nothing";
+    ASSERT_TRUE(mutated.has_value())
+        << "the mutant must still PARSE, or the red below would be a parse "
+           "error wearing the facet's clothes";
+
+    auto const* seen = (*mutated)->asmConstraint("a");
+    ASSERT_NE(seen, nullptr);
+    ASSERT_TRUE(seen->registerOrdinal.has_value());
+    EXPECT_EQ((*mutated)->registerInfo(*seen->registerOrdinal)->name, "rbx")
+        << "the loader must report the MUTANT's register — reporting `rax` "
+           "would mean the letter table is hardcoded in C++ and the JSON is "
+           "decoration";
+    EXPECT_NE((*mutated)->registerInfo(*seen->registerOrdinal)->name, "rax");
+
+    // And the shipped schema is untouched by the mutation — the two answers
+    // coexist, which is the whole claim: the mapping is per-document.
+    EXPECT_EQ((*shipped)->registerInfo(*baseline->registerOrdinal)->name,
+              "rax");
+}
+
+TEST(TargetSchema, RemovingAsmConstraintsFromTheShippedDocumentEmptiesIt) {
+    bool removed = false;
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "arm64", [&removed](nlohmann::json& doc) {
+            if (!doc.contains("asmConstraints")) return;
+            doc.erase("asmConstraints");
+            removed = true;
+        });
+    ASSERT_TRUE(removed)
+        << "arm64 declares no `asmConstraints` — the mutation was a no-op";
+    ASSERT_TRUE(mutated.has_value())
+        << "the key is OPTIONAL: removing it must load clean, not error";
+    EXPECT_EQ((*mutated)->asmConstraintCount(), 0u);
+    EXPECT_EQ((*mutated)->asmConstraint("r"), nullptr)
+        << "with the key gone every letter must be refused — a non-empty "
+           "table here would mean the facet is populated from somewhere "
+           "other than the document";
+}
+
+// ⚠⚠ THE FAILURE MODE THE ROOT-KEY ALLOWLIST EXISTS TO ABOLISH, PINNED
+// FROM THE OTHER SIDE. Before TF-C74 an unknown root key was silently
+// ignored, so a misspelled facet name loaded perfectly clean and no-op'd.
+// `ShippedTargetsLoadCleanUnderEveryContainerGate` proves `asmConstraints`
+// IS in the allowlist; this proves a near-miss is NOT.
+TEST(TargetSchema, MisspelledAsmConstraintsRootKeyIsRefused) {
+    bool renamed = false;
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [&renamed](nlohmann::json& doc) {
+            if (!doc.contains("asmConstraints")) return;
+            doc["asmConstraint"] = doc.at("asmConstraints");  // singular typo
+            doc.erase("asmConstraints");
+            renamed = true;
+        });
+    ASSERT_TRUE(renamed)
+        << "x86_64 declares no `asmConstraints` — the mutation was a no-op";
+    EXPECT_FALSE(mutated.has_value())
+        << "`asmConstraint` (singular) must be REFUSED — silently ignoring "
+           "it would leave a target whose whole inline-asm binding is a "
+           "knob that lies";
+    if (!mutated.has_value()) {
+        EXPECT_TRUE(anyHasCode(mutated.error(),
+                               DiagnosticCode::C_MalformedJson));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// nop / rdtsc / cntvct — the three opcodes the inline-asm clients need
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(TargetSchema, ShippedTargetsDeclareNop) {
+    // ✔MEASURED by assembling a bare `nop` with gcc 13.3.0 and reading it
+    // back with objdump: x86_64 `90` (one byte), aarch64 `d503201f`.
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(x86.has_value());
+    ASSERT_TRUE(arm.has_value());
+
+    auto const xOp = (*x86)->opcodeByMnemonic("nop");
+    ASSERT_TRUE(xOp.has_value());
+    auto const* xInfo = (*x86)->opcodeInfo(*xOp);
+    ASSERT_NE(xInfo, nullptr);
+    EXPECT_EQ(xInfo->maxOperands, 0);
+    ASSERT_EQ(xInfo->encoding.variants.size(), 1u);
+    EXPECT_EQ(xInfo->encoding.variants[0].tmpl.opcodeBytes,
+              (std::vector<std::uint8_t>{0x90}));
+    // ★ NOT DECORATION: a `nop` has no result, so a PURE declaration would
+    // make it dead by definition and a dead-code pass would be RIGHT to
+    // delete the one instruction whose entire purpose is to occupy bytes.
+    EXPECT_TRUE(xInfo->hasSideEffects);
+
+    auto const aOp = (*arm)->opcodeByMnemonic("nop");
+    ASSERT_TRUE(aOp.has_value());
+    auto const* aInfo = (*arm)->opcodeInfo(*aOp);
+    ASSERT_NE(aInfo, nullptr);
+    EXPECT_EQ(aInfo->maxOperands, 0);
+    ASSERT_EQ(aInfo->encoding.variants.size(), 1u);
+    EXPECT_EQ(aInfo->encoding.variants[0].tmpl.fixedWord, 0xD503201Fu);
+    EXPECT_TRUE(aInfo->hasSideEffects);
+}
+
+TEST(TargetSchema, ShippedX86_64DeclaresRdtscWithItsRegisterPair) {
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+    auto const op = (*x86)->opcodeByMnemonic("rdtsc");
+    ASSERT_TRUE(op.has_value());
+    auto const* info = (*x86)->opcodeInfo(*op);
+    ASSERT_NE(info, nullptr);
+
+    // ✔MEASURED with gcc + objdump: `0f 31`, two bytes, no ModR/M, no
+    // operands, and NO REX.W (a 64-bit RDTSC form does not exist).
+    EXPECT_EQ(info->maxOperands, 0);
+    ASSERT_EQ(info->encoding.variants.size(), 1u);
+    EXPECT_EQ(info->encoding.variants[0].tmpl.opcodeBytes,
+              (std::vector<std::uint8_t>{0x0F, 0x31}));
+
+    // ★ RDTSC is not a function of its (empty) operand list: two reads must
+    // return two values. Declared pure, CSE folds the pair into one read
+    // and every elapsed-time measurement in the program becomes ZERO.
+    EXPECT_TRUE(info->hasSideEffects);
+
+    // The value arrives in EDX:EAX, which no single result slot can name.
+    EXPECT_EQ(info->result, dss::TargetResultRule::None);
+    ASSERT_TRUE(info->implicitRegisters.has_value());
+    EXPECT_EQ(info->implicitRegisters->outputNames,
+              (std::vector<std::string>{"rax", "rdx"}));
+    EXPECT_EQ(info->implicitRegisters->clobberedNames,
+              (std::vector<std::string>{"rax", "rdx"}));
+
+    // ★ ROLES REUSED, NOT MINTED: `high`/`low` already existed for the
+    // 128-bit MUL projection and mean exactly what they mean here. They are
+    // what stops a reorder of the positional arrays from silently swapping
+    // the halves — a swap that multiplies every measured interval by 2^32
+    // while still producing a plausible-looking number.
+    auto const& roles = info->implicitRegisters->outputRoleOrdinals;
+    auto ordinalOfRole = [&roles](std::string_view role)
+        -> std::optional<std::uint16_t> {
+        for (auto const& [name, ord] : roles) {
+            if (name == role) return ord;
+        }
+        return std::nullopt;
+    };
+    auto const low  = ordinalOfRole("low");
+    auto const high = ordinalOfRole("high");
+    ASSERT_TRUE(low.has_value());
+    ASSERT_TRUE(high.has_value());
+    EXPECT_EQ((*x86)->registerInfo(*low)->name, "rax");
+    EXPECT_EQ((*x86)->registerInfo(*high)->name, "rdx");
+}
+
+TEST(TargetSchema, ShippedArm64DeclaresCntvctDistinctFromTlsbase) {
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(arm.has_value());
+
+    auto const op = (*arm)->opcodeByMnemonic("cntvct");
+    ASSERT_TRUE(op.has_value());
+    auto const* info = (*arm)->opcodeInfo(*op);
+    ASSERT_NE(info, nullptr);
+
+    // ✔MEASURED, aarch64-linux-gnu-gcc 13.3.0 + objdump, four destination
+    // registers assembled together so the fixed word separates cleanly from
+    // the Rd field: mrs x0 → d53be040, x1 → d53be041, x7 → d53be047,
+    // x30 → d53be05e. ⇒ base 0xD53BE040 with Rd in bits 0..4.
+    EXPECT_EQ(info->maxOperands, 0);
+    ASSERT_EQ(info->encoding.variants.size(), 1u);
+    EXPECT_EQ(info->encoding.variants[0].tmpl.fixedWord, 0xD53BE040u);
+    ASSERT_TRUE(info->encoding.variants[0].resultSlot.has_value());
+    EXPECT_EQ(*info->encoding.variants[0].resultSlot, dss::EncodingSlotKind::Rd)
+        << "the STANDARD rd slot — zero new slot vocabulary, exactly as the "
+           "tlsbase row does it";
+
+    // ★★ THE TWO MRS ROWS DIFFER IN EXACTLY ONE PLACE, AND IT MATTERS.
+    // Same instruction, same slot, adjacent CRm (13 vs 14) — and OPPOSITE
+    // side-effect declarations. A thread's TLS base is invariant, so
+    // folding two reads of it is a legitimate optimization; a counter is
+    // not, and folding two reads of THAT makes every measured interval
+    // exactly zero. The flag is the only thing separating a value you may
+    // cache from one you may not.
+    auto const tls = (*arm)->opcodeByMnemonic("tlsbase");
+    ASSERT_TRUE(tls.has_value());
+    auto const* tlsInfo = (*arm)->opcodeInfo(*tls);
+    ASSERT_NE(tlsInfo, nullptr);
+    EXPECT_EQ(tlsInfo->encoding.variants[0].tmpl.fixedWord, 0xD53BD040u);
+    EXPECT_NE(info->encoding.variants[0].tmpl.fixedWord,
+              tlsInfo->encoding.variants[0].tmpl.fixedWord);
+    EXPECT_TRUE(info->hasSideEffects);
+    EXPECT_FALSE(tlsInfo->hasSideEffects);
+
+    // ★ NOT NAMED `mrs`. `tlsbase` is ALSO an MRS, so a row claiming the
+    // generic name while encoding one hardcoded system register — with no
+    // slot in which to name another — would make `opcodeByMnemonic("mrs")`
+    // resolve to something that can only ever read CNTVCT_EL0.
+    EXPECT_FALSE((*arm)->opcodeByMnemonic("mrs").has_value())
+        << "`mrs` must stay unclaimed for a genuine general MRS with a "
+           "system-register slot, if a consumer ever justifies one";
+    // ⚠ And it is NOT a cycle counter — CNTVCT_EL0 is a fixed-frequency
+    // system counter. `cyclecounter` would have been the plausible wrong
+    // name; code dividing it by the CPU clock is wrong on this target.
+    EXPECT_FALSE((*arm)->opcodeByMnemonic("cyclecounter").has_value());
+}
+
+// ★★★ THE REGISTER TABLE IS CASE-SENSITIVE, AND THAT IS THE LOAD-BEARING HALF
+// OF D-ASM-DIALECT-MNEMONIC-MATCH-IS-CASE-SENSITIVE'S DESIGN.
+//
+// gas accepts `MOV X0, X1`, so DSS must too — but the fold belongs to the
+// DIALECT, not to the CPU. One processor can be written in two dialects with
+// different case rules (AT&T and Intel are already two dialects for this same
+// target), so a case-insensitive register table would push a dialect fact into
+// the target description and every dialect reading that target would inherit
+// it. The engine therefore folds the written spelling under
+// `assembly.spellingCase` and then asks this table, which compares exactly.
+//
+// ⚠ THIS PIN IS WHAT STOPS THE OBVIOUS "FIX". Making `registerByName`
+// case-insensitive would turn the uppercase tests in `tests/asm/` green while
+// silently relocating the policy — and nothing else in the tree would notice.
+TEST(TargetSchema, RegisterByNameStaysCaseSensitiveOnBothShippedTargets) {
+    struct Probe {
+        std::string_view target;
+        std::string_view declared;   // as the shipped table spells it
+        std::string_view shouted;
+    };
+    // ✔MEASURED by reading both shipped documents: every `registers[].name` and
+    // every `opcodes[].mnemonic` in x86_64 (65 / 88) and arm64 (129 / 82) is
+    // entirely lowercase, with no fold-collisions in either table — which is
+    // what makes a lowercase fold direction correct for the dialect side.
+    constexpr std::array<Probe, 4> kProbes{{
+        {"x86_64", "rax", "RAX"},
+        {"x86_64", "eax", "EAX"},
+        {"arm64",  "x0",  "X0"},
+        {"arm64",  "w0",  "W0"},
+    }};
+    for (auto const& p : kProbes) {
+        auto sch = TargetSchema::loadShipped(p.target);
+        ASSERT_TRUE(sch.has_value()) << p.target;
+        EXPECT_TRUE((*sch)->registerByName(p.declared).has_value())
+            << p.target << ": the shipped table must declare '" << p.declared
+            << "', or this pin is asserting nothing";
+        EXPECT_FALSE((*sch)->registerByName(p.shouted).has_value())
+            << p.target << ": '" << p.shouted
+            << "' resolved — the CASE POLICY has moved into the CPU "
+               "description, where a second dialect for this target could no "
+               "longer choose a different one";
+    }
+}
+
+// ★ THE SAME BOUNDARY FOR THE OPCODE TABLE. A dialect row names target opcodes
+// by string (`opcodes: ["mov", "load", "store"]`), and that is CONFIG-TO-CONFIG
+// vocabulary — never source text — so it is not a folded surface either.
+TEST(TargetSchema, OpcodeByMnemonicStaysCaseSensitive) {
+    auto sch = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(sch.has_value());
+    EXPECT_TRUE((*sch)->opcodeByMnemonic("mov").has_value());
+    EXPECT_FALSE((*sch)->opcodeByMnemonic("MOV").has_value())
+        << "the opcode table folded — a dialect row naming 'MOV' would then "
+           "resolve, which is a config typo silently accepted";
 }

@@ -12322,7 +12322,11 @@ namespace {
 // PASS the runtime probe while SILENTLY DELETING the barrier — the exact semantics
 // the feature exists to provide. This pins the LINK at the MIR tier: the empty
 // `__asm__ volatile("")` must lower to EXACTLY ONE MirOpcode::CompilerBarrier.
-// RED-ON-DISABLE: map asmStmt→Skip (c-subset.lang.json hirLowering) or drop the
+// RED-ON-DISABLE: map asmStmt→Skip (the `hirLowering.ruleMappings` row keyed on
+// rule `asmStmt` — it lives in `asm.lang.json`, NOT in `c-subset.lang.json`, and
+// C inherits it through `languageReferences`; this recipe said c-subset until
+// 2026-08-13, which would have sent a mutator to a file with no such row and made
+// an unmutatable pin look merely stubborn) or drop the
 // addInst in hir_to_mir's InlineAsm case → the count drops to 0 → RED. (The
 // barrier→blocks-optimizer half is pinned by test_cse LoadNotCsedAcrossCompiler-
 // Barrier; T2 ∘ that = "the asm statement blocks the optimizer", each link
@@ -12454,42 +12458,89 @@ TEST(MirLoweringCSubset, InlineAsmEmptySectionFormsEachLowerToOneCompilerBarrier
 // lowers to a 0-child InlineAsm leaf, the diagnostic count drops to 0 and the
 // barrier count rises to 1 ⇒ BOTH halves below go red, which is what makes the
 // pair a routing assertion rather than a smoke test.
-TEST(MirLoweringCSubset, ExtendedInlineAsmReachingHirLoweringIsRefusedNotDropped) {
+TEST(MirLoweringCSubset, AsmPayloadHirLoweringCannotREPRESENTIsRefusedNotDropped) {
+    // ⚠⚠ RE-SCOPED BY INLINE-ASM P5, NOT WEAKENED — and the distinction is the
+    // reason this block is long. The pin used to be
+    // `ExtendedInlineAsmReachingHirLoweringIsRefusedNotDropped` and its fixture
+    // was `__asm__ ("" : : "r"(p))`. P5 makes the front end CAPTURE that
+    // statement, so the fixture stopped reaching the backstop at all and the
+    // pin's own anti-vacuity guard fired — loudly, by design:
+    //     "the extended asm was accepted semantically, so this fixture no
+    //      longer reaches the backstop and every assertion below is vacuous."
+    // That guard did its job. Deleting the test, or relaxing it to "passes
+    // now", would have thrown away the property while the property is still
+    // true.
+    //
+    // ★★★ WHAT THE PROPERTY ACTUALLY IS, restated so the re-scope is checkable.
+    // It was never "extended asm is refused" — that was the SHAPE the property
+    // happened to take when nothing could be bound. It is: **HIR lowering must
+    // refuse an asm payload it cannot REPRESENT, rather than build a descriptor
+    // out of the parts it understood and drop the rest.** The old backstop was
+    // `inlineAsmPayloadProbe`, a PRESENCE test ("is there an operand list?")
+    // whose only outcome was a refusal; P5 deleted it because a presence test
+    // beside a real capture is a second, weaker walk over one grammar. The
+    // backstop that replaced it is stronger: the capture's own refusal arms,
+    // which fire on what cannot be REPRESENTED instead of on what is PRESENT.
+    //
+    // ★ THE FIXTURE IS CHOSEN TO BE EXACTLY THAT. A multi-alternative
+    // constraint asks the register allocator to CHOOSE between `r` and `m`
+    // (GNU 6.47.2.4). `HirInlineAsmOperand` has one constraint and one binding;
+    // there is no field in which "either of these two" can be written down. So
+    // this is a payload the descriptor genuinely cannot hold — and picking one
+    // alternative unannounced is precisely the accept-and-ignore the whole arc
+    // is closed against.
     auto L = lowerCSubset(
-        "void f(void){ int p = 0; __asm__ (\"\" : : \"r\"(p)); }");
-    // PREMISE, ASSERTED: the semantic tier DID refuse this statement. Without
-    // the check the test could silently become a test of an ACCEPTED construct
-    // — the "absence is satisfied by nothing existing" shape, one tier over.
+        "void f(void){ int p = 0; __asm__ (\"\" : \"=r,m\"(p)); }");
+
+    // PREMISE, ASSERTED — unchanged in spirit and still the thing that stops
+    // this test quietly becoming a test of an ACCEPTED construct.
     ASSERT_TRUE(L.model.hasErrors())
-        << "the extended asm was accepted semantically, so this fixture no "
-           "longer reaches the backstop and every assertion below is vacuous";
-    // ...and lowering ran ANYWAY, which is the whole reason the arm is live
-    // here: the backstop fires, exactly once, loud.
+        << "the semantic tier accepted this constraint, so the fixture no "
+           "longer reaches the HIR backstop and every assertion below is "
+           "vacuous — pick a payload the descriptor still cannot represent";
+
+    // ...and lowering ran ANYWAY (lowerCSubset has no `hasErrors()` bail, on
+    // purpose), which is why the arm is live here at all.
     EXPECT_EQ(dss::test_support::countCode(
                   L.hirReporter, DiagnosticCode::H_UnsupportedLoweringForKind), 1u)
-        << "the backstop must fail LOUD, exactly once — a silent drop of the "
-           "operand section is the miscompile it exists to refuse. Got: "
+        << "the backstop must fail LOUD, exactly once — a descriptor built from "
+           "the parts that WERE understood, with this operand silently dropped, "
+           "is the miscompile it exists to refuse. Got: "
         << (L.hirReporter.all().empty() ? std::string{"<no diagnostics>"}
                                         : L.hirReporter.all()[0].actual);
-    // The message must NAME what was dropped and where the refusal belongs,
-    // otherwise it is a wrong-turn signpost rather than a diagnostic.
+
+    // The message must NAME what could not be carried, otherwise it is a
+    // wrong-turn signpost rather than a diagnostic.
     if (!L.hirReporter.all().empty()) {
         std::string const msg = L.hirReporter.all()[0].actual;
-        EXPECT_NE(msg.find("extended inline-asm"), std::string::npos) << msg;
-        EXPECT_NE(msg.find("silent miscompile"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("inline-asm constraint"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("=r,m"), std::string::npos)
+            << "quote the constraint verbatim: " << msg;
     }
-    // AND NOTHING WAS LOWERED IN ITS PLACE — ✔MEASURED, not assumed: the Error
-    // node the backstop returns is FATAL to MIR lowering, so no MIR module is
-    // produced at all and there is no barrier left to drop an operand from.
-    // Written as an assertion rather than as an `if (L.mir.ok)` guard around a
-    // barrier count, deliberately: that guard would NEVER RUN, and a dormant
-    // branch is the same "satisfied by nothing happening" defect this cycle
-    // corrected in the semantic suite.
+
+    // AND NOTHING WAS LOWERED IN ITS PLACE — the Error node the backstop returns
+    // is FATAL to MIR lowering, so no module is produced and there is no
+    // barrier left for an operand to have been dropped from.
     EXPECT_FALSE(L.mir.ok)
         << "MIR lowering SUCCEEDED on a statement HIR lowering refused — "
-           "'diagnose and lower anyway' leaves the barrier standing with the "
-           "operand binding gone, which is the silent drop this arm exists to "
-           "refuse";
+           "'diagnose and lower anyway' leaves an asm instruction standing with "
+           "one operand binding gone, which is the silent drop this arm exists "
+           "to refuse";
+
+    // ★★ THE CONTROL, AND IT IS NEW. Without it this pin is satisfied by a
+    // lowering that refuses EVERY asm payload — which is literally the pre-P5
+    // state the cycle replaced, and the failure mode a re-scoped guard is most
+    // likely to slide back into. The neighbouring REPRESENTABLE constraint must
+    // travel the same path and come out clean.
+    auto ok = lowerCSubset(
+        "void f(void){ int p = 0; __asm__ (\"\" : \"=r\"(p)); }");
+    EXPECT_FALSE(ok.model.hasErrors())
+        << "the single-alternative neighbour must be accepted semantically";
+    EXPECT_EQ(dss::test_support::countCode(
+                  ok.hirReporter, DiagnosticCode::H_UnsupportedLoweringForKind), 0u)
+        << "HIR lowering must CARRY a representable payload, not refuse it. Got: "
+        << (ok.hirReporter.all().empty() ? std::string{"<no diagnostics>"}
+                                         : ok.hirReporter.all()[0].actual);
 }
 
 // ── TF-C95 D-CSUBSET-ATOMIC-FENCE: the __sync_synchronize→AtomicFence ROUTING pin ──

@@ -11987,20 +11987,23 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "inputsTailRule, inputsTailFusedRule, "
                               "clobbersTailRule, clobbersTailFusedRule, "
                               "labelsTailRule, labelsTailFusedRule, "
-                              "operandListRule, clobberListRule, "
-                              "gotoLabelListRule, gotoQualifierToken }");
+                              "operandListRule, operandRule, clobberListRule, "
+                              "gotoLabelListRule, gotoQualifierToken, "
+                              "memoryClobber, conditionCodeClobber }");
                 } else {
                     // Closed keys (typo discriminator) — the `$`-prefixed
                     // documentation convention stays exempt, exactly as in
                     // `attributeSemantics` and the enclosing `semantics` object.
-                    static constexpr std::array<std::string_view, 13>
+                    static constexpr std::array<std::string_view, 16>
                         kInlineAsmKeys{"rule", "templateRule",
                                        "outputsTailRule", "inputsTailRule",
                                        "inputsTailFusedRule", "clobbersTailRule",
                                        "clobbersTailFusedRule", "labelsTailRule",
                                        "labelsTailFusedRule", "operandListRule",
+                                       "operandRule",
                                        "clobberListRule", "gotoLabelListRule",
-                                       "gotoQualifierToken"};
+                                       "gotoQualifierToken",
+                                       "memoryClobber", "conditionCodeClobber"};
                     DSS_CHECK_KEY_VOCABULARY(kInlineAsmKeys);
                     for (auto it = ia.begin(); it != ia.end(); ++it) {
                         if (isDocumentationKey(it.key())) continue;
@@ -12052,8 +12055,70 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readRule("labelsTailRule",        cia.labelsTailRule,        cia.labelsTailRuleName);
                     readRule("labelsTailFusedRule",   cia.labelsTailFusedRule,   cia.labelsTailFusedRuleName);
                     readRule("operandListRule",       cia.operandListRule,       cia.operandListRuleName);
+                    readRule("operandRule",           cia.operandRule,           cia.operandRuleName);
                     readRule("clobberListRule",       cia.clobberListRule,       cia.clobberListRuleName);
                     readRule("gotoLabelListRule",     cia.gotoLabelListRule,     cia.gotoLabelListRuleName);
+                    // ── the two non-register clobber SPELLINGS ──
+                    // Strings, not rules and not token kinds: a clobber list holds
+                    // string literals, and these are the two entries that name no
+                    // register (GCC 6.47.2.5). Same ALL-OR-NOTHING discipline as
+                    // every key above, and for the same reason stated concretely:
+                    // omit `memoryClobber` and `__asm__("" ::: "memory")` stops
+                    // being recognisable as a barrier and starts being resolved
+                    // against the TARGET's register file, so the compiler refuses
+                    // a form every reference compiler accepts — and it does so from
+                    // a diagnostic that names a register table, pointing the reader
+                    // at the wrong file entirely.
+                    // ⚠ EMPTY IS REFUSED SEPARATELY FROM ABSENT. `""` would compare
+                    // equal to no clobber a source can write, so the check it feeds
+                    // would be permanently, silently false — the disarmed-guard
+                    // shape this facet exists to prevent, reached by a typo rather
+                    // than by an omission.
+                    auto readSpelling = [&](char const* key,
+                                            std::string& outText) {
+                        auto const path =
+                            std::format("/semantics/inlineAsm/{}", key);
+                        if (!ia.contains(key) || !ia.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path,
+                                      std::format("'inlineAsm.{}' is required and "
+                                                  "must be a string — the "
+                                                  "'inlineAsm' object is "
+                                                  "ALL-OR-NOTHING, and this is "
+                                                  "GNU-asm VOCABULARY that must "
+                                                  "not be a C++ string literal in "
+                                                  "the analyzer", key));
+                            return;
+                        }
+                        outText = ia.at(key).get<std::string>();
+                        if (outText.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      std::format("'inlineAsm.{}' is EMPTY — it "
+                                                  "would then match no clobber any "
+                                                  "source can write, silently "
+                                                  "disarming the check it feeds; "
+                                                  "state the spelling or remove "
+                                                  "the whole 'inlineAsm' object",
+                                                  key));
+                        }
+                    };
+                    readSpelling("memoryClobber",        cia.memoryClobber);
+                    readSpelling("conditionCodeClobber", cia.conditionCodeClobber);
+                    // ★ THE TWO SPELLINGS MUST DIFFER. Declared equal, one of the
+                    // two checks becomes unreachable and the config reads as if
+                    // both were configured — the silent half-configuration this
+                    // block refuses everywhere else, here reachable by a copy-paste
+                    // rather than an omission.
+                    if (!cia.memoryClobber.empty()
+                        && cia.memoryClobber == cia.conditionCodeClobber) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  "/semantics/inlineAsm/conditionCodeClobber",
+                                  std::format("'inlineAsm.memoryClobber' and "
+                                              "'inlineAsm.conditionCodeClobber' "
+                                              "are BOTH '{}' — one of the two "
+                                              "checks could then never fire, and "
+                                              "nothing downstream could tell which",
+                                              cia.memoryClobber));
+                    }
                     // The one TOKEN key — resolved against the schema's token
                     // interner exactly like `volatileMarker`/`identifierToken`, and
                     // REQUIRED on the same all-or-nothing grounds: without it
@@ -14096,11 +14161,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             coll.emit(DiagnosticCode::C_InvalidHirLowering, "/assembly",
                       "'assembly' must be an object");
         } else {
-            static constexpr std::array<std::string_view, 10> kAssemblyKeys{
+            static constexpr std::array<std::string_view, 11> kAssemblyKeys{
                 "unitRule",      "lineRule",      "elementRule",
                 "directiveRule", "statementRule", "labelTailRule",
                 "operandSeqRule", "operandOrder", "operandForms",
-                "instructions"};
+                "instructions",  "spellingCase"};
             DSS_CHECK_KEY_VOCABULARY(kAssemblyKeys);
             // `directives` is intentionally NOT in the required set above — it
             // is validated separately below because it is the one key whose
@@ -14182,6 +14247,49 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     assemblyClean = false;
                 } else {
                     cfg.operandOrder = *v;
+                }
+            }
+
+            // ── spellingCase ── the OTHER dialect-wide lexical fact, and it is
+            // REQUIRED for the same reason `operandOrder` is: there is no
+            // defensible default. Assuming a fold makes a dialect accept
+            // spellings it never declared; assuming an exact match makes it
+            // refuse what its own reference assembler takes (which is the
+            // defect D-ASM-DIALECT-MNEMONIC-MATCH-IS-CASE-SENSITIVE names). A
+            // dialect must SAY which it is.
+            if (!as.contains("spellingCase")
+                || !as.at("spellingCase").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/assembly/spellingCase",
+                          std::format("'spellingCase' is required and must be "
+                                      "one of {} — it says whether a written "
+                                      "mnemonic, register, operand selector or "
+                                      "directive has to match this dialect's "
+                                      "declared spelling byte for byte. There "
+                                      "is no safe default: guessing a fold "
+                                      "accepts spellings the dialect never "
+                                      "declared, and guessing an exact match "
+                                      "refuses input the reference assembler "
+                                      "takes. (It never reaches a SYMBOL name, "
+                                      "a '.type' marker or a '.section' name "
+                                      "operand — those stay exact in every "
+                                      "dialect, because folding them would "
+                                      "merge two things the reference keeps "
+                                      "apart)",
+                                      asmNameList(kAsmSpellingCaseNames)));
+                assemblyClean = false;
+            } else {
+                const auto name = as.at("spellingCase").get<std::string>();
+                const auto v = asmSpellingCaseFromName(name);
+                if (!v) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/assembly/spellingCase",
+                              std::format("unknown spelling case '{}' — the "
+                                          "closed set is {}", name,
+                                          asmNameList(kAsmSpellingCaseNames)));
+                    assemblyClean = false;
+                } else {
+                    cfg.spellingCase = *v;
                 }
             }
 
@@ -14313,6 +14421,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             } else {
                 json const& arr = as.at("instructions");
                 std::unordered_set<std::string> seenSpellings;
+                // ⚠ THE JSON INDEX OF EACH ACCEPTED ROW, KEPT BECAUSE THE TWO
+                // NUMBERINGS DIVERGE. A row rejected above is not pushed, so
+                // `cfg.instructions[p]` is NOT `/assembly/instructions/p` once
+                // anything has failed — and the ambiguity diagnostic below has
+                // to hand the reader a path that opens the row it is talking
+                // about. Reporting a stale index is how a precise refusal sends
+                // someone to the wrong line.
+                std::vector<std::size_t> rowJsonIndex;
                 for (std::size_t i = 0; i < arr.size(); ++i) {
                     const auto path =
                         std::format("/assembly/instructions/{}", i);
@@ -14323,8 +14439,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         assemblyClean = false;
                         continue;
                     }
-                    static constexpr std::array<std::string_view, 4>
-                        kInstRowKeys{"spelling", "opcodes", "width", "cond"};
+                    static constexpr std::array<std::string_view, 5>
+                        kInstRowKeys{"spelling", "opcodes", "width", "cond",
+                                     "operandSelectors"};
                     DSS_CHECK_KEY_VOCABULARY(kInstRowKeys);
                     for (auto it = row.begin(); it != row.end(); ++it) {
                         if (isDocumentationKey(it.key())) continue;
@@ -14458,21 +14575,185 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         ins.width = row.at("width").get<std::uint32_t>();
                     }
-                    // ★ A DUPLICATE SPELLING IS A LOAD ERROR. `instructionBySpelling`
-                    // is first-match, so a second row for `movq` would be dead
-                    // config that silently never applies — and the one that DID
-                    // apply would be whichever the author happened to write first.
-                    if (!seenSpellings.insert(ins.spelling).second) {
-                        coll.emit(DiagnosticCode::C_ConflictingField,
-                                  path + "/spelling",
-                                  std::format("mnemonic '{}' has more than one "
-                                              "'instructions' row — lookup is by "
-                                              "spelling, so the later row would "
-                                              "silently never apply",
-                                              ins.spelling));
-                        assemblyClean = false;
-                        continue;
+                    // ── operandSelectors ── OPTIONAL; the written operands that
+                    // are part of the MNEMONIC rather than operands of it.
+                    // ⚠ THE NAME IS TEXT AND IS NEVER INTERPRETED HERE: whether
+                    // `cntvct_el0` is a system register or `eq` a condition is
+                    // not a question this loader — or the engine — is allowed to
+                    // have an opinion about, because having one is how `sysreg`
+                    // enters the shared substrate's vocabulary.
+                    if (row.contains("operandSelectors")) {
+                        json const& sels = row.at("operandSelectors");
+                        if (!sels.is_array() || sels.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/operandSelectors",
+                                      "'operandSelectors' must be a NON-EMPTY "
+                                      "array of { index, name } objects — an "
+                                      "empty one selects nothing and would be "
+                                      "dead config; omit the key instead");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        bool selsClean = true;
+                        for (std::size_t k = 0; k < sels.size(); ++k) {
+                            auto const selPath =
+                                std::format("{}/operandSelectors/{}", path, k);
+                            json const& sel = sels[k];
+                            if (!sel.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          selPath,
+                                          "each selector must be an object "
+                                          "{ index, name }");
+                                selsClean = false;
+                                continue;
+                            }
+                            static constexpr std::array<std::string_view, 2>
+                                kSelKeys{"index", "name"};
+                            DSS_CHECK_KEY_VOCABULARY(kSelKeys);
+                            for (auto it = sel.begin(); it != sel.end(); ++it) {
+                                if (isDocumentationKey(it.key())) continue;
+                                if (std::ranges::find(kSelKeys, it.key())
+                                    != kSelKeys.end()) continue;
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          std::format("{}/{}", selPath, it.key()),
+                                          std::format("unknown key '{}' in an "
+                                                      "'operandSelectors' entry "
+                                                      "— allowed keys are "
+                                                      "'index', 'name' (typo "
+                                                      "discriminator)", it.key()));
+                                selsClean = false;
+                            }
+                            if (!sel.contains("index")
+                                || !sel.at("index").is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          selPath + "/index",
+                                          "'index' is required and must be the "
+                                          "operand's 0-based position AS "
+                                          "WRITTEN, counting selectors — gas "
+                                          "writes the selector second in `mrs "
+                                          "x0, cntvct_el0` and FIRST in `msr "
+                                          "tpidr_el0, x0`, so a position-blind "
+                                          "key would be wrong about one of them");
+                                selsClean = false;
+                                continue;
+                            }
+                            if (!sel.contains("name")
+                                || !sel.at("name").is_string()
+                                || sel.at("name").get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          selPath + "/name",
+                                          "'name' is required and must be the "
+                                          "exact operand text that selects this "
+                                          "row");
+                                selsClean = false;
+                                continue;
+                            }
+                            AsmOperandSelector s;
+                            s.index = sel.at("index").get<std::uint32_t>();
+                            s.name  = sel.at("name").get<std::string>();
+                            // ★ TWO SELECTORS ON ONE INDEX CANNOT BOTH HOLD —
+                            // the row could never match anything, which is a
+                            // spelling that silently does nothing.
+                            if (ins.selectorAt(s.index) != nullptr) {
+                                coll.emit(DiagnosticCode::C_ConflictingField,
+                                          selPath + "/index",
+                                          std::format("mnemonic '{}' declares "
+                                                      "two selectors at operand "
+                                                      "index {} — both would have "
+                                                      "to match one operand, so "
+                                                      "the row could never apply",
+                                                      ins.spelling, s.index));
+                                selsClean = false;
+                                continue;
+                            }
+                            ins.operandSelectors.push_back(std::move(s));
+                        }
+                        if (!selsClean) { assemblyClean = false; continue; }
                     }
+                    // ★★★ A DUPLICATE SPELLING IS A LOAD ERROR **UNLESS THE
+                    // SELECTORS SEPARATE THE ROWS** (plan 29 §4.7.1). Without
+                    // selectors the rule is unchanged and unchanged for the same
+                    // reason: election would be first-match, so a second row for
+                    // `movq` is dead config and the one that DID apply would be
+                    // whichever the author happened to write first.
+                    //
+                    // ★★ WITH selectors, `cset` legitimately has TWELVE rows —
+                    // and the pair `{selector row, bare row}` is exactly the
+                    // ambiguity that would re-create the `ldr`/`ldur` defect one
+                    // level up. So the check is now PAIRWISE over every earlier
+                    // row with this spelling and the verdict is
+                    // `asmRowsAreSelectorDisjoint`: provably separable, or
+                    // refused NAMING BOTH ROWS. Never first-match, never
+                    // most-specific-silently-wins.
+                    //
+                    // ★★★ AND IT IS ASKED UNDER `spellingCase`, WHICH IS THE
+                    // HALF OF THE CASE-FOLDING FIX THAT IS EASIEST TO FORGET
+                    // AND WORST TO OMIT. In a folding dialect `mov` and `MOV`
+                    // are ONE spelling: if this check kept comparing raw bytes,
+                    // both rows would load perfectly clean and both would then
+                    // match `mov x0, x1` at lowering time — re-creating the
+                    // exact ambiguity §4.7.1 forbids, through the door the fix
+                    // itself opened. So the SET is keyed on `spellingKey` and
+                    // the pairwise compare is `spellingMatches`, the same two
+                    // functions the engine matches with.
+                    {
+                        bool ambiguous = false;
+                        if (!seenSpellings.insert(cfg.spellingKey(ins.spelling))
+                                 .second) {
+                            for (std::size_t p = 0;
+                                 p < cfg.instructions.size(); ++p) {
+                                auto const& prior = cfg.instructions[p];
+                                if (!cfg.spellingMatches(prior.spelling,
+                                                         ins.spelling)) {
+                                    continue;
+                                }
+                                if (cfg.rowsAreSelectorDisjoint(prior, ins)) {
+                                    continue;
+                                }
+                                coll.emit(
+                                    DiagnosticCode::C_ConflictingField,
+                                    path + "/spelling",
+                                    std::format(
+                                        "mnemonic '{}' has two 'instructions' "
+                                        "rows that can BOTH match the same line "
+                                        "— this row (/assembly/instructions/{}) "
+                                        "and an earlier one spelled '{}' "
+                                        "(/assembly/instructions/{}). Two rows "
+                                        "are separable only when some operand "
+                                        "INDEX carries a selector in both with "
+                                        "DIFFERENT names; a selector row against "
+                                        "a bare row is not, because the bare row "
+                                        "matches everything the selector row "
+                                        "does. Electing between them would take "
+                                        "the first and silently encode one "
+                                        "instruction where the programmer wrote "
+                                        "the other.{}",
+                                        ins.spelling, i, prior.spelling,
+                                        rowJsonIndex[p],
+                                        // ★ SAY SO WHEN THE TWO SPELLINGS ARE
+                                        // NOT THE SAME BYTES. "'MOV' has two
+                                        // rows" beside a table that visibly
+                                        // contains one `MOV` reads as a
+                                        // compiler bug; naming the policy that
+                                        // made them one spelling is the whole
+                                        // diagnosis.
+                                        prior.spelling == ins.spelling
+                                            ? std::string{}
+                                            : std::format(
+                                                  " These two differ only in "
+                                                  "CASE, and this dialect "
+                                                  "declares 'spellingCase': "
+                                                  "'{}' — so they are one "
+                                                  "spelling here",
+                                                  asmSpellingCaseName(
+                                                      cfg.spellingCase))));
+                                ambiguous = true;
+                                break;
+                            }
+                        }
+                        if (ambiguous) { assemblyClean = false; continue; }
+                    }
+                    rowJsonIndex.push_back(i);
                     cfg.instructions.push_back(std::move(ins));
                 }
             }
@@ -14765,14 +15046,26 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             dir.operandOnly =
                                 row.at("operandOnly").get<bool>();
                         }
-                        if (!seenDirectives.insert(dir.spelling).second) {
+                        // ⚠ KEYED ON `spellingKey`, THE INSTRUCTION TABLE'S
+                        // TWIN. `directiveBySpelling` matches under
+                        // `spellingCase`, so in a folding dialect `.globl` and
+                        // `.GLOBL` are one directive and the second row is the
+                        // dead config this refusal exists to name. Deduplicating
+                        // on raw bytes here while matching on folded ones there
+                        // is the drift that makes a "later row never applies"
+                        // guard stop guarding.
+                        if (!seenDirectives.insert(cfg.spellingKey(dir.spelling))
+                                 .second) {
                             coll.emit(DiagnosticCode::C_ConflictingField,
                                       path + "/spelling",
                                       std::format("directive '{}' has more than "
                                                   "one row — lookup is by "
-                                                  "spelling, so the later row "
+                                                  "spelling (under 'spellingCase'"
+                                                  ": '{}'), so the later row "
                                                   "would silently never apply",
-                                                  dir.spelling));
+                                                  dir.spelling,
+                                                  asmSpellingCaseName(
+                                                      cfg.spellingCase)));
                             assemblyClean = false;
                             continue;
                         }

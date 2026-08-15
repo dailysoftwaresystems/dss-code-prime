@@ -2,6 +2,7 @@
 
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/arg_payload.hpp"
+#include "core/types/target_schema.hpp"   // TargetRegClass (the piece's result-register pool)
 
 #include <cstdio>
 #include <cstdlib>
@@ -41,7 +42,8 @@ void resetMovedFrom_(Mir::InstArena& inst, Mir::BlockArena& block, Mir::FuncAren
                      Mir::GlobalArena& global,
                      std::vector<MirBlockId>& instBlock, std::vector<MirInstId>& operandPool,
                      std::vector<MirPhiIncoming>& phiPool, std::vector<MirBlockId>& succPool,
-                     MirLiteralPool& literalPool) noexcept {
+                     MirLiteralPool& literalPool,
+                     MirAsmDescriptorPool& asmDescriptorPool) noexcept {
     inst   = Mir::InstArena{};
     block  = Mir::BlockArena{};
     func   = Mir::FuncArena{};
@@ -51,6 +53,7 @@ void resetMovedFrom_(Mir::InstArena& inst, Mir::BlockArena& block, Mir::FuncAren
     phiPool.clear();
     succPool.clear();
     literalPool = MirLiteralPool{};
+    asmDescriptorPool = MirAsmDescriptorPool{};
 }
 
 } // namespace
@@ -62,6 +65,7 @@ Mir::Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
          std::vector<MirBlockId> instBlock, std::vector<MirInstId> operandPool,
          std::vector<MirPhiIncoming> phiPool, std::vector<MirBlockId> succPool,
          MirLiteralPool literalPool,
+         MirAsmDescriptorPool asmDescriptorPool,
          MirAliasingMode aliasingMode,
          bool charTypesAliasAll) noexcept
     : instArena_(std::move(instArena)),
@@ -73,6 +77,7 @@ Mir::Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
       phiPool_(std::move(phiPool)),
       succPool_(std::move(succPool)),
       literalPool_(std::move(literalPool)),
+      asmDescriptorPool_(std::move(asmDescriptorPool)),
       aliasingMode_(aliasingMode),
       charTypesAliasAll_(charTypesAliasAll) {
     // The four arenas are tagged by ONE module id (the cross-tier guard relies
@@ -111,13 +116,15 @@ Mir::Mir(Mir&& other) noexcept
       phiPool_(std::move(other.phiPool_)),
       succPool_(std::move(other.succPool_)),
       literalPool_(std::move(other.literalPool_)),
+      asmDescriptorPool_(std::move(other.asmDescriptorPool_)),
       aliasingMode_(other.aliasingMode_),
       charTypesAliasAll_(other.charTypesAliasAll_) {
     other.aliasingMode_ = MirAliasingMode::Permissive;
     other.charTypesAliasAll_ = true;
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
-                    other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_);
+                    other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_,
+                    other.asmDescriptorPool_);
 }
 
 Mir& Mir::operator=(Mir&& other) noexcept {
@@ -131,13 +138,15 @@ Mir& Mir::operator=(Mir&& other) noexcept {
     phiPool_     = std::move(other.phiPool_);
     succPool_    = std::move(other.succPool_);
     literalPool_ = std::move(other.literalPool_);
+    asmDescriptorPool_ = std::move(other.asmDescriptorPool_);
     aliasingMode_ = other.aliasingMode_;
     other.aliasingMode_ = MirAliasingMode::Permissive;
     charTypesAliasAll_ = other.charTypesAliasAll_;
     other.charTypesAliasAll_ = true;
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
-                    other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_);
+                    other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_,
+                    other.asmDescriptorPool_);
     return *this;
 }
 
@@ -237,7 +246,36 @@ std::uint32_t Mir::intrinsicId(MirInstId id) const {
     return payloadForOpcode_(instArena_.at(id), MirOpcode::IntrinsicCall, id, "intrinsicId");
 }
 std::uint32_t Mir::returnPieceOrdinal(MirInstId id) const {
-    return payloadForOpcode_(instArena_.at(id), MirOpcode::ReturnPiece, id, "returnPieceOrdinal");
+    // The PER-CLASS result-register index (low 16). The high 16 is the register
+    // CLASS the ordinal indexes — see returnPieceRegClass and
+    // mir_return_piece_payload.hpp for why both facts must be stored.
+    return return_piece_payload::ordinal(
+        payloadForOpcode_(instArena_.at(id), MirOpcode::ReturnPiece, id,
+                          "returnPieceOrdinal"));
+}
+TargetRegClass Mir::returnPieceRegClass(MirInstId id) const {
+    return static_cast<TargetRegClass>(return_piece_payload::regClass(
+        payloadForOpcode_(instArena_.at(id), MirOpcode::ReturnPiece, id,
+                          "returnPieceRegClass")));
+}
+std::uint32_t Mir::asmDescriptorIndex(MirInstId id) const {
+    // Both asm forms carry the same payload, so the shared typed reader accepts
+    // either — the opcode guard is "is this an asm block", not "is this the
+    // non-terminator one". Spelt as an explicit two-arm test rather than a
+    // payloadForOpcode_ call because that helper compares one opcode.
+    detail::MirInst const& n = instArena_.at(id);
+    if (n.opcode != MirOpcode::InlineAsm && n.opcode != MirOpcode::InlineAsmGoto) {
+        std::fprintf(stderr,
+                     "dss::Mir fatal: asmDescriptorIndex: MirInstId=%u is '%.*s', "
+                     "not 'inlineasm' or 'inlineasmgoto'\n",
+                     id.v,
+                     static_cast<int>(mnemonic(n.opcode).size()), mnemonic(n.opcode).data());
+        std::abort();
+    }
+    return n.payload;
+}
+MirAsmDescriptor const& Mir::asmDescriptor(MirInstId id) const {
+    return asmDescriptorPool_.at(asmDescriptorIndex(id));
 }
 
 MirFuncId Mir::blockFunc(MirBlockId id) const {
@@ -637,11 +675,26 @@ MirInstId MirBuilder::addInst(MirOpcode opcode, std::span<MirInstId const> opera
     // The value-origin opcodes and the sentinel have dedicated builders (so a
     // Const's payload is always a real literal-pool index, etc.); reject them here
     // so the only way to spell them is the safe path.
+    //
+    // *** `InlineAsm` IS IN THIS LIST AS A STRUCTURAL BACKSTOP, NOT FOR SYMMETRY.
+    // Its payload indexes the module's `MirAsmDescriptorPool`, and MIR is rebuilt
+    // by three live verbatim-copy sites that forward `instPayload` into a module
+    // whose pool is EMPTY (`opt/passes/mir_rebuild_helper.cpp`,
+    // `opt/passes/inlining.cpp` x2). Forwarding the index there would name the
+    // wrong descriptor -- i.e. drop the clobber list -- with nothing to observe
+    // it. Refusing the opcode here makes a copy site that forgot `addInlineAsm`
+    // ABORT. A checklist would have to be re-audited every time a fourth copy
+    // site appears; this cannot be forgotten, because forgetting it does not
+    // compile away -- it aborts on the first asm block that reaches the
+    // optimizer. (`InlineAsmGoto` is a TERMINATOR, so the terminator refusal
+    // above already catches it; its dedicated builder is `addInlineAsmGoto`.)
     if (opcode == MirOpcode::Arg || opcode == MirOpcode::Const
-        || opcode == MirOpcode::GlobalAddr || opcode == MirOpcode::Invalid) {
+        || opcode == MirOpcode::GlobalAddr || opcode == MirOpcode::InlineAsm
+        || opcode == MirOpcode::Invalid) {
         std::fprintf(stderr,
                      "dss::MirBuilder fatal: addInst: opcode '%.*s' has a dedicated builder "
-                     "(addArg/addConst/addGlobalAddr); do not build it via addInst\n",
+                     "(addArg/addConst/addGlobalAddr/addInlineAsm); do not build it via "
+                     "addInst\n",
                      static_cast<int>(info.mnemonic.size()), info.mnemonic.data());
         std::abort();
     }
@@ -723,21 +776,178 @@ MirInstId MirBuilder::addArg(std::uint32_t ordinal, TypeId type,
     return appendInst_(pod, {}, /*terminates=*/false);
 }
 
-MirInstId MirBuilder::addReturnPiece(MirInstId call, std::uint32_t ordinal,
-                                     TypeId pieceType, MirInstFlags flags) {
+MirInstId MirBuilder::addReturnPiece(MirInstId producer, std::uint32_t ordinal,
+                                     TargetRegClass regClass, TypeId pieceType,
+                                     MirInstFlags flags) {
     if (!pieceType.valid()) requireValueType_("addReturnPiece");
-    if (!call.valid()) {
-        std::fputs("dss::MirBuilder fatal: addReturnPiece: call operand must be valid\n",
+    if (!producer.valid()) {
+        std::fputs("dss::MirBuilder fatal: addReturnPiece: producer operand must be valid\n",
                    stderr);
+        std::abort();
+    }
+    // The producer must be a multi-result opcode. A piece anchored to anything
+    // else has no result-register pool to be captured from, and the LIR-side
+    // look-ahead would leave it unconsumed -- which is fail-loud there, but this
+    // is where the mistake is actually made.
+    MirOpcode const pop = instArena_.at(producer).opcode;
+    if (pop != MirOpcode::Call && pop != MirOpcode::InlineAsm
+        && pop != MirOpcode::InlineAsmGoto) {
+        std::fprintf(stderr,
+                     "dss::MirBuilder fatal: addReturnPiece: producer MirInstId=%u is '%.*s'; "
+                     "a result piece may only be anchored to a multi-result producer "
+                     "(call / inlineasm / inlineasmgoto)\n",
+                     producer.v,
+                     static_cast<int>(mnemonic(pop).size()), mnemonic(pop).data());
+        std::abort();
+    }
+    // Plan 29 4.4.5: the ordinal and the CLASS it indexes are two facts and both
+    // are stored. An ordinal wide enough to collide with the class field would
+    // silently re-file the piece in another register pool -- refuse it.
+    if (ordinal > return_piece_payload::kOrdinalMax) {
+        std::fprintf(stderr,
+                     "dss::MirBuilder fatal: addReturnPiece: ordinal %u exceeds the "
+                     "encodable maximum %u\n",
+                     ordinal, return_piece_payload::kOrdinalMax);
+        std::abort();
+    }
+    // `None` is the default-constructed value of the enum, i.e. exactly what a
+    // caller that forgot to choose would pass. A piece with no pool is not a
+    // recoverable state -- it is the silent wrong-pool default this split exists
+    // to remove.
+    if (regClass == TargetRegClass::None) {
+        std::fprintf(stderr,
+                     "dss::MirBuilder fatal: addReturnPiece: result piece %u has register "
+                     "class 'none' -- the class selects which result-register pool the "
+                     "ordinal indexes and must be stated, never defaulted\n",
+                     ordinal);
         std::abort();
     }
     detail::MirInst pod;
     pod.opcode  = MirOpcode::ReturnPiece;
     pod.flags   = flags;
     pod.typeId  = pieceType;
-    pod.payload = ordinal;
-    MirInstId const operands[] = {call};
+    pod.payload = return_piece_payload::encode(
+        ordinal, static_cast<std::uint32_t>(regClass));
+    MirInstId const operands[] = {producer};
     return appendInst_(pod, operands, /*terminates=*/false);
+}
+
+std::uint32_t MirBuilder::asmDescriptorPoolAdd(MirAsmDescriptor descriptor) {
+    return asmDescriptorPool_.add(std::move(descriptor));
+}
+
+// Shared shape checks for the two asm builders: the descriptor's input list and
+// the instruction's operand list are the SAME list seen from two sides, so a
+// mismatch means a later consumer would bind `%N` to the wrong value.
+void MirBuilder::checkAsmOperandAlignment_(MirAsmDescriptor const& descriptor,
+                                           std::size_t operandCount,
+                                           char const* builder) const {
+    if (descriptor.inputs.size() != operandCount) {
+        std::fprintf(stderr,
+                     "dss::MirBuilder fatal: %s: descriptor declares %zu input(s) but %zu "
+                     "operand(s) were supplied\n",
+                     builder, descriptor.inputs.size(), operandCount);
+        std::abort();
+    }
+}
+
+MirInstId MirBuilder::addInlineAsm(MirAsmDescriptor descriptor,
+                                   std::span<MirInstId const> operands,
+                                   TypeId resultType, MirInstFlags flags) {
+    checkAsmOperandAlignment_(descriptor, operands.size(), "addInlineAsm");
+    // Result rule: output 0 IS the instruction's own value. No outputs means no
+    // result; one or more outputs means a result type is required. `R::Optional`
+    // cannot express that correlation, so it is checked here, where the
+    // descriptor is in hand.
+    if (descriptor.outputs.empty() && resultType.valid()) {
+        std::fputs("dss::MirBuilder fatal: addInlineAsm: a result type was supplied but the "
+                   "descriptor declares no outputs\n", stderr);
+        std::abort();
+    }
+    if (!descriptor.outputs.empty() && !resultType.valid()) {
+        std::fputs("dss::MirBuilder fatal: addInlineAsm: the descriptor declares outputs but "
+                   "no result type was supplied (output 0 IS this instruction's value)\n",
+                   stderr);
+        std::abort();
+    }
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::InlineAsm;
+    pod.flags   = flags;
+    pod.typeId  = resultType;
+    pod.payload = asmDescriptorPool_.add(std::move(descriptor));
+    return appendInst_(pod, operands, /*terminates=*/false);
+}
+
+MirBuilder::AsmGotoResult
+MirBuilder::addInlineAsmGoto(MirAsmDescriptor descriptor,
+                             std::span<MirInstId const> operands,
+                             std::span<MirBlockId const> labels,
+                             MirInstFlags flags) {
+    checkAsmOperandAlignment_(descriptor, operands.size(), "addInlineAsmGoto");
+    if (labels.empty()) {
+        std::fputs("dss::MirBuilder fatal: addInlineAsmGoto: an `asm goto` must name at "
+                   "least one label (opcodeInfo requires >= 1 successor)\n", stderr);
+        std::abort();
+    }
+    // EVERY output of an `asm goto` is a successor-head piece, output 0 included:
+    // a terminator has nothing after it, so it cannot carry a result of its own.
+    // The opcode row says `R::None`; this is that rule stated where a caller can
+    // still act on it.
+    bool const hasOutputs = !descriptor.outputs.empty();
+
+    MirBlockId const asmBlock = openBlock_;
+    std::vector<AsmGotoEdge> edges;
+    edges.reserve(labels.size());
+    std::vector<MirBlockId> succs;
+    succs.reserve(labels.size());
+    for (MirBlockId const label : labels) {
+        checkSameModule_(label.arenaTag, "asm-goto label");
+        if (!hasOutputs) {
+            edges.push_back(AsmGotoEdge{label, label, /*split=*/false});
+            succs.push_back(label);
+            continue;
+        }
+        // Interpose a landing block. `createBlock` reserves without opening, so
+        // the asm's own block stays open for the terminator below; the caller
+        // then opens each landing block and fills its head with the pieces.
+        // `finish()`'s per-block "filled + terminated" sweep turns a forgotten
+        // edge into an abort rather than a silently dead block.
+        MirBlockId const landing = createBlock(StructCfMarker::Linear);
+        edges.push_back(AsmGotoEdge{landing, label, /*split=*/true});
+        succs.push_back(landing);
+    }
+    if (openBlock_ != asmBlock) {
+        std::fputs("dss::MirBuilder fatal: addInlineAsmGoto: creating the landing blocks "
+                   "changed the open block\n", stderr);
+        std::abort();
+    }
+
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::InlineAsmGoto;
+    pod.flags   = flags;
+    pod.typeId  = InvalidType;
+    pod.payload = asmDescriptorPool_.add(std::move(descriptor));
+    MirInstId const term = appendInst_(pod, operands, /*terminates=*/true);
+    recordSuccessors_(MirOpcode::InlineAsmGoto, succs);
+    return AsmGotoResult{term, std::move(edges)};
+}
+
+MirInstId MirBuilder::cloneInlineAsmGoto(MirAsmDescriptor descriptor,
+                                         std::span<MirInstId const> operands,
+                                         std::span<MirBlockId const> successors,
+                                         MirInstFlags flags) {
+    checkAsmOperandAlignment_(descriptor, operands.size(), "cloneInlineAsmGoto");
+    for (MirBlockId const b : successors) checkSameModule_(b.arenaTag, "asm-goto successor");
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::InlineAsmGoto;
+    pod.flags   = flags;
+    pod.typeId  = InvalidType;
+    pod.payload = asmDescriptorPool_.add(std::move(descriptor));
+    MirInstId const id = appendInst_(pod, operands, /*terminates=*/true);
+    // recordSuccessors_ re-checks the arity against the opcode row, so a clone
+    // that dropped an edge fails here rather than in a backend pass.
+    recordSuccessors_(MirOpcode::InlineAsmGoto, successors);
+    return id;
 }
 
 MirInstId MirBuilder::addReadIndirectResult(TypeId pointerType, MirInstFlags flags) {
@@ -1106,6 +1316,7 @@ Mir MirBuilder::finish() && {
                std::move(instBlock_),
                std::move(operandPool_), std::move(phiPool_), std::move(succPool_),
                std::move(literalPool_),
+               std::move(asmDescriptorPool_),
                aliasingMode_,
                charTypesAliasAll_};
 }

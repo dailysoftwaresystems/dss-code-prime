@@ -938,6 +938,100 @@ operandKindFilterFromName(std::string_view s) noexcept {
     return kOperandKindFilterTable.fromName(s);
 }
 
+// ── GNU inline-asm constraint letters (the `asmConstraints` facet) ────
+//
+// A GNU `asm` statement binds every operand with a CONSTRAINT — `"=r"(o)`,
+// `"a"(x)`, `"m"(*p)`, `"i"(7)`. A constraint splits cleanly in two, and the
+// split is the entire reason this facet exists:
+//
+//   * the MODIFIERS (`=` output, `+` in-out, `&` earlyclobber, `%`
+//     commutative) are GNU-asm GRAMMAR. They mean the same thing on every
+//     processor, the C front end parses them, and they NEVER appear here.
+//   * the LETTER is a MACHINE FACT. ✔MEASURED (gcc 13.3.0, `-O2 -S`, with
+//     three competing `"r"` operands live so a lucky allocation cannot be
+//     mistaken for a pin): `"=a"` lands in `%rax` on x86_64 and is rejected
+//     outright on AArch64 ("impossible constraint in 'asm'"). No reading of
+//     the C standard yields that; only the target can say it.
+//
+// ★★★ WHICH LETTER MEANS WHICH REGISTER IS TARGET VOCABULARY AND LIVES IN
+// `.target.json`. A C++ table keyed on architecture would be an agnosticism
+// break that NO GREP CATCHES until the second architecture's inline asm
+// arrives — by which time the table is load-bearing and the break is
+// expensive to undo.
+//
+// ⚠ THIS FACET IS DELIBERATELY NARROWER THAN THE ONE THAT WAS REVERTED.
+// [[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]] killed an
+// `asmSyntax` block on these same two files that carried `registerPrefix`,
+// `immediatePrefix`, comment characters and operand ORDER. ✔MEASURED with
+// gcc on ONE target: AT&T `movq %rsi, (%rdi)` vs Intel `mov QWORD PTR
+// [rdi], rsi` — every one of those differs between two dialects of the SAME
+// CPU, so each is a (target, DIALECT) fact and storing it per-target stored
+// a per-(X,Y) fact per-X. Constraint letters face the identical test and
+// SURVIVE it: `"=a"` means RAX under AT&T and under Intel, in ELF and in PE.
+// The letter names a REGISTER, and a register is a property of a processor.
+// ⇒ NOTHING THAT VARIES WITH DIALECT MAY ENTER THIS FACET — no sigils, no
+// operand order, no mnemonic spellings. The loader enforces the one case a
+// human would actually get wrong (a modifier smuggled into a letter).
+//
+// ★★ THE LETTERS BIND TO VOCABULARY THAT ALREADY EXISTS — there is no fourth
+// axis and no `AsmConstraint*` verb set:
+//   * `r`, `x`, `w` → a register CLASS    (`TargetRegClass`)
+//   * `a`, `d`, `S` → a SPECIFIC register (`registers[].name` → ordinal, the
+//                     same name resolution the `implicitRegisters` roles use)
+//   * `i`, `m`      → an operand FORM     (`OperandKindFilter`)
+enum class AsmConstraintBinding : std::uint8_t {
+    RegisterClass = 0,
+    Register      = 1,
+    OperandKind   = 2,
+};
+
+// ★ THE DISCRIMINATOR SPELLING IS ALSO THE PAYLOAD KEY NAME, and that is
+// load-bearing rather than cute: `"binds": "register"` requires the key
+// `"register"`. ONE table therefore drives the discriminator vocabulary, the
+// key the loader demands, AND the list every diagnostic renders — so they
+// cannot drift apart the way a hand-typed valid-value list does (the failure
+// `kKnownImplicitRegisterRoles` records in its own comment, where the prose
+// told readers a valid role was invalid).
+inline constexpr EnumNameTable<AsmConstraintBinding, 3>
+    kAsmConstraintBindingTable{{{
+        { AsmConstraintBinding::RegisterClass, "registerClass" },
+        { AsmConstraintBinding::Register,      "register"      },
+        { AsmConstraintBinding::OperandKind,   "operandKind"   },
+    }}};
+
+[[nodiscard]] constexpr std::string_view
+asmConstraintBindingName(AsmConstraintBinding b) noexcept {
+    return kAsmConstraintBindingTable.name(b);
+}
+[[nodiscard]] constexpr std::optional<AsmConstraintBinding>
+asmConstraintBindingFromName(std::string_view s) noexcept {
+    return kAsmConstraintBindingTable.fromName(s);
+}
+
+// One declared constraint letter. EXACTLY ONE payload is engaged and it is
+// the one `binds` names — the loader enforces both halves, so a consumer may
+// `switch (binds)` and dereference the matching arm without re-checking.
+//
+// ★ THE PAYLOADS ARE `optional` RATHER THAN PLAIN VALUES ON PURPOSE. Ordinal
+// 0 is a perfectly valid register (`rax` on x86_64, `x0` on arm64) and
+// `OperandKindFilter::Reg` is 0 as well, so a zero-initialized arm would read
+// back as a PLAUSIBLE answer to a consumer that forgot to switch on `binds` —
+// the silent-wrong-answer shape, not the loud one. `nullopt` is the only
+// value that cannot be mistaken for a measurement.
+struct DSS_EXPORT TargetAsmConstraint {
+    // The letter exactly as it appears in the constraint string, WITHOUT
+    // modifiers. A string rather than a `char` because gcc machine
+    // constraints are not all one character (aarch64 `Ush`, x86 `Yz`), and
+    // because the natural growth direction is longer spellings, not wider
+    // chars. CASE-SENSITIVE and that is load-bearing: ✔MEASURED, x86_64 `d`
+    // is `%rdx` and `D` is `%rdi` — two different registers.
+    std::string letter;
+    AsmConstraintBinding binds = AsmConstraintBinding::RegisterClass;
+    std::optional<TargetRegClass>    registerClass;    // binds == RegisterClass
+    std::optional<std::uint16_t>     registerOrdinal;  // binds == Register
+    std::optional<OperandKindFilter> operandKind;      // binds == OperandKind
+};
+
 // Encoding slot — names WHERE a register/immediate value goes inside
 // the emitted byte sequence. Closed vocabulary. The x86-variable
 // walker reads this enum to project an operand (or the instruction's
@@ -2731,6 +2825,25 @@ struct DSS_EXPORT TargetSchemaData {
     std::vector<TargetRegisterInfo> registers;
     substrate::TransparentStringMap<std::uint16_t> registerIndex;
 
+    // GNU inline-asm constraint letters declared by this target (the
+    // `asmConstraints` root key — see `TargetAsmConstraint` for the
+    // vocabulary-vs-grammar line this facet is drawn on). OPTIONAL and
+    // EMPTY BY DEFAULT: a target that declares none simply refuses every
+    // constraint letter by name, which is the correct answer for a
+    // processor whose inline-asm binding has not been described yet.
+    //
+    // ★ Populated AFTER `registers`, because a `binds: "register"` row
+    // resolves its name to an ORDINAL at load — the same precedent as the
+    // `implicitRegisters` roles. A dangling name is a load error, never a
+    // lookup that fails later at a site with no target in hand.
+    //
+    // ★ No side index. The table is a handful of rows (✔MEASURED: 10 on
+    // x86_64, 4 on arm64) keyed by a one- or two-character string, so a
+    // `TransparentStringMap` would cost more to build than the linear scan
+    // it replaces; the loader rejects duplicate letters, so the scan is
+    // unambiguous by construction rather than by convention.
+    std::vector<TargetAsmConstraint> asmConstraints;
+
     // The CIE's `return_address_register` — the DWARF column an unwinder
     // reads to find where this frame's return address went.
     //
@@ -3079,6 +3192,53 @@ public:
         auto it = d_.registerIndex.find(name);
         if (it == d_.registerIndex.end()) return std::nullopt;
         return it->second;
+    }
+
+    // ── GNU inline-asm constraint letters ───────────────────────
+    // Every letter this target declares, in declaration order. EMPTY is a
+    // legitimate state: it means this processor has not described its
+    // inline-asm binding, and every constraint is then refused BY NAME.
+    [[nodiscard]] std::span<TargetAsmConstraint const>
+    asmConstraints() const noexcept {
+        return d_.asmConstraints;
+    }
+    [[nodiscard]] std::size_t asmConstraintCount() const noexcept {
+        return d_.asmConstraints.size();
+    }
+
+    // Resolve one constraint LETTER. Returns nullptr when this target does
+    // not declare it — which the caller must turn into a diagnostic naming
+    // the letter AND the target, never into a fallback guess. ✔MEASURED,
+    // this is exactly gcc's own behaviour: `"=a"` is `%rax` on x86_64 and
+    // "impossible constraint in 'asm'" on AArch64.
+    //
+    // ⚠ Takes the LETTER ONLY. A caller holding `"=&a"` must have stripped
+    // the modifiers first: `=`/`+`/`&`/`%` are GNU-asm grammar owned by the
+    // front end, and the loader refuses to store them, so passing a raw
+    // constraint string here always misses. Case-sensitive (`d` ≠ `D`).
+    [[nodiscard]] TargetAsmConstraint const*
+    asmConstraint(std::string_view letter) const noexcept {
+        for (auto const& c : d_.asmConstraints) {
+            if (c.letter == letter) return &c;
+        }
+        return nullptr;
+    }
+
+    // ★ THE VALID-LIST RENDERER FOR THE CONSUMER'S DIAGNOSTIC, so that the
+    // one message this facet cannot emit itself — "this target does not
+    // declare letter X" — still cannot be written with a hand-typed list.
+    // The list is per-TARGET, so there is no correct constant to type: the
+    // letters differ between processors, which is the whole point of the
+    // facet. ✔MEASURED, x86_64 declares 'a' and arm64 does not.
+    [[nodiscard]] std::string declaredAsmConstraintLetters() const {
+        std::string out;
+        for (auto const& c : d_.asmConstraints) {
+            if (!out.empty()) out += ", ";
+            out += '\'';
+            out += c.letter;
+            out += '\'';
+        }
+        return out;
     }
 
     // The CIE's `return_address_register` (see the field's docblock in

@@ -62,17 +62,24 @@ enum class HirKind : std::uint16_t {
     //    get NO HirKind — they fail loud at CST→HIR (D-CSUBSET-SEH-FINALLY /
     //    D-CSUBSET-SEH-LEAVE, trigger-gated; sqlite ground truth: zero uses). ──
     SehTryExcept,
-    // ── FC17.9(i) (D-CSUBSET-INLINE-ASM): the GNU inline-asm STATEMENT
-    //    `__asm__ [volatile] ("") ;`. Cycle-1 is the empty-template optimizer
-    //    barrier ONLY — a 0-child LEAF (no payload) that HIR→MIR lowers to
-    //    MirOpcode::CompilerBarrier (the _ReadWriteBarrier op: zero target
-    //    instructions, a full-memory reordering fence). The empty-vs-non-empty
-    //    gate is semantic (S_InlineAsmNonEmptyTemplate rejects a non-empty
-    //    template BEFORE codegen), so this node is emitted only for the
-    //    provably-inert empty form. A C-language statement in the core enum,
-    //    matching the SehTryExcept/goto precedent. The non-empty per-target
-    //    text arc (D-CSUBSET-INLINE-ASM-TEXT) will later carry the template
-    //    bytes on a literal-pool payload + a volatile side-table bit. ──
+    // ── FC17.9(i) / P5 (D-CSUBSET-INLINE-ASM, -OPERANDS, -TEXT): the GNU
+    //    inline-asm STATEMENT `__asm__ [volatile|goto] (template [: … ]) ;`.
+    //    Children = the operand VALUE EXPRESSIONS, outputs first then inputs,
+    //    source order within each — which is the `%N` index space itself (GNU
+    //    6.47.2.3), so a consumer never re-derives it. `payload` is a handle
+    //    into the per-CU `HirInlineAsmPool` (`hir_inline_asm.hpp`) carrying the
+    //    template text, the per-operand constraint records, the clobber list,
+    //    the `asm goto` label ordinals and the qualifier flags.
+    //    ★ `payload == kNoInlineAsmDescriptor` (0) is the BARE BARRIER form —
+    //    `__asm__ [volatile] ("")` with no sections — which HIR→MIR lowers to
+    //    MirOpcode::CompilerBarrier (zero target instructions, a full-memory
+    //    reordering fence). The sentinel is 0 and pool handles are 1-based
+    //    precisely so a node that was never given a descriptor cannot read back
+    //    as a plausible pointer to somebody else's operands.
+    //    A C-language statement in the core enum, matching the SehTryExcept/goto
+    //    precedent. ⛔ The payload-carrying form is NOT a second HirKind: two
+    //    kinds would encode one fact and every consumer would carry both arms
+    //    forever (plan 29 §4.4's one-fact test, one tier up). ──
     InlineAsm,
     // ── Expressions ──
     Literal, Ref, Call, IntrinsicCall,
@@ -309,11 +316,23 @@ struct ChildArity {
         case HirKind::ReturnStmt: case HirKind::VarDecl:
             return {0, 1};                                             // [value/init?]
         case HirKind::BreakStmt: case HirKind::ContinueStmt: case HirKind::Unreachable:
-        // D-CSUBSET-INLINE-ASM: the empty-template asm barrier is a pure leaf —
-        // no children, no payload (cycle-1). A future non-empty form carries the
-        // template on a payload, still 0 children.
-        case HirKind::InlineAsm:
             return {0, 0};
+        // ⚠ `InlineAsm` USED TO SHARE THE ARM ABOVE, and widening it in place
+        // silently widened Break/Continue/Unreachable too — caught by
+        // `tests/hir/test_hir_node.cpp`'s compile-time arity pins, which is
+        // exactly what a fall-through `case` group costs when one member's
+        // shape changes. Kept as its own arm from here on.
+        // D-CSUBSET-INLINE-ASM-OPERANDS (P5): the GNU inline-asm statement —
+        // [operand value expressions…], OUTPUTS FIRST then INPUTS, source order
+        // within each. `{0, N}` and not `{0, 0}`: the empty-template barrier
+        // `__asm__ volatile("")` still has zero children, and an asm block may
+        // legitimately have zero operands while carrying clobbers or labels.
+        // ★ The bound is UNBOUNDED rather than a number because the operand
+        // count is the SOURCE's, not the target's; the per-operand constraint
+        // records live in the `HirInlineAsmPool` entry the payload names, and
+        // `HirVerifier::checkInlineAsm` is what pins children == operands.
+        case HirKind::InlineAsm:
+            return {0, kUnboundedArity};
         // ── Unstructured CF (FC5) ──
         case HirKind::GotoStmt:           return {0, 0};   // leaf; target label ordinal in payload
         case HirKind::LabelStmt:          return {1, 1};   // [labeledStmt]; label ordinal in payload

@@ -3,11 +3,43 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "mir/mir_opcode.hpp"
 
+// ── inline-asm P5: the MIR→LIR EXPANSION's three extra dependencies ──
+//
+// ★ ALL THREE ARE READS OF SOMETHING ALREADY SHIPPED, and that is what keeps
+// the expansion from being a second implementation of anything:
+//   * `asm/asm_template_to_lir.hpp` — THE one text→LIR instruction engine, the
+//     same one the standalone `.s` walker drives. A template is a `.s` fragment;
+//     lowering it through a private decoder is how the two surfaces would come
+//     to disagree about what `movq %rax,%rcx` encodes to.
+//   * `analysis/compilation_unit/...` + `core/types/grammar_schema.hpp` — the
+//     ordinary parse. The template TEXT has to become a `Tree` before the engine
+//     can walk it, and the dialect that parses it is named by the TARGET
+//     (`defaultAssemblyLanguage`), never by this file.
+//   * `mir/mir_asm_descriptor.hpp` — the constraint/clobber vocabulary the front
+//     end captured, read verbatim. This tier resolves register NAMES against the
+//     target's table; it enumerates none of its own.
+//
+// ⚠ NO CMAKE EDIT WAS NEEDED AND THAT IS A MEASUREMENT, NOT AN OMISSION:
+// `lir_lowering`'s include root is `src/`, and every OBJECT library here is
+// aggregated into ONE shared library (`src/CMakeLists.txt`'s
+// `$<TARGET_OBJECTS:…>` list), so the symbols resolve at the aggregate link.
+// The dependency direction also stays acyclic — `asm` depends on `lir`+`mir`,
+// and `lir_lowering` is a THIRD library that depends on `asm`; nothing depends
+// on `lir_lowering`.
+#include "analysis/compilation_unit/compilation_unit.hpp"
+#include "asm/asm_template_to_lir.hpp"
+#include "core/types/diagnostic_budget.hpp"
+#include "core/types/grammar_schema.hpp"
+#include "mir/mir_asm_descriptor.hpp"
+
+#include <algorithm>
 #include <array>
 #include <format>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -64,6 +96,16 @@ namespace {
         case MirOpcode::SehExceptionCode: return "SehExceptionCode";
         case MirOpcode::SehExceptionInfo: return "SehExceptionInfo";
         case MirOpcode::RecoverParentFrameSlot: return "RecoverParentFrameSlot"; // c116b
+        // Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS). These two are NOT yet
+        // lowered — the template expansion is the remaining P5 piece — so they
+        // reach `reportUnsupported` and are exactly the case the `<deferred>`
+        // default serves worst. Naming them matters more here than for a typical
+        // deferral: the statement they come from is one the user WROTE, so the
+        // refusal is read by an author looking at their own `__asm__`, not by a
+        // compiler engineer reading a MIR dump. "MIR opcode '<deferred>' is not
+        // yet lowered" names neither the feature nor the construct.
+        case MirOpcode::InlineAsm:     return "InlineAsm";
+        case MirOpcode::InlineAsmGoto: return "InlineAsmGoto";
         default:                       return "<deferred>";
     }
 }
@@ -88,15 +130,26 @@ namespace {
     }
 }
 
+// ⚠⚠ THIS WAS A HAND-MAINTAINED LIST AND IT HAD ALREADY DRIFTED. It enumerated
+// eight opcodes by name while `MirOpcodeInfo::isTerminator` — written beside the
+// opcode in `mir_opcode.hpp` and consumed by the MIR builder and verifier — says
+// the same thing for every opcode there is. One fact, two owners, and the second
+// owner had to be edited by hand every time an opcode was added.
+//
+// ✔MEASURED 2026-08-15 that the drift was live rather than theoretical:
+// `InlineAsmGoto` is declared `isTerminator = true` (`mir_opcode.hpp:563`) and was
+// ABSENT here, so an `asm goto` with labels never reached `lowerTerminator` at all.
+// It fell through to the non-terminator path and produced TWO diagnostics — a
+// spurious *"MIR block ended with non-terminator opcode"* structural-violation
+// report naming the compiler's own bookkeeping, plus the generic
+// *"not yet lowered"* — instead of the one precise refusal its arm exists to give.
+// A reader would have gone looking for a malformed MIR producer that does not
+// exist.
+//
+// Derived from the table now, so the list cannot drift again and a new terminator
+// opcode needs no edit here.
 [[nodiscard]] bool isMirTerminator(MirOpcode op) noexcept {
-    return op == MirOpcode::Br
-        || op == MirOpcode::CondBr
-        || op == MirOpcode::Switch
-        || op == MirOpcode::Return
-        || op == MirOpcode::Unreachable
-        || op == MirOpcode::IndirectBr        // D-CSUBSET-COMPUTED-GOTO
-        || op == MirOpcode::SehTryBegin       // c115 SEH — fail-loud arms in
-        || op == MirOpcode::SehFilterReturn;  // lowerTerminator (D-WIN64-SEH-FUNCLETS)
+    return ::dss::isTerminator(op);
 }
 
 // Single source of truth for the lowerer's opcode-mnemonic cache. The
@@ -679,6 +732,37 @@ struct Lowerer {
     // assigns the alloca's frame offset under. Both reset per function.
     std::unordered_map<std::uint32_t, std::uint32_t> allocaSlotIndex_;
     std::uint32_t                   allocaLirCount_ = 0;
+
+    // ── inline-asm P5 state ───────────────────────────────────────────────
+    //
+    // The dialect grammar the ACTIVE TARGET names in `defaultAssemblyLanguage`,
+    // loaded at most once per module and cached. `asmDialectResolved_` is
+    // separate from a null check so a FAILED load is not retried once per asm
+    // statement — the diagnostic is reported once and the module fails.
+    std::shared_ptr<GrammarSchema> asmDialect_;
+    bool                           asmDialectResolved_ = false;
+
+    // ★★★ (producer MIR inst, piece ordinal) → the vreg the EXPANSION already
+    // captured it into. This is what lets `lowerReturnPiece` stay keyed on
+    // DERIVABILITY rather than on producer identity: it asks *"did my producer
+    // define piece k?"*, never *"is my producer an InlineAsm?"*.
+    //
+    // ⚠ WHY THE EXPANSION CAPTURES ITS OWN PIECES INSTEAD OF EMITTING LIR
+    // `ret_piece`. ✔MEASURED 2026-08-15: `lir_callconv`'s piece look-ahead lives
+    // INSIDE the `isCall` arm (`lir_callconv.cpp:3003` gates it,
+    // `:3802` is the loop), and a `ret_piece` that reaches the general path
+    // unconsumed is FAIL-LOUD by design (`:2622-2631`). An asm block is not a
+    // call, so a `ret_piece` emitted for one would be refused by the very rule
+    // that protects struct returns. Capturing here is therefore not a shortcut
+    // around the piece machinery — it is the only placement that does not
+    // require the piece machinery to learn what an asm block is.
+    std::unordered_map<std::uint64_t, LirReg> asmPieceReg_;
+
+    [[nodiscard]] static std::uint64_t asmPieceKey(MirInstId producer,
+                                                   std::uint32_t ordinal) noexcept {
+        return (static_cast<std::uint64_t>(producer.v) << 32)
+             | static_cast<std::uint64_t>(ordinal);
+    }
 
     // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD (FC3.5 sweep-c3): per-function
     // MIR value-use census — value id → (use count, last user). Built
@@ -1920,6 +2004,8 @@ struct Lowerer {
         switch (op) {
             case MirOpcode::Arg:    return lowerArg(id);
             case MirOpcode::ReturnPiece: return lowerReturnPiece(id);
+            // inline-asm P5: `__asm__(...)`, the non-terminator form.
+            case MirOpcode::InlineAsm: return lowerInlineAsm(id);
             case MirOpcode::ReadIndirectResult: return lowerReadIndirectResult(id);
             case MirOpcode::VaRegSaveAreaAddr:
                 return lowerVaFrameAddr(id, MnemonicSlot::VaRegSaveArea,
@@ -2392,6 +2478,28 @@ struct Lowerer {
     // a leaf carrying the per-class return ordinal as payload. lir_callconv
     // captures it from the cc's return register (the caller-side mirror of `arg`).
     void lowerReturnPiece(MirInstId id) {
+        // ★★★ DID MY PRODUCER ALREADY PLACE THIS PIECE? Asked FIRST, and asked as
+        // a question about DERIVABILITY rather than about what kind of thing the
+        // producer is — the same keying plan 29 §4.4.1 requires of the piece
+        // SOURCE. A producer whose results do not live in the calling
+        // convention's return registers (an inline-asm block leaves them in the
+        // registers its output constraints named) captures them at its own
+        // expansion and records the vreg here; the piece read is then a pure
+        // rename with no instruction of its own.
+        //
+        // ⚠ THERE IS NO `if (producer is InlineAsm)` HERE AND THERE MUST NEVER
+        // BE ONE. The next multi-result producer that captures its own results
+        // — x86 `div`'s quotient+remainder, a flags+value arithmetic op, DSS
+        // Axis multi-return — works through this arm with no edit, which is the
+        // whole reason `ReturnPiece` was reused instead of an asm-private verb.
+        if (auto const ops = mir.instOperands(id); !ops.empty()) {
+            auto const it = asmPieceReg_.find(
+                asmPieceKey(ops[0], mir.returnPieceOrdinal(id)));
+            if (it != asmPieceReg_.end()) {
+                defineValue(id, it->second);
+                return;
+            }
+        }
         if (!opcode(MnemonicSlot::RetPiece).has_value()) {
             reportMissingOpcode(MnemonicSlot::RetPiece, "MIR ReturnPiece");
             return;
@@ -2411,10 +2519,578 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
-        LirReg const result = lir.newVReg(regClassFor(id));
+        // Plan 29 §4.4.5: the piece's register class is the one the PRODUCER
+        // declared, read off the piece rather than re-derived from its MIR type.
+        // ⚠ The two agree for every Call piece — the ABI classifier picked both —
+        // which is exactly why the inference survived; they diverge the moment a
+        // producer chooses a class independently of the type (an asm `"=x"` on an
+        // integer), and the divergence is silent because GPR is the else-branch
+        // default of every downstream two-way test.
+        LirReg const result =
+            lir.newVReg(static_cast<LirRegClass>(mir.returnPieceRegClass(id)));
         emitInst(*opcode(MnemonicSlot::RetPiece), result, std::span<LirOperand const>{},
                     /*payload=*/mir.returnPieceOrdinal(id));
         defineValue(id, result);
+    }
+
+    // ═════════ inline assembly (plan 29 P5) — the MIR→LIR EXPANSION ═════════
+    //
+    // ★★★ WHAT AN `__asm__` STATEMENT BECOMES, IN ORDER:
+    //   1. one move per register-PINNED input   (`"a"(x)`  → `mov rax, x`)
+    //   2. the TEMPLATE, parsed by the target's own assembly dialect and
+    //      lowered through the ONE text→LIR engine the standalone `.s` uses
+    //   3. one move per register-PINNED output  (`"=a"(y)` → `mov y, rax`)
+    //   4. ONE `ImplicitRegisterConstraint`, attached to EVERY instruction 1–3
+    //
+    // ★★ STEP 4 IS THE WHOLE SAFETY PROPERTY AND ITS "EVERY" IS LOAD-BEARING.
+    // `collectImplicitClobberPositions` records ONE forbidden position per
+    // instruction that carries the constraint. Attach the handle to the first
+    // instruction only and a vreg whose live range starts INSIDE the block —
+    // after that position — is never excluded, so the allocator hands it a
+    // register the block destroys. The failure is silent: every structural test
+    // (the handle survived, the reference census counts 1) still passes.
+    //
+    // Agnostic by construction: no mnemonic, no register name and no dialect
+    // spelling appears below. The dialect comes from the TARGET
+    // (`defaultAssemblyLanguage`), the register names come from the SOURCE and
+    // are resolved against the target's own table, and the instruction
+    // vocabulary is the engine's.
+
+    // The dialect grammar the ACTIVE TARGET names, loaded once per module.
+    // nullptr ⇒ already reported.
+    [[nodiscard]] GrammarSchema const* asmDialect() {
+        if (asmDialectResolved_) return asmDialect_.get();
+        asmDialectResolved_ = true;
+        std::string_view const name = target.defaultAssemblyLanguage();
+        if (name.empty()) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "target '{}' declares no 'defaultAssemblyLanguage', so an "
+                    "embedded `__asm__` template cannot be parsed — the dialect "
+                    "that reads the template is a property of the target, and "
+                    "guessing one here would assemble the programmer's text "
+                    "against a grammar they did not write for "
+                    "(D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET)", target.name()));
+            return nullptr;
+        }
+        auto loaded = GrammarSchema::loadShipped(name);
+        if (!loaded.has_value()) {
+            for (auto const& e : loaded.error()) {
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format("assembly dialect '{}' (named by target '{}' as "
+                                "its 'defaultAssemblyLanguage') did not load: "
+                                "{}: {}", name, target.name(), e.path, e.message));
+            }
+            return nullptr;
+        }
+        asmDialect_ = *loaded;
+        return asmDialect_.get();
+    }
+
+    // ★ A REGISTER NAME AS THE SOURCE WROTE IT, RESOLVED TO THE FULL-WIDTH
+    // PARENT THE ALLOCATOR ACTUALLY MODELS. `"=a"` reaches this tier as a
+    // register name; a clobber list may spell the same machine register `"eax"`.
+    // LIR names ONE register and carries the width on the instruction, and the
+    // allocator holds every `subOf` row out of its pools — so a clobber recorded
+    // against the 32-bit spelling would name an ordinal no live range can hold
+    // and protect NOTHING. Following the target's own `subOf` chain is the same
+    // resolution `resolvePhysicalRegister` performs for the `.s` path.
+    //
+    // ⚠ FAILS AS A DIAGNOSTIC, NEVER AS AN ABORT. This is USER TEXT —
+    // `asm("" ::: "nosuchreg")` is a program a compiler must refuse politely.
+    // `LirBuilder::regConstraintPoolAdd` aborts on an unresolvable name and its
+    // docblock says so; this is the pre-validation it requires.
+    [[nodiscard]] bool
+    canonicalAsmRegister(std::string const& spelling, MirInstId at,
+                         std::string_view role,
+                         std::uint16_t& outOrdinal, std::string& outName,
+                         LirRegClass& outClass) {
+        auto ord = target.registerByName(spelling);
+        if (!ord.has_value()) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "inline asm (MIR inst {}) names '{}' as {}, but target '{}' "
+                    "declares no register by that name — the constraint and "
+                    "clobber vocabulary is the TARGET's register table, so a "
+                    "name absent from it cannot be protected or written",
+                    at.v, spelling, role, target.name()));
+            return false;
+        }
+        // Walk `subOf` to the full-width parent. Bounded by the number of
+        // declared registers so a cyclic `subOf` in a malformed target fails
+        // loud instead of hanging the compiler.
+        std::size_t hops = 0;
+        std::size_t const limit = target.registerCount();
+        for (;;) {
+            auto const* info = target.registerInfo(*ord);
+            if (info == nullptr) {
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format("inline asm (MIR inst {}): target '{}' resolved "
+                                "'{}' to register ordinal {} but declares no "
+                                "info row for it", at.v, target.name(),
+                                spelling, *ord));
+                return false;
+            }
+            if (info->subOf.empty()) {
+                outOrdinal = *ord;
+                outName    = info->name;
+                outClass   = static_cast<LirRegClass>(info->regClass);
+                return true;
+            }
+            if (++hops > limit) {
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format("inline asm (MIR inst {}): target '{}' has a "
+                                "cyclic `subOf` chain starting at '{}'",
+                                at.v, target.name(), spelling));
+                return false;
+            }
+            auto parent = target.registerByName(info->subOf);
+            if (!parent.has_value()) {
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format("inline asm (MIR inst {}): target '{}' declares "
+                                "register '{}' as a sub-register of '{}', which "
+                                "it does not declare", at.v, target.name(),
+                                info->name, info->subOf));
+                return false;
+            }
+            ord = parent;
+        }
+    }
+
+    // One inline-asm operand, resolved to the register the template will name.
+    struct AsmBound {
+        LirReg        reg{InvalidLirReg};
+        LirRegClass   cls     = LirRegClass::None;
+        bool          pinned  = false;
+        std::uint16_t ordinal = 0;     // meaningful iff `pinned`
+        std::string   name;            // canonical parent name iff `pinned`
+        std::uint32_t widthBits = 64;
+        std::string   spelling;        // what the template writes for it
+    };
+
+    // GNU numbering: outputs first, then inputs, `%0`.. across BOTH lists
+    // (GCC 6.47.2.3). ★ THE CONVENTION IS THE EMBEDDING LANGUAGE'S, NOT THE
+    // ENGINE'S — `asm_template_to_lir.hpp` says so outright: the engine only
+    // COMPARES spellings, so a dialect that numbered its placeholders
+    // differently needs no engine change and this is the one place the GNU
+    // rule is stated.
+    [[nodiscard]] static std::string asmOperandSpelling(std::size_t index) {
+        return std::format("%{}", index);
+    }
+
+    [[nodiscard]] std::uint32_t asmWidthBitsForType(TypeId ty) const {
+        return lirInstWidthBits(widthFlagsForType(ty));
+    }
+
+    [[nodiscard]] bool
+    bindAsmOperand(MirAsmOperand const& o, MirInstId at, std::size_t gnuIndex,
+                   std::string_view role, TypeId valueType, AsmBound& out) {
+        out.spelling  = asmOperandSpelling(gnuIndex);
+        out.widthBits = asmWidthBitsForType(valueType);
+        // ⚠ `"+r"` — ONE operand that is read AND written. ✔MEASURED (plan 29
+        // §4.4.4): the tie is a per-opcode BOOL `requires2Address` hardwired to
+        // *result == operand[0]* with `0` a literal at four sites, and there is
+        // ONE result slot — no `(result k, operand j)` pair is expressible.
+        // Accepting it would emit an asm block that reads a register the source
+        // said also holds the output, with no diagnostic. The fix is a CORE fix
+        // (an operand INDEX replacing the bool, which every two-address target
+        // benefits from) and it belongs in `lir_2addr_legalize`, not here.
+        if (o.isReadWrite) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "inline asm (MIR inst {}): {} {} uses the read-write "
+                    "constraint \"{}\", and LIR cannot yet TIE an output to an "
+                    "input — `requires2Address` is a per-opcode bool fixed to "
+                    "*result == operand[0]*, so no (result, operand) pair is "
+                    "expressible. Refused rather than emitted untied, which "
+                    "would drop the tie silently "
+                    "(D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE)",
+                    at.v, role, gnuIndex, o.constraint));
+            return false;
+        }
+        LirRegClass const cls = static_cast<LirRegClass>(o.regClass);
+        if (cls == LirRegClass::None) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format("inline asm (MIR inst {}): {} {} (constraint "
+                            "\"{}\") carries no register class",
+                            at.v, role, gnuIndex, o.constraint));
+            return false;
+        }
+        if (o.fixedRegister.empty()) {
+            // ⚠ `"=&r"` ON AN UNPINNED OUTPUT IS REFUSED, AND THE REASON IS A
+            // MEASUREMENT RATHER THAN A CHOICE. The mechanism exists and is
+            // correct — `kLirInstFlagEarlyClobberResult` moves the result's def
+            // from the LATE slot to the EARLY one, so the inputs no longer
+            // expire under it (`lir_liveness.cpp`). But the instruction that
+            // WRITES an unpinned output is emitted by the shared template
+            // engine, and ✔MEASURED 2026-08-15 `LirBuilder` exposes no way to
+            // set a flag on an already-appended instruction: `addInst` takes
+            // `flags` by value and there is no `setInstFlags` sibling to
+            // `setInstRegConstraints`. So this tier cannot mark it.
+            // ★ A PINNED earlyclobber output (`"=&a"`) IS ALREADY CORRECT and is
+            // deliberately NOT refused: its register is in `clobberedNames`, so
+            // `effectiveForbiddenOrdinals` bars every live range covering the
+            // block from holding it — which is exactly what `&` asks for, by a
+            // different mechanism. Refusing it too would reject a program this
+            // build compiles correctly.
+            if (o.isEarlyClobber) {
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format(
+                        "inline asm (MIR inst {}): {} {} uses the earlyclobber "
+                        "constraint \"{}\" on an ALLOCATOR-CHOSEN register. The "
+                        "liveness rule that implements `&` keys on "
+                        "`kLirInstFlagEarlyClobberResult`, and the instruction "
+                        "that writes this operand is emitted by the shared "
+                        "assembly engine, which `LirBuilder` gives no way to "
+                        "flag after the fact. Refused rather than accepted and "
+                        "ignored — an ignored `&` lets the output share a "
+                        "register with an input the template has not finished "
+                        "reading, which is a miscompile with no diagnostic. A "
+                        "register-PINNED earlyclobber (\"=&a\") is accepted: its "
+                        "clobber entry already forbids the sharing "
+                        "(D-LIR-EARLYCLOBBER-FLAG-UNSETTABLE-AFTER-EMISSION)",
+                        at.v, role, gnuIndex, o.constraint));
+                return false;
+            }
+            out.reg    = lir.newVReg(cls);
+            out.cls    = cls;
+            out.pinned = false;
+            return true;
+        }
+        std::uint16_t ord  = 0;
+        std::string   name;
+        LirRegClass   pcls = LirRegClass::None;
+        if (!canonicalAsmRegister(o.fixedRegister, at,
+                                  std::format("the register for {} {} "
+                                              "(constraint \"{}\")",
+                                              role, gnuIndex, o.constraint),
+                                  ord, name, pcls)) {
+            return false;
+        }
+        out.reg     = makePhysicalReg(ord, pcls);
+        out.cls     = pcls;
+        out.pinned  = true;
+        out.ordinal = ord;
+        out.name    = std::move(name);
+        return true;
+    }
+
+    // ★★★ THE EXPANSION. `succs` is empty for the non-terminator form.
+    // Returns false on any refusal (already reported).
+    [[nodiscard]] bool expandInlineAsm(MirInstId id) {
+        MirAsmDescriptor const& desc = mir.asmDescriptor(id);
+        GrammarSchema const* dialect = asmDialect();
+        if (dialect == nullptr) return false;
+
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != desc.inputs.size()) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format("inline asm (MIR inst {}): the descriptor declares "
+                            "{} input(s) but the instruction carries {} operand(s) "
+                            "— the two are 1:1 by construction",
+                            id.v, desc.inputs.size(), operands.size()));
+            return false;
+        }
+
+        // ── 1. resolve every operand BEFORE emitting anything ──
+        // ★ NOTHING IS EMITTED UNTIL EVERY OPERAND, THE CLOBBER LIST AND THE
+        // `outputs ⊆ clobbered` INVARIANT HAVE ALL PASSED. A refusal after the
+        // pins were emitted would leave a half-expanded block whose registers
+        // are pinned for a template that never ran.
+        std::vector<AsmBound> outs(desc.outputs.size());
+        std::vector<AsmBound> ins(desc.inputs.size());
+        for (std::size_t k = 0; k < desc.outputs.size(); ++k) {
+            // Output k's value type: piece 0 IS the instruction's own result.
+            TypeId const ty = (k == 0) ? mir.instType(id) : pieceTypeForAsm(id, k);
+            if (!bindAsmOperand(desc.outputs[k], id, k, "output", ty, outs[k]))
+                return false;
+        }
+        for (std::size_t j = 0; j < desc.inputs.size(); ++j) {
+            if (!bindAsmOperand(desc.inputs[j], id, desc.outputs.size() + j,
+                                "input", mir.instType(operands[j]),
+                                ins[j])) {
+                return false;
+            }
+        }
+
+        // ── 2. the ONE per-instruction constraint ──
+        ImplicitRegisterConstraint c;
+        for (auto const& b : ins)  if (b.pinned) c.inputNames.push_back(b.name);
+        for (auto const& b : outs) if (b.pinned) c.outputNames.push_back(b.name);
+        // The SOURCE's clobber list, resolved through the target's table. (The
+        // `"memory"` and `"cc"` spellings never reach here — the front end
+        // hoists them into `clobbersMemory` / `clobbersConditionCodes`, so this
+        // list is uniformly resolvable against `registers[]`.)
+        for (auto const& spelling : desc.clobbers) {
+            std::uint16_t ord = 0;
+            std::string   name;
+            LirRegClass   cls = LirRegClass::None;
+            if (!canonicalAsmRegister(spelling, id, "a clobbered register",
+                                      ord, name, cls)) {
+                return false;
+            }
+            c.clobberedNames.push_back(std::move(name));
+        }
+        // ★★★ `outputs ⊆ clobbered`, REPLICATED HERE BECAUSE NO LOADER RUNS ON
+        // THIS PATH. ✔MEASURED: the target JSON loader enforces the invariant for
+        // the per-OPCODE carrier (`target_schema_json.cpp`), and
+        // `effectiveForbiddenOrdinals` deliberately omits OUTPUTS from the
+        // forbidden set — *"the instruction reads its operands BEFORE writing its
+        // outputs"*. The second is safe ONLY because of the first. The
+        // per-INSTRUCTION carrier is lowering-built and meets no loader, so
+        // without this loop a value live in the output's register ACROSS the
+        // block keeps its allocation and dies with no diagnostic.
+        // (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED)
+        for (auto const& outName : c.outputNames) {
+            bool present = false;
+            for (auto const& cl : c.clobberedNames) {
+                if (cl == outName) { present = true; break; }
+            }
+            if (!present) c.clobberedNames.push_back(outName);
+        }
+        // The fail-loud half. The loop above cannot leave a violation behind, so
+        // reaching this is a defect in THIS function rather than in its input —
+        // which is exactly when a silent pass is most expensive, because the
+        // invariant it guards is invisible to every downstream test.
+        for (auto const& outName : c.outputNames) {
+            bool present = false;
+            for (auto const& cl : c.clobberedNames) {
+                if (cl == outName) { present = true; break; }
+            }
+            if (!present) {
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format(
+                        "inline asm (MIR inst {}): internal invariant violated — "
+                        "output register '{}' is not in the instruction's clobber "
+                        "set. Register allocation omits outputs from the "
+                        "forbidden set on the strength of `outputs ⊆ clobbered`, "
+                        "so shipping this entry would let a value live across the "
+                        "block keep a register the block overwrites "
+                        "(D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-"
+                        "CLOBBERED)", id.v, outName));
+                return false;
+            }
+        }
+        bool const anyConstraint = !c.inputNames.empty()
+                                || !c.outputNames.empty()
+                                || !c.clobberedNames.empty();
+
+        // The move used for the pins and the captures. Resolved only when some
+        // operand is pinned, so a target that declares no `mov` still compiles
+        // an asm block that needs none.
+        bool const needMoves = std::any_of(
+            outs.begin(), outs.end(), [](AsmBound const& b) { return b.pinned; })
+            || std::any_of(ins.begin(), ins.end(),
+                           [](AsmBound const& b) { return b.pinned; });
+        std::optional<std::uint16_t> movOp;
+        if (needMoves) {
+            movOp = opcode(MnemonicSlot::Mov);
+            if (!movOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mov, "inline asm register pin");
+                return false;
+            }
+        }
+
+        // ── 3. parse the template with the TARGET's dialect ──
+        // ⚠ A PARSE ERROR IS THE PROGRAMMER'S DIAGNOSTIC, NOT A CRASH. The text
+        // came from a C string literal and may be anything at all.
+        UnitBuilder ub{asmDialect_, DiagnosticBudget::libraryDefault()};
+        // The dialect is line-oriented — the newline IS its statement
+        // terminator (`asm-x86_64-att.lang.json`'s tokens banner) — so a
+        // template whose last line has no `\n` would lose that line. Appending
+        // one unconditionally is harmless: a blank line lowers to nothing.
+        ub.addInMemory(desc.templateText + "\n", "<inline asm>");
+        CompilationUnit unit = std::move(ub).finish();
+        if (unit.trees().empty()) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format("inline asm (MIR inst {}): the template produced no "
+                            "parse tree under dialect '{}'",
+                            id.v, dialect->name()));
+            return false;
+        }
+        Tree const& tree = unit.trees()[0];
+        bool templateParsed = true;
+        for (auto const& d : tree.diagnostics().all()) {
+            if (d.severity != DiagnosticSeverity::Error) continue;
+            templateParsed = false;
+            ParseDiagnostic copy = d;
+            reporter.report(std::move(copy));
+        }
+        if (!templateParsed) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "inline asm (MIR inst {}): the assembly template did not "
+                    "parse under dialect '{}' (named by target '{}'). The "
+                    "diagnostics above are the dialect's own; a template is a "
+                    "fragment of that dialect and is read by the same grammar a "
+                    "standalone `.s` is", id.v, dialect->name(), target.name()));
+            return false;
+        }
+
+        // ── 4. emit: pins → template → captures ──
+        // The instruction ids `LirBuilder` mints are contiguous and monotonic
+        // (`addInst` returns `instArena_.size() - 1`), so the block this
+        // expansion emits is the half-open id range recorded around it. That is
+        // how step 5 reaches instructions the ENGINE emitted, which this tier
+        // never sees individually.
+        std::uint32_t const firstEmitted = nextLirInstIdValue();
+        for (std::size_t j = 0; j < ins.size(); ++j) {
+            if (!ins[j].pinned) continue;
+            std::optional<LirReg> const src = regForValue(operands[j]);
+            if (!src.has_value()) return false;
+            std::array<LirOperand, 1> const pin{LirOperand::makeReg(*src)};
+            emitInst(*movOp, ins[j].reg, pin);
+        }
+
+        std::vector<AsmOperandBinding> bindings;
+        bindings.reserve(outs.size() + ins.size());
+        for (auto const& b : outs) {
+            bindings.push_back({b.spelling, b.reg, b.cls, b.widthBits});
+        }
+        for (auto const& b : ins) {
+            bindings.push_back({b.spelling, b.reg, b.cls, b.widthBits});
+        }
+        if (!lowerAsmTemplateToLirRun(tree, *dialect, target, bindings, lir,
+                                      reporter)) {
+            return false;
+        }
+        // ★ THE ENGINE EMITS DIRECTLY INTO THE BUILDER, so `recordSource` never
+        // saw its instructions and `lirInstEverEmitted_` may still be false —
+        // in which case `nextLirInstIdValue()` below would report an empty
+        // module and the handle would never be attached. A template that
+        // carried at least one non-blank line and lowered without a refusal
+        // emitted at least one instruction, which is exactly the condition
+        // under which `lastInst()` becomes safe. Counting the lines here (with
+        // the dialect's OWN `lineRule`, never by scanning the text) is what
+        // makes the accounting exact instead of optimistic.
+        if (templateLineCount(tree, dialect->assembly()) > 0) {
+            lirInstEverEmitted_ = true;
+        }
+
+        // Every register-pinned OUTPUT is read out of its register immediately.
+        // ⚠ Unpinned outputs are NOT captured: the template wrote the operand's
+        // vreg directly (that IS the `%N` binding), so a copy would be dead.
+        for (std::size_t k = 0; k < outs.size(); ++k) {
+            if (!outs[k].pinned) continue;
+            LirReg const dest = lir.newVReg(outs[k].cls);
+            std::array<LirOperand, 1> const cap{LirOperand::makeReg(outs[k].reg)};
+            emitInst(*movOp, dest, cap);
+            outs[k].reg = dest;   // the VALUE now lives in the vreg, not the pin
+        }
+        std::uint32_t const afterEmitted = nextLirInstIdValue();
+
+        // ── 5. attach the ONE constraint to EVERY instruction the block emitted ──
+        if (anyConstraint && afterEmitted > firstEmitted) {
+            std::uint32_t const handle = lir.regConstraintPoolAdd(std::move(c));
+            for (std::uint32_t v = firstEmitted; v < afterEmitted; ++v) {
+                lir.setInstRegConstraints(LirInstId{v, lir.id().v}, handle);
+            }
+        }
+
+        // ── 6. publish the outputs ──
+        // Output 0 is the instruction's OWN result (Call's rule); outputs
+        // 1..N-1 are read by `ReturnPiece`s that follow, and are handed their
+        // vreg through the derivability lookup in `lowerReturnPiece`.
+        for (std::size_t k = 1; k < outs.size(); ++k) {
+            asmPieceReg_[asmPieceKey(id, static_cast<std::uint32_t>(k))] =
+                outs[k].reg;
+        }
+        if (!outs.empty()) defineValue(id, outs[0].reg);
+        return true;
+    }
+
+    // How many NON-BLANK lines the template holds, read through the dialect's
+    // own `lineRule` rather than by looking at the text. A blank line has no
+    // visible children and contributes nothing; a line with any content lowered
+    // to at least one instruction, because the two shapes a template cannot
+    // carry (a directive, a label) are REFUSALS the engine already reported.
+    [[nodiscard]] static std::uint32_t
+    templateLineCount(Tree const& tree, AssemblyConfig const& cfg) {
+        std::uint32_t n = 0;
+        for (NodeId const line : asm_walk::visibleChildren(tree, tree.root())) {
+            if (tree.kind(line) != NodeKind::Internal) continue;
+            if (tree.rule(line).v != cfg.lineRule.v) continue;
+            if (!asm_walk::visibleChildren(tree, line).empty()) ++n;
+        }
+        return n;
+    }
+
+    // Output k's MIR value type for k >= 1: the type of the `ReturnPiece` that
+    // reads it. The pieces immediately follow their producer (HIR→MIR places
+    // them there and `lir_callconv` fails loud on broken adjacency), so the
+    // scan is bounded by the piece run rather than by the block.
+    // ⚠ Falls back to the producer's own type when the piece has not been
+    // reached — the width is then the conservative full one, never a guess at a
+    // narrower access.
+    [[nodiscard]] TypeId pieceTypeForAsm(MirInstId producer, std::size_t k) const {
+        MirBlockId const mb = mir.instBlock(producer);
+        if (!mb.valid()) return mir.instType(producer);
+        std::uint32_t const n = mir.blockInstCount(mb);
+        bool seen = false;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            MirInstId const cur = mir.blockInstAt(mb, i);
+            if (cur.v == producer.v) { seen = true; continue; }
+            if (!seen) continue;
+            if (mir.instOpcode(cur) != MirOpcode::ReturnPiece) break;
+            if (mir.returnPieceOrdinal(cur) == k) return mir.instType(cur);
+        }
+        return mir.instType(producer);
+    }
+
+    void lowerInlineAsm(MirInstId id) {
+        if (!expandInlineAsm(id)) {
+            // Poison ONLY a value the MIR says exists, so downstream reads do
+            // not cascade "used before definition" over the real diagnostic.
+            if (mir.instType(id).valid() && !valueToReg.has(id)) poisonValue(id);
+        }
+    }
+
+    // `asm goto` — the TERMINATOR form. Returns true iff the block was sealed.
+    //
+    // ⚠⚠ REFUSED, AND THE REFUSAL IS THE CORRECT ANSWER RATHER THAN A DEFERRAL.
+    // ✔MEASURED 2026-08-15 on both shipped dialects: neither declares an operand
+    // placeholder at all (x86 AT&T's `attRegister` is `[RegisterSigil,
+    // Identifier]`, so `%0` lexes as sigil + IntLiteral and matches nothing;
+    // arm64 gas spells `%` as `TypeSigil`), and NEITHER declares the `%l[label]`
+    // form an `asm goto` template needs to NAME its labels. A template that
+    // cannot name its labels cannot branch to them — so sealing this block with
+    // an unconditional jump to any one successor would silently pick a branch
+    // the programmer did not write, and sealing it with a fall-through would
+    // discard the edges entirely. Both are miscompiles with no diagnostic.
+    // (`asm goto` with NO labels never reaches here: HIR→MIR routes it to the
+    // ordinary non-terminator form, which this build lowers.)
+    [[nodiscard]] bool lowerInlineAsmGoto(MirInstId id,
+                                          std::span<MirBlockId const> succs) {
+        dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+            DiagnosticSeverity::Error,
+            std::format(
+                "`asm goto` (MIR inst {}) has {} label edge(s), and assembly "
+                "dialect '{}' declares no label-placeholder form for a template "
+                "to name them by — so the template cannot branch to its own "
+                "labels. Refused rather than sealed with a synthesized branch, "
+                "which would choose an edge the programmer did not write "
+                "(D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER)",
+                id.v, succs.size(), target.defaultAssemblyLanguage()));
+        return false;
     }
 
     // FC7 C3 (AAPCS64/Apple x8 sret): the callee-side entry read of the indirect-
@@ -7572,6 +8248,9 @@ struct Lowerer {
             case MirOpcode::SehFilterReturn:
                 sealed = lowerSehFilterReturn(termId, succs);
                 break;
+            case MirOpcode::InlineAsmGoto:
+                sealed = lowerInlineAsmGoto(termId, succs);
+                break;
             default:
                 reportUnsupported(op, termId);
                 break;
@@ -8662,9 +9341,27 @@ struct Lowerer {
     // `lirToMir` vector so `lirToMir[li.v]` is always the producer.
     void recordSource(LirInstId li) {
         if (!li.valid()) return;
+        lirInstEverEmitted_ = true;
         if (li.v >= lirToMir.size()) lirToMir.resize(li.v + 1);
         lirToMir[li.v] = currentMir;
     }
+
+    // ★ THE ID `LirBuilder::addInst` WILL MINT NEXT. Ids are contiguous and
+    // monotonic (`addInst` returns `instArena_.size() - 1`, slot 0 being the
+    // arena's sentinel), so a half-open id range is a faithful description of
+    // "the instructions emitted between these two points" — which is how the
+    // inline-asm expansion reaches instructions the shared assembly ENGINE
+    // emitted directly into the builder, bypassing the wrappers above.
+    //
+    // ⚠ `lastInst()` ABORTS on a module with no instructions and `LirBuilder`
+    // exposes no count, so the empty case is TRACKED rather than probed.
+    // `lirInstEverEmitted_` is set by `recordSource`, i.e. by every emission
+    // this lowering makes; the engine's emissions are accounted for separately
+    // at the one site that needs it.
+    [[nodiscard]] std::uint32_t nextLirInstIdValue() {
+        return lirInstEverEmitted_ ? (lir.lastInst().v + 1u) : 1u;
+    }
+    bool lirInstEverEmitted_ = false;
 
     // Forwarding wrappers around `LirBuilder` emitters that AUTO-RECORD
     // the source MIR inst (via `currentMir`). Cycle 3e fix-up: every

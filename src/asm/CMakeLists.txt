@@ -1,5 +1,9 @@
 add_library(asm OBJECT
     asm.cpp
+    # Plan 29 P5: the per-instruction text->LIR engine, shared by the
+    # standalone `.s` walker (asm_text_to_lir.cpp) and by an embedded
+    # `__asm__` template. One engine, two callers -- see the header banner.
+    asm_template_to_lir.cpp
     asm_text_to_lir.cpp
     disasm.cpp
     format/fixed32.cpp

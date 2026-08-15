@@ -189,14 +189,23 @@ namespace {
 
 // Point the named calling convention's `vaListLayout` at `strategy` and set
 // `key` on it. Returns the load result.
+//
+// ★ `value` defaults to the integer 48 (what every rejection case below used
+// when this helper hardcoded it), but is a parameter because the ACCEPTANCE
+// case needs a bool: `variadicUsesOverflowBase` is the only key valid for the
+// `homogeneous_pointer` strategy that no shipped layout already declares, and
+// feeding it a 48 would exercise a TYPE rejection instead of the key-scoping
+// acceptance the pin is for. The rejection cases are unaffected — the
+// cross-strategy gate fires on the key's NAME, before any value is read.
 [[nodiscard]] auto loadWithVaListKey(char const* target, char const* ccName,
-                                     char const* strategy, char const* key) {
+                                     char const* strategy, char const* key,
+                                     nlohmann::json value = 48) {
     return mutateShippedTargetSchemaDoc(
         target, [&](nlohmann::json& doc) {
             for (auto& cc : doc["callingConventions"]) {
                 if (cc.value("name", std::string{}) != ccName) continue;
                 cc["vaListLayout"]["strategy"] = strategy;
-                cc["vaListLayout"][key] = 48;
+                cc["vaListLayout"][key] = value;
             }
         });
 }
@@ -264,7 +273,32 @@ TEST(VaListStrategyKeys, AGenuineTypoSaysNoStrategyDeclaresIt) {
 TEST(VaListStrategyKeys, AKeyValidForTheDeclaredStrategyIsAccepted) {
     // The complementary arm — proving the gate is scoped to the CROSS-strategy
     // case and has not simply become "reject everything optional".
-    auto r = loadWithVaListKey("x86_64", "sysv_amd64", "sysv_register_save",
-                               "gpOffsetLimit");
+    //
+    // ⚠⚠ THIS PIN WAS VACUOUS AND SAID SO TO NO ONE (found 2026-08-14 by the
+    // byte-difference contract in `mutate_target_schema.hpp`, which threw here
+    // the moment it landed). It used to aim at
+    // `("x86_64", "sysv_amd64", "sysv_register_save", "gpOffsetLimit")` — and
+    // the shipped x86_64 `sysv_amd64` layout ALREADY declares
+    // `"strategy": "sysv_register_save"` AND `"gpOffsetLimit": 48`. The
+    // mutation wrote the two values that were already there, so the "mutant"
+    // was the shipped document byte-for-byte and this test asserted nothing
+    // beyond `ShippedTargetsStillLoad` above. Its name promised a key was
+    // ADDED; no key was ever added.
+    //
+    // ★ WHY `ms_x64`. A key that is valid for the declared strategy and NOT
+    // already present is the only shape that makes this pin mean what its name
+    // says, and there is exactly ONE in the shipped configs: every layout
+    // declares its complete key set EXCEPT x86_64's `ms_x64`, a
+    // `homogeneous_pointer` that omits `variadicUsesOverflowBase`. So this is
+    // now a genuine addition of an optional key onto its OWN strategy — the
+    // true mirror of the two rejection cases above, which put a key onto a
+    // strategy it does not belong to.
+    //
+    // ⚠ If a future shipped `ms_x64` starts declaring
+    // `variadicUsesOverflowBase: true`, this mutation becomes a no-op again —
+    // and the helper will THROW rather than let it pass quietly. That is the
+    // contract working, not a regression: re-aim the pin, never silence it.
+    auto r = loadWithVaListKey("x86_64", "ms_x64", "homogeneous_pointer",
+                               "variadicUsesOverflowBase", true);
     ASSERT_TRUE(r.has_value()) << summarize(r.error());
 }

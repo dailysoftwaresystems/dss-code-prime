@@ -765,15 +765,117 @@ private:
                 out_ += "goto"; out_ += flagsStr(f); out_ += " *";
                 emitExpr(hir_.indirectGotoTarget(id)); out_ += '\n'; return;
             case HirKind::InlineAsm:
-                // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm barrier —
-                // a 0-child leaf (no payload in cycle-1). Round-trips as a bare
-                // `inline_asm` keyword line.
-                out_ += "inline_asm"; out_ += flagsStr(f); out_ += '\n'; return;
+                emitInlineAsm(id, f); return;
             case HirKind::Error: case HirKind::Extension:
                 emitExtOrError(id, /*inlineForm=*/false, ind); out_ += '\n'; return;
             default:
                 report("unexpected node kind in statement position"); out_ += "error\n"; return;
         }
+    }
+
+    // -- inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS) -----------------------
+    //
+    // TWO FORMS, because the node has two. `payload == kNoInlineAsmDescriptor`
+    // is the bare barrier and renders EXACTLY as it always has - a lone
+    // `inline_asm` keyword line - so every pre-P5 golden is byte-identical.
+    // A descriptor renders as:
+    //
+    //   inline_asm "TEMPLATE" [{ [extended] [goto] [mem] [cc]
+    //                          [outputs <N> operands ( <opnd> , ... )]
+    //                          [clobbers ( "r" , ... )]
+    //                          [labels ( L<n> , ... )] }]
+    //   <opnd> := "constraint" [ [name] ] [class <N>] [pin "reg"] -> <expr>
+    //
+    // * THE POOL HANDLE IS NOT PRINTED, and that is what keeps the round trip
+    // stable: the descriptor is rendered INLINE, the parser re-adds it and gets
+    // a fresh handle in tree order, and re-emitting yields the same bytes. The
+    // `lit <value>` form works exactly this way and for exactly this reason.
+    // !! With NO pool supplied the handle CANNOT be resolved, so the `#<handle>`
+    // fallback is emitted AND a diagnostic is reported - the literal pool's
+    // out-of-range arm, never the silent degradation its no-pool arm takes: a
+    // `lit` without its value still says `lit`, whereas an asm statement
+    // rendered without its operands would read as a bare barrier, which is a
+    // DIFFERENT PROGRAM.
+    void emitInlineAsm(HirNodeId id, HirFlags f) {
+        std::uint32_t const handle = hir_.payload(id);
+        out_ += "inline_asm";
+        out_ += flagsStr(f);
+        if (handle == kNoInlineAsmDescriptor) { out_ += '\n'; return; }
+        if (ctx_.inlineAsmPool == nullptr || !ctx_.inlineAsmPool->contains(handle)) {
+            report("inline-asm descriptor handle does not resolve against the "
+                   "supplied pool - rendering the opaque handle form; the "
+                   "operands, clobbers and labels are NOT in this output");
+            out_ += std::format(" #{}\n", handle);
+            return;
+        }
+        auto const& d = ctx_.inlineAsmPool->at(handle);
+        out_ += ' ';
+        out_ += quote(d.templateText);
+        // !! THE DESCRIPTOR TAIL IS BRACED, AND THE BRACES ARE NOT DECORATION.
+        // The flags are bare keywords and one of them is `goto`, which is ALSO
+        // a statement keyword -- and this format's lexer is newline-blind. So
+        //     inline_asm "nop"
+        //     goto L1
+        // would parse the NEXT STATEMENT's `goto` as this asm's goto flag and
+        // then choke on `L1`. Bracing the tail makes its extent explicit and
+        // kills that whole collision class rather than renaming one keyword out
+        // of the way (the next keyword added would re-open it).
+        // The braces are omitted when there is nothing to put in them, so the
+        // commonest form -- a plain basic template -- stays a one-token tail.
+        auto const kids = hir_.children(id);
+        bool const anyTail = d.isExtended || d.isGoto || d.clobbersMemory
+                             || d.clobbersConditionCodes || !d.operands.empty()
+                             || !d.clobbers.empty() || !d.labelOrdinals.empty();
+        if (!anyTail) { out_ += '\n'; return; }
+        out_ += " {";
+        if (d.isExtended)             out_ += " extended";
+        if (d.isGoto)                 out_ += " goto";
+        if (d.clobbersMemory)         out_ += " mem";
+        if (d.clobbersConditionCodes) out_ += " cc";
+        if (!d.operands.empty()) {
+            out_ += std::format(" outputs {} operands (", d.outputCount);
+            for (std::size_t i = 0; i < d.operands.size(); ++i) {
+                auto const& op = d.operands[i];
+                out_ += (i == 0 ? " " : ", ");
+                out_ += quote(op.constraint.raw);
+                if (!op.symbolicName.empty()) {
+                    out_ += " ["; out_ += op.symbolicName; out_ += ']';
+                }
+                if (op.regClassResolved)
+                    out_ += std::format(" class {}", op.regClass);
+                if (!op.fixedRegister.empty()) {
+                    out_ += " pin "; out_ += quote(op.fixedRegister);
+                }
+                out_ += " -> ";
+                // The operand's VALUE is child i - the descriptor and the child
+                // list are index-aligned by construction, and `HirVerifier`'s
+                // `checkInlineAsm` is what keeps them so.
+                if (i < kids.size()) { emitExpr(kids[i]); }
+                else {
+                    report("inline-asm descriptor declares more operands than the "
+                           "node has children");
+                    out_ += "error";
+                }
+            }
+            out_ += " )";
+        }
+        if (!d.clobbers.empty()) {
+            out_ += " clobbers (";
+            for (std::size_t i = 0; i < d.clobbers.size(); ++i) {
+                out_ += (i == 0 ? " " : ", ");
+                out_ += quote(d.clobbers[i]);
+            }
+            out_ += " )";
+        }
+        if (!d.labelOrdinals.empty()) {
+            out_ += " labels (";
+            for (std::size_t i = 0; i < d.labelOrdinals.size(); ++i) {
+                out_ += (i == 0 ? " " : ", ");
+                out_ += std::format("L{}", d.labelOrdinals[i]);
+            }
+            out_ += " )";
+        }
+        out_ += " }\n";
     }
 
     // A parameter VarDecl inside a (extern)function body.
@@ -1243,6 +1345,10 @@ public:
     std::vector<DiagPend> pDiag_;
     std::vector<HirNodeId> indexToId_;          // pre-order index -> built node
     HirLiteralPool        pLiterals_;           // values from inline `lit <value>` forms
+    // Inline-asm P5: descriptors rebuilt from the inline `inline_asm ...` form.
+    // Handles are re-minted IN TREE ORDER by `parseInlineAsm`, which is what
+    // makes emit(parse(emit(h))) byte-identical without printing the handle.
+    HirInlineAsmPool      pInlineAsm_;
 
     // Parse the whole file. Returns the module root (invalid on a fatal header
     // error). Populates the builder, interner, side-table pending lists.
@@ -1861,7 +1967,7 @@ private:
             return builder_.makeContinue(d, flags); }
         // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm barrier — a bare
         // `inline_asm` leaf (mirrors the writer arm; no payload in cycle-1).
-        if (kw == "inline_asm") return builder_.addLeaf(HirKind::InlineAsm, InvalidType, 0, flags);
+        if (kw == "inline_asm") return parseInlineAsm(flags);
         if (kw == "return") {
             // A return value may carry inline attributes (`return @loc(...) expr`).
             // A value-less `return` is always block-terminal (nothing may follow
@@ -1900,6 +2006,97 @@ private:
     [[nodiscard]] bool startsExpr() {
         if (!peekIs(Tk::Ident)) return false;
         return isExprKeyword(lex_.peek().text);
+    }
+
+    // Inline-asm P5: the inverse of `emitInlineAsm`. Three forms, matching the
+    // writer exactly:
+    //   `inline_asm`                 - the bare barrier (payload 0, no children)
+    //   `inline_asm #<n>`            - the opaque handle the writer falls back to
+    //                                  when it had no pool; carried through
+    //                                  VERBATIM so a pool-less round trip is
+    //                                  still byte-identical
+    //   `inline_asm "tmpl" ...`      - a full descriptor, re-added to THIS parse's
+    //                                  pool (handle re-minted in tree order)
+    //
+    // * SECTION ORDER IS FIXED AND THE PARSE IS ORDER-DEPENDENT, deliberately:
+    // the writer emits one canonical order, so accepting a permuted input would
+    // admit text `emitHir` can never produce and quietly break the
+    // emit(parse(emit)) identity the format's contract rests on.
+    [[nodiscard]] HirNodeId parseInlineAsm(HirFlags flags) {
+        if (accept(Tk::Hash)) {
+            auto const raw = takeInt();
+            return builder_.addLeaf(HirKind::InlineAsm, InvalidType,
+                                    static_cast<std::uint32_t>(raw), flags);
+        }
+        if (!peekIs(Tk::Str)) {
+            return builder_.addLeaf(HirKind::InlineAsm, InvalidType,
+                                    kNoInlineAsmDescriptor, flags);
+        }
+        HirInlineAsmDescriptor d;
+        d.templateText = takeStr();
+        std::vector<HirNodeId> children;
+        // No brace => a bare template with no flags and no sections. See the
+        // writer for why the tail is braced at all (`goto` is a statement
+        // keyword and this lexer is newline-blind).
+        if (!accept(Tk::LBrace)) {
+            std::uint32_t const bare = pInlineAsm_.add(std::move(d));
+            return builder_.addLeaf(HirKind::InlineAsm, InvalidType, bare, flags);
+        }
+        if (acceptKeyword("extended")) d.isExtended             = true;
+        if (acceptKeyword("goto"))     d.isGoto                 = true;
+        if (acceptKeyword("mem"))      d.clobbersMemory         = true;
+        if (acceptKeyword("cc"))       d.clobbersConditionCodes = true;
+
+        if (acceptKeyword("outputs")) {
+            d.outputCount = static_cast<std::uint32_t>(takeInt());
+            if (!acceptKeyword("operands")) {
+                malformed("expected 'operands (' after 'outputs <n>'");
+                return builder_.addLeaf(HirKind::InlineAsm, InvalidType,
+                                        kNoInlineAsmDescriptor, flags);
+            }
+            expect(Tk::LParen, "'('");
+            do {
+                HirInlineAsmOperand op;
+                // The RAW constraint is what the source wrote; re-splitting it
+                // through the SAME `parseAsmConstraint` the front end used is
+                // what keeps the modifier flags from becoming a second source of
+                // truth that a hand-edited `.dsshir` could contradict.
+                auto const parsed = parseAsmConstraint(takeStr());
+                if (!parsed.ok())
+                    malformed("inline-asm operand constraint does not parse: "
+                              + std::string{asmConstraintDefectDescription(parsed.defect)});
+                op.constraint = parsed.value;
+                op.isOutput   = d.operands.size() < d.outputCount;
+                if (accept(Tk::LBrack)) {
+                    op.symbolicName = takeIdent();
+                    expect(Tk::RBrack, "']'");
+                }
+                if (acceptKeyword("class")) {
+                    op.regClassResolved = true;
+                    op.regClass = static_cast<std::uint8_t>(takeInt());
+                }
+                if (acceptKeyword("pin")) op.fixedRegister = takeStr();
+                expect(Tk::Arrow, "'->' before an inline-asm operand value");
+                children.push_back(parseNode());
+                d.operands.push_back(std::move(op));
+            } while (accept(Tk::Comma));
+            expect(Tk::RParen, "')'");
+        }
+        if (acceptKeyword("clobbers")) {
+            expect(Tk::LParen, "'('");
+            do { d.clobbers.push_back(takeStr()); } while (accept(Tk::Comma));
+            expect(Tk::RParen, "')'");
+        }
+        if (acceptKeyword("labels")) {
+            expect(Tk::LParen, "'('");
+            do { d.labelOrdinals.push_back(parseLabelOrdinal()); }
+            while (accept(Tk::Comma));
+            expect(Tk::RParen, "')'");
+        }
+        expect(Tk::RBrace, "'}' closing the inline-asm descriptor");
+        std::uint32_t const handle = pInlineAsm_.add(std::move(d));
+        return builder_.addParent(HirKind::InlineAsm, children, InvalidType,
+                                  handle, flags);
     }
 
     HirNodeId parseVarLike(HirFlags flags) {
@@ -2211,6 +2408,7 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
 
     // Hand back the rebuilt literal pool (empty if the source used `#index`).
     res->literalPool = std::move(parser.pLiterals_);
+    res->inlineAsmPool = std::move(parser.pInlineAsm_);
 
     // Apply the collected side-table annotations to the frozen module's maps.
     for (auto& [id, v] : parser.pLoc_)       res->sourceMap.set(id, v);
@@ -2227,7 +2425,8 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
     }
 
     // Verify-on-load: the round-trip is only clean if the rebuilt module verifies.
-    HirVerifier verifier{res->hir, &res->sourceMap, &res->interner};
+    HirVerifier verifier{res->hir, &res->sourceMap, &res->interner,
+                         &res->inlineAsmPool};
     (void)verifier.verify(reporter);
 
     res->ok = reporter.errorCount() == errBefore;
