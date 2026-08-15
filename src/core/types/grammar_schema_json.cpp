@@ -1863,6 +1863,59 @@ void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll
     }
 }
 
+// ★★★ CAN A TEMPLATE STARTED IN `mode` EVER LEX A PLACEHOLDER? Returns the
+// kinds of `FIRST(placeholderRule)` that `mode`'s lexeme table does NOT mint —
+// empty means the mode can produce every token a placeholder may begin with,
+// which is the whole of what `assembly.templateLexerMode` has to guarantee.
+//
+// ★★ WHY THE QUESTION IS PHRASED OVER FIRST-SETS AND MODE MEANINGS AND NOT
+// OVER THE `templatePlaceholder` TOKEN ROLE. The role is a HOLE: the shared
+// `asm.lang.json` spells it and each dialect binds it in
+// `languageReferences.bindTokens`. That binding is consumed by
+// `mergeLanguageReferences`, which substitutes the resolved KIND into the
+// merged shapes — the role NAME does not survive into this pass, so a check
+// written against it would either read a stale table or need the merge to
+// publish a map it does not have. FIRST-sets and `lexerModeTokens` are both
+// facts this pass already holds, and they answer the same question one level
+// more generally: whatever a dialect calls its sigil, the mode must mint the
+// kind the placeholder rule actually starts with.
+//
+// ⚠ THE FALLBACK IS WHY "HAS A `tokens` TABLE" IS NOT THE TEST. A mode's lookup
+// falls back to the GLOBAL table for every lexeme it does not override
+// (`GrammarSchema::lookupLexemeInMode` returns empty and `longestMatchInMode`
+// retries globally), so `main`, a `tokens: "default"` copy, a mode with no
+// `tokens` key, AND a mode that overrides some UNRELATED lexeme all read a
+// template exactly as the `.s` surface does. Only minting the placeholder's own
+// first kind distinguishes the template surface from the file surface.
+[[nodiscard]] std::vector<SchemaTokenId>
+templateModeUnmintedFirstKinds(GrammarSchemaData const& data,
+                               LexerModeId mode, RuleId placeholderRule) {
+    // A rule that did not resolve has already been refused by `readRule`;
+    // reporting a second, derived failure for it would send the reader to the
+    // wrong key.
+    if (!placeholderRule.valid()) return {};
+    auto const ruleIt = data.compiledRules.find(placeholderRule.v);
+    if (ruleIt == data.compiledRules.end()) return {};
+    auto const& firstSet = ruleIt->second.firstSet;
+    if (firstSet.empty()) return {};
+
+    std::unordered_set<std::uint32_t> minted;
+    if (auto const tableIt = data.lexerModeTokens.find(mode.v);
+        tableIt != data.lexerModeTokens.end()) {
+        for (auto const& [lexeme, meanings] : tableIt->second) {
+            for (auto const& m : meanings) {
+                if (m.id.valid()) minted.insert(m.id.v);
+            }
+        }
+    }
+
+    std::vector<SchemaTokenId> unminted;
+    for (SchemaTokenId const k : firstSet) {
+        if (!minted.contains(k.v)) unminted.push_back(k);
+    }
+    return unminted;
+}
+
 // Parse one lexeme's array of meaning objects into a vector of
 // LexemeMeaning, sorted priority-ascending (stable on declaration-order
 // ties). Shared by the top-level `tokens` table and per-mode `tokens`
@@ -14161,11 +14214,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             coll.emit(DiagnosticCode::C_InvalidHirLowering, "/assembly",
                       "'assembly' must be an object");
         } else {
-            static constexpr std::array<std::string_view, 11> kAssemblyKeys{
+            static constexpr std::array<std::string_view, 13> kAssemblyKeys{
                 "unitRule",      "lineRule",      "elementRule",
                 "directiveRule", "statementRule", "labelTailRule",
                 "operandSeqRule", "operandOrder", "operandForms",
-                "instructions",  "spellingCase"};
+                "instructions",  "spellingCase",
+                "templateLexerMode", "templateOperandRule"};
             DSS_CHECK_KEY_VOCABULARY(kAssemblyKeys);
             // `directives` is intentionally NOT in the required set above — it
             // is validated separately below because it is the one key whose
@@ -14222,6 +14276,209 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readRule("statementRule",  cfg.statementRule);
             readRule("labelTailRule",  cfg.labelTailRule);
             readRule("operandSeqRule", cfg.operandSeqRule);
+
+            // ── the TEMPLATE SURFACE: `templateLexerMode` + `templateOperandRule`
+            //
+            // ★★★ OPTIONAL AS A PAIR, REQUIRED OF EACH OTHER, AND THAT IS THE
+            // WHOLE OF WHY THIS IS NOT TWO INDEPENDENT `if (contains)` BLOCKS.
+            // A dialect that hosts no embedded `__asm__` declares neither and
+            // loses nothing. Declaring ONE is always a defect, and a SILENT one
+            // in both directions: a mode with no rule mints placeholder tokens
+            // no shape accepts (every template fails at the parser with a
+            // message about the sigil, never about the missing rule), and a rule
+            // with no mode declares a shape whose FIRST token nothing ever
+            // produces (every template fails as if the placeholder had not been
+            // declared at all). Neither half announces itself, which is exactly
+            // the accept-and-do-nothing this config surface refuses everywhere
+            // else — `operandForms` is REQUIRE-ALL for the same reason.
+            {
+                bool const hasMode = as.contains("templateLexerMode");
+                bool const hasRule = as.contains("templateOperandRule");
+                if (hasMode != hasRule) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("/assembly/{}",
+                                          hasMode ? "templateOperandRule"
+                                                  : "templateLexerMode"),
+                              std::format(
+                                  "'assembly' declares '{}' but not '{}' — the "
+                                  "two are the TWO HALVES of one capability (an "
+                                  "embedded assembly template's operand "
+                                  "placeholders) and neither does anything "
+                                  "alone. The mode is what gives this dialect's "
+                                  "placeholder sigil a token kind of its own; "
+                                  "the rule is what lets the lowering RECOGNISE "
+                                  "a placeholder without naming another "
+                                  "document's rule in C++. Declare both, or "
+                                  "neither and host no templates",
+                                  hasMode ? "templateLexerMode"
+                                          : "templateOperandRule",
+                                  hasMode ? "templateOperandRule"
+                                          : "templateLexerMode"));
+                    assemblyClean = false;
+                } else if (hasMode) {
+                    // ★ THE RULE IS READ FIRST BECAUSE THE MODE CHECK NEEDS IT.
+                    // "Is this a mode a template can be read in?" is not a
+                    // question about the mode alone — see the FIRST-set arm
+                    // below, which asks whether this mode can produce the token
+                    // the placeholder RULE begins with. Reading the rule after
+                    // the mode (as this block did when it shipped) left that
+                    // question unanswerable and the check enforced a proxy.
+                    readRule("templateOperandRule", cfg.templateOperandRule);
+                    json const& lm = as.at("templateLexerMode");
+                    if (!lm.is_string() || lm.get<std::string>().empty()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  "/assembly/templateLexerMode",
+                                  "'templateLexerMode' must name one of this "
+                                  "document's declared lexer modes");
+                        assemblyClean = false;
+                    } else {
+                        auto const modeName = lm.get<std::string>();
+                        auto const it = data.lexerModeIds.find(modeName);
+                        if (it == data.lexerModeIds.end()) {
+                            coll.emit(DiagnosticCode::C_UnknownLexerMode,
+                                      "/assembly/templateLexerMode",
+                                      std::format(
+                                          "unknown lexer mode '{}' — the "
+                                          "template parse entry starts the "
+                                          "tokenizer in this mode, so a name "
+                                          "that resolves to nothing would lex "
+                                          "every template in the MAIN mode and "
+                                          "silently give back the `.s` surface",
+                                          modeName));
+                            assemblyClean = false;
+                        } else if (it->second.v >= data.lexerModes.size()) {
+                            // ⚠ A VALIDITY TEST, NOT A CLAUSE OF THE NEXT ONE.
+                            // This used to be `&&`-ed into the body-mode
+                            // condition below, which meant an out-of-range id
+                            // FELL THROUGH TO THE ACCEPTING ARM and installed
+                            // itself — the tokenizer then aborted the process
+                            // (`initial lexer mode is not declared by this
+                            // schema`) at the first template, one tier away
+                            // from the document that caused it. A bound check
+                            // that decides "valid" when it fails is not a bound
+                            // check.
+                            // ⓘ Not reachable from any config today — the loader
+                            // mints dense ids 1..N and `lexerModeIds` is written
+                            // only alongside `lexerModes` — so this is an
+                            // internal-consistency refusal. It is kept because
+                            // the alternative to refusing is the abort above,
+                            // and a loader that indexes an unchecked id is one
+                            // refactor away from doing it out of bounds.
+                            coll.emit(DiagnosticCode::C_UnknownLexerMode,
+                                      "/assembly/templateLexerMode",
+                                      std::format(
+                                          "lexer mode '{}' resolved to id {}, "
+                                          "which this document's {} declared "
+                                          "mode(s) do not contain — the template "
+                                          "parse entry hands this id to the "
+                                          "tokenizer, which treats an undeclared "
+                                          "one as a fatal caller defect",
+                                          modeName, it->second.v,
+                                          data.lexerModes.size()));
+                            assemblyClean = false;
+                        } else if (data.lexerModes[it->second.v]
+                                       .defaultToken.has_value()) {
+                            // ⚠ A BODY MODE HAS A `defaultToken`, AND THE
+                            // TOKENIZER NEVER REACHES THE PER-MODE LOOKUP IN
+                            // ONE — it scans a codepoint at a time to the
+                            // mode's `endsAt`. The loader already warns that
+                            // such a mode's `tokens` table "can never be
+                            // consulted"; naming one HERE is the same defect
+                            // one level up and is an ERROR rather than a
+                            // warning, because the result is a template lexed
+                            // entirely as comment/string body characters.
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      "/assembly/templateLexerMode",
+                                      std::format(
+                                          "lexer mode '{}' declares a "
+                                          "'defaultToken', which makes it a "
+                                          "BODY mode — the tokenizer scans a "
+                                          "body mode one codepoint at a time "
+                                          "and never performs the per-mode "
+                                          "lexeme lookup, so a template started "
+                                          "in it would produce body characters "
+                                          "and not one placeholder. Name a "
+                                          "SCANNING mode (one with a 'tokens' "
+                                          "override and no 'defaultToken')",
+                                          modeName));
+                            assemblyClean = false;
+                        } else if (auto const unminted =
+                                       templateModeUnmintedFirstKinds(
+                                           data, it->second,
+                                           cfg.templateOperandRule);
+                                   !unminted.empty()) {
+                            // ★★★ THE OTHER HALF OF "A SCANNING MODE", AND
+                            // WITHOUT IT THIS CHECK ENFORCED HALF OF WHAT ITS
+                            // OWN MESSAGE PROMISED — it tested `defaultToken`
+                            // only, so `"templateLexerMode": "main"` loaded
+                            // clean and installed the `.s` surface, which is the
+                            // exact outcome the unknown-mode arm above says it
+                            // exists to prevent.
+                            //
+                            // ⚠ AND "THE MODE MUST HAVE A `tokens` OVERRIDE"
+                            // WOULD HAVE BEEN THE WRONG REPAIR: it rejects the
+                            // most obvious instance and leaves the defect. ✔The
+                            // corpus already demonstrates the general case — the
+                            // `decoy` mode in
+                            // `PointingTheTemplateModeElsewhereDisablesTheWholeSurface`
+                            // HAS an override (`@@` → TypeSigil) and the whole
+                            // placeholder surface is still dead when a template
+                            // is read in it. What matters is not that the mode
+                            // overrides SOMETHING; it is that the mode can
+                            // produce the token a placeholder BEGINS with.
+                            //
+                            // ⇒ the test is FIRST(templateOperandRule) ⊆ the
+                            // kinds this mode's table mints. It is stated purely
+                            // in facts this pass already holds — a merged rule's
+                            // FIRST set and a mode's RESOLVED meanings — and
+                            // deliberately NOT in terms of the `templatePlaceholder`
+                            // token ROLE: role names live in the host's
+                            // `languageReferences.bindTokens`, are consumed
+                            // during the merge, and are not available here.
+                            // ✔MEASURED that both inputs are ready at this
+                            // point: `computeFirstAndNullable` runs in the shapes
+                            // pass (line ~5051 of this file) and
+                            // `lexerModeTokens` is filled by the lexer-mode pass
+                            // before it — both thousands of lines above the
+                            // `assembly` block.
+                            std::string missing;
+                            for (SchemaTokenId const k : unminted) {
+                                if (!missing.empty()) missing += ", ";
+                                missing += '\'';
+                                missing += data.schemaTokens->name(k);
+                                missing += '\'';
+                            }
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      "/assembly/templateLexerMode",
+                                      std::format(
+                                          "lexer mode '{}' mints no meaning for "
+                                          "{} — the token kind(s) a template "
+                                          "operand placeholder BEGINS with. A "
+                                          "mode's lexeme lookup falls back to "
+                                          "the GLOBAL table for every lexeme its "
+                                          "own table does not override, so a "
+                                          "mode that does not give the "
+                                          "placeholder sigil a kind of its own "
+                                          "reads a template EXACTLY as the `.s` "
+                                          "surface does and no placeholder can "
+                                          "ever be lexed — the whole template "
+                                          "surface is silently dead. That is "
+                                          "true of 'main', of a mode whose "
+                                          "'tokens' is the literal \"default\" "
+                                          "(a verbatim copy of the global "
+                                          "table), of a mode with no 'tokens' "
+                                          "key at all, AND of a mode that "
+                                          "overrides some unrelated lexeme. Name "
+                                          "the SCANNING mode whose 'tokens' "
+                                          "table mints the placeholder sigil",
+                                          modeName, missing));
+                            assemblyClean = false;
+                        } else {
+                            cfg.templateLexerMode = it->second;
+                        }
+                    }
+                }
+            }
 
             // ── operandOrder ── the ONE dialect-wide fact (see
             // `assembly_config.hpp` for why it is not per-instruction).
@@ -14401,6 +14658,59 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                     cfg.operandFormRules[static_cast<std::size_t>(role)] =
                         data.rules->find(ruleName);
+                }
+            }
+
+            // ★★★ `templateOperandRule` MAY NOT ALSO BE AN `operandForms` RULE,
+            // AND THIS IS THE THIRD SHAPE OF THE SAME SILENT NO-OP THE TEMPLATE
+            // PAIR ABOVE REFUSES TWICE.
+            //
+            // ✔TRACED in `AsmInstructionLowering::decodeOperand`: the placeholder
+            // branch lives INSIDE the `while (mask == 0)` descent — deliberately,
+            // so a placeholder nested inside a roled form stays the roled
+            // decode's business. So the moment `rolesForRule(templateOperandRule)`
+            // is non-zero the loop body never runs for that node, the placeholder
+            // branch is DEAD CODE, and every `%0` decodes as whatever role the
+            // dialect bound — a register spelling of `%0`, an immediate, a
+            // symbol. The key loads clean, the surface looks declared, and
+            // nothing placeholder-shaped ever happens.
+            //
+            // ⚠ IT IS CHECKED HERE RATHER THAN IN THE TEMPLATE BLOCK because
+            // `operandForms` is read AFTER it — `cfg.operandFormRules` is not
+            // populated until the loop above finishes, so the same test one
+            // hundred lines earlier would have compared against an empty table
+            // and passed on every document.
+            if (cfg.templateOperandRule.valid()) {
+                std::uint8_t const mask =
+                    cfg.rolesForRule(cfg.templateOperandRule);
+                if (mask != 0) {
+                    std::string roles;
+                    for (auto const& [text, role] : kAsmOperandRoleNames) {
+                        if (!AssemblyConfig::maskHas(mask, role)) continue;
+                        if (!roles.empty()) roles += ", ";
+                        roles += '\'';
+                        roles += text;
+                        roles += '\'';
+                    }
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              "/assembly/templateOperandRule",
+                              std::format(
+                                  "'templateOperandRule' names a rule that "
+                                  "'operandForms' ALSO binds (to {}) — and a "
+                                  "rule that carries an operand ROLE never "
+                                  "reaches the placeholder decode at all. The "
+                                  "lowering descends through rules bound to NO "
+                                  "role and tests for a placeholder on the way "
+                                  "down, so a roled placeholder rule makes the "
+                                  "placeholder branch unreachable and every "
+                                  "placeholder decodes as that role instead: the "
+                                  "key would be accepted and do nothing. A "
+                                  "placeholder is not one of this dialect's "
+                                  "operand shapes — it names an operand of the "
+                                  "construct that embedded the assembly — so "
+                                  "give it a rule of its own",
+                                  roles));
+                    assemblyClean = false;
                 }
             }
 

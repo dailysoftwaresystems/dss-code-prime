@@ -16,7 +16,7 @@
   "isa": "aarch64",
 
   "languageReferences": {
-    "$comment": "★★★ THE SHARED LINE STRUCTURE, REACHED BY REFERENCE — AND THIS BLOCK IS BYTE-FOR-BYTE THE SAME SHAPE AS THE AT&T DOCUMENT'S, WHICH IS THE MEASUREMENT. `entry: \"asmLine\"` imports exactly the seven rules reachable from it and NOTHING of the embedded `__asm__(…)` surface (the entry-closure scoping in `mergeLanguageReferences`), so this dialect owes four standalone holes plus the two shared with the embedded surface — not the sixteen `asm.lang.json` declares.\n★ THE FIVE BOUND TOKENS ARE THE SAME FIVE ROLES the AT&T document binds, to five DIFFERENT kinds of this document's own. Same roles, different vocabularies, one grammar: the property the mechanism exists to have, now witnessed by a second signatory rather than argued for by one.",
+    "$comment": "★★★ THE SHARED LINE STRUCTURE, REACHED BY REFERENCE — AND THIS BLOCK IS BYTE-FOR-BYTE THE SAME SHAPE AS THE AT&T DOCUMENT'S, WHICH IS THE MEASUREMENT. `entry: \"asmLine\"` imports exactly the rules reachable from it and NOTHING of the embedded `__asm__(…)` surface (the entry-closure scoping in `mergeLanguageReferences`), so this dialect owes the standalone holes plus the ones shared with the embedded surface — not every hole `asm.lang.json` declares.\n★ THE BOUND TOKENS ARE THE SAME ROLES the AT&T document binds, to DIFFERENT kinds of this document's own. Same roles, different vocabularies, one grammar: the property the mechanism exists to have, now witnessed by a second signatory rather than argued for by one.\n\n★★★ THE TEMPLATE PLACEHOLDER ROLES ARRIVED 2026-08-15 (D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER) AND THIS DIALECT IS THE ONE THAT NEEDED THEM MOST. ✔MEASURED: AArch64 has no register-PINNING constraint letter (this target declares `r`, `w`, `m`, `i` and none of them names a specific register), so an `__asm__` OUTPUT on arm64 can only be written through a placeholder — which means that until these five bindings existed, EVERY aarch64 asm output was unspellable and sqlite's own `hwtime.h` arm (`mrs %0, cntvct_el0`) could not be written at all.\n★★ AND THE BINDING SPLIT IS THE INTERESTING PART, BECAUSE IT IS NOT THE SAME AS THE AT&T DOCUMENT'S. TWO of the five roles bind to kinds this document mints ONLY in its `asm-template` lexer mode (`%` -> PlaceholderSigil and `%l` -> PlaceholderLabelSigil), while `templateOperandIndex` binds to the ORDINARY global `IntLiteral` and `symbolicNameOpen`/`symbolicNameClose` bind to the ORDINARY `BracketOpen`/`BracketClose` this dialect already declares globally for its memory form — `[sp, #-16]` and `%[out]` genuinely use the same byte here, and the AT&T document had to declare a bracket of its own because x86 gas has none. Two dialects, one role set, two different vocabularies AND two different declaration sites: the sharpest witness this mechanism has produced.\n★ No FIRST-set collision follows from reusing the bracket: `armMemory` opens with `BracketOpen` and the placeholder opens with the placeholder sigil, so the two alt branches stay disjoint — and `detectAmbiguousAlternatives` re-runs over the MERGED rule set, so that is checked rather than asserted.",
     "asm": {
       "entry": "asmLine",
       "bindRules": {
@@ -27,7 +27,12 @@
         "labelSeparator": "LabelColon",
         "directiveIntroducer": "DirectiveDot",
         "operandSeparator": "OperandComma",
-        "symbolName": "Identifier"
+        "symbolName": "Identifier",
+        "templatePlaceholder": "PlaceholderSigil",
+        "templateLabelPlaceholder": "PlaceholderLabelSigil",
+        "templateOperandIndex": "IntLiteral",
+        "symbolicNameOpen": "BracketOpen",
+        "symbolicNameClose": "BracketClose"
       }
     }
   },
@@ -48,7 +53,6 @@
              "stringStyle": { "escapeKind": "none", "endsAt": "*/" } }],
 
     "#":  [{ "kind": "ImmediateSigil" }],
-    "%%": [{ "kind": "PercentEscape" }],
     "%":  [{ "kind": "TypeSigil" }],
     ",": [{ "kind": "OperandComma" }],
     ":": [{ "kind": "LabelColon" }],
@@ -66,7 +70,16 @@
   "lexerModes": {
     "$comment": "The two comment bodies, verbatim in shape from the AT&T dialect (which took them verbatim from `c-subset.lang.json`): every character inside becomes an `EmptySpace` CommentChar, and an unterminated body is reported as a comment rather than as a wall of stray tokens. The `endsAtExclusive` on `//` above is what keeps the terminating `LineEnd` OUTSIDE the comment body — without it a comment-terminated line loses its terminator and merges with the next.",
     "line-comment":  { "defaultToken": { "kind": "CommentChar", "flags": ["EmptySpace"] }, "unterminatedAs": "comment" },
-    "block-comment": { "defaultToken": { "kind": "CommentChar", "flags": ["EmptySpace"] }, "unterminatedAs": "comment" }
+    "block-comment": { "defaultToken": { "kind": "CommentChar", "flags": ["EmptySpace"] }, "unterminatedAs": "comment" },
+
+    "$templateComment": "★★★ `asm-template` — THE SECOND LEXICAL SURFACE OF THIS DIALECT (2026-08-15, D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER), AND THE SIBLING OF THE AT&T DOCUMENT'S MODE OF THE SAME NAME. Not a body mode: no `defaultToken`, so the scanner runs its ordinary lexeme match and consults this table FIRST with the global table as fallback. Entered only by the TEMPLATE PARSE ENTRY, which reads the name from `assembly.templateLexerMode`; a `.s` never enters it.\n\n★★ THREE ROWS, AND THE THIRD IS THE ONE THAT NEEDS DEFENDING.\n  • `%` -> `PlaceholderSigil` — the operand placeholder. `%` is `TypeSigil` globally here (`.type main, %function`), which is a DIFFERENT collision from the AT&T document's `RegisterSigil` and is exactly why the escape has to be declared per dialect: the byte being escaped means something different in each. The same one-byte argument that made a dialect a language, one level down.\n  • `%l` -> `PlaceholderLabelSigil` — `asm goto`'s label sigil, two bytes so maximal munch settles `%l[done]` against `%0` in the tokenizer. ⚠ It cannot shadow `lsl`/`ldr`/`ldp`: the lexeme starts at the percent.\n⚠⚠ THE `%l` ROW IS THE GRAMMAR HALF ONLY — NOTHING LOWERS A LABEL PLACEHOLDER. The row makes `%l[done]` LEX and PARSE; the lowering then refuses it by name, because a label target must resolve to a BLOCK of the function that embedded the template and an operand binding carries a register and no block. Keeping the row is what turns a tokenizer complaint about the percent byte into a sentence about `asm goto`. See `asm.lang.json`'s `asmTemplateLabelRef` for the full statement.\n  • `%%` -> `PercentEscape` — declared with **NO SHAPE REFERENCING IT IN THIS DIALECT**, and that is deliberate rather than an oversight. AArch64 gas has no register sigil (`x0`, not `%x0`), so there is no `%%<reg>` form to accept — the AT&T document has one and this one does not. What the row buys is the MUNCH GUARD, which is a correctness property and not a convenience: ✔MEASURED 2026-08-14 on `aarch64-linux-gnu-gcc` 13.3.0 with the source fed as base64, extended `\"A%%0B\"` emits `A%0B` and the `%0` that appears is NOT re-read as operand 0. Without this row `%%0` would lex as PlaceholderSigil + PlaceholderSigil + IntLiteral and a placeholder scanner would find a lone `%` in front of the digit. With it, the two bytes are consumed together and `%%0` reaches no shape at all — refused loud, which is what the reference toolchain does one stage later when gas sees the emitted `%0`.\n★★ THE ORDERING MECHANISM IS LEXEME **LENGTH**, NOT DECLARATION ORDER — ✔MEASURED in `tokenizer.cpp`'s `longestMatchInMode`, which probes DOWN from the longest key; `nlohmann::json` sorts object keys anyway, so a `.json` file's row order does not survive the parse. ⇒ a 'red on reordering' pin cannot exist; the pin that can exist DELETES the `%%` row.\n⚠ NO BRACKET ROWS HERE, UNLIKE THE AT&T SIBLING: `[`/`]` are already global in this dialect (the memory form), so `%[out]` reaches them through the mode's global fallback and `symbolicNameOpen`/`symbolicNameClose` bind to those same kinds.",
+    "asm-template": {
+      "tokens": {
+        "%%": [{ "kind": "PercentEscape" }],
+        "%":  [{ "kind": "PlaceholderSigil" }],
+        "%l": [{ "kind": "PlaceholderLabelSigil" }]
+      }
+    }
   },
 
   "numberStyle": {
@@ -154,6 +167,10 @@
     "statementRule":   "asmStatement",
     "labelTailRule":   "asmLabelTail",
     "operandSeqRule":  "asmOperandSeq",
+
+    "$templateSurfaceComment": "★★★ THE TWO KEYS THAT MAKE AN EMBEDDED `__asm__` TEMPLATE READABLE BY THIS DIALECT (2026-08-15, D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER). OPTIONAL AS A PAIR, REQUIRED OF EACH OTHER — the loader refuses one without the other, because a mode with no rule mints placeholder tokens no shape accepts and a rule with no mode declares a shape whose FIRST token nothing ever produces; both are silent no-ops.\n★ ON THIS TARGET THEY ARE WHAT MAKES AN ASM OUTPUT POSSIBLE AT ALL — `arm64.target.json` declares the constraint letters `r`/`w`/`m`/`i` and none of them PINS a register, so an output has nowhere to be captured from except the placeholder's own vreg. That is not a gap in the target description: AArch64 genuinely has no register-pinning constraint letter, which is why gcc's own `hwtime.h` writes `mrs %0, cntvct_el0` here and `\"=a\"`/`\"=d\"` on x86.",
+    "templateLexerMode":   "asm-template",
+    "templateOperandRule": "asmTemplateOperand",
 
     "operandOrder": "destinationFirst",
 

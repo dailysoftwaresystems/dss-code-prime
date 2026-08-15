@@ -774,10 +774,13 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                     || s == EncodingSlotKind::OpcodePlusReg
                     || s == EncodingSlotKind::Rd;
             };
-            bool const has2AddrDestWire = o.requires2Address
+            // The wire that supplies the destination is the one on the
+            // TIED operand — index 0 for every shipped opcode, whatever
+            // `twoAddressSourceOperand` declares for a non-zero tie.
+            bool const has2AddrDestWire = o.requires2Address.has_value()
                 && std::any_of(v.wires.begin(), v.wires.end(),
                                [&](TargetEncodingWire const& w) {
-                                   return w.index == 0
+                                   return w.index == *o.requires2Address
                                        && isDestSlot(w.slotKind);
                                });
             // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: a variant that wires
@@ -927,35 +930,41 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         //   * a variant whose operandKinds[0] is NOT `reg` — would
         //     trigger the pass's hard-fail at runtime; reject at
         //     load instead.
-        if (o.requires2Address) {
+        // ⚠ EVERY CLAUSE IS KEYED ON THE DECLARED INDEX, NEVER ON A
+        // LITERAL 0 (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE). A rule that
+        // kept checking operand 0 while the legalize pass copied
+        // operand j would validate a shape the pass never builds — the
+        // exact silent divergence the index replaced the bool to avoid.
+        if (o.requires2Address.has_value()) {
+            std::size_t const tied = *o.requires2Address;
             if (o.result == TargetResultRule::None) {
                 fail(std::format("/opcodes/{}/requires2Address", i),
                      std::format("opcode '{}': `requires2Address: true` "
                                  "requires `result != none` — the "
-                                 "legalize pass copies operands[0] INTO "
+                                 "legalize pass copies operands[{}] INTO "
                                  "result, which doesn't exist when "
                                  "result is `none`",
-                                 o.mnemonic));
+                                 o.mnemonic, tied));
             }
-            if (o.maxOperands < 1) {
+            if (o.maxOperands <= tied) {
                 fail(std::format("/opcodes/{}/requires2Address", i),
-                     std::format("opcode '{}': `requires2Address: true` "
-                                 "requires `maxOperands >= 1` — "
-                                 "operand 0 must exist to be copied "
-                                 "to the destination",
-                                 o.mnemonic));
+                     std::format("opcode '{}': the two-address tie names "
+                                 "operand {}, so `maxOperands` must exceed "
+                                 "it (declared {}) — the tied operand must "
+                                 "exist to be copied to the destination",
+                                 o.mnemonic, tied, o.maxOperands));
             }
             for (std::size_t vi = 0; vi < o.encoding.variants.size(); ++vi) {
                 auto const& v = o.encoding.variants[vi];
-                if (!v.operandKinds.empty()
-                    && v.operandKinds[0] != OperandKindFilter::Reg) {
-                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/0", i, vi),
-                         std::format("opcode '{}' variant {}: "
-                                     "`requires2Address: true` requires "
-                                     "operandKinds[0] to be 'reg' — the "
+                if (v.operandKinds.size() > tied
+                    && v.operandKinds[tied] != OperandKindFilter::Reg) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", i, vi, tied),
+                         std::format("opcode '{}' variant {}: the "
+                                     "two-address tie names operand {}, so "
+                                     "operandKinds[{}] must be 'reg' — the "
                                      "legalize pass needs a Reg operand "
                                      "to copy from",
-                                     o.mnemonic, vi));
+                                     o.mnemonic, vi, tied, tied));
                 }
             }
         }
@@ -1013,7 +1022,9 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     // catches the misconfiguration once.
     bool const anyRequires2Address = std::any_of(
         opcodes.begin(), opcodes.end(),
-        [](TargetOpcodeInfo const& o) { return o.requires2Address; });
+        [](TargetOpcodeInfo const& o) {
+            return o.requires2Address.has_value();
+        });
     if (anyRequires2Address && mnemonicIndex.find("mov") == mnemonicIndex.end()) {
         fail("/opcodes",
              "at least one opcode declares `requires2Address: true` "

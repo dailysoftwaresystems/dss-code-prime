@@ -1051,38 +1051,37 @@ TEST(AsmShippedDialects, Arm64GasCannotExpressAPercentNumberOperandAsASiblingAlt
     expectPercentNumberAltIsRefused(kArm, "armOperand", "TypeSigil");
 }
 
-// ══ `%%` LEXES AS ONE TOKEN — THE MISCOMPILE GUARD ═════════════════════════
+// ══ `%%` LEFT THE GLOBAL TABLE — THE BIDIRECTIONAL HALF ════════════════════
 //
-// ★★★ THE DEFECT THIS PREVENTS HAS NO DIAGNOSTIC. In an embedded `__asm__`
-// TEMPLATE, `%0` is an operand placeholder and a literal percent is written
-// `%%`. ✔MEASURED 2026-08-14 with sources fed as base64 (gcc 13.3.0, clang
-// 18.1.3, aarch64-linux-gnu-gcc 13.3.0): extended `"A%%0B"` emits `A%0B` on all
-// three — the `%0` that APPEARS once `%%` has been unescaped is NOT re-read as
-// operand 0. So any design that unescapes into a buffer and then scans for
-// placeholders binds `%%0` to operand 0 and silently emits the wrong register.
-// Declaring `%%` as a lexeme of its own makes that unrepresentable: the two
-// bytes are consumed together and there is no lone `%` left to introduce a
-// placeholder.
+// ★★★ WHAT MOVED AND WHY, BECAUSE THIS TEST USED TO ASSERT THE OPPOSITE.
+// From 2026-08-14 to 2026-08-15 `%%` was a row of the dialect's GLOBAL `tokens`
+// table with NO shape referencing it, and the arm here pinned that a `.s`
+// containing `%%0` read the two bytes as ONE token. That was the correct
+// interim state — and it stopped being correct the moment `attRegister` grew
+// its `PercentEscape Identifier` arm: with the row still global, that arm would
+// have made a standalone `.s` ACCEPT `%%eax`, and gas rejects it.
+// (D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER — kept on ONE line, because a
+// name wrapped across a comment break is a name no grep and no anchor guard
+// can find.)
+// ⇒ the row now lives in `lexerModes.asm-template.tokens`, so the escaped form
+// is reachable from an embedded TEMPLATE and unreachable from a `.s` BY
+// CONSTRUCTION rather than by a check that could be forgotten.
 //
-// ⚠⚠ AND THE MECHANISM IS LEXEME **LENGTH**, NOT DECLARATION ORDER — THE BRIEF
-// FOR THIS WORK SAID ORDER AND THE CODE SAYS OTHERWISE. ✔MEASURED in
-// `tokenizer.cpp`'s `longestMatch`: the scanner probes DOWN from the schema's
-// longest declared lexeme and returns the first hit, so a 2-byte `%%` beats the
-// 1-byte `%` for every input regardless of row order; `priority` and
-// declaration order only break ties among the meanings of ONE lexeme. On top of
-// that `nlohmann::json`'s default object is a `std::map`, so a `.json` file's
-// row order does not survive the parse at all. ⇒ a "red on reordering the two
-// rows" pin CANNOT EXIST — reordering is provably inert — and the arm below
-// pins the property against the only mutation that can change it: DELETING the
-// two-byte row.
-
-// `%%0` must lex with the two percent bytes CONSUMED TOGETHER. No shape
-// references `PercentEscape` yet (by design — see the dialect banners), so the
-// line does not parse in either world and the CST keeps no leaf for the
-// offending token; the observable is therefore the PARSER'S OWN REPORT of what
-// it got, which quotes the token's text. That is a stronger instrument than a
-// kind name anyway: it is the actual byte span the tokenizer produced.
-void expectDoublePercentIsOneToken(ShippedDialect const& d) {
+// ★★ WHAT THIS FILE PINS IS THEREFORE THE **SEPARATION**, NOT THE BINDING. The
+// miscompile guard proper — `%%0` must not bind operand 0 where `%0` does —
+// needs the template surface and lives in `tests/asm/test_asm_template_to_lir.cpp`
+// (`DoublePercentZeroDoesNotBindOperandZero`, plus the row-deletion arm). Here
+// the question is the one only a `.s` can ask: does the escape leak into the
+// file surface? [[feedback_reference_compilers_are_the_spec]] is bidirectional,
+// so accepting what no reference assembler accepts is the same class of defect
+// as refusing what they do.
+//
+// ⚠ THE RED-ON-DISABLE RUNS IN THE ACCEPTING DIRECTION, WHICH IS THE UNUSUAL
+// ONE AND THE RIGHT ONE HERE. Deleting a row cannot break a property that
+// depends on the row's ABSENCE, so the mutant PUTS THE ROW BACK in the global
+// table and asserts the reading changes. A test that mutated in the other
+// direction would be asserting nothing at all.
+void expectDoublePercentIsNotAFileToken(ShippedDialect const& d) {
     // A directive operand position, so the two bytes are read in a real
     // context rather than at end of input.
     auto const source = std::string{"\t.quad %%0\n"};
@@ -1094,49 +1093,93 @@ void expectDoublePercentIsOneToken(ShippedDialect const& d) {
     ASSERT_FALSE(shippedMsg.empty())
         << d.language
         << ": `%%0` was ACCEPTED in a `.s` — no reference assembler spells "
-           "`%%`, so this input must be refused in both worlds";
+           "`%%`, so this input must be refused in the file surface";
+    EXPECT_EQ(shippedMsg.find("%%"), std::string::npos)
+        << d.language
+        << ": a `.s` read `%%` as ONE token — the escape row has leaked back "
+           "into the global table, and `%%eax` would now parse in a file gas "
+           "rejects.\n  got: " << shippedMsg;
 
-    // ── RED-ON-DISABLE: delete the two-byte row, in this process, on a copy ──
-    // ⚠ THE MUTATION IS THE ONLY ONE THAT CAN CHANGE THE OUTCOME, AND THAT IS
-    // MEASURED RATHER THAN ASSUMED: the scanner is longest-match by lexeme
-    // LENGTH (`tokenizer.cpp`'s `longestMatch` probes DOWN from the longest
-    // declared key), so `%%` beats `%` regardless of row order — and
-    // `nlohmann::json` sorts object keys, so a `.json` file's row order does
-    // not even survive the parse. Reordering is provably inert; DELETING the
-    // row is what flips the lexing.
+    // ── RED-ON-DISABLE: put the row back in the GLOBAL table ──
+    // ⚠ AND ASSERT IT IS NOT ALREADY THERE FIRST. Without that check this arm
+    // would be green on a document that never moved the row, i.e. green for
+    // exactly the state it exists to forbid.
     auto mutated = shippedDialectDoc(d.language);
-    ASSERT_EQ(mutated["tokens"].erase("%%"), 1u)
-        << d.language << ": the shipped document declares no `%%` row at all — "
-           "the arm above would then be green for the wrong reason";
-    auto const without = lowerAsmText(mutated, source, d.target);
-    ASSERT_TRUE(without->loadErrors.empty()) << parseMessages(*without);
-    auto const mutatedMsg = parseMessages(*without);
-    ASSERT_FALSE(mutatedMsg.empty()) << d.language;
+    ASSERT_FALSE(mutated["tokens"].contains("%%"))
+        << d.language << ": the shipped document still declares `%%` in its "
+           "GLOBAL token table — the arm above is asserting nothing";
+    ASSERT_TRUE(mutated["lexerModes"]["asm-template"]["tokens"].contains("%%"))
+        << d.language << ": the shipped document declares no `%%` row in its "
+           "TEMPLATE mode either — the escape is simply gone";
+    mutated["tokens"]["%%"] = nlohmann::json::parse(
+        R"([{"kind": "PercentEscape"}])");
+    auto const leaked = lowerAsmText(mutated, source, d.target);
+    ASSERT_TRUE(leaked->loadErrors.empty()) << parseMessages(*leaked);
+    auto const leakedMsg = parseMessages(*leaked);
+    ASSERT_FALSE(leakedMsg.empty()) << d.language;
 
-    // THE DIFFERENTIAL: with the row, the parser reports ONE token spanning
-    // both bytes; without it, a single-byte sigil — which is exactly the state
-    // in which a placeholder scanner finds a lone `%` in front of the `0` and
-    // binds `%%0` to operand 0.
-    EXPECT_NE(shippedMsg, mutatedMsg)
+    // THE DIFFERENTIAL: with the row global the two bytes are consumed
+    // together, so the parser reports a DIFFERENT token from the single-byte
+    // sigil it reports without it. A mutation that did not change the reading
+    // would mean the scanner is not consulting the table this pin is about.
+    // ⚠ THE ASSERTION IS INEQUALITY OF THE TWO READINGS, NOT THE PRESENCE OF
+    // `%%` IN THE MESSAGE, AND THAT IS A CORRECTION RATHER THAN A WEAKENING.
+    // The stronger-looking form was written first and is WRONG on x86: with the
+    // row global, `attRegister`'s escaped arm CONSUMES the `%%` and the parser
+    // then complains about the `0` that follows, so the message quotes `0` and
+    // never `%%` — the reading did change, and a `%%`-substring test would have
+    // called that no change. Comparing the two readings is the claim; quoting a
+    // particular byte back was a proxy for it that does not hold on both
+    // dialects.
+    EXPECT_NE(shippedMsg, leakedMsg)
         << d.language
-        << ": deleting the `%%` row did NOT change how `%%0` is read — this pin "
-           "is asserting nothing.\n  shipped: " << shippedMsg;
-    EXPECT_NE(shippedMsg.find("%%"), std::string::npos)
-        << d.language
-        << ": the shipped dialect did not read `%%` as one token.\n  shipped: "
-        << shippedMsg << "  mutated: " << mutatedMsg;
-    EXPECT_EQ(mutatedMsg.find("%%"), std::string::npos)
-        << d.language
-        << ": without the row the two bytes must be read separately.\n  mutated: "
-        << mutatedMsg;
+        << ": adding `%%` to the GLOBAL table did NOT change how a `.s` reads "
+           "`%%0` — this pin is asserting nothing.\n  shipped: " << shippedMsg;
 }
 
-TEST(AsmShippedDialects, X86AttLexesDoublePercentAsOneToken) {
-    expectDoublePercentIsOneToken(kX86);
+TEST(AsmShippedDialects, X86AttDoesNotLexDoublePercentInAFile) {
+    expectDoublePercentIsNotAFileToken(kX86);
 }
 
-TEST(AsmShippedDialects, Arm64GasLexesDoublePercentAsOneToken) {
-    expectDoublePercentIsOneToken(kArm);
+TEST(AsmShippedDialects, Arm64GasDoesNotLexDoublePercentInAFile) {
+    expectDoublePercentIsNotAFileToken(kArm);
+}
+
+// ★★★ THE SHARPEST FORM OF THE SAME CLAIM, AND IT ONLY EXISTS ON x86 BECAUSE
+// ONLY x86 HAS A REGISTER SIGIL TO ESCAPE. The generic arm above compares two
+// REFUSAL MESSAGES; this one compares a refusal with an ACCEPTANCE, which is
+// the actual defect the row's placement prevents: with `%%` in the GLOBAL
+// table, `attRegister`'s escaped arm becomes reachable from a `.s` and DSS
+// starts accepting `movq %%rcx, %%rax` in a file — input gas rejects outright.
+// ✔ [[feedback_reference_compilers_are_the_spec]] is bidirectional, so that is
+// a defect of the same weight as refusing what the reference accepts.
+TEST(AsmShippedDialects, X86AttWouldAcceptAnEscapedRegisterInAFileIfTheRowLeaked) {
+    constexpr std::string_view kEscapedRegisterLine = "\tmovq %%rcx, %%rax\n";
+
+    auto const shipped = lowerAsmText(
+        shippedDialectDoc(kX86.language),
+        prologue(kX86) + std::string{kEscapedRegisterLine} + "\tret\n",
+        kX86.target);
+    ASSERT_TRUE(shipped->loadErrors.empty()) << parseMessages(*shipped);
+    EXPECT_FALSE(parsedCleanly(*shipped))
+        << "a `.s` ACCEPTED `%%rcx, %%rax` — the escaped register form has "
+           "leaked out of the template surface, and gas rejects this input";
+
+    auto mutated = shippedDialectDoc(kX86.language);
+    ASSERT_FALSE(mutated["tokens"].contains("%%"))
+        << "the shipped document declares `%%` globally — the arm above is "
+           "asserting nothing";
+    mutated["tokens"]["%%"] = nlohmann::json::parse(
+        R"([{"kind": "PercentEscape"}])");
+    auto const leaked = lowerAsmText(
+        mutated, prologue(kX86) + std::string{kEscapedRegisterLine} + "\tret\n",
+        kX86.target);
+    ASSERT_TRUE(leaked->loadErrors.empty()) << parseMessages(*leaked);
+    EXPECT_TRUE(parsedCleanly(*leaked))
+        << "putting `%%` back in the GLOBAL table did NOT make the `.s` accept "
+           "the escaped register — then the row's PLACEMENT is not what keeps "
+           "the two surfaces apart, and this pin asserts nothing: "
+        << parseMessages(*leaked);
 }
 
 // ★ AND THE BIDIRECTIONAL HALF: `%%` is TEMPLATE vocabulary, so a `.s` file

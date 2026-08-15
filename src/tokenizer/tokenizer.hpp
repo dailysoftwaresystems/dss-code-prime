@@ -49,9 +49,26 @@ public:
     // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE). A caller with no
     // operator budget in scope says so out loud with
     // `DiagnosticBudget::libraryDefault()`.
+    //
+    // `initialMode` (optional): the lexer mode the BOTTOM scan frame starts in.
+    // Default `InvalidLexerMode` ⇒ `main`, which is every whole-FILE caller and
+    // is byte-identical to the behaviour before this parameter existed.
+    //
+    // ★★ IT EXISTS FOR FRAGMENTS, AND THE FIRST ONE IS AN EMBEDDED ASSEMBLY
+    // TEMPLATE. A `.s` file and an `__asm__` template are the same dialect and
+    // the same grammar, but NOT the same lexical surface: ✔MEASURED on gcc
+    // 13.3.0 / clang 18.1.3, `%` is the register sigil in a `.s`, a literal in
+    // a BASIC template and an operand introducer in an EXTENDED one. A dialect
+    // says so with a per-mode `tokens` override and names the mode in
+    // `assembly.templateLexerMode`; the fragment's parse entry passes it here.
+    // ⚠ The mode is the bottom frame, not a push — see tokenize()'s comment for
+    // why a pushed mode is silently wrong from the first newline onward. An id
+    // this schema does not declare is a FATAL caller defect, never a quiet
+    // fallback to `main`.
     Tokenizer(std::shared_ptr<SourceBuffer>        src,
               std::shared_ptr<GrammarSchema const> schema,
-              DiagnosticBudget                     budget);
+              DiagnosticBudget                     budget,
+              LexerModeId                          initialMode = {});
 
     Tokenizer(Tokenizer const&)            = delete;
     Tokenizer& operator=(Tokenizer const&) = delete;
@@ -68,6 +85,7 @@ private:
     std::shared_ptr<SourceBuffer>        source_;
     std::shared_ptr<GrammarSchema const> schema_;
     std::unique_ptr<DiagnosticReporter>  reporter_;
+    LexerModeId                          initialMode_{};
 };
 
 } // namespace dss

@@ -314,6 +314,39 @@ public:
     // (builder-contract discipline, same as `beginBlock`'s guards).
     void setInstRegConstraints(LirInstId inst, std::uint32_t poolIndex);
 
+    // OR bits into an already-appended instruction's flag byte
+    // (D-LIR-EARLYCLOBBER-FLAG-UNSETTABLE-AFTER-EMISSION). The sibling
+    // of `setInstRegConstraints`, and it exists for the same reason: a
+    // producer that did not call `addInst` itself still has a fact to
+    // record about the instruction. The inline-asm expansion is that
+    // producer — the instruction writing an unpinned `"=&r"` output is
+    // emitted by the SHARED assembly engine, so the tier that knows the
+    // operand is earlyclobber never holds the `flags` argument.
+    //
+    // ★★ OR-IN, NEVER ASSIGN, AND THAT IS THE WHOLE POINT OF THE
+    // SIGNATURE. `flags` already carries the WIDTH selector
+    // (`kLirInstFlagWidth32/8/16`), which the engine sets from the
+    // operand's register spelling. A plain `setInstFlags` would let a
+    // caller adding one annotation bit silently clear the width and
+    // re-run a 32-bit operation at 64 bits — a miscompile with no
+    // diagnostic, and exactly the class of bug this carrier exists to
+    // prevent. There is deliberately no clearing counterpart: no
+    // producer has ever needed to UNSET a flag, and offering it would
+    // make the same overwrite reachable in one call.
+    //
+    // `inst` must belong to this builder — aborts otherwise, the same
+    // builder-contract discipline as `setInstRegConstraints`.
+    void orInstFlags(LirInstId inst, std::uint8_t flags);
+
+    // The result register of an already-appended instruction. The read
+    // half `orInstFlags` needs to be usable at all: a producer that did
+    // not call `addInst` cannot know WHICH of the instructions a shared
+    // engine appended defines a given vreg, and the ids are contiguous,
+    // so the only way to find it is to ask. `Lir` exposes the same
+    // reader on the frozen module; this is the mid-build one. Aborts on
+    // a cross-module id, like every other id-taking builder method.
+    [[nodiscard]] LirReg instResult(LirInstId inst) const;
+
     // The most recently appended instruction. Exists so a pass can carry
     // side data onto a terminator: the terminator emitters return an id,
     // but the SHARED dispatch `lir_pass_util::emitTerminator` returns a

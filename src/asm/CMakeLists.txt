@@ -19,7 +19,14 @@ target_include_directories(asm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # files produced here.
 target_compile_definitions(asm PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
-target_link_libraries(asm PRIVATE core lir mir)
+# ⚠ `analysis_syntactic` + `tokenizer` ARE HERE FOR THE TEMPLATE PARSE ENTRY
+# (`parseAsmTemplateText`, plan 29 §4.6.3). An embedded `__asm__` template is
+# lexed in the dialect's OWN `assembly.templateLexerMode` rather than in `main`,
+# so the entry has to drive Tokenizer + Parser directly instead of going through
+# `UnitBuilder` (which reads every buffer as a whole FILE, i.e. in `main`).
+# Both are aggregated into the same shared library, so this line states an
+# existing compile-time dependency rather than creating a link one.
+target_link_libraries(asm PRIVATE core lir mir tokenizer analysis_syntactic)
 
 # D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN — the EncodingSlotKind exhaustiveness gate
 # this file used to carry is now PROJECT-WIDE (root CMakeLists.txt), so the four

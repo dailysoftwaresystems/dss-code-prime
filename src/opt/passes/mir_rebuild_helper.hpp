@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -71,6 +72,34 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
 // The setAliasingMode / setCharTypesAliasAll propagation is identical to
 // the shared helper (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE).
 DSS_EXPORT void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder);
+
+// The `cloneGlobalsVerbatim` body, generalized to a rebuild that DROPS
+// functions — which shifts every later function's ORDINAL and therefore
+// invalidates the "same ordinal, new tag" shortcut above. Used by the
+// optimizer's inline-definition strip epilogue
+// (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED), the one rebuild
+// that removes whole functions and must still run on EVERY module.
+//
+// `oldOrdinalToNew[i]` is the rebuilt module's ordinal for old function ordinal
+// `i`, or `UINT32_MAX` if that function was dropped. Its size MUST equal the old
+// module's `moduleFuncCount()`.
+//
+// ★ WHY THIS EXISTS RATHER THAN A CARVE-OUT. `cloneGlobalsOrCarveOut` answers a
+// runtime-init module by SKIPPING the pass — correct for an optimization, and
+// catastrophic here: skipping the strip emits an inline definition's body as a
+// real external definition, which is exactly the miscompile the strip prevents.
+// A pass that must not be skippable needs a real remap, so this is one.
+//
+// ★ FAIL-LOUD: a global whose `initFunc` maps to `UINT32_MAX` aborts. Nothing
+// should ever drop a module-init function, and silently re-pointing a global's
+// initializer at whichever function inherited the ordinal would be a wrong-body
+// call with no diagnostic.
+//
+// ORDERING CONTRACT is unchanged: call AFTER every surviving function has been
+// re-added to `builder`.
+DSS_EXPORT void
+cloneGlobalsRemappingInitFunc(Mir const& mir, MirBuilder& builder,
+                              std::span<std::uint32_t const> oldOrdinalToNew);
 
 // Per-pass policy driving the rebuild. Pass-specific state lives on
 // the concrete subclass; the rebuilder owns only the rewrite map +

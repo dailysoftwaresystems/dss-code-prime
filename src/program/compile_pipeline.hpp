@@ -477,7 +477,15 @@ optimizeModule(Mir&                  mir,
                TargetSchema const&   target,
                TypeInterner const&   interner,
                CompileOptions const& opts,
-               DiagnosticReporter&   reporter);
+               DiagnosticReporter&   reporter,
+               // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the
+               // module's extern table. `opt::optimize`'s unconditional strip
+               // epilogue reads it to find the C99 6.7.4p7 inline definitions
+               // that must not be emitted (a function whose SymbolId is also an
+               // extern's). BOTH call sites pass their own module's table —
+               // per-CU here, whole-program in `Program::compileOneTarget` —
+               // because a body surviving either optimize reaches codegen.
+               std::span<ExternImport const> externImports = {});
 
 // LOWER half: MIR → LIR → liveness → regalloc → rewrite → legalize → callconv →
 // assemble → symbol-table populate → user-entry scan. Consumes the `CuMirModule`

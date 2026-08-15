@@ -60,6 +60,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <ranges>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -185,6 +186,55 @@ struct OptimizedArm {
     // composition. A manifest-level flag would have to red both or neither.
     // See the ★ DECISION note above `judgeOptimizedArtifactIdentity`.
     bool                         mustDifferFromBaseline = false;
+    // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: THIS arm's own
+    // expected exit code, legal ONLY inside an example that declares
+    // `optimizationObservable` (see `OptimizationObservable` below). Absent ⇒ the
+    // arm must match the baseline, which is the rule for every other arm in the
+    // corpus. Per-ARM and not per-example on purpose: an example may declare
+    // several arms and only the ones that actually run the responsible pass
+    // diverge — a `["ConstFold"]` arm over a C99 inline definition still exits
+    // like the baseline, and only the arm running `Inlining` does not. A
+    // per-example value would pin the divergent number onto every arm.
+    std::optional<std::int64_t>  exitCode;
+};
+
+// ★★★ THE EXEMPTION THAT UNLOCKS A PER-ARM EXPECTATION, AND WHY THE AXIOM DID
+// NOT SIMPLY GET RELAXED (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-
+// EMITTED). `OptimizedArm`'s contract — "same exit code + stdout as the
+// baseline" — was carrying TWO facts in one sentence:
+//   (i)  the CORRECTNESS INVARIANT: an optimizer must not change a program's
+//        observable behaviour; and
+//   (ii) the MECHANICAL EXPECTATION: this arm's exit code equals the baseline's.
+// C99 6.7.4p7 breaks (ii) WITHOUT breaking (i): a call to a function with an
+// inline definition may use EITHER that definition or the external one, and it
+// is explicitly unspecified which — so two conforming compilations legitimately
+// exit differently. ✔MEASURED on gcc 13.3.0, clang 18.1.3 and clang 19: the same
+// two-CU program exits 42 at `-O0` and 7 at `-O1`/`-O2`/`-O3`/`-Os`, on all
+// three. Relaxing (i) corpus-wide to express that would have thrown away the
+// property this harness exists to enforce, for one example.
+//
+// ⇒ (i) STAYS ABSOLUTE. (ii) is carved out, per example, LOUDLY, and the
+// carve-out is STRUCTURAL rather than a comment: this repo has already shipped a
+// `$comment` asserting something measured false, so a promise in prose is not a
+// gate. Three load-time refusals do the work (see `validateOptimizationObservable`):
+// an arm cannot declare `exitCode` without the exemption; an exemption that
+// exempts nothing is rejected; and a declared "difference" equal to the baseline
+// is rejected. A fourth guard counts the exemptions corpus-wide, because a policy
+// carve-out that cannot be counted is one that grows.
+//
+// ⛔ THIS IS NOT THE SAME AXIS AS THE PER-TARGET `exitCodeOverride`, AND MUST NOT
+// BE FOLDED INTO IT. Per-TARGET divergence is EXTERNALLY VERIFIABLE — `sizeof
+// (wchar_t)` really is 2 on pe64 and 4 elsewhere, so reality catches a wrong
+// override. Per-OPTIMIZATION-LEVEL divergence is indistinguishable from an
+// optimizer bug by inspection, which is the exact failure the differential arm
+// exists to catch. Only the axis that cannot be checked by reality gets the gate.
+struct OptimizationObservable {
+    // The clause of the language standard that makes the difference conforming
+    // (e.g. "C99 6.7.4p7"). REQUIRED and non-empty. Deliberately an OPEN
+    // vocabulary — C's unspecified behaviours cannot be enumerated — but a
+    // CITATION is required rather than prose, so the claim points somewhere a
+    // reader can check instead of asserting itself.
+    std::string clause;
 };
 
 // V2-4 Part C (D-DIAG-CLI-POSITION-RENDER-AND-ASSERT): one declared
@@ -263,6 +313,13 @@ struct ExampleManifest {
     // source with the listed pipeline + asserts baseline-equal
     // exit code + stdout.
     std::vector<OptimizedArm>    optimizedPipelines;
+    // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: present ⇒ this
+    // example is EXEMPT from the mechanical "optimized arm equals baseline" half
+    // of the differential contract, because a named standard clause makes the
+    // difference conforming. Its presence is the ONLY thing that lets an arm
+    // declare its own `exitCode`, and its absence with an arm that does is a LOAD
+    // ERROR — so a divergent expectation can never be smuggled in silently.
+    std::optional<OptimizationObservable> optimizationObservable;
     // V2-4 Part C: when NON-EMPTY this is an EXPECT-ERROR example — the
     // source is malformed, the compile MUST fail, and the produced
     // diagnostics MUST equal this declared set EXACTLY (code + 1-based
@@ -312,6 +369,90 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
         }
     }
     return dep;
+}
+
+// ★★★ THE THREE LOAD-TIME REFUSALS THAT MAKE THE `optimizationObservable`
+// CARVE-OUT STRUCTURAL RATHER THAN A PROMISE
+// (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED). Returns false
+// having already ADD_FAILURE'd. Each refusal closes one way the exemption could
+// erode into "an arm may expect whatever it likes":
+//
+//   R1  an arm declares `exitCode` while the example declares NO
+//       `optimizationObservable`. This is the load-bearing one: it makes the
+//       "vacuous arm hiding behind a declared exit code" IMPOSSIBLE rather than
+//       discouraged. Without R1, any arm that started failing could be silenced
+//       by writing down the number it happens to produce — which is precisely
+//       the optimizer bug the differential arm exists to catch.
+//   R2  the example declares `optimizationObservable` and no arm declares a
+//       differing `exitCode` — an exemption that exempts nothing. Left
+//       unchecked, exemptions accumulate on examples that no longer need them
+//       (or never did) and the corpus-wide count stops meaning anything.
+//   R3  an arm declares an `exitCode` EQUAL to the baseline it would otherwise
+//       have been compared against — a declared "difference" that is not one.
+//       Checked against the manifest-level `exitCode` AND every per-target
+//       override, because an arm that diverges on one target and not another has
+//       not been thought through, and the harness should say so at load rather
+//       than pass by coincidence on whichever target ran.
+[[nodiscard]] bool
+validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
+    bool anyDiffering = false;
+    for (auto const& arm : m.optimizedPipelines) {
+        if (!arm.exitCode.has_value()) continue;
+        // R1
+        if (!m.optimizationObservable.has_value()) {
+            ADD_FAILURE()
+                << "manifest " << path.generic_string()
+                << " optimizedPipelines arm '" << arm.label
+                << "' declares its own 'exitCode' but the example declares no"
+                   " 'optimizationObservable'. An optimized arm must produce the"
+                   " baseline's exit code; declaring a different one is legal"
+                   " ONLY where a named standard clause makes both results"
+                   " conforming. Add"
+                   " \"optimizationObservable\": {\"clause\": \"...\"} — or, if"
+                   " no clause sanctions it, this arm is an optimizer bug and the"
+                   " expectation must not be written down.";
+            return false;
+        }
+        // R3 — against the manifest-level pin...
+        if (*arm.exitCode == m.exitCode) {
+            ADD_FAILURE()
+                << "manifest " << path.generic_string()
+                << " optimizedPipelines arm '" << arm.label
+                << "' declares exitCode " << *arm.exitCode
+                << ", which EQUALS the manifest's baseline exitCode — a declared"
+                   " difference that is not one. Drop the key: an arm with no"
+                   " 'exitCode' is already required to match the baseline, and"
+                   " that is the stronger assertion.";
+            return false;
+        }
+        // ...and against every per-target override.
+        for (auto const& t : m.targets) {
+            if (t.exitCodeOverride.has_value()
+                && *arm.exitCode == *t.exitCodeOverride) {
+                ADD_FAILURE()
+                    << "manifest " << path.generic_string()
+                    << " optimizedPipelines arm '" << arm.label
+                    << "' declares exitCode " << *arm.exitCode
+                    << ", which EQUALS target '" << t.spec
+                    << "'s exitCode override — so on that target the arm asserts"
+                       " no difference at all while claiming an exemption.";
+                return false;
+            }
+        }
+        anyDiffering = true;
+    }
+    // R2
+    if (m.optimizationObservable.has_value() && !anyDiffering) {
+        ADD_FAILURE()
+            << "manifest " << path.generic_string()
+            << " declares 'optimizationObservable' (clause \""
+            << m.optimizationObservable->clause
+            << "\") but no optimizedPipelines arm declares a differing"
+               " 'exitCode'. An exemption that exempts nothing weakens the"
+               " corpus-wide count of examples allowed to diverge; remove it.";
+        return false;
+    }
+    return true;
 }
 
 [[nodiscard]] ExampleManifest readManifest(fs::path const& path) {
@@ -598,10 +739,64 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
                 }
                 oa.mustDifferFromBaseline =
                     arm.at("mustDifferFromBaseline").get<bool>();
+            // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the
+            // per-arm expected exit code. Parsed here; LEGALITY (R1/R3) is
+            // decided below, once the example-level exemption and the effective
+            // baseline are both known.
+            if (arm.contains("exitCode")) {
+                if (!arm.at("exitCode").is_number_integer()) {
+                    ADD_FAILURE() << "manifest " << path.generic_string()
+                                  << " optimizedPipelines 'exitCode' must be an"
+                                     " integer";
+                    return m;
+                }
+                oa.exitCode = arm.at("exitCode").get<std::int64_t>();
+            }
+            // ★ §A.2 — SHIP ONLY THE WITNESSED EXPECTATION, AND MAKE THE
+            // UNSHIPPED ONE FAIL LOUD RATHER THAN BE IGNORED. The differential
+            // contract covers exit code AND stdout, but only exit code has a
+            // witness today, so only `exitCode` is implemented. An unknown key
+            // is a LOAD ERROR naming it — including a `stdout`/`expectedStdout`
+            // an author might reasonably assume works — because the alternative
+            // is a manifest that declares an expectation nothing reads. A stdout
+            // expectation joins later through the SAME gate by being added here.
+            for (auto const& [k, unusedV] : arm.items()) {
+                (void)unusedV;
+                if (k == "label" || k == "passes" || k == "shippedPipeline"
+                    || k == "exitCode" || k == "mustDifferFromBaseline"
+                    || k.starts_with("$")) {
+                    continue;
+                }
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " optimizedPipelines arm '" << oa.label
+                              << "' declares unknown key '" << k
+                              << "' — the runner reads label / passes /"
+                                 " shippedPipeline / exitCode (plus $comment"
+                                 " keys). An expectation the runner does not"
+                                 " read is an assertion that never fires.";
+                return m;
             }
             m.optimizedPipelines.push_back(std::move(oa));
         }
     }
+    // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the example-level
+    // EXEMPTION. Parsed after the arms so the refusals below can see both.
+    if (j.contains("optimizationObservable")) {
+        auto const& oo = j.at("optimizationObservable");
+        if (!oo.is_object() || !oo.contains("clause")
+            || !oo.at("clause").is_string()
+            || oo.at("clause").get<std::string>().empty()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " 'optimizationObservable' must be an object with a"
+                             " non-empty string 'clause' naming the standard"
+                             " clause that makes the optimized arm's different"
+                             " result conforming (e.g. \"C99 6.7.4p7\")";
+            return m;
+        }
+        m.optimizationObservable =
+            OptimizationObservable{oo.at("clause").get<std::string>()};
+    }
+    if (!validateOptimizationObservable(m, path)) return m;
     return m;
 }
 
@@ -1669,11 +1864,25 @@ void runOneTarget(fs::path const&        exampleDir,
                     << " arm='" << arm.label << "' — " << j.note;
             }
         }
-
-        ASSERT_EQ(optResult.exitCode, baseline.exitCode)
+        // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: an arm inside
+        // an `optimizationObservable` example may pin its OWN exit code; every
+        // other arm must equal the baseline. Note this is still a STRICT
+        // equality against a declared number — the arm is not exempted from
+        // being checked, only from being checked against the baseline. R1/R3 at
+        // load time have already established that the number exists because a
+        // clause sanctions it and that it genuinely differs.
+        std::int64_t const armExpectedExit =
+            arm.exitCode.has_value() ? *arm.exitCode
+                                     : static_cast<std::int64_t>(baseline.exitCode);
+        ASSERT_EQ(static_cast<std::int64_t>(optResult.exitCode), armExpectedExit)
             << "differential-verify FAIL: optimized arm '" << arm.label
             << "' produced exit code " << optResult.exitCode
-            << " vs baseline " << baseline.exitCode
+            << " vs expected " << armExpectedExit
+            << (arm.exitCode.has_value()
+                    ? std::string{" (this arm declares its own exit code under"
+                                  " optimizationObservable clause \""}
+                          + m.optimizationObservable->clause + "\")"
+                    : std::string{" (the baseline's)"})
             << " — pipeline regression";
         if (effectiveStdout.has_value()) {
             ASSERT_EQ(optResult.capturedStdout, baseline.capturedStdout)
@@ -2369,4 +2578,73 @@ TEST(ExamplesCorpusLint, StagingPrimitiveLivesOnlyInTheSharedHeader) {
             << rel << " does not include " << kHeader
             << ", so whatever staging it performs is not the shared one.";
     }
+// ── D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the carve-out
+//    CENSUS ───────────────────────────────────────────────────────────────────
+//
+// ★★★ A POLICY CARVE-OUT THAT CANNOT BE COUNTED IS ONE THAT WILL GROW. R1/R2/R3
+// make each individual `optimizationObservable` well-formed; none of them stops
+// the SET from spreading, one defensible-looking example at a time, until "the
+// optimized arm matches the baseline" is a suggestion. So the population itself
+// is pinned: adding an exemption is a deliberate act that RED-LINES this test and
+// forces the author to change the expected count in the same change — which is
+// exactly the review moment the carve-out needs, and which no per-manifest rule
+// can create.
+//
+// ★ THE LIST IS PINNED BY NAME, NOT JUST BY CARDINALITY. A bare count would let
+// one exemption be silently traded for another; naming them makes the diff say
+// which example gained the licence.
+//
+// To ADD an exemption: satisfy R1/R2/R3, then add the example here and say in the
+// commit why that clause makes the divergence conforming. To REMOVE one: delete
+// both. If this list ever grows past a handful, the right response is to question
+// the policy, not to keep appending.
+TEST(ExamplesCorpusLint, OnlyDeclaredExamplesMayDivergeFromTheirBaseline) {
+    auto const argv = ::testing::internal::GetArgvs();
+    ASSERT_GE(argv.size(), 2u)
+        << "the corpus lint entry needs the examples ROOT as argv[1]";
+    fs::path const corpusRoot = argv[1];
+    ASSERT_TRUE(fs::is_directory(corpusRoot))
+        << "argv[1] is not a directory: " << corpusRoot.generic_string();
+
+    // The COMPLETE set of examples licensed to have an optimized arm whose exit
+    // code differs from its baseline, each with the clause that licenses it.
+    std::vector<std::pair<std::string, std::string>> const kExpected{
+        {"c-subset/inline_c99_inline_definition_crosscu", "C99 6.7.4p7"},
+    };
+
+    std::vector<std::pair<std::string, std::string>> found;
+    std::size_t manifestCount = 0;
+    for (auto const& langEntry : fs::directory_iterator(corpusRoot)) {
+        if (!langEntry.is_directory()) continue;
+        for (auto const& nameEntry : fs::directory_iterator(langEntry.path())) {
+            if (!nameEntry.is_directory()) continue;
+            auto const mp = nameEntry.path() / "expected.json";
+            if (!fs::exists(mp)) continue;
+            ++manifestCount;
+            auto const m = readManifest(mp);
+            if (!m.optimizationObservable.has_value()) continue;
+            found.emplace_back(
+                langEntry.path().filename().generic_string() + "/"
+                    + nameEntry.path().filename().generic_string(),
+                m.optimizationObservable->clause);
+        }
+    }
+    // Same "a lint that linted nothing is a defect" guard the emulator lint has.
+    ASSERT_GT(manifestCount, 0u)
+        << "no expected.json manifests under " << corpusRoot.generic_string()
+        << " — the census measured nothing and must not report success";
+
+    std::ranges::sort(found);
+    auto expected = kExpected;
+    std::ranges::sort(expected);
+    std::ostringstream got;
+    for (auto const& [id, clause] : found) got << "\n  " << id << "  [" << clause << "]";
+    EXPECT_EQ(found, expected)
+        << "the set of examples declaring 'optimizationObservable' changed."
+           " Expected " << kExpected.size() << ", found " << found.size()
+        << " over " << manifestCount << " manifests:" << got.str()
+        << "\nAn optimized arm is required to reproduce its baseline's exit code;"
+           " this list is every example excused from that, and it is pinned by"
+           " NAME so a new excuse cannot arrive silently. If you added one,"
+           " update kExpected in the same change and justify the clause.";
 }

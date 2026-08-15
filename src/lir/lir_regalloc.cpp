@@ -1017,9 +1017,25 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
             // operands would silently drive the exclusion set and
             // misallocate r.vreg. Skip the exclusion when the
             // looked-up inst isn't this range's definer.
-            if (info != nullptr && info->requires2Address
+            if (info != nullptr && info->requires2Address.has_value()
                 && lir.instResult(producingInst) == r.vreg) {
                 auto const ops = lir.instOperands(producingInst);
+                // The COALESCE TARGET is the operand the schema ties
+                // the result to, not a literal 0
+                // (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE).
+                //
+                // ⚠⚠ SKIPPING THE WRONG ONE IS A SILENT MISCOMPILE, NOT
+                // A MISSED OPTIMIZATION, and the direction is worth
+                // spelling out because it is not symmetric. Legalize
+                // runs AFTER this pass and inserts `mov result,
+                // operands[tied]` BEFORE the op — so `result` sharing a
+                // register with any UNTIED operand means that operand's
+                // value is destroyed by the copy before the op ever
+                // reads it. Excluding the tied operand instead would
+                // only cost a redundant move; failing to exclude an
+                // untied one costs correctness. Hence: skip exactly the
+                // index the schema names.
+                std::size_t const tied = *info->requires2Address;
                 // The 2026-06-02 HIGH-2 fixed-buffer overflow
                 // pre-check (`ops.size() > excludedStorage.size()
                 // + 1`) is gone with the growable scratch
@@ -1029,8 +1045,9 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                 // cannot truncate, so the fail-loud arm's job
                 // (never silently drop an exclusion) is satisfied
                 // by construction.
-                // Skip operand[0] (legitimate coalesce target).
-                for (std::size_t k = 1; k < ops.size(); ++k) {
+                // Skip the tied operand (legitimate coalesce target).
+                for (std::size_t k = 0; k < ops.size(); ++k) {
+                    if (k == tied) continue;
                     if (ops[k].kind != LirOperandKind::Reg) continue;
                     LirReg const opReg = ops[k].reg;
                     // Source reg may be already-physical (e.g. from

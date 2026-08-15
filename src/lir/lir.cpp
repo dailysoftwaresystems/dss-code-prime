@@ -436,6 +436,41 @@ LirBuilder::regConstraintPoolAdd(ImplicitRegisterConstraint constraint) {
                            constraint.inputRoleOrdinals, "input-role");
     resolveConstraintRoles(target_, constraint.outputRoleNames,
                            constraint.outputRoleOrdinals, "output-role");
+    // ★★★ `outputs ⊆ clobbered`, ENFORCED WHERE THE ENTRY IS BUILT
+    // (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED).
+    // The `.target.json` loader enforces this for the per-OPCODE
+    // carrier; until now the per-INSTRUCTION carrier — which meets no
+    // loader — was governed by a COMMENT. The register allocator omits
+    // outputs from its forbidden set on the strength of the rule, so a
+    // violating entry does not fail loudly downstream: it leaves a live
+    // value in a register the instruction overwrites, with no
+    // diagnostic. Checked AFTER resolution so the ordinals it reads are
+    // the builder's own, never a caller's (which are overwritten
+    // above), and so an unresolvable NAME is still reported as such.
+    //
+    // ⛔ THE ALTERNATIVE — teaching the allocator to exclude outputs —
+    // was rejected deliberately: it would diverge the per-instruction
+    // path from the per-opcode one and pessimise every shipped compound
+    // op (`idiv`, shift-by-CL) whose output legitimately aliases an
+    // operand. The two carriers must agree by construction.
+    if (auto const bad = constraint.firstOutputNotClobbered();
+        bad.has_value()) {
+        std::fputs("dss::Lir fatal: LirBuilder::regConstraintPoolAdd: "
+                   "implicit-output register '", stderr);
+        std::fputs(constraint.outputNames[*bad].c_str(), stderr);
+        std::fputs("' is not in this constraint's clobbered set. Every "
+                   "register the instruction WRITES is by definition "
+                   "clobbered for any value live across it, and register "
+                   "allocation omits outputs from its forbidden set on "
+                   "exactly that basis — so accepting this entry would "
+                   "let a live value keep a register the instruction "
+                   "overwrites, with no diagnostic. This mirrors the "
+                   "rule the .target.json loader enforces for the "
+                   "per-opcode carrier; a producer fed by USER text must "
+                   "pre-validate with `firstOutputNotClobbered()` and "
+                   "REPORT.\n", stderr);
+        std::abort();
+    }
     return regConstraintPool_.add(std::move(constraint));
 }
 
@@ -453,6 +488,23 @@ void LirBuilder::setInstRegConstraints(LirInstId inst,
     // no such thing today, but the guard is free) still cannot land here.
     instArena_.at(inst).regConstraints =
         lirRegConstraintHandleForIndex(poolIndex);
+}
+
+void LirBuilder::orInstFlags(LirInstId inst, std::uint8_t flags) {
+    if (inst.arenaTag != moduleId_.v) {
+        lirFatal("LirBuilder::orInstFlags: cross-module inst id");
+    }
+    // `ArenaBuilder::at` re-validates index + tag, so an id this builder
+    // never minted cannot land here.
+    auto& slot = instArena_.at(inst);
+    slot.flags = static_cast<std::uint8_t>(slot.flags | flags);
+}
+
+LirReg LirBuilder::instResult(LirInstId inst) const {
+    if (inst.arenaTag != moduleId_.v) {
+        lirFatal("LirBuilder::instResult: cross-module inst id");
+    }
+    return instArena_.at(inst).result;
 }
 
 LirInstId LirBuilder::lastInst() const {

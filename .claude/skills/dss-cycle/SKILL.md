@@ -112,8 +112,28 @@ comes next, fix the handoff: it is the one a future reader will find.
 
 ## Hard stops — always route through the pause gate
 
+★★★ **OPERATOR RULING 2026-08-15 — A HARD STOP GATES *OPENING A CAPABILITY*, NEVER *FIXING A DEFECT*.
+THERE IS NO HARD STOP ON FIXES, ANYWHERE, AT ALL.** Verbatim: *"please remove the hard stop on FIXES
+at all!"* If the work is repairing something already shipped that is wrong — a silent miscompile, a
+crash on legal input, a false rule, a conformance divergence, a guard that asserts nothing — it is a
+FIX, and **no hard stop applies to it** regardless of which subsystem it lands in. Fixes proceed
+autonomously under the ordinary bar.
+⚠ **Why this needed saying:** a hard stop is a scope guard against a cycle quietly starting a large
+new arc. Applied to a fix it inverts into the opposite of its purpose — it becomes a reason to leave
+known-broken shipped behaviour in place, which is precisely the deferral §A.7 forbids, wearing a
+governance rule as a disguise. ✔The case that produced this ruling: `hwtime.h` was blocked by
+`__inline__` handling, which touches the inliner; treating that as OPT7-gated would have parked a
+measured defect behind a rule written to stop *new pass development*.
+★ **The distinction to apply, and it is about the DELIVERABLE, not the file you edit:**
+*"does this make something CORRECT that is currently WRONG?"* → **FIX, no gate.**
+*"does this make DSS able to do something it has never done?"* → **capability, gate still applies.**
+Touching a gated subsystem's source does not by itself make it a capability; the OPT7 gate is about
+opening the inter-procedural *arc*, not about every line in `src/opt/`.
+
 - **OPT7 / inlining** (`G-406`, sub-anchor `D-OPT7-1`) — first inter-procedural pass, touches
-  linkage / DCE / cross-CU legality. A supervised cycle; **never open autonomously**.
+  linkage / DCE / cross-CU legality. A supervised cycle; **never open autonomously.**
+  ⇒ **Gated: opening the arc.** ⇒ **NOT gated: fixing a defect in inlining that already ships**,
+  per the ruling above.
 - **Trigger-gated anchors** — NOT a TODO. "Do not build until the trigger fires." If it has not
   fired, skip and report "trigger not fired". Backlog ordering is sequencing guidance, not a closure
   license.

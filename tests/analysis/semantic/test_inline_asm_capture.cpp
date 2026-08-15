@@ -478,6 +478,80 @@ TEST(InlineAsmRefusals, APercentFormInABasicTemplateIsRefusedButALiteralPercentI
     EXPECT_FALSE(extended.model->hasErrors()) << errorInventory(*extended.model);
 }
 
+// ★★★ `:::` WITH EVERY SECTION EMPTY IS **EXTENDED**, AND THIS IS THE ONLY PIN
+// THAT SAYS SO ANYWHERE (D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER).
+//
+// Every other basic/extended pin in this file uses a statement with a POPULATED
+// section, so all of them stay green under the wrong rule "extended ⟺ some
+// section has content". `:::` is the one shape where the colon is the ONLY
+// evidence, and it is the shape a downstream consumer cannot reconstruct: three
+// colons, no outputs, no inputs, no clobbers.
+//
+// ✔ORACLES RE-MEASURED 2026-08-15 (not inherited from a brief) on gcc 13.3.0 and
+// clang 18.1.3, `-c`, sources written to files so no shell quoting could alter a
+// byte, with the matched control on each row:
+//
+//   `__asm__("xorl %eax,%eax")`          rc=0  / rc=0   ← BASIC, `%` literal
+//   `__asm__("xorl %eax,%eax" :::)`      rc=1  / rc=1   ← "operand number missing
+//                                                         after %-letter" /
+//                                                         "invalid % escape"
+//   `__asm__("xorl %eax,%eax" ::: "eax")` rc=1 / rc=1   ← the same message, which
+//                                                         is what proves it is
+//                                                         the COLON and not the
+//                                                         clobber content
+//   `__asm__("movl %%eax, %%ebx" :::)`   rc=0  / rc=0   ← extended, `%%` escape
+//
+// ★ WHY IT MATTERS BEYOND THIS TIER. The MIR/LIR expansion used to re-derive the
+// surface from the section lists, which reads `:::` as BASIC — i.e. it would
+// ACCEPT the bare `%eax` both oracles reject. That over-acceptance never reached
+// a user because THIS check fires first; the pin below is what keeps that true.
+// (The reconstruction's other half — refusing the `%%` row, which both oracles
+// compile — was live, and is why `MirAsmDescriptor` now carries `isExtended`.)
+//
+// RED-ON-DISABLE: in `inline_asm_facts.hpp`'s structural scan, move
+// `f.isExtended = true;` out of the `isTailRule(r)` arm and key it on the
+// operand/clobber lists being non-empty instead → the `:::` row reads BASIC,
+// `%eax` becomes a literal, the S0067 expectation drops to zero ⇒ RED, while
+// every other basic/extended pin in this file stays green.
+TEST(InlineAsmRefusals, EmptySectionsStillMakeTheTemplateExtended) {
+    // The DISCRIMINATING statement: extended by the colon alone.
+    auto empty = analyzeFor("x86_64",
+                            wrap("__asm__ (\"xorl %eax,%eax\" :::);"));
+    ASSERT_TRUE(empty.model.has_value());
+    EXPECT_TRUE(has(*empty.model,
+                    DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
+        << "`%eax` in an EXTENDED template is an error on gcc AND clang; reading "
+           "`:::` as basic would ACCEPT it: " << errorInventory(*empty.model);
+    EXPECT_FALSE(has(*empty.model,
+                     DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate))
+        << "the BASIC-template code must NOT fire — that would be the right "
+           "refusal reached by the wrong reading: " << errorInventory(*empty.model);
+
+    // CONTROL A — the same bytes with a POPULATED clobber section. Both oracles
+    // give the identical message, so the reading must be identical here too.
+    auto clob = analyzeFor("x86_64",
+                           wrap("__asm__ (\"xorl %eax,%eax\" ::: \"rax\");"));
+    ASSERT_TRUE(clob.model.has_value());
+    EXPECT_TRUE(has(*clob.model,
+                    DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
+        << errorInventory(*clob.model);
+
+    // CONTROL B — the same bytes with NO colon. Both oracles COMPILE this, so
+    // refusing it would be the divergence in the other direction, and without
+    // this row the pin is satisfied by refusing `%eax` everywhere.
+    auto basic = analyzeFor("x86_64", wrap("__asm__ (\"xorl %eax,%eax\");"));
+    ASSERT_TRUE(basic.model.has_value());
+    EXPECT_FALSE(basic.model->hasErrors()) << errorInventory(*basic.model);
+
+    // CONTROL C — an EXTENDED template with empty sections that both oracles
+    // COMPILE (`%%` is the literal-percent escape). It must pass the semantic
+    // gate, so this pin cannot be met by refusing everything that carries `:::`.
+    auto escaped = analyzeFor("x86_64",
+                              wrap("__asm__ (\"movl %%eax, %%ebx\" :::);"));
+    ASSERT_TRUE(escaped.model.has_value());
+    EXPECT_FALSE(escaped.model->hasErrors()) << errorInventory(*escaped.model);
+}
+
 // S0069 — the template exists and cannot be turned into text at all.
 TEST(InlineAsmRefusals, AnUndecodableTemplateIsRefusedRatherThanPartiallyAssembled) {
     auto bad = analyzeFor("x86_64", wrap("__asm__ (\"nop \\q\");"));

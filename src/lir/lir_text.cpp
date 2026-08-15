@@ -1081,6 +1081,15 @@ private:
             // refuses the entry itself — a parse error must never become a
             // process abort.
             if (!constraintNamesResolve(c)) continue;
+            // ★★★ ...AND THE SAME IS NOW TRUE OF `outputs ⊆ clobbered`.
+            // `regConstraintPoolAdd` gained an ABORT on that invariant
+            // (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-
+            // CLOBBERED), and its own message says a producer fed by USER
+            // text must pre-validate and REPORT. This is that producer:
+            // every byte here came from a file. Without this check a
+            // malformed `.dsslir` KILLS THE PROCESS instead of being
+            // diagnosed — a refusal that crashes is not a refusal.
+            if (!constraintSubsetHolds(c)) continue;
 
             std::uint32_t const actualIdx =
                 builder_.regConstraintPoolAdd(std::move(c));
@@ -1176,6 +1185,81 @@ private:
         for (auto const& [r, n] : c.inputRoleNames)  checkOne(n, "inrole");
         for (auto const& [r, n] : c.outputRoleNames) checkOne(n, "outrole");
         return ok;
+    }
+
+    // ★★★ `outputs ⊆ clobbered`, ASKED WITH THE TYPE'S OWN QUERY AND ANSWERED
+    // WITH A DIAGNOSTIC. `LirBuilder::regConstraintPoolAdd` ABORTS on a
+    // violation — the right answer for a lowering, which can only reach it by
+    // its own bug — and its message spells out the obligation this function
+    // discharges: *"a producer fed by USER text must pre-validate with
+    // `firstOutputNotClobbered()` and REPORT"*.
+    //
+    // ★ THE TEST IS OVER ORDINALS, NOT NAMES, AND THAT IS WHY THE NAMES ARE
+    // RESOLVED HERE FIRST — not because this file prefers ordinals, but because
+    // `firstOutputNotClobbered` reads them and is the ONE implementation of the
+    // rule. Re-deriving it here with a name compare is how two copies drift, and
+    // the builder's abort would then disagree with this diagnostic.
+    //
+    // ⚠ AND THE ORDINAL IS THE REGISTER-TABLE INDEX, WHICH IS NOT THE SAME AS
+    // "the physical register". ✔MEASURED 2026-08-15 on the shipped x86_64 table:
+    // `eax` is row 33 with `subOf: rax` and `rax` is row 0, so `registerByName`
+    // returns DIFFERENT ordinals for two spellings of one register and
+    // `out [eax] clobber [rax]` is REFUSED here — though
+    // `firstOutputNotClobbered`'s own docblock says such a pair "must satisfy
+    // the rule".
+    //
+    // ★ THAT IS NOT A LIVE MISCOMPILE, AND THE REASON IS WHERE THE
+    // CANONICALISATION LIVES. The LOWERING producer (`mir_to_lir.cpp`'s
+    // `canonicalAsmRegister`) walks `subOf` to the PARENT ordinal before it
+    // builds the name arrays, so every entry the compiler itself creates is
+    // already in parent spellings and the ordinals agree. Only a HAND-WRITTEN
+    // `.dsslir` naming a sub-register reaches the gap, and it is refused rather
+    // than mis-accepted. ⇒ this caller does NOT grow a bespoke alias walk to
+    // close it: a second, kinder authority here would disagree with the
+    // builder's abort, which is the drift the shared query exists to prevent.
+    // The fix, if the shape ever needs to load, belongs in the query or in the
+    // reader's canonicalisation — not in a private copy of the rule.
+    //
+    // ⚠ WRITES THE TWO ORDINAL ARRAYS INTO `c`, WHICH IS SAFE ONLY BECAUSE THE
+    // BUILDER OVERWRITES ALL FIVE. `regConstraintPoolAdd` re-derives every
+    // ordinal from the names ("names are the authored source of truth"), so
+    // nothing this function writes survives into the pool — it is scratch for
+    // the query, not a half-resolution the pool could inherit.
+    [[nodiscard]] bool constraintSubsetHolds(ImplicitRegisterConstraint& c) {
+        // ⚠ A MISS BAILS; IT DOES NOT SKIP. `constraintNamesResolve` ran first
+        // and reported every unresolvable name, so this cannot fire today — but
+        // "skip the ones that fail" would leave `outputOrdinals` SHORTER than
+        // `outputNames`, and the index `firstOutputNotClobbered` returns is then
+        // used to subscript the NAMES. A short array cannot make the test pass
+        // wrongly, but it CAN make the message name the wrong register, which is
+        // the half-applied shape this repo keeps rediscovering. Returning false
+        // keeps the two arrays index-aligned or produces no verdict at all.
+        auto const resolve = [&](std::vector<std::string> const& names,
+                                 std::vector<std::uint16_t>&     ordinals) {
+            ordinals.clear();
+            ordinals.reserve(names.size());
+            for (auto const& n : names) {
+                auto const ord = schema_.registerByName(n);
+                if (!ord.has_value()) return false;
+                ordinals.push_back(*ord);
+            }
+            return true;
+        };
+        if (!resolve(c.outputNames,    c.outputOrdinals))    return false;
+        if (!resolve(c.clobberedNames, c.clobberedOrdinals)) return false;
+        auto const bad = c.firstOutputNotClobbered();
+        if (!bad.has_value()) return true;
+        emit(DiagnosticCode::I_TextMalformed,
+             std::format("register-constraint out register '{}' is not in the "
+                         "same entry's clobber set. Every register the "
+                         "instruction WRITES is clobbered for any value live "
+                         "across it, and register allocation omits outputs from "
+                         "its forbidden set on exactly that basis — so this "
+                         "entry would let a live value keep a register the "
+                         "instruction overwrites, with no diagnostic. Add '{}' "
+                         "to the 'clobber' list",
+                         c.outputNames[*bad], c.outputNames[*bad]));
+        return false;
     }
 
     // Parse `<value-arm> core <Kind>` — same shape on entries AND on

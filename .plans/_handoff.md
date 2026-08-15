@@ -42,6 +42,50 @@ cannot tell "works" from "does nothing".*
 `D-ASM-ARM64-CONDITION-AS-OPERAND-UNMODELLED` (a **FALSE CLOSE** corrected — it had been witnessed
 only on `eq`/`ne`, the two spellings where the substrate and gas vocabularies coincide).
 
+### 0.00 ★ OPERATOR-QUEUED CYCLE 2026-08-15 — two tasks, both BLOCKED ON LANE Z LANDING
+⚠ **Sequencing, measured:** the in-flight lane owns `src/mir/lowering/hir_to_mir.cpp`, `src/mir/mir_asm_descriptor.{hpp,cpp}` and `tests/mir/**`, **and it is the lane ADDING the two fields task 2 pins**. Task 1 collides outright; task 2's subject does not exist until it lands. **Dispatch both only after that lane reports.**
+
+**TASK 1 — route asm output store-back through `emitScalarStore` (a REAL silent defect).**
+`Lowerer::lowerInlineAsm` stores each inline-asm OUTPUT back through its lvalue address with a bare
+`mir.addInst(MirOpcode::Store, st)` at **TWO** sites — the `asm goto` successor-head path
+(`std::array<MirInstId, 2> st{rp, outAddrs[k]};`) and the non-terminator path
+(`std::array<MirInstId, 2> st{pieceVals[k], outAddrs[k]};`). Both **bypass `Lowerer::emitScalarStore`**
+(same file, ~`:594`), the documented funnel that (a) routes an `_Atomic`-qualified lvalue to
+`MirOpcode::AtomicStore` with `kAtomicOrderSeqCst` and (b) stamps the c21 `MirInstFlags::Volatile`
+from `volatileFlagFor(node) | volatileFlagForType(accessedTy)`.
+⇒ **Two silent consequences:** `volatile int x; __asm__("…" : "=r"(x));` loses the Volatile flag on
+the write-back, so the optimizer may elide or reorder a store the source marked volatile; and
+`_Atomic int x; …` emits a **plain Store on an atomic object**. ★ `emitScalarLoad`'s own docblock says
+a missed funnel site is caught **LOUD** by the MIR verifier's atomic belt (`I_AtomicAccessNotLowered`),
+so this is **likely a LIVE verifier failure rather than only a quality gap — confirm which by writing
+the fixture FIRST.**
+⚠ **The two halves of one operand are already asymmetric:** the READ half of a `"+r"` operand (added
+2026-08-15) already goes through `emitScalarLoad`.
+**Fix:** call `emitScalarStore(st, pieceTypeFor(k), kids[k])` at both sites instead of `addInst`.
+⚠ **Keep the ordering** — the non-terminator path emits its stores in a SECOND pass, deliberately
+after the producer→`ReturnPiece` adjacency window closes.
+**Tests** in `tests/mir/test_mir_lowering_c_subset.cpp` (its `lowerCSubset` harness now threads both
+the target schema and `hir->inlineAsmPool`, so a descriptor-carrying `__asm__` reaches MIR): assert
+the volatile fixture's store-back carries the Volatile flag and the `_Atomic` fixture lowers to
+`AtomicStore`. Red-on-disable by reverting each call individually and re-running through `ctest`.
+
+**TASK 2 — pin the two new `MirAsmDescriptor` fields through the MIR rebuild (test hardening).**
+`MirAsmDescriptor` gained `bool isExtended` (the BASIC/EXTENDED surface, carried because `:::` with
+every section empty is **unreconstructable** downstream) and `std::optional<std::uint32_t> tiedOutput`
+on `MirAsmOperand` (set on the synthesized INPUT entry carrying a `"+r"` operand's read half, naming
+the output it shares a location with). `tests/opt/test_inline_asm_rebuild_carriage.cpp` pins that the
+descriptor survives the rebuild passes, but its `sentinelDescriptor()`/`expectSentinel()` pair sets and
+checks templateText, isVolatile, outputs, inputs, clobbers and the two clobber flags — **not the two
+new fields**.
+ⓘ **Today this cannot drop anything**: every rebuild site passes `src.asmDescriptor(id)` **WHOLE by
+value**, so new members ride along. The exposure is a **future refactor to a field-by-field copy** —
+precisely the silent-drop class `mir_asm_descriptor.hpp`'s own docblock guards (*"A POOL INDEX IS NOT
+SELF-CARRYING, AND THAT IS THE WHOLE HAZARD"*).
+**Fix:** extend `sentinelDescriptor()` to set `isExtended = true` and give one input a `tiedOutput`;
+extend `expectSentinel()` to assert both. **Red-on-disable by making ONE rebuild site copy the
+descriptor field-by-field, omitting the two new fields**, confirming the pin reds through `ctest`, then
+reverting.
+
 ### 0.0 ⚠ THE NEXT CYCLE'S MANDATE — four blockers, operator-scheduled 2026-08-15
 Balance ends **+6 by an explicit §B decision** (*"close everything already closed, commit, then
 another cycle for the new blockers — I WANT ASM FULLY 100% DELIVERED"*). Not drift: this cycle

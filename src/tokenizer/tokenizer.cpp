@@ -588,10 +588,12 @@ struct NumberScan {
 
 Tokenizer::Tokenizer(std::shared_ptr<SourceBuffer>        src,
                      std::shared_ptr<GrammarSchema const> schema,
-                     DiagnosticBudget                     budget)
+                     DiagnosticBudget                     budget,
+                     LexerModeId                          initialMode)
     : source_(std::move(src))
     , schema_(std::move(schema))
-    , reporter_(std::make_unique<DiagnosticReporter>(budget.asConfig())) {
+    , reporter_(std::make_unique<DiagnosticReporter>(budget.asConfig()))
+    , initialMode_(initialMode) {
     if (!source_) tokenizerFatal("source is null");
     if (!schema_) tokenizerFatal("schema is null");
 }
@@ -680,7 +682,51 @@ TokenizeResult Tokenizer::tokenize() && {
 
     const auto mainModeId = schema_->findLexerMode("main");
     if (!mainModeId.valid()) tokenizerFatal("schema has no 'main' lexer mode");
-    frames.push_back(Frame{ .mode = mainModeId, .style = nullptr, .dynamicSuffix = {} });
+    // ★★★ THE BOTTOM FRAME IS NOT ALWAYS `main` — A FRAGMENT MAY START IN A
+    // DECLARED MODE (`initialMode_`, 2026-08-15).
+    //
+    // A whole FILE is always read in `main`; a FRAGMENT of a language embedded
+    // in another one need not be. The first consumer is an embedded `__asm__`
+    // TEMPLATE, whose surface differs from the same dialect's `.s` surface IN
+    // THE LEXER and not merely in the grammar — ✔MEASURED on gcc 13.3.0 and
+    // clang 18.1.3, `%` is literal in a basic template, an operand introducer
+    // in an extended one, and the register sigil in a `.s`. One document, three
+    // readings of one byte; the mode is where that belongs.
+    //
+    // ⚠ THE MODE SITS AT `frames[0]`, NOT PUSHED ON TOP OF `main`, AND THE
+    // DIFFERENCE IS BEHAVIOURAL RATHER THAN COSMETIC. Every `frames.size() <= 1`
+    // guard in this function reads "this is the floor, there is nothing below
+    // it", so a pushed initial mode would be a frame the fragment's own scan can
+    // pop out from under itself. Two mechanisms would do it:
+    //   • the END-OF-INPUT UNTERMINATED SWEEP runs `while (frames.size() > 1)`
+    //     and reports every frame it drops — so a PUSHED fragment mode is
+    //     reported "EOF inside lexer mode 'X'" on EVERY fragment, for reaching
+    //     the end of the fragment, which is what a fragment is. At frame 0 it is
+    //     the floor and is never swept. ✔This one fires for ANY pushed mode, the
+    //     two shipped `asm-template` modes included.
+    //   • the `popAtNewline` AUTO-POP, for a fragment mode that declares it: the
+    //     first newline of a multi-line fragment would drop the frame and every
+    //     later line would be read on the WHOLE-FILE surface.
+    // ⚠ THE SECOND IS CONDITIONAL AND THIS COMMENT USED TO STATE IT FLATLY
+    // ("would be popped by the first newline"). ✔MEASURED: the pop is gated on
+    // the mode's `popAtNewline`, and NEITHER shipped `asm-template` mode declares
+    // it — so for the modes this change actually ships, only the first mechanism
+    // bites. The premise is right and the blanket consequence was not; the
+    // frame-0 choice is what makes BOTH harmless for any fragment mode a future
+    // language declares, which is why it is not "correct for today's two modes".
+    //
+    // ⚠ AND IT IS VALIDATED, NEVER DEFAULTED-AWAY: an id this schema does not
+    // declare is a caller defect, and silently falling back to `main` would hand
+    // that caller the exact surface it asked not to have. Callers that want
+    // `main` pass nothing.
+    LexerModeId startMode = mainModeId;
+    if (initialMode_.valid()) {
+        if (initialMode_.v >= schema_->lexerModes().size() + 1u) {
+            tokenizerFatal("initial lexer mode is not declared by this schema");
+        }
+        startMode = initialMode_;
+    }
+    frames.push_back(Frame{ .mode = startMode, .style = nullptr, .dynamicSuffix = {} });
 
     // Locally-scoped emit helper — collapses the five "construct span +
     // push Token" sites that previously appeared once per branch. The
@@ -769,16 +815,22 @@ TokenizeResult Tokenizer::tokenize() && {
             case ModeOp::PopMode: {
                 // Main mode (depth 1) must never pop.
                 if (frames.size() <= 1) {
-                    tokenizerFatal("PopMode would underflow the frame stack (main mode unreachable)");
+                    // "bottom frame", not "main": a FRAGMENT's floor is the
+                    // caller's `initialMode` (see tokenize()'s banner), so a
+                    // message naming `main` would misidentify the frame it is
+                    // protecting on exactly the inputs that reach this path
+                    // from an embedded template.
+                    tokenizerFatal("PopMode would underflow the frame stack (the bottom scan frame is unreachable)");
                 }
                 frames.pop_back();
                 break;
             }
             case ModeOp::ReplaceMode: {
-                // Replace must operate on a real body frame; replacing
-                // main mode would break the depth-1 invariant.
+                // Replace must operate on a real body frame; replacing the
+                // BOTTOM frame would break the depth-1 invariant. (Bottom, not
+                // "main" — a fragment's floor is the caller's `initialMode`.)
                 if (frames.size() <= 1) {
-                    tokenizerFatal("ReplaceMode applied at main-mode depth");
+                    tokenizerFatal("ReplaceMode applied at bottom-frame depth");
                 }
                 StringStyle const* style = schema_->stringStyle(m);
                 // The replaced frame starts with no dynamicSuffix.
@@ -1059,7 +1111,10 @@ TokenizeResult Tokenizer::tokenize() && {
         // branch above already `continue`d, so `frames.back()` is the
         // mode whose token table the operator/identifier lookups must
         // consult first (with global fallback). `frames` always holds at
-        // least the always-on "main" frame, so `back()` is safe.
+        // least the BOTTOM frame this scan was seeded with — `main` for a
+        // whole file, the caller's `initialMode` for a fragment — and nothing
+        // can pop it (see the two guards in the mode-op switch), so `back()`
+        // is safe.
         const LexerModeId activeMode = frames.back().mode;
 
         // Whitespace runs emit one token per byte (matches the per-char
@@ -1213,8 +1268,12 @@ TokenizeResult Tokenizer::tokenize() && {
     }
 
     // Unterminated body modes: source ended before the active body's
-    // endsAt was matched. Emit one diagnostic per unterminated frame
-    // (excluding the always-on "main" at frames[0]). The diagnostic
+    // endsAt was matched. Emit one diagnostic per unterminated frame,
+    // EXCLUDING the bottom frame at frames[0] — `main` for a whole file, the
+    // caller's `initialMode` for a fragment. ★ THAT EXCLUSION IS WHY an
+    // embedded template's mode is seeded at frame 0 rather than pushed: a
+    // pushed one would be swept here and every well-formed fragment would
+    // report "EOF inside lexer mode 'asm-template'". The diagnostic
     // flavor comes from the schema-declared `unterminatedFlavor` on
     // the mode — no more substring-sniffing the mode name. Generic
     // falls back to P_UnterminatedString since that's the closest

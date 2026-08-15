@@ -15,9 +15,12 @@
 #include "opt/passes/inlining.hpp"
 #include "opt/passes/licm.hpp"
 #include "opt/passes/mem2reg.hpp"
+#include "opt/passes/mir_rebuild_helper.hpp"
 #include "opt/passes/simplify_cfg.hpp"
 
 #include <format>
+#include <unordered_set>
+#include <vector>
 
 // Per-pass dispatcher. `runPass` returns:
 //   { ok: bool, mutated: bool }
@@ -106,13 +109,93 @@ struct PassRunResult {
     return {false, false};
 }
 
+// ★★★ THE INLINE-DEFINITION STRIP
+// (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED, C99 6.7.4p7).
+//
+// Removes every function that must not be emitted because it is an INLINE
+// DEFINITION: it "does not provide an external definition for the function", it
+// exists in the module ONLY so the inliner may use it as 6.7.4p7's "alternative
+// to an external definition", and by the time the pipeline is done its job is
+// over. This is LLVM's `EliminateAvailableExternally` in one screen, and it is
+// the second half of a decision whose first half is in CST→HIR.
+//
+// ★★★ WHY IT IS AN EPILOGUE AND NOT A PASS. It must run on EVERY module at
+// EVERY optimization level, and a pass runs only if a pipeline lists it. The
+// debug pipeline is `["Identity"]`; had this been a pass that `release.pipeline
+// .json` listed, a debug build would emit the body and DSS would start LINKING
+// programs that gcc, clang and the C standard all say have no external
+// definition — ✔MEASURED, all three fail at `-O0`. Gating it on "will we
+// optimize" has the same defect. So: unconditional, after the loop, no
+// configuration surface, and impossible to forget.
+//
+// ★★ HOW IT KNOWS WHICH FUNCTIONS. Not a flag — a property of the module. An
+// inline definition is the ONLY function whose SymbolId is also declared by an
+// `ExternImport`; HIR→MIR fails loud on that pair for every other producer
+// ("Each SymbolId must belong to either a function OR an extern, never both"),
+// and it sanctions it for exactly the C99 6.7.4p7 case. That matters because
+// SymbolIds survive every rebuild verbatim, whereas a `MirFuncAttribute` keyed
+// by MirFuncId is discarded the first time any pass rebuilds the module — and a
+// lost mark here emits a body that must not exist. The carrier had to be
+// something the module cannot forget.
+//
+// ★ AND WHAT SURVIVES IT. Nothing else changes. The `ExternImport` row stays, so
+// a call the inliner did NOT take still binds to a sibling CU's external
+// definition, or fails loud `K_SymbolUndefined` naming the symbol — the exact
+// path, and the exact diagnostic, that this shape produced before the body
+// existed at all. A call the inliner DID take leaves the row unreferenced, and
+// the linker's `rejectOrDropUnreferencedExterns` drops it silently. Taking the
+// function's ADDRESS is likewise unchanged and still fails loud, which is what
+// both reference compilers do at every `-O` level (✔MEASURED) and what 6.7.4p7
+// requires: it licenses using the inline definition for a CALL, not for an
+// address.
+//
+// Returns the number of functions dropped (0 = the module had none, the common
+// case, and the scan below is the only cost).
+[[nodiscard]] std::size_t
+stripInlineDefinitions(Mir& mir, std::span<ExternImport const> externImports) {
+    if (externImports.empty()) return 0;
+    std::unordered_set<std::uint32_t> externSyms;
+    externSyms.reserve(externImports.size());
+    for (ExternImport const& e : externImports) externSyms.insert(e.symbol.v);
+
+    std::size_t const nf = mir.moduleFuncCount();
+    // `oldOrdinalToNew[i]` = the rebuilt ordinal of old function `i`, or
+    // UINT32_MAX when dropped. Built in the SAME walk that decides the drop, so
+    // the table and the rebuild cannot disagree about which function is which.
+    std::vector<std::uint32_t> oldOrdinalToNew(nf, UINT32_MAX);
+    std::size_t dropped = 0;
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        if (externSyms.contains(mir.funcSymbol(mir.funcAt(i)).v)) {
+            ++dropped;
+            continue;
+        }
+        oldOrdinalToNew[i] = static_cast<std::uint32_t>(i - dropped);
+    }
+    if (dropped == 0) return 0;
+
+    MirBuilder builder;
+    passes::MirIdentityRebuildPolicy policy;
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        if (oldOrdinalToNew[i] == UINT32_MAX) continue;
+        passes::MirFunctionRebuilder rb{mir, builder, policy};
+        rb.rebuildFunction(mir.funcAt(i));
+    }
+    // AFTER every surviving function is re-added — the helper's ordering
+    // contract, and the remap it needs to re-point a runtime-init global now
+    // that ordinals have shifted.
+    passes::cloneGlobalsRemappingInitFunc(mir, builder, oldOrdinalToNew);
+    mir = std::move(builder).finish();
+    return dropped;
+}
+
 } // namespace
 
 OptResult optimize(Mir& mir,
                    TargetSchema const& target,
                    TypeInterner const& interner,
                    OptPipeline const& pipeline,
-                   DiagnosticReporter& reporter) {
+                   DiagnosticReporter& reporter,
+                   std::span<ExternImport const> externImports) {
     // D-OPT1-RETURN-FALSE-DIAGNOSTIC-CONTRACT: a false return MUST
     // be paired with a new error. Snapshot + belt-and-suspenders
     // emit below covers any future failure path that forgets to.
@@ -262,6 +345,17 @@ OptResult optimize(Mir& mir,
             break;
         }
     }
+
+    // ★★★ THE INLINE-DEFINITION STRIP, unconditional and ahead of the final
+    // verify (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED). Placed
+    // HERE, after the fixed-point loop, for two reasons that pull the same way:
+    // the inliner must have had every iteration to consume these bodies before
+    // they go, and the module that reaches codegen must be the module the final
+    // verify approved. `result.ok` is untouched — the strip cannot fail (it
+    // aborts loud on the one impossible input, a dropped module-init function),
+    // and reporting it as a pass would put a mandatory normalize into a
+    // configurable surface, which is exactly what it must not be.
+    (void)stripInlineDefinitions(mir, externImports);
 
     // RELEASE posture (D-OPT1-VERIFY-FREQUENCY-CONFIG): a pipeline that did NOT
     // verify after every pass verifies its FINAL MIR exactly once here — a

@@ -16,6 +16,7 @@
 #include "hir/hir_node.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
+#include "mir/mir_asm_descriptor.hpp"           // MirAsmDescriptor (inline-asm P5 carriage)
 #include "mir/mir_text.hpp"
 #include "mir/mir_verifier.hpp"
 #include "opt/optimizer.hpp"
@@ -48,6 +49,12 @@ namespace {
 // Each layer's diagnostics are surfaced to the test; ML2's are separated
 // so the caller can opt-in or opt-out of `expected-clean`.
 struct Lowered {
+    // ⚠ DECLARED FIRST SO IT IS DESTROYED LAST. `analyze` takes the target
+    // NON-OWNING and the returned `SemanticModel` republishes it
+    // (`SemanticModel::target()`), so the schema must outlive the model.
+    // Members destroy in reverse declaration order; putting this anywhere below
+    // `model` would leave a dangling `target()` during teardown.
+    std::shared_ptr<TargetSchema const> target;
     SemanticModel                    model;
     std::unique_ptr<CstToHirResult>  hir;
     DiagnosticReporter               hirReporter;
@@ -85,16 +92,27 @@ struct Lowered {
     // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): thread the selected CC's va_list
     // strategy into analyze() so a Win64 (ms_x64) variadic source gets the `char*`
     // `va_list` type (not SysV's __va_list_tag[1]) — mirrors compile_pipeline.cpp.
-    std::optional<VaListStrategy> vaStrategy;
+    // ★★ INLINE-ASM P5: THE TARGET IS THREADED INTO `analyze`, AND WITHOUT IT
+    // AN ASM OPERAND CANNOT REACH MIR AT ALL. A GNU constraint LETTER is a
+    // MACHINE fact — `"r"` means whatever the processor's `asmConstraints`
+    // facet says — so with no target in scope
+    // `HirInlineAsmOperand::regClassResolved` stays false and `lowerInlineAsm`
+    // REFUSES rather than guessing a register bank. `compile_pipeline.cpp`
+    // passes it; this harness did not, which is why every asm fixture in this
+    // file was a barrier or a refusal. Held in `Lowered::target` because
+    // `analyze` takes it NON-OWNING and the model republishes it.
+    std::optional<VaListStrategy>       vaStrategy;
+    std::shared_ptr<TargetSchema const> targetSchema;
     if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
-        if (auto const* cc = (*t)->callingConventionByName(ccName);
+        targetSchema = *t;
+        if (auto const* cc = targetSchema->callingConventionByName(ccName);
             cc != nullptr && cc->vaListLayout.has_value()) {
             vaStrategy = cc->vaListLayout->strategy;
         }
     }
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
                          dataModel, std::nullopt, vaStrategy, std::nullopt,
-                         std::nullopt, ldf);
+                         std::nullopt, ldf, targetSchema.get());
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
@@ -219,8 +237,18 @@ struct Lowered {
                                     &hir->noInlineMap,
                                     &hir->alwaysInlineMap,   // TF-C81
                                     &hir->noOptimizeMap,   // TF-C85
-                                    &hir->noSanitizeThreadMap);   // TF-C92
+                                    &hir->noSanitizeThreadMap,   // TF-C92
+                                    // inline-asm P5: WITHOUT THIS POOL every
+                                    // descriptor-carrying `__asm__` statement is
+                                    // REFUSED ("the HirInlineAsmPool was not
+                                    // threaded into lowerToMir") — the operands,
+                                    // the clobbers and the template are all
+                                    // unreachable. `compile_pipeline.cpp` passes
+                                    // it; a harness that does not cannot see an
+                                    // asm statement at all.
+                                    &hir->inlineAsmPool);
     return Lowered{
+        .target      = std::move(targetSchema),
         .model       = std::move(model),
         .hir         = std::move(hir),
         .hirReporter = std::move(hirReporter),
@@ -567,7 +595,16 @@ namespace {
                                     &hir->noInlineMap,   // TF-C78
                                     &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
                                     &hir->noOptimizeMap,   // TF-C85 (#pragma optimize)
-                                    &hir->noSanitizeThreadMap);   // TF-C92 (no_sanitize_thread)
+                                    &hir->noSanitizeThreadMap,   // TF-C92
+                                    // inline-asm P5: WITHOUT THIS POOL every
+                                    // descriptor-carrying `__asm__` statement is
+                                    // REFUSED ("the HirInlineAsmPool was not
+                                    // threaded into lowerToMir") — the operands,
+                                    // the clobbers and the template are all
+                                    // unreachable. `compile_pipeline.cpp` passes
+                                    // it; a harness that does not cannot see an
+                                    // asm statement at all.
+                                    &hir->inlineAsmPool);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -636,7 +673,16 @@ namespace {
                                     &hir->noInlineMap,   // TF-C78
                                     &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
                                     &hir->noOptimizeMap,   // TF-C85 (#pragma optimize)
-                                    &hir->noSanitizeThreadMap);   // TF-C92 (no_sanitize_thread)
+                                    &hir->noSanitizeThreadMap,   // TF-C92
+                                    // inline-asm P5: WITHOUT THIS POOL every
+                                    // descriptor-carrying `__asm__` statement is
+                                    // REFUSED ("the HirInlineAsmPool was not
+                                    // threaded into lowerToMir") — the operands,
+                                    // the clobbers and the template are all
+                                    // unreachable. `compile_pipeline.cpp` passes
+                                    // it; a harness that does not cannot see an
+                                    // asm statement at all.
+                                    &hir->inlineAsmPool);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -12543,6 +12589,254 @@ TEST(MirLoweringCSubset, AsmPayloadHirLoweringCannotREPRESENTIsRefusedNotDropped
                                          : ok.hirReporter.all()[0].actual);
 }
 
+// ── inline-asm P5: the MIR-tier CARRIAGE pins (the two facts that used to be
+//    reconstructed or dropped at the HIR→MIR seam) ────────────────────────────
+namespace {
+// The one `InlineAsm` instruction of a lowered fixture, plus its descriptor.
+// Fails the test (rather than returning a default) when there is not exactly
+// one: a pin that silently read descriptor #0 of a two-asm module would assert
+// about the wrong statement.
+struct LoweredAsm {
+    MirInstId               inst;
+    MirAsmDescriptor const* desc = nullptr;
+};
+[[nodiscard]] LoweredAsm theOneInlineAsm(Mir const& m) {
+    LoweredAsm found;
+    int        n = 0;
+    for (MirInstId id : stdbitAllEntryInsts(m)) {
+        if (m.instOpcode(id) != MirOpcode::InlineAsm) continue;
+        ++n;
+        found.inst = id;
+        found.desc = &m.asmDescriptor(id);
+    }
+    EXPECT_EQ(n, 1) << "the fixture must lower to exactly one InlineAsm";
+    return found;
+}
+} // namespace
+
+// ★★★ `isExtended` TRAVELS FROM THE FRONT END INSTEAD OF BEING RE-DERIVED FROM
+// THE SECTION LISTS (D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER).
+//
+// "Any `:` makes the statement extended" is a LEXICAL fact about the template —
+// it selects which LEXER MODE reads it, because in a BASIC template `%` is
+// literal and in an EXTENDED one `%` introduces an operand. The LIR expansion
+// used to reconstruct that fact by asking "is ANY section populated?", which is
+// exact for every shape except one: `__asm__("…" :::)` has three colons and
+// three EMPTY sections, so the reconstruction reads it as BASIC.
+//
+// ✔MEASURED 2026-08-15, gcc 13.3.0 and clang 18.1.3, and the OBSERVABLE SYMPTOM
+// IS THE OPPOSITE OF THE ONE THE HOLE WAS FIRST REPORTED AS. The over-acceptance
+// half never reached the LIR tier — `__asm__("xorl %eax,%eax" :::)` is already
+// refused by the semantic scan (S0067), matching both oracles. What the
+// reconstruction actually did was UNDER-accept: `__asm__("movl %%eax, %%ebx" :::)`
+// compiles on gcc AND clang (rc=0 both) and this build REFUSED it with a raw
+// `expected 'Identifier' — got '%'` out of the `.s` lexer, while the matched
+// `::: "ebx"` control compiled clean. Refusing what the reference toolchain
+// builds is the same defect from the other side.
+//
+// ⚠ THE THREE ROWS BELOW ARE A DISCRIMINATION, NOT A SMOKE TEST. Only the
+// EMPTY-SECTION row can tell a carried flag from a reconstructed one — the other
+// two agree under both readings, and a pin containing only those would stay
+// green against the exact bug this closes.
+//
+// RED-ON-DISABLE — TWO mutants, both RUN on 2026-08-15 with the subject
+// binary's mtime checked before and after so the mutant is proven COMPILED IN,
+// and both driven through `ctest` (a bare `.exe` misses `DSS_CONFIG_ROOT`):
+//   (1) DELETE `desc.isExtended = src.isExtended;` in `hir_to_mir.cpp` → the
+//       field keeps its `false` default and **TWO** rows go red, not one. That
+//       is worth stating because the prediction written here first said one:
+//       with the copy gone the carried flag is the ONLY source, so every
+//       extended row fails, and the mutant therefore cannot tell a carried flag
+//       from a reconstructed one.
+//   (2) ★ THE DISCRIMINATING MUTANT — replace the copy with the LIR consumer's
+//       old reconstruction (`!operands.empty() || !clobbers.empty() ||
+//       clobbersMemory || clobbersConditionCodes`). MEASURED: **exactly one**
+//       failure, the `:::` row. That is the pin's real subject — the regression
+//       this closes is not "the field is unset", it is "the field is DERIVED" —
+//       and only mutant (2) demonstrates the row was READ.
+TEST(MirLoweringCSubset, InlineAsmExtendedSurfaceIsCarriedNotReconstructed) {
+    struct Row {
+        char const* src;
+        bool        extended;
+        char const* why;
+    };
+    Row const rows[] = {
+        {"void f(void){ __asm__(\"nop\"); }", false,
+         "no colon at all — a BASIC template, `%` is literal"},
+        {"void f(void){ __asm__(\"nop\" ::: \"rax\"); }", true,
+         "a populated clobber section — extended under BOTH readings"},
+        // ★ THE DISCRIMINATING ROW.
+        {"void f(void){ __asm__(\"nop\" :::); }", true,
+         "three colons, every section EMPTY — extended by the colon alone, and "
+         "invisible to any consumer that reconstructs the fact from the section "
+         "lists"},
+    };
+    for (auto const& r : rows) {
+        auto L = lowerCSubset(r.src);
+        ASSERT_FALSE(L.model.hasErrors())
+            << r.src << " — " << (L.model.diagnostics().all().empty()
+                                      ? std::string{}
+                                      : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.mir.ok)
+            << r.src << " — "
+            << (L.mirReporter.all().empty() ? std::string{}
+                                            : L.mirReporter.all()[0].actual);
+        auto const got = theOneInlineAsm(L.mir.mir);
+        ASSERT_NE(got.desc, nullptr) << r.src;
+        EXPECT_EQ(got.desc->isExtended, r.extended) << r.src << " — " << r.why;
+    }
+}
+
+// ★★★ `"+r"` CONTRIBUTES **BOTH** HALVES, AND THEY NAME THE SAME OBJECT
+// (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE).
+//
+// A `+` operand is one thing the source wrote and two things the machine needs.
+// It was filed in `outputs` only, and an output contributes just an LVALUE
+// ADDRESS to store the result back through — so NO MIR operand carried the value
+// the template is entitled to READ, and the LIR binder had to refuse the
+// constraint outright. ✔MEASURED 2026-08-15: gcc 13.3.0 and clang 18.1.3 both
+// BUILD AND RUN `__asm__("addl $5, %0" : "+r"(x))` with x==7 and print 12.
+//
+// ★★ THE ASSERTIONS THAT MAKE THIS MORE THAN "IT COMPILES". A test that only
+// checked `inputs.size() == 1` would pass against a lowering that re-lowered the
+// operand expression as an rvalue — which is a MISCOMPILE, not a shortcut:
+// `"+r"(a[i++])` would read one element and write another. So this pins that the
+// read half LOADS FROM THE VERY ADDRESS the store-back writes to, and that the
+// address is computed ONCE. That is precisely "the value read was the one the C
+// variable held", stated at the tier this lane owns.
+//
+// ⓘ END-TO-END EXECUTION IS NOT ASSERTED HERE AND CANNOT BE YET: the LIR binder
+// (`mir_to_lir.cpp`'s `bindAsmOperand`) still refuses `isReadWrite` outright.
+// This pin covers the carriage; the run is owed once that refusal is replaced by
+// a read of `tiedOutput`.
+//
+// RED-ON-DISABLE — both mutants RUN on 2026-08-15 through `ctest`, with the
+// subject binary's mtime checked before and after so each is proven compiled in:
+//   (a) DELETE the tied-input append loop in `lowerInlineAsm` → MEASURED: the
+//       descriptor and the operand list fall out of step and
+//       `MirBuilder::checkAsmOperandAlignment_` kills the run —
+//       *"addInlineAsm: descriptor declares 0 input(s) but 1 operand(s) were
+//       supplied"*. Red by process death rather than by assertion, and that is
+//       the honest report: the two halves are structurally coupled, so the
+//       carriage cannot be half-removed quietly.
+//   (b) ★ REPLACE the `emitScalarLoad(outAddrs[k])` read half with a second
+//       `lowerExpr(kids[k])` — the double-evaluation miscompile, which COMPILES
+//       CLEAN. MEASURED: red on both single-evaluation assertions (`Gep` count
+//       2 vs 1; the read's pointer id 8 vs the store's 5). ⚠ This mutant was
+//       GREEN against two earlier fixtures — see the block comment below, which
+//       is why the fixture is `p[i]`.
+TEST(MirLoweringCSubset, ReadWriteAsmOperandCarriesItsReadHalfTiedToItsOutput) {
+    auto L = lowerCSubset(
+        "void f(void){ int x = 7; __asm__(\"addl $5, %0\" : \"+r\"(x)); }");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? std::string{} : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? std::string{}
+                                        : L.mirReporter.all()[0].actual);
+    Mir const& m   = L.mir.mir;
+    auto const got = theOneInlineAsm(m);
+    ASSERT_NE(got.desc, nullptr);
+
+    // ── the WRITE half, unchanged: one output, and it records the source's word.
+    ASSERT_EQ(got.desc->outputs.size(), 1u);
+    EXPECT_EQ(got.desc->outputs[0].constraint, "+r");
+    EXPECT_TRUE(got.desc->outputs[0].isReadWrite);
+    EXPECT_FALSE(got.desc->outputs[0].tiedOutput.has_value())
+        << "the tie is written on the INPUT — GNU's matching constraint — and an "
+           "output carrying one too would be the same fact in two places";
+
+    // ── the READ half, which used to be dropped here.
+    ASSERT_EQ(got.desc->inputs.size(), 1u)
+        << "a `+` operand must append one tied input; without it no MIR operand "
+           "carries the value the template reads";
+    ASSERT_TRUE(got.desc->inputs[0].tiedOutput.has_value())
+        << "the pairing must be a CARRIED index, not a position a consumer "
+           "infers from `inputs` being one longer than the source wrote";
+    EXPECT_EQ(*got.desc->inputs[0].tiedOutput, 0u);
+    EXPECT_EQ(got.desc->inputs[0].constraint, "+r");
+    EXPECT_EQ(got.desc->inputs[0].regClass, got.desc->outputs[0].regClass)
+        << "both halves are the same source operand, so they select the same "
+           "register class";
+
+    // ── inputs are 1:1 with the instruction's MIR operands, by construction.
+    auto const ops = m.instOperands(got.inst);
+    ASSERT_EQ(ops.size(), got.desc->inputs.size());
+    ASSERT_EQ(ops.size(), 1u);
+    ASSERT_EQ(m.instOpcode(ops[0]), MirOpcode::Load)
+        << "the read half must LOAD the variable's current value";
+
+    // ── ★★ THE SINGLE-EVALUATION PIN, ON A FIXTURE THAT CAN SEE IT.
+    //
+    // ⚠⚠ IT USES `p[i]`, NOT THE `int x` ABOVE, AND THE FIXTURE WAS CHOSEN BY
+    // RUNNING THE MUTANT — TWICE — NOT BY ARGUING ABOUT IT. The
+    // double-evaluation mutant (replace the load-from-`outAddrs[k]` with a
+    // second `lowerExpr(kids[k])`) was RUN on 2026-08-15 and the pin stayed
+    // GREEN against BOTH of the first two fixtures tried:
+    //   * `int x`  — `lowerLvalueAddress(x)` and the pointer inside
+    //                `lowerExpr(x)` are the SAME Alloca, so an address-identity
+    //                assertion sees one id either way;
+    //   * `*p`     — the address IS the `arg` value `%v1`, so a second lowering
+    //                emits a second `load` but from the same pointer id.
+    // Only an lvalue whose ADDRESS is itself computed (`gep(%p, i*4)`) makes the
+    // duplication visible: one evaluation ⇒ one `Gep`, two ⇒ two, and the read
+    // then loads from the one the store does not write. Two green mutant runs
+    // are what turned "this assertion looks strong" into a measurement.
+    {
+        auto D = lowerCSubset(
+            "void f(int *p, int i){ __asm__(\"addl $5, %0\" : \"+r\"(p[i])); }");
+        ASSERT_TRUE(D.mir.ok)
+            << (D.mirReporter.all().empty() ? std::string{}
+                                            : D.mirReporter.all()[0].actual);
+        Mir const& dm  = D.mir.mir;
+        auto const asmi = theOneInlineAsm(dm);
+        ASSERT_NE(asmi.desc, nullptr);
+        ASSERT_EQ(asmi.desc->inputs.size(), 1u);
+        auto const dops = dm.instOperands(asmi.inst);
+        ASSERT_EQ(dops.size(), 1u);
+        ASSERT_EQ(dm.instOpcode(dops[0]), MirOpcode::Load);
+        auto const readPtr = dm.instOperands(dops[0]);
+        ASSERT_EQ(readPtr.size(), 1u);
+
+        MirInstId storePtr{};
+        int       stores = 0;
+        for (MirInstId id : stdbitAllEntryInsts(dm)) {
+            if (dm.instOpcode(id) != MirOpcode::Store) continue;
+            auto const so = dm.instOperands(id);
+            if (so.size() != 2u) continue;
+            if (so[0].v != asmi.inst.v) continue;   // the piece-0 store-back
+            ++stores;
+            storePtr = so[1];
+        }
+        ASSERT_EQ(stores, 1) << "output 0 stores back exactly once";
+        EXPECT_EQ(readPtr[0].v, storePtr.v)
+            << "the read half and the write half must resolve to ONE address — "
+               "a second lowering of the operand expression evaluates its side "
+               "effects twice and can read a different object than it writes";
+        // ...and the address is COMPUTED once. Stated directly rather than left
+        // to follow from the id compare: "the operand expression is evaluated
+        // exactly once" is the property, and the count is the property's own
+        // spelling.
+        EXPECT_EQ(stdbitCountOp(dm, stdbitAllEntryInsts(dm), MirOpcode::Gep), 1)
+            << "`p[i]` must be addressed ONCE for a read-write operand";
+    }
+
+    // ── THE CONTROL. A write-only `"=r"` neighbour must gain NOTHING: without
+    // it this pin is satisfied by a lowering that appends a tied input to every
+    // output, which would hand the template an operand the source never wrote.
+    auto W = lowerCSubset(
+        "void f(void){ int x = 7; __asm__(\"movl $5, %0\" : \"=r\"(x)); }");
+    ASSERT_TRUE(W.mir.ok)
+        << (W.mirReporter.all().empty() ? std::string{}
+                                        : W.mirReporter.all()[0].actual);
+    auto const wo = theOneInlineAsm(W.mir.mir);
+    ASSERT_NE(wo.desc, nullptr);
+    EXPECT_FALSE(wo.desc->outputs[0].isReadWrite);
+    EXPECT_TRUE(wo.desc->inputs.empty())
+        << "a write-only output has no read half to carry";
+    EXPECT_TRUE(W.mir.mir.instOperands(wo.inst).empty());
+}
+
 // ── TF-C95 D-CSUBSET-ATOMIC-FENCE: the __sync_synchronize→AtomicFence ROUTING pin ──
 // The BUILTIN→OPCODE half of the fence feature, and the ONLY test that covers it:
 // every other AtomicFence pin (test_mir_to_lir's slot routing, the test_asm_* byte
@@ -12844,7 +13138,16 @@ constexpr char const* kSetjmpRoundTripSrc =
                                     &hir->noInlineMap,        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
                                     &hir->alwaysInlineMap,  // TF-C81 (D-CSUBSET-ALWAYSINLINE)
                                     &hir->noOptimizeMap,  // TF-C85 (#pragma optimize)
-                                    &hir->noSanitizeThreadMap);  // TF-C92 (no_sanitize_thread)
+                                    &hir->noSanitizeThreadMap,   // TF-C92
+                                    // inline-asm P5: WITHOUT THIS POOL every
+                                    // descriptor-carrying `__asm__` statement is
+                                    // REFUSED ("the HirInlineAsmPool was not
+                                    // threaded into lowerToMir") — the operands,
+                                    // the clobbers and the template are all
+                                    // unreachable. `compile_pipeline.cpp` passes
+                                    // it; a harness that does not cannot see an
+                                    // asm statement at all.
+                                    &hir->inlineAsmPool);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),

@@ -108,6 +108,15 @@ struct Lowerer {
                                            // name is invisible to the guard's
                                            // whole-token regex and reads as a
                                            // second, unresolvable anchor).
+    HirInlineDefinitionMap const* inlineDefinitionMap;  // optional — native-
+                                           // FUNCTION C99 6.7.4p7 INLINE
+                                           // DEFINITION. nullptr / no entry ⇒ an
+                                           // ordinary definition, emitted normally
+                                           // (the SAFE default: a lost mark makes
+                                           // the cross-table guard below reject the
+                                           // extern LOUDLY, never silently ship a
+                                           // body that should not exist).
+                                           // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED
     HirMutabilityMap const*  mutabilityMap; // optional — native-global const-ness
                                            // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL).
                                            // nullptr / no entry ⇒ mutable.
@@ -217,6 +226,16 @@ struct Lowerer {
     // direct calls go through `GlobalAddr(SymbolId)`, and codegen wires the
     // symbol to the MirFunc later. Hence: set, not map.
     std::unordered_set<std::uint32_t> functionSymbols;
+    // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the subset of
+    // `functionSymbols` whose body is a C99 6.7.4p7 INLINE DEFINITION — populated
+    // by `collectFunctions` from `inlineDefinitionMap`, i.e. COMPLETE before
+    // `collectExterns` runs, which is the only consumer. Its sole job is to tell
+    // that pass WHICH function-and-extern SymbolId pair is the sanctioned one, so
+    // the cross-table ambiguity guard keeps firing for every other producer.
+    // ⚠ NOT a lowering input beyond that: nothing is stamped onto the MirFunc (see
+    // `InlineDefinitionAttr` for why a MIR-side flag would be lost at the first
+    // optimizer rebuild), and the fact reaches the optimizer as the PAIR itself.
+    std::unordered_set<std::uint32_t> inlineDefinitionSymbols;
     // Set of module-level global symbols. Populated by the global pre-pass
     // alongside `functionSymbols` so a `Ref` to a global resolves to a
     // `GlobalAddr(SymbolId)` (consumed via `Load` for reads, used as the
@@ -9347,6 +9366,18 @@ struct Lowerer {
         // pass keys elision of an unused-output asm off it, which is why this is
         // reported as a front-end gap rather than left as a silent `false`.
         desc.isVolatile             = true;
+        // ★★★ THE BASIC/EXTENDED SURFACE TRAVELS; IT IS NOT RE-DERIVED. "Any
+        // colon makes the statement extended" is a LEXICAL fact about the
+        // template that only the front end can see, and `:::` with every
+        // section empty is the shape a downstream reader cannot reconstruct: it
+        // has no outputs, no inputs and no clobbers, so a consumer asking "is
+        // any section populated?" reads it as BASIC and lexes `%` as literal.
+        // ✔MEASURED 2026-08-15 at the CLI: that reconstruction REFUSED
+        // `__asm__("movl %%eax, %%ebx" :::)` — which gcc 13.3.0 and clang 18.1.3
+        // both compile — with a raw `expected 'Identifier' — got '%'` out of the
+        // `.s` lexer, while the matched `::: "ebx"` control compiled clean.
+        // (D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER)
+        desc.isExtended             = src.isExtended;
         desc.clobbers               = src.clobbers;
         desc.clobbersMemory         = src.clobbersMemory;
         desc.clobbersConditionCodes = src.clobbersConditionCodes;
@@ -9372,6 +9403,39 @@ struct Lowerer {
             else                     desc.inputs.push_back(std::move(mo));
         }
 
+        // ★★★ `"+r"` — ONE SOURCE OPERAND, TWO MACHINE FACTS, AND THE READ HALF
+        // USED TO BE DROPPED HERE (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE).
+        //
+        // A `+` operand is filed in `outputs` above, and an output contributes
+        // only an LVALUE ADDRESS to store the result back through. Nothing then
+        // carried the value the template is entitled to READ, so the LIR binder
+        // had no choice but to refuse the constraint outright — a `"+r"` that
+        // gcc 13.3.0 and clang 18.1.3 both compile AND RUN correctly
+        // (✔MEASURED 2026-08-15: `__asm__("addl $5, %0" : "+r"(x))` with x=7
+        // prints 12 on both) did not build here at all.
+        //
+        // ★ THE ANSWER IS GNU'S OWN TRANSFORMATION, NOT A NEW MECHANISM. gcc
+        // rewrites `"+r"(x)` into an `"=r"` output PLUS a matching-constraint
+        // input `"0"(x)` appended AFTER every explicit input; the two share one
+        // location. This appends exactly that entry, in OUTPUT order, carrying
+        // `tiedOutput` so the pairing is a fact the descriptor states rather
+        // than a position a consumer infers. Appending (never inserting) is what
+        // keeps every source-written `%N` index it already had.
+        //
+        // ⚠ A `+` WRITTEN IN THE **INPUT** SECTION GETS NOTHING HERE, and that
+        // is deliberate. Such an operand already has its read half (it is an
+        // input); what it lacks is the write-back, and there is no output entry,
+        // no `ReturnPiece` and no lvalue address to invent one from. It keeps
+        // `isReadWrite` with no `tiedOutput`, which is precisely the shape a
+        // consumer must still refuse.
+        for (std::size_t k = 0; k < src.outputCount; ++k) {
+            if (!src.operands[k].constraint.isReadWrite) continue;
+            MirAsmOperand tied = desc.outputs[k];
+            tied.isEarlyClobber = false;   // `&` is the OUTPUT's promise, not the read's
+            tied.tiedOutput     = static_cast<std::uint32_t>(k);
+            desc.inputs.push_back(std::move(tied));
+        }
+
         // ── lower the operand value expressions ─────────────────────────────────
         // Outputs are LVALUES: the asm writes a register and the piece is stored back
         // through the lvalue's ADDRESS. Taking the address here (rather than after the
@@ -9386,18 +9450,44 @@ struct Lowerer {
         // cause.
         std::vector<MirInstId> outAddrs;
         outAddrs.reserve(src.outputCount);
+        // The VALUES behind the tied read halves appended to `desc.inputs`
+        // above, in the same (output) order. Kept apart from `inputs` until the
+        // source-written inputs are in, because the two lists must end up
+        // aligned 1:1 with `desc.inputs` and that list is source-inputs-first.
+        std::vector<MirInstId> tiedReads;
         for (std::size_t k = 0; k < src.outputCount; ++k) {
             MirInstId const addr = lowerLvalueAddress(kids[k]);
             if (!addr.valid()) return false;
             outAddrs.push_back(addr);
+            if (!src.operands[k].constraint.isReadWrite) continue;
+            // ★★ THE READ HALF LOADS FROM THE ADDRESS ALREADY TAKEN — the
+            // operand expression is lowered ONCE. Re-lowering `kids[k]` as an
+            // rvalue is the obvious spelling and it is a MISCOMPILE.
+            // ✔MEASURED 2026-08-15 by running that exact mutant: on
+            // `"+r"(p[i])` it emits a SECOND `const`/`mul`/`gep` chain, so the
+            // asm reads through one address and writes through another (`Gep`
+            // count 2 vs 1). INFERRED from the same shape, not separately
+            // measured: an operand with a side effect (`a[i++]`) would then
+            // evaluate it twice. One evaluation, one address, one load, one
+            // store-back — which is what makes the read and the write provably
+            // the SAME object.
+            // ⚠ THROUGH `emitScalarLoad`, NEVER A BARE `addInst(Load, …)`: it is
+            // the funnel that routes an `_Atomic` lvalue to `AtomicLoad` and
+            // stamps the c21 Volatile flag, and `volatile`-qualified operands are
+            // the common case in the headers this feature exists for.
+            std::array<MirInstId, 1> const ld{addr};
+            MirInstId const val = emitScalarLoad(ld, hir.typeId(kids[k]), kids[k]);
+            if (!val.valid()) return false;
+            tiedReads.push_back(val);
         }
         std::vector<MirInstId> inputs;
-        inputs.reserve(src.operands.size() - src.outputCount);
+        inputs.reserve(src.operands.size() - src.outputCount + tiedReads.size());
         for (std::size_t j = src.outputCount; j < src.operands.size(); ++j) {
             MirInstId const v = lowerExpr(kids[j]);
             if (!v.valid()) return false;
             inputs.push_back(v);
         }
+        inputs.insert(inputs.end(), tiedReads.begin(), tiedReads.end());
 
         // Output k's piece type is the type of the lvalue the source bound to it —
         // the C type of `out` in `"=r"(out)`. The register CLASS is the CONSTRAINT's
@@ -11423,6 +11513,14 @@ struct Lowerer {
             SymbolId const sym  = hir.functionSymbol(decl);
             if (!sig.valid() || !sym.valid()) continue;
             functionSymbols.insert(sym.v);
+            // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: read the
+            // C99 6.7.4p7 mark here, in the SAME walk that registers the symbol,
+            // so the two facts cannot disagree about which function they describe.
+            if (inlineDefinitionMap != nullptr)
+                if (auto const* p = inlineDefinitionMap->tryGet(decl);
+                    p != nullptr && p->isInlineDefinition) {
+                    inlineDefinitionSymbols.insert(sym.v);
+                }
         }
     }
 
@@ -11636,7 +11734,8 @@ struct Lowerer {
                     "this extern declaration.", decl.v));
                 continue;
             }
-            if (functionSymbols.contains(sym.v)) {
+            if (functionSymbols.contains(sym.v)
+                && !inlineDefinitionSymbols.contains(sym.v)) {
                 // Cross-table ambiguity: this SymbolId is already
                 // owned by an intra-module `Function`. The linker's
                 // `LK6 cycle 2a` cross-table reject catches this
@@ -11651,6 +11750,26 @@ struct Lowerer {
                     "OR an extern, never both.", decl.v, sym.v));
                 continue;
             }
+            // ★★★ D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: THE
+            // ONE SANCTIONED EXCEPTION, and the exception IS the carrier. A C99
+            // 6.7.4p7 inline definition contributes BOTH a body (so the optimizer
+            // may use it as 6.7.4p7's "alternative to an external definition") and
+            // this extern declaration (so an un-inlined call still binds to a
+            // sibling CU's external definition, or fails loud K_SymbolUndefined —
+            // exactly as before). The pair is legal ONLY for a symbol CST→HIR
+            // marked, which is why the guard above stays live for every other
+            // producer rather than being deleted: it is still the thing that
+            // catches a genuine cross-table ambiguity.
+            //
+            // ★★ AND THE PAIR IS WHAT `opt::optimize`'s epilogue LOOKS FOR. It has
+            // to be a property of the module rather than a side-table, because
+            // every optimizer pass rebuilds the module into a fresh arena and a
+            // MirFuncId-keyed attribute would not survive the first rebuild —
+            // whereas SymbolIds are preserved verbatim. Because the guard above
+            // makes this pair impossible for anything else, "function symbol that
+            // is also an extern symbol" is an exact, self-identifying test for
+            // "must never be emitted", with no new per-function MIR flag and no
+            // language/target/format knowledge anywhere in it.
             if (!seenExternSyms.insert(sym.v).second) {
                 // Two ExternFunction decls with the same SymbolId
                 // — likely a copy-paste in the test fixture or a
@@ -12652,7 +12771,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirAlwaysInlineMap const* alwaysInlineMap,
                           HirNoOptimizeMap const*  noOptimizeMap,
                           HirNoSanitizeThreadMap const* noSanitizeThreadMap,
-                          HirInlineAsmPool const*  inlineAsmPool) {
+                          HirInlineAsmPool const*  inlineAsmPool,
+                          HirInlineDefinitionMap const* inlineDefinitionMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -12671,6 +12791,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .alwaysInlineMap = alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         .noOptimizeMap = noOptimizeMap,       // TF-C85 (#pragma optimize region)
         .noSanitizeThreadMap = noSanitizeThreadMap,   // TF-C92 (no_sanitize_thread)
+        // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED (C99 6.7.4p7)
+        .inlineDefinitionMap = inlineDefinitionMap,
         .mutabilityMap = mutabilityMap,
         .volatileMap = volatileMap,
         .returnsTwiceMap = returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)

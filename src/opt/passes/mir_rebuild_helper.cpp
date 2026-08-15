@@ -63,6 +63,61 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
     return GlobalClonePrelude::Cloned;
 }
 
+void cloneGlobalsRemappingInitFunc(Mir const& mir, MirBuilder& builder,
+                                   std::span<std::uint32_t const> oldOrdinalToNew) {
+    // Same alias-analysis polarity propagation every clone path performs
+    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE).
+    builder.setAliasingMode(mir.aliasingMode());
+    builder.setCharTypesAliasAll(mir.charTypesAliasAll());
+
+    if (oldOrdinalToNew.size() != mir.moduleFuncCount()) {
+        std::fprintf(stderr,
+            "dss::opt::passes::cloneGlobalsRemappingInitFunc fatal: remap has "
+            "%zu entries but the source module has %zu functions — the caller "
+            "built the table from a different module than it is cloning.\n",
+            oldOrdinalToNew.size(), mir.moduleFuncCount());
+        std::abort();
+    }
+
+    std::uint32_t const newTag = builder.id().v;
+    std::size_t const ng = mir.moduleGlobalCount();
+    for (std::uint32_t i = 0; i < ng; ++i) {
+        MirGlobalId const g = mir.globalAt(i);
+        std::uint32_t const initIdx = mir.globalInitLiteralIndex(g);
+        std::uint32_t newInitIdx = UINT32_MAX;
+        if (initIdx != UINT32_MAX) {
+            newInitIdx = builder.literalPoolAdd(mir.literalValue(initIdx));
+        }
+        MirFuncId const oldInitFunc = mir.globalInitFunc(g);
+        MirFuncId newInitFunc{};
+        if (oldInitFunc.valid()) {
+            std::uint32_t const mapped = oldOrdinalToNew[oldInitFunc.v];
+            if (mapped == UINT32_MAX) {
+                std::fprintf(stderr,
+                    "dss::opt::passes::cloneGlobalsRemappingInitFunc fatal: "
+                    "global symbol %u is initialized by function ordinal %u, "
+                    "which the rebuild DROPPED. A module-init function is never "
+                    "a legitimate drop target; re-pointing the global at "
+                    "whichever function inherited the ordinal would be a silent "
+                    "wrong-body call.\n",
+                    mir.globalSymbol(g).v, oldInitFunc.v);
+                std::abort();
+            }
+            newInitFunc = MirFuncId{mapped, newTag};
+        }
+        builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
+                          newInitIdx, newInitFunc,
+                          mir.globalBinding(g), mir.globalVisibility(g),
+                          mir.globalIsConst(g),
+                          // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
+                          // thread storage duration across the clone.
+                          mirThreadStorageOf(mir.globalIsThreadLocal(g)),
+                          // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: preserve the
+                          // global's explicit alignment across the rebuild.
+                          mir.globalAlignmentBytes(g));
+    }
+}
+
 void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder) {
     // Same alias-analysis polarity propagation as cloneGlobalsOrCarveOut
     // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE) — without it the

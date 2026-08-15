@@ -177,7 +177,7 @@
       }
     },
     {
-      "$comment": "add reg-reg — REX.W 0x01 /r (ADD r/m64, r64). LIR is 3-address (dst, src1, src2); requires2Address=true makes the legalize pass insert `mov dst, src1` first when dst!=src1, then the assembler emits `add dst, src2` (writing into ModR/M.rm, which is dst).",
+      "$comment": "add reg-reg — REX.W 0x01 /r (ADD r/m64, r64). LIR is 3-address (dst, src1, src2); requires2Address=true makes the legalize pass insert `mov dst, src1` first when dst!=src1, then the assembler emits `add dst, src2` (writing into ModR/M.rm, which is dst).\n\n★ `requires2Address: true` MEANS *result == operand[0]*, AND THE OPERAND IS NOW NAMEABLE (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE, 2026-08-15). A sibling key `twoAddressSourceOperand: <j>` ties the result to operand j instead; omitted, it is 0, which is what every opcode in this document and in arm64.target.json means today. The index is a SEPARATE key on purpose: `requires2Address: 1` would read to a human as \"true\" and to the loader as \"tie to operand 1\", so the polymorphic spelling was rejected. The loader refuses the index without the flag, refuses an index >= maxOperands, and refuses a non-integer. ⚠ Two rules move WITH the index and both are enforced at load: the tied operand's `guard.operandKinds[j]` must be `reg` (the legalize pass copies FROM it, and it cannot copy from an immediate — which is why `add`/`sub` could not be re-tied to operand 1 at all, their imm32 variants forbid it), and the variant's destination wire must sit on operand j (after legalize THAT operand is the destination).",
       "mnemonic":      "add",
       "result":        "value",
       "hasSideEffects": false,

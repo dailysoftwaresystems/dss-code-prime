@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -56,10 +57,41 @@ struct MirAsmOperand {
     // allocator picks within `regClass`.
     std::string    fixedRegister;
     // `"+r"` — this operand is read AND written: one input tied to one output.
+    // Recorded on BOTH halves of a lowered `+` operand, because both entries
+    // describe the SAME source operand and both are quoted by diagnostics.
     bool           isReadWrite = false;
     // `"=&r"` — earlyclobber: the output is written before every input is read,
     // so it may not share a register with any of them.
     bool           isEarlyClobber = false;
+
+    // ★★★ SET ⇔ THIS IS AN **INPUT** ENTRY THAT SHARES ITS LOCATION WITH THE
+    // OUTPUT AT THE INDEX IT HOLDS — GNU's matching constraint (6.47.2.4 `"0"`),
+    // which is how a `"+r"` operand's READ half reaches the template
+    // (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE).
+    //
+    // A `+` operand is ONE thing the source wrote and TWO things the machine
+    // needs: a value to read and a location to write. `hir_to_mir.cpp` files the
+    // write half in `outputs` (so it gets a `ReturnPiece` and a store-back) and
+    // APPENDS the read half to `inputs` — after every source-written input, so
+    // no existing `%N` index moves — with this field naming its partner. Without
+    // it the read half is unrecoverable: an input tied to output 0 and an
+    // ordinary input are byte-identical otherwise.
+    //
+    // ⚠ THE INDEX IS CARRIED, NEVER RECONSTRUCTED, and that is the whole point.
+    // "the last N inputs are the tied ones, in output order" is derivable ONLY
+    // while every producer happens to append in that order — the same
+    // reconstruct-the-fact-from-the-shape trade that made `isExtended` below a
+    // conformance defect one tier down. `std::optional<index>` is the shape
+    // `TargetOpcodeInfo::requires2Address` already uses for a (result, operand)
+    // tie, and it carries the same warning: NEVER compare it to `true`/`false`
+    // — `opt == true` is a VALUE comparison and silently means "tied to output
+    // 1". Ask `.has_value()`, read the index with `*`.
+    //
+    // ⛔ AN OUTPUT NEVER CARRIES IT. The tie is written on the input because
+    // that is where GNU writes it and because the consumer binds outputs FIRST:
+    // when input j is bound, `outs[*tiedOutput]` already holds the register the
+    // template will use for both halves.
+    std::optional<std::uint32_t> tiedOutput;
 };
 
 struct DSS_EXPORT MirAsmDescriptor {
@@ -71,12 +103,50 @@ struct DSS_EXPORT MirAsmDescriptor {
     // `opcodeClobbersMemory` regardless, so this records the SOURCE's word; it
     // is not the optimizer's only defence.)
     bool isVolatile = false;
+
+    // ★★★ THE STATEMENT CARRIED AT LEAST ONE `:` — THE EXTENDED FORM. It is a
+    // LEXICAL fact about the TEMPLATE, and it is carried rather than derived
+    // because the two forms are read by DIFFERENT LEXER MODES
+    // (`AsmTemplateSurface`): in a BASIC template `%` is LITERAL and the text
+    // reaches the assembler verbatim; in an EXTENDED one `%` introduces an
+    // operand. ✔MEASURED 2026-08-15 on gcc 13.3.0 and clang 18.1.3 (re-measured
+    // for this carrier, not inherited):
+    //
+    //   `__asm__("xorl %eax,%eax")`             BASIC     → both rc=0.
+    //   `__asm__("xorl %eax,%eax" :::)`         EXTENDED  → both rc=1 ("operand
+    //                                                      number missing after
+    //                                                      %-letter" / "invalid
+    //                                                      % escape").
+    //   `__asm__("movl %%eax, %%ebx" :::)`      EXTENDED  → both rc=0.
+    //
+    // ★ **ANY** COLON MAKES IT EXTENDED, INCLUDING `:::` WITH EVERY SECTION
+    // EMPTY — which is exactly the shape no consumer can reconstruct. A reader
+    // that asks "does this descriptor have any outputs, inputs or clobbers?"
+    // gets `no` for that statement and reads it on the BASIC surface, so the
+    // third row above — a program both reference compilers COMPILE — was
+    // REFUSED by this build with a raw `expected 'Identifier' — got '%'` parse
+    // error out of the `.s` lexer (✔MEASURED at the CLI, same date, against the
+    // matched `::: "ebx"` control which compiled clean). Under
+    // [[feedback_reference_compilers_are_the_spec]] refusing what the reference
+    // toolchain builds is as much a defect as accepting what it rejects, so the
+    // fact travels instead of being re-derived.
+    bool isExtended = false;
+
     // Outputs in SOURCE order. Output k is result piece k: the `ReturnPiece`
     // anchored to this instruction whose payload ordinal is k.
     std::vector<MirAsmOperand> outputs;
     // Inputs in SOURCE order, ALIGNED 1:1 with the instruction's MIR operands
     // (operand j is input j — an asm block has no callee operand, which is why
     // `InlineAsm` is `{0,N}` and not `Call`'s `{1,N}`).
+    //
+    // ⚠ THE SOURCE-WRITTEN INPUTS COME FIRST, THEN THE TIED READ HALVES. Every
+    // `"+r"` OUTPUT appends one entry here carrying `tiedOutput` — GNU's own
+    // transformation (a `+` operand becomes an `=` output plus a matching `"0"`
+    // input, appended AFTER the explicit inputs so no index the template can
+    // name is disturbed). The `%N` space this list feeds is therefore still
+    // outputs-then-SOURCE-inputs for every spelling a template may write; the
+    // tied entries occupy the indices past the last one the front end lets a
+    // `%N` reach, exactly as they do in gcc.
     std::vector<MirAsmOperand> inputs;
     // Register names the block DESTROYS. Names only — `"memory"` and `"cc"` are
     // the two clobber spellings that name no register and are hoisted into the

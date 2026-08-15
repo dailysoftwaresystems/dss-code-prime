@@ -347,6 +347,23 @@ lowerToMir(Hir const&               hir,
            // The BARE-BARRIER form (`payload == kNoInlineAsmDescriptor`) needs
            // no pool by construction and keeps lowering exactly as before, so
            // every existing pool-free caller is unaffected.
-           HirInlineAsmPool const*  inlineAsmPool = nullptr);
+           HirInlineAsmPool const*  inlineAsmPool = nullptr,
+           // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED (C99
+           // 6.7.4p7): per-FUNCTION mark identifying a body that is an INLINE
+           // DEFINITION — one CST→HIR lowered from a file-scope definition every
+           // declaration of which spelled `inline` without `extern`. Supplied by
+           // the driver as `&CstToHirResult::inlineDefinitionMap`.
+           //
+           // ★ IT AUTHORIZES ONE THING ONLY: such a function may carry the SAME
+           // SymbolId as an `ExternFunction` in the same module. That pair is
+           // otherwise a loud cross-table ambiguity, and stays loud for every
+           // other producer. Nothing is stamped onto the resulting `MirFunc`.
+           //
+           // ⚠ `nullptr` IS THE SAFE DIRECTION, unlike `inlineAsmPool` above. A
+           // caller that does not thread this map does not silently emit a body
+           // it should not: the cross-table guard simply rejects the extern and
+           // says so. The failure is loud and localized, so a pool-free test
+           // fixture stays correct rather than becoming subtly wrong.
+           HirInlineDefinitionMap const* inlineDefinitionMap = nullptr);
 
 } // namespace dss

@@ -1,9 +1,12 @@
 #include "asm/asm_template_to_lir.hpp"
 
+#include "analysis/syntactic/parser.hpp"
 #include "asm/asm_variant_elect.hpp"
 #include "core/types/assembly_config.hpp"
+#include "core/types/source_buffer.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
+#include "tokenizer/tokenizer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -839,6 +842,133 @@ struct AsmInstructionLowering::Impl {
         return AsmOperandRole::Register;
     }
 
+    // ★★★ A TEMPLATE PLACEHOLDER — EVERY FORM THE DIALECT'S
+    // `templateOperandRule` COVERS — RESOLVED THROUGH THE HOST BY ITS WRITTEN
+    // SPELLING, EXACTLY AS A REGISTER SPELLING IS.
+    //
+    // ★★ IT PRODUCES A `Register`-ROLE OPERAND AND NOTHING DOWNSTREAM KNOWS THE
+    // DIFFERENCE, which is the whole design. An operand placeholder (`%0`,
+    // `%[name]` in the shipped dialects) denotes the vreg the embedding language
+    // bound to it, so variant election, the width-honesty gate, the two-address
+    // legalizer and every encoder see an ordinary register operand and need no
+    // placeholder concept at all.
+    //
+    // ⛔ AND THAT IS **NOT** TRUE OF AN `asm goto` LABEL PLACEHOLDER (`%l[done]`,
+    // GNU 6.47.2.7), WHICH THE SHIPPED GRAMMAR ALSO ACCEPTS. This banner used to
+    // list it alongside the other two and claim the same "nothing downstream
+    // knows the difference"; it cannot be true, and saying so was the recurring
+    // defect of a comment recording more than the code does. A label names a
+    // BRANCH DESTINATION, and `AsmOperandBinding` carries a `LirReg` and no
+    // block — so a label spelling matches no binding, falls through to the
+    // physical-register lookup, and is REFUSED BY THE HOST BY NAME.
+    // ★ THE STATE IS DELIBERATE AND IT IS THE GRAMMAR HALF ONLY. Binding a label
+    // to a LIR block is the EMBEDDING language's half: the blocks around a
+    // template belong to the caller, the successor edge has to exist in the
+    // caller's CFG before a branch to it can be emitted, and only the caller can
+    // supply either. Keeping the SHAPE is what makes the refusal a sentence
+    // about `asm goto` instead of a tokenizer complaint about the sigil byte,
+    // which cannot tell an author whether the form is unsupported or misspelled.
+    //
+    // ★★★ WHY THE SPELLING IS REBUILT FROM THE TOKENS RATHER THAN TAKEN AS THE
+    // NODE'S SOURCE TEXT OR AS ITS LAST TOKEN. Both obvious readings are wrong,
+    // in opposite directions. The LAST TOKEN — which is what `decodeRegister`
+    // uses, correctly, because a register's sigil carries no identity — would
+    // hand the host `0` for `%0`; the host's binding table is keyed on the
+    // spelling the EMBEDDING language mints (`%0`, GNU 6.47.2.3), so `0` matches
+    // nothing and every placeholder would be refused as unbound. The NODE'S
+    // SOURCE TEXT would carry whatever whitespace the author wrote between the
+    // sigil and the selector, so `% 0` and `%0` would be two different keys for
+    // one operand. Concatenating the visible token texts is exact for both and
+    // keeps this function free of any opinion about what the pieces MEAN — the
+    // engine still only COMPARES, and a dialect that numbered its placeholders
+    // differently needs no change here.
+    //
+    // ★★★ THE SPELLING IS **NOT** FOLDED BY THE DIALECT'S `spellingCase`, AND
+    // THAT IS THE OPPOSITE CALL FROM EVERY OTHER SPELLING IN THIS ENGINE —
+    // deliberately, because it is a different KIND of spelling. `spellingCase`
+    // exists because gas is case-insensitive about ITS OWN vocabulary
+    // (mnemonics, registers, directives, operand selectors); a placeholder
+    // names an operand of the EMBEDDING language and is not gas vocabulary at
+    // all. ✔MEASURED: GNU 6.47.2.3 symbolic operand names are ordinary C
+    // identifiers and gcc is case-SENSITIVE about them — `%[Out]` does not name
+    // an operand declared `[out]`. Folding here would silently merge two
+    // distinct operands into one under both shipped dialects, which are
+    // `asciiFolded`, and the caller would get whichever of the two the binding
+    // table happened to list first.
+    // ⚠ THE TWO-SEAM CONTRACT DOES NOT APPLY: that contract binds
+    // `namesRegister` and `resolveRegister`, and the role disambiguation is
+    // bypassed for a placeholder (the rule already settled what this operand
+    // is), so there is no second seam to disagree with.
+    // ⚠⚠ BUT THE **NORMALIZATION** CLAUSE OF `resolveRegister`'S CONTRACT IS A
+    // DIFFERENT SENTENCE AND IT USED TO SAY THE OPPOSITE OF WHAT THIS DOES.
+    // `AsmLoweringHost::namesRegister`'s block promised host authors that "the
+    // engine folds before it asks" and that "a binding must be registered in
+    // folded form" — written when `decodeRegister` was the only caller, and
+    // false for this one from the moment it landed. A host that followed the
+    // written instruction and registered `%[out]` for a source-spelled `%[Out]`
+    // would MISS in `TemplateHost::bindingFor`, which compares exactly. The
+    // contract now states the split (register spellings arrive FOLDED,
+    // placeholder spellings arrive VERBATIM) and names this function as the
+    // second caller; `SpellingCaseSplitsAtThePlaceholderSeam` in
+    // tests/asm/test_asm_template_to_lir.cpp exercises both halves against ONE
+    // `asciiFolded` dialect so the two callers cannot drift silently.
+    std::optional<AsmDecodedOperand> decodePlaceholder(NodeId node) {
+        std::string written;
+        auto walk = [&](auto&& self, NodeId n) -> void {
+            if (!n.valid()) return;
+            if (tree_.kind(n) == NodeKind::Token) {
+                written += tree_.text(n);
+                return;
+            }
+            for (NodeId const c : tree_.children(n)) {
+                if (isEmptySpace(tree_.flags(c))) continue;
+                self(self, c);
+            }
+        };
+        walk(walk, node);
+        if (written.empty()) {
+            sink_.fail(node,
+                 std::format("a template operand placeholder carries no text — "
+                             "the dialect's 'templateOperandRule' matched a "
+                             "production with no tokens under it{}",
+                             sink_.pairSuffix()));
+            return std::nullopt;
+        }
+
+        AsmDecodedOperand out;
+        out.role = AsmOperandRole::Register;
+        out.node = node;
+
+        AsmResolvedRegister resolved;
+        switch (host_.resolveRegister(written, node, resolved)) {
+        case AsmRegisterLookup::Reported:
+            return std::nullopt;
+        case AsmRegisterLookup::NotARegister:
+            // ⚠ THE EMBEDDED HOST NEVER LANDS HERE — it enumerates its bound
+            // set and reports (`Reported`). Reaching this arm means a caller
+            // with NO operand table saw a placeholder, i.e. a standalone `.s`
+            // parsed in the template lexer mode. That is a caller defect and it
+            // must say so, not report "unknown register '%0'", which would send
+            // the reader to the target's register list for a token the target
+            // could never have declared.
+            sink_.fail(node,
+                 std::format("'{}' is a TEMPLATE placeholder, and this assembly "
+                             "text was lowered by a caller that binds no "
+                             "template operands — a placeholder names an operand "
+                             "(or an `asm goto` label) of the construct that "
+                             "embedded the assembly, so there is nothing here "
+                             "for it to denote{}", written, sink_.pairSuffix()));
+            return std::nullopt;
+        case AsmRegisterLookup::Resolved:
+            break;
+        }
+        out.regSpelling  = std::move(written);
+        out.regWidthBits = resolved.widthBits;
+        out.reg          = resolved.reg;
+        out.regClass     = resolved.regClass;
+        return out;
+    }
+
     // Decode one operand node into a role + payload.
     std::optional<AsmDecodedOperand> decodeOperand(NodeId node) {
         // The bound `attOperand`-style alt node wraps the chosen form; descend
@@ -846,6 +976,31 @@ struct AsmInstructionLowering::Impl {
         NodeId cur = node;
         std::uint8_t mask = cfg_.rolesForRule(tree_.rule(cur));
         while (mask == 0) {
+            // ★ THE PLACEHOLDER IS TESTED BY RULE, NEVER BY TOKEN, AND ONLY AT
+            // THE OPERAND'S OWN POSITION. The dialect names the rule
+            // (`assembly.templateOperandRule`); this engine never spells
+            // `asmTemplateOperand` or `%`. And there is no `if (embedded)`
+            // hiding here: the rule can only match when the dialect's TEMPLATE
+            // LEXER MODE minted its sigil, so a standalone `.s` never reaches
+            // this branch — the surfaces are separated in the lexer, which is
+            // where they actually differ.
+            //
+            // ⚠ IT SITS INSIDE THE UNROLED DESCENT RATHER THAN AS A SUBTREE
+            // SEARCH ABOVE IT, AND THE DIFFERENCE IS NOT COSMETIC. A
+            // `findDescendantOfRule` over the whole operand would also match a
+            // placeholder nested INSIDE a roled form — the day a dialect
+            // declares one in its memory production (`[%0, #8]` is the obvious
+            // next ask), the whole memory operand would decode as a bare
+            // register and the base/offset would vanish silently. Walking down
+            // only through wrappers the dialect bound to NO role means this
+            // branch fires exactly where an operand begins, and a nested
+            // placeholder stays the roled decode's business — which today
+            // refuses it, loudly, which is the correct answer until a dialect
+            // declares that form.
+            if (cfg_.templateOperandRule.valid()
+                && tree_.rule(cur).v == cfg_.templateOperandRule.v) {
+                return decodePlaceholder(cur);
+            }
             auto const kids = visibleChildren(tree_, cur);
             NodeId next{};
             for (NodeId const k : kids) {
@@ -2331,6 +2486,18 @@ public:
         // ⚠ THE ENGINE COULD NOT WRITE THIS MESSAGE, and that is the point of
         // it living here: the OPERAND LIST is the embedding language's, so only
         // its host can enumerate it. The engine holds no `%N` convention.
+        //
+        // ★★ THE `asm goto` LABEL CLAUSE IS NOT PADDING — IT IS THE ONLY PLACE A
+        // LABEL PLACEHOLDER CAN BE DESCRIBED AT ALL. The shipped grammar accepts
+        // one, and it arrives here as an ordinary unmatched spelling: an
+        // `AsmOperandBinding` carries a `LirReg` and no block, so no caller can
+        // bind a label and the lookup can never succeed. The host cannot TELL a
+        // label spelling from a mistyped operand one — that is a fact of the
+        // rule the engine already settled — so the message states the third
+        // possibility instead of pretending to detect it. Without the clause the
+        // sentence read as "you meant a register or an operand", which is a true
+        // dichotomy for two of the three forms the dialect declares and sends
+        // the author of the third to the target's register list.
         std::string bound;
         for (auto const& b : bindings_) {
             if (!bound.empty()) bound += ", ";
@@ -2340,10 +2507,14 @@ public:
         }
         sink_.fail(at, std::format(
             "'{}' names neither a register this target declares nor one of the "
-            "{} operand(s) bound to this assembly template ({}) — in a template "
-            "a register-position name is one or the other, and binding it to "
-            "some register anyway would read a value the enclosing function "
-            "never wrote{}",
+            "{} operand(s) bound to this assembly template ({}) — and binding it "
+            "to some register anyway would read a value the enclosing function "
+            "never wrote. ⓘ If this is an `asm goto` LABEL placeholder, it lands "
+            "here for a reason no spelling can fix: a label must resolve to a "
+            "BLOCK of the function that embedded this template, an operand "
+            "binding carries a register and no block, and only the embedding "
+            "language can supply one — so this build parses the label form and "
+            "lowers none{}",
             spelling, bindings_.size(),
             bound.empty() ? std::string{"this template binds none"} : bound,
             sink_.pairSuffix()));
@@ -2466,6 +2637,131 @@ void lowerTemplateElement(Tree const& tree, AssemblyConfig const& cfg,
 }
 
 } // namespace
+
+std::optional<Tree>
+parseAsmTemplateText(std::string                          templateText,
+                     std::string                          bufferName,
+                     std::shared_ptr<GrammarSchema const> dialect,
+                     AsmTemplateSurface                   surface,
+                     DiagnosticBudget                     budget,
+                     DiagnosticReporter&                  reporter) {
+    auto const emit = [&reporter](std::string message) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::A_AsmTextUnsupported;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::move(message);
+        reporter.report(std::move(d));
+    };
+    if (!dialect) {
+        emit("an assembly template was parsed with no dialect grammar — the "
+             "active target names the dialect, and reaching here without one "
+             "is a caller defect rather than a property of the template");
+        return std::nullopt;
+    }
+    AssemblyConfig const& cfg = dialect->assembly();
+    // ⚠ THE TWO REFUSALS BELOW ARE DIFFERENT QUESTIONS AND ARE KEPT APART.
+    // "no `assembly` block" means this grammar is not an assembly dialect at
+    // all; "no template surface" means it is one and deliberately hosts no
+    // EMBEDDED templates. Collapsing them would send an implementer to the
+    // wrong half of the document.
+    if (!cfg.declared) {
+        emit(std::format("language '{}' has no 'assembly' block, so it cannot "
+                         "read an assembly template — the embedded-assembly "
+                         "path was reached for a language that declares no "
+                         "instruction vocabulary", dialect->name()));
+        return std::nullopt;
+    }
+    // ★★★ THE SURFACE SELECTS THE MODE, AND A BASIC TEMPLATE NEEDS NO TEMPLATE
+    // SURFACE AT ALL. A basic template reaches the assembler verbatim in the
+    // reference compilers, so the `.s` reading (`main`) IS its reading — a
+    // dialect that declares no `templateLexerMode` can still host one, and
+    // demanding the key here would refuse a construct gcc and clang compile.
+    LexerModeId mode{};   // invalid ⇒ `main`
+    if (surface == AsmTemplateSurface::Extended) {
+        if (!cfg.templateLexerMode.valid()) {
+            // ⚠ THE ILLUSTRATION USED TO SPELL `%0` AND `%eax`, WHICH ARE THIS
+            // AT&T DIALECT'S BYTES AND NOT EVERY DIALECT'S — an aarch64-gas
+            // reader got a refusal demonstrating a syntax their document does
+            // not have (registers there are `x0`, not `%x0`). The sentence says
+            // the same thing in ROLE terms instead, which is what the rest of
+            // this engine is careful to do and is one of the two places the
+            // prose slipped out of it.
+            emit(std::format(
+                "dialect '{}' declares no 'assembly.templateLexerMode', so it "
+                "hosts no EXTENDED assembly templates — an extended template's "
+                "operand placeholders need this dialect's placeholder sigil to "
+                "carry a token kind distinct from the one it carries in a `.s`, "
+                "and the mode is where a dialect says so. Refused rather than "
+                "parsed in the MAIN mode, which would silently read the "
+                "template as a `.s` line: every operand placeholder would be "
+                "rejected and every bare register spelling ACCEPTED, and the "
+                "reference compilers do exactly the opposite in an extended "
+                "template", dialect->name()));
+            return std::nullopt;
+        }
+        mode = cfg.templateLexerMode;
+    }
+
+    // ★ THE TRAILING NEWLINE. The dialect is line-oriented (the newline IS the
+    // statement terminator), so a template whose last line has none would lose
+    // that line. Appending one unconditionally is harmless: a blank line
+    // lowers to nothing.
+    templateText += '\n';
+    auto src = SourceBuffer::fromString(std::move(templateText),
+                                        std::move(bufferName));
+
+    // ★★ THE PARSER CONFIG IS BUILT FROM THE DIALECT, NOT DEFAULT-CONSTRUCTED.
+    // `ParserConfig{}`'s `maxExpressionDepth` is a C++ FALLBACK; a language
+    // states its own in `parser.maxExpressionDepth`, and the `.s` path honours
+    // it (`parserConfigFor`, compilation_unit.cpp — "THE single chokepoint that
+    // makes the cap config-driven"). Passing `{}` here meant one document's
+    // declared cap applied on one of its two surfaces and was silently ignored
+    // on the other, which is the definition of a knob that lies.
+    // ⚠ IT READS THE SCHEMA ACCESSOR RATHER THAN CALLING THAT CHOKEPOINT
+    // BECAUSE THE CHOKEPOINT IS NOT CALLABLE: `parserConfigFor` sits in
+    // compilation_unit.cpp's ANONYMOUS namespace, so it has no linkage outside
+    // that TU. The single source of truth both sites read is
+    // `GrammarSchema::maxExpressionDepth()` — the helper is a two-line adapter
+    // over it, not the authority. Promoting it to a shared header is the right
+    // long-term shape and is the change to make the day a second knob joins the
+    // config; it is recorded here rather than done half-way.
+    ParserConfig parserCfg;
+    if (auto const cap = dialect->maxExpressionDepth()) {
+        parserCfg.maxExpressionDepth = *cap;
+    }
+
+    Tokenizer tk{src, dialect, budget, mode};
+    auto [stream, lexDiagnostics] = std::move(tk).tokenize();
+    Parser parser{src, dialect, std::move(stream), budget, std::move(parserCfg),
+                  std::move(lexDiagnostics)};
+    // ★ THE LEXER'S REPORTER IS HANDED TO THE PARSER, which folds it into the
+    // Tree — the same one-stream-per-fragment discipline `UnitBuilder` applies
+    // to a file. Without it a tokenizer diagnostic (an undeclared byte in the
+    // template) would be dropped on the floor and the parse would fail for a
+    // reason nobody could see.
+    ParseResult result = std::move(parser).parse();
+
+    // ★★★ EVERY SEVERITY IS FORWARDED, NOT ONLY `Error`, AND THE COMMENT ABOVE
+    // IS WHY. This loop used to `continue` on anything that was not an Error,
+    // so a tokenizer or parser WARNING about a template was dropped on the
+    // failure path and — because the only production caller holds the returned
+    // Tree as a scope-local and never drains its diagnostics — unreachable on
+    // the success path too. "Nothing is dropped on the floor" was half true, and
+    // the half that was false was the half a reader would rely on.
+    // ★ `ffi/c_header_parser.cpp` is the precedent that already does this
+    // (`for (auto const& d : model.diagnostics().all()) reporter.report(d);`),
+    // and matching it means the two fragment readers behave the same way.
+    // ⚠ THE `parsed` VERDICT STILL KEYS ON `Error` ALONE — forwarding a warning
+    // must never fail a parse that succeeded.
+    bool parsed = true;
+    for (auto const& d : result.tree.diagnostics().all()) {
+        if (d.severity == DiagnosticSeverity::Error) parsed = false;
+        ParseDiagnostic copy = d;
+        reporter.report(std::move(copy));
+    }
+    if (!parsed) return std::nullopt;
+    return std::move(result.tree);
+}
 
 bool lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                               GrammarSchema const&               dialect,

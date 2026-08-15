@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/assembly_config.hpp"
+#include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/target_schema.hpp"
@@ -311,18 +312,51 @@ public:
     // dialect that binds `register` and `displaced` to ONE rule (aarch64's
     // sigil-less names) decides between them on this answer alone.
     //
-    // ★★★ THE `spelling` A HOST RECEIVES IS ALREADY NORMALIZED BY THE DIALECT'S
-    // `assembly.spellingCase` — the engine folds before it asks, so a host
-    // compares EXACTLY and never folds again. That direction is deliberate: a
-    // host would have to be handed the dialect to fold correctly, and the two
-    // hosts folding independently is precisely how the standalone `.s` path and
-    // the embedded template path would come to disagree about what `X0` is.
+    // ★★★ A HOST HAS **TWO** CALLERS AND THEY NORMALIZE DIFFERENTLY. THE SPLIT
+    // IS DELIBERATE, IT IS NOT SYMMETRIC, AND IT IS STATED HERE BECAUSE THE ONE
+    // THING A HOST AUTHOR CANNOT GUESS IS WHICH TEXT ARRIVES IN WHICH FORM.
+    //
+    //   • A REGISTER SPELLING (`decodeRegister`, the `.s` and template register
+    //     forms alike) ARRIVES FOLDED by the dialect's `assembly.spellingCase`
+    //     — the engine folds before it asks, so a host compares EXACTLY and
+    //     never folds again. That direction is deliberate: a host would have to
+    //     be handed the dialect to fold correctly, and the two hosts folding
+    //     independently is precisely how the standalone `.s` path and the
+    //     embedded template path would come to disagree about what `X0` is.
+    //
+    //   • A TEMPLATE OPERAND PLACEHOLDER (`decodePlaceholder`) ARRIVES VERBATIM
+    //     — NOT folded, under any `spellingCase`. ✔MEASURED: GNU 6.47.2.3
+    //     symbolic operand names are ordinary C identifiers and gcc is
+    //     case-SENSITIVE about them, so `%[Out]` does not name an operand
+    //     declared `[out]`. `spellingCase` exists because gas is
+    //     case-insensitive about ITS OWN vocabulary (mnemonics, registers,
+    //     directives, operand selectors); a placeholder names an operand of the
+    //     EMBEDDING language and is not gas vocabulary at all. Folding it would
+    //     merge two distinct operands into one under both shipped dialects,
+    //     which are `asciiFolded`, and hand the caller whichever the binding
+    //     table listed first — a silent miscompile, not a conformance fix.
+    //
     // ⚠ CONSEQUENCE FOR A HOST WITH A LOOKUP TABLE OF ITS OWN (the template
-    // host's operand BINDINGS): its keys are matched against normalized text,
-    // so under a folding dialect a binding must be registered in folded form.
-    // No shipped binding spelling has a letter in it today (`%0`, `%1`), so
-    // nothing depends on it yet — it is written down because the day one does,
-    // the failure would be a silently unbound operand.
+    // host's operand BINDINGS): a binding whose spelling is a PLACEHOLDER is
+    // registered and matched EXACTLY AS THE TEMPLATE WRITES IT — do not fold it
+    // — while a binding whose spelling is a REGISTER NAME must be registered in
+    // the dialect's folded form, because that is the form this virtual will be
+    // handed. `TemplateHost::bindingFor` compares with `==` and therefore
+    // inherits both rules unchanged.
+    // ⚠ THE PARAGRAPH THIS REPLACED SAID ONLY THE FIRST HALF ("the engine folds
+    // before it asks … a binding must be registered in folded form") and was
+    // written when `decodeRegister` was the only caller. It became false for one
+    // of two callers the moment the placeholder decode landed, and a host author
+    // who followed it would have registered `%[out]` for a source-spelled
+    // `%[Out]` and got a refusal.
+    // ⓘ THIS IS DOCUMENTATION, NOT ENFORCEMENT, AND THE DISTINCTION IS HONEST:
+    // nothing in the signature stops the two callers from drifting. Enforcing it
+    // would mean carrying the discriminator IN the signature (a `spelling KIND`
+    // parameter, or two virtuals), which is a larger change than the
+    // documentation defect it would fix. What holds the line today is
+    // `SpellingCaseSplitsAtThePlaceholderSeam` in
+    // tests/asm/test_asm_template_to_lir.cpp, which asserts BOTH halves against
+    // ONE `asciiFolded` dialect.
     [[nodiscard]] virtual bool
     namesRegister(std::string_view spelling) const = 0;
 
@@ -402,6 +436,71 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// ★★★ PARSE ONE EMBEDDED ASSEMBLY TEMPLATE INTO A TREE — the step BEFORE
+// `lowerAsmTemplateToLirRun`, and the reason it is a function of this file.
+//
+// ★★ A TEMPLATE IS NOT LEXED LIKE A `.s`, AND ONLY THIS TIER KNOWS THAT.
+// ✔MEASURED on gcc 13.3.0 and clang 18.1.3 (sources fed as base64):
+// `__asm__("xorl %eax,%eax")` — BASIC — assembles with `%` LITERAL;
+// `__asm__("xorl %eax,%eax" ::: "eax")` — EXTENDED, and ANY colon makes it
+// extended — is REJECTED BY BOTH ("operand number missing after %-letter" /
+// "invalid % escape in inline assembly string"); `%%eax` assembles. So in a
+// template `%` introduces an OPERAND and the register sigil must be doubled,
+// while in a `.s` `%` IS the register sigil. The dialect states that with a
+// per-mode `tokens` override and names the mode in `assembly.templateLexerMode`;
+// this function is the "template parse entry" that selects it.
+// ⇒ a caller that tokenized the template itself would get the `.s` surface and
+// every placeholder would die at the parser, which is exactly the state this
+// function was added to end.
+//
+// ★ IT ALSO OWNS THE TRAILING NEWLINE. The dialect is line-oriented — the
+// newline IS its statement terminator — so a template whose last line has no
+// `\n` would lose that line entirely. That is a property of the DIALECT
+// SURFACE, not of any particular caller, so it is applied here once rather
+// than remembered at every call site.
+//
+// ★★★ WHICH OF THE TWO SURFACES A TEMPLATE IS READ ON, AND IT IS THE CALLER'S
+// FACT TO STATE — there is no default, because a wrong default is silent.
+//
+// ✔MEASURED on gcc 13.3.0 and clang 18.1.3, sources fed as base64 so no shell
+// could alter a byte, with matched positive controls:
+//
+//   `__asm__("xorl %eax,%eax")`               BASIC     → both accept; `%` is
+//                                                         LITERAL and the text
+//                                                         reaches the assembler
+//                                                         verbatim.
+//   `__asm__("xorl %eax,%eax" ::: "eax")`     EXTENDED  → both REJECT ("operand
+//                                                         number missing after
+//                                                         %-letter" / "invalid
+//                                                         % escape").
+//   `__asm__("xorl %%eax,%%eax" ::: "eax")`   EXTENDED  → both accept.
+//
+// ⇒ ANY colon makes a template extended, and the two forms genuinely differ IN
+// THE LEXER rather than only in what the parser accepts. A BASIC template is
+// therefore read on the `.s` surface — whatever the reference ASSEMBLER takes,
+// this takes — and needs no placeholder vocabulary at all; an EXTENDED one is
+// read on the dialect's template surface, where `%` introduces an operand.
+// ⚠ Reading a BASIC template on the extended surface would refuse `%eax`, which
+// gcc and clang both COMPILE; reading an EXTENDED one on the `.s` surface would
+// accept `%eax`, which they both REJECT. Both directions are conformance
+// defects, which is why this is a parameter and not a policy.
+enum class AsmTemplateSurface : std::uint8_t {
+    Basic,      // no operand sections — the `.s` surface, `%` literal
+    Extended,   // any `:` at all — the dialect's `templateLexerMode`
+};
+
+// Returns nullopt with at least one diagnostic reported when the template did
+// not parse — the dialect's OWN parse diagnostics are forwarded to `reporter`
+// first, so the caller can add its context and never has to invent a reason —
+// or, for `Extended` only, when the dialect declares no template surface.
+[[nodiscard]] DSS_EXPORT std::optional<Tree>
+parseAsmTemplateText(std::string                          templateText,
+                     std::string                          bufferName,
+                     std::shared_ptr<GrammarSchema const> dialect,
+                     AsmTemplateSurface                   surface,
+                     DiagnosticBudget                     budget,
+                     DiagnosticReporter&                  reporter);
 
 // ★★★ LOWER ONE EMBEDDED ASSEMBLY TEMPLATE INTO THE CALLER'S OWN `LirBuilder`.
 //

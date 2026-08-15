@@ -61,15 +61,22 @@ std::uint16_t op(std::string_view mnemonic) {
 
 [[nodiscard]] ImplicitRegisterConstraint sampleConstraint() {
     ImplicitRegisterConstraint c;
+    // ⚠ `rax` appears in BOTH `outputs` and `clobbered`, and that is not
+    // decoration: `LirBuilder::regConstraintPoolAdd` enforces
+    // `outputs ⊆ clobbered` (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-
+    // SUBSET-OF-CLOBBERED), so a set that declared `rax` an output
+    // without clobbering it would abort the process here instead of
+    // reaching the verifier rule this fixture exists to exercise.
     c.inputNames        = {"rcx"};
     c.outputNames       = {"rax"};
-    c.clobberedNames    = {"rdx"};
+    c.clobberedNames    = {"rdx", "rax"};
     // Resolved by hand here because this path deliberately BYPASSES
     // `LirBuilder::regConstraintPoolAdd` (which is what normally derives
     // them) — these modules exist precisely to be malformed.
     c.inputOrdinals     = {*x86Schema()->registerByName("rcx")};
     c.outputOrdinals    = {*x86Schema()->registerByName("rax")};
-    c.clobberedOrdinals = {*x86Schema()->registerByName("rdx")};
+    c.clobberedOrdinals = {*x86Schema()->registerByName("rdx"),
+                           *x86Schema()->registerByName("rax")};
     return c;
 }
 

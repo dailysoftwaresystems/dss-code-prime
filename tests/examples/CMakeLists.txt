@@ -117,5 +117,17 @@ endforeach()
 
 add_test(NAME "examples/corpus-lints"
          COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
-                 --gtest_filter=${EXAMPLES_LINT_SUITE}.*
+                 --gtest_filter=${EXAMPLES_LINT_SUITE}.EveryArmAgreesWithItsSiblingsOnTheEmulator
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the carve-out census
+# gets its OWN entry rather than riding the emulator lint's. Both are corpus-wide
+# and both live in ${EXAMPLES_LINT_SUITE}, but a `${EXAMPLES_LINT_SUITE}.*` filter
+# would report a census failure under the name "manifest-emulator-lint" — a red
+# test whose NAME points at the wrong question, which is how a finding gets
+# investigated in the wrong place and then re-filed as flaky. The per-example
+# entries' exclusion filter is still the whole suite, so nothing runs twice.
+add_test(NAME "examples/optimization-observable-census"
+         COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
+                 --gtest_filter=${EXAMPLES_LINT_SUITE}.OnlyDeclaredExamplesMayDivergeFromTheirBaseline
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

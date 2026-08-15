@@ -1687,8 +1687,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       "opcode entry must be an object");
             continue;
         }
-        static constexpr std::array<std::string_view, 12> kOpcodeKeys{
+        static constexpr std::array<std::string_view, 13> kOpcodeKeys{
             "mnemonic", "result", "hasSideEffects", "requires2Address",
+            "twoAddressSourceOperand",
             "isCall", "terminatorKind", "minOperands", "maxOperands",
             "minSuccessors", "maxSuccessors", "encoding",
             "implicitRegisters"};
@@ -1726,8 +1727,74 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         if (o.contains("hasSideEffects") && o.at("hasSideEffects").is_boolean()) {
             info.hasSideEffects = o.at("hasSideEffects").get<bool>();
         }
-        if (o.contains("requires2Address") && o.at("requires2Address").is_boolean()) {
-            info.requires2Address = o.at("requires2Address").get<bool>();
+        // ── 2-address tie: the FLAG plus the OPTIONAL operand INDEX ──
+        // `requires2Address: true` alone means the historical shape,
+        // *result == operand[0]*, and every shipped opcode spells it that
+        // way. `twoAddressSourceOperand: <j>` refines WHICH operand the
+        // result is tied to (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE).
+        //
+        // ★ THE INDEX IS A SEPARATE KEY RATHER THAN AN INTEGER-VALUED
+        // `requires2Address`, AND THAT IS THE WHOLE SAFETY ARGUMENT. A
+        // polymorphic `requires2Address: 1` would be read by a human as
+        // "true" and by the loader as "tie to operand 1" — a divergence
+        // between what the author meant and what the assembler encodes,
+        // with no diagnostic. Two keys with an ENFORCED dependency cannot
+        // drift (they collapse into the one in-memory field below), and
+        // neither spelling can be misread as the other.
+        //
+        // ⚠ AND THE FLAG IS REJECTED WHEN IT IS NOT A BOOLEAN, which the
+        // pre-index loader merely IGNORED. `"requires2Address": 1` used to
+        // read as "not two-address" and silently skip legalization — an
+        // encoding bug with no diagnostic — and now it is also the most
+        // likely way an author would try to spell the index. Both readings
+        // are wrong; say so instead of picking one.
+        if (o.contains("requires2Address")
+            && !o.at("requires2Address").is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/requires2Address", i),
+                      std::format("opcode '{}': 'requires2Address' must be a "
+                                  "boolean. To tie the result to an operand "
+                                  "other than 0, keep "
+                                  "'requires2Address': true and add "
+                                  "'twoAddressSourceOperand': <index>",
+                                  info.mnemonic));
+        }
+        bool const twoAddressDeclared =
+            o.contains("requires2Address")
+            && o.at("requires2Address").is_boolean()
+            && o.at("requires2Address").get<bool>();
+        if (twoAddressDeclared) info.requires2Address = std::uint8_t{0};
+        if (o.contains("twoAddressSourceOperand")) {
+            auto const& tsoNode = o.at("twoAddressSourceOperand");
+            if (!tsoNode.is_number_unsigned()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/opcodes/{}/twoAddressSourceOperand", i),
+                          std::format("opcode '{}': 'twoAddressSourceOperand' "
+                                      "must be a non-negative integer — it is "
+                                      "the INDEX of the operand the result is "
+                                      "tied to, not a flag",
+                                      info.mnemonic));
+            } else if (!twoAddressDeclared) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/opcodes/{}/twoAddressSourceOperand", i),
+                          std::format("opcode '{}': 'twoAddressSourceOperand' "
+                                      "requires 'requires2Address: true' — an "
+                                      "index with no tie declared would be read "
+                                      "by nothing, so the operand the author "
+                                      "meant to tie would silently stay free",
+                                      info.mnemonic));
+            } else {
+                auto const idx = tsoNode.get<std::uint64_t>();
+                if (idx > 0xFFu) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/opcodes/{}/twoAddressSourceOperand", i),
+                              std::format("opcode '{}': 'twoAddressSourceOperand' "
+                                          "{} does not fit an operand index",
+                                          info.mnemonic, idx));
+                } else {
+                    info.requires2Address = static_cast<std::uint8_t>(idx);
+                }
+            }
         }
         if (o.contains("isCall") && o.at("isCall").is_boolean()) {
             info.isCall = o.at("isCall").get<bool>();

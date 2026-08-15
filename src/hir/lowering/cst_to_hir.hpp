@@ -161,6 +161,14 @@ struct DSS_EXPORT CstToHirResult {
                                   // `mir_text` surfaces as `nosanitizethread`. Its
                                   // sink is STORAGE, not a pass — DSS ships no
                                   // sanitizer (see NoSanitizeThreadAttr)
+    HirInlineDefinitionMap inlineDefinitionMap; // bound to `hir` — native-FUNCTION
+                                  // C99 6.7.4p7 INLINE DEFINITION
+                                  // (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-
+                                  // DEFINITION-EMITTED). Keyed on the FUNCTION node
+                                  // (not the declaration node the five maps above
+                                  // use); read at HIR→MIR to sanction the one legal
+                                  // function-and-extern SymbolId pair, and NOT
+                                  // stamped onto MirFunc — see InlineDefinitionAttr
     HirMutabilityMap mutabilityMap; // bound to `hir` — native-global const-ness
                                   // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL); read at
                                   // HIR→MIR to pick `.rodata` vs writable `.data`
@@ -246,6 +254,7 @@ struct DSS_EXPORT CstToHirResult {
     CstToHirResult(Hir h, HirLiteralPool lp, HirInlineAsmPool ap)
         : hir(std::move(h)), sourceMap(hir), linkageMap(hir), noInlineMap(hir),
           alwaysInlineMap(hir), noOptimizeMap(hir), noSanitizeThreadMap(hir),
+          inlineDefinitionMap(hir),
           mutabilityMap(hir), threadLocalMap(hir), volatileMap(hir),
           returnsTwiceMap(hir), alignmentMap(hir), literalPool(std::move(lp)),
           inlineAsmPool(std::move(ap)) {}

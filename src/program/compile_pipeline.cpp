@@ -131,7 +131,14 @@ bool optimizeModule(Mir&                  mir,
                     TargetSchema const&   target,
                     TypeInterner const&   interner,
                     CompileOptions const& opts,
-                    DiagnosticReporter&   reporter) {
+                    DiagnosticReporter&   reporter,
+                    // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED:
+                    // the module's extern table, read by `opt::optimize`'s
+                    // unconditional strip epilogue to identify the C99 6.7.4p7
+                    // inline definitions it must remove before codegen. Passed by
+                    // BOTH call sites (per-CU here, whole-program in program.cpp)
+                    // because a body that survives either one is emitted.
+                    std::span<ExternImport const> externImports) {
     // c97: one optimize phase covering pipeline resolution + every pass +
     // the mandatory prune-normalize — both the per-CU and merged call sites.
     substrate::PhaseTimers::Scope optimizePhase{
@@ -176,7 +183,7 @@ bool optimizeModule(Mir&                  mir,
         effectivePipeline = &loadedPipeline;
     }
     auto const optResult = ::dss::opt::optimize(
-        mir, target, interner, *effectivePipeline, reporter);
+        mir, target, interner, *effectivePipeline, reporter, externImports);
     return optResult.ok && tierClean(reporter, optEntry);
 }
 
@@ -818,7 +825,14 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           // point: this is the argument whose absence used to make
                           // the whole statement lower to a bare barrier, dropping
                           // the template, the operands and the clobber list.
-                          &hir->inlineAsmPool);
+                          &hir->inlineAsmPool,
+                          // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED
+                          // (C99 6.7.4p7): which lowered bodies are INLINE
+                          // DEFINITIONS. Without it HIR→MIR rejects the
+                          // function-plus-extern SymbolId pair CST→HIR now emits
+                          // for such a definition — loudly, which is the safe
+                          // direction, but the feature is dead.
+                          &hir->inlineDefinitionMap);
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
@@ -828,7 +842,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
     //      extracted to the shared `optimizeModule` (Cycle 26) so the N>1 whole-program
     //      path can run the SAME pipeline over the MERGED module. Pure code-motion —
     //      same arguments as the former inline block, so the per-CU output is identical.
-    if (!optimizeModule(mir.mir, target, model.lattice().interner(), opts, reporter)) {
+    if (!optimizeModule(mir.mir, target, model.lattice().interner(), opts, reporter,
+                        // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED:
+                        // this CU's extern table, still owned by `mir` here (the
+                        // LOWER half moves it into MIR→LIR later).
+                        mir.externImports)) {
         return std::nullopt;
     }
 

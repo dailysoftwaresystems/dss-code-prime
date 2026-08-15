@@ -263,6 +263,20 @@ struct Lowerer {
     // THIS axis that risk is sharper, because nothing in the emitted binary
     // changes, so an intermittent miss has no behavioural symptom at all.
     std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>>& noSanitizeThreadAcc;
+    // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED (C99 6.7.4p7): the
+    // same accumulator shape, but keyed on the FUNCTION node rather than the
+    // DECLARATION node its five neighbours use, and populated at exactly ONE site
+    // — `lowerInlineDefinitionAsDeclaration`, the sole place that decides a
+    // definition is an inline definition. ★ THE "RECORD IT AT ALL THREE SITES"
+    // RULE ITS NEIGHBOURS FOLLOW DOES NOT APPLY AND MUST NOT BE COPIED HERE: this
+    // is not a source annotation that any Function lowering might carry, it is a
+    // property one specific arm CONFERS, and recording it anywhere else would mark
+    // an ordinary definition as un-emittable — which is a silent link failure, the
+    // opposite direction from a lost `noinline`. Applied to the result's
+    // HirInlineDefinitionMap after finish(); absence ⇒ an ordinary definition that
+    // is emitted normally, so the side-table stays sparse and the default is the
+    // safe one.
+    std::vector<std::pair<HirNodeId, InlineDefinitionAttr>>& inlineDefinitionAcc;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared accumulator of (decl HIR node →
     // ThreadLocalAttr) pairs, populated from the bound symbol's
     // `SymbolRecord.isThreadLocal` at each Global lowering site AND the
@@ -1102,6 +1116,7 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, AlwaysInlineAttr>>& alwinl,
             std::vector<std::pair<HirNodeId, NoOptimizeAttr>>& noopt,
             std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>>& nosanthr,
+            std::vector<std::pair<HirNodeId, InlineDefinitionAttr>>& inldef,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& rtwice,
@@ -1115,7 +1130,7 @@ struct Lowerer {
           spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), noInlineAcc(noinl),
           alwaysInlineAcc(alwinl), noOptimizeAcc(noopt),
-          noSanitizeThreadAcc(nosanthr),
+          noSanitizeThreadAcc(nosanthr), inlineDefinitionAcc(inldef),
           threadLocalAcc(tls), volatileAcc(vol),
           returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
           sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin),
@@ -9446,9 +9461,9 @@ struct Lowerer {
     // without `extern` is an INLINE DEFINITION — it "does not provide an
     // external definition for the function", so this translation unit emits NO
     // body for it and the call resolves against some other TU's external
-    // definition. Returns true (with `outNode` set to the replacement HIR node,
-    // or invalid when the language synthesizes nothing) when it CLAIMED the
-    // declaration; false leaves the ordinary definition path untouched.
+    // definition. Returns true (having pushed whatever it produced onto `out`)
+    // when it CLAIMED the declaration; false leaves the ordinary definition path
+    // untouched.
     //
     // ★ THE SUPPRESSION AND THE REPLACEMENT ARE ONE DECISION, deliberately in
     // one function. Suppressing the body without leaving a declaration behind
@@ -9459,6 +9474,37 @@ struct Lowerer {
     // import and calls direct) or fails LOUD K_SymbolUndefined naming the
     // symbol, exactly as a bare prototype does.
     //
+    // ★★★ D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED (2026-08-15):
+    // THE BODY IS NOW LOWERED TOO, AND THE TWO HALVES OF 6.7.4p7 ARE FINALLY BOTH
+    // REALIZED. Emitting nothing is the right EMISSION decision and stays exactly
+    // as it was — ✔MEASURED on gcc 13.3.0, clang 18.1.3 and clang 19, `inline`
+    // and `__inline__`, `-std` in {default, c99, gnu17}: at `-O0` all three fail
+    // to link a called inline definition with no external definition anywhere,
+    // and `nm` shows `U <name>`. But the same paragraph also makes the inline
+    // definition "an ALTERNATIVE to an external definition, which a translator
+    // may use to implement ANY CALL to the function in the same translation
+    // unit", and at `-O1`/`-O2`/`-O3`/`-Os` all three oracles DO that: they
+    // inline it, the call disappears and the program links. Discarding the body
+    // here is what made that unreachable — the inliner's §2.9 gate already admits
+    // this exact callee shape, it simply never had a body to see. So the body is
+    // lowered as an ordinary Function and MARKED via `inlineDefinitionAcc`; the
+    // optimizer's epilogue (`opt::optimize`) removes it again, unconditionally,
+    // so nothing downstream of the optimizer can ever emit it.
+    //
+    // ★★ THE BODY IS LOWERED ON EXACTLY THE PATH THAT EMITS THE `ExternFunction`,
+    // AND THAT COUPLING IS LOad-BEARING RATHER THAN INCIDENTAL. The strip predicate
+    // downstream is "a function whose SymbolId is ALSO declared by an
+    // `ExternImport`" — a property that survives every optimizer rebuild, unlike a
+    // side-table keyed by MirFuncId. A body lowered WITHOUT the extern beside it
+    // would therefore not be recognized as un-emittable, and would ship as a real
+    // external definition. Hence both early exits below keep today's
+    // emit-absolutely-nothing behaviour:
+    //   * `!decl.prototypeSynthesizesExtern` — the language mints no extern from a
+    //     prototype, so there would be no extern to pair the body with.
+    //   * `claimSuppressedShimSymbol` — the symbol's external definition IS the
+    //     compiler-synthesized shim, which the synth pass will define. Lowering the
+    //     user's body too would give one SymbolId two definitions.
+    //
     // ★ ONLY A `Global` BINDING IS CLAIMED. 6.7.4p7 constrains functions with
     // EXTERNAL linkage; a `static inline` has internal linkage (6.7.4p6 admits
     // any internal-linkage function as inline) and MUST still be emitted, as
@@ -9466,9 +9512,8 @@ struct Lowerer {
     [[nodiscard]] bool
     lowerInlineDefinitionAsDeclaration(NodeId node, DeclarationRule const& decl,
                                        DeclaratorConfig const& dc,
-                                       LinkageAttr linkAttr,
-                                       HirNodeId& outNode) {
-        outNode = HirNodeId{};
+                                       LinkageAttr linkAttr, NodeId discNode,
+                                       std::vector<HirNodeId>& out) {
         if (linkAttr.binding != SymbolBinding::Global) return false;
         auto vis = declRoleChildren(tree(), node, decl);
         auto const carrier = decl.declaratorListChild.has_value()
@@ -9498,8 +9543,9 @@ struct Lowerer {
         // target, so claiming it here is not a workaround for the suppression —
         // it is the correct realization of it. Routed through the SHARED helper
         // so the two sites cannot drift again (they already had).
-        // Claimed ⇒ no extern node, no import row; `outNode` stays invalid,
-        // which the caller already handles ("the language synthesizes nothing").
+        // Claimed ⇒ no extern node, no import row, and (see the ★★ note above) no
+        // body either: the shim IS this symbol's external definition and the synth
+        // pass defines it, so a second definition here would be a redefinition.
         if (claimSuppressedShimSymbol(shipped, node, sym, rec->name, rec->type))
             return true;
         HirNodeId const ef =
@@ -9517,7 +9563,32 @@ struct Lowerer {
             // suppression site, kept in lockstep with the bare-prototype arm
             // above (these two have drifted before; see the TF-C112 note).
             shipped != nullptr ? shipped->linkName : std::string{}});
-        outNode = ef;
+        out.push_back(ef);
+        // ★★★ AND NOW THE BODY, for the optimizer only. Lowered by the SAME
+        // `lowerDeclaratorModeFunction` every ordinary definition goes through —
+        // deliberately not a bespoke path, so an inline definition's body is
+        // subject to exactly the semantics, diagnostics and attribute wiring its
+        // non-inline twin is, and cannot drift into being a second dialect of
+        // "function". The ONE thing that distinguishes it is the mark recorded
+        // below; `opt::optimize`'s epilogue reads the resulting function/extern
+        // SymbolId pair and drops the body, ALWAYS — in debug as well as release,
+        // because the debug pipeline is `["Identity"]` and a gate on "will we
+        // optimize" would leave the body live at -O0 and emit it.
+        //
+        // ⚠ A degraded lowering still counts. `lowerDeclaratorModeFunction`
+        // returns an Error node when the semantic tier already rejected the
+        // declarator; pushing it is right (the caller pushes it on the ordinary
+        // path too) but it carries no symbol, so it is NOT marked — an unmarked
+        // node is simply an ordinary node, and the compile is failing anyway.
+        HirNodeId const body =
+            lowerDeclaratorModeFunction(node, decl, dc, discNode, linkAttr);
+        if (body.valid()) {
+            out.push_back(body);
+            if (builder.kind(body) == HirKind::Function) {
+                inlineDefinitionAcc.push_back(
+                    {body, InlineDefinitionAttr{/*isInlineDefinition=*/true}});
+            }
+        }
         return true;
     }
 
@@ -9645,10 +9716,11 @@ struct Lowerer {
                                   declarators.empty() ? NodeId{} : declarators[0]);
             // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): a C99 6.7.4p7 inline
             // definition provides no external definition — lower it as a
-            // DECLARATION and emit no body.
-            if (HirNodeId ef; lowerInlineDefinitionAsDeclaration(
-                                  node, decl, dc, fnLink, ef)) {
-                if (ef.valid()) out.push_back(ef);
+            // DECLARATION, plus (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-
+            // EMITTED) a MARKED body the optimizer may inline from and whose
+            // emission the optimizer's epilogue unconditionally suppresses.
+            if (lowerInlineDefinitionAsDeclaration(node, decl, dc, fnLink,
+                                                   discNode, out)) {
                 return;
             }
             out.push_back(
@@ -10465,6 +10537,11 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // NoSanitizeThreadAttr) accumulator, moved onto result->noSanitizeThreadMap
     // after finish().
     std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>> noSanitizeThreadAcc;
+    // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: shared (FUNCTION
+    // node → InlineDefinitionAttr) accumulator, moved onto
+    // result->inlineDefinitionMap after finish(). Keyed on the FUNCTION node, not
+    // the declaration node its neighbours use, and written at ONE site.
+    std::vector<std::pair<HirNodeId, InlineDefinitionAttr>> inlineDefinitionAcc;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared (decl node → ThreadLocalAttr)
     // accumulator, moved onto result->threadLocalMap after finish().
     std::vector<std::pair<HirNodeId, ThreadLocalAttr>> threadLocalAcc;
@@ -10510,7 +10587,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, inlineAsmPool, spans, externDecls, linkage,
             mutability, noInlineAcc, alwaysInlineAcc, noOptimizeAcc,
-            noSanitizeThreadAcc,
+            noSanitizeThreadAcc, inlineDefinitionAcc,
             threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
             vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc, synthRecipeAcc));
     }
@@ -10610,6 +10687,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         result->noOptimizeMap.set(id, attr);
     for (auto& [id, attr] : noSanitizeThreadAcc)   // TF-C92 (no_sanitize_thread)
         result->noSanitizeThreadMap.set(id, attr);
+    for (auto& [id, attr] : inlineDefinitionAcc)   // C99 6.7.4p7 inline definition
+        result->inlineDefinitionMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     for (auto& [id, attr] : threadLocalAcc)
         result->threadLocalMap.set(id, attr);   // TLS C1

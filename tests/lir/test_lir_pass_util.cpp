@@ -77,6 +77,13 @@ std::uint16_t op(std::string_view mnemonic) {
 // A constraint set in the shape an inline-asm statement produces: an
 // input pinned to one register, an output in another, a third destroyed.
 // Register NAMES only — `regConstraintPoolAdd` derives the ordinals.
+//
+// ⚠ THE CALLER MUST KEEP `outputs ⊆ clobbered` (D-LIR-PER-INSTRUCTION-
+// OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED): the builder now rejects an
+// output that is not also clobbered, so `out` must name a register the
+// `clobber` list covers. The helper does NOT silently repair it — a
+// fixture that quietly satisfied the rule its subject enforces would
+// stop the rule from ever being exercised by these tests.
 [[nodiscard]] ImplicitRegisterConstraint sampleConstraint(
     std::string in, std::string out, std::string clobber) {
     ImplicitRegisterConstraint c;
@@ -107,7 +114,7 @@ struct SeededModule {
     LirBuilder b{*x86Schema()};
     SeededModule out{Lir{}};
     out.constraintIndex =
-        b.regConstraintPoolAdd(sampleConstraint("rcx", "rax", "rdx"));
+        b.regConstraintPoolAdd(sampleConstraint("rcx", "rdx", "rdx"));
     out.literalIndex = b.literalPoolAdd(i64Literal(0x1122334455667788LL));
 
     (void)b.addFunction(SymbolId{1});
@@ -263,7 +270,7 @@ struct TwoAddressModule {
     TwoAddressModule out{Lir{}, op("add")};
     LirBuilder b{*x86Schema()};
     std::uint32_t const ci =
-        b.regConstraintPoolAdd(sampleConstraint("rcx", "rax", "rdx"));
+        b.regConstraintPoolAdd(sampleConstraint("rcx", "rdx", "rdx"));
     (void)b.addFunction(SymbolId{1});
     LirBlockId const entry = b.createBlock();
     b.beginBlock(entry);
@@ -295,7 +302,7 @@ struct CallModule {
     CallModule out{Lir{}, op("call")};
     LirBuilder b{*x86Schema()};
     std::uint32_t const ci =
-        b.regConstraintPoolAdd(sampleConstraint("rcx", "rax", "rdx"));
+        b.regConstraintPoolAdd(sampleConstraint("rcx", "rdx", "rdx"));
     (void)b.addFunction(SymbolId{1});
     LirBlockId const entry = b.createBlock();
     b.beginBlock(entry);
@@ -345,7 +352,7 @@ struct PressureModule {
     b.beginBlock(entry);
     auto seed = [&](LirInstId inst) {
         b.setInstRegConstraints(
-            inst, b.regConstraintPoolAdd(sampleConstraint("rcx", "rax", "rdx")));
+            inst, b.regConstraintPoolAdd(sampleConstraint("rcx", "rdx", "rdx")));
         ++out.carrierCount;
     };
     std::vector<LirReg> vals;
@@ -687,7 +694,7 @@ TEST(LirPassUtil, RegConstraintPoolAddResolvesNamesToOrdinals) {
     LirBuilder b{*x86Schema()};
     // Ordinals deliberately supplied WRONG: the builder re-derives them,
     // so a caller cannot desynchronise the two representations.
-    ImplicitRegisterConstraint c = sampleConstraint("rcx", "rax", "rdx");
+    ImplicitRegisterConstraint c = sampleConstraint("rcx", "rdx", "rdx");
     c.inputOrdinals = {9999};
     c.outputOrdinals.clear();
     std::uint32_t const idx = b.regConstraintPoolAdd(std::move(c));
@@ -702,7 +709,7 @@ TEST(LirPassUtil, RegConstraintPoolAddResolvesNamesToOrdinals) {
     ASSERT_EQ(stored.outputOrdinals.size(), 1u);
     ASSERT_EQ(stored.clobberedOrdinals.size(), 1u);
     EXPECT_EQ(stored.inputOrdinals[0], *x86Schema()->registerByName("rcx"));
-    EXPECT_EQ(stored.outputOrdinals[0], *x86Schema()->registerByName("rax"));
+    EXPECT_EQ(stored.outputOrdinals[0], *x86Schema()->registerByName("rdx"));
     EXPECT_EQ(stored.clobberedOrdinals[0], *x86Schema()->registerByName("rdx"));
 }
 
@@ -711,6 +718,74 @@ TEST(LirPassUtilDeathTest, RegConstraintPoolAddRejectsAnUnknownRegisterName) {
     EXPECT_DEATH(
         (void)b.regConstraintPoolAdd(sampleConstraint("rax", "rax", "nosuchreg")),
         "not in the target schema's register table");
+}
+
+// ── `outputs ⊆ clobbered` on the PER-INSTRUCTION carrier ─────────────
+//
+// D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED. The
+// register allocator's forbidden set is `inputs ∪ clobbered` and OUTPUTS
+// ARE DELIBERATELY OMITTED (`lir_regalloc.cpp` says so outright: the op
+// reads its operands before it writes its outputs, so a same-register
+// overlap is fine). That omission is safe ONLY because every output is
+// also a clobber — a rule the `.target.json` loader enforces for the
+// per-OPCODE carrier and which, until this cycle, NOTHING enforced for
+// the per-INSTRUCTION one. A lowering that pinned an output without
+// clobbering it produced a constraint the allocator would not exclude,
+// and a value live in that register died with no diagnostic.
+//
+// ⚠ THE POSITIVE CONTROL IS HALF THE TEST. A refusal arm alone passes on
+// a builder that refuses EVERY constraint set, which would break the
+// whole per-instruction carrier while looking like a hardened one.
+TEST(LirPassUtilDeathTest, RegConstraintPoolAddRejectsAnOutputThatIsNotClobbered) {
+    LirBuilder b{*x86Schema()};
+    EXPECT_DEATH(
+        // `rax` is declared an implicit OUTPUT while only `rdx` is
+        // clobbered — the exact shape an inline-asm lowering produces
+        // when it materialises a register-pinned `"=a"` output and
+        // forgets to enter it into the clobber set.
+        (void)b.regConstraintPoolAdd(sampleConstraint("rcx", "rax", "rdx")),
+        "is not in this constraint's clobbered set");
+}
+
+TEST(LirPassUtil, RegConstraintPoolAddAcceptsAnOutputThatIsAlsoClobbered) {
+    LirBuilder b{*x86Schema()};
+    // The idiv shape: `rdx` is an implicit output AND a clobber, which is
+    // legal and must stay legal — the fix must not pessimise the compound
+    // ops whose output legitimately aliases a declared register.
+    ImplicitRegisterConstraint c = sampleConstraint("rcx", "rdx", "rdx");
+    c.clobberedNames.emplace_back("rax");   // a clobber that is NOT an output
+    std::uint32_t const idx = b.regConstraintPoolAdd(std::move(c));
+
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const e = b.createBlock();
+    b.beginBlock(e);
+    b.addReturn(op("ret"), std::span<LirOperand const>{});
+    Lir const lir = std::move(b).finish();
+
+    auto const& stored = lir.regConstraintPool().at(idx);
+    ASSERT_EQ(stored.outputOrdinals.size(), 1u);
+    EXPECT_EQ(stored.outputOrdinals[0], *x86Schema()->registerByName("rdx"));
+    EXPECT_EQ(stored.clobberedOrdinals.size(), 2u)
+        << "the rule is a SUBSET rule — a clobber that is not an output must "
+           "still be accepted";
+    EXPECT_FALSE(stored.firstOutputNotClobbered().has_value());
+}
+
+// The predicate itself, exercised on the shape that made the rule
+// necessary and on the one that satisfies it. `firstOutputNotClobbered`
+// is what a producer fed by USER text must call BEFORE the builder — the
+// builder aborts, and a malformed program owes a diagnostic — so it is a
+// contract in its own right, not an implementation detail of the abort.
+TEST(LirPassUtil, FirstOutputNotClobberedNamesTheOffendingIndex) {
+    ImplicitRegisterConstraint c;
+    c.outputOrdinals    = {7, 9};
+    c.clobberedOrdinals = {7};
+    auto const bad = c.firstOutputNotClobbered();
+    ASSERT_TRUE(bad.has_value());
+    EXPECT_EQ(*bad, 1u) << "the FIRST unclobbered output is index 1, not 0";
+
+    c.clobberedOrdinals.push_back(9);
+    EXPECT_FALSE(c.firstOutputNotClobbered().has_value());
 }
 
 TEST(LirPassUtilDeathTest, SetInstRegConstraintsRejectsAnOutOfRangeIndex) {

@@ -2676,6 +2676,12 @@ struct Lowerer {
         std::string   name;            // canonical parent name iff `pinned`
         std::uint32_t widthBits = 64;
         std::string   spelling;        // what the template writes for it
+        // `"=&r"` — the source said this output is written before every
+        // input has been read. Carried per-operand because the flag it
+        // becomes is stamped on ONE instruction (the one that defines
+        // this vreg), not on the whole expansion.
+        bool          earlyClobber = false;
+        std::string   constraint;      // verbatim, for diagnostics
     };
 
     // GNU numbering: outputs first, then inputs, `%0`.. across BOTH lists
@@ -2695,26 +2701,34 @@ struct Lowerer {
     [[nodiscard]] bool
     bindAsmOperand(MirAsmOperand const& o, MirInstId at, std::size_t gnuIndex,
                    std::string_view role, TypeId valueType, AsmBound& out) {
-        out.spelling  = asmOperandSpelling(gnuIndex);
-        out.widthBits = asmWidthBitsForType(valueType);
-        // ⚠ `"+r"` — ONE operand that is read AND written. ✔MEASURED (plan 29
-        // §4.4.4): the tie is a per-opcode BOOL `requires2Address` hardwired to
-        // *result == operand[0]* with `0` a literal at four sites, and there is
-        // ONE result slot — no `(result k, operand j)` pair is expressible.
-        // Accepting it would emit an asm block that reads a register the source
-        // said also holds the output, with no diagnostic. The fix is a CORE fix
-        // (an operand INDEX replacing the bool, which every two-address target
-        // benefits from) and it belongs in `lir_2addr_legalize`, not here.
+        out.spelling   = asmOperandSpelling(gnuIndex);
+        out.widthBits  = asmWidthBitsForType(valueType);
+        out.constraint = o.constraint;
+        // ⚠ `"+r"` — ONE operand that is read AND written, and the blocker is
+        // NO LONGER IN LIR. ✔MEASURED 2026-08-15: the LIR half is done — the
+        // two-address tie carries an operand INDEX rather than a bool fixed to
+        // *result == operand[0]* (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE), and a
+        // read-write asm operand does not even need it, because the template
+        // binds ONE spelling to ONE vreg that is both the instruction's result
+        // and its operand — the tie is then an identity, not a constraint.
+        // ★ WHAT IS ACTUALLY MISSING IS THE OPERAND'S INPUT VALUE. ✔MEASURED in
+        // `hir_to_mir.cpp`: a `+` operand is filed in `desc.outputs` (index <
+        // `outputCount`) and outputs contribute only an LVALUE ADDRESS for the
+        // store-back piece — the read half is never lowered, so no MIR operand
+        // carries the value the template is entitled to read. Accepting it here
+        // would bind the template to a vreg NOTHING wrote: the asm would read
+        // an undefined register with no diagnostic. Refused until the front end
+        // lowers a `+` operand's value as an input as well as an lvalue.
         if (o.isReadWrite) {
             dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
                 DiagnosticSeverity::Error,
                 std::format(
                     "inline asm (MIR inst {}): {} {} uses the read-write "
-                    "constraint \"{}\", and LIR cannot yet TIE an output to an "
-                    "input — `requires2Address` is a per-opcode bool fixed to "
-                    "*result == operand[0]*, so no (result, operand) pair is "
-                    "expressible. Refused rather than emitted untied, which "
-                    "would drop the tie silently "
+                    "constraint \"{}\". The tie itself is expressible now, but "
+                    "the front end lowers a read-write operand's LVALUE only — "
+                    "no MIR operand carries the value the template must READ, "
+                    "so binding it would hand the template a register nothing "
+                    "wrote. Refused rather than read-as-undefined "
                     "(D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE)",
                     at.v, role, gnuIndex, o.constraint));
             return false;
@@ -2729,46 +2743,20 @@ struct Lowerer {
             return false;
         }
         if (o.fixedRegister.empty()) {
-            // ⚠ `"=&r"` ON AN UNPINNED OUTPUT IS REFUSED, AND THE REASON IS A
-            // MEASUREMENT RATHER THAN A CHOICE. The mechanism exists and is
-            // correct — `kLirInstFlagEarlyClobberResult` moves the result's def
-            // from the LATE slot to the EARLY one, so the inputs no longer
-            // expire under it (`lir_liveness.cpp`). But the instruction that
-            // WRITES an unpinned output is emitted by the shared template
-            // engine, and ✔MEASURED 2026-08-15 `LirBuilder` exposes no way to
-            // set a flag on an already-appended instruction: `addInst` takes
-            // `flags` by value and there is no `setInstFlags` sibling to
-            // `setInstRegConstraints`. So this tier cannot mark it.
-            // ★ A PINNED earlyclobber output (`"=&a"`) IS ALREADY CORRECT and is
-            // deliberately NOT refused: its register is in `clobberedNames`, so
-            // `effectiveForbiddenOrdinals` bars every live range covering the
-            // block from holding it — which is exactly what `&` asks for, by a
-            // different mechanism. Refusing it too would reject a program this
-            // build compiles correctly.
-            if (o.isEarlyClobber) {
-                dss::report(reporter,
-                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
-                    DiagnosticSeverity::Error,
-                    std::format(
-                        "inline asm (MIR inst {}): {} {} uses the earlyclobber "
-                        "constraint \"{}\" on an ALLOCATOR-CHOSEN register. The "
-                        "liveness rule that implements `&` keys on "
-                        "`kLirInstFlagEarlyClobberResult`, and the instruction "
-                        "that writes this operand is emitted by the shared "
-                        "assembly engine, which `LirBuilder` gives no way to "
-                        "flag after the fact. Refused rather than accepted and "
-                        "ignored — an ignored `&` lets the output share a "
-                        "register with an input the template has not finished "
-                        "reading, which is a miscompile with no diagnostic. A "
-                        "register-PINNED earlyclobber (\"=&a\") is accepted: its "
-                        "clobber entry already forbids the sharing "
-                        "(D-LIR-EARLYCLOBBER-FLAG-UNSETTABLE-AFTER-EMISSION)",
-                        at.v, role, gnuIndex, o.constraint));
-                return false;
-            }
-            out.reg    = lir.newVReg(cls);
-            out.cls    = cls;
-            out.pinned = false;
+            // `"=&r"` on an ALLOCATOR-CHOSEN register is honoured by stamping
+            // `kLirInstFlagEarlyClobberResult` onto the instruction that
+            // defines this vreg — see `stampEarlyClobberOutputs` below, which
+            // runs after the shared assembly engine has emitted it.
+            // (D-LIR-EARLYCLOBBER-FLAG-UNSETTABLE-AFTER-EMISSION closed the
+            // middle of that chain: `LirBuilder::orInstFlags`.)
+            // ★ A PINNED earlyclobber output (`"=&a"`) needs no flag at all:
+            // its register is in `clobberedNames`, so `effectiveForbidden
+            // Ordinals` already bars every live range covering the block from
+            // holding it — exactly what `&` asks for, by a different mechanism.
+            out.reg          = lir.newVReg(cls);
+            out.cls          = cls;
+            out.pinned       = false;
+            out.earlyClobber = o.isEarlyClobber;
             return true;
         }
         std::uint16_t ord  = 0;
@@ -2787,6 +2775,41 @@ struct Lowerer {
         out.ordinal = ord;
         out.name    = std::move(name);
         return true;
+    }
+
+    // ★★★ WHICH SURFACE THIS TEMPLATE IS READ ON — BASIC (`.s`, `%` literal) or
+    // EXTENDED (the dialect's `templateLexerMode`, where `%` introduces an
+    // operand). ✔MEASURED on gcc 13.3.0 and clang 18.1.3: the SAME bytes
+    // `"xorl %eax,%eax"` COMPILE as a basic template and are REJECTED the
+    // moment any `:` appears. Both directions are conformance defects, so this
+    // is a decision, never a default.
+    //
+    // The template surface is CARRIED, not reconstructed. `MirAsmDescriptor::
+    // isExtended` comes straight from `HirInlineAsmDescriptor::isExtended`, whose
+    // rule is "ANY colon, including `:::` with every section empty".
+    //
+    // ★ THIS REPLACED A SECTION-COUNTING RECONSTRUCTION, AND THE RECONSTRUCTION
+    // WAS LIVE-WRONG IN THE DIRECTION ITS OWN COMMENT DENIED. That comment argued
+    // the only misread shape was `__asm__("…" :::)` being taken as BASIC, and
+    // called it a harmless over-acceptance because "the one that never rejects
+    // valid code is the only defensible pick". ✔MEASURED 2026-08-15, both halves
+    // of that were wrong:
+    //   * the over-acceptance never reached a user — the SEMANTIC tier reads
+    //     `HirInlineAsmFacts::isExtended` and already refuses a bare `%eax` in
+    //     `__asm__("xorl %eax,%eax" :::)` with `S0067`, matching gcc 13.3.0 and
+    //     clang 18.1.3, which both reject it;
+    //   * and it DID reject valid code: `__asm__("movl %%eax, %%ebx" :::)`
+    //     compiles rc=0 on BOTH oracles, and this build refused it with a raw
+    //     `error[P0001]: expected 'Identifier' — got '%'` out of the `.s` lexer,
+    //     because the empty sections routed an EXTENDED template onto the `.s`
+    //     surface where `%%` has no meaning. The matched control `::: "ebx"` —
+    //     one clobber, so the reconstruction said Extended — compiled clean.
+    // ⇒ a defaulting rule defended as "errs safe" errs in whichever direction the
+    // missing fact happened to correlate with. Carry the fact.
+    [[nodiscard]] static AsmTemplateSurface
+    asmTemplateSurfaceFor(MirAsmDescriptor const& desc) {
+        return desc.isExtended ? AsmTemplateSurface::Extended
+                               : AsmTemplateSurface::Basic;
     }
 
     // ★★★ THE EXPANSION. `succs` is empty for the non-terminator form.
@@ -2867,6 +2890,13 @@ struct Lowerer {
         // reaching this is a defect in THIS function rather than in its input —
         // which is exactly when a silent pass is most expensive, because the
         // invariant it guards is invisible to every downstream test.
+        // ⓘ `regConstraintPoolAdd` now ABORTS on the same violation
+        // (`ImplicitRegisterConstraint::firstOutputNotClobbered`), so this loop
+        // is no longer the only guard — but it stays, and it stays FIRST: this
+        // tier is fed by USER text and owes a diagnostic, never a process kill.
+        // The builder's abort is the backstop for producers that forget; the
+        // ordinal-based query cannot be used here because the ordinals are
+        // derived by the builder, so the canonical NAMES are what this tier has.
         for (auto const& outName : c.outputNames) {
             bool present = false;
             for (auto const& cl : c.clobberedNames) {
@@ -2908,33 +2938,24 @@ struct Lowerer {
             }
         }
 
-        // ── 3. parse the template with the TARGET's dialect ──
+        // ── 3. parse the template on the RIGHT SURFACE ──
+        //
+        // ★★★ A TEMPLATE IS NOT LEXED LIKE A `.s`, AND THIS TIER MUST SAY WHICH
+        // READING APPLIES. `parseAsmTemplateText` owns the surface choice and
+        // the trailing newline (the dialect is line-oriented, so a last line
+        // without `\n` would be lost); this call replaced a bare `UnitBuilder`,
+        // which reads every buffer in the `main` lexer mode and therefore put
+        // EVERY template on the `.s` surface — the state in which a placeholder
+        // is unlexable and the whole `%N` vocabulary is unreachable from C.
+        //
         // ⚠ A PARSE ERROR IS THE PROGRAMMER'S DIAGNOSTIC, NOT A CRASH. The text
-        // came from a C string literal and may be anything at all.
-        UnitBuilder ub{asmDialect_, DiagnosticBudget::libraryDefault()};
-        // The dialect is line-oriented — the newline IS its statement
-        // terminator (`asm-x86_64-att.lang.json`'s tokens banner) — so a
-        // template whose last line has no `\n` would lose that line. Appending
-        // one unconditionally is harmless: a blank line lowers to nothing.
-        ub.addInMemory(desc.templateText + "\n", "<inline asm>");
-        CompilationUnit unit = std::move(ub).finish();
-        if (unit.trees().empty()) {
-            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
-                DiagnosticSeverity::Error,
-                std::format("inline asm (MIR inst {}): the template produced no "
-                            "parse tree under dialect '{}'",
-                            id.v, dialect->name()));
-            return false;
-        }
-        Tree const& tree = unit.trees()[0];
-        bool templateParsed = true;
-        for (auto const& d : tree.diagnostics().all()) {
-            if (d.severity != DiagnosticSeverity::Error) continue;
-            templateParsed = false;
-            ParseDiagnostic copy = d;
-            reporter.report(std::move(copy));
-        }
-        if (!templateParsed) {
+        // came from a C string literal and may be anything at all; the dialect's
+        // own diagnostics are forwarded before this tier adds its context.
+        std::optional<Tree> const tree = parseAsmTemplateText(
+            desc.templateText, "<inline asm>", asmDialect_,
+            asmTemplateSurfaceFor(desc), DiagnosticBudget::libraryDefault(),
+            reporter);
+        if (!tree.has_value()) {
             dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
                 DiagnosticSeverity::Error,
                 std::format(
@@ -2969,7 +2990,7 @@ struct Lowerer {
         for (auto const& b : ins) {
             bindings.push_back({b.spelling, b.reg, b.cls, b.widthBits});
         }
-        if (!lowerAsmTemplateToLirRun(tree, *dialect, target, bindings, lir,
+        if (!lowerAsmTemplateToLirRun(*tree, *dialect, target, bindings, lir,
                                       reporter)) {
             return false;
         }
@@ -2982,9 +3003,10 @@ struct Lowerer {
         // under which `lastInst()` becomes safe. Counting the lines here (with
         // the dialect's OWN `lineRule`, never by scanning the text) is what
         // makes the accounting exact instead of optimistic.
-        if (templateLineCount(tree, dialect->assembly()) > 0) {
+        if (templateLineCount(*tree, dialect->assembly()) > 0) {
             lirInstEverEmitted_ = true;
         }
+        if (!stampEarlyClobberOutputs(id, outs, firstEmitted)) return false;
 
         // Every register-pinned OUTPUT is read out of its register immediately.
         // ⚠ Unpinned outputs are NOT captured: the template wrote the operand's
@@ -3015,6 +3037,71 @@ struct Lowerer {
                 outs[k].reg;
         }
         if (!outs.empty()) defineValue(id, outs[0].reg);
+        return true;
+    }
+
+    // ★★★ `"=&r"` — STAMP THE EARLYCLOBBER FLAG ONTO THE INSTRUCTION THAT
+    // DEFINES THE OUTPUT (D-LIR-EARLYCLOBBER-FLAG-UNSETTABLE-AFTER-EMISSION).
+    //
+    // The whole mechanism was already built at BOTH ends and could not be
+    // connected in the middle: `kLirInstFlagEarlyClobberResult` exists, and
+    // `lir_liveness.cpp` consumes it correctly (the result's def moves from the
+    // LATE slot to the EARLY one, so the inputs no longer expire under it and
+    // the linear scan cannot hand the result an input's register). What was
+    // missing is that the instruction WRITING an unpinned output is emitted by
+    // the SHARED assembly engine, which this tier never sees instruction by
+    // instruction — and `addInst` took `flags` by value with no sibling setter.
+    // `LirBuilder::orInstFlags` is that setter.
+    //
+    // ★★ WHY IT MATTERS, MEASURED RATHER THAN ASSUMED: on both reference
+    // compilers a PLAIN `"=r"` output SHARES its register with an input
+    // (`%0=%eax %1=%eax` on x86_64, `x0 x0` on aarch64), and DSS's allocator
+    // does the same — non-overlapping ranges reuse registers. So an `&` that
+    // was accepted and ignored would let a template that writes `%0` before it
+    // has finished reading `%1` destroy its own input, with no diagnostic.
+    //
+    // ⚠ THE SEARCH IS OVER THE WHOLE EMITTED RANGE, NOT JUST THE FIRST
+    // INSTRUCTION. A multi-instruction template is already safe by liveness
+    // (an output written at instruction 1 and an input read at instruction 3
+    // have OVERLAPPING ranges, so the allocator separates them anyway); the
+    // single-instruction shape is the one the flag exists for, because there
+    // the input's range ends exactly where the result's def begins. Flagging
+    // every def of the vreg is correct in both shapes — `firstDef` takes the
+    // minimum — and needs no case analysis here.
+    //
+    // ⚠ ZERO DEFS IS A REFUSAL, NOT A NO-OP. A template that never wrote the
+    // operand leaves nothing to flag, and silently returning would ship an `&`
+    // the compiler did not honour — the accept-and-ignore this refuses.
+    [[nodiscard]] bool
+    stampEarlyClobberOutputs(MirInstId id, std::vector<AsmBound> const& outs,
+                             std::uint32_t firstEmitted) {
+        std::uint32_t const end = nextLirInstIdValue();
+        for (auto const& b : outs) {
+            if (!b.earlyClobber || b.pinned) continue;
+            std::uint32_t stamped = 0;
+            for (std::uint32_t v = firstEmitted; v < end; ++v) {
+                LirInstId const li{v, lir.id().v};
+                if (!(lir.instResult(li) == b.reg)) continue;
+                lir.orInstFlags(li, kLirInstFlagEarlyClobberResult);
+                ++stamped;
+            }
+            if (stamped == 0) {
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format(
+                        "inline asm (MIR inst {}): the earlyclobber output "
+                        "\"{}\" is bound to template operand '{}', and no "
+                        "instruction the template lowered to WRITES it — so "
+                        "there is nothing to mark as written-before-the-inputs-"
+                        "are-read. Refused rather than silently dropping the "
+                        "`&`, which would let the output share a register with "
+                        "an input the template has not finished reading "
+                        "(D-LIR-EARLYCLOBBER-FLAG-UNSETTABLE-AFTER-EMISSION)",
+                        id.v, b.constraint, b.spelling));
+                return false;
+            }
+        }
         return true;
     }
 

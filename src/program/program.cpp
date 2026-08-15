@@ -1224,7 +1224,32 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // ONCE. Not done now because `buildCuMir` is shared with the N==1 path (which must
     // still optimize per-CU) and the redundant per-CU pass is correctness-neutral.
     if (!optimizeModule(merged->mir, **targetR, merged->host.interner(),
-                        compileOpts, reporter)) {
+                        compileOpts, reporter,
+                        // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED:
+                        // the MERGED module's extern table.
+                        //
+                        // ★★ THIS CALL IS A GUARANTEED NO-OP, AND KNOWING WHY IS
+                        // WHAT MAKES IT SAFE TO MAKE. The strip drops a function
+                        // whose SymbolId is also an extern's — so the question
+                        // that matters here is whether a merged module can pair a
+                        // GENUINE cross-CU definition with a sibling CU's `extern`
+                        // declaration of it. If it could, this call would delete a
+                        // real definition. It cannot: `mergeCuMirs` step 6 skips
+                        // every extern row whose `mangledName` is in
+                        // `plan.definedNames` ("→ direct, strip"), having already
+                        // rewired those calls to direct in step 4. So by the time
+                        // the merged module exists, an extern row and a defining
+                        // function of the same symbol never co-exist. ✔MEASURED
+                        // besides: `extern int f(void);` in cu_a with `int f(void)
+                        // {…}` in cu_b links and runs correctly at BOTH configs.
+                        //
+                        // ⇒ It is passed anyway, deliberately. The per-CU optimize
+                        // is what actually strips these bodies, and "the other one
+                        // already did it" is exactly the assumption that ships a
+                        // body when it did not. A no-op that costs one empty-set
+                        // scan is the right price for not having to re-derive that
+                        // argument the next time the merge changes.
+                        merged->externImports)) {
         return std::nullopt;  // optimize / verify failure already reported via `reporter`
     }
 

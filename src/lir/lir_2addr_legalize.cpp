@@ -116,36 +116,47 @@ legalizeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
             }
 
             // `requires2Address` is DEFINED as the reg-reg shape
-            // (operand 0 must be a register so a `mov` can copy
-            // it to the destination). Convergence-fix E: emit a
+            // (the TIED operand must be a register so a `mov` can
+            // copy it to the destination). Convergence-fix E: emit a
             // hard diagnostic if a schema declares
-            // `requires2Address: true` on an opcode whose first
+            // `requires2Address: true` on an opcode whose tied
             // operand isn't a Reg — silently skipping legalize
             // would let the assembler emit the wrong-shape bytes.
-            if (info != nullptr && info->requires2Address) {
-                if (newOps.empty()
-                    || newOps[0].kind != LirOperandKind::Reg) {
+            //
+            // ★ THE TIED OPERAND IS WHICHEVER ONE THE SCHEMA NAMES
+            // (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE). It was the literal
+            // `0` here and at the two sites below; `requires2Address`
+            // now carries the index, so a `(result, operand j)` tie is
+            // expressible and every two-address target — not just an
+            // asm-private path — can declare one.
+            std::size_t const tied =
+                (info != nullptr && info->requires2Address.has_value())
+                    ? *info->requires2Address : 0u;
+            if (info != nullptr && info->requires2Address.has_value()) {
+                if (newOps.size() <= tied
+                    || newOps[tied].kind != LirOperandKind::Reg) {
                     report(reporter,
                            DiagnosticCode::L_UnsupportedLoweringForOpcode,
                            DiagnosticSeverity::Error,
                            std::format("2-address legalize: opcode "
-                                       "'{}' declares "
-                                       "`requires2Address: true` "
-                                       "but its first operand is "
-                                       "not a register — legalize "
+                                       "'{}' ties its result to "
+                                       "operand {}, but that operand is "
+                                       "not a register (the instruction "
+                                       "carries {}) — legalize "
                                        "cannot synthesize the "
                                        "implicit copy",
-                                       info->mnemonic));
+                                       info->mnemonic, tied,
+                                       newOps.size()));
                     legalized = false;
                 }
             }
 
             bool const needsLegalize =
-                info != nullptr && info->requires2Address
-                && !newOps.empty()
-                && newOps[0].kind == LirOperandKind::Reg
+                info != nullptr && info->requires2Address.has_value()
+                && newOps.size() > tied
+                && newOps[tied].kind == LirOperandKind::Reg
                 && result_reg.valid()
-                && newOps[0].reg != result_reg;
+                && newOps[tied].reg != result_reg;
 
             if (needsLegalize) {
                 auto const movOp =
@@ -163,18 +174,18 @@ legalizeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
                     // well-formed shape on inspection.
                     legalized = false;
                 } else {
-                    // Emit `mov result, operands[0]` BEFORE the
+                    // Emit `mov result, operands[tied]` BEFORE the
                     // original inst. The mov's source is the
                     // SAME `LirReg` operand that the binary op
                     // would have read; the dest is the binary
                     // op's result vreg/preg.
-                    LirOperand const movSrc[] = { newOps[0] };
+                    LirOperand const movSrc[] = { newOps[tied] };
                     (void)b.addInst(*movOp, result_reg, movSrc);
-                    // Rewrite the original inst's operands[0] to
+                    // Rewrite the original inst's tied operand to
                     // point at the destination — the binary op
                     // now reads from its own result reg (the
                     // 2-address constraint).
-                    newOps[0] = LirOperand::makeReg(result_reg);
+                    newOps[tied] = LirOperand::makeReg(result_reg);
                 }
             }
 

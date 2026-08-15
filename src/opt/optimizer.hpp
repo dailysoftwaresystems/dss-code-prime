@@ -19,10 +19,13 @@
 // before deleting any symbol. Substrate already on MirFunc + MirGlobal.
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/extern_import.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
+
+#include <span>
 
 #include <array>
 #include <cstddef>
@@ -252,10 +255,26 @@ struct OptResult {
 // (D-OPT1-VERIFY-AFTER-EVERY-PASS) for the interner-gated rule set
 // (CondBr-is-Bool, Return-matches-FnSig, Arg-in-range, no-Extension-
 // types). Without it, `checkTypeInvariants` is silently skipped.
+// `externImports` is the module's extern declaration table — the SAME vector the
+// LOWER half moves into MIR→LIR. It is read for exactly one thing: the
+// unconditional inline-definition strip epilogue
+// (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED, C99 6.7.4p7). A
+// function whose SymbolId also appears here is an inline definition — a body the
+// module carries so the inliner may use it, and which must NEVER be emitted —
+// and the epilogue removes it after the pipeline has had its chance to inline it.
+//
+// ⚠ DEFAULTS TO EMPTY, AND THE DEFAULT IS "STRIP NOTHING". That is right for
+// every hand-built MIR fixture (a module with no extern table cannot contain the
+// function/extern pair by construction), and it is safe rather than merely
+// convenient: an omitted table leaves the module exactly as the pipeline left it.
+// The real front end always passes its table, so the only way to reach an
+// unstripped inline definition is to build one by hand and then not declare it.
 [[nodiscard]] DSS_EXPORT OptResult optimize(Mir& mir,
                                             TargetSchema const& target,
                                             TypeInterner const& interner,
                                             OptPipeline const& pipeline,
-                                            DiagnosticReporter& reporter);
+                                            DiagnosticReporter& reporter,
+                                            std::span<ExternImport const>
+                                                externImports = {});
 
 } // namespace dss::opt

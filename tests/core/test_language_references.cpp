@@ -1467,3 +1467,354 @@ TEST(LanguageReferences, ShippedAsmDeclaresTheTwoNonRegisterClobberSpellings) {
     EXPECT_EQ(asmCfg.conditionCodeClobber, "cc");
     EXPECT_NE(asmCfg.memoryClobber, asmCfg.conditionCodeClobber);
 }
+
+// ═══ 6. THE **STANDALONE** ENTRY, AND THE TEMPLATE PLACEHOLDER SURFACE ═════
+//
+// ★★★ WHY A SECOND HOST RATHER THAN MORE ASSERTIONS ON THE FIRST. `asm.lang.json`
+// has TWO entries and the loader imports the closure of the ONE a host names.
+// Every test above enters at `asmStmt` (the embedded `__asm__(…)` surface), so
+// not one of them can see the seven line-structure rules or the five placeholder
+// rules — they are simply not in that closure, by design. A claim about the
+// STANDALONE closure therefore needs a host that names it, and a host that names
+// it owes a DIFFERENT set of holes. Bolting the claim onto the existing host
+// would have meant changing its entry, which would have silently deleted the
+// coverage every test above provides.
+//
+// ★★ AND THE HOST IS ALIEN ON PURPOSE, EXACTLY AS THE FIRST ONE IS. Not one
+// lexeme below is spelled the way either shipped dialect spells it: the
+// placeholder sigil is `?`, the label sigil `?^`, the brackets `(` and `)`, the
+// line terminator `;`. If the shipped documents' spellings leaked into the
+// merged rules — if `%` were baked into `asm.lang.json` anywhere — these rules
+// would predict on kinds this host never declares and every assertion below
+// would go red.
+
+namespace {
+
+// ⚠ THE RAW-STRING DELIMITER IS `JSON`, NOT THE FILE'S USUAL BARE `R"(`, AND
+// IT HAS TO BE: this host declares `)` as a token lexeme, so the two bytes `)"`
+// appear inside the payload and the default delimiter closes the literal there.
+// ✔MEASURED as a wall of parse errors the first time it was written the usual
+// way. Keeping `(`/`)` as the alien brackets is deliberate — the shipped
+// dialects use `[`/`]`, and a host that reused those would weaken the "not one
+// lexeme is spelled the way the real ones spell it" claim.
+//
+// The standalone-entry host. ⚠ `?^` IS TWO BYTES AND `?` IS ONE, which is the
+// same maximal-munch relation the shipped dialects rely on for `%l` versus `%`
+// — stated here because a one-byte label sigil would make this host pass while
+// the real ones could not work.
+constexpr std::string_view kLineHostDoc = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "AsmLineHostProbe", "version": "0.0.1" },
+  "languageReferences": {
+    "asm": {
+      "entry": "asmLine",
+      "bindRules": { "asmStandaloneOperand": "probeOperand" },
+      "bindTokens": {
+        "lineEnd":                  "StopMark",
+        "labelSeparator":           "TieMark",
+        "directiveIntroducer":      "LeadMark",
+        "operandSeparator":         "SplitMark",
+        "symbolName":               "Identifier",
+        "templatePlaceholder":      "SlotMark",
+        "templateLabelPlaceholder": "SlotLabelMark",
+        "templateOperandIndex":     "IntLiteral",
+        "symbolicNameOpen":         "HugOpen",
+        "symbolicNameClose":        "HugClose"
+      }
+    }
+  },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    ";":  [{ "kind": "StopMark" }],
+    "->": [{ "kind": "TieMark" }],
+    "~":  [{ "kind": "LeadMark" }],
+    "&":  [{ "kind": "SplitMark" }],
+    "?^": [{ "kind": "SlotLabelMark" }],
+    "?":  [{ "kind": "SlotMark" }],
+    "(":  [{ "kind": "HugOpen" }],
+    ")":  [{ "kind": "HugClose" }],
+    "$":  [{ "kind": "CoinMark" }]
+  },
+  "numberStyle": {
+    "decimal": true,
+    "emitKind": { "integer": "IntLiteral" }
+  },
+  "shapes": {
+    "root":         { "sequence": [{ "repeat": "asmLine" }] },
+    "probeOperand": { "sequence": ["CoinMark", "Identifier"] }
+  }
+})JSON";
+
+// The FIVE rules the placeholder surface adds, spelled out rather than counted
+// — the discipline `kAsmRules` states: a count stays green if the mechanism
+// imports five of the WRONG shapes.
+constexpr std::array<std::string_view, 5> kAsmTemplateRules{
+    "asmTemplateOperand",
+    "asmTemplateOperandRef",
+    "asmTemplateSelector",
+    "asmTemplateSymbolicName",
+    "asmTemplateLabelRef",
+};
+
+// The line-structure rules the STANDALONE entry pulls in, including the alt
+// wrapper the placeholder hangs off.
+constexpr std::array<std::string_view, 8> kAsmLineRules{
+    "asmLine",       "asmElement",       "asmDirective",  "asmStatement",
+    "asmStatementTail", "asmLabelTail",  "asmOperandSeq", "asmOperandItem",
+};
+
+[[nodiscard]] nlohmann::json lineHostJson() {
+    return nlohmann::json::parse(kLineHostDoc);
+}
+
+} // namespace
+
+TEST(LanguageReferences, TheStandaloneEntryImportsItsOwnClosureAndNoOther) {
+    auto schema = loadOk(std::string{kLineHostDoc});
+    ASSERT_NE(schema, nullptr);
+
+    for (auto const& r : kAsmLineRules) {
+        EXPECT_TRUE(schema->rules().contains(r))
+            << "the standalone entry did not import '" << r << "'";
+    }
+    for (auto const& r : kAsmTemplateRules) {
+        EXPECT_TRUE(schema->rules().contains(r))
+            << "the standalone entry did not import '" << r
+            << "' — the placeholder surface is not reachable from `asmLine`, "
+               "so no dialect could ever spell it";
+    }
+    // ★ AND THE EMBEDDED CLOSURE MUST **NOT** ARRIVE. Entry-closure scoping is
+    // the property that lets a `.s` dialect owe no `operandExpr` binding; if
+    // this host silently received `asmStmt` too it would owe holes it has no
+    // vocabulary for, and the scoping would be decorative.
+    for (auto const& r : {"asmStmt", "asmOperand", "asmOperandList",
+                          "asmClobberList", "asmOutputsTail"}) {
+        EXPECT_FALSE(schema->rules().contains(r))
+            << "the standalone entry leaked the EMBEDDED rule '" << r << "'";
+    }
+}
+
+// ★★★ COMPILED, NOT MERELY INTERNED — THE DISTINCTION THIS WHOLE FILE EXISTS
+// FOR. `rules().contains(...)` is satisfied by a NAME in an interner; it says
+// nothing about whether the rule has a position table, a FIRST set, or any
+// binding to the host's vocabulary. A merge that imported the JSON body and
+// failed to substitute the holes would pass the section above and predict on
+// NOTHING here.
+TEST(LanguageReferences, ThePlaceholderRulesArriveCompiledOnTheHostsOwnKinds) {
+    auto schema = loadOk(std::string{kLineHostDoc});
+    ASSERT_NE(schema, nullptr);
+
+    auto kind = [&](std::string_view n) {
+        const auto k = schema->schemaTokens().find(n);
+        EXPECT_TRUE(k.valid()) << "host token kind '" << n << "' is missing";
+        return k;
+    };
+    auto rule = [&](std::string_view n) {
+        const auto r = schema->rules().find(n);
+        EXPECT_TRUE(r.valid()) << "rule '" << n << "' is missing";
+        return r;
+    };
+
+    const auto slot      = kind("SlotMark");
+    const auto slotLabel = kind("SlotLabelMark");
+    const auto hugOpen   = kind("HugOpen");
+    const auto coin      = kind("CoinMark");
+    const auto intLit    = kind("IntLiteral");
+
+    // Every one of the five has a NON-EMPTY FIRST set — the interned-but-dead
+    // failure mode's exact signature is an empty one.
+    for (auto const& r : kAsmTemplateRules) {
+        EXPECT_FALSE(schema->firstSetOf(rule(r)).empty())
+            << "'" << r << "' arrived with an EMPTY FIRST set — it is interned "
+               "but not compiled, so it would match nothing and say nothing";
+    }
+
+    // And each predicts on THIS host's alien kinds, which is the substitution
+    // proved rather than assumed.
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperandRef"), slot));
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateLabelRef"), slotLabel));
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateSymbolicName"), hugOpen));
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateSelector"), intLit));
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateSelector"), hugOpen));
+
+    auto const anyFirst = schema->firstSetOf(rule("asmTemplateOperand"));
+    ASSERT_EQ(anyFirst.size(), 2u)
+        << "`asmTemplateOperand` must predict on exactly the two placeholder "
+           "sigils";
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperand"), slot));
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperand"), slotLabel));
+
+    // ★★ THE REACHABILITY CLAIM, WHICH IS SEPARATE FROM THE COMPILATION ONE. A
+    // placeholder rule that compiled perfectly and hung off nothing would be
+    // just as useless. `asmOperandSeq` must predict on the placeholder sigils
+    // AND on the host's own operand production — the alt is the join.
+    for (auto const k : {slot, slotLabel, coin}) {
+        EXPECT_TRUE(schema->firstSetContains(rule("asmOperandSeq"), k))
+            << "the instruction operand list does not predict on one of the "
+               "three operand openings — the placeholder is compiled but "
+               "unreachable, or the dialect's own operand production is";
+    }
+}
+
+// ★★★ THE BEHAVIOURAL HALF — the schema's OWN decision procedure walks
+// `? 0` and `?^ ( done )` to COMPLETION. Nothing here re-implements the
+// grammar; it supplies host tokens and checks each is accepted, which is the
+// same instrument `HostSpelledAsmBarrierWalksTheMergedRuleToCompletion` uses on
+// the embedded entry.
+TEST(LanguageReferences, HostSpelledPlaceholdersWalkTheMergedRulesToCompletion) {
+    auto schema = loadOk(std::string{kLineHostDoc});
+    ASSERT_NE(schema, nullptr);
+
+    auto kind = [&](std::string_view n) {
+        const auto k = schema->schemaTokens().find(n);
+        EXPECT_TRUE(k.valid()) << "host token kind '" << n << "' is missing";
+        return k;
+    };
+    auto rule = [&](std::string_view n) {
+        const auto r = schema->rules().find(n);
+        EXPECT_TRUE(r.valid()) << "rule '" << n << "' is missing";
+        return r;
+    };
+
+    const auto indexRef  = rule("asmTemplateOperandRef");
+    const auto labelRef  = rule("asmTemplateLabelRef");
+    const auto selector  = rule("asmTemplateSelector");
+    const auto bracketed = rule("asmTemplateSymbolicName");
+
+    // ★ THE WALK ENTERS THE TWO **FAMILY** RULES, NOT THE `alt` ABOVE THEM, AND
+    // THAT IS THE SCHEMA'S SHAPE RATHER THAN A CONVENIENCE. `asmTemplateOperand`
+    // is an alt of two RULE references, so its first slot is a RuleLeaf to be
+    // descended into, not a token to be consumed — the same structure the
+    // embedded barrier walk handles at the template slot. Its FIRST set is
+    // asserted in the test above; what is walked here is what the cursor
+    // actually does.
+
+    // `? 0` — an operand by INDEX, in this host's spelling.
+    {
+        auto cur = schema->advance(schema->enterRule(indexRef),
+                                   kind("SlotMark"));
+        ASSERT_TRUE(cur.valid())
+            << "asmTemplateOperandRef rejected the host's placeholder sigil";
+        // ⚠ AND THE SIGIL ALONE IS NOT AN OPERAND. A grammar that completed
+        // here would bind a placeholder naming nothing.
+        EXPECT_FALSE(schema->isAtEndOfRule(cur))
+            << "a bare placeholder sigil COMPLETED the rule";
+        // The selector is a RULE, and it is the FACTORING that makes the two
+        // selector forms expressible without two arms sharing a FIRST token.
+        ASSERT_EQ(schema->slotKind(cur), SlotKind::RuleLeaf);
+        EXPECT_EQ(schema->slotRuleRef(cur).v, selector.v)
+            << "the slot after the sigil is not the selector rule";
+
+        auto inner = schema->advance(schema->enterRule(selector),
+                                     kind("IntLiteral"));
+        ASSERT_TRUE(inner.valid())
+            << "the index selector rejected the host's integer kind";
+        EXPECT_TRUE(schema->isAtEndOfRule(inner));
+
+        cur = schema->leaveRule(cur);
+        ASSERT_TRUE(cur.valid()) << "could not resume after the selector";
+        EXPECT_TRUE(schema->isAtEndOfRule(cur))
+            << "`? 0` walked the rule but did not COMPLETE it";
+    }
+
+    // `?^ ( done )` — an `asm goto` label by NAME. ★ THE LABEL SIGIL IS A
+    // DIFFERENT KIND FROM THE OPERAND SIGIL, so this arm also proves the two
+    // placeholder families did not collapse into one during the merge.
+    {
+        auto cur = schema->advance(schema->enterRule(labelRef),
+                                   kind("SlotLabelMark"));
+        ASSERT_TRUE(cur.valid())
+            << "asmTemplateLabelRef rejected the host's LABEL sigil";
+        ASSERT_EQ(schema->slotKind(cur), SlotKind::RuleLeaf);
+        EXPECT_EQ(schema->slotRuleRef(cur).v, bracketed.v)
+            << "a label reference does not descend into the bracketed name — "
+               "the two forms are not sharing one symbolic-name rule";
+
+        auto inner = schema->advance(schema->enterRule(bracketed),
+                                     kind("HugOpen"));
+        ASSERT_TRUE(inner.valid()) << "the bracketed name did not open";
+        inner = schema->advance(inner, kind("Identifier"));
+        ASSERT_TRUE(inner.valid()) << "the label name was rejected";
+        inner = schema->advance(inner, kind("HugClose"));
+        ASSERT_TRUE(inner.valid()) << "the bracketed name did not close";
+        EXPECT_TRUE(schema->isAtEndOfRule(inner));
+
+        cur = schema->leaveRule(cur);
+        ASSERT_TRUE(cur.valid());
+        EXPECT_TRUE(schema->isAtEndOfRule(cur))
+            << "`?^ ( done )` walked the rule but did not COMPLETE it";
+    }
+
+    // ⚠ AND THE SIGILS ARE NOT INTERCHANGEABLE. If the merge had bound both
+    // roles to one kind — the easy way to get this wrong — every assertion
+    // above would still pass and `%0` would parse as a label.
+    EXPECT_FALSE(schema->advance(schema->enterRule(indexRef),
+                                 kind("SlotLabelMark")).valid())
+        << "the OPERAND rule accepted the LABEL sigil";
+    EXPECT_FALSE(schema->advance(schema->enterRule(labelRef),
+                                 kind("SlotMark")).valid())
+        << "the LABEL rule accepted the OPERAND sigil";
+}
+
+// ─── red-on-disable, FAIL-CLOSED ──────────────────────────────────────────
+//
+// ★★★ THE MUTANT MUST BE PROVEN READ, AND THE INSTRUMENT HERE IS THE LOADER'S
+// OWN REFUSAL NAMING THE HOLE. Erasing a placeholder binding is only a load
+// error if the imported rules GENUINELY SPELL that hole — i.e. if the
+// placeholder surface really did arrive in this entry's closure. So this arm
+// does double duty: it proves the binding is load-bearing AND it re-proves the
+// import, by a mechanism completely independent of the FIRST-set assertions
+// above. If the merge silently stopped importing the placeholder rules, the
+// hole would stop being spelled and the erase would load CLEAN — which is
+// exactly the failure this arm is shaped to catch.
+TEST(LanguageReferenceRefusals, AnUnboundPlaceholderHoleFailsLoud) {
+    for (auto const* hole : {"templatePlaceholder", "templateLabelPlaceholder",
+                             "templateOperandIndex", "symbolicNameOpen",
+                             "symbolicNameClose"}) {
+        auto doc = lineHostJson();
+        doc["languageReferences"]["asm"]["bindTokens"].erase(hole);
+        auto const result =
+            GrammarSchema::loadFromText(doc.dump(), "<asm-line-host>");
+        ASSERT_FALSE(result.has_value())
+            << "erasing the '" << hole << "' binding LOADED CLEAN — either the "
+               "hole is not spelled by the `asmLine` closure (the placeholder "
+               "rules did not arrive) or an unbound hole has stopped being a "
+               "load error";
+        bool named = false;
+        for (auto const& d : result.error()) {
+            named = named
+                || (d.message.find(hole) != std::string::npos
+                    && d.message.find("UNBOUND") != std::string::npos)
+                || d.path.find(hole) != std::string::npos;
+        }
+        EXPECT_TRUE(named)
+            << "the refusal for '" << hole << "' does not name it: "
+            << firstError(result.error());
+    }
+}
+
+// ★★ AND THE OTHER DIRECTION: the rules must come FROM THE REFERENCE. A host
+// with the block removed must not have them — otherwise every assertion above
+// is measuring something the loader would have produced anyway.
+TEST(LanguageReferences, WithoutTheReferenceThePlaceholderRulesAreAbsent) {
+    auto doc = lineHostJson();
+    doc.erase("languageReferences");
+    // The root must stop naming `asmLine`, or the document is simply broken and
+    // its emptiness would prove nothing about the mechanism.
+    doc["shapes"]["root"] = nlohmann::json::parse(
+        R"({ "sequence": [{ "repeat": "probeOperand" }] })");
+    auto const result =
+        GrammarSchema::loadFromText(doc.dump(), "<asm-line-host-noref>");
+    ASSERT_TRUE(result.has_value())
+        << "the reference-less control must be a COMPLETE language, or its "
+           "emptiness is a side effect of a failed load: "
+        << firstError(result.error());
+    for (auto const& r : kAsmTemplateRules) {
+        EXPECT_FALSE((*result)->rules().contains(r))
+            << "'" << r << "' exists in a host that references NOTHING";
+    }
+    for (auto const& r : kAsmLineRules) {
+        EXPECT_FALSE((*result)->rules().contains(r))
+            << "'" << r << "' exists in a host that references NOTHING";
+    }
+}

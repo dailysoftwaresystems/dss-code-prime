@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/ascii_case.hpp"   // asciiToLower — the ONE folding helper
 #include "core/types/rule_id.hpp"
+#include "core/types/strong_ids.hpp"   // LexerModeId — the template surface's mode
 
 #include <array>
 #include <cstdint>
@@ -553,6 +554,40 @@ struct DSS_EXPORT AssemblyConfig {
     RuleId statementRule{};
     RuleId labelTailRule{};
     RuleId operandSeqRule{};
+
+    // ★★★ THE TEMPLATE SURFACE — how an EMBEDDED `__asm__` template differs
+    // from a standalone `.s`, declared as two names rather than built into the
+    // engine (D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER, 2026-08-15).
+    //
+    // ★★ WHY A LEXER MODE AND NOT A GRAMMAR ALTERNATIVE. ✔MEASURED, and
+    // EXERCISED rather than read: `%` is ALREADY the register sigil in the AT&T
+    // dialect and the type sigil in the arm64 one, and
+    // `detectAmbiguousAlternatives` REFUSES two sibling alts sharing a FIRST
+    // token — two in-process tests watch the loader refuse the naive arm. So a
+    // placeholder needs `%` to carry a SECOND kind in template context, which
+    // is precisely what a per-mode `tokens` override is for. The mode is named
+    // here so the template parse entry selects it from CONFIG rather than from
+    // a hard-coded string.
+    // ★ AND THE MODE BUYS A CORRECTNESS PROPERTY, NOT ONLY AN EXPRESSIVENESS
+    // ONE: a placeholder token is minted ONLY inside the template mode, so
+    // every placeholder-headed shape is unreachable from a `.s` BY
+    // CONSTRUCTION. gas rejects `%0` in a `.s`; so does DSS, without a check
+    // that could be forgotten.
+    //
+    // `templateOperandRule` names the SHARED grammar's placeholder rule
+    // (`asm.lang.json`'s `asmTemplateOperand`). The lowering engine asks the
+    // dialect which rule that is, exactly as it asks which rule is
+    // `labelTailRule` — so the engine holds no opinion about how a placeholder
+    // is spelled and never names a rule of another document in C++.
+    //
+    // ⚠ OPTIONAL AS A PAIR, REQUIRED OF EACH OTHER — the loader refuses one
+    // without the other. A mode with no rule mints tokens no shape accepts; a
+    // rule with no mode declares a shape whose FIRST token nothing ever
+    // produces. Both halves are silent no-ops, which is the one outcome this
+    // config surface is shaped to make impossible. A dialect that hosts no
+    // embedded templates declares neither, and both stay invalid.
+    LexerModeId templateLexerMode{};
+    RuleId      templateOperandRule{};
 
     // Indexed by `static_cast<std::size_t>(AsmOperandRole)`. Every role is
     // REQUIRED when the block is present — a partial `operandForms` is a load

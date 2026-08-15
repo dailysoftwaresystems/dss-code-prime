@@ -2676,6 +2676,41 @@ struct DSS_EXPORT ImplicitRegisterConstraint {
         }
         return std::nullopt;
     }
+
+    // ★★★ THE `outputs ⊆ clobbered` INVARIANT, AS A QUERY ON THE TYPE
+    // ITSELF (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-
+    // CLOBBERED, 2026-08-15). Returns the index of the first output
+    // ordinal absent from `clobberedOrdinals`, or nullopt when the
+    // invariant holds.
+    //
+    // ⚠ IT LIVES HERE BECAUSE THIS TYPE HAS **TWO** PRODUCERS AND ONLY
+    // ONE OF THEM MEETS A LOADER. The `.target.json` loader enforces
+    // the rule for the per-OPCODE carrier; `LirBuilder::
+    // regConstraintPoolAdd` accepts a per-INSTRUCTION one built by a
+    // lowering, with no loader in the path. And the register
+    // allocator's forbidden set is `inputs ∪ clobbered` — outputs are
+    // deliberately omitted, on the strength of this invariant holding.
+    // So a violating entry does not fail: it silently leaves a value
+    // allocated to a register the instruction overwrites. Two carriers,
+    // one validator, and a THIRD component's safety argument resting on
+    // the validation only one of them got.
+    //
+    // Reads ORDINALS, not names: a target may spell one register
+    // several ways (sub-register aliases), and two different spellings
+    // of the same physical register must satisfy the rule. Callers that
+    // hold only names must resolve first — which every producer already
+    // does, because the ordinals are what the allocator reads.
+    [[nodiscard]] std::optional<std::size_t>
+    firstOutputNotClobbered() const noexcept {
+        for (std::size_t k = 0; k < outputOrdinals.size(); ++k) {
+            bool found = false;
+            for (auto const cl : clobberedOrdinals) {
+                if (cl == outputOrdinals[k]) { found = true; break; }
+            }
+            if (!found) return k;
+        }
+        return std::nullopt;
+    }
 };
 
 // One row per opcode; index in the vector IS the opcode's numeric
@@ -2718,15 +2753,35 @@ struct DSS_EXPORT TargetOpcodeInfo {
     TargetEncodingInfo   encoding;
 
     // 2-address legalization constraint (plan 13 AS3 — `lir_2addr_
-    // legalize.cpp`). When `true`, the LIR pre-assembly legalize
-    // pass ensures the instruction's `result` register equals
-    // `operands[0]` before the assembler sees it — by inserting an
-    // implicit `mov result, operands[0]` whenever they differ. x86's
+    // legalize.cpp`). ENGAGED means the LIR pre-assembly legalize pass
+    // ensures the instruction's `result` register equals the operand
+    // this names, before the assembler sees it — by inserting an
+    // implicit `mov result, operands[j]` whenever they differ. x86's
     // reg-reg arithmetic (add/sub/mul) needs this (REX.W 0x03 /r
     // writes into r/m, so the dest IS one of the sources); ARM64's
     // reg-reg arithmetic is 3-address natively and leaves this
-    // false.
-    bool                 requires2Address = false;
+    // DISENGAGED.
+    //
+    // ★★★ THE VALUE IS THE TIED SOURCE OPERAND'S INDEX, NOT A FLAG
+    // (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE, 2026-08-15). It was a
+    // `bool` with `0` written as a LITERAL at four consumer sites, so
+    // the only tie the whole pipeline could express was
+    // *result == operand[0]* — no `(result, operand j)` pair existed
+    // anywhere, which is what made a read-write asm operand (`"+r"`)
+    // unrepresentable. `.target.json` spells the default shape as
+    // `requires2Address: true` (⇒ index 0, every shipped opcode's
+    // meaning, unchanged) and a non-zero tie as that key PLUS
+    // `twoAddressSourceOperand: <j>`; the loader rejects the index
+    // without the flag, and rejects an index outside `maxOperands`.
+    //
+    // ⚠ NEVER COMPARE THIS TO `true` OR `false`. `opt == true` is a
+    // VALUE comparison (`*opt == 1`), so it silently means "tied to
+    // operand 1" — the trap that comes with folding a flag and an
+    // index into one field. Ask `.has_value()` (or use it in a
+    // boolean context, which every pre-existing reader already did
+    // and which keeps meaning "is this opcode two-address"), and read
+    // the index with `*`.
+    std::optional<std::uint8_t> requires2Address;
 
     // Implicit-register constraint (cycle 10p substrate, 2026-06-04).
     // Optional per-opcode block describing fixed-register semantics

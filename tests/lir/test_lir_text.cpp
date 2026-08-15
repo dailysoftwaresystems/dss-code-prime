@@ -1521,7 +1521,13 @@ namespace {
     ImplicitRegisterConstraint c;
     c.inputNames      = {"rax", "rdx"};
     c.outputNames     = {"rax"};
-    c.clobberedNames  = {"rdx", "rcx"};
+    // ⚠ `rax` is an output, so it MUST also be clobbered — `LirBuilder::
+    // regConstraintPoolAdd` enforces `outputs ⊆ clobbered` (D-LIR-PER-
+    // INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED) and this
+    // fixture goes through the real builder. `rcx` stays a clobber that
+    // is NOT an output, so the round trip still carries a set where the
+    // three arrays genuinely differ.
+    c.clobberedNames  = {"rdx", "rcx", "rax"};
     c.inputRoleNames  = {{"dividend", "rax"}};
     c.outputRoleNames = {{"quotient", "rax"}, {"remainder", "rdx"}};
     return c;
@@ -1567,7 +1573,7 @@ TEST(LirTextRoundTrip, RegisterConstraintPoolSurvivesTheTextCodec) {
     std::string const text = roundTripOrFail(lir, *sch, ctx, "reg constraints");
 
     // Shape pins: the section, all five clauses, and the per-inst handle.
-    EXPECT_NE(text.find("rc#0 = in [rax, rdx] out [rax] clobber [rdx, rcx] "
+    EXPECT_NE(text.find("rc#0 = in [rax, rdx] out [rax] clobber [rdx, rcx, rax] "
                         "inrole [dividend = rax] "
                         "outrole [quotient = rax, remainder = rdx]"),
               std::string::npos)
@@ -1592,11 +1598,16 @@ TEST(LirTextRoundTrip, RegisterConstraintPoolSurvivesTheTextCodec) {
         result->lir.instRegConstraints(result->lir.blockInstAt(bb, 0));
     ASSERT_NE(c, nullptr);
     EXPECT_EQ(c->inputNames, (std::vector<std::string>{"rax", "rdx"}));
-    EXPECT_EQ(c->clobberedNames, (std::vector<std::string>{"rdx", "rcx"}));
+    EXPECT_EQ(c->clobberedNames,
+              (std::vector<std::string>{"rdx", "rcx", "rax"}));
     EXPECT_EQ(c->outputRoleNames.size(), 2u);
-    ASSERT_EQ(c->clobberedOrdinals.size(), 2u);
+    ASSERT_EQ(c->clobberedOrdinals.size(), 3u);
     EXPECT_EQ(c->clobberedOrdinals[0], *sch->registerByName("rdx"));
     EXPECT_EQ(c->clobberedOrdinals[1], *sch->registerByName("rcx"));
+    EXPECT_EQ(c->clobberedOrdinals[2], *sch->registerByName("rax"));
+    EXPECT_FALSE(c->firstOutputNotClobbered().has_value())
+        << "the round trip must preserve `outputs ⊆ clobbered` — the "
+           "allocator omits outputs from its forbidden set on that basis";
     ASSERT_EQ(c->outputRoleOrdinals.size(), 2u);
     EXPECT_EQ(c->outputRoleOrdinals[0].first, "quotient");
     EXPECT_EQ(c->outputRoleOrdinals[0].second, *sch->registerByName("rax"));
@@ -1648,6 +1659,84 @@ TEST(LirTextParser, UnknownRegisterNameInAConstraintIsRefusedNotAborted) {
         if (d.code == DiagnosticCode::I_TextUnknownName) sawUnknown = true;
     }
     EXPECT_TRUE(sawUnknown);
+}
+
+// ★★★ `outputs ⊆ clobbered` IS A **DIAGNOSTIC** HERE, NOT A PROCESS KILL
+// (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED).
+//
+// `LirBuilder::regConstraintPoolAdd` ABORTS on a violating entry — right for a
+// LOWERING, which can only reach it through its own bug — and its message
+// states the obligation this test pins: *"a producer fed by USER text must
+// pre-validate with `firstOutputNotClobbered()` and REPORT"*. The `.dsslir`
+// reader is that producer; every byte it hands the builder came from a file.
+// Before this arm existed the reader pre-validated the NAMES but not the SUBSET,
+// so a hand-written or truncated `.dsslir` would kill the process instead of
+// being diagnosed — and a refusal that crashes is not a refusal.
+//
+// ★ EXERCISED, NOT READ. The whole point is that the arm RUNS: a test that
+// merely inspected the source could not tell a reachable guard from a dead one,
+// and the failure mode being replaced is an `abort()` — so if the guard is
+// removed this test does not fail politely, it takes the runner down. That is
+// the strongest red-on-disable shape available here.
+//
+// RED-ON-DISABLE: delete the `if (!constraintSubsetHolds(c)) continue;` call in
+// `parseRegConstraintPool` → the entry reaches `regConstraintPoolAdd`, which
+// aborts ⇒ the test binary dies with a non-zero exit and no gtest summary.
+TEST(LirTextParser, AnOutputNotInTheClobberSetIsRefusedNotAborted) {
+    auto sch = shippedX86();
+    auto const doc = [&](char const* rc) {
+        return std::format(
+            "dsslir 1\n"
+            "target {} version \"{}\"\n"
+            "symbols {{\n  %1\n}}\n"
+            "literal_pool {{}}\n"
+            "reg_constraints {{\n"
+            "  {}\n"
+            "}}\n"
+            "module {{\n"
+            "  function %1 {{\n"
+            "    block ^b0 [entry] -> [] {{\n"
+            "      rax = mov #1 ; payload=0 flags=0 rc=1\n"
+            "      ret rax ; payload=0 flags=0\n"
+            "    }}\n"
+            "  }}\n"
+            "}}\n",
+            sch->name(), std::string{sch->version()}, rc);
+    };
+
+    // `rax` is written and NOT clobbered — the shape register allocation is
+    // unsafe against, because it omits outputs from its forbidden set.
+    DiagnosticReporter rep;
+    auto result = parseLir(
+        doc("rc#0 = in [] out [rax] clobber [rdx] inrole [] outrole []"),
+        *sch, rep);
+    EXPECT_FALSE(result->ok);
+    bool sawMalformed = false;
+    std::string first;
+    for (auto const& d : rep.all()) {
+        if (d.code != DiagnosticCode::I_TextMalformed) continue;
+        sawMalformed = true;
+        if (first.empty()) first = d.actual;
+    }
+    EXPECT_TRUE(sawMalformed)
+        << "the subset violation must be REPORTED; the builder's abort is the "
+           "backstop for producers that forget, never the answer for a file";
+    // The message must NAME the offending register — "malformed" alone leaves
+    // the author of a 10k-line `.dsslir` with nowhere to look.
+    EXPECT_NE(first.find("rax"), std::string::npos) << first;
+    EXPECT_NE(first.find("clobber"), std::string::npos) << first;
+
+    // ★ THE POSITIVE CONTROL. Without it this pin is satisfied by a reader that
+    // refuses EVERY entry carrying an output — which would make the whole
+    // register-constraint section unreadable and still look green here.
+    DiagnosticReporter okRep;
+    auto good = parseLir(
+        doc("rc#0 = in [] out [rax] clobber [rdx, rax] inrole [] outrole []"),
+        *sch, okRep);
+    EXPECT_TRUE(good->ok)
+        << "the SAME entry with `rax` added to the clobber list must load: "
+        << (okRep.all().empty() ? std::string{} : okRep.all()[0].actual);
+    ASSERT_EQ(good->lir.regConstraintPool().size(), 1u);
 }
 
 TEST(LirTextParser, AnOutOfRangeRcHandleIsRefusedNotAborted) {
