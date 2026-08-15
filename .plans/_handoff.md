@@ -11,12 +11,18 @@
 
 **Last updated:** 2026-08-14 (written MID-CYCLE, deliberately, as insurance against a context loss —
 this is the SECOND such write of this cycle; the session that wrote the first one ran out of context)
-· **Branch:** `feature/finish-hooks-and-dependson-surface` · **no PR yet**
-**HEAD:** `d4c2836` ✔MEASURED — *identical to `origin/main`*. **NOTHING FROM THIS CYCLE IS COMMITTED.**
+· **Branch:** `feature/finish-hooks-and-dependson-surface`
+· 📄 **PR [#53](https://github.com/dailysoftwaresystems/dss-code-prime/pull/53) is OPEN against `main`.**
 
-⚠⚠ **READ THIS FIRST IF YOU ARE PICKING UP COLD: AP6 IS IN FLIGHT AND LIVES ENTIRELY IN THE WORKING
-TREE.** `git status` is dirty by design and there is no WIP commit. If the tree is lost the cycle is
-lost. ✔**The scratchpad plan (`ap6-plan-v2-LOCKED.md`) is NO LONGER a single point of failure** — its
+✅ **AP6 IS COMMITTED AND PUSHED — the working tree is CLEAN.** ✔MEASURED commits ahead of
+`origin/main`: `867fa81` (AP6 itself), `e3fd4e1` (plan-06 B.12 corrected), `6a4dac6` (WSL leg +
+harness rules + DCO authorization), `293d069` (the macOS leg). ⚠ The first two are **UNSIGNED** —
+they predate the operator's sign-off authorization (§4) and were pushed unsigned by explicit
+instruction; the branch is exactly these commits, so a sign-off rebase reaches all of it. The
+operator merges when the PR is finished.
+
+⚠ **The earlier "AP6 lives entirely in the working tree, if the tree is lost the cycle is lost"
+warning is RETIRED** — it was true for most of this cycle and is now false. ✔**The scratchpad plan (`ap6-plan-v2-LOCKED.md`) is NO LONGER a single point of failure** — its
 binding content was copied into `.plans/06-artifact-profile-plan - tbd.md` **§5.1 B.11** this cycle,
 which is now the durable home of "AP6 plan v2" and where the closed rows citing *"plan v2 §N"*
 resolve. B.10 (the operator's U-2 ruling) was already durable there.
