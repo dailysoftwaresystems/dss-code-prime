@@ -96,7 +96,24 @@ ZERO warnings tree-wide**; full ctest **859/861** at the merge point, with both 
    both after measuring the arm is live in project mode (`--config=release` vs `debug` emit different
    pe64 bytes). ✔`examples/README.md` counts re-derived by parsing every manifest (593 → **595**, and
    eleven further figures). ✔aarch64 witnessed directly under `qemu-aarch64`; WSL x86_64 green.
-3. **Legs.** ✅ **WSL x86_64 (gcc) GREEN** — ✔native ext4 build, **BUILD_OK, 0 warnings**, ctest
+3. **Legs — ✅ ALL FOUR GREEN.** ✔**Windows MSVC-Debug 864/864**, 0 warnings. ✔**qemu-aarch64 STRICT
+   863/864** (`DSS_STRICT_ARM_VERDICTS=1`, qemu + sysroot present, so skips would have HARD-FAILED) —
+   same single `line_endings_guard` artifact as the gcc leg, same disproof. ✅ **macOS (Apple Silicon,
+   26.5.2, Xcode clang) — BUILD rc=0 and the AP5/AP6 ctest surface 9/9 PASSED** over a FRESH CLONE of
+   `6a4dac6`, with the checkout asserted to contain `DSS_SPAWN_USE_POSIX_SPAWN` (3 occurrences) BEFORE
+   building so the build could not be vacuous. ★ **This is what closed
+   `D-SPAWN-APPLE-POSIX-SPAWN-ARM-COMPILED-BY-NO-LOCAL-LEG`** — an Apple-only mechanism that no local
+   leg compiled, and both new corpus examples' **Mach-O binaries executed on real arm64 hardware for
+   the first time**. ✔The CRLF worktree defect behind the two `line_endings_guard` reds is FIXED at
+   source (`dependency_resolver.cpp` normalized; `git hash-object` == `HEAD` blob, so a provable
+   no-op).
+   ⚠ **THREE clang-only warnings, NONE of them AP5/AP6 and NONE introduced by this PR** — googletest's
+   own header, `tests/core/test_diagnostic_reporter.cpp:289` (`-Wdangling-gsl`), and
+   `src/asm/asm_text_to_lir.cpp:2561` (`-Wswitch`, enumerator `Switch` unhandled). ✔That last is in a
+   file this PR touched but NOT in a region it changed (the PR's only hunk there is line 3357). All
+   three are invisible to the MSVC and gcc legs. **DISCLOSED, not created** — registering them is
+   blocked by the same counting rule as the 219 (§1.5), which is why they are recorded here.
+4. **Legs (historical detail).** ✅ **WSL x86_64 (gcc) GREEN** — ✔native ext4 build, **BUILD_OK, 0 warnings**, ctest
    **863/864**; the single failure was `line_endings_guard` and it was **MY HARNESS, not the repo**:
    the run rsynced the Windows WORKING TREE, which carries `w/crlf` on `dependency_resolver.cpp`,
    while ✔`git ls-files --eol` shows **ZERO `i/crlf`** committed blobs. Re-verified against a
