@@ -458,7 +458,7 @@ nothing. ✔`bash tools/check-anchor-registry.sh` → **OK (1154 src anchors)** 
 
 | Destination | The named gap |
 |---|---|
-| **AP6 `dependsOn` resolution** | Resolver landed but UNVERIFIED (§1.4); two corpus examples not started; gate not run. |
+| **AP6 `dependsOn` resolution** | ✅ **REACHED.** Resolver verified, both corpus examples landed plus the standalone-`module` third (§1.0-bis), gate run on all four legs. What is left is not AP6 work: CI, and the operator's merge of PR #53. |
 | **sqlite round trip proven by execution** | ~15 of 20 build cells never *run*. Needs execution legs, not more building. |
 | **Unwind info on all 5 formats** | ✔Executables: pe64 + ELF + Mach-O land, ELF `.o` round-trips through gcc. Remaining: COFF `.obj` (effort) and Mach-O `MH_OBJECT` (**blocked** — no clang on this host). |
 | **Assembly reaches real `gcc -S` output** | `leaq X(%rip)` unreachable — no target declares `rip`. **OPERATOR DECISION.** |
@@ -470,12 +470,21 @@ nothing. ✔`bash tools/check-anchor-registry.sh` → **OK (1154 src anchors)** 
 
 ## 3. PRIORITIES
 
-1. **`NEXT` — FINISH AP6**, in the §1.2 order: verify the resolver, then the two corpus examples,
-   then G2, then the full gate on every available leg. §A.3 binds — the hard part does not get
-   sliced, and B.6.3 already ruled ONE CYCLE, all of it.
-2. **`PENDING CI` — the macOS `posix_spawn` arm.** ✔Its two new file actions are `#if defined(__APPLE__)`
-   and were compiled by **neither** local leg. 📄`macos-latest` is the closure leg. Do not claim it
-   verified before that leg is green.
+1. **`NEXT` — PR [#53](https://github.com/dailysoftwaresystems/dss-code-prime/pull/53) IS FINISHED;
+   the remaining work is CI and the operator's merge.** ⇒ **AP6 itself is DONE** — the older
+   "FINISH AP6: verify the resolver, then the two corpus examples, then G2, then the full gate"
+   entry is RETIRED, every clause of it discharged (§1.2, §1.0-bis, four legs green). ⚠ **Before the
+   merge, two things are the operator's, not a cycle's:** the DCO sign-off rebase reaching `867fa81`
+   and `e3fd4e1` (§"The branch, for whoever merges it"), and the §4 rebase-conflict surface against
+   PR #54, which owns diagnostic ordinals `0xE065-0xE06B` and `0xB010-0xB012` — those are RESERVED in
+   `tools/check-diagnostic-codes.py` and that reservation row must be RETIRED when #54 merges.
+   ⛔ **Do not open a new AP cycle to fill the gap.** AP7 is trigger-gated on a second language.
+2. **`PENDING CI` — the macOS `posix_spawn` arm.** ✔**MEASURED 2026-08-16 on a REAL Mac** (Apple
+   clang 21, Mach-O arm64): the Apple-only `#if defined(__APPLE__)` file actions are COMPILED and
+   EXECUTED, full suite 865/865 — which is stronger than the "compiled by neither local leg" state
+   this row was written in. ⇒ **What remains is narrower than the old wording: CI (`macos-latest`)
+   and CODE REVIEW of that arm**, which `293d069` explicitly did not claim. 📄 Still do not call the
+   arm reviewed on the strength of a green run — executing a path is not reading it.
 3. **`OPERATOR DECISION` — the DCO gate.** ✔PR #52 merged with `DCO fail` reported ⇒ the check is
    **advisory, not required**, contradicting the workflow's own contract. Enforce it in branch
    protection, or retire it. Row: `D-CI-DCO-GATE-IS-ADVISORY-A-PR-MERGED-WITH-IT-RED`.
