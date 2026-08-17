@@ -12,7 +12,7 @@
     { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
   ],
   "optimizedPipelines": [
-    {"label": "mem2reg-then-copyprop", "passes": ["Mem2Reg", "CopyProp"]},
-    {"label": "constfold-mem2reg-copyprop", "passes": ["ConstFold", "Mem2Reg", "CopyProp"]}
+    {"label": "mem2reg-then-copyprop", "passes": ["Mem2Reg", "CopyProp"], "mustDifferFromBaseline": true},
+    {"label": "constfold-mem2reg-copyprop", "passes": ["ConstFold", "Mem2Reg", "CopyProp"], "mustDifferFromBaseline": true}
   ]
 }

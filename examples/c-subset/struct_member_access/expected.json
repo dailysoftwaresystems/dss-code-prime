@@ -10,6 +10,6 @@
     { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
   ],
   "optimizedPipelines": [
-    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST: the pass set this arm names contains NO Inlining, and the values this example computes all sit behind a call. Without a callee body exposed, ConstFold / Mem2Reg / CopyProp / Cse / Licm / SimplifyCfg / Dce have nothing to work on. The operands arrive as runtime arguments across non-inlined `set_fields`/`sum_fields` — the example is AUTHORED so that no pass folds them, and its own comment says so. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."}
   ]
 }

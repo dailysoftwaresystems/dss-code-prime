@@ -3,13 +3,22 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/abi/abi_catalog.hpp"
 #include "ffi/binary_reader.hpp"
+// `guessFormat` + `emitAndReturn`: the format-mismatch guard is the FF1
+// classifier's ONLY target-aware consumer, so it reuses the dispatcher's own
+// magic-byte table and the reader tier's one kind->F_* emit path rather than
+// re-stating either (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL).
+#include "ffi/binary_readers/reader_common.hpp"
 #include "ffi/mangling/c_mangle.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/hir_node.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -27,6 +36,110 @@ std::string recordedImportIdentity(std::string_view declaredImportName,
     if (!declaredImportName.empty()) return std::string{declaredImportName};
     if (!embeddedSoname.empty())     return std::string{embeddedSoname};
     return std::string{readerLibraryPath};
+}
+
+// ── The FormatGuess → ObjectFormatKind vocabulary map ───────────────────────
+//
+// A pure TRANSLATION between two closed enums, in the same shape as
+// `toDiagnosticCode(BinaryReadErrorKind)` in `reader_common.hpp`: no arm does
+// anything a different arm does not, so this is a TABLE, not a per-format
+// policy branch. `nullopt` means "these bytes name no single object format",
+// which is a real answer and not a failure — see the three sources of it below.
+//
+// It lives HERE rather than beside `guessFormat` on purpose. FF1 is target-BLIND
+// by construction ("`readImports` carries no target", binary_reader.hpp), and
+// `ObjectFormatKind` is the vocabulary of the tier that HAS a target; teaching
+// the magic-byte classifier that vocabulary would be the first crack in the
+// property that lets one reader serve every build.
+//
+// The two Mach-O variants map to `MachO` even though `readImports` refuses
+// them: a universal `.dylib` handed to an ELF build is WRONGLY-FORMATTED first
+// and unsliced second, and "this is a Mach-O binary, the target needs elf" is
+// the message that gets the operator to the right file. On a Mach-O target the
+// kinds agree, nothing is rejected here, and FF1's own `lipo -thin` /
+// 32-bit-unsupported remediations reach the operator unchanged.
+[[nodiscard]] static std::optional<ObjectFormatKind>
+objectFormatKindOfGuess(FormatGuess g) noexcept {
+    switch (g) {
+        case FormatGuess::Elf:      return ObjectFormatKind::Elf;
+        case FormatGuess::Pe:       return ObjectFormatKind::Pe;
+        case FormatGuess::MachO64:  return ObjectFormatKind::MachO;
+        case FormatGuess::MachOFat: return ObjectFormatKind::MachO;
+        case FormatGuess::MachO32:  return ObjectFormatKind::MachO;
+        // An `ar` archive is a CONTAINER: the members carry the object format,
+        // the wrapper carries none. Classifying it from the global magic would
+        // be a guess, and the member-level check already exists one tier down.
+        case FormatGuess::Ar:       return std::nullopt;
+        // Unrecognised bytes -- `readImportsFromBytes` owns that message (it
+        // enumerates what IS recognised, which this function cannot).
+        case FormatGuess::Unknown:  return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+// Classify the file WITHOUT reading it and WITHOUT reporting anything: the
+// leading bytes are all `guessFormat` consumes (8 for `ar`, 4 for ELF/Mach-O,
+// 2 for PE). Every failure -- cannot open, short, empty -- returns `nullopt`
+// and defers to `readImports`, which opens the same path two lines later and
+// reports F_FileOpenFailed / F_FileEmpty with its own wording. A SILENT probe
+// whose failures are handled loud by the very next call is exactly the contract
+// `isArArchiveFile` (program/compile_pipeline.cpp) already runs on this same
+// flag's inputs; duplicating the open-failure diagnostic here would double-
+// report one broken path.
+[[nodiscard]] static std::optional<ObjectFormatKind>
+peekObjectFormatKind(std::filesystem::path const& libraryPath) {
+    std::ifstream in(libraryPath, std::ios::binary);
+    if (!in) return std::nullopt;
+    std::uint8_t buf[8] = {};
+    in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
+    auto const got = static_cast<std::size_t>(in.gcount());
+    if (got == 0u) return std::nullopt;
+    return objectFormatKindOfGuess(
+        guessFormat(std::span<std::uint8_t const>{buf, got}));
+}
+
+// ★ THE COMPARISON ITSELF — the SINGLE owner of "is this library's format the
+// one this build emits", and of the sentence that says it isn't. Doc + rationale
+// on the declaration in `ingest.hpp`.
+std::optional<BinaryReadError>
+checkLibraryMatchesTargetFormat(std::filesystem::path const& libraryPath,
+                                ObjectFormatSchema const&    format,
+                                DiagnosticReporter&          reporter) {
+    auto const detected = peekObjectFormatKind(libraryPath);
+    if (!detected.has_value() || *detected == format.kind()) return std::nullopt;
+    // Message shape mirrors `elf::readRelocatableObject`'s wrong-schema refusal
+    // (link/format/elf_object_reader.cpp): name the input, name what it IS, name
+    // what was needed, and say what to do. Every format spelling comes from the
+    // closed `kObjectFormatKindTable` or from the schema -- never a literal.
+    return emitAndReturn(
+        BinaryReadErrorKind::UnsupportedFormat,
+        std::format(
+            "--resolve-library '{0}': this file's object format is {1}, but the "
+            "build emits object format '{2}' (kind {3}) -- a {1} library cannot "
+            "satisfy a {3} link, and binding its exports would record an import "
+            "the loader can never resolve. Point --resolve-library at the {3} "
+            "build of this library, or build for a {1} target.",
+            libraryPath.generic_string(),
+            objectFormatKindName(*detected),
+            format.name(),
+            objectFormatKindName(format.kind())),
+        reporter);
+}
+
+// The target-aware read. Doc + rationale live on the declaration in
+// `ingest.hpp`; the two callers are `readSource` below (the C/HIR binder) and
+// `bindAsmExternImports` in `program/compile_pipeline.cpp` (the encode tier) --
+// the same two-binder shape, and the same one-function remedy, as
+// `recordedImportIdentity` above.
+std::expected<std::vector<ImportSurface>, BinaryReadError>
+readImportsForTargetFormat(std::filesystem::path const& libraryPath,
+                           ObjectFormatSchema const&    format,
+                           DiagnosticReporter&          reporter) {
+    if (auto rejected =
+            checkLibraryMatchesTargetFormat(libraryPath, format, reporter)) {
+        return std::unexpected(std::move(*rejected));
+    }
+    return readImports(libraryPath, reporter);
 }
 
 namespace {
@@ -62,14 +175,21 @@ toFfiVisibility(SymbolVisibility v) noexcept {
 // parser) for CHeaderSource; FF2 + FF6 multi-file for CHeaderDirSource.
 // Returns std::nullopt on hard failure (each path emits its own
 // F_* diagnostic via the underlying reader).
+//
+// `format` is threaded in for the BinaryLibrarySource arm alone: a binary
+// source is the one shape whose CONTENT can disagree with the target's object
+// format, and `readImportsForTargetFormat` is the shared chokepoint that says
+// so (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL). The header arms
+// are unaffected -- a `.h` declares no object format, so there is nothing to
+// compare and no arm here branches on `format` itself.
 [[nodiscard]] std::vector<ImportSurface>
-readSource(IngestionSource const& src, DiagnosticReporter& reporter,
-           bool& outFailed) {
+readSource(IngestionSource const& src, ObjectFormatSchema const& format,
+           DiagnosticReporter& reporter, bool& outFailed) {
     return std::visit(
         [&](auto const& s) -> std::vector<ImportSurface> {
             using T = std::decay_t<decltype(s)>;
             if constexpr (std::is_same_v<T, BinaryLibrarySource>) {
-                auto r = readImports(s.path, reporter);
+                auto r = readImportsForTargetFormat(s.path, format, reporter);
                 if (!r) { outFailed = true; return {}; }
                 return std::move(*r);
             } else if constexpr (std::is_same_v<T, CHeaderSource>) {
@@ -257,7 +377,7 @@ ingest(std::span<IngestionSource const> sources,
 
     for (auto const& src : sources) {
         bool failed = false;
-        auto rows = readSource(src, reporter, failed);
+        auto rows = readSource(src, format, reporter, failed);
         if (failed) return returnWithSnapshot();
         bool const fromBinary =
             std::holds_alternative<BinaryLibrarySource>(src);

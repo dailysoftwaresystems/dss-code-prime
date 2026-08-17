@@ -41,8 +41,8 @@
   "$supportedDataSectionsComment": "rodata (__TEXT,__const -- read-only), data (__DATA,__data), bss (__DATA,__bss zero-fill), relro (reloc-bearing const, __DATA,__const -- merged so its rebase slots land in writable pages). NO tdata/tbss: thread_local in a dylib needs the TLV descriptor model (D-LK3-DYLIB-TLS-MODEL); fails loud by this set's absence.",
   "supportedDataSections": ["rodata", "data", "bss", "relro"],
 
-  "$artifactProfilesComment": "This format SERVES the shared-library profile (plan 06 AP3). The cli profile is the exec sibling.",
-  "artifactProfiles": ["lib"],
+  "$artifactProfilesComment": "This format SERVES the shared-library profile (plan 06 AP3). The cli profile is the exec sibling. \u2605 `module` JOINED THIS SET 2026-08-15 (plan 06 \u00a75.1 B.12, as CORRECTED): a module IS a library, so it is served by every format that serves `lib` or `staticlib` and by nothing else. `artifactProfile` says what a project builds ITSELF as; `DependencyComposition` says how it is CONSUMED (`module` is SourceMerge \u2014 a consumer takes its SOURCES and ignores its artifact). Those are orthogonal, so a module builds standalone like any other library and the static-vs-dynamic choice is made by the `<target>:<format>` spec the author writes in `targets[]`, exactly as it already is for `lib` vs `staticlib` \u2014 no new rule and no engine change.",
+  "artifactProfiles": ["lib", "module"],
 
   "macho": {
     "$comment": "mach_header_64 identity for an x86_64 MH_DYLIB. cputype = 16777223 (0x01000007 = CPU_TYPE_X86_64), cpusubtype = 3 (CPU_SUBTYPE_X86_64_ALL, same as the x86_64 exec). filetype = dylib (MH_DYLIB = 6). flags = 1048709 (MH_NOUNDEFS|MH_DYLDLINK|MH_TWOLEVEL|MH_NO_REEXPORTED_DYLIBS -- no MH_PIE on a library; same value as the arm64 dylib).",

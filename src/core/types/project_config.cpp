@@ -10,6 +10,8 @@
 #include <cstddef>
 #include <fstream>
 #include <iterator>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -46,6 +48,18 @@ std::string joinKeys(std::array<std::string_view, N> const& keys) {
     for (auto const& k : keys) {
         if (!out.empty()) out += ", ";
         out += k;
+    }
+    return out;
+}
+
+// The same joiner for a RUNTIME list (a language's declared profiles, a
+// format's served set, the shipped formats that serve a profile). One
+// separator convention for every list this file puts in front of a user.
+std::string joinStrings(std::span<std::string const> items) {
+    std::string out;
+    for (auto const& s : items) {
+        if (!out.empty()) out += ", ";
+        out += s;
     }
     return out;
 }
@@ -674,6 +688,11 @@ parseProjectConfig(std::string_view jsonText,
         return std::nullopt;
     if (!readRequiredString(doc, "artifactProfile", pc.artifactProfile, sourceLabel, rep))
         return std::nullopt;
+
+    // `targets[]` is REQUIRED of every profile, `module` included — see the
+    // re-taken decision on `parseProjectConfig` in the header. A module is a
+    // library that happens to be consumed by source-merge, and COMPILING one
+    // needs a target even where nothing is linked.
     if (!readRequiredStringArray(doc, "targets", pc.targets, sourceLabel, rep))
         return std::nullopt;
     if (!readRequiredStringArray(doc, "sources", pc.sources, sourceLabel, rep))
@@ -865,14 +884,9 @@ bool enforceArtifactProfile(std::span<std::string const> declared,
               "'artifactProfiles[]' entries (requested profile: '"
             + std::string{profile} + "').";
     } else {
-        std::string list;
-        for (auto const& p : declared) {
-            if (!list.empty()) list += ", ";
-            list += p;
-        }
         msg = "artifact profile '" + std::string{profile}
             + "' is not supported by language '" + std::string{language}
-            + "' (supported: " + list + ").";
+            + "' (supported: " + joinStrings(declared) + ").";
     }
     report(rep, DiagnosticCode::D_ArtifactProfileNotSupported,
            DiagnosticSeverity::Error, std::move(msg));
@@ -882,6 +896,7 @@ bool enforceArtifactProfile(std::span<std::string const> declared,
 bool enforceArtifactProfileFormat(std::span<std::string const> served,
                                   std::string_view profile,
                                   std::string_view formatName,
+                                  std::span<std::string const> servingFormats,
                                   DiagnosticReporter& rep) {
     // Same generic membership predicate as the language gate — only the
     // diagnostic code + message differ (remediation-distinct: fix the
@@ -889,27 +904,43 @@ bool enforceArtifactProfileFormat(std::span<std::string const> served,
     // the backend [this format gate]).
     if (artifactProfileSupported(served, profile)) return true;
 
-    std::string msg;
-    if (served.empty()) {
-        // Empty served-set sub-case (message-only discrimination; the
-        // decision is the single predicate above). A relocatable/object
-        // format, or a format whose backend isn't shipped, serves nothing.
-        msg = "object format '" + std::string{formatName}
-            + "' serves no artifact profiles — it cannot produce profile '"
-            + std::string{profile} + "'. Choose a target whose object format "
-              "produces this profile (or ship the backend that emits it).";
-    } else {
-        std::string list;
-        for (auto const& p : served) {
-            if (!list.empty()) list += ", ";
-            list += p;
-        }
-        msg = "artifact profile '" + std::string{profile}
-            + "' is not served by object format '" + std::string{formatName}
-            + "' (serves: " + list + ").";
+    // What the CHOSEN format does serve, for the "and here is what you asked"
+    // half of both messages. The empty served set is discriminated in the
+    // wording (a relocatable / backend-less format serves nothing) — it is not
+    // a separate decision; the decision was the single predicate above.
+    std::string const servedClause =
+        served.empty() ? std::string{"serves no artifact profiles"}
+                       : "serves: " + joinStrings(served);
+
+    // ── THE SPLIT (closes
+    //    D-AP3-UNSERVED-PROFILE-MISREPORTS-AS-A-FORMAT-MISMATCH) ─────────────
+    //
+    // Which of the two rejects is TRUE is decided by the measurement the
+    // caller supplies, never by this tier guessing: a profile no shipped
+    // format serves cannot be fixed by picking another target, and telling its
+    // author to pick one would send them through the entire target matrix
+    // after a format that does not exist.
+    if (servingFormats.empty()) {
+        report(rep, DiagnosticCode::D_ArtifactProfileNoServingFormat,
+               DiagnosticSeverity::Error,
+               "artifact profile '" + std::string{profile}
+               + "' is registered but no shipped object format implements it "
+                 "yet — the format you chose ('" + std::string{formatName}
+               + "') " + servedClause + ", and no other shipped format serves '"
+               + std::string{profile}
+               + "' either. No choice of target can build this profile until a "
+                 "backend that emits it ships; build a different profile, or "
+                 "ship that backend.");
+        return false;
     }
+
     report(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch,
-           DiagnosticSeverity::Error, std::move(msg));
+           DiagnosticSeverity::Error,
+           "artifact profile '" + std::string{profile}
+           + "' is not served by object format '" + std::string{formatName}
+           + "' (" + servedClause + "). Object formats that DO serve '"
+           + std::string{profile} + "': " + joinStrings(servingFormats)
+           + " — choose a target whose object format is one of those.");
     return false;
 }
 

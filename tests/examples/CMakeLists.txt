@@ -84,6 +84,24 @@ file(GLOB_RECURSE EXAMPLE_MANIFESTS
 # directory argument so argv[1] keeps its meaning in both shapes.
 set(EXAMPLES_LINT_SUITE "ExamplesCorpusLint")
 
+# ★ THE ENTRY IS NAMED FOR THE SUITE, NOT FOR ONE OF ITS TESTS — renamed from
+# `examples/manifest-emulator-lint` in AP6 (2026-08-14) because the name had
+# started DENYING what the entry runs. The `--gtest_filter` below selects the
+# whole `ExamplesCorpusLint` suite, and that suite has grown past the emulator
+# question: it now also carries the recursive-staging pin
+# (`StagesNestedSubdirectoriesWithContentIntact`) and the single-definition-site
+# pin (`StagingPrimitiveLivesOnlyInTheSharedHeader`), neither of which has
+# anything to do with an emulator. A reader triaging a red
+# `examples/manifest-emulator-lint` would have gone looking at manifests and
+# qemu for a failure in a filesystem walk.
+# ⚠ THE OLD NAME IS CITED AS LANDED EVIDENCE by the CLOSED registry row
+# `D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR` above. That citation was
+# ANNOTATED with this rename rather than rewritten — a closed row records what
+# was true when it closed, and silently editing its evidence to match today's
+# tree is how an audit trail stops being one. Anything else naming this entry
+# must move WITH it; ✔MEASURED at the rename, the repo-wide citations were this
+# file, `tests/examples/examples_runner.cpp` (x2) and that one registry row.
+
 foreach(MANIFEST ${EXAMPLE_MANIFESTS})
     get_filename_component(EXAMPLE_DIR ${MANIFEST} DIRECTORY)
     get_filename_component(EXAMPLE_NAME ${EXAMPLE_DIR} NAME)
@@ -97,7 +115,7 @@ foreach(MANIFEST ${EXAMPLE_MANIFESTS})
     dss_strict_arm_verdicts(${TEST_NAME})
 endforeach()
 
-add_test(NAME "examples/manifest-emulator-lint"
+add_test(NAME "examples/corpus-lints"
          COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
                  --gtest_filter=${EXAMPLES_LINT_SUITE}.*
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

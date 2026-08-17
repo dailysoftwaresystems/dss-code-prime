@@ -631,8 +631,16 @@ TEST(MachOCodeSignPlaceholder, ShippedX86DarwinExecEmitsAdHocSignature) {
 // back from .plans/_deferred-anchor-registry.md rather than restated from
 // memory. ⚠ The id this comment used to carry
 // (`D-LK7-ADHOC-CODESIGN-MACHO-STATIC-PATH-DROP`, "proposed anchor") existed
-// NOWHERE else in the tree, and the anchor guard cannot catch that: it scans
-// src/, examples/ and real-examples/, never tests/.
+// NOWHERE else in the tree, and the anchor guard could not catch that, because
+// it scanned src/, examples/ and real-examples/ and never tests/.
+// ★ THAT HOLE IS NOW CLOSED (AP6, 2026-08-14): the guard scans `tests/` and
+// `integrated_tests/` too, and THIS comment was one of exactly four citations
+// it caught on the first widened run. The retired spelling is deliberately
+// still written out above rather than deleted — a rename is only auditable if
+// both names survive somewhere — so the registry row for the live id records it
+// as a retired spelling, which is what makes the line above resolve. Deleting
+// the dead name to satisfy the guard would have been the one fix the guard's
+// own docblock forbids.
 //
 // MEASURED 2026-08-05. `macho::encode`'s dispatch gate routes a
 // codesign request to the dynamic arm by testing

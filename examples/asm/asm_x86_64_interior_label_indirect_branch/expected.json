@@ -11,6 +11,6 @@
   ],
 
   "optimizedPipelines": [
-    { "label": "release", "shippedPipeline": "release" }
+    { "label": "release", "shippedPipeline": "release", "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST BY CONSTRUCTION: the source of this example IS assembly, so it is assembled without ever forming the HIR/MIR an optimizer pass runs on. No pipeline can transform it and no edit to this example could ever make this arm differ — the arm still earns its place by pinning that naming a pipeline does not BREAK an assembly example. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in." }
   ]
 }

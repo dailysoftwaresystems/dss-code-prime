@@ -12,7 +12,7 @@
     { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
   ],
   "optimizedPipelines": [
-    {"label": "mem2reg-only", "passes": ["Mem2Reg"]},
-    {"label": "copyprop-after-mem2reg", "passes": ["Mem2Reg", "CopyProp"]}
+    {"label": "mem2reg-only", "passes": ["Mem2Reg"], "mustDifferFromBaseline": true},
+    {"label": "copyprop-after-mem2reg", "passes": ["Mem2Reg", "CopyProp"], "mustDifferFromBaseline": true}
   ]
 }

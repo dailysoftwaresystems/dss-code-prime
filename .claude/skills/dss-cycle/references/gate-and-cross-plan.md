@@ -87,6 +87,47 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - **★ FOUR ROWS THAT LOOK DIFFERENT AND ARE THE SAME ROW.** Before appending, grep the registry for
   the SYMPTOM, the ARTEFACT and the FILE NAMES in your evidence — not the title you have in mind
   (§C.-1 1b). Nine rows about one absent macro family is one row, or better, one fix.
+- **★★ THE DIAGNOSTIC-CODE ALLOCATION GATE — the ordinal space has no lock, so this is the lock.**
+
+  ```bash
+  python tools/check-diagnostic-codes.py
+  ```
+
+  `DiagnosticCode` is one flat ordinal space whose values are PUBLISHED identities (`error[D0029]`,
+  quoted in docs and `expected.json` fixtures), so a renumber rewrites a name users have already
+  seen. It has two hazards and **the AP5/AP6 close-out hit both**:
+  - ✔**Two concurrent lanes allocated `0xD029`.** One lane was told the slot was free; another had
+    already taken it for `D_DependencyBuildFailed`. Nothing mechanical noticed — it was caught only
+    because the second lane RE-MEASURED the header instead of trusting its brief. That is diligence,
+    not a mechanism, and it is the same non-mechanism `tools/run-gate.sh` exists to replace.
+  - ✔**A code shipped with no test at all.** `D-AP6-NEW-DIAGNOSTIC-CODES-HAD-NO-VALUE-PIN` closed on
+    exactly this and **re-opened one cycle later**: `D_LanguageTargetIsaMismatch` (0xD02A) landed
+    engine code in `src/` while appearing in ZERO test files.
+
+  ★ **The instrument reads the ENUM, never a hand-maintained table.** The contiguity pin in
+  `tests/core/test_parse_diagnostic.cpp` is a good pin and it structurally cannot catch either
+  hazard: it only checks rows somebody remembered to add, so a lane that allocates and never touches
+  the table is invisible to the very test meant to catch it. Anything asking a human to keep a second
+  list in sync has the failure mode of the thing it is checking.
+
+  Three checks: **duplicate value** → fatal, no baseline (hazard 1); **enumerator with no explicit
+  value** → fatal, because it takes `predecessor + 1` and an inserted row above it silently
+  renumbers a published code; **code no compiled test names** → RATCHET against a frozen baseline of
+  37 pre-existing, since that debt is not one cycle's work but NEW debt is.
+  - ⚠ **`UNCOVERED_BASELINE` shrinks freely and GROWS only as a §B decision.** Appending a name to
+    reach green is the workaround this gate exists to forbid; the tool prints every name that becomes
+    covered so the shrink is visible.
+  - ★ Coverage is measured with **comments stripped** — 7 codes are named only in test prose, and
+    counting a comment would let a lane satisfy the gate by MENTIONING its new code in a sentence.
+    Identifiers are tokenized, not substring-matched: ✔the first real run corrected the very scan
+    that built its baseline, which had called `P_InvalidEscape` covered on the strength of
+    `P_InvalidEscapeSequence` appearing in a test.
+  - A collapsed parse (enum block not found, implausibly few enumerators, no test sources) exits **2**
+    rather than reporting "0 duplicates, OK" — the instrument that enforces run-gate's lesson must not
+    embody its inverse.
+  - `--self-test` covers the collision shapes a text-compare would miss (`0xd029` vs `0xD029`,
+    decimal vs hex), the commented-out-enumerator false positive, the comment-strip property, and the
+    collapse guards. Run it if you touch the script.
 
 **Any red the cycle cannot self-repair → STOP and report the blocker. Do not push broken.**
 Better to wake the user to "stopped at step N, here is the blocker" than to push something

@@ -60,6 +60,24 @@ TEST(DiagnosticCode, SymbolicNameRoundtrip) {
               "D_DependencyGitFetchFallback");
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyGitNameCollision),
               "D_DependencyGitNameCollision");
+    // The same feature CONTINUED at 0xD022 after 0xD021 landed in between; see
+    // the band-continuation pin below for why the gap is kept rather than
+    // closed.
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyTargetFormatUnresolvable),
+              "D_DependencyTargetFormatUnresolvable");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyTargetFormatAmbiguous),
+              "D_DependencyTargetFormatAmbiguous");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyDerivedNameInvalid),
+              "D_DependencyDerivedNameInvalid");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyOutputNameCollision),
+              "D_DependencyOutputNameCollision");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyGraphTooDeep),
+              "D_DependencyGraphTooDeep");
+    // (0xD027 is UNUSED — see the band-continuation pin below.)
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_ArtifactProfileNoServingFormat),
+              "D_ArtifactProfileNoServingFormat");
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_DependencyBuildFailed),
+              "D_DependencyBuildFailed");
 }
 
 // The ten codes allocated for `.dss-project.json`'s `preBuildScripts` /
@@ -119,6 +137,124 @@ TEST(DiagnosticCode, ProjectScriptsAndDependsOnBandIsContiguousAndRenders) {
     }
     // Non-vacuity: a counter incremented in the loop, not sizeof the array.
     EXPECT_EQ(checked, 10);
+}
+
+// ★ THE SAME FEATURE, CONTINUED AT 0xD022 — AND THE GAP AT 0xD021 IS PINNED
+// DELIBERATELY, NOT TOLERATED. AP6's consumer-driven format derivation added
+// three more `dependsOn` codes, but `D_SuppressRequestIgnored` (0xD021) had
+// already taken the next slot, so this topic is NO LONGER one contiguous run.
+// That is the correct outcome and this pin exists to stop someone "tidying" it:
+// the number is the OPERATOR-VISIBLE identity (`error[D0022]`), it appears in
+// docs and in `expected.json` fixtures, and renumbering an allocated code to
+// close a cosmetic gap would rewrite a published name. A gap inside a topic's
+// range is cheap; a moved number is not.
+//
+// So this asserts two different things from the run above: the three values
+// themselves, AND that their predecessor is 0xD021 rather than 0xD020 — i.e.
+// the gap is where it is supposed to be. A future code appended at 0xD025 must
+// extend this pin, not the one above.
+//
+// ★ EXTENDED THROUGH 0xD029, AND THE EXTENSION IS THE POINT OF THE PIN, NOT
+// BOOKKEEPING. `D-AP6-NEW-DIAGNOSTIC-CODES-HAD-NO-VALUE-PIN` closed on exactly
+// this failure: a literal `EXPECT_EQ(checked, N)` cannot notice codes that were
+// never added to the table, so four later allocations (0xD025 / 0xD026 from the
+// AP6 graph work, 0xD028 from the AP3 artifact-profile reject split, and
+// 0xD029 below) sat outside any value pin. The contiguity check is what forces
+// the issue — appending 0xD029 alone would fail `previous + 1` against 0xD024 —
+// so the run is carried forward whole rather than sampled.
+//
+// 0xD029 is `D_DependencyBuildFailed`, and it is the reason this edit exists:
+// it splits "the dependency's own build failed" out of 0xD022, which had been
+// emitted for BOTH that and the zero-candidate format derivation. The two rows
+// sitting at opposite ends of one contiguous run is the visible form of a
+// distinction that has to survive — see the paired resolver pins, which assert
+// each fact fires its OWN code and NOT the other's.
+TEST(DiagnosticCode, DependsOnBandContinuationAfterTheSuppressSlot) {
+    struct Row {
+        DiagnosticCode   code;
+        std::uint16_t    value;
+        std::string_view rendered;
+    };
+    constexpr Row kRows[] = {
+        {DiagnosticCode::D_DependencyTargetFormatUnresolvable, 0xD022, "D0022"},
+        {DiagnosticCode::D_DependencyTargetFormatAmbiguous,    0xD023, "D0023"},
+        {DiagnosticCode::D_DependencyDerivedNameInvalid,       0xD024, "D0024"},
+        {DiagnosticCode::D_DependencyOutputNameCollision,      0xD025, "D0025"},
+        {DiagnosticCode::D_DependencyGraphTooDeep,             0xD026, "D0026"},
+        // 0xD027 is deliberately ABSENT: it was allocated as
+        // `D_ArtifactProfileEmitsNoArtifact` and freed again in the same
+        // in-flight change (plan 06 §5.1 B.12 and its correction, 2026-08-15 —
+        // a `module` IS a library, so a standalone module build is legitimate
+        // and the code it would have reported was withdrawn with the rule).
+        // The slot is left unused rather than back-filled, because 0xD028
+        // shipped alongside it and renumbering a code is what the append-only
+        // rule forbids.
+        {DiagnosticCode::D_ArtifactProfileNoServingFormat,     0xD028, "D0028"},
+        {DiagnosticCode::D_DependencyBuildFailed,              0xD029, "D0029"},
+        // ★ 0xD02A IS A DIFFERENT TOPIC AND IT BELONGS IN THIS RUN ANYWAY —
+        // `D_LanguageTargetIsaMismatch`, the language↔target architecture gate
+        // (plan 06 §5.1 B.13.5), not a `dependsOn` code. It is carried here
+        // because THIS PIN GUARDS AN ORDINAL RUN, NOT A TOPIC: the moment a
+        // value is left out, `previous + 1` stops constraining everything after
+        // it, and a code with no pin is exactly what re-opened
+        // `D-AP6-NEW-DIAGNOSTIC-CODES-HAD-NO-VALUE-PIN` one cycle after it
+        // closed. ⓘ Splitting this into a topic-named pin later is fine; doing
+        // so must KEEP the value in some contiguity run, not merely move it to
+        // a lone `EXPECT_EQ` that the next allocation can silently step past.
+        // ⚠ One of its two emit sites IS in the dependency resolver
+        // (`dependency_resolver.cpp:947`), so the topic boundary was never as
+        // clean as the test name suggests.
+        {DiagnosticCode::D_LanguageTargetIsaMismatch,          0xD02A, "D002A"},
+    };
+
+    // The predecessor is the SUPPRESS slot, not the last `dependsOn` code —
+    // asserted explicitly so the discontinuity is a stated fact rather than an
+    // accident someone later "corrects".
+    ASSERT_EQ(static_cast<std::uint16_t>(DiagnosticCode::D_SuppressRequestIgnored),
+              0xD021)
+        << "the slot this run continues after moved";
+    ASSERT_EQ(static_cast<std::uint16_t>(DiagnosticCode::D_DependencyGitNameCollision),
+              0xD020)
+        << "the earlier dependsOn run moved; both pins must agree";
+
+    // ⓘ THE RUN NOW CARRIES A SECOND, STATED HOLE AT 0xD027 — an allocation
+    // that was withdrawn in the same in-flight change that made it (see the
+    // table above). It is named here rather than tolerated as slack, so the
+    // contiguity check keeps its whole strength everywhere else: exactly ONE
+    // value may be skipped, and it must be THIS one.
+    constexpr std::uint16_t kWithdrawnSlot = 0xD027;
+
+    int           checked  = 0;
+    std::uint16_t previous = 0xD021;
+    for (Row const& row : kRows) {
+        EXPECT_EQ(static_cast<std::uint16_t>(row.code), row.value)
+            << diagnosticCodeName(row.code) << " was renumbered";
+        std::uint16_t const expected =
+            static_cast<std::uint16_t>(previous + 1u) == kWithdrawnSlot
+                ? static_cast<std::uint16_t>(previous + 2u)
+                : static_cast<std::uint16_t>(previous + 1u);
+        EXPECT_EQ(row.value, expected)
+            << diagnosticCodeName(row.code) << " is not contiguous with its predecessor";
+        previous = row.value;
+        ASSERT_EQ(row.value & 0xF000u, 0xD000u)
+            << diagnosticCodeName(row.code) << " escaped the D_* band";
+        EXPECT_EQ(diagnosticCodePrefix(row.code), row.rendered);
+        ++checked;
+    }
+    // Non-vacuity: a counter incremented in the loop, not sizeof the array.
+    // ⚠ THIS LITERAL IS THE THING THAT WENT WRONG LAST TIME. It must be raised
+    // by hand whenever a row is appended, and a code allocated WITHOUT touching
+    // it is a code with no value pin — which is precisely how 0xD022..0xD024
+    // once landed unpinned behind an `EXPECT_EQ(checked, 10)`.
+    //
+    // ⓘ THIS LITERAL IS NO LONGER THE ONLY THING STANDING BETWEEN AN ALLOCATION
+    // AND AN UNPINNED CODE, and that is the point of the change that raised it
+    // to 8. `tools/check-diagnostic-codes.py` reads the ENUM itself and fails on
+    // any code no compiled test names — a hand-maintained table can only check
+    // rows somebody remembered to add, which is precisely how 0xD02A shipped
+    // engine code while appearing in zero test files. Keep raising this literal;
+    // just do not mistake it for the mechanism.
+    EXPECT_EQ(checked, 8);
 }
 
 TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {

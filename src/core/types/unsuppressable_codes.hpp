@@ -81,6 +81,30 @@ struct UnsuppressableEntry {
 //     H_ExternHasInitializer.
 //   - Pending-plan announcement (suppressing misleads the user):
 //     D_PlanNotLanded.
+//   - `dependsOn` GIT ACQUISITION (4 codes, added 2026-08-14 with their
+//     emit sites in `program/dependency_cache.cpp`):
+//     D_DependencyGitNotFound, D_DependencyGitAcquireFailed,
+//     D_DependencyGitNameCollision — each prong (2), the build stops
+//     and this line is the only statement of why — plus
+//     D_DependencyGitFetchFallback, the one prong (1) of the family:
+//     the build PROCEEDS on sources it could not refresh, so
+//     suppressing it ships an artifact from a revision the operator
+//     did not choose, green.
+//   - `dependsOn` GRAPH STRUCTURE (1 code, added 2026-08-14 with the
+//     resolver's emit site in `program/dependency_resolver.cpp`):
+//     D_DependencyCycle — prong (1), on a CODE-SPECIFIC argument
+//     rather than the code-independent one that was rejected. The
+//     behaviour its reject forbids is breaking the back edge and
+//     proceeding, which makes the resolved dependency set depend on
+//     where the walk started; the reject AND its statement are the
+//     mechanism. ⚠ Its three siblings (0xD019 / 0xD01B / 0xD01C) are
+//     deliberately NOT here — they take
+//     `DiagnosticDelivery::Guaranteed` at their emit sites instead,
+//     nothing distinguishing them from `D_FileNotFound` or
+//     `D_ArtifactProfileFormatMismatch`, both non-members. The AP6
+//     codes allocated after them (0xD022..0xD026) get no membership
+//     verdict this cycle, per 0xD020's own re-read-against-the-landed-
+//     site rule.
 //   - Lowering / verifier structural invariants (cannot reach
 //     codegen): H_UnsupportedLoweringForKind, H_ExternDeclMalformed,
 //     H_VerifierFailure, H_TypeUnresolved + ALL 12 I_* MIR-verifier
@@ -203,12 +227,25 @@ struct UnsuppressableEntry {
 //     fail-loud, which would need per-code elevation opt-in rather than
 //     the code-agnostic arm. No such producer exists, and inventing the
 //     mechanism before one does would ship an untested arm.
-//   ⇒ BLOCKED ON, precisely: 0xD01F has NO EMIT SITE yet (MEASURED
-//     2026-08-13), so it cannot join this table at all —
-//     `EveryMemberHasAnEmitSiteOrIsMarkedRetired` reds on a member
-//     nothing emits. The AP6 lane landing `dependency_resolver` /
-//     `git_acquire` is the trigger for BOTH the row and this anchor's
-//     final closure.
+//   ✅ UNBLOCKED AND LANDED 2026-08-14 (AP6 lane D1). The blocker recorded
+//     here was: "0xD01F has NO EMIT SITE yet (MEASURED 2026-08-13), so it
+//     cannot join this table at all". It has one now —
+//     `program/dependency_cache.cpp`'s fetch-failed-with-usable-checkout
+//     arm — and the row is in the closed table, so the trigger as worded
+//     ("first Info-severity entry added to the closed table") HAS FIRED.
+//     What fired with it is the resolution already argued above, not the
+//     one the original anchor proposed: for this member, Info's
+//     non-elevation under `--warnings-as-errors` is THE REQUIRED
+//     BEHAVIOUR, so there is nothing to repair. Pinned three-sided in
+//     `tests/program/test_dependency_git_cache.cpp` — under
+//     `--warnings-as-errors` the code appears exactly once, at Info, with
+//     `errorCount() == 0` — because "no promotion happened" is also what
+//     zero diagnostics looks like.
+//   ⇒ WHAT REMAINS OPEN IS ONLY THE RESIDUAL NAMED ABOVE: a FUTURE Info
+//     member that DOES want strict-mode fail-loud would need per-code
+//     elevation opt-in rather than the code-agnostic arm. No such producer
+//     exists; inventing the mechanism before one does would ship an
+//     untested arm. That is a trigger, not a gap.
 //   ⓘ Note what is NO LONGER part of this question: 0xD01F also needs the
 //     reporter's cap to leave it alone, and that used to be a second
 //     reason to want membership. It is now a separate, independently

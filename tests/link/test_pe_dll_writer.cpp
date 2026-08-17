@@ -346,9 +346,15 @@ TEST(PeDllFormatJson, ShippedFileLoadsCleanly) {
     EXPECT_FALSE(loaded.format->processArgs().has_value());
     EXPECT_TRUE(loaded.format->entryCallingConvention().empty());
     EXPECT_TRUE(loaded.format->entryPoint().empty());
-    // Serves the lib profile (the .so mirror), not cli.
-    ASSERT_EQ(loaded.format->artifactProfiles().size(), 1u);
+    // Serves the LIBRARY profiles (the .so mirror), not cli. `module` joined
+    // `lib` here 2026-08-15: a module IS a library — it builds standalone like
+    // any other library project and only its CONSUMPTION differs
+    // (`SourceMerge` takes its sources and ignores the artifact), so it is
+    // served by every format that serves `lib` or `staticlib`. Pinned as the
+    // exact set, in order, so a future profile cannot be added here silently.
+    ASSERT_EQ(loaded.format->artifactProfiles().size(), 2u);
     EXPECT_EQ(loaded.format->artifactProfiles()[0], "lib");
+    EXPECT_EQ(loaded.format->artifactProfiles()[1], "module");
     // Image flavor, but NO deferred-import scope: Windows binds every
     // import at load from a NAMED module — a referenced no-library
     // extern still rejects loud at build time (the c143/c150 gate).

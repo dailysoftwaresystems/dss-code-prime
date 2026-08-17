@@ -267,47 +267,80 @@ TEST(UnsuppressableCodes, BuildHookFailuresAreRefusedBySuppressAndKeepTheirText)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// THE NEGATIVE, so the per-code verdicts are PINNED rather than assumed.
+// THE FOUR `dependsOn` GIT CODES — ✅ LANDED 2026-08-14, AND THIS PIN TURNED
+// AROUND WITH THEM.
 //
-// The four `dependsOn` git codes were judged individually on 2026-08-13 (see
-// the verdict block beside the D_Script* rows in `unsuppressable_codes.cpp`).
-// Each one QUALIFIES on the criterion, and NONE was added, for a reason that
-// is a hard property of this file rather than caution: none of them has an
-// emit site yet, and `EveryMemberHasAnEmitSiteOrIsMarkedRetired` below reds on
-// a member nothing emits — that guard exists because five members once
-// outlived their emit sites and asserted nothing.
+// It used to be the NEGATIVE (`DependsOnGitCodesStaySuppressableUntilTheyAre-
+// Emitted`), asserting all four were NOT members. That was correct while none
+// of them had an emit site: `EveryMemberHasAnEmitSiteOrIsMarkedRetired` below
+// reds on a member nothing emits, so the recorded verdicts — judged
+// individually on 2026-08-13, all four QUALIFYING — could not be acted on. The
+// AP6 lane landed the sites in `program/dependency_cache.cpp` and the rows in
+// the same change, so the deferral is over and the assertion is the other way
+// round.
 //
-// Without this negative the deferral would be invisible: a future batch-sweep
-// could add all four (or, worse, three of four) and nothing would notice the
-// verdicts were never re-read. Asserting the absence makes the row-and-pin
-// land together or not at all.
-TEST(UnsuppressableCodes, DependsOnGitCodesStaySuppressableUntilTheyAreEmitted) {
+// ⚠ IT IS NOT MERELY DELETED, and that matters. The reason to keep a pin here
+// is unchanged in kind: a future batch-sweep could remove all four (or, worse,
+// three of four) and direction A below would go QUIET rather than red, because
+// a non-member with an emit site is a perfectly ordinary thing. Naming them on
+// the membership side is what makes the removal of a row visible.
+TEST(UnsuppressableCodes, DependsOnGitCodesAreRefusedBySuppressAndKeepTheirText) {
     for (auto const code : {DiagnosticCode::D_DependencyGitNotFound,
                             DiagnosticCode::D_DependencyGitAcquireFailed,
                             DiagnosticCode::D_DependencyGitFetchFallback,
                             DiagnosticCode::D_DependencyGitNameCollision}) {
-        EXPECT_FALSE(isUnsuppressable(code))
+        EXPECT_TRUE(isUnsuppressable(code))
             << diagnosticCodeName(code)
-            << " became a closed-table member. If its emit site has landed "
-               "that may well be correct — the recorded verdict says it "
-               "qualifies — but the row and this pin must move together: "
-               "re-read the verdict against what the site ACTUALLY does "
-               "(0xD020 in particular flips prong depending on whether it "
-               "stops the build or picks a repo), then move the code out of "
-               "this list. 0xD01F additionally needs "
-               "`delivery = DiagnosticDelivery::Guaranteed` at its emit site: "
-               "it is Info-severity, nothing downstream re-reports it, and "
-               "membership must not be the thing that buys it cap-immunity.";
+            << " left the closed table. Three of these four are prong (2) — "
+               "the build stops and this diagnostic is the only statement of "
+               "why — and D_DependencyGitFetchFallback is prong (1): the build "
+               "PROCEEDS on sources it could not refresh, so suppressing it "
+               "ships an artifact from a revision the operator did not choose, "
+               "green. Read the verdict block beside the D_Script* rows in "
+               "`unsuppressable_codes.cpp` before removing a row.";
 
-        // ...and "suppressable" is a live behaviour, not just a predicate.
+        // ...and "unsuppressable" is a live behaviour, not just a predicate:
+        // the user names the code and the diagnostic lands anyway, WITH its
+        // text. A code delivered with its prose stripped is the same
+        // empty-explanation shape by a different route.
         DiagnosticReporter::Config cfg;
         cfg.policy.suppress.insert(code);
         DiagnosticReporter r{cfg};
-        r.report(makeDiag(code));
-        EXPECT_EQ(r.all().size(), 0u)
-            << diagnosticCodeName(code)
-            << " is not a member, so --suppress must still silence it";
+        auto d   = makeDiag(code, DiagnosticSeverity::Info);
+        d.actual = "git dependency 'https://example.invalid/bar.git'";
+        r.report(std::move(d));
+
+        ASSERT_EQ(r.all().size(), 1u)
+            << diagnosticCodeName(code) << " was silenced by --suppress";
+        EXPECT_EQ(r.all()[0].actual,
+                  "git dependency 'https://example.invalid/bar.git'")
+            << "the delivered diagnostic must still NAME the dependency";
     }
+}
+
+// ★ THE ONE ASYMMETRY IN THE FAMILY, PINNED SEPARATELY BECAUSE IT IS THE ONE A
+// "TIDY-UP" WOULD BREAK. `D_DependencyGitFetchFallback` is Info by written
+// decision: `applyPolicy`'s `--warnings-as-errors` arm promotes every Warning
+// code-agnostically, so at Warning severity this notice would fail every
+// offline build — the exact outcome it exists to prevent. Membership does NOT
+// exempt a code from that elevation (it gates silencing only), so the severity
+// at the emit site is the whole defence, and this asserts that being a member
+// did not change it.
+TEST(UnsuppressableCodes, FetchFallbackMembershipDoesNotMakeItFailAWarningsAsErrorsBuild) {
+    ASSERT_TRUE(isUnsuppressable(DiagnosticCode::D_DependencyGitFetchFallback));
+
+    DiagnosticReporter::Config cfg;
+    cfg.policy.warningsAsErrors = true;
+    DiagnosticReporter r{cfg};
+    r.report(makeDiag(DiagnosticCode::D_DependencyGitFetchFallback,
+                      DiagnosticSeverity::Info));
+
+    ASSERT_EQ(r.all().size(), 1u);
+    EXPECT_EQ(r.all()[0].severity, DiagnosticSeverity::Info)
+        << "the elevation arm must leave Info alone; promoting it would make "
+           "every --warnings-as-errors build fail the moment the network did";
+    EXPECT_EQ(r.errorCount(), 0u)
+        << "and the offline build must still be a passing build";
 }
 
 // The split the whole cycle is about, pinned as a property of the two
@@ -867,41 +900,49 @@ TEST(UnsuppressableCodes, EveryMemberHasAnEmitSiteOrIsMarkedRetired) {
            "needs refusing again, un-retire the code deliberately (marker off, "
            "table row back, doc comment describing ONLY the refused shape)";
 
-    // ★ THE `dependsOn` VERDICTS, MADE SELF-FIRING RATHER THAN REMEMBERED.
-    // Four codes were judged against the suppression criterion on 2026-08-13
-    // and all four QUALIFY; none could be added, because a member with no emit
-    // site reds direction A above. `DependsOnGitCodesStaySuppressableUntil-
-    // TheyAreEmitted` pins the other half — that they are NOT members and ARE
-    // still suppressable — but that assertion describes the STATUS QUO, so it
-    // stays green forever if the AP6 lane lands the emit sites and nobody
-    // remembers the verdicts. The obligation would then rest entirely on a
-    // human reading a registry row, which is the failure mode this file's own
-    // direction-A guard exists to prevent (five members once outlived their
-    // emit sites while every test passed).
+    // ★ THE `dependsOn` VERDICTS, STILL SELF-FIRING — NOW POINTED THE OTHER
+    // WAY. This loop used to assert the four git codes had NO emit site, so
+    // that the ARRIVAL of one would red and force the recorded verdicts to be
+    // acted on. They arrived (AP6 lane D1, `program/dependency_cache.cpp`) and
+    // the rows landed in the same change, so the trigger has fired and the
+    // property worth holding is the PAIRING it produced: site AND row, both
+    // present, for each of the four.
     //
-    // This is the missing half: it reds on the EVENT that should trigger the
-    // work — an emit site appearing — rather than on someone acting on it.
-    // Same mechanism as 0xE052 directly above, pointed the other way in time:
-    // that one guards a code that HAD a site and must not regain one, this one
-    // guards codes that have no site YET and whose arrival is a decision point.
+    // ⚠ THIS IS NOT DIRECTION A RESTATED, and the difference is what makes it
+    // worth the lines. Direction A quantifies over MEMBERS — it can only catch
+    // a member that lost its site. Delete the four rows and direction A goes
+    // silent, because a non-member with an emit site is an entirely ordinary
+    // thing; delete the four SITES and `DependsOnGitCodesAreRefusedBySuppress-
+    // AndKeepTheirText` still passes, because `isUnsuppressable` is a pure
+    // table lookup. Only naming both halves together catches either half
+    // leaving on its own.
     for (auto const* name : {"D_DependencyGitNotFound",
                              "D_DependencyGitAcquireFailed",
                              "D_DependencyGitFetchFallback",
                              "D_DependencyGitNameCollision"}) {
-        EXPECT_FALSE(scan.siteOf.contains(name))
+        EXPECT_TRUE(scan.siteOf.contains(name))
             << name
-            << " GAINED AN EMIT SITE, so its recorded verdict is now actionable"
-               " and must be acted on in the same commit. Read the verdict "
-               "block beside the D_Script* rows in `unsuppressable_codes.cpp`: "
-               "all four qualify, so add this code to the closed table and move"
-               " it out of the list in "
-               "`DependsOnGitCodesStaySuppressableUntilTheyAreEmitted`. TWO "
-               "verdicts must be RE-READ against the site rather than taken on "
-               "trust — 0xD020 flips prong depending on whether it stops the "
-               "build or picks a repo, and 0xD01F additionally needs `delivery ="
-               " DiagnosticDelivery::Guaranteed` AT the site, because it is "
-               "Info-severity and membership must not be what buys it "
-               "cap-immunity.";
+            << " LOST ITS EMIT SITE while remaining a closed-table member. "
+               "That is the five-dead-members bug this whole property exists "
+               "for: an unemittable code cannot be suppressed, so the row "
+               "asserts nothing while making a dead code read as load-bearing. "
+               "Either restore the site or retire the code deliberately "
+               "(marker at the declaration, row removed, doc comment corrected)"
+               ".";
+        auto const code = std::string{name};
+        bool       isMember = false;
+        for (auto const& [c, why] : codes) {
+            if (diagnosticCodeName(c) == code) { isMember = true; break; }
+        }
+        EXPECT_TRUE(isMember)
+            << name
+            << " has an emit site but is NO LONGER a closed-table member. The "
+               "verdict block beside the D_Script* rows in "
+               "`unsuppressable_codes.cpp` records why all four qualify — three "
+               "on prong (2) and D_DependencyGitFetchFallback on prong (1), "
+               "where suppression ships an artifact built from a revision the "
+               "operator did not choose. Removing a row needs that block "
+               "rewritten, not just this line deleted.";
     }
 
     // ── A: a live member must be emittable ──────────────────────────────────

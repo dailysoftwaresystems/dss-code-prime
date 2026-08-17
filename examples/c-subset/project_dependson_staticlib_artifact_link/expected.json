@@ -1,0 +1,35 @@
+{
+  "$comment": "PROJECT MODE + the compiler's `dependsOn` ARTIFACT-LINK arm (plan 06 §5.1 B.2/B.6.2, docs/project-config-spec.md §2.6) — the arm B.6.2 refused to leave dispatching through a path no corpus example ever runs. `foldlib/` is a project in its own right (`.dss-project.json` + `fold.c`) and reaches the scratch tree only because both runners stage the example's neighbourhood RECURSIVELY through tests/test_support/stage_tree.hpp. Exit 42: with argc == 1 the consumer's own inlinable helper yields acc == 10, and the archive is called with 20 and folds it to 20 + 20 + 2. The fold lives ONLY in the archive: main.c declares dss_fold_twice extern and defines nothing, so the resolver must find foldlib/.dss-project.json, read its `staticlib` profile, dispatch ArtifactLink, DERIVE the archive's object format from this consumer's target (never from the dependency's own targets[], which lists elf64-x86_64 alone), build it under <output>/deps/foldlib/<formatName>/, and append it to this target's resolveLibraries. ✔MEASURED that all four derived archives are produced: out/deps/foldlib/{pe64-x86_64-windows-staticlib/fold.lib, elf64-x86_64-linux-staticlib/fold.a, elf64-aarch64-linux-staticlib/fold.a, macho64-arm64-darwin-staticlib/fold.a}. Neither source file contains the literal 42. NON-FOLDING: argc is an OS-supplied runtime value.",
+  "$commentRedOnDisable": "Delete the `dependsOn` entry from .dss-project.json and no archive is built, nothing is appended to --resolve-library, and no definition of dss_fold_twice reaches the link. ✔MEASURED 2026-08-15 against a mutant copy of this example: the compile FAILS LOUD with K_SymbolUndefined on ALL FOUR targets (`undefined symbol 'dss_fold_twice'`, `_dss_fold_twice` on macho), rc=1, and the `deps/` output directory is never created at all — so BOTH runners go red (in-process: Examples.RunFromManifest FAILED; CLI: `[FAIL] compile rc == 0`) before any binary exists to spawn. 42 is a function of the dependency, never a constant. ⚠ The mutation was verified ABSENT BY THE LOADER'S OWN MATCHER (the `dependsOn` KEY is gone from the parsed object); a TEXT grep for `dependsOn` still matches twice inside these very $comment strings, so a grep-based absence check would have gone green over a live mutant.",
+  "$commentB10Witness": "★ THE DEPENDENCY'S MANIFEST LISTS ONLY `x86_64:elf64-x86_64-linux-staticlib` WHILE THIS EXAMPLE BUILDS FOUR CONSUMER TARGETS, AND THAT IS THE POINT. Plan 06 §5.1 B.10 ruled that a dependency's own targets[] is not consulted when it is built as a dependency, because it states what a project builds for ITSELF rather than what its code can support. The rejected superset rule would have failed this example on every host including the Windows gate. So a green run here is the runtime witness for the derivation: kind-match + profile-serving + crossValidateTargetFormat, fail-closed on zero (D022) or two-or-more (D023) candidates.",
+  "$commentOptimizedArm": "★ THE RELEASE ARM IS SHIPPED, AND THAT IS A MEASUREMENT — see the sibling note on project_dependson_module_source_merge for the plumbing chain. ✔MEASURED 2026-08-15: `optimizedPipelines` / `shippedPipeline` / `--config` each occur 0 times in integrated_tests/runner.cpp (the CLI-runner gap examples/README.md already names, unchanged by this example), BUT the arm is live in the in-process runner in project mode — the arm ledger reports `2 verified (2 ran)` of 8 declared arms on windows, i.e. baseline AND release both compiled and spawned. ⚠ AND IT TOOK A SECOND MEASUREMENT TO MAKE IT BITE: with the consumer written as a bare `return dss_fold_twice(argc * 20);`, `--config=release` and `--config=debug` emitted a BYTE-IDENTICAL pe64 image (same sha256), because the only call was external and the optimizer had nothing to transform — a green arm over a no-op. main.c now carries an inlinable helper, an accumulator and a short loop, and the two configs emit DIFFERENT bytes (both exit 42), so the arm witnesses the optimizer working AROUND the dependency-resolved call instead of merely not breaking it. Declaring the arm without checking that would have been the masked-coverage trap.",
+  "language": "c-subset",
+  "project": ".dss-project.json",
+  "exitCode": 42,
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "artifact_link.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "artifact_link",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "artifact_link",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "artifact_link",
+      "runOn": ["darwin"]
+    }
+  ]
+}

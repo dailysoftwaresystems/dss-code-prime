@@ -48,6 +48,11 @@ namespace dss {
 //                         deferred, D-AP2-TARGET-NAME-DEFAULT-FORMAT).
 //                         Spec FORMAT is validated downstream by the
 //                         delegated compile path (D_InvalidTargetSpec).
+//                         REQUIRED for EVERY artifact profile, `module`
+//                         included: a module is a library that happens to be
+//                         consumed by source-merge, so it builds standalone
+//                         like any other project and codegen needs a target
+//                         (data model / pointer width / ABI) to do it.
 //   * `sources`         — source paths OR glob patterns. The LOADER keeps each
 //                         entry VERBATIM (a glob string is a valid non-empty
 //                         source string — no filesystem here). `Program::
@@ -211,6 +216,24 @@ struct DSS_EXPORT ProjectConfig {
 // user fixes and re-runs. Spec-format / path-existence checks are NOT
 // done here — they belong to the delegated compile path.
 //
+// ⓘ `targets[]` IS REQUIRED OF EVERY PROFILE, `module` INCLUDED — and that is
+// a decision RE-TAKEN 2026-08-15 after the opposite rule was built and then
+// REJECTED (plan 06 §5.1 B.12 and its correction). The rejected rule made
+// `targets[]` a LOAD ERROR for `module` on the ground that such a project
+// "produces no build product". ✔The operator's ruling: *a module is a library,
+// essentially, just used via code.* Two ORTHOGONAL facts had been conflated —
+// `artifactProfile` says what a project builds ITSELF as (a module builds as a
+// library: it needs targets, a serving format, and an artifact), while
+// `DependencyComposition` says how it is CONSUMED (`SourceMerge`: the consumer
+// takes its SOURCES and ignores its artifact entirely). Only the CONSUMPTION
+// path emits nothing, and the resolver's `SourceMerge` arm already handles
+// that by never asking a module for one. ★ The sharper form: COMPILING a
+// module REQUIRES a target even where nothing is linked, because codegen needs
+// a data model, pointer width and ABI — so forbidding `targets[]` would have
+// forbidden the standalone compile, leaving a module untypecheckable and
+// undiagnosable until a consumer imported it, at which point its errors
+// surface inside the CONSUMER's build attributed to the consumer.
+//
 // A top-level key beginning with `$` (`$comment`, `$…Comment`) is PROSE and is
 // SKIPPED by the unknown-key check — the codebase-wide documentation-key
 // convention, via `dss::detail::isDocumentationKey`. This CLOSES
@@ -282,16 +305,36 @@ enforceArtifactProfile(std::span<std::string const> declared,
                        DiagnosticReporter& rep);
 
 // The AP3 driver gate (FORMAT side). Returns true iff `profile` is SERVED by
-// the chosen object format's `served` set. On rejection emits exactly one
-// `D_ArtifactProfileFormatMismatch` — the message names the format + its
-// served set (empty-set discriminated as "serves no artifact profiles") —
-// and returns false. `formatName` names the object format in the message.
-// Calls the SAME `artifactProfileSupported` predicate as the language gate;
-// only the diagnostic code + message differ (remediation-distinct).
+// the chosen object format's `served` set. Calls the SAME
+// `artifactProfileSupported` predicate as the language gate.
+//
+// ★ ON REJECTION IT REPORTS ONE OF TWO REMEDIATION-DISTINCT FACTS (closes
+// D-AP3-UNSERVED-PROFILE-MISREPORTS-AS-A-FORMAT-MISMATCH), chosen by
+// `servingFormats` — the names of the SHIPPED object formats that DO serve
+// `profile` (measured by the caller, which is the tier that can read the
+// shipped-format inventory; `core/` deliberately cannot):
+//   * NON-EMPTY ⇒ a GENUINE mismatch: `D_ArtifactProfileFormatMismatch`, and
+//     the message NAMES those formats. That naming is the actionable half —
+//     "not served here" without "served there" makes the reader search the
+//     whole target matrix by hand.
+//   * EMPTY ⇒ `D_ArtifactProfileNoServingFormat`: the profile is registered
+//     but no shipped format implements it YET. Saying "you picked the wrong
+//     format" here would be a confident falsehood — there is no right one to
+//     pick, and the only real fixes are to build a different profile or to
+//     ship the backend. ✔MEASURED 2026-08-15, six registered profiles are in
+//     this state: `gui`, `script`, `sproc`, `transpile`, `shader`, `hdl`.
+// Either way the message also names the chosen format + its served set (the
+// empty served set discriminated as "serves no artifact profiles").
+//
+// ⚠ `servingFormats` is a measurement of what is IMPLEMENTED, never of what is
+// POSSIBLE. It may decide WHICH REJECT to report; it may NOT be turned into a
+// manifest rule (the withdrawn B.12 derivation would have refused `targets[]`
+// on a `gui` project because no gui backend has shipped yet).
 [[nodiscard]] DSS_EXPORT bool
 enforceArtifactProfileFormat(std::span<std::string const> served,
                              std::string_view profile,
                              std::string_view formatName,
+                             std::span<std::string const> servingFormats,
                              DiagnosticReporter& rep);
 
 } // namespace dss

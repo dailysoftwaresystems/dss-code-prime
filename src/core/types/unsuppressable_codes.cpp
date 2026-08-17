@@ -166,12 +166,34 @@ namespace {
 constexpr std::string_view kWhyBuildHook =
     "a failed build hook already aborts the build; silenced, it aborts "
     "with nothing on stderr saying which hook failed or why";
+constexpr std::string_view kWhyGitNotFound =
+    "nothing can be acquired without git, so the build stops; silenced, it "
+    "stops with nothing naming the missing tool";
+constexpr std::string_view kWhyGitAcquireFailed =
+    "a git dependency could not be fetched and no checkout exists to build "
+    "from; silenced, the build stops without naming the dependency that is "
+    "missing";
+constexpr std::string_view kWhyGitFetchFallback =
+    "the build deliberately continued on a checkout it could not refresh; "
+    "silenced, an artifact compiled from a revision the operator did not "
+    "choose ships green, with the only line that said so removed";
+constexpr std::string_view kWhyGitNameCollision =
+    "two git dependencies want one cache directory and the build stops "
+    "before either is fetched; silenced, it stops with nothing naming the "
+    "two entries that collide";
+constexpr std::string_view kWhyDependencyCycle =
+    "the dependency graph has a ring, and the reject is what stops the walk "
+    "from breaking it; silenced, the build resolves whichever half the walk "
+    "reached first and ships an artifact missing the rest";
 constexpr std::string_view kWhyPlanNotLanded =
     "it announces a mode whose engine has not landed; silenced, the run "
     "fails with no statement that the feature does not exist yet";
 constexpr std::string_view kWhyTargetAbi =
     "silenced, a mismatched target spec dispatches the wrong backend and "
     "the emitted image executes wrong machine code at user runtime";
+constexpr std::string_view kWhyLanguageTargetIsa =
+    "it is the SOLE statement of why the build stopped; silenced, the run "
+    "exits non-zero having printed nothing at all";
 constexpr std::string_view kWhySynthRecipe =
     "silenced, the shim recipe falls out of every synthesis pass and its "
     "symbol goes undefined, breaking the binary LOAD rather than the "
@@ -367,7 +389,12 @@ constexpr std::string_view kWhyOperatorNameNotDefinable =
     "silenced, __has_include(<h>) answers 0 while #include <h> still "
     "splices the header, so the guard and the include disagree";
 
-constexpr std::array<UnsuppressableEntry, 145> kUnsuppressableCodes{{
+// ⓘ EXTENT 150 → 151 (2026-08-15): `D_LanguageTargetIsaMismatch` (0xD02A)
+// joined on prong (2) — see its row below. The extent is deliberately an
+// explicit count rather than a deduced `[]`, so adding a row without thinking
+// about it is a COMPILE ERROR rather than a silent append; ✔it caught this
+// very addition. Raise it by hand, exactly once per row.
+constexpr std::array<UnsuppressableEntry, 151> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -378,8 +405,8 @@ constexpr std::array<UnsuppressableEntry, 145> kUnsuppressableCodes{{
     // if they were not members.
     {DiagnosticCode::D_ScriptSpawnFailed, kWhyBuildHook},
     {DiagnosticCode::D_ScriptExitedNonZero, kWhyBuildHook},
-    // ── `dependsOn` git acquisition (0xD01D..0xD020) — VERDICTS RECORDED,
-    // MEMBERSHIP DEFERRED, ONE TRIGGER ────────────────────────────────────
+    // ── `dependsOn` git acquisition (0xD01D..0xD020) — ✅ ALL FOUR LANDED,
+    // 145 → 149, IN THE SAME CHANGE AS THEIR EMIT SITES ───────────────────
     // Judged individually 2026-08-13, because a four-code family is exactly
     // the shape that gets swept in as a batch (the 2-of-3 inline-asm split
     // below is this table's evidence that the criterion gets APPLIED). Each
@@ -410,21 +437,101 @@ constexpr std::array<UnsuppressableEntry, 145> kUnsuppressableCodes{{
     //     "the build would then compile against a dependency it did not ask
     //     for" — so this verdict must be re-read against the landed site, not
     //     assumed.
-    // ⛔ NOT ADDED, and the reason is a hard property of this file, not
-    // caution: none of the four has an emit site (MEASURED 2026-08-13 —
-    // `DiagnosticCode::D_DependencyGit*` appears only in the enum, the name
-    // switch, and test name-pins). `EveryMemberHasAnEmitSiteOrIsMarkedRetired`
-    // in `tests/core/test_unsuppressable_codes.cpp` REDS on any member without
-    // one, and it exists because five members once outlived their emit sites
-    // and asserted nothing. A row added now would be that bug on purpose.
-    // ⇒ TRIGGER: the AP6 cycle that lands `dependency_resolver` / `git_acquire`
-    // emit sites adds the rows in the same commit as the sites, re-reading
-    // 0xD020's verdict against what its site actually does. 0xD01F ALSO needs
-    // `delivery = DiagnosticDelivery::Guaranteed` at its emit site — it is
-    // Info-severity and its whole purpose is to not fail the build, so nothing
-    // downstream re-reports it and the cap would otherwise be free to eat it.
-    // That pairing is the point of the split: 0xD01F needs BOTH properties and
-    // now has to ask for each one separately, on its own merits.
+    //
+    // ✔ RE-READ AGAINST THE LANDED SITES, 2026-08-14 (AP6 lane D1), because the
+    // deferral note below used to say the verdicts must be. All four now emit
+    // from `program/dependency_cache.cpp`:
+    //   * 0xD01D — `DependencyCache::requireGit`, LATCHED so it fires once per
+    //     build however many git dependencies asked, and returning false so the
+    //     caller abandons. Prong (2) HOLDS.
+    //   * 0xD01E — the acquire path's no-usable-checkout arm, which returns
+    //     `CacheOutcome::AcquireFailed` with an EMPTY checkout path so a caller
+    //     cannot proceed on it. Prong (2) HOLDS.
+    //   * 0xD020 — `DependencyCache::registerGitDependency`, which returns
+    //     nullopt BEFORE any clone or fetch runs, so the collision stops the
+    //     build rather than picking a repo. The verdict therefore stays PRONG
+    //     (2) and does NOT flip to prong (1): nothing is acquired, so nothing
+    //     wrong can be compiled. (Had the site instead chosen one of the two,
+    //     the entry would have had to be rewritten as prong (1).)
+    //   * 0xD01F — the fetch-failed-with-usable-checkout arm, which emits at
+    //     `DiagnosticSeverity::Info` with `DiagnosticDelivery::Guaranteed` set
+    //     AT THE SITE and then RETURNS SUCCESS, so the build proceeds on
+    //     unrefreshed sources. Prong (1) HOLDS, and it is the only one of the
+    //     four that reaches prong (1) at all.
+    // ⓘ The `Guaranteed` at 0xD01F's site is deliberately NOT redundant even
+    // though membership also bypasses the cap. That bypass is a CONSEQUENCE of
+    // what a member is, not a service membership offers: a code must obtain
+    // delivery on delivery's merits, or the suppression criterion becomes a
+    // side-channel again. `test_dependency_git_cache.cpp` asserts the field on
+    // the emitted diagnostic, not merely that it survived a saturated cap —
+    // membership alone would make the survival assertion vacuous.
+    //
+    // ⚠ 0xD019 / 0xD01A / 0xD01B / 0xD01C are a DIFFERENT question with a
+    // different recorded answer and are NOT here. Do not extend this block to
+    // them by pattern.
+    {DiagnosticCode::D_DependencyGitNotFound, kWhyGitNotFound},
+    {DiagnosticCode::D_DependencyGitAcquireFailed, kWhyGitAcquireFailed},
+    {DiagnosticCode::D_DependencyGitFetchFallback, kWhyGitFetchFallback},
+    {DiagnosticCode::D_DependencyGitNameCollision, kWhyGitNameCollision},
+    // ── `dependsOn` GRAPH STRUCTURE: 0xD01A JOINS, 149 → 150, AND ITS THREE
+    // SIBLINGS STILL DO NOT ────────────────────────────────────────────────
+    // The paragraph above says 0xD019 / 0xD01A / 0xD01B / 0xD01C are "a
+    // DIFFERENT question with a different recorded answer". They are — and the
+    // answer, written when the resolver landed, splits them 1-of-4. That split
+    // is the same evidence the 2-of-3 inline-asm split below is: the criterion
+    // was APPLIED rather than the family swept in.
+    //
+    // ★ D_DependencyCycle (0xD01A) — PRONG (1), and the argument is
+    // CODE-SPECIFIC rather than the code-independent one that was rejected
+    // ("resolve() returns false, so a suppressed reject means rc=1 with empty
+    // stderr" is equally true of eleven current NON-members). What makes this
+    // one different is what the reject PREVENTS. The alternative to failing on
+    // a back edge is breaking it and continuing, and its allocation note spells
+    // out the consequence: the resolved dependency set then depends on where
+    // the walk started, so two targets of ONE build can legitimately see
+    // DIFFERENT source sets. So the reject AND ITS STATEMENT are the mechanism
+    // — silencing it does not merely hide an explanation, it re-opens a
+    // wrong-artifact shape whose symptom is an inexplicable link error much
+    // later. That is prong (1) on the written criterion.
+    //
+    // ⚠ 0xD019 / 0xD01B / 0xD01C are STILL OUT, deliberately, and take
+    // `DiagnosticDelivery::Guaranteed` at their emit sites instead: nothing
+    // distinguishes them from `D_FileNotFound` or
+    // `D_ArtifactProfileFormatMismatch`, both non-members, and 0xD01B is
+    // allocated as the THIRD SIBLING of 0xD010 / 0xD011, which are non-members
+    // too. Suppressing any of the three leaves a build that stopped with less
+    // explanation — a DELIVERY concern, which now has its own property. The
+    // three AP6 codes allocated after them (0xD022 / 0xD023 / 0xD024) get no
+    // membership verdict at all this cycle: 0xD020's own note requires a
+    // verdict be re-read against the landed site, not assumed, and 0xD025 /
+    // 0xD026 arrive with the same reservation.
+    //
+    // ★ 0xD029 `D_DependencyBuildFailed` IS OUT, AND UNLIKE THE ROWS ABOVE THAT
+    // IS A VERDICT RATHER THAN A RESERVATION — read off the landed emit site as
+    // 0xD020's note requires. `dependency_resolver.cpp`'s `buildNode_` emits it
+    // when a dependency's own sub-build returns non-zero and then returns
+    // `nullopt`, so the resolve fails either way: no wrong bytes can ship, and
+    // prong (1) is out.
+    //
+    // What makes it different from every other `dependsOn` code is prong (2),
+    // and the difference is structural rather than a judgment call. Prong (2)
+    // is narrow BY CONSTRUCTION — it requires that the diagnostic be the ONLY
+    // statement of why the build stopped — and here it demonstrably is not:
+    // the emit site's immediately preceding loop merges EVERY diagnostic from
+    // the dependency's own build into this reporter, each carrying a
+    // `contextPrefix` of `[dependency=<name> target=<spec>] `. Those are the
+    // explanation; 0xD029 is the attribution line above them, and its own text
+    // says so ("the reason is in the diagnostic(s) above"). Suppressing it
+    // costs an operator a summary while leaving the cause on screen — advisory,
+    // which is exactly what `--suppress` is documented to control.
+    //
+    // ⓘ It also does NOT take `DiagnosticDelivery::Guaranteed`, the other half
+    // of 0xD019 / 0xD01B / 0xD01C's shape, and for the same reason: a pointer
+    // whose referents are ordinary capped diagnostics must not outlive them.
+    // Guaranteeing the pointer alone would produce a surviving line directing
+    // the reader upward at nothing. If this needs cap-immunity, the merged
+    // inner diagnostics take it FIRST and this line comes with them.
+    {DiagnosticCode::D_DependencyCycle, kWhyDependencyCycle},
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -435,6 +542,30 @@ constexpr std::array<UnsuppressableEntry, 145> kUnsuppressableCodes{{
     {DiagnosticCode::D_TargetAbiModelUnsupportedByDriver, kWhyTargetAbi},
     {DiagnosticCode::D_TargetMachineCodeMismatch, kWhyTargetAbi},
     {DiagnosticCode::D_TargetAbiModelMismatch, kWhyTargetAbi},
+    // ★★ D_LanguageTargetIsaMismatch (0xD02A) — A MEMBER ON PRONG (2), AND
+    // THIS ROW CORRECTS THE CODE'S OWN ALLOCATION NOTE, WHICH WAS WRONG.
+    // The note reasoned that suppressing it costs only "a build that stops
+    // with LESS explanation" — a prong-(2) miss by a hair. ✔MEASURED through
+    // the real CLI instead of reasoned about: `--suppress=
+    // D_LanguageTargetIsaMismatch` on x86 assembly aimed at arm64 yields
+    // **rc=1, stdout 0 bytes, stderr 0 bytes** — a completely silent non-zero
+    // exit, which is prong (2) verbatim. There is no "less" explanation
+    // because there is no OTHER diagnostic: unlike D_DependencyBuildFailed
+    // (0xD029), which is an attribution line ABOVE a set of merged inner
+    // diagnostics, this reject fires alone and both call sites then return
+    // `nullopt`/false without reporting anything further. ⇒ it IS the whole
+    // explanation, so removing it removes all of it.
+    // ⓘ Its two nearest neighbours were already members for the same class of
+    // reason, which is what makes the omission an inconsistency rather than a
+    // judgement call: D_TargetMachineCodeMismatch and D_TargetAbiModelMismatch
+    // sit immediately above. Prong-(2) precedent in its own band: 0xD01D and
+    // 0xD020. ⚠ `DiagnosticDelivery::Guaranteed` does NOT substitute for
+    // membership — delivery and suppression are separate questions, and the
+    // measurement above was taken WITH Guaranteed already set.
+    // Control that proves the fix works: suppressing a real member
+    // (D_TargetMachineCodeMismatch) yields D_SuppressRequestIgnored and still
+    // reports.
+    {DiagnosticCode::D_LanguageTargetIsaMismatch, kWhyLanguageTargetIsa},
     // D_SynthRecipeFamilyUnknown (D-CSUBSET-C11-THREADS-HEADER /
     // D-FFI-PE-CRT-UCRT-MIGRATION, 2026-07-25): the driver's shim-synthesis
     // seam found a `synthesize` recipe id belonging to no known shim family

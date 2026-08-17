@@ -496,6 +496,10 @@ std::span<std::string const> GrammarSchema::artifactProfiles() const noexcept {
     return d_.artifactProfiles;
 }
 
+std::string_view GrammarSchema::isa() const noexcept {
+    return d_.isa;
+}
+
 ImportConfig const& GrammarSchema::imports() const noexcept {
     return d_.imports;
 }

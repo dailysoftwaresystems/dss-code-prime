@@ -4,8 +4,14 @@ add_library(program OBJECT
     compile_pipeline.cpp
     cli_args.cpp
     input_resolver.cpp
+    project_sources.cpp
     cross_validate_target_format.cpp
+    cross_validate_language_target.cpp
     build_scripts.cpp
+    git_acquire.cpp
+    dependency_lockfile.cpp
+    dependency_cache.cpp
+    dependency_resolver.cpp
     dump_predefined_macros.cpp
 )
 
@@ -31,11 +37,20 @@ if(MSVC)
     target_compile_options(program PRIVATE /bigobj)
 endif()
 
-# NO nlohmann/json EDGE, and that is now correct rather than an omission.
-# `project_config.cpp` was the only source here that included it, and it moved
-# to `core/types/` on 2026-08-13
-# (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS) — `core` already links
-# nlohmann PRIVATE for its own config-document readers. Verified by
-# `grep -rn '#include <nlohmann' src/program/` returning nothing. Re-add the
-# edge (PRIVATE) the day a `program` source parses JSON directly again; the
-# include path does NOT arrive transitively from `core`.
+# ✅ THE nlohmann/json EDGE IS BACK, ON THE TERMS THE PREVIOUS NOTE SET. That
+# note read: "`project_config.cpp` was the only source here that included it,
+# and it moved to `core/types/` on 2026-08-13
+# (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS) ... Re-add the edge (PRIVATE)
+# the day a `program` source parses JSON directly again; the include path does
+# NOT arrive transitively from `core`." That day is AP6: `dependency_lockfile.cpp`
+# reads and writes `.dss-deps/dss-lock.json` and `#include <nlohmann/json.hpp>`
+# directly.
+#
+# PRIVATE, and the honest include list is ONE file — `grep -rn
+# '^#include <nlohmann' src/program/` is the whole instrument, exactly as
+# src/core/CMakeLists.txt keeps its own list honest. `dependency_lockfile.hpp`
+# is a public header and deliberately names NO JSON type: the document shape is
+# an implementation detail of the .cpp, so no consumer of the lockfile inherits
+# the dependency (contrast the sanctioned `_json.hpp` shape in `core`, which is
+# for headers whose declared job IS to accept a `nlohmann::json const&`).
+target_link_libraries(program PRIVATE nlohmann_json::nlohmann_json)

@@ -22,6 +22,8 @@ dss_add_test(NAME program/test_input_resolver
              SOURCES test_input_resolver.cpp)
 dss_add_test(NAME program/test_cross_validate_target_format
              SOURCES test_cross_validate_target_format.cpp)
+dss_add_test(NAME program/test_cross_validate_language_target
+             SOURCES test_cross_validate_language_target.cpp)
 dss_add_test(NAME program/test_project_config
              SOURCES test_project_config.cpp)
 
@@ -69,6 +71,45 @@ dss_add_test(NAME program/test_asm_data_directives
 # allowlist row in the two `tools/check-orphan-tests` twins.
 dss_add_test(NAME program/test_build_scripts
              SOURCES test_build_scripts.cpp)
+
+# The `.dss-deps` git dependency cache — the acquisition seam
+# (`src/program/git_acquire.*`), the lockfile (`dependency_lockfile.*`) and
+# B.4's four-outcome state machine (`dependency_cache.*`).
+#
+# ★ DRIVER TIER, AND NOT tests/examples/, FOR A STRUCTURAL REASON RATHER THAN A
+# PREFERENCE. Two of the four outcomes are NETWORK FAILURES, and no corpus
+# example can produce one on demand — the corpus compiles real manifests with
+# real inputs, and "the network is down" is not an input it can supply. The
+# whole file therefore drives an injected fake `IGitRunner`: zero network, zero
+# dependence on `git` being installed, and every arm of the machine reachable
+# deterministically. (B.7 layer 2 — one offline `file://` end-to-end witness
+# through real git, environment-gated — is a separate and complementary thing.)
+dss_add_test(NAME program/test_dependency_git_cache
+             SOURCES test_dependency_git_cache.cpp)
+
+# `dependsOn` RESOLUTION (`src/program/dependency_resolver.*`) and its wiring
+# into `Program::compileProject` — the graph walk, the composition-verb
+# dispatch, B.10's consumer-driven format derivation, U-7's dependency-side
+# hooks, U-8's absorption rule and U-9's artifact layout.
+#
+# ★ DRIVER TIER RATHER THAN tests/examples/, and for a structural reason. Half
+# of what this file asserts has NO corpus surface at all: a corpus example's
+# only observables are an exit code and stdout, while the load-bearing
+# properties here are WHICH OBJECT FORMAT a dependency was built with, WHICH
+# TARGET its artifact was threaded to, and which of two rejects fired first.
+# Two of the six B.10 pins also need a shipped-format inventory the real config
+# directory cannot produce (a second candidate, and none), which they obtain by
+# pointing DSS_CONFIG_ROOT at a mirrored tree — something no example manifest
+# can express.
+#
+# ★ It defines its own `main`, like `test_build_scripts.cpp` and for the same
+# reason: U-7's pins need a hook program that writes a file AT A PATH RELATIVE
+# TO ITS OWN WORKING DIRECTORY, and the binary re-execs ITSELF as that fixture.
+# Self-spawn keeps the fixture available on every host with no PATH assumption,
+# and needs no second target, no `$<TARGET_FILE:…>` define and no allowlist row
+# in the two `tools/check-orphan-tests` twins.
+dss_add_test(NAME program/test_dependency_resolver
+             SOURCES test_dependency_resolver.cpp)
 
 # The `runOn` host-token vocabulary (`src/program/platform_token.hpp`) — the ONE
 # spelling of windows/linux/darwin, shared by the `.dss-project.json`

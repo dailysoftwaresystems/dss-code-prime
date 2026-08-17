@@ -391,6 +391,30 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::D_DependencyGitFetchFallback:   return "D_DependencyGitFetchFallback";
         case DiagnosticCode::D_DependencyGitNameCollision:   return "D_DependencyGitNameCollision";
         case DiagnosticCode::D_SuppressRequestIgnored:       return "D_SuppressRequestIgnored";
+        // Project dependencies, continued (0xD022..0xD024) — the run is not
+        // contiguous with the block above; 0xD021 landed between the halves.
+        case DiagnosticCode::D_DependencyTargetFormatUnresolvable:
+            return "D_DependencyTargetFormatUnresolvable";
+        case DiagnosticCode::D_DependencyTargetFormatAmbiguous:
+            return "D_DependencyTargetFormatAmbiguous";
+        case DiagnosticCode::D_DependencyDerivedNameInvalid:
+            return "D_DependencyDerivedNameInvalid";
+        case DiagnosticCode::D_DependencyOutputNameCollision:
+            return "D_DependencyOutputNameCollision";
+        case DiagnosticCode::D_DependencyGraphTooDeep:
+            return "D_DependencyGraphTooDeep";
+        // The AP3 artifact-profile gate's reject split (the other arm is
+        // D_ArtifactProfileFormatMismatch above).
+        case DiagnosticCode::D_ArtifactProfileNoServingFormat:
+            return "D_ArtifactProfileNoServingFormat";
+        // The derivation SUCCEEDED and the dependency's own build then failed —
+        // the fact 0xD022 used to absorb.
+        case DiagnosticCode::D_DependencyBuildFailed:
+            return "D_DependencyBuildFailed";
+        // The language↔target architecture gate
+        // (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE).
+        case DiagnosticCode::D_LanguageTargetIsaMismatch:
+            return "D_LanguageTargetIsaMismatch";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";

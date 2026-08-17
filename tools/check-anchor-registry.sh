@@ -4,7 +4,8 @@
 # recurred TWICE before being system-enforced.
 #
 # Contract: every `D-*` identifier cited in a SCANNED ROOT (`src/`, `examples/`,
-# `real-examples/` — see the roots table below) MUST resolve to a row in
+# `tests/`, `integrated_tests/`, `real-examples/` — see the roots table below)
+# MUST resolve to a row in
 # `.plans/_deferred-anchor-registry.md` OR a citation in any `.plans/*.md`
 # file. The script greps source/, extracts each unique `D-*` anchor name,
 # and fails-loud listing every anchor that has no plan-side counterpart.
@@ -27,6 +28,18 @@ cd "${REPO_ROOT}"
 # Same pattern the developer-side audit grep uses (see the cross-plan
 # staleness sweep commit message). Two-segment names like `D-OPT` are
 # treated as informal; the registry contract enforces ≥3 segments.
+# ── THE LEADING `\<` IS LOAD-BEARING; the `.ps1` twin spells it `\b` ──────────
+# It stops the regex reaching INSIDE a longer hyphenated word and lifting a false
+# anchor out of its tail. The live case is the phrase `FIXED-32-BIT-WORD` at
+# `src/asm/format/fixed32.hpp:19`: its tail is anchor-SHAPED, but the `D` is
+# preceded by `E`, so there is no word boundary and the phrase is correctly
+# skipped. Drop `\<` and this guard reds forever on an innocent comment.
+# ⚠ Do NOT illustrate that tail by writing it out as a standalone literal — it
+# becomes a citation of an anchor with no row, in the guard's own source. The
+# `.ps1` twin carried exactly that from TF-C111 until AP6 (2026-08-14) and it was
+# the sole thing blocking `tools/` from being scanned. Any placeholder must stay
+# UNDER the threshold: `D-XX-EXAMPLE` is inert here, three segments are not.
+# See D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS.
 ANCHOR_REGEX='\<D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
 
 # ── EVERY **GREP** IN THIS FILE RUNS IN THE BYTE LOCALE (`LC_ALL=C`) ─────────
@@ -435,11 +448,85 @@ else
     fi
 fi
 
+# ── tests/ + integrated_tests/ ADDED 2026-08-14 (AP6),
+# D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS.
+# The guard promised "every `D-*` resolves" and delivered it for the subtree it
+# looked at, which is worse than no guard because it is TRUSTED. `tests/` is not
+# a quiet corner: ✔MEASURED at the widening, **709 distinct anchors** are cited
+# there and 18 more in `integrated_tests/` — comparable to `examples/` (406) and
+# on the same order as `src/` (864). The two corpus HARNESSES live in these
+# roots, i.e. the code that decides whether every other root's pins ran at all.
+#
+# ★★ THE MATCHER WAS **NOT** CHANGED, AND THAT WAS A MEASURED DECISION, NOT AN
+# OMISSION — read this before "fixing" the wrapped-name case.
+# The widening was proposed on the premise that a comment which WRAPS an anchor
+# name across two lines defeats a line-based scan, leaving a bare prefix like
+# `D-CSUBSET-STRUCT`, and that ~62 such fragments would strand. ✔MEASURED on the
+# live tree before touching anything: over `tests/` + `integrated_tests/`, of
+# 705 distinct names extracted with the source filter set, the number that fail
+# the resolve is **4** — and not one of them is a wrapped fragment.
+# The premise was wrong because THIS GUARD ALREADY HANDLES THAT CLASS BY
+# CONSTRUCTION: the resolve is a SUBSTRING test (`grep -qrF`, phase 3 below),
+# and a wrapped fragment is by definition a PREFIX of the real anchor, so it is
+# a substring of any plan text carrying the whole name. That is case (1) of the
+# two the resolve documents at PHASE 1's comment, and it has been the contract
+# since the guard was written.
+# ⇒ Teaching the matcher to join comment-continuation lines would have been a
+# change to a `grep` with NO failing case behind it, in a file whose own history
+# is a list of subtle `grep` regressions (`grep -P` absent from Git Bash and
+# exiting 2 as a silent false negative; `-o` swallowing prefixes; `-F -f`
+# quadratic on BSD grep). Reflowing the comments instead would have been a large
+# no-behaviour diff enforcing a rule no future author can be held to. Neither
+# was needed; the ROOTS were the whole defect. The substring contract is now
+# pinned from the test side, because it is load-bearing rather than incidental:
+# narrow it to a whole-word match and dozens of wrapped citations strand at once.
+#
+# ⚠ THE FILE-TYPE FILTERS WERE WIDENED IN THE SAME CHANGE, and it is not
+# cosmetic: `CMakeLists.txt` is where the ctest ENTRY NAMES live, and entry names
+# are cited as landed evidence by closed registry rows. ✔MEASURED: 10 CMake
+# files across `src/` and `tests/` cite anchors and none of them was scanned,
+# so `tests/examples/CMakeLists.txt` could rename an entry a registry row names
+# and nothing would notice. `*.md`, `*.s`, `*.inc` and `*.probes` came along for
+# the same reason — a citation is a citation whatever the extension — and
+# ✔MEASURED at 89 additional distinct anchors across all roots, **0 unresolved**.
+# `real-examples/` keeps its DRIVER-only filter set: it contains zero files of
+# any of the added types, so adding them there would be the silent no-op version
+# of a fix, which this file already names as a hazard above.
+#
+# ★ WHAT MUST LAND WITH THIS AND CANNOT BE VERIFIED BY THE GUARD ITSELF.
+# ✔MEASURED 2026-08-14: 11 of the names cited under `tests/` resolve TODAY only
+# because the registry row named at the top of this note QUOTES them verbatim
+# while complaining that they are unregistered — remove that one row's lines and
+# they strand. That row predicted this exact false green in its own text ("a
+# detector whose contract is 'the string appears somewhere' can be satisfied by
+# the very document that reports the violation"). The widening is therefore
+# green on the honest set ONLY if the rows/Allowlist entries for those 11 land
+# in the same commit. They are not the guard's to create and it cannot tell the
+# difference — which is the residual, and it is recorded here rather than left
+# to be rediscovered.
+#
+# ★ ONE TABLE, READ BY BOTH THE COLLECTION SCAN **AND** THE FAIL-PATH LOCATOR.
+# It was already one table for the collection loop, and the note above says why;
+# what that note did not cover is that the LOCATOR near the bottom of this file
+# spelled the roots and their filters a THIRD time, hardcoded. ✔MEASURED at the
+# AP6 widening: adding two roots to the table alone left the locator scanning the
+# old three, so a missing anchor cited ONLY under `tests/` would have been
+# reported with no `cited in:` line at all — the exact "guessing game" the
+# locator's own comment says it exists to prevent, and silent, because a report
+# missing one line still looks like a report. It is now derived from this array,
+# so a root cannot be half-added.
+# ⚠ bash 3.2 (macOS): index with `"${arr[@]}"` only where the array is known
+# non-empty, which it is here by literal construction.
+#
 # root|floor|include-globs (space separated)
-for _spec in \
-    'src|400|*.cpp *.hpp *.json *.c' \
-    'examples|150|*.cpp *.hpp *.json *.c' \
+_ROOT_SPECS=(
+    'src|400|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
+    'examples|150|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
+    'tests|300|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
+    'integrated_tests|8|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
     'real-examples|10|*.sh *.ps1 *.py'
+)
+for _spec in "${_ROOT_SPECS[@]}"
 do
     _root="${_spec%%|*}"; _rest="${_spec#*|}"
     _floor="${_rest%%|*}"; _globs="${_rest#*|}"
@@ -598,7 +685,7 @@ if [[ ${#MISSING[@]} -eq 0 ]]; then
 fi
 
 echo "anchor-registry: FAIL — the following anchors are cited in a SCANNED ROOT"
-echo "(src/, examples/, real-examples/ — NOT src/ alone) but"
+echo "(src/, examples/, tests/, integrated_tests/, real-examples/ — NOT src/ alone) but"
 echo "have no matching row/citation in any .plans/*.md file:"
 echo ""
 # ★★ THE TREE IS WALKED ONCE — NOT ONCE PER MISSING ANCHOR.
@@ -629,11 +716,16 @@ echo ""
 # finds nothing is a NORMAL outcome here, never an error. Hoisting the greps out
 # of the loop does not retire that hazard — it still applies to this ONE run.
 _locator_tmp="$(mktemp)"; _tmps+=("${_locator_tmp}")
-{ LC_ALL=C grep -rEo "${ANCHOR_REGEX}" src/ examples/ \
-    --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' 2>/dev/null || true; \
-  LC_ALL=C grep -rEo "${ANCHOR_REGEX}" real-examples/ \
-    --include='*.sh' --include='*.ps1' --include='*.py' 2>/dev/null || true; } \
-    > "${_locator_tmp}"
+# ★ DERIVED FROM `_ROOT_SPECS`, never respelled — see the note on that table.
+# One grep PER ROOT (not one grep over all roots) because the filters differ per
+# root, which is the same reason the collection loop above is per-root.
+: > "${_locator_tmp}"
+for _spec in "${_ROOT_SPECS[@]}"; do
+    _root="${_spec%%|*}"; _rest="${_spec#*|}"; _globs="${_rest#*|}"
+    _inc=(); for _g in ${_globs}; do _inc+=(--include="${_g}"); done
+    { LC_ALL=C grep -rEo "${ANCHOR_REGEX}" "${_root}/" "${_inc[@]}" 2>/dev/null || true; } \
+        >> "${_locator_tmp}"
+done
 # The missing list goes through a file too, so an anchor containing a shell
 # metacharacter could never be re-interpreted on its way into awk.
 _missing_tmp="$(mktemp)"; _tmps+=("${_missing_tmp}")

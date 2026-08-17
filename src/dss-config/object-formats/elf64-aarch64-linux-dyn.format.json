@@ -38,8 +38,8 @@
   "$supportedDataSectionsComment": "rodata (read-only, R+X PT_LOAD #1 -- reloc-FREE items only: a reloc-bearing rodata item would need a load-time write into a read-only page, D-LK-DYN-RODATA-ITEM-RELOC fails loud), data (mutable initialized globals, R+W PT_LOAD #2), bss (zero-init, NOBITS tail of PT_LOAD #2), relro (reloc-bearing CONST data, c145 -- merged into `.data` by the dynamic arm so its R_AARCH64_RELATIVE slots land in writable pages). NO tdata/tbss: thread-locals in a shared library need the general-dynamic TLS model (D-LK-DYN-TLS-MODEL, not implemented); the linker's pre-walker gate rejects them loudly by this set's absence.",
   "supportedDataSections": ["rodata", "data", "bss", "relro"],
 
-  "$artifactProfilesComment": "This format SERVES the shared-library profile (plan 06 AP3). The cli profile is NOT served (a .so is not a runnable console binary).",
-  "artifactProfiles": ["lib"],
+  "$artifactProfilesComment": "This format SERVES the shared-library profile (plan 06 AP3). The cli profile is NOT served (a .so is not a runnable console binary). \u2605 `module` JOINED THIS SET 2026-08-15 (plan 06 \u00a75.1 B.12, as CORRECTED): a module IS a library, so it is served by every format that serves `lib` or `staticlib` and by nothing else. `artifactProfile` says what a project builds ITSELF as; `DependencyComposition` says how it is CONSUMED (`module` is SourceMerge \u2014 a consumer takes its SOURCES and ignores its artifact). Those are orthogonal, so a module builds standalone like any other library and the static-vs-dynamic choice is made by the `<target>:<format>` spec the author writes in `targets[]`, exactly as it already is for `lib` vs `staticlib` \u2014 no new rule and no engine change.",
+  "artifactProfiles": ["lib", "module"],
 
   "elf": {
     "$comment": "Elf64_Ehdr identity for an arm64 shared library. type = ET_DYN (3). e_entry = 0 (no process entry). machine = 183 (EM_AARCH64). NO interpreter (validate() rejects one on dyn). bindNow = true: eager binding, DT_FLAGS_1 = DF_1_NOW + R_AARCH64_GLOB_DAT in .rela.dyn -- the same v1 stance as the exec image.",

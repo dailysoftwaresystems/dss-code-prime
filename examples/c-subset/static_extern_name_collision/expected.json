@@ -28,6 +28,6 @@
     }
   ],
   "optimizedPipelines": [
-    {"label": "inlining", "passes": ["Inlining"]}
+    {"label": "inlining", "passes": ["Inlining"], "mustDifferFromBaseline": true}
   ]
 }

@@ -2670,6 +2670,43 @@ struct DSS_EXPORT TargetSchemaData {
     std::string             version;          // semantic version string
     TargetAbiModel          abiModel = TargetAbiModel::RegisterMachine;
 
+    // ★★★ THE INSTRUCTION-SET ARCHITECTURE THIS TARGET EXECUTES — the
+    // TARGET half of the (language emits · target executes) ISA axis
+    // (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE). The LANGUAGE half is
+    // `GrammarSchema::isa()`; the engine compares the two DECLARED values
+    // for equality and never reads a name, a format kind, or a machine code.
+    //
+    // ⚠ IT IS NOT `name`, AND THE DIFFERENCE IS THE WHOLE POINT. `name` is
+    // this document's IDENTITY — the filename stem, the string a user types
+    // in `--target <name>:<format>` — and keying a build decision on it is
+    // the identity branch the agnosticism veto forbids. `isa` is a FACT
+    // ABOUT THE HARDWARE that several distinct target documents may
+    // legitimately share: the day an `x86_64-v3` or an `arm64e` target
+    // ships, it declares the SAME `isa` as its sibling and every ISA-bound
+    // language accepts it with NO edit to any language document. That
+    // property is the design's acceptance criterion, not a side effect.
+    // ✔MEASURED: the shipped values are `x86_64` and `aarch64`, and the
+    // arm64 target's `isa` DIFFERS from its own `name` — so an
+    // `if (name == …)` impostor cannot reproduce the shipped verdicts
+    // without inventing a second mapping table.
+    //
+    // ⚠ IT IS NOT THE `machine` CODE EITHER. Those are per-FORMAT encodings
+    // of the arch (`elf.machine` 183 / `pe.machine` 0xAA64 /
+    // `macho.cputype` 0x0100000C all name the same ISA), they live on the
+    // format side, and `cross_validate_target_format.cpp` reaches them only
+    // through a table keyed on the target NAME — so they answer
+    // "do this target and this format agree?", never "what does this target
+    // execute?".
+    //
+    // EMPTY ⇒ the target declares no ISA. Optional at load (a new REQUIRED
+    // key breaks the load of every existing target document and fixture),
+    // and the gate is FAIL-CLOSED on the absence: a language that DOES
+    // declare a binding cannot be shown to match an undeclared target, so
+    // the pair is refused with the message saying the target declares none.
+    // A language that declares nothing is portable and is unaffected — the
+    // common case pays nothing for this axis existing.
+    std::string             isa;              // "x86_64" / "aarch64" / ""
+
     // Opcode table — slot 0 carries the `"invalid"` sentinel mnemonic
     // (loader-enforced). Other slot-0 fields (terminator/result/arity)
     // are NOT pinned by the loader; the substrate treats opcode 0 as
@@ -2981,6 +3018,11 @@ public:
     // version bump might have permuted.
     [[nodiscard]] std::string_view  version()  const noexcept { return d_.version; }
     [[nodiscard]] TargetAbiModel    abiModel() const noexcept { return d_.abiModel; }
+    // The instruction-set architecture this target EXECUTES (the `target.isa`
+    // key). EMPTY ⇒ undeclared; see `TargetSchemaData::isa` for why that is a
+    // fail-CLOSED input to the language↔target gate rather than a wildcard,
+    // and for why this is not `name()` and not a `machine` code.
+    [[nodiscard]] std::string_view  isa()      const noexcept { return d_.isa; }
     [[nodiscard]] std::string_view  frameLoadMnemonic()  const noexcept {
         return d_.frameLoadMnemonic;
     }

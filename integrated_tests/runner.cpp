@@ -51,6 +51,8 @@
 
 #include "arm_verdict_ledger.hpp"
 #include "run_binary.hpp"
+#include "stage_tree.hpp"  // recursive corpus staging — ONE copy, shared with
+                           // tests/examples/examples_runner.cpp
 
 #include <nlohmann/json.hpp>
 
@@ -95,6 +97,11 @@ using ::dss::test_support::findOnPath;
 using ::dss::test_support::qemuSysrootHint;
 using ::dss::test_support::specFormatName;
 using ::dss::test_support::specTargetArch;
+// …and from `stage_tree.hpp`, which is the SAME header the in-process sibling
+// includes. Named one-by-one rather than pulled in with a using-DIRECTIVE so
+// that a name appearing here is a name this file deliberately took.
+using ::dss::test_support::stageExampleTree;
+using ::dss::test_support::stageExampleTreeSelfTest;
 
 int passes  = 0;
 int failures = 0;
@@ -231,6 +238,15 @@ struct FsAnswer {
     }
     return {true, {}};
 }
+
+// The corpus neighbour-staging primitive now lives ONCE, in
+// `tests/test_support/stage_tree.hpp`, and this runner and its in-process
+// sibling both include it (see the ★★ hoist note at the top of that header).
+// It used to sit here duplicated VERBATIM — ✔MEASURED 14,765 bytes between the
+// twin markers, `cmp`-identical against the sibling's copy.
+// The pin that a copy never comes BACK is
+// `ExamplesCorpusLint.StagingPrimitiveLivesOnlyInTheSharedHeader`, which reads
+// THIS file off disk from the in-process sibling's gtest binary.
 
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): one prerequisite LIBRARY artifact a
 // target build depends on — built FIRST, then threaded into the dependent
@@ -829,23 +845,22 @@ struct CliArmOutcome {
     // [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]]: one runner enforcing while
     // its sibling shrugs is a SILENT harness bug of the same shape as a
     // `.ps1`/`.sh` pair where only one side is wrong.
-    // CONTRACT, deliberately identical to the sibling's: the IMMEDIATE
-    // directory only, no subdirectories, and the manifest excluded. An example
-    // whose data lives in a subdir needs BOTH loops made recursive in the same
-    // change.
-    for (auto const& entry : fs::directory_iterator(exampleDir)) {
-        if (!entry.is_regular_file()) continue;
-        if (entry.path().filename() == "expected.json") continue;
-        std::error_code copyEc;
-        fs::copy_file(entry.path(), outDir / entry.path().filename(),
-                      fs::copy_options::overwrite_existing, copyEc);
-        if (copyEc) {
-            check(exampleName + ": staged neighbor file "
-                  + entry.path().filename().generic_string(),
-                  false, copyEc.message());
-            return {ArmVerdict::Poisoned,
-                    "neighbor staging: " + copyEc.message()};
-        }
+    // CONTRACT, deliberately identical to the sibling's, and it is now the
+    // RECURSIVE one: whole SUBDIRECTORIES cross with their relative subpaths
+    // intact, and only the TOP-LEVEL manifest is excluded. It used to be the
+    // immediate directory only, with a `continue` on every non-regular entry —
+    // so an example whose dependency lives in `<example>/dep_module/` had that
+    // directory dropped in silence and then died on a missing-file error
+    // naming the manifest. The walk is `stageExampleTree` from the shared
+    // `tests/test_support/stage_tree.hpp` — the SAME function the in-process
+    // sibling calls, not a copy held equal to it — so the two runners cannot
+    // stage different trees, which is the whole point of the ★ note above.
+    if (std::string const err = stageExampleTree(exampleDir, outDir);
+        !err.empty()) {
+        check(exampleName + ": staged the example's neighbor files into "
+                  + outDir.generic_string(),
+              false, err);
+        return {ArmVerdict::Poisoned, "neighbor staging: " + err};
     }
 
     // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): build each prerequisite LIBRARY
@@ -909,11 +924,12 @@ struct CliArmOutcome {
               present.ok,
               present.ok ? ""
                          : present.why
-                               + " — the neighbor staging above copies the "
-                                 "example dir's IMMEDIATE files only, so a "
-                                 "project manifest in a SUBDIRECTORY needs that "
-                                 "loop (and its twin in tests/examples/"
-                                 "examples_runner.cpp) made recursive");
+                               + " — the neighbor staging above is RECURSIVE "
+                                 "and preserves relative subpaths, so a "
+                                 "manifest in a SUBDIRECTORY does reach the "
+                                 "scratch tree; an absent one now means the "
+                                 "path is wrong in expected.json, not that the "
+                                 "staging dropped it");
         if (!present.ok) {
             return {ArmVerdict::Poisoned, "project manifest: " + present.why};
         }
@@ -2018,6 +2034,36 @@ int main(int argc, char* argv[]) {
         check("Mentions 'unknown flag'",
               body.find("unknown flag") != std::string::npos,
               "stderr: " + body);
+    }
+    std::cout << "\n";
+
+    // ── Harness self-test: recursive neighbour staging ──
+    //
+    // Deliberately UNNUMBERED. The `[Test N]` labels in this file are cited
+    // from outside it — `.plans/_deferred-anchor-registry.md` names `[Test 4]`
+    // as where the manifest emulator lint lives — so slotting a new number in
+    // before the corpus would silently invalidate a registry citation, and
+    // appending it at the end would put a HARNESS check after the 581 examples
+    // it protects. Neither is worth a number: this tests the runner, not the
+    // compiler, and running it here means a broken staging primitive announces
+    // itself BEFORE the corpus fails 581 times in its wake.
+    //
+    // Calls the SAME `stageExampleTreeSelfTest` the in-process sibling drives
+    // from `ExamplesCorpusLint.StagesNestedSubdirectoriesWithContentIntact` —
+    // and "the same" is now literal rather than enforced: since the AP6 hoist
+    // there is ONE definition, in `tests/test_support/stage_tree.hpp`, so the
+    // byte-compare lint that used to hold two copies together has nothing left
+    // to compare and was deleted with them. A capability exercised in one
+    // corpus harness and merely present in the other is the silent harness bug
+    // this whole file's ★ notes keep pointing at, so the TEST lands in both,
+    // not just the code.
+    std::cout << "[Harness self-test] Neighbour staging is recursive\n";
+    {
+        std::string const findings =
+            stageExampleTreeSelfTest(outputBase / "harness-stage-tree");
+        check("Neighbour staging carries SUBDIRECTORIES across with their"
+              " relative paths and exact bytes",
+              findings.empty(), findings);
     }
     std::cout << "\n";
 

@@ -12,7 +12,7 @@
     { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
   ],
   "optimizedPipelines": [
-    {"label": "mem2reg-cse", "passes": ["Mem2Reg", "Cse"]},
-    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]}
+    {"label": "mem2reg-cse", "passes": ["Mem2Reg", "Cse"], "mustDifferFromBaseline": true},
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true}
   ]
 }

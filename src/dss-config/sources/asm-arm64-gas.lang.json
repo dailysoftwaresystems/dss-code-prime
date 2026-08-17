@@ -12,6 +12,9 @@
 
   "artifactProfiles": ["cli"],
 
+  "$isaComment": "★★★ THE ARCHITECTURE THIS LANGUAGE EMITS (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE) — the AT&T twin carries the full argument; read that file's copy and keep the two in step. ★★ THE VALUE IS `aarch64`, MATCHING `arm64.target.json`'s DECLARED `isa` AND NOT THAT TARGET'S `name` (`arm64`) NOR THIS DOCUMENT'S OWN NAME (`asm-arm64-gas`). Both of those are IDENTITIES — the strings a user types — while this is the fact both sides declare about the hardware, and the gate compares only the declared values. That the three spellings differ is the measurement: a rule keyed on any name would have to invent a mapping table, and this one does not have a table at all.",
+  "isa": "aarch64",
+
   "languageReferences": {
     "$comment": "★★★ THE SHARED LINE STRUCTURE, REACHED BY REFERENCE — AND THIS BLOCK IS BYTE-FOR-BYTE THE SAME SHAPE AS THE AT&T DOCUMENT'S, WHICH IS THE MEASUREMENT. `entry: \"asmLine\"` imports exactly the seven rules reachable from it and NOTHING of the embedded `__asm__(…)` surface (the entry-closure scoping in `mergeLanguageReferences`), so this dialect owes four standalone holes plus the two shared with the embedded surface — not the sixteen `asm.lang.json` declares.\n★ THE FIVE BOUND TOKENS ARE THE SAME FIVE ROLES the AT&T document binds, to five DIFFERENT kinds of this document's own. Same roles, different vocabularies, one grammar: the property the mechanism exists to have, now witnessed by a second signatory rather than argued for by one.",
     "asm": {

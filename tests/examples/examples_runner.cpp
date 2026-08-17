@@ -49,8 +49,12 @@
 #include "core/types/source_buffer.hpp"
 #include "opt/optimizer.hpp"
 #include "program/program.hpp"
+#include "repo_root.hpp"   // the single-definition-site lint reads BOTH runners
+                           // and the shared header off disk
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
+#include "stage_tree.hpp"  // recursive corpus staging — ONE copy, shared with
+                           // integrated_tests/runner.cpp
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -67,6 +71,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>  // std::error_code (do not rely on a transitive
+                         // include from <filesystem>)
 #include <vector>
 
 #if !defined(_WIN32)
@@ -169,6 +175,16 @@ struct OptimizedArm {
     std::vector<std::string>     passes;  // PassId names (inline-array form)
     bool                         hasPasses = false;          // `passes` key present
     std::optional<std::string>   shippedPipeline;            // shipped-config form
+    // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING: the
+    // ESCALATION LEVER. False (the default) ⇒ a byte-identical optimized image
+    // is REPORTED; true ⇒ it is a hard RED. Opt-in PER ARM rather than per
+    // manifest because the two live side by side in one file: a
+    // `{"passes":["ConstFold"]}` arm over a source with nothing to fold is
+    // honestly a no-op, while the `{"shippedPipeline":"release"}` arm on the
+    // same manifest may be the ONLY thing witnessing the optimizer x feature
+    // composition. A manifest-level flag would have to red both or neither.
+    // See the ★ DECISION note above `judgeOptimizedArtifactIdentity`.
+    bool                         mustDifferFromBaseline = false;
 };
 
 // V2-4 Part C (D-DIAG-CLI-POSITION-RENDER-AND-ASSERT): one declared
@@ -570,6 +586,19 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
                 }
                 oa.shippedPipeline = arm.at("shippedPipeline").get<std::string>();
             }
+            // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING:
+            // optional per-arm escalation. Absent ⇒ false ⇒ report-only.
+            if (arm.contains("mustDifferFromBaseline")) {
+                if (!arm.at("mustDifferFromBaseline").is_boolean()) {
+                    ADD_FAILURE() << "manifest " << path.generic_string()
+                                  << " optimizedPipelines"
+                                     " 'mustDifferFromBaseline' must be a"
+                                     " boolean";
+                    return m;
+                }
+                oa.mustDifferFromBaseline =
+                    arm.at("mustDifferFromBaseline").get<bool>();
+            }
             m.optimizedPipelines.push_back(std::move(oa));
         }
     }
@@ -800,6 +829,213 @@ struct ArmResult {
     // summary can name the runOn list / the missing emulator rather than
     // reprint a bare status.
     std::string detail;
+    // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING: the
+    // WHOLE produced artifact, read off disk before this arm returns.
+    //
+    // ⚠ CAPTURED HERE, NOT COMPARED-BY-PATH LATER, and that is forced rather
+    // than chosen: each arm builds inside its OWN `ScratchDir`, which is an
+    // RAII sandbox destroyed when `compileAndRunArm` returns. By the time
+    // `runOneTarget` holds two ArmResults, neither artifact exists on disk any
+    // more. Bytes rather than a hash: a hash collision's failure direction is a
+    // SILENT MISS — exactly the class of defect this exists to end — and corpus
+    // artifacts are single-digit KB, so the exact comparison costs nothing.
+    std::string artifactBytes;
+};
+
+// ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ─────────
+//
+// THE DEFECT. An `optimizedPipelines` arm compiles the example a SECOND time
+// under a named pipeline and asserts the binary still produces the baseline's
+// exit code and stdout. ✔MEASURED (AP6, 2026-08-14): the ArtifactLink corpus
+// example read `return dss_fold_twice(argc * 20);`, and release vs debug
+// produced a BYTE-IDENTICAL pe64 image (`18EF3364…BFAE08FA` both ways) — the
+// only call was external, so the optimizer had nothing to transform and the arm
+// asserted that a no-op stayed a no-op. ★ The arm LOOKED correct the whole
+// time: it was declared, it ran, it passed, and it witnessed nothing. Nothing
+// in either harness detected that, so every `optimizedPipelines` arm in the
+// corpus was trusted ON DECLARATION ALONE.
+//
+// WHAT IS COMPARED, AND WHY IT IS AGNOSTIC. Two artifacts' BYTES — not a
+// section table, not an instruction count, not a symbol, not an entry point.
+// Nothing below knows what a language, a processor or an object format is, and
+// nothing below may learn: the corpus spans three formats and several arches,
+// and any structural opinion would be a fourth place for target identity to
+// leak into a harness that has none.
+//
+// WHAT THE TWO OUTCOMES ARE WORTH, stated precisely because the asymmetry is
+// the whole reason this is a report and not an assert:
+//   * IDENTICAL bytes are CONCLUSIVE — the pipeline transformed nothing, so the
+//     arm's exit-code/stdout comparison is `x == x` and cannot fail.
+//   * DIFFERING bytes are NECESSARY BUT NOT SUFFICIENT — they prove the
+//     pipeline changed the image, not that it changed anything a reader would
+//     call an optimization. This check therefore RAISES the floor from "an arm
+//     was declared" to "an arm changed the output"; it does not certify that a
+//     specific transform fired, and it must never be cited as if it did.
+//
+// DETERMINISM IS A PRECONDITION, AND IT IS OBSERVED RATHER THAN ASSUMED. Two
+// compiles of one source in two different scratch directories must produce
+// equal bytes when the pipeline changes nothing — i.e. no embedded timestamp,
+// no embedded build path, no address-space randomness in the emitters. The AP6
+// measurement above IS that observation: the pe64 images matched exactly across
+// two independent builds. If a future emitter breaks it, the failure direction
+// is a FALSE QUIET (every arm looks like it differed), never a false red.
+
+// The exact bytes of a produced artifact. `nullopt` ⇒ the file could not be
+// read; the caller POISONS the arm rather than continuing, because an arm whose
+// artifact cannot be read has no identity to compare and must never be allowed
+// to reach the rule below as an empty string.
+[[nodiscard]] std::optional<std::string> readArtifactBytes(fs::path const& p) {
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return std::nullopt;
+    std::string bytes{std::istreambuf_iterator<char>(in),
+                      std::istreambuf_iterator<char>{}};
+    if (!in.good() && !in.eof()) return std::nullopt;
+    return bytes;
+}
+
+// A short, greppable image fingerprint for the REPORT LINE ONLY. FNV-1a/64.
+//
+// ⚠ The judgement below compares BYTES, never this. A digest exists so a
+// reader can eyeball two ledger lines and so an operator can grep a CI log for
+// one image — and if it ever became the comparison, a collision would silently
+// re-open the exact defect this file is closing.
+[[nodiscard]] std::string artifactFingerprint(std::string_view bytes) {
+    std::uint64_t h = 14695981039346656037ull;
+    for (char const ch : bytes) {
+        h ^= static_cast<std::uint64_t>(static_cast<unsigned char>(ch));
+        h *= 1099511628211ull;
+    }
+    std::string out(16, '0');
+    for (std::size_t i = 16; i-- > 0;) {
+        out[i] = "0123456789ABCDEF"[static_cast<std::size_t>(h & 0xFu)];
+        h >>= 4;
+    }
+    return out;
+}
+
+enum class ArtifactIdentity {
+    Differed,        // the two arms' images differ — the pipeline did something
+    Identical,       // byte-identical — this arm cannot assert anything
+    CaptureMissing,  // one side produced no bytes at all: a HARNESS defect
+};
+
+struct ArtifactIdentityJudgement {
+    ArtifactIdentity outcome = ArtifactIdentity::CaptureMissing;
+    // Does this outcome RED the entry? See the ★ DECISION note below.
+    bool             red = false;
+    // Rendered, greppable, and EMPTY when there is nothing to say — so the
+    // caller's summary does not have to know the rule's vocabulary.
+    std::string      note;
+};
+
+// ★ THE DECISION: REPORT BY DEFAULT, HARD RED WHEN THE ARM OPTS IN.
+//
+// ⚠ The registry row leaves this open on purpose ("some features legitimately
+// produce identical bytes, so decide report-vs-red deliberately"), so the
+// reasoning is recorded here rather than in a commit message.
+//
+// ✔MEASURED on this corpus before choosing (2026-08-15, Windows leg, every one
+// of the 474 manifests that declares `optimizedPipelines` swept through this
+// very check): 559 optimized arms ran, 559 were compared, and **77 produced a
+// BYTE-IDENTICAL image** — spread over 70 distinct examples. By arm label:
+// 36 `release`, 31 `full-release-like`, 6 `constfold-only`, 3 `full`,
+// 1 `dce-only`. A blanket red is therefore not a strictness setting, it is a
+// 77-way corpus break, and this lane could not have fixed one of them honestly:
+// making an arm differ means EDITING THE EXAMPLE'S SOURCE until the optimizer
+// has something to chew on, which is a per-example authoring judgement (AP6 did
+// exactly that, by hand, for ONE example). The realistic response to 77 reds is
+// to DELETE the offending arms, which lowers coverage — the precise opposite of
+// what this row wants.
+//
+// Three further reasons the default is a report:
+//
+//   1. IDENTITY IS HOST- AND TARGET-DEPENDENT, so a red would make GREEN depend
+//      on which leg you are standing on. Which arms run at all is gated by
+//      `runOn` — the 559 arms above are the pe64 ones this host can spawn, and
+//      an elf64 or macho64 leg compares a DIFFERENT set. An allowlist of
+//      known-identical arms would have to be measured per leg and would red on
+//      every leg it was not measured on.
+//   2. THE HONEST CASES ARE REAL, and the sweep found them rather than
+//      predicting them: 7 of the 77 are `asm/` examples, whose source IS
+//      assembly. A pipeline has nothing to transform there BY CONSTRUCTION, and
+//      the arm is still worth running — it pins that the pipeline does not
+//      BREAK the example. Reddening those punishes an honest manifest for the
+//      shape of its subject, and no edit to the example could ever clear it.
+//   3. AN ARM THAT KNOWS IT MUST WITNESS CAN SAY SO. The failure the row
+//      describes is specifically an arm whose JOB is the optimizer x feature
+//      composition. That is a property only the manifest knows, so the manifest
+//      is where it is declared: `"mustDifferFromBaseline": true` turns the
+//      report into a hard red for that arm alone.
+//
+// FAILURE DIRECTION IF THIS CHOICE IS WRONG — a FALSE GREEN. An arm added
+// tomorrow that witnesses nothing still passes, carrying a printed note that a
+// reader can miss (ctest hides a passing test's stdout). That is the SAME CLASS
+// as today's defect, and the reason it is nonetheless the right trade is that
+// the fact stops being INVISIBLE: it is measured on every run, printed with a
+// stable `[artifact-identity]` tag, counted per entry, and one manifest key
+// away from a red. The opposite mistake — blanket red — fails as 300 FALSE REDS
+// plus standing pressure to weaken manifests, and a corpus that has been
+// weakened to get green cannot be un-weakened by deleting a check.
+//
+// ⚠ THE LEVER SHIPS UNARMED. No corpus manifest sets `mustDifferFromBaseline`
+// yet, because `examples/**` is outside this lane. The examples whose arms
+// exist to witness the optimizer (the ArtifactLink example of the row above
+// first among them) should opt in; that is corpus work, reported upward, not
+// done here.
+//
+// `requireDiffers` is the arm's opt-in. `CaptureMissing` ALWAYS reds regardless
+// of it: two empty strings compare equal, so a broken capture would otherwise
+// masquerade as the strongest possible finding.
+[[nodiscard]] ArtifactIdentityJudgement
+judgeOptimizedArtifactIdentity(std::string const& baselineBytes,
+                               std::string const& optimizedBytes,
+                               bool               requireDiffers) {
+    ArtifactIdentityJudgement j;
+    if (baselineBytes.empty() || optimizedBytes.empty()) {
+        j.outcome = ArtifactIdentity::CaptureMissing;
+        j.red     = true;
+        j.note    = "artifact bytes were not captured (baseline="
+                  + std::to_string(baselineBytes.size()) + " bytes, optimized="
+                  + std::to_string(optimizedBytes.size())
+                  + " bytes) — the identity check cannot run, and an"
+                    " uncomparable arm must never be read as a compared one";
+        return j;
+    }
+    if (baselineBytes != optimizedBytes) {
+        j.outcome = ArtifactIdentity::Differed;
+        j.red     = false;
+        return j;  // nothing to say: the arm changed the image
+    }
+    j.outcome = ArtifactIdentity::Identical;
+    j.red     = requireDiffers;
+    j.note    = "optimized image is BYTE-IDENTICAL to the baseline ("
+              + std::to_string(baselineBytes.size()) + " bytes, fnv1a="
+              + artifactFingerprint(baselineBytes)
+              + ") — the pipeline transformed nothing, so this arm's"
+                " exit-code/stdout comparison is x==x and cannot fail";
+    if (requireDiffers) {
+        j.note += ". The arm declares \"mustDifferFromBaseline\": true, so this"
+                  " is a FAILURE: either the source has nothing for the pipeline"
+                  " to transform (give it one — an inlinable helper, an"
+                  " accumulator, a loop) or the pipeline regressed";
+    }
+    return j;
+}
+
+// Per-ENTRY accounting for the check above. Threaded like `ArmVerdictLedger`
+// so the summary at the end of the entry can print one line whatever happened.
+//
+// ★ `armsThatRan` and `compared` are incremented at DIFFERENT SITES on purpose,
+// and the assertion that they are equal is what keeps this check from becoming
+// the very thing it polices. A check whose only output is a printed note goes
+// silent — and therefore green — if its call site is deleted or if capture
+// starts returning nothing. Counting the arms that reached `Ran` separately
+// from the comparisons actually performed makes that silence LOUD.
+struct ArtifactIdentityTally {
+    std::size_t              armsThatRan = 0;  // optimized arms that produced a run
+    std::size_t              compared    = 0;  // identity judgements performed
+    std::size_t              identical   = 0;  // ... of which byte-identical
+    std::vector<std::string> notes;            // one per non-silent judgement
 };
 
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build ONE
@@ -883,6 +1119,16 @@ buildDependencyArtifact(DependsOnArtifact const& dep,
     return depArtifact;
 }
 
+// The corpus neighbour-staging primitive now lives ONCE, in
+// `tests/test_support/stage_tree.hpp`, and this runner and its CLI-subprocess
+// sibling both include it (see the ★★ hoist note at the top of that header).
+// It used to sit here duplicated VERBATIM — ✔MEASURED 14,765 bytes between the
+// twin markers, `cmp`-identical against the sibling's copy — and was
+// held together by a run-time byte-compare lint that the hoist deleted along
+// with the duplication it guarded. What guards the shared home now is
+// `ExamplesCorpusLint.StagingPrimitiveLivesOnlyInTheSharedHeader` below, which
+// reds if a copy comes BACK into either runner.
+
 [[nodiscard]] ArmResult
 compileAndRunArm(fs::path const& exampleDir,
                  ExampleManifest const& m,
@@ -893,22 +1139,33 @@ compileAndRunArm(fs::path const& exampleDir,
     ArmResult armResult;
     ScratchDir scratch{Location::InsideRepo, "examples"};
     // Mirror the EXAMPLE DIR's file neighborhood into the scratch dir
-    // (every regular file except the manifest) — not just the declared
+    // (every file except the top-level manifest) — not just the declared
     // sources. The CLI-subprocess runner (integrated_tests) compiles IN
     // the example dir, where a quote include resolves against the
     // includer's directory; the in-process scratch must offer the same
     // neighbor files or an include-bearing example (e.g.
     // include_typedef_cast's myint.h) false-fails here only. The entry
-    // files passed to the driver stay exactly `m.sources`. CONTRACT: the
-    // mirror is the IMMEDIATE dir only (no subdirectories) — an example
-    // whose includes live in a subdir needs this loop made recursive
-    // (recreating relative paths) in the same change.
-    for (auto const& entry : fs::directory_iterator(exampleDir)) {
-        if (!entry.is_regular_file()) continue;
-        if (entry.path().filename() == "expected.json") continue;
-        fs::copy_file(entry.path(),
-                      scratch.path() / entry.path().filename(),
-                      fs::copy_options::overwrite_existing);
+    // files passed to the driver stay exactly `m.sources`.
+    //
+    // CONTRACT, and it is now the RECURSIVE one: the mirror carries whole
+    // SUBDIRECTORIES across, relative subpaths intact. It used to be the
+    // immediate dir only, with a `continue` on every non-regular entry — so
+    // an example whose dependency lives in `<example>/dep_module/` had that
+    // directory dropped in silence and then died on a missing-file error
+    // naming the manifest. The walk is `stageExampleTree` from the shared
+    // `tests/test_support/stage_tree.hpp` — the SAME function the CLI sibling
+    // calls, not a copy held equal to it — so the two runners cannot stage
+    // different trees.
+    if (std::string const err = stageExampleTree(exampleDir, scratch.path());
+        !err.empty()) {
+        // A staging failure POISONS the arm rather than falling through to a
+        // compile: the sources are simply not on disk, so every diagnostic the
+        // driver would then emit describes the harness, not the example.
+        ADD_FAILURE() << "staging the neighbor files of "
+                      << exampleDir.generic_string() << " into "
+                      << scratch.path().generic_string() << " failed: " << err;
+        armResult.verdict = ArmVerdict::Poisoned;
+        return armResult;
     }
     // Every DECLARED source must have been among the copied files — a
     // manifest typo fails loud here, not as a confusing driver error.
@@ -945,11 +1202,11 @@ compileAndRunArm(fs::path const& exampleDir,
             ADD_FAILURE() << "manifest 'project' file '" << *m.project
                           << "' not found in example dir "
                           << exampleDir.generic_string()
-                          << " — the mirror above copies the example dir's"
-                             " IMMEDIATE files only, so a project manifest in a"
-                             " SUBDIRECTORY needs that loop (and its twin in"
-                             " integrated_tests/runner.cpp) made recursive in"
-                             " the same change";
+                          << " — the mirror above is RECURSIVE and preserves"
+                             " relative subpaths, so a project manifest in a"
+                             " SUBDIRECTORY does reach the scratch tree; an"
+                             " absent one now means the path is wrong in"
+                             " expected.json, not that the staging dropped it";
             armResult.verdict = ArmVerdict::Poisoned;
             return armResult;
         }
@@ -1124,6 +1381,41 @@ compileAndRunArm(fs::path const& exampleDir,
         return armResult;
     }
 
+    // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING: take the
+    // image NOW. `scratch` is destroyed when this function returns, so this is
+    // the last moment the artifact exists. Deliberately BEFORE the `runOn` and
+    // emulator gates below: whether an image was TRANSFORMED is a question
+    // about the COMPILE, and a machine that cannot spawn the binary can still
+    // answer it. (The comparison itself still only happens when both arms ran —
+    // an optimized arm is not even compiled when the baseline did not run, which
+    // is D-TEST-EXAMPLES-CROSS-HOST-RELEASE-ARM-NEVER-COMPILED's business, not
+    // this row's.)
+    auto captured = readArtifactBytes(artifactPath);
+    // ★ CROSS-CHECKED AGAINST `file_size`, not merely non-empty. A SHORT READ is
+    // the capture failure this mechanism is least able to survive: it produces a
+    // plausible prefix, and two arms' prefixes are far likelier to match than
+    // their whole images — so a truncating reader would manufacture "identical"
+    // findings out of thin air. `sz` is an independent measurement of the same
+    // file, so requiring the two to agree turns that into a loud failure.
+    if (!captured.has_value() || captured->empty()
+        || static_cast<std::uintmax_t>(captured->size()) != sz) {
+        // FAIL LOUD, never fall through with a partial or empty string: an
+        // uncaptured image reaching the identity rule as "" would compare equal
+        // to any other uncaptured image and report the strongest possible
+        // finding on no evidence at all.
+        ADD_FAILURE() << "could not read the produced artifact for the"
+                         " optimized-vs-baseline identity check: "
+                      << artifactPath.generic_string() << " (arm=" << armLabel
+                      << ", file_size reported " << sz << " bytes, read "
+                      << (captured.has_value()
+                              ? std::to_string(captured->size())
+                              : std::string{"<open failed>"})
+                      << ')';
+        armResult.verdict = ArmVerdict::Poisoned;
+        return armResult;
+    }
+    armResult.artifactBytes = std::move(*captured);
+
     auto const host = currentHostOs();
     bool const shouldRun = std::any_of(t.runOn.begin(), t.runOn.end(),
         [&](std::string const& s) { return s == host; });
@@ -1265,7 +1557,8 @@ void runOneTarget(fs::path const&        exampleDir,
                   ExampleManifest const& m,
                   ExampleTarget const&   t,
                   std::string const&     exampleId,
-                  ArmVerdictLedger&      ledger) {
+                  ArmVerdictLedger&      ledger,
+                  ArtifactIdentityTally& identity) {
     ASSERT_FALSE(t.spec.empty())
         << "target spec missing in manifest";
     ASSERT_FALSE(t.artifact.empty())
@@ -1348,6 +1641,35 @@ void runOneTarget(fs::path const&        exampleDir,
             << "differential-verify: optimized arm '" << arm.label
             << "' verdict=" << armVerdictName(optResult.verdict)
             << " — baseline ran but optimized arm did not";
+        // Counted HERE — at the verdict, not at the comparison — so that a
+        // deleted or short-circuited comparison shows up as a count mismatch in
+        // the entry summary instead of as a check that quietly stopped looking.
+        ++identity.armsThatRan;
+
+        // ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ──
+        //
+        // Both arms ran, so both images exist as bytes. Ask whether the
+        // pipeline changed anything at all BEFORE asserting that the program's
+        // behaviour is unchanged: if it did not, the two assertions below are
+        // comparing an artifact with itself and the arm is coverage in name
+        // only. Report by default; RED when the arm declared it must differ.
+        {
+            auto const j = judgeOptimizedArtifactIdentity(
+                baseline.artifactBytes, optResult.artifactBytes,
+                arm.mustDifferFromBaseline);
+            ++identity.compared;
+            if (j.outcome == ArtifactIdentity::Identical) ++identity.identical;
+            if (!j.note.empty()) {
+                identity.notes.push_back("spec=" + t.spec + " arm=" + arm.label
+                                         + ": " + j.note);
+            }
+            if (j.red) {
+                ADD_FAILURE()
+                    << "ARTIFACT IDENTITY: " << exampleId << " spec=" << t.spec
+                    << " arm='" << arm.label << "' — " << j.note;
+            }
+        }
+
         ASSERT_EQ(optResult.exitCode, baseline.exitCode)
             << "differential-verify FAIL: optimized arm '" << arm.label
             << "' produced exit code " << optResult.exitCode
@@ -1492,18 +1814,20 @@ TEST(Examples, RunFromManifest) {
         exampleDir.parent_path().filename().generic_string() + "/"
         + exampleDir.filename().generic_string();
 
-    ArmVerdictLedger ledger;
+    ArmVerdictLedger      ledger;
+    ArtifactIdentityTally identity;
     for (auto const& t : m.targets) {
         SCOPED_TRACE("target spec=" + t.spec);
         // V2-4 Part C: an `expectDiagnostics` manifest asserts a failed
         // compile + positioned diagnostics; otherwise the source must
         // compile + run cleanly.
         if (m.expectDiagnostics.empty()) {
-            runOneTarget(exampleDir, m, t, exampleId, ledger);
+            runOneTarget(exampleDir, m, t, exampleId, ledger, identity);
         } else {
             runErrorTarget(exampleDir, m, t, exampleId, ledger);
         }
     }
+
 
     // ── D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the ledger ───────────────
     //
@@ -1552,6 +1876,43 @@ TEST(Examples, RunFromManifest) {
                       << "=1 to make this a failure)\n";
         }
     }
+
+    // ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ─────
+    //
+    // LAST in the body, deliberately: the assertion below is fatal, and the arm
+    // ledger and the strict-verdict gate above are what a reader triages a red
+    // entry with. An assertion that suppressed them would answer its own
+    // question by hiding everyone else's.
+    //
+    // Printed UNCONDITIONALLY and with a stable tag, for the same reason the
+    // arm ledger is: this is the accounting that answers "what did this entry's
+    // optimized arms actually witness?", and it is worthless if it only appears
+    // when something is wrong. `compared=0` on an entry with no optimized arms
+    // is a real and expected line — most of the corpus has none.
+    std::cout << "[artifact-identity] " << exampleId
+              << ": optimized-arms-ran=" << identity.armsThatRan
+              << " compared=" << identity.compared
+              << " byte-identical=" << identity.identical << '\n';
+    for (auto const& n : identity.notes) {
+        std::cout << "[artifact-identity]   " << exampleId << ' ' << n << '\n';
+    }
+
+    // ★ THE CHECK'S OWN NON-VACUITY GUARD, and it is a hard failure on every
+    // host regardless of any opt-in. The report above is advisory BY DESIGN,
+    // which makes it exactly the kind of mechanism that can rot into silence —
+    // delete the comparison block, or let capture start handing back nothing,
+    // and every entry keeps printing a cheerful zero. So the two counts are
+    // taken at DIFFERENT SITES (`armsThatRan` at the arm's verdict,
+    // `compared` inside the comparison) and reconciled here: an optimized arm
+    // that RAN and was not COMPARED is a harness defect, not a quiet day.
+    ASSERT_EQ(identity.compared, identity.armsThatRan)
+        << "artifact-identity accounting mismatch for " << exampleId << ": "
+        << identity.armsThatRan
+        << " optimized arm(s) ran but only " << identity.compared
+        << " were compared against their baseline image. The optimized-vs-"
+           "baseline byte comparison is what keeps a declared arm from counting"
+           " as coverage while witnessing nothing; a comparison that stopped"
+           " happening must never present as a passing entry.";
 }
 
 // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB (harness-wiring pin): the shared
@@ -1591,7 +1952,9 @@ TEST(RunHarnessStack, GenerousSpawnStackBumpIsWired) {
 
 // ── D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR: the corpus emulator lint ───
 //
-// Registered as ONE extra ctest entry (`examples/manifest-emulator-lint`)
+// Registered inside the ONE extra ctest entry (`examples/corpus-lints`, which
+// was named `examples/manifest-emulator-lint` until AP6 renamed it for the
+// SUITE once the suite outgrew this one lint)
 // rather than running inside all 558 per-example entries: the question is
 // corpus-wide, the answer is identical for every entry, and re-deriving it 558
 // times would cost the suite a corpus re-walk per test for no new information.
@@ -1654,4 +2017,356 @@ TEST(ExamplesCorpusLint, EveryArmAgreesWithItsSiblingsOnTheEmulator) {
         << findings.size() << " manifest emulator finding(s) over "
         << manifestCount << " manifests / " << arms.size()
         << " declared (arm x runOn) pairs:" << report.str();
+}
+
+// ── Recursive neighbour staging: the BEHAVIOURAL pin ───────────────────────
+//
+// Filed in the `ExamplesCorpusLint` suite, which is the ONE suite the
+// per-example ctest entries exclude by `--gtest_filter` and the single
+// `examples/corpus-lints` entry selects. The question this asks is
+// corpus-wide and its answer identical for every entry, so it runs ONCE rather
+// than 581 times — the same reasoning the emulator lint above records.
+//
+// ⚠ RUN THIS SUITE THROUGH ctest, NOT the bare `dss_examples_runner.exe`.
+// This pin itself is cwd-independent — it plants its own fixture in a temp
+// sandbox — but its sibling below resolves the repo through `repo_root.hpp`,
+// whose candidate (3) is a 12-hop walk UP from the PROCESS cwd, and the
+// compiles this binary drives resolve shipped config the same way
+// (`core/types/config_path_walk.cpp`). A bare invocation started somewhere
+// else can therefore walk into a DIFFERENT tree and assert confidently against
+// it. Only the ctest entry pins the answer: it sets `WORKING_DIRECTORY
+// ${CMAKE_SOURCE_DIR}` and the target bakes `DSS_TEST_REPO_ROOT` (see the ★ -D
+// note in tests/examples/CMakeLists.txt, which exists because this binary was
+// the ONE test target that had silently lost the baked root).
+//
+// The assertions live in `stageExampleTreeSelfTest`, in the shared header, so
+// that the CLI-subprocess runner executes THE SAME checks from THE SAME code —
+// which is what the hoist bought: "character-identical" used to be a property a
+// lint had to keep re-proving, and is now a property of there being one copy.
+// All this wrapper adds is a scratch sandbox and the GTest reporting.
+TEST(ExamplesCorpusLint, StagesNestedSubdirectoriesWithContentIntact) {
+    // `Location::Temp`, not `InsideRepo`: this pin drives no schema loader, so
+    // it needs no cwd-rooted config walk, and keeping its fixture out of the
+    // repo means a crashed run cannot leave a stray `dep_module/` where the
+    // corpus glob might later meet it.
+    ScratchDir sandbox{Location::Temp, "stage-tree-pin"};
+    std::string const findings =
+        stageExampleTreeSelfTest(sandbox.path() / "stage-tree");
+    EXPECT_TRUE(findings.empty()) << findings;
+}
+
+// ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ────────
+//
+// The two-direction pin for the optimized-vs-baseline identity check. Filed in
+// `ExamplesCorpusLint` (the one suite the per-example entries exclude and the
+// single `examples/corpus-lints` entry selects) because its answer is the same
+// for every entry, exactly like its neighbours here.
+//
+// ★ WHY THE FIXTURE IS TWO FILES OF BYTES AND NOT TWO COMPILES. The obvious
+// fixture — an example whose release arm genuinely optimizes and one whose
+// arm cannot — would pin the rule THROUGH the compiler, and would thereby make
+// this pin's own verdict depend on the host, the target format, and on the
+// optimizer continuing to make that particular choice. The "arms differ" half
+// would silently invert on any leg where that source stopped optimizing, and a
+// pin that can invert is worse than none. The MECHANISM under test compares two
+// artifacts' bytes and knows nothing else; the fixture is built at exactly that
+// altitude, so it is deterministic on every leg — while the CORPUS is what
+// exercises the mechanism against real compiler output on every run, and the
+// `compared == armsThatRan` reconciliation in `RunFromManifest` is what makes
+// that exercise fail loud if the wiring between them ever breaks.
+//
+// The bytes deliberately contain embedded NULs: capture goes through a text-
+// mode-hostile path (an `ifstream` in binary mode into a `std::string`), and an
+// implementation that truncated at the first NUL would make two DIFFERENT
+// images compare equal — a false "identical", i.e. a false red on any arm that
+// opted in.
+TEST(ExamplesCorpusLint, ByteIdenticalOptimizedArtifactIsDetectedBothWays) {
+    ScratchDir sandbox{Location::Temp, "artifact-identity-pin"};
+    auto const dir = sandbox.path();
+
+    auto const plant = [&dir](char const* name, std::string const& bytes) {
+        fs::path const p = dir / name;
+        std::ofstream out(p, std::ios::binary);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        out.close();
+        // A fixture that failed to write its own subject would make every
+        // capture below return the same empty string, and the "identical" half
+        // would pass for the wrong reason.
+        EXPECT_TRUE(out.good()) << "could not plant " << p.generic_string();
+        return p;
+    };
+
+    // Two images that DIFFER, and two that are byte-identical while living at
+    // DIFFERENT paths (which is the real situation: each arm builds in its own
+    // scratch dir, so path equality is never the question).
+    //
+    // Assembled byte by byte rather than written as one literal with a hand-
+    // counted length: a `std::string{lit, N}` whose N is one too large reads
+    // past the literal, and the fixture would be pinning undefined behaviour.
+    std::string imageA;
+    imageA += '\x7F';
+    imageA += "DSS";
+    imageA += '\0';              // the first embedded NUL
+    imageA += "\x01\x02\x03";
+    imageA += " baseline image ";
+    imageA += '\0';              // and a second, well past it
+    imageA += " tail";
+    std::string const imageACopy = imageA;
+
+    // The differing byte is chosen PAST the first NUL, so a capture that
+    // truncated there could not produce a passing "differed" verdict.
+    std::size_t const firstNul = imageA.find('\0');
+    ASSERT_NE(firstNul, std::string::npos);
+    std::size_t const flipAt = imageA.size() / 2;
+    ASSERT_GT(flipAt, firstNul);
+    std::string imageB = imageA;
+    imageB[flipAt] = static_cast<char>(imageB[flipAt] ^ 0x5A);  // always changes
+
+    ASSERT_EQ(imageA.size(), imageB.size())
+        << "the fixture must differ in CONTENT, not in length — a length-only"
+           " difference would let a size comparison pass for a byte comparison";
+    ASSERT_NE(imageA, imageB);
+    ASSERT_EQ(imageA, imageACopy);
+
+    auto const pBaseline  = plant("baseline.img",  imageA);
+    auto const pDifferent = plant("optimized.img", imageB);
+    auto const pSame      = plant("identical.img", imageACopy);
+
+    // CAPTURE — through the SAME reader the runner uses, so this pin cannot be
+    // green over a capture path the corpus does not take.
+    auto const capBaseline  = readArtifactBytes(pBaseline);
+    auto const capDifferent = readArtifactBytes(pDifferent);
+    auto const capSame      = readArtifactBytes(pSame);
+    ASSERT_TRUE(capBaseline.has_value());
+    ASSERT_TRUE(capDifferent.has_value());
+    ASSERT_TRUE(capSame.has_value());
+    // Binary-exact, NULs and all — the property the rest of this pin rests on.
+    EXPECT_EQ(*capBaseline, imageA);
+    EXPECT_EQ(capBaseline->size(), imageA.size());
+    EXPECT_NE(*capBaseline, *capDifferent);
+
+    // DIRECTION 1 — the two arms genuinely differ ⇒ the check STAYS QUIET.
+    // Quiet means all three things: not Identical, not red, and NOTHING added
+    // to the summary. A rule that reported on every arm would drown the corpus
+    // and would be ignored, which is the same outcome as not reporting.
+    {
+        auto const j = judgeOptimizedArtifactIdentity(
+            *capBaseline, *capDifferent, /*requireDiffers*/ false);
+        EXPECT_EQ(static_cast<int>(j.outcome),
+                  static_cast<int>(ArtifactIdentity::Differed));
+        EXPECT_FALSE(j.red);
+        EXPECT_TRUE(j.note.empty()) << "unexpected note: " << j.note;
+    }
+    // ... and STILL quiet when the arm opted in: opting in must strengthen the
+    // identical case only. If `mustDifferFromBaseline` could red an arm that
+    // DID differ, the lever would be unusable and nobody would set it.
+    {
+        auto const j = judgeOptimizedArtifactIdentity(
+            *capBaseline, *capDifferent, /*requireDiffers*/ true);
+        EXPECT_EQ(static_cast<int>(j.outcome),
+                  static_cast<int>(ArtifactIdentity::Differed));
+        EXPECT_FALSE(j.red);
+        EXPECT_TRUE(j.note.empty()) << "unexpected note: " << j.note;
+    }
+
+    // DIRECTION 2 — the two arms are BYTE-IDENTICAL ⇒ the check FIRES.
+    // Report by default: detected and narrated, but not a failure.
+    {
+        auto const j = judgeOptimizedArtifactIdentity(
+            *capBaseline, *capSame, /*requireDiffers*/ false);
+        EXPECT_EQ(static_cast<int>(j.outcome),
+                  static_cast<int>(ArtifactIdentity::Identical));
+        EXPECT_FALSE(j.red) << "the DEFAULT must not red — see the ★ DECISION"
+                               " note: 77 corpus arms are identical today, 7 of"
+                               " them legitimately (their source is assembly)";
+        EXPECT_NE(j.note.find("BYTE-IDENTICAL"), std::string::npos)
+            << "the note must SAY what it found; it is the entire output of the"
+               " default path. Got: " << j.note;
+        // The fingerprint is in the note so an operator can grep one image out
+        // of a CI log — it is never what the judgement compared.
+        EXPECT_NE(j.note.find(artifactFingerprint(*capBaseline)),
+                  std::string::npos) << j.note;
+    }
+    // ... and the SAME input reds once the arm declares it must differ. This is
+    // the escalation lever the corpus can arm per arm.
+    {
+        auto const j = judgeOptimizedArtifactIdentity(
+            *capBaseline, *capSame, /*requireDiffers*/ true);
+        EXPECT_EQ(static_cast<int>(j.outcome),
+                  static_cast<int>(ArtifactIdentity::Identical));
+        EXPECT_TRUE(j.red)
+            << "an arm that declares mustDifferFromBaseline and then produces"
+               " the baseline's image byte-for-byte must FAIL";
+        EXPECT_NE(j.note.find("mustDifferFromBaseline"), std::string::npos)
+            << "the red must name the key that caused it. Got: " << j.note;
+    }
+
+    // FAIL-CLOSED — an UNCAPTURED image is neither "identical" nor "differed".
+    // Two empty strings compare equal, so without this clause a capture that
+    // silently returned nothing would report the strongest possible finding on
+    // zero evidence, and would red every opted-in arm at once.
+    for (auto const require : {false, true}) {
+        auto const j = judgeOptimizedArtifactIdentity(*capBaseline, "", require);
+        EXPECT_EQ(static_cast<int>(j.outcome),
+                  static_cast<int>(ArtifactIdentity::CaptureMissing));
+        EXPECT_TRUE(j.red) << "a missing capture must red whether or not the arm"
+                              " opted in (requireDiffers=" << require << ')';
+        EXPECT_NE(j.note.find("not captured"), std::string::npos) << j.note;
+    }
+    // And the reader itself reports absence rather than an empty success — the
+    // upstream half of the same fail-closed property.
+    EXPECT_FALSE(readArtifactBytes(dir / "no-such-artifact.img").has_value());
+
+    // ── THE ESCALATION LEVER MUST ACTUALLY BE WIRED TO THE MANIFEST ─────────
+    //
+    // ★ This clause exists because of the row this whole change closes. No
+    // corpus manifest sets `mustDifferFromBaseline` yet (`examples/**` is
+    // another lane's), so the key's PARSE is exercised by nothing — which makes
+    // it precisely the shape of defect being fixed here: a declared capability
+    // that is never witnessed. A parser that silently read every arm as `false`
+    // would leave the lever permanently unarmed, and the arm that opted in
+    // would go on passing while the manifest said it must not.
+    //
+    // AGNOSTIC BY CONSTRUCTION: the fixture manifest's language and target spec
+    // are obvious placeholders. `readManifest` stores both as opaque strings —
+    // nothing about a real language, arch or object format is needed to ask
+    // whether one boolean survived the parse, and naming one here would put
+    // target identity into a file that has none.
+    {
+        fs::path const mp = dir / "expected.json";
+        std::ofstream mf(mp);
+        mf << R"({
+  "language": "<fixture-language>",
+  "source": "<fixture-source>",
+  "exitCode": 0,
+  "targets": [{"spec": "<fixture-arch>:<fixture-format>",
+               "artifact": "<fixture-artifact>", "runOn": ["<fixture-host>"]}],
+  "optimizedPipelines": [
+    {"label": "opted-in",  "passes": ["ConstFold"], "mustDifferFromBaseline": true},
+    {"label": "opted-out", "passes": ["ConstFold"], "mustDifferFromBaseline": false},
+    {"label": "unstated",  "passes": ["ConstFold"]}
+  ]
+})";
+        mf.close();
+        ASSERT_TRUE(mf.good()) << "could not plant " << mp.generic_string();
+
+        auto const parsed = readManifest(mp);
+        ASSERT_EQ(parsed.optimizedPipelines.size(), 3u)
+            << "the fixture manifest did not parse — the assertions below would"
+               " then be reading default-constructed arms";
+        EXPECT_EQ(parsed.optimizedPipelines[0].label, "opted-in");
+        EXPECT_TRUE(parsed.optimizedPipelines[0].mustDifferFromBaseline)
+            << "an arm that declares mustDifferFromBaseline:true must reach the"
+               " comparison as opted-in, or the lever is decorative";
+        EXPECT_FALSE(parsed.optimizedPipelines[1].mustDifferFromBaseline);
+        // ABSENT must mean report-only. If the default ever flipped, the 77
+        // byte-identical corpus arms measured today would all red at once.
+        EXPECT_FALSE(parsed.optimizedPipelines[2].mustDifferFromBaseline)
+            << "an arm that does not mention the key must default to"
+               " REPORT-ONLY — see the ★ DECISION note";
+    }
+}
+
+// ── The primitive has exactly ONE definition site: the STRUCTURAL pin ──────
+//
+// ★★ THIS PIN REPLACES `StagingTwinsAreCharacterIdentical`, WHICH THE HOIST
+// DELETED. That lint read both runners off disk and compared the 14,765 bytes
+// between two twin markers, because `stageExampleTree` +
+// `stageExampleTreeSelfTest` were duplicated VERBATIM in the two files. It was
+// a good guard over a bad situation, and once the block moved to
+// `tests/test_support/stage_tree.hpp` it could never fail again — there was no
+// longer a second copy to differ from. A pin that cannot fail is worse than no
+// pin, because it reads as coverage; so it was removed in the same change that
+// removed its subject, and this one took its place.
+//
+// WHAT CAN STILL REGRESS, and is therefore what this pins: a copy coming BACK.
+// That is not hypothetical here — this repo has paid for exactly that drift
+// twice (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT,
+// D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS), both times by someone adding a
+// local copy rather than reaching for the shared header. The three clauses are
+// the three ways the single-definition property dies: the header stops
+// defining it, a runner starts defining it, or a runner stops including it.
+//
+// It is deliberately NOT mirrored into the sibling runner, and the distinction
+// is worth restating because the house rule cuts the other way: a CAPABILITY
+// must land in both harnesses, but this is not a capability — it is a statement
+// ABOUT the pair, true or false exactly once, and a second copy would itself
+// need a third pin to keep the two copies of the comparison honest.
+TEST(ExamplesCorpusLint, StagingPrimitiveLivesOnlyInTheSharedHeader) {
+    // ⚠ EVERY NEEDLE IS ASSEMBLED AT RUN TIME, and that is load-bearing rather
+    // than stylistic: this pin reads the very file it is compiled from. A whole
+    // literal here would be a match in `examples_runner.cpp` no matter what the
+    // rest of the file said — so the "no definition in a runner" clause would
+    // red on the pin itself, and worse, the "runner includes the header" clause
+    // would go GREEN off the pin's own text even if the real `#include` were
+    // deleted. That is the exact self-measuring failure the lint this replaces
+    // warned about in its own comment.
+    std::string const defPrimitive =
+        std::string{"std::string stageExample"} + "Tree(fs::path const&";
+    std::string const defSelfTest =
+        std::string{"std::string stageExample"} + "TreeSelfTest(fs::path const&";
+    std::string const includeLine =
+        std::string{"#include \"stage_"} + "tree.hpp\"";
+
+    char const* const kHeader = "tests/test_support/stage_tree.hpp";
+    char const* const kRunners[] = {
+        "tests/examples/examples_runner.cpp",
+        "integrated_tests/runner.cpp",
+    };
+    // Throws with `repoRootDiagnostic()` — which names all three resolution
+    // sources and the cwd — rather than failing as a puzzling absent file.
+    fs::path const root = ::dss::test::repoRoot();
+
+    auto const slurp = [&root](char const* rel) -> std::string {
+        fs::path const p = root / rel;
+        std::ifstream in(p, std::ios::binary);
+        EXPECT_TRUE(in.good())
+            << "cannot read " << p.generic_string()
+            << " — this pin must never pass because it failed to look";
+        std::string text{std::istreambuf_iterator<char>(in),
+                         std::istreambuf_iterator<char>{}};
+        // CR stripped so a checkout with `core.autocrlf=true` matches the same
+        // needles this LF tree does.
+        text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+        return text;
+    };
+
+    // CLAUSE 1 — the shared header really is the definition site. Checked FIRST
+    // and with a size floor, because clauses 2 and 3 are both satisfied by an
+    // EMPTY header: no runner defines the primitive if nobody does, and an
+    // `#include` of a blank file is still an `#include`. Without this the pin
+    // would report the strongest possible green over a deleted implementation.
+    std::string const header = slurp(kHeader);
+    EXPECT_GT(header.size(), 8000u)
+        << kHeader << " is implausibly small (" << header.size()
+        << " bytes) — the staging primitive and its self-test should both be"
+           " here";
+    EXPECT_NE(header.find(defPrimitive), std::string::npos)
+        << kHeader << " does not DEFINE the staging primitive, so the two"
+                      " runners have no shared implementation to agree on";
+    EXPECT_NE(header.find(defSelfTest), std::string::npos)
+        << kHeader << " does not DEFINE the staging self-test, so the two"
+                      " runners cannot be running the same assertions";
+
+    for (auto const* rel : kRunners) {
+        std::string const text = slurp(rel);
+        // CLAUSE 2 — no runner may carry its own copy. This is the one that
+        // catches the relapse: a second definition compiles perfectly (the
+        // local one simply wins unqualified lookup) and the suite stays green
+        // while the two harnesses silently stage different trees again.
+        EXPECT_EQ(text.find(defPrimitive), std::string::npos)
+            << rel << " DEFINES the staging primitive again. It belongs in "
+            << kHeader << " and nowhere else — a per-runner copy is how the"
+               " 14,765-byte duplication this pin replaced came about, and it"
+               " is invisible at the call site.";
+        EXPECT_EQ(text.find(defSelfTest), std::string::npos)
+            << rel << " DEFINES the staging self-test again; both harnesses"
+                      " must run the assertions from "
+            << kHeader << ", or one of them is pinning its own copy.";
+        // CLAUSE 3 — and it must actually reach the shared one. Without this a
+        // runner could satisfy clause 2 by dropping the capability entirely.
+        EXPECT_NE(text.find(includeLine), std::string::npos)
+            << rel << " does not include " << kHeader
+            << ", so whatever staging it performs is not the shared one.";
+    }
 }

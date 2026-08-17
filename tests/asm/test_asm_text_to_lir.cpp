@@ -1525,7 +1525,15 @@ TEST(AsmTextToLir, OneSpellingDenotesBothDirectAndIndirectBranch) {
         << messages(*indirect);
 }
 
-// ══ D-ASM-INDIRECT-BRANCH-SUCCESSOR-SET-UNDERIVABLE ═════════════════════════
+// ══ D-ASM-INDIRECT-BRANCH-SUCCESSOR-SET-UNSTATED ════════════════════════════
+//
+// ⚠ SPELLING CORRECTED 2026-08-14 (AP6). This banner read
+// `…-SUCCESSOR-SET-UNDERIVABLE`, which is not the registered id — the row is
+// `…-SUCCESSOR-SET-UNSTATED` (registry, CLOSED 2026-08-13), and its own text is
+// what the ★★★ note below paraphrases. The near-miss survived because the
+// anchor guard scanned `src/`, `examples/` and `real-examples/` and never
+// `tests/`; the same cycle that widened it to the test roots is the cycle this
+// citation stopped resolving to nothing. Nothing about the test changed.
 //
 // ★★★ THE REFUSAL IS KEYED ON DERIVABILITY, NOT ON THE OPCODE, AND THAT IS A
 // LIFETIME CLAIM RATHER THAN A WORDING ONE. `buildIndirectBr` asks

@@ -28,18 +28,29 @@
 // file, a URL, a Windows path), and both need exactly one thing from the OS:
 // "run this program, let me see its output, tell me how it exited."
 //
-// THE SURFACE IS DELIBERATELY THREE FUNCTIONS. An earlier draft proposed a
-// `SpawnHandle` lifecycle (`spawnStart` / `spawnWait` / `spawnKill` /
-// `spawnDrainStdout` / `spawnClose`) plus a `SpawnStdio` enum with
-// `CapturePipe` and `Discard` arms. An audit ruled that a SPECULATIVE BUILD:
-// no consumer this cycle needs a non-blocking handle, a kill, a timeout, or a
-// captured pipe, and an unused async API is an unused async API whether or
-// not it is written carefully. Add an arm the day a caller needs it, with its
-// own pin. What ships here is the intersection of what both real consumers
-// need and nothing else. `detail::interpretExecHandshake` further down is NOT
-// a fourth entry point walking back that decision — it is one DECISION lifted
-// out of `spawnAndWaitInherit`'s POSIX arm so that it can be pinned; see the
-// note above it for why that extraction had to happen.
+// THE SURFACE IS DELIBERATELY SMALL, AND EVERY ARM ARRIVED WITH A CALLER. An
+// earlier draft proposed a `SpawnHandle` lifecycle (`spawnStart` / `spawnWait`
+// / `spawnKill` / `spawnDrainStdout` / `spawnClose`) plus a `SpawnStdio` enum
+// with `CapturePipe` and `Discard` arms. An audit ruled that a SPECULATIVE
+// BUILD: no consumer then needed a non-blocking handle, a kill, a timeout, or a
+// captured stream, and an unused async API is an unused async API whether or
+// not it is written carefully. That ruling came with a RULE — add an arm the
+// day a caller needs it, with its own pin — and `spawnAndWaitRedirectStdout`
+// below is that day arriving for exactly ONE of the proposed arms: dependency
+// acquisition has to READ what `git rev-parse` printed, and the inheriting
+// spawn deliberately cannot tell it. The handle lifecycle, the kill, the
+// timeout and the `Discard` arm still have no caller and are still absent.
+//
+// ★ AND THE CAPTURE ARM IS A FILE, NOT THE `CapturePipe` THAT WAS PROPOSED.
+// That is the one place the new arm departs from the old sketch, and it departs
+// on evidence rather than taste — see the contract over
+// `spawnAndWaitRedirectStdout` for the measured deadlock a pipe would have
+// re-imported into a facility that has no timeout to escape it with.
+//
+// `detail::interpretExecHandshake` further down is NOT a third entry point
+// walking back that decision — it is one DECISION lifted out of the POSIX arm
+// shared by both spawns so that it can be pinned; see the note above it for why
+// that extraction had to happen.
 //
 // ★ NO SHELL, EVER. `argv[0]` is executed DIRECTLY — `CreateProcessW` on
 // Windows, `posix_spawn` on macOS, `fork` + `execv` elsewhere on POSIX (the
@@ -90,6 +101,19 @@
 //   Every one of those is a decision about how the TEST SUITE judges an
 //   emitted binary. None of it belongs in a compiler shipped to users, and
 //   folding it in would put a 5-second kill timer on the user's build script.
+//
+//   ★ BOTH FILES NOW CAPTURE A CHILD'S STDOUT, AND THEY CAPTURE IT DIFFERENTLY
+//   ON PURPOSE — which is the same split, not a new duplication. `run_binary`
+//   captures into an anonymous PIPE because it must also enforce a deadline and
+//   kill a child that overruns it, and a killed child must still yield whatever
+//   it managed to print; a pipe is the only thing that can be read out of a
+//   process you are about to terminate. Paying for that means paying for the
+//   concurrent drain thread its `D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS`
+//   note measures. This facility enforces no deadline and kills nothing, so it
+//   captures into a FILE and the whole class of buffer-limit deadlocks is
+//   absent rather than managed. Sharing the capture would mean importing the
+//   drain, and the drain exists only to survive the timeout this facility does
+//   not have.
 //
 // ✅ THE QUOTING IS NOW SHARED; THE SPAWN MACHINERY IS NOT — and that split is
 // the whole point. The ONE thing the two implementations SHOULD share is argv
@@ -226,6 +250,66 @@ struct SpawnResult {
 spawnAndWaitInherit(std::vector<std::string> const& argv,
                     std::filesystem::path const&    cwd = {});
 
+// The same spawn, with the child's STDOUT going to `stdoutFile` instead of the
+// compiler's own. STDERR AND STDIN STILL INHERIT — only stdout moves.
+//
+// Everything `spawnAndWaitInherit` documents above holds here unchanged: no
+// shell, argv byte-identical, argv[0] resolved against the CALLER's directory,
+// `cwd` empty = inherit, no timeout, the same `spawned` / `exitCode`
+// discrimination and the same host-dependent 8-bit POSIX exit range. The two
+// entry points ARE one implementation with one parameter; what differs is
+// written here and nowhere else.
+//
+// ★ WHY IT EXISTS. `spawnAndWaitInherit` has no capture arm by design, and
+// dependency acquisition needs one narrow thing it cannot give: the ANSWER a
+// tool printed. `git rev-parse HEAD` writes a commit id to stdout and says
+// nothing through its exit code that the caller could use instead. Inheriting
+// would put that id on the user's terminal, where the compiler cannot read it.
+//
+// ★★ A FILE, NEVER AN ANONYMOUS PIPE — THE ONE DECISION THIS ARM IS ABOUT.
+// A pipe has a fixed kernel buffer (64 KiB on Linux, 4 KiB by default for a
+// Windows anonymous pipe). A parent that waits for the child and drains
+// AFTERWARDS deadlocks the moment the child writes past that buffer: the child
+// blocks in `write`, the parent blocks in the wait, and neither moves. That is
+// not a hypothesis — `tests/test_support/run_binary.hpp` shipped exactly that
+// shape and MEASURED it (D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS, ~7 KB
+// of JSON, two spawns consuming 240 s of a 240.7 s run before the harness
+// killed a child that was working correctly). Its fix was a drain thread
+// running CONCURRENTLY with the wait, which is correct THERE and would be a
+// poor trade here: this facility has NO TIMEOUT (see the two-implementations
+// note above), so a drain that ever stopped early would hang the compiler with
+// nothing to break the deadlock. A file handle has no buffer limit, needs no
+// drain and needs no second thread, so the entire failure class is ABSENT
+// rather than managed. The cost — the output lands on disk instead of in
+// memory — is paid by a caller that wanted a file's worth of output anyway.
+//
+// THE FILE IS TRUNCATED, NOT APPENDED (`CREATE_ALWAYS` / `O_TRUNC`), and it is
+// created against the CALLER's directory even when `cwd` sends the child
+// somewhere else — the same rule argv[0] resolution follows, and the reason a
+// caller can hand in a path it computed itself and still find it afterwards.
+//
+// READ IT AFTER THE CALL RETURNS. The child is the only writer; every handle
+// this function opened is closed before it returns, on every path. There is no
+// concurrent-read hazard because there is no concurrent read: the caller is
+// blocked in here for as long as the child is alive.
+//
+// ★ AND THERE IS NO SILENT FALLBACK TO INHERITING. If the file cannot be
+// created, if this process's own stdin/stderr cannot be handed on, or if the
+// child cannot install the redirection, the call FAILS with `spawned == false`
+// and a diagnostic naming `stdoutFile` — it never runs the program with the
+// compiler's stdout attached. That degradation would be the worst available
+// outcome: the caller would get a clean exit code and an empty file, i.e. a
+// wrong ANSWER rather than an error, and the tool's real output would be
+// scattered across the user's terminal.
+//
+// An EMPTY `stdoutFile` is a caller bug and is reported as one rather than
+// quietly meaning "inherit" — that sentinel is internal, and a caller that
+// reached this entry point wanted output it could read.
+[[nodiscard]] DSS_EXPORT SpawnResult
+spawnAndWaitRedirectStdout(std::vector<std::string> const& argv,
+                           std::filesystem::path const&    cwd,
+                           std::filesystem::path const&    stdoutFile);
+
 // ── The exec-status handshake, decided as a value (POSIX only) ─────────────
 //
 // ★ WHY THIS IS LIFTED OUT AT ALL, WHICH IS THE WHOLE POINT. On POSIX,
@@ -246,8 +330,8 @@ spawnAndWaitInherit(std::vector<std::string> const& argv,
 //
 // So the decision is a PURE function of what the parent observed: no
 // descriptor, no syscall, no global state, no allocation beyond the message it
-// returns. It is `detail` and not surface — the "three functions" note at the
-// top of this file still describes what a consumer calls.
+// returns. It is `detail` and not surface — the "surface is deliberately small"
+// note at the top of this file still describes what a consumer calls.
 //
 // ★ AND IT IS DECLARED ON EVERY POSIX HOST, INCLUDING ONES WITH NO CALLER.
 // macOS spawns through `posix_spawn`, which reports exec failure through its
@@ -266,7 +350,7 @@ namespace detail {
 // kernel then delivers it whole or not at all, rather than in pieces that could
 // tear across two reads.
 struct ChildFailure {
-    char stage;  // 'C' = chdir, 'X' = execv
+    char stage;  // 'C' = chdir, 'D' = dup2 of the stdout redirect, 'X' = execv
     int  error;  // errno as the CHILD saw it
 };
 
@@ -275,13 +359,39 @@ struct HandshakeVerdict {
     std::string diagnostic;  // empty ONLY on the clean-exec arm
 };
 
+// Everything a verdict may need to NAME, in one parameter.
+//
+// It is a struct rather than four more positional arguments because the list
+// grew past what a call site can be read for: `(bytes, expected, errno, record,
+// "…", "…", "…", "…")` invites a swap between two same-typed strings that no
+// compiler can catch and that every message would then report backwards.
+//
+// `entryPoint` is carried rather than hardcoded because BOTH public spawns take
+// this decision, and a diagnostic that named the wrong one would send a reader
+// to a function that was never called. `stdoutPath` is empty for
+// `spawnAndWaitInherit`, which has no redirection to fail at — and the 'D' arm
+// is unreachable for it, because its child never dups anything.
+struct HandshakeContext {
+    std::string entryPoint;  // the public function the caller actually invoked
+    std::string exePath;     // the RESOLVED image argv[0] named
+    std::string cwdPath;     // empty when the child inherited our directory
+    std::string stdoutPath;  // empty when stdout was not redirected
+};
+
 // What `bytesRead` bytes off the exec-status pipe (and a `readErrno`, zero when
 // `read` never failed) mean:
 //
 //   bytesRead == 0, no error       SPAWNED. CLOEXEC closed the write end, so
 //                                  the exec took and there was nothing to say.
-//   bytesRead == expectedBytes     NOT spawned. `failure->stage` says whether
-//                                  the child died at `chdir` or at `execv`.
+//   bytesRead == expectedBytes     NOT spawned. `failure->stage` says which of
+//                                  the child's three steps it died at — `chdir`
+//                                  ('C'), the stdout redirect's `dup2` ('D'),
+//                                  or `execv` ('X'). A byte that is none of
+//                                  those is reported AS an unrecognised stage
+//                                  rather than folded into the nearest arm: the
+//                                  record was whole, so "the handshake broke" is
+//                                  false, and picking a stage would be a guess
+//                                  printed as if the child had said it.
 //   anything else, and any
 //   non-EINTR read error           NOT spawned — and the diagnostic says the
 //                                  HANDSHAKE broke, not that exec failed. That
@@ -296,7 +406,7 @@ struct HandshakeVerdict {
 [[nodiscard]] DSS_EXPORT HandshakeVerdict
 interpretExecHandshake(std::size_t bytesRead, std::size_t expectedBytes,
                        int readErrno, ChildFailure const* failure,
-                       std::string const& exePath, std::string const& cwdPath);
+                       HandshakeContext const& context);
 
 } // namespace detail
 

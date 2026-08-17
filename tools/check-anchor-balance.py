@@ -70,6 +70,20 @@ REG_REL = ".plans/_deferred-anchor-registry.md"
 
 # The ONLY marker that means closed. Everything else in a status cell is open.
 CLOSED_MARK = "✅"  # white heavy check mark
+# A row that DISCLOSES debt which already existed rather than CREATING new debt.
+# Operator ruling 2026-08-14: "the balance gate forbids a cycle that OPENS NEW debt;
+# it does not forbid a cycle that DISCLOSES PRE-EXISTING debt. Those are different
+# quantities and the gate should count them separately." Before this, the gate
+# counted them as one -- so a cycle that honestly wrote up a defect it merely FOUND
+# was punished exactly like one that shipped new deferrals, and the cheapest way to
+# pass was to not write the row. That is the precise dishonesty this gate exists to
+# prevent, produced BY the gate. A disclosed row is still OPEN work and still counts
+# in every total; it is exempt only from the net-increase FAILURE.
+# star IT IS NOT A LOOPHOLE, AND THE ASYMMETRY IS THe POINT: the marker asserts the
+# defect PRE-DATES this cycle, which is checkable -- the reviewer can look for it in
+# the base ref. Marking a defect you introduced is a false statement about history,
+# not a formatting choice.
+DISCLOSED_MARK = "🔵"  # large blue circle
 
 # A markdown table separator row: | --- | :--: | ... |
 SEP_ROW = re.compile(r"^\s*\|[\s:|-]+\|\s*$")
@@ -236,6 +250,15 @@ def is_closed(cell):
     turning an open row closed.
     """
     return cell.lstrip().lstrip("*_ ").startswith(CLOSED_MARK)
+
+
+def is_disclosed(cell):
+    """A status cell DISCLOSES pre-existing debt iff it opens with the disclosed mark.
+
+    Same leading-position test as is_closed, and for the same reason: a mark anywhere
+    in the prose would let a row that merely MENTIONS disclosure claim the exemption.
+    """
+    return cell.lstrip().lstrip("*_ ").startswith(DISCLOSED_MARK)
 
 
 def row_name(cell1):
@@ -689,7 +712,10 @@ def main():
           % ("", len(a_reg), len(a_plan), len(after)))
     print("anchor-balance: GATED count %d -> %d   (net %+d)"
           % (len(gate_before), len(gate_after), len(gate_after) - len(gate_before)))
-    print("anchor-balance: closed %d, opened %d" % (len(closed), len(opened)))
+    disclosed = sorted(n for n in opened if is_disclosed(after[n][1]))
+    created = [n for n in opened if n not in set(disclosed)]
+    print("anchor-balance: closed %d, opened %d  (created %d, disclosed-pre-existing %d)"
+          % (len(closed), len(opened), len(created), len(disclosed)))
     for n in closed:
         print("  - %s" % n)
     for n in opened:
@@ -741,10 +767,14 @@ def main():
               "defect this gate exists to stop.")
         return 1
 
-    if len(gate_after) > len(gate_before):
+    net_new = len(gate_after) - len(gate_before) - len(disclosed)
+    if disclosed:
+        print("anchor-balance: %d disclosed-pre-existing row(s) are EXEMPT from the net "
+              "increase (they record debt that already existed)." % len(disclosed))
+    if net_new > 0:
         print()
-        print("anchor-balance: FAIL - this cycle leaves %d more row(s) OPEN than it found."
-              % (len(gate_after) - len(gate_before)))
+        print("anchor-balance: FAIL - this cycle CREATED %d more OPEN row(s) than it closed."
+              % net_new)
         print("  Close what you opened, or take it to the operator as a decision (dss-cycle "
               "section B). Do NOT widen this gate to fit the cycle.")
         return 1

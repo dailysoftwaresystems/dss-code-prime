@@ -31,7 +31,32 @@ that is a delegation you skipped.
 **PARALLELISM:** when a step splits into disjoint file sets — engine `.cpp` vs `*.json`
 config vs `examples/` corpus vs `tests/` — launch those agents IN ONE MESSAGE so they run
 concurrently, and tell each agent explicitly which paths it owns and which it must not
-touch. Overlapping writes are the only real hazard; disjointness removes it.
+touch.
+
+⚠⚠ **DISJOINTNESS IS NOT ENOUGH, AND THIS LINE USED TO CLAIM IT WAS.** It said *"overlapping
+writes are the only real hazard; disjointness removes it."* ✔MEASURED 2026-08-15 and that is
+false: a lane writing **only to files it owns** still breaks every sibling, because the shared
+tree is a shared *build input*. Three independent lanes hit it in one cycle — one could not
+reach `rc=0` on the shared `build/` for reasons entirely in another lane's files; one had its
+own private `build-warn/` reddened by 23 errors in files it did not own; and one had its
+scratchpad script overwritten mid-run by a sibling. **Ownership partitions WRITES; it does not
+partition the COMPILER, the build dir, or the scratchpad.**
+
+★★ **A BYTE-CHANGING MEASUREMENT GOES IN A `git worktree` — PASTE `worktrees.md` §H.0 INTO THE
+BRIEF, DO NOT CITE IT.** §H.0 already names *"red-on-disable mutants"* explicitly and predates
+the incidents above, so the gap is not knowledge — it is that a brief which says *"prove
+red-on-disable"* and never says *where* leaves a lane to mutate shipped source in the shared
+tree, which is the obvious reading. ✔The cost of getting this right is trivial and measured: a
+sibling lane the same day hit the wall, moved to a throwaway worktree, verified, and
+`git worktree prune`d.
+- ⚠ **The orchestrator's half: DO NOT RUN TREE-READING GATES WHILE LANES ARE LIVE.** Red-on-disable
+  *requires* knowingly-wrong bytes in shipped source, so every correct application of §A.5 opens a
+  window in which every measurement of the worktree is false — **the more rigorous the lane, the
+  wider the window.** ✔The orchestrator was fooled by exactly this: a gate run mid-window reported
+  a clean verdict and a next-free diagnostic ordinal ~200 slots off, from bytes existing in no real
+  tree. Nothing was wrong with the instrument.
+- Give each lane a **lane-private scratch subdirectory**; the session scratchpad is shared.
+- See [[D-GATE-H0-WORKTREE-RULE-IS-WRITTEN-AND-UNENFORCED]] for the full measurement.
 
 **★ DO NOT DELEGATE — the orchestrator keeps these:**
 - **Step 6, the gate** (builds, ctest, the 3-leg run, the sqlite re-probe). A delegated

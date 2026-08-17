@@ -1555,6 +1555,13 @@ enum class DiagnosticCode : std::uint16_t {
     //   this is "the chosen FORMAT doesn't produce this profile" (fix the
     //   target/format, or ship the backend that emits it). Remediation-
     //   distinct → distinct code.
+    //   ⚠ NARROWED 2026-08-15 (closes
+    //   D-AP3-UNSERVED-PROFILE-MISREPORTS-AS-A-FORMAT-MISMATCH): this code now
+    //   means a GENUINE mismatch — the profile IS served by at least one
+    //   shipped object format, just not by this one — and its message NAMES
+    //   the formats that do serve it, which is the actionable half that was
+    //   missing. The "no format serves it anywhere" case it used to absorb
+    //   moved to `D_ArtifactProfileNoServingFormat` (0xD028).
     D_ArtifactProfileFormatMismatch = 0xD011,
     // c105 (D-PP-USER-DEFINE): `--define` was passed but the language declares
     // no preprocess block — the macros could never be consumed. Silent
@@ -1666,15 +1673,28 @@ enum class DiagnosticCode : std::uint16_t {
     //   decision, and the spawn layer's status prose discriminates.)
     D_ScriptExitedNonZero        = 0xD018,
 
-    // ── Project dependencies: `dependsOn` (0xD019..0xD020) ──
+    // ── Project dependencies: `dependsOn` (0xD019..0xD020, CONTINUED at
+    // 0xD022..0xD026 and 0xD029) ──
     // A `dependsOn` entry names either a RELATIVE PATH to another project
     // directory or a GIT URL cloned into `.dss-deps/<name>`. Resolution is
     // recursive (a dependency may itself declare `dependsOn`), so the failure
-    // surface splits into three groups, each with its own remediation and
+    // surface splits into four groups, each with its own remediation and
     // therefore its own codes:
     //   * manifest/graph structure — 0xD019, 0xD01A;
     //   * consumability of a RESOLVED dependency — 0xD01B, 0xD01C;
-    //   * git acquisition — 0xD01D..0xD020.
+    //   * git acquisition — 0xD01D..0xD020, plus the derived-name reject
+    //     0xD024;
+    //   * building a resolved dependency for the CONSUMER's targets —
+    //     0xD022, 0xD023, plus the output-name collision 0xD025 and the
+    //     build-FAILED outcome 0xD029. Note the split inside this group: the
+    //     first two are outcomes of the format DERIVATION (no candidate / two
+    //     candidates, so nothing is compiled), while 0xD029 is what happens
+    //     AFTER a successful derivation — remediation-distinct, and one code
+    //     used to carry both;
+    //   * resolver limits — 0xD026.
+    // The run is deliberately NOT contiguous: 0xD021 is an unrelated
+    // reporter-policy code that landed between the two halves. See the
+    // allocation note at 0xD022 for why the gap is kept rather than closed.
     // Every one of these is a DRIVER-band (`D_`) code because the decision is
     // made at project-load time, before any grammar/CU exists to hang a source
     // span on — the same placement argument that put `D_ArtifactProfile-
@@ -1801,20 +1821,32 @@ enum class DiagnosticCode : std::uint16_t {
     //   purpose: an anchor with a live consumer is not free to be closed
     //   either way.
     D_DependencyGitFetchFallback = 0xD01F,
-    // D_DependencyGitNameCollision: two DISTINCT git URLs derive the same
-    //   `.dss-deps/<name>` directory (e.g. `https://host-a/x.git` and
-    //   `https://host-b/x.git`, or the ssh and https spellings of two genuinely
-    //   different repos). Whichever one is acquired second would either clobber
-    //   the first or be silently skipped in favour of it — and the build would
-    //   then compile against a dependency it did not ask for, with no
-    //   indication anything substituted. Fail loud. Note the ordering
-    //   obligation this implies at the emit site: the collision must be
-    //   detected on the DERIVED NAMES before acquisition, not discovered when a
-    //   clone lands on a non-empty directory, or the first repo's working tree
-    //   is already damaged by the time we complain. The SAME url appearing
-    //   twice is NOT a collision — that is the diamond case, and it dedups
-    //   silently, exactly as a repeated `path` dependency does (see
-    //   `D_DependencyCycle` 0xD01A on diamonds vs cycles).
+    // D_DependencyGitNameCollision: two `dependsOn` git entries want ONE
+    //   `.dss-deps/<name>` directory to hold two different things. TWO shapes
+    //   fire it, and they are one code because the hazard, the detection point
+    //   and the fix are identical in both:
+    //     (a) two DISTINCT git URLs deriving the same name (e.g.
+    //         `https://host-a/x.git` and `https://host-b/x.git`, or the ssh and
+    //         https spellings of two genuinely different repos);
+    //     (b) the SAME url declared twice with DIFFERENT `ref`s — the derived
+    //         name is trivially identical and the two entries disagree about
+    //         which commit that one checkout should hold.
+    //   In both, whichever entry is acquired second would either clobber the
+    //   first or be silently skipped in favour of it — and the build would then
+    //   compile against a dependency it did not ask for, with no indication
+    //   anything substituted. Fail loud. Note the ordering obligation this
+    //   implies at the emit site: the collision must be detected on the DERIVED
+    //   NAMES before acquisition, not discovered when a clone lands on a
+    //   non-empty directory, or the first repo's working tree is already
+    //   damaged by the time we complain. Shape (b) makes that ordering
+    //   MANDATORY rather than merely preferable: post-acquisition detection
+    //   cannot see it at all, because the second entry's checkout target
+    //   already exists and looks like a cache hit.
+    //   The same url with the SAME ref (or both refs absent) is NOT a collision
+    //   — that is the diamond case, and it dedups silently, exactly as a
+    //   repeated `path` dependency does (see `D_DependencyCycle` 0xD01A on
+    //   diamonds vs cycles). The discriminator is therefore the full
+    //   `(url, ref)` pair, not the url alone.
     D_DependencyGitNameCollision = 0xD020,
     // D_SuppressRequestIgnored: a `--suppress=<code>` request naming a
     //   WELL-FORMED, REAL diagnostic code that is a member of
@@ -1867,6 +1899,482 @@ enum class DiagnosticCode : std::uint16_t {
     //   without the compiler deciding for them (the clang `-Werror,
     //   -Wunknown-warning-option` posture, measured above).
     D_SuppressRequestIgnored     = 0xD021,
+
+    // ── Project dependencies, continued: consumer-driven format derivation
+    // and the `.dss-deps/<name>` derivation (0xD022..0xD024) ──
+    // These three continue the `dependsOn` surface opened at 0xD019 and are
+    // documented as part of it (see the group list in that band's header —
+    // which is where the later additions 0xD025 / 0xD026 / 0xD029 are placed
+    // too; this sub-header covers only the run it names).
+    // They are NOT contiguous with it because 0xD021 landed in between, and
+    // this enum is APPEND-ONLY: the number is the operator-visible identity
+    // (`error[D0020]`) and already appears in docs and in `expected.json`
+    // fixtures, so renumbering an allocated code to tidy the run would rewrite
+    // a published name. A gap inside a topic's range is cheap; a moved number
+    // is not.
+    //
+    // D_DependencyTargetFormatUnresolvable: for one of the CONSUMER's target
+    //   specs, NO shipped object format can produce the DEPENDENCY's artifact.
+    //   A dependency is built for the platforms the CONSUMER declares, and its
+    //   object format is DERIVED, never read off the dependency's own manifest:
+    //   the format is the unique F satisfying all three of
+    //     (1) `F.format.kind == consumerFormat.format.kind` — `elf`/`pe`/
+    //         `macho`, a DECLARED field, never a format-NAME parse;
+    //     (2) `dependency.artifactProfile ∈ F.artifactProfiles()`;
+    //     (3) `crossValidateTargetFormat(target, F)` passes — the EXISTING
+    //         validator (`program/cross_validate_target_format.hpp:52`:
+    //         machine identity + ABI model), not a parallel one minted here.
+    //   This code is the ZERO-candidate outcome; 0xD023 is the two-or-more
+    //   outcome. The prose must name all three coordinates the search ran over
+    //   — the consumer's target spec, the DEPENDENCY's `artifactProfile`, and
+    //   the format KIND — and must say plainly that the dependency cannot be
+    //   built for this target. Those three ARE the search key, so naming them
+    //   is what turns "no format" into a claim the reader can check against the
+    //   config directory in one pass; without them the message is a dead end.
+    //
+    //   ★ WHY THE ALTERNATIVE WAS REJECTED — recorded because it is the
+    //   obvious design and a later reader will re-propose it. The earlier rule
+    //   required the DEPENDENCY's own `targets[]` to be a SUPERSET of the
+    //   consumer's. ✔MEASURED, that is not merely strict, it is UNSATISFIABLE:
+    //   object-format served-profile sets are pairwise DISJOINT (`cli` 7
+    //   formats, `lib` 5, `staticlib` 5, and 7 serve none, over all 24
+    //   `src/dss-config/object-formats/*.format.json`), and
+    //   `program.cpp:2053-2064` enforces `profile ∈ format.artifactProfiles()`
+    //   on EVERY `targets[]` entry. So a `cli` consumer's specs are always
+    //   `…-exec` / `…-pie` and a `staticlib` dependency's are always
+    //   `…-staticlib`: the two lists can never share a string, and the superset
+    //   rule would have rejected EVERY legitimate ArtifactLink edge — a dead
+    //   arm whose own test would have gone green on the reject.
+    //
+    //   ★ AND IT WOULD BE WRONG EVEN IF IT WERE SATISFIABLE, which is the part
+    //   that generalizes. `targets[]` states the platforms a project builds FOR
+    //   ITSELF; "which platforms this code can support" is a DIFFERENT
+    //   statement. Reading a build list as a CAPABILITY CLAIM makes a perfectly
+    //   portable dependency that merely has not listed arm64 reject an arm64
+    //   consumer: the tool refuses work that WOULD HAVE SUCCEEDED, with a
+    //   message that reads as a capability verdict while reporting a
+    //   bookkeeping gap. That is a false negative carrying a confidently
+    //   misleading diagnostic — strictly worse than the late failure it would
+    //   replace, because a dependency that genuinely cannot serve a platform
+    //   still fails, as a compile error INSIDE ITSELF pointing at the actual
+    //   unsupported construct. Neither option is silent, so fail-loud does not
+    //   decide between them; the diagnostic's TRUTHFULNESS does.
+    //
+    //   Remediation-distinct from both profile/format rejects it sits beside.
+    //   `D_ArtifactProfileFormatMismatch` (0xD011) is "the format YOU named
+    //   does not serve the profile YOU declared" — a pair the user wrote, fixed
+    //   by editing that manifest line. This code is about a format the user
+    //   never named and cannot see, because the driver derived it and came back
+    //   empty: the fix is to ship (or declare) the missing backend for that
+    //   kind, or to drop the unservable target from the CONSUMER. Distinct from
+    //   `D_DependencyArtifactProfileUnsupported` (0xD01B) on the same axis:
+    //   there the profile is not consumable AT ALL and no choice of target
+    //   changes that; here the profile is fine and only this one platform has
+    //   no producer.
+    //
+    //   ★ EMIT-SITE OBLIGATION, because clause (3) is a REPORTER and not a
+    //   predicate. `crossValidateTargetFormat` emits
+    //   `D_TargetMachineCodeMismatch` / `D_TargetAbiModelMismatch`
+    //   (`cross_validate_target_format.cpp:63,126`) on the failing path. Used
+    //   as a candidate FILTER it is deliberately run against candidates
+    //   EXPECTED to fail — every other arch's format of the same kind — so the
+    //   probe MUST run on a throwaway reporter (the `DiagnosticReporter
+    //   scratch{…}` pattern already in use at `program.cpp:1752`), with only
+    //   the final verdict reported. Otherwise an ordinary single-arch build
+    //   emits a mismatch line per rejected candidate and this code arrives
+    //   buried in noise it manufactured itself.
+    //
+    //   ⚠ THIS CODE IS THE ZERO-CANDIDATE DERIVATION AND NOTHING ELSE. It ALSO
+    //   used to be emitted when a dependency's own build returned non-zero —
+    //   the state in which the derivation SUCCEEDED — which put a manifest
+    //   problem and a source-code problem behind one ordinal. That fact now has
+    //   its own code, `D_DependencyBuildFailed` (0xD029); do not route a build
+    //   outcome back through here.
+    D_DependencyTargetFormatUnresolvable = 0xD022,
+    // D_DependencyTargetFormatAmbiguous: the SAME derivation as 0xD022 returned
+    //   TWO OR MORE candidate formats for one consumer target. The uniqueness
+    //   in "the unique F" is load-bearing rather than incidental phrasing: with
+    //   two producers the pick decides the dependency's CONTAINER (a shared
+    //   library versus a position-independent image, say) and therefore what
+    //   the consumer's link actually absorbs. Fails CLOSED, naming the consumer
+    //   target AND EVERY candidate format — the remediation is to look at
+    //   exactly those formats and decide which of them should have declined the
+    //   profile, which is impossible from a message that names only the count.
+    //   Never a silent first-match, and never a "prefer the one that sorts
+    //   first" tiebreak: a tiebreak is a policy nobody declared, invisible in
+    //   the config, and it makes the emitted artifact depend on
+    //   directory-iteration order.
+    //
+    //   ★ NO SHIPPED CONFIG CAN PRODUCE THIS TODAY. Recorded here rather than
+    //   left for a reader to discover and mistake for dead code. ✔MEASURED over
+    //   all 24 shipped formats × the 2 shipped targets: the reachable
+    //   (kind, target) pairs are elf×{x86_64, arm64}, macho×{x86_64, arm64} and
+    //   pe×{x86_64}, and for each of them paired with each of the two
+    //   ArtifactLink profiles (`lib`, `staticlib` — `module` is
+    //   `DependencyComposition::SourceMerge` and builds no artifact, so it
+    //   never derives a format) EXACTLY ONE format qualifies: 10 triples, 10
+    //   unique answers. So this is a FAIL-CLOSED GUARD against a config that
+    //   grows a second candidate, not a currently reachable state — and that is
+    //   precisely why it is allocated BEFORE it can fire. The alternative is a
+    //   derivation with no ≥2 branch, i.e. one that silently takes
+    //   `candidates[0]` on the day someone adds a format; the guard has to
+    //   exist first or the defect it prevents ships in the same commit that
+    //   creates the possibility.
+    //
+    //   ✔MEASURED, and load-bearing for the paragraph above: uniqueness is NOT
+    //   a property of the shipped format set on its own. `cli` has TWO elf
+    //   candidates per arch — `…-exec` and `…-pie`, both declaring
+    //   `artifactProfiles: ["cli"]` and the same `machine` — so the triple
+    //   (elf, cli, x86_64) genuinely has two answers. It never reaches this
+    //   derivation only because `cli` is `DependencyComposition::NotConsumable`
+    //   (`artifact_profile.hpp:98`) and 0xD01B rejects it first. The ORDER of
+    //   those two gates is therefore a correctness dependency, not a
+    //   convenience: run the derivation before the consumability gate and this
+    //   code becomes reachable, with a real ambiguity, for the commonest
+    //   profile in the repo. Whoever reorders them owns that.
+    D_DependencyTargetFormatAmbiguous = 0xD023,
+    // D_DependencyDerivedNameInvalid: a git dependency's DERIVED cache
+    //   directory name is NOT USABLE as a directory under `.dss-deps/`. The
+    //   derivation is itself part of the spec, not an implementation detail,
+    //   because 0xD020 makes COLLISIONS BETWEEN DERIVED NAMES a diagnostic and
+    //   a diagnostic about a derived value is meaningless unless the derivation
+    //   is pinned: take the LAST NON-EMPTY path segment of the URL, strip ONE
+    //   trailing `.git`, compare CASE-SENSITIVELY. `…/org/bar.git` and
+    //   `…/org/bar/` both give `bar`; `…/org/Bar.git` gives `Bar`, which is a
+    //   DIFFERENT name and not a collision.
+    //
+    //   ★ THREE SHAPES REACH THIS CODE, NOT ONE — the note said "contains an
+    //   illegal character" while the shipped site routes all three states of
+    //   `DerivedNameStatus` (`program/dependency_cache.hpp`) here, and a
+    //   docblock narrower than its own emit site is the drift plan v2 §3 item 3
+    //   called out for 0xD020. They are ONE code because they are one fact —
+    //   "the derived name cannot be used" — with one remediation, re-spelling
+    //   the URL:
+    //     (a) NO SEGMENT — the URL has no non-empty last segment at all (`""`,
+    //         `"///"`, `".git"`), so nothing is derived;
+    //     (b) ILLEGAL CHARACTER — a character outside `[A-Za-z0-9._-]`;
+    //     (c) RESERVED NAME — every character is legal but the name cannot be a
+    //         directory under `.dss-deps/`: `.` and `..` resolve ON TOP OF or
+    //         OUTSIDE the cache root, and `dss-lock.json` is the lockfile's own
+    //         path. All three are reachable from a real URL
+    //         (`https://host/..`, `https://host/dss-lock.json`), and none of
+    //         them is caught by the character check — which is exactly why
+    //         (c) is a separate state rather than an assumed impossibility.
+    //
+    //   ★ WHY IT FAILS LOUD INSTEAD OF TRANSLITERATING. Sanitising the
+    //   offending characters — dropping them, or folding them to `_` — is the
+    //   obvious alternative and it is the wrong one: it manufactures a SECOND,
+    //   INVISIBLE collision source on top of the one 0xD020 exists to catch.
+    //   Two URLs whose last segments differ only in characters the sanitiser
+    //   erases would land in the same `.dss-deps/<name>`, and unlike 0xD020's
+    //   case the two names the user can READ are genuinely different — so the
+    //   resulting collision report would look like a compiler bug rather than a
+    //   manifest problem. The mapping is also silent and lossy in a path the
+    //   user has to type when they go looking at the checkout. A rejected name
+    //   costs one manifest edit; a transliterated one is a wrong-dependency
+    //   build.
+    //
+    //   The character set is deliberately a CONSERVATIVE INTERSECTION rather
+    //   than a host capability test. Windows reserves `<>:"/\|?*` and POSIX
+    //   only `/` and NUL, and a case-insensitive filesystem folds names this
+    //   case-SENSITIVE derivation treats as distinct — so deriving legality
+    //   from the HOST would make one manifest resolve on one machine and fail
+    //   on another. That is the same host-dependence the argv-vector script
+    //   design refuses at 0xD017, for the same reason. The diagnostic must show
+    //   the URL and the DERIVED NAME — plus the offending character on shape
+    //   (b), which is the only shape that has one: the whole difficulty is that
+    //   the name appears NOWHERE in the manifest, so a message quoting only the
+    //   URL leaves the reader to run the derivation in their head.
+    //
+    //   Remediation is to repoint or re-spell the URL (or mirror the repo under
+    //   a plain last segment) — NOT to name the directory explicitly. The
+    //   `dependsOn` entry is a closed three-key set (`path` / `git` / `ref`)
+    //   whose unknown members fail loud, so there is no escape hatch, and the
+    //   message must not imply one. If that proves too strict in practice the
+    //   fix is to allocate the key deliberately, not to loosen this check.
+    //
+    //   Remediation-distinct from `D_DependencyGitNameCollision` (0xD020):
+    //   that is two acceptable names that are the SAME, fixed by making the two
+    //   entries distinguishable; this is a SINGLE name that is not usable at
+    //   all, and it fires with only one git entry in the manifest. Distinct
+    //   from `C_MissingField` / `C_MalformedJson` too: the manifest is
+    //   well-formed and the field is present — it is the value DERIVED from it
+    //   that is unusable, so no JSON-shape message would point at the right
+    //   thing.
+    D_DependencyDerivedNameInvalid = 0xD024,
+    // D_DependencyOutputNameCollision: two DIFFERENT dependencies derive the
+    //   same `deps/<name>` output directory, so their artifacts would be
+    //   written on top of each other.
+    //
+    //   ★ WHY IT EXISTS AT ALL, since U-9 calls the layout "collision-free by
+    //   construction". That is established only for GIT dependencies: U-5
+    //   derives the cache name from the URL and 0xD020 rejects a collision
+    //   between two distinct `(url, ref)` pairs BEFORE anything is fetched. For
+    //   a `path` dependency NOTHING derives a name and NOTHING detects a
+    //   collision — `../a/util` and `../b/util` both want `deps/util`, the
+    //   second build silently overwrites the first's artifact, and the consumer
+    //   links a library it never asked for with no indication that anything was
+    //   substituted. That is precisely 0xD020's own hazard with the detection
+    //   removed, so it gets the same answer: fail loud, before the second build
+    //   can clobber the first.
+    //
+    //   THE DERIVATION IS UNIFORM ACROSS BOTH ENTRY KINDS and is part of the
+    //   spec for the same reason U-5's is: the name of the DEPENDENCY'S OWN
+    //   CANONICAL MANIFEST DIRECTORY. A git dependency's directory IS
+    //   `.dss-deps/<name>`, so this reproduces U-5's name exactly — the two
+    //   derivations agree by CONSTRUCTION rather than by coincidence, and git
+    //   names keep 0xD020's `(url, ref)` check on top of this one.
+    //
+    //   The message must name BOTH dependencies and BOTH directories: the
+    //   colliding name appears nowhere in the manifest, so a message quoting
+    //   only one side leaves the reader unable to tell which two entries are
+    //   in conflict. Remediation is to rename one of the two dependency
+    //   DIRECTORIES — there is no key for naming the output directory
+    //   explicitly (the `dependsOn` entry is a closed three-key set whose
+    //   unknown members fail loud), and the message must not imply one.
+    //
+    //   The DEGENERATE case shares this code rather than taking a second:
+    //   a directory whose own name is empty (a filesystem root) or `.` / `..`
+    //   yields no usable output name at all. It is the same fact — "the name
+    //   this dependency's artifacts would be filed under is not usable" — and
+    //   the same remediation, "put the project in a named directory", so per
+    //   this file's own rule that codes split on REMEDIATION it is one code.
+    //
+    //   Remediation-distinct from `D_DependencyGitNameCollision` (0xD020),
+    //   which is about the `.dss-deps` CHECKOUT directory and fires before
+    //   acquisition on the `(url, ref)` pair. A `path` dependency has no
+    //   checkout and never reaches that check; this one covers the OUTPUT tree
+    //   and covers every entry kind.
+    D_DependencyOutputNameCollision = 0xD025,
+    // D_DependencyGraphTooDeep: recursive `dependsOn` resolution nested deeper
+    //   than the resolver's declared limit (`kMaxDependencyDepth`,
+    //   `program/dependency_resolver.hpp`).
+    //
+    //   ★ IT IS NOT A WEAKER `D_DependencyCycle` (0xD01A) AND MUST NOT REUSE
+    //   IT. That code's whole subject is a manifest ALREADY ON THE DFS STACK,
+    //   and its payload is the ring; this graph is acyclic and legal, and
+    //   telling its author to "break the cycle" would send them looking for
+    //   something that is not there. The DFS stack catches cycles and catches
+    //   NOTHING ELSE: a deep acyclic graph walks until the C++ stack runs out.
+    //   ✔That failure class is CI-INVISIBLE on this project's own standing
+    //   note — deep-recursion overflows pass the Release/MinGW legs and surface
+    //   on MSVC-Debug — and it arrives as a process death with NO diagnostic,
+    //   which is the one outcome the fail-loud bar exists to forbid.
+    //
+    //   The limit is a BUDGET, not a measurement of the host stack, and the
+    //   message says so: no hand-written project nests prerequisites that deep,
+    //   so a graph that does is either generated or wrong. The prose carries
+    //   the CHAIN as its payload for the same reason 0xD01A carries the ring —
+    //   a bare "too deep" on a large graph is unactionable.
+    D_DependencyGraphTooDeep     = 0xD026,
+
+    // ── the AP3 artifact-profile gate's REJECT SPLIT (0xD028, paired with
+    // 0xD011 above) — closing
+    // D-AP3-UNSERVED-PROFILE-MISREPORTS-AS-A-FORMAT-MISMATCH ──
+    //
+    // ONE code used to answer two different questions and answered one of them
+    // with a confident falsehood: `D_ArtifactProfileFormatMismatch` reads
+    // *"you picked the wrong format"*, which is a true statement about the
+    // wrong thing when the fact is *"no format implements this anywhere"*.
+    // Sending a user to re-pick a format when no format can work is the
+    // misleading-diagnostic class the B.10 ruling already rejected a superset
+    // rule for. The two facts are remediation-distinct, so they are two codes:
+    //   * 0xD011 — ≥1 shipped format serves the profile, but not THIS one (fix
+    //              the target — the message NAMES the formats that do);
+    //   * 0xD028 — ZERO shipped formats serve it (no backend exists yet;
+    //              changing the target cannot help).
+    //
+    // ⓘ 0xD027 WAS ALLOCATED HERE AND IS FREE AGAIN. It was
+    // `D_ArtifactProfileEmitsNoArtifact`, minted for a third arm — "this
+    // profile produces no build product, so it cannot be built standalone" —
+    // that was REJECTED with the `emitsArtifact` column it read (plan 06 §5.1
+    // B.12 and its correction, 2026-08-15): a `module` IS a library, so a
+    // standalone module build is legitimate and must NOT be refused. The slot
+    // is left unused rather than back-filled, because 0xD028 shipped in the
+    // same change and renumbering a code is what the append-only rule forbids.
+    //
+    // D_ArtifactProfileNoServingFormat: NO shipped object format serves the
+    //   project's `artifactProfile` — the union of `artifactProfiles[]` over
+    //   `src/dss-config/object-formats/` does not contain it. ✔MEASURED
+    //   2026-08-15 over all 24 shipped format documents, that union is
+    //   `{cli, lib, staticlib, module}`, so SIX registered profiles are in
+    //   this state: `gui`, `script`, `sproc`, `transpile`, `shader`, `hdl`.
+    //
+    //   Remediation-distinct from 0xD011 in the strongest possible way: for
+    //   0xD011 there is a target that works and the message names it; here NO
+    //   target works, and the only real fixes are to build a different profile
+    //   or to ship the backend that emits this one. Reporting the 0xD011
+    //   wording would send the author around the entire target matrix looking
+    //   for a format that does not exist.
+    //
+    //   ⚠ The set it is derived from is the SHIPPED-FORMAT INVENTORY, a record
+    //   of what is IMPLEMENTED and never of what is POSSIBLE. That is why it
+    //   may report this diagnostic and may NOT be turned into a manifest rule
+    //   — the withdrawn B.12 derivation would have refused `targets[]` on a
+    //   `gui` project purely because no gui backend has shipped yet.
+    D_ArtifactProfileNoServingFormat = 0xD028,
+
+    // ── `dependsOn`, the OTHER half of the derivation's failure surface:
+    // THE DERIVATION SUCCEEDED AND THE BUILD FAILED (0xD029) — closes
+    // D-DEPS-BUILD-FAILURE-REUSES-THE-DERIVATION-UNRESOLVABLE-CODE ──
+    //
+    // D_DependencyBuildFailed: a dependency was built FOR A CONSUMER TARGET
+    //   (B.10's consumer-driven rule) and its own build returned non-zero. The
+    //   dependency's sources are the problem; everything upstream of the
+    //   compile worked.
+    //
+    //   ★ IT EXISTS BECAUSE 0xD022 WAS CARRYING THIS FACT TOO, AND THE TWO ARE
+    //   NOT THE SAME EVENT. `D_DependencyTargetFormatUnresolvable` (0xD022) is
+    //   allocated above as the ZERO-CANDIDATE outcome of the format
+    //   DERIVATION — no shipped object format can serve this dependency's
+    //   profile for this target, so the dependency is never compiled at all.
+    //   This code is the exact opposite state: the derivation ran, found its
+    //   unique format, the dependency WAS compiled for it, and the compile
+    //   failed. Reusing 0xD022 for both meant one ordinal answered two
+    //   questions with two unrelated remediations — EDIT A MANIFEST (or ship a
+    //   backend) versus FIX SOURCE CODE — and neither a reader, a log triage,
+    //   nor `--suppress=D_DependencyTargetFormatUnresolvable` could tell which
+    //   one had happened. The ordinal is the operator-visible identity, so a
+    //   code that means two things is a code that means nothing precise.
+    //
+    //   ⓘ THE SPLIT IS ONLY THE CODE. The surrounding behaviour was already
+    //   right and is deliberately unchanged: the message names the
+    //   DEPENDENCY'S MANIFEST PATH, the CONSUMER's target spec and the DERIVED
+    //   dependency spec, and directs the reader to the diagnostics above —
+    //   which the resolver has already re-reported from the sub-build carrying
+    //   a `contextPrefix` of `[dependency=<outputName> target=<depSpec>] `.
+    //   That attribution is the load-bearing half (it is what closed
+    //   D-DEPS-DEPENDENCY-CANNOT-DECLINE-A-TARGET: a dependency that cannot
+    //   serve a platform fails INSIDE ITSELF, and this edge is where that
+    //   failure is named). Whoever touches the emit site keeps it.
+    //
+    //   ★ DELIBERATELY *NOT* A MEMBER OF `kUnsuppressableCodes`, and the
+    //   verdict is read off THE LANDED EMIT SITE per 0xD020's own note rather
+    //   than inherited from the band. `dependency_resolver.cpp`'s
+    //   `buildNode_` emits it on `rc != 0` and returns `nullopt`, so the
+    //   resolve fails and the build stops with or without it — no wrong bytes
+    //   can ship, which rules out prong (1). Prong (2) is where it differs
+    //   from EVERY other `dependsOn` code, and the difference is structural:
+    //   prong (2) requires that this diagnostic be THE ONLY STATEMENT of why
+    //   the build stopped, and here it demonstrably is not — the inner
+    //   diagnostics were merged into the caller's reporter IMMEDIATELY BEFORE
+    //   this one, prefixed with the dependency they came from, and THEY are
+    //   the explanation. This code is the attribution line above them.
+    //   Silencing it costs an operator the summary while leaving the cause on
+    //   screen, which is exactly the advisory class `--suppress` controls.
+    //
+    //   ⚠ AND FOR THE SAME REASON IT DOES NOT TAKE `DiagnosticDelivery::
+    //   Guaranteed` at its site, which is the other half of 0xD019 /
+    //   0xD01B / 0xD01C's shape and is a SEPARATE question from suppression.
+    //   Those three are self-contained statements; this one says "the reason
+    //   is in the diagnostic(s) above" and is therefore only as useful as the
+    //   diagnostics it points at — which are ordinary merged copies, subject
+    //   to the reporter's cap like anything else. Guaranteeing delivery of the
+    //   pointer while its referents can still be dropped would manufacture the
+    //   worst possible output: a surviving line naming a dependency and
+    //   directing the reader upward at nothing. If this band ever needs
+    //   cap-immunity it must be taken by the MERGED INNER DIAGNOSTICS FIRST,
+    //   and this line with them — never by this line alone.
+    D_DependencyBuildFailed      = 0xD029,
+
+    // ── THE LANGUAGE↔TARGET ARCHITECTURE GATE (0xD02A) —
+    // D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE ─────────────────────────────────
+    //
+    // D_LanguageTargetIsaMismatch: the source language declares an
+    //   instruction-set architecture it emits for (`isa` in its `.lang.json`)
+    //   and the requested target does not declare the SAME one. Emitted for a
+    //   ROOT build at the driver's per-target chokepoint, and for a
+    //   `dependsOn` dependency at RESOLVE time — before that dependency is
+    //   cloned, hooked or compiled.
+    //
+    // ★ THE FACT IS DEFINITIONAL, NOT BOOKKEEPING, WHICH IS WHY IT IS A
+    //   REJECT AND NOT A WARNING. Most languages compile for any processor: C
+    //   does, and it declares no `isa`. An assembly DIALECT does not — its
+    //   surface IS an instruction set, so `asm-x86_64-att` cannot be assembled
+    //   for AArch64 in the same sense that a document cannot be in two
+    //   languages at once. Nothing downstream can repair the pairing.
+    //
+    // ★ WHAT IT IS *NOT*, and the distinction is load-bearing because the
+    //   near-miss design was REJECTED (operator, 2026-08-14). This is NOT a
+    //   per-project list of supported platforms. `targets[]` is "the platforms
+    //   a project builds for ITSELF" — a BUILD LIST that drifts — so reading
+    //   one as a CAPABILITY CLAIM makes a portable dependency that merely
+    //   forgot to list an architecture refuse a legitimate consumer. An ISA
+    //   binding cannot drift that way: a NEW target document declaring the
+    //   same `isa` satisfies an existing binding with NO edit to any language
+    //   document and no code change. If a change ever requires editing
+    //   language configs when a target is added, this design has been
+    //   rebuilt into the rejected one.
+    //
+    // ⓘ THE VERDICT READS TWO DECLARED VALUES AND NOTHING ELSE. Not
+    //   `target.name()` (an IDENTITY — the string a user types in a
+    //   `<target>:<format>` spec, and the identity branch the agnosticism
+    //   veto forbids), not `format.kind()` (which cannot separate
+    //   architectures at all: `elf64-x86_64-linux-exec` and
+    //   `elf64-aarch64-linux-exec` are BOTH `kind: "elf"`), and not the
+    //   per-format `machine` codes (a target↔FORMAT agreement check, reached
+    //   through a table keyed on the target NAME). ✔MEASURED: the shipped
+    //   arm64 target declares `isa: "aarch64"` — DIFFERENT from its own
+    //   `name` — so a name-keyed impostor cannot even reproduce the shipped
+    //   verdicts without inventing a second mapping table.
+    //
+    // ⓘ FAIL-CLOSED ON AN UNDECLARED TARGET. `isa` is OPTIONAL on the target
+    //   side (a required key breaks every pre-existing target document), so a
+    //   target that declares none cannot be SHOWN to satisfy a binding and is
+    //   refused under this same code, with the message saying the target
+    //   declares no architecture. A language that declares none is PORTABLE
+    //   and never reaches this code at all — the common case pays nothing.
+    //
+    // ★★ A MEMBER OF `kUnsuppressableCodes` ON PRONG (2). ⚠ THIS PARAGRAPH
+    //   REPLACES AN EARLIER VERDICT OF "DELIBERATELY *NOT* A MEMBER", AND THE
+    //   CORRECTION IS KEPT VISIBLE BECAUSE THE ERROR IS INSTRUCTIVE: the
+    //   original was REASONED to the right shape and then wrong on the one
+    //   fact that decides it.
+    //
+    //   ✔Prong (1) is genuinely out, and that half of the old note stands:
+    //   both sites return failure to their caller (`compileOneTarget` →
+    //   `nullopt`, the resolver's `gather_` → `nullopt`), so the REJECT — not
+    //   the diagnostic — stops the build, and suppression cannot ship wrong
+    //   bytes.
+    //
+    //   ⛔ Prong (2) is where it went wrong. The old note asserted the only
+    //   cost under suppression is "a build that stops with LESS explanation".
+    //   ✔MEASURED THROUGH THE REAL CLI rather than reasoned about:
+    //   `--suppress=D_LanguageTargetIsaMismatch` on x86 assembly aimed at
+    //   arm64 gives **rc=1, stdout 0 bytes, stderr 0 bytes**. Not less
+    //   explanation — NO explanation, which is prong (2) verbatim ("a
+    //   non-zero exit with an empty explanation").
+    //
+    //   ★ WHY THERE IS NO "LESS": this code fires ALONE. It is not an
+    //   attribution line above other output the way `D_DependencyBuildFailed`
+    //   (0xD029) sits above merged inner diagnostics — nothing else is
+    //   reported on this path, so removing it removes ALL of it. That is the
+    //   single structural test to apply to any future code here, and it is
+    //   cheaper than the reasoning the old note attempted: ask whether
+    //   ANOTHER diagnostic survives suppression. If none does, prong (2) is
+    //   met.
+    //
+    //   ⚠ `DiagnosticDelivery::Guaranteed` DOES NOT SUBSTITUTE. Both emit
+    //   sites already set it, and the measurement above was taken WITH it
+    //   set — delivery governs the reporter's cap, suppression governs
+    //   whether the diagnostic exists at all. The old note treated them as
+    //   interchangeable; they are orthogonal, exactly as this header says
+    //   elsewhere. Keep Guaranteed AND the membership.
+    //
+    //   ⓘ Its two nearest neighbours were already members for the same class
+    //   of reason, which makes the omission an inconsistency rather than a
+    //   judgement call: `D_TargetMachineCodeMismatch` and
+    //   `D_TargetAbiModelMismatch` sit right beside it in the table.
+    //   Prong-(2) precedent in this band: 0xD01D and 0xD020.
+    //
+    //   ⚠ OPEN QUESTION THE OLD NOTE RAISED AND THIS ONE INHERITS: it claimed
+    //   0xD019 / 0xD01B / 0xD01C and `D_ArtifactProfileFormatMismatch` are
+    //   "indistinguishable" from this code and all non-members. If that is
+    //   true, the SAME measurement would make them members too — they were
+    //   NOT measured. Do not bulk-add them on this note's authority; measure
+    //   each at its own landed site. See
+    //   [[D-DIAG-SOLE-STATEMENT-REJECTS-MAY-SUPPRESS-TO-A-SILENT-EXIT]].
+    D_LanguageTargetIsaMismatch  = 0xD02A,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

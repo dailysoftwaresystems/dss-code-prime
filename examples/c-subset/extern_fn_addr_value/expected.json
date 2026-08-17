@@ -8,7 +8,7 @@
     { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
   ],
   "optimizedPipelines": [
-    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
-    {"label": "release", "shippedPipeline": "release"}
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
   ]
 }
