@@ -9,23 +9,51 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-15 (AP5/AP6 CLOSE-OUT, written mid-cycle as insurance — the THIRD such
-write of this arc) · **Branch:** `feature/finish-hooks-and-dependson-surface`
+**Last updated:** 2026-08-16 (AP5/AP6 close-out COMMITTED, plus the `module` corpus example) ·
+**Branch:** `feature/finish-hooks-and-dependson-surface`
 · 📄 **PR [#53](https://github.com/dailysoftwaresystems/dss-code-prime/pull/53) is OPEN against `main`.**
 
-⚠⚠ **READ THIS FIRST: THE TREE IS NO LONGER CLEAN, AND THE CLOSE-OUT IS UNCOMMITTED.**
-✔MEASURED 2026-08-15: **508 dirty paths — 455 under `examples/`** (the corpus arming, §1.0) **and 53
-elsewhere**, plus 3 untracked. ⇒ **the earlier "AP6 is committed and pushed, the working tree is
-CLEAN" line was true on 2026-08-14 and is now FALSE**; five parallel lanes ran after it. Nothing in
-§1.0 is committed. If this tree is lost, that work is lost.
+✅ **EVERYTHING BELOW IS COMMITTED AND PUSHED.** ✔MEASURED 2026-08-16: the AP5/AP6 close-out landed as
+**`f0695b7`** (509 files, +4826/−870, DCO signed-off, pushed `e4bb2e9..f0695b7`), and the corpus
+example that followed it as the commit this handoff ships with. ⇒ **the earlier "the tree is no
+longer clean, nothing in §1.0 is committed" warning is RETIRED** — it was true while five lanes were
+in flight and is now false. AP6 proper remains `867fa81` · `e3fd4e1` · `6a4dac6` · `293d069`; §1.0 is
+the close-out on top of those.
 
-✅ **AP6 ITSELF IS COMMITTED AND PUSHED** — `867fa81`, `e3fd4e1`, `6a4dac6`, `293d069`. What follows
-in §1.0 is the close-out ON TOP of those. ✔MEASURED commits ahead of
-`origin/main`: `867fa81` (AP6 itself), `e3fd4e1` (plan-06 B.12 corrected), `6a4dac6` (WSL leg +
-harness rules + DCO authorization), `293d069` (the macOS leg). ⚠ The first two are **UNSIGNED** —
-they predate the operator's sign-off authorization (§4) and were pushed unsigned by explicit
-instruction; the branch is exactly these commits, so a sign-off rebase reaches all of it. The
-operator merges when the PR is finished.
+### 1.0-bis ✅ `D-AP6-NO-CORPUS-EXAMPLE-FOR-A-STANDALONE-MODULE-BUILD` — CLOSED 2026-08-16
+`examples/c-subset/project_module_standalone_build/` — a `c-subset` project declaring
+`artifactProfile: "module"` with FOUR staticlib specs, `"runOn": []` on every target (the corpus's
+compile-only shape; precedent `examples/asm/asm_x86_64_extern_call_object`), no `optimizedPipelines`.
+✔Artifact names derived from `TargetSpec::outputExtension` (`target_spec.cpp:57-59`) and then
+confirmed empirically — all four archives emitted, each beginning `!<arch>`. ✔Independent
+corroboration of B.13.3: exactly **10** formats declare `module`, identical to the lib+staticlib set.
+★ **Red-on-disable, unprompted:** deleting `"module"` from one format descriptor gives rc=1,
+`D_ArtifactProfileFormatMismatch` (0xD011) and an **empty output tree** — and it corrected the lane's
+own draft comment, which had guessed a different code.
+⚠ **CLOSED ON THE STANDALONE HALF ONLY, by measured necessity.** The corpus has **no artifact-content
+assertion** and **no "must-not-exist" vocabulary**, so the `!<arch>` magic and "the consumed module
+emits no second artifact" both stay pinned in `ModuleIsALibrary.*` unit tests. Minting manifest keys
+with one consumer each is the speculative build §A.2 forbids.
+⚠ **THE TWO-RUNNERS RULE COULD NOT BE SATISFIED, AND THAT IS A RUNNER DEFECT, NOT A MANIFEST ONE.**
+✔MEASURED: `integrated_tests/runner.cpp:1196-1245` binds the first target whose `runOn` names the
+host and otherwise **returns without compiling**; and after binding it spawns **unconditionally**
+(`:1141`), so naming a host would trade a silent skip for a guaranteed red trying to EXECUTE an
+archive. ⇒ folded into [[D-TEST-CLI-CORPUS-RUNNER-IGNORES-OPTIMIZED-PIPELINES-AND-STDOUT]], which is
+now a **three-wide** gap (`optimizedPipelines`, stdout, compile-only verdicts). ⛔ That row stays
+EXCLUDED by operator instruction — documented, not executed.
+
+### The branch, for whoever merges it
+✔**MEASURED 2026-08-16 (`git log origin/main..HEAD`): SEVEN commits ahead of `origin/main`**, oldest
+first — `867fa81` (AP6 itself: the resolver, git acquisition, both composition arms) · `e3fd4e1`
+(plan-06 B.12 corrected) · `6a4dac6` (WSL leg + harness rules + DCO authorization) · `293d069` (the
+macOS leg) · `b93a410` (handoff: stale header retired) · `e4bb2e9` (handover brief) · `f0695b7` (the
+AP5/AP6 close-out, 509 files) — plus the commit this handoff ships in.
+⚠ **The two OLDEST — `867fa81` and `e3fd4e1` — carry NO DCO `Signed-off-by` trailer.** ✔MEASURED by
+grepping each commit body: those two lack it, the other five have it. They predate the operator's
+sign-off authorization (§4) and were pushed unsigned by explicit instruction. The branch is exactly
+these commits, so one sign-off rebase reaches all of it. The operator merges when the PR is finished.
+⇒ **Do not read "unsigned" as GPG here:** ✔MEASURED `%G?` = `N` for **all seven** — this repo does
+not GPG-sign at all, so a GPG check distinguishes nothing. The DCO trailer is the axis that matters.
 
 ⚠ **The earlier "AP6 lives entirely in the working tree, if the tree is lost the cycle is lost"
 warning is RETIRED** — it was true for most of this cycle and is now false. ✔**The scratchpad plan (`ap6-plan-v2-LOCKED.md`) is NO LONGER a single point of failure** — its
@@ -43,9 +71,15 @@ derivation) and **B.11 carries the design-audit rulings M2–M8 + the U-8 correc
 before touching anything dependency-shaped.
 
 ✔**MEASURED baseline of the MERGED tree** (Windows MSVC-Debug, `build/`, 2026-08-14): build **rc=0,
-ZERO warnings tree-wide**; full ctest **859/861** at the merge point, with both reds diagnosed and FIXED (§1.3). ✅ **The FINAL gate after the resolver, the two corpus examples and the CR fix is 864/864, 0 failed** (§1.2). The pre-cycle baseline at `d4c2836` was 860/860.
+ZERO warnings tree-wide**; full ctest **859/861** at the merge point, with both reds diagnosed and FIXED (§1.3). The pre-cycle baseline at `d4c2836` was 860/860; the gate after the resolver, the two corpus examples and the CR fix was 864/864 (§1.2).
+✅ **CURRENT GATE: 866/866, 0 failed** — ✔MEASURED 2026-08-16, Windows MSVC-Debug, `FULL-CTEST-RC=0`.
+The 864 → 866 delta is the ISA test plus the `module` corpus example, and nothing else regressed.
+✔**All four legs green at the 865 mark** before the example landed: Windows · WSL x86_64 gcc ·
+qemu-aarch64 (strict verdicts) · macOS arm64 (Apple clang 21, Mach-O arm64). ⚠ The +1 example is
+compile-only and has **not** been re-run on the three non-Windows legs; it exercises no host spawn,
+so the risk is low but it is INFERRED, not measured.
 
-### 1.0 ⚠ THE 2026-08-15 CLOSE-OUT — UNCOMMITTED, five parallel lanes plus orchestrator work
+### 1.0 ✅ THE 2026-08-15 CLOSE-OUT — COMMITTED as `f0695b7`; five parallel lanes plus orchestrator work
 
 **Operator instruction for this stretch:** finish everything artifact-profile-related; defer the
 rest to another session. ⛔ **`D-TEST-CLI-CORPUS-RUNNER-IGNORES-OPTIMIZED-PIPELINES-AND-STDOUT` is
@@ -97,7 +131,7 @@ output was a missing input file plus `Connection reset by peer`. **In every case
 caught it was an explicit `echo "RC=$?"` immediately after the command.** ⇒ `tools/run-gate.sh`'s
 rule applies to REMOTE and BACKGROUND work too, not just local gates.
 
-**c. Lane work landed (all uncommitted).**
+**c. Lane work landed (all of it now in `f0695b7`).**
 - **`-Werror=switch` / `/we4062` tree-wide** at ONE chokepoint (`CMakeLists.txt:220-227`), retiring
   FIVE per-file ratchets across 8 hand-listed files. ✔Coverage 434/434 of our TUs, 0/4 googletest.
   ✔Zero fallout (257 warnings = baseline exactly). ✔Red-on-disable on the REAL defect: the
@@ -519,7 +553,9 @@ build dir is evidence only if it actually contains the binary.
 
 | Date | Commit | What shipped | Gate |
 |---|---|---|---|
-| 2026-08-14 | *(uncommitted)* | **AP6 in flight — see §1.** Resolver + driver wiring landed (the `D_PlanNotLanded` reject is gone); git acquisition; per-target library channel; wrong-format guard at both binders; 3 latent spawn defects fixed; recursive corpus staging; docs rewritten; plan v2 rescued into §5.1 B.11. 5 diagnostic slots taken (`0xD022`–`0xD026`). **Two reds found by the merged-tree baseline and fixed**, one of them a test its authoring lane never compiled. | merged-tree build **rc=0, 0 warnings** · ctest **859/861** → both reds fixed · balance **982→982 OK** · anchor guard **OK** (with the §1.5 false-green residual) · ⚠ resolver **UNVERIFIED**, corpus examples **not started** |
+| 2026-08-16 | *(this commit)* | **`module` corpus example** — `project_module_standalone_build`, the first corpus proof that a `module` project builds standalone (B.13.3). Closed on the standalone half only; artifact-content and must-not-exist assertions are inexpressible in the corpus and stay in unit pins (§1.0-bis) | Win **866/866** · ⚠ example not re-run on the 3 non-Windows legs |
+| 2026-08-16 | `f0695b7` | **AP5/AP6 close-out**, 509 files: `tools/check-diagnostic-codes.py` (the ordinal-allocation gate, built after two lanes both took `0xD029`) · `-Werror=switch` tree-wide at one chokepoint (closes G-711) · the ISA-mismatch diagnostic + its unsuppressable row · corpus arming | **All four legs 865/865**: Win · WSL gcc · qemu-aarch64 strict · macOS arm64 |
+| 2026-08-14 | `867fa81` | **AP6 in flight — see §1.** Resolver + driver wiring landed (the `D_PlanNotLanded` reject is gone); git acquisition; per-target library channel; wrong-format guard at both binders; 3 latent spawn defects fixed; recursive corpus staging; docs rewritten; plan v2 rescued into §5.1 B.11. 5 diagnostic slots taken (`0xD022`–`0xD026`). **Two reds found by the merged-tree baseline and fixed**, one of them a test its authoring lane never compiled. | merged-tree build **rc=0, 0 warnings** · ctest **859/861** → both reds fixed · balance **982→982 OK** · anchor guard **OK** (with the §1.5 false-green residual) · ⚠ resolver **UNVERIFIED**, corpus examples **not started** |
 | 2026-08-13 (post-push) | — | **Two findings after the cycle closed, neither moving a verdict.** (a) The WSL lane's build watcher span until killed **over a build that had SUCCEEDED** — its producer `tee -a`'d both FAILURE arms into the log but wrote `BUILD OK` to stdout only. (b) `e42ae5a5`'s message quotes **1018** anchor citations; the committed tree measures **1019**. | gates re-run: guard OK 1019 · balance 983→983 · line-endings OK |
 | 2026-08-13 | `e42ae5a5` | **Unwind lands**: DWARF CFI + `.eh_frame` on ELF/Mach-O execs (gdb unwinds 4 DSS frames) and in ELF `.o` (round-tripped through gcc, 9 frames vs 2 stripped) · 2 silent pe64 unwind miscompiles · interior labels end-to-end · arm64 32-bit bitwise widening + MOVZ W-form · `.section`/`.space` · config key gates · **2 false-green red-on-disable mechanisms found** · handoff created | **Win 851/851 · WSL 851/851 · arm64 594/594 strict** |
 | 2026-08-13 | `75ca4034` | asm-anchor burn-down: net −4 anchors; closed 2 silent miscompiles shipped one cycle earlier; a `.s` calls libc and RUNS | Win 838/838 · ⚠ **WSL + arm64 NOT run** |
