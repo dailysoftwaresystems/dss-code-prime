@@ -58,6 +58,26 @@ enum class Location : std::uint8_t {
     InsideRepo  = 1,  // `<cwd>/test-scratch/<group>/...` — for cwd-walk tests
 };
 
+// The SAME resolution the product applies to any path it reports or keys on —
+// `fs::weakly_canonical`, falling back to `lexically_normal` when the filesystem
+// refuses to answer. Mirrors `canonicalize` in
+// `src/program/dependency_resolver.cpp`; see the ctor for the measured failure
+// that made this necessary.
+//
+// ⚠ IT IS DELIBERATELY A COPY, NOT A CALL. Tests must not link the resolver to
+// build a directory path, and the shared alternative — exporting a canonicalizer
+// from `src/` for tests to import — would let a product-side change silently
+// retune every fixture in the tree, which is the opposite of what a fixture is
+// for. The coupling that matters is asserted rather than assumed: the pin
+// `MatchesTheProductsOwnCanonicalizer` in `test_scratch_dir.cpp` fails if these
+// two ever disagree on the same input.
+[[nodiscard]] inline std::filesystem::path
+canonicalizeLikeTheProduct(std::filesystem::path const& p) {
+    std::error_code ec;
+    std::filesystem::path const c = std::filesystem::weakly_canonical(p, ec);
+    return ec ? p.lexically_normal() : c;
+}
+
 class ScratchDir {
 public:
     // `group` becomes a subdir under the base — e.g. "link-writer",
@@ -86,6 +106,8 @@ public:
                 "ScratchDir ctor: current_path() failed: " + ec.message());
         }
 
+        originalCwd_ = canonicalizeLikeTheProduct(originalCwd_);
+
         std::filesystem::path base;
         switch (loc) {
             case Location::Temp:
@@ -98,6 +120,33 @@ public:
                      / std::string{group};
                 break;
         }
+        // ★★ CANONICALIZE THE BASE — the ONE site, deliberately, because the
+        // alternative is 53 test files each remembering to do it. ✔MEASURED
+        // 2026-08-17: `windows-msvc-release` CI failed 2 tests / 5 cases while
+        // ALL FOUR local legs were green, and the cause was here.
+        //
+        // WHY. `temp_directory_path()` returns whatever `TMP`/`TEMP` holds, and
+        // GitHub's Windows runner holds the 8.3 SHORT form —
+        // `C:/Users/RUNNER~1/...` for user `runneradmin`. The product resolves a
+        // dependency path with `fs::weakly_canonical`
+        // (`src/program/dependency_resolver.cpp` `canonicalize`), which rewrites
+        // that to the LONG form `C:/Users/runneradmin/...`. So a diagnostic
+        // NAMED the manifest correctly while `message.find(fixturePath)` returned
+        // npos — two spellings of one directory, compared as strings.
+        //
+        // ⚠ THE LOCAL GATE STRUCTURALLY CANNOT SEE THIS, which is why it reached
+        // CI. 8.3 shortening only kicks in for a directory component longer than
+        // 8 characters; the local operator's user directory is `rafae` (5), so
+        // short form == long form and every assertion here is trivially
+        // satisfied. It is not a flaky test or a Release-vs-Debug difference —
+        // it is a test that could only ever fail on a machine whose username is
+        // long. ⇒ reproduced locally by pointing `TMP`/`TEMP` at an 8.3 spelling,
+        // and that reproduction is now a permanent pin in `test_scratch_dir.cpp`
+        // (`ShortPathSpellingIsDefeatedAtTheChokepoint`) rather than a one-off.
+        //
+        // Same function as the product's, fallback included: a degraded key beats
+        // an exception out of a test fixture's constructor.
+        base = canonicalizeLikeTheProduct(base);
         std::filesystem::create_directories(base, ec);
         if (ec) {
             throw std::runtime_error(

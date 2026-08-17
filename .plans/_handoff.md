@@ -42,6 +42,40 @@ archive. ⇒ folded into [[D-TEST-CLI-CORPUS-RUNNER-IGNORES-OPTIMIZED-PIPELINES-
 now a **three-wide** gap (`optimizedPipelines`, stdout, compile-only verdicts). ⛔ That row stays
 EXCLUDED by operator instruction — documented, not executed.
 
+### 1.0-ter ✅ THE FIRST REAL CI RED OF THIS ARC — `windows-msvc-release`, fixed 2026-08-17
+⚠⚠ **READ THIS BEFORE TRUSTING ANY "ALL LEGS GREEN" LINE ABOVE, INCLUDING THE FOUR-LEG TABLE.**
+✔MEASURED: CI ran for the first time in this window and `windows-msvc-release` failed **2 tests /
+5 cases** (`program/test_dependency_resolver`, `program/test_cross_validate_language_target`) **while
+all four local legs were 866/866**. Four green legs did not catch it and **could not have**.
+
+**The cause was never in the product.** `temp_directory_path()` returns whatever `TMP`/`TEMP` holds;
+GitHub's Windows runner holds the **8.3 SHORT** spelling `C:/Users/RUNNER~1/…` for user
+`runneradmin`. The product resolves paths with `fs::weakly_canonical` and so REPORTS the long
+spelling. `message.find(fixturePath)` compared **two spellings of one directory**. The diagnostic had
+named the manifest correctly the entire time.
+
+★★ **WHY MORE LEGS WOULD NOT HAVE HELPED — the useful lesson.** 8.3 shortening needs a path component
+longer than 8 characters. The local user directory is `rafae` (5), so short spelling **==** long
+spelling and every such assertion is trivially satisfied here; Linux and macOS have no 8.3 at all.
+⇒ **the local gate is structurally incapable of this class**, at any number of legs. Some defect
+classes belong to CI and to no local configuration, so **"all four legs green" is never by itself a
+proof of merge-readiness** — a claim this handoff made twice today before CI refuted it.
+
+✅ **CLOSED SAME CYCLE, at ONE chokepoint** — `ScratchDir` canonicalizes with the product's own
+function, so **53 test files** inherit it by construction. ✔Reproduced locally first by pointing
+`TMP`/`TEMP` at an 8.3 spelling; ✔red-on-disable with all five fail-closed clauses including the
+**binary** hash moving; ✔**full suite 866/866 UNDER the adversarial short TEMP**, which is a strictly
+stronger gate than the ordinary one and proves no OTHER fixture carries the same latent defect.
+★ The pin **stages its own adversary** (Windows 8.3, POSIX symlink) so it is red on a normal host —
+and ⚠ the weaker host-independent fixed-point pin was **MEASURED GREEN over the live mutant**, which
+is exactly why both are kept. Row: [[D-TEST-FIXTURE-PATHS-UNCANONICALIZED-INVISIBLE-TO-EVERY-LOCAL-LEG]].
+
+ⓘ **The other two CI reds are NOT ours.** `linux-clang-asan` died at 52 s with `429 Too Many
+Requests` downloading `actions/create-github-app-token@v3` (3 attempts, never reached a compiler) —
+✔transient, and it re-ran clean. **DCO** is the two unsigned commits below, an operator decision.
+✔A rerun was taken as a falsifiable test of that split and confirmed it: asan recovered,
+`windows-msvc-release` **failed again at 7m23s** — deterministic, never flaky.
+
 ### The branch, for whoever merges it
 ✔**MEASURED 2026-08-16 (`git log origin/main..HEAD`): SEVEN commits ahead of `origin/main`**, oldest
 first — `867fa81` (AP6 itself: the resolver, git acquisition, both composition arms) · `e3fd4e1`
@@ -496,8 +530,13 @@ nothing. ✔`bash tools/check-anchor-registry.sh` → **OK (1154 src anchors)** 
 
 ## 3. PRIORITIES
 
-1. **`NEXT` — PR [#53](https://github.com/dailysoftwaresystems/dss-code-prime/pull/53) IS FINISHED;
-   the remaining work is CI and the operator's merge.** ⇒ **AP6 itself is DONE** — the older
+1. **`NEXT` — PR [#53](https://github.com/dailysoftwaresystems/dss-code-prime/pull/53): CONFIRM THE
+   `windows-msvc-release` LEG IS GREEN ON THE NEXT CI RUN, then the operator's merge.**
+   ⚠ **The "PR #53 is finished, only CI and the merge remain" line written earlier today was
+   PREMATURE** — CI then failed `windows-msvc-release` on 2 tests. That is fixed (§1.0-ter) and
+   verified locally under the reproducing environment, but ⚠ **the fix has NOT yet been seen green in
+   CI itself**, and this is precisely the class of defect no local run can confirm. Do not call the
+   PR finished again until that leg passes. ⇒ **AP6 itself is DONE** — the older
    "FINISH AP6: verify the resolver, then the two corpus examples, then G2, then the full gate"
    entry is RETIRED, every clause of it discharged (§1.2, §1.0-bis, four legs green). ⚠ **Before the
    merge, two things are the operator's, not a cycle's:** the DCO sign-off rebase reaching `867fa81`
