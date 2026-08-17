@@ -8,7 +8,7 @@
     { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] }
   ],
   "optimizedPipelines": [
-    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
-    {"label": "release", "shippedPipeline": "release"}
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: x86_64:elf64-x86_64-linux-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST: after lowering, this program is already minimal — a constant return with no redundancy, no dead block and no promotable local — so every pass in the named set is a no-op on it. `main` is `return 42`; the point of the example is the declaration that is NOT emitted. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."},
+    {"label": "release", "shippedPipeline": "release", "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: x86_64:elf64-x86_64-linux-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST: after lowering, this program is already minimal — a constant return with no redundancy, no dead block and no promotable local — so every pass in the named set is a no-op on it. `main` is `return 42`; the point of the example is the declaration that is NOT emitted. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."}
   ]
 }

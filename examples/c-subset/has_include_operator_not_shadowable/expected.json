@@ -10,6 +10,6 @@
     { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
   ],
   "optimizedPipelines": [
-    { "label": "release", "shippedPipeline": "release" }
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
   ]
 }

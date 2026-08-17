@@ -2195,9 +2195,22 @@ constexpr std::uint32_t kMaxSchemaVersion = 4;
 // ENTIRE phase. Every name here is a key the loader genuinely reads.
 // Shared with the referenced-document check so a fragment gets the same
 // typo discrimination its host does.
-constexpr std::array<std::string_view, 23> kDocumentKeys{
+constexpr std::array<std::string_view, 24> kDocumentKeys{
     // identity + loader gates
     "dssSchemaVersion", "language", "reservedWordPolicy", "parser",
+    // ⚠ `isa` MUST be in this table, and its reason is the sharpest one here.
+    // It is OPTIONAL and its absence means PORTABLE — so a typo'd `isaa` /
+    // `Isa` loads perfectly clean and silently turns an assembly DIALECT into
+    // a language that claims it can be assembled for every architecture. The
+    // failure is not a diagnostic that never fires; it is the gate this key
+    // exists to arm being disarmed, with x86 text handed to an AArch64
+    // opcode table. It sits here rather than inside the `language` block
+    // BECAUSE that block has no typo discriminator at all (✔MEASURED: there
+    // is no `kLanguageKeys` — an unknown key inside `language` is accepted
+    // in silence), and `artifactProfiles` — the closest sibling: a
+    // language-level declaration read by a driver gate — is top-level for
+    // exactly the same reason.
+    "isa",
     // lexical surface
     "lexerModes", "tokens", "keywords", "operators", "scopes",
     "syncTokens", "numberStyle",
@@ -4692,6 +4705,61 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     continue;
                 }
                 data.artifactProfiles.push_back(std::move(profile));
+            }
+        }
+    }
+
+    // ── isa ── THE ARCHITECTURE THIS LANGUAGE EMITS ───────────────────────
+    // (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE.) Optional; ABSENT ⇒ the language
+    // is PORTABLE and builds for every target. Present ⇒ the language emits
+    // for exactly this instruction set, and a target declaring a different
+    // one is refused by `crossValidateLanguageTarget` (program/).
+    //
+    // ⚠ THE VALUE IS DELIBERATELY NOT VALIDATED AGAINST THE SHIPPED TARGET
+    // INVENTORY. That inventory is a record of what is IMPLEMENTED, never of
+    // what is POSSIBLE (plan 06 §5.1 B.12-CORRECTED's binding reasoning), so
+    // a closed vocabulary here would refuse a language that names an
+    // architecture whose target has not shipped yet — and would force a C++
+    // or config edit every time a new architecture arrives, which is the
+    // precise failure mode this design exists to avoid. An architecture that
+    // matches no shipped target simply matches nothing, and says so LOUDLY at
+    // the gate (naming both declared values) rather than silently.
+    if (doc.contains("isa")) {
+        json const& isaNode = doc.at("isa");
+        if (!isaNode.is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/isa",
+                      "'isa' must be a string naming the instruction-set "
+                      "architecture this language emits (e.g. \"x86_64\", "
+                      "\"aarch64\"). OMIT it entirely for a PORTABLE language "
+                      "— that is the default and what every non-assembly "
+                      "language declares.");
+        } else {
+            auto isaText = isaNode.get<std::string>();
+            auto const isSpace = [](char c) noexcept {
+                return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+                    || c == '\v' || c == '\f';
+            };
+            bool const blank =
+                isaText.empty()
+                || std::ranges::all_of(isaText, isSpace);
+            bool const padded =
+                !isaText.empty()
+                && (isSpace(isaText.front()) || isSpace(isaText.back()));
+            if (blank || padded) {
+                // An empty or padded value is worse than an absent one: absent
+                // means PORTABLE and is honest, while `""` reads as a declared
+                // binding that can never match any target, and `" x86_64"`
+                // reads as a binding that matches nothing while LOOKING right
+                // in every diagnostic that prints it.
+                coll.emit(DiagnosticCode::C_MalformedJson, "/isa",
+                          "'isa' must be a non-empty string with no leading or "
+                          "trailing whitespace — the language↔target gate "
+                          "compares it for exact equality, so a blank or padded "
+                          "value matches NO target while still declaring a "
+                          "binding. OMIT the key to declare a PORTABLE "
+                          "language.");
+            } else {
+                data.isa = std::move(isaText);
             }
         }
     }

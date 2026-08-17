@@ -286,7 +286,21 @@ TEST(Reporter, CapNoticeRemedyNamesBothTheCliFlagAndTheConfigField) {
     r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, b, 10, 11));
     ASSERT_TRUE(r.hitCap());
 
-    auto const& text = r.all().back().actual;
+    // ⚠ THE SPAN IS NAMED, NOT CHAINED, AND THAT IS THE POINT OF THE LINE.
+    // `all()` returns a `std::span` BY VALUE, so `r.all().back().actual` binds
+    // a `std::string const&` through a VIEW TEMPORARY that dies at the end of
+    // the full expression — clang reports it as `-Wdangling-gsl` ("object
+    // backing the pointer will be destroyed at the end of the full-expression")
+    // and NEITHER MSVC NOR GCC SAYS A WORD
+    // (D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS).
+    // The bytes themselves live in the reporter's own vector, so the chained
+    // spelling happened to read valid memory here — but only because nothing
+    // reports again before the reads: one more `report()` may reallocate that
+    // vector and the reference really does dangle, silently, on a test whose
+    // whole job is to read the text back. "Right until someone adds a line" is
+    // not a property this file asserts of anything else.
+    auto const  diags = r.all();
+    auto const& text  = diags.back().actual;
     EXPECT_NE(text.find("--max-diagnostics"), std::string::npos)
         << "the remedy must name the CLI flag: an operator at a terminal "
            "cannot set a C++ config field, and they are the likeliest reader";

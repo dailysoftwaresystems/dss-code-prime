@@ -26,6 +26,7 @@
 #include "program/build_scripts.hpp"  // runBuildScripts — the manifest's pre/post build hooks
 #include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"
+#include "program/cross_validate_language_target.hpp"
 #include "program/cross_validate_target_format.hpp"
 #include "program/dependency_resolver.hpp"  // AP6: `dependsOn` resolution
 #include "program/git_acquire.hpp"          // SystemGitRunner — the default git seam
@@ -463,6 +464,43 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // silently dispatch the linker to the wrong PLT-stub emitter,
     // producing SIGILL at runtime with no driver diagnostic.
     if (!crossValidateTargetFormat(**targetR, **formatR, reporter)) {
+        return std::nullopt;
+    }
+
+    // ★ THE LANGUAGE↔TARGET ARCHITECTURE GATE, ROOT ARM
+    // (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE). Its sibling directly above asks
+    // whether the TARGET and the FORMAT agree; this asks whether the LANGUAGE
+    // may be compiled for the TARGET at all. A language that declares no `isa`
+    // is PORTABLE and this is a single empty-string test — which is what every
+    // C, T-SQL and toy compile in the repo takes.
+    //
+    // ★ IT LIVES HERE BECAUSE THIS IS THE ONE CHOKEPOINT WHERE A GRAMMAR AND A
+    // TARGET MEET. `compileOneTarget` is reached by EVERY build in the
+    // process: the CLI `--compile` path, a `.dss-project.json` build, and a
+    // dependency's own sub-build (which runs a fresh `Program` through
+    // `compileFiles`/`compileUnits`). Placing the gate at the project entry
+    // point instead would have left `dss --compile hello.s --target arm64:…`
+    // — the single most direct way to hit this mistake — completely
+    // unguarded, and would have made the same source mean different things
+    // depending on which entry point invoked it.
+    //
+    // ⓘ The DEPENDENCY arm is NOT this call. `dependency_resolver.cpp` runs
+    // the same gate at RESOLVE time so a dependency is refused BEFORE it is
+    // cloned, hooked and built, and so the message names the dependency's own
+    // manifest rather than the project the operator invoked. This site is the
+    // backstop that also covers a root build with no `dependsOn` at all.
+    //
+    // ⓘ `grammar.name()` is the language's OWN declared name (`AsmX86_64Att`),
+    // not the document stem the operator typed (`asm-x86_64-att`), and that is
+    // deliberate rather than a compromise: it is the identity THIS function
+    // actually holds, and it is the same string the driver already uses as the
+    // language identity in `CuBuildKey::languageName`. Re-deriving the
+    // document stem here would mean restating a resolution
+    // `resolveGrammarForTarget` owns — a second derivation that can disagree
+    // with the first. The message carries the actionable half either way: both
+    // declared ISA values, and where each is declared.
+    if (!crossValidateLanguageTarget(grammar, grammar.name(), **targetR,
+                                     targetSpecStr, /*subject=*/{}, reporter)) {
         return std::nullopt;
     }
 
@@ -2063,6 +2101,63 @@ int Program::run(int argc, char* argv[]) {
     return 0;
 }
 
+namespace {
+
+// The SHIPPED object formats that serve `profile`, by format name — the
+// measurement the AP3 gate's reject arm needs to tell "you picked the wrong
+// format" from "no format implements this anywhere" (closing
+// D-AP3-UNSERVED-PROFILE-MISREPORTS-AS-A-FORMAT-MISMATCH). Sorted, because it
+// is printed and a diagnostic must read the same on every host rather than
+// inheriting the filesystem's enumeration order.
+//
+// `nullopt` ⇒ the shipped object-format DIRECTORY could not be located, which
+// is NOT the same answer as "no format serves it" and must never collapse into
+// it: an empty vector is the input that selects the "no backend exists"
+// message, so returning one here would manufacture the exact confident
+// falsehood this split exists to remove. The caller reports the load failure
+// instead.
+//
+// It is called ONLY on the reject path — a build whose profile IS served pays
+// nothing for it. `dependency_resolver.cpp` reads the same inventory for a
+// different question (WHICH format to build a dependency with) and memoizes it
+// per resolve; this one runs at most once per build, immediately before the
+// driver returns 1.
+[[nodiscard]] std::optional<std::vector<std::string>>
+shippedFormatsServingProfile(std::string_view profile) {
+    auto const dir = findShippedConfigDir("object-formats");
+    if (!dir) return std::nullopt;
+
+    std::error_code ec;
+    std::vector<std::string> names;
+    for (fs::directory_iterator it{*dir, ec}, end; !ec && it != end;
+         it.increment(ec)) {
+        std::string const file = it->path().filename().string();
+        constexpr std::string_view kSuffix = ".format.json";
+        if (file.size() <= kSuffix.size()) continue;
+        if (!std::string_view{file}.ends_with(kSuffix)) continue;
+        names.push_back(file.substr(0, file.size() - kSuffix.size()));
+    }
+    std::sort(names.begin(), names.end());
+
+    std::vector<std::string> serving;
+    for (auto const& n : names) {
+        auto loaded = ObjectFormatSchema::loadShipped(n);
+        // A shipped document that will not LOAD serves nothing by definition,
+        // and reporting its load failure here would put an unrelated format's
+        // error in front of a profile diagnostic. The format the user actually
+        // named was loaded by the caller and reported there.
+        if (!loaded.has_value()) continue;
+        // The SAME generic membership predicate the gate itself uses — no
+        // per-profile-name and no format-identity branch.
+        if (artifactProfileSupported((*loaded)->artifactProfiles(), profile)) {
+            serving.push_back(n);
+        }
+    }
+    return serving;
+}
+
+} // namespace
+
 int Program::compileProject(
     const std::string& projectFilePath,
     DiagnosticReporter::Config const& reporterConfig
@@ -2158,12 +2253,40 @@ int Program::compileProject(
         if (!parsed.has_value()) continue;           // delegate → D_InvalidTargetSpec
         auto fmtR = ObjectFormatSchema::loadShipped(parsed->formatName);
         if (!fmtR.has_value()) continue;             // delegate → D_SchemaLoadFailed
-        if (!enforceArtifactProfileFormat((*fmtR)->artifactProfiles(),
-                                          pc.artifactProfile,
-                                          parsed->formatName, rep)) {
+        // THE TWO REJECT ARMS. The membership question is asked FIRST and
+        // separately so the inventory scan is paid only by a build that is
+        // already being rejected — every accepted target reads exactly the one
+        // format it named, as before.
+        if (artifactProfileSupported((*fmtR)->artifactProfiles(),
+                                     pc.artifactProfile)) {
+            continue;
+        }
+        auto serving = shippedFormatsServingProfile(pc.artifactProfile);
+        if (!serving.has_value()) {
+            // The inventory could not be read, so WHICH reject is true is
+            // unknown — and an empty list would silently assert the stronger,
+            // possibly false one. Report what actually went wrong instead.
+            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                       "the shipped object-format directory "
+                       "('src/dss-config/object-formats') could not be located, "
+                       "so the artifact profile '" + pc.artifactProfile
+                       + "' could not be checked against the formats that serve "
+                         "it. Set DSS_CONFIG_ROOT to the directory that contains "
+                         "'src/dss-config', or run from inside the compiler's "
+                         "source tree.");
             drainDiagnosticsToStderr(rep);
             return 1;
         }
+        // The verdict is already known (the predicate above is the SAME one
+        // this call re-asks), so the return value carries no new information
+        // and is deliberately discarded — the call's remaining job is to write
+        // whichever of the two rejects `serving` selects. Reading it into an
+        // `if` would imply a path that cannot exist.
+        (void) enforceArtifactProfileFormat((*fmtR)->artifactProfiles(),
+                                            pc.artifactProfile,
+                                            parsed->formatName, *serving, rep);
+        drainDiagnosticsToStderr(rep);
+        return 1;
     }
 
     // Thread the manifest's OPTIONAL compile-flag arrays onto the SAME

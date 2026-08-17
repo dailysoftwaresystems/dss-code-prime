@@ -8,6 +8,7 @@
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
 #include "program/build_scripts.hpp"
+#include "program/cross_validate_language_target.hpp"
 #include "program/cross_validate_target_format.hpp"
 #include "program/dependency_cache.hpp"
 #include "program/program.hpp"
@@ -146,6 +147,14 @@ private:
         // Expanded against `dir` (B.3). EMPTY for the root: the driver expands
         // the root's own `sources[]` itself, after ITS pre-build hooks.
         std::vector<std::string> ownSources;
+        // The dependency's own language document, already loaded by
+        // `admitNode_` for the AP2 gate and KEPT rather than re-loaded: phase 2
+        // needs it per (node × consumer target) for the ISA gate
+        // (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE), and re-loading per pair would
+        // re-parse one document once per target of every consumer. NULL only
+        // for the ROOT (index 0), whose grammar is `compileProject`'s to load
+        // and whose ISA gate is the DRIVER's arm — see `gather_`.
+        std::shared_ptr<GrammarSchema const> grammar;
     };
 
     // What one subtree contributes to the build that encloses it.
@@ -510,6 +519,20 @@ Resolver::admitNode_(std::size_t parent, fs::path const& manifestPath,
                                     node.config.language, rep_)) {
             return std::nullopt;
         }
+        // KEPT for phase 2's ISA gate
+        // (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE). The document is already
+        // parsed here; dropping it and re-loading per (node × consumer target)
+        // would re-parse one `.lang.json` once per target of every consumer,
+        // and — worse — would put a SECOND load site on a path whose first one
+        // owns the failure message.
+        //
+        // ⚠ The ISA verdict CANNOT be taken here. This function runs ONCE per
+        // canonical manifest, in phase 1, where no consumer target exists yet;
+        // the verdict is a relation between this language and a TARGET, so it
+        // belongs where the target is known. Taking it here would mean
+        // answering a per-target question with whatever target happened to be
+        // first — the same class of mistake as `deriveFormat_`'s memo key.
+        node.grammar = *grammarR;
     }
 
     // ── COMPOSITION: THE VERB, NEVER THE NAME (B.2) ──────────────────────────
@@ -841,7 +864,15 @@ Resolver::buildNode_(std::size_t index, std::string const& consumerSpec,
         rep_.report(std::move(copy));
     }
     if (rc != 0) {
-        emitDriverError(rep_, DiagnosticCode::D_DependencyTargetFormatUnresolvable,
+        // 0xD029 and NOT 0xD022, which this site used to reuse
+        // (D-DEPS-BUILD-FAILURE-REUSES-THE-DERIVATION-UNRESOLVABLE-CODE).
+        // 0xD022 is the ZERO-CANDIDATE outcome of `deriveFormat_` — the
+        // dependency never got compiled. Reaching HERE means the derivation
+        // succeeded, produced `depFmt`, and the compile then failed inside the
+        // dependency: a source problem, not a manifest one. The message below
+        // is unchanged — the attribution it carries, and the prefixed inner
+        // diagnostics merged just above, are the load-bearing half.
+        emitDriverError(rep_, DiagnosticCode::D_DependencyBuildFailed,
                         "dependency '" + node.manifestPath.generic_string()
                         + "' failed to build for consumer target '"
                         + consumerSpec + "' (built as '" + depSpec
@@ -879,6 +910,48 @@ Resolver::gather_(std::size_t index, std::string const& consumerSpec,
     };
 
     for (std::size_t const child : nodes_[index].children) {
+        // ★ THE LANGUAGE↔TARGET ARCHITECTURE GATE, DEPENDENCY ARM
+        // (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE) — ONE SITE, ABOVE THE
+        // COMPOSITION FORK, DELIBERATELY.
+        //
+        // Placed here and not in either arm below because the question is the
+        // same for both and the §A.5 multi-site rule says the way to guarantee
+        // that is ONE chokepoint rather than two copies that can drift.
+        // Putting it in `deriveFormat_` — the other candidate, and the one that
+        // looks natural because that IS the per-target derivation — would have
+        // been wrong TWICE OVER, and both faults are measured properties of
+        // that function rather than guesses:
+        //   * `deriveFormat_` NEVER RUNS FOR `SourceMerge` (the arm below
+        //     `continue`s before reaching it), so half the feature would have
+        //     been silently unguarded; and
+        //   * its memo key is (format kind × target × artifactProfile) and
+        //     OMITS NODE IDENTITY, so one dependency's verdict would be served
+        //     to a different dependency that shares a profile — a wrong answer,
+        //     not merely a missed one.
+        // `gather_`'s own memo is keyed (node × consumer target spec), which is
+        // exactly the granularity this verdict has, so a memo hit re-serves an
+        // answer computed for the SAME pair.
+        //
+        // ⓘ THE ROOT (index 0) IS NOT CHECKED HERE, and that is not an
+        // omission: this loop walks a node's CHILDREN, so every node except the
+        // root is judged, and the root's own language is judged by the DRIVER
+        // arm in `compileOneTarget` — which is also the only arm a project with
+        // no `dependsOn` at all ever reaches.
+        //
+        // ⓘ A node whose grammar could not be loaded is SKIPPED rather than
+        // guessed at: `admitNode_` already reported `D_SchemaLoadFailed` and
+        // abandoned the walk, so this is unreachable defensively — the same
+        // "let the one owner report it" discipline `run()` applies to an
+        // unparseable target spec.
+        if (nodes_[child].grammar
+            && !crossValidateLanguageTarget(
+                   *nodes_[child].grammar, nodes_[child].config.language,
+                   target, consumerSpec,
+                   "project 'dependsOn': dependency '"
+                       + nodes_[child].manifestPath.generic_string() + "'",
+                   rep_)) {
+            return std::nullopt;
+        }
         if (nodes_[child].composition == DependencyComposition::SourceMerge) {
             // A source-merge node is NOT a build, so nothing is absorbed here:
             // its subtree's artifacts pass straight THROUGH to the build that

@@ -28,7 +28,7 @@
     }
   ],
   "optimizedPipelines": [
-    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
-    {"label": "release", "shippedPipeline": "release"}
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST: the work this example pins happens behind an EXTERN call the pipeline cannot see through, so no pass has a body to transform on this side of the call. `memset`/`memcpy` are extern libc calls. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."},
+    {"label": "release", "shippedPipeline": "release", "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST: the work this example pins happens behind an EXTERN call the pipeline cannot see through, so no pass has a body to transform on this side of the call. `memset`/`memcpy` are extern libc calls. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."}
   ]
 }

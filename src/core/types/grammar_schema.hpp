@@ -413,6 +413,38 @@ struct DSS_EXPORT GrammarSchemaData {
     // reject a project asking for an unsupported profile.
     std::vector<std::string>                          artifactProfiles;
 
+    // ★★★ THE INSTRUCTION-SET ARCHITECTURE THIS LANGUAGE EMITS — the LANGUAGE
+    // half of the (language emits · target executes) ISA axis, optional
+    // top-level `isa` (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE). The target half
+    // is `TargetSchema::isa()`; the gate compares the two DECLARED strings.
+    //
+    // ★ EMPTY IS THE DEFAULT AND IT MEANS **PORTABLE**, NOT "unknown". Most
+    // source languages compile for any architecture — C, T-SQL, the toy
+    // language, and the shared `asm` inline-asm core all declare nothing and
+    // build for every target, paying nothing for this axis existing. Only a
+    // language whose surface IS an instruction set declares a value:
+    // `asm-x86_64-att` cannot be assembled for AArch64 and `asm-arm64-gas`
+    // cannot be assembled for x86-64, and that is DEFINITIONAL — it is what
+    // those languages ARE, not a list of platforms someone remembered to
+    // maintain.
+    //
+    // ⚠ THIS IS NOT A CAPABILITY LIST, AND THE DISTINCTION IS THE ONE THAT
+    // KILLED THE EARLIER DESIGN. A per-project enumeration of supported
+    // targets was REJECTED (2026-08-14) because `targets[]` is "the platforms
+    // a project builds for ITSELF" — a BUILD LIST that drifts, so reading it
+    // as a capability claim makes a portable dependency that merely forgot to
+    // list an architecture refuse a legitimate consumer. A dialect's ISA
+    // cannot drift that way: it is a single fact about the language, and a
+    // NEW target declaring the same `isa` satisfies an existing binding with
+    // NO edit to this or any other language document.
+    //
+    // Compared by EQUALITY ONLY — deliberately no subset/superset lattice.
+    // "x86-64 code also runs in a 32-bit x86 process" is exactly the kind of
+    // capability claim this axis refuses to make; a language that genuinely
+    // emits for two architectures is two languages (which is why the shipped
+    // dialects are already named `asm-<arch>-<syntax>`).
+    std::string                                       isa;
+
     // Config-driven import resolution (schema v4 `imports` block). Default
     // `ImportStrategy::None` (no cross-refs) for v1/v2/v3 configs and any v4
     // config that omits the block. Consumed by ConfigDrivenImportResolver —
@@ -812,6 +844,14 @@ public:
     // entry is a loader-validated registered profile name. Consumed by the
     // driver (AP2+) to reject a project requesting an unsupported profile.
     [[nodiscard]] std::span<std::string const> artifactProfiles() const noexcept;
+
+    // The instruction-set architecture this language EMITS (optional top-level
+    // `isa`). EMPTY ⇒ the language is PORTABLE and builds for every target —
+    // that is the default and the overwhelmingly common case. Consumed by
+    // `crossValidateLanguageTarget` (program/) against `TargetSchema::isa()`.
+    // See `GrammarSchemaData::isa` for why an empty value is portability and
+    // not "unknown", and for why this is not a capability enumeration.
+    [[nodiscard]] std::string_view isa() const noexcept;
 
     // Config-driven import resolution (schema v4 `imports` block). Default
     // `ImportStrategy::None` when the config omits the block. Consumed by

@@ -17,32 +17,21 @@ target_compile_definitions(asm PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
 target_link_libraries(asm PRIVATE core lir mir)
 
-# D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN: enforce EXHAUSTIVE EncodingSlotKind
-# dispatch at compile time in the four format walkers. Each switch over
-# EncodingSlotKind is written with NO `default:` arm (one explicit case per
-# enumerator + a post-switch out-of-range backstop), so the "no-default +
-# missing case = error" flavor (GCC/Clang `-Werror=switch`; MSVC `/we4062`)
-# turns a future EncodingSlotKind enumerator added without a matching arm
-# into a BUILD ERROR — on local MSVC too. That closes the gap this gate was
-# born from: the drift previously surfaced only as a `-Wswitch` warning on
-# the macOS / linux-clang CI legs and was invisible on local MSVC. Mirrors
-# the optimizer.cpp runPass gate (D-OPT-RUNPASS-EXHAUSTIVE-WARN,
-# src/opt/CMakeLists.txt).
+# D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN — the EncodingSlotKind exhaustiveness gate
+# this file used to carry is now PROJECT-WIDE (root CMakeLists.txt), so the four
+# format/ walkers (fixed32.cpp, fixed32_disasm.cpp, x86_variable.cpp,
+# x86_variable_disasm.cpp) are covered by construction rather than by a list.
 #
-# Per-file scope is load-bearing: it must NOT spread to asm.cpp / disasm.cpp,
-# whose switches legitimately use subset-with-`default` forms. The no-default
-# flavor (4062 / -Werror=switch) leaves those alone; the with-default flavor
-# (/we4061 / -Wswitch-enum) would noisily flag them without catching real
-# drift.
-set(_dss_asm_exhaustive_switch_files
-    format/fixed32.cpp
-    format/fixed32_disasm.cpp
-    format/x86_variable.cpp
-    format/x86_variable_disasm.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    set_source_files_properties(${_dss_asm_exhaustive_switch_files} PROPERTIES
-        COMPILE_OPTIONS "-Werror=switch")
-elseif(MSVC)
-    set_source_files_properties(${_dss_asm_exhaustive_switch_files} PROPERTIES
-        COMPILE_OPTIONS "/we4062")
-endif()
+# ★ WHY THE LIST HAD TO GO, and it is not tidiness. The hand-written list here
+# named FOUR files and missed `asm_text_to_lir.cpp` — same target, same
+# no-`default` control-flow dispatch shape, same defect class — which then
+# shipped an unhandled `Switch` enumerator that only a macOS build ever
+# reported (D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS).
+# A gate you have to remember to extend is a gate that gets extended late.
+#
+# ⚠ Do NOT restore a per-file block here. The old comment justified the
+# per-file scope as protecting asm.cpp / disasm.cpp, whose switches use
+# deliberate subset-with-`default` forms — but that protection was never
+# needed: `-Werror=switch` / C4062 are the NO-`default` flavor and are
+# suppressed outright by the presence of a `default:` arm. The scoping cost a
+# missed file and bought nothing.

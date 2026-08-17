@@ -29,7 +29,7 @@
     }
   ],
   "optimizedPipelines": [
-    {"label": "full", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
-    {"label": "release", "shippedPipeline": "release"}
+    {"label": "full", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
   ]
 }

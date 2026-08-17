@@ -10,6 +10,6 @@
     { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"] }
   ],
   "optimizedPipelines": [
-    {"label": "release", "shippedPipeline": "release"}
+    {"label": "release", "shippedPipeline": "release", "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: x86_64:pe64-x86_64-windows-exec. It DIFFERED on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec, so identity here is target-dependent and an arm-level opt-in (which applies to every target at once) would red the spec where it is identical. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST, AND FORMAT-DEPENDENT: this example's source is platform-conditional, and identity was MEASURED to disagree between legs for exactly that reason. The key is per-ARM and applies to EVERY target at once, so arming it on the strength of the leg where it differs would red the leg where it does not. MEASURED identical on pe64 and DIFFERING on elf64 — the guards fold differently per format. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."}
   ]
 }

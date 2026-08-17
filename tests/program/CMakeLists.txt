@@ -22,6 +22,8 @@ dss_add_test(NAME program/test_input_resolver
              SOURCES test_input_resolver.cpp)
 dss_add_test(NAME program/test_cross_validate_target_format
              SOURCES test_cross_validate_target_format.cpp)
+dss_add_test(NAME program/test_cross_validate_language_target
+             SOURCES test_cross_validate_language_target.cpp)
 dss_add_test(NAME program/test_project_config
              SOURCES test_project_config.cpp)
 

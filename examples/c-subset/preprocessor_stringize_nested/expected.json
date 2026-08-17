@@ -31,6 +31,6 @@
     }
   ],
   "optimizedPipelines": [
-    {"label": "release", "shippedPipeline": "release"}
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
   ]
 }

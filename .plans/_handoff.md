@@ -9,12 +9,18 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-14 (written MID-CYCLE, deliberately, as insurance against a context loss —
-this is the SECOND such write of this cycle; the session that wrote the first one ran out of context)
-· **Branch:** `feature/finish-hooks-and-dependson-surface`
+**Last updated:** 2026-08-15 (AP5/AP6 CLOSE-OUT, written mid-cycle as insurance — the THIRD such
+write of this arc) · **Branch:** `feature/finish-hooks-and-dependson-surface`
 · 📄 **PR [#53](https://github.com/dailysoftwaresystems/dss-code-prime/pull/53) is OPEN against `main`.**
 
-✅ **AP6 IS COMMITTED AND PUSHED — the working tree is CLEAN.** ✔MEASURED commits ahead of
+⚠⚠ **READ THIS FIRST: THE TREE IS NO LONGER CLEAN, AND THE CLOSE-OUT IS UNCOMMITTED.**
+✔MEASURED 2026-08-15: **508 dirty paths — 455 under `examples/`** (the corpus arming, §1.0) **and 53
+elsewhere**, plus 3 untracked. ⇒ **the earlier "AP6 is committed and pushed, the working tree is
+CLEAN" line was true on 2026-08-14 and is now FALSE**; five parallel lanes ran after it. Nothing in
+§1.0 is committed. If this tree is lost, that work is lost.
+
+✅ **AP6 ITSELF IS COMMITTED AND PUSHED** — `867fa81`, `e3fd4e1`, `6a4dac6`, `293d069`. What follows
+in §1.0 is the close-out ON TOP of those. ✔MEASURED commits ahead of
 `origin/main`: `867fa81` (AP6 itself), `e3fd4e1` (plan-06 B.12 corrected), `6a4dac6` (WSL leg +
 harness rules + DCO authorization), `293d069` (the macOS leg). ⚠ The first two are **UNSIGNED** —
 they predate the operator's sign-off authorization (§4) and were pushed unsigned by explicit
@@ -39,6 +45,161 @@ before touching anything dependency-shaped.
 ✔**MEASURED baseline of the MERGED tree** (Windows MSVC-Debug, `build/`, 2026-08-14): build **rc=0,
 ZERO warnings tree-wide**; full ctest **859/861** at the merge point, with both reds diagnosed and FIXED (§1.3). ✅ **The FINAL gate after the resolver, the two corpus examples and the CR fix is 864/864, 0 failed** (§1.2). The pre-cycle baseline at `d4c2836` was 860/860.
 
+### 1.0 ⚠ THE 2026-08-15 CLOSE-OUT — UNCOMMITTED, five parallel lanes plus orchestrator work
+
+**Operator instruction for this stretch:** finish everything artifact-profile-related; defer the
+rest to another session. ⛔ **`D-TEST-CLI-CORPUS-RUNNER-IGNORES-OPTIMIZED-PIPELINES-AND-STDOUT` is
+EXPLICITLY EXCLUDED** by standing instruction (it would conflict with another session's PR) — do not
+touch it or `integrated_tests/**`.
+
+**a. ★ NEW MECHANICAL GATE — `tools/check-diagnostic-codes.py`.** ✔Built because two concurrent lanes
+allocated `0xD029`, caught only because one lane RE-MEASURED instead of trusting its brief. Reads the
+ENUM, never a hand-maintained table — the contiguity pin in `test_parse_diagnostic.cpp` structurally
+cannot catch this, since it only checks rows somebody remembered to add. Three checks: duplicate
+value (fatal), enumerator with no explicit value (fatal), code no compiled test names (ratchet vs a
+frozen 37-name baseline). Prints next-free-per-band on the green path. `--self-test` included; wired
+into the Step 6 battery in `references/gate-and-cross-plan.md`.
+✔**RED-ON-DISABLE on the production header** (268,981 bytes): clean unmutated; re-staging the real
+collision reports it; dropping an explicit value reports it — each mutation guarded by an assert that
+the bytes changed.
+
+**b. ✅ ALL FOUR LEGS GREEN — 865/865 EACH. ✔MEASURED 2026-08-15/16, rc captured DIRECTLY from each
+command and never inferred from a wrapper.** Baseline was 864/864 at the AP6 commit; the +1 is the
+new `program/test_cross_validate_language_target` binary, so the delta reconciles exactly.
+
+| leg | build | ctest |
+|---|---|---|
+| Windows MSVC-Debug | `BUILD-EXIT=0`, zero warnings | **`FULL-CTEST-RC=0`, 865/865** |
+| WSL x86_64 gcc (native ext4) | rc=0, only pre-existing `-Winvalid-pch` | **865/865**, 0 committed CRLF |
+| qemu-aarch64, `DSS_STRICT_ARM_VERDICTS=ON` | rc=0, `file` confirms aarch64 | **`CTEST-RC=0`, 865/865** |
+| macOS Apple Silicon, Apple clang 21.0.0 | rc=0, 1 warning **in vendored googletest only** | **`CTEST-RC=0`, 865/865** |
+
+⚠⚠ **EVERY NON-WINDOWS LEG FIRST FAILED ON AN INVISIBLE AMBIENT PRECONDITION, NOT ON THE PRODUCT.
+Read these three rows BEFORE re-running any leg or you will re-diagnose them from scratch:**
+- **arm64** reported **595 of 865 FAILED (31% passing)** — all from ONE harness self-check
+  (`RunHarnessStack`, `RLIMIT_STACK` 8 MiB vs 256 MiB wanted) linked into all 595 example binaries.
+  `Examples.RunFromManifest` passed throughout. `ulimit -s 262144`, no rebuild ⇒ 865/865.
+  ★ The orchestrator's first hypothesis (strict verdicts converting skips to failures) was
+  **REFUTED by the ledger** (`environmental: 0 emulator-missing`). Do not re-derive it.
+  [[D-TEST-ARM64-LEG-NEEDS-AMBIENT-ULIMIT-STACK-OR-595-ENTRIES-RED]]
+- **macOS** died at configure with `cmake: command not found` because the emsdk login profile
+  **REPLACES** `PATH`, hiding `/opt/homebrew/bin`. Fix: prepend it, plus `EMSDK_QUIET=1`.
+  ⚠ Never pipe binary OUT of that host — the profile writes to stdout.
+  [[D-TEST-MACOS-LEG-EMSDK-PROFILE-REPLACES-PATH-HIDING-HOMEBREW]]
+- **WSL** reported `line_endings_guard` red purely because the rsync excluded `.git/`; the guard
+  fails closed by design and is RIGHT. With `.git` present it passes and reports 0 CRLF files.
+ⓘ macOS passed with `ulimit -s` still at 8176, which CORROBORATES that the harness's stack self-bump
+works natively and the arm64 cascade was specifically a `qemu-user` limitation.
+
+★★ **THREE TIMES THIS CYCLE A BACKGROUND TASK REPORTED `exit code 0` OVER WORK THAT NEVER RAN** — a
+wrong MSBuild target (`MSB1009`), the macOS `cmake` failure, and an orphaned macOS task whose whole
+output was a missing input file plus `Connection reset by peer`. **In every case the only thing that
+caught it was an explicit `echo "RC=$?"` immediately after the command.** ⇒ `tools/run-gate.sh`'s
+rule applies to REMOTE and BACKGROUND work too, not just local gates.
+
+**c. Lane work landed (all uncommitted).**
+- **`-Werror=switch` / `/we4062` tree-wide** at ONE chokepoint (`CMakeLists.txt:220-227`), retiring
+  FIVE per-file ratchets across 8 hand-listed files. ✔Coverage 434/434 of our TUs, 0/4 googletest.
+  ✔Zero fallout (257 warnings = baseline exactly). ✔Red-on-disable on the REAL defect: the
+  `CfClass::Switch` fallthrough is now a build error on the local MSVC gate, not a macOS-only
+  sighting. Closes plan-07 **G-711**, pending ~3 months.
+- **`emitsArtifact` fully reverted** (byte-identical to HEAD); `0xD027` freed; **`module` added to
+  all TEN `lib`/`staticlib` formats**; the AP3 reject split (`0xD011` vs `0xD028`) pinned
+  three-sidedly. ✔`ModuleIsALibrary.StandaloneModuleBuildEmitsAnArchive` + `…EmitsNoSecondArtifact`.
+  ★ Zero engine code — the archive fork dispatches on the format's declared `container`.
+- **`0xD029` `D_DependencyBuildFailed`** split out of `0xD022`. NOT unsuppressable, and that is a
+  measured VERDICT: it is an attribution line above merged inner diagnostics that survive.
+- **Byte-identity detector** in `examples_runner.cpp` (+549) with the per-arm
+  `mustDifferFromBaseline` lever; then **548 arms armed across 385 manifests**, 97 vacuous units
+  triaged and documented, **zero examples edited, zero arms deleted**.
+- **ISA gate behavioural test** — `tests/program/test_cross_validate_language_target.cpp` (new, 857
+  lines, 19 tests), all four verdicts non-vacuous, impostor built from target twins differing ONLY in
+  `target.isa`, both call sites reached, red-on-disable turning exactly ONE pin red.
+
+**d. ★ ORCHESTRATOR FIX — `D_LanguageTargetIsaMismatch` IS NOW UNSUPPRESSABLE.** The ISA lane
+refuted the landed note, which claimed suppression costs only "less explanation". ✔MEASURED via the
+real CLI: `--suppress=D_LanguageTargetIsaMismatch` gave **rc=1, stdout 0 bytes, stderr 0 bytes** — a
+silent non-zero exit, prong (2) verbatim. Added to the table; the allocation note rewritten. ⓘ The
+addition overflowed `std::array<UnsuppressableEntry, 150>` and broke the build — extent raised to
+151, and the explicit count is now documented as deliberate (it makes an unconsidered append a
+compile error, which is what it just did).
+
+**e. ✔ANCHOR STATE.** Guard **OK (1163 src anchors all resolve, 0 cell-width violations)**.
+Balance **created 4, closed 1 — FAILING, and deliberately so (§B carry, operator-authorized).** The
+four: `D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION` and
+`D-DEPS-SOURCEMERGE-INHERITS-THE-CONSUMERS-COMPILATION-ENVIRONMENT` (both requested by the operator);
+`D-TEST-CORPUS-DARWIN-LEG-BYTE-IDENTITY-UNMEASURED`; `D-AP6-NO-CORPUS-EXAMPLE-FOR-A-STANDALONE-MODULE-BUILD`.
+⚠ **Do NOT close any of them by weakening a row.**
+
+**f. ★★ AP7 IS SCOPED AND TRIGGER-GATED.** Operator, 2026-08-15: *"we'll have an AP7 that will allow
+any language project to import any other language project and we'll use the IRs to make it work…
+allow a C language project to import a python one."* **TRIGGER: *"we need a second language for that
+before starting this anchor."*** ⛔ Not a TODO — if the trigger has not fired, report "trigger not
+fired" and skip. ⓘ Whether a given shipped language satisfies it is a **§B call, not the cycle's**.
+Recorded in plan-06 §5 (AP7 row) and `D-DEPS-SOURCEMERGE-INHERITS-THE-CONSUMERS-COMPILATION-ENVIRONMENT`.
+
+**h. ★★★ MERGE GUIDANCE FOR PR [#54](https://github.com/dailysoftwaresystems/dss-code-prime/pull/54)
+(`feature/c23-conformance-burndown-3`, "GNU extended inline asm"). READ BEFORE MERGING EITHER PR.**
+✔MEASURED 2026-08-15 (`gh pr view 54 --json files` ∩ `git status`): **17 files are touched by BOTH
+branches.** None of the overlaps is a semantic fight — they are independent additions to shared
+files — but **two of them break silently if merged naively**, so they are called out first.
+
+- ⚠⚠ **`src/core/types/unsuppressable_codes.cpp` — THE DANGEROUS ONE.** The table is a FIXED-EXTENT
+  `std::array<UnsuppressableEntry, N>`. This branch raised **150 → 151** (adding
+  `D_LanguageTargetIsaMismatch`); #54 adds its own rows and will have raised it too. **Taking both
+  sides' rows while keeping ONE side's extent does not compile — and a merge that "resolves" it by
+  dropping rows to fit the number is silently wrong.** ⇒ take ALL rows from both sides and set the
+  extent to `150 + (this branch's 1) + (#54's count)`. The explicit count is deliberate: it makes an
+  unconsidered append a compile error, and it already caught this branch doing exactly that.
+- ⚠⚠ **`src/asm/asm_text_to_lir.cpp` + `src/asm/CMakeLists.txt` — #54 MAY FAIL TO BUILD AFTER THE
+  MERGE, THROUGH NO FAULT OF ITS OWN.** This branch enabled **`-Werror=switch` / `/we4062`
+  tree-wide** at one chokepoint (`CMakeLists.txt:220-227`) and RETIRED the five per-file ratchets,
+  including `src/asm`'s. ⇒ every switch #54 adds over an enum is now a hard error if non-exhaustive,
+  on a file #54 heavily edits. 📄Expect to fix a few arms; do NOT re-add a per-file ratchet or a
+  `default:` to silence it — the whole point is that the compiler walks you to every site.
+  ✔This already caught a live silent fallthrough (`CfClass::Switch`) that only macOS had seen.
+- **`src/core/types/parse_diagnostic.{hpp,cpp}` — no conflict in substance: DIFFERENT BANDS.** This
+  branch took `D_` **0xD028 / 0xD029 / 0xD02A**; #54 took `S_` **0xE065..0xE06B** and `L_`
+  **0xB010..0xB012**. ⇒ take both sides' enumerators verbatim. ⛔ **RENUMBER NOTHING** — these are
+  published `error[Dxxxx]` identities. ✔Run `python tools/check-diagnostic-codes.py` immediately
+  after the merge: it fails on any duplicate value and on any unvalued enumerator. ⓘ `0xD027` is a
+  WITHDRAWN HOLE, deliberately not back-filled.
+  ★ **AND RETIRE THE RESERVATION:** `RESERVED_ELSEWHERE` in that script currently holds #54's two
+  ranges so this branch could not allocate into them. **The moment #54 merges, DELETE both rows** —
+  the codes are then in the enum and the ordinary duplicate check covers them, whereas a stale
+  reservation starts refusing legitimate ordinals. See `D-DIAG-ORDINAL-SPACE-HAS-NO-CROSS-BRANCH-VIEW`.
+- **`.plans/_deferred-anchor-registry.md` — both sides APPEND rows. Take both; never drop one** (the
+  audit trail is load-bearing, §F). ⚠ Watch the cell-count guard: a literal `|` inside a cell is read
+  as a column boundary and silently truncates the row — escape it `\|`. Run
+  `tools/check-anchor-registry.sh` after merging; it catches exactly that.
+- **`.plans/_handoff.md` — do NOT hand-merge hunks.** This file is REWRITTEN wholesale every cycle by
+  contract. Whoever merges second rewrites it for the merged state.
+- **`src/dss-config/targets/{x86_64,arm64}.target.json` and `sources/asm-{x86_64-att,arm64-gas}.lang.json`
+  — take both sides' keys.** This branch added the **`isa` axis** (`x86_64` / `aarch64`; the target
+  `arm64` deliberately declares `aarch64`, ARM's psABI name — **do not "tidy" that to match the
+  target name**, a test pins the divergence on purpose). #54 edits the same documents for inline-asm
+  vocabulary. The keys are disjoint.
+- **`src/core/types/target_schema.{hpp,_json.cpp}`, `grammar_schema_json.cpp`** — this branch added
+  the `isa` accessor and its loader; #54 adds inline-asm fields. Disjoint additions, take both.
+- **`tests/core/test_parse_diagnostic.cpp`** — this branch extended the contiguity run through
+  `0xD02A` and pinned the `0xD027` hole explicitly (`kWithdrawnSlot`). If #54 adds value pins,
+  keep both and raise the hand-maintained `EXPECT_EQ(checked, N)` to the combined total.
+- **`examples/c-subset/c_inline_asm/expected.json`** — the only example both touch. This branch added
+  `mustDifferFromBaseline` / `$commentByteIdentical` corpus keys; #54 owns the example's content.
+  Take #54's content plus this branch's keys. 📄**For #54's OTHER new examples:** if an
+  `examples/asm/**` example declares `optimizedPipelines`, it will be byte-identical to its baseline
+  by construction (assembly never forms HIR/MIR), so give it a `$commentByteIdentical` note —
+  **not** `mustDifferFromBaseline`, which would red it forever.
+- `src/lir/CMakeLists.txt` — this branch retired its per-file switch ratchet; take that plus #54's edits.
+
+📄 **What #54 does NOT need to worry about:** `integrated_tests/runner.cpp` is untouched by this
+branch, and `D-TEST-CLI-CORPUS-RUNNER-IGNORES-OPTIMIZED-PIPELINES-AND-STDOUT` was deliberately left
+undone by operator decision precisely to keep it that way.
+
+**g. NEXT, in order.** (1) finish the full ctest; (2) re-run the other three legs — nothing since the
+close-out began; (3) the MinGW `ConfigMirror` fix, which reds two of B.10's fail-closed pins on every
+gcc leg; (4) commit code AND plans together. ⚠ **`.plans/_handoff.md` must be staged in THAT commit.**
+
 ### 1.1 ✅ Landed in the working tree
 - **Substrate** — `spawnAndWaitRedirectStdout(argv, cwd, stdoutFile)`, an OS file handle and never a
   pipe. Three latent defects found and fixed: `dup2(n,n)` is a no-op that does **not** clear
@@ -47,7 +208,15 @@ ZERO warnings tree-wide**; full ctest **859/861** at the merge point, with both 
   child's stdin and stderr**. ✔Windows 48/48, ✔WSL x86_64 60/60.
 - **Diagnostics** — `0xD022` Unresolvable · `0xD023` Ambiguous · `0xD024` DerivedNameInvalid ·
   **`0xD025` `D_DependencyOutputNameCollision`** · **`0xD026` `D_DependencyGraphTooDeep`**.
-  ✔**NEXT FREE SLOT IS `0xD027`.**
+  ⛔ **"NEXT FREE SLOT IS `0xD027`" IS STALE — DO NOT USE IT.** ✔RE-MEASURED 2026-08-15: `0xD027` was
+  allocated and then **WITHDRAWN**, and is a permanent HOLE that must not be back-filled (renumbering
+  rewrites a published `error[Dxxxx]`). Since then `0xD028` `D_ArtifactProfileNoServingFormat`,
+  `0xD029` `D_DependencyBuildFailed` and `0xD02A` `D_LanguageTargetIsaMismatch` landed.
+  ✔**NEXT FREE IN THE `D_` BAND IS `0xD02B`.**
+  ★ **STOP READING THAT NUMBER OUT OF THIS FILE.** A stale next-free slot in a lane brief is exactly
+  how two lanes collided on `0xD029` this cycle. Ask the header instead:
+  `python tools/check-diagnostic-codes.py` prints the next free ordinal **per band** on its green
+  path, derived from the enum itself.
 - **Driver (U-2 mechanism)** — `Program::setResolveLibraryAdditionsByTarget`, an INTERNAL per-target
   channel **keyed by target spec** (not index-parallel — keying removes the mis-alignment failure
   mode instead of diagnosing it). `compileOneTarget` returns `std::optional<fs::path>` with

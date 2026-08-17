@@ -2564,6 +2564,53 @@ private:
         case CfClass::CondBr:      buildCondBr(ins, armNames, payload, flags); return;
         case CfClass::Call:        buildCall(ins, armNames, payload, flags, widthBits); return;
         case CfClass::IndirectBr:  buildIndirectBr(ins, armNames, payload, flags, widthBits); return;
+        // ★★★ THIS ARM IS A REFUSAL, AND IT REPLACES A SILENT FALLTHROUGH —
+        // NOT A WARNING. ✔MEASURED 2026-08-15
+        // (D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS):
+        // with no `Switch` case and no `default:`, a switch-classed instruction
+        // fell straight out of this dispatch into the PLAIN data path below —
+        // destination/source partition, then election over
+        // `candidatesForClass(row, Switch)`. Two outcomes, both wrong and
+        // neither loud about the real cause:
+        //   * a target whose switch opcode declares a variant matching the
+        //     written shape ELECTS, and `builder_.addInst` appends a
+        //     NON-TERMINATOR — the multi-way dispatch is lowered to an ordinary
+        //     instruction and the block is left unterminated. A silent
+        //     miscompile: control flow the programmer wrote, gone, rc=0.
+        //   * a target whose variants do not match is refused as
+        //     "no candidate target opcode encodes that shape", which blames the
+        //     OPERANDS for what is really an unimplemented control-flow class.
+        // ⚠ AND IT IS REACHABLE FROM CONFIG, not merely in theory.
+        // `terminatorKind: "switch"` is a validated `.target.json` value —
+        // `tests/core/test_target_schema.cpp` pins that a switch-kinded opcode
+        // with minSuccessors 2 LOADS and one with minSuccessors 1 is refused —
+        // and `cfClassOf` maps it here. Nothing between the loader and this
+        // point filters it: `resolveRows` only cross-checks that a row's
+        // candidates agree, and `emitInstruction`'s `anyClass()` gate only asks
+        // that SOME class resolved. The reason no test caught it is that
+        // NEITHER SHIPPED TARGET declares such an opcode today — a
+        // right-by-coincidence-of-the-current-target-table shape, the same one
+        // D-ASM-COND-ALLOWED-ONLY-ON-JCC was.
+        // ★ WHY REFUSE RATHER THAN LOWER: there is nothing to lower TO. LIR's
+        // terminator API is br / cond-br / indirect-br / return / unreachable
+        // (`lir.hpp`); `addSwitch` exists on the MIR builder ONLY, and
+        // `target_schema.hpp`'s own note calls the LIR one "reserved". A build
+        // that cannot represent the construct must say so, in one message that
+        // names the construct — which is what this arm does.
+        case CfClass::Switch:
+            fail(ins.node,
+                 std::format("'{}' is {}, which this build does not lower from "
+                             "assembly text: LIR carries no multi-way "
+                             "terminator (its terminators are an unconditional "
+                             "branch, a conditional branch, an indirect branch, "
+                             "a return and an unreachable trap), so the "
+                             "case-value-to-label mapping a switch instruction "
+                             "carries has nowhere to go. Spell the dispatch as "
+                             "compare-and-branch, or as an indirect branch "
+                             "through a jump table{}",
+                             ins.mnemonic, cfClassName(*cfClass),
+                             pairSuffix()));
+            return;
         case CfClass::Unreachable:
             fail(ins.node,
                  std::format("'{}' is {}, which this build does not lower from "

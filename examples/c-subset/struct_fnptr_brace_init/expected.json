@@ -10,6 +10,6 @@
     { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
   ],
   "optimizedPipelines": [
-    { "label": "release", "shippedPipeline": "release" }
+    { "label": "release", "shippedPipeline": "release", "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST: every call here is INDIRECT through a function pointer. The shipped pipeline does not devirtualize a statically-known target, so there is nothing to inline or fold. If it ever gains that, this arm starts differing and should be armed then. `a.op`/`b.op` are brace-initialized function-pointer members. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in." }
   ]
 }

@@ -47,11 +47,13 @@
         "Licm",
         "SimplifyCfg",
         "Dce"
-      ]
+      ],
+      "mustDifferFromBaseline": true
     },
     {
       "label": "release",
-      "shippedPipeline": "release"
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
     }
   ]
 }

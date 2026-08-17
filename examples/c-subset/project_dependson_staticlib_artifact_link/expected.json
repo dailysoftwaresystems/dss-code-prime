@@ -7,7 +7,7 @@
   "project": ".dss-project.json",
   "exitCode": 42,
   "optimizedPipelines": [
-    { "label": "release", "shippedPipeline": "release" }
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
   ],
   "targets": [
     {

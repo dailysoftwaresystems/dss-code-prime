@@ -164,6 +164,68 @@ endif()
 # belt for that one critical generated TU.
 add_compile_options("$<$<AND:$<CXX_COMPILER_ID:GNU>,$<PLATFORM_ID:Windows>>:-Wa,-mbig-obj>")
 
+# ── Exhaustive-switch enforcement, PROJECT-WIDE ──
+# D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS, closing half.
+#
+# ★ WHAT THE MEASUREMENT ACTUALLY SHOWED, because the anchor row got it wrong.
+# The row recorded the macOS-only `-Wswitch` finding as a CLANG-ONLY warning —
+# a toolchain gap, to be closed by adding a clang leg to the routine gate.
+# ✔MEASURED: it is nothing of the kind. GCC 13 reports the identical
+# `enumeration value 'X' not handled in switch [-Wswitch]` at the identical
+# line the moment `-Wall` (or `-Wswitch` alone) is on the command line, and a
+# sweep of EVERY CMakeLists.txt in this tree found NO `-Wall`, NO `-Wextra`
+# and NO `/W4` anywhere. Clang saw it only because AppleClang's DEFAULTS
+# include `-Wswitch`; MSVC's equivalent (C4062) is off by default at every
+# `/W` level. So the class was invisible for a reason that costs nothing to
+# fix and needs no new CI leg: NOBODY ASKED FOR IT. A gate gap, not a
+# compiler quirk — and a whole warning class hid behind the mis-diagnosis.
+#
+# ★ WHY IT IS PROJECT-WIDE AND NOT A SIXTH HAND-LISTED RATCHET. This gate
+# already existed FIVE TIMES over, per-file, in five different CMakeLists
+# (src/asm, src/opt, src/lir, src/core, src/mir/lowering — see the anchor
+# notes retained at each site). The file that shipped the defect,
+# `src/asm/asm_text_to_lir.cpp`, sits in the SAME TARGET as four files the
+# src/asm ratchet covers and was simply not on its hand-written list; its own
+# comment even describes the drift as surfacing "only ... on the macOS /
+# linux-clang CI legs". Duplication is what bred the missed site, so the
+# remedy is the section-A.5 move: ONE chokepoint, coverage by construction,
+# no list to forget a file from.
+#
+# ⚠ THIS IS THE NO-`default` FLAVOR, AND THAT IS THE WHOLE REASON IT IS SAFE
+# TO GENERALIZE. `-Wswitch` / C4062 fire ONLY on a switch over an enum that
+# has NO `default:` arm and is missing an enumerator. Every subset-switch in
+# this tree that deliberately carries a `default:` is untouched — the five
+# per-file blocks each said so in their own comments, which is precisely why
+# their per-file scoping was never load-bearing for correctness. The noisy
+# with-default flavor (`-Wswitch-enum` / C4061) is deliberately NOT enabled.
+#
+# ✔BLAST RADIUS MEASURED BEFORE ENABLING, on the whole tree (702 targets,
+# src + tests + integrated_tests), GCC 13.3 `-Wall -Wextra`: **ZERO**
+# `-Wswitch` occurrences. So this flag costs no source changes today and its
+# entire job is to keep it that way. (The same probe found 1039 other
+# warnings in classes NOT enabled here; they are reported to the operator
+# rather than dumped into this change.)
+#
+# ⚠ FAILURE DIRECTION IF THIS IS WRONG: it is an ERROR, not a warning, so the
+# way it fails is LOUD AND IMMEDIATE — a future toolchain that reports
+# `-Wswitch` somewhere we cannot currently compile (an `__APPLE__`-only arm,
+# a newer libstdc++ enum) reds the build instead of shipping. That is the
+# direction we want: the alternative, a warning nobody reads, is the exact
+# mechanism that let an unhandled control-flow enumerator sit unnoticed
+# across three legs. If it ever needs relaxing, relax it at THIS line so the
+# relaxation is visible in one place — never with a blanket `default:` arm,
+# which would hide the unhandled enumerator instead of reporting it.
+#
+# Placed AFTER the FetchContent block on purpose (same reason as /bigobj
+# above): directory-scoped options do not reach googletest / nlohmann_json,
+# which were already added by FetchContent_MakeAvailable and must not be
+# gated on our warning policy.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    add_compile_options(-Werror=switch)
+elseif(MSVC)
+    add_compile_options(/we4062)
+endif()
+
 # ── Precompiled headers (build-time only — D-CI-WINDOWS-MSVC-BUILD-TIME-CEILING) ──
 # The windows-msvc-release CI leg re-parses the same heavy, templated STL
 # headers (<format>, <unordered_map>, <vector>, …) in every one of the ~280

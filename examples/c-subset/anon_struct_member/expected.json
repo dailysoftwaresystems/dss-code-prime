@@ -10,6 +10,6 @@
     { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
   ],
   "optimizedPipelines": [
-    {"label": "release", "shippedPipeline": "release"}
+    {"label": "release", "shippedPipeline": "release", "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST: the values here live in an AGGREGATE (struct/union/array) local or global. The shipped pipeline does not promote aggregate storage, so the address-compute/store/load chain survives the pipeline unchanged. `s.a`/`s.b` are members of a struct local. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."}
   ]
 }

@@ -403,6 +403,18 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "D_DependencyOutputNameCollision";
         case DiagnosticCode::D_DependencyGraphTooDeep:
             return "D_DependencyGraphTooDeep";
+        // The AP3 artifact-profile gate's reject split (the other arm is
+        // D_ArtifactProfileFormatMismatch above).
+        case DiagnosticCode::D_ArtifactProfileNoServingFormat:
+            return "D_ArtifactProfileNoServingFormat";
+        // The derivation SUCCEEDED and the dependency's own build then failed —
+        // the fact 0xD022 used to absorb.
+        case DiagnosticCode::D_DependencyBuildFailed:
+            return "D_DependencyBuildFailed";
+        // The language↔target architecture gate
+        // (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE).
+        case DiagnosticCode::D_LanguageTargetIsaMismatch:
+            return "D_LanguageTargetIsaMismatch";
 
         case DiagnosticCode::F_FileOpenFailed:               return "F_FileOpenFailed";
         case DiagnosticCode::F_FileEmpty:                    return "F_FileEmpty";

@@ -21,42 +21,29 @@ target_compile_definitions(lir PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
 target_link_libraries(lir PRIVATE core)
 
-# D-LIR-TEXT-EXHAUSTIVE-WARN (2026-08-03, TF-C112): enforce EXHAUSTIVE
-# closed-enum dispatch in lir_text.cpp. The file's two CLOSED-ENUM switches —
-# the `TypeKind` round-trip-tag table `typeKindName` and `parseInst`'s
-# `TargetTerminatorKind` terminator dispatch — are both written with NO
-# `default:` arm (one explicit case per enumerator, plus a post-switch
-# out-of-range backstop where the function returns a value), so the
-# "no-default + missing case = error" flavor (GCC/Clang `-Werror=switch`;
-# MSVC `/we4062`) turns a future enumerator added without a matching arm
-# into a BUILD ERROR, on local MSVC too.
+# D-LIR-TEXT-EXHAUSTIVE-WARN (2026-08-03, TF-C112) — the exhaustive closed-enum
+# gate on lir_text.cpp is now PROJECT-WIDE (root CMakeLists.txt). The TU's two
+# no-`default` switches — the `TypeKind` round-trip-tag table `typeKindName` and
+# `parseInst`'s `TargetTerminatorKind` terminator dispatch — remain covered;
+# they are just no longer covered BY NAME.
 #
-# Born from exactly that drift: `TypeKind::VolatileQual` /
-# `TypeKind::NullptrT` and `TargetTerminatorKind::IndirectBr` had all been
-# appended to their enums with no arm here, surfacing only as `-Wswitch` on
-# the clang/ASan leg and INVISIBLE to every local GCC/MSVC build for their
-# whole lifetime — the TypeKind pair as an un-parseable `core ?` tag (two
-# live kinds sharing the one un-invertible sentinel spelling), the terminator
-# one as a DROPPED terminator that made `LirBuilder` `abort()`.
+# The history is kept because it is the strongest evidence for the gate: three
+# enumerators (`TypeKind::VolatileQual`, `TypeKind::NullptrT`,
+# `TargetTerminatorKind::IndirectBr`) had been appended to their enums with no
+# arm here and were INVISIBLE to every local GCC/MSVC build for their whole
+# lifetime — the TypeKind pair emitting an un-parseable `core ?` tag (two live
+# kinds sharing one un-invertible sentinel), the terminator one DROPPING the
+# terminator until `LirBuilder` `abort()`ed.
 #
-# The TU's two OTHER switches are untouched and stay that way: the lexer's
-# `switch (c)` is over a char, and `parseOperand`'s `TokKind` dispatch is a
-# deliberate subset-with-`default` that diagnoses everything else. Both
-# `-Wswitch` and C4062 are suppressed by the presence of a `default:`, so
-# neither is dragged into the gate.
+# The TU's two other switches stay unaffected, and that is automatic rather
+# than arranged: the lexer's `switch (c)` is over a char, and `parseOperand`'s
+# `TokKind` dispatch is a deliberate subset-with-`default`. Both `-Wswitch` and
+# C4062 are suppressed by the presence of a `default:` arm.
 #
-# The fourth instance of this gate pattern: mirrors
-# D-DIAG-CODENAME-EXHAUSTIVE-WARN (src/core), D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN
-# (src/asm) and D-OPT-RUNPASS-EXHAUSTIVE-WARN (src/opt). Per-file scope is
-# load-bearing: do NOT spread this to the sibling LIR TUs, whose switches
-# legitimately use subset-with-`default` forms.
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    set_source_files_properties(lir_text.cpp PROPERTIES
-        COMPILE_OPTIONS "-Werror=switch")
-elseif(MSVC)
-    set_source_files_properties(lir_text.cpp PROPERTIES
-        COMPILE_OPTIONS "/we4062")
-endif()
+# ⚠ This was the FOURTH per-file copy of one gate. The fifth copy's list is
+# what missed `src/asm/asm_text_to_lir.cpp` — see
+# D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS. Do not add a
+# sixth; extend the chokepoint instead.
 
 # ML5 cycle 3: MIR→LIR isel pass lives in `lowering/`; separate OBJECT lib
 # so the LIR substrate itself stays MIR-free (the LIR module is target-

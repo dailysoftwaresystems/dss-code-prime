@@ -12,6 +12,6 @@
     { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
   ],
   "optimizedPipelines": [
-    {"label": "constfold-only", "passes": ["ConstFold"]}
+    {"label": "constfold-only", "passes": ["ConstFold"], "mustDifferFromBaseline": true}
   ]
 }

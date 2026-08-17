@@ -1555,6 +1555,13 @@ enum class DiagnosticCode : std::uint16_t {
     //   this is "the chosen FORMAT doesn't produce this profile" (fix the
     //   target/format, or ship the backend that emits it). Remediation-
     //   distinct → distinct code.
+    //   ⚠ NARROWED 2026-08-15 (closes
+    //   D-AP3-UNSERVED-PROFILE-MISREPORTS-AS-A-FORMAT-MISMATCH): this code now
+    //   means a GENUINE mismatch — the profile IS served by at least one
+    //   shipped object format, just not by this one — and its message NAMES
+    //   the formats that do serve it, which is the actionable half that was
+    //   missing. The "no format serves it anywhere" case it used to absorb
+    //   moved to `D_ArtifactProfileNoServingFormat` (0xD028).
     D_ArtifactProfileFormatMismatch = 0xD011,
     // c105 (D-PP-USER-DEFINE): `--define` was passed but the language declares
     // no preprocess block — the macros could never be consumed. Silent
@@ -1667,7 +1674,7 @@ enum class DiagnosticCode : std::uint16_t {
     D_ScriptExitedNonZero        = 0xD018,
 
     // ── Project dependencies: `dependsOn` (0xD019..0xD020, CONTINUED at
-    // 0xD022..0xD024) ──
+    // 0xD022..0xD026 and 0xD029) ──
     // A `dependsOn` entry names either a RELATIVE PATH to another project
     // directory or a GIT URL cloned into `.dss-deps/<name>`. Resolution is
     // recursive (a dependency may itself declare `dependsOn`), so the failure
@@ -1678,7 +1685,12 @@ enum class DiagnosticCode : std::uint16_t {
     //   * git acquisition — 0xD01D..0xD020, plus the derived-name reject
     //     0xD024;
     //   * building a resolved dependency for the CONSUMER's targets —
-    //     0xD022, 0xD023, plus the output-name collision 0xD025;
+    //     0xD022, 0xD023, plus the output-name collision 0xD025 and the
+    //     build-FAILED outcome 0xD029. Note the split inside this group: the
+    //     first two are outcomes of the format DERIVATION (no candidate / two
+    //     candidates, so nothing is compiled), while 0xD029 is what happens
+    //     AFTER a successful derivation — remediation-distinct, and one code
+    //     used to carry both;
     //   * resolver limits — 0xD026.
     // The run is deliberately NOT contiguous: 0xD021 is an unrelated
     // reporter-policy code that landed between the two halves. See the
@@ -1890,8 +1902,10 @@ enum class DiagnosticCode : std::uint16_t {
 
     // ── Project dependencies, continued: consumer-driven format derivation
     // and the `.dss-deps/<name>` derivation (0xD022..0xD024) ──
-    // These three finish the `dependsOn` surface opened at 0xD019 and are
-    // documented as part of it (see the group list in that band's header).
+    // These three continue the `dependsOn` surface opened at 0xD019 and are
+    // documented as part of it (see the group list in that band's header —
+    // which is where the later additions 0xD025 / 0xD026 / 0xD029 are placed
+    // too; this sub-header covers only the run it names).
     // They are NOT contiguous with it because 0xD021 landed in between, and
     // this enum is APPEND-ONLY: the number is the operator-visible identity
     // (`error[D0020]`) and already appears in docs and in `expected.json`
@@ -1969,6 +1983,13 @@ enum class DiagnosticCode : std::uint16_t {
     //   the final verdict reported. Otherwise an ordinary single-arch build
     //   emits a mismatch line per rejected candidate and this code arrives
     //   buried in noise it manufactured itself.
+    //
+    //   ⚠ THIS CODE IS THE ZERO-CANDIDATE DERIVATION AND NOTHING ELSE. It ALSO
+    //   used to be emitted when a dependency's own build returned non-zero —
+    //   the state in which the derivation SUCCEEDED — which put a manifest
+    //   problem and a source-code problem behind one ordinal. That fact now has
+    //   its own code, `D_DependencyBuildFailed` (0xD029); do not route a build
+    //   outcome back through here.
     D_DependencyTargetFormatUnresolvable = 0xD022,
     // D_DependencyTargetFormatAmbiguous: the SAME derivation as 0xD022 returned
     //   TWO OR MORE candidate formats for one consumer target. The uniqueness
@@ -2146,6 +2167,214 @@ enum class DiagnosticCode : std::uint16_t {
     //   the CHAIN as its payload for the same reason 0xD01A carries the ring —
     //   a bare "too deep" on a large graph is unactionable.
     D_DependencyGraphTooDeep     = 0xD026,
+
+    // ── the AP3 artifact-profile gate's REJECT SPLIT (0xD028, paired with
+    // 0xD011 above) — closing
+    // D-AP3-UNSERVED-PROFILE-MISREPORTS-AS-A-FORMAT-MISMATCH ──
+    //
+    // ONE code used to answer two different questions and answered one of them
+    // with a confident falsehood: `D_ArtifactProfileFormatMismatch` reads
+    // *"you picked the wrong format"*, which is a true statement about the
+    // wrong thing when the fact is *"no format implements this anywhere"*.
+    // Sending a user to re-pick a format when no format can work is the
+    // misleading-diagnostic class the B.10 ruling already rejected a superset
+    // rule for. The two facts are remediation-distinct, so they are two codes:
+    //   * 0xD011 — ≥1 shipped format serves the profile, but not THIS one (fix
+    //              the target — the message NAMES the formats that do);
+    //   * 0xD028 — ZERO shipped formats serve it (no backend exists yet;
+    //              changing the target cannot help).
+    //
+    // ⓘ 0xD027 WAS ALLOCATED HERE AND IS FREE AGAIN. It was
+    // `D_ArtifactProfileEmitsNoArtifact`, minted for a third arm — "this
+    // profile produces no build product, so it cannot be built standalone" —
+    // that was REJECTED with the `emitsArtifact` column it read (plan 06 §5.1
+    // B.12 and its correction, 2026-08-15): a `module` IS a library, so a
+    // standalone module build is legitimate and must NOT be refused. The slot
+    // is left unused rather than back-filled, because 0xD028 shipped in the
+    // same change and renumbering a code is what the append-only rule forbids.
+    //
+    // D_ArtifactProfileNoServingFormat: NO shipped object format serves the
+    //   project's `artifactProfile` — the union of `artifactProfiles[]` over
+    //   `src/dss-config/object-formats/` does not contain it. ✔MEASURED
+    //   2026-08-15 over all 24 shipped format documents, that union is
+    //   `{cli, lib, staticlib, module}`, so SIX registered profiles are in
+    //   this state: `gui`, `script`, `sproc`, `transpile`, `shader`, `hdl`.
+    //
+    //   Remediation-distinct from 0xD011 in the strongest possible way: for
+    //   0xD011 there is a target that works and the message names it; here NO
+    //   target works, and the only real fixes are to build a different profile
+    //   or to ship the backend that emits this one. Reporting the 0xD011
+    //   wording would send the author around the entire target matrix looking
+    //   for a format that does not exist.
+    //
+    //   ⚠ The set it is derived from is the SHIPPED-FORMAT INVENTORY, a record
+    //   of what is IMPLEMENTED and never of what is POSSIBLE. That is why it
+    //   may report this diagnostic and may NOT be turned into a manifest rule
+    //   — the withdrawn B.12 derivation would have refused `targets[]` on a
+    //   `gui` project purely because no gui backend has shipped yet.
+    D_ArtifactProfileNoServingFormat = 0xD028,
+
+    // ── `dependsOn`, the OTHER half of the derivation's failure surface:
+    // THE DERIVATION SUCCEEDED AND THE BUILD FAILED (0xD029) — closes
+    // D-DEPS-BUILD-FAILURE-REUSES-THE-DERIVATION-UNRESOLVABLE-CODE ──
+    //
+    // D_DependencyBuildFailed: a dependency was built FOR A CONSUMER TARGET
+    //   (B.10's consumer-driven rule) and its own build returned non-zero. The
+    //   dependency's sources are the problem; everything upstream of the
+    //   compile worked.
+    //
+    //   ★ IT EXISTS BECAUSE 0xD022 WAS CARRYING THIS FACT TOO, AND THE TWO ARE
+    //   NOT THE SAME EVENT. `D_DependencyTargetFormatUnresolvable` (0xD022) is
+    //   allocated above as the ZERO-CANDIDATE outcome of the format
+    //   DERIVATION — no shipped object format can serve this dependency's
+    //   profile for this target, so the dependency is never compiled at all.
+    //   This code is the exact opposite state: the derivation ran, found its
+    //   unique format, the dependency WAS compiled for it, and the compile
+    //   failed. Reusing 0xD022 for both meant one ordinal answered two
+    //   questions with two unrelated remediations — EDIT A MANIFEST (or ship a
+    //   backend) versus FIX SOURCE CODE — and neither a reader, a log triage,
+    //   nor `--suppress=D_DependencyTargetFormatUnresolvable` could tell which
+    //   one had happened. The ordinal is the operator-visible identity, so a
+    //   code that means two things is a code that means nothing precise.
+    //
+    //   ⓘ THE SPLIT IS ONLY THE CODE. The surrounding behaviour was already
+    //   right and is deliberately unchanged: the message names the
+    //   DEPENDENCY'S MANIFEST PATH, the CONSUMER's target spec and the DERIVED
+    //   dependency spec, and directs the reader to the diagnostics above —
+    //   which the resolver has already re-reported from the sub-build carrying
+    //   a `contextPrefix` of `[dependency=<outputName> target=<depSpec>] `.
+    //   That attribution is the load-bearing half (it is what closed
+    //   D-DEPS-DEPENDENCY-CANNOT-DECLINE-A-TARGET: a dependency that cannot
+    //   serve a platform fails INSIDE ITSELF, and this edge is where that
+    //   failure is named). Whoever touches the emit site keeps it.
+    //
+    //   ★ DELIBERATELY *NOT* A MEMBER OF `kUnsuppressableCodes`, and the
+    //   verdict is read off THE LANDED EMIT SITE per 0xD020's own note rather
+    //   than inherited from the band. `dependency_resolver.cpp`'s
+    //   `buildNode_` emits it on `rc != 0` and returns `nullopt`, so the
+    //   resolve fails and the build stops with or without it — no wrong bytes
+    //   can ship, which rules out prong (1). Prong (2) is where it differs
+    //   from EVERY other `dependsOn` code, and the difference is structural:
+    //   prong (2) requires that this diagnostic be THE ONLY STATEMENT of why
+    //   the build stopped, and here it demonstrably is not — the inner
+    //   diagnostics were merged into the caller's reporter IMMEDIATELY BEFORE
+    //   this one, prefixed with the dependency they came from, and THEY are
+    //   the explanation. This code is the attribution line above them.
+    //   Silencing it costs an operator the summary while leaving the cause on
+    //   screen, which is exactly the advisory class `--suppress` controls.
+    //
+    //   ⚠ AND FOR THE SAME REASON IT DOES NOT TAKE `DiagnosticDelivery::
+    //   Guaranteed` at its site, which is the other half of 0xD019 /
+    //   0xD01B / 0xD01C's shape and is a SEPARATE question from suppression.
+    //   Those three are self-contained statements; this one says "the reason
+    //   is in the diagnostic(s) above" and is therefore only as useful as the
+    //   diagnostics it points at — which are ordinary merged copies, subject
+    //   to the reporter's cap like anything else. Guaranteeing delivery of the
+    //   pointer while its referents can still be dropped would manufacture the
+    //   worst possible output: a surviving line naming a dependency and
+    //   directing the reader upward at nothing. If this band ever needs
+    //   cap-immunity it must be taken by the MERGED INNER DIAGNOSTICS FIRST,
+    //   and this line with them — never by this line alone.
+    D_DependencyBuildFailed      = 0xD029,
+
+    // ── THE LANGUAGE↔TARGET ARCHITECTURE GATE (0xD02A) —
+    // D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE ─────────────────────────────────
+    //
+    // D_LanguageTargetIsaMismatch: the source language declares an
+    //   instruction-set architecture it emits for (`isa` in its `.lang.json`)
+    //   and the requested target does not declare the SAME one. Emitted for a
+    //   ROOT build at the driver's per-target chokepoint, and for a
+    //   `dependsOn` dependency at RESOLVE time — before that dependency is
+    //   cloned, hooked or compiled.
+    //
+    // ★ THE FACT IS DEFINITIONAL, NOT BOOKKEEPING, WHICH IS WHY IT IS A
+    //   REJECT AND NOT A WARNING. Most languages compile for any processor: C
+    //   does, and it declares no `isa`. An assembly DIALECT does not — its
+    //   surface IS an instruction set, so `asm-x86_64-att` cannot be assembled
+    //   for AArch64 in the same sense that a document cannot be in two
+    //   languages at once. Nothing downstream can repair the pairing.
+    //
+    // ★ WHAT IT IS *NOT*, and the distinction is load-bearing because the
+    //   near-miss design was REJECTED (operator, 2026-08-14). This is NOT a
+    //   per-project list of supported platforms. `targets[]` is "the platforms
+    //   a project builds for ITSELF" — a BUILD LIST that drifts — so reading
+    //   one as a CAPABILITY CLAIM makes a portable dependency that merely
+    //   forgot to list an architecture refuse a legitimate consumer. An ISA
+    //   binding cannot drift that way: a NEW target document declaring the
+    //   same `isa` satisfies an existing binding with NO edit to any language
+    //   document and no code change. If a change ever requires editing
+    //   language configs when a target is added, this design has been
+    //   rebuilt into the rejected one.
+    //
+    // ⓘ THE VERDICT READS TWO DECLARED VALUES AND NOTHING ELSE. Not
+    //   `target.name()` (an IDENTITY — the string a user types in a
+    //   `<target>:<format>` spec, and the identity branch the agnosticism
+    //   veto forbids), not `format.kind()` (which cannot separate
+    //   architectures at all: `elf64-x86_64-linux-exec` and
+    //   `elf64-aarch64-linux-exec` are BOTH `kind: "elf"`), and not the
+    //   per-format `machine` codes (a target↔FORMAT agreement check, reached
+    //   through a table keyed on the target NAME). ✔MEASURED: the shipped
+    //   arm64 target declares `isa: "aarch64"` — DIFFERENT from its own
+    //   `name` — so a name-keyed impostor cannot even reproduce the shipped
+    //   verdicts without inventing a second mapping table.
+    //
+    // ⓘ FAIL-CLOSED ON AN UNDECLARED TARGET. `isa` is OPTIONAL on the target
+    //   side (a required key breaks every pre-existing target document), so a
+    //   target that declares none cannot be SHOWN to satisfy a binding and is
+    //   refused under this same code, with the message saying the target
+    //   declares no architecture. A language that declares none is PORTABLE
+    //   and never reaches this code at all — the common case pays nothing.
+    //
+    // ★★ A MEMBER OF `kUnsuppressableCodes` ON PRONG (2). ⚠ THIS PARAGRAPH
+    //   REPLACES AN EARLIER VERDICT OF "DELIBERATELY *NOT* A MEMBER", AND THE
+    //   CORRECTION IS KEPT VISIBLE BECAUSE THE ERROR IS INSTRUCTIVE: the
+    //   original was REASONED to the right shape and then wrong on the one
+    //   fact that decides it.
+    //
+    //   ✔Prong (1) is genuinely out, and that half of the old note stands:
+    //   both sites return failure to their caller (`compileOneTarget` →
+    //   `nullopt`, the resolver's `gather_` → `nullopt`), so the REJECT — not
+    //   the diagnostic — stops the build, and suppression cannot ship wrong
+    //   bytes.
+    //
+    //   ⛔ Prong (2) is where it went wrong. The old note asserted the only
+    //   cost under suppression is "a build that stops with LESS explanation".
+    //   ✔MEASURED THROUGH THE REAL CLI rather than reasoned about:
+    //   `--suppress=D_LanguageTargetIsaMismatch` on x86 assembly aimed at
+    //   arm64 gives **rc=1, stdout 0 bytes, stderr 0 bytes**. Not less
+    //   explanation — NO explanation, which is prong (2) verbatim ("a
+    //   non-zero exit with an empty explanation").
+    //
+    //   ★ WHY THERE IS NO "LESS": this code fires ALONE. It is not an
+    //   attribution line above other output the way `D_DependencyBuildFailed`
+    //   (0xD029) sits above merged inner diagnostics — nothing else is
+    //   reported on this path, so removing it removes ALL of it. That is the
+    //   single structural test to apply to any future code here, and it is
+    //   cheaper than the reasoning the old note attempted: ask whether
+    //   ANOTHER diagnostic survives suppression. If none does, prong (2) is
+    //   met.
+    //
+    //   ⚠ `DiagnosticDelivery::Guaranteed` DOES NOT SUBSTITUTE. Both emit
+    //   sites already set it, and the measurement above was taken WITH it
+    //   set — delivery governs the reporter's cap, suppression governs
+    //   whether the diagnostic exists at all. The old note treated them as
+    //   interchangeable; they are orthogonal, exactly as this header says
+    //   elsewhere. Keep Guaranteed AND the membership.
+    //
+    //   ⓘ Its two nearest neighbours were already members for the same class
+    //   of reason, which makes the omission an inconsistency rather than a
+    //   judgement call: `D_TargetMachineCodeMismatch` and
+    //   `D_TargetAbiModelMismatch` sit right beside it in the table.
+    //   Prong-(2) precedent in this band: 0xD01D and 0xD020.
+    //
+    //   ⚠ OPEN QUESTION THE OLD NOTE RAISED AND THIS ONE INHERITS: it claimed
+    //   0xD019 / 0xD01B / 0xD01C and `D_ArtifactProfileFormatMismatch` are
+    //   "indistinguishable" from this code and all non-members. If that is
+    //   true, the SAME measurement would make them members too — they were
+    //   NOT measured. Do not bulk-add them on this note's authority; measure
+    //   each at its own landed site. See
+    //   [[D-DIAG-SOLE-STATEMENT-REJECTS-MAY-SUPPRESS-TO-A-SILENT-EXIT]].
+    D_LanguageTargetIsaMismatch  = 0xD02A,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

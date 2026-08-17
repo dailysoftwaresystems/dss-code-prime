@@ -351,7 +351,7 @@ are registered:
 
 | Dependency's verb | Profiles as shipped | What the driver does | Reject |
 |---|---|---|---|
-| `SourceMerge` | `module` | The dependency's expanded sources join **this** project's compilation and are lowered with them. It produces no artifact of its own. | **Same `language` required** — `D_DependencyLanguageMismatch` (`D01C`). |
+| `SourceMerge` | `module` | The dependency's expanded sources join **this** project's compilation and are lowered with them. It contributes **no separate artifact to this build** — nothing of its own is linked in, because what crossed the boundary was source, not a binary. ⚠ That is a statement about this ROLE, not about the profile: a `module` project **built standalone is a library and does emit an artifact** (it is served by all ten `lib`/`staticlib` formats, and the container comes from its own `<target>:<format>` spec). A module you could not build standalone would be one you could not test or get a diagnostic from until somebody imported it. | **Same `language` required** — `D_DependencyLanguageMismatch` (`D01C`). |
 | `ArtifactLink` | `lib`, `staticlib` | The dependency is **built to its own artifact**, and that artifact is threaded into this target's `resolveLibraries`. The two builds stay separate. | — (see the format derivation below for `D022` / `D023`.) |
 | `NotConsumable` | every other registered profile | **Fail loud** — the profile is a terminal deliverable. | `D_DependencyArtifactProfileUnsupported` (`D01B`). |
 

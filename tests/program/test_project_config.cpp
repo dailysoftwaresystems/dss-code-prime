@@ -1565,12 +1565,29 @@ TEST(CompileProjectIntegration, SupportedProfileProceedsPastGate) {
 // ── AP3: enforceArtifactProfileFormat (the FORMAT-side gate) ────
 // The format-side twin of the AP2 language gate — same generic
 // `artifactProfileSupported` predicate, distinct code/message.
+//
+// ⚠ The gate's REJECT arm SPLIT IN TWO (closing
+// D-AP3-UNSERVED-PROFILE-MISREPORTS-AS-A-FORMAT-MISMATCH). The
+// `servingFormats` argument — the shipped formats that DO serve the profile,
+// MEASURED by the caller — picks which reject is true, so these cells now
+// state that measurement explicitly instead of leaving one code to answer two
+// different questions. See the dedicated split section below.
+
+namespace {
+// The measured serving sets these unit cells hand the gate. They are NOT the
+// authority (the driver measures the real inventory — pinned end-to-end in the
+// split section below); they are the two SHAPES the gate must distinguish.
+std::vector<std::string> const kSomeFormatsServeLib = {
+    "elf64-x86_64-linux-dyn", "pe64-x86_64-windows-dll"};
+std::vector<std::string> const kNoFormatServesIt = {};
+} // namespace
 
 TEST(EnforceArtifactProfileFormat, ServedProfileAcceptedSilently) {
     std::vector<std::string> served = {"cli"};
     DiagnosticReporter rep;
     EXPECT_TRUE(enforceArtifactProfileFormat(asSpan(served), "cli",
-                                             "elf64-x86_64-linux-exec", rep));
+                                             "elf64-x86_64-linux-exec",
+                                             asSpan(kSomeFormatsServeLib), rep));
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
@@ -1579,18 +1596,32 @@ TEST(EnforceArtifactProfileFormat, UnservedProfileFailsLoud) {
     std::vector<std::string> served = {"cli"};  // an exec format
     DiagnosticReporter rep;
     EXPECT_FALSE(enforceArtifactProfileFormat(asSpan(served), "lib",
-                                              "elf64-x86_64-linux-exec", rep));
+                                              "elf64-x86_64-linux-exec",
+                                              asSpan(kSomeFormatsServeLib), rep));
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
 }
 
 // A relocatable / backend-less format serves NOTHING → rejects any profile
-// (fail-closed, the format-side twin of the empty-language-set reject).
+// (fail-closed, the format-side twin of the empty-language-set reject). The
+// profile IS served elsewhere, so this is still a genuine mismatch — the
+// empty set here is the CHOSEN FORMAT's, which is a different axis from the
+// empty `servingFormats` that selects the "no backend anywhere" arm.
 TEST(EnforceArtifactProfileFormat, EmptyServedSetRejects) {
     std::vector<std::string> served = {};
+    std::vector<std::string> const servingCli = {"elf64-x86_64-linux-exec"};
     DiagnosticReporter rep;
     EXPECT_FALSE(enforceArtifactProfileFormat(asSpan(served), "cli",
-                                              "elf64-x86_64-linux", rep));
+                                              "elf64-x86_64-linux",
+                                              asSpan(servingCli), rep));
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+    EXPECT_NE(firstMessageForCode(rep,
+                                  DiagnosticCode::D_ArtifactProfileFormatMismatch)
+                  .find("serves no artifact profiles"),
+              std::string::npos)
+        << "the chosen format's EMPTY served set stays discriminated in the "
+           "wording; got: "
+        << firstMessageForCode(rep,
+                               DiagnosticCode::D_ArtifactProfileFormatMismatch);
 }
 
 // Integration with the REAL shipped format's served set.
@@ -1600,10 +1631,12 @@ TEST(EnforceArtifactProfileFormatShipped, ExecServesCliRejectsLib) {
     EXPECT_FALSE((*f)->artifactProfiles().empty());
     DiagnosticReporter rep1;
     EXPECT_TRUE(enforceArtifactProfileFormat((*f)->artifactProfiles(), "cli",
-                                             "elf64-x86_64-linux-exec", rep1));
+                                             "elf64-x86_64-linux-exec",
+                                             asSpan(kSomeFormatsServeLib), rep1));
     DiagnosticReporter rep2;
     EXPECT_FALSE(enforceArtifactProfileFormat((*f)->artifactProfiles(), "lib",
-                                              "elf64-x86_64-linux-exec", rep2));
+                                              "elf64-x86_64-linux-exec",
+                                              asSpan(kSomeFormatsServeLib), rep2));
     EXPECT_EQ(countCode(rep2, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
 }
 
@@ -1644,6 +1677,9 @@ TEST(CompileProjectIntegration, LibProfileOnExecFormatMismatch) {
     EXPECT_EQ(prog.compileProject(path.string(), rep), 1);
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u);
+    // `lib` IS served — by the shared-library formats — so this stays the
+    // GENUINE mismatch arm and must not be reported as "no backend exists".
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNoServingFormat), 0u);
 }
 
 // N1: multi-target — one serving, one not — fails the build with the mismatch
@@ -1675,6 +1711,110 @@ TEST(ProjectConfigDiagnostics, DArtifactNameEscapesOutputDirRoundTrip) {
               "D_ArtifactNameEscapesOutputDir");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_ArtifactNameEscapesOutputDir),
               "D0015");
+}
+
+// ════════════════════════════════════════════════════════════════
+// THE AP3 REJECT SPLIT — which reject is TRUE is a MEASUREMENT
+// (closes D-AP3-UNSERVED-PROFILE-MISREPORTS-AS-A-FORMAT-MISMATCH)
+// ════════════════════════════════════════════════════════════════
+//
+// `D_ArtifactProfileFormatMismatch` used to answer two different questions and
+// answered one of them with a confident falsehood: it reads "you picked the
+// wrong format", which is a true statement about the wrong thing when NO
+// shipped format implements the profile anywhere. The remediation differs
+// completely — pick another target vs. ship a backend — so the two facts are
+// two codes, chosen by the SHIPPED-FORMAT INVENTORY the driver measures:
+//   * ≥1 format serves it, not this one ⇒ 0xD011, NAMING the ones that do;
+//   * ZERO formats serve it             ⇒ 0xD028.
+// ✔RE-MEASURED 2026-08-15 over all 24 `src/dss-config/object-formats/
+// *.format.json`: the served union is `{cli, lib, staticlib, module}` (cli 7
+// formats, lib 5, staticlib 5, module 10 = the lib+staticlib union, and 7
+// formats serve nothing), so the second arm's population is exactly `gui`,
+// `script`, `sproc`, `transpile`, `shader`, `hdl`.
+
+TEST(EnforceArtifactProfileFormat, NoShippedFormatServesItReportsTheOtherCode) {
+    std::vector<std::string> served = {"cli"};
+    DiagnosticReporter rep;
+    EXPECT_FALSE(enforceArtifactProfileFormat(asSpan(served), "shader",
+                                              "elf64-x86_64-linux-exec",
+                                              asSpan(kNoFormatServesIt), rep));
+    ASSERT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNoServingFormat), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u);
+    std::string const m =
+        firstMessageForCode(rep, DiagnosticCode::D_ArtifactProfileNoServingFormat);
+    EXPECT_NE(m.find("shader"), std::string::npos) << m;
+    EXPECT_NE(m.find("no shipped object format implements it yet"),
+              std::string::npos)
+        << m;
+}
+
+// The actionable half of the genuine mismatch: EVERY serving format is named.
+// Without this the reader is told where the profile is NOT served and left to
+// search the target matrix for where it is.
+TEST(EnforceArtifactProfileFormat, GenuineMismatchNamesTheFormatsThatDoServeIt) {
+    std::vector<std::string> served = {"cli"};
+    DiagnosticReporter rep;
+    EXPECT_FALSE(enforceArtifactProfileFormat(asSpan(served), "lib",
+                                              "elf64-x86_64-linux-exec",
+                                              asSpan(kSomeFormatsServeLib), rep));
+    ASSERT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNoServingFormat), 0u);
+    std::string const m =
+        firstMessageForCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch);
+    for (auto const& f : kSomeFormatsServeLib) {
+        EXPECT_NE(m.find(f), std::string::npos)
+            << "every serving format must be named; missing '" << f
+            << "' in: " << m;
+    }
+    EXPECT_NE(m.find("elf64-x86_64-linux-exec"), std::string::npos)
+        << "…and the format the user actually chose; got: " << m;
+}
+
+// ★ THE DRIVER MEASURES THE REAL INVENTORY. The unit cells above hand the gate
+// a list; this one proves the DRIVER computes one — the message names a real
+// shipped shared-library format that this test never mentioned to it. A
+// hardcoded or empty list would fail here, and a regression that stopped
+// scanning would report the wrong arm entirely.
+TEST(CompileProjectIntegration, TheServingFormatListIsMeasuredFromTheShippedSet) {
+    dss::test_support::ScratchDir scratch{
+        dss::test_support::Location::Temp, "program"};
+    auto path = writeProjectFile(scratch.path(), R"({
+      "language": "c-subset", "artifactProfile": "lib",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
+    })");
+    Program prog;
+    DiagnosticReporter rep;
+    EXPECT_EQ(prog.compileProject(path.string(), rep), 1);
+    ASSERT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+    std::string const m =
+        firstMessageForCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch);
+    // Cross-checked against the shipped documents themselves rather than a
+    // re-typed list: whatever declares `lib` must appear in the message.
+    std::size_t named = 0;
+    for (std::string_view fmt : {"elf64-x86_64-linux-dyn", "elf64-aarch64-linux-dyn",
+                                 "macho64-arm64-darwin-dylib",
+                                 "macho64-x86_64-darwin-dylib",
+                                 "pe64-x86_64-windows-dll"}) {
+        auto f = ObjectFormatSchema::loadShipped(std::string{fmt});
+        ASSERT_TRUE(f.has_value()) << fmt;
+        ASSERT_TRUE(artifactProfileSupported((*f)->artifactProfiles(), "lib"))
+            << fmt << " no longer declares `lib` — re-derive this pin";
+        EXPECT_NE(m.find(fmt), std::string::npos)
+            << "a format that DOES serve `lib` is missing from the "
+               "remediation; got: "
+            << m;
+        ++named;
+    }
+    EXPECT_EQ(named, 5u);
+}
+
+// ── the new code's name / prefix round-trip ─────────────────────────────────
+
+TEST(ProjectConfigDiagnostics, DArtifactProfileNoServingFormatRoundTrip) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_ArtifactProfileNoServingFormat),
+              "D_ArtifactProfileNoServingFormat");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::D_ArtifactProfileNoServingFormat),
+              "D0028");
 }
 
 // ── Routing: routesToMultiUnit (the shared >1 threshold) ────────
@@ -1719,13 +1859,23 @@ TEST(ProjectConfigDiagnostics, DArtifactProfileNotSupportedRoundTrip) {
 // stop the build each breaks at least one side.
 //
 // HONESTY NOTES (the matrix's scope — stated so no reader over-reads):
-//   * No shipped object format SERVES a non-cli profile (the four exec
-//     formats serve ["cli"]; relocatable/spirv/wasm serve nothing). So
-//     lib/staticlib/script/sproc have NO positive format-gate cell —
-//     here they can only ever be REJECTED. A future shared-library /
-//     SQL-emit backend would add the serving format + the positive
-//     cell with ZERO gate-code change (the gate is generic set-
-//     membership, never a format-name branch).
+//   * ⚠ RE-MEASURED 2026-08-15 over all 24 shipped
+//     `src/dss-config/object-formats/*.format.json`: the union of their
+//     `artifactProfiles[]` is {cli, lib, staticlib, module} — cli by 7
+//     formats, lib by 5 (dyn/dylib/dll), staticlib by 5 (the archive
+//     formats), module by all 10 of those (a module IS a library), and
+//     7 formats serve nothing at all. (The note that used to stand here
+//     said no format serves a non-cli profile; that was true when
+//     written and the shared-library / archive backends have shipped
+//     since.) Every cell below still points at ONE exec target, so
+//     lib/staticlib/module are REJECTED here — but as a GENUINE
+//     mismatch (a serving format exists, and the message names it),
+//     which is a different arm from script/sproc, where none exists.
+//   * script/sproc/gui/transpile/shader/hdl are served by NOTHING, so
+//     they have no positive format-gate cell anywhere. A future
+//     SQL-emit / gui backend would add the serving format + the
+//     positive cell with ZERO gate-code change (the gate is generic
+//     set-membership, never a format-name branch).
 //   * toy & tsql-subset are onboarded here in the GATE sense only —
 //     they emit no artifact in this matrix. c-subset is the sole real
 //     end-to-end emit (`RealCliProjectEmitsElfExecutable`, last test).
@@ -1816,6 +1966,11 @@ TEST(ArtifactProfileMatrix, CSubsetStaticlibMismatchByFormatGate) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u)
         << "staticlib IS declared by c-subset — the LANGUAGE gate must not fire";
+    // The OTHER side of the split: `staticlib` IS served (by the archive
+    // formats), so this cell must keep the genuine-mismatch code. The pair of
+    // cells — this one and TsqlScript… above — is what proves the driver is
+    // MEASURING the inventory rather than reporting a constant.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNoServingFormat), 0u);
 }
 
 // §7 criterion #3: the language-gate message must NAME the language and
@@ -1841,20 +1996,38 @@ TEST(ArtifactProfileMatrix, CSubsetGuiMessageNamesLanguageAndSupportedSet) {
 // format serves script → the FORMAT gate rejects. Proves the two gates
 // are distinct AND that a declared-but-unserved profile reaches (and is
 // caught by) the format gate.
-TEST(ArtifactProfileMatrix, TsqlScriptMismatchByFormatGate) {
+//
+// ⚠ WHICH REJECT CHANGED, AND IT WAS NOT WEAKENED. ZERO shipped formats serve
+// `script`, so the truthful verdict is "no backend implements this yet"
+// (`D_ArtifactProfileNoServingFormat`), NOT "you picked the wrong format".
+// The cell asserts the more precise code AND, unlike before, the TEXT — the
+// old assertion could not tell the two facts apart, which is the whole defect
+// being closed. The mismatch code is now asserted ABSENT, so a regression that
+// re-merged the arms is red rather than silently acceptable.
+TEST(ArtifactProfileMatrix, TsqlScriptRejectedAsUnimplementedByEveryFormat) {
     DiagnosticReporter rep;
     int const rc = runMatrixCell("tsql-subset", "script", kExecTarget, rep);
     EXPECT_EQ(rc, 1);
-    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNoServingFormat), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u)
+        << "no shipped format serves `script` — 'pick a different format' is a "
+           "confidently wrong remediation here";
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u)
         << "script IS declared by tsql-subset — the LANGUAGE gate must not fire";
+    std::string const m =
+        firstMessageForCode(rep, DiagnosticCode::D_ArtifactProfileNoServingFormat);
+    EXPECT_NE(m.find("script"), std::string::npos) << m;
+    EXPECT_NE(m.find("no shipped object format implements it yet"),
+              std::string::npos)
+        << "the message must state the actual fact; got: " << m;
 }
 
-TEST(ArtifactProfileMatrix, TsqlSprocMismatchByFormatGate) {
+TEST(ArtifactProfileMatrix, TsqlSprocRejectedAsUnimplementedByEveryFormat) {
     DiagnosticReporter rep;
     int const rc = runMatrixCell("tsql-subset", "sproc", kExecTarget, rep);
     EXPECT_EQ(rc, 1);
-    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNoServingFormat), 1u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u);
 }
 
@@ -1912,6 +2085,122 @@ TEST(CompileProjectIntegration, RealCliProjectEmitsElfExecutable) {
     EXPECT_EQ(hdr[1], static_cast<unsigned char>('E'));
     EXPECT_EQ(hdr[2], static_cast<unsigned char>('L'));
     EXPECT_EQ(hdr[3], static_cast<unsigned char>('F'));
+}
+
+// ════════════════════════════════════════════════════════════════
+// ★★ A MODULE IS A LIBRARY — the profile / composition split, both
+//    halves, driven end-to-end (operator ruling 2026-08-15)
+// ════════════════════════════════════════════════════════════════
+//
+// `artifactProfile` and `DependencyComposition` answer two ORTHOGONAL
+// questions, and B.12 was withdrawn for conflating them:
+//   * artifactProfile — what does this project build ITSELF as? `module`
+//     builds as a LIBRARY. It declares `targets[]`, it is served by every
+//     format that serves `lib` or `staticlib`, and it produces an artifact.
+//   * DependencyComposition — how is it CONSUMED? `module` is `SourceMerge`:
+//     a consumer takes its SOURCES and ignores its artifact entirely.
+//
+// The two facts are pinned TOGETHER, on the same module source, because
+// either one alone is satisfied by a wrong implementation: a build that
+// refused the standalone compile would still pass the consumption pin, and a
+// consumer that linked the module's archive instead of merging its sources
+// would still pass the standalone pin. This is also the pin that was
+// IMPOSSIBLE while the withdrawn rule stood — it made the standalone half a
+// load error.
+
+TEST(ModuleIsALibrary, StandaloneModuleBuildEmitsAnArchive) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    {
+        std::ofstream f{scratch.path() / "scale.c", std::ios::binary};
+        f << "int dss_scale(int n) { return n * 7; }\n";
+    }
+    // A `-staticlib` target: the profile says "I am a library", the target
+    // spec says "in an archive container" — the same division `lib` and
+    // `staticlib` already use, so `module` needed no new mechanism.
+    auto path = writeProjectFile(scratch.path(), R"({
+      "language": "c-subset", "artifactProfile": "module",
+      "targets": ["x86_64:elf64-x86_64-linux-staticlib"], "sources": ["scale.c"]
+    })");
+    scratch.useAsCwd();
+
+    Program prog;
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(path.string(), rep), 0)
+        << "a `module` project must build STANDALONE — otherwise it cannot be "
+           "type-checked, codegen'd or diagnosed until some consumer imports "
+           "it, and its errors then surface inside the CONSUMER's build";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u)
+        << "the archive formats SERVE `module` — the AP3 gate must pass";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNoServingFormat), 0u);
+
+    auto const out = scratch.path() / "target"
+                   / "elf64-x86_64-linux-staticlib" / "scale.a";
+    ASSERT_TRUE(std::filesystem::exists(out))
+        << "expected the archive at " << out.string();
+    ASSERT_GT(std::filesystem::file_size(out), 0u);
+    // The BYTES, not merely a file: an `ar` archive starts with "!<arch>\n".
+    std::ifstream in{out, std::ios::binary};
+    char magic[8] = {0};
+    in.read(magic, 8);
+    EXPECT_EQ(std::string_view(magic, 8), "!<arch>\n")
+        << "a module built against an archive format must BE an archive";
+}
+
+// The other half, same profile: CONSUMED, the module contributes SOURCES and
+// no second artifact is produced or linked. The consumer's binary resolves a
+// symbol only the module defines, which is what proves the merge happened —
+// and the module's OWN artifact is asserted ABSENT, which is what proves the
+// consumer ignored it rather than building and linking it.
+TEST(ModuleIsALibrary, ConsumedModuleMergesSourcesAndEmitsNoSecondArtifact) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const dir = scratch.path();
+    auto const dep = dir / "scalemod";
+    std::error_code mkEc;
+    std::filesystem::create_directories(dep, mkEc);
+    ASSERT_FALSE(mkEc) << mkEc.message();
+
+    auto write = [](std::filesystem::path const& p, std::string_view text) {
+        std::ofstream f{p, std::ios::binary};
+        f << text;
+    };
+    write(dep / "scale.c", "int dss_scale(int n) { return n * 7; }\n");
+    // The SAME manifest shape as the standalone pin above — targets and all.
+    write(dep / ".dss-project.json", R"({
+      "language": "c-subset", "artifactProfile": "module",
+      "targets": ["x86_64:elf64-x86_64-linux-staticlib"], "sources": ["scale.c"]
+    })");
+    write(dir / "main.c",
+          "extern int dss_scale(int);\n"
+          "int main(void){ return dss_scale(6); }\n");
+    auto const proj = dir / "app.dss-project.json";
+    write(proj, R"({
+      "language": "c-subset", "artifactProfile": "cli",
+      "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
+      "dependsOn": [{ "path": "scalemod" }]
+    })");
+    scratch.useAsCwd();
+
+    Program prog;
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
+        << "the consumer must build: `SourceMerge` supplies the definition "
+           "`main` calls";
+    auto const consumerOut =
+        dir / "target" / "elf64-x86_64-linux-exec" / "main";
+    EXPECT_TRUE(std::filesystem::exists(consumerOut))
+        << "expected the consumer artifact at " << consumerOut.string();
+    // ★ NO second artifact. The dependency declares a `-staticlib` target of
+    // its own and the consumer must IGNORE it: a resolver that built the
+    // module as a library and linked it would leave this archive behind.
+    EXPECT_FALSE(std::filesystem::exists(
+        dep / "target" / "elf64-x86_64-linux-staticlib" / "scale.a"))
+        << "a source-merged dependency must not be BUILT — its artifact "
+           "emission is ignored, which is exactly what `SourceMerge` means";
 }
 
 // ════════════════════════════════════════════════════════════════

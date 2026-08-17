@@ -350,7 +350,21 @@ public:
     explicit ConfigMirror(fs::path const& root) : root_(root) {
         std::error_code ec;
         fs::path const dst = root_ / "src" / "dss-config";
-        fs::create_directories(dst, ec);
+        // ⚠⚠ CREATE THE PARENT, NEVER `dst` ITSELF — and this is a cross-leg
+        // defect, not a style preference. `fs::copy(src, dst, recursive)` into a
+        // directory that ALREADY EXISTS returns `File exists` on libstdc++
+        // (✔MEASURED on MinGW gcc 13.2) while succeeding on MSVC. Pre-creating
+        // `dst` therefore redded BOTH of this file's B.10 fail-closed pins —
+        // `AmbiguousDerivationFailsClosedNamingEveryCandidate` and
+        // `NoCandidateRejectsAtResolveTimeNamingTheAxis` — on every gcc leg,
+        // while the Windows gate stayed green and could never see it.
+        // ★ The failure shape is the dangerous one: the two tests that go dark
+        // are the ones asserting that a zero-candidate and an ambiguous format
+        // derivation each REJECT LOUDLY, so a leg without them is a leg where
+        // B.10's central safety property is unverified — and the red looks like
+        // a product failure, which invites "fixing" it by weakening the test.
+        // Letting `fs::copy` create the leaf sidesteps the whole disagreement.
+        fs::create_directories(dst.parent_path(), ec);
         fs::copy(dss::test::configRoot(), dst,
                  fs::copy_options::recursive
                      | fs::copy_options::overwrite_existing,
@@ -618,6 +632,15 @@ TEST(DependencyResolverB10, NoCandidateRejectsAtResolveTimeNamingTheAxis) {
     EXPECT_NE(prog.compileProject(proj.string(), rep), 0);
     ASSERT_EQ(countCode(rep, DiagnosticCode::D_DependencyTargetFormatUnresolvable),
               1u);
+    // ★ AND NOT THE BUILD-FAILURE CODE — the other half of the split this pin
+    // is now paired with (see the 0xD022-vs-0xD029 section below). Nothing was
+    // compiled here: the derivation came back with zero candidates, so the
+    // dependency never reached `buildNode_`. Without this clause the two facts
+    // could drift back onto one ordinal and this pin would not notice, which is
+    // exactly how they came to share one in the first place.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_DependencyBuildFailed), 0u)
+        << "a zero-candidate derivation is not a failed build; the dependency "
+           "was never compiled at all";
 
     std::string const m =
         messageFor(rep, DiagnosticCode::D_DependencyTargetFormatUnresolvable);
@@ -707,6 +730,127 @@ TEST(DependencyResolverB10, RetiredDependencyTargetNotBuiltSemanticIsUnreference
            "mention is how a later cycle re-derives the rejected superset rule. "
            "First: "
         << (hits.empty() ? std::string{} : hits.front());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// THE DERIVATION-GAP / BUILD-FAILURE SPLIT — 0xD022 vs 0xD029
+// (D-DEPS-BUILD-FAILURE-REUSES-THE-DERIVATION-UNRESOLVABLE-CODE)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// ★ TWO FACTS, PINNED SEPARATELY AND EACH ASSERTING THE OTHER'S CODE IS ABSENT,
+// BECAUSE THAT IS THE ONLY SHAPE THAT CAN CATCH THE DEFECT THAT WAS HERE.
+// `buildNode_` used to report a dependency's FAILED BUILD as
+// `D_DependencyTargetFormatUnresolvable` — a code allocated for the ZERO-
+// CANDIDATE outcome of the format derivation. Both facts made the resolve fail,
+// both named the dependency, and both produced a non-zero rc, so every
+// "an error fired" assertion in this file stayed green over them. What the two
+// do NOT share is the remediation: one is fixed by editing a manifest or
+// shipping a backend, the other by fixing source code — and an operator running
+// `--suppress=D_DependencyTargetFormatUnresolvable` to quiet a known config gap
+// was silently muting compile failures too.
+//
+// So the discriminating assertion is EXCLUSIVE, not merely positive: each pin
+// asserts its own code exactly once AND the sibling code exactly zero times.
+// Merging the two codes back together fails both pins in the same run, from
+// opposite directions.
+//
+//   * B.10 #4 above (`NoCandidateRejectsAtResolveTimeNamingTheAxis`) owns the
+//     DERIVATION-GAP half and carries the 0xD029-is-absent clause;
+//   * the pin below owns the BUILD-FAILURE half.
+
+// ── THE DEPENDENCY COMPILES AND FAILS ───────────────────────────────────────
+//
+// A REAL compile failure in a REAL dependency build: `nosuchsymbol` is an
+// undeclared identifier, so the dependency's own sub-build returns non-zero
+// after the derivation has already succeeded and picked its format. Nothing is
+// stubbed — the format inventory is the shipped one, and the dependency really
+// is compiled for the consumer's target before it fails.
+//
+// The `staticlib` profile is load-bearing rather than incidental: it composes as
+// `ArtifactLink`, which is what routes the dependency through `buildNode_`'s own
+// `Program`. A `module` dependency is `SourceMerge` — its sources are folded
+// into the CONSUMER's compile, so a broken one fails in the consumer's build and
+// never reaches this emit site at all.
+//
+// Three things are asserted, and the third is the one most likely to be
+// regressed by someone "simplifying" the failure path:
+//   (1) the new code fires exactly once;
+//   (2) 0xD022 does NOT fire — the derivation succeeded, and saying otherwise
+//       is the defect this pin exists for;
+//   (3) the INNER diagnostics are still merged into the caller's reporter with
+//       the `[dependency=<outputName> target=<derived spec>] ` prefix. That
+//       attribution is the load-bearing half of this whole design — it is what
+//       lets a failure be reported AT THE DEPENDENCY EDGE instead of two hops
+//       from its cause — and the summary line is worthless without it, since it
+//       says the reason is "in the diagnostic(s) above".
+TEST(DependencyResolverBuildFailure, DependencyCompileFailureIsItsOwnCodeNotTheDerivationGap) {
+    ScratchDir scratch{Location::Temp, "dep-resolver"};
+    fs::path const dir = scratch.path();
+    fs::path const dep = dir / "leafbad";
+
+    // Real source, real compile, real failure: `nosuchsymbol` is undeclared.
+    writeText(dep / "lib.c", "int dep_answer(void){ return nosuchsymbol; }\n");
+    writeText(fs::path{manifestPathIn(dep)},
+              renderManifest({.profile = "staticlib",
+                              .targets = {std::string{kElfX64Exec}},
+                              .sources = {"lib.c"}}));
+    writeText(dir / "main.c", kMainSource);
+    fs::path const proj = dir / "app.dss-project.json";
+    writeText(proj, renderManifest({.targets   = {std::string{kElfX64Exec}},
+                                    .sources   = {(dir / "main.c").generic_string()},
+                                    .dependsOn = {pathEntry(dep.generic_string())}}));
+
+    Program prog;
+    prog.setOutputDir(dir / "out");
+    DiagnosticReporter rep;
+    EXPECT_NE(prog.compileProject(proj.string(), rep), 0)
+        << "the dependency's source does not compile — the build must fail";
+
+    // (1) THE NEW CODE, exactly once.
+    ASSERT_EQ(countCode(rep, DiagnosticCode::D_DependencyBuildFailed), 1u)
+        << "a dependency that compiled and FAILED must report its own code";
+    // (2) AND NOT THE DERIVATION GAP. The derivation ran and succeeded — it is
+    // what chose `elf64-x86_64-linux-staticlib` — so reporting "no shipped
+    // object format can build this dependency" would be a confident falsehood
+    // pointing the reader at the format inventory instead of at their code.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_DependencyTargetFormatUnresolvable),
+              0u)
+        << "a FAILED BUILD is not a zero-candidate derivation; these two facts "
+           "have different remediations and must not share an ordinal";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_DependencyTargetFormatAmbiguous), 0u);
+
+    // The message still names all three coordinates a reader needs to act.
+    std::string const m = messageFor(rep, DiagnosticCode::D_DependencyBuildFailed);
+    EXPECT_NE(m.find(manifestPathIn(dep)), std::string::npos)
+        << "must name the DEPENDENCY's manifest; got: " << m;
+    EXPECT_NE(m.find(std::string{kElfX64Exec}), std::string::npos)
+        << "must name the CONSUMER's target spec; got: " << m;
+    EXPECT_NE(m.find(std::string{kElfX64StaticLib}), std::string::npos)
+        << "must name the DERIVED dependency spec; got: " << m;
+
+    // (3) THE ATTRIBUTION SURVIVES. The prefix is compared in FULL — a check for
+    // the substring "dependency=" would stay green over a prefix that lost the
+    // target half, and the target half is what distinguishes one consumer
+    // target's failure from another's in a multi-target build.
+    std::string const expectedPrefix =
+        "[dependency=leafbad target=x86_64:" + std::string{kElfX64StaticLib} + "] ";
+    std::size_t innerPrefixed = 0;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::D_DependencyBuildFailed) continue;
+        if (d.contextPrefix == expectedPrefix) ++innerPrefixed;
+    }
+    EXPECT_GT(innerPrefixed, 0u)
+        << "the dependency's own diagnostics must reach the caller's reporter "
+           "carrying `" << expectedPrefix
+        << "` — without them the summary above points at nothing";
+    // And the summary line itself is NOT prefixed: it is the resolver speaking
+    // about the dependency, not the dependency speaking.
+    for (auto const& d : rep.all()) {
+        if (d.code != DiagnosticCode::D_DependencyBuildFailed) continue;
+        EXPECT_TRUE(d.contextPrefix.empty())
+            << "the resolver's own summary must not wear the dependency's "
+               "prefix; got: " << d.contextPrefix;
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════

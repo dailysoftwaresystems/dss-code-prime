@@ -191,6 +191,9 @@ constexpr std::string_view kWhyPlanNotLanded =
 constexpr std::string_view kWhyTargetAbi =
     "silenced, a mismatched target spec dispatches the wrong backend and "
     "the emitted image executes wrong machine code at user runtime";
+constexpr std::string_view kWhyLanguageTargetIsa =
+    "it is the SOLE statement of why the build stopped; silenced, the run "
+    "exits non-zero having printed nothing at all";
 constexpr std::string_view kWhySynthRecipe =
     "silenced, the shim recipe falls out of every synthesis pass and its "
     "symbol goes undefined, breaking the binary LOAD rather than the "
@@ -386,7 +389,12 @@ constexpr std::string_view kWhyOperatorNameNotDefinable =
     "silenced, __has_include(<h>) answers 0 while #include <h> still "
     "splices the header, so the guard and the include disagree";
 
-constexpr std::array<UnsuppressableEntry, 150> kUnsuppressableCodes{{
+// ⓘ EXTENT 150 → 151 (2026-08-15): `D_LanguageTargetIsaMismatch` (0xD02A)
+// joined on prong (2) — see its row below. The extent is deliberately an
+// explicit count rather than a deduced `[]`, so adding a row without thinking
+// about it is a COMPILE ERROR rather than a silent append; ✔it caught this
+// very addition. Raise it by hand, exactly once per row.
+constexpr std::array<UnsuppressableEntry, 151> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -497,6 +505,32 @@ constexpr std::array<UnsuppressableEntry, 150> kUnsuppressableCodes{{
     // membership verdict at all this cycle: 0xD020's own note requires a
     // verdict be re-read against the landed site, not assumed, and 0xD025 /
     // 0xD026 arrive with the same reservation.
+    //
+    // ★ 0xD029 `D_DependencyBuildFailed` IS OUT, AND UNLIKE THE ROWS ABOVE THAT
+    // IS A VERDICT RATHER THAN A RESERVATION — read off the landed emit site as
+    // 0xD020's note requires. `dependency_resolver.cpp`'s `buildNode_` emits it
+    // when a dependency's own sub-build returns non-zero and then returns
+    // `nullopt`, so the resolve fails either way: no wrong bytes can ship, and
+    // prong (1) is out.
+    //
+    // What makes it different from every other `dependsOn` code is prong (2),
+    // and the difference is structural rather than a judgment call. Prong (2)
+    // is narrow BY CONSTRUCTION — it requires that the diagnostic be the ONLY
+    // statement of why the build stopped — and here it demonstrably is not:
+    // the emit site's immediately preceding loop merges EVERY diagnostic from
+    // the dependency's own build into this reporter, each carrying a
+    // `contextPrefix` of `[dependency=<name> target=<spec>] `. Those are the
+    // explanation; 0xD029 is the attribution line above them, and its own text
+    // says so ("the reason is in the diagnostic(s) above"). Suppressing it
+    // costs an operator a summary while leaving the cause on screen — advisory,
+    // which is exactly what `--suppress` is documented to control.
+    //
+    // ⓘ It also does NOT take `DiagnosticDelivery::Guaranteed`, the other half
+    // of 0xD019 / 0xD01B / 0xD01C's shape, and for the same reason: a pointer
+    // whose referents are ordinary capped diagnostics must not outlive them.
+    // Guaranteeing the pointer alone would produce a surviving line directing
+    // the reader upward at nothing. If this needs cap-immunity, the merged
+    // inner diagnostics take it FIRST and this line comes with them.
     {DiagnosticCode::D_DependencyCycle, kWhyDependencyCycle},
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
@@ -508,6 +542,30 @@ constexpr std::array<UnsuppressableEntry, 150> kUnsuppressableCodes{{
     {DiagnosticCode::D_TargetAbiModelUnsupportedByDriver, kWhyTargetAbi},
     {DiagnosticCode::D_TargetMachineCodeMismatch, kWhyTargetAbi},
     {DiagnosticCode::D_TargetAbiModelMismatch, kWhyTargetAbi},
+    // ★★ D_LanguageTargetIsaMismatch (0xD02A) — A MEMBER ON PRONG (2), AND
+    // THIS ROW CORRECTS THE CODE'S OWN ALLOCATION NOTE, WHICH WAS WRONG.
+    // The note reasoned that suppressing it costs only "a build that stops
+    // with LESS explanation" — a prong-(2) miss by a hair. ✔MEASURED through
+    // the real CLI instead of reasoned about: `--suppress=
+    // D_LanguageTargetIsaMismatch` on x86 assembly aimed at arm64 yields
+    // **rc=1, stdout 0 bytes, stderr 0 bytes** — a completely silent non-zero
+    // exit, which is prong (2) verbatim. There is no "less" explanation
+    // because there is no OTHER diagnostic: unlike D_DependencyBuildFailed
+    // (0xD029), which is an attribution line ABOVE a set of merged inner
+    // diagnostics, this reject fires alone and both call sites then return
+    // `nullopt`/false without reporting anything further. ⇒ it IS the whole
+    // explanation, so removing it removes all of it.
+    // ⓘ Its two nearest neighbours were already members for the same class of
+    // reason, which is what makes the omission an inconsistency rather than a
+    // judgement call: D_TargetMachineCodeMismatch and D_TargetAbiModelMismatch
+    // sit immediately above. Prong-(2) precedent in its own band: 0xD01D and
+    // 0xD020. ⚠ `DiagnosticDelivery::Guaranteed` does NOT substitute for
+    // membership — delivery and suppression are separate questions, and the
+    // measurement above was taken WITH Guaranteed already set.
+    // Control that proves the fix works: suppressing a real member
+    // (D_TargetMachineCodeMismatch) yields D_SuppressRequestIgnored and still
+    // reports.
+    {DiagnosticCode::D_LanguageTargetIsaMismatch, kWhyLanguageTargetIsa},
     // D_SynthRecipeFamilyUnknown (D-CSUBSET-C11-THREADS-HEADER /
     // D-FFI-PE-CRT-UCRT-MIGRATION, 2026-07-25): the driver's shim-synthesis
     // seam found a `synthesize` recipe id belonging to no known shim family

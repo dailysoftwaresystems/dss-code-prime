@@ -881,8 +881,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // tests), which is the INVERSE failure a closed key set can cause and the
     // reason every gate here is pinned against the real shipped configs
     // rather than against a hand-written sample.
-    static constexpr std::array<std::string_view, 7> kTargetKeys{
-        "name", "version", "abiModel", "frameLoadMnemonic",
+    static constexpr std::array<std::string_view, 8> kTargetKeys{
+        "name", "version", "abiModel", "isa", "frameLoadMnemonic",
         "frameStoreMnemonic", "description", "dwarfReturnAddressColumn"};
     DSS_CHECK_KEY_VOCABULARY(kTargetKeys);
     rejectUnknownKeys(target, kTargetKeys, "/target",
@@ -940,6 +940,54 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             return std::unexpected(std::move(coll).release());
         }
     }
+    // ── target.isa — THE ARCHITECTURE THIS TARGET EXECUTES ────────────────
+    // (D-ISA-LANGUAGE-BOUND-TO-ARCHITECTURE.) The target half of the ISA
+    // axis; `GrammarSchema::isa()` is the language half, and the gate
+    // compares the two DECLARED strings. See the `TargetSchemaData::isa`
+    // docblock for why this is neither `name` nor a `machine` code.
+    //
+    // OPTIONAL, and deliberately so: a REQUIRED key breaks the load of every
+    // target document that predates it (✔MEASURED: 90 synthetic target
+    // documents in `test_target_schema.cpp` alone), which is the mechanical
+    // cost §A.1b warns a new REQUIRE-ALL role imposes. The absence is made
+    // safe at the GATE instead, where it fails CLOSED.
+    //
+    // ⚠ THE VALUE IS *NOT* CROSS-CHECKED AGAINST THE SHIPPED TARGET
+    // INVENTORY, AND MUST NOT BE. That inventory records what is
+    // IMPLEMENTED, never what is POSSIBLE (plan 06 §5.1 B.12-CORRECTED),
+    // so validating against it would refuse a language that legitimately
+    // declares an architecture for which no target has shipped yet. Only
+    // the SHAPE is checked here; the vocabulary is open by construction,
+    // which is exactly what lets a new target satisfy an existing language
+    // binding with no C++ and no language-document edit.
+    if (target.contains("isa")) {
+        json const& isaNode = target.at("isa");
+        if (!isaNode.is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/target/isa",
+                      "'isa' must be a string naming the instruction-set "
+                      "architecture this target executes (e.g. \"x86_64\", "
+                      "\"aarch64\").");
+            return std::unexpected(std::move(coll).release());
+        }
+        auto isaText = isaNode.get<std::string>();
+        // Same shape rule `name` above gets, for the same reason and with a
+        // sharper consequence: the gate compares this string for EQUALITY,
+        // so `" aarch64"` would match nothing, and an ISA-bound language
+        // would be refused on the very target that implements it — with a
+        // message showing two values that look identical.
+        if (isaText.empty() || allWhitespace(isaText)
+            || hasLeadingTrailingWS(isaText)) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/target/isa",
+                      "'isa' must be a non-empty string with no leading or "
+                      "trailing whitespace — the language↔target gate "
+                      "compares it for exact equality, so a padded value "
+                      "matches nothing while LOOKING correct. OMIT the key "
+                      "entirely to declare no architecture.");
+            return std::unexpected(std::move(coll).release());
+        }
+        data.isa = std::move(isaText);
+    }
+
     // Optional frame-op mnemonic overrides (default "frame_load" /
     // "frame_store" on TargetSchemaData). A target may rename the
     // pseudo-ops without breaking the rewrite/verifier substrate.
