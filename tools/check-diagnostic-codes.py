@@ -126,6 +126,22 @@ MIN_PLAUSIBLE_CODES = 300
 #   here would start refusing legitimate ordinals. Delete the row, do not
 #   "update" it.
 #
+# ✔VERIFIED 2026-08-16 AGAINST THE REAL BRANCH, which was NOT possible when
+#   these rows were written — `feature/c23-conformance-burndown-3` did not then
+#   exist on `origin` and the ranges were taken on report. It exists now
+#   (`b52784a`), so the rows were checked by reading its enum directly:
+#     git show origin/feature/c23-conformance-burndown-3:src/core/types/parse_diagnostic.hpp
+#   ⇒ S_ 0xE065-0xE06B is exactly 7 InlineAsm codes, L_ 0xB010-0xB012 exactly 3
+#   SideStructure codes — both ranges correct, neither over- nor under-claimed.
+#   ⇒ Their D_ band stops at 0xD021 and ours starts at 0xD022, so the band this
+#   branch actually grew has NO overlap at all.
+#   ★ The interesting negative: S_ 0xE062-0xE064 appear on BOTH branches with
+#   IDENTICAL names AND values. That is shared ancestry, not a collision, and it
+#   is why the check must compare (value -> name) rather than "value seen twice
+#   across branches" — the latter would report three false conflicts here.
+#   ⓘ This verification is a SNAPSHOT. If #54 gains codes before it merges the
+#   ranges can widen; re-run the command above rather than trusting this note.
+#
 # Each entry: (low, high, why) — INCLUSIVE on both ends.
 RESERVED_ELSEWHERE = (
     (0xE065, 0xE06B,

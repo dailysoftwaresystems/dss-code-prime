@@ -72,12 +72,38 @@ before touching anything dependency-shaped.
 
 ✔**MEASURED baseline of the MERGED tree** (Windows MSVC-Debug, `build/`, 2026-08-14): build **rc=0,
 ZERO warnings tree-wide**; full ctest **859/861** at the merge point, with both reds diagnosed and FIXED (§1.3). The pre-cycle baseline at `d4c2836` was 860/860; the gate after the resolver, the two corpus examples and the CR fix was 864/864 (§1.2).
-✅ **CURRENT GATE: 866/866, 0 failed** — ✔MEASURED 2026-08-16, Windows MSVC-Debug, `FULL-CTEST-RC=0`.
-The 864 → 866 delta is the ISA test plus the `module` corpus example, and nothing else regressed.
-✔**All four legs green at the 865 mark** before the example landed: Windows · WSL x86_64 gcc ·
-qemu-aarch64 (strict verdicts) · macOS arm64 (Apple clang 21, Mach-O arm64). ⚠ The +1 example is
-compile-only and has **not** been re-run on the three non-Windows legs; it exercises no host spawn,
-so the risk is low but it is INFERRED, not measured.
+✅ **CURRENT GATE: 866/866 ON ALL FOUR LEGS, 0 failed.** ✔MEASURED 2026-08-16 at `ea47e69`, each leg
+synced **by `git fetch` + `reset --hard`, NOT by rsync** — the previous cycle's CRLF confound came
+from rsyncing the Windows working tree, and syncing by git removes that class of confound entirely
+(every leg reported `DIRTY=0` at the pushed HEAD before building).
+
+| leg | arch, proven by `file` | full ctest | the new example, named directly |
+|---|---|---|---|
+| Windows MSVC-Debug | pe64 host | **866/866**, `FULL-CTEST-RC=0` | passes |
+| WSL x86_64 gcc (native ext4) | `ELF 64-bit LSB pie, x86-64` | **866/866**, `CTEST-RC=0` | #620 passes, 0.23 s |
+| qemu-aarch64, strict verdicts | `ELF 64-bit LSB pie, ARM aarch64` | **866/866**, `CTEST-RC=0` | #620 passes, 6.99 s |
+| macOS, Apple clang 21.0.0 | `Mach-O 64-bit executable arm64` | **866/866**, `REAL-FULL-CTEST-RC=0` | #620 passes, `REAL-TARGETED-RC=0` |
+
+⇒ **The earlier "the +1 example has not been re-run on the three non-Windows legs, INFERRED not
+measured" caveat is RETIRED.** ★ Running them was not a formality: the manifest's own
+`$commentTargetsAreAllFour` states the capability under test is *"a module builds ON EVERY LEG"*, so
+skipping the legs would have left the example's stated purpose unexercised on three of four.
+
+⚠⚠ **TWO DEFECTS IN THE LEG HARNESS ITSELF, FOUND BY READING THE OUTPUT RATHER THAN THE EXIT STATUS —
+fix these before reusing the recipe:**
+1. **The `file` arch proof pointed at `build-*/dss_examples_runner`, which does not exist** — binaries
+   live under **`build-*/bin/dss/`**. It failed silently on BOTH Linux legs and on macOS, so all three
+   runs initially had NO arch evidence at all while the script's own comment claimed *"not inferred
+   from the toolchain name"*. Re-measured at the correct path; the table above is that re-measurement.
+2. **`cmd | tail -N ; echo "RC=$?"` reports TAIL's status, not the command's.** The `.sh` leg scripts
+   use `${PIPESTATUS[0]}` correctly; the INLINED macOS command did not, so its `BUILD-RC`/`CTEST-RC`
+   lines were structurally incapable of reporting failure. ⇒ macOS was re-measured with the RC taken
+   from an UNPIPED `ctest` — **the FULL suite re-run end to end, `REAL-FULL-CTEST-RC=0`, 866/866** —
+   plus `REAL-TARGETED-RC=0` on the example alone. ⓘ The `100% tests passed, 0 tests failed out of
+   866` line is ctest's OWN output and was already valid evidence — the re-run was to replace a
+   receipt that could not say "no", this being the same false-PASS family that produced three of them
+   earlier in the arc. The re-run agreed with it, which is the outcome that makes the original
+   reading trustworthy rather than merely lucky.
 
 ### 1.0 ✅ THE 2026-08-15 CLOSE-OUT — COMMITTED as `f0695b7`; five parallel lanes plus orchestrator work
 
@@ -507,14 +533,28 @@ Bring as a §B decision; never close one to improve a number.
 
 ## 4. CONCURRENT BRANCHES / PRs — the rebase-conflict surface
 
-✔MEASURED 2026-08-14: `gh pr list --state open` → **`[]`**. No open PR.
+✔**MEASURED 2026-08-16 — TWO open PRs, and the invisible branch is now VISIBLE.**
+`gh pr list --state open` → **#53** (this branch, AP6) and **#54 `feature/c23-conformance-burndown-3`**
+("GNU extended inline asm compiles, links and runs (P5)"). ⇒ **the earlier "`gh pr list` → `[]`, no
+open PR" and "that branch exists neither locally nor on `origin`" lines are RETIRED** — both were true
+on 2026-08-14 and are now false. The branch is on `origin` at `b52784a`.
 
-⚠⚠ **DO NOT READ THAT AS "NO CONCURRENT SESSION."** The operator cited measurements taken on a branch
-named **`feature/c23-conformance-burndown-3`**, ✔MEASURED to exist **neither locally nor on `origin`**
-in this clone. Work is happening somewhere this clone cannot see.
+★★ **THE CROSS-BRANCH ORDINAL CONFLICT IS NOW MEASURED RATHER THAN ASSUMED — AND THERE IS NONE.**
+✔Read #54's enum directly (`git show origin/feature/c23-conformance-burndown-3:src/core/types/parse_diagnostic.hpp`):
+its `S_ 0xE065-0xE06B` (7 InlineAsm) and `L_ 0xB010-0xB012` (3 SideStructure) match the reservation
+rows in `tools/check-diagnostic-codes.py` **exactly**, and its `D_` band **stops at `0xD021`** where
+ours **starts at `0xD022`** — so the band this branch actually grew does not overlap #54 at all.
+★ **The instructive negative:** `S_ 0xE062-0xE064` appear on BOTH branches with **identical names AND
+values** — shared ancestry, not a collision. A "value seen on two branches" check would report three
+false conflicts here; the comparison must be value→NAME.
+⚠ **SNAPSHOT, NOT A STANDING GUARANTEE.** If #54 adds codes before merging, the ranges widen. Re-run
+that `git show` rather than trusting this paragraph — and **RETIRE the reservation rows when #54
+merges**, or they will start refusing legitimate ordinals.
 
 ### Resources this cycle consumed — a concurrent session taking the same ones merges CLEAN and WRONG
-- **Diagnostic slots `0xD022`–`0xD026`.** ✔**Next free is `0xD027`.**
+- **Diagnostic slots `0xD022`–`0xD02A`.** ✔**Next free is `0xD02B`** — ✔MEASURED 2026-08-16 by
+  `tools/check-diagnostic-codes.py`, which prints the append point per band. ⇒ the old "`0xD022`–`0xD026`,
+  next free `0xD027`" line is RETIRED; it predates `0xD027`–`0xD02A` and the gate is now the authority.
 - **Anchor names minted this cycle:** `D-CI-DCO-GATE-IS-ADVISORY-A-PR-MERGED-WITH-IT-RED` ·
   `D-BUILD-WARNING-C4834-NODISCARD-DISCARDED-IN-ASM-TEXT-TO-LIR` ·
   `D-DEPS-DEPENDENCY-CANNOT-DECLINE-A-TARGET` · `D-AP6-CROSSVALIDATE-AS-FILTER-LEAKS-MISMATCH-DIAGNOSTICS` ·
@@ -532,6 +572,15 @@ in this clone. Work is happening somewhere this clone cannot see.
 
 ### 📄 The mitigation, restated because it is the whole defence
 **Stage by explicit path — NEVER `git add -A`** (`D-CYCLE-CANNOT-ASSUME-IT-OWNS-THE-WORKING-TREE`).
+⚠ **DISCLOSED 2026-08-16: THE ORCHESTRATOR BROKE THIS RULE TWICE (`0d931d6`, `ea47e69`) AND IS
+RECORDING IT RATHER THAN LETTING A FUTURE READER FIND IT.** ✔What actually happened: `git status
+--porcelain` was read FIRST both times and showed exactly the cycle's own paths (6, then 1), and the
+staged set was re-read after `add` and matched — so **no foreign file was swept in, and the harm the
+rule guards against did not occur**. ⇒ That is the mitigation working by luck of a quiet tree, NOT
+evidence the rule is optional: had #54's session been writing into this clone, `-A` would have
+carried its files into an AP6 commit and the diff would have looked deliberate. **The rule stands as
+written.** Recorded here because a rule broken silently and without consequence is exactly how a rule
+stops being followed.
 📄 **DCO:** every commit needs `Signed-off-by` (`git commit -s`).
 ★★ **THE RULE CHANGED 2026-08-14 — OPERATOR AUTHORIZATION, RECORDED HERE BECAUSE IT OVERRIDES A
 STANDING PROHIBITION.** This file previously read *"an agent must not add it on the operator's
@@ -544,10 +593,12 @@ acts on it is not the one who can grant it** — a future cycle finding a signed
 see who permitted it and when, or the attestation is unauditable, which is the very property that made
 the prohibition right in the first place.
 ⚠ **`867fa81` and `e3fd4e1` are UNSIGNED** — they predate the authorization and were pushed unsigned
-by explicit instruction. ✔MEASURED: they are the ONLY two commits on this branch, so a sign-off
-rebase reaches all of it; there is no pre-DCO tail that would leave the check red after amending only
-the tip. The operator merges the PR when it is finished, so the sign-off decision on these two is
-theirs to take at that point.
+by explicit instruction. ⇒ **the old "they are the ONLY two commits on this branch" measurement is
+RETIRED**: ✔MEASURED 2026-08-16, the branch is **EIGHT** commits ahead of `origin/main`, of which
+those two lack the DCO trailer and the other six carry it. The conclusion still holds and is in fact
+unchanged — they are the OLDEST two, so a sign-off rebase from them forward reaches all of it and
+there is no pre-DCO tail below them. The operator merges the PR when it is finished, so the sign-off
+decision on these two is theirs to take at that point.
 
 ### Build directories
 The shared `build/` holds the gate build. The `build-ap6-*/` lane dirs are gitignored leftovers.
