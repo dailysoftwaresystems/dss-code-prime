@@ -9546,8 +9546,17 @@ struct Lowerer {
                         res.terminator, static_cast<std::uint32_t>(k),
                         outClasses[k], pieceTypeFor(k));
                     if (!rp.valid()) return false;
+                    // ★ THROUGH THE FUNNEL, NOT A BARE `Store`. `emitScalarStore`
+                    // is what routes an `_Atomic` lvalue to `AtomicStore` and
+                    // stamps the c21 Volatile flag; a bare `addInst` here emitted
+                    // a plain Store on an atomic object (caught LOUD by the
+                    // verifier's atomic belt, `I_AtomicAccessNotLowered`) and
+                    // silently dropped `volatile` on the write-back. The READ
+                    // half of a `"+r"` operand already goes through
+                    // `emitScalarLoad`, so the two halves of one operand were
+                    // asymmetric.
                     std::array<MirInstId, 2> st{rp, outAddrs[k]};
-                    mir.addInst(MirOpcode::Store, st);
+                    emitScalarStore(st, pieceTypeFor(k), kids[k]);
                 }
                 mir.addBr(e.label);
             }
@@ -9585,9 +9594,14 @@ struct Lowerer {
         }
         // Pass 2 — store each captured piece back through its lvalue address. Only
         // now, with the adjacency window closed, may Stores appear.
+        // ★ `emitScalarStore`, never a bare `addInst` — see the sibling site in the
+        // `asm goto` arm. ⚠ THE SECOND PASS STAYS A SECOND PASS: routing through the
+        // funnel does not license moving these stores up beside their producer, which
+        // would break the producer→`ReturnPiece` adjacency `lir_callconv.cpp` fails
+        // loud on.
         for (std::size_t k = 0; k < src.outputCount; ++k) {
             std::array<MirInstId, 2> st{pieceVals[k], outAddrs[k]};
-            mir.addInst(MirOpcode::Store, st);
+            emitScalarStore(st, pieceTypeFor(k), kids[k]);
         }
         return true;
     }

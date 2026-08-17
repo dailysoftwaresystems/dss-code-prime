@@ -484,6 +484,12 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         std::vector<MirInstId> newAsmOps;
         newAsmOps.reserve(asmOps.size());
         for (auto a : asmOps) newAsmOps.push_back(mapOperand(a));
+        // ★ WHOLE, BY VALUE — never field-by-field. `tests/opt/
+        // test_inline_asm_rebuild_carriage.cpp` pins `isExtended` and the inputs'
+        // `tiedOutput`; ✔MEASURED 2026-08-17 that a field-by-field copy omitting
+        // those two reds both pins at this site. That is the silent-drop class
+        // `mir_asm_descriptor.hpp` guards, and it is why this call passes the
+        // descriptor whole rather than reconstructing it.
         MirInstId const newId = dst_.addInlineAsm(src_.asmDescriptor(oldId), newAsmOps,
                                                   src_.instType(oldId),
                                                   src_.instFlags(oldId));

@@ -2922,12 +2922,20 @@ struct Lowerer {
                                 || !c.outputNames.empty()
                                 || !c.clobberedNames.empty();
 
-        // The move used for the pins and the captures. Resolved only when some
-        // operand is pinned, so a target that declares no `mov` still compiles
-        // an asm block that needs none.
-        bool const needMoves = std::any_of(
-            outs.begin(), outs.end(), [](AsmBound const& b) { return b.pinned; })
-            || std::any_of(ins.begin(), ins.end(),
+        // The move used for the input materialisation and the output captures.
+        // Resolved only when the block actually needs one, so a target that
+        // declares no `mov` still compiles an asm block that needs none — an
+        // operand-less `__asm__("nop")` asks nothing of the target's move.
+        // ⚠ THE INPUT HALF IS "ANY INPUT AT ALL", NOT "ANY PINNED INPUT".
+        // EVERY input is materialised into its bound register (see the loop in
+        // step 4), so gating on `pinned` here left `movOp` DISENGAGED on the
+        // path that dereferences it: the plain `"r"` input crashed the builder
+        // with `LirBuilder::addInst: Invalid opcode` out of a `*movOp` on an
+        // empty optional. It stayed invisible while unpinned inputs were being
+        // skipped entirely — the same omission hid both halves.
+        bool const needMoves =
+            !ins.empty()
+            || std::any_of(outs.begin(), outs.end(),
                            [](AsmBound const& b) { return b.pinned; });
         std::optional<std::uint16_t> movOp;
         if (needMoves) {
@@ -2974,8 +2982,28 @@ struct Lowerer {
         // how step 5 reaches instructions the ENGINE emitted, which this tier
         // never sees individually.
         std::uint32_t const firstEmitted = nextLirInstIdValue();
+        // ★★★ EVERY INPUT IS MOVED INTO ITS BOUND REGISTER — PINNED OR NOT.
+        // ⚠ INPUTS ARE **NOT** THE MIRROR OF OUTPUTS, AND ASSUMING THEY WERE IS
+        // A SILENT MISCOMPILE. The capture loop below skips UNPINNED outputs for
+        // a real reason — *the template itself writes that vreg*, so a copy
+        // would be dead. The symmetric-looking claim about inputs is FALSE:
+        // `bindAsmOperand` mints a FRESH vreg for an unpinned operand
+        // (`lir.newVReg(cls)`), and for an input NOTHING EVER WRITES IT unless
+        // this loop does. Skipping the unpinned half bound the template to an
+        // undefined register with no diagnostic — precisely the read-as-
+        // undefined outcome the `"+r"` refusal in `bindAsmOperand` exists to
+        // prevent, arriving through the plain `"r"` path instead.
+        // ✔MEASURED 2026-08-17 before the fix, `__asm__("movl %1, %0"
+        // : "=r"(r) : "r"(a))` with a==42 compiled rc=0 and returned 0 on BOTH
+        // `pe64-x86_64` and `elf64-x86_64`, at debug AND release: the input's
+        // load defined the register the OUTPUT was allocated, and the template's
+        // `%1` read a register never written (`mov %r15d,%r14d`).
+        // ★ The copy is emitted rather than binding the operand's own value
+        // vreg directly, so that ONE mechanism serves both halves and the bound
+        // register always carries the CONSTRAINT's class — a value vreg may
+        // hold a different class than the constraint asks for, and a direct
+        // bind would silently hand the template the wrong register file.
         for (std::size_t j = 0; j < ins.size(); ++j) {
-            if (!ins[j].pinned) continue;
             std::optional<LirReg> const src = regForValue(operands[j]);
             if (!src.has_value()) return false;
             std::array<LirOperand, 1> const pin{LirOperand::makeReg(*src)};

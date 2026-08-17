@@ -12837,6 +12837,91 @@ TEST(MirLoweringCSubset, ReadWriteAsmOperandCarriesItsReadHalfTiedToItsOutput) {
     EXPECT_TRUE(W.mir.mir.instOperands(wo.inst).empty());
 }
 
+// ── THE OUTPUT STORE-BACK GOES THROUGH `emitScalarStore`, NOT A BARE `addInst` ──
+//
+// ★★★ WHY THIS IS A REAL DEFECT AND NOT TIDINESS. `Lowerer::lowerInlineAsm` wrote
+// each output back through its lvalue address with a bare
+// `mir.addInst(MirOpcode::Store, st)` at TWO sites (the `asm goto` successor-head
+// path and the non-terminator second pass). Both bypassed `emitScalarStore`, the
+// documented funnel that (a) routes an `_Atomic`-qualified lvalue to `AtomicStore`
+// with `kAtomicOrderSeqCst` and (b) stamps the c21 `MirInstFlags::Volatile`.
+// ⇒ TWO consequences of different severity, and BOTH are exercised below:
+//   * `_Atomic` — a plain `Store` on an atomic object. ✔MEASURED as a LIVE
+//     verifier failure through the real CLI before the fix:
+//     `_Atomic int g; __asm__("movl $42, %0" : "=r"(g));` exited rc=1 with
+//     `error[I_AtomicAccessNotLowered] … plain 'store' to an _Atomic-qualified
+//     pointee`. Valid C that the compiler refused.
+//   * `volatile` — SILENT. It compiled and ran, and the write-back simply lost the
+//     flag, so the optimizer is free to elide or reorder a store the source marked
+//     volatile. That half had no diagnostic at all.
+// ★ The two halves of ONE operand were already asymmetric: the READ half of a
+// `"+r"` operand goes through `emitScalarLoad` (pinned by the test above).
+//
+// RED-ON-DISABLE: revert either call to `mir.addInst(MirOpcode::Store, st)` — the
+// atomic arm loses its `AtomicStore` and the volatile arm loses its flag.
+// ⚠ THE PLAIN CONTROL IS LOAD-BEARING: without it this test is satisfied by a
+// lowering that stamps `Volatile` on EVERY asm store-back, which would be a
+// different defect wearing this test as cover.
+TEST(MirLoweringCSubset, AsmOutputStoreBackGoesThroughTheScalarFunnel) {
+    // ── volatile: a plain Store that CARRIES the flag ──
+    auto V = lowerCSubset(
+        "volatile int g;\nvoid f(void){ __asm__(\"movl $5, %0\" : \"=r\"(g)); }");
+    ASSERT_TRUE(V.mir.ok)
+        << (V.mirReporter.all().empty() ? std::string{}
+                                        : V.mirReporter.all()[0].actual);
+    {
+        Mir const& m = V.mir.mir;
+        int stores = 0;
+        int volatileStores = 0;
+        for (MirInstId const id : stdbitAllEntryInsts(m)) {
+            if (m.instOpcode(id) != MirOpcode::Store) continue;
+            ++stores;
+            if ((m.instFlags(id) & MirInstFlags::Volatile) != MirInstFlags::None)
+                ++volatileStores;
+        }
+        EXPECT_EQ(stores, 1) << "one output, one store-back";
+        EXPECT_EQ(volatileStores, 1)
+            << "the asm output store-back must carry the volatile flag the "
+               "source asked for";
+    }
+
+    // ── the CONTROL: a non-volatile output's store-back must NOT be flagged ──
+    auto P = lowerCSubset(
+        "int g;\nvoid f(void){ __asm__(\"movl $5, %0\" : \"=r\"(g)); }");
+    ASSERT_TRUE(P.mir.ok)
+        << (P.mirReporter.all().empty() ? std::string{}
+                                        : P.mirReporter.all()[0].actual);
+    {
+        Mir const& m = P.mir.mir;
+        int volatileStores = 0;
+        for (MirInstId const id : stdbitAllEntryInsts(m)) {
+            if (m.instOpcode(id) != MirOpcode::Store) continue;
+            if ((m.instFlags(id) & MirInstFlags::Volatile) != MirInstFlags::None)
+                ++volatileStores;
+        }
+        EXPECT_EQ(volatileStores, 0)
+            << "a plain output must not be stamped volatile — otherwise the "
+               "volatile arm above proves nothing";
+    }
+
+    // ── _Atomic: AtomicStore, and NO plain Store ──
+    auto A = lowerCSubset(
+        "_Atomic int g;\nvoid f(void){ __asm__(\"movl $5, %0\" : \"=r\"(g)); }");
+    ASSERT_TRUE(A.mir.ok)
+        << (A.mirReporter.all().empty() ? std::string{}
+                                        : A.mirReporter.all()[0].actual);
+    {
+        Mir const& m = A.mir.mir;
+        auto ids = stdbitAllEntryInsts(m);
+        EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::AtomicStore), 1)
+            << "an _Atomic asm output lowers to AtomicStore";
+        // Asserting the AtomicStore alone would stay green if a plain Store were
+        // ALSO emitted; the exclusivity is what the verifier belt polices.
+        EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Store), 0)
+            << "no plain store may survive beside it";
+    }
+}
+
 // ── TF-C95 D-CSUBSET-ATOMIC-FENCE: the __sync_synchronize→AtomicFence ROUTING pin ──
 // The BUILTIN→OPCODE half of the fence feature, and the ONLY test that covers it:
 // every other AtomicFence pin (test_mir_to_lir's slot routing, the test_asm_* byte

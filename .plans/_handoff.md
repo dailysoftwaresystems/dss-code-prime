@@ -9,10 +9,119 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-14, **second session** (⚠ **MID-CYCLE, rewritten as insurance after the
-first session exhausted its context and its three implementation lanes were killed by the process
-exit — see §0, especially §0.4 for what is half-done in the tree**)
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** `d4c2836b` ✔MEASURED, `== origin/main` (0/0)
+**Last updated:** 2026-08-17 (⚠ **MID-CYCLE insurance write — the fix and its pin are IN THE TREE and
+green on the Windows leg; the WSL + arm64 legs and the commit are NOT done. See §0.000.**)
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** `4095c13b` ✔MEASURED (Cycle P5b),
+working tree carries the P5c fix uncommitted.
+
+---
+
+## 0.000 ★★★ P5c — A SILENT MISCOMPILE IN SHIPPED EXTENDED ASM: EVERY UNPINNED INPUT READ AN UNDEFINED REGISTER
+
+**✔MEASURED 2026-08-17 on the compiler that had just passed 873/873.**
+`__asm__("movl %1, %0" : "=r"(r) : "r"(a))` with `a == 42` compiled **rc=0** and the program
+**returned 0** — on **BOTH** `pe64-x86_64` and `elf64-x86_64`, at **BOTH** debug and release.
+The disassembly named it outright: the input's load defined the register the OUTPUT had been
+allocated, and the template's `%1` read one nothing ever wrote — `mov 0x0(%r14),%r14d` (load `a`),
+then `mov %r15d,%r14d` (the template), with r15 untouched since the prologue.
+
+**Cause (`expandInlineAsm`, `src/lir/lowering/mir_to_lir.cpp`):** the materialisation loop opened
+`if (!ins[j].pinned) continue;`, so only PINNED inputs were moved into their bound register.
+`bindAsmOperand` mints a FRESH vreg for an unpinned operand and, for an INPUT, **nothing else ever
+writes it.**
+★★ **THE FALSE SYMMETRY IS THE LESSON.** The capture loop twelve lines below skips unpinned OUTPUTS
+for a correct reason its own comment states — *the template wrote that vreg, so a copy would be dead*
+— and the input loop reads as its mirror image. It is not one: an output is written by the TEMPLATE,
+an input must be written by the LOWERING.
+★ **A second defect hid underneath and only surfaced once the first was fixed:** `needMoves` gated
+resolution of `MnemonicSlot::Mov` on *any operand pinned*, so with unpinned inputs alone `movOp`
+stayed disengaged and the corrected loop dereferenced an empty optional
+(`LirBuilder::addInst: Invalid opcode`). One omission concealed both halves.
+
+**✔MEASURED FIXED:** the four probes (`movl $42,%0` / `movl %1,%0` / two-input `"=&r"` / arm64
+`add %0,%1,%2` on `long`) all exit **42**, debug AND release, on pe64 native, WSL elf64-x86_64 and
+qemu-aarch64. Anchor `D-LIR-ASM-UNPINNED-INPUT-NEVER-MATERIALISED`, born ✅ CLOSED (balance net 0).
+
+### ★★★ WHY 873 GREEN TESTS SAW NOTHING — the durable finding
+The corpus's **three** inline-asm examples declared **ZERO input operands between them**:
+`c_inline_asm` is the EMPTY template; `c_inline_asm_extended` is register-PINNED OUTPUTS (`rdtsc`)
+on x86_64 and a pure CLOBBER list on aarch64. ⇒ **A FEATURE'S COVERAGE IS AS WIDE AS THE OPERAND
+SHAPES ITS TESTS NAME, NEVER AS THE NUMBER OF TESTS.** Counting examples said inline asm was well
+covered; counting SHAPES said inputs had never once run.
+⚠ It also re-reads the cycle that shipped it: `hwtime.h` compiling was a TRUE result *because*
+`rdtsc` has outputs and no inputs — the motivating construct could not have caught this.
+
+### ★★ AND THE PIN ITSELF NEARLY SHIPPED A FALSE CLAIM
+New example `examples/c-subset/c_inline_asm_operands`. I first wrote that it *"discriminates at both
+arms, because a register nothing wrote is undefined at every optimization level"* — reasoning that
+sounds airtight and is **WRONG**. ✔MEASURED with the mutant restored and the example reduced to the
+call-shaped two-input helper alone: **baseline exited 42 (GREEN — the mutant SURVIVED)**, release
+exited 1. Adding a single-input shape lowered **directly in `main`** made the same mutant fail the
+BASELINE arm outright. ⇒ a pin that survives because an undefined register HAPPENED to hold the right
+value is not a pin, and which shape gets that luck cannot be read off the source. The example
+carries **both** shapes and must not be "simplified" to one.
+⚠ The original claim came from a standalone probe of a DIFFERENT program shape — a property measured
+on one subject and asserted about another.
+
+### 0.001 ✅ THE TWO OPERATOR-QUEUED TASKS (§0.00) ARE DONE IN THIS SAME CYCLE
+
+**TASK 1 — asm output store-back through `emitScalarStore`.** ✔**IT WAS A LIVE VERIFIER FAILURE, not
+only a quality gap** — the fixture was written FIRST to settle exactly that, as §0.00 instructed:
+`_Atomic int g; __asm__("movl $42, %0" : "=r"(g));` exited **rc=1** with
+`error[I_AtomicAccessNotLowered] … plain 'store' to an _Atomic-qualified pointee`. Valid C, refused.
+The `volatile` half was the SILENT one: it compiled, ran, and simply lost the flag.
+Both sites now call `emitScalarStore(st, pieceTypeFor(k), kids[k])`; the second pass stays a second
+pass (the producer→`ReturnPiece` adjacency window must still close first).
+Pin `MirLoweringCSubset.AsmOutputStoreBackGoesThroughTheScalarFunnel` — volatile arm, `_Atomic` arm
+(AtomicStore == 1 **and** plain Store == 0), and a **plain control** proving the lowering does not
+stamp volatile on everything. ✔RED-ON-DISABLE: reverting one call reds all three arms, control green.
+Anchor `D-MIR-ASM-OUTPUT-STORE-BACK-BYPASSES-THE-SCALAR-FUNNEL`, born ✅ CLOSED.
+
+**TASK 2 — pin `isExtended` + `tiedOutput` through the MIR rebuild.** Sentinel sets both to
+NON-DEFAULT values (`tiedOutput` names output **1**, so a drop re-defaulting to `0` stays visible);
+`expectSentinel` asserts engagement with `ASSERT_TRUE(...has_value())` before the value, since
+`.value()` on a dropped optional aborts instead of naming the site. ⚠ Adding an input made the
+descriptor's input count non-zero, and `MirBuilder::checkAsmOperandAlignment_` **aborts** on a
+descriptor/operand mismatch — so all three fixtures plant the asm through one `plantSentinelAsm`
+helper instead of three call sites that can drift. ✔RED-ON-DISABLE: a field-by-field copy at rebuild
+site 1 omitting exactly those two fields reds both new assertions; reverted.
+Anchor `D-TEST-MIR-ASM-DESCRIPTOR-NEW-FIELDS-UNPINNED-THROUGH-REBUILD`, born ✅ CLOSED.
+
+### 0.002 GATE STATE — ✅ ALL THREE LEGS GREEN ON THE FULL DIFF
+✔ **Windows ctest 874/874, rc=0** · ✔ **WSL x86_64 + qemu-arm64 874/874, rc=0 under
+`DSS_STRICT_ARM_VERDICTS=1`** · ✔ **`integrated_tests` (the CLI-subprocess runner) passed, and the new
+example is genuinely IN it** — verified by name in `ctest -V`, not inferred from the glob, because a
+capability that reaches one runner while its sibling shrugs is a silent harness bug.
+Anchor balance **net 0** (three rows, all born ✅ CLOSED); registry guard OK (1047 src anchors
+resolve); line-endings OK.
+⚠ **An instrument bug worth carrying:** the WSL sync used `rsync --exclude 'build*'`, which is
+UNANCHORED and therefore matched `src/program/build_scripts.cpp` — the mirror failed to configure with
+*"Cannot find source file"*, which reads like a missing-file bug in the tree and is not one. Anchor
+excludes with a leading slash (`/build*`).
+
+### 0.003 ⚠ A LOOSE END P5b LEFT, SURFACED NOT SILENTLY DECIDED — `--scanstatus` IS STILL OFF
+`real-examples/c/sqlite/legs.json`'s `$scanstatusComment` instructs, in its own words, to *"re-add
+the flag in the change that closes it"*. ✔MEASURED: **every blocker that comment names is now
+closed** — `__volatile__`, the `:` operand lists, the asm TEXT, and (P5b) the `__inline__`-only
+external-definition gap, after which `hwtime.h` compiles and runs at release on pe64,
+elf64-x86_64 and macho64-x86_64. **The flag was not re-added, and the comment still concludes it
+stays off for the `__inline__` reason it no longer has.**
+⚠ **WHY THIS IS A DECISION AND NOT A CHORE:** `hwtime.h` still fails at **debug**, and that failure
+is CONFORMANT — gcc 13.3.0, clang 18.1.3 and clang 19 all fail to link a called inline definition at
+`-O0` and succeed from `-O1`. So re-adding `--scanstatus` buys sqlite's own `build(Default)`
+configuration and its two corpus files, at the cost of a debug leg that goes red for a reason the
+reference compilers share. ⇒ **Decide it explicitly (re-add release-only / re-add and accept the
+debug red / keep off and correct the stale comment) — do not let it drift by inheriting a paragraph
+that is now false.** 🧠 Not attempted this cycle: it is scope the operator has not asked for, and
+guessing the answer would bake a policy into a config comment.
+
+**STILL OWED on this cycle:** re-run both gate legs, commit + push.
+🧠 **sqlite re-probe judged not proportionate here and the reasoning is stated rather than assumed:**
+the whole diff touches the inline-asm lowering path plus one test, and `--scanstatus` is OFF, so no
+sqlite TU in this configuration contains an `__asm__` at all. The in-suite
+`harness/test_sqlite_harness_legs` runs as part of the 874. ⚠ If `--scanstatus` is ever re-enabled
+(§0.003) that reasoning expires immediately — the asm path becomes live in sqlite and a full re-probe
+becomes mandatory.
 📄 PRs **#50, #51 and #52 are all MERGED**; this branch was cut clean from main. ⚠ The public-repo bot
 rebases/squash-merges, so `4969e9e2` / `e5b60f6c` / `e42ae5a5` (the asm cycles) are **NOT ancestors of
 HEAD** — their *content* is in main, their SHAs are not reachable. Do not `git show` them and conclude
@@ -42,8 +151,8 @@ cannot tell "works" from "does nothing".*
 `D-ASM-ARM64-CONDITION-AS-OPERAND-UNMODELLED` (a **FALSE CLOSE** corrected — it had been witnessed
 only on `eq`/`ne`, the two spellings where the substrate and gas vocabularies coincide).
 
-### 0.00 ★ OPERATOR-QUEUED CYCLE 2026-08-15 — two tasks, both BLOCKED ON LANE Z LANDING
-⚠ **Sequencing, measured:** the in-flight lane owns `src/mir/lowering/hir_to_mir.cpp`, `src/mir/mir_asm_descriptor.{hpp,cpp}` and `tests/mir/**`, **and it is the lane ADDING the two fields task 2 pins**. Task 1 collides outright; task 2's subject does not exist until it lands. **Dispatch both only after that lane reports.**
+### 0.00 ✅ OPERATOR-QUEUED CYCLE 2026-08-15 — BOTH TASKS DONE 2026-08-17 (see §0.001). Brief kept below.
+⚠ **Sequencing, measured (now historical — the lane landed):** the in-flight lane owns `src/mir/lowering/hir_to_mir.cpp`, `src/mir/mir_asm_descriptor.{hpp,cpp}` and `tests/mir/**`, **and it is the lane ADDING the two fields task 2 pins**. Task 1 collides outright; task 2's subject does not exist until it lands. **Dispatch both only after that lane reports.**
 
 **TASK 1 — route asm output store-back through `emitScalarStore` (a REAL silent defect).**
 `Lowerer::lowerInlineAsm` stores each inline-asm OUTPUT back through its lvalue address with a bare
@@ -86,7 +195,25 @@ extend `expectSentinel()` to assert both. **Red-on-disable by making ONE rebuild
 descriptor field-by-field, omitting the two new fields**, confirming the pin reds through `ctest`, then
 reverting.
 
-### 0.0 ⚠ THE NEXT CYCLE'S MANDATE — four blockers, operator-scheduled 2026-08-15
+### 0.0 ✘ STALE — ALL FOUR OF THESE CLOSED IN CYCLE P5b (`4095c13b`). KEPT ONLY AS THE RECORD.
+⛔ **Do not plan off this list.** ✔MEASURED 2026-08-17 that items 1–3 are done and item 4 shipped
+(`hwtime.h` compiles and runs at release). The **current** open asm set is:
+`D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` — **narrowed to the LABEL half only**; `%N`, `%%` and
+aarch64 outputs all measured working, `%l[name]` still fail-loud refused ·
+`D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE` (`"+r"` carriage lands, `bindAsmOperand` still refuses it) ·
+`D-CSUBSET-INLINE-ASM-POSITIONAL-LABEL-REF-ACCEPTED-WITH-NO-GRAMMAR` ·
+`D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER` ·
+`D-ASM-TEMPLATE-DIAGNOSTICS-RENDER-WITHOUT-SOURCE-CONTEXT` · `D-CSUBSET-INLINE-ASM-SPELLING` (bare
+`asm`) · `D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER` ·
+`D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL` · `D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED` ·
+`D-ASM-ARM64-GAS-SURFACE-INCOMPLETE` · `D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT`
+(BLOCKING trigger). ⚠ Still trigger-gated and **meant to stay open**:
+`D-ASM-TARGET-DECLARES-NO-BYTE-ORDER`, `D-ASM-COND-ON-TERMINATOR-ARMS-UNWITNESSED`,
+`D-ASM-SYSTEM-REGISTER-AS-ENCODED-DATA-UNMODELLED`.
+
+<details><summary>The 2026-08-15 mandate, kept as the record</summary>
+
+#### ⚠ THE NEXT CYCLE'S MANDATE — four blockers, operator-scheduled 2026-08-15
 Balance ends **+6 by an explicit §B decision** (*"close everything already closed, commit, then
 another cycle for the new blockers — I WANT ASM FULLY 100% DELIVERED"*). Not drift: this cycle
 FOUND more than it fixed because it was a deep investigation. **Close these next:**
@@ -107,6 +234,8 @@ FOUND more than it fixed because it was a deep investigation. **Close these next
 Also open: `D-LIR-VERIFY-VREG-CLASS-RULE-ASSUMES-A-ONE-TO-ONE-LIR-TO-MIR-MAP` and
 `D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED`; plus trigger-gated
 `D-ASM-SYSTEM-REGISTER-AS-ENCODED-DATA-UNMODELLED` which is MEANT to stay open.
+
+</details>
 
 <details><summary>§0 as written mid-cycle, kept as the record</summary>
 

@@ -63,10 +63,25 @@ public:
 // any field a drop could mimic: a non-empty template, a volatile bit, two
 // outputs with distinct classes, a named clobber, and BOTH clobber flags. A
 // dropped-and-re-defaulted descriptor cannot look like this one.
+//
+// ★★ EVERY FIELD THE DESCRIPTOR GAINS MUST BE ADDED HERE, AND THE TWO NEWEST
+// ONES SHOW WHY. `isExtended` and `MirAsmOperand::tiedOutput` arrived after this
+// fixture was written and were NOT pinned. Today nothing can drop them — every
+// rebuild site passes `src.asmDescriptor(id)` WHOLE by value, so new members ride
+// along for free — and that is exactly the trap: the pin's strength is a property
+// of how the copy happens to be spelled today, not of anything asserted. The
+// exposure is a future refactor to a field-by-field copy, which is the silent-drop
+// class `mir_asm_descriptor.hpp`'s own docblock exists to guard
+// ("A POOL INDEX IS NOT SELF-CARRYING, AND THAT IS THE WHOLE HAZARD").
+// ⚠ Both are set to NON-DEFAULT values on purpose: `isExtended` defaults to the
+// BASIC surface and `tiedOutput` to `nullopt`, so a dropped field would be
+// indistinguishable from a field that was never set if the sentinel used the
+// defaults.
 MirAsmDescriptor sentinelDescriptor() {
     MirAsmDescriptor d;
     d.templateText = "cpuid; rdtsc";
     d.isVolatile   = true;
+    d.isExtended   = true;
     MirAsmOperand o0;
     o0.constraint    = "=a";
     o0.regClass      = TargetRegClass::GPR;
@@ -77,11 +92,34 @@ MirAsmDescriptor sentinelDescriptor() {
     o1.regClass       = TargetRegClass::FPR;
     o1.isEarlyClobber = true;
     d.outputs.push_back(o1);
+    // ★ THE TIED INPUT. `tiedOutput` is set on the synthesized INPUT entry that
+    // carries a `"+r"` operand's READ half, naming the output it shares a
+    // location with — so it belongs on an input and nowhere else. Index 1 rather
+    // than 0 deliberately: a drop that re-defaulted the field to `0` instead of
+    // `nullopt` would be invisible against output 0.
+    MirAsmOperand i0;
+    i0.constraint = "r";
+    i0.regClass   = TargetRegClass::FPR;
+    i0.tiedOutput = 1u;
+    d.inputs.push_back(i0);
     d.clobbers.push_back("rbx");
     d.clobbers.push_back("rcx");
     d.clobbersMemory         = true;
     d.clobbersConditionCodes = true;
     return d;
+}
+
+// The sentinel declares ONE input, and `MirBuilder::checkAsmOperandAlignment_`
+// ABORTS the process on a descriptor/operand-count mismatch. Planting the asm
+// through one helper keeps that coupling in a single place: a later change to the
+// sentinel's input list cannot leave three call sites silently out of step, and
+// the failure mode if it did is an abort with no test name attached.
+MirInstId plantSentinelAsm(MirBuilder& mb, TypeId ty) {
+    MirLiteralValue v;
+    v.value = std::int64_t{7};
+    v.core  = TypeKind::I64;
+    MirInstId const ops[] = {mb.addConst(v, ty)};
+    return mb.addInlineAsm(sentinelDescriptor(), ops, ty);
 }
 
 // Field-by-field, because "a descriptor is present" is a much weaker claim than
@@ -90,6 +128,10 @@ MirAsmDescriptor sentinelDescriptor() {
 void expectSentinel(MirAsmDescriptor const& d, char const* where) {
     EXPECT_EQ(d.templateText, "cpuid; rdtsc") << where;
     EXPECT_TRUE(d.isVolatile) << where;
+    // The BASIC/EXTENDED surface: carried, never reconstructed downstream —
+    // `:::` with every section empty is unreconstructable from the sections
+    // alone, and a lowering that guessed it rejected valid code.
+    EXPECT_TRUE(d.isExtended) << where;
     ASSERT_EQ(d.outputs.size(), 2u) << where;
     EXPECT_EQ(d.outputs[0].constraint, "=a") << where;
     EXPECT_EQ(d.outputs[0].regClass, TargetRegClass::GPR) << where;
@@ -97,6 +139,14 @@ void expectSentinel(MirAsmDescriptor const& d, char const* where) {
     EXPECT_EQ(d.outputs[1].constraint, "=&x") << where;
     EXPECT_EQ(d.outputs[1].regClass, TargetRegClass::FPR) << where;
     EXPECT_TRUE(d.outputs[1].isEarlyClobber) << where;
+    ASSERT_EQ(d.inputs.size(), 1u) << where;
+    EXPECT_EQ(d.inputs[0].constraint, "r") << where;
+    EXPECT_EQ(d.inputs[0].regClass, TargetRegClass::FPR) << where;
+    // ASSERT on the engagement first: a dropped `tiedOutput` is `nullopt`, and
+    // reading `.value()` off it would abort the process instead of failing the
+    // test with a message naming the site.
+    ASSERT_TRUE(d.inputs[0].tiedOutput.has_value()) << where;
+    EXPECT_EQ(*d.inputs[0].tiedOutput, 1u) << where;
     ASSERT_EQ(d.clobbers.size(), 2u) << where;
     EXPECT_EQ(d.clobbers[0], "rbx") << where;
     EXPECT_EQ(d.clobbers[1], "rcx") << where;
@@ -146,7 +196,7 @@ TEST(InlineAsmRebuildCarriage, Site1SharedRebuildSubstrateReAddsTheDescriptor) {
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
-    MirInstId const asmSrc = mb.addInlineAsm(sentinelDescriptor(), {}, i64);
+    MirInstId const asmSrc = plantSentinelAsm(mb, i64);
     (void)mb.addReturnPiece(asmSrc, 1, TargetRegClass::FPR, i64);
     mb.addReturn();
     Mir const src = std::move(mb).finish();
@@ -208,7 +258,7 @@ TEST(InlineAsmRebuildCarriage, Site2InlinedCalleeBodyCarriesItsDescriptor) {
                    SymbolVisibility::Default);
     MirBlockId const cEntry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(cEntry);
-    (void)mb.addInlineAsm(sentinelDescriptor(), {}, i64);
+    (void)plantSentinelAsm(mb, i64);
     mb.addReturn();
 
     // caller: calls it. NOTE the caller has NO asm of its own, so after the
@@ -277,7 +327,7 @@ TEST(InlineAsmRebuildCarriage, Site3MultiBlockInlinerHostKeepsItsOwnDescriptor) 
                    SymbolVisibility::Default);
     MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(mEntry);
-    (void)mb.addInlineAsm(sentinelDescriptor(), {}, i64);
+    (void)plantSentinelAsm(mb, i64);
     MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
     MirInstId const ops[]      = {calleeAddr};
     (void)mb.addInst(MirOpcode::Call, ops, InvalidType);
