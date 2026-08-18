@@ -527,6 +527,16 @@ _ROOT_SPECS=(
     'real-examples|10|*.sh *.ps1 *.py'
 )
 for _spec in "${_ROOT_SPECS[@]}"
+#
+# ★ ONE INSTANCE FOUND INDEPENDENTLY ON THE OTHER BRANCH, kept because it is the
+# sharpest argument for this widening that either side produced:
+# `D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE` was cited in `integrated_tests/runner.cpp`
+# as the CLASS NAME of the rule "one runner enforcing while its sibling shrugs is a
+# silent harness bug" — and no such row had ever been written. The project was citing
+# a rule by an anchor that does not exist, in the very file whose violation of it was
+# being closed. An unenforced citation is a citation that rots.
+# ⚠ A future root that reds is closed by REGISTERING the rows, never by narrowing
+# the guard.
 do
     _root="${_spec%%|*}"; _rest="${_spec#*|}"
     _floor="${_rest%%|*}"; _globs="${_rest#*|}"
@@ -673,14 +683,95 @@ while IFS= read -r src_a; do
     fi
 done < "${_plan_cand}"
 
+# ══ RETIRED IDS — a citation must not name an id that has been withdrawn ══════
+#
+# ★★★ WHY THIS EXISTS, AND IT IS A DEFECT IN *THIS FILE* THAT WAS PROVEN BY THIS
+# FILE'S OWN BUG REPORT. Resolution above is deliberately SUBSTRING-anywhere in
+# `.plans/` (see the three-phase block: it is what lets a line-wrapped citation
+# and a parent-name citation resolve). The cost of that tolerance is that it
+# CANNOT DISTINGUISH A LIVE NAME FROM A DEAD ONE — any name mentioned anywhere in
+# the plans resolves forever, including in the prose that reports it as dead.
+# ✔MEASURED 2026-08-17: `D-ASM-INDIRECT-BRANCH-SUCCESSOR-SET-UNDERIVABLE` was
+# cited in `tests/asm/test_asm_text_to_lir.cpp` after a one-word rename to
+# `…-UNSTATED`. It resolved — and the ONLY text in `.plans/` supplying that
+# resolution was the row that had just been written to REPORT it as stale. The
+# act of documenting the dangling citation is what made the guard green about it.
+# ⇒ A guard whose pass is manufactured by its own bug report asserts nothing.
+#
+# ★★ THE MATCHER IS POSITIONAL, NOT A SEARCH, AND IT TOOK TWO FALSE POSITIVES TO
+# GET THERE — both worth keeping, because each one is the previous rule's own
+# failure mode:
+#   (1) Searching the status cell for the words `RETIRED ID` red on
+#       `D-GATE-ANCHOR-GUARD-DOES-NOT-SCAN-INTEGRATED-TESTS`, whose prose merely
+#       says "as a retired id". Prose is not a marker.
+#   (2) Searching it for the unspaced token `RETIRED-ID` then red on
+#       `D-GATE-ANCHOR-CITATION-RESOLVES-VIA-ITS-OWN-BUG-REPORT` — the row that
+#       DOCUMENTS the token, and therefore contains it. ★★★ The row explaining the
+#       rule was classified BY the rule: the same self-reference this whole check
+#       exists to kill, one level up, and it appeared within minutes of the fix.
+# ⇒ A marker that is merely PRESENT can always be tripped by writing about it. The
+# marker must be POSITIONAL: the status cell must OPEN with the retirement, in the
+# CLOSED headline itself, where prose never sits. Same rule the anchor-balance
+# instrument already uses — a row is CLOSED iff its status cell BEGINS with `✅`,
+# defining the complement rather than enumerating glyphs anywhere in the cell.
+# ⚠ The regex is byte-anchored under LC_ALL=C, so the `✅` and the em-dash are
+# compared as literal bytes; that is intended, not incidental.
+#
+# ⚠ EQUALITY, NOT SUBSTRING, and deliberately so: a retired id may be a PREFIX of
+# a live one, and substring here would red the live citation too. The failure this
+# catches is a citation that still spells the dead name exactly.
+# ⛔ A retired id must not appear in scanned source AT ALL, narration included. A
+# comment that spells a dead id is how the dead id survives — the LK7 case is
+# exactly that: a test comment quoted the withdrawn spelling while explaining the
+# gap, and the spelling outlived the explanation. Narration cites the LIVE row.
+_retired_tmp="$(mktemp)"; _tmps+=("${_retired_tmp}")
+LC_ALL=C awk -F'|' '
+    /^\| `D-/ {
+        key = $2; gsub(/[` ]/, "", key)
+        if ($3 ~ /^ *\**✅ \*\*CLOSED [0-9-]+ — RETIRED-ID/) print key
+    }
+' .plans/_deferred-anchor-registry.md > "${_retired_tmp}"
+_retired_count="$(grep -c . "${_retired_tmp}" || true)"
+# FAIL-CLOSED on a collapsed extraction, like every other scan here. The registry
+# carries retired rows; zero means the marker drifted or the table shape changed,
+# never that the check has nothing to do.
+if [[ "${_retired_count}" -lt 1 ]]; then
+    echo "anchor-registry: FAIL — the retired-id scan found 0 marked rows." >&2
+    echo "  This does NOT mean no id is retired — it means THIS scan collapsed (the \`RETIRED-ID\` token was renamed, or the registry's column layout moved)." >&2
+    echo "  Refusing to report a pass. Fix the scan; do not delete the check." >&2
+    exit 2
+fi
+RETIRED_CITED=()
+while IFS= read -r _rid; do
+    [[ -z "${_rid}" ]] && continue
+    while IFS= read -r _src_a; do
+        [[ "${_src_a}" == "${_rid}" ]] && RETIRED_CITED+=("${_rid}")
+    done <<< "${SRC_ANCHORS}"
+done < "${_retired_tmp}"
+
+if [[ ${#RETIRED_CITED[@]} -gt 0 ]]; then
+    echo "anchor-registry: FAIL — ${#RETIRED_CITED[@]} citation(s) name a RETIRED anchor id:" >&2
+    for _rid in "${RETIRED_CITED[@]}"; do
+        echo "    ${_rid}" >&2
+        LC_ALL=C grep -rn --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' \
+            --include='*.sh' --include='*.ps1' --include='*.py' \
+            -F -- "${_rid}" src/ tests/ integrated_tests/ examples/ real-examples/ 2>/dev/null \
+            | sed 's/^/      /' >&2 || true
+    done
+    echo "  A retired id resolves only because the plans still MENTION it. Repoint each" >&2
+    echo "  citation at the live row named in the retired row's own status cell." >&2
+    exit 4
+fi
+
 if [[ ${#MISSING[@]} -eq 0 ]]; then
     # ${_anchor_count}, not `echo "${SRC_ANCHORS}" | wc -l` — the latter reports 1 for
     # an EMPTY set (echo emits a lone newline), which is exactly how the fail-open bug
     # above dressed a scan of nothing as "OK (1 src anchors all resolve)".
-    echo "anchor-registry: OK (${_anchor_count} src anchors all resolve to plans)"
+    echo "anchor-registry: OK (${_anchor_count} src anchors all resolve to plans, ${_retired_count} retired id(s) uncited)"
     # ★ The cell-width verdict is NOT allowed to be swallowed by the anchor
     # check's success. Exit codes: 1 = an anchor resolves nowhere, 2 = a scan
-    # collapsed, 3 = a markdown table row drops content.
+    # collapsed, 3 = a markdown table row drops content, 4 = a citation names a
+    # retired id.
     exit "${_cw_status}"
 fi
 

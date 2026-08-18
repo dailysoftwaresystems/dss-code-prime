@@ -15,14 +15,21 @@
 // **Always against current host platform** (user invariant
 // 2026-06-02): each example's manifest declares a per-target
 // `runOn` list naming the host OSes that may spawn the produced
-// binary. This runner picks the FIRST target whose `runOn`
-// includes the current host and uses THAT target spec; if no
-// target matches the host, the example is skipped with a loud
-// diagnostic (not silent — every example must run somewhere).
+// binary. This runner binds ONE target per manifest — of those
+// whose `runOn` includes the current host, the one whose ARCH IS
+// THE HOST'S, else the first such target (`selectBoundTargetIndex`,
+// tests/test_support/arm_verdict_ledger.hpp) — and uses THAT
+// target spec; if no target matches the host, the example is
+// skipped with a loud diagnostic (not silent — every example must
+// run somewhere). ⚠ `runOn` names an OS, NOT a machine: two arms
+// can both say `linux` while only one of them can execute here,
+// which is exactly how a native aarch64 host came to verify
+// nothing at all (D-TEST-INTEGRATED-TESTS-CANNOT-PASS-ON-A-NATIVE-
+// ARM64-LINUX-HOST).
 //
 // A SKIP IS NOT A PASS (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT). Every
 // DECLARED target arm of every manifest — including the ones this runner's
-// first-match binding never reaches — lands in an `ArmVerdictLedger` with a
+// one-target binding never reaches — lands in an `ArmVerdictLedger` with a
 // named reason, and the Results line reports `K of T declared target arms NOT
 // verified` beside the pass/fail counts. A skip whose cause is the MACHINE
 // (a declared `emulator` absent from PATH) is a warning by default and a
@@ -35,6 +42,25 @@
 // User invariant (2026-06-02): strict asserts on every observable
 // — exit codes EQ, no timeouts, no spawn failures. Wrong-value
 // breaks the run.
+//
+// OPTIMIZED ARMS (D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT +
+// D-TEST-INTEGRATED-RUNNER-IGNORES-THE-RELEASE-ARM-AND-STDOUT-PINS). A manifest
+// declares `optimizedPipelines` arms whose binaries must behave exactly like the
+// baseline's. This runner used to read NONE of that vocabulary and never passed
+// `--config` at all, so it built every example at the CLI default only — the
+// project's flagship "witness the OPTIMIZER" rule was enforced by ONE of its two
+// runners, over a corpus where a large majority of manifests declare an arm.
+// ✔MEASURED 2026-08-17 at HEAD b52784a6: **474 of 597** manifests declare
+// `optimizedPipelines`, **388** of them via `shippedPipeline` (all `"release"`).
+//
+// Each arm the CLI can express is now a SECOND build+run of the same source with
+// `--config=<shippedPipeline>`, differentially compared against the baseline —
+// exit code, and stdout where the manifest pins it. An arm the CLI CANNOT
+// express (an inline `passes` list — there is no flag for one, and publishing
+// the optimizer's internal pass vocabulary as a user surface to satisfy a
+// harness would be the wrong trade) is ledgered, printed and COUNTED, never
+// silently dropped. `[Test 5]` then asserts the whole mechanism is not inert,
+// including one check a build that never received the flag cannot satisfy.
 //
 // PROJECT MODE (D-EXAMPLES-RUNNER-PROJECT-MANIFEST): a manifest may name a
 // `.dss-project.json` via the top-level `"project"` key INSTEAD of
@@ -50,6 +76,7 @@
 // implemented identically in the in-process sibling.
 
 #include "arm_verdict_ledger.hpp"
+#include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "stage_tree.hpp"  // recursive corpus staging — ONE copy, shared with
                            // tests/examples/examples_runner.cpp
@@ -60,6 +87,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>  // std::memcmp (the arm-vs-baseline artifact comparison)
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -94,7 +122,10 @@ using ::dss::test_support::currentHostArch;
 using ::dss::test_support::currentHostOs;
 using ::dss::test_support::DeclaredArm;
 using ::dss::test_support::findOnPath;
+using ::dss::test_support::HostBindingCandidate;
+using ::dss::test_support::kNoBoundTarget;
 using ::dss::test_support::qemuSysrootHint;
+using ::dss::test_support::selectBoundTargetIndex;
 using ::dss::test_support::specFormatName;
 using ::dss::test_support::specTargetArch;
 // …and from `stage_tree.hpp`, which is the SAME header the in-process sibling
@@ -269,6 +300,51 @@ struct DependsOnArtifact {
     std::vector<DependsOnArtifact> dependsOn;
 };
 
+// D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT +
+// D-TEST-INTEGRATED-RUNNER-IGNORES-THE-RELEASE-ARM-AND-STDOUT-PINS: one declared
+// OPTIMIZED arm. Mirrors the in-process examples_runner's `OptimizedArm` field
+// for field, because both runners must ACCEPT and REJECT the same manifests.
+//
+// ★ WHAT THIS RUNNER CAN AND CANNOT DRIVE, and why the split is a property of
+// the CLI rather than a shortcut. An arm declares EXACTLY ONE OF:
+//   * `shippedPipeline`: the NAME of a shipped pipeline config. The CLI's
+//     `--config=<name>` selects a shipped pipeline BY NAME
+//     (src/program/cli_args.cpp → `CompileOptions::config` →
+//     `resolvePipelineName` → `loadShippedPipeline`), so this form maps ONTO the
+//     CLI surface exactly — and the name is threaded THROUGH from the manifest,
+//     never spelled in this file, so the runner learns a new shipped pipeline the
+//     day one ships. A name the CLI does not recognise fails LOUD in the
+//     subprocess (`--config: '<x>' is not a recognized configuration`) and the
+//     arm is Poisoned with that rc — it is never silently downgraded to the
+//     default build.
+//   * `passes`: an inline PassId-name array. The shipped CLI has NO flag that
+//     expresses one, and inventing one would publish the optimizer's internal
+//     pass vocabulary as a user-facing surface purely to satisfy a harness. Such
+//     an arm is therefore ledgered `NotSelectedByRunner` with a named reason and
+//     COUNTED in the summary — it is witnessed by the in-process sibling, which
+//     drives `CompileOptions::pipelineOverride` directly. It is NOT skipped
+//     silently: a skip nobody can see is the defect this row exists to close.
+struct OptimizedArm {
+    std::string                 label;   // diagnostic-rendering name (free-form)
+    std::vector<std::string>    passes;  // PassId names (inline-array form)
+    bool                        hasPasses = false;  // `passes` key present
+    std::optional<std::string>  shippedPipeline;    // shipped-config form
+    // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: THIS arm's own
+    // expected exit code, legal ONLY inside an example that declares
+    // `optimizationObservable`. Absent ⇒ the arm must match the baseline.
+    std::optional<std::int64_t> exitCode;
+};
+
+// The example-level EXEMPTION that alone makes a per-arm `exitCode` legal. Its
+// `clause` names the standard text under which two conforming compilations may
+// legitimately differ (e.g. "C99 6.7.4p7"). Mirrors the in-process runner —
+// including the three load-time refusals in `validateOptimizationObservable`,
+// because a manifest one runner accepts and the other rejects is the same
+// silent-harness-bug class as a capability landing on one runner only.
+struct OptimizationObservable {
+    std::string clause;
+};
+
 struct ExampleTarget {
     std::string              spec;
     std::string              artifact;
@@ -282,6 +358,12 @@ struct ExampleTarget {
     // is 2 on pe64, 4 on elf/mach-o). Absent ⇒ the manifest `exitCode` applies.
     // Mirrors the in-process examples_runner so BOTH corpus harnesses agree.
     std::optional<std::int64_t> exitCodeOverride;
+    // D-TEST-INTEGRATED-RUNNER-IGNORES-THE-RELEASE-ARM-AND-STDOUT-PINS: optional
+    // PER-TARGET expected stdout. Overrides the manifest-level `expectedStdout`
+    // for THIS target only — needed where one source's output is platform-
+    // divergent (Windows msvcrt CRLF translation makes "hello\r\n" of the same
+    // program's "hello\n" elsewhere). Mirrors the in-process examples_runner.
+    std::optional<std::string> expectedStdoutOverride;
     // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): prerequisite library artifacts
     // this target links against (built FIRST, threaded into `--resolve-library`).
     // Empty (the default) ⇒ a plain single-artifact build. Mirrors the
@@ -327,7 +409,25 @@ struct ExampleManifest {
     std::vector<std::string>   sources;
     bool                       multiCu = false;
     std::int64_t               exitCode = 0;
+    // D-TEST-INTEGRATED-RUNNER-IGNORES-THE-RELEASE-ARM-AND-STDOUT-PINS: optional
+    // captured-stdout pin. Present ⇒ the child's stdout+stderr are routed through
+    // a pipe and the drained bytes must equal this string EXACTLY. Empty-string
+    // is a VALID pin (asserts the binary printed nothing); the `has_value()` gate
+    // distinguishes "no pin" from "pin to empty". Mirrors the in-process runner,
+    // including the capture-only-when-pinned rule (a pipe changes the child's
+    // stdio, so it is not routed for examples that never asked).
+    std::optional<std::string> expectedStdout;
     std::vector<ExampleTarget> targets;
+    // D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT: the declared
+    // OPTIMIZED arms. Each one this runner can express is a SECOND build+run of
+    // the same source through `--config=<shippedPipeline>`, differentially
+    // compared against the baseline arm.
+    std::vector<OptimizedArm>  optimizedPipelines;
+    // Present ⇒ this example is EXEMPT from the mechanical "optimized arm equals
+    // baseline" half of the differential contract, because a named standard
+    // clause makes the difference conforming. Its presence is the ONLY thing that
+    // lets an arm declare its own `exitCode`.
+    std::optional<OptimizationObservable> optimizationObservable;
     // V2-4 Part C: NON-EMPTY ⇒ EXPECT-ERROR example. The CLI must REJECT
     // the malformed source (non-zero exit) and emit each diagnostic's
     // positioned `:line:col` (the Part A renderer) on stderr.
@@ -372,6 +472,79 @@ struct ExampleManifest {
             if (!parseDependsOnEntry(nested, path, nestedDep)) return false;
             out.dependsOn.push_back(std::move(nestedDep));
         }
+    }
+    return true;
+}
+
+// ★★★ THE THREE LOAD-TIME REFUSALS THAT MAKE THE `optimizationObservable`
+// CARVE-OUT STRUCTURAL RATHER THAN A PROMISE. A byte-for-byte behavioural mirror
+// of the in-process runner's `validateOptimizationObservable`, spelled with this
+// runner's `std::cerr` + `return false` convention instead of gtest's
+// `ADD_FAILURE`.
+//
+// ⚠ THE MIRROR IS THE POINT, not a convenience. These are REFUSALS: a manifest
+// one runner rejects and the other accepts is exactly the silent harness bug
+// [[D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT]] closes — and it
+// is the worse direction of it, because the accepting runner would report a
+// green verdict over a manifest the project's own rules forbid.
+//
+//   R1  an arm declares `exitCode` while the example declares NO
+//       `optimizationObservable` — the load-bearing one: without it, any arm
+//       that started failing could be silenced by writing down the number it
+//       happens to produce, which is precisely the optimizer bug the
+//       differential arm exists to catch.
+//   R2  the example declares `optimizationObservable` and no arm declares a
+//       differing `exitCode` — an exemption that exempts nothing.
+//   R3  an arm declares an `exitCode` EQUAL to the baseline it would otherwise
+//       have been compared against (manifest-level AND every per-target
+//       override) — a declared "difference" that is not one.
+[[nodiscard]] bool validateOptimizationObservable(ExampleManifest const& m,
+                                                  fs::path const&        path) {
+    bool anyDiffering = false;
+    for (auto const& arm : m.optimizedPipelines) {
+        if (!arm.exitCode.has_value()) continue;
+        if (!m.optimizationObservable.has_value()) {  // R1
+            std::cerr << "  optimizedPipelines arm '" << arm.label
+                      << "' declares its own 'exitCode' but the example declares"
+                         " no 'optimizationObservable'. An optimized arm must"
+                         " produce the baseline's exit code; declaring a"
+                         " different one is legal ONLY where a named standard"
+                         " clause makes both results conforming: "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        if (*arm.exitCode == m.exitCode) {  // R3, manifest-level
+            std::cerr << "  optimizedPipelines arm '" << arm.label
+                      << "' declares exitCode " << *arm.exitCode
+                      << ", which EQUALS the manifest's baseline exitCode — a"
+                         " declared difference that is not one. Drop the key: an"
+                         " arm with no 'exitCode' is already required to match"
+                         " the baseline, and that is the stronger assertion: "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        for (auto const& t : m.targets) {  // R3, per-target overrides
+            if (t.exitCodeOverride.has_value()
+                && *arm.exitCode == *t.exitCodeOverride) {
+                std::cerr << "  optimizedPipelines arm '" << arm.label
+                          << "' declares exitCode " << *arm.exitCode
+                          << ", which EQUALS target '" << t.spec
+                          << "'s exitCode override — so on that target the arm"
+                             " asserts no difference at all while claiming an"
+                             " exemption: " << path.generic_string() << "\n";
+                return false;
+            }
+        }
+        anyDiffering = true;
+    }
+    if (m.optimizationObservable.has_value() && !anyDiffering) {  // R2
+        std::cerr << "  manifest declares 'optimizationObservable' (clause \""
+                  << m.optimizationObservable->clause
+                  << "\") but no optimizedPipelines arm declares a differing"
+                     " 'exitCode'. An exemption that exempts nothing weakens the"
+                     " corpus-wide count of examples allowed to diverge; remove"
+                     " it: " << path.generic_string() << "\n";
+        return false;
     }
     return true;
 }
@@ -522,6 +695,17 @@ struct ExampleManifest {
                   << path.generic_string() << "\n";
         return false;
     }
+    // D-TEST-INTEGRATED-RUNNER-IGNORES-THE-RELEASE-ARM-AND-STDOUT-PINS: the
+    // manifest-level stdout pin. Same shape and same rules as the in-process
+    // runner's — an empty string is a real pin, not "absent".
+    if (j.contains("expectedStdout")) {
+        if (!j.at("expectedStdout").is_string()) {
+            std::cerr << "  'expectedStdout' must be a string in "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        out.expectedStdout = j.at("expectedStdout").get<std::string>();
+    }
     if (!j.contains("targets") || !j.at("targets").is_array()) {
         std::cerr << "  missing 'targets' array in "
                   << path.generic_string() << "\n";
@@ -546,6 +730,16 @@ struct ExampleManifest {
             }
             et.exitCodeOverride = t.at("exitCode").get<std::int64_t>();
         }
+        // D-TEST-INTEGRATED-RUNNER-IGNORES-THE-RELEASE-ARM-AND-STDOUT-PINS:
+        // optional per-target stdout override (mirrors the in-process runner).
+        if (t.contains("expectedStdout")) {
+            if (!t.at("expectedStdout").is_string()) {
+                std::cerr << "  target 'expectedStdout' must be a string in "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            et.expectedStdoutOverride = t.at("expectedStdout").get<std::string>();
+        }
         // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): optional prerequisite
         // library artifacts (mirrors the in-process examples_runner).
         if (t.contains("dependsOn")) {
@@ -562,6 +756,117 @@ struct ExampleManifest {
         }
         out.targets.push_back(std::move(et));
     }
+    // D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT: the OPTIMIZED
+    // arms. Parsed with the in-process runner's exact rules — including the
+    // CLOSED per-arm key set, which is what stops a manifest from declaring an
+    // expectation no runner reads.
+    if (j.contains("optimizedPipelines")) {
+        if (!j.at("optimizedPipelines").is_array()) {
+            std::cerr << "  'optimizedPipelines' must be an array in "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        for (auto const& arm : j.at("optimizedPipelines")) {
+            if (!arm.is_object()
+                || !arm.contains("label") || !arm.at("label").is_string()) {
+                std::cerr << "  each optimizedPipelines entry needs string"
+                             " 'label' + exactly one of 'passes' /"
+                             " 'shippedPipeline' in "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            OptimizedArm oa;
+            oa.label = arm.at("label").get<std::string>();
+            if (arm.contains("passes")) {
+                if (!arm.at("passes").is_array()) {
+                    std::cerr << "  optimizedPipelines 'passes' must be an array"
+                                 " in " << path.generic_string() << "\n";
+                    return false;
+                }
+                oa.hasPasses = true;
+                for (auto const& p : arm.at("passes")) {
+                    if (!p.is_string()) {
+                        std::cerr << "  optimizedPipelines.passes entries must be"
+                                     " strings in " << path.generic_string()
+                                  << "\n";
+                        return false;
+                    }
+                    oa.passes.push_back(p.get<std::string>());
+                }
+            }
+            if (arm.contains("shippedPipeline")) {
+                if (!arm.at("shippedPipeline").is_string()
+                    || arm.at("shippedPipeline").get<std::string>().empty()) {
+                    std::cerr << "  optimizedPipelines 'shippedPipeline' must be"
+                                 " a NON-EMPTY string naming a shipped pipeline"
+                                 " config (it is threaded verbatim into the CLI's"
+                                 " --config=<name>) in "
+                              << path.generic_string() << "\n";
+                    return false;
+                }
+                oa.shippedPipeline =
+                    arm.at("shippedPipeline").get<std::string>();
+            }
+            // EXACTLY-ONE-OF, enforced at LOAD rather than at use. The in-process
+            // sibling enforces the same rule inside `buildPipeline`; hoisting it
+            // to the parse here is deliberate and NOT a divergence — this runner
+            // has no pipeline object to build, so `buildPipeline` has no twin,
+            // and a manifest that declares both (or neither) must still be
+            // REJECTED by both runners rather than accepted by one of them.
+            if (oa.hasPasses == oa.shippedPipeline.has_value()) {
+                std::cerr << "  optimizedPipelines arm '" << oa.label
+                          << "' must declare EXACTLY ONE OF 'passes' or"
+                             " 'shippedPipeline' (got "
+                          << (oa.hasPasses ? "both" : "neither") << ") in "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            if (arm.contains("exitCode")) {
+                if (!arm.at("exitCode").is_number_integer()) {
+                    std::cerr << "  optimizedPipelines 'exitCode' must be an"
+                                 " integer in " << path.generic_string() << "\n";
+                    return false;
+                }
+                oa.exitCode = arm.at("exitCode").get<std::int64_t>();
+            }
+            // The CLOSED per-arm key set, mirroring the sibling exactly. An
+            // expectation the runner does not read is an assertion that never
+            // fires, so an unknown key is a LOAD ERROR naming it.
+            for (auto const& [k, unusedV] : arm.items()) {
+                (void)unusedV;
+                if (k == "label" || k == "passes" || k == "shippedPipeline"
+                    || k == "exitCode" || k.starts_with("$")) {
+                    continue;
+                }
+                std::cerr << "  optimizedPipelines arm '" << oa.label
+                          << "' declares unknown key '" << k
+                          << "' — the runner reads label / passes /"
+                             " shippedPipeline / exitCode (plus $comment keys)."
+                             " An expectation the runner does not read is an"
+                             " assertion that never fires: "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            out.optimizedPipelines.push_back(std::move(oa));
+        }
+    }
+    // Parsed AFTER the arms so the refusals below can see both halves.
+    if (j.contains("optimizationObservable")) {
+        auto const& oo = j.at("optimizationObservable");
+        if (!oo.is_object() || !oo.contains("clause")
+            || !oo.at("clause").is_string()
+            || oo.at("clause").get<std::string>().empty()) {
+            std::cerr << "  'optimizationObservable' must be an object with a"
+                         " non-empty string 'clause' naming the standard clause"
+                         " that makes the optimized arm's different result"
+                         " conforming (e.g. \"C99 6.7.4p7\") in "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        out.optimizationObservable =
+            OptimizationObservable{oo.at("clause").get<std::string>()};
+    }
+    if (!validateOptimizationObservable(out, path)) return false;
     return true;
 }
 
@@ -794,34 +1099,121 @@ buildDependsOnArtifactCli(std::string const&       compiler,
 struct CliArmOutcome {
     ArmVerdict  verdict = ArmVerdict::Poisoned;
     std::string detail;
+    // Populated only when `verdict == Ran`. The caller owns the differential
+    // comparison, exactly as the in-process sibling's `runOneTarget` does — the
+    // helper produces observations, the caller asserts over them.
+    int         exitCode = 0;
+    std::string capturedStdout;
+    // Populated as soon as the COMPILE produced an artifact, even when the run
+    // was skipped: the artifact-byte instrument below compares an optimized
+    // arm's image with the baseline's, and that comparison is host-independent.
+    fs::path    artifactPath;
+    bool        compiled = false;
 };
 
-// Drive ONE example's SELECTED target through the CLI subprocess path:
-//   1. spawn `dss-code-prime --compile <src> --language <l> --target <spec> --output <outdir>`
+// ── THE INSTRUMENT THAT KEEPS THE OPTIMIZED ARM FROM GOING INERT ────────────
+//
+// ★★★ WHY A COUNT OF ARMS IS NOT ENOUGH, and this is the whole reason this
+// section exists. If a future edit drops the `--config=<name>` from the arm's
+// command line, every optimized arm still COMPILES, still RUNS, and still
+// produces the baseline's exit code — because it now IS the baseline build. The
+// differential comparison would pass, the ledger would say `Ran`, and the arm
+// would be witnessing nothing at all. That is the exact "masked effectiveness"
+// shape the bar names: a guard that is present, green, and asserting nothing.
+//
+// ⇒ the runner asserts a POSITIVE, SELF-WITNESSING property: at least one
+// optimized arm's ARTIFACT must differ BYTE-WISE from its baseline's. It cannot
+// be satisfied by a build that never received the flag.
+//
+// ✔MEASURED 2026-08-17 (the control experiment that makes this sound, run before
+// the instrument was written): compiling `examples/c-subset/array_decay/main.c`
+// for `x86_64:pe64-x86_64-windows-exec` TWICE into two DIFFERENT output
+// directories produced BYTE-IDENTICAL images, and the same source at
+// `--config=release` produced a DIFFERENT one (first difference at byte 401).
+// So the compiler is deterministic across output paths — an artifact difference
+// is a signal about the PIPELINE and not about the directory it landed in, which
+// is the premise the whole instrument rests on. Had DSS embedded its output path
+// or a timestamp, this guard would have been green in BOTH directions and worse
+// than useless.
+std::size_t optimizedArmsDeclaredOnBoundTarget = 0;
+std::size_t optimizedArmsRunViaConfigFlag      = 0;
+std::size_t optimizedArmsArtifactDiffered      = 0;
+std::size_t optimizedArmsNotExpressibleOnCli   = 0;
+// The stdout half needs its own non-vacuity witness, and for a reason specific
+// to it: an EMPTY pin ("this program prints nothing") is satisfied by a capture
+// pipe that was never routed at all. ✔MEASURED 2026-08-17 over the shipped
+// corpus — of the effective pins on a bound target, windows 150 of which 26 are
+// NON-EMPTY, linux 125 / 27, darwin 152 / 27 — so every host has real bytes to
+// compare, and only a NON-EMPTY pin proves the drain actually happened.
+std::size_t stdoutPinsAsserted         = 0;
+std::size_t stdoutPinsAssertedNonEmpty = 0;
+
+// Byte-compare two files. A negative answer carries its REASON for the same
+// reason `fileExists`/`fileNonEmpty` do: "same size, different bytes" and
+// "cannot read one of them" send a reader to different places, and the
+// instrument above must never count an unreadable pair as a difference.
+[[nodiscard]] FsAnswer filesDiffer(fs::path const& a, fs::path const& b) {
+    std::error_code ec;
+    auto const sizeA = fs::file_size(a, ec);
+    if (ec) return {false, "cannot size '" + a.generic_string() + "'"};
+    auto const sizeB = fs::file_size(b, ec);
+    if (ec) return {false, "cannot size '" + b.generic_string() + "'"};
+    if (sizeA != sizeB) return {true, {}};
+    std::ifstream fa(a.string(), std::ios::binary);
+    std::ifstream fb(b.string(), std::ios::binary);
+    if (!fa || !fb) return {false, "cannot open both images for comparison"};
+    constexpr std::size_t kChunk = 64u * 1024u;
+    std::vector<char> bufA(kChunk);
+    std::vector<char> bufB(kChunk);
+    while (fa && fb) {
+        fa.read(bufA.data(), static_cast<std::streamsize>(kChunk));
+        fb.read(bufB.data(), static_cast<std::streamsize>(kChunk));
+        auto const gotA = fa.gcount();
+        auto const gotB = fb.gcount();
+        if (gotA != gotB) return {true, {}};
+        if (gotA == 0) break;
+        if (std::memcmp(bufA.data(), bufB.data(),
+                        static_cast<std::size_t>(gotA)) != 0) {
+            return {true, {}};
+        }
+    }
+    return {false, "byte-identical"};
+}
+
+// Drive ONE ARM of one example's SELECTED target through the CLI subprocess path:
+//   1. spawn `dss-code-prime --compile <src> --language <l> --target <spec> --output <outdir> [--config=<name>]`
 //   2. check rc == 0
 //   3. check artifact file exists at outdir/<artifact>
-//   4. spawn artifact, capture exit code via run_binary.hpp
-//   5. ASSERT exit code == manifest.exitCode
+//   4. spawn artifact, capture exit code (and, when pinned, stdout) via run_binary.hpp
+//
+// It does NOT assert the exit code or the stdout. The CALLER owns those, because
+// the differential contract is a relation BETWEEN arms and only the caller holds
+// both sides — the same division of labour as the in-process sibling's
+// `compileAndRunArm` / `runOneTarget` pair.
+//
+// `configName` EMPTY ⇒ no `--config` is passed at all, which is the BASELINE arm
+// and is exactly what this runner did for its whole life before the optimized
+// arms landed. That is deliberate rather than "debug spelled implicitly": the
+// CLI's own default is a shipped behaviour worth exercising, and passing
+// `--config=debug` here would silently stop testing it.
 //
 // All checks are strict — wrong values fail the test.
-[[nodiscard]] CliArmOutcome runSelectedTargetViaCli(std::string const& compiler,
+[[nodiscard]] CliArmOutcome compileAndRunArmViaCli(std::string const& compiler,
                       fs::path const&    exampleDir,
-                      fs::path const&    outputBase,
+                      fs::path const&    outDir,
                       ExampleManifest const& m,
                       ExampleTarget const*   target,
-                      std::string const&     exampleName) {
-    // Target spec format is `<cpu>:<format>`; the `:` is illegal
-    // in Windows path components. Substitute `_` to derive a
-    // filesystem-safe sub-directory name. The substitution is
-    // local to disk layout and never leaks back into the CLI's
-    // --target argument (which keeps the canonical `:`-form).
-    auto const specDir = [&]() {
-        std::string s = target->spec;
-        for (auto& c : s) if (c == ':') c = '_';
-        return s;
-    }();
-    auto const outDir =
-        outputBase / "ex" / exampleName / specDir;
+                      std::string const&     exampleName,
+                      std::string const&     armLabel,
+                      std::string const&     configName,
+                      bool                   captureStdout) {
+    // Every `[FAIL]` line names the ARM it belongs to, so a red run cannot leave
+    // a reader guessing which of two builds of the same source produced it. The
+    // baseline keeps its historical bare-name spelling (no suffix) so existing
+    // failure lines read exactly as before.
+    auto const armName = (armLabel == "baseline")
+                             ? exampleName
+                             : exampleName + " [arm=" + armLabel + "]";
     // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: a full temp filesystem used to abort the whole run here; it is now this one example's [FAIL].
     if (auto const made = madeDirectory(outDir); !made.ok) {
         check(exampleName + ": output directory created", false, made.why);
@@ -876,7 +1268,7 @@ struct CliArmOutcome {
     std::string resolveArgs;
     for (auto const& dep : target->dependsOn) {
         auto depArtifact = buildDependsOnArtifactCli(
-            compiler, dep, exampleDir, outDir, m.language, exampleName);
+            compiler, dep, exampleDir, outDir, m.language, armName);
         if (!depArtifact.has_value()) {  // check already fired
             return {ArmVerdict::Poisoned,
                     "dependsOn library " + dep.spec + " did not build"};
@@ -919,7 +1311,7 @@ struct CliArmOutcome {
     if (projectMode) {
         auto const projectPath = outDir / *m.project;
         auto const present = fileExists(projectPath);
-        check(exampleName + ": project manifest staged at "
+        check(armName + ": project manifest staged at "
                   + projectPath.generic_string(),
               present.ok,
               present.ok ? ""
@@ -935,7 +1327,7 @@ struct CliArmOutcome {
         }
         ProjectFacts facts;
         if (!readProjectFacts(projectPath, facts)) {
-            check(exampleName + ": project manifest is readable", false,
+            check(armName + ": project manifest is readable", false,
                   "see the parse error above");
             return {ArmVerdict::Poisoned, "project manifest unreadable"};
         }
@@ -951,7 +1343,7 @@ struct CliArmOutcome {
         for (auto const& s : facts.targets) {
             declaredList += (declaredList.empty() ? "" : ", ") + s;
         }
-        check(exampleName + ": target spec " + target->spec
+        check(armName + ": target spec " + target->spec
                   + " is declared by " + *m.project,
               declared,
               "the project builds only [" + declaredList + "], so this arm "
@@ -962,7 +1354,7 @@ struct CliArmOutcome {
         }
         bool const langAgrees = m.language.empty()
                              || m.language == facts.language;
-        check(exampleName + ": expected.json language mirrors " + *m.project,
+        check(armName + ": expected.json language mirrors " + *m.project,
               langAgrees,
               "expected.json says '" + m.language + "', the project manifest "
               "says '" + facts.language + "'; in project mode the project "
@@ -971,7 +1363,7 @@ struct CliArmOutcome {
             return {ArmVerdict::Poisoned, "language mirror disagrees"};
         }
         if (specFormatName(target->spec).empty()) {
-            check(exampleName + ": target spec has an '<arch>:<format>' separator",
+            check(armName + ": target spec has an '<arch>:<format>' separator",
                   false,
                   "without it the per-format artifact subdirectory a project "
                   "build routes into cannot be derived");
@@ -992,7 +1384,7 @@ struct CliArmOutcome {
                 + "' declared by '" + *m.project
                 + "' is not present on this machine (host=" + currentHostOs()
                 + ")";
-            std::cout << "  [SKIP] " << exampleName << " — " << why << "\n";
+            std::cout << "  [SKIP] " << armName << " — " << why << "\n";
             return {ArmVerdict::SkippedBuildInputMissing, why};
         }
         projectArg = quote(projectPath.string());
@@ -1009,6 +1401,19 @@ struct CliArmOutcome {
     // `Mode::Project` arm). Passing them would be inert at best and a second
     // source of truth at worst. `--output` and `--resolve-library` still apply:
     // the manifest MERGES its own `resolveLibraries` onto them.
+    //
+    // D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT: `--config=<name>`
+    // is the ONE token that turns this from a default build into the arm the
+    // manifest declared, and the name is threaded VERBATIM from the manifest's
+    // `shippedPipeline`. Nothing here knows what pipelines exist — the CLI owns
+    // that vocabulary (`parseCompileConfig`) and REJECTS an unrecognised name
+    // with a real diagnostic, so a typo surfaces as a failed compile naming the
+    // bad value rather than as a silent default build wearing the arm's label.
+    // Applied in PROJECT MODE too: `--config` is a global CLI flag, not a
+    // `--compile`-only one, so a project manifest that grows an arm gets it for
+    // free instead of silently ignoring it.
+    std::string const configArg =
+        configName.empty() ? std::string{} : (" --config=" + configName);
     std::string cmd = quote(compiler)
         + (projectMode
                ? (" --project " + projectArg)
@@ -1016,6 +1421,7 @@ struct CliArmOutcome {
                   + " --language " + m.language
                   + " --target "   + target->spec))
         + resolveArgs
+        + configArg
         + " --output "   + quote(outDir.string())
         + " > " + quote(cliLog.string()) + " 2>&1";
 
@@ -1028,7 +1434,7 @@ struct CliArmOutcome {
         CwdGuard compileCwd{outDir};
         // FAIL-CLOSED: a chdir that did not take would send the generated
         // sources somewhere else and the failure would look like a DSS defect.
-        check(exampleName + ": compile cwd set to " + outDir.generic_string(),
+        check(armName + ": compile cwd set to " + outDir.generic_string(),
               compileCwd.ok,
               compileCwd.ok ? "" : "chdir failed; a project manifest's relative "
                                    "sources and its generated files would "
@@ -1044,7 +1450,7 @@ struct CliArmOutcome {
 
     auto const compileOk = [&]() -> bool {
         if (sysRc == 0) return true;
-        check(exampleName + ": compile rc == 0 (rc=" + std::to_string(sysRc)
+        check(armName + ": compile rc == 0 (rc=" + std::to_string(sysRc)
               + ", cli log: " + cliLog.generic_string() + ")",
               false);
         return false;
@@ -1053,7 +1459,7 @@ struct CliArmOutcome {
         return {ArmVerdict::Poisoned,
                 "compile rc=" + std::to_string(sysRc)};
     }
-    check(exampleName + ": compile exits 0", true);
+    check(armName + ": compile exits 0", true);
 
     // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: THE case this defect is about — these two are the checks a RED run reaches, and in their throwing form a failing example killed the runner rather than naming itself.
     // D-AP2-OUTPUT-ROUTING: a PROJECT build forces `setPerFormatOutputSubdir(true)`
@@ -1068,7 +1474,7 @@ struct CliArmOutcome {
         ? outDir / specFormatName(target->spec) / target->artifact
         : outDir / target->artifact;
     auto const artifactPresent = fileExists(artifactPath);
-    check(exampleName + ": artifact exists at "
+    check(armName + ": artifact exists at "
           + artifactPath.generic_string(),
           artifactPresent.ok, artifactPresent.why);
     if (!artifactPresent.ok) {
@@ -1076,11 +1482,23 @@ struct CliArmOutcome {
     }
 
     auto const artifactNonEmpty = fileNonEmpty(artifactPath);
-    check(exampleName + ": artifact non-empty",
+    check(armName + ": artifact non-empty",
           artifactNonEmpty.ok, artifactNonEmpty.why);
     if (!artifactNonEmpty.ok) {
         return {ArmVerdict::Poisoned, "artifact: " + artifactNonEmpty.why};
     }
+    // From here the COMPILE has demonstrably produced an image. Every remaining
+    // exit carries it, because the arm-vs-baseline artifact comparison is
+    // host-independent and must survive a run this MACHINE cannot perform: a box
+    // with no emulator still proves the two pipelines produced different code.
+    auto const compiledOutcome = [&](ArmVerdict v, std::string why) {
+        CliArmOutcome o;
+        o.verdict      = v;
+        o.detail       = std::move(why);
+        o.artifactPath = artifactPath;
+        o.compiled     = true;
+        return o;
+    };
 
     // D-LK10-ENTRY-ARM64: cross-ARCH execution gate. The runOn match
     // above reconciled the host OS; now reconcile the host ARCH. A
@@ -1102,16 +1520,16 @@ struct CliArmOutcome {
             std::string const why = "target arch '" + targetArch
                 + "' != host arch '" + currentHostArch()
                 + "' and the manifest declares no 'emulator'";
-            std::cout << "  [SKIP] " << exampleName << " — " << why << "\n";
-            return {ArmVerdict::SkippedNoEmulatorDeclared, why};
+            std::cout << "  [SKIP] " << armName << " — " << why << "\n";
+            return compiledOutcome(ArmVerdict::SkippedNoEmulatorDeclared, why);
         }
         auto const emuPath = findOnPath(target->emulator);
         if (emuPath.empty()) {
             std::string const why = "declared emulator '" + target->emulator
                 + "' is not on PATH (target arch '" + targetArch
                 + "' != host arch '" + currentHostArch() + "')";
-            std::cout << "  [SKIP] " << exampleName << " — " << why << "\n";
-            return {ArmVerdict::SkippedEmulatorMissing, why};
+            std::cout << "  [SKIP] " << armName << " — " << why << "\n";
+            return compiledOutcome(ArmVerdict::SkippedEmulatorMissing, why);
         }
         launcherPrefix.push_back(emuPath);
     }
@@ -1130,79 +1548,318 @@ struct CliArmOutcome {
     dss::test_support::RunResult result;
     {
         CwdGuard cwd{outDir};
-        check(exampleName + ": run cwd set to " + outDir.generic_string(),
+        check(armName + ": run cwd set to " + outDir.generic_string(),
               cwd.ok,
               cwd.ok ? "" : "chdir failed; a staged neighbor file would be "
                             "unreachable and the example would fail as if DSS "
                             "were at fault");
         if (!cwd.ok) {
-            return {ArmVerdict::Poisoned, "could not chdir to the output dir"};
+            return compiledOutcome(ArmVerdict::Poisoned,
+                                   "could not chdir to the output dir");
         }
+        // D-TEST-INTEGRATED-RUNNER-IGNORES-THE-RELEASE-ARM-AND-STDOUT-PINS:
+        // capture ONLY when a pin exists, byte-for-byte the in-process sibling's
+        // rule (examples_runner.cpp: `m.expectedStdout || t.expectedStdoutOverride`).
+        // Capturing unconditionally would swap every example's inherited stdio
+        // for a pipe — a behavioural change to 597 examples riding along with a
+        // harness fix, and one that examples never pinned would never notice.
         result = dss::test_support::runBinary(
-            absArtifact, std::chrono::milliseconds{5000}, false,
+            absArtifact, std::chrono::milliseconds{5000}, captureStdout,
             launcherPrefix);
     }
-    check(exampleName + ": spawn succeeded (diag='"
+    check(armName + ": spawn succeeded (diag='"
           + result.diagnostic + "')", result.spawned);
     if (!result.spawned) {
-        return {ArmVerdict::Poisoned, "spawn failed: " + result.diagnostic};
+        return compiledOutcome(ArmVerdict::Poisoned,
+                               "spawn failed: " + result.diagnostic);
     }
 
-    check(exampleName + ": no timeout", !result.timedOut);
-    if (result.timedOut) return {ArmVerdict::Poisoned, "spawn timed out"};
+    check(armName + ": no timeout", !result.timedOut);
+    if (result.timedOut) {
+        return compiledOutcome(ArmVerdict::Poisoned, "spawn timed out");
+    }
 
+    // `Ran` means EXECUTED, not "asserted successfully" — the CALLER owns the
+    // assertions (an arm's expectation is a relation between arms, and only the
+    // caller holds both sides). Conflating the two would let a failing example
+    // disappear from the verified count and reappear as a skip.
+    auto out = compiledOutcome(ArmVerdict::Ran, {});
+    out.exitCode       = result.exitCode;
+    out.capturedStdout = result.capturedStdout;
+    return out;
+}
+
+// Render a `\n`/`\r`-bearing pin readably in a one-line [FAIL] detail. A raw
+// CRLF diff printed literally looks like two identical strings, which is the
+// single most confusing way a stdout pin can fail.
+[[nodiscard]] std::string escapeForDetail(std::string const& s) {
+    std::string out;
+    out.reserve(s.size() + 8u);
+    for (char const c : s) {
+        if (c == '\n')      out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else                out += c;
+    }
+    return out;
+}
+
+// A filesystem-safe spelling of an arm label (labels are free-form manifest
+// text: `full-release-like`, `mem2reg-cse-dce`, …). Anything outside
+// `[A-Za-z0-9._-]` becomes `_`, so an arm's scratch directory can never depend
+// on what a manifest author typed.
+[[nodiscard]] std::string sanitizeForPath(std::string const& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char const c : s) {
+        bool const safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                       || (c >= '0' && c <= '9') || c == '.' || c == '-'
+                       || c == '_';
+        out += safe ? c : '_';
+    }
+    return out;
+}
+
+// Drive one example's SELECTED target: the BASELINE arm, then every declared
+// OPTIMIZED arm, then the differential comparison between them.
+//
+// ★★★ WHAT "ENFORCED" MEANS HERE, and why this is not a copy of the in-process
+// differential. The in-process sibling compares an optimized arm against the
+// BASELINE'S OBSERVED exit code. This runner compares against the same thing —
+// but it reaches it through the CLI, where the arm is selected by a FLAG the
+// user actually types (`--config=release`) rather than by an in-process
+// `pipelineOverride` that BYPASSES the shipped pipeline registry entirely
+// (src/program/compile_pipeline.hpp:172). So the two runners witness genuinely
+// different halves of the same promise: the sibling proves the release PIPELINE
+// preserves behaviour, and this one proves that asking the shipped BINARY for it
+// on the command line actually delivers that pipeline. Neither substitutes for
+// the other, which is why both must run the arm.
+void runSelectedTargetViaCli(std::string const& compiler,
+                      fs::path const&    exampleDir,
+                      fs::path const&    outputBase,
+                      ExampleManifest const& m,
+                      ExampleTarget const*   target,
+                      std::string const&     exampleName,
+                      std::string const&     exampleId) {
+    // Target spec format is `<cpu>:<format>`; the `:` is illegal in Windows path
+    // components. Substitute `_` to derive a filesystem-safe sub-directory name.
+    // The substitution is local to disk layout and never leaks back into the
+    // CLI's --target argument (which keeps the canonical `:`-form).
+    auto const specDir = [&]() {
+        std::string s = target->spec;
+        for (auto& c : s) if (c == ':') c = '_';
+        return s;
+    }();
+    // Model 3: capture stdout when EITHER the manifest-level pin OR this
+    // target's override is present (so a per-target override alone still routes
+    // the pipe). Identical to the in-process sibling's rule.
+    bool const captureStdout = m.expectedStdout.has_value()
+                            || target->expectedStdoutOverride.has_value();
+    std::optional<std::string> const effectiveStdout =
+        target->expectedStdoutOverride.has_value()
+            ? target->expectedStdoutOverride : m.expectedStdout;
     // C11/C23 6.4.5: the per-target override (when present) is the authority for
     // THIS target's exit code; otherwise the manifest-level `exitCode`.
-    std::int64_t const expectedExit =
-        target->exitCodeOverride.has_value() ? *target->exitCodeOverride : m.exitCode;
-    bool const exitMatches =
-        static_cast<std::int64_t>(result.exitCode) == expectedExit;
-    // The qemu-sysroot remedy line is appended ONLY on the failing branch, and
-    // through the SAME shared helper the in-process runner uses
-    // (D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY item (2), first half). Pairing is the
-    // point: an arm that explains itself in one harness and stays mute in the
-    // other is the divergence `arm_verdict_ledger.hpp` exists to prevent, and
-    // this runner is the one whose 581-manifest sweep produces the failure en
-    // masse. On a pass the hint would be noise, so it never renders there.
-    check(exampleName + ": OS exit code == "
-          + std::to_string(expectedExit)
-          + " (got " + std::to_string(result.exitCode) + ")"
-          + (exitMatches ? std::string{}
-                         : qemuSysrootHint(target->spec, target->emulator)),
-          exitMatches);
-    // `Ran` means EXECUTED AND ASSERTED, not "asserted successfully" — the
-    // `check` above already owns pass/fail. Conflating the two would let a
-    // failing example disappear from the verified count and reappear as a skip.
-    return {ArmVerdict::Ran, {}};
+    std::int64_t const expectedExit = target->exitCodeOverride.has_value()
+                                          ? *target->exitCodeOverride
+                                          : m.exitCode;
+
+    // ── The BASELINE arm — the build this runner has always performed ───────
+    auto const baseline = compileAndRunArmViaCli(
+        compiler, exampleDir, outputBase / "ex" / exampleName / specDir, m,
+        target, exampleName, "baseline", /*configName*/ "", captureStdout);
+    // Recorded HERE rather than by the caller so the bound target's baseline row
+    // precedes its own optimized-arm rows in the ledger — a summary that lists
+    // an arm before the build it is differential against reads backwards. The
+    // ledger's `arm` string stays the historical `"cli"` for the baseline, so
+    // every pre-existing skip line greps exactly as it did.
+    armLedger.record(exampleId, target->spec, "cli", baseline.verdict,
+                     baseline.detail);
+    if (baseline.verdict == ArmVerdict::Ran) {
+        bool const exitMatches =
+            static_cast<std::int64_t>(baseline.exitCode) == expectedExit;
+        // The qemu-sysroot remedy line is appended ONLY on the failing branch,
+        // and through the SAME shared helper the in-process runner uses
+        // (D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY item (2), first half). Pairing is
+        // the point: an arm that explains itself in one harness and stays mute
+        // in the other is the divergence `arm_verdict_ledger.hpp` exists to
+        // prevent. On a pass the hint would be noise, so it never renders there.
+        check(exampleName + ": OS exit code == " + std::to_string(expectedExit)
+              + " (got " + std::to_string(baseline.exitCode) + ")"
+              + (exitMatches ? std::string{}
+                             : qemuSysrootHint(target->spec, target->emulator)),
+              exitMatches);
+        if (effectiveStdout.has_value()) {
+            ++stdoutPinsAsserted;
+            if (!effectiveStdout->empty()) ++stdoutPinsAssertedNonEmpty;
+            bool const stdoutMatches =
+                baseline.capturedStdout == *effectiveStdout;
+            check(exampleName + ": captured stdout matches the manifest pin ("
+                      + std::to_string(effectiveStdout->size()) + " bytes)",
+                  stdoutMatches,
+                  stdoutMatches ? ""
+                                : "expected \"" + escapeForDetail(*effectiveStdout)
+                                      + "\", got \""
+                                      + escapeForDetail(baseline.capturedStdout)
+                                      + "\"");
+        }
+    }
+
+    // ── The declared OPTIMIZED arms ─────────────────────────────────────────
+    for (auto const& arm : m.optimizedPipelines) {
+        ++optimizedArmsDeclaredOnBoundTarget;
+        auto const ledgerArm = "cli:" + arm.label;
+        // An inline `passes` list has no CLI spelling. LOUD AND COUNTED, never
+        // silent: it lands in the ledger (so the Results line's "NOT verified"
+        // total carries it), it prints, and the corpus summary reports the
+        // count. The in-process sibling drives `pipelineOverride` directly and
+        // IS the witness for this form.
+        if (arm.hasPasses) {
+            ++optimizedArmsNotExpressibleOnCli;
+            std::string const why =
+                "arm '" + arm.label + "' declares an inline 'passes' list, and"
+                " the shipped CLI has no flag that expresses one (only"
+                " --config=<shipped pipeline name>). Witnessed by the in-process"
+                " runner (tests/examples/examples_runner), which drives"
+                " CompileOptions::pipelineOverride directly";
+            std::cout << "  [SKIP] " << exampleName << " [arm=" << arm.label
+                      << "] — " << why << "\n";
+            armLedger.record(exampleId, target->spec, ledgerArm,
+                             ArmVerdict::NotSelectedByRunner, why);
+            continue;
+        }
+        // The baseline's COMPILE failing means this arm has nothing to be
+        // differential against, and a second failing compile of the same source
+        // would only double the noise. Ledgered rather than dropped, so the
+        // declared work still appears in the accounting.
+        if (!baseline.compiled) {
+            armLedger.record(exampleId, target->spec, ledgerArm,
+                             baseline.verdict,
+                             baseline.detail
+                                 + " (compile not attempted: the baseline arm"
+                                   " produced no artifact)");
+            continue;
+        }
+        auto const armOut = compileAndRunArmViaCli(
+            compiler, exampleDir,
+            outputBase / "ex" / exampleName
+                / (specDir + ".arm-" + sanitizeForPath(arm.label)),
+            m, target, exampleName, arm.label, *arm.shippedPipeline,
+            captureStdout);
+        armLedger.record(exampleId, target->spec, ledgerArm, armOut.verdict,
+                         armOut.detail);
+        if (!armOut.compiled) continue;  // its own check already fired
+        ++optimizedArmsRunViaConfigFlag;
+
+        // ★ THE SELF-WITNESSING HALF. Compared even when the RUN was skipped,
+        // because two pipelines producing different code is a fact about the
+        // COMPILER and needs no machine to execute the result. This is what a
+        // dropped `--config` cannot survive: without the flag the arm IS the
+        // baseline build and every image below is byte-identical.
+        if (auto const differs = filesDiffer(armOut.artifactPath,
+                                             baseline.artifactPath);
+            differs.ok) {
+            ++optimizedArmsArtifactDiffered;
+        }
+
+        if (baseline.verdict != ArmVerdict::Ran) continue;  // nothing to compare
+        // The two arms must share the run outcome: both ran, or the arm names
+        // why it could not. A baseline that ran while its arm did not is a real
+        // finding, not a skip.
+        bool const armRan = armOut.verdict == ArmVerdict::Ran;
+        check(exampleName + " [arm=" + arm.label
+                  + "]: ran (the baseline ran, so this arm must too)",
+              armRan,
+              armRan ? "" : "verdict=" + std::string{armVerdictName(armOut.verdict)}
+                                + " — " + armOut.detail);
+        if (!armRan) continue;
+
+        // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: an arm inside
+        // an `optimizationObservable` example may pin its OWN exit code; every
+        // other arm must equal the baseline. Still a STRICT equality against a
+        // declared number — the arm is not exempted from being checked, only
+        // from being checked against the baseline. R1/R3 at load time already
+        // established that the number exists because a clause sanctions it and
+        // that it genuinely differs.
+        std::int64_t const armExpectedExit =
+            arm.exitCode.has_value() ? *arm.exitCode
+                                     : static_cast<std::int64_t>(baseline.exitCode);
+        bool const armExitMatches =
+            static_cast<std::int64_t>(armOut.exitCode) == armExpectedExit;
+        check(exampleName + " [arm=" + arm.label + "]: OS exit code == "
+                  + std::to_string(armExpectedExit) + " (got "
+                  + std::to_string(armOut.exitCode) + ")",
+              armExitMatches,
+              armExitMatches
+                  ? ""
+                  : "differential-verify FAIL: optimized arm '" + arm.label
+                        + "' (--config=" + *arm.shippedPipeline
+                        + ") produced exit code "
+                        + std::to_string(armOut.exitCode) + " vs expected "
+                        + std::to_string(armExpectedExit)
+                        + (arm.exitCode.has_value()
+                               ? " (this arm declares its own exit code under"
+                                 " optimizationObservable clause \""
+                                     + m.optimizationObservable->clause + "\")"
+                               : " (the baseline's)")
+                        + " — pipeline regression");
+        if (effectiveStdout.has_value()) {
+            bool const armStdoutMatches =
+                armOut.capturedStdout == baseline.capturedStdout;
+            check(exampleName + " [arm=" + arm.label
+                      + "]: captured stdout matches the baseline arm",
+                  armStdoutMatches,
+                  armStdoutMatches
+                      ? ""
+                      : "differential-verify FAIL: baseline \""
+                            + escapeForDetail(baseline.capturedStdout)
+                            + "\", optimized \""
+                            + escapeForDetail(armOut.capturedStdout) + "\"");
+        }
+    }
 }
 
 // Bind the target this runner will drive, ledger EVERY declared arm of the
 // manifest, and run the bound one.
 //
 // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-CLI-HARNESS-BINDS-FIRST-
-// MATCHING-TARGET: this runner selects only the FIRST target whose `runOn`
-// includes the host and never considers the rest — a known harness limitation
-// with its own anchor, deliberately NOT fixed here. What IS fixed here is the
-// accounting: an arm this runner never reaches is ledgered as
-// `NotSelectedByRunner` rather than being absent (which would understate the
-// declared work) or counted as a skip (which would blame the manifest or the
-// machine for a harness rule).
+// MATCHING-TARGET: this runner drives ONE target per manifest and never
+// considers the rest — a known harness limitation with its own anchor,
+// deliberately NOT fixed here. What IS fixed here is the accounting: an arm this
+// runner never reaches is ledgered as `NotSelectedByRunner` rather than being
+// absent (which would understate the declared work) or counted as a skip (which
+// would blame the manifest or the machine for a harness rule).
+//
+// D-TEST-INTEGRATED-TESTS-CANNOT-PASS-ON-A-NATIVE-ARM64-LINUX-HOST: WHICH one it
+// binds is the fixed part. It used to be the first `runOn` match, which on a
+// native aarch64 Linux box is the corpus's x86_64 arm — cross-arch there, no
+// emulator declared — so that host ran NOTHING and [Test 5]'s stdout-capture
+// witness had no non-empty pin to assert. The rule now prefers the arm THIS
+// MACHINE CAN EXECUTE (`selectBoundTargetIndex`, arm_verdict_ledger.hpp: target
+// arch == host arch, else first `runOn` match). On every host whose manifests
+// offer exactly one `runOn` match — every windows and darwin arm in the corpus —
+// the two rules pick the SAME target by construction.
 void runExampleViaCli(std::string const& compiler,
                       fs::path const&    exampleDir,
                       fs::path const&    outputBase,
                       ExampleManifest const& m,
                       std::string const& exampleId) {
     auto const host = currentHostOs();
-    ExampleTarget const* target = nullptr;
+
+    // The `runOn` verdict is computed ONCE and feeds both the binding and the
+    // ledger below, so the two can never disagree about which arms matched this
+    // host — the divergence class that produced this whole family of defects.
+    std::vector<HostBindingCandidate> candidates;
+    candidates.reserve(m.targets.size());
     for (auto const& t : m.targets) {
-        for (auto const& osName : t.runOn) {
-            if (osName == host) {
-                target = &t;
-                break;
-            }
-        }
-        if (target != nullptr) break;
+        candidates.push_back(
+            {t.spec, std::find(t.runOn.begin(), t.runOn.end(), host)
+                         != t.runOn.end()});
     }
+    std::size_t const boundIndex =
+        selectBoundTargetIndex(candidates, currentHostArch());
+    ExampleTarget const* const target =
+        (boundIndex == kNoBoundTarget) ? nullptr : &m.targets[boundIndex];
 
     auto const exampleName = exampleDir.filename().generic_string();
 
@@ -1213,26 +1870,46 @@ void runExampleViaCli(std::string const& compiler,
 
     // Every target that is NOT the bound one gets its verdict FIRST, so no
     // return path below can drop it.
-    for (auto const& t : m.targets) {
-        if (&t == target) continue;
-        bool const runOnMatches = std::find(t.runOn.begin(), t.runOn.end(), host)
-                                != t.runOn.end();
+    //
+    // D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT: the declared
+    // work is (target × arm), not target alone. Before the optimized arms
+    // landed, a 4-target 2-arm manifest declared 4 rows here and the Results
+    // line's `T declared target arms` understated the corpus by the whole
+    // optimizer axis — the same undercount D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-
+    // VERDICT closed one level up. An unreached target's arms carry THAT
+    // target's reason, because that is genuinely why they did not run.
+    for (std::size_t i = 0; i < m.targets.size(); ++i) {
+        if (i == boundIndex) continue;
+        auto const& t             = m.targets[i];
+        bool const  runOnMatches  = candidates[i].runsOnHost;
+        ArmVerdict  verdict = ArmVerdict::SkippedByRunOn;
+        std::string why;
         if (runOnMatches) {
-            armLedger.record(exampleId, t.spec, "cli",
-                             ArmVerdict::NotSelectedByRunner,
-                             "runOn includes host=" + host
-                                 + " but this runner binds only the FIRST"
-                                   " matching target (spec=" + boundSpec
-                                 + ") — D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET");
+            verdict = ArmVerdict::NotSelectedByRunner;
+            // ⚠ The anchor name stays ONE contiguous token in the source: a
+            // `"D-TEST-..." "..."` split still produces the right runtime
+            // string, and makes the anchor ungreppable in the file that cites it.
+            why = "runOn includes host=" + host
+                + " but this runner binds ONE target per manifest and bound"
+                  " spec=" + boundSpec + " (the host's own arch where the"
+                  " manifest offers it)"
+                + " — D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET";
         } else {
             std::string runOnList;
-            for (std::size_t i = 0; i < t.runOn.size(); ++i) {
-                if (i != 0) runOnList += ',';
-                runOnList += t.runOn[i];
+            // `k`, not `i`: the enclosing loop now owns `i` (it indexes
+            // `candidates` in lockstep with `m.targets`), and a shadowing
+            // counter here would compile silently while reading as a bug.
+            for (std::size_t k = 0; k < t.runOn.size(); ++k) {
+                if (k != 0) runOnList += ',';
+                runOnList += t.runOn[k];
             }
-            armLedger.record(exampleId, t.spec, "cli",
-                             ArmVerdict::SkippedByRunOn,
-                             "runOn=[" + runOnList + "] excludes host=" + host);
+            why = "runOn=[" + runOnList + "] excludes host=" + host;
+        }
+        armLedger.record(exampleId, t.spec, "cli", verdict, why);
+        for (auto const& arm : m.optimizedPipelines) {
+            armLedger.record(exampleId, t.spec, "cli:" + arm.label, verdict,
+                             why + " (so this target's optimized arm was not"
+                                   " built either)");
         }
     }
 
@@ -1244,11 +1921,8 @@ void runExampleViaCli(std::string const& compiler,
         return;
     }
 
-    auto const outcome = runSelectedTargetViaCli(compiler, exampleDir,
-                                                 outputBase, m, target,
-                                                 exampleName);
-    armLedger.record(exampleId, target->spec, "cli", outcome.verdict,
-                     outcome.detail);
+    runSelectedTargetViaCli(compiler, exampleDir, outputBase, m, target,
+                            exampleName, exampleId);
 }
 
 // V2-4 Part C: drive an EXPECT-ERROR example through the CLI SUBPROCESS.
@@ -1506,6 +2180,20 @@ void runAllExamples(std::string const& compiler,
         // V2-4 Part C: an expectDiagnostics manifest asserts a rejected
         // compile + positioned CLI diagnostics; otherwise the standard
         // compile + run path.
+        //
+        // ⚠ [[D-TEST-EXAMPLES-OPTIMIZED-ARM-DROPPED-ON-DIAGNOSTIC-MANIFEST]] —
+        // NAMED HERE BECAUSE THIS RUNNER NOW REPRODUCES IT, IDENTICALLY AND
+        // DELIBERATELY. `optimizedPipelines` is PARSED for every manifest above,
+        // and the expect-error branch below never looks at it — so an arm
+        // declared on an `expectDiagnostics` example would be accepted and then
+        // silently dropped, exactly as the in-process sibling drops it. ✔MEASURED
+        // 2026-08-17: ZERO of the shipped manifests declare both, so nothing is
+        // being dropped today. The RIGHT fix is a load-time REFUSAL of the pair
+        // (the model is the `project` + `expectDiagnostics` refusal in
+        // `readManifest` above, which both runners already share) — and it must
+        // land in BOTH runners in ONE change. Adding it to only this side would
+        // make the two runners accept different manifests, which is the very
+        // divergence [Test 6] and this whole change exist to end.
         if (m.expectDiagnostics.empty()) {
             runExampleViaCli(compiler, exampleDir, outputBase, m, exampleId);
         } else {
@@ -1565,6 +2253,233 @@ void runManifestEmulatorLint() {
                   + ": emulator declaration is consistent with its siblings",
               false, f.message);
     }
+    std::cout << "\n";
+}
+
+// ── D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT: the instrument ─
+//
+// ★★★ THE CHECK THAT CANNOT BE SATISFIED BY A BUILD THAT NEVER GOT THE FLAG.
+// Three guards, in the order a reader should doubt them:
+//
+//   (1) the corpus DECLARED optimized arms on the targets this host binds. A
+//       zero here means every assertion below is vacuously satisfied, and a
+//       vacuous green is the one outcome this whole change exists to end.
+//   (2) at least one of them was BUILT through `--config=<name>`. This is the
+//       one a refactor kills first — deleting the arm loop leaves (1) intact.
+//   (3) ★ at least one arm's ARTIFACT DIFFERS BYTE-WISE from its baseline's.
+//       (1) and (2) are both satisfied by an arm whose `--config` was dropped
+//       from the command line: it still compiles, still runs, still exits like
+//       the baseline — because it now IS the baseline build — and every
+//       differential comparison passes while witnessing nothing. Only a
+//       POSITIVE difference in the produced image proves the flag reached the
+//       compiler and changed what it emitted.
+//
+// The floors are `> 0`, deliberately NOT pinned counts: the corpus grows every
+// cycle and a hardcoded number is an inert pin that gets edited back into a
+// rubber stamp the first time it reds. `> 0` is the honest floor for "this
+// instrument measured something", and the exact figures are PRINTED beside it so
+// a reader can see the trend without the suite depending on it.
+void runOptimizedArmInstrument() {
+    std::cout << "[Test 5] Optimized-arm instrument (--config=<shipped pipeline>)\n";
+    check("the corpus declared optimized arms on the bound targets",
+          optimizedArmsDeclaredOnBoundTarget > 0,
+          "0 declared optimizedPipelines arms reached a bound target — every"
+          " optimizer assertion in this runner is vacuously satisfied");
+    check("at least one optimized arm was BUILT through --config",
+          optimizedArmsRunViaConfigFlag > 0,
+          "of " + std::to_string(optimizedArmsDeclaredOnBoundTarget)
+              + " declared arm(s), none produced an artifact via"
+                " --config=<shippedPipeline>; the CLI-surface optimizer witness"
+                " is inert");
+    check("at least one optimized arm's ARTIFACT DIFFERS byte-wise from its"
+          " baseline's (proves --config reached the compiler and changed what"
+          " it emitted)",
+          optimizedArmsArtifactDiffered > 0,
+          "all " + std::to_string(optimizedArmsRunViaConfigFlag)
+              + " optimized arm image(s) were BYTE-IDENTICAL to their"
+                " baselines. Either the config flag is no longer threaded into"
+                " the compile (so the arm IS the baseline build and asserts"
+                " nothing), or the shipped pipelines have stopped differing");
+    // The stdout half's own non-vacuity witness. An EMPTY pin is satisfied by a
+    // pipe that was never routed, so "some pin was asserted" is not enough —
+    // only a NON-EMPTY one proves bytes were actually drained from the child.
+    check("at least one NON-EMPTY stdout pin was asserted (proves the capture"
+          " pipe was routed, which an empty pin cannot)",
+          stdoutPinsAssertedNonEmpty > 0,
+          "of " + std::to_string(stdoutPinsAsserted)
+              + " stdout pin(s) asserted on this host, NONE was non-empty — an"
+                " empty pin is satisfied by a capture that never happened, so"
+                " this host proved nothing about the capture path");
+    std::cout << "  " << stdoutPinsAsserted << " stdout pin(s) asserted ("
+              << stdoutPinsAssertedNonEmpty << " non-empty)\n";
+    std::cout << "  " << optimizedArmsDeclaredOnBoundTarget
+              << " declared on bound targets; "
+              << optimizedArmsRunViaConfigFlag << " built via --config; "
+              << optimizedArmsArtifactDiffered
+              << " produced an image differing from their baseline; "
+              << optimizedArmsNotExpressibleOnCli
+              << " not expressible on the CLI surface (inline 'passes' arms —"
+                 " witnessed by the in-process runner)\n\n";
+}
+
+// ── THE CLASS, not the instance: the two runners' manifest vocabularies ─────
+//
+// ★★★ WHY A VOCABULARY PIN AND NOT JUST THE FIX. The defect this cycle closes
+// was NOT "one key was forgotten". It was that a key can be added to one corpus
+// runner and never to the other, and NOTHING SAYS SO — the manifests keep
+// parsing, both suites keep passing, and the sibling silently asserts less than
+// its author believes. That happened to `optimizedPipelines`, `shippedPipeline`,
+// `passes`, `optimizationObservable`, `clause` and `expectedStdout` — SIX keys,
+// over months, while a written rule ("a capability change MUST hit BOTH
+// runners") sat in this very file. ⇒ the rule needs a MACHINE check, not more
+// prose. Fixing only the six would leave the seventh to happen exactly the same
+// way.
+//
+// WHAT IT ASSERTS: the set of manifest keys each runner READS — every
+// `contains("k")` / `.at("k")` / `.value("k", …)` outside a comment — is
+// IDENTICAL in the two sources. ✔MEASURED 2026-08-17 after this change: 25 keys,
+// zero difference in either direction.
+//
+// ⚠ ITS SCOPE, stated so nobody mistakes it for more than it is. This reads
+// SOURCE TEXT, so it proves the key is MENTIONED, not that it is honoured; and
+// it knows the three nlohmann accessor spellings both files actually use
+// (neither uses `operator[]` — ✔MEASURED). It is a guard against the specific
+// failure that occurred: a key one runner has never heard of. A runner that
+// reads a key and ignores it is a different defect, and the load-time closed
+// key sets plus [Test 5]'s instrument are what stand against that one.
+//
+// If a key is ever LEGITIMATELY one-sided, this pin reds and the remedy is to
+// say so where a reader will see it — not to widen the matcher until it stops
+// asking.
+void runRunnerVocabularyPin() {
+    std::cout << "[Test 6] Both corpus runners recognise the same manifest keys\n";
+    // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT, same discipline: `repoRoot`
+    // THROWS when it cannot resolve, and this call sits outside every `try` in
+    // `main`. Uncaught, it would end the process with no [FAIL] line, no Results
+    // line and no name for what died — the exact failure that defect is about.
+    fs::path root;
+    try {
+        root = ::dss::test::repoRoot();
+    } catch (std::exception const& e) {
+        check("resolve the repo root for the runner-vocabulary comparison", false,
+              std::string{e.what()});
+        std::cout << "\n";
+        return;
+    }
+    struct Source {
+        char const* label;
+        fs::path    path;
+    };
+    Source const sources[2] = {
+        {"integrated_tests/runner.cpp", root / "integrated_tests" / "runner.cpp"},
+        {"tests/examples/examples_runner.cpp",
+         root / "tests" / "examples" / "examples_runner.cpp"},
+    };
+    std::vector<std::string> found[2];
+    for (int i = 0; i < 2; ++i) {
+        std::ifstream in(sources[i].path.string(), std::ios::binary);
+        std::string   body((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+        // NON-VACUITY, first and loudest: an unreadable or moved source yields an
+        // EMPTY key set, and two empty sets compare EQUAL. That is the false
+        // green this pin would otherwise hand out at exactly the moment it stopped
+        // working, so it is checked before the comparison, not after.
+        check(std::string{"read "} + sources[i].label + " ("
+                  + std::to_string(body.size()) + " bytes)",
+              !body.empty(),
+              "cannot read " + sources[i].path.generic_string()
+                  + " — with no text there are no keys, and two empty key sets"
+                    " compare equal, so this pin would pass having read nothing");
+        if (body.empty()) return;
+
+        // Comments are STRIPPED before matching. Both files discuss manifest keys
+        // in prose at length — including keys they deliberately do NOT read — and
+        // a matcher that counted prose would report agreement that the code does
+        // not have. (Same trap as the mutant whose own comment carried the
+        // witness token: the text that DESCRIBES a thing must never be mistaken
+        // for the thing.)
+        std::string code;
+        code.reserve(body.size());
+        for (std::size_t i2 = 0; i2 < body.size();) {
+            if (body.compare(i2, 2, "//") == 0) {
+                while (i2 < body.size() && body[i2] != '\n') ++i2;
+            } else if (body.compare(i2, 2, "/*") == 0) {
+                i2 += 2;
+                while (i2 + 1 < body.size()
+                       && !(body[i2] == '*' && body[i2 + 1] == '/')) {
+                    ++i2;
+                }
+                i2 = (i2 + 2 < body.size()) ? i2 + 2 : body.size();
+            } else {
+                code += body[i2++];
+            }
+        }
+        // `contains("k")` / `.at("k")` / `.value("k", …)` — the three spellings
+        // both files use to ASK a manifest for a key.
+        for (char const* accessor : {"contains(\"", ".at(\"", ".value(\""}) {
+            std::string const needle{accessor};
+            for (std::size_t at = code.find(needle); at != std::string::npos;
+                 at = code.find(needle, at + 1)) {
+                auto const start = at + needle.size();
+                auto const end   = code.find('"', start);
+                if (end == std::string::npos) break;
+                auto key = code.substr(start, end - start);
+                if (key.empty()) continue;
+                // Manifest keys are plain identifiers. Anything else is a string
+                // that merely sits in an accessor's argument position.
+                bool identifier = true;
+                for (char const c : key) {
+                    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                          || (c >= '0' && c <= '9') || c == '_')) {
+                        identifier = false;
+                        break;
+                    }
+                }
+                if (identifier) found[i].push_back(std::move(key));
+                at = end;
+            }
+        }
+        std::sort(found[i].begin(), found[i].end());
+        found[i].erase(std::unique(found[i].begin(), found[i].end()),
+                       found[i].end());
+        check(std::string{sources[i].label} + " reads at least one manifest key"
+                  + " (" + std::to_string(found[i].size()) + " found)",
+              !found[i].empty(),
+              "the key matcher found nothing — its accessor spellings no longer"
+              " describe how this file reads a manifest, so its agreement with"
+              " the sibling means nothing");
+        if (found[i].empty()) return;
+    }
+
+    auto const missingFrom = [&](int lacking, int having) {
+        std::string out;
+        for (auto const& k : found[having]) {
+            if (std::find(found[lacking].begin(), found[lacking].end(), k)
+                != found[lacking].end()) {
+                continue;
+            }
+            out += (out.empty() ? "" : ", ") + k;
+        }
+        return out;
+    };
+    auto const onlyInSibling   = missingFrom(0, 1);
+    auto const onlyInThisOne   = missingFrom(1, 0);
+    check("the two corpus runners read the SAME manifest key set ("
+              + std::to_string(found[0].size()) + " keys)",
+          onlyInSibling.empty() && onlyInThisOne.empty(),
+          (onlyInSibling.empty()
+               ? std::string{}
+               : "read ONLY by tests/examples/examples_runner.cpp: ["
+                     + onlyInSibling + "]. ")
+              + (onlyInThisOne.empty()
+                     ? std::string{}
+                     : "read ONLY by integrated_tests/runner.cpp: ["
+                           + onlyInThisOne + "]. ")
+              + "A manifest key one corpus runner has never heard of is"
+                " INDISTINGUISHABLE FROM A TYPO to that runner: the example still"
+                " passes there, having asserted less than its author believes."
+                " Teach both runners the key, or — if the divergence is genuinely"
+                " intentional — record WHY here, where the next reader meets it.");
     std::cout << "\n";
 }
 
@@ -2072,6 +2987,13 @@ int main(int argc, char* argv[]) {
 
     // ── Test 4: manifest emulator lint (needs the walk's declarations) ──
     runManifestEmulatorLint();
+
+    // ── Test 5: the optimized-arm instrument (needs the walk's counters) ──
+    runOptimizedArmInstrument();
+
+    // ── Test 6: the two runners' manifest vocabularies (source-level, host-
+    //    independent, needs nothing from the walk) ──
+    runRunnerVocabularyPin();
 
     // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the skip accounting, and it is
     // deliberately IN the Results line rather than only near it. The defect was

@@ -117,6 +117,29 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      ran the pin.** A changed file on disk is not a changed input. Show the artifact rebuilt (mtime),
      or the config tree that was read (`DSS_CONFIG_ROOT`), or both — and if you cannot show it, the
      demonstration proved nothing no matter how red or green it came out.
+   - **★★★ AND THE FIFTH CHECK HAS A MIRROR: PROVE THE *RESTORED* BYTES REACHED THE PROCESS TOO.**
+     A red-on-disable makes **two** claims — *mutant RED* **and** *subject GREEN* — and a stale binary
+     silently invalidates the second. The rule above is stated only for the mutate direction, and every
+     word of it applies identically to the restore.
+     ✔MEASURED 2026-08-17 (`D-GATE-RED-ON-DISABLE-RESTORE-NOT-PROVEN-TO-REACH-THE-PROCESS`): a mutation
+     script restored the SOURCE in its `finally` and never rebuilt, so the next script's "UNMUTATED"
+     column ran against a binary that still contained the mutant. **Both of its columns were therefore
+     the mutant — and they agreed perfectly, which reads exactly like a stable measurement.** It
+     produced a false *"these shapes fail even unmutated"* verdict that briefly looked like a
+     correctness bug in the fix under test; the corrected run **inverted the verdict outright**.
+     ⇒ assert a build witness on **every** transition — warm-up → GOOD → MUTANT → RESTORED — and abort
+     fail-closed if any artifact's mtime did not advance. Measure the good column only after a
+     witnessed rebuild.
+   - **★★ A VACUOUS ASM PIN CAN SURVIVE *BOTH* ARMS — `release` is not a rescue.** ✔MEASURED 2026-08-17,
+     twice, in two different shapes. (a) A two-input asm example behind a CALL left its mutant GREEN at
+     baseline and red only at release; the same defect lowered directly in `main` reddened baseline.
+     (b) Worse: a **single `"+r"` operand** stayed green over a live mutant at **both** debug and
+     release — the read half's `mov` targets a dead vreg emitted just before the template, the result
+     vreg's range starts right after, they never overlap, and the linear scan hands the result that
+     very register, already holding the right value. Two tied operands → red on both arms.
+     ⇒ **run the mutant against every arm and report which actually went red.** A pin that survives
+     because an undefined register happened to hold the right value is not a pin, and which shape gets
+     that luck cannot be read off the source.
    - **★★ A PIN MUST DRIVE ITS SUBJECT THROUGH THE SUBJECT'S REAL INPUT PATH — never re-type its
      data.** ✔MEASURED 2026-08-06: a pin stubbed a driver's vocabulary list with eight hand-typed
      tokens — clean by construction, in a shape the driver NEVER RECEIVES — and so could not see

@@ -677,17 +677,31 @@ MirInstId MirBuilder::addInst(MirOpcode opcode, std::span<MirInstId const> opera
     // so the only way to spell them is the safe path.
     //
     // *** `InlineAsm` IS IN THIS LIST AS A STRUCTURAL BACKSTOP, NOT FOR SYMMETRY.
-    // Its payload indexes the module's `MirAsmDescriptorPool`, and MIR is rebuilt
-    // by three live verbatim-copy sites that forward `instPayload` into a module
+    // Its payload indexes the module's `MirAsmDescriptorPool`, and MIR is copied
+    // by FOUR live verbatim-copy sites that forward `instPayload` into a module
     // whose pool is EMPTY (`opt/passes/mir_rebuild_helper.cpp`,
-    // `opt/passes/inlining.cpp` x2). Forwarding the index there would name the
-    // wrong descriptor -- i.e. drop the clobber list -- with nothing to observe
-    // it. Refusing the opcode here makes a copy site that forgot `addInlineAsm`
-    // ABORT. A checklist would have to be re-audited every time a fourth copy
-    // site appears; this cannot be forgotten, because forgetting it does not
-    // compile away -- it aborts on the first asm block that reaches the
-    // optimizer. (`InlineAsmGoto` is a TERMINATOR, so the terminator refusal
-    // above already catches it; its dedicated builder is `addInlineAsmGoto`.)
+    // `opt/passes/inlining.cpp` x2, and `mir/merge/mir_merge.cpp`'s cross-CU
+    // `FunctionCloner`). Forwarding the index there would name the wrong
+    // descriptor -- i.e. drop the clobber list -- with nothing to observe it.
+    // Refusing the opcode here makes a copy site that forgot `addInlineAsm`
+    // ABORT. This cannot be forgotten, because forgetting it does not compile
+    // away -- it aborts on the first asm block that reaches that site.
+    //
+    // ⚠ AND THE FOURTH SITE IS WHY THE COUNT IS WRITTEN OUT RATHER THAN LEFT
+    // VAGUE. This comment said "three" and named only the three OPTIMIZER sites
+    // from the day the opcode landed until 2026-08-17, when the cross-CU merge --
+    // which is neither an optimizer pass nor reachable from a single-TU build --
+    // aborted a 2-TU sqlite build on four legs. The refusal did its job (a loud
+    // abort, not a silent dropped clobber list), but the census beside it was
+    // already wrong. A NEW copy site must be added to this list, and to
+    // `tests/opt/test_inline_asm_rebuild_carriage.cpp` + `tests/mir/
+    // test_mir_merge.cpp`, which drive each site ALONE.
+    // (`InlineAsmGoto` is a TERMINATOR, so the terminator refusal above already
+    // catches it at `addInst`; its dedicated builders are `addInlineAsmGoto` for
+    // the ORIGINAL emit and `cloneInlineAsmGoto` for every copy site. A copy site
+    // that omits its terminator arm entirely does not reach `addInst` at all --
+    // it hits its own switch default, which is why each cloner's default arm is
+    // also a fatal.)
     if (opcode == MirOpcode::Arg || opcode == MirOpcode::Const
         || opcode == MirOpcode::GlobalAddr || opcode == MirOpcode::InlineAsm
         || opcode == MirOpcode::Invalid) {

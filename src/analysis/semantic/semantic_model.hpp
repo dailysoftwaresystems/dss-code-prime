@@ -680,6 +680,23 @@ struct DSS_EXPORT ShippedExternSymbol {
     // IMPORT: a `#include`d descriptor's symbol is imported whether or not the TU
     // calls it), so every pre-existing row is byte-identical.
     bool eagerImport = true;
+    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the CONFIG-ROOT-RELATIVE path of
+    // the shipped source file that provides this symbol's body on the active
+    // object format (`runtime/platform/pe/dirent.c`), or EMPTY for an ordinary
+    // import row.
+    //
+    // ★★ NON-EMPTY MAKES THIS ROW UNBOUND AND NON-EAGER, AND BOTH HALVES MATTER.
+    // UNBOUND (— `HirExternRecord.noLibraryBinding`) because there is no image to
+    // name: Windows exports `opendir` from nothing, so binding it to ANY library
+    // produces a binary the loader rejects at process start with 0xC0000139 and
+    // rc=0 from every compile stage (D-FFI-DESCRIPTOR-EAGER-IMPORT). NON-EAGER
+    // because the eager bit exists to keep an import the TU never referenced, and
+    // a body that is being COMPILED INTO THIS PROGRAM needs no import kept at all.
+    // The reference then resolves exactly where C23 5.1.1.2 phase 8 says it does
+    // — at the LINK tier, against the sibling CU the driver added to the build
+    // graph. That is the same route a plain `extern int f(void);` over a two-file
+    // `cc a.c b.c` already takes; no new binding rule was invented for this.
+    std::string shippedSourcePath;
 };
 
 // c86 + c156: the link identity of a goal-2 SUPPRESSED shipped descriptor
@@ -745,6 +762,21 @@ struct DSS_EXPORT SuppressedShippedSymbol {
     // The descriptor is the authority on which name the LIBRARY exports; a user
     // prototype restates the C signature, never the platform's link identity.
     std::string linkName;
+    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the suppressed row's
+    // SHIPPED-SOURCE realization for the active object format — the
+    // CONFIG-ROOT-RELATIVE path of the file that provides this symbol's body
+    // (`runtime/platform/pe/dirent.c`), or EMPTY for an ordinary import row.
+    //
+    // ★ IT RIDES HERE FOR THE SAME REASON `recipeId` DOES, one axis over, and the
+    // failure it prevents is the same one TF-C112 measured. A suppressed row is
+    // the ONLY channel by which a descriptor symbol reaches the link WITHOUT
+    // passing through `SemanticModel::shippedExterns()`, so a property the
+    // injected path reads off a row must ride here too or it is silently dropped
+    // for exactly the declarations users write most. A user bare prototype of
+    // `opendir` over `#include <dirent.h>` that lost this would re-export the name
+    // as a RAW IMPORT — and no pe image exports `opendir`, so the binary would
+    // fail to LOAD at process start with rc=0 from every compile stage.
+    std::string shippedSourcePath;
 };
 
 class DSS_EXPORT SemanticModel {

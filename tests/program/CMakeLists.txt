@@ -141,8 +141,83 @@ dss_add_test(NAME program/test_entry_argv_run
 dss_add_test(NAME program/test_suppress_request_ignored
              SOURCES test_suppress_request_ignored.cpp)
 
+# The COMPILER'S BUILD STAMP (`src/program/dss_build_stamp.hpp`) — the identity
+# the runtime object cache keys on. Driver tier because the subject is a
+# `src/program/` header whose value is produced by the BUILD SYSTEM, so the only
+# way to observe it is to compile against the real generated header.
+#
+# ★ AND IT IS THE ONLY PLACE THE STAMP'S SHAPE IS OBSERVED. Its production
+# consumer — `src/program/runtime_object_cache.cpp` — hashes the stamp into a
+# key, which means every defect in this list (empty, whitespace-bearing, missing
+# the version) still produces a perfectly valid-looking key over there and is
+# invisible from that side. The assertions have to live where the string is,
+# not where it is consumed.
+dss_add_test(NAME program/test_build_stamp
+             SOURCES test_build_stamp.cpp)
+
+# The opt-in (top-level CMakeLists). Wires BOTH the generated header's include
+# path and the ordering edge onto this ONE target — no other target can see the
+# header, which is what keeps a stamp that changes on every dirty edit from
+# rebuilding the world.
+dss_use_build_stamp(dss_program_test_build_stamp)
+
 # It REUSES tests/core/native_c_probe.hpp for the reference-compiler probe
 # rather than growing a second copy of host-compiler discovery, shell quoting
 # and output capture — the same reason tests/conformance adds this path.
 target_include_directories(dss_program_test_suppress_request_ignored
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/core)
+
+# The shipped runtime's content-addressed object cache
+# (`src/program/runtime_object_cache.{hpp,cpp}` —
+# D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF). Driver tier, and not
+# tests/examples/, for two structural reasons rather than convenience:
+#
+#   · The sibling-lookup case must SCAN A DIRECTORY IT CONTROLS. Its
+#     load-bearing arm is the >1-candidate refusal, and the shipped
+#     `object-formats/` tree deliberately contains no ambiguous pair — so the
+#     ambiguity has to be CONSTRUCTED in a scratch directory. A corpus example
+#     compiles a source against the shipped tree and has no such knob.
+#   · The cache-key cases assert a BYTE-EXACT key document and the ABSENCE of
+#     invalidation on an out-of-scope edit. The examples runner's only
+#     observable is an exit code, which cannot distinguish "the cache hit" from
+#     "the cache missed and recompiled" — the very difference under test.
+#
+# ⓘ It does NOT call `dss_use_build_stamp`, and that is deliberate: this test
+# asserts the key document's SHAPE, and the one term it cannot pin to a literal
+# is `compiler=`, whose value is the stamp. Opting in would let the test
+# reconstruct the expected value from the same macro the subject reads, which
+# asserts only that a macro equals itself — and it would drag a second target
+# into the rebuild-on-every-dirty-edit set the stamp's opt-in exists to bound.
+# The stamp string's own shape is pinned by `program/test_build_stamp` above.
+dss_add_test(NAME program/test_runtime_object_cache
+             SOURCES test_runtime_object_cache.cpp)
+
+# THE SHIPPED-RUNTIME COMPILE GATE (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF)
+# — every source named by ANY descriptor's `realization` map must actually
+# COMPILE for the object format that declares it, cross, from whatever host runs
+# the suite.
+#
+# ★★★ IT IS A REPLACEMENT, NOT AN ADDITION. A `--compile-runtime` CLI verb was
+# designed and then CANCELLED on the explicit understanding that the coverage it
+# bought moves into this test. Automatic compilation only ever compiles what a
+# build REACHES, so a declared realization no example exercises stays uncompiled
+# and its breakage stays invisible until a user hits it. This is what makes every
+# declared realization exercised.
+#
+# Driver tier, and the reason is structural rather than convenience: the gate
+# drives `Program::compileFiles` through the real production driver, derives its
+# machines from `crossValidateTargetFormat` + `resolveArchiveSiblingFormat`, and
+# derives its artifact name from `TargetSpec::outputExtension` — three of its
+# four subjects are `src/program/`, and it shares this directory with the object
+# cache those same units feed. It reads the descriptor corpus only through
+# `src/ffi/shipped_lib_descriptor.hpp`'s own readers, so it needs no JSON link:
+# the format keys are discovered by offering the closed `ObjectFormatKind`
+# vocabulary to `allShippedSourcesForFormat` and keeping what the corpus answers.
+#
+# ⓘ Its DECLARATIVE sibling is `tests/ffi/test_shipped_source_realization.cpp`
+# (R1 every realization names an existing file; R2 every file is named; R3 no
+# format declares both an image and a source). Neither half implies the other — a
+# perfectly-declared corpus can name a unit that does not compile — and neither
+# restates the other's assertions.
+dss_add_test(NAME program/test_shipped_runtime_compiles
+             SOURCES test_shipped_runtime_compiles.cpp)

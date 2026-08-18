@@ -417,6 +417,14 @@ private:
             case TypeKind::Tuple:  out_ += "tuple<"; args(in.operands(t)); out_ += '>'; return;
             case TypeKind::Struct: {
                 out_ += "struct "; out_ += quote(in.name(t));
+                // D-FFI-OPAQUE-TAG-HAS-NO-SPELLING: an INCOMPLETE composite has no
+                // field list at all, and it must not be spelled `{}` -- that is a
+                // LEGAL COMPLETE zero-field struct (see `isIncompleteComposite`), so
+                // emitting braces here would reintern an opaque tag as a COMPLETE
+                // zero-byte type. Exactly the silent-drop shape the ` packed` marker
+                // below exists to prevent, and the marker follows its precedent: a
+                // bare keyword after the name. No braces follow `opaque`.
+                if (in.isIncompleteComposite(t)) { out_ += " opaque"; return; }
                 // D-CSUBSET-PACKED: emit a ` packed` marker for a packed struct so the
                 // whole-composite packed flag round-trips (else it would reintern
                 // UNPACKED — a silent ABI drop across the text boundary). May combine
@@ -2222,6 +2230,16 @@ private:
         if (kw == "tuple") { expect(Tk::LAngle, "'<'"); auto ts = parseTypeListUntil(Tk::RAngle); expect(Tk::RAngle, "'>'");
             return interner_.tuple(ts); }
         if (kw == "struct") { std::string name = takeStr();
+            // D-FFI-OPAQUE-TAG-HAS-NO-SPELLING: the appendType twin. `opaque` marks an
+            // INCOMPLETE composite and is TERMINAL -- no `{}` follows, because an
+            // incomplete type has no field list (as distinct from `{}`, which is a
+            // legal COMPLETE zero-field struct). `declSiteKey` is a FIXED 0 here, not a
+            // decl-site id: every textual mention of `struct "FILE" opaque` must name
+            // ONE type, which is the same canonicalization the complete-at-once path
+            // gets by deriving its key from field content. The semantic analyzer's
+            // self-referential path still passes a real decl-site key.
+            if (acceptKeyword("opaque"))
+                return interner_.forwardComposite(TypeKind::Struct, name, 0);
             // D-CSUBSET-PACKED: an optional ` packed` marker after the name (before the
             // `{`) round-trips the whole-composite packed flag. Routed through
             // forwardComposite + completeComposite below (the structType convenience

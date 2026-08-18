@@ -9,8 +9,16 @@
 #include <string_view>
 #include <unordered_map>
 
-// Shared RELOCATABLE-OBJECT symbol-NAMING substrate for the object writers
-// (ELF ET_REL, PE/COFF Obj, Mach-O MH_OBJECT) — D-LK-OBJECT-EXTERN-SYMBOL-NAMES.
+// Shared symbol-NAMING substrate for the object/image writers — the ONE owner of
+// the `AssembledModule::symbols` lookup, serving BOTH artifact tiers:
+//   * RELOCATABLE objects (ELF ET_REL, PE/COFF Obj, Mach-O MH_OBJECT) via
+//     `definedName` / `definedBinding` / `externName` —
+//     D-LK-OBJECT-EXTERN-SYMBOL-NAMES;
+//   * FINAL IMAGES (ELF ET_EXEC + ET_DYN, Mach-O exec/dylib, PE image) via
+//     `imageName` — D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS.
+// The two tiers differ in ONE predicate clause and that difference is documented
+// on `imageName`; everything else (the carrier, the lookup, the `<prefix><id>`
+// fallback shape) is shared, so a writer can never grow a private name table.
 //
 // A relocatable object's `.symtab` must carry the SOURCE-LEVEL C identifier
 // name for every externally-visible DEFINED function — otherwise a foreign
@@ -83,6 +91,51 @@ public:
             ModuleSymbol const& ms = *it->second;
             if (!ms.name.empty()
                 && isExternallyVisible(ms.binding, ms.visibility)) {
+                return ms.name;
+            }
+        }
+        return std::string{internalPrefix} + std::to_string(id.v);
+    }
+
+    // The `.symtab` name for a DEFINED symbol in a FINAL IMAGE (an exec, a PIE,
+    // a `.so`/dylib/DLL) -- the final-image companion of `definedName`, reading
+    // the SAME `module.symbols` carrier through the SAME lookup, and differing
+    // in EXACTLY ONE clause: it does NOT require `isExternallyVisible`.
+    // D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS.
+    //
+    // ★ WHY THE PREDICATE LEGITIMATELY DIFFERS, rather than one method serving
+    // both tiers. `definedName`'s visibility gate is not a naming preference --
+    // it exists because a RELOCATABLE object's `.symtab` names are a FOREIGN
+    // LINKER'S RESOLUTION KEYS: exposing a `static` under its real name there
+    // makes two TUs that both define `helper` collide at `ld` (`multiple
+    // definition`), which is the exact defect D-LK-INTERNAL-LINKAGE-FN-EMITTED-
+    // GLOBAL-FOREIGN-COLLISION closed. A FINAL IMAGE is never re-linked, so its
+    // `.symtab` resolves NOTHING -- it is read by debuggers, profilers and crash
+    // reporters, for which a `static`'s real name is precisely the wanted
+    // answer, and duplicate local names across CUs are normal and harmless
+    // (`readelf -sW` over any gcc-linked binary shows exactly this shape: every
+    // static function keeps its source name in the final image). Suppressing the
+    // name there bought nothing and cost every backtrace frame its identity:
+    // ✔MEASURED before this method existed, gdb over a DSS ELF exec printed
+    // `#0 sym_84 / #1 sym_89 / #2 sym_93` for `static_helper`/`global_helper`/
+    // `main`, on BOTH x86_64 and aarch64.
+    //
+    // THE FALLBACK IS DELIBERATE, NOT INCIDENTAL, and covers exactly the symbols
+    // that genuinely HAVE no declared name -- there is nothing truer to emit for
+    // them, and `<prefix><id>` is at least unique and greppable:
+    //   * the LINKER-INJECTED entry trampoline (`entry_trampoline.cpp` prepends
+    //     it as functions[0] with a minted SymbolId and no `ModuleSymbol` row);
+    //   * a compiler-SYNTHESIZED symbol (string-literal rodata, an init thunk);
+    //   * an interior `&&label` block symbol (D-CSUBSET-COMPUTED-GOTO);
+    //   * a hand-built substrate module with an empty `symbols` table.
+    // A row that EXISTS but carries an empty name also lands here rather than
+    // emitting a zero-length name: an empty `.symtab` name is indistinguishable
+    // from "no name recorded" to every reader, so it would be a silent loss.
+    [[nodiscard]] std::string
+    imageName(SymbolId id, std::string_view internalPrefix) const {
+        if (auto const it = definedBySym_.find(id.v); it != definedBySym_.end()) {
+            ModuleSymbol const& ms = *it->second;
+            if (!ms.name.empty()) {
                 return ms.name;
             }
         }

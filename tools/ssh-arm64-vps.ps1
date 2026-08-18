@@ -9,7 +9,11 @@
 # ★ NO HOST DETAILS ARE TRACKED. Precedence: parameter > env > .secrets\arm64-vps.env >
 #   FAIL LOUD. `.secrets/` is gitignored because this repo is slated to go public (PR #37).
 # ★ KEY-BASED ONLY. `BatchMode=yes` makes ssh FAIL rather than prompt. No key material and
-#   no password lives in the repo — `.secrets/` holds the key's PATH, never the key.
+#   no password lives in the repo. ⚠ UPDATED 2026-08-17: `.secrets/` now holds the KEY
+#   ITSELF (`arm64-vps.key`), not merely its path. A `$HOME`-relative path resolves to a
+#   DIFFERENT directory in WSL / Git Bash / PowerShell, so the host was reachable or not
+#   depending on which shell you started in. `.secrets/` is gitignored, as are *.key and
+#   *.env repo-wide.
 # ★ KEY LOCATION IS THE REAL CROSS-HOST WRINKLE: the key normally lives in the WSL home,
 #   whose 0600 mode Windows `ssh.exe` cannot honour. So this delegates to WSL by default
 #   rather than pretending otherwise. Set DSS_VPS_KEY to a Windows-side path to use
@@ -47,6 +51,29 @@ if (-not $VpsUser) { $VpsUser = if ($env:DSS_VPS_USER) { $env:DSS_VPS_USER } els
 # ssh fall back to whatever default identity it could find, which under
 # BatchMode=yes fails much later and blames the host. Matches `ssh-macos.ps1`.
 if (-not $KeyPath) { $KeyPath = if ($env:DSS_VPS_KEY) { $env:DSS_VPS_KEY } else { $conf['DSS_VPS_KEY'] } }
+
+# ★★★ THE SCRIPT FINDS THE KEY. THE CALLER NEVER DOES ANYTHING MANUALLY.
+# Operator instruction 2026-08-17: "you must be able to get everything from the tool
+# scripts, which goes inside .secrets and find the key. never manually."
+#
+# ⚠ TWO DEFECTS FIXED HERE, and the pair-break is the instructive one. The `.sh` twin
+# expands `$HOME` out of the config (`eval printf`); this script did NOT, and reported
+# the path LITERALLY — "no private key at '$HOME/.ssh/oracle-vps-private-key'". These
+# two files declare themselves CAPABILITY-PAIRED in their own headers, and nothing
+# checked it (D-HARNESS-VPS-SSH-PS1-DOES-NOT-EXPAND-HOME).
+# ⚠ AND EXPANDING $HOME WOULD NOT HAVE BEEN ENOUGH: `$HOME` names a DIFFERENT directory
+# in WSL, Git Bash and PowerShell, and ✔MEASURED the key existed only under WSL's $HOME
+# — so the host was reachable or not depending on which shell you started in.
+# `$REPO/.secrets/` is the SAME directory in all three; resolving there removes the
+# shell from the answer. `.secrets/` is gitignored (as are *.key/*.env repo-wide).
+$_repoKey = Join-Path $PSScriptRoot '..\.secrets\arm64-vps.key'
+if ($KeyPath) { $KeyPath = $KeyPath -replace '^\$HOME', $HOME -replace '^~', $HOME }
+if ($KeyPath -and -not (Test-Path $KeyPath) -and (Test-Path $_repoKey)) {
+    Write-Warning "ssh-arm64-vps: DSS_VPS_KEY='$KeyPath' does not exist; using the repo-local key $_repoKey"
+    $KeyPath = $_repoKey
+} elseif (-not $KeyPath -and (Test-Path $_repoKey)) {
+    $KeyPath = $_repoKey
+}
 
 if (-not $VpsHost -or -not $VpsUser) {
     Write-Error "ssh-arm64-vps: connection data missing. Create .secrets\arm64-vps.env with DSS_VPS_HOST, DSS_VPS_USER, DSS_VPS_KEY (a key PATH), or pass -VpsHost/-VpsUser."

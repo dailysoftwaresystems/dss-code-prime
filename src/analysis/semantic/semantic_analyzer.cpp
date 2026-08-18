@@ -9564,15 +9564,59 @@ inlineAsmSection(std::string_view label, std::vector<std::string> const& items,
 // literal concatenation crosses tokens. A span computed by adding the decoded
 // offset to the literal's start would be confidently wrong, which is worse than
 // a whole-literal span plus an exact offset.
+//
+// ★★★ EVERY SIGIL BELOW COMES FROM `semantics.inlineAsmTemplateLexemes` AND NOT
+// ONE OF THEM IS A C++ LITERAL ANY MORE (2026-08-17,
+// D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER, CLOSED). This
+// function used to compare against `'%'`, `'l'`, `'['` and `']'` while every
+// assembly DIALECT declared the same spellings in config — one fact with two
+// owners, and nothing in the shipped build could detect them disagreeing,
+// because this tier has NO dialect in scope when it scans (the dialect is
+// resolved at MIR→LIR; `TargetSchema` carries only its stem name; and `target`
+// is legitimately `nullptr` for the LSP, the FFI header parser and every
+// direct-API caller — all of which still scan templates). The sigils are
+// HOST-LANGUAGE vocabulary — gcc substitutes them before the assembler ever sees
+// the text — so they live beside `memoryClobber`/`conditionCodeClobber`, and the
+// language config is the one thing this tier is guaranteed to have.
+//
+// ★★ THE MESSAGES ARE DERIVED TOO, NOT JUST THE COMPARISONS. A refusal that
+// quotes a hard-coded `%0` at a language spelling it `$0` sends the reader to
+// fix the wrong byte, which is the same defect one tier over. `L.operandRef` and
+// its three siblings build every quoted form from the declared lexemes.
+//
+// ★ FORMS ARE SEPARATED BY MAXIMAL MUNCH — longest declared lexeme first —
+// which is exactly how `longestMatchInMode` separates the same three in the
+// tokenizer, so the two tiers cannot disagree about where a form starts. The
+// loader REFUSES an escape or label lexeme that is not longer than the
+// placeholder, so the ordering below can never be ambiguous.
+//
+// ⓘ THE DIGITS AND THE MODIFIER LETTER STAY IN C++, and that is not an
+// exception being carved out. An operand INDEX is bound to the shared
+// `templateOperandIndex` role (an `IntLiteral`) rather than being a sigil, and a
+// modifier LETTER is per-TARGET width-view vocabulary that no shipped
+// `.target.json` declares — the scan REFUSES it rather than lowering it. Neither
+// is a template lexeme, so neither is a role of the set.
 template <class Report>
-inline void scanInlineAsmTemplate(InlineAsmFacts const& f, std::string_view text,
+inline void scanInlineAsmTemplate(InlineAsmFacts const& f,
+                                  InlineAsmTemplateLexemes const& L,
+                                  std::string_view text,
                                   Report const& report) {
     NodeId const at = f.templateNode;
+    // No placeholder role ⇒ this language declares no operand-reference surface
+    // at all, and there is nothing to scan FOR. Refusing to guess a sigil is the
+    // point: the alternative is scanning for a byte nobody declared.
+    if (L.placeholder.empty()) return;
+
     auto const isDigit = [](char c) { return c >= '0' && c <= '9'; };
     auto const isAlpha = [](char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
     };
-    // `%<digits>` / `%l<digits>` — returns the index and advances `i` past it.
+    auto const at_ = [&](std::size_t i, std::string_view lex) {
+        return !lex.empty() && i + lex.size() <= text.size()
+            && text.compare(i, lex.size(), lex) == 0;
+    };
+    // `<placeholder><digits>` / `<label><digits>` — returns the index and
+    // advances `i` past it.
     auto const readIndex = [&](std::size_t& i) -> std::size_t {
         std::size_t v = 0;
         while (i < text.size() && isDigit(text[i])) {
@@ -9581,128 +9625,236 @@ inline void scanInlineAsmTemplate(InlineAsmFacts const& f, std::string_view text
         }
         return v;
     };
-    // `[name]` — returns the name and advances `i` past the `]`, or nullopt when
-    // the bracket never closes (which is a template defect, not a name).
+    // `<open>name<close>` — returns the name and advances `i` past the closing
+    // lexeme, or nullopt when it never closes (a template defect, not a name).
     auto const readBracketName =
         [&](std::size_t& i) -> std::optional<std::string> {
-        std::size_t const close = text.find(']', i);
+        if (L.symbolicNameClose.empty()) return std::nullopt;
+        std::size_t const close = text.find(L.symbolicNameClose, i);
         if (close == std::string_view::npos) return std::nullopt;
         std::string name{text.substr(i, close - i)};
-        i = close + 1;
+        i = close + L.symbolicNameClose.size();
         return name;
     };
+    // The spelling of ONE form, quoted back at the author exactly as this
+    // language spells it.
+    auto const quote = [](std::string const& s) { return "`" + s + "`"; };
+    // ★ A CLAUSE THAT DISAPPEARS WHEN ITS ROLE DOES. A role may be declared
+    // ABSENT (an explicit `null`), and a message that then advised the author to
+    // "write `` for a literal percent" would be quoting a lexeme no language
+    // spells — the empty-backtick shape a hard-coded sigil produces one step
+    // further along. Every optional clause below is built through this, so an
+    // absent role costs the reader a sentence rather than handing them one that
+    // is wrong.
+    auto const clause = [&](std::string const& lexeme, std::string_view before,
+                            std::string_view after) {
+        return lexeme.empty() ? std::string{}
+                              : std::string{before} + quote(lexeme)
+                                    + std::string{after};
+    };
+    // Is the bracketed `<open>name<close>` form spellable at all in this
+    // language? Both halves are needed; one alone can never close a name.
+    bool const hasNamed =
+        !L.symbolicNameOpen.empty() && !L.symbolicNameClose.empty();
 
     std::size_t const operandCount = f.operands.size();
     std::size_t const labelCount   = f.labels.size();
 
     for (std::size_t i = 0; i < text.size();) {
-        if (text[i] != '%') { ++i; continue; }
+        // Longest-first: the escape and the label sigil both EXTEND the
+        // placeholder, and the loader guarantees they are strictly longer.
+        bool const atEscape = at_(i, L.escape);
+        bool const atLabel  = at_(i, L.labelPlaceholder);
+        bool const atPlain  = at_(i, L.placeholder);
+        if (!atEscape && !atLabel && !atPlain) { ++i; continue; }
         std::size_t const formStart = i;
-        ++i;
-        if (i >= text.size()) {
-            // A trailing bare `%`. In BASIC it is one literal character and the
-            // reference toolchain assembles it; in EXTENDED both reference
-            // compilers error.
+        // The byte that FOLLOWS a plain placeholder — what selects the form.
+        std::size_t const afterSigil = formStart + L.placeholder.size();
+        if (!atEscape && !atLabel && afterSigil >= text.size()) {
+            // A trailing bare placeholder. In BASIC it is one literal character
+            // and the reference toolchain assembles it; in EXTENDED both
+            // reference compilers error.
             if (!f.isExtended) break;
             report(DiagnosticCode::S_InlineAsmOperandModifierUnsupported, at,
-                   "the inline-asm template ends with a bare `%` at byte offset "
+                   "the inline-asm template ends with a bare "
+                   + quote(L.placeholder) + " at byte offset "
                    + std::to_string(formStart)
-                   + " — in an EXTENDED template (any `:` makes it extended) `%` "
-                     "introduces an operand reference, so a trailing one names "
-                     "nothing. gcc and clang reject this form too; write `%%` for "
-                     "a literal percent");
+                   + " — in an EXTENDED template (any `:` makes it extended) "
+                   + quote(L.placeholder)
+                   + " introduces an operand reference, so a trailing one names "
+                     "nothing. gcc and clang reject this form too"
+                   + clause(L.escape, "; write ", " for a literal percent"));
             break;
         }
-        char const c = text[i];
+        char const c = afterSigil < text.size() ? text[afterSigil] : '\0';
 
-        // ── the BASIC reading: `%` is LITERAL, with exactly two exceptions ──
+        // ── the BASIC reading: the placeholder is LITERAL, with exactly two
+        //    exceptions ──
         if (!f.isExtended) {
-            bool const looksLikePlaceholder = (c == '%') || isDigit(c) || (c == '[');
-            if (!looksLikePlaceholder) { ++i; continue; }
+            bool const opensName = at_(afterSigil, L.symbolicNameOpen);
+            if (!atEscape && !isDigit(c) && !opensName) { ++i; continue; }
+            std::string const form =
+                atEscape ? L.escape
+                         : (opensName ? L.placeholder + L.symbolicNameOpen
+                                      : L.placeholder + std::string{c});
             report(DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate, at,
-                   std::string{"the inline-asm template contains `%"} + c
-                   + "` at byte offset " + std::to_string(formStart)
+                   "the inline-asm template contains " + quote(form)
+                   + " at byte offset " + std::to_string(formStart)
                    + ", but this statement has NO operand sections at all, so it "
-                     "is a BASIC template in which `%` is LITERAL — the text is "
+                     "is a BASIC template in which " + quote(L.placeholder)
+                   + " is LITERAL — the text is "
                      "emitted verbatim and nothing is substituted. ✔MEASURED on "
                      "gcc 13.3.0 and clang 18.1.3: the reference toolchain emits "
                      "it unchanged and the ASSEMBLER then rejects it (\"bad "
                      "register name\"), so this program does not build there "
                      "either. Add the operand sections this template expects "
-                     "(even `::` alone makes it extended), or write a literal "
-                     "percent as `%%` in an extended template");
-            i = formStart + 2;
+                     "(even `::` alone makes it extended)"
+                   + clause(L.escape, ", or write a literal percent as ",
+                            " in an extended template"));
+            i = formStart + form.size();
             continue;
         }
 
         // ── the EXTENDED reading ──
-        // The `%%` escape. `i` already sits on the SECOND `%`, so ONE more
-        // increment consumes the pair.
-        // ⚠ THIS LINE HAD AN OFF-BY-ONE AND IT WAS NOT COSMETIC: advancing past
-        // the pair skipped the byte AFTER it, so `%%%0` lost its placeholder —
-        // `%` literal followed by operand 0 read as `%` literal followed by
-        // nothing. That is a MISSED refusal, i.e. the silent direction.
-        if (c == '%') { ++i; continue; }
+        // The escape. Consumed WHOLE — nothing inside it is re-read.
+        // ⚠ THIS ADVANCE HAD AN OFF-BY-ONE AND IT WAS NOT COSMETIC: advancing
+        // past the pair skipped the byte AFTER it, so `%%%0` lost its
+        // placeholder — a literal percent followed by operand 0 read as a
+        // literal percent followed by nothing. That is a MISSED refusal, i.e.
+        // the silent direction. Advancing by the lexeme's own length is what
+        // makes the bug unwritable rather than fixed.
+        if (atEscape) { i = formStart + L.escape.size(); continue; }
 
-        // `%l<N>` / `%l[name]` — an `asm goto` LABEL reference. GNU 6.47.2.7
-        // numbers the labels AFTER every operand, so the label index space is a
-        // CONTINUATION of the operand one, not a second one starting at zero.
-        if (c == 'l' && i + 1 < text.size()
-            && (isDigit(text[i + 1]) || text[i + 1] == '[')) {
-            ++i;                                        // past the `l`
-            if (text[i] == '[') {
-                ++i;
+        // The label reference. GNU 6.47.2.7 numbers the labels AFTER every
+        // operand, so the label index space is a CONTINUATION of the operand
+        // one, not a second one starting at zero.
+        std::size_t const afterLabel = formStart + L.labelPlaceholder.size();
+        if (atLabel && afterLabel < text.size()
+            && (isDigit(text[afterLabel])
+                || (hasNamed && at_(afterLabel, L.symbolicNameOpen)))) {
+            i = afterLabel;
+            // ⚠ BOTH HALVES OF THE PAIR, OR THE FORM IS NOT SPELLABLE. A
+            // language that declares an opener and no closer cannot write a
+            // symbolic name at all, so recognizing the opener would make every
+            // such reference report "no closing ``" — a refusal quoting a lexeme
+            // nobody declared. It falls through to the generic refusal instead.
+            if (hasNamed && at_(i, L.symbolicNameOpen)) {
+                i += L.symbolicNameOpen.size();
                 auto const name = readBracketName(i);
                 if (!name) {
                     report(DiagnosticCode::S_InlineAsmTemplateUnparsable, at,
-                           "the inline-asm template has an unterminated `%l[` "
-                           "label reference at byte offset "
-                           + std::to_string(formStart) + " — no closing `]`");
+                           "the inline-asm template has an unterminated "
+                           + quote(L.labelPlaceholder + L.symbolicNameOpen)
+                           + " label reference at byte offset "
+                           + std::to_string(formStart) + " — no closing "
+                           + quote(L.symbolicNameClose));
                     continue;
                 }
                 bool found = false;
                 for (auto const& l : f.labels) found = found || (l.name == *name);
                 if (!found) {
                     report(DiagnosticCode::S_InlineAsmPlaceholderOutOfRange, at,
-                           "the inline-asm template references label `%l[" + *name
-                           + "]` at byte offset " + std::to_string(formStart)
+                           "the inline-asm template references label "
+                           + quote(L.namedLabelRef(*name))
+                           + " at byte offset " + std::to_string(formStart)
                            + ", which is not among the " + std::to_string(labelCount)
                            + " label(s) this `asm goto` declares");
                 }
                 continue;
             }
-            std::size_t const idx = readIndex(i);
-            if (idx < operandCount || idx >= operandCount + labelCount) {
-                report(DiagnosticCode::S_InlineAsmPlaceholderOutOfRange, at,
-                       "the inline-asm template references label `%l"
-                       + std::to_string(idx) + "` at byte offset "
-                       + std::to_string(formStart)
-                       + ", which is out of range: GNU 6.47.2.7 numbers `asm goto` "
-                         "labels AFTER the operands, so with " + std::to_string(operandCount)
-                       + " operand(s) and " + std::to_string(labelCount)
-                       + " label(s) the valid label indices are "
-                       + (labelCount == 0
-                              ? std::string{"(none — this statement declares no labels)"}
-                              : std::to_string(operandCount) + ".."
-                                    + std::to_string(operandCount + labelCount - 1)));
-            }
+            // ── the POSITIONAL form `%l<N>` — REFUSED, and the refusal is what
+            //    makes the two tiers agree
+            //    (D-CSUBSET-INLINE-ASM-POSITIONAL-LABEL-REF-ACCEPTED-WITH-NO-GRAMMAR)
+            //
+            // ★★★ THIS BRANCH USED TO RANGE-CHECK THE INDEX AND PASS A VALID ONE
+            // SILENTLY, AND THAT SILENCE WAS THE DEFECT. ✔MEASURED 2026-08-17 on
+            // this tree: `asm.lang.json` declares ONE label-reference shape —
+            // `asmTemplateLabelRef` = `templateLabelPlaceholder`
+            // `asmTemplateSymbolicName`, i.e. the BRACKETED `%l[name]` — and no
+            // shape at all for the positional spelling. So a `%l0` that cleared
+            // this gate was a construct ACCEPTED by one half of the compiler and
+            // unrepresentable in the other: `%l0` lexes as `PlaceholderLabelSigil`
+            // + `IntLiteral` and matches no production. A checker that validates
+            // the INDEX of a form the grammar cannot parse is checking the wrong
+            // property, and the passing answer is the dangerous one.
+            //
+            // ★★ WHY REFUSE HERE RATHER THAN DECLARE THE SHAPE. Both are
+            // legitimate directions and this one is chosen on a MEASUREMENT, not
+            // on cost: the lowering half does not exist for EITHER spelling.
+            // `AsmOperandBinding` is `{spelling, reg, regClass, widthBits}` — it
+            // carries a `LirReg` and NO block — so nothing can bind a label, and
+            // the bracketed form the grammar DOES declare is itself refused
+            // downstream for exactly that reason. Declaring the positional shape
+            // today would move the wall, not remove it, and would add a second
+            // spelling to a feature that lowers neither. When the label-binding
+            // carrier lands, the shape and this refusal are retired TOGETHER.
+            //
+            // ⚠ IT IS NOT A CLAIM THAT gcc REJECTS THIS. gcc accepts `%l<N>` and
+            // numbers labels AFTER the operands (GNU 6.47.2.7). Under
+            // [[feedback_reference_compilers_are_the_spec]] that makes this a
+            // NAMED GAP, and the message says so — it must never read as "your
+            // program is wrong". What it must not do is stay silent, because the
+            // alternative refusal arrives at the dialect parser and blames the
+            // assembly text for a shape the C tier already had the facts to name.
+            //
+            // ★ THE INDEX IS STILL DECODED AND STILL REPORTED. The range facts
+            // are the actionable half — they are what lets the author rewrite the
+            // reference in the spelling that IS declared — so they are folded
+            // into this one diagnostic rather than dropped or emitted as a second
+            // one. ONE construct, ONE refusal.
+            std::size_t const idx    = readIndex(i);
+            bool const inRange       = idx >= operandCount
+                                       && idx < operandCount + labelCount;
+            std::string const declared =
+                !hasNamed
+                    ? std::string{"a spelling this language declares"}
+                : inRange
+                    ? quote(L.namedLabelRef(f.labels[idx - operandCount].name))
+                    : ("the bracketed form " + quote(L.namedLabelRef("name")));
+            report(DiagnosticCode::S_InlineAsmOperandModifierUnsupported, at,
+                   "the inline-asm template references an `asm goto` label by "
+                   "POSITION — " + quote(L.labelRef(std::to_string(idx)))
+                   + " at byte offset " + std::to_string(formStart)
+                   + " — and this build declares no grammar for that spelling. "
+                     "gcc accepts it (GNU 6.47.2.7 numbers `asm goto` labels "
+                     "AFTER the operands, so with " + std::to_string(operandCount)
+                   + " operand(s) and " + std::to_string(labelCount)
+                   + " label(s) the positional label indices would be "
+                   + (labelCount == 0
+                          ? std::string{"(none — this statement declares no "
+                                        "labels)"}
+                          : std::to_string(operandCount) + ".."
+                                + std::to_string(operandCount + labelCount - 1))
+                   + "); the assembly grammar declares only the BRACKETED "
+                     "spelling, so write " + declared
+                   + " instead. Refused here rather than at the dialect parser "
+                     "because the label list is a fact of THIS statement: "
+                     "refusing later would blame the assembly text for a form "
+                     "the C tier already knows the name of "
+                     "(D-CSUBSET-INLINE-ASM-POSITIONAL-LABEL-REF-ACCEPTED-WITH-"
+                     "NO-GRAMMAR)");
             continue;
         }
 
-        // `%<N>` — an operand by index.
+        // `<placeholder><N>` — an operand by index.
         if (isDigit(c)) {
+            i = afterSigil;
             std::size_t const idx = readIndex(i);
             if (idx >= operandCount) {
                 report(DiagnosticCode::S_InlineAsmPlaceholderOutOfRange, at,
-                       "the inline-asm template references operand `%"
-                       + std::to_string(idx) + "` at byte offset "
+                       "the inline-asm template references operand "
+                       + quote(L.operandRef(std::to_string(idx)))
+                       + " at byte offset "
                        + std::to_string(formStart) + ", but this statement declares "
                        + std::to_string(operandCount) + " operand(s)"
                        + (operandCount == 0
                               ? std::string{}
-                              : " (valid: %0..%" + std::to_string(operandCount - 1) + ")")
+                              : " (valid: " + L.operandRef("0") + ".."
+                                    + L.operandRef(
+                                          std::to_string(operandCount - 1)) + ")")
                        + ". The index space is the OUTPUTS-THEN-INPUTS "
-                         "concatenation (GNU 6.47.2.3), so `%0` is the first "
+                         "concatenation (GNU 6.47.2.3), so " + quote(L.operandRef("0"))
+                       + " is the first "
                          "OUTPUT when one exists and the first INPUT when it does "
                          "not — an off-by-one here is usually a section edited "
                          "without renumbering");
@@ -9710,15 +9862,19 @@ inline void scanInlineAsmTemplate(InlineAsmFacts const& f, std::string_view text
             continue;
         }
 
-        // `%[name]` — an operand by its symbolic name.
-        if (c == '[') {
-            ++i;
+        // `<placeholder><open>name<close>` — an operand by its symbolic name.
+        // Both halves of the pair, or the form is not spellable (see the label
+        // branch above for why recognizing a lone opener is worse than not).
+        if (hasNamed && at_(afterSigil, L.symbolicNameOpen)) {
+            i = afterSigil + L.symbolicNameOpen.size();
             auto const name = readBracketName(i);
             if (!name) {
                 report(DiagnosticCode::S_InlineAsmTemplateUnparsable, at,
-                       "the inline-asm template has an unterminated `%[` operand "
-                       "reference at byte offset " + std::to_string(formStart)
-                       + " — no closing `]`");
+                       "the inline-asm template has an unterminated "
+                       + quote(L.placeholder + L.symbolicNameOpen)
+                       + " operand reference at byte offset "
+                       + std::to_string(formStart)
+                       + " — no closing " + quote(L.symbolicNameClose));
                 continue;
             }
             bool found = false;
@@ -9727,10 +9883,14 @@ inline void scanInlineAsmTemplate(InlineAsmFacts const& f, std::string_view text
             }
             if (!found) {
                 report(DiagnosticCode::S_InlineAsmPlaceholderOutOfRange, at,
-                       "the inline-asm template references operand `%[" + *name
-                       + "]` at byte offset " + std::to_string(formStart)
+                       "the inline-asm template references operand "
+                       + quote(L.namedOperandRef(*name))
+                       + " at byte offset " + std::to_string(formStart)
                        + ", but no operand of this statement carries that symbolic "
-                         "name (GNU 6.47.2.3 `[name] \"constraint\" (expr)`)");
+                         "name (GNU 6.47.2.3 "
+                       + quote(L.symbolicNameOpen + "name" + L.symbolicNameClose
+                               + " \"constraint\" (expr)")
+                       + ")");
             }
             continue;
         }
@@ -9747,36 +9907,46 @@ inline void scanInlineAsmTemplate(InlineAsmFacts const& f, std::string_view text
         // 32-bit operation 64-bit: the standalone arm64 dialect shipped exactly
         // that miscompile once (`mov w0, w1` encoded 64-bit) and it was found by
         // EXECUTION, not by review.
-        if (isAlpha(c) && i + 1 < text.size()
-            && (isDigit(text[i + 1]) || text[i + 1] == '[')) {
+        if (isAlpha(c) && afterSigil + 1 < text.size()
+            && (isDigit(text[afterSigil + 1])
+                || at_(afterSigil + 1, L.symbolicNameOpen))) {
             report(DiagnosticCode::S_InlineAsmOperandModifierUnsupported, at,
-                   std::string{"the inline-asm template uses the operand modifier "
-                               "`%"} + c + "` at byte offset "
+                   "the inline-asm template uses the operand modifier "
+                   + quote(L.placeholder + std::string{c}) + " at byte offset "
                    + std::to_string(formStart)
                    + " — a modifier asks for a narrower VIEW of the register the "
                      "operand was bound to, and no shipped target declares its "
                      "width-view vocabulary. Refusing: falling back to the full "
                      "register would run the operation at the WRONG WIDTH with a "
                      "clean build log (D-CSUBSET-INLINE-ASM-OPERANDS)");
-            i += 2;
+            i = afterSigil + 1;
             continue;
         }
 
-        // Every other `%` form in an EXTENDED template. gcc says "operand number
-        // missing after %-letter" and clang "invalid % escape" — so refusing
-        // matches the reference rather than being stricter than it. `%=` (GNU's
-        // per-instance unique number) lands here too: it is a real GNU feature
-        // this build does not expand, and emitting it verbatim would hand the
-        // assembler a `%=` it reads as a register spelling.
+        // Every other placeholder form in an EXTENDED template. gcc says
+        // "operand number missing after %-letter" and clang "invalid % escape" —
+        // so refusing matches the reference rather than being stricter than it.
+        // GNU's per-instance unique number (`%=`) lands here too: it is a real
+        // GNU feature this build does not expand, and emitting it verbatim would
+        // hand the assembler a form it reads as a register spelling.
         report(DiagnosticCode::S_InlineAsmOperandModifierUnsupported, at,
-               std::string{"the inline-asm template contains `%"} + c
-               + "` at byte offset " + std::to_string(formStart)
+               "the inline-asm template contains "
+               + quote(L.placeholder + std::string{c})
+               + " at byte offset " + std::to_string(formStart)
                + ", which is not an operand reference this build can expand. In "
-                 "an EXTENDED template (any `:` makes it extended) `%` introduces "
-                 "an operand — `%0`, `%[name]`, `%l0` for an `asm goto` label — "
-                 "and `%%` is the literal percent. gcc and clang reject an "
-                 "unrecognised `%`-form here too");
-        i = formStart + 2;
+                 "an EXTENDED template (any `:` makes it extended) "
+               + quote(L.placeholder) + " introduces an operand — "
+               + quote(L.operandRef("0"))
+               + (hasNamed ? ", " + quote(L.namedOperandRef("name"))
+                           : std::string{})
+               + (L.labelPlaceholder.empty()
+                      ? std::string{}
+                      : ", " + quote(L.labelRef("0"))
+                            + " for an `asm goto` label")
+               + clause(L.escape, " — and ", " is the literal percent")
+               + ". gcc and clang reject an unrecognised placeholder form here "
+                 "too");
+        i = afterSigil + 1;
     }
 }
 
@@ -11162,9 +11332,15 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                        "the asm overwrites (D-CSUBSET-INLINE-ASM-OPERANDS)");
             }
 
-            // ── (6) THE TEMPLATE'S `%` FORMS ──
+            // ── (6) THE TEMPLATE'S PLACEHOLDER FORMS ──
+            // ⚠ THE SIGILS COME FROM CONFIG, NEVER FROM C++ LITERALS, for the
+            // same reason `memoryClobber` does one section up — and the reason
+            // it is `cfg` rather than the dialect is that this tier HAS a
+            // language config by construction and legitimately has no target
+            // (D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER).
             if (f.templateText.has_value()) {
-                scanInlineAsmTemplate(f, *f.templateText, report);
+                scanInlineAsmTemplate(f, cfg.inlineAsmTemplateLexemes,
+                                      *f.templateText, report);
             }
         }
 
@@ -14052,6 +14228,39 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 for (auto const& [ovFmt, ovImage] : sym.library)
                     effectiveLibrary.insert_or_assign(ovFmt, ovImage);
 
+                // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the SIBLING axis,
+                // merged by the IDENTICAL rule one line above — the descriptor's
+                // per-format `realization` map with the symbol's own merged over
+                // it. `library` answers WHICH IMAGE; this answers WHETHER THIS ROW
+                // IS AN IMPORT AT ALL.
+                //
+                // ★★★ A ROW REALIZED FROM SHIPPED SOURCE MUST NOT BECOME AN
+                // IMPORT. Windows exports `opendir` from no image — not ucrtbase,
+                // not kernel32 — so an `ExternImport{opendir, <anything>}` is a
+                // binary the loader rejects at PROCESS START with 0xC0000139 and
+                // no diagnostic at any compile stage (the eager-import law,
+                // D-FFI-DESCRIPTOR-EAGER-IMPORT). The DECLARATION is still
+                // injected, so calls type-check and lower exactly as they do for
+                // a sibling CU's definition; the driver adds the shipped source
+                // file to the build graph and the LINKER resolves the reference
+                // against the body it compiles. That is the same path a plain
+                // two-file `cc a.c b.c` already takes — no new binding rule.
+                //
+                // AGNOSTIC: a map lookup keyed by the active format's declared
+                // NAME. There is no `if (format == "pe")` here or anywhere on
+                // this path — the decision is DATA the platform declared.
+                std::string shippedSourceForFormat;
+                if (s.activeFormat.has_value()) {
+                    std::unordered_map<std::string, std::string> effectiveRealization =
+                        desc->realization;
+                    for (auto const& [ovFmt, ovSrc] : sym.realization)
+                        effectiveRealization.insert_or_assign(ovFmt, ovSrc);
+                    auto const it = effectiveRealization.find(
+                        std::string{objectFormatKindName(*s.activeFormat)});
+                    if (it != effectiveRealization.end())
+                        shippedSourceForFormat = it->second;
+                }
+
                 // GOAL-2: a user decl of this name wins — skip the descriptor's.
                 if (userDeclaredNames.contains(sym.name)) {
                     // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): record the
@@ -14097,7 +14306,22 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                                     // re-import Darwin-x86_64's
                                                     // LEGACY 32-bit-inode
                                                     // `_fstat`, silently.
-                                                    sym.linkName});
+                                                    sym.linkName,
+                                                    // D-RUNTIME-DSS-SHIPS-NO-
+                                                    // IMPLEMENTATION-HALF: and so
+                                                    // does the SHIPPED-SOURCE
+                                                    // realization. A user bare
+                                                    // prototype of `opendir` over
+                                                    // `#include <dirent.h>` — the
+                                                    // feature-test pattern real
+                                                    // code writes — must NOT
+                                                    // re-export the name as a raw
+                                                    // import: no pe image exports
+                                                    // it, so the binary would fail
+                                                    // to LOAD. Exactly the shape
+                                                    // TF-C112 found for the UCRT
+                                                    // printf shims, one axis over.
+                                                    shippedSourceForFormat});
                     }
                     continue;
                 }
@@ -14170,6 +14394,38 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 rec.linkName = sym.linkName;
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, sym.name, id);
+
+                // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: a row whose body is
+                // SHIPPED SOURCE is declared exactly as any other shipped extern
+                // — the SymbolId was minted and injected above, so the name
+                // resolves and every call type-checks — but it reaches the link
+                // tier UNBOUND and NON-EAGER instead of as an import.
+                //
+                // ★★ DROPPING THE ROW ENTIRELY WAS THE OBVIOUS SHORTCUT AND IT IS
+                // WRONG — MEASURED. With no `ShippedExternSymbol` the CST⇒HIR
+                // lowerer emits no extern node, HIR⇒MIR never seeds
+                // `functionSymbols`, and the very first call fails loud at the Ref
+                // lowering: "H0009 HIR Ref to unbound symbol". The row must EXIST
+                // and merely name no library — which is precisely the shape a user
+                // bare prototype over a two-file build already produces, and
+                // precisely what C23 5.1.1.2 phase 8 describes.
+                //
+                // ★ SO THE LIBRARY MAP IS DROPPED, NOT THE ROW. `effectiveLibrary`
+                // is deliberately NOT forwarded: an image name here would be a
+                // second owner of a body this program is compiling, and on pe there
+                // is no image that exports it at all.
+                if (!shippedSourceForFormat.empty()) {
+                    shippedExterns.push_back(ShippedExternSymbol{
+                        id, sym.name, sym.signature,
+                        /*library=*/{},
+                        sym.kind == ffi::ShippedSymbolKind::Function,
+                        /*recipeId=*/std::string{},
+                        sym.version,
+                        sym.linkName,
+                        /*eagerImport=*/false,
+                        shippedSourceForFormat});
+                    continue;
+                }
 
                 shippedExterns.push_back(ShippedExternSymbol{
                     id, sym.name, sym.signature, std::move(effectiveLibrary),
@@ -14987,6 +15243,23 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     if (!shippedTagAdoptions.empty()) {
         TypeInterner const& in = s.lattice.interner();
         for (auto const& ad : shippedTagAdoptions) {
+            // D-FFI-OPAQUE-TAG-HAS-NO-SPELLING: an INCOMPLETE shipped tag makes NO
+            // LAYOUT CLAIM, so there is nothing for the translation unit's definition
+            // to disagree with — completing an incomplete tag is ordinary C (a TU that
+            // defines `struct DIR { … }` after an opaque `<dirent.h>` declared it
+            // compiles on every reference compiler), and refusing it made DSS stricter
+            // than all of them. The descriptor cannot be harmed by adopting: an
+            // incomplete type has no members for a shipped signature to reference, and
+            // pointer-to-incomplete and pointer-to-complete of the same tag are the
+            // SAME TYPE in C, which is the whole reason an opaque handle works.
+            // ⚠ NARROWING, NOT DELETING: this arm requires the SHIPPED side to be
+            // incomplete. Two COMPLETE declarations that disagree still fall through to
+            // the layout comparison below and are still refused — that refusal is the
+            // property this mechanism exists for, and a test pins it.
+            if (in.isIncompleteComposite(ad.shipped)) {
+                for (SymbolId fid : ad.surfaces) s.symbols.at(fid).type = ad.user;
+                continue;
+            }
             // `aggregateLayout` is necessarily present — nothing is ever recorded
             // without it (the injection gate above).
             auto const shippedLay =

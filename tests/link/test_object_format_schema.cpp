@@ -14,6 +14,9 @@
 //   * `relocationByKind` / `relocationByName` lookups round-trip and
 //     return nullptr on miss.
 
+// The repo's SHA-256 — the independent oracle the retained `contentDigest()`
+// is pinned against (the tests hex-render it themselves; see `hexOracle`).
+#include "core/crypto/sha256.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "link/object_format_backend.hpp"
 #include "link/object_format_schema.hpp"
@@ -21,9 +24,12 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -2366,8 +2372,8 @@ macroRowsOf(ObjectFormatSchema const& s) {
 TEST(FormatPredefinedMacros, KeyIsPARSEDNotMerelyAccepted) {
     auto r = ObjectFormatSchema::loadFromText(withRootKey(
         R"("predefinedMacros":[
-             {"name":"__PROBE_A__","kind":"constant","value":"1"},
-             {"name":"__PROBE_B__","kind":"constant","value":"7"}])"));
+             {"name":"__PROBE_A__","kind":"constant","value":"1","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
+             {"name":"__PROBE_B__","kind":"constant","value":"7","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(macroRowsOf(**r),
               (std::vector<std::pair<std::string, std::string>>{
@@ -2408,14 +2414,14 @@ TEST(FormatPredefinedMacros, MisspelledKeyRejectedAndNamed) {
 // reject) because a copy-pasted parser is exactly what would drift.
 TEST(FormatPredefinedMacros, SharedEntryGrammarIsInherited) {
     auto missingValue = ObjectFormatSchema::loadFromText(withRootKey(
-        R"("predefinedMacros":[{"name":"__X__","kind":"constant"}])"));
+        R"("predefinedMacros":[{"name":"__X__","kind":"constant","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
     EXPECT_FALSE(missingValue.has_value())
         << "a 'constant' entry without `value` must be rejected, exactly as on "
            "the language and target sides";
 
     auto duplicate = ObjectFormatSchema::loadFromText(withRootKey(
-        R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1"},
-                               {"name":"__X__","kind":"constant","value":"2"}])"));
+        R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
+                               {"name":"__X__","kind":"constant","value":"2","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
     EXPECT_FALSE(duplicate.has_value())
         << "a duplicate name WITHIN one array must be rejected — the effective "
            "value would otherwise depend on which seed site iterated last";
@@ -2445,7 +2451,7 @@ TEST(FormatPredefinedMacros, SharedEntryGrammarIsInherited) {
 TEST(FormatPredefinedMacros, EntryUnknownKeyRejectedAndNamed) {
     auto typo = ObjectFormatSchema::loadFromText(withRootKey(
         R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                "availabelObjectFormats":["elf"]}])"));
+                                "availabelObjectFormats":["elf"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
     ASSERT_FALSE(typo.has_value())
         << "a misspelled entry key must be REFUSED — silently ignoring this "
            "one makes a format-gated macro leak onto every format";
@@ -2460,7 +2466,7 @@ TEST(FormatPredefinedMacros, EntryUnknownKeyRejectedAndNamed) {
     // actually fires.
     auto prose = ObjectFormatSchema::loadFromText(withRootKey(
         R"("predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                "$valueComment":"why this spelling"}])"));
+                                "$valueComment":"why this spelling","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}])"));
     EXPECT_TRUE(prose.has_value())
         << "`$`-prefixed keys are prose, not knobs — and the carve-out must be "
            "the PREFIX predicate, not a literal `$comment` compare";
@@ -2668,4 +2674,136 @@ TEST(ObjectFormatSchemaLoader, EveryShippedFormatDeclaresHeaderNameMatching) {
     // added or dropped without a decision shows up here rather than vacuously.
     EXPECT_EQ(insensitive, 12u);
     EXPECT_EQ(sensitive, 12u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `contentDigest()` — the retained content digest
+// ─────────────────────────────────────────────────────────────────────────
+//
+// `ObjectFormatSchema::loadFromText` retains the lowercase 64-hex SHA-256 of
+// the EXACT document bytes it was handed, computed at the one chokepoint where
+// those bytes are already in memory. It exists so the runtime-object cache can
+// key on the config a build actually LOADED without re-walking
+// `src/dss-config/` from disk — ~165 ms per invocation, MEASURED 2026-08-17
+// (86 files, 2,078,133 bytes; I/O-dominated: walk+read 152-160 ms, hash only
+// 9-13 ms), which would be paid on every build.
+//
+// ★★ THE ONE-BYTE ARM IS BUILT AT EQUAL LENGTH, AND THAT IS THE POINT OF IT.
+// A "digest" that had quietly become a size or length stamp would sail through
+// a mutation test whose two inputs differ in SIZE — and the mutation this cache
+// has to tell apart is exactly the equal-length kind (MEASURED: a real
+// descriptor mutation was 9149 bytes before AND after). So the fixture ASSERTS
+// equal length and EXACTLY ONE differing byte rather than merely being
+// constructed that way, and it perturbs a byte of STRUCTURAL JSON WHITESPACE so
+// the two documents PARSE IDENTICALLY — the digest cannot then be coming from
+// anything the parser produced.
+
+namespace {
+
+// Lowercase-hex render, written here rather than reached for from
+// `dss::crypto::toHexLower`: an oracle that shares code with the subject
+// cannot witness the subject.
+[[nodiscard]] std::string hexOracle(std::array<std::uint8_t, 32> const& digest) {
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (std::uint8_t const byte : digest) {
+        out.push_back(kHexDigits[byte >> 4]);
+        out.push_back(kHexDigits[byte & 0x0fu]);
+    }
+    return out;
+}
+
+// SHA-256 over `text`'s exact bytes — the INDEPENDENT expectation the retained
+// digest is pinned against, computed here and never read back off the schema.
+[[nodiscard]] std::string digestOracle(std::string_view text) {
+    return hexOracle(dss::crypto::sha256(std::span<std::uint8_t const>{
+        reinterpret_cast<std::uint8_t const*>(text.data()), text.size()}));
+}
+
+// Number of positions at which two strings differ; `npos` if their lengths do
+// (so a length change can never be mistaken for a one-byte change).
+[[nodiscard]] std::size_t differingBytes(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return std::string_view::npos;
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i] != b[i]) ++n;
+    }
+    return n;
+}
+
+// `text` with its first LF turned into a space: same length, one byte
+// different, and provably the same document to the parser — JSON forbids a raw
+// newline inside a string, so every LF in a valid document is structural
+// whitespace and a space is its equal in every position it can occupy.
+[[nodiscard]] std::string withOneWhitespaceByteChanged(std::string_view text) {
+    std::string out{text};
+    auto const pos = out.find('\n');
+    EXPECT_NE(pos, std::string::npos)
+        << "the fixture carries no LF to perturb — reach for another "
+           "same-length mutation rather than dropping this arm";
+    if (pos != std::string::npos) out[pos] = ' ';
+    return out;
+}
+
+} // namespace
+
+TEST(ObjectFormatSchemaContentDigest, IsSixtyFourLowercaseHexDigits) {
+    auto r = ObjectFormatSchema::loadFromText(kElfMinimal);
+    ASSERT_TRUE(r.has_value()) << rejectSummary(r);
+    auto const digest = (*r)->contentDigest();
+    EXPECT_EQ(digest.size(), 64u);
+    EXPECT_EQ(digest.find_first_not_of("0123456789abcdef"),
+              std::string_view::npos)
+        << "not lowercase hex: " << digest;
+}
+
+TEST(ObjectFormatSchemaContentDigest, SameTextTwiceYieldsTheSameDigest) {
+    auto a = ObjectFormatSchema::loadFromText(kElfMinimal);
+    auto b = ObjectFormatSchema::loadFromText(kElfMinimal);
+    ASSERT_TRUE(a.has_value()) << rejectSummary(a);
+    ASSERT_TRUE(b.has_value()) << rejectSummary(b);
+    ASSERT_NE(a->get(), b->get())
+        << "the two loads returned the SAME object, so an equal digest would "
+           "be a tautology rather than a determinism claim";
+    EXPECT_EQ((*a)->contentDigest(), (*b)->contentDigest());
+}
+
+TEST(ObjectFormatSchemaContentDigest, OneByteAtEqualLengthChangesTheDigest) {
+    std::string const original{kElfMinimal};
+    std::string const perturbed = withOneWhitespaceByteChanged(original);
+
+    ASSERT_EQ(original.size(), perturbed.size())
+        << "the two inputs must be the SAME LENGTH, or a size stamp would "
+           "pass this test";
+    ASSERT_EQ(differingBytes(original, perturbed), 1u);
+
+    auto a = ObjectFormatSchema::loadFromText(original);
+    auto b = ObjectFormatSchema::loadFromText(perturbed);
+    ASSERT_TRUE(a.has_value()) << rejectSummary(a);
+    ASSERT_TRUE(b.has_value()) << rejectSummary(b);
+
+    // Parse-identical — the perturbed byte was JSON whitespace …
+    EXPECT_EQ((*a)->name(), (*b)->name());
+    EXPECT_EQ((*a)->version(), (*b)->version());
+    EXPECT_EQ((*a)->relocationCount(), (*b)->relocationCount());
+    // … and still byte-distinguishable, which is the whole contract.
+    EXPECT_NE((*a)->contentDigest(), (*b)->contentDigest());
+}
+
+TEST(ObjectFormatSchemaContentDigest, EqualsAnIndependentSha256OfTheLoadedBytes) {
+    auto r = ObjectFormatSchema::loadFromText(kElfMinimal);
+    ASSERT_TRUE(r.has_value()) << rejectSummary(r);
+    EXPECT_EQ((*r)->contentDigest(), digestOracle(kElfMinimal));
+}
+
+// ⚠ EMPTY MEANS UNKNOWN, NEVER WRONG. The public `ObjectFormatData` ctor is the
+// documented bypass (the hand-built fixtures above use it), and it has no
+// document bytes to digest. An empty digest is a DETECTABLE unknown a cache can
+// refuse to key on; a fabricated or inherited one is a silent wrong key.
+TEST(ObjectFormatSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItEmpty) {
+    ObjectFormatSchema const schema{dss::detail::ObjectFormatData{}};
+    EXPECT_TRUE(schema.contentDigest().empty())
+        << "a schema with no document bytes reported a digest: "
+        << schema.contentDigest();
 }

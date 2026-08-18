@@ -1365,6 +1365,48 @@ if ($LegFilterRaw.Count) {
   $Legs        = @($AllLegs | Where-Object { $LegFilterRaw -contains $_.label })
   $FilteredOut = @($AllLegs | Where-Object { $LegFilterRaw -notcontains $_.label } | ForEach-Object { $_.label })
 }
+# >>> dss:run-fidelity-select >>>
+# DSS_RUN_FIDELITY: restrict this run to legs whose artefact executes at a given
+# FIDELITY. [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+#
+# ★ WHY THIS IS NOT DSS_LEGS WITH EXTRA STEPS. `DSS_LEGS=elf64-arm64` names a LEG;
+# the operator then has to know, per host, whether that leg reaches real hardware
+# here — the host-keyed reasoning this harness exists to remove from operators'
+# heads. `DSS_RUN_FIDELITY=native,foreign-kernel` names the EVIDENCE wanted and
+# lets the resolver work out which legs supply it on THIS box, so one command means
+# the same thing on the Mac, the arm64 VPS and this desktop.
+#
+# ★★ IT SELECTS THE RUN, NEVER THE BUILD, and a deselected leg is still LEDGERED —
+# `not-selected-by-runner`, the same class DSS_LEGS uses, with a detail naming the
+# fidelity it actually has here. Silence about a declared leg is a harness bug.
+#
+# ⚠ VALIDATED AT THE DOOR against the resolver's own vocabulary, never against a
+# list re-typed in this driver: a typo would otherwise select zero legs, which
+# reads exactly like a host that can execute nothing.
+$FidelityFilter = if ($env:DSS_RUN_FIDELITY) { @($env:DSS_RUN_FIDELITY -split '[,\s]+' | Where-Object { $_ }) } else { @() }
+$FidelityDropped = @()
+if ($FidelityFilter.Count) {
+  # ⚠ THE DIRECT FORM, NOT Invoke-LegResolver: that helper is defined ~1,400
+  # lines BELOW this point and PowerShell binds functions as the script executes,
+  # so calling it here would fail at runtime on the one path an operator reaches
+  # by typing a filter. Everything else in Step 1 uses this same direct spelling.
+  $fidOut = @(& $python3.Source $LegsPy '--run-fidelities' 2>&1)
+  if ($LASTEXITCODE -ne 0) { Die "could not read the run-fidelity vocabulary from harness_legs.py: $($fidOut -join ' ')" }
+  $fidKnown = @($fidOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+  $fidBad = @($FidelityFilter | Where-Object { $fidKnown -notcontains $_ })
+  if ($fidBad.Count) {
+    Die "DSS_RUN_FIDELITY names $($fidBad.Count) value(s) this harness does not declare: $($fidBad -join ' ')`n      Known: $($fidKnown -join ' ')`n      A value nothing matches would silently select ZERO legs, which reads exactly like a host that can execute nothing."
+  }
+  $keep = @($Legs | Where-Object { "$($_.run.fidelity)" -and $FidelityFilter -contains "$($_.run.fidelity)" })
+  $FidelityDropped = @($Legs | Where-Object { -not ("$($_.run.fidelity)" -and $FidelityFilter -contains "$($_.run.fidelity)") } | ForEach-Object { $_.label })
+  if (-not $keep.Count) {
+    $have = (($Legs | ForEach-Object { "$($_.label)=$(if ("$($_.run.fidelity)") { $_.run.fidelity } else { '<never runs>' })" }) -join ' ')
+    Die "DSS_RUN_FIDELITY='$($env:DSS_RUN_FIDELITY)' selected NO leg on this host.`n      Per-leg fidelity here: $have`n      A run that covers nothing must stop, not report a clean sweep of zero legs."
+  }
+  $Legs = $keep
+  $FilteredOut = @($FilteredOut + $FidelityDropped | Select-Object -Unique)
+}
+# <<< dss:run-fidelity-select <<<
 Info "catalogue declares $($AllLegs.Count) leg(s) — the SAME set on every host:"
 $SelectedLabels = @($Legs | ForEach-Object { $_.label })
 foreach ($lg in $AllLegs) {
@@ -1376,6 +1418,12 @@ foreach ($lg in $AllLegs) {
     'launched' { "run: LAUNCHED via '$($lg.run.launcher -join ' ')'$(if ("$($lg.run.pathTranslation)" -ne 'none') { " [paths -> $($lg.run.pathTranslation)]" })" }
     default    { "run: skip [$($lg.run.verdict)]" }
   }
+  # ★ THE FIDELITY, BESIDE THE MODE — the two are not the same fact, and the whole
+  # reason this field exists is that one `launched` line can mean real aarch64
+  # hardware and another can mean qemu. Printing the mode alone is what made the
+  # distinction unreadable. [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-
+  # RECORDED-NOR-SELECTABLE]
+  if ("$($lg.run.fidelity)") { $runTxt = "$runTxt  fidelity: $($lg.run.fidelity)" }
   Info "  [$sel] $($lg.label.PadRight(15)) $($lg.spec.PadRight(34)) build: ATTEMPTED   $runTxt"
 }
 if ($FilteredOut.Count) {
@@ -2626,10 +2674,18 @@ Assert-StagedSourceCoherence 'staged sqlite (Step 4)'
 Pass "recipe: $nTus TUs, $nDefs defines, $nIncs include dirs (sqlite @ $sqliteHead) staged under $Stage"
 
 # ── Step 5 — locate (or build) the dss-code-prime compiler ───────────────────
-# Picks the NEWEST existing binary (build-rel Release / build MSVC / build-dbg
-# Ninja-Debug) — newest-wins deliberately avoids a STALE Release binary that
-# predates a project-config field (the exact trap that fails loud below). With
-# no binary present (a fresh clone) it configures + builds Release into build-rel.
+# Picks the NEWEST existing binary across every known build root — newest-wins
+# deliberately avoids a STALE Release binary that predates a project-config field
+# (the exact trap that fails loud below). With no binary present (a fresh clone)
+# it configures + builds Release into the release root.
+# ⚠ THE ROOT LIST IS TRANSITION-SAFE AND SPANS BOTH LAYOUTS. The repo is
+# consolidating onto a single `build/` root with per-build subdirectories
+# (D-BUILD-LAYOUT-FLAT-ROOT-BUILD-DIRS-NOT-MIGRATED); listing only the new paths
+# would break every run made before the physical move, and listing only the
+# legacy ones would keep this harness pinned to trees that are being deleted.
+# New paths come FIRST so that once both exist the new layout wins. Existence
+# decides, never a version flag — the list follows the tree instead of having to
+# be kept in sync with it.
 # ★ THE COMPILER IS A HOST BINARY AND HAS NOTHING TO DO WITH THE LEG SET: ONE
 # dss-code-prime emits every one of the five targets, selected from config. That
 # is why there is one Step 5 and not one per leg.
@@ -2662,7 +2718,7 @@ function Find-Dss {
   # machine this compiler RUNS on, and probing for a name that cannot exist here
   # costs nothing.
   $names = @('dss-code-prime.exe', 'dss-code-prime')
-  $roots = @('build-rel', 'build', 'build-dbg')
+  $roots = @('build/rel', 'build/dbg', 'build-rel', 'build', 'build-dbg')
   $script:DssSearchedDirs = @()
   $cands = @()
   foreach ($r in $roots) {
@@ -2696,8 +2752,12 @@ if ($env:DSS_BIN -and (Test-Path $env:DSS_BIN)) {
 } else {
   $DssBin = Find-Dss
   if (-not $DssBin) {
-    Info "no existing binary — configuring + building Release (build-rel)"
-    $bdir = Join-Path $RepoRoot 'build-rel'
+    # A FRESH build always goes to the NEW layout — there is no reason to create
+    # another legacy root. `Find-Dss` above still finds a legacy tree if one
+    # exists, so this only decides where a from-scratch build LANDS.
+    $relDir = if (Test-Path (Join-Path $RepoRoot 'build-rel')) { 'build-rel' } else { 'build/rel' }
+    Info "no existing binary — configuring + building Release ($relDir)"
+    $bdir = Join-Path $RepoRoot $relDir
     if (-not (Test-Path $bdir)) { & cmake -S $RepoRoot -B $bdir -DCMAKE_BUILD_TYPE=Release; if ($LASTEXITCODE -ne 0) { Die "cmake configure failed" } }
     & cmake --build $bdir --config Release --target dss-code-prime -j $Jobs
     if ($LASTEXITCODE -ne 0) { Die "dss-code-prime build failed" }
@@ -3214,7 +3274,18 @@ foreach ($lg in $AllLegs) {
 # a HARNESS-class non-verification — the runner did not select it — which is the
 # meaning `not-selected-by-runner` already carries in the closed vocabulary.
 foreach ($lbl in $FilteredOut) {
-  Set-LegVerdict $lbl 'not-selected-by-runner' "removed from this run by DSS_LEGS='$($env:DSS_LEGS)' — DECLARED coverage that was not exercised"
+  # ★ WHICH FILTER DROPPED IT, by name. Two filters can remove a leg now, and a
+  # detail that blamed DSS_LEGS for a DSS_RUN_FIDELITY drop would send a reader to
+  # correct a variable they never set. The fidelity arm also states the fidelity
+  # the leg ACTUALLY has here, which is the fact that decides what to type next.
+  # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+  if ($FidelityDropped -contains $lbl) {
+    $lgf = @($AllLegs | Where-Object { $_.label -eq $lbl })[0]
+    $had = if ($lgf -and "$($lgf.run.fidelity)") { "$($lgf.run.fidelity)" } else { '<never runs here>' }
+    Set-LegVerdict $lbl 'not-selected-by-runner' "removed from this run by DSS_RUN_FIDELITY='$($env:DSS_RUN_FIDELITY)' — this leg's run fidelity on this host is '$had'. DECLARED coverage that was not exercised"
+  } else {
+    Set-LegVerdict $lbl 'not-selected-by-runner' "removed from this run by DSS_LEGS='$($env:DSS_LEGS)' — DECLARED coverage that was not exercised"
+  }
 }
 
 # ── WHAT EACH LAUNCHER NEEDS BEYOND ITS OWN argv[0] ─────────────────────────
@@ -4145,17 +4216,36 @@ foreach ($leg in $BuildableLegs) {
   # one does and the build failed. Both leave the leg with NO ORACLE, said in
   # those terms at Step 9, and the corpus still runs.
   $LegLedger[$lbl].Oracle = ''; $LegLedger[$lbl].OracleCc = ''; $LegLedger[$lbl].OracleTriple = ''
+  # ★★ THE ORACLE'S *STATUS*, KEPT ON EVERY OUTCOME — the fact the old code threw
+  # away. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] `build-failed` means
+  # THE CONTROL RAN AND AGREED WITH US; `no-reference-compiler` means there is no
+  # control at all. Both used to leave an empty Oracle and print the same "NO
+  # ORACLE" line, so a leg whose reference rejects exactly what dss rejects read as
+  # a leg with a missing control. Taken from the resolver's own JSON, never
+  # re-derived from the rc here or from whether a log file happens to exist.
+  $LegLedger[$lbl].OracleStatus = ''
+  $LegLedger[$lbl].OracleLog = (Join-Path $legOut 'reference-oracle.log')
+  $LegLedger[$lbl].BuildAttribution = ''
   $oracleRun = Invoke-LegResolver @('--build-reference-oracle', $lbl,
                                     '--manifest', $manifest,
                                     '--oracle-dir', $legOut,
-                                    '--oracle-log', (Join-Path $legOut 'reference-oracle.log'))
+                                    '--oracle-log', $LegLedger[$lbl].OracleLog)
+  $orep = $null
+  try { $orep = ($oracleRun.Stdout | Where-Object { $_ -match '^\s*\{' } | Select-Object -Last 1) | ConvertFrom-Json } catch { $orep = $null }
+  if ($orep) { $LegLedger[$lbl].OracleStatus = "$($orep.status)" }
   if ($oracleRun.Rc -eq 0) {
-    $orep = ($oracleRun.Stdout | Select-Object -Last 1) | ConvertFrom-Json
     $LegLedger[$lbl].Oracle       = "$($orep.path)"
     $LegLedger[$lbl].OracleCc     = "$($orep.cc)"
     $LegLedger[$lbl].OracleTriple = "$($orep.triple)"
     Info "[$lbl] same-platform ORACLE built by $($orep.cc) ($($orep.triple)) -> $($orep.path)"
   } else {
+    # ★ AND THE TWO NON-ZERO ARMS ARE NOT ONE EVENT. rc 3 = the control RAN and
+    # could not build the very sources dss is about to be handed, which is the
+    # EVIDENCE the per-TU attribution below consumes. rc 4 = this host owns no
+    # compiler for this leg, which is evidence about nothing.
+    if ($oracleRun.Rc -eq 3) {
+      Info "[$lbl] the same-platform ORACLE also FAILED to build these sources — its diagnostics are the CONTROL for this leg's build ($($LegLedger[$lbl].OracleLog))"
+    }
     # The resolver's own words, never this driver's paraphrase of them.
     foreach ($l in ($oracleRun.Text -split "`n")) { if ($l.Trim()) { Warn "[$lbl] oracle: $l" } }
   }
@@ -4171,8 +4261,42 @@ foreach ($leg in $BuildableLegs) {
   $ctimeSuffix = $build.TimeSuffix
   if (-not $build.Ok) {
     Get-Content $clog | Select-String -Pattern 'error\[' | Select-Object -First 5 | ForEach-Object { Info "      $($_.Line)" }
-    Set-LegVerdict $lbl 'poisoned' "build FAILED$ctimeSuffix — $($build.Error). See $clog"
-    Warn "[$lbl] BUILD FAILED$ctimeSuffix — $($build.Error). See $clog"
+    $why = "$($build.Error)"
+    # >>> dss:build-attribution >>>
+    # ★★★ WHOSE FAILURE IS THIS? Asked ONLY when dss actually emitted diagnostics,
+    # because that is the only arm with anything to compare against the control.
+    # [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] The DECISION is the
+    # resolver's — ONE implementation for both drivers, exactly as the confound
+    # report is — and this block only prints what it returned. A resolver refusal
+    # is NOT an attribution: nothing is excused and the detail stays as it was,
+    # which is the safe direction.
+    if ($build.ErrCount -gt 0) {
+      $attrRun = Invoke-LegResolver @('--attribute-build', $lbl,
+                                      '--compile-log', $clog,
+                                      '--oracle-log', $LegLedger[$lbl].OracleLog,
+                                      '--oracle-status', $LegLedger[$lbl].OracleStatus,
+                                      '--manifest', $manifest)
+      $attr = $null
+      if ($attrRun.Rc -eq 0 -or $attrRun.Rc -eq 3) {
+        try { $attr = ($attrRun.Stdout -join "`n") | ConvertFrom-Json } catch { $attr = $null }
+      }
+      if ($attr) {
+        # EVERY TU IS PRINTED, upstream ones included: an upstream TU that vanished
+        # from the log would be indistinguishable from one that compiled.
+        foreach ($l in $attr.report) { if ("$l".Trim()) { Info "$l" } }
+        $charged = @($attr.chargedToDss)
+        $LegLedger[$lbl].BuildAttribution =
+          "$($charged.Count) of $(@($attr.tus).Count) rejected TU(s) charged to DSS" +
+          $(if ($charged.Count) { ": " + (($charged | ForEach-Object { ($_ -split '/')[-1] }) -join ' ') } else { '' })
+        $why = "$($build.Error) — $($LegLedger[$lbl].BuildAttribution)"
+      } else {
+        foreach ($l in ($attrRun.Text -split "`n")) { if ($l.Trim()) { Warn "[$lbl] attribution: $l" } }
+        Warn "[$lbl] build attribution UNAVAILABLE (rc $($attrRun.Rc)) — every diagnostic stays charged to dss, which is the safe direction"
+      }
+    }
+    # <<< dss:build-attribution <<<
+    Set-LegVerdict $lbl 'poisoned' "build FAILED$ctimeSuffix — $why. See $clog"
+    Warn "[$lbl] BUILD FAILED$ctimeSuffix — $why. See $clog"
     continue
   }
   $fixture = $build.Path
@@ -5744,6 +5868,15 @@ foreach ($lbl in $LegOrder) {
                                '--leg-oracle-cc', "$(if ($lr) { $lr.OracleCc })",
                                '--leg-oracle-triple', "$(if ($lr) { $lr.OracleTriple })")
   foreach ($l in ($orep.Text -split "`n")) { if ($l.Trim()) { Info "oracle   : $l" } }
+  # ★★ AND WHAT THE ORACLE WAS *FOR*, on the same shelf as the oracle line itself.
+  # [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] An attribution that appears
+  # only in the per-leg build chatter thousands of lines up is one nobody reads,
+  # and the summary is the part of this run that is always read. Printed only when
+  # there IS one — a leg that built has nothing to attribute, and a blank line here
+  # would read as a missing answer rather than an absent question.
+  if ($lr -and "$($lr.BuildAttribution)".Trim()) {
+    Info "oracle   : $lbl build attribution: $($lr.BuildAttribution)"
+  }
 }
 # The RUN reference's own absence, on its own line: the per-leg verdicts above
 # already say NO ORACLE where it matters, and this names the log that explains

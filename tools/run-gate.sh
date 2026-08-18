@@ -29,7 +29,7 @@
 #
 # Example:
 #   tools/run-gate.sh /tmp/ctest.log '100% tests passed' \
-#       ctest --test-dir build-dbg --output-on-failure
+#       ctest --test-dir build/dbg --output-on-failure
 set -u
 
 if [ "$#" -lt 3 ]; then

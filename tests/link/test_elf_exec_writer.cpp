@@ -31,6 +31,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -3706,4 +3707,196 @@ TEST(ElfExecWriter, VersionReadFromRealLibraryRoundTripsIntoVerneed) {
     std::uint16_t const vnaOther = readU16LE(bytes, aux + 6);
     EXPECT_GE(vnaOther, 2u);
     EXPECT_EQ(readU16LE(bytes, shOffset(bytes, vsymIdx) + 2), vnaOther);
+}
+
+// ── D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS ──────────────────
+//
+// THE red-on-disable pin: a FINAL IMAGE's `.symtab` must carry each function's
+// DECLARED name, and must keep `sym_<id>` for exactly the symbols that have no
+// declared name.
+//
+// ✔MEASURED, the defect this closes: gdb over a DSS-built ELF exec printed
+//   #0 sym_84 / #1 sym_89 / #2 sym_93
+// where the source says `static_helper` / `global_helper` / `main`, on BOTH
+// x86_64 and aarch64 — beside a CORRECT `.eh_frame`. The name column was the
+// only wrong part of the image: every st_value/st_size/st_info byte, and every
+// instruction, is unchanged by the fix (the same run after it reports the same
+// three addresses, now named).
+//
+// ★ WHY THIS LOOPS OVER BOTH IMAGE ARMS AND NOT JUST BOTH PORTS. The ELF walker
+// has TWO image symtab builders and BOTH hardcoded `sym_<id>`:
+// `encodeElfExecDynamic` (any module carrying an extern — which, because every
+// shipped exec/PIE format spells `processExit` as `by-name-import` for `exit`,
+// is EVERY REAL EXECUTABLE) and the shared static-ET_EXEC arm's `emitFuncSym`
+// (reachable with zero externs). Pinning one arm would have left the other free
+// to rot, and the LIVE one is the dynamic arm — the one a "minimal ET_EXEC"
+// test would never have reached.
+//
+// ★ EVERY CELL RUNS THROUGH A `void` CALLABLE so a failed ASSERT returns from
+// the BODY instead of aborting the whole matrix. A sibling cycle measured
+// exactly this vacuity: a `for (port : {x86, arm})` loop with a bare ASSERT
+// aborted at the x86_64 half and NEVER RAN the aarch64 half, where the mutant
+// failed silently — the safe arm masked the dangerous one.
+namespace {
+
+// Every `.symtab` name in an emitted image, in emission order. Returned as a
+// LIST and asserted by membership so the pin survives a legitimate reordering of
+// the symtab (which is not what it exists to police) while still failing on a
+// changed SPELLING (which is).
+[[nodiscard]] std::vector<std::string>
+imageSymtabNames(std::vector<std::uint8_t> const& bytes) {
+    std::vector<std::string> out;
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    if (symtabIdx < 0 || strtabIdx < 0) return out;
+    std::uint64_t const shoff  = readU64LE(bytes, 40);
+    std::uint64_t const symOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    std::uint64_t const symSz  = readU64LE(bytes, shoff + symtabIdx * 64 + 32);
+    std::uint64_t const strOff = readU64LE(bytes, shoff + strtabIdx * 64 + 24);
+    for (std::uint64_t i = 0; i < symSz / 24; ++i) {
+        out.push_back(
+            readCStr(bytes, strOff + readU32LE(bytes, symOff + i * 24 + 0)));
+    }
+    return out;
+}
+
+struct ImagePortSpec {
+    char const*               label;
+    char const*               targetName;
+    char const*               formatName;
+    std::vector<std::uint8_t> retBytes;    // a lone return
+    std::vector<std::uint8_t> callBytes;   // call-extern + return
+    std::uint32_t             callOffset;  // the reloc patch site
+};
+
+} // namespace
+
+TEST(ElfImageSymbolNames,
+     ImageSymtabNamesEveryDeclaredFunctionOnBothPortsAndBothImageArms) {
+    // x86_64: `call rel32` (operand at +1) + RET.
+    // arm64:  `BL #0` (patch site at +0, 4-byte aligned) + RET.
+    // These byte strings are the ONLY per-port data here; every assertion below
+    // is identical for both, because the naming decision is made in
+    // format-neutral substrate (`ObjectSymbolNames::imageName`) that no target
+    // or format can reach into.
+    std::vector<ImagePortSpec> const ports{
+        {"x86_64", "x86_64", "elf64-x86_64-linux-exec",
+         {0xC3},
+         {0xE8, 0, 0, 0, 0, 0xC3},
+         1},
+        {"arm64", "arm64", "elf64-aarch64-linux-exec",
+         {0xC0, 0x03, 0x5F, 0xD6},
+         {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6},
+         0},
+    };
+
+    // ONE cell = one (port, image arm) pair. `void` on purpose — see above.
+    auto runCell = [](ImagePortSpec const& port, bool dynamicArm) -> void {
+        std::string const label =
+            std::string{port.label} + (dynamicArm ? " [dynamic image arm]"
+                                                  : " [static ET_EXEC arm]");
+        auto target = TargetSchema::loadShipped(port.targetName);
+        ASSERT_TRUE(target.has_value()) << label;
+        auto fmt = ObjectFormatSchema::loadShipped(port.formatName);
+        ASSERT_TRUE(fmt.has_value()) << label;
+
+        AssembledModule mod;
+        mod.expectedFuncCount = 3;
+
+        // fn #7 — a `static` (Local binding) function WITH a declared name. THE
+        // discriminating case: an image wants this name (it is a backtrace
+        // frame), while a relocatable `.o` must NOT expose it (a foreign linker
+        // keys by name, and two TUs' `helper`s would collide — D-LK-INTERNAL-
+        // LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION). Pre-fix: `sym_7`.
+        AssembledFunction f7;
+        f7.symbol = SymbolId{7};
+        f7.bytes  = dynamicArm ? port.callBytes : port.retBytes;
+        if (dynamicArm) {
+            Relocation rel;
+            rel.offset = port.callOffset;
+            rel.target = SymbolId{99};
+            rel.kind   = RelocationKind{1};   // call rel32 / call26
+            f7.relocations.push_back(rel);
+        }
+        mod.functions.push_back(std::move(f7));
+
+        // fn #8 — an externally-visible function with a declared name.
+        AssembledFunction f8;
+        f8.symbol = SymbolId{8};
+        f8.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f8));
+
+        // fn #9 — NO `ModuleSymbol` row at all: the shape of the linker-injected
+        // `_start` trampoline (minted SymbolId, no declared name). This one MUST
+        // keep `sym_9`; the fallback is the deliberate answer for a symbol that
+        // genuinely has no name, not an oversight.
+        AssembledFunction f9;
+        f9.symbol = SymbolId{9};
+        f9.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f9));
+
+        mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "img_static_fn",
+                                           SymbolBinding::Local,
+                                           SymbolVisibility::Default});
+        mod.symbols.push_back(ModuleSymbol{SymbolId{8}, "img_global_fn",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+
+        if (dynamicArm) {
+            mod.externImports.push_back(
+                ExternImport{SymbolId{99}, "printf", "libc.so.6"});
+        }
+
+        DiagnosticReporter rep;
+        auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
+        std::string diags;
+        for (auto const& d : rep.all()) diags += d.actual + "\n";
+        ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
+        ASSERT_FALSE(bytes.empty()) << label << "\n" << diags;
+
+        // The DYNAMIC cell must really reach the dynamic builder and the STATIC
+        // cell must really not — otherwise both cells could be silently
+        // exercising ONE builder and half the matrix would assert nothing about
+        // the arm it claims to cover.
+        EXPECT_EQ(findSectionByName(bytes, ".dynsym") >= 0, dynamicArm)
+            << label
+            << ": this cell did not reach the image arm it names, so its result "
+               "says nothing about that arm";
+
+        auto const names = imageSymtabNames(bytes);
+        ASSERT_FALSE(names.empty()) << label << ": no `.symtab` names read";
+        auto has = [&](std::string_view want) {
+            return std::find(names.begin(), names.end(), want) != names.end();
+        };
+
+        // THE FIX, both directions: the declared names are PRESENT...
+        EXPECT_TRUE(has("img_static_fn"))
+            << label
+            << ": a `static` function must appear under its DECLARED name in a "
+               "final image — this is the frame a debugger prints";
+        EXPECT_TRUE(has("img_global_fn"))
+            << label << ": an externally-visible function must keep its name";
+        // ...and the pre-fix synthetic spellings are GONE. These two are the
+        // red-on-disable discriminators: restore either hardcoded `"sym_" + id`
+        // and they fail, alongside the EXPECT_TRUEs above.
+        EXPECT_FALSE(has("sym_7"))
+            << label
+            << ": `sym_7` is the PRE-FIX spelling of `img_static_fn`; emitting "
+               "it means the image threw the declared name away again";
+        EXPECT_FALSE(has("sym_8"))
+            << label << ": `sym_8` is the PRE-FIX spelling of `img_global_fn`";
+
+        // The deliberate fallback survives, and is asserted rather than assumed:
+        // if this ever fails, a nameless symbol has acquired a name from
+        // somewhere it should not have.
+        EXPECT_TRUE(has("sym_9"))
+            << label
+            << ": a symbol with NO declared name (the injected entry "
+               "trampoline's shape) must keep the `sym_<id>` fallback";
+    };
+
+    for (auto const& port : ports) {
+        runCell(port, /*dynamicArm=*/false);
+        runCell(port, /*dynamicArm=*/true);
+    }
 }

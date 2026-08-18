@@ -125,6 +125,7 @@ know exists.
 | `availableObjectFormats` | no | Per-target AVAILABILITY — which object formats this header EXISTS on (the sibling axis to `library`, which says which IMAGE per format). ABSENT/EMPTY = available on **every** format (C-standard headers omit it); a POSIX-only header carries `["elf","macho"]`, so `#include <sys/time.h>` **fails loud** for a windows-pe target and `__has_include` answers the per-target truth. Same object-format vocabulary as `library` — an unknown name **fails loud** on read. A `symbols` entry may carry its own `availableObjectFormats` to gate one symbol (see `stdio.json`'s `__stdinp` / `_wfopen`). |
 | `includes`  | no       | The transitive sibling headers this header `#include`s in the real world (`inttypes.json` declares `["stdint.h"]`, mirroring C 7.8p1). Including the parent injects each declared sibling's surface too, walking the config-declared graph cycle-safely. Each entry is a header NAME resolved by the same `<stem>.json` convention as a source angle-include (`"sys/uio.h"` → `sys/uio.json`). ABSENT/EMPTY = no transitive edges. **`includes` does NOT count toward "declares something"** — an includes-only descriptor still fails loud. |
 | `symbols`   | no\*     | The exported LINK surface (extern functions/objects). An entry accepts **TWELVE** keys and no more — an unknown one **fails loud** (`symbols[i]`) exactly as at the root. **`name`** (REQUIRED) — the undecorated C identifier; the linker-visible form is produced downstream by FF4 mangling. **`signature`** (REQUIRED) — a hir-text type string: a full `fn(…) -> …` FnSig for a function, or the value type for an object, decoded by the one shared `parseTypeFromText` codec. **`signatureByDataModel`** — a per-DATA-MODEL override map (`"LP64"`/`"LLP64"`/`"ILP32"` → signature string); the ACTIVE model's entry replaces `signature`, and EVERY declared override is parsed on every read, so a form that only Windows selects can never lurk malformed. An unknown model key fails loud. **`kind`** — `"function"` (default) or `"object"`; selects `ExternFunction` vs `ExternGlobal`. **`linkage`** — `"external"` (default) or `"weak"`; validated and carried (the synthesis path currently emits Strong for every shipped import). **`availableObjectFormats`** — per-SYMBOL availability, the symbol-granularity sibling of the header-level key. Load-bearing, not cosmetic: DSS imports EVERY declared shipped extern whether the program references it or not, so a name absent from the active format's runtime image must not be declared there or nothing links. **`noreturn`** — this extern never returns (`abort`, `exit`, `longjmp`, `thrd_exit`). A shipped extern has no user prototype to carry C11 `_Noreturn`, so the descriptor declares it and a direct call lowers to `Block{ call, Unreachable }`. **`returnsTwice`** — C11 7.13.1.1 (`setjmp`, `_setjmp`); rides to MIR as `MirInstFlags::ReturnsTwice`, which is what stops mem2reg promoting a live-across-`setjmp` local and stops the inliner taking the callee. **`synthesize`** — this symbol is NOT an import but a COMPILER-SYNTHESIZED body; the value is a recipe id from a CLOSED vocabulary and MUST equal `name` (the synth pass identifies each recipe by symbol name, so both an unknown id and a mismatch are rejected on read). Live use: `threads.json`'s `<threads.h>` shim (21 pe rows over kernel32, 21 macho rows over pthread/libSystem — the elf rows are ordinary glibc imports) and `stdio.json`'s five pe printf/scanf rows over the UCRT `__stdio_common_v*` cores, which `ucrtbase.dll` does not export as `printf`/`fprintf`/`sprintf`/`sscanf`/`vfprintf` at all. **`version`** — the ELF symbol VERSION this import must bind (`stdlib.json`'s `realpath` → `GLIBC_2.3` on x86_64-elf), so a reference does not misbind to a multi-versioned glibc symbol's OLDEST compat instance. A flat string, or per-target `variants` (`when` + `value`) since the version is genuinely per-target. Empty = unversioned; ELF-only semantics, carried and unused on PE/Mach-O. **`linkName`** — the UNDECORATED name the shipped library actually EXPORTS for this C identifier ON THIS TARGET, when it is not the identifier itself. Same shape as `version` (flat string, or per-target `variants` with `when` + `value`) and read by the same decoder. Live use: Darwin's modern 64-bit-inode ABI is reached through `$INODE64` asm-label aliases on **x86_64** and through the plain names on **arm64**, so `sys/stat.json`'s `stat`/`fstat`/`lstat`, `unistd.json`'s `statfs`/`fstatfs` and `dirent.json`'s `opendir`/`readdir` each carry a `when:{format:"macho",arch:"x86_64"}` arm; every other target matches nothing and keeps the identifier. ★ Write the BASE name only — `"fstat$INODE64"`, never `"_fstat$INODE64"`. Mach-O's leading underscore is a per-FORMAT fact the ENGINE composes (`ffi::linkNameFor` → `applyCMangling`), exactly as `version` composes `realpath` + `GLIBC_2.3` into `realpath@GLIBC_2.3` rather than making you spell it. ★ NOT the same thing as a user's C `__asm("x")` (which is verbatim and BYPASSES mangling); this is the INPUT to mangling, and a user `__asm` outranks it. ★ AUTHORING CHECK, and it REPLACES the older "verify the symbol is exported" rule for this class: an export check does NOT catch a wrong link name, because BOTH `_fstat` and `_fstat$INODE64` exist in libSystem's x86_64 slice. The check that works is **"does a real compiler for THIS target emit THIS name for THIS C identifier"** — compile a one-line TU with the platform toolchain and read the undefined symbol it emits. Getting this wrong does not fail loud: a descriptor SHADOWS the SDK header entirely, so the platform's own asm label never participates, the plain name resolves against the LEGACY implementation, and the program links, loads, and misbinds (MEASURED — it made `fstat` return `st_size == 0` and sqlite call every database "malformed"). **`library`** — a per-symbol OVERRIDE of the descriptor's map, same `{pe,elf,macho}` shape, MERGED over it (symbol keys win; an omitted format inherits). Counts today: `availableObjectFormats` 157 entries, `synthesize` 47, `noreturn` 6, `signatureByDataModel` 6, `returnsTwice` 2, `version` 1, `linkName` 7 — and the per-symbol `library` override is used by **no** descriptor at present. Its last user was `stdio.json`'s `__stdio_common_vsprintf` row, retired when this file's own `pe` default became `ucrtbase.dll`; it is documented because the reader accepts it and the next split-runtime symbol will need it, not because anything depends on it today. |
+| `realization` | no | **The SIBLING AXIS TO `library`, and the answer to a question `library` cannot ask.** `library` says WHICH IMAGE a symbol is imported FROM, per object format. `realization` says whether it is imported **at all** — a per-OBJECT-FORMAT map (`"pe"`/`"elf"`/`"macho"`) whose value is an object `{"source": "<path>"}` naming a file **DSS ships and COMPILES FOR THE TARGET**, config-root-relative (i.e. relative to `src/dss-config/`). ABSENT (every descriptor but `dirent.json` today) ⇒ IMPORT, the default, byte-identical to the pre-ruling image. Same closed object-format key vocabulary as `library`, same `decodeLibraryMap`-shaped chokepoint, and the SAME merge rule — a per-**symbol** `realization` is merged OVER the descriptor's (symbol keys win; a format the symbol omits inherits). That is what makes it an EXTENSION of this axis rather than a second, parallel notion of where a body comes from: "where does this symbol's body come from, on this format" was already this map's established shape. ★ **THE ENGINE NEVER BRANCHES ON FORMAT** — it reads the declared realization and either emits an import or adds the source file to the build graph; there is no `if (format == "pe")` on the path. ★ **THE VALUE IS A PATH, NOT A UNIT NAME**, so the string in the descriptor is the string you can paste into `ls` and it greps in BOTH directions; an earlier draft named a unit and derived the path from a manifest, and both the manifest and the derivation were deleted as extra owners of facts the descriptor and the file tree already hold. **FOUR REFUSALS, all checked format-INDEPENDENTLY so an arm no current target selects cannot rot:** **R1** a realization naming a source that is not there ⇒ LOAD ERROR naming BOTH the descriptor row and the missing path (at descriptor read time — this is the one that can otherwise produce a build silently missing a body); **R2** a source file NO descriptor names ⇒ inert config, refused by the gate test (`tests/ffi/test_shipped_source_realization.cpp`) rather than at load, because without the deleted manifest the check costs a directory walk plus a corpus scan per compile while an inert `.c` can only waste disk; **R3** one format carrying BOTH a `library` image and a `source` ⇒ LOAD ERROR — two owners for one body is the defect, not a fallback, and preferring either silently is how a program links against an image that does not export the symbol and dies at LOAD; **R4** no HEADERS in the runtime tree, folded into R2 rather than given an extension check — a header is never a translation unit, so no realization can name one, so the unclaimed-file rule refuses it by construction. See the section below. |
 | `constants` | no\*     | The header's object-like `#define` macro-CONSTANTS as NEUTRAL named integer constants (e.g. `CHAR_BIT`). Each entry: `name`, `value` (a JSON integer — the int64 BIT-PATTERN; for an unsigned `type` the uint64 value reinterpreted, so the full unsigned range round-trips), `type` (a hir-text INTEGER-SCALAR type, `i8`…`u128`), OR per-target `variants` (`when` + `value` + `type`). The semantic phase injects each as a compile-time constant that folds to a literal in VALUE and CONSTANT-EXPRESSION position (`int a[CHAR_BIT]`). A non-integer-scalar type, an out-of-range / negative-for-unsigned value, or an unknown key **fails loud**. A function-like macro belongs in `macros`; a float one in `floatConstants`. |
 | `floatConstants` | no\* | The header's FLOATING-point macro-constants (`math.json` ships `INFINITY` and `HUGE_VAL`) — the `constants` surface is integer-ONLY, so a float there fails loud. Each entry: `name`, `value` (a **string** — JSON has no Infinity/NaN, so `"inf"`/`"+inf"`/`"-inf"` map to the IEEE-754 infinities and any other string is a finite literal parsed by the one float decoder), `type` (a FLOAT scalar, `f32`/`f64`). A finite literal that OVERFLOWS to ±inf **fails loud** — only the explicit `inf` tokens may produce an infinity. |
 | `typedefs`  | no\*     | The header's `typedef`s as NEUTRAL type aliases (e.g. `size_t`). Each entry: `name`, and EITHER a flat `type` (any hir-text type) OR per-target `variants` (`when` + `type`). Injected as a type-position name. A builtin type of the same name wins. |
@@ -349,8 +350,14 @@ The active c-subset config (`src/dss-config/sources/c-subset.lang.json`) sets
 per-platform directory to choose: every target reads the SAME descriptors, and
 each descriptor's `library` MAP names the runtime image per object format. At
 `compile_pipeline` resolution the active target's format (`objectFormatKindName`
-→ `"pe"`/`"elf"`/`"macho"`) selects its entry; a map missing that format inherits
-the language's `externLibraryByFormat[format]` default. This is the same neutral
+→ `"pe"`/`"elf"`/`"macho"`) selects its entry. ⚠ A map missing that format is
+**UNBOUND**, resolved at the LINK tier per C23 5.1.1.2 phase 8 — it does NOT
+inherit a per-language default. This sentence used to say it inherited
+`externLibraryByFormat[format]`, and that was **stale**: UCRT-P4 (Decision 1)
+REMOVED that field outright rather than repointing it, because a per-language
+default is a guess about a fact the descriptor corpus owns per SYMBOL. The
+`library` row in the table above has always been correct; this paragraph was not,
+and the two contradicted each other in one file. This is the same neutral
 descriptor + per-format map design throughout — agnostic, no `if(format)` in
 shared substrate, and it dissolved the former `D-FFI-SHIPPED-LIB-PLATFORM-SELECT`
 deferral entirely (a single descriptor set serves all targets).
@@ -359,6 +366,138 @@ deferral entirely (a single descriptor set serves all targets).
 <stdio.h>` + `puts("hello")` links `puts` against ucrtbase.dll on Windows-PE
 (msvcrt.dll until the TF-C111 CRT migration), libc.so.6 on Linux-ELF (x86_64 +
 arm64), and libSystem on macOS-Mach-O — from the one `stdio.json`.
+
+---
+
+## Per-target REALIZATION — when DSS ships the body (`D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF`)
+
+The `library` map above answers *which image*. It cannot answer *what if there is
+no image* — and that case is not exotic. **Windows has no POSIX directory API.**
+`opendir` / `readdir` / `closedir` are exported by nothing: not `ucrtbase.dll`,
+not `kernel32.dll`, not any Windows component. Under the eager-import law
+(`D-FFI-DESCRIPTOR-EAGER-IMPORT`) declaring them anyway produces a binary the
+loader rejects at process start with `0xC0000139` — rc=0 from every compile
+stage.
+
+**DSS ships the source.** This directory is the DECLARATION half of a toolchain;
+`src/dss-config/runtime/` is the IMPLEMENTATION half, and the `realization` map
+is the single fact that binds the two:
+
+```jsonc
+// dirent.json
+"library":     { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+"realization": { "pe": { "source": "runtime/platform/src/dirent.c" } }
+```
+
+On `elf`/`macho` no key is present, the default (IMPORT) stands, and those arms
+are byte-identical to what shipped before. On `pe` the driver adds
+`runtime/platform/src/dirent.c` to the build graph as an **ordinary extra
+translation unit compiled FOR THE TARGET**, and the linker resolves the
+reference against that body exactly as it resolves a sibling CU's definition.
+
+### Why this is the standard structure, not an invention
+
+Every production toolchain splits at one line. The **compiler** synthesizes only
+*stateless* glue — builtins, thunks, TLS sequences, import stubs, `va_arg`,
+libcall lowering: inline-able, no heap, no cross-call state. A **runtime library
+of compiled source** provides everything with state, allocation or nontrivial
+control flow: `libgcc`, `compiler-rt`, `libmingwex`, `newlib`/`musl`/`glibc`.
+`opendir` holds a handle across three calls, allocates, and does string surgery —
+squarely the second category, and *literally* the libmingwex case: mingw-w64
+implements these three functions as ordinary C in `mingw-w64-crt/misc/dirent.c`,
+over the same Win32 primitives DSS uses.
+
+gcc's literal answer here is "link libmingwex". **DSS cannot take it**: depending
+on a host mingw-w64 breaks *build ANY target inside ANY host*
+(`D-HARNESS-CROSS-HOST-ANY-TARGET`) — a Windows-targeting build on a Mac would
+need a mingw sysroot — and it re-introduces exactly the third-party runtime
+dependency the pe→UCRT migration ran to eliminate. So DSS ships its own. This is
+the standard structure reached by the only route the constraints allow.
+
+★ **THE SCOPE RULE ABOVE NEEDED NO WIDENING FOR THIS.** It already says *OS
+LIBRARIES ONLY … libc/POSIX, Win32, libSystem*, and already promises *"which is
+why it can ship it, version it, and GUARANTEE IT ON EVERY HOST"*. `opendir` is
+POSIX; POSIX is named in scope; the every-host guarantee is already made. What
+was missing was not permission but the mechanism that **honours** what the scope
+section already says.
+
+### The tree
+
+```
+src/dss-config/runtime/
+  platform/                    <- the LOW-LEVEL tier: OS / libc / ABI gap-filling
+    src/dirent.c               <- authored C
+    dist/{debug,release}/...   <- generated objects; GITIGNORED, anchored path
+```
+
+`runtime/` is a **tier namespace**. `platform/` is the low-level tier; high-level
+language runtimes (a CLR, a JVM) land as siblings under `runtime/managed/<lang>/`.
+It is **not** `os` (too narrow — `strcasecmp` is libc, not OS, and the soft-float
+helpers this tier will eventually hold are pure computation) and **not** `native`
+(a word already load-bearing in this repo's test vocabulary). `src/` and `dist/`
+make the tree self-describing: authored source in one, generated objects in the
+other, nothing generated ever interleaved with anything authored.
+
+⚠ **NO `.h` LIVES HERE, AND THIS TREE IS NEVER AN INCLUDE-SEARCH ROOT.** A
+private header for the dirent unit would land at a path that IS the include path
+`dirent.h` and would **shadow the descriptor the unit exists to consume** —
+silently, producing exactly the struct-layout disagreement described next. R4
+refuses it, and the driver builds a runtime CU with the system descriptor dirs
+only, never the user's `-I` list.
+
+⚠ **THE PATH CARRIES NO FORMAT SEGMENT.** An earlier draft used
+`platform/<format>/…`; it was overruled because the descriptor already names the
+file, so the path need not disambiguate anything — and a format segment would
+force every format-INDEPENDENT unit (a `strcasecmp`, a soft-float helper) either
+to be duplicated across format directories or to sit in one that lies about it. A
+format-specific unit gets a distinct FILE NAME; the per-format `realization` map
+is what routes each format to its own file.
+
+### ★★★ The property this design has that a compiler-built IR body does not
+
+**The layout agreement is checked by the compiler.** `struct dirent` is declared
+ONCE — here, in `dirent.json` — and `runtime/platform/src/dirent.c` `#include`s
+`<dirent.h>` to get it. There is no second copy of the layout to drift, and no
+way to ship a runtime that disagrees with its own published ABI.
+
+✔**MEASURED, not claimed**: renaming `d_name` in this file's `pe` `struct dirent`
+variant makes `runtime/platform/src/dirent.c` **fail to compile**, with the error
+positioned in the runtime source. The alternative — hand-building the body in the
+compiler's IR builder — has no such check: a layout mismatch there lands in the
+*silent wrong answer* class (a wrong directory listing, the copy-relocation
+`environ` shape), which is precisely what this project refuses to ship.
+
+### Language neutrality
+
+★ **"A C file is language-specific" is a category error.** `libgcc` is C and
+serves gcc's C, C++, Fortran, Ada, Go and D front ends. An implementation written
+*in* C is not an implementation *for* C — it sits behind an ABI. The descriptor
+stays language-neutral (it **is** the ABI declaration); any DSS language that can
+call the ABI gets `opendir`, **DSS Axis included, with no Axis-side work**. The
+reader stays agnostic with no identity branch because the realization is declared
+in DATA and never branched on in code.
+
+The language is not restated anywhere: the file's `.c` extension resolves it
+through `fileExtensions`, the same mechanism every ordinary compile uses, and
+`.c` is claimed by exactly one shipped language. An extension no language claims,
+or one that two claim (`.s`/`.S`, claimed by both asm dialects), **fails loud**
+rather than guessing — that ambiguity is a real future fork for a hand-written
+assembly runtime unit, and it needs the *arch*, not the language.
+
+Bootstrap is not circular: DSS's C front end compiles the runtime and every other
+language consumes it — gcc's arrangement exactly — and it dogfoods the compiler on
+its own runtime, which is a real correctness signal.
+
+⚠ **ONE UNIT PER HEADER**, mirroring one-descriptor-per-header. Deliberately not a
+monolithic `dss-libc.c`: a monolith overclaims (DSS ships the **gap** between what
+a platform provides and what POSIX declares — mingw-w64 names its equivalent
+`libmingwex`, *extensions*, for exactly that reason) and would make every pe binary
+carry every future unit, or force dead-stripping to undo it.
+
+`examples/c-subset/shipped_dirent_readdir` proves it end to end, and it is a
+differential over the realization axis rather than over the source: the SAME
+`main.c` binds three libc imports on elf/macho and links a DSS-compiled body on
+pe, and all four legs answer 42.
 
 ---
 

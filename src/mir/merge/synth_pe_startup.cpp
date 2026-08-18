@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <format>
 #include <string>
+#include <string_view>
 #include <utility>     // std::move
 
 namespace dss {
@@ -26,6 +27,17 @@ namespace {
 // the MirRebuildPolicy base defaults (accept all phi incomings, no substitution).
 class IdentityClonePolicy final : public opt::passes::MirRebuildPolicy {
 public:
+    // The rebuild DRIVER this policy belongs to — printed by every
+    // `MirFunctionRebuilder` fatal.
+    // See D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS (kept on ONE line: a
+    // wrapped anchor name mints a SECOND, unregistered anchor).
+    // Deliberately NOT a `kPassNameTable` pass name: this is a MIR merge step,
+    // so a fatal saying `[pass=SynthPeStartup]` tells the reader the abort did
+    // not come from the optimizer pipeline at all.
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "SynthPeStartup";
+    }
+
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
         std::vector<MirBlockId> blocks;

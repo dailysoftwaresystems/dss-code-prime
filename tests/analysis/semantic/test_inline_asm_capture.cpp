@@ -648,3 +648,98 @@ TEST(InlineAsmAcceptance, WithNoTargetTheMachineQuestionsAreUnaskedAndTheGrammar
     EXPECT_TRUE(has(m5, DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate))
         << errorInventory(m5);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. THE `asm goto` LABEL REFERENCE — THE TWO SPELLINGS, AND WHICH TIER OWNS
+//    THE ANSWER (D-CSUBSET-INLINE-ASM-POSITIONAL-LABEL-REF-ACCEPTED-WITH-NO-
+//    GRAMMAR)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ★★★ THE DEFECT THIS PINS WAS A PASSING TEST, NOT A FAILING ONE. Before
+// 2026-08-17 the semantic tier RANGE-CHECKED a positional `%l<N>` and let a
+// valid one through in silence, while `asm.lang.json` declared exactly one
+// label-reference shape — the bracketed `%l[name]` — and no production the
+// positional spelling could ever match. One construct, two tiers, two answers.
+//
+// ⚠ THE ASSERTION IS ON CONTENT, NEVER ON A COUNT OF DIAGNOSTICS. "One error
+// fired" is satisfied by the wrong error; what has to hold is that the message
+// names the CONSTRUCT (`asm goto`), states the spelling this build declares,
+// and — when the index resolves — names the very label the author meant, which
+// is the half that lets them rewrite it.
+TEST(InlineAsmRefusals, APositionalAsmGotoLabelReferenceIsRefusedNamingTheDeclaredSpelling) {
+    // `%l0` with ZERO operands is the FIRST label — an IN-RANGE reference, and
+    // therefore the one the old range check passed silently. This is the arm
+    // that would have gone green before the fix.
+    auto inRange = analyzeFor(
+        "x86_64", wrap("__asm__ goto (\"jmp %l0\" : : : : lbl);"));
+    ASSERT_TRUE(inRange.model.has_value());
+    EXPECT_TRUE(has(*inRange.model,
+                    DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
+        << "an IN-RANGE positional label reference must still be refused — the "
+           "index is not the property in question, the SHAPE is: "
+        << errorInventory(*inRange.model);
+
+    bool namedTheConstructAndTheLabel = false;
+    for (auto const& d : inRange.model->diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_InlineAsmOperandModifierUnsupported)
+            continue;
+        namedTheConstructAndTheLabel =
+            d.actual.find("asm goto") != std::string::npos
+            && d.actual.find("%l0") != std::string::npos
+            // The DECLARED spelling, rendered with the author's own label name
+            // — not a generic "use brackets".
+            && d.actual.find("`%l[lbl]`") != std::string::npos;
+    }
+    EXPECT_TRUE(namedTheConstructAndTheLabel)
+        << "the refusal must name `asm goto`, quote the form as written, and "
+           "render the bracketed spelling WITH the label this index resolves "
+           "to: " << errorInventory(*inRange.model);
+
+    // An OUT-OF-RANGE positional reference is refused by the SAME code — the
+    // form is unsupported whether or not the index would have resolved, and
+    // reporting it as "out of range" would tell the author to renumber a
+    // spelling that has no shape at any number.
+    auto outOfRange = analyzeFor(
+        "x86_64", wrap("__asm__ goto (\"jmp %l7\" : : : : lbl);"));
+    ASSERT_TRUE(outOfRange.model.has_value());
+    EXPECT_TRUE(has(*outOfRange.model,
+                    DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
+        << errorInventory(*outOfRange.model);
+    EXPECT_EQ(countOf(*outOfRange.model,
+                      DiagnosticCode::S_InlineAsmPlaceholderOutOfRange), 0u)
+        << "an unsupported SHAPE must not be reported as an out-of-range INDEX "
+           "— that message sends the author to renumber something that cannot "
+           "parse at any number: " << errorInventory(*outOfRange.model);
+
+    // ★★ POSITIVE CONTROL #1 — THE BRACKETED SPELLING, WHICH THE GRAMMAR DOES
+    // DECLARE, MUST STILL CLEAR THIS TIER. Without it the pin above is
+    // satisfied by a blanket "refuse every `%l`", which is a different (and
+    // wrong) compiler. The bracketed form's own capability gap is refused
+    // downstream, by the tier that owns the missing label carrier.
+    auto bracketed = analyzeFor(
+        "x86_64", wrap("__asm__ goto (\"jmp %l[lbl]\" : : : : lbl);"));
+    ASSERT_TRUE(bracketed.model.has_value());
+    EXPECT_EQ(countOf(*bracketed.model,
+                      DiagnosticCode::S_InlineAsmOperandModifierUnsupported), 0u)
+        << "the BRACKETED `%l[name]` is the spelling this build's grammar "
+           "declares — refusing it here would make the two tiers disagree in "
+           "the opposite direction: " << errorInventory(*bracketed.model);
+
+    // ★★ POSITIVE CONTROL #2 — an ORDINARY operand placeholder is untouched.
+    // `%l` and `%0` share the `%` sigil, so a refusal keyed too loosely would
+    // take the operand form with it.
+    auto operand = analyzeFor(
+        "x86_64", wrap("__asm__ (\"m %0\" : \"=r\"(lo));"));
+    ASSERT_TRUE(operand.model.has_value());
+    EXPECT_FALSE(operand.model->hasErrors()) << errorInventory(*operand.model);
+
+    // ★ AND THE REFUSAL IS TARGET-INDEPENDENT, because the label form is GNU
+    // inline-asm vocabulary rather than a processor fact. arm64 must answer
+    // identically — a divergence here would mean the check had picked up a
+    // target dependency it has no business having.
+    auto arm = analyzeFor("arm64", wrap("__asm__ goto (\"b %l0\" : : : : lbl);"));
+    ASSERT_TRUE(arm.model.has_value());
+    EXPECT_TRUE(has(*arm.model,
+                    DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
+        << errorInventory(*arm.model);
+}

@@ -71,6 +71,20 @@ build-wsl/
 # Ad-hoc out-of-source build dirs (e.g. build-rel / build-dbg used for
 # timed before/after measurements and per-config canary builds).
 build-*/
+# D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the shipped RUNTIME's object cache.
+# `src/dss-config/runtime/platform/` is self-describing — `src/` holds authored C,
+# `dist/` holds generated objects — and nothing generated is ever interleaved with
+# anything authored. A generated tree living INSIDE `src/` with nothing ignoring it
+# is exactly how object files end up committed.
+#
+# ★★ THE PATH IS ANCHORED, AND THAT IS NOT STYLE. A bare `dist` glob would match
+# any directory of that name anywhere in the repo, and — worse in the direction
+# that bites — the class of accident this repo already paid for: an UNANCHORED
+# `build*` exclude silently matched `src/program/build_scripts.cpp`, and a gate leg
+# was configured against a tree missing a changed `.cpp`. Anchoring keeps the rule
+# to the one tree it is about, so a future source file whose name merely starts
+# with `dist` cannot disappear.
+/src/dss-config/runtime/platform/dist/
 tmp_probe/
 # Ad-hoc agent/probe scratch at repo root (repro programs, throwaway bash
 # scripts) — working files, never committed. (Prefer the out-of-repo session
@@ -112,12 +126,50 @@ __pycache__/
 # Project-wide skills under .claude/skills/ stay tracked.
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+# Agent worktrees: throwaway checkouts an agent creates for an isolated build.
+# ★ THIS RULE WAS ONLY IN `.git/info/exclude`, WHICH IS PER-CLONE AND NEVER
+# COMMITTED, so it protected exactly one machine. ✔MEASURED: the arm64 VPS leg
+# failed `check-line-endings.sh` on
+# `.claude/worktrees/agent-<id>/{LICENSE,VERSION}` — files carrying CRLF inside a
+# vendored checkout that this repo does not own and must not rewrite. The guard
+# was RIGHT to refuse untracked CR-bearing files; what was wrong is that agent
+# scratch was visible to it at all on every host but mine. ⚠ Note the shape of
+# the near-miss: the prescribed remedy (convert the file to LF) would have
+# corrupted somebody else's vendored tree to silence a guard about our own.
+.claude/worktrees/
 
 #.plans/ -- Not for now, but will be used when first minimal implementation is done and we start working on the next steps.
 
 # Operator connection data for tools/ssh-*.{ps1,sh} — hosts, logins, key PATHS.
 # NEVER tracked: this repo is slated to go public (PR #37) and these name real machines.
-# ★ PATHS ONLY. No private key material and no passwords belong here or anywhere in
-#   the working tree — the ssh tooling is key-based (BatchMode=yes) precisely so that
-#   no secret ever has to be stored to make automation work.
+# ★ Connection data + key material for the cross-host tooling.
+#   ⚠ THE ORIGINAL RULE HERE WAS "PATHS ONLY, no private key material" — that changed
+#   on 2026-08-17 by operator instruction, and the reason is worth keeping: a key
+#   referenced as `$HOME/.ssh/<name>` resolves to a DIFFERENT directory in WSL, Git Bash
+#   and PowerShell, so a host was reachable or not depending on which shell you started
+#   in. ✔MEASURED: the arm64 VPS key existed only under WSL's $HOME, making the carriage
+#   work from WSL and fail from the other two. `.secrets/` is the SAME directory in all
+#   three, so the key lives here and the carriage FINDS it — "you must be able to get
+#   everything from the tool scripts … never manually".
 .secrets/
+
+# ★★ BELT AND BRACES, and deliberately BROADER than `.secrets/`. Key material and
+#   connection data must never reach a commit even if it is written somewhere nobody
+#   anticipated — a rule that only covers the directory people are supposed to use is a
+#   rule that protects the disciplined case and misses the accident. This repo is slated
+#   to go public (PR #37), so the cost of a miss is unbounded and irreversible.
+#   ⛔ Do NOT narrow these to a directory. If a legitimate file is caught, un-ignore it
+#   by an explicit `!` exception with a reason, never by weakening the pattern.
+*.env
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ecdsa
+id_ed25519
+*_rsa
+*_ed25519
+# Explicit exceptions: template/example files that carry NO secret, only field names.
+!*.env.example
+!*.env.template

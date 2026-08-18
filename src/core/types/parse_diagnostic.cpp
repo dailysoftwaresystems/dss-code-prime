@@ -132,6 +132,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::C_InvalidFormatName:        return "C_InvalidFormatName";
         case DiagnosticCode::C_InvalidPreprocess:        return "C_InvalidPreprocess";
         case DiagnosticCode::C_ConflictingPredefinedMacro: return "C_ConflictingPredefinedMacro";
+        case DiagnosticCode::C_UnbackedPredefinedMacro: return "C_UnbackedPredefinedMacro";
         case DiagnosticCode::S_UndeclaredIdentifier:     return "S_UndeclaredIdentifier";
         case DiagnosticCode::S_RedeclaredSymbol:         return "S_RedeclaredSymbol";
         case DiagnosticCode::S_TypeMismatch:             return "S_TypeMismatch";
@@ -480,6 +481,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "F_ShippedSymbolUnavailableForTarget";
         case DiagnosticCode::F_HeaderNameCaseAmbiguous:
             return "F_HeaderNameCaseAmbiguous";
+        case DiagnosticCode::F_ShippedCorpusInvariantBroken:
+            return "F_ShippedCorpusInvariantBroken";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch

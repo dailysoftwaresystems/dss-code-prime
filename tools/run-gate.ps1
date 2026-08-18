@@ -51,7 +51,7 @@
     Remaining arguments, passed through verbatim.
 
 .EXAMPLE
-    tools/run-gate.ps1 build/ctest.log '100% tests passed' ctest --test-dir build-dbg --output-on-failure
+    tools/run-gate.ps1 build/ctest.log '100% tests passed' ctest --test-dir build/dbg --output-on-failure
 #>
 [CmdletBinding()]
 param(

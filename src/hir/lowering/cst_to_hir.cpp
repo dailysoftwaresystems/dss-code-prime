@@ -10652,8 +10652,15 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         // library-bound — a descriptor always ships a per-format `library` map
         // (`noLibraryBinding=false` above). Producers A (~8815) and B (~7943)
         // leave the bit FALSE, so their unreferenced imports drop like gcc's.
+        // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: a row realized from SHIPPED
+        // SOURCE names no image, so it rides the EXISTING no-library marker (c86's
+        // bare-prototype channel) and resolves at the LINK tier against the CU the
+        // driver added to the build graph. It reuses that marker rather than
+        // minting a second "unbound" concept, because there is only one question
+        // here — does this reference name an image? — and c86 already answers it.
         externDecls.push_back(HirExternRecord{
-            node, ext.name, ext.library, /*noLibraryBinding=*/false,
+            node, ext.name, ext.library,
+            /*noLibraryBinding=*/!ext.shippedSourcePath.empty(),
             ext.version,          // D-LK-ELF-SYMBOL-VERSIONING (c156)
             // UCRT-P4 (Decision 1): almost always TRUE — a `#include`d descriptor
             // symbol is imported whether or not the TU calls it. It is FALSE only

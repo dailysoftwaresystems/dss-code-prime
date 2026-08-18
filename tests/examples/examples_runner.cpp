@@ -739,6 +739,7 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
                 }
                 oa.mustDifferFromBaseline =
                     arm.at("mustDifferFromBaseline").get<bool>();
+            }
             // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the
             // per-arm expected exit code. Parsed here; LEGALITY (R1/R3) is
             // decided below, once the example-level exemption and the effective
@@ -2578,6 +2579,8 @@ TEST(ExamplesCorpusLint, StagingPrimitiveLivesOnlyInTheSharedHeader) {
             << rel << " does not include " << kHeader
             << ", so whatever staging it performs is not the shared one.";
     }
+}
+
 // ── D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the carve-out
 //    CENSUS ───────────────────────────────────────────────────────────────────
 //

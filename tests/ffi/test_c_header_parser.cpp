@@ -449,3 +449,47 @@ TEST(FfiCHeaderParser, NonExternGlobalRejectionCarriesSourceSpan) {
 // 2026-06-03: shipped-headers tree + `readCHeaderShipped` /
 // `findShippedFfiHeader` deleted as dead code, no production
 // consumer ever called them.)
+
+// ── D-FFI-HEADER-DIAGNOSTICS-RENDER-WITHOUT-SOURCE-CONTEXT ──────────────────
+//
+// ★★★ A DIAGNOSTIC THAT CANNOT BE RENDERED IS BARELY BETTER THAN ONE THAT WAS
+// NEVER EMITTED. `readCHeaderFromText` builds a CompilationUnit the driver never
+// sees and lets it die at return, forwarding only the diagnostics. Nothing folded
+// that unit's buffers into the render-time `BufferRegistry` (`program.cpp` builds
+// it from the unit it DOES see), so a forwarded diagnostic carried a buffer id
+// that resolved to nothing and rendered as `--> <unknown-buffer:N>:offset K`
+// instead of the offending header line.
+//
+// ★ THIS IS THE SAME DEFECT AS `parseAsmTemplateText`'s, found by looking for the
+// CLASS rather than the instance after that one was closed
+// (D-ASM-TEMPLATE-DIAGNOSTICS-RENDER-WITHOUT-SOURCE-CONTEXT). The fix is the same
+// too: the reporter retains the buffers its own diagnostics point into.
+//
+// ★★ THE ASSERTION IS THE ECHOED SOURCE LINE, NOT THE CODE. A test that asserted
+// only "a diagnostic was produced" — or only its code — passes happily over
+// `<unknown-buffer>` and proves nothing about the thing that is broken. It must
+// see the offending TEXT come back through the renderer's own gutter.
+//
+// RED-ON-DISABLE: delete the `reporter.sourceBuffers().add(...)` loop in
+// `src/ffi/c_header_parser.cpp` and `<unknown-buffer` returns.
+TEST(CHeaderParser, MalformedHeaderDiagnosticRendersTheOffendingLine) {
+    DiagnosticReporter reporter;
+    // A deliberately malformed declaration. The exact diagnostic code is not the
+    // subject and is deliberately not asserted — the RENDER is.
+    auto const r = readCHeaderFromText("int f(@@@);\n", "<malformed-header.h>",
+                                       "libtest", reporter);
+    ASSERT_FALSE(r.has_value()) << "the fixture must actually fail to parse";
+    ASSERT_FALSE(reporter.all().empty()) << "a failure must emit a diagnostic";
+
+    // An EMPTY caller registry, deliberately: it is exactly the driver's
+    // situation for a buffer minted below the compilation unit, so the fallback
+    // store is the only thing that can resolve this id.
+    BufferRegistry const empty;
+    std::string const rendered = reporter.formatAll(empty);
+
+    EXPECT_EQ(rendered.find("<unknown-buffer"), std::string::npos)
+        << "the header's buffer must resolve; got:\n" << rendered;
+    EXPECT_NE(rendered.find("int f(@@@);"), std::string::npos)
+        << "the rendered diagnostic must echo the offending header line; got:\n"
+        << rendered;
+}

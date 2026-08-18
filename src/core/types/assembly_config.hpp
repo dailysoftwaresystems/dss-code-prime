@@ -2,6 +2,13 @@
 
 #include "core/export.hpp"
 #include "core/types/ascii_case.hpp"   // asciiToLower — the ONE folding helper
+// `CfiOpKind` — the closed unwind-rule vocabulary a `frameRule` directive row
+// NAMES. Included rather than re-spelled: the alternative (a private rule enum
+// here, or the rule stored as a bare string) is the "one fact, two owners"
+// shape the bar vetoes, and `cfi.hpp` is dependency-free by construction (it
+// includes `core/export.hpp` and the standard library only), so there is no
+// cycle to route around the way `sectionName` has to.
+#include "core/types/cfi.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/strong_ids.hpp"   // LexerModeId — the template surface's mode
 
@@ -235,9 +242,66 @@ enum class AsmDirectiveVerb : std::uint8_t {
     // REFUSED, naming the operand it will not interpret; it is never silently
     // ignored and never half-applied.
     SectionByName,
+
+    // ★★★ THE CALL-FRAME-INFORMATION FAMILY.
+    // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED.
+    // Until these existed the 18 `.cfi_*` spellings the AT&T dialect
+    // declares were `IgnoredAnnotation` — parsed, accepted, and DROPPED — so a
+    // `.s` assembled, ran correctly, and could not be unwound: no debugger
+    // backtrace, no profiler stack, and an exception thrown through the frame
+    // terminating instead of propagating. That is an accept-and-ignore with a
+    // silent RUNTIME consequence, which is the one shape this project's bar
+    // refuses outright.
+    //
+    // ★★★ THEY MINT NO UNWIND VOCABULARY, AND THAT WAS THE DESIGN RULE.
+    // `core/types/cfi.hpp` already declares `CfiOpKind` — the closed set of
+    // rule changes a producer can STATE — and its own docblock records that
+    // every enumerator was written from a `.cfi_*` spelling a real assembler
+    // emits. So a `FrameRule` row names one of THOSE (see
+    // `AsmDirectiveSpelling::frameRule`) and nothing else, exactly as
+    // `SectionData` names a `DataSectionKind` rather than inventing a section
+    // taxonomy. The dialect owns the SPELLING; the shared core owns the MEANING.
+    //
+    // `.cfi_startproc` — everything until the matching `FrameEnd` describes the
+    // frame of the function that is open. ⚠ NOT derivable from the function
+    // boundary: gas lets a `.s` describe SOME functions and not others, and a
+    // producer that assumed every function had CFI would emit a table covering
+    // frames nobody described.
+    FrameStart,
+    // `.cfi_endproc` — closes the description opened by `FrameStart`. An
+    // unmatched one either way is a refusal: a stream that never closes has no
+    // extent, and one that closes twice has no owner.
+    FrameEnd,
+    // `.cfi_def_cfa` / `.cfi_offset` / `.cfi_restore` / … — ONE rule change, at
+    // the PC reached by the instruction this directive follows. The row's
+    // `frameRule` names the `CfiOpKind`.
+    FrameRule,
+    // `.cfi_return_column N` — the CIE's return-address column. DSS DERIVES it
+    // from the target's `dwarfReturnAddressColumn`, so this row exists to
+    // CHECK the file's claim against it: a `.s` naming a different column is
+    // refused (one shared CIE cannot carry two), and one naming the same column
+    // is the no-op gcc emits. ⚠ Accepting it as an annotation would let a file
+    // silently redefine where the return address lives.
+    FrameReturnColumn,
+    // ★★★ DECLARED BY THE REFERENCE ASSEMBLER, AND DELIBERATELY REFUSED — the
+    // EXACT COMPLEMENT of `IgnoredAnnotation`, and the reason it is a verb
+    // rather than an absent row. `IgnoredAnnotation` says "this carries
+    // information DSS derives elsewhere"; this says "this carries information
+    // DSS cannot carry AT ALL, so it is refused by name". Leaving the spelling
+    // undeclared would produce the generic *unknown directive* refusal — loud,
+    // but it tells the reader the dialect does not know the spelling, which is
+    // false, and the obvious repair for a future reader is to add it as an
+    // `ignoredAnnotation`. That repair is precisely
+    // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED being re-created inside its own
+    // fix, and the row's closing note names it as the thing that must not
+    // happen. A declared refusal makes the decision visible in the config and
+    // carries its `$comment` to whoever reads it next.
+    // ⚠ WHAT IT IS *NOT*: a fallback bucket. Every row carrying it must state,
+    // in its own `$comment`, the fact this build cannot represent.
+    Unrepresentable,
 };
 
-inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 8>
+inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 13>
     kAsmDirectiveVerbNames{{
         {"sectionText", AsmDirectiveVerb::SectionText},
         {"globalSymbol", AsmDirectiveVerb::GlobalSymbol},
@@ -247,12 +311,43 @@ inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 8>
         {"emitData", AsmDirectiveVerb::EmitData},
         {"reserveFillBytes", AsmDirectiveVerb::ReserveFillBytes},
         {"sectionByName", AsmDirectiveVerb::SectionByName},
+        {"frameStart", AsmDirectiveVerb::FrameStart},
+        {"frameEnd", AsmDirectiveVerb::FrameEnd},
+        {"frameRule", AsmDirectiveVerb::FrameRule},
+        {"frameReturnColumn", AsmDirectiveVerb::FrameReturnColumn},
+        {"unrepresentable", AsmDirectiveVerb::Unrepresentable},
     }};
 static_assert(kAsmDirectiveVerbNames.size()
                   == static_cast<std::size_t>(
-                         AsmDirectiveVerb::SectionByName)
+                         AsmDirectiveVerb::Unrepresentable)
                          + 1,
               "every AsmDirectiveVerb enumerator needs a config spelling");
+
+// ★★★ THE `frameRule` NAME → `CfiOpKind`, RESOLVED AGAINST THE ONE OWNER OF
+// THOSE NAMES. Deliberately a LOOP over `cfiOpKindName` rather than a second
+// `{name, kind}` table beside it: a parallel table is a second home for a fact
+// `core/types/cfi.hpp` already states, and the two drift the first time a rule
+// is added (the `hasDwarfNumber` bit-mask that `DwarfRegisterMapping` deleted
+// for exactly this reason). Define the lookup as the complement of the
+// existing names, never as an enumeration of them.
+[[nodiscard]] constexpr std::optional<CfiOpKind>
+asmFrameRuleFromName(std::string_view name) noexcept {
+    for (std::size_t i = 0; i < kCfiOpKindCount; ++i) {
+        auto const k = static_cast<CfiOpKind>(i);
+        if (cfiOpKindName(k) == name) return k;
+    }
+    return std::nullopt;
+}
+
+// Does this verb belong to the call-frame family — i.e. is it meaningful only
+// between a `FrameStart` and its `FrameEnd`? ONE predicate, so the walker's
+// "are we inside a frame description?" gate and any future loader check cannot
+// disagree about the membership of the set.
+[[nodiscard]] constexpr bool
+asmVerbIsFrameBody(AsmDirectiveVerb v) noexcept {
+    return v == AsmDirectiveVerb::FrameRule
+        || v == AsmDirectiveVerb::FrameReturnColumn;
+}
 
 // Does this verb OPEN A SECTION — i.e. can a `SectionByName` operand resolve
 // to a row carrying it? ★ ONE PREDICATE, SO THE LOADER'S "which rows may be
@@ -532,6 +627,32 @@ struct AsmDirectiveSpelling {
     // in either case nothing could ever reach the row, and a row nothing can
     // reach is config that silently does nothing.
     bool             operandOnly = false;
+
+    // ★★★ `FrameRule` ONLY (required there, refused on every other verb): WHICH
+    // rule change this spelling states. The value is a `CfiOpKind` — the shared
+    // core's unwind vocabulary — resolved AT LOAD from the name
+    // `cfiOpKindName()` publishes, so an unknown rule is a load error naming
+    // the closed set rather than a directive that silently carries nothing.
+    //
+    // ★ WHY THE NAMES LINE UP 1:1 WITH gas's SPELLINGS AND THAT IS NOT A
+    // COINCIDENCE: `core/types/cfi.hpp` states outright that every enumerator
+    // was written from a `.cfi_*` spelling a real assembler emits. So the AT&T
+    // row for `.cfi_def_cfa_register` names `"def_cfa_register"` and the
+    // mapping reads as an identity — but it is DECLARED, because a dialect
+    // whose spelling is `.frame_cfa_reg` binds the same rule with no engine
+    // change, which is the whole reason the spelling and the meaning are two
+    // fields.
+    std::optional<CfiOpKind> frameRule;
+    // `FrameRule` ONLY. TRUE on `.cfi_rel_offset`, whose stated offset is
+    // measured from the CURRENT CFA rather than from the canonical frame
+    // address — gas defines it as `.cfi_offset reg, off − <current CFA
+    // offset>` and resolves it against its own running state. There is no
+    // `CfiOpKind` for it and there must not be: it is the SAME rule
+    // (`RegAtCfaOffset`) stated in a different coordinate system, so a second
+    // enumerator would put one fact in two places and every consumer would
+    // carry both arms forever. The producer folds it; the representation never
+    // sees it.
+    bool                     frameOffsetFromCfa = false;
 };
 
 struct DSS_EXPORT AssemblyConfig {

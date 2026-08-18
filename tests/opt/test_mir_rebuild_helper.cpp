@@ -25,9 +25,12 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <functional>
 #include <variant>
 #include <unordered_map>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 using namespace dss;
@@ -41,6 +44,12 @@ namespace {
 // this policy is a pure functional copy of the source function.
 class IdentityPolicy final : public MirRebuildPolicy {
 public:
+    // Mandatory (pure virtual) — a policy that does not name itself does not
+    // compile (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS).
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "IdentityRoundTrip";
+    }
+
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
         return mirReversePostOrder(src, src.funcEntry(fn));
@@ -500,6 +509,10 @@ namespace {
 // vacuously on one arm.)
 class InjectingPolicy : public MirRebuildPolicy {
 public:
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "NoOptimizeNeuter";
+    }
+
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
         ++selectBlocksCalls;
@@ -528,6 +541,13 @@ public:
 // `PruneUnreachable` posture. It must run even on a `noOptimize` function.
 class MandatoryInjectingPolicy final : public InjectingPolicy {
 public:
+    // Re-answered rather than inherited: a fatal that named the BASE policy
+    // would point the reader at the neuter test while the mandatory-normalize
+    // test is the one that died.
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "MandatoryNormalization";
+    }
+
     [[nodiscard]] bool mandatoryNormalization() const noexcept override {
         return true;
     }
@@ -537,6 +557,10 @@ public:
 // the `Mem2Reg` notification, isolated.
 class NeuterNotedPolicy final : public MirRebuildPolicy {
 public:
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "NeuterNotice";
+    }
+
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
         std::vector<MirBlockId> out;
@@ -895,3 +919,358 @@ TEST(MirRebuildHelper, CloneGlobalsPreservesThreadLocal) {
         EXPECT_FALSE(out.globalIsThreadLocal(out.globalAt(1)));
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// EVERY REBUILD ABORT NAMES THE PASS THAT DROVE IT
+// (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS)
+//
+// ~9 policies drive one `MirFunctionRebuilder`, and its fatal text is identical
+// whichever one is driving: `rewriteOperand: old MirInstId v=N has no rewrite
+// entry` names the HELPER and hides the culprit. ✔MEASURED as a cost — isolating
+// D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER took a `DSS_OPT_TRACE`
+// run whose only product was the word `SimplifyCfg`.
+//
+// ★★ WHY THESE ARE DEATH TESTS AND NOT AN INSPECTION OF THE FORMAT STRING. The
+// attribution's whole value is that it SURVIVES THE PROCESS — a fatal is the one
+// message a reader cannot follow up interactively. A test that asserted the
+// literal existed in the source would pass for a message nothing ever printed;
+// only a spawned child that actually dies proves the text reaches stderr. These
+// use `EXPECT_DEATH`, so the abort happens in the CHILD and takes no sibling
+// test's verdict with it (the failure mode
+// D-TEST-ABORT-IN-A-FIXTURE-HAS-NO-GUARD exists to stop).
+//
+// ★★ THE MATCHERS CARRY NO REGEX METACHARACTERS ON PURPOSE. The obvious witness
+// is the bracketed form `[pass=X]`, and `[...]` is a CHARACTER CLASS to both
+// regex engines GoogleTest can be built against (POSIX extended on Linux, its own
+// simple RE on Windows) — the assertion would then pass on the letters `p`, `a`,
+// `s`, `=` in any order and red on nothing. `pass=X` is a literal in both.
+//
+// COVERAGE: five of the nine fatal paths in `mir_rebuild_helper.cpp` are
+// reachable from a hand-built module through a policy; the enumeration of all
+// nine, and why the other four are not reachable from a unit test, is at the
+// bottom of this block.
+namespace {
+
+// The `rewriteOperand` path — THE fatal the row was written about. `shouldEmit`
+// drops an instruction that a later instruction still uses, which is precisely
+// the "operand referenced a skipped instruction" arm.
+class SkipUsedValuePolicy final : public MirRebuildPolicy {
+public:
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "SkipUsedValueProbe";
+    }
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& src, MirFuncId fn) override {
+        std::vector<MirBlockId> out;
+        for (std::uint32_t i = 0; i < src.funcBlockCount(fn); ++i)
+            out.push_back(src.funcBlockAt(fn, i));
+        return out;
+    }
+    [[nodiscard]] bool shouldEmit(MirInstId oldId) override {
+        return oldId.v != skip.v;
+    }
+    MirInstId skip{};
+};
+
+// The `emitTerminator` successor path: a policy that omits a REACHABLE block
+// from `selectBlocks`, so the entry's terminator points at a block the rebuild
+// never created.
+class DropSuccessorPolicy final : public MirRebuildPolicy {
+public:
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "DropSuccessorProbe";
+    }
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& src, MirFuncId fn) override {
+        return {src.funcEntry(fn)};   // deliberately incomplete
+    }
+};
+
+// The absorb-chain cycle path: a policy that absorbs a block into ITSELF, so the
+// chase never terminates and trips the block-count cap.
+class SelfAbsorbPolicy final : public MirRebuildPolicy {
+public:
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "SelfAbsorbProbe";
+    }
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& src, MirFuncId fn) override {
+        std::vector<MirBlockId> out;
+        for (std::uint32_t i = 0; i < src.funcBlockCount(fn); ++i)
+            out.push_back(src.funcBlockAt(fn, i));
+        return out;
+    }
+    [[nodiscard]] std::optional<MirBlockId>
+    absorbSuccessor(MirBlockId oldB) override { return oldB; }
+};
+
+// The `onZeroPhiIncomings` path: reject every incoming, so a phi ends phase 3
+// with none.
+class RejectEveryPhiIncomingPolicy final : public MirRebuildPolicy {
+public:
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "RejectPhiIncomingProbe";
+    }
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& src, MirFuncId fn) override {
+        return mirReversePostOrder(src, src.funcEntry(fn));
+    }
+    [[nodiscard]] bool acceptPhiIncoming(
+        MirPhiIncoming const& /*inc*/, MirBlockId /*oldPhiBlock*/,
+        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/)
+        override {
+        return false;
+    }
+};
+
+// ★ THE NEUTER ATTRIBUTION PROBE. Its hooks are the base defaults — it exists
+// only to be the policy a rebuilder is CONSTRUCTED with while the policy actually
+// driving a `noOptimize` function is `MirIdentityRebuildPolicy`. The fatal must
+// name THIS pass, not the substitute.
+class NeuterAttributionPolicy final : public MirRebuildPolicy {
+public:
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "NeuterAttributionProbe";
+    }
+    [[nodiscard]] std::vector<MirBlockId>
+    selectBlocks(Mir const& src, MirFuncId fn) override {
+        std::vector<MirBlockId> out;
+        for (std::uint32_t i = 0; i < src.funcBlockCount(fn); ++i)
+            out.push_back(src.funcBlockAt(fn, i));
+        return out;
+    }
+};
+
+// Two blocks: entry stores a const then branches; the tail returns the const.
+// The Return's operand is produced in the ENTRY block, so dropping that producer
+// leaves a live use with no rewrite entry.
+[[nodiscard]] Mir buildTwoBlockUse(TypeInterner& interner, MirInstId& producer) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tail  = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirLiteralValue v; v.value = std::int64_t{41}; v.core = TypeKind::I32;
+    producer = mb.addConst(v, i32);
+    mb.addBr(tail);
+    mb.beginBlock(tail);
+    mb.addReturn(producer);
+    return std::move(mb).finish();
+}
+
+// A diamond with a phi at the join — the shape `acceptPhiIncoming` filters.
+[[nodiscard]] Mir buildDiamondWithPhi(TypeInterner& interner) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const thenB = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const elseB = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const joinB = mb.createBlock(StructCfMarker::IfJoin);
+
+    mb.beginBlock(entry);
+    MirLiteralValue cv; cv.value = true; cv.core = TypeKind::Bool;
+    mb.addCondBr(mb.addConst(cv, boolT), thenB, elseB);
+
+    mb.beginBlock(thenB);
+    MirLiteralValue t; t.value = std::int64_t{1}; t.core = TypeKind::I32;
+    MirInstId const tv = mb.addConst(t, i32);
+    mb.addBr(joinB);
+
+    mb.beginBlock(elseB);
+    MirLiteralValue e; e.value = std::int64_t{2}; e.core = TypeKind::I32;
+    MirInstId const ev = mb.addConst(e, i32);
+    mb.addBr(joinB);
+
+    mb.beginBlock(joinB);
+    MirPhiIncoming const incs[] = {{tv, thenB}, {ev, elseB}};
+    mb.addReturn(mb.addPhi(i32, incs));
+    return std::move(mb).finish();
+}
+
+// A single `noOptimize` function whose only phi has NO incomings. It is the ONLY
+// fatal a neutered rebuild can still reach: `MirIdentityRebuildPolicy` selects
+// every block and accepts every incoming, so nothing the SUBSTITUTE does can
+// abort — the defect has to be in the source MIR itself.
+[[nodiscard]] Mir buildNoOptimizeEmptyPhi(TypeInterner& interner) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{1}, SymbolBinding::Global,
+                   SymbolVisibility::Default, /*noInline=*/false,
+                   /*alwaysInline=*/false, /*noOptimize=*/true);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(b0);
+    mb.addReturn(mb.addPhi(i32));   // zero incomings — the structural violation
+    return std::move(mb).finish();
+}
+
+} // namespace
+
+// ★★ ONE TEST, FIVE ARMS, AND THE LOOP BODY IS A VOID CALLABLE ON PURPOSE. A
+// bare `ASSERT_*` inside a range-for `return`s from the enclosing TEST, so the
+// FIRST arm to fail would silently cancel every later arm and the run would still
+// read as one failure instead of five unexamined paths. Routing each arm through
+// `std::function<void()>` makes the `return` local to the arm. (That exact
+// vacuity was caught twice in this repo during the cycle this test was written.)
+TEST(MirRebuildHelperDeathTest, EveryReachableRebuildFatalNamesItsPass) {
+    // ★ TWO WITNESSES PER ARM, AND THE SECOND IS WHAT KEEPS THE COVERAGE CLAIM
+    // HONEST. `passWitness` alone would pass for an arm that died in the WRONG
+    // fatal path — every path in this file now prints the same `pass=` field, so
+    // e.g. the self-absorb arm reaching `rewriteOperand` instead of the
+    // absorb-cycle cap would still match and the block would silently be four
+    // paths tested twice rather than five tested once. `pathWitness` pins WHICH
+    // abort ran. Neither carries a regex metacharacter; `.*` between them is the
+    // only one, and it is deliberate (the pass field precedes the detail).
+    struct Arm {
+        char const*                  label;
+        char const*                  passWitness;
+        char const*                  pathWitness;
+        std::function<void()>        run;
+    };
+
+    std::vector<Arm> const arms = {
+        {"rewriteOperand: operand referenced a skipped instruction",
+         "pass=SkipUsedValueProbe",
+         "rewriteOperand: old MirInstId",
+         [] {
+             TypeInterner interner{CompilationUnitId{1}};
+             MirInstId producer{};
+             Mir const src = buildTwoBlockUse(interner, producer);
+             MirBuilder dstB;
+             SkipUsedValuePolicy policy;
+             policy.skip = producer;
+             MirFunctionRebuilder rb{src, dstB, policy};
+             rb.rebuildFunction(src.funcAt(0));
+         }},
+        {"emitTerminator: successor omitted from selectBlocks",
+         "pass=DropSuccessorProbe",
+         "emitTerminator successor old",
+         [] {
+             TypeInterner interner{CompilationUnitId{1}};
+             MirInstId producer{};
+             Mir const src = buildTwoBlockUse(interner, producer);
+             MirBuilder dstB;
+             DropSuccessorPolicy policy;
+             MirFunctionRebuilder rb{src, dstB, policy};
+             rb.rebuildFunction(src.funcAt(0));
+         }},
+        {"absorbSuccessor: cycle in the absorb chain",
+         "pass=SelfAbsorbProbe",
+         "absorbSuccessor chain exceeded block count",
+         [] {
+             TypeInterner interner{CompilationUnitId{1}};
+             MirInstId producer{};
+             Mir const src = buildTwoBlockUse(interner, producer);
+             MirBuilder dstB;
+             SelfAbsorbPolicy policy;
+             MirFunctionRebuilder rb{src, dstB, policy};
+             rb.rebuildFunction(src.funcAt(0));
+         }},
+        {"onZeroPhiIncomings: every incoming rejected",
+         "pass=RejectPhiIncomingProbe",
+         "zero accepted incomings",
+         [] {
+             TypeInterner interner{CompilationUnitId{1}};
+             Mir const src = buildDiamondWithPhi(interner);
+             MirBuilder dstB;
+             RejectEveryPhiIncomingPolicy policy;
+             MirFunctionRebuilder rb{src, dstB, policy};
+             rb.rebuildFunction(src.funcAt(0));
+         }},
+        // ★ THE ONE ARM THAT DISTINGUISHES `drivingPassName` FROM
+        // `this->passName()`. The function is `noOptimize`, so TF-C85 swaps in
+        // `MirIdentityRebuildPolicy` — and the fatal must still name the pass the
+        // rebuilder was CONSTRUCTED with. If the substrate ever reports the
+        // ACTIVE policy here it prints `pass=Identity`, which sends the reader
+        // looking for an abort in the debug pipeline that never happened, and
+        // this arm is the only thing in the suite that would notice.
+        {"onZeroPhiIncomings under the noOptimize neuter names the DRIVING pass",
+         "pass=NeuterAttributionProbe",
+         "zero accepted incomings",
+         [] {
+             TypeInterner interner{CompilationUnitId{1}};
+             Mir const src = buildNoOptimizeEmptyPhi(interner);
+             MirBuilder dstB;
+             NeuterAttributionPolicy policy;
+             MirFunctionRebuilder rb{src, dstB, policy};
+             rb.rebuildFunction(src.funcAt(0));
+         }},
+    };
+
+    ASSERT_EQ(arms.size(), 5u)
+        << "arm count is pinned so a deleted arm is a failure, not a quietly "
+           "smaller run";
+
+    for (auto const& arm : arms) {
+        SCOPED_TRACE(arm.label);
+        std::string const witness =
+            std::string{arm.passWitness} + ".*" + arm.pathWitness;
+        EXPECT_DEATH(arm.run(), witness)
+            << "the rebuilder aborted without naming the pass that drove it (or "
+               "died in a different path than this arm builds) — a reader of an "
+               "un-attributed fatal is left with a helper name and ~9 candidate "
+               "policies (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS)";
+    }
+}
+
+// The subject spelling is shared by ALL nine fatal paths, so it is asserted once
+// here rather than nine times above: a message that named the pass but not the
+// helper would be a different kind of unusable.
+TEST(MirRebuildHelperDeathTest, FatalStillNamesTheHelperAsWellAsThePass) {
+    // ⚠ The statement is a NAMED callable rather than an inline lambda: a `{a, b}`
+    // (or any top-level comma) inside a macro argument splits it into two
+    // arguments and `EXPECT_DEATH` reports "passed 4 arguments, but takes just 2".
+    // The same trap is documented in tests/analysis/compilation_unit.
+    std::function<void()> const die = [] {
+        TypeInterner interner{CompilationUnitId{1}};
+        MirInstId producer{};
+        Mir const src = buildTwoBlockUse(interner, producer);
+        MirBuilder dstB;
+        SkipUsedValuePolicy policy;
+        policy.skip = producer;
+        MirFunctionRebuilder rb{src, dstB, policy};
+        rb.rebuildFunction(src.funcAt(0));
+    };
+    EXPECT_DEATH(die(), "MirFunctionRebuilder fatal")
+        << "the pass name ADDS an attribution; it must not REPLACE the subject";
+}
+
+// THE ENUMERATION, so a reader can tell coverage from hope. Nine `std::abort`
+// paths live in `mir_rebuild_helper.cpp`, all nine now route through the one
+// `rebuildFatal` composer that cannot be called without a pass name:
+//
+//   1. rewriteOperand — no rewrite entry                    ← arm 1 above
+//   2. emitTerminator/mapSucc — successor not in blockMap    ← arm 2
+//   3. rebuildFunction — absorb-chain cycle                  ← arm 3
+//   4. rebuildFunction phase 3 — zero accepted incomings     ← arms 4 and 5
+//   5. rebuildFunction phase 3 — redirected pred not in map
+//   6. emitValue — BlockAddress target not in blockMap
+//   7. emitTerminator — `default:` no clone arm for a terminator opcode
+//   8. cloneGlobalsRemappingInitFunc — remap/module size mismatch
+//   9. cloneGlobalsRemappingInitFunc — a dropped module-init function
+//
+// Paths 5–9 are NOT covered by a death test here, and the reason is stated rather
+// than left as an absence:
+//   * 5 needs a policy that ACCEPTS a phi incoming and simultaneously redirects
+//     its pred to an elided block — reachable, but the shape only exists as a
+//     self-contradictory policy, i.e. the test would assert the substrate's
+//     response to a policy no pass can be written to resemble.
+//   * 6 needs a computed-goto (`&&label`) module whose address-taken block a
+//     policy then elides; the address-taken guard (MF-B) is what prevents it, so
+//     building it means disabling a second mechanism inside this test.
+//   * 7 is unreachable BY CONSTRUCTION without adding a terminator opcode to
+//     `MirOpcode` — the arm exists for a future opcode, and a test could only
+//     reach it by shipping a fake one.
+//   * 8 and 9 belong to `cloneGlobalsRemappingInitFunc`, a free function with a
+//     single call site (the optimizer's inline-definition strip), not to the
+//     rebuilder. They take the pass name as an explicit parameter, so the
+//     compiler enforces the attribution the same way the pure virtual does for a
+//     policy: there is no overload without it.
+// ⇒ What is claimed is that ALL NINE compose through one attributed helper (a
+// structural property, and the mutant below is what proves it is load-bearing),
+// and that FIVE of them are additionally witnessed end-to-end by a dying process.

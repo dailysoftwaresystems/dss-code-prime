@@ -1,15 +1,22 @@
 #include "program/dump_predefined_macros.hpp"
 
 #include "analysis/preprocess/preprocessor.hpp"   // mergePredefinedMacros — THE owner
+#include "core/types/config_path_walk.hpp"   // findShippedConfigDir (the SHARED shippedLibDirs resolution)
+#include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "ffi/shipped_lib_descriptor.hpp"    // validateShippedSurfaceRequirements (the `impliedSurface` satisfaction half)
 #include "link/object_format_schema.hpp"
 #include "program/target_spec.hpp"
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <ostream>
+#include <span>
+#include <system_error>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -172,7 +179,7 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
     // order, and whether the three families collide, comes from this one call.
     MergedPredefinedMacros const merged = mergePredefinedMacros(
         req.languageMacros, req.targetMacros, req.formatMacros,
-        req.activeFormat);
+        req.activeFormat, req.exclusiveGroups);
     // `conflicts` non-empty ⇒ `effective` is documented UNUSABLE. Return the
     // merge's own messages and NOTHING else — no header, no partial list.
     if (!merged.conflicts.empty()) return std::unexpected(merged.conflicts);
@@ -224,6 +231,11 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
     // `merged.effective`, and its origin is accepted only while the two agree
     // name-for-name. A future reordering inside the merge therefore produces a
     // loud refusal instead of thirty confidently mislabelled lines.
+    // These per-family calls pass NO exclusion groups (the parameter defaults to
+    // empty), and that is deliberate rather than an oversight: the authoritative
+    // check already ran over the FULL merge above and returned on violation, so
+    // re-running it against one family at a time could only ever under-report a
+    // pair that spans two families. Origin attribution is all these calls are for.
     struct FamilySurvivors {
         PredefinedMacroOrigin origin;
         MergedPredefinedMacros merged;
@@ -480,7 +492,57 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
         // `formatKindOfSpec` reads for the front-end build key, and the same one
         // the preprocessor receives as `activeFormat`.
         req.activeFormat   = (*formatR)->kind();
+        // D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC: same groups the compile
+        // path passes, so this instrument and the compiler agree about which
+        // identities are presentable.
+        req.exclusiveGroups = grammar->preprocess().mutuallyExclusivePredefinedMacros;
         req.userDefines    = args.defines;
+
+        // ★★★ D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE — THE DUMP MUST
+        // TELL THE SAME TRUTH THE COMPILER DOES.
+        //
+        // This flag is the instrument used to verify a leg's macro identity, and
+        // it is how the co-definition defect was found in the first place. So it
+        // must refuse exactly what a compile refuses. A macro whose `impliedSurface`
+        // claim is unbacked does NOT get quietly dropped from the listing — that
+        // would be the instrument inventing a THIRD answer ("the macro isn't
+        // there") distinct from both what the config says and what the compiler
+        // does. It is reported, by name, and nothing partial is printed, for the
+        // same reason the collision arm below prints nothing partial.
+        //
+        // The search path is the LANGUAGE's own `semantics.shippedLibDirs`,
+        // resolved by the SHARED `findShippedConfigDir` (`$DSS_CONFIG_ROOT`, else
+        // the cwd walk) — the same resolution `applySystemDirs` performs for a
+        // real compile, so the dump reads the same corpus the compile would.
+        std::vector<std::filesystem::path> systemDirs;
+        for (std::string const& sub : grammar->semantics().shippedLibDirs) {
+            if (auto const resolved = findShippedConfigDir(sub)) {
+                std::error_code ec;
+                auto const abs = std::filesystem::absolute(*resolved, ec);
+                systemDirs.push_back(ec ? *resolved : abs);
+            }
+        }
+        {
+            DiagnosticReporter reqRep;
+            std::array<std::pair<std::span<PredefinedMacroDef const>,
+                                 std::string_view>, 3> const families{{
+                {req.languageMacros, kPredefinedMacroFamilyPaths[0]},
+                {req.targetMacros,   kPredefinedMacroFamilyPaths[1]},
+                {req.formatMacros,   kPredefinedMacroFamilyPaths[2]}}};
+            bool backed = true;
+            for (auto const& [rows, doc] : families) {
+                if (!ffi::validateShippedSurfaceRequirements(
+                        rows, doc, systemDirs, req.activeFormat, reqRep)) {
+                    backed = false;
+                }
+            }
+            if (!backed) {
+                for (auto const& d : reqRep.all()) {
+                    emitLoud(err, d.code, "[target=" + spec + "] " + d.actual);
+                }
+                return 1;
+            }
+        }
 
         auto rendered = renderPredefinedMacroDump(req);
         if (!rendered.has_value()) {

@@ -313,6 +313,19 @@ readCHeaderFromText(std::string_view    text,
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
 
+    // ★★★ THE HEADER'S BUFFERS MUST TRAVEL WITH ITS DIAGNOSTICS, OR THE
+    // DIAGNOSTICS CANNOT BE RENDERED. `cu` is a CompilationUnit the driver never
+    // sees: it dies at the end of this function, and `program.cpp` builds its
+    // render-time `BufferRegistry` only from the unit it DOES see. So a forwarded
+    // diagnostic carried a buffer id that resolved to nothing and rendered as
+    // `--> <unknown-buffer:N>:offset K` instead of the offending header line.
+    // ⇒ SAME DEFECT, SAME FIX, as `parseAsmTemplateText`
+    // (D-ASM-TEMPLATE-DIAGNOSTICS-RENDER-WITHOUT-SOURCE-CONTEXT) — found by the
+    // lane that closed that one, looking for the class rather than the instance.
+    // The reporter is the object that spans the gap, so it retains the buffers.
+    for (auto const& tree : cu->trees()) {
+        if (auto s = tree.sourceShared()) reporter.sourceBuffers().add(std::move(s));
+    }
     for (auto const& d : model.diagnostics().all()) {
         reporter.report(d);
     }

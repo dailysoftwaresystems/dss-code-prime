@@ -1,4 +1,5 @@
 {
+    "$comment": "Scoop manifest for the dsscp compiler, rendered by packaging/render.py. The release tarball is a PREFIX TREE produced by `cmake --install` (bin/, lib/, share/) — see cmake/DssInstall.cmake, the single owner of what ships. Scoop extracts it whole into the app directory and shims `bin\\dsscp.exe`, so the exe keeps its relative hop to share\\dss-code-prime\\<version>\\dss-config, which is how it finds the descriptors that resolve `#include <stdio.h>`. A shim launches the real exe in place rather than copying it, so the hop survives. Still depends on the queued dss-code-prime -> dsscp binary rename.",
     "version": "@VERSION@",
     "description": "@DESCRIPTION@",
     "homepage": "@HOMEPAGE@",
@@ -9,5 +10,5 @@
             "hash": "@SHA256_WINDOWS_X64@"
         }
     },
-    "bin": "bin\\dss\\dsscp.exe"
+    "bin": "bin\\dsscp.exe"
 }

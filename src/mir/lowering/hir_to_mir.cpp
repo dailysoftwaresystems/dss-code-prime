@@ -7744,6 +7744,10 @@ struct Lowerer {
     //   - `AssignStmt` whose target is `Ref(sym)` — the symbol is being
     //     mutated, so it must live in a storage slot rather than as a
     //     pure-SSA value.
+    //   - `InlineAsm` whose OUTPUT operand k is `Ref(sym)` — an asm output
+    //     is an assignment to that object and is lowered through
+    //     `lowerLvalueAddress`, so it needs the same storage slot
+    //     (D-CSUBSET-ASM-OUTPUT-ON-A-PARAMETER-NOT-ADDRESS-TAKEN).
     // Walks every child; HIR is already verified well-formed before this
     // pass, so all referenced types are valid.
     void collectAddressTakenSymbols(HirNodeId node,
@@ -7780,6 +7784,50 @@ struct Lowerer {
             HirNodeId const target = hir.assignTarget(node);
             if (auto s = refSymOf(target); s.has_value()) {
                 out.insert(*s);
+            }
+        } else if (k == HirKind::InlineAsm) {
+            // ★★ AN INLINE-ASM **OUTPUT** IS AN ASSIGNMENT TO THE NAMED OBJECT,
+            // AND IT REACHES THAT OBJECT THE SAME WAY `AssignStmt` DOES — through
+            // `lowerLvalueAddress`. So it belongs in this set for the identical
+            // reason the `AssignStmt` arm above does, and leaving it out REFUSED
+            // VALID C (D-CSUBSET-ASM-OUTPUT-ON-A-PARAMETER-NOT-ADDRESS-TAKEN).
+            // ✔MEASURED 2026-08-17 through the CLI, before this arm existed:
+            //     static int f(int v){ __asm__("movl $42,%0" : "=r"(v)); return v; }
+            // failed `error[H0009] … symbol 86 has no storage slot
+            // (non-addressable param or unbound) — required by lvalue use`, while
+            // the SAME function with `&v` also taken compiled and exited 42 on
+            // both configs. gcc 13.3.0 compiles and runs both. A body LOCAL was
+            // never affected (its `VarDecl` already allocates a slot); the gap was
+            // exactly the pure-SSA `Arg` a non-address-taken PARAMETER lowers to.
+            //
+            // ★ WHY NOT REBIND THE SSA VALUE INSTEAD. `symbolToValue` is written
+            // at ONE site (param reception) and never rebound — this lowering is
+            // not an SSA renamer and mints no phis — so a rebind could not survive
+            // the `asm goto` shape at all, where the write-back lands in a
+            // SUCCESSOR block. Giving the object real storage is the mechanism
+            // this pass already has for "a named object is written", Mem2Reg
+            // promotes the slot straight back to SSA afterwards, and — the part
+            // that matters for `"+r"` — the read half and the write-back then go
+            // through ONE address, so they are provably the same object. Copying
+            // the parameter into a fresh local would break exactly that.
+            //
+            // Inputs are rvalues and are deliberately NOT marked: they lower via
+            // `lowerExpr`, which is happy with a pure-SSA `Arg`. An output whose
+            // expression is `p[i]` / `s.f` / `*q` is already covered by the Index /
+            // MemberAccess arms (or needs nothing, for Deref).
+            std::uint32_t const handle = hir.payload(node);
+            if (inlineAsmPool != nullptr && handle != kNoInlineAsmDescriptor
+                && inlineAsmPool->contains(handle)) {
+                auto const kids = hir.children(node);
+                // Clamped against the child count rather than trusted: a
+                // descriptor/child-count disagreement is `lowerInlineAsm`'s
+                // refusal to report, and this analysis must not index past the
+                // children on the way to it.
+                std::size_t const nOut = std::min<std::size_t>(
+                    inlineAsmPool->at(handle).outputCount, kids.size());
+                for (std::size_t i = 0; i < nOut; ++i) {
+                    if (auto s = refSymOf(kids[i]); s.has_value()) out.insert(*s);
+                }
             }
         } else if (k == HirKind::VaArg || k == HirKind::VaStart
                    || k == HirKind::VaEnd) {

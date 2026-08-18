@@ -1945,10 +1945,33 @@ encodeElfExecDynamic(
     appendSymtabEntry(0, makeStInfo(STB_LOCAL, STT_SECTION),
                       IDX_TEXT, 0, 0);
     std::uint32_t const firstNonLocal = 2;
+    // Real DECLARED function names in the FINAL IMAGE's `.symtab`, from the
+    // format-neutral `module.symbols` carrier through the shared
+    // `ObjectSymbolNames` owner — the SAME table the (b.7) `.dynsym` export set
+    // above already reads.
+    // D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS:
+    // this loop hardcoded `sym_<id>`, so EVERY frame of EVERY backtrace over
+    // a DSS exec/PIE arrived anonymised (✔MEASURED: gdb printed `#0 sym_84 /
+    // #1 sym_89 / #2 sym_93` where the source says `static_helper` /
+    // `global_helper` / `main`, on both x86_64 and aarch64) — beside the CORRECT
+    // `.eh_frame` the sibling cycle had just made it emit.
+    //
+    // `imageName`, NOT `definedName`: this is a final image, so a `static`'s real
+    // name is both safe (nothing re-links it) and wanted (it is a frame in the
+    // backtrace). The `<prefix><id>` fallback survives ONLY for the genuinely
+    // nameless — here that is the linker-injected `_start` trampoline, which is
+    // functions[0] and carries no `ModuleSymbol` row. See `imageName`'s docblock.
+    //
+    // ★ THE BINDING IS DELIBERATELY UNCHANGED (STB_GLOBAL for every function,
+    // and `firstNonLocal` stays 2 because of it). gcc emits a static as
+    // STB_LOCAL, and matching that is a REAL improvement — but it would move
+    // statics into a local-first prefix and make this hardcoded `2` wrong, so it
+    // is its own change with its own witness, not a silent rider on the names:
+    // D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL.
+    link::format::ObjectSymbolNames const imgNames{module};
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
         auto const& fn = module.functions[i];
-        std::string const name =
-            std::string{"sym_"} + std::to_string(fn.symbol.v);
+        std::string const name = imgNames.imageName(fn.symbol, "sym_");
         std::uint32_t const nameOff = strtab.add(name);
         appendSymtabEntry(nameOff,
                           makeStInfo(STB_GLOBAL, STT_FUNC),
@@ -3567,11 +3590,15 @@ encode(AssembledModule const&    module,
     StringTable strtab;
     std::vector<std::uint8_t> symtab;
 
-    // Real source-level C names for the externally-visible defined functions
+    // Real declared symbol names from the format-neutral `module.symbols`
+    // carrier. In the RELOCATABLE `.o`: the externally-visible defined functions
     // (D-LK-OBJECT-EXTERN-SYMBOL-NAMES) AND the undefined extern references
-    // (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE), so a foreign linker resolves both
-    // by name; `sym_<id>` fallback for static/local/synthesized symbols. Built
-    // once from `module` for O(1) per-symbol lookup below.
+    // (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE), so a foreign linker resolves both by
+    // name, with a `sym_<id>` fallback for static/local/synthesized symbols. In
+    // the ET_EXEC image: EVERY named function, `static` included, via `imageName`
+    // (D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS) — an image's
+    // `.symtab` resolves nothing and is read by debuggers. Built once from
+    // `module` for O(1) per-symbol lookup below.
     link::format::ObjectSymbolNames const objNames{module};
 
     // Helper: emit one Elf64_Sym record (24 bytes).
@@ -3657,22 +3684,47 @@ encode(AssembledModule const&    module,
     // multi-TU link (`ld: multiple definition`); DSS's own linker keys by
     // (cuId,SymbolId) and was unaffected.
     //
-    // ET_EXEC is a FINAL image (no foreign re-link): it keeps the synthesized
+    // ET_EXEC is a FINAL image (no foreign re-link), so it keeps its GLOBAL
+    // binding UNCHANGED (`definedFuncBinding` forces Global). Only the ET_REL
+    // `.o` (the foreign-linker input) carries the real per-symbol binding;
+    // ET_EXEC emits no DATA symbols here at all (`addDataSymbolVas` handles
+    // those, and it emits none — D-LINK-ELF-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB).
+    //
+    // ★ THE NAME NO LONGER FOLLOWS THE BINDING HERE, and the reason the two
+    // parted is that the OLD justification for the synthesized exec name was
+    // MEASURABLY FALSE. This comment used to read "it keeps the synthesized
     // `sym_<id>` name UNCHANGED — entry-point resolution matches the schema's
-    // `entryPoint` string against that reconstructed name (D-LK1-1) — AND its
-    // GLOBAL binding UNCHANGED (`definedFuncBinding` forces Global), so the
-    // informational `.symtab` stays byte-identical. Only the ET_REL `.o` (the
-    // foreign-linker input) carries the real per-symbol binding; ET_EXEC emits
-    // no DATA symbols here at all (`addDataSymbolVas` handles those).
+    // `entryPoint` string against that reconstructed name (D-LK1-1)", i.e. it
+    // claimed the `.symtab` STRING BYTES were load-bearing for entry resolution.
+    // ✔MEASURED — they are not, and never were: `resolveEntryFnIdx`
+    // (`exec_reloc_apply.hpp`) RE-DERIVES `<prefix><SymbolId>` from the symbol id
+    // itself and compares THAT to `format.entryPoint()`; it never opens the
+    // symtab. Renaming a symtab entry therefore cannot move an image entry. (And
+    // every shipped exec/PIE format declares `"entryPoint": ""`, so that arm is
+    // dormant regardless.) A comment that recorded a coupling the code did not
+    // have is what kept this defect alive. See
+    // D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS.
     auto definedFuncBinding = [&](SymbolId id) -> SymbolBinding {
         return isExec ? SymbolBinding::Global : objNames.definedBinding(id);
     };
 
-    // Emit one defined FUNCTION symbol (STT_FUNC, shndx=.text) — name + binding
-    // coupled through `objNames`.
+    // Emit one defined FUNCTION symbol (STT_FUNC, shndx=.text).
+    //
+    // NAME: both tiers read the ONE format-neutral `module.symbols` carrier
+    // through `objNames`; they differ only in which tier's predicate applies.
+    //   * FINAL IMAGE (`isExec`) → `imageName`: the real declared name for every
+    //     named function INCLUDING a `static` (a debugger wants that frame named,
+    //     and nothing re-links an image so it cannot collide), `sym_<id>` only for
+    //     the genuinely nameless — here the linker-injected entry trampoline.
+    //   * RELOCATABLE `.o` → `definedName`: externally-visible names only, since
+    //     these names ARE a foreign linker's resolution keys and a real-named
+    //     static would collide across TUs (D-LK-INTERNAL-LINKAGE-FN-EMITTED-
+    //     GLOBAL-FOREIGN-COLLISION).
+    // `isExec` is an artifact-KIND question answered by the loaded schema
+    // (`id.objectType`), not a format/target/language identity test.
     auto emitFuncSym = [&](FuncSymRecord const& f) {
         std::string const symName =
-            isExec ? std::string{"sym_"} + std::to_string(f.symId.v)
+            isExec ? objNames.imageName(f.symId, "sym_")
                    : objNames.definedName(f.symId, "sym_");
         std::uint32_t const nameOff = strtab.add(symName);
         std::uint32_t const idx =

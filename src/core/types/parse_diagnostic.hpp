@@ -413,6 +413,33 @@ enum class DiagnosticCode : std::uint16_t {
     // CROSS-document conflict between two independently valid configs).
     C_ConflictingPredefinedMacro  = 0xC038,
 
+    // ★★★ D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE: a predefined macro
+    // declares a `requires` claim about the SHIPPED HEADER SURFACE, and the
+    // corpus does not back it — the claimed header resolves to no descriptor, or
+    // is declared absent on the very object format the macro is effective on, or
+    // does not (through its ACTIVE include closure) declare a name the claim
+    // named.
+    //
+    // ★ THE DEFECT THIS EXISTS TO END, MEASURED: `_MSC_VER` was declared on pe
+    // for months while the MSVC header world it promises was never shipped. Real
+    // source (sqlite's `hwtime.h`, `windirent.h`) read the macro, took the branch
+    // it advertises, and reached declarations DSS could not satisfy — so the
+    // failure surfaced far from the false claim, as an unrelated-looking error in
+    // the user's code. The macro's presence must be a CHECKED CONSEQUENCE of the
+    // realized surface, not a second declaration of the same fact sitting beside
+    // it.
+    //
+    // It is an ASSERTION, never a suppression: an unbacked macro fails the build
+    // rather than being quietly withdrawn. Withdrawing it would flip `#ifdef`
+    // branches under the user with no diagnostic at all — the same species of
+    // silent wrongness in the opposite direction.
+    //
+    // Distinct from `C_ConflictingPredefinedMacro` (0xC038), which is about a
+    // NAME being owned twice, and from `C_InvalidPreprocess` (0xC037), which is a
+    // malformed `preprocess` block: this row is well-formed and singly-owned, and
+    // still says something untrue about the platform.
+    C_UnbackedPredefinedMacro     = 0xC039,
+
     // ── S0xxx — semantic analysis (phase #8; see 08.6-semantic-plan §3) ──
     // Emitted by the language-agnostic semantic analyzer
     // (`src/analysis/semantic/`). The 0xE high nibble renders as the letter
@@ -1504,10 +1531,31 @@ enum class DiagnosticCode : std::uint16_t {
     // Renders error[S0066].
     S_InlineAsmConstraintUnsupportedForm = 0xE066,
 
-    // D-CSUBSET-INLINE-ASM-OPERANDS (inline-asm P5): an operand MODIFIER
-    // placeholder — `%w0`, `%k0`, `%b0` — which asks for a narrower VIEW of
-    // the register the operand was bound to (arm64's `w0` half of `x0`; x86's
-    // `%k`/`%b`/`%h` width letters) rather than for the operand itself.
+    // D-CSUBSET-INLINE-ASM-OPERANDS (inline-asm P5).
+    //
+    // ★★ THE DE-FACTO CONTRACT IS BROADER THAN THE NAME, AND THE NAME IS THE
+    // NARROW ONE: this code means **a `%`-form in an EXTENDED inline-asm template
+    // that this build cannot expand.** ✔MEASURED 2026-08-17 that
+    // `scanInlineAsmTemplate` already emits it for THREE distinct constructs, of
+    // which the modifier is only the first
+    // (D-DIAG-S0067-DOCBLOCK-NAMES-ONE-OF-THE-THREE-FORMS-IT-REPORTS):
+    //
+    //   (1) an operand MODIFIER placeholder — `%w0`, `%k0`, `%b0` — which asks
+    //       for a narrower VIEW of the register the operand was bound to
+    //       (arm64's `w0` half of `x0`; x86's `%k`/`%b`/`%h` width letters)
+    //       rather than for the operand itself;
+    //   (2) any other unrecognised `%`-form, including GNU's `%=` (the unique
+    //       per-instantiation number) and a template ending in a bare `%`;
+    //   (3) the POSITIONAL `asm goto` label reference `%lN` — gcc accepts it,
+    //       this build declares only the bracketed `%l[name]`, and the two tiers
+    //       must agree, so it is refused here where the label list lives
+    //       (D-CSUBSET-INLINE-ASM-POSITIONAL-LABEL-REF-ACCEPTED-WITH-NO-GRAMMAR).
+    //
+    // ⚠ The broader contract is the RIGHT one — the docblock simply never
+    // followed the code. Widened rather than split into three codes: they share
+    // one refusal reason, one severity, and one remedy (write the form this build
+    // declares), and three codes would make the census enumerate spellings
+    // instead of the property.
     //
     // ★ WHY A REFUSAL AND NOT A LOWERING: the view a modifier letter selects
     // is per-TARGET vocabulary of exactly the kind `asmConstraints` already
@@ -4196,6 +4244,24 @@ enum class DiagnosticCode : std::uint16_t {
     //   `kUnsuppressableCodes` — suppressing it would restore the silent
     //   host-dependent pick. (D-PP-HEADER-CASE-INSENSITIVE-PE, 2026-08-04.)
     F_HeaderNameCaseAmbiguous      = 0x5025,
+
+    // ★★★ D-FFI-DESCRIPTOR-INCLUDES-EDGE-GATE: a SHIPPED-CORPUS invariant broke.
+    // Emitted only by the corpus-wide sweep (`validateShippedIncludeClosure`),
+    // which evaluates the two invariants that ship with the conditional
+    // `includes` edge gate:
+    //
+    //   (i)  an `includes` edge ACTIVE on object format F resolves to nothing, or
+    //        resolves to a descriptor that declares it does not exist on F — the
+    //        config promising, on F, a surface it also declares absent from F;
+    //   (ii) a descriptor available on F contributes NO name on F, from its own
+    //        surfaces or its active closure — a header whose `#include` compiles
+    //        and declares nothing.
+    //
+    // Distinct from `F_ShippedLibDescriptorMalformed` (0x501B): each descriptor
+    // here is individually well-formed and decodes cleanly. The fault is in the
+    // RELATIONSHIP between descriptors, or between a descriptor and the format it
+    // claims to serve, which is a thing no per-file read can see.
+    F_ShippedCorpusInvariantBroken = 0x5026,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

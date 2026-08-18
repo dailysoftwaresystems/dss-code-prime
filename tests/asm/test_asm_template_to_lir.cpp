@@ -1297,19 +1297,36 @@ TEST(AsmTemplateToLir, DoublePercentZeroDoesNotBindOperandZero) {
 //
 // ⚠ THE INTENDED ARM WAS "delete the row, watch `%%rcx` stop lowering". What
 // actually happens is that the DOCUMENT STOPS LOADING: `PercentEscape` is
-// declared ONLY in the template mode's table, so deleting the row leaves
+// reachable ONLY through the template mode, so removing it leaves
 // `attRegister`'s escaped arm referencing a kind nothing interns and the loader
 // refuses with `/shapes/attRegister: unknown reference 'PercentEscape'`. That is
 // a better result than the behavioural one and it is the one asserted — the
 // mutant is provably READ, because the loader names the exact shape that
 // depended on it, and the row cannot be dropped by accident.
+//
+// ★★ THE LEVER MOVED WITH THE OWNER (P5c, 2026-08-17 —
+// D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER). The dialect
+// no longer DECLARES the `%%` row; `asm.lang.json` owns the bytes and the loader
+// synthesizes the row by joining them to the KIND this document binds to the
+// `templateEscape` role. So the mutation that removes the row is now the removal
+// of that BINDING — and the assertion is unchanged, which is the point: the
+// consumer still names itself, and the arm now also proves the row is DERIVED
+// rather than declared.
 TEST(AsmTemplateToLir, DeletingTheEscapeRowIsRefusedAtLoadNamingItsConsumer) {
     auto const without = loadDialectMutated(
         kX86.dialect, [](nlohmann::json& doc) {
-            ASSERT_EQ(doc["lexerModes"]["asm-template"]["tokens"].erase("%%"),
-                      1u)
-                << "the shipped document declares no `%%` row in its template "
-                   "mode — this arm would be green for the wrong reason";
+            ASSERT_FALSE(doc["lexerModes"]["asm-template"].contains("tokens"))
+                << "the dialect declares template-mode tokens of its own again "
+                   "— the row is supposed to be synthesized from "
+                   "asm.lang.json's semantics.inlineAsmTemplateLexemes";
+            std::size_t erased = 0;
+            for (auto& [_, ref] : doc["languageReferences"].items()) {
+                if (!ref.is_object() || !ref.contains("bindTokens")) continue;
+                erased += ref["bindTokens"].erase("templateEscape");
+            }
+            ASSERT_EQ(erased, 1u)
+                << "the shipped document binds no 'templateEscape' role — this "
+                   "arm would be green for the wrong reason";
         });
     EXPECT_EQ(without.grammar, nullptr)
         << "the document loaded with the `%%` row deleted — nothing depends on "
@@ -1341,25 +1358,59 @@ TEST(AsmTemplateToLir, DeletingTheEscapeRowIsRefusedAtLoadNamingItsConsumer) {
 // every other silently-dead mode accepted.
 // ★ The behavioural claim it carried is not orphaned; the test directly below
 // makes it sharper.
-TEST(AsmTemplateToLir, ATemplateModeMintingNoPlaceholderSigilIsRefusedAtLoad) {
+//
+// ★★★ AND IT MOVED AGAIN AT P5c (2026-08-17,
+// D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER), THIS TIME
+// FROM A REFUSAL TO AN IMPOSSIBILITY — which is the stronger of the two and is
+// why the test now asserts the OPPOSITE outcome.
+//
+// ⓘ WHAT CHANGED. The failure this arm guarded was "the named mode does not mint
+// the placeholder sigil, so the whole template surface is silently dead". The
+// dialect no longer declares those rows at all: the LOADER synthesizes one row
+// per template role INTO whatever scanning mode `templateLexerMode` names. A
+// named mode therefore CANNOT fail to mint the sigil — not "is checked and
+// refused", but cannot. So a decoy that overrides something irrelevant now loads
+// clean AND lowers templates, and asserting a refusal here would be asserting
+// that the fix did not happen.
+// ⚠ THE GUARD IS NOT GONE, IT IS RELOCATED, AND THE RESIDUE IS STILL LIVE: the
+// same FIRST-set check now fires when the LANGUAGE declares a role `null` that
+// this dialect's grammar needs (see the sibling suite
+// `analysis/semantic/test_inline_asm_template_sigil_agreement`), and `main` is
+// still refused below because it is not a mode this document declares.
+TEST(AsmTemplateToLir, TheLoaderFillsWhicheverScanningModeIsNamed) {
     auto const decoyed = loadDialectMutated(
         kX86.dialect, [](nlohmann::json& doc) {
             // A real scanning mode that overrides something irrelevant — the
-            // shape a "has a tokens override" check would have accepted.
+            // exact shape that used to make the template surface silently dead.
             doc["lexerModes"]["decoy"]["tokens"]["@@"] =
                 nlohmann::json::parse(R"([{"kind": "TypeSigil"}])");
             doc["assembly"]["templateLexerMode"] = "decoy";
         });
-    EXPECT_EQ(decoyed.grammar, nullptr)
-        << "a template mode that mints no placeholder sigil loaded clean — "
-           "every template would be read on the `.s` surface and the whole "
-           "placeholder surface would be silently dead";
-    auto const why = joined(decoyed.loadErrors);
-    EXPECT_NE(why.find("decoy"), std::string::npos)
-        << "the refusal must name the mode: " << why;
-    EXPECT_NE(why.find("PlaceholderSigil"), std::string::npos)
-        << "the refusal must name the KIND the mode failed to mint — that is "
-           "what tells an author which row is missing: " << why;
+    ASSERT_NE(decoyed.grammar, nullptr)
+        << "a scanning mode named as the template lexer mode was REFUSED — the "
+           "loader is supposed to FILL it from the language's role set, which is "
+           "what makes a silently-dead template surface unconstructible: "
+        << joined(decoyed.loadErrors);
+
+    // The mode it was pointed at is the mode that got the rows...
+    LexerModeId const mode = decoyed.grammar->assembly().templateLexerMode;
+    ASSERT_TRUE(mode.valid());
+    EXPECT_EQ(decoyed.grammar->findLexerMode("decoy").v, mode.v)
+        << "the loaded schema's template mode is not the one the key named";
+
+    // ...and a template still lowers through it, which is the behavioural half.
+    auto const moved = runTemplateWith(decoyed.grammar, kX86,
+                                       "movq %1, %0\n", {"%0", "%1"});
+    ASSERT_TRUE(moved->parsed)
+        << "`%0` did not parse with the template mode repointed at a decoy — the "
+           "synthesis did not follow the key:\n" << messages(*moved);
+    EXPECT_TRUE(moved->ok) << messages(*moved);
+
+    // ...while the mode's OWN unrelated override is untouched: the synthesis
+    // ADDS the role rows, it does not replace the table.
+    EXPECT_FALSE(decoyed.grammar->lookupLexemeInMode(mode, "@@").empty())
+        << "the decoy's own `@@` row was discarded — the synthesis is "
+           "overwriting a declaration instead of extending it";
 }
 
 // ★★★ AND `main` IS REFUSED BY THE SAME CHECK RATHER THAN BY ITS NAME. This is
@@ -1390,6 +1441,15 @@ TEST(AsmTemplateToLir, TheMainModeIsRefusedAsATemplateLexerMode) {
 // global table under a non-main id, so `lexerModeTokens` has an entry for it and
 // any check phrased over "does this mode have a table?" passes it — while the
 // surface it produces is byte-for-byte the `.s` one.
+//
+// ★★ STILL REFUSED AT P5c, AND NOW FOR A SHARPER REASON. It is no longer "this
+// mode mints no placeholder sigil" (the loader would happily mint one INTO it);
+// it is that a verbatim copy of the global table is a SECOND DECLARATION of the
+// template sigils — with their `.s` meanings — in the one mode whose table the
+// loader owns. Overwriting it would silently discard a statement the author made,
+// so the load is refused instead
+// (D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER, R1's third
+// shape).
 TEST(AsmTemplateToLir, ATemplateModeWhoseTokensAreDefaultIsRefusedAtLoad) {
     auto const copied = loadDialectMutated(
         kX86.dialect, [](nlohmann::json& doc) {
@@ -1399,9 +1459,12 @@ TEST(AsmTemplateToLir, ATemplateModeWhoseTokensAreDefaultIsRefusedAtLoad) {
     EXPECT_EQ(copied.grammar, nullptr)
         << "a `tokens: \"default\"` mode was accepted as the template lexer "
            "mode — it is the global table under another name";
-    EXPECT_NE(joined(copied.loadErrors).find("PlaceholderSigil"),
-              std::string::npos)
-        << joined(copied.loadErrors);
+    auto const why = joined(copied.loadErrors);
+    EXPECT_NE(why.find("global-copy"), std::string::npos)
+        << "the refusal must name the mode: " << why;
+    EXPECT_NE(why.find("inlineAsmTemplateLexemes"), std::string::npos)
+        << "the refusal must name the OWNER whose rows this table would be a "
+           "second copy of: " << why;
 }
 
 // ★★★ THE BEHAVIOURAL HALF, SHARPENED: THE ENTRY READS THE **NAMED** MODE'S OWN
@@ -1415,41 +1478,48 @@ TEST(AsmTemplateToLir, ATemplateModeWhoseTokensAreDefaultIsRefusedAtLoad) {
 // read a hard-coded mode name — or the shipped table — the opposite would hold.
 // ⚠ Same binary, same input text shape, ONE config key: no other experiment in
 // this file separates "the mode is consulted" from "the shipped mode works".
-TEST(AsmTemplateToLir, TheTemplateEntryReadsTheNamedModesOwnTable) {
-    auto const decoyed = loadDialectMutated(
-        kX86.dialect, [](nlohmann::json& doc) {
-            doc["lexerModes"]["at-sigil-template"]["tokens"]["@"] =
-                nlohmann::json::parse(R"([{"kind": "PlaceholderSigil"}])");
-            doc["lexerModes"]["at-sigil-template"]["tokens"]["@l"] =
-                nlohmann::json::parse(R"([{"kind": "PlaceholderLabelSigil"}])");
-            doc["assembly"]["templateLexerMode"] = "at-sigil-template";
-        });
-    ASSERT_NE(decoyed.grammar, nullptr) << joined(decoyed.loadErrors);
+// ★★★ AND AT P5c THIS TEST BECAME THE REFUSAL IT USED TO DEMONSTRATE
+// (2026-08-17, D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER).
+//
+// ⓘ WHAT IT USED TO DO: mint `@`→`PlaceholderSigil` and `@l`→
+// `PlaceholderLabelSigil` in a decoy mode, repoint `templateLexerMode` at it, and
+// show that `@0` then lowered while `%0` went dead. The experiment was exactly
+// right about the mechanism it tested — the entry reads the NAMED mode — and it
+// is exactly the shape now FORBIDDEN, because a dialect choosing the template
+// sigil's spelling is the second owner this row closed. The sigils belong to the
+// HOST LANGUAGE (gcc substitutes them before the assembler is involved), so
+// changing them is a change to `asm.lang.json`'s role set, not to a dialect.
+//
+// ★★ SO THE CLAIM SPLIT IN TWO AND BOTH HALVES ARE KEPT.
+//   • "the entry reads the NAMED mode's table" → `TheLoaderFillsWhicheverScanning
+//     ModeIsNamed` above (repoint the key at a decoy; the rows land THERE, a
+//     template lowers through it, and the decoy's own unrelated row survives).
+//   • "a dialect can choose the spelling" → REFUSED, here, in the direction that
+//     is easiest to miss: not the same BYTES, but the same role-bound KIND under
+//     other bytes. A refusal that only matched the shipped bytes would let a
+//     dialect re-take ownership just by spelling it differently.
+TEST(AsmTemplateToLir, ADialectMintingThePlaceholderKindUnderItsOwnBytesIsRefused) {
+    for (auto const& p : {kX86, kArm}) {
+        auto const decoyed = loadDialectMutated(
+            p.dialect, [](nlohmann::json& doc) {
+                doc["lexerModes"]["asm-template"]["tokens"]["@"] =
+                    nlohmann::json::parse(R"([{"kind": "PlaceholderSigil"}])");
+            });
+        EXPECT_EQ(decoyed.grammar, nullptr)
+            << p.dialect << ": a dialect minted the placeholder KIND under its "
+               "own byte and loaded clean — the template sigils have one owner, "
+               "and 'spell it differently' is the same second owner";
+        auto const why = joined(decoyed.loadErrors);
+        EXPECT_NE(why.find("PlaceholderSigil"), std::string::npos)
+            << p.dialect << ": the refusal must name the KIND that gave it away: "
+            << why;
+        EXPECT_NE(why.find("inlineAsmTemplateLexemes"), std::string::npos)
+            << p.dialect << ": the refusal must name the OWNER: " << why;
 
-    // The shipped document still reads `%0`...
-    auto const shipped = runTemplate(kX86, "movq %1, %0\n", {"%0", "%1"});
-    ASSERT_TRUE(shipped->ok) << messages(*shipped);
-
-    // ...and under the repointed key the SAME engine reads `@0` instead.
-    auto const moved = runTemplateWith(decoyed.grammar, kX86,
-                                       "movq @1, @0\n", {"@0", "@1"});
-    ASSERT_TRUE(moved->parsed)
-        << "`@0` did not parse with the template mode repointed at the mode "
-           "that mints `@` — the entry is not reading the NAMED mode's table:\n"
-        << messages(*moved);
-    ASSERT_TRUE(moved->ok) << messages(*moved);
-    ASSERT_EQ(moved->bindingRegs.size(), 2u);
-    auto const blk  = moved->lir.funcBlockAt(moved->lir.funcAt(0), 0);
-    auto const inst = moved->lir.blockInstAt(blk, 0);
-    EXPECT_TRUE(moved->lir.instResult(inst) == moved->bindingRegs[0])
-        << "`@0` did not become binding 0";
-
-    // ...while `%0`, which the shipped mode reads, is now dead in this document.
-    auto const stale = runTemplateWith(decoyed.grammar, kX86,
-                                       "movq %1, %0\n", {"%0", "%1"});
-    EXPECT_FALSE(stale->parsed && stale->ok)
-        << "`%0` still lowered although the named mode mints no `%` "
-           "placeholder — the entry is reading a table it was not pointed at";
+        // The shipped document is unaffected — the mutation is the only variable.
+        auto const shipped = runTemplate(p, "nop\n", {});
+        EXPECT_TRUE(shipped->ok) << p.dialect << ": " << messages(*shipped);
+    }
 }
 
 // ★★★ THE PAIR RULE, EXERCISED IN BOTH DIRECTIONS. `templateLexerMode` and
@@ -1543,42 +1613,93 @@ TEST(AsmTemplateToLir, ATemplateLexerModeThatIsABodyModeIsRefusedAtLoad) {
         << "the refusal must say WHY a body mode cannot serve: " << why;
 }
 
-// ★★ AND THE DIALECT MUST BE ABLE TO REFUSE THE WHOLE CAPABILITY CLEANLY. A
-// dialect that declares NEITHER key is legal — it hosts no embedded templates —
-// and the template entry must say so by name rather than parsing in `main` and
-// blaming the author's `%0`.
-TEST(AsmTemplateToLir, ADialectWithNoTemplateSurfaceRefusesTheEntryByName) {
-    auto const none = loadDialectMutated(
+// ★★★ AND A DIALECT THAT IMPORTS THE SHARED `.s` SURFACE CANNOT DROP THE
+// TEMPLATE CAPABILITY — WHICH IS A REAL CONTRACT CHANGE AT P5c, AND IS RECORDED
+// AS ONE RATHER THAN GLOSSED (2026-08-17,
+// D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER).
+//
+// ⓘ WHAT THIS TEST USED TO ASSERT AND WHY IT INVERTED. It said "a dialect that
+// declares NEITHER key is legal — it hosts no embedded templates", loaded such a
+// document, and then checked that an EXTENDED template parse was refused BY NAME
+// while a BASIC one still succeeded. ✔MEASURED that the legality half was true
+// only BECAUSE of the defect this row closed: the template placeholder KINDS
+// (`PlaceholderSigil`, `PlaceholderLabelSigil`, `PlaceholderNameOpen`/`Close`,
+// `PercentEscape`) were interned by the dialect's OWN `asm-template` rows, so
+// they existed whether or not the capability was declared. With the rows
+// synthesized from the language's role set, the only thing that interns them is
+// the capability — and `asm.lang.json`'s `asmLine` closure SPELLS all four holes
+// (`asmTemplateOperandRef`, `asmTemplateLabelRef`, `asmTemplateSymbolicName` are
+// reachable from `asmOperandItem`), so the bindings are mandatory and now point
+// at kinds nothing declares.
+// ⇒ For a dialect importing that closure the capability was never really
+// optional; "optional" was the duplication wearing a costume. The refusal is
+// precise and names every kind, which is the fail-loud half.
+// ⚠ WHAT IS LOST, STATED PLAINLY: the runtime arm — `parseAsmTemplateText`
+// refusing an EXTENDED template BY NAME on a surface-less dialect, and accepting
+// a BASIC one — is no longer constructible from a shipped dialect, because no
+// shipped dialect can be surface-less. That guard is still in the code and still
+// correct for a dialect that imports a NARROWER entry (one whose closure does not
+// reach the template shapes); it is now unexercised, and that is anchored rather
+// than deleted.
+// ★ TWO STAGES, BECAUSE THE FIRST REFUSAL SHORT-CIRCUITS THE SECOND — and that
+// ordering is itself measured rather than assumed. Erasing the capability alone
+// orphans the `templateEscape` BINDING, which the merge refuses and which drops
+// the whole reference, so the placeholder-kind refusals never get a chance to
+// speak. Stage 2 removes that binding too and reads what is underneath.
+TEST(AsmTemplateToLir, ADialectImportingTheSharedSurfaceCannotDropTheTemplateCapability) {
+    // ── stage 1: the capability alone ──
+    // `templateEscape` is spelled by NO shared shape — only by the language's
+    // role set, and only for a document that declares the capability — so keeping
+    // the binding with the capability gone is a binding that configures nothing,
+    // and this loader never lets that pass in silence.
+    auto const capOnly = loadDialectMutated(
         kX86.dialect, [](nlohmann::json& doc) {
             doc["assembly"].erase("templateLexerMode");
             doc["assembly"].erase("templateOperandRule");
         });
-    ASSERT_NE(none.grammar, nullptr)
-        << "declaring NEITHER key must stay legal: " << joined(none.loadErrors);
-    DiagnosticReporter rep;
-    auto const tree = parseAsmTemplateText(
-        "nop\n", "<template>", none.grammar, AsmTemplateSurface::Extended,
-        DiagnosticBudget::libraryDefault(), rep);
-    EXPECT_FALSE(tree.has_value())
-        << "a dialect with no template surface parsed an EXTENDED template "
-           "anyway";
-    std::string why;
-    for (auto const& d : rep.all()) { why += d.actual; why += '\n'; }
-    EXPECT_NE(why.find("templateLexerMode"), std::string::npos)
-        << "the refusal must name the missing key: " << why;
+    EXPECT_EQ(capOnly.grammar, nullptr)
+        << "a dialect dropped the template capability and kept its role "
+           "bindings, and loaded clean";
+    auto const why1 = joined(capOnly.loadErrors);
+    EXPECT_NE(why1.find("templateEscape"), std::string::npos)
+        << "the orphaned role binding must be named: " << why1;
+    EXPECT_NE(why1.find("PercentEscape"), std::string::npos)
+        << "the dialect's OWN consumer of the synthesized row must be named — "
+           "`attRegister`'s escaped-register arm is what actually breaks: "
+        << why1;
 
-    // ★★ AND THE OTHER HALF, WHICH IS THE ONE A NAIVE IMPLEMENTATION GETS
-    // WRONG: a BASIC template needs no template surface, because it reaches the
-    // assembler verbatim in the reference compilers. Refusing it here would
-    // reject `__asm__("nop")` on a dialect that hosts no extended asm — a
-    // construct gcc and clang both compile.
-    DiagnosticReporter basicRep;
-    auto const basic = parseAsmTemplateText(
-        "nop\n", "<template>", none.grammar, AsmTemplateSurface::Basic,
-        DiagnosticBudget::libraryDefault(), basicRep);
-    EXPECT_TRUE(basic.has_value())
-        << "a BASIC template was refused for want of a template surface it "
-           "does not need";
+    // ── stage 2: the capability AND the role binding ──
+    // Now the four template holes the shared `asmLine` closure SPELLS
+    // (`asmTemplateOperandRef`, `asmTemplateLabelRef`,
+    // `asmTemplateSymbolicName`) are bound to kinds nothing interns, because the
+    // synthesized mode was the only thing that declared them.
+    auto const alsoBinding = loadDialectMutated(
+        kX86.dialect, [](nlohmann::json& doc) {
+            doc["assembly"].erase("templateLexerMode");
+            doc["assembly"].erase("templateOperandRule");
+            std::size_t erased = 0;
+            for (auto& [_, ref] : doc["languageReferences"].items()) {
+                if (!ref.is_object() || !ref.contains("bindTokens")) continue;
+                erased += ref["bindTokens"].erase("templateEscape");
+            }
+            ASSERT_EQ(erased, 1u);
+        });
+    EXPECT_EQ(alsoBinding.grammar, nullptr)
+        << "a dialect importing the shared `.s` surface loaded with NO template "
+           "capability — its template placeholder kinds would then be interned "
+           "by nothing, so the shared template shapes resolve against nothing";
+    auto const why2 = joined(alsoBinding.loadErrors);
+    for (auto const* kind : {"PlaceholderSigil", "PlaceholderLabelSigil",
+                             "PlaceholderNameOpen", "PlaceholderNameClose"}) {
+        EXPECT_NE(why2.find(kind), std::string::npos)
+            << "the refusal must name the undeclared kind '" << kind << "' — the "
+               "author has to know WHICH declarations went away with the "
+               "capability, not merely that one did: " << why2;
+    }
+
+    // The shipped document is unaffected — the erases are the only variables.
+    auto const shipped = runTemplate(kX86, "nop\n", {});
+    EXPECT_TRUE(shipped->ok) << messages(*shipped);
 }
 
 // ★★★ THE BASIC/EXTENDED SPLIT IS A **LEXER** SPLIT, AND THIS IS THE ARM THAT

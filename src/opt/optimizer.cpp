@@ -183,7 +183,11 @@ stripInlineDefinitions(Mir& mir, std::span<ExternImport const> externImports) {
     // AFTER every surviving function is re-added — the helper's ordering
     // contract, and the remap it needs to re-point a runtime-init global now
     // that ordinals have shifted.
-    passes::cloneGlobalsRemappingInitFunc(mir, builder, oldOrdinalToNew);
+    // The name is what the helper's two fatals report — this epilogue is NOT a
+    // `kPassNameTable` pass, so it names itself
+    // (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS).
+    passes::cloneGlobalsRemappingInitFunc(mir, builder, oldOrdinalToNew,
+                                          "InlineDefinitionStrip");
     mir = std::move(builder).finish();
     return dropped;
 }

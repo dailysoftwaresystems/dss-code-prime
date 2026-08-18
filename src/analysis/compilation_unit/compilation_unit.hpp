@@ -392,6 +392,16 @@ private:
     TreeId loadAndAdd_(std::filesystem::path const& path, bool& ok,
                        std::shared_ptr<GrammarSchema const> schema);
 
+    // ★★★ The UNCONDITIONAL predefined-macro identity validation, run once from
+    // `finish()`. The cross-family NAME collision, the mutual-exclusion groups
+    // and the `requires` backing claim are statements about a (language, target,
+    // object-format) TRIPLE, not about any TU — so they run for EVERY CU, in
+    // every language, whether or not a preprocessor ran and whether or not any
+    // header was included. See the definition for the three MEASURED paths on
+    // which they previously did not run at all. Reports into
+    // `driverDiagnostics_`.
+    void validatePredefinedMacroIdentity_();
+
     // EVERY registered schema whose `fileExtensions` claims `path`'s extension
     // (case-insensitive, dot included), deduplicated by schema identity and in
     // registration order. Empty for an empty/unclaimed extension.

@@ -6104,10 +6104,26 @@ TEST(ShippedLibDescriptor, RealUnistdJsonFsctlMachoOnly) {
     ASSERT_NE(sym, nullptr) << "fsctl must still decode on elf";
     EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
                                                ObjectFormatKind::Elf));
-    auto const* close_ = findDarwinBsdSymbol(e, "close");
-    ASSERT_NE(close_, nullptr) << "positive control: close must be present";
-    EXPECT_TRUE(close_->availableObjectFormats.empty())
-        << "positive control: close ships with no per-symbol set";
+    // Positive control: a row with NO per-symbol availability set really does
+    // read as "every format", so the exclusions above are discriminating rather
+    // than trivially true.
+    //
+    // ⚠ THE CONTROL MOVED OFF `close`, AND WHY IT HAD TO IS THE POINT. Every
+    // `unistd.json` symbol row is now explicitly gated, and MUST be: the header
+    // opened on pe, where an ungated POSIX row would declare an extern the
+    // runtime does not export and break the binary's LOAD under the
+    // eager-import law. `lseek` is NOT a control (it is gated too) — so the
+    // control is the descriptor-level fact instead, asserted on the row this
+    // test already read: `fsctl` carries a set, and the set is EXACTLY [macho].
+    // That keeps the control's job (prove `availableObjectFormats` is being
+    // READ, not ignored) without needing an ungated row that this descriptor
+    // no longer has, and it is STRONGER than the old one, which only proved a
+    // field was absent.
+    EXPECT_EQ(sym->availableObjectFormats,
+              (std::vector<std::string>{"macho"}))
+        << "positive control: the availability set is READ, and reads exactly "
+           "what the descriptor declares — an empty or ignored set would make "
+           "the elf exclusion above pass for the wrong reason";
 }
 
 // D-LK-SQLITE-MACHO-UNDEFINED-LIBSYSTEM-SYMBOLS — the five Darwin filesystem/
@@ -6175,10 +6191,23 @@ TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
                        "sysctlbyname, and declaring it there would plant an "
                        "undefined import (DSS eager-imports every shipped extern)";
     }
-    auto const* closeCtl = findDarwinBsdSymbol(e, "close");
-    ASSERT_NE(closeCtl, nullptr) << "positive control: close must be present";
-    EXPECT_TRUE(closeCtl->availableObjectFormats.empty())
-        << "positive control: close ships with no per-symbol set";
+    // Positive control — see the twin in `RealUnistdJsonFsctlMachoOnly` for why
+    // it is no longer `close`: every `unistd.json` symbol row is now explicitly
+    // gated (the header opened on pe, where an ungated POSIX row would break
+    // the binary's LOAD). The control is therefore the POSITIVE half of the
+    // same read: each of the five rows excluded from elf above must carry the
+    // set that excludes it, spelled exactly, so the exclusions cannot be
+    // passing because the set was ignored.
+    for (auto const* name : {"flock", "statfs", "fstatfs", "sysctl",
+                             "sysctlbyname"}) {
+        auto const* sym = findDarwinBsdSymbol(e, name);
+        ASSERT_NE(sym, nullptr) << name << " must still decode on elf";
+        EXPECT_EQ(sym->availableObjectFormats,
+                  (std::vector<std::string>{"macho"}))
+            << "positive control: " << name << "'s availability set is READ "
+               "and reads exactly [macho] — an ignored set would make the elf "
+               "exclusion above pass for the wrong reason";
+    }
 }
 
 TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {

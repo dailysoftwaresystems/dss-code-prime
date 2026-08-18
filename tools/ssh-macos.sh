@@ -53,6 +53,24 @@ unset _envHost _envUser _envKey
 : "${DSS_MACOS_HOST:=}" ; : "${DSS_MACOS_USER:=}" ; : "${DSS_MACOS_KEY:=}"
 DSS_MACOS_KEY=$(eval printf '%s' "\"$DSS_MACOS_KEY\"")
 
+# ★★★ THE SCRIPT FINDS THE KEY — the caller never does anything manually.
+# Operator instruction 2026-08-17. Same reasoning as the arm64-vps twin (read the
+# long note there): `$HOME` names a DIFFERENT directory in WSL, Git Bash and
+# PowerShell, so a `$HOME`-relative key makes a host reachable or not depending on
+# which shell you started in. `$REPO/.secrets/` is the same directory in all of
+# them and is gitignored, so key material never reaches a commit.
+# ⚠ CAPABILITY-PAIRED with `ssh-macos.ps1` and with BOTH arm64-vps carriages: a
+# change to one lands in all four, or the pairing this file's header claims is a
+# claim nothing checks.
+_repo_key=$REPO/.secrets/macos.key
+if [ -n "$DSS_MACOS_KEY" ] && [ ! -f "$DSS_MACOS_KEY" ] && [ -f "$_repo_key" ]; then
+    echo "ssh-macos: DSS_MACOS_KEY='$DSS_MACOS_KEY' does not exist; using the repo-local key $_repo_key" >&2
+    DSS_MACOS_KEY=$_repo_key
+elif [ -z "$DSS_MACOS_KEY" ] && [ -f "$_repo_key" ]; then
+    DSS_MACOS_KEY=$_repo_key
+fi
+unset _repo_key
+
 if [ -z "$DSS_MACOS_HOST" ] || [ -z "$DSS_MACOS_USER" ]; then
     {
       echo "ssh-macos: connection data missing."
@@ -69,6 +87,31 @@ if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; t
     resolved=$(getent hosts "$DSS_MACOS_HOST" 2>/dev/null | awk '{print $1; exit}')
     [ -z "$resolved" ] && resolved=$(ping -c1 -W1 "$DSS_MACOS_HOST" 2>/dev/null \
         | sed -n 's/.*(\([0-9.]\{7,15\}\)).*/\1/p' | head -1)
+    # ★ avahi, when this is a Linux box that actually has an mDNS responder.
+    if [ -z "$resolved" ] && command -v avahi-resolve-host-name >/dev/null 2>&1; then
+        resolved=$(avahi-resolve-host-name -4 "$DSS_MACOS_HOST" 2>/dev/null | awk '{print $2; exit}')
+    fi
+    # ★★★ DELEGATE TO THE WINDOWS RESOLVER — THE ONE THAT ACTUALLY SPEAKS mDNS HERE.
+    # ✔MEASURED 2026-08-17: from Git Bash and WSL, `getent` and `ping` both fail on a
+    # `.local` name because neither has an mDNS responder — but WINDOWS resolves it
+    # natively: `[System.Net.Dns]::GetHostAddresses('<name>.local')` returns the
+    # address, as does `Resolve-DnsName`. (`ping.exe` does NOT, so it is not the probe
+    # to use — testing with ping is what makes this look unresolvable.)
+    # ⇒ We are running under Windows in both those shells, so the resolver is right
+    # there; we were simply asking the wrong one.
+    # ⛔ THIS IS WHY THE CONFIG HOLDS A NAME AND NEVER AN IP: the Mac is on DHCP and
+    # a pinned address is wrong the moment the lease changes — a hardcoded IP turns a
+    # transient lookup problem into a permanently wrong file.
+    if [ -z "$resolved" ]; then
+        for _psh in powershell.exe pwsh.exe; do
+            command -v "$_psh" >/dev/null 2>&1 || continue
+            resolved=$("$_psh" -NoProfile -NonInteractive -Command \
+                "try { [System.Net.Dns]::GetHostAddresses('$DSS_MACOS_HOST') | Where-Object { \$_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1 -ExpandProperty IPAddressToString } catch { }" \
+                2>/dev/null | tr -d '\r' | grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1)
+            [ -n "$resolved" ] && break
+        done
+        unset _psh
+    fi
     if [ -z "$resolved" ]; then
         {
           echo "ssh-macos: cannot resolve '$DSS_MACOS_HOST' from this host."
@@ -81,6 +124,32 @@ if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; t
 fi
 
 args=(-o ConnectTimeout=10 -o BatchMode=yes)
+# ★★ A KEY ON A WINDOWS DRIVE IS WORLD-READABLE TO WSL, AND ssh REFUSES IT.
+# ✔MEASURED 2026-08-17 on the arm64-vps twin: the repo lives on `/mnt/c`, whose
+# DrvFs mount maps Windows ACLs to mode 0444 regardless of `icacls`, so ssh says
+# "UNPROTECTED PRIVATE KEY FILE … 0444 … too open" and then fails as "Permission
+# denied (publickey)" — blaming the SERVER for a LOCAL file-mode problem. `chmod`
+# cannot fix it (DrvFs ignores mode without the `metadata` mount option), so the
+# only fix is a private COPY. The script does it; the caller never does anything
+# manually. Kept identical to `ssh-arm64-vps.sh` — these are a capability pair.
+if [ -n "$DSS_MACOS_KEY" ] && [ -r "$DSS_MACOS_KEY" ]; then
+    _mode=$(stat -c '%a' "$DSS_MACOS_KEY" 2>/dev/null || echo '')
+    case "$_mode" in
+        ''|*00) : ;;
+        *)
+            chmod 600 "$DSS_MACOS_KEY" 2>/dev/null || true
+            if [ "$(stat -c '%a' "$DSS_MACOS_KEY" 2>/dev/null || echo 600)" != "600" ]; then
+                _priv=$(mktemp "${TMPDIR:-/tmp}/.dss-macos-key.XXXXXX") || {
+                    echo "ssh-macos: cannot create a private copy of the key." >&2; exit 3; }
+                chmod 600 "$_priv" && cat "$DSS_MACOS_KEY" > "$_priv" || {
+                    rm -f "$_priv"; echo "ssh-macos: failed to stage a private key copy." >&2; exit 3; }
+                trap 'rm -f "$_priv"' EXIT HUP INT TERM
+                DSS_MACOS_KEY=$_priv
+            fi
+            ;;
+    esac
+    unset _mode
+fi
 [ -n "$DSS_MACOS_KEY" ] && [ -f "$DSS_MACOS_KEY" ] && args+=(-i "$DSS_MACOS_KEY")
 [ "${DSS_MACOS_STRICT_HOSTKEY:-0}" != "1" ] && \
     args+=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)

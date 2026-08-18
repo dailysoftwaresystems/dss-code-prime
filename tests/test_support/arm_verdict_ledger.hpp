@@ -36,10 +36,12 @@
 //     remedy while naming three different things the machine did not supply:
 //     no launcher at all, a launcher whose own prerequisites are absent, and a
 //     build input.
-//   * HARNESS     (`NotSelectedByRunner`) — the CLI-subprocess runner binds only
-//     the FIRST target whose `runOn` matches the host
-//     (D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET), so later matching targets
-//     are never considered. Ledgered honestly rather than left absent or
+//   * HARNESS     (`NotSelectedByRunner`) — the CLI-subprocess runner binds ONE
+//     target per manifest (`selectBoundTargetIndex` below: the host's own arch
+//     where the manifest offers it, else the first `runOn` match), so the other
+//     matching targets are never considered
+//     (D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET, whose remaining half is
+//     that ONE is bound at all). Ledgered honestly rather than left absent or
 //     miscounted as a skip. NEVER a failure, not even in strict mode: it is a
 //     known harness limitation with its own anchor, and failing on it would make
 //     strict mode unusable until that anchor closes.
@@ -150,6 +152,76 @@ namespace dss::test_support {
 [[nodiscard]] inline std::string specFormatName(std::string const& spec) {
     auto const colon = spec.find(':');
     return colon == std::string::npos ? std::string{} : spec.substr(colon + 1);
+}
+
+// ── WHICH TARGET A ONE-TARGET-PER-MANIFEST RUNNER BINDS ON THIS HOST ───────
+//
+// D-TEST-INTEGRATED-TESTS-CANNOT-PASS-ON-A-NATIVE-ARM64-LINUX-HOST. The
+// CLI-subprocess runner builds and spawns ONE target per manifest (its
+// in-process sibling iterates all of them), and it used to bind the FIRST
+// target whose `runOn` admits the host. `runOn` names an OS, not a MACHINE:
+// the corpus declares `x86_64:elf64-x86_64-linux-exec` before
+// `arm64:elf64-aarch64-linux-exec`, and both say `linux`. So on a NATIVE
+// aarch64 box the runner bound the x86_64 arm — cross-arch there, with no
+// `emulator` declared — and never considered the one arm that machine can
+// execute at full speed with no launcher at all.
+//
+// ✔MEASURED on the arm64 VPS (real hardware, not qemu) before this rule
+// existed: `55 verified (31 ran), 4353 skipped, 1307 not-selected`, and ZERO
+// non-empty stdout pins — so [Test 5]'s capture-path witness could not be
+// satisfied and that entire host verified NO runtime behaviour. The runner
+// picked a target it cannot run and skipped the one it can.
+//
+// THE RULE: among the targets whose `runOn` admits this host, bind the one
+// whose TARGET ARCH EQUALS THE HOST'S; fall back to the first `runOn` match
+// only when the manifest offers no native arm. That is one comparison between
+// two values the SYSTEM reports — `specTargetArch(spec)` against
+// `currentHostArch()` — so it names no arch, no OS and no object format, and it
+// will keep binding correctly for a target this repo has not shipped yet.
+//
+// ⚠ IT DELIBERATELY DOES NOT PREFER AN EMULATABLE ARM, and there is a
+// measurement behind that: emulating the x86_64 arm on that aarch64 box cost
+// **879 s on ONE test**. Native is both far cheaper AND the stronger verdict,
+// so "can this host RUN it" is answered by arch equality, never by a launcher.
+//
+// ⚠ THE OS GATE STILL OUTRANKS THE ARCH PREFERENCE. `runsOnHost` is evaluated
+// by the caller and a `false` is never overridden here: a manifest that
+// declares the host's own arch for ANOTHER OS (`arm64:macho64-arm64-darwin-exec`
+// on arm64 Linux) must stay unbound, because the produced image is not loadable
+// here. Arch equality answers "can this machine execute those instructions",
+// which is necessary and not sufficient.
+//
+// ⓘ WHY IT LIVES IN THIS HEADER rather than in the one runner that calls it:
+// this is the file that ends "the two harnesses disagree about the host"
+// defects (see the `specFormatName` note above). The binding rule is host
+// vocabulary, it is precisely what the two runners must never diverge on again,
+// and here it gets a unit test on EVERY host — which matters more than usual,
+// because the host that exposed the defect is not the host most cycles run on.
+struct HostBindingCandidate {
+    std::string spec;        // "<arch>:<format>", exactly as the manifest wrote it
+    bool        runsOnHost;  // this target's `runOn` list admits this host OS
+};
+
+// "No target of this manifest can be bound on this host." A named constant, not
+// a bare `-1` at four call sites: an index type that cannot be negative makes
+// the sentinel invisible otherwise.
+inline constexpr std::size_t kNoBoundTarget = static_cast<std::size_t>(-1);
+
+[[nodiscard]] inline std::size_t
+selectBoundTargetIndex(std::vector<HostBindingCandidate> const& candidates,
+                       std::string const& hostArch) {
+    std::size_t firstRunOnMatch = kNoBoundTarget;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        if (!candidates[i].runsOnHost) continue;   // wrong OS — never bindable
+        if (firstRunOnMatch == kNoBoundTarget) firstRunOnMatch = i;
+        if (specTargetArch(candidates[i].spec) == hostArch) {
+            return i;   // this host EXECUTES it — no emulator, no launcher
+        }
+    }
+    // No native arm declared for this host: the previous behaviour, kept as the
+    // FALLBACK so a single-target manifest (every windows- and darwin-matching
+    // manifest in the corpus) binds exactly what it always did.
+    return firstRunOnMatch;
 }
 
 // D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY, closing-work item (2), first half: the

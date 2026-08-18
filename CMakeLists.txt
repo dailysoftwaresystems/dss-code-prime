@@ -311,6 +311,69 @@ function(dss_pch_reproducible target)
     endif()
 endfunction()
 
+# ── THE COMPILER'S BUILD STAMP (the runtime object cache's compiler identity) ──
+#
+# `cmake/DssBuildStamp.cmake` computes the value and documents WHY it exists and
+# why the three obvious alternatives (hash the compiler image / (path,size,mtime)
+# / `DSS_PROJECT_VERSION` alone) are each refused. This block is only the wiring,
+# and the wiring carries two decisions worth stating here.
+#
+# ★ IT REGENERATES AT BUILD TIME, NOT AT CONFIGURE TIME. A configure-time
+# `configure_file` would bake the stamp of whenever CMake last ran, so every
+# commit made without re-configuring would build a binary claiming an older
+# identity — and the cache would then serve the OLD compiler's artifacts to the
+# NEW one, silently. `add_custom_target` (always out of date) is what makes the
+# value track the tree. The script writes the header ONLY when the value
+# changed, so an unchanged stamp costs a `git status` and nothing else.
+# ✔MEASURED 2026-08-17 on this workstation, dirty tree (133 entries, a
+# 1,440,179-byte `git diff HEAD`): 63 ms + 231 ms ≈ 0.3 s, ONCE per build.
+#
+# ★★ THE INCLUSION IS SCOPED ON PURPOSE, and this is the part to defend in
+# review. The generated header changes on every dirty edit, so every TU that
+# `#include`s it recompiles on every dirty edit. Reaching it requires opting in
+# through `dss_use_build_stamp()` — a target that does not ask cannot see the
+# header at all. The intended includer is the runtime object cache TU and
+# nothing else; a widely-included header pulling this in would rebuild the world
+# on every keystroke. That is a review-stop, not a preference.
+find_package(Git QUIET)   # → GIT_EXECUTABLE, or undefined on a machine with none
+
+set(DSS_BUILD_STAMP_DIR "${CMAKE_BINARY_DIR}/generated")
+set(DSS_BUILD_STAMP_HEADER
+    "${DSS_BUILD_STAMP_DIR}/program/dss_build_stamp_generated.hpp")
+
+add_custom_target(dss_build_stamp_generate
+    COMMAND ${CMAKE_COMMAND}
+            "-DDSS_STAMP_VERSION=${DSS_VERSION}"
+            "-DDSS_STAMP_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+            "-DDSS_STAMP_GIT=${GIT_EXECUTABLE}"
+            "-DDSS_STAMP_OUTPUT=${DSS_BUILD_STAMP_HEADER}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake"
+    BYPRODUCTS "${DSS_BUILD_STAMP_HEADER}"
+    COMMENT "dss: computing DSS_BUILD_STAMP"
+    VERBATIM)
+
+# Carries the include paths only. `${CMAKE_SOURCE_DIR}/src` is here as well as
+# the generated dir so the pair is self-sufficient: `program/dss_build_stamp.hpp`
+# is the checked-in entry point and it must resolve for anyone who opted in.
+add_library(dss_build_stamp INTERFACE)
+target_include_directories(dss_build_stamp INTERFACE
+    "${DSS_BUILD_STAMP_DIR}"
+    "${CMAKE_SOURCE_DIR}/src")
+
+# THE opt-in. One call wires BOTH halves — the include paths and the ordering
+# edge — because they are useless apart: paths without the edge is a race
+# (the header may not exist yet on a clean build), and the edge without the
+# paths does not compile. `add_dependencies` is named EXPLICITLY on the consumer
+# rather than left to ride the INTERFACE library, so the ordering holds on every
+# generator without depending on how interface-target dependencies propagate.
+# The dependency is ORDER-ONLY in Ninja, so an always-out-of-date generator does
+# NOT drag its consumers into a rebuild — only a changed header does that, via
+# the compiler's own depfile.
+function(dss_use_build_stamp target)
+    target_link_libraries(${target} PRIVATE dss_build_stamp)
+    add_dependencies(${target} dss_build_stamp_generate)
+endfunction()
+
 add_subdirectory(src)
 
 if(DSS_BUILD_TESTS)
@@ -413,3 +476,12 @@ if(DSS_BUILD_TESTS)
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     endif()
 endif()
+
+# ── The install set (D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE) ──
+# Kept whole in its own module rather than interleaved here: it owns what a
+# package ships (the CLI, its shared library, and `src/dss-config/`), it forwards
+# the installed layout to the resolver that has to find it again at runtime, and
+# it registers the scratch-prefix smoke test that proves an installed compiler
+# actually compiles. Included LAST because it modifies targets created by
+# `add_subdirectory(src)` above.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssInstall.cmake")

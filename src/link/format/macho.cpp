@@ -166,6 +166,21 @@ static_assert(kCodeSigCommandSize == kLinkeditDataCommandSize,
               "linkedit_data_command shape is wire-frozen at 16 bytes; "
               "both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use it.");
 constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
+// D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED: every blob inside a FINAL IMAGE's
+// __LINKEDIT must START on a pointer-sized boundary — 8 on every 64-bit
+// Mach-O. This is not a style preference: Apple's image validator (dyld's
+// `Header::validStructureLinkedit`, which Apple's `ld` runs on every link
+// INPUT) walks the blobs named by LC_DYLD_INFO / LC_DYLD_CHAINED_FIXUPS /
+// LC_DYSYMTAB / LC_SYMTAB / LC_CODE_SIGNATURE and REFUSES the whole image
+// with `ld: mis-aligned LINKEDIT content '<blob>'` on the first one that
+// fails. Two blobs carry a laxer rule (the indirect symbol table needs 4,
+// the string table 1); they are over-aligned to the same 8 here rather than
+// special-cased, because over-alignment always satisfies a laxer rule and
+// ONE rule for the whole chain is what stops the next blob appended to it
+// from silently re-opening this defect. The chain is padded at BOTH ends of
+// the writer — the cursor arithmetic and the byte emission — and the two are
+// cross-checked loud (see `linkeditOverrunBlob` in encodeExecDynamic).
+constexpr std::uint64_t kLinkeditBlobAlign = 8;
 
 // Emit one `build_version_command` (LC_BUILD_VERSION, 24 bytes, ntools=0)
 // — the SINGLE chokepoint shared by both the static (encodeExec) and
@@ -2037,11 +2052,31 @@ encodeExec(AssembledModule const&    module,
     // ── (f) Build nlist_64 + string table — defined symbols only.
     //       (Extern dyld symbols flow through the encodeExecDynamic
     //       arm with N_UNDF|N_EXT entries; LK6 cycle 2c closed.)
+    //
+    // Real DECLARED function names in the FINAL IMAGE's nlist, from the
+    // format-neutral `module.symbols` carrier through the shared
+    // `ObjectSymbolNames` owner — `imageName`, NOT `definedName`, because
+    // nothing ever re-links an image: its nlist resolves NOTHING and is read
+    // only by debuggers, profilers and crash reporters, for which a `static`'s
+    // real name is precisely the wanted answer.
+    // D-LINK-MACHO-IMAGE-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS: this loop
+    // hardcoded `_sym_<id>`, so every frame of every Mach-O backtrace arrived
+    // anonymised. The `_sym_<id>` fallback survives for exactly the symbols
+    // that genuinely have no declared name — here the linker-injected entry
+    // trampoline, which is functions[0] and carries no `ModuleSymbol` row.
+    // See `imageName`'s docblock for why the two tiers legitimately differ.
+    //
+    // ★ THE BINDING IS DELIBERATELY UNCHANGED (N_SECT|N_EXT for every defined
+    // function). clang marks a `static` N_SECT with NO N_EXT, and matching that
+    // is a real improvement — but it also re-shapes LC_DYSYMTAB's
+    // ilocalsym/iextdefsym bands, so it is its own change with its own witness
+    // rather than a silent rider on the names:
+    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT.
+    link::format::ObjectSymbolNames const imgNames{module};
     StringTable strtab;
     std::vector<std::uint8_t> nlistBytes;
     for (auto const& fn : module.functions) {
-        std::string const symName =
-            "_sym_" + std::to_string(fn.symbol.v);
+        std::string const symName = imgNames.imageName(fn.symbol, "_sym_");
         std::uint32_t const nameOff = strtab.add(symName);
         std::size_t const fi = static_cast<std::size_t>(&fn - module.functions.data());
         appendU32LE(nlistBytes, nameOff);
@@ -3819,28 +3854,54 @@ encodeExecDynamic(AssembledModule const&    module,
     // ── (k) Build nlist_64 + string table: defined externs first,
     //       undefined externs next.
     //
-    // c153 (D-LK3-3): on the DYLIB arm a defined function's nlist
-    // name is its REAL (pre-mangled) source name when externally
-    // visible — `nm libdss.dylib` and debuggers read nlist, and a
-    // library's symbols are its ABI surface (the c139/c150 real-name
-    // discipline; ObjectSymbolNames falls back to the internal
-    // `_sym_<id>` for static/synthesized functions). dyld's dlsym
-    // resolves against the EXPORT TRIE (above), not nlist — this is
-    // the human-facing surface. The EXEC arm keeps the internal
-    // `_sym_<id>` names unchanged (byte-identical output; an
-    // executable's nlist is not a linking surface). NOTE: exported
-    // DATA globals appear in the trie only — the dynamic arm's nlist
-    // carries functions + undefined externs (extending it is a
-    // numDefs/LC_DYSYMTAB re-shape deferred until a consumer needs
-    // `nm` visibility for data; dlsym works today via the trie).
-    link::format::ObjectSymbolNames const dylibSymNames{module};
+    // A defined function's nlist name is its REAL (pre-mangled) declared
+    // source name, on BOTH image flavors — `nm`, `lldb`, `atos`, `otool -tV`'s
+    // call annotations and the macOS crash reporter all read nlist.
+    //
+    // ★ ONE CALL, NOT A FLAVOR TERNARY. c153 (D-LK3-3) named only the DYLIB
+    // arm and routed it through `definedName`, leaving the EXEC arm on a
+    // hardcoded `_sym_<id>`; both halves of that were wrong, and
+    // D-LINK-MACHO-IMAGE-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS closed them
+    // together:
+    //   * the EXEC arm's rationale ("an executable's nlist is not a linking
+    //     surface") is TRUE and is the argument for naming it, not against —
+    //     precisely because nothing re-links an image, a `static`'s real name
+    //     there is safe, and it is the frame a backtrace prints. ✔MEASURED
+    //     pre-fix on real Apple Silicon: the macOS crash reporter printed
+    //     `#0 sym_83 / #1 sym_88 / #2 sym_92` where the source says
+    //     `static_helper` / `global_helper` / `main`.
+    //   * the DYLIB arm used `definedName`, whose `isExternallyVisible` gate
+    //     exists to protect a RELOCATABLE `.o`'s foreign-linker resolution
+    //     keys — a tier this is not. It therefore dropped a `static`'s name
+    //     from a dylib's nlist too (✔MEASURED: `_sym_83` beside a correctly
+    //     named `_dss_lib_entry`).
+    // `imageName` is the final-image companion of `definedName` — the SAME
+    // `module.symbols` carrier, the SAME lookup, minus that one gate. Both
+    // flavors are final images, so the flavor no longer selects a NAMING
+    // rule and the ternary is gone.
+    //
+    // ★ THE EXPORT SURFACE IS UNTOUCHED, and that separation is the point:
+    // the export trie built above is the ABI surface dyld's dlsym walks, and
+    // it has its OWN `isExternallyVisible` gate over `module.symbols` — so a
+    // `static` gains a name in nlist while staying unexportable. ✔MEASURED by
+    // execution on Apple Silicon with an Apple-clang-built dlopen probe:
+    // `dlsym(handle, "lib_static_helper")` stays NULL after this change while
+    // `dlsym(handle, "dss_lib_entry")` resolves and calls correctly.
+    //
+    // NOTE: exported DATA globals appear in the trie only — the dynamic arm's
+    // nlist carries functions + undefined externs (extending it is a
+    // numDefs/LC_DYSYMTAB re-shape deferred until a consumer needs `nm`
+    // visibility for data; dlsym works today via the trie).
+    //
+    // ★ THE BINDING IS DELIBERATELY UNCHANGED (N_SECT|N_EXT for every defined
+    // function) — see the static arm's matching note and
+    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT.
+    link::format::ObjectSymbolNames const imgNames{module};
     StringTable strtab;
     std::vector<std::uint8_t> nlistBytes;
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
         auto const& fn = module.functions[i];
-        std::string const symName =
-            isDylib ? dylibSymNames.definedName(fn.symbol, "_sym_")
-                    : "_sym_" + std::to_string(fn.symbol.v);
+        std::string const symName = imgNames.imageName(fn.symbol, "_sym_");
         std::uint32_t const nameOff = strtab.add(symName);
         appendU32LE(nlistBytes, nameOff);
         appendU8(nlistBytes,
@@ -4398,27 +4459,73 @@ encodeExecDynamic(AssembledModule const&    module,
     // linkeditFileSize grows by it automatically; the export blob is
     // EMPTY on the exec arm (byte-identical output) and on an
     // exportless dylib.
+    //
+    // ★ EVERY cursor below is `alignUp(prevEnd, kLinkeditBlobAlign)` — see
+    // that constant for why Apple's validator makes this mandatory rather
+    // than tidy (D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED). `rebaseOff` alone
+    // needs no step: `linkeditFileOff` is already page-aligned, and a page is
+    // a multiple of 8 on every Mach-O target. The blob SIZES stay exact —
+    // only the STARTS move — so each LC keeps reporting the true payload
+    // length and the pad bytes belong to nobody.
     std::uint64_t const rebaseOff = linkeditFileOff;
     std::uint64_t const rebaseSize = dyldRebaseBlob.size();
-    std::uint64_t const bindOff = rebaseOff + rebaseSize;
+    std::uint64_t const bindOff =
+        alignUp(rebaseOff + rebaseSize, kLinkeditBlobAlign);
     std::uint64_t const bindSize = dyldBindBlob.size();
-    std::uint64_t const exportOff = bindOff + bindSize;
+    std::uint64_t const exportOff =
+        alignUp(bindOff + bindSize, kLinkeditBlobAlign);
     std::uint64_t const exportSize = exportTrieBlob.size();
-    std::uint64_t const indirectSymtabOff = exportOff + exportSize;
+    std::uint64_t const indirectSymtabOff =
+        alignUp(exportOff + exportSize, kLinkeditBlobAlign);
     std::uint64_t const indirectSymtabSize =
         static_cast<std::uint64_t>(indirectSyms.size()) * 4u;
-    std::uint64_t const symtabOff = indirectSymtabOff + indirectSymtabSize;
+    // ⚠⚠ D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED (CLOSED here). `symtabOff`
+    // used to be packed hard against the preceding blob with NO alignment
+    // step, so the nlist_64 table landed wherever the bind / export /
+    // indirect-symbol sizes left it. An nlist_64 carries an 8-byte `n_value`.
+    // ✔MEASURED 2026-08-17 on real Apple Silicon (macOS 26.5.2): `symoff` =
+    // 50076 (≡ 4 mod 8) on BOTH the exec and the dylib, and BOTH before and
+    // after the sibling name fix — so it was PRE-EXISTING and orthogonal (name
+    // lengths only move the strtab, which is last).
+    // ★★ IT WAS A LIVE CAPABILITY GAP, NOT A COSMETIC ONE, and the first
+    // reading of it was WRONG — this record keeps the correction rather than
+    // quietly rewriting it: `dyld_info -exports` refusing the image looked
+    // like one inspector being strict, until APPLE'S OWN `ld` was asked to
+    // link against the dylib and refused it with the SAME words —
+    //   `ld: mis-aligned LINKEDIT content 'symbol table' in '<dylib>'`
+    // on all four probes (exported symbol / static symbol × before / after).
+    // ⇒ A DSS-built Mach-O dylib could not be consumed as a LINK INPUT by the
+    // Apple toolchain at all. The control that made it OURS rather than a tool
+    // quirk: the same `dyld_info` reads `/usr/lib/libSystem.B.dylib` fine.
+    // ★ WHAT ALWAYS WORKED, so the scope was never overstated: dyld LOADED and
+    // RAN these images (`dlopen` + `dlsym` + CALL all succeeded) and `nm` /
+    // `otool` / `lldb` / the crash reporter read the table — which is exactly
+    // why a green suite and a running binary could not see this.
+    // ★ AND THE BLAST RADIUS WAS BOUNDED BY MEASUREMENT, not assumption: the
+    // MH_OBJECT (relocatable `.o`) writer lays out its OWN LINKEDIT-less
+    // trailer and is UNAFFECTED — a DSS-built `.o` linked by Apple `cc` with
+    // an Apple-compiled `main` gave rc=0 and RAN, before and after this fix.
+    // So the defect was the IMAGE cursor chain, and the whole chain (not only
+    // the one offset that happened to be measured) is aligned above.
+    std::uint64_t const symtabOff =
+        alignUp(indirectSymtabOff + indirectSymtabSize, kLinkeditBlobAlign);
     std::uint64_t const symtabSize =
         static_cast<std::uint64_t>(numberOfSymbols) * kNlist64Size;
+    // The string table's own requirement is 1 (it is a byte stream), and
+    // `symtabSize` is a multiple of 16, so this is 8-aligned for free — pinned
+    // by the same test rather than left to that coincidence.
     std::uint64_t const strtabOff = symtabOff + symtabSize;
     std::uint64_t const strtabSize = strtab.size();
     // LK7: codesign placeholder lives at the tail of __LINKEDIT
-    // (8-byte aligned per Apple's `cs_blobs.h` SuperBlob alignment).
+    // (8-byte aligned per Apple's `cs_blobs.h` SuperBlob alignment — the
+    // SAME `kLinkeditBlobAlign` the rest of the chain now uses, and this
+    // cursor was ALREADY correct before that chain was fixed; it is spelled
+    // with the shared constant so the tail cannot drift from the head).
     // Plan 16 fills the reserved bytes post-link. The segment's
     // filesize covers the reservation so dyld maps it into the
     // __LINKEDIT segment alongside the other linkedit payloads.
     std::uint64_t const codeSigFileOff = emitCodeSig
-        ? alignUp(strtabOff + strtabSize, 8u)
+        ? alignUp(strtabOff + strtabSize, kLinkeditBlobAlign)
         : 0u;
     // LC_CODE_SIGNATURE's `dataoff` field is `uint32_t` per Apple's
     // `linkedit_data_command` definition. If the __LINKEDIT layout
@@ -5091,31 +5198,75 @@ encodeExecDynamic(AssembledModule const&    module,
                      tdataLayout.bytes.end());
     }
 
+    // D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED: the __LINKEDIT blobs are
+    // emitted by APPENDING, while the load commands above already published
+    // each blob's file offset from the cursor arithmetic. `seekTo` is the
+    // single place those two views are reconciled: it writes the alignment
+    // gap the cursors reserved, and it RECORDS an overrun (stream already
+    // past the offset an LC published) instead of silently truncating the
+    // blob that follows. An overrun is an internal invariant break — the
+    // image would load and then read the wrong bytes — so it is reported
+    // loud below rather than shipped.
+    char const* linkeditOverrunBlob = nullptr;
+    std::uint64_t linkeditOverrunAt = 0;
+    auto seekTo = [&](std::uint64_t off, char const* blobName) {
+        if (bytes.size() > off) {
+            if (linkeditOverrunBlob == nullptr) {
+                linkeditOverrunBlob = blobName;
+                linkeditOverrunAt = bytes.size();
+            }
+            return;
+        }
+        while (bytes.size() < off) bytes.push_back(0);
+    };
+    auto linkeditCursorsAgree = [&]() -> bool {
+        if (linkeditOverrunBlob == nullptr) return true;
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: __LINKEDIT emission "
+                         "overran the '{}' cursor — the stream was already "
+                         "at 0x{:x} when that blob's published file offset "
+                         "was reached. The load commands name offsets the "
+                         "byte emission no longer agrees with, so the image "
+                         "would read the wrong bytes at run time "
+                         "(substrate invariant violation, "
+                         "D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED).",
+                         linkeditOverrunBlob, linkeditOverrunAt));
+        return false;
+    };
+
     // Pad to linkeditFileOff
-    while (bytes.size() < linkeditFileOff) bytes.push_back(0);
+    seekTo(linkeditFileOff, "__LINKEDIT segment start");
 
     // __LINKEDIT: F5 dyld REBASE opcode stream — leads __LINKEDIT at
     // rebaseOff == linkeditFileOff and PIE-rebases each __DATA abs64 pointer
     // site (symbol-address globals). Empty for a module with none.
+    seekTo(rebaseOff, "rebase opcodes");
     bytes.insert(bytes.end(), dyldRebaseBlob.begin(), dyldRebaseBlob.end());
 
     // __LINKEDIT: dyld binding bytes (legacy bind opcode stream
     // OR chained-fixups payload depending on useChainedFixups).
+    seekTo(bindOff, useChainedFixups ? "chained fixups" : "bind opcodes");
     bytes.insert(bytes.end(), dyldBindBlob.begin(), dyldBindBlob.end());
 
     // __LINKEDIT: the c153 MH_DYLIB export trie at exportOff (empty on
     // the exec arm / an exportless dylib — zero bytes inserted).
+    seekTo(exportOff, "exports trie");
     bytes.insert(bytes.end(), exportTrieBlob.begin(), exportTrieBlob.end());
 
     // Indirect-symtab
+    seekTo(indirectSymtabOff, "indirect symbol table");
     for (auto const idx : indirectSyms) appendU32LE(bytes, idx);
 
     // nlist_64[]
+    seekTo(symtabOff, "symbol table");
     bytes.insert(bytes.end(), nlistBytes.begin(), nlistBytes.end());
 
     // string table
+    seekTo(strtabOff, "symbol table strings");
     auto strtabBytes = std::move(strtab).release();
     bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
+
+    if (!linkeditCursorsAgree()) return {};
 
     // LK7 / D-LK7-ADHOC-CODESIGN-MACHO: pad to the 8-byte-aligned
     // codesign reservation, then fill it. At this point `bytes.size()`
@@ -5124,7 +5275,14 @@ encodeExecDynamic(AssembledModule const&    module,
     // the signature). The CodeDirectory's `codeLimit` is therefore
     // `codeSigFileOff` and the page hashes cover those bytes.
     if (emitCodeSig) {
-        while (bytes.size() < codeSigFileOff) bytes.push_back(0);
+        // The ad-hoc signature hashes EXACTLY `bytes[0, codeSigFileOff)`, so
+        // an overrun here would silently sign a PREFIX of the image and leave
+        // the tail uncovered by any page hash. Same loud cursor check as the
+        // rest of the chain (requirement of D-LK7-ADHOC-CODESIGN-MACHO now
+        // that D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED moves the blobs ahead
+        // of the reservation).
+        seekTo(codeSigFileOff, "code signature");
+        if (!linkeditCursorsAgree()) return {};
         if (im.codeSignature.has_value()) {
             // Build the real ad-hoc CodeDirectory + SuperBlob over the
             // signed bytes and write it into the reservation. execSeg

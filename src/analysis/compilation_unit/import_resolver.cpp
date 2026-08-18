@@ -372,7 +372,8 @@ private:
                     // `#include` line (this tier alone has systemDirs to catch it).
                     ffi::forEachDescriptorInClosure(
                         resolved.path, context.systemDirs,
-                        context.headerNameMatching, systemVisited,
+                        context.headerNameMatching, context.activeFormat,
+                        systemVisited,
                         [&](std::filesystem::path const& descPath) {
                             context.shippedLibDescriptors.push_back(
                                 ShippedDescriptorRef{descPath, directive.span,
@@ -395,6 +396,40 @@ private:
                                          DiagnosticCode::F_ShippedHeaderNotFound,
                                          DiagnosticSeverity::Error, sourceBuffer,
                                          directive.span, missingHeader);
+                        },
+                        [&](std::string const&                missingHeader,
+                            std::filesystem::path const& /*childPath*/) {
+                            // D-FFI-DESCRIPTOR-INCLUDES-EDGE-GATE: an `includes`
+                            // edge ACTIVE on this object format whose child
+                            // descriptor declares it does not EXIST on this object
+                            // format. The config contradicts itself, and this tier
+                            // is the only one holding a positioned `#include` span,
+                            // so it is the one that says so — the SAME code the
+                            // semantic tier raises for a directly-included
+                            // unavailable header, because it is the same fact
+                            // reached one edge further in.
+                            //
+                            // ⚠ THE ALTERNATIVE WAS ALREADY SHIPPING AND IT WAS
+                            // WRONG IN BOTH DIRECTIONS. Before the gate this tier
+                            // recorded the sibling unconditionally, so the SEMANTIC
+                            // tier raised `F_ShippedHeaderUnavailableForTarget`
+                            // naming a header the user never wrote — while the
+                            // preprocessor silently spliced nothing for it. Same
+                            // config fact, one tier loud about the wrong subject and
+                            // one tier mute.
+                            //
+                            // `actual` carries the SIBLING's name, not the user's
+                            // header: the span already points at the `#include` the
+                            // user wrote, so naming the sibling is what tells them
+                            // which edge is broken.
+                            ParseDiagnostic d;
+                            d.code =
+                                DiagnosticCode::F_ShippedHeaderUnavailableForTarget;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = sourceBuffer;
+                            d.span     = directive.span;
+                            d.actual   = missingHeader;
+                            context.diagnostics.report(std::move(d));
                         });
                     continue;
                 }

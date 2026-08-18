@@ -1,14 +1,29 @@
 #include "core/types/target_schema.hpp"
 
+// `findShippedConfig` / `ShippedConfigLocator` — the SAME resolver
+// `TargetSchema::loadShipped` uses, so the content-digest fixture below reads
+// the exact file the compiler would have read.
+#include "core/types/config_path_walk.hpp"
+// The repo's SHA-256 — the independent oracle the retained `contentDigest()`
+// is pinned against (the tests hex-render it themselves; see `hexOracle`).
+#include "core/crypto/sha256.hpp"
+
 #include "mutate_target_schema.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstdint>
+#include <fstream>
 #include <gtest/gtest.h>
+#include <ios>
 #include <nlohmann/json.hpp>
 #include <set>
+#include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // Negative-path tests for the `TargetSchema` JSON loader. Mirrors the
@@ -1936,7 +1951,7 @@ TEST(TargetSchema, TFC74PredefinedMacroUnknownKindRejected) {
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "predefinedMacros":[{"name":"__X__","kind":"consant","value":"1"}]})",
+            "predefinedMacros":[{"name":"__X__","kind":"consant","value":"1","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "the `kind` verb set is CLOSED — a typo must never load as some "
@@ -1948,7 +1963,7 @@ TEST(TargetSchema, TFC74PredefinedMacroConstantRequiresValue) {
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "predefinedMacros":[{"name":"__X__","kind":"constant"}]})",
+            "predefinedMacros":[{"name":"__X__","kind":"constant","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "a constant predefine with no `value` would expand to nothing — "
@@ -1961,7 +1976,7 @@ TEST(TargetSchema, TFC74PredefinedMacroBadObjectFormatRejected) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "availableObjectFormats":["machoo"]}]})",
+                                 "availableObjectFormats":["machoo"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "an unknown object-format name is a typo that would make the macro "
@@ -1976,8 +1991,8 @@ TEST(TargetSchema, TFC74PredefinedMacroDuplicateNameRejected) {
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1"},
-                                {"name":"__X__","kind":"constant","value":"2"}]})",
+            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
+                                {"name":"__X__","kind":"constant","value":"2","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "two entries for one name would make the effective value depend on "
@@ -2006,7 +2021,7 @@ TEST(TargetSchema, PredefinedMacroEntryUnknownKeyRejectedAndNamed) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "availabelObjectFormats":["elf"]}]})",
+                                 "availabelObjectFormats":["elf"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "a misspelled entry key must be REFUSED — silently ignoring this "
@@ -2031,7 +2046,7 @@ TEST(TargetSchema, PredefinedMacroEntryDollarPrefixedKeyStillAccepted) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "$valueComment":"why this spelling"}]})",
+                                 "$valueComment":"why this spelling","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_TRUE(r.has_value())
         << "`$`-prefixed keys are prose, not knobs — and the carve-out must be "
@@ -2666,7 +2681,7 @@ TEST(TargetSchema, TFC76PredefinedMacroSentinelObjectFormatRejected) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "availableObjectFormats":["unknown"]}]})",
+                                 "availableObjectFormats":["unknown"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "'unknown' spells correctly, so only an explicit selectability check "
@@ -3853,4 +3868,175 @@ TEST(TargetSchema, OpcodeByMnemonicStaysCaseSensitive) {
     EXPECT_FALSE((*sch)->opcodeByMnemonic("MOV").has_value())
         << "the opcode table folded — a dialect row naming 'MOV' would then "
            "resolve, which is a config typo silently accepted";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `contentDigest()` — the retained content digest
+// ─────────────────────────────────────────────────────────────────────────
+//
+// `TargetSchema::loadFromText` retains the lowercase 64-hex SHA-256 of the
+// EXACT document bytes it was handed, computed at the one chokepoint where
+// those bytes are already in memory. It exists so the runtime-object cache can
+// key on the config a build actually LOADED without re-walking
+// `src/dss-config/` from disk — ~165 ms per invocation, MEASURED 2026-08-17
+// (86 files, 2,078,133 bytes; I/O-dominated: walk+read 152-160 ms, hash only
+// 9-13 ms), which would be paid on every build.
+//
+// ★★ THE ONE-BYTE ARM IS BUILT AT EQUAL LENGTH, AND THAT IS THE POINT OF IT.
+// A "digest" that had quietly become a size or length stamp would sail through
+// a mutation test whose two inputs differ in SIZE — and the mutation this cache
+// has to tell apart is exactly the equal-length kind (MEASURED: a real
+// descriptor mutation was 9149 bytes before AND after). So the fixture ASSERTS
+// equal length and EXACTLY ONE differing byte rather than merely being
+// constructed that way, and it perturbs a byte of STRUCTURAL JSON WHITESPACE so
+// the two documents PARSE IDENTICALLY — the digest cannot then be coming from
+// anything the parser produced.
+//
+// ★ The fixture is the SHIPPED descriptor's real bytes, resolved through the
+// same `findShippedConfig` the compiler's own `loadShipped` uses. A digest is a
+// claim about BYTES, so a hand-authored stand-in would pin the digest of a
+// document nothing ever loads.
+
+namespace {
+
+// Lowercase-hex render, written here rather than reached for from
+// `dss::crypto::toHexLower`: an oracle that shares code with the subject
+// cannot witness the subject.
+[[nodiscard]] std::string hexOracle(std::array<std::uint8_t, 32> const& digest) {
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (std::uint8_t const byte : digest) {
+        out.push_back(kHexDigits[byte >> 4]);
+        out.push_back(kHexDigits[byte & 0x0fu]);
+    }
+    return out;
+}
+
+// SHA-256 over `text`'s exact bytes — the INDEPENDENT expectation the retained
+// digest is pinned against, computed here and never read back off the schema.
+[[nodiscard]] std::string digestOracle(std::string_view text) {
+    return hexOracle(::dss::crypto::sha256(std::span<std::uint8_t const>{
+        reinterpret_cast<std::uint8_t const*>(text.data()), text.size()}));
+}
+
+// Number of positions at which two strings differ; `npos` if their lengths do
+// (so a length change can never be mistaken for a one-byte change).
+[[nodiscard]] std::size_t differingBytes(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return std::string_view::npos;
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i] != b[i]) ++n;
+    }
+    return n;
+}
+
+// `text` with its first LF turned into a space: same length, one byte
+// different, and provably the same document to the parser — JSON forbids a raw
+// newline inside a string, so every LF in a valid document is structural
+// whitespace and a space is its equal in every position it can occupy.
+[[nodiscard]] std::string withOneWhitespaceByteChanged(std::string_view text) {
+    std::string out{text};
+    auto const pos = out.find('\n');
+    EXPECT_NE(pos, std::string::npos)
+        << "the fixture carries no LF to perturb — reach for another "
+           "same-length mutation rather than dropping this arm";
+    if (pos != std::string::npos) out[pos] = ' ';
+    return out;
+}
+
+// The shipped descriptor's bytes, read the way `loadFromFile` reads them
+// (binary, no newline translation) from the path `loadShipped` would resolve.
+[[nodiscard]] std::string shippedTargetText(std::string_view targetName) {
+    auto pathR = ::dss::findShippedConfig(::dss::ShippedConfigLocator{
+        targetName, "targets", ".target.json", "target",
+        ::dss::DiagnosticCode::C_InvalidTargetName});
+    EXPECT_TRUE(pathR.has_value())
+        << "cannot resolve shipped target '" << targetName << "'";
+    if (!pathR.has_value()) return {};
+    std::ifstream in{*pathR, std::ios::binary};
+    EXPECT_TRUE(in.is_open()) << pathR->string();
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    return std::move(buf).str();
+}
+
+}  // namespace
+
+TEST(TargetSchemaContentDigest, IsSixtyFourLowercaseHexDigits) {
+    std::string const text = shippedTargetText("x86_64");
+    ASSERT_FALSE(text.empty());
+    auto r = TargetSchema::loadFromText(text, "<digest-fixture>");
+    ASSERT_TRUE(r.has_value());
+    auto const digest = (*r)->contentDigest();
+    EXPECT_EQ(digest.size(), 64u);
+    EXPECT_EQ(digest.find_first_not_of("0123456789abcdef"),
+              std::string_view::npos)
+        << "not lowercase hex: " << digest;
+}
+
+TEST(TargetSchemaContentDigest, SameTextTwiceYieldsTheSameDigest) {
+    std::string const text = shippedTargetText("x86_64");
+    ASSERT_FALSE(text.empty());
+    auto a = TargetSchema::loadFromText(text, "<digest-fixture>");
+    auto b = TargetSchema::loadFromText(text, "<digest-fixture>");
+    ASSERT_TRUE(a.has_value());
+    ASSERT_TRUE(b.has_value());
+    ASSERT_NE(a->get(), b->get())
+        << "the two loads returned the SAME object, so an equal digest would "
+           "be a tautology rather than a determinism claim";
+    EXPECT_EQ((*a)->contentDigest(), (*b)->contentDigest());
+}
+
+TEST(TargetSchemaContentDigest, OneByteAtEqualLengthChangesTheDigest) {
+    std::string const original = shippedTargetText("x86_64");
+    ASSERT_FALSE(original.empty());
+    std::string const perturbed = withOneWhitespaceByteChanged(original);
+
+    ASSERT_EQ(original.size(), perturbed.size())
+        << "the two inputs must be the SAME LENGTH, or a size stamp would "
+           "pass this test";
+    ASSERT_EQ(differingBytes(original, perturbed), 1u);
+
+    auto a = TargetSchema::loadFromText(original, "<digest-fixture>");
+    auto b = TargetSchema::loadFromText(perturbed, "<digest-fixture>");
+    ASSERT_TRUE(a.has_value());
+    ASSERT_TRUE(b.has_value());
+
+    // Parse-identical — the perturbed byte was JSON whitespace …
+    EXPECT_EQ((*a)->name(), (*b)->name());
+    EXPECT_EQ((*a)->version(), (*b)->version());
+    EXPECT_EQ((*a)->opcodes().size(), (*b)->opcodes().size());
+    // … and still byte-distinguishable, which is the whole contract.
+    EXPECT_NE((*a)->contentDigest(), (*b)->contentDigest());
+}
+
+TEST(TargetSchemaContentDigest, EqualsAnIndependentSha256OfTheLoadedBytes) {
+    std::string const text = shippedTargetText("x86_64");
+    ASSERT_FALSE(text.empty());
+    auto r = TargetSchema::loadFromText(text, "<digest-fixture>");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->contentDigest(), digestOracle(text));
+}
+
+// The file route lands the SAME digest as handing the same bytes to
+// `loadFromText` directly — `loadShipped` → `loadFromFile` → `loadFromText` is
+// the path every real load takes, and it must not acquire a different key.
+TEST(TargetSchemaContentDigest, LoadShippedDigestsTheFileItRead) {
+    std::string const text = shippedTargetText("x86_64");
+    ASSERT_FALSE(text.empty());
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    EXPECT_EQ((*shipped)->contentDigest(), digestOracle(text));
+}
+
+// ⚠ EMPTY MEANS UNKNOWN, NEVER WRONG. The public `TargetSchemaData` ctor is the
+// documented bypass, and it has no document bytes to digest. An empty digest is
+// a DETECTABLE unknown a cache can refuse to key on; a fabricated or inherited
+// one is a silent wrong key.
+TEST(TargetSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItEmpty) {
+    TargetSchema const schema{::dss::detail::TargetSchemaData{}};
+    EXPECT_TRUE(schema.contentDigest().empty())
+        << "a schema with no document bytes reported a digest: "
+        << schema.contentDigest();
 }

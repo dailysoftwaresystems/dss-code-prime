@@ -1964,6 +1964,122 @@ struct DSS_EXPORT InlineAsmConfig {
     }
 };
 
+// ── inline-asm P5c (`semantics.inlineAsmTemplateLexemes`) ──
+//    D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER, closed.
+//
+// ★★★ THE TEMPLATE SIGILS ARE **ONE** FACT WITH **ONE** OWNER, AND THIS IS IT.
+// Until 2026-08-17 they had two: `scanInlineAsmTemplate` compared against the
+// C++ literals `'%'`, `'l'`, `'['`, `']'` while every assembly DIALECT declared
+// the same spellings in its `asm-template` lexer mode — and nothing in the
+// shipped build could notice them disagreeing, because the semantic tier has no
+// dialect in scope when it scans. The dialect now declares only the CAPABILITY
+// (`assembly.templateLexerMode` + `templateOperandRule`); this block declares
+// the VOCABULARY; and the loader INTERSECTS them, synthesizing the dialect's
+// per-mode token rows from these bytes. A dialect that declares template
+// lexemes of its own is a LOAD ERROR naming both sites.
+//
+// ★★ WHY IT IS A **LANGUAGE** FACT AND NOT A DIALECT ONE — the measurement that
+// decides where this lives. `%0`, `%%`, `%l[label]` and `[name]` are GNU
+// **C-extension** syntax: gcc SUBSTITUTES them before the assembler ever sees
+// the text, so gas never receives a `%0` — it receives the substituted register
+// name. The dialect's job begins AFTER substitution. The sigils therefore belong
+// to the HOST language's inline-asm surface, which is precisely where
+// `memoryClobber` / `conditionCodeClobber` already live (see the block above for
+// the same argument made about the two non-register clobber spellings). It is
+// also why this structurally solves the null-target case rather than happening
+// to: the semantic analyzer ALWAYS has the language config — it cannot analyze
+// without one — and legitimately has no target (the LSP, the FFI header parser
+// and every direct-API caller all scan templates with `target == nullptr`).
+//
+// ★★ ROLES, NOT BYTES. A flat byte list could not say which byte is which, and
+// every reader would re-derive it. This is a fixed set of named ROLES modelled
+// exactly as `assembly.operandForms` is: EVERY role is REQUIRED whenever the
+// object is present, with an EXPLICIT `null` permitted for a role a language
+// genuinely lacks — so a partial block can never silently mean "this form is
+// unrecognized". An unknown role key is a LOAD ERROR naming it.
+//
+// ★★★ AND `null` MEANS THE FORM DOES NOT EXIST, WHICH IS A CLAIM A DOCUMENT CAN
+// CONTRADICT — THE FOUR CASES, CLOSED (2026-08-17):
+//     role declared + role bound   ⇒ the row is synthesized
+//     role declared + NOT bound    ⇒ LOAD ERROR (nothing can carry the sigil)
+//     role NULL     + role bound   ⇒ LOAD ERROR (this grammar still needs it)
+//     role NULL     + NOT bound    ⇒ HONOURED — no row, and the scan stops
+//                                    recognizing the form
+// ⚠ THE THIRD ROW IS NOT PEDANTRY; IT CLOSES A MEASURED PLATFORM SPLIT. Without
+// it, `symbolicNameClose: null` meant TWO different things: on `asm-x86_64-att`
+// the bound kind (`PlaceholderNameClose`) had no other declaration, so the load
+// failed two tiers away with an unresolvable shape reference; on
+// `asm-arm64-gas` the same role binds `BracketClose`, which its GLOBAL table
+// declares for the memory form, so the template went on accepting the form the
+// language had just declared ABSENT. ⇒ the outcome turned on whether an
+// UNRELATED lexeme happened to mint the same kind, and a pin that loaded "the
+// first discovered dialect" was therefore decided by `directory_iterator` order
+// — green on NTFS (sorted), red on ext4 (hash order). The split was the symptom;
+// two meanings for one declaration was the defect, and the silent-accept side
+// was the one that looked green.
+// ★ The rule is decidable from the two documents alone — a binding exists only
+// because the imported closure SPELLS the role — so it can never depend on what
+// else is interned, in what order, on which filesystem.
+//
+// ⓘ WHERE `null` IS ACTUALLY HONOURED, AND IT IS THE CASE THE CLAUSE IS FOR: a
+// HOST that declares the role set and NO `assembly.templateLexerMode` — it
+// SCANS templates and never lexes one. There the null costs it a recognized
+// form and nothing else, which is a language genuinely lacking a form. (It is
+// also why the check is gated on the capability: `symbolicNameOpen`/`Close` are
+// the same roles a host binds for its OWN operand spelling
+// `[name] "constraint" (expr)`, which has nothing to do with the template.)
+//
+// ⚠ THE ROLE NAMES ARE THE `bindTokens` HOLE NAMES ON PURPOSE. That is the
+// intersection seam: the language says which BYTES play each role, the dialect
+// says which of ITS token kinds plays the same role (it already had to, because
+// the shared template shapes spell those holes), and the loader joins them by
+// name. One name space, no second table to keep in step.
+//
+// ⓘ WHAT IS **NOT** HERE, AND WHY THAT IS NOT AN OMISSION: the operand INDEX
+// digits and the modifier LETTER. `%0`'s `0` is bound to the shared
+// `templateOperandIndex` role (an `IntLiteral`), and a modifier letter is a
+// per-TARGET width-view vocabulary no shipped `.target.json` declares — the scan
+// REFUSES it rather than lowering it. Neither is a sigil, so neither is a role
+// of this set.
+struct DSS_EXPORT InlineAsmTemplateLexemes {
+    // `templatePlaceholder` — GNU `%`. Introduces an operand reference.
+    std::string placeholder;
+    // `templateEscape` — GNU `%%`. The literal percent. MUST be longer than
+    // `placeholder` wherever both are declared, or maximal munch cannot separate
+    // them; the loader refuses the pairing that cannot be lexed.
+    std::string escape;
+    // `templateLabelPlaceholder` — GNU `%l`. An `asm goto` label reference.
+    std::string labelPlaceholder;
+    // `symbolicNameOpen` / `symbolicNameClose` — GNU `[` / `]`. The brackets of
+    // `%[name]` and of an operand's own `[name] "constraint" (expr)` spelling.
+    std::string symbolicNameOpen;
+    std::string symbolicNameClose;
+    // The object was PRESENT. Distinguishes "declared, and this role is null"
+    // from "no template surface at all" — every emptiness test below has to be
+    // able to tell those apart.
+    bool declared = false;
+
+    // ── the DERIVED spellings the diagnostics quote ──
+    // Every `%0` / `%%` / `%[name]` / `%l[name]` that used to be a C++ string
+    // literal in `scanInlineAsmTemplate` is built HERE, from the declared bytes.
+    // A message that quotes a hard-coded `%` at a language that spells it `$` is
+    // the same defect as a scan that looks for one.
+    [[nodiscard]] std::string operandRef(std::string_view index) const {
+        return placeholder + std::string{index};
+    }
+    [[nodiscard]] std::string namedOperandRef(std::string_view name) const {
+        return placeholder + symbolicNameOpen + std::string{name}
+             + symbolicNameClose;
+    }
+    [[nodiscard]] std::string labelRef(std::string_view index) const {
+        return labelPlaceholder + std::string{index};
+    }
+    [[nodiscard]] std::string namedLabelRef(std::string_view name) const {
+        return labelPlaceholder + symbolicNameOpen + std::string{name}
+             + symbolicNameClose;
+    }
+};
+
 // The full `semantics` block. Every facet is optional; absent ⇒ that
 // facet is just not analyzed.
 struct DSS_EXPORT SemanticConfig {
@@ -2284,6 +2400,19 @@ struct DSS_EXPORT SemanticConfig {
     // `inlineAsm.rule` invalid ⇒ the language has no inline-asm surface
     // (toy/tsql — none of the checks run).
     InlineAsmConfig inlineAsm;
+    // The inline-asm TEMPLATE's lexical role set — the ONE owner of the sigils
+    // (D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER). See
+    // `InlineAsmTemplateLexemes` above. `declared == false` ⇒ this language
+    // declares no template surface, and `scanInlineAsmTemplate` scans nothing
+    // rather than falling back on a guessed sigil.
+    // ⚠ IT IS A SIBLING OF `inlineAsm` RATHER THAN A MEMBER, AND THE REASON IS
+    // MEASURED, NOT stylistic: `semantics.inlineAsm` names twelve rules of the
+    // EMBEDDED `__asm__` surface, so the reference merge scopes it to hosts that
+    // import that surface and it never reaches a DIALECT document (which imports
+    // the `.s` line surface only). The lexeme role set names NO rule, so it is
+    // surface-neutral and travels to BOTH — which is exactly what a single owner
+    // consumed by the semantic tier AND by the dialect's lexer requires.
+    InlineAsmTemplateLexemes inlineAsmTemplateLexemes;
     // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): `_Generic` generic
     // selection. `genericRule` = the `genericExpr` shape; `genericControlChild` =
     // the visible-child index of the controlling `assignmentExpr`. When Pass 2

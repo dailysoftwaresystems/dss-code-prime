@@ -240,18 +240,45 @@ decodeConstantValue(json const& v, TypeKind kind) {
 // clean selection outcomes.
 enum class WhenMatch { Match, NoMatch, Error };
 
+// WHICH AXES OF THE `when` SELECTOR PARTICIPATE IN THE MATCH. One evaluator,
+// three modes — never a second evaluator (a `when` decoded by two readers is a
+// `when` two readers can disagree about).
+//
+//  • `FormatOnly`     — `{format}` is the WHOLE legal key vocabulary; an `arch`
+//                       or `dataModel` key FAILS LOUD. The preprocessor-facing
+//                       surfaces (`macros`, and the `includes` edge gate) live
+//                       here: neither arch nor the data model is threaded into
+//                       preprocess (c9 build-key avoidance), so a key naming
+//                       them could only ever be a config author's mistake.
+//  • `FullTarget`     — `{arch,format,dataModel}` are all legal and all
+//                       participate. The TYPED surfaces (structs / constants /
+//                       typedefs / per-target `value` variants), which select a
+//                       LAYOUT or a TYPE and therefore need every axis.
+//  • `FormatReachability` — `{arch,format,dataModel}` are all legal and
+//                       VALIDATED, but only `format` participates. This answers
+//                       a strictly weaker question than `FullTarget`: "could
+//                       this arm be selected on object format F, for SOME
+//                       target?" — which is the right question for a NAME
+//                       PRESENCE scan (`shippedSurfaceNamesForFormat`), because
+//                       a variant set changes a name's TYPE or LAYOUT per arch,
+//                       never whether the name exists at all. Answering it with
+//                       `FullTarget` and no active arch would say NoMatch for
+//                       every arch-keyed arm and under-report the surface;
+//                       answering it by ignoring `variants` entirely would
+//                       over-report it. Both are silent wrong answers to a
+//                       question two fail-loud invariants are built on.
+enum class WhenAxes { FormatOnly, FullTarget, FormatReachability };
+
 // Decode + test a variant's `when` object (the per-target SELECTOR shared by the
 // `structs` / `constants` / `typedefs` / `macros` variant surfaces). The contract
 // is MATCH-ALL-SPECIFIED: every key the `when` SPECIFIES must equal the active
 // value (generic string equality — never an `if (arch == "x86_64")` here); an
 // unspecified key is a wildcard. A key tested against an UNKNOWN active value
 // (activeTarget / activeFormat nullopt — direct-API/LSP/test callers) can never
-// match. `allowArch` gates whether `arch` and `dataModel` are legal keys: the
-// TYPED surfaces (struct/constant/typedef) carry all three of
-// {arch,format,dataModel}; the preprocessor `macros` surface is FORMAT-ONLY
-// (neither arch nor the data model is threaded into preprocess — c9 build-key
-// avoidance), so its `when` keys are {format} alone and an `arch`/`dataModel` key
-// there fails loud. `activeFormatName` is the precomputed
+// match. `axes` selects which keys are LEGAL and which PARTICIPATE — see the
+// `WhenAxes` table above. EVERY mode VALIDATES every key it admits (a typo'd
+// value fails loud in all three, including on an axis that does not
+// participate). `activeFormatName` is the precomputed
 // `objectFormatKindName(*activeFormat)` (empty when activeFormat is nullopt);
 // `activeDataModelName` is the precomputed `dataModelName(dataModel)` — the
 // descriptor reader always has a data model (a non-optional parameter), so unlike
@@ -269,7 +296,7 @@ enum class WhenMatch { Match, NoMatch, Error };
 // selector arch/format already use rather than a typedef-only `typeByDataModel`
 // key, so structs/constants/versions gain the axis for free.
 [[nodiscard]] WhenMatch
-matchVariantWhen(json const& when, bool allowArch, std::string const& whenCtx,
+matchVariantWhen(json const& when, WhenAxes axes, std::string const& whenCtx,
                  std::optional<std::string_view> activeTarget,
                  std::optional<ObjectFormatKind> activeFormat,
                  std::string const& activeFormatName,
@@ -279,7 +306,14 @@ matchVariantWhen(json const& when, bool allowArch, std::string const& whenCtx,
     // {format} only for macros. An unknown/forbidden key (e.g. `arch` in a macro
     // `when`, or a typo'd "ach") fails loud — a silently-ignored key would match
     // more broadly than intended.
-    if (allowArch) {
+    //
+    // ★ LEGALITY AND PARTICIPATION ARE SEPARATE. `FormatReachability` admits the
+    // arch axes (they are legal in a typed surface's `when`) and still VALIDATES
+    // their values, but does not let them decide the match — which is what makes
+    // it a strictly WEAKER test than `FullTarget` rather than a different one.
+    bool const archKeysLegal        = (axes != WhenAxes::FormatOnly);
+    bool const archKeysParticipate  = (axes == WhenAxes::FullTarget);
+    if (archKeysLegal) {
         if (!rejectUnknownKeys(reporter, when, whenCtx,
                                {"arch", "format", "dataModel"}))
             return WhenMatch::Error;
@@ -288,7 +322,7 @@ matchVariantWhen(json const& when, bool allowArch, std::string const& whenCtx,
             return WhenMatch::Error;
     }
     bool matches = true;
-    if (allowArch && when.contains("dataModel")) {
+    if (archKeysLegal && when.contains("dataModel")) {
         if (!when.at("dataModel").is_string()) {
             emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
                                         + ": 'dataModel' must be a string");
@@ -305,9 +339,9 @@ matchVariantWhen(json const& when, bool allowArch, std::string const& whenCtx,
                                         + "' (expected \"LP64\"/\"LLP64\"/\"ILP32\")");
             return WhenMatch::Error;
         }
-        if (activeDataModelName != wantModel) matches = false;
+        if (archKeysParticipate && activeDataModelName != wantModel) matches = false;
     }
-    if (allowArch && when.contains("arch")) {
+    if (archKeysLegal && when.contains("arch")) {
         if (!when.at("arch").is_string()) {
             emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
                                         + ": 'arch' must be a string");
@@ -316,7 +350,9 @@ matchVariantWhen(json const& when, bool allowArch, std::string const& whenCtx,
         std::string const wantArch = when.at("arch").get<std::string>();
         // The arch name is OPEN (it lives only in the target schemas this reader
         // does not load) — an unknown arch simply never matches.
-        if (!activeTarget.has_value() || *activeTarget != wantArch) matches = false;
+        if (archKeysParticipate
+            && (!activeTarget.has_value() || *activeTarget != wantArch))
+            matches = false;
     }
     if (when.contains("format")) {
         if (!when.at("format").is_string()) {
@@ -438,7 +474,7 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
             return false;
         }
         WhenMatch const wm =
-            matchVariantWhen(vdef.at("when"), /*allowArch=*/true, vctx + ".when",
+            matchVariantWhen(vdef.at("when"), WhenAxes::FullTarget, vctx + ".when",
                              activeTarget, activeFormat, activeFormatName,
                              activeDataModelName, reporter);
         if (wm == WhenMatch::Error) return false;
@@ -644,10 +680,10 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
             ShippedMacro vMacro;
             vMacro.name = mname;
             if (!decodeMacroBody(vdef, vat, vMacro)) { okVariants = false; break; }
-            // FORMAT-ONLY selector (allowArch=false — arch is not threaded into the
+            // FORMAT-ONLY selector (WhenAxes::FormatOnly — arch is not threaded into the
             // preprocessor). A nullopt activeFormat can never match (no selection).
             WhenMatch const wm = matchVariantWhen(
-                vdef.at("when"), /*allowArch=*/false, vat + ".when",
+                vdef.at("when"), WhenAxes::FormatOnly, vat + ".when",
                 /*activeTarget=*/std::nullopt, activeFormat, activeFormatName,
                 /*activeDataModelName=*/std::string_view{}, reporter);
             if (wm == WhenMatch::Error) { okVariants = false; break; }
@@ -771,6 +807,99 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             continue;
         }
         out.emplace(kv.key(), kv.value().get<std::string>());
+    }
+    return true;
+}
+
+// ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — decode a per-object-format
+// `realization` MAP node (`{"pe": {"unit": "dirent"}}`) into `out`
+// (format → shipped source unit NAME).
+//
+// DELIBERATELY THE SAME SHAPE AND THE SAME CHOKEPOINT DISCIPLINE AS
+// `decodeLibraryMap` ABOVE — same closed object-format key vocabulary, same
+// sentinel rejection, same "non-object node is a SHAPE error, per-key errors are
+// collect-all" contract, and the same single function serving BOTH the
+// descriptor-level map and the per-symbol override. That is what makes this an
+// EXTENSION of the `library` axis rather than a second, parallel notion of
+// "where a body comes from": the two maps cannot drift on key validation,
+// because they validate keys the same way, in code written the same way.
+//
+// The VALUE is an OBJECT with a closed one-key set rather than a bare string,
+// and that is not ceremony. A bare string would be indistinguishable from an
+// image name — the exact ambiguity between "imported from X" and "provided by
+// X" this axis exists to remove — and it would leave no place for a second
+// realization KIND to land without a type change. `{"unit": …}` states the kind.
+//
+// ★ THE UNIT IS NAMED, NEVER PATHED. A path here would make every future
+// re-layout of the runtime tree a config migration, and it would turn refusal R2
+// from a set difference over NAMES into a path walk. The layout is the loader's
+// business (`<tier>/<name>/<name>.c`), exactly as `<stem>.json` is for headers.
+[[nodiscard]] bool decodeRealizationMap(
+    json const& node, std::string const& ctx, std::string const& field,
+    DiagnosticReporter& reporter,
+    std::unordered_map<std::string, std::string>& out) {
+    if (!node.is_object()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+            + "' must be a per-object-format object whose values name a shipped "
+              "source FILE, e.g. "
+              "{\"pe\":{\"source\":\"runtime/platform/pe/dirent.c\"}}");
+        return false;
+    }
+    for (auto const& kv : node.items()) {
+        auto const keyKind = objectFormatKindFromName(kv.key());
+        if (!keyKind.has_value()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+                + "' has unknown object-format key '" + kv.key()
+                + "' (expected one of the object-format names, e.g. "
+                  "\"pe\"/\"elf\"/\"macho\")");
+            continue;
+        }
+        // Same reason as `decodeLibraryMap`: the `unknown` sentinel SPELLS
+        // correctly, so only an explicit check stops it, and a realization
+        // stored under it would select for no real format at all.
+        if (!isSelectableObjectFormatKind(*keyKind)) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+                + "' names the invalid sentinel — "
+                + std::string{kObjectFormatKindSentinelRejection});
+            continue;
+        }
+        if (!kv.value().is_object()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+                + "." + kv.key() + "' must be an object, e.g. "
+                  "{\"source\":\"runtime/platform/pe/dirent.c\"}");
+            continue;
+        }
+        (void)rejectUnknownKeys(reporter, kv.value(),
+                                ctx + " " + field + "." + kv.key(), {"source"});
+        if (!kv.value().contains("source") || !kv.value().at("source").is_string()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+                + "." + kv.key() + "' must declare a string 'source' naming a "
+                  "shipped source FILE, relative to src/dss-config/");
+            continue;
+        }
+        std::string src = kv.value().at("source").get<std::string>();
+        // The path is RELATIVE to the shipped-config root and must stay inside
+        // it. This is the same containment posture `findShippedConfig` takes on a
+        // logical name, applied to a path: a `..` component or an absolute/rooted
+        // spelling would let a descriptor reach an arbitrary file on the host, so
+        // both are refused HERE rather than at the filesystem.
+        bool escapes = src.empty();
+        {
+            std::filesystem::path const asPath{src};
+            if (asPath.is_absolute() || asPath.has_root_name()
+                || src.find('\\') != std::string::npos)
+                escapes = true;
+            for (auto const& seg : asPath)
+                if (seg == ".." || seg == ".") escapes = true;
+        }
+        if (escapes) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
+                + "." + kv.key() + ".source' must be a non-empty path RELATIVE to "
+                  "src/dss-config/, with forward slashes and no '.'/'..' "
+                  "components, got '" + src + "'");
+            continue;
+        }
+        out.emplace(kv.key(), std::move(src));
     }
     return true;
 }
@@ -943,10 +1072,23 @@ void checkMacroSymbolShadowing(json const& doc, ShippedLibDescriptor const& out,
 }
 
 // Decode the optional `includes` array (the transitive sibling-header NAMES, plan
-// D-FFI-DESCRIPTOR-INCLUDES) into `out`. Each entry must be a NON-EMPTY string (a
-// header NAME later resolved via `resolveSystemDescriptor`'s `<stem>.json`
-// convention by the closure walker — this decode does NOT resolve or validate
-// existence, only shape). Absent/empty ⇒ no transitive edges (back-compat). Shared
+// D-FFI-DESCRIPTOR-INCLUDES) into `out`, keeping only the edges ACTIVE on
+// `activeFormat`. Each entry is EITHER a NON-EMPTY string (an UNCONDITIONAL edge —
+// today's shape, always taken) OR an object `{header, when}` whose `when` is
+// evaluated by the ONE shared `matchVariantWhen` in its FORMAT-ONLY mode (the same
+// vocabulary the `macros` surface uses). A header NAME is later resolved via
+// `resolveSystemDescriptor`'s `<stem>.json` convention by the closure walker — this
+// decode does NOT resolve or validate existence, only shape.
+//
+// ★ THE GATE IS ON THE EDGE, NOT ON THE CHILD. An inactive edge is NOT AN EDGE on
+// this target: the closure never contains the child, so no tier can form an opinion
+// about it and no two tiers can disagree. The alternative (walk every edge, then
+// have each tier drop unavailable children) is what produced the drift this gate
+// closes — the preprocessor dropped them SILENTLY while the semantic tier reported
+// `F_ShippedHeaderUnavailableForTarget` on the user's `#include` line for a header
+// the user never wrote.
+//
+// Absent/empty ⇒ no transitive edges (back-compat). Shared
 // chokepoint: the full interned read AND the fast interner-free
 // `readShippedLibIncludes` (the preprocessor + import-resolver tiers) both decode
 // through this, so they can never drift (the `decodeShippedMacros`/
@@ -954,7 +1096,8 @@ void checkMacroSymbolShadowing(json const& doc, ShippedLibDescriptor const& out,
 // resolves to a real descriptor is the walker's concern (it alone has systemDirs).
 void decodeShippedIncludes(json const& doc, std::string const& pathStr,
                            DiagnosticReporter& reporter,
-                           std::vector<std::string>& out) {
+                           std::vector<std::string>& out,
+                           std::optional<ObjectFormatKind> activeFormat) {
     if (!doc.contains("includes")) return;
     if (!doc.at("includes").is_array()) {
         emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
@@ -962,14 +1105,87 @@ void decodeShippedIncludes(json const& doc, std::string const& pathStr,
                                       "strings, e.g. [\"stdio.h\"]");
         return;
     }
+    std::string const activeFormatName =
+        activeFormat.has_value() ? std::string{objectFormatKindName(*activeFormat)}
+                                 : std::string{};
+    std::size_t iidx = 0;
     for (auto const& v : doc.at("includes")) {
-        if (!v.is_string() || v.get<std::string>().empty()) {
-            emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
-                                        + "': every 'includes' entry must be a non-empty "
-                                          "header-name string (e.g. \"stdio.h\")");
+        std::string const at =
+            "'" + pathStr + "' includes[" + std::to_string(iidx) + "]";
+        ++iidx;
+        // FORM 1 — a bare non-empty STRING: the unconditional edge, byte-identical
+        // to the pre-gate shape and always taken.
+        if (v.is_string()) {
+            if (v.get<std::string>().empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": an 'includes' header-name string must be "
+                                              "non-empty");
+                continue;
+            }
+            out.push_back(v.get<std::string>());
             continue;
         }
-        out.push_back(v.get<std::string>());
+        // FORM 2 — `{header, when}`: the CONDITIONAL edge.
+        if (!v.is_object()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at
+                                        + ": every 'includes' entry must be a non-empty "
+                                          "header-name string (e.g. \"stdio.h\") or an "
+                                          "object {\"header\":\"h\",\"when\":{...}}");
+            continue;
+        }
+        if (!rejectUnknownKeys(reporter, v, at, {"header", "when"})) continue;
+        if (!v.contains("header") || !v.at("header").is_string()
+            || v.at("header").get<std::string>().empty()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at
+                                        + ": a conditional 'includes' entry requires a "
+                                          "non-empty string 'header'");
+            continue;
+        }
+        // `when` is REQUIRED in the object form, and must declare at least one
+        // key. Both rules exist for the same reason: an object entry with no
+        // condition — omitted `when`, or `when:{}` which matches everything — is
+        // a SECOND SPELLING of the string form, and a fact with an owner does not
+        // get a second owner. The author who wrote `{"header":"x"}` meant to
+        // write a condition and lost it; that must fail loud, not silently
+        // degrade into an unconditional edge.
+        if (!v.contains("when") || !v.at("when").is_object()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at
+                                        + ": a conditional 'includes' entry requires a "
+                                          "'when' object (e.g. {\"format\":\"pe\"}); an "
+                                          "UNCONDITIONAL edge is spelled as a bare header-"
+                                          "name string");
+            continue;
+        }
+        if (v.at("when").empty()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + at
+                                        + ": 'when' must declare at least one key — an "
+                                          "empty 'when' matches every target, which is "
+                                          "what the bare header-name string already says");
+            continue;
+        }
+        // THE ONE SHARED `when` EVALUATOR, in the SAME format-only mode the
+        // `macros` surface uses (this tier has no arch and no data model — the
+        // preprocessor and the import resolver are both keyed on (file x format)
+        // alone). Its vocabulary, its closed format-name check and its fail-loud
+        // on an unknown key are therefore identical to the macro surface's, by
+        // construction rather than by convention.
+        //
+        // EAGER: the SHAPE of every entry is validated above regardless of
+        // whether the edge is active, and `matchVariantWhen` validates the `when`
+        // itself on every read — so a malformed INACTIVE edge fails the read on
+        // EVERY target (the anti-lurking property the variant surfaces already
+        // have). Only the DECISION is per-format.
+        WhenMatch const wm =
+            matchVariantWhen(v.at("when"), WhenAxes::FormatOnly, at + ".when",
+                             /*activeTarget=*/std::nullopt, activeFormat,
+                             activeFormatName,
+                             /*activeDataModelName=*/std::string_view{}, reporter);
+        if (wm == WhenMatch::Error) continue;   // already reported
+        // NoMatch (including EVERY conditional edge when no format is active —
+        // LSP / direct-API / test callers) ⇒ the edge is NOT TAKEN. It is not an
+        // edge on this target at all, so no tier sees it and no tier can disagree
+        // about it. Mirrors "a variants-only macro is not injected".
+        if (wm == WhenMatch::Match) out.push_back(v.at("header").get<std::string>());
     }
 }
 
@@ -1262,6 +1478,18 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             return std::nullopt;
     }
 
+    // (2.4) D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the SIBLING axis to `library`.
+    // `library` answers "which IMAGE, per format"; this answers "IMPORTED at all,
+    // per format". Absent (every descriptor but dirent.json today) ⇒ every symbol
+    // imports, byte-identical to the pre-ruling image. Same shared-chokepoint
+    // discipline and the same hard-fail-on-shape contract as `library` above.
+    if (doc.contains("realization")) {
+        if (!decodeRealizationMap(doc.at("realization"),
+                                  std::string{"'"} + path.generic_string() + "'",
+                                  "realization", reporter, out.realization))
+            return std::nullopt;
+    }
+
     // (2.5) Optional `availableObjectFormats` — the per-target AVAILABILITY set
     // (which object-formats this header EXISTS on). Absent/empty ⇒ available on
     // every format (back-compat). Decoded through the SHARED chokepoint so the
@@ -1274,9 +1502,13 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // interned read + the interner-free `readShippedLibIncludes` (the closure
     // walker's source) can never drift. Resolution/existence of each name is the
     // walker's concern (it alone carries `systemDirs`) — HERE we only validate
-    // shape (non-empty strings). A malformed `includes` field fails the read via
-    // the errorCount delta below (never a partial import).
-    decodeShippedIncludes(doc, path.generic_string(), reporter, out.includes);
+    // shape (a non-empty string, or a `{header, when}` object). A malformed
+    // `includes` field fails the read via the errorCount delta below (never a
+    // partial import). `activeFormat` gates which edges the decode KEEPS, so the
+    // descriptor this read returns carries exactly the transitive set the closure
+    // walker builds for the same format.
+    decodeShippedIncludes(doc, path.generic_string(), reporter, out.includes,
+                          activeFormat);
 
     // (3) `symbols` array — OPTIONAL. A header may carry only `constants`
     // (e.g. <limits.h>, all `#define`s, no linkable symbols) or only
@@ -1299,7 +1531,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // human note, e.g. the LP64-vs-LLP64 deferral rationale in stdio/stdlib) —
     // accepted + ignored, never consumed by lowering.
     (void)rejectUnknownKeys(reporter, doc, "(root)",
-                            {"header", "standard", "library", "availableObjectFormats",
+                            {"header", "standard", "library", "realization",
+                             "availableObjectFormats",
                              "includes", "symbols", "constants", "floatConstants",
                              "typedefs", "structs", "unions", "macros", "$comment"});
 
@@ -1428,7 +1661,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     TypeId const vType = decodeTypedefType(vdef, vat);   // EAGER
                     if (vType == InvalidType) { okVariants = false; break; }
                     WhenMatch const wm = matchVariantWhen(
-                        vdef.at("when"), /*allowArch=*/true, vat + ".when",
+                        vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
                         activeTarget, activeFormat, activeFormatName,
                         activeDataModelName, reporter);
                     if (wm == WhenMatch::Error) { okVariants = false; break; }
@@ -1748,6 +1981,19 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             && !decodeLibraryMap(sym.at("library"), at, "library", reporter, symLibrary))
             continue;
 
+        // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the per-SYMBOL `realization`
+        // override, the exact sibling of the `library` override just above and
+        // merged over the descriptor's map by the SAME rule (symbol keys win, an
+        // omitted format inherits). It exists at symbol granularity for the same
+        // reason `library` does: one row of a header can diverge from the rest —
+        // a header may be importable on a format for most of its surface while
+        // one symbol has no platform implementation there at all.
+        std::unordered_map<std::string, std::string> symRealization;
+        if (sym.contains("realization")
+            && !decodeRealizationMap(sym.at("realization"), at, "realization",
+                                     reporter, symRealization))
+            continue;
+
         // FC3 c1: optional per-data-model signature override
         // (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH closure for the
         // LP64-merged libc symbols — fseek/ftell/atol/strtol/strtoul/
@@ -1811,7 +2057,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                                 {"name", "signature", "signatureByDataModel",
                                  "kind", "linkage", "availableObjectFormats",
                                  "noreturn", "returnsTwice", "synthesize", "version",
-                                 "linkName", "library"});
+                                 "linkName", "library", "realization"});
 
         // Decode the signature via the ONE type-text decoder. A decode failure
         // is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
@@ -1841,7 +2087,67 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             ShippedSymbol{std::move(name), sig, kind, linkage, std::move(symAvail),
                           noreturn, returnsTwice, std::move(synthesize),
                           std::move(version), std::move(linkName),
-                          std::move(symLibrary)});
+                          std::move(symLibrary), std::move(symRealization)});
+    }
+
+    // ══ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — R1 + R3, AT LOAD ==========
+    //
+    // Both are checked on the descriptor BEING READ, over EVERY declared format
+    // rather than the active one, so an arm no current target selects cannot rot.
+    // Cost is one `is_regular_file` per realization entry and one map lookup per
+    // format — 39 of the 40 descriptors declare no `realization` at all and pay
+    // literally nothing.
+    {
+        auto effective = [&](std::unordered_map<std::string, std::string> const& base,
+                             std::unordered_map<std::string, std::string> const& ov) {
+            auto m = base;
+            for (auto const& [k, v] : ov) m.insert_or_assign(k, v);
+            return m;
+        };
+        auto checkOwner =
+            [&](std::unordered_map<std::string, std::string> const& lib,
+                std::unordered_map<std::string, std::string> const& real,
+                std::string const& ctx) {
+                for (auto const& [fmt, src] : real) {
+                    // R3 — an IMAGE and a SOURCE for one format. Two owners for one
+                    // body is the defect, not a fallback: silently preferring
+                    // either is how a program links against an image that does not
+                    // export the symbol and then dies at LOAD, with no diagnostic
+                    // at any compile stage.
+                    if (auto const libIt = lib.find(fmt); libIt != lib.end()) {
+                        emitMalformed(reporter,
+                            "shipped-lib descriptor '" + path.generic_string() + "' "
+                            + ctx + " declares BOTH an import ('library." + fmt
+                            + "' = '" + libIt->second
+                            + "') AND a shipped-source realization ('realization."
+                            + fmt + ".source' = '" + src + "') for the object format '"
+                            + fmt + "' — two owners for one body "
+                            "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R3)");
+                    }
+                    // R1 — the named source is not there. Deliberately NOT reported
+                    // as a bare "file not found": the message names BOTH sides,
+                    // because either half alone leaves the reader guessing which
+                    // one is wrong.
+                    if (!resolveShippedSourcePath(src).has_value()) {
+                        emitMalformed(reporter,
+                            "shipped-lib descriptor '" + path.generic_string() + "' "
+                            + ctx + " declares a shipped-source realization naming '"
+                            + src + "' for the object format '" + fmt
+                            + "', but no readable file exists there (resolved "
+                              "against src/dss-config/) — that format would carry a "
+                              "DECLARED symbol with no body "
+                              "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R1)");
+                    }
+                }
+            };
+        checkOwner(out.library, out.realization, "(root)");
+        for (std::size_t i = 0; i < out.symbols.size(); ++i) {
+            auto const& sym = out.symbols[i];
+            if (sym.realization.empty() && out.realization.empty()) continue;
+            checkOwner(effective(out.library, sym.library),
+                       effective(out.realization, sym.realization),
+                       "symbols[" + std::to_string(i) + "] ('" + sym.name + "')");
+        }
     }
 
     // (5) Optional `constants` array — the neutral form of a header's object-
@@ -1949,7 +2255,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         okVariants = false; break;
                     }
                     WhenMatch const wm = matchVariantWhen(
-                        vdef.at("when"), /*allowArch=*/true, vat + ".when",
+                        vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
                         activeTarget, activeFormat, activeFormatName,
                         activeDataModelName, reporter);
                     if (wm == WhenMatch::Error) { okVariants = false; break; }
@@ -2295,7 +2601,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         // Does this variant's `when` MATCH the active target? (the
                         // SHARED selector — typed surfaces allow {arch,format}.)
                         WhenMatch const wm = matchVariantWhen(
-                            vdef.at("when"), /*allowArch=*/true, vat + ".when",
+                            vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
                             activeTarget, activeFormat, activeFormatName,
                             activeDataModelName, reporter);
                         if (wm == WhenMatch::Error) { okVariants = false; break; }
@@ -2508,8 +2814,9 @@ readShippedLibTypedefNames(std::filesystem::path const& path,
 }
 
 std::optional<std::vector<std::string>>
-readShippedLibIncludes(std::filesystem::path const& path,
-                       DiagnosticReporter&          reporter) {
+readShippedLibIncludes(std::filesystem::path const&    path,
+                       DiagnosticReporter&             reporter,
+                       std::optional<ObjectFormatKind> activeFormat) {
     // Interner-FREE `includes` read for the two `systemDirs`-bearing tiers (the
     // preprocessor macro-splice + the import resolver), which have no interner.
     // Decodes through the SAME `decodeShippedIncludes` chokepoint as the full read,
@@ -2518,12 +2825,15 @@ readShippedLibIncludes(std::filesystem::path const& path,
     // `header`/typed-surface gate — the semantic read owns those (this stays no
     // STRICTER than the full read). std::nullopt on a broken JSON / malformed
     // `includes`; EMPTY ⇒ the descriptor declares no `includes` (the common case).
+    // `activeFormat` selects which CONDITIONAL edges are active; every entry's
+    // SHAPE is validated regardless, so this is no stricter and no laxer per
+    // target than the full read on the same document.
     std::size_t const errBefore = reporter.errorCount();
     json const* const docPtr = cachedDescriptorJson(path, reporter);
     if (!docPtr) return std::nullopt;
     json const& doc = *docPtr;
     std::vector<std::string> out;
-    decodeShippedIncludes(doc, path.generic_string(), reporter, out);
+    decodeShippedIncludes(doc, path.generic_string(), reporter, out, activeFormat);
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;  // empty ⇒ no transitive edges
 }
@@ -2532,10 +2842,13 @@ void forEachDescriptorInClosure(
     std::filesystem::path const&                             startPath,
     std::span<std::filesystem::path const>                   systemDirs,
     HeaderNameMatching                                       matching,
+    std::optional<ObjectFormatKind>                          activeFormat,
     std::unordered_set<std::string>&                         visited,
     std::function<void(std::filesystem::path const&)> const& visit,
     std::function<void(std::string const&,
-                       HeaderSearchResult const&)> const&    onUnresolvedInclude) {
+                       HeaderSearchResult const&)> const&    onUnresolvedInclude,
+    std::function<void(std::string const&,
+                       std::filesystem::path const&)> const& onUnavailableChild) {
     // ★ CYCLE / DIAMOND GUARD (correctness must): a single DFS keyed on the
     // weakly-canonical descriptor path (the SAME key the semantic readDescriptors
     // dedup + cachedDescriptorJson use). A path is visited AT MOST ONCE, so a cycle
@@ -2551,14 +2864,32 @@ void forEachDescriptorInClosure(
     // transitively-included sibling's on any name collision).
     visit(startPath);
 
+    // ★ A DESCRIPTOR THAT DOES NOT EXIST ON THIS FORMAT DECLARES NOTHING ON IT —
+    // ITS EDGES INCLUDED. Only ever reached for the ROOT (a child's availability is
+    // tested in the loop below, BEFORE it is visited), and the root is the header
+    // the USER named: the caller owns that verdict (the semantic tier's
+    // `F_ShippedHeaderUnavailableForTarget`, positioned on the `#include` line), so
+    // the root is still VISITED and only the DESCENT stops.
+    // ⚠ THIS FIXED A REAL LEAK, not a hypothetical one: before the gate, a root
+    // refused as unavailable still had its whole `includes` closure recorded, so
+    // the semantic tier injected every SIBLING's surface for an `#include` that had
+    // just been rejected. It was unobservable only because the rejection also
+    // errored the compile — a coincidence, not a design.
+    if (activeFormat.has_value()
+        && !shippedHeaderAvailableForFormat(startPath, *activeFormat)) {
+        return;
+    }
+
     // Read this descriptor's `includes` interner-free with a THROWAWAY reporter: a
     // malformed `includes` FIELD is surfaced by the semantic readShippedLibDescriptor
     // that reads the SAME descriptor (the import resolver records a ref per closure
     // descriptor) — never silent, never double-reported here (the
     // shippedHeaderAvailableForFormat throwaway-reporter precedent). A malformed
     // field ⇒ nullopt ⇒ no children traversed (the loud report comes from semantic).
+    // `activeFormat` selects the ACTIVE edges: an entry whose `when` does not match
+    // is not an edge on this target and never appears here.
     DiagnosticReporter throwaway;
-    auto const includes = readShippedLibIncludes(startPath, throwaway);
+    auto const includes = readShippedLibIncludes(startPath, throwaway, activeFormat);
     if (!includes) return;
     for (std::string const& headerName : *includes) {
         // Resolve each sibling by the SAME `<stem>.json` funnel a source
@@ -2576,9 +2907,47 @@ void forEachDescriptorInClosure(
             onUnresolvedInclude(headerName, child);
             continue;
         }
-        forEachDescriptorInClosure(child.path, systemDirs, matching, visited, visit,
-                                   onUnresolvedInclude);   // DFS recurse
+        // ★★ AN ACTIVE EDGE WHOSE CHILD DOES NOT EXIST ON THIS FORMAT IS A CONFIG
+        // CONTRADICTION, AND IT IS LOUD. The config said "on this format, including
+        // me also includes X" and, in the same breath, "X does not exist on this
+        // format". There is no correct silent answer: dropping the child hides a
+        // surface the parent PROMISED, and recording it makes the semantic tier
+        // report a header the user never wrote. So the walker reports it and each
+        // tier renders it in its own voice, exactly as `onUnresolvedInclude` already
+        // works — the resolver (which alone owns a positioned `#include` span) is
+        // loud; the preprocessor stays silent so nothing double-reports.
+        // ⚠ Invariant (i) in `validateShippedIncludeClosure` refuses this STATICALLY
+        // over the whole corpus, including arms no current target selects. This arm
+        // is the belt to that invariant's braces: the invariant is a sweep, and a
+        // sweep only covers the corpus it was run over.
+        if (activeFormat.has_value()
+            && !shippedHeaderAvailableForFormat(child.path, *activeFormat)) {
+            onUnavailableChild(headerName, child.path);
+            continue;
+        }
+        forEachDescriptorInClosure(child.path, systemDirs, matching, activeFormat,
+                                   visited, visit, onUnresolvedInclude,
+                                   onUnavailableChild);   // DFS recurse
     }
+}
+
+void forEachDescriptorInClosure(
+    std::filesystem::path const&                             startPath,
+    std::span<std::filesystem::path const>                   systemDirs,
+    HeaderNameMatching                                       matching,
+    std::unordered_set<std::string>&                         visited,
+    std::function<void(std::filesystem::path const&)> const& visit,
+    std::function<void(std::string const&,
+                       HeaderSearchResult const&)> const&    onUnresolvedInclude) {
+    // The FORMAT-BLIND walk. `onUnavailableChild` is an empty lambda and that is
+    // SAFE BY CONSTRUCTION, not by hope: the only site that invokes it is guarded
+    // on `activeFormat.has_value()`, and this overload passes nullopt. See the
+    // header for why this is an overload rather than a default argument.
+    forEachDescriptorInClosure(startPath, systemDirs, matching,
+                               /*activeFormat=*/std::nullopt, visited, visit,
+                               onUnresolvedInclude,
+                               [](std::string const&,
+                                  std::filesystem::path const&) {});
 }
 
 bool objectFormatInAvailabilitySet(std::span<std::string const> availableObjectFormats,
@@ -2599,6 +2968,154 @@ bool shippedHeaderAvailableForFormat(std::filesystem::path const& descriptorPath
     auto avail = readShippedLibAvailability(descriptorPath, throwaway);
     if (!avail) return true;
     return objectFormatInAvailabilitySet(*avail, fmt);
+}
+
+namespace {
+
+// Is a `variants`-bearing typed entry REACHABLE on object format `fmt`? True iff
+// the entry declares no `variants` (a flat entry is present on every format its
+// descriptor is) or at least ONE variant's `when` is format-compatible.
+//
+// ★ THIS IS A NAME-PRESENCE QUESTION, WHICH IS STRICTLY WEAKER THAN THE
+// SELECTION QUESTION, AND THAT IS DELIBERATE. `readShippedLibDescriptor` asks
+// "which arm is ACTIVE for this (arch, format, dataModel)?" and needs all three
+// axes. A surface SCAN has no arch and no data model, and it does not need
+// them: a variant set exists to give a name a different TYPE or LAYOUT per
+// arch, never to make the name exist on one arch and not another. So the honest
+// question here is "could this arm be selected on THIS FORMAT, for some target?"
+// — `WhenAxes::FormatReachability`. The two wrong answers were both available
+// and both silent: asking the full question with no arch says NoMatch for every
+// arch-keyed arm and UNDER-reports the surface; ignoring `variants` entirely
+// OVER-reports it. Two fail-loud invariants are built on this answer.
+//
+// LENIENT on shape: a malformed `variants` node is reported for real by the
+// semantic read of the same descriptor; here it simply yields "not reachable",
+// and the caller's error-count delta turns a malformed descriptor into a refusal
+// to answer at all rather than a wrong answer.
+[[nodiscard]] bool
+typedEntryReachableOnFormat(json const& entry, std::string const& at,
+                            ObjectFormatKind fmt,
+                            std::string const& fmtName,
+                            DiagnosticReporter& reporter) {
+    auto const it = entry.find("variants");
+    if (it == entry.end()) return true;             // flat ⇒ always present
+    if (!it->is_array() || it->empty()) return false;
+    std::size_t vidx = 0;
+    for (auto const& vdef : *it) {
+        std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
+        ++vidx;
+        if (!vdef.is_object() || !vdef.contains("when")
+            || !vdef.at("when").is_object()) {
+            continue;
+        }
+        WhenMatch const wm = matchVariantWhen(
+            vdef.at("when"), WhenAxes::FormatReachability, vat + ".when",
+            /*activeTarget=*/std::nullopt, fmt, fmtName,
+            /*activeDataModelName=*/std::string_view{}, reporter);
+        if (wm == WhenMatch::Match) return true;
+    }
+    return false;
+}
+
+// Harvest every NAME an entry array contributes, applying the per-entry
+// reachability gate. `key` is the surface array's name; `hasVariants` says
+// whether that surface admits `variants` at all (the flat surfaces skip the
+// reachability probe entirely rather than probe a key that cannot be there).
+void harvestNamedSurface(json const& doc, std::string const& pathStr,
+                         char const* key, bool surfaceAdmitsVariants,
+                         ObjectFormatKind fmt, std::string const& fmtName,
+                         DiagnosticReporter& reporter,
+                         std::vector<std::string>& out) {
+    auto const it = doc.find(key);
+    if (it == doc.end() || !it->is_array()) return;
+    std::size_t idx = 0;
+    for (auto const& e : *it) {
+        std::string const at = "'" + pathStr + "' " + key + "["
+                               + std::to_string(idx) + "]";
+        ++idx;
+        if (!e.is_object() || !e.contains("name") || !e.at("name").is_string())
+            continue;                       // shape is the full read's to refuse
+        std::string name = e.at("name").get<std::string>();
+        if (name.empty()) continue;
+        if (surfaceAdmitsVariants
+            && !typedEntryReachableOnFormat(e, at, fmt, fmtName, reporter)) {
+            continue;
+        }
+        out.push_back(std::move(name));
+    }
+}
+
+}  // namespace
+
+std::optional<std::vector<std::string>>
+shippedSurfaceNamesForFormat(std::filesystem::path const& path,
+                             ObjectFormatKind             fmt,
+                             DiagnosticReporter&          reporter) {
+    std::size_t const errBefore = reporter.errorCount();
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    json const&       doc      = *docPtr;
+    std::string const pathStr  = path.generic_string();
+    std::string const fmtName{objectFormatKindName(fmt)};
+
+    std::vector<std::string> out;
+
+    // The DOCUMENT-level availability set is the TIER-2 fallback for a symbol
+    // that declares none of its own — the same two-tier resolution the corpus
+    // symbol index uses, so "which symbols exist on F" has ONE answer.
+    std::vector<std::string> docAvail;
+    decodeShippedAvailability(doc, pathStr, reporter, docAvail);
+
+    // symbols — the one surface with a PER-ENTRY availability set.
+    if (auto const symsIt = doc.find("symbols");
+        symsIt != doc.end() && symsIt->is_array()) {
+        std::size_t idx = 0;
+        for (auto const& sym : *symsIt) {
+            std::string const at =
+                "'" + pathStr + "' symbols[" + std::to_string(idx) + "]";
+            ++idx;
+            if (!sym.is_object() || !sym.contains("name")
+                || !sym.at("name").is_string())
+                continue;
+            std::string name = sym.at("name").get<std::string>();
+            if (name.empty()) continue;
+            std::vector<std::string> symAvail;
+            decodeShippedAvailability(sym, at, reporter, symAvail);
+            if (!objectFormatInAvailabilitySet(
+                    symAvail.empty() ? docAvail : symAvail, fmt)) {
+                continue;
+            }
+            out.push_back(std::move(name));
+        }
+    }
+
+    // The typed surfaces. `constants` / `typedefs` / `structs` admit per-target
+    // `variants`; `floatConstants` / `unions` are flat. The flags are read off
+    // the SAME facts the full read's key vocabularies declare — a surface that
+    // grows `variants` later must flip its flag here, and the surface-name test
+    // is what makes that visible.
+    harvestNamedSurface(doc, pathStr, "constants",      true,  fmt, fmtName,
+                        reporter, out);
+    harvestNamedSurface(doc, pathStr, "floatConstants", false, fmt, fmtName,
+                        reporter, out);
+    harvestNamedSurface(doc, pathStr, "typedefs",       true,  fmt, fmtName,
+                        reporter, out);
+    harvestNamedSurface(doc, pathStr, "structs",        true,  fmt, fmtName,
+                        reporter, out);
+    harvestNamedSurface(doc, pathStr, "unions",         false, fmt, fmtName,
+                        reporter, out);
+
+    // macros — decoded through the REAL macro decoder with the real format, so a
+    // variants-only macro that selects no arm on `fmt` contributes no name here
+    // for exactly the reason it contributes no `#define` to a compile.
+    {
+        std::vector<ShippedMacro> macros;
+        decodeShippedMacros(doc, pathStr, reporter, macros, fmt);
+        for (auto& m : macros) out.push_back(std::move(m.name));
+    }
+
+    if (reporter.errorCount() != errBefore) return std::nullopt;
+    return out;
 }
 
 namespace {
@@ -2757,6 +3274,23 @@ realizeRow(ShippedLibDescriptor const& desc, ShippedSymbol const& sym,
     real.linkName   = sym.linkName;
     real.signature  = sym.signature;
     real.isFunction = sym.kind == ShippedSymbolKind::Function;
+    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the per-SYMBOL `realization` override
+    // MERGED OVER the descriptor's map by the SAME rule as `library` directly
+    // above — one merge shape for one axis pair, so the two cannot answer
+    // differently about the same row.
+    std::unordered_map<std::string, std::string> realizationMap = desc.realization;
+    for (auto const& [ovFmt, ovUnit] : sym.realization)
+        realizationMap.insert_or_assign(ovFmt, ovUnit);
+    if (auto const it = realizationMap.find(formatKey); it != realizationMap.end()) {
+        // ★ THE SHIPPED-SOURCE ARM. The platform declares this symbol exists here
+        // and states that its BODY is SHIPPED, not imported. It is a terminal
+        // answer, tested BEFORE the library/no-library split below and never a
+        // fallback from it: R3 already refused a row that named both, so reaching
+        // here means the descriptor named exactly one owner for this body.
+        real.shippedSourcePath = it->second;
+        real.status = ShippedRealizationStatus::ProvidedByShippedSource;
+        return real;
+    }
     // ★ THE ENUMERATED NO-LIBRARY ARM. Available here, yet the row names no image
     // FOR this format: the platform says the symbol exists but not where it lives,
     // so there is nothing to bind. A synthesized shim needs no image at all, so a
@@ -2973,6 +3507,629 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
         return out;
     }
     return out;
+}
+
+// ═══ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — THE SHIPPED SOURCE TREE ═════════════
+
+namespace {
+
+// One descriptor claim: which (format, config-root-relative source path) pair a
+// `realization` entry names, plus a human locator for the diagnostic
+// ("dirent.json symbols[0] realization").
+struct ShippedSourceClaim {
+    std::string format;
+    std::string source;
+    std::string where;
+};
+
+// EVERY shipped-source claim any descriptor under `descriptorDir` makes, on ANY
+// object format. FORMAT-INDEPENDENT on purpose: the refusals must hold for an arm
+// no current target selects, or an inactive arm rots silently — the bidirectional
+// half of the bar.
+[[nodiscard]] std::vector<ShippedSourceClaim>
+claimedShippedSources(std::filesystem::path const& descriptorDir,
+                      DiagnosticReporter&          reporter) {
+    std::vector<ShippedSourceClaim> claims;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(descriptorDir, ec)) return claims;
+    for (std::filesystem::recursive_directory_iterator
+             it{descriptorDir,
+                std::filesystem::directory_options::skip_permission_denied, ec},
+             end;
+         it != end; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        if (it->path().extension() != ".json") continue;
+        json const* const docPtr = cachedDescriptorJson(it->path(), reporter);
+        if (!docPtr) continue;   // a broken descriptor is the full read's business
+        std::string const where = it->path().filename().generic_string();
+        auto harvest = [&](json const& node, std::string const& ctx) {
+            if (!node.is_object()) return;
+            for (auto const& kv : node.items()) {
+                if (!kv.value().is_object()) continue;
+                if (!kv.value().contains("source")) continue;
+                if (!kv.value().at("source").is_string()) continue;
+                claims.push_back(ShippedSourceClaim{
+                    kv.key(), kv.value().at("source").get<std::string>(),
+                    where + " " + ctx});
+            }
+        };
+        if (docPtr->contains("realization"))
+            harvest(docPtr->at("realization"), "(root) realization");
+        if (docPtr->contains("symbols") && docPtr->at("symbols").is_array()) {
+            std::size_t i = 0;
+            for (auto const& sym : docPtr->at("symbols")) {
+                std::string const ctx =
+                    "symbols[" + std::to_string(i++) + "] realization";
+                if (!sym.is_object() || !sym.contains("realization")) continue;
+                harvest(sym.at("realization"), ctx);
+            }
+        }
+    }
+    return claims;
+}
+
+} // namespace
+
+std::optional<std::filesystem::path> findShippedConfigRootDir() {
+    // `findShippedConfigDir` composes `<root>/src/dss-config/<subdir>`; an EMPTY
+    // subdir therefore resolves the config root itself, by the SAME precedence
+    // ($DSS_CONFIG_ROOT first, then the bounded cwd walk) every other shipped
+    // thing uses. Reusing that one function rather than opening a fresh walk is
+    // the whole point — the header's own note records that seventeen private
+    // cwd-walks under `tests/` drifted from it exactly once each.
+    return findShippedConfigDir("");
+}
+
+std::optional<std::filesystem::path>
+resolveShippedSourcePath(std::string_view configRelativePath) {
+    auto const root = findShippedConfigRootDir();
+    if (!root) return std::nullopt;
+    std::filesystem::path const p =
+        (*root / std::filesystem::path{std::string{configRelativePath}})
+            .lexically_normal();
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(p, ec)) return std::nullopt;
+    return p;
+}
+
+std::vector<std::string>
+readShippedSourcesForFormat(std::filesystem::path const& path,
+                            std::string_view             formatName) {
+    // INTERNER-FREE, DIAGNOSTIC-FREE fast read — the `readShippedLibAvailability`
+    // precedent. The driver asks this once per resolved descriptor per build, and
+    // the answer is "none" for 39 of the 40 descriptors, so it must not pay for a
+    // full typed read. Descriptor HEALTH is owned by the tier that reads it for
+    // real (the `#include` path) plus the corpus-wide decode test; a malformed
+    // descriptor here simply contributes nothing.
+    DiagnosticReporter throwaway{};
+    json const* const  docPtr = cachedDescriptorJson(path, throwaway);
+    if (!docPtr) return {};
+    std::vector<std::string> out;
+    auto take = [&](json const& node) {
+        if (!node.is_object()) return;
+        auto const it = node.find(std::string{formatName});
+        if (it == node.end() || !it->is_object()) return;
+        if (!it->contains("source") || !it->at("source").is_string()) return;
+        std::string src = it->at("source").get<std::string>();
+        if (src.empty()) return;
+        // The per-symbol override wins over the descriptor default, and a source
+        // named twice is ONE build-graph edge — the merge and the dedup are the
+        // same operation over a set of PATHS.
+        if (std::find(out.begin(), out.end(), src) == out.end())
+            out.push_back(std::move(src));
+    };
+    if (docPtr->contains("realization")) take(docPtr->at("realization"));
+    if (docPtr->contains("symbols") && docPtr->at("symbols").is_array())
+        for (auto const& sym : docPtr->at("symbols"))
+            if (sym.is_object() && sym.contains("realization"))
+                take(sym.at("realization"));
+    return out;
+}
+
+std::vector<std::string>
+allShippedSourcesForFormat(std::filesystem::path const& descriptorDir,
+                           std::string_view             formatName) {
+    // Shares `claimedShippedSources` with the refusals, so "which sources does
+    // this format realize" has ONE answer for the driver and the validator. A
+    // second walk here is exactly the drift surface this axis exists to remove.
+    DiagnosticReporter throwaway{};
+    std::vector<std::string> out;
+    for (auto const& c : claimedShippedSources(descriptorDir, throwaway)) {
+        if (c.format != formatName) continue;
+        if (std::find(out.begin(), out.end(), c.source) == out.end())
+            out.push_back(c.source);
+    }
+    std::sort(out.begin(), out.end());   // deterministic across filesystems
+    return out;
+}
+
+bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
+                               std::filesystem::path const& runtimeRootDir,
+                               DiagnosticReporter&          reporter) {
+    std::size_t const errBefore = reporter.errorCount();
+    auto const        claims    = claimedShippedSources(descriptorDir, reporter);
+
+    // R1 lives at DESCRIPTOR READ TIME (`readShippedLibDescriptor`), where it is a
+    // single `is_regular_file` per declared entry and therefore free. It is
+    // repeated here so the corpus sweep is a TOTAL statement about the tree rather
+    // than a partial one that assumes every descriptor has been read.
+    std::unordered_set<std::string> claimedPaths;
+    for (auto const& c : claims) {
+        auto const resolved = resolveShippedSourcePath(c.source);
+        if (resolved) {
+            claimedPaths.insert(resolved->generic_string());
+            continue;
+        }
+        emitMalformed(reporter,
+            "shipped-lib descriptor '" + c.where + "." + c.format
+            + "' declares a shipped-source realization naming '" + c.source
+            + "', but no readable file exists there (resolved against "
+              "src/dss-config/) — the object format '" + c.format
+            + "' would be left with a DECLARED symbol and no body "
+              "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R1)");
+    }
+
+    // ★★ R2 + R4 ARE ONE RULE, AND FOLDING THEM IS STRICTLY STRONGER THAN
+    // KEEPING THEM APART: **every regular file under the runtime tree must be
+    // named by some descriptor's `realization` map.**
+    //
+    // R2 (a source file no descriptor names) is that rule read forwards: nothing
+    // can ever add such a file to a build graph, because the ONLY thing that adds
+    // one is a descriptor naming it. Inert config, and the direction R1
+    // structurally cannot see.
+    //
+    // R4 (no headers in this tree) is that SAME rule read backwards, and it needed
+    // no extension vocabulary at all. The layout mirrors the include namespace, so
+    // a private header for the dirent unit would land at `<format>/dirent.h` —
+    // which IS the include path `dirent.h` — and would SHADOW the descriptor the
+    // unit exists to consume, silently, producing exactly the struct-layout
+    // disagreement the compile-time check exists to catch. A header is never a
+    // translation unit, so no `realization` can name one, so the unclaimed-file
+    // rule refuses it BY CONSTRUCTION. Enumerating `.h` as a special case would
+    // have been the glyph-enumerating check this repo keeps deleting — define the
+    // complement, never the members. (The other half of R4 — that this tree is
+    // never added to an include-search root — holds by construction on the driver
+    // side: a shipped source CU is built with the SYSTEM dirs only, and the user's
+    // `-I` list is never extended with it.)
+    std::error_code ec;
+    // ★★★ THE SUBJECT IS DERIVED, NOT PASSED — SO THE WRONG SUBJECT IS
+    // UNREPRESENTABLE. `runtimeRootDir` is the runtime ROOT (`.../runtime`); this
+    // function walks `<root>/<tier>/src/` and nothing else.
+    //
+    // ⚠ THE TRAP THIS CLOSES, and it would have looked like a config error
+    // rather than a wrong argument: a tier also contains `dist/`, the GENERATED
+    // object cache. Handed a tier root, an unfiltered walk refuses every cached
+    // object as "named by no descriptor" and EVERY WARM BUILD GOES RED. Deriving
+    // `src/` per tier means `dist/` is not merely filtered out, it is never a
+    // candidate — and a future `runtime/managed/<lang>/src/` is covered with no
+    // edit here.
+    //
+    // ⚠⚠ AND IT IS NOT CLOSED BY FILTERING TO `.c`. An extension filter would
+    // make this function silently ignore a stray `.txt` or `.o` sitting in the
+    // AUTHORED tree, which is exactly the inert-config case R2 exists to catch.
+    // The problem was the SUBJECT DIRECTORY, so the subject is what got fixed.
+    if (std::filesystem::is_directory(runtimeRootDir / "src", ec)) {
+        // The caller handed a TIER (or a `src/`) instead of the root. Refusing is
+        // the whole point: silently scanning the wrong tree is how a guard passes
+        // while guarding nothing.
+        emitMalformed(reporter,
+            "shipped-source tree: '" + runtimeRootDir.generic_string()
+            + "' looks like a TIER (it has a 'src' child), but this check takes the "
+              "runtime ROOT and derives '<root>/<tier>/src' itself — passing a tier "
+              "would put the generated 'dist/' cache in scope and red every warm "
+              "build (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R2/R4)");
+        return false;
+    }
+    for (std::filesystem::directory_iterator tierIt{runtimeRootDir, ec}, tierEnd;
+         tierIt != tierEnd; tierIt.increment(ec)) {
+        if (ec) break;
+        if (!tierIt->is_directory(ec)) continue;
+        std::filesystem::path const authored = tierIt->path() / "src";
+        if (!std::filesystem::is_directory(authored, ec)) continue;
+        for (std::filesystem::recursive_directory_iterator
+                 it{authored,
+                    std::filesystem::directory_options::skip_permission_denied, ec},
+                 end;
+             it != end; it.increment(ec)) {
+            if (ec) break;
+            if (!it->is_regular_file(ec)) continue;
+            std::filesystem::path const p = it->path();
+            if (claimedPaths.contains(p.lexically_normal().generic_string()))
+                continue;
+            emitMalformed(reporter,
+                "shipped-source tree: '" + p.generic_string() + "' is named by NO "
+                "shipped-lib descriptor under '" + descriptorDir.generic_string()
+                + "' in a 'realization' map, so nothing can ever add it to a build "
+                  "graph. Only files a descriptor names may live under '"
+                + authored.generic_string()
+                + "' — in particular a HEADER here would sit at an INCLUDE PATH and "
+                  "silently shadow the descriptor a unit exists to consume "
+                  "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R2/R4)");
+        }
+    }
+
+    return reporter.errorCount() == errBefore;
+}
+
+namespace {
+
+// What the ACTIVE closure of one descriptor looks like on ONE object format.
+// Built by the SAME `forEachDescriptorInClosure` a compile uses, with the SAME
+// edge gate — so nothing here can be true of the sweep and false of a build.
+struct ClosureSurfaceOnFormat {
+    std::vector<std::string> names;             // union over every closure member
+    std::vector<std::string> unresolvedEdges;   // header names resolving to nothing
+    std::vector<std::string> unavailableEdges;  // ACTIVE edge, child absent on fmt
+    std::vector<std::string> undecodable;       // members whose surface would not decode
+};
+
+[[nodiscard]] ClosureSurfaceOnFormat
+closureSurfaceOnFormat(std::filesystem::path const&           startPath,
+                       std::span<std::filesystem::path const> systemDirs,
+                       ObjectFormatKind                       fmt) {
+    ClosureSurfaceOnFormat outS;
+    std::unordered_set<std::string> visited;
+    // Case-SENSITIVE resolution, and the choice is load-bearing rather than
+    // incidental: this sweep is FORMAT-INDEPENDENT by design (it evaluates arms
+    // no current target selects), while `headerNameMatching` is a per-FORMAT
+    // policy. Using one format's policy to answer a question about all of them
+    // would make the answer depend on which format asked. The conservative POSIX
+    // rule is the one every format's own rule is at least as permissive as, so a
+    // claim or an edge that resolves here resolves on every format — and one that
+    // does not is refused with a spelling the author can fix in one place.
+    forEachDescriptorInClosure(
+        startPath, systemDirs, kDefaultHeaderNameMatching, fmt, visited,
+        [&](std::filesystem::path const& p) {
+            DiagnosticReporter throwaway;
+            auto names = shippedSurfaceNamesForFormat(p, fmt, throwaway);
+            if (!names) {
+                outS.undecodable.push_back(p.generic_string());
+                return;
+            }
+            for (auto& n : *names) outS.names.push_back(std::move(n));
+        },
+        [&](std::string const& headerName, HeaderSearchResult const&) {
+            outS.unresolvedEdges.push_back(headerName);
+        },
+        [&](std::string const& headerName, std::filesystem::path const&) {
+            outS.unavailableEdges.push_back(headerName);
+        });
+    return outS;
+}
+
+// The availability set a descriptor DECLARES, as format KINDS, intersected with
+// `servedFormats`. An EMPTY declared set means "every format", so it yields the
+// whole served set — which is why the served set has to be an INPUT: "every
+// format" is not a fact this file can know, and enumerating the whole
+// `ObjectFormatKind` table would evaluate `wasm`/`spirv` arms that no shipped
+// object-format document declares and refuse the corpus for failing to serve a
+// platform nobody targets.
+[[nodiscard]] std::vector<ObjectFormatKind>
+declaredFormatsOf(std::span<std::string const>     declared,
+                  std::span<ObjectFormatKind const> servedFormats) {
+    std::vector<ObjectFormatKind> out;
+    for (ObjectFormatKind const f : servedFormats) {
+        if (objectFormatInAvailabilitySet(declared, f)) out.push_back(f);
+    }
+    return out;
+}
+
+// The corpus-sweep emitter. A DISTINCT code from `emitMalformed`'s
+// `F_ShippedLibDescriptorMalformed` on purpose: every descriptor involved here
+// is individually well-formed and decodes cleanly, and telling an author their
+// JSON is malformed when it is not sends them to the wrong file.
+void emitCorpusInvariant(DiagnosticReporter& reporter, std::string msg) {
+    dss::report(reporter, DiagnosticCode::F_ShippedCorpusInvariantBroken,
+                DiagnosticSeverity::Error, std::move(msg));
+}
+
+// The `requires` emitter. Its subject is a CONFIG ROW in a language/target/
+// format document, not a descriptor, so it carries the C_ (configuration) code.
+void emitUnbackedPredefine(DiagnosticReporter& reporter, std::string msg) {
+    dss::report(reporter, DiagnosticCode::C_UnbackedPredefinedMacro,
+                DiagnosticSeverity::Error, std::move(msg));
+}
+
+}  // namespace
+
+bool validateShippedIncludeClosure(
+    std::filesystem::path const&           descriptorDir,
+    std::span<ObjectFormatKind const>      servedFormats,
+    DiagnosticReporter&                    reporter) {
+    // ═══ THE TWO INVARIANTS THAT SHIP WITH THE `includes` EDGE GATE ═══
+    //
+    // ★★★ WHY THEY ARE PART OF THE GATE AND NOT A SEPARATE NICETY. A conditional
+    // edge turns a LOUD failure into a QUIET one for free: before the gate, an
+    // `includes` edge to a header that does not exist on the active format
+    // produced a diagnostic (the wrong one, on the wrong subject — see the import
+    // resolver — but a diagnostic); after the gate, an author can silence that by
+    // writing a `when` that simply never fires, and get an empty surface instead
+    // of a complaint. A mechanism that lets a config author buy silence must ship
+    // with the checks that make silence expensive.
+    //
+    //   (i)  EDGE FIRES ⇒ CHILD AVAILABLE. For every descriptor D and every
+    //        object format F in D's availability set, every `includes` edge of D
+    //        ACTIVE on F must resolve to a child descriptor that is itself
+    //        available on F. The config may not promise, on F, a surface it
+    //        declares absent on F.
+    //   (ii) NO EMPTY SURFACE ON A SERVED FORMAT. A descriptor available on F
+    //        must contribute AT LEAST ONE name on F — from its own surfaces or
+    //        from its active closure. A header that exists and declares nothing
+    //        is a header whose `#include` compiles and whose contents silently
+    //        are not there, which is the shape of the defect this whole cycle
+    //        exists to close.
+    //
+    // Both are STATIC over the WHOLE corpus and INDEPENDENT OF ANY BUILD'S ACTIVE
+    // FORMAT — the `validateShippedSourceTree` posture, and for its reason: an
+    // arm no current target selects must not be allowed to rot.
+    //
+    // ── WHAT THEY HONESTLY DO NOT COVER ────────────────────────────────────
+    //  * PARTIAL OMISSION. (ii) is an EXISTENCE claim, not a COMPLETENESS one. A
+    //    descriptor that declares one of the forty names its real header
+    //    declares passes (ii) exactly as a complete one does. Nothing here can
+    //    know the real header's full surface, so nothing here can measure
+    //    completeness; the `requires` mechanism is how a CONSUMER states the
+    //    specific names it depends on, and that is the only completeness check
+    //    in the system.
+    //  * SEMANTIC CORRECTNESS. A name being present says nothing about its
+    //    signature, its layout, or whether the platform actually behaves that
+    //    way. `ShippedTypeConsistency` and the corpus tests own those.
+    //  * ARCH AND DATA MODEL. Both invariants are FORMAT-keyed. A variant arm
+    //    keyed on an arch this sweep does not enumerate is treated as PRESENT on
+    //    every format it is format-compatible with (see
+    //    `WhenAxes::FormatReachability`), so an arch-only hole is not visible
+    //    here. That is a deliberate weakening: name presence is not an arch
+    //    property in any descriptor written so far, and asking the arch question
+    //    would require this sweep to enumerate targets it has no business
+    //    knowing.
+    //  * FORMATS NOT IN `servedFormats`. The caller supplies the served set;
+    //    a format left out of it is simply not asked about.
+    //  * QUOTE-INCLUDED or NON-SHIPPED headers. Only the shipped descriptor
+    //    corpus under `descriptorDir` is in scope.
+    std::size_t const errBefore = reporter.errorCount();
+    if (servedFormats.empty()) {
+        emitCorpusInvariant(reporter,
+            "shipped-lib corpus sweep: no served object formats were supplied, so "
+            "the include-closure invariants would pass VACUOUSLY over every "
+            "descriptor. A sweep that cannot fail is not a sweep — pass the "
+            "object-format kinds this build actually serves");
+        return false;
+    }
+
+    std::error_code ec;
+    std::vector<std::filesystem::path> descriptors;
+    for (std::filesystem::recursive_directory_iterator
+             it{descriptorDir,
+                std::filesystem::directory_options::skip_permission_denied, ec},
+             end;
+         it != end; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        if (it->path().extension() != ".json") continue;
+        descriptors.push_back(it->path());
+    }
+    // Deterministic order on every host (a directory iteration order is the
+    // filesystem's, and a sweep that reports its failures in a host-dependent
+    // order is a sweep whose output cannot be diffed).
+    std::sort(descriptors.begin(), descriptors.end());
+
+    std::span<std::filesystem::path const> const searchDirs{&descriptorDir, 1};
+
+    for (std::filesystem::path const& p : descriptors) {
+        std::string const rel = p.generic_string();
+        DiagnosticReporter availRep;
+        auto const avail = readShippedLibAvailability(p, availRep);
+        if (!avail) {
+            // A descriptor that does not even yield an availability set is
+            // malformed; the corpus decode test owns that diagnostic. Reported
+            // here too rather than skipped, because a SWEEP that quietly steps
+            // over the files it cannot read is a sweep whose green means nothing.
+            emitCorpusInvariant(reporter,
+                "shipped-lib corpus sweep: '" + rel + "' does not decode far "
+                "enough to read its 'availableObjectFormats', so neither "
+                "include-closure invariant can be evaluated for it");
+            continue;
+        }
+        for (ObjectFormatKind const fmt : declaredFormatsOf(*avail, servedFormats)) {
+            std::string const fmtName{objectFormatKindName(fmt)};
+            ClosureSurfaceOnFormat const cs =
+                closureSurfaceOnFormat(p, searchDirs, fmt);
+
+            // (i) — the two ways an active edge fails to land.
+            for (std::string const& h : cs.unresolvedEdges) {
+                emitCorpusInvariant(reporter,
+                    "shipped-lib corpus invariant (i): '" + rel + "' declares an "
+                    "'includes' edge to '" + h + "' that is ACTIVE on object "
+                    "format '" + fmtName + "', but that header resolves to no "
+                    "descriptor at all");
+            }
+            for (std::string const& h : cs.unavailableEdges) {
+                emitCorpusInvariant(reporter,
+                    "shipped-lib corpus invariant (i): '" + rel + "' is available "
+                    "on object format '" + fmtName + "' and its 'includes' edge to "
+                    "'" + h + "' is ACTIVE there, but '" + h + "'\'s descriptor "
+                    "declares it does NOT exist on '" + fmtName + "'. The config "
+                    "promises a surface it also declares absent — gate the edge "
+                    "with a 'when', or widen the child's "
+                    "'availableObjectFormats'");
+            }
+            for (std::string const& d : cs.undecodable) {
+                emitCorpusInvariant(reporter,
+                    "shipped-lib corpus invariant (ii): the closure of '" + rel
+                    + "' on object format '" + fmtName + "' contains '" + d
+                    + "', whose surface does not decode — the invariant cannot be "
+                      "evaluated, and an unevaluated invariant is reported, never "
+                      "assumed");
+            }
+
+            // (ii) — the surface must not be empty on a format this descriptor
+            // claims to serve.
+            if (cs.names.empty() && cs.undecodable.empty()) {
+                emitCorpusInvariant(reporter,
+                    "shipped-lib corpus invariant (ii): '" + rel + "' is available "
+                    "on object format '" + fmtName + "' but contributes NO name "
+                    "there — not from its own surfaces and not from its active "
+                    "'includes' closure. An '#include' of it would compile and "
+                    "declare nothing, which is a header that silently is not "
+                    "there. Either declare a surface for '" + fmtName
+                    + "', or remove '" + fmtName
+                    + "' from its 'availableObjectFormats'");
+            }
+        }
+    }
+    return reporter.errorCount() == errBefore;
+}
+
+bool validateShippedSurfaceRequirements(
+    std::span<PredefinedMacroDef const>    macros,
+    std::string_view                       declaringDocument,
+    std::span<std::filesystem::path const> systemDirs,
+    std::optional<ObjectFormatKind>        activeFormat,
+    DiagnosticReporter&                    reporter) {
+    // ═══ D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE — SATISFACTION ═══
+    //
+    // The SHAPE of the predicate is core's (`ShippedSurfaceClaim`); this
+    // is the half that can see the shipped corpus, which is why it lives here.
+    //
+    // ★★★ THE CLAIM IS CHECKED PER FORMAT, AND THE FORMAT SET IS THE MACRO'S OWN.
+    // A macro gated `["pe"]` is checked on pe — on EVERY leg, including the elf
+    // one, because an arm no current build selects is exactly the arm that rots.
+    // An UNGATED macro is effective on every format, but this function cannot
+    // enumerate "every format" (see `validateShippedIncludeClosure`'s note), so
+    // it checks the ACTIVE one. That is weaker per invocation and equal in
+    // practice: the driver builds a CU per (target, object-format), so a
+    // multi-format build checks each format's arm on that format's own leg.
+    //
+    // ★ IT IS AN ASSERTION, NEVER A SUPPRESSION. A macro whose backing is missing
+    // does NOT get quietly withdrawn — the build fails. A silently-withdrawn
+    // identity macro flips `#ifdef` branches under the user with no diagnostic,
+    // which is the same species of quiet wrongness as the silently-PRESENT one
+    // this whole mechanism exists to end.
+    std::size_t const errBefore = reporter.errorCount();
+    // "<file family> <array pointer>[<index>]" — the declaring document and the
+    // exact row. `declaredAt` is a full JSON pointer whose ARRAY PREFIX is
+    // already the tail of `declaringDocument`, so printing both verbatim
+    // repeats it ("…/predefinedMacros/preprocess/predefinedMacros/0"); the
+    // index is the only part that is not already said.
+    auto const where = [&](PredefinedMacroDef const& pm) {
+        std::string_view idx{pm.declaredAt};
+        if (auto const slash = idx.rfind('/'); slash != std::string_view::npos) {
+            idx = idx.substr(slash + 1);
+        }
+        return std::string{declaringDocument} + "[" + std::string{idx} + "]";
+    };
+    for (PredefinedMacroDef const& pm : macros) {
+        // Only a `surface` claim is EVALUATED. `claims-nothing` states a
+        // declared absence, and `not-expressible` states that the macro DOES
+        // imply something this predicate cannot express — recorded by ruling
+        // B', deliberately NOT evaluated here (a language-feature predicate
+        // is an operator-deferred build, and silently treating the tag as
+        // "nothing" would be the conflation the third state exists to stop).
+        if (pm.impliedSurface.kind != ImpliedSurfaceKind::Surface) continue;
+
+        // The formats this claim must hold on.
+        std::vector<ObjectFormatKind> formats;
+        for (std::string const& fn : pm.availableObjectFormats) {
+            auto const k = objectFormatKindFromName(fn);
+            // The name vocabulary is validated at config load; a value that got
+            // here unknown would be a loader hole, so it is reported rather than
+            // skipped.
+            if (!k || !isSelectableObjectFormatKind(*k)) {
+                emitUnbackedPredefine(reporter,
+                    std::string{"predefined macro '"} + pm.name + "' ("
+                    + where(pm) + ") declares 'impliedSurface' but its 'availableObjectFormats' "
+                      "entry '" + fn + "' does not name a selectable object "
+                      "format, so the requirement has no format to hold on");
+                continue;
+            }
+            formats.push_back(*k);
+        }
+        if (pm.availableObjectFormats.empty()) {
+            if (!activeFormat.has_value()) {
+                // No gate and no active format: there is no platform in scope, so
+                // the claim has no subject. NOT a skipped check — a check whose
+                // subject does not exist. Every driver path sets the active
+                // format (the CU is built once per (target, object-format) pair);
+                // the callers that do not are the LSP, the direct API and the
+                // FFI header parser, which deliberately have no target at all.
+                continue;
+            }
+            formats.push_back(*activeFormat);
+        }
+
+        for (ObjectFormatKind const fmt : formats) {
+            std::string const fmtName{objectFormatKindName(fmt)};
+            for (ShippedSurfaceClaim const& claim :
+                 pm.impliedSurface.headers) {
+                // Resolve the claimed header by the SAME `<stem>.json` funnel a
+                // source `#include <h>` uses. Case-SENSITIVE for the reason the
+                // corpus sweep is: the claim is checked on formats other than the
+                // active one, and a per-format case policy cannot answer a
+                // cross-format question.
+                HeaderSearchResult const hit = resolveSystemDescriptor(
+                    claim.header, systemDirs, kDefaultHeaderNameMatching);
+                if (hit.status != HeaderSearchStatus::Found) {
+                    emitUnbackedPredefine(reporter,
+                        std::string{"predefined macro '"} + pm.name + "' ("
+                        + where(pm) + ") requires shipped header '" + claim.header
+                        + "' on object format '" + fmtName
+                        + "', but no descriptor for it is on the shipped-library "
+                          "search path. The macro asserts a platform surface that "
+                          "is not there — build the surface, or state honestly "
+                          "that the macro requires nothing by removing the claim");
+                    continue;
+                }
+                if (!shippedHeaderAvailableForFormat(hit.path, fmt)) {
+                    emitUnbackedPredefine(reporter,
+                        std::string{"predefined macro '"} + pm.name + "' ("
+                        + where(pm) + ") requires shipped header '" + claim.header
+                        + "' on object format '" + fmtName
+                        + "', but that header's descriptor declares it does NOT "
+                          "exist on '" + fmtName
+                        + "'. A macro may not promise, on a format, a header the "
+                          "corpus says is absent from it");
+                    continue;
+                }
+                ClosureSurfaceOnFormat const cs =
+                    closureSurfaceOnFormat(hit.path, systemDirs, fmt);
+                if (!cs.undecodable.empty()) {
+                    emitUnbackedPredefine(reporter,
+                        std::string{"predefined macro '"} + pm.name + "' ("
+                        + where(pm) + ") requires shipped header '" + claim.header
+                        + "' on object format '" + fmtName + "', but '"
+                        + cs.undecodable.front()
+                        + "' in its include closure does not decode — the "
+                          "requirement cannot be verified, and an unverified "
+                          "requirement is reported, never assumed satisfied");
+                    continue;
+                }
+                std::vector<std::string> missing;
+                for (std::string const& want : claim.names) {
+                    if (std::find(cs.names.begin(), cs.names.end(), want)
+                        == cs.names.end()) {
+                        missing.push_back(want);
+                    }
+                }
+                if (missing.empty()) continue;
+                std::string list;
+                for (std::string const& m : missing) {
+                    if (!list.empty()) list += "', '";
+                    list += m;
+                }
+                emitUnbackedPredefine(reporter,
+                    std::string{"predefined macro '"} + pm.name + "' ("
+                    + where(pm) + ") requires '" + claim.header + "' to declare '" + list
+                    + "' on object format '" + fmtName
+                    + "', and the shipped surface reachable from that header does "
+                      "not. The macro's presence must be a CHECKED CONSEQUENCE of "
+                      "the realized surface, not a second declaration of the same "
+                      "fact sitting next to it — so either the surface ships, or "
+                      "the macro does not");
+            }
+        }
+    }
+    return reporter.errorCount() == errBefore;
 }
 
 } // namespace dss::ffi

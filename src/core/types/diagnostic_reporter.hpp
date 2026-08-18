@@ -50,6 +50,16 @@ public:
     // nullptr if not registered.
     [[nodiscard]] std::shared_ptr<SourceBuffer const> tryGet(BufferId id) const noexcept;
 
+    // Register every buffer `other` holds. Idempotent per id, exactly like
+    // `add` — a buffer both registries already share is registered once.
+    // ★ IT EXISTS SO A BUFFER CAN TRAVEL WITH ITS DIAGNOSTICS ACROSS A
+    // REPORTER MERGE. `DiagnosticReporter` retains the buffers minted for its
+    // own diagnostics (see `sourceBuffers()`), and a merge that carried the
+    // diagnostics but not the buffers would hand the destination a diagnostic
+    // whose source is unreachable — the exact `<unknown-buffer:N>` render this
+    // pair of facilities exists to end.
+    void addAll(BufferRegistry const& other);
+
     [[nodiscard]] std::size_t size() const noexcept { return byId_.size(); }
 
 private:
@@ -152,9 +162,53 @@ public:
         for (ParseDiagnostic& d : all_) fn(d.buffer, d.span);
     }
 
+    // ★★★ THE BUFFERS THIS REPORTER'S OWN DIAGNOSTICS POINT INTO — the
+    // retention that makes a MID-PIPELINE fragment renderable.
+    //
+    // ⚠ THE PROBLEM IT SOLVES, ✔MEASURED 2026-08-17 THROUGH THE CLI. A
+    // `ParseDiagnostic` carries a `BufferId`, never the buffer; the two travel
+    // separately and are re-paired at the driver, which builds its
+    // `BufferRegistry` from the compiled units (`cu.trees()` +
+    // `cu.auxiliaryBuffers()`). That re-pairing reaches every buffer that
+    // exists BEFORE the compile — and NO buffer minted during it. An embedded
+    // assembly template is parsed at the LIR tier out of a C string literal,
+    // so its `SourceBuffer` is minted mid-compile, is reachable from no
+    // `CompilationUnit`, and on the parse-FAILURE path dies with the `Tree`
+    // that held it. Both of its diagnostic families rendered as
+    //     error[P0001]: expected 'LineEnd' — got '@'
+    //       --> <unknown-buffer:6>:offset 13
+    // — a forwarded parse error AND (measured, and not what the anchor
+    // predicted) every `A_AsmTextUnsupported` refusal the lowering itself
+    // raises, which stamps the same fragment buffer from `tree_.source()`.
+    //
+    // ★ SO THE PAIRING MOVES TO THE OBJECT THAT ALREADY SPANS THE GAP. The
+    // reporter is handed to the fragment parse and outlives it; retaining the
+    // buffer HERE, at the moment it is minted and before a single token is
+    // read, makes it survive the failure path by construction rather than by a
+    // caller remembering to drain something. `format()` consults this store
+    // when the caller-supplied registry cannot resolve — so a reporter can
+    // always render its own diagnostics, whatever registry it is handed,
+    // including an empty one.
+    // ⚠ IT CANNOT MIS-RESOLVE. `BufferId` is minted from ONE process-wide
+    // monotonic counter (`substrate::mintMonotonicId<BufferId>`), so an id that
+    // resolves here and an id that resolves in the driver's registry are the
+    // same buffer; the fallback can only ever ADD an answer where there was
+    // none.
+    // ⓘ REUSES `BufferRegistry` RATHER THAN A SECOND CONTAINER: registration,
+    // idempotency and lookup already have an owner, and a parallel
+    // `vector<shared_ptr<SourceBuffer>>` would be a second spelling of it.
+    // ⓘ NOT ROLLED BACK BY `truncateTo`. A speculative parse that registers a
+    // buffer and is then rewound leaves a retained buffer no diagnostic names —
+    // which costs a map entry and renders nothing. Rolling it back would risk
+    // the opposite (a live diagnostic losing its source), and that failure is
+    // silent while this one is not.
+    [[nodiscard]] BufferRegistry&       sourceBuffers()       noexcept { return ownBuffers_; }
+    [[nodiscard]] BufferRegistry const& sourceBuffers() const noexcept { return ownBuffers_; }
+
     // Pretty-printers. The registry resolves BufferId → SourceBuffer so
     // multi-file diagnostics (related-locations spanning includes, future)
-    // format correctly.
+    // format correctly. `bufs` WINS; `sourceBuffers()` is consulted only for
+    // an id it does not carry.
     [[nodiscard]] std::string formatAll(BufferRegistry const& bufs) const;
     [[nodiscard]] std::string format(ParseDiagnostic const& d,
                                      BufferRegistry const& bufs) const;
@@ -165,6 +219,13 @@ private:
     [[nodiscard]] std::optional<ParseDiagnostic> applyPolicy(ParseDiagnostic d) const;
 
     [[nodiscard]] bool isRecentDuplicate(ParseDiagnostic const& d) const noexcept;
+
+    // `bufs` first, then this reporter's own retained buffers. ONE helper so
+    // the primary location and every related location resolve identically — a
+    // fallback applied to one and not the other is how a related note keeps
+    // printing `<unknown-buffer>` next to a correctly rendered primary.
+    [[nodiscard]] std::shared_ptr<SourceBuffer const>
+    resolveBuffer_(BufferId id, BufferRegistry const& bufs) const noexcept;
 
     // Record that the global cap ate one more diagnostic, and REWRITE the
     // marker's prose so it always states the running total. The rewrite is
@@ -182,6 +243,7 @@ private:
     bool                                    hitCap_ = false;
     std::size_t                             droppedByCap_   = 0;
     std::size_t                             capMarkerIndex_ = 0;  // index into all_; valid only while hitCap_
+    BufferRegistry                          ownBuffers_{};        // see sourceBuffers()
 };
 
 // Ergonomic free function for the common "construct a ParseDiagnostic

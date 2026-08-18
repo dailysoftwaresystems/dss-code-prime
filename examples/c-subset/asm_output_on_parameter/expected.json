@@ -1,0 +1,33 @@
+{
+  "$comment": "D-CSUBSET-ASM-OUTPUT-ON-A-PARAMETER-NOT-ADDRESS-TAKEN: an inline-asm OUTPUT operand bound to a FUNCTION PARAMETER whose address is never taken. ✔MEASURED 2026-08-17 through the real CLI, before the fix: `static int f(int v){ __asm__(\"movl $42,%0\" : \"=r\"(v)); return v; }` was REFUSED at BOTH configs with `error[H0009] symbol 86 has no storage slot (non-addressable param or unbound) — required by lvalue use`, while the SAME function with `&v` also taken compiled and exited 42; gcc 13.3.0 compiles and runs both. The controls named the cause exactly — a plain `\"=r\"` failed identically to a `\"+r\"`, so it was never a constraint-letter defect but the ADDRESS-TAKEN SET: every other asm example in the corpus binds its outputs to BODY LOCALS, which are slot-backed from their VarDecl, while a non-address-taken parameter stays a pure-SSA `Arg` with no storage for `lowerLvalueAddress` to return. ★★ THE EXIT CODE PROVES THE WRITE-BACK HIT THE PARAMETER, NOT A COPY: `bumpParam` reads `v` as an input, writes `v` as an output and then returns `v`, so the obvious wrong fix (copy the parameter to a fresh local and let the asm write that — which compiles and runs, and is a silent miscompile) returns the incoming 22 instead of 42. ★ SHAPE 2 EXERCISES THE OUTPUT LOOP: two outputs, both parameters, so a fix that marked only output 0 addressable passes shape 1 and fails shape 2. ⚠ The `volatile` seed is load-bearing — without it release folds the arguments to constants before lowering and neither call is parameter-shaped any more. ⚠ NO `\"+r\"` SHAPE, and that is measured rather than an oversight: `\"+r\"(v)` on a parameter reaches the SAME verdict as `\"+r\"` on an address-taken local — refused by D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE at the LIR tier, a separate open row — so including it would redden this example for a reason unrelated to what it pins.",
+  "$commentArmLimit": "READ THIS BEFORE MUTATING THE FIX THIS EXAMPLE PINS. The declared `release` arm below CANNOT be evidenced by this example under a mutant that breaks the baseline -- which the fix's mutant does, because it turns the compile into a REFUSAL. When the baseline arm fails the runner does not attempt the release arm; it ledgers `[poisoned] arm=release (compile not attempted: baseline arm did not run)`. That is correct and fail-loud, but it BOUNDS what a red-on-disable may claim here. ✔MEASURED 2026-08-17: driving this source through the CLI under the mutant reds BOTH arms (baseline AND release, on pe64-x86_64 AND elf64-x86_64, all four rc=1 with H0009), while INSIDE the runner only baseline is observed red. ⇒ So the release-arm discrimination is evidenced by the CLI measurement, NOT by this example's arm ledger -- do not cite the ledger for it. (No allocator-luck vacuity is possible either way: the mutant is a compile refusal, not a wrong value.) See D-TEST-EXAMPLES-RELEASE-ARM-POISONED-WHEN-BASELINE-FAILS and the same warning in examples/README.md.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

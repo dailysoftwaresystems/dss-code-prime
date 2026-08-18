@@ -1275,6 +1275,106 @@ TEST(Program_CompileFiles, BufferlessDriverDiagnosticStaysCodeOnly) {
            "got:\n" << err;
 }
 
+// ── D-ASM-TEMPLATE-DIAGNOSTICS-RENDER-WITHOUT-SOURCE-CONTEXT ────────
+//
+// ★★★ A DIAGNOSTIC ABOUT AN EMBEDDED ASSEMBLY TEMPLATE MUST RENDER THE
+// OFFENDING TEMPLATE LINE — not a buffer id nothing resolves.
+//
+// ⚠ ✔MEASURED 2026-08-17 through the CLI, before the fix, on BOTH shipped
+// x86_64 formats and at both surfaces:
+//     error[P0001]: expected 'LineEnd' — got '@'
+//       --> <unknown-buffer:6>:offset 13
+// The template's `SourceBuffer` is minted at the LIR tier inside
+// `parseAsmTemplateText`, out of a C string literal. The driver builds its
+// `BufferRegistry` from `cu.trees()` + `cu.auxiliaryBuffers()`, which reaches
+// every buffer that exists BEFORE the compile and none minted during it — so
+// the id resolved to nothing and the source line was unreachable. On the
+// parse-FAILURE path it was worse: the `Tree` was destroyed and the buffer
+// died with it, leaving the caller holding diagnostics whose source was
+// already gone, which is precisely what forwarding them was for.
+//
+// ★★ THE PIN ASSERTS THE ECHOED SOURCE LINE, NEVER MERELY THE CODE, AND THAT
+// DISTINCTION IS THE WHOLE POINT. A test asserting `A_AsmTextUnsupported` was
+// emitted passes happily over `<unknown-buffer>` and proves nothing about the
+// thing that was broken. Each arm therefore matches the renderer's own gutter
+// (`{:>2} | <line>`), which the diagnostic PROSE cannot satisfy: arm 1's prose
+// carries only `'@'`, never `movl $42, %0 @@@`; arm 2's carries `'frobnicate'`
+// followed by a quote, never `frobnicate %0`.
+//
+// ★★ AND IT CARRIES **BOTH** FORMS, BECAUSE THE DEFECT HAD TWO AND THE ANCHOR
+// NAMED ONE. The forwarded lex/parse diagnostics are only half the population:
+// `AsmDiagnosticSink::fail` stamps `tree_.source().id()` — the SAME fragment
+// buffer — so every `A_AsmTextUnsupported` refusal the LOWERING raises on a
+// template that parsed cleanly was equally unrenderable, and that is the
+// commoner half (every "this dialect/target cannot encode that"). A green over
+// the parse-failure arm alone would leave the success-path arm latent.
+TEST(Program_CompileFiles, MalformedAsmTemplateRendersTheOffendingTemplateLine) {
+    // ⚠ ONE `ScratchDir` FOR BOTH ARMS. A second one constructed after
+    // `useAsCwd()` captures the FIRST scratch dir as its `originalCwd_` and
+    // roots itself INSIDE it (`Location::InsideRepo` is cwd-relative) — it
+    // happens to work, and it makes the schema loader's upward walk depend on
+    // a nesting nobody wrote down.
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // ARM 1 — the FAILURE path: the template does not PARSE, so there is no
+    // `Tree` and the buffer only survives because it is registered at its mint.
+    // `@` is not in the dialect's vocabulary; column 14 is its first byte.
+    auto const src = writeCSubsetSource(
+        scratch.path(), "bad_template.c",
+        "int main(void) {\n"
+        "    int r = 0;\n"
+        "    __asm__(\"movl $42, %0 @@@\" : \"=r\"(r));\n"
+        "    return r;\n"
+        "}\n");
+    auto const src2 = writeCSubsetSource(
+        scratch.path(), "unlowerable_template.c",
+        "int main(void) {\n"
+        "    int r = 0;\n"
+        "    __asm__(\"frobnicate %0\" : \"=r\"(r));\n"
+        "    return r;\n"
+        "}\n");
+    scratch.useAsCwd();
+    Program prog;
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc, 0) << "a template that does not parse must fail the build";
+    EXPECT_EQ(err.find("<unknown-buffer"), std::string::npos)
+        << "the template's buffer did not reach the renderer; got:\n" << err;
+    EXPECT_NE(err.find(" 1 | movl $42, %0 @@@"), std::string::npos)
+        << "expected the OFFENDING TEMPLATE LINE echoed in the renderer's "
+           "gutter — asserting the code alone would pass over "
+           "'<unknown-buffer>'; got:\n" << err;
+    EXPECT_NE(err.find("--> <inline asm>:1:14"), std::string::npos)
+        << "expected the positioned header at the first '@' (line 1, col 14); "
+           "got:\n" << err;
+    EXPECT_NE(err.find('^'), std::string::npos)
+        << "expected a '^' caret underline; got:\n" << err;
+
+    // ARM 2 — the SUCCESS path: the template PARSES and the LOWERING refuses
+    // it. Same buffer, different diagnostic family (`A_AsmTextUnsupported`
+    // from `AsmDiagnosticSink::fail`), and it was equally unrenderable.
+    Program prog2;
+    testing::internal::CaptureStderr();
+    int const rc2 = prog2.compileFiles(
+        {src2.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err2 = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc2, 0) << "an unlowerable template must fail the build";
+    EXPECT_EQ(err2.find("<unknown-buffer"), std::string::npos)
+        << "a LOWERING refusal names the same fragment buffer and must render "
+           "it too; got:\n" << err2;
+    EXPECT_NE(err2.find(" 1 | frobnicate %0"), std::string::npos)
+        << "expected the offending template line echoed; the prose says "
+           "\"'frobnicate'\" and can never satisfy this; got:\n" << err2;
+    EXPECT_NE(err2.find("--> <inline asm>:1:1"), std::string::npos)
+        << "expected the positioned header at the mnemonic; got:\n" << err2;
+    EXPECT_NE(err2.find("^^^^^^^^^^"), std::string::npos)
+        << "expected the caret to underline all ten bytes of the mnemonic; "
+           "got:\n" << err2;
+}
+
 // D-CAP-MARKER-MULTI-TARGET-E2E-PIN close (e4508b9 → next 2026-06-01):
 // the prior anchor was reserved because `D_TargetMachineCodeMismatch`
 // joined `kUnsuppressableCodes` and bypasses all cap/dedup gates —

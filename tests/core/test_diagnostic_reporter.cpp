@@ -806,6 +806,18 @@ TEST(ReporterFormat, ContextPrefixAppearsBeforeExpectedActual) {
                       buf->id(),
                       14, 15, "'}'");
     d.contextPrefix = "[target=x86_64:elf64-x86_64-linux] ";
+    // ⚠ `expected` is set DELIBERATELY, and this test used to omit it. This pin
+    // is named for the EXPECTED/ACTUAL section, but `makeDiag` fills only
+    // `actual`, so it was really rendering the PROSE-ONLY form and matching on
+    // the `got ` prefix that form used to carry. When that prefix was correctly
+    // removed from prose-only messages (D-DIAG-PROSE-MESSAGE-RENDERS-WITH-A-BARE-GOT-PREFIX
+    // — `parseText: got Unexpected '}'` read as machine noise), this pin went red
+    // for a reason that had nothing to do with the ordering it exists to protect.
+    // ⇒ The fix is to give it the CONTRAST it is named for, not to relax the
+    // matcher: a pin that stops asserting its own subject to stay green asserts
+    // nothing. The prose-only ordering is covered separately by
+    // `ProseOnlyMessageHasNoGotPrefixButAContrastKeepsIt`.
+    d.expected = {"'{'"};  // std::vector<std::string>, not a string
     r.report(d);
 
     auto const out = r.format(r.all()[0], bufs);
@@ -1119,4 +1131,60 @@ TEST(ReporterFormat, PastEndSpanRendersSameAsClampedSpan) {
             << "past-end span " << over << " (buffer size " << n
             << ") must clamp to end-of-buffer, not read past it";
     }
+}
+
+// ── D-DIAG-PROSE-MESSAGE-RENDERS-WITH-A-BARE-GOT-PREFIX ─────────────────────
+//
+// ★★★ `got X` IS HALF OF A PAIR. The renderer's contrast form is
+// `expected Y — got X`; printed without its `expected` half it is a sentence
+// fragment, and for the SEMANTIC band it is an ungrammatical one, because those
+// codes carry a full prose sentence in `actual` and leave `expected` empty by
+// design. ✔MEASURED at HEAD before the fix, on two live codes:
+//   error[S006A]: got the inline-asm template references operand `%3` at byte
+//                 offset 2, but …
+//
+// ★ THE CONDITION IS ON `expected`, NOT ON THE CODE'S BAND — keying it on the
+// band would be a second owner of "is this a contrast?" that could disagree with
+// the field the renderer actually reads.
+//
+// ⚠ BOTH ARMS ARE LOAD-BEARING. Asserting only the prose arm would be satisfied
+// by a renderer that dropped `got` everywhere, which would break the parse band's
+// genuine contrast — the defect inverted. The control is what makes this a fix
+// rather than a trade.
+TEST(DiagnosticReporterRender, ProseOnlyMessageHasNoGotPrefixButAContrastKeepsIt) {
+    // ── the prose arm: no `expected`, so no contrast, so no "got".
+    ParseDiagnostic prose;
+    prose.code     = DiagnosticCode::S_InlineAsmOperandModifierUnsupported;
+    prose.severity = DiagnosticSeverity::Error;
+    prose.actual   = "the inline-asm template references operand `%3`";
+
+    DiagnosticReporter r;
+    r.report(prose);
+    BufferRegistry const bufs;
+    std::string const renderedProse = r.formatAll(bufs);
+
+    EXPECT_NE(renderedProse.find("the inline-asm template references operand `%3`"),
+              std::string::npos)
+        << "the prose must survive verbatim; got:\n" << renderedProse;
+    EXPECT_EQ(renderedProse.find("got the inline-asm"), std::string::npos)
+        << "a message with nothing to contrast against must not be prefixed "
+           "`got `; got:\n" << renderedProse;
+
+    // ── the control: a real contrast still reads as one. Without this arm the
+    // assertion above is satisfied by deleting `got` from every render.
+    ParseDiagnostic contrast;
+    contrast.code     = DiagnosticCode::P_UnexpectedToken;
+    contrast.severity = DiagnosticSeverity::Error;
+    contrast.expected = {"';'"};
+    contrast.actual   = "'}'";
+
+    DiagnosticReporter r2;
+    r2.report(contrast);
+    std::string const renderedContrast = r2.formatAll(bufs);
+
+    EXPECT_NE(renderedContrast.find("expected ';'"), std::string::npos)
+        << renderedContrast;
+    EXPECT_NE(renderedContrast.find("got '}'"), std::string::npos)
+        << "the contrast form must KEEP its `got` half; got:\n"
+        << renderedContrast;
 }

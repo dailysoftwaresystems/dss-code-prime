@@ -110,6 +110,8 @@ public:
         out.externImports       = std::move(externs_);
         out.dataItems           = std::move(dataItems_);
         out.blockSymbolBindings = std::move(blockSymbolBindings_);
+        out.perFuncCfi          = std::move(perFuncCfi_);
+        out.cfiInitial          = cfiInitial_;
         return out;
     }
 
@@ -281,7 +283,10 @@ public:
         return derivableIndirectSuccessors();
     }
 
-    void onInstructionEmitted() override { ++blockInstCount_; }
+    void onInstructionEmitted() override {
+        ++blockInstCount_;
+        ++funcInstCount_;
+    }
     void onTerminatorEmitted() override { openTerminated_ = true; }
     void onBlockOpened(LirBlockId) override {
         openTerminated_ = false;
@@ -568,6 +573,42 @@ private:
             return;
         }
         case AsmDirectiveVerb::IgnoredAnnotation:
+            return;
+        // ★★★ THE CALL-FRAME FAMILY IS APPLIED IN PASS 2, NOT HERE, AND THE
+        // REASON IS THE ONE FACT PASS 1 CANNOT KNOW: **WHICH INSTRUCTION THE
+        // RULE FOLLOWS.** A `.cfi_*` rule takes effect at the PC reached by the
+        // instruction above it, and no LIR instruction exists until the emit
+        // walk. Recording it here against a source position and re-resolving it
+        // later would be a second ordering to keep in step with the first.
+        // ⚠ SO THEY ARE SILENT HERE RATHER THAN VALIDATED-TWICE — the same
+        // split `trackSection` uses one direction and this uses the other: pass
+        // 2 does the whole job, diagnostics included, so no directive is ever
+        // reported by both passes.
+        case AsmDirectiveVerb::FrameStart:
+        case AsmDirectiveVerb::FrameEnd:
+        case AsmDirectiveVerb::FrameRule:
+        case AsmDirectiveVerb::FrameReturnColumn:
+            return;
+        // ★★★ DECLARED AND DELIBERATELY REFUSED.
+        // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED.
+        // The reference assembler takes this directive; this
+        // build cannot represent what it states; so it is refused BY NAME
+        // instead of accepted and dropped. Reported in PASS 1 because the
+        // refusal needs nothing the emit walk provides — and a pass-1 refusal
+        // stops the run before pass 2, so it can never be reported twice.
+        case AsmDirectiveVerb::Unrepresentable:
+            sink_.fail(kids[1],
+                 std::format("'.{}' is declared by this dialect as "
+                             "UNREPRESENTABLE: the reference assembler accepts "
+                             "it, and this build has no way to carry what it "
+                             "states, so it is refused by name rather than "
+                             "parsed and dropped. Accepting it would produce a "
+                             "binary that runs correctly and describes its own "
+                             "frames wrongly — the failure is invisible until "
+                             "something tries to unwind. See this directive's "
+                             "'$comment' in the dialect document for the "
+                             "specific fact that cannot be represented{}",
+                             spelling, sink_.pairSuffix()));
             return;
         }
         sink_.fail(kids[1], "unhandled directive verb");
@@ -1141,6 +1182,11 @@ private:
                     return;
                 }
                 trackSection(element);
+                // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED: the call-frame
+                // family is applied HERE and only here, because the anchor a
+                // rule needs — the instruction it follows — exists only in this
+                // pass. See the family docblock beside `applyFrameDirective`.
+                applyFrameDirective(element);
                 return;
             }
             // A statement: a label definition, an instruction, or a label
@@ -1226,6 +1272,527 @@ private:
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // CALL FRAME INFORMATION — the `.s` PRODUCER
+    // (D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED).
+    // ══════════════════════════════════════════════════════════════════════
+    //
+    // ★★★ WHAT THIS PRODUCES AND WHY IT IS NOT A NEW CARRIER. The output is
+    // `LirFuncCfi` — the SAME per-function op list the calling-convention
+    // materializer emits for a C function (`lir/lir_callconv.hpp`), keyed the
+    // same way (by the `LirInstId` after which the rule is in effect) and
+    // resolved to byte offsets by the SAME join in `asm.cpp`. Two producers,
+    // one representation, one resolver: a `.s` frame and a C frame become
+    // `.eh_frame` FDEs through identical code, so neither can drift into
+    // describing frames the other cannot.
+    //
+    // ★★ THE ANCHOR IS THE PRECEDING INSTRUCTION, WHICH IS EXACTLY WHAT gas
+    // MEANS. `.cfi_def_cfa_offset 48` written under `subq $40, %rsp` says "from
+    // the end of that instruction onward, the CFA is 48 above rsp" — DWARF's
+    // `DW_CFA_advance_loc` target and `LirCfiOp::inst`'s documented "the
+    // instruction AFTER which the rule is in effect" are the same convention,
+    // because they are describing the same physical fact.
+    // ⚠ A RULE BEFORE THE FUNCTION'S FIRST INSTRUCTION anchors to NOTHING and
+    // takes effect at offset 0. That is `LirCfiOp` with an INVALID `inst` and
+    // `atBlockEnd == false` — a state the callconv producer never emits (its
+    // ops always follow an instruction it just wrote) and which the resolver
+    // therefore has to be told about explicitly rather than inferring.
+    //
+    // ★ WHAT IS FOLDED HERE RATHER THAN CARRIED. `.cfi_adjust_cfa_offset` and
+    // `.cfi_rel_offset` both state a number relative to the RUNNING CFA offset,
+    // and DWARF encodes only absolute ones — `dwarf_cfi.hpp` refuses an
+    // unresolved `AdjustCfaOffset` outright, naming the producer as the tier
+    // that must fold. gas resolves them against its own running state for the
+    // same reason. So this walker keeps that state (including the
+    // remember/restore stack, which changes it) and emits absolute rules.
+
+    // The frame description that is currently open, i.e. between a
+    // `frameStart` directive and its `frameEnd`.
+    struct OpenFrame {
+        bool         active = false;
+        NodeId       at{};             // the `.cfi_startproc`, for diagnostics
+        std::size_t  funcIndex = 0;    // which `perFuncCfi_` slot it fills
+        // The running CFA offset, in bytes, as gas would track it. Seeded from
+        // the entry state (`callPushBytes`) and updated by every CFA rule.
+        std::int64_t cfaOffset = 0;
+        // `.cfi_remember_state` pushes, `.cfi_restore_state` pops. Only the CFA
+        // offset is stacked because it is the only piece of state this walker
+        // has to answer a question about; the REGISTER rules are carried
+        // through to the encoder untouched, where `foldCfiOps` owns the full
+        // state machine.
+        std::vector<std::int64_t> cfaStack;
+    };
+
+    // ★★★ THE ENTRY STATE, DERIVED FROM THE TARGET AND CROSS-CHECKED ACROSS
+    // EVERY CALLING CONVENTION IT DECLARES.
+    //
+    // A `.s` names no calling convention — the `encode` tier runs no callconv
+    // pass by construction — so the C path's "read `callingConvention(index)`"
+    // has no index to read. But the three facts an entry state needs are psABI
+    // properties of the MACHINE rather than of a convention: whether the call
+    // instruction pushes the return address (`callPushBytes`), which register
+    // is the stack pointer, and whether there is a link register. ✔MEASURED
+    // 2026-08-17 on both shipped targets: x86_64's `sysv_amd64` and `ms_x64`
+    // agree (rsp / 8 / no link register) and arm64's `aapcs64` and
+    // `apple_arm64` agree (sp / 0 / x30).
+    //
+    // ⚠ SO IT IS DERIVED **AND VERIFIED**, NOT ASSUMED. Reading convention 0
+    // and hoping would be a silent guess the day a target declares a convention
+    // with a different call-push; requiring every declared convention to AGREE
+    // turns that day into a diagnostic. This is the same discipline the
+    // `fdePointerRelocationOf` lookup uses — derive from what the target already
+    // states, and REFUSE on ambiguity rather than picking.
+    [[nodiscard]] std::optional<CfiInitialState> deriveCfiInitialState(NodeId at) {
+        if (cfiInitial_.has_value()) return cfiInitial_;
+        auto const ccs = target_.callingConventions();
+        if (ccs.empty()) {
+            sink_.fail(at,
+                 std::format("target '{}' declares no calling convention, so "
+                             "the frame state every function of this file "
+                             "starts in cannot be stated — call-frame "
+                             "information needs the stack-pointer register and "
+                             "whether the call instruction pushes a return "
+                             "address{}", target_.name(), sink_.pairSuffix()));
+            return std::nullopt;
+        }
+        std::optional<CfiInitialState> agreed;
+        std::string_view               agreedName;
+        for (auto const& cc : ccs) {
+            if (!cc.stackPointer.has_value()) {
+                sink_.fail(at,
+                     std::format("target '{}' calling convention '{}' declares "
+                                 "no stack-pointer register, so no "
+                                 "canonical-frame-address rule can be stated "
+                                 "for a function in this file{}",
+                                 target_.name(), cc.name, sink_.pairSuffix()));
+                return std::nullopt;
+            }
+            CfiInitialState st;
+            st.cfaRegister = cc.stackPointer->ordinal;
+            st.cfaOffset   = static_cast<std::int64_t>(cc.callPushBytes);
+            if (cc.callPushBytes > 0) {
+                st.returnAddressAtCfaOffset =
+                    -static_cast<std::int64_t>(cc.callPushBytes);
+            } else if (cc.linkRegister.has_value()) {
+                st.returnAddressRegister = cc.linkRegister->ordinal;
+            }
+            if (!agreed.has_value()) {
+                agreed     = st;
+                agreedName = cc.name;
+                continue;
+            }
+            if (!(*agreed == st)) {
+                sink_.fail(at,
+                     std::format("target '{}' calling conventions '{}' and '{}' "
+                                 "describe DIFFERENT frame entry states, and an "
+                                 "assembly file names no convention — so this "
+                                 "build cannot say which one a '.s' function "
+                                 "starts in. One shared CIE cannot describe "
+                                 "both, and picking either would misdescribe "
+                                 "every function written for the other{}",
+                                 target_.name(), agreedName, cc.name,
+                                 sink_.pairSuffix()));
+                return std::nullopt;
+            }
+        }
+        cfiInitial_ = agreed;
+        return cfiInitial_;
+    }
+
+    // The operand nodes of a directive, in source order. `kids[2]` is the
+    // optional operand sequence; a directive with no operands has none.
+    [[nodiscard]] std::vector<NodeId>
+    directiveOperands(std::vector<NodeId> const& kids) const {
+        std::vector<NodeId> out;
+        if (kids.size() < 3) return out;
+        for (NodeId const o : visibleChildren(tree_, kids[2])) {
+            if (tree_.kind(o) == NodeKind::Internal) out.push_back(o);
+        }
+        return out;
+    }
+
+    // ★★★ THE REGISTER A CFI RULE NAMES — AND IT ARRIVES IN TWO FORMS, BOTH OF
+    // WHICH THE REFERENCE ASSEMBLER TAKES.
+    //   * a DWARF REGISTER NUMBER (`.cfi_offset 6, -16`) — what gcc emits;
+    //   * this dialect's register SPELLING (`.cfi_offset %rbp, -16` /
+    //     `.cfi_offset x29, -16`) — what a hand-written file often uses.
+    //
+    // ★★ THE NUMBER IS RESOLVED THROUGH THE TARGET'S OWN `dwarfNumber` TABLE,
+    // NEVER THROUGH THE HARDWARE ENCODING. They are different permutations —
+    // `%rbp` is DWARF 6 and hardware 5 — and an encoder handed the wrong one
+    // writes a table a debugger follows into the wrong frame, without
+    // complaining. The same table `dwarf_cfi.hpp` reads on the way out is the
+    // one read here on the way in, so a round trip is the identity by
+    // construction.
+    //
+    // ★ THE RETURN-ADDRESS COLUMN IS CHECKED FIRST because on x86_64 it is 16 —
+    // a synthetic column no register carries — and on AArch64 it is 30, which
+    // IS x30's ordinary number. Preferring the RA column on a tie is safe
+    // precisely because they encode identically (`dwarfOf` maps both to 30) and
+    // it is what makes the CIE's own rule and the file's rule name one thing.
+    [[nodiscard]] std::optional<CfiRegRef>
+    frameRegisterOperand(NodeId operandNode, std::string_view spelling) {
+        auto decoded = decodeOperand(operandNode);
+        if (!decoded) return std::nullopt;
+        if (decoded->role == AsmOperandRole::Register) {
+            if (!decoded->reg.isPhysical) {
+                sink_.fail(operandNode,
+                     std::format("'.{}' names a register this walker did not "
+                                 "resolve to a physical one{}",
+                                 spelling, sink_.pairSuffix()));
+                return std::nullopt;
+            }
+            return CfiRegRef::physical(
+                static_cast<std::uint16_t>(decoded->reg.id));
+        }
+        if (!decoded->hasValue || decoded->isMemory) {
+            sink_.fail(operandNode,
+                 std::format("'.{}' needs a register — either a DWARF register "
+                             "NUMBER (which is what a compiler emits) or one of "
+                             "this dialect's register spellings — and this "
+                             "operand is neither{}",
+                             spelling, sink_.pairSuffix()));
+            return std::nullopt;
+        }
+        if (decoded->value < 0) {
+            sink_.fail(operandNode,
+                 std::format("'.{}' names DWARF register {}, and a DWARF "
+                             "register number is never negative{}",
+                             spelling, decoded->value, sink_.pairSuffix()));
+            return std::nullopt;
+        }
+        auto const wanted = static_cast<std::uint64_t>(decoded->value);
+        if (auto const ra = target_.dwarfReturnAddressColumn();
+            ra.has_value() && wanted == *ra) {
+            return CfiRegRef::returnAddress();
+        }
+        auto const regs = target_.registers();
+        std::optional<std::uint16_t> found;
+        for (std::size_t i = 0; i < regs.size(); ++i) {
+            if (!regs[i].dwarfNumber.has_value()) continue;
+            if (*regs[i].dwarfNumber != wanted) continue;
+            if (found.has_value()) {
+                // Two rows claiming one DWARF number means the target's table
+                // no longer identifies a register. Picking either writes a rule
+                // about the wrong one — silently.
+                sink_.fail(operandNode,
+                     std::format("target '{}' declares DWARF register number {} "
+                                 "on BOTH '{}' and '{}', so '.{}' cannot name "
+                                 "one of them{}",
+                                 target_.name(), wanted, regs[*found].name,
+                                 regs[i].name, spelling, sink_.pairSuffix()));
+                return std::nullopt;
+            }
+            found = static_cast<std::uint16_t>(i);
+        }
+        if (!found.has_value()) {
+            sink_.fail(operandNode,
+                 std::format("target '{}' declares no register with DWARF "
+                             "number {}, so '.{}' names a frame slot this build "
+                             "cannot resolve. The numbering is a per-target "
+                             "psABI table (`registers[].dwarfNumber` in that "
+                             "target's document) and the hardware encoding is a "
+                             "DIFFERENT permutation, so guessing one from the "
+                             "other would describe another register entirely{}",
+                             target_.name(), wanted, spelling,
+                             sink_.pairSuffix()));
+            return std::nullopt;
+        }
+        return CfiRegRef::physical(*found);
+    }
+
+    // A plain signed integer operand (an offset, a delta, a column).
+    [[nodiscard]] std::optional<std::int64_t>
+    frameNumberOperand(NodeId operandNode, std::string_view spelling,
+                       std::string_view what) {
+        auto decoded = decodeOperand(operandNode);
+        if (!decoded) return std::nullopt;
+        if (!decoded->hasValue || decoded->isMemory
+            || decoded->role == AsmOperandRole::Register) {
+            sink_.fail(operandNode,
+                 std::format("'.{}' needs {} as a plain number, and this "
+                             "operand is not one{}",
+                             spelling, what, sink_.pairSuffix()));
+            return std::nullopt;
+        }
+        return decoded->value;
+    }
+
+    // How many operands each rule takes, derived from the SHARED predicates in
+    // `core/types/cfi.hpp` rather than from a table repeated here. A rule that
+    // names a register and carries an offset takes two; one that only names a
+    // register takes one; the CFA-offset rules take one number; the state-stack
+    // ops take none. ★ `DefCfa` is the one that takes both a register and an
+    // offset, which is exactly `cfiOpTouchesCfa && !offset-only` — spelled out
+    // below rather than encoded as a magic count, so a reader can check it.
+    struct FrameRuleArity { bool reg; bool srcReg; bool offset; };
+    [[nodiscard]] static constexpr FrameRuleArity arityOf(CfiOpKind k) noexcept {
+        switch (k) {
+        case CfiOpKind::DefCfa:            return {true,  false, true};
+        case CfiOpKind::DefCfaRegister:    return {true,  false, false};
+        case CfiOpKind::DefCfaOffset:      return {false, false, true};
+        case CfiOpKind::AdjustCfaOffset:   return {false, false, true};
+        case CfiOpKind::RegAtCfaOffset:    return {true,  false, true};
+        case CfiOpKind::RegValIsCfaOffset: return {true,  false, true};
+        case CfiOpKind::RegInRegister:     return {true,  true,  false};
+        case CfiOpKind::RegSameValue:      return {true,  false, false};
+        case CfiOpKind::RegUndefined:      return {true,  false, false};
+        case CfiOpKind::RegRestoreInitial: return {true,  false, false};
+        case CfiOpKind::RememberState:     return {false, false, false};
+        case CfiOpKind::RestoreState:      return {false, false, false};
+        }
+        return {false, false, false};
+    }
+
+    // Apply one call-frame directive during the emit walk.
+    void applyFrameDirective(NodeId directive) {
+        auto const kids = visibleChildren(tree_, directive);
+        if (kids.size() < 2) return;      // pass 1 refused a nameless directive
+        std::string const spelling{tree_.text(kids[1])};
+        auto const* row = cfg_.directiveBySpelling(spelling);
+        if (row == nullptr || row->operandOnly) return;
+        switch (row->verb) {
+        case AsmDirectiveVerb::FrameStart:  openFrame(directive, spelling); return;
+        case AsmDirectiveVerb::FrameEnd:    closeFrame(directive, spelling); return;
+        case AsmDirectiveVerb::FrameRule:
+            applyFrameRule(directive, kids, *row, spelling);
+            return;
+        case AsmDirectiveVerb::FrameReturnColumn:
+            applyFrameReturnColumn(directive, kids, spelling);
+            return;
+        default: return;
+        }
+    }
+
+    void openFrame(NodeId at, std::string_view spelling) {
+        if (frame_.active) {
+            sink_.fail(at,
+                 std::format("'.{}' opens a frame description while one is "
+                             "already open — frame descriptions do not nest, "
+                             "and the rules after this point would belong to "
+                             "two functions at once{}",
+                             spelling, sink_.pairSuffix()));
+            return;
+        }
+        if (openFunctionLabel_ == kNoLabel) {
+            sink_.fail(at,
+                 std::format("'.{}' opens a frame description with no function "
+                             "open — call-frame information describes the frame "
+                             "of one function, and there is nothing here for it "
+                             "to describe. Mark the entry with this dialect's "
+                             "function-entry directive ({}) first{}",
+                             spelling,
+                             cfg_.spellingsForVerb(
+                                 AsmDirectiveVerb::FunctionEntry),
+                             sink_.pairSuffix()));
+            return;
+        }
+        // ⚠ `openFunction` pushes a slot and sets `openFunctionLabel_` in the
+        // same breath, so the guard above already implies a non-empty vector.
+        // It is checked anyway rather than trusted, because the alternative on
+        // a substrate break is `size() - 1` underflowing to a huge index.
+        if (perFuncCfi_.empty()) {
+            sink_.fail(at,
+                 std::format("internal: '.{}' opens a frame description with a "
+                             "function open but no per-function slot for it — "
+                             "the label walk and the frame walk disagree about "
+                             "this file's function list{}",
+                             spelling, sink_.pairSuffix()));
+            return;
+        }
+        auto const initial = deriveCfiInitialState(at);
+        if (!initial.has_value()) return;
+        frame_.active    = true;
+        frame_.at        = at;
+        frame_.funcIndex = perFuncCfi_.size() - 1;
+        frame_.cfaOffset = initial->cfaOffset;
+        frame_.cfaStack.clear();
+        // ★ ENGAGE THE SLOT HERE, not on the first rule. A function bracketed
+        // by frame-start/frame-end with NO rules between is DESCRIBED and must
+        // get its own (rule-free) unwind entry — ✔MEASURED 2026-08-17, that is
+        // exactly what gcc 13.3.0 emits for a leaf function and what gas turns
+        // into an FDE. Engaging on the first rule instead would make a leaf
+        // silently unwindable-through-nothing.
+        perFuncCfi_[frame_.funcIndex].emplace();
+    }
+
+    void closeFrame(NodeId at, std::string_view spelling) {
+        if (!frame_.active) {
+            sink_.fail(at,
+                 std::format("'.{}' closes a frame description that was never "
+                             "opened{}", spelling, sink_.pairSuffix()));
+            return;
+        }
+        if (!frame_.cfaStack.empty()) {
+            sink_.fail(at,
+                 std::format("'.{}' closes a frame description with {} "
+                             "remembered state(s) never restored — the rules "
+                             "after the unmatched remember describe a frame the "
+                             "source never returned to{}",
+                             spelling, frame_.cfaStack.size(),
+                             sink_.pairSuffix()));
+            return;
+        }
+        frame_.active = false;
+    }
+
+    void applyFrameRule(NodeId directive, std::vector<NodeId> const& kids,
+                        AsmDirectiveSpelling const& row,
+                        std::string_view spelling) {
+        if (!requireOpenFrame(directive, spelling)) return;
+        // A `frameRule` row with no rule cannot load (the loader requires it);
+        // the guard keeps a substrate break from becoming a wrong rule.
+        if (!row.frameRule.has_value()) {
+            sink_.fail(directive,
+                 std::format("internal: directive '.{}' declares verb "
+                             "'frameRule' with no rule, which the load-time "
+                             "validation that guarantees this did not hold{}",
+                             spelling, sink_.pairSuffix()));
+            return;
+        }
+        CfiOpKind const kind    = *row.frameRule;
+        auto const      arity   = arityOf(kind);
+        auto const      operands = directiveOperands(kids);
+        std::size_t const wanted = static_cast<std::size_t>(arity.reg)
+                                 + static_cast<std::size_t>(arity.srcReg)
+                                 + static_cast<std::size_t>(arity.offset);
+        if (operands.size() != wanted) {
+            sink_.fail(directive,
+                 std::format("'.{}' states the frame rule '{}', which takes {} "
+                             "operand(s); {} were written. A rule applied with "
+                             "the wrong operands describes a frame the source "
+                             "did not{}",
+                             spelling, cfiOpKindName(kind), wanted,
+                             operands.size(), sink_.pairSuffix()));
+            return;
+        }
+        LirCfiOp op;
+        op.kind = kind;
+        std::size_t next = 0;
+        if (arity.reg) {
+            auto const r = frameRegisterOperand(operands[next++], spelling);
+            if (!r.has_value()) return;
+            op.reg = *r;
+        }
+        if (arity.srcReg) {
+            auto const r = frameRegisterOperand(operands[next++], spelling);
+            if (!r.has_value()) return;
+            op.srcReg = *r;
+        }
+        if (arity.offset) {
+            auto const v = frameNumberOperand(operands[next++], spelling,
+                                              "a byte offset");
+            if (!v.has_value()) return;
+            op.offset = *v;
+        }
+        // ── the folds ────────────────────────────────────────────────────
+        // ★ `.cfi_adjust_cfa_offset N` becomes an ABSOLUTE `def_cfa_offset`,
+        //   because DWARF has no adjust opcode and `dwarf_cfi.hpp` refuses one
+        //   unresolved, naming the producer as the tier that must fold. gas
+        //   does the identical resolution against its own running state.
+        if (kind == CfiOpKind::AdjustCfaOffset) {
+            op.kind   = CfiOpKind::DefCfaOffset;
+            op.offset = frame_.cfaOffset + op.offset;
+        }
+        // ★ `.cfi_rel_offset reg, off` is `.cfi_offset reg, off − CFA offset`.
+        //   Declared per ROW (`offsetFromCfa`) rather than detected here, so a
+        //   dialect spelling it differently binds the same fold.
+        if (row.frameOffsetFromCfa) {
+            op.offset -= frame_.cfaOffset;
+        }
+        // ── running state, so the next fold sees this rule ───────────────
+        switch (op.kind) {
+        case CfiOpKind::DefCfa:
+        case CfiOpKind::DefCfaOffset: frame_.cfaOffset = op.offset; break;
+        case CfiOpKind::RememberState:
+            frame_.cfaStack.push_back(frame_.cfaOffset);
+            break;
+        case CfiOpKind::RestoreState:
+            if (frame_.cfaStack.empty()) {
+                sink_.fail(directive,
+                     std::format("'.{}' restores a frame state that was never "
+                                 "remembered — the producer's own model of the "
+                                 "frame is inconsistent, and encoding it would "
+                                 "describe a frame that never existed{}",
+                                 spelling, sink_.pairSuffix()));
+                return;
+            }
+            frame_.cfaOffset = frame_.cfaStack.back();
+            frame_.cfaStack.pop_back();
+            break;
+        default: break;
+        }
+        recordFrameOp(op);
+    }
+
+    void applyFrameReturnColumn(NodeId directive,
+                                std::vector<NodeId> const& kids,
+                                std::string_view spelling) {
+        if (!requireOpenFrame(directive, spelling)) return;
+        auto const operands = directiveOperands(kids);
+        if (operands.size() != 1) {
+            sink_.fail(directive,
+                 std::format("'.{}' takes exactly one operand — the DWARF "
+                             "column the return address lives in; {} were "
+                             "written{}",
+                             spelling, operands.size(), sink_.pairSuffix()));
+            return;
+        }
+        auto const stated = frameNumberOperand(operands[0], spelling,
+                                               "a DWARF column number");
+        if (!stated.has_value()) return;
+        auto const declared = target_.dwarfReturnAddressColumn();
+        if (!declared.has_value()) {
+            sink_.fail(operands[0],
+                 std::format("'.{}' states a return-address column, but target "
+                             "'{}' declares none — so this build has nothing to "
+                             "check the claim against and no column to write "
+                             "into the CIE{}",
+                             spelling, target_.name(), sink_.pairSuffix()));
+            return;
+        }
+        // ★★ THE CHECK *IS* THE HONOURING. One shared CIE carries one
+        // return-address column, so a file naming a DIFFERENT one is asking for
+        // something this image cannot express; accepting it silently would let
+        // a `.s` redefine where the return address lives and have no effect
+        // whatever. Naming the same column is the no-op gcc emits.
+        if (static_cast<std::uint64_t>(*stated) != *declared) {
+            sink_.fail(operands[0],
+                 std::format("'.{}' states DWARF return-address column {}, but "
+                             "target '{}' declares column {}. The column is a "
+                             "property of the whole image's shared CIE, so a "
+                             "per-function override cannot be expressed — and "
+                             "accepting it would leave the emitted table saying "
+                             "{} while this file says {}{}",
+                             spelling, *stated, target_.name(), *declared,
+                             *declared, *stated, sink_.pairSuffix()));
+        }
+    }
+
+    [[nodiscard]] bool requireOpenFrame(NodeId at, std::string_view spelling) {
+        if (frame_.active) return true;
+        sink_.fail(at,
+             std::format("'.{}' states a call-frame rule outside any frame "
+                         "description — a rule with no frame to belong to has "
+                         "no function and no extent. Open one with this "
+                         "dialect's {} directive{}",
+                         spelling,
+                         cfg_.spellingsForVerb(AsmDirectiveVerb::FrameStart),
+                         sink_.pairSuffix()));
+        return false;
+    }
+
+    // Attach one op to the open frame, anchored to the instruction it follows.
+    // ⚠ AN INVALID `inst` IS THE FUNCTION-ENTRY ANCHOR (offset 0) and is a
+    // deliberate state, not a miss — see the family docblock above.
+    void recordFrameOp(LirCfiOp op) {
+        if (funcInstCount_ > 0) op.inst = builder_.lastInst();
+        if (frame_.funcIndex < perFuncCfi_.size()
+            && perFuncCfi_[frame_.funcIndex].has_value()) {
+            perFuncCfi_[frame_.funcIndex]->ops.push_back(op);
+        }
+    }
+
     // ── functions and blocks ──────────────────────────────────────────────
     void enterLabel(std::string const& name, NodeId at) {
         auto const it = labelIndex_.find(name);
@@ -1249,6 +1816,11 @@ private:
         if (!sink_.ok()) return;
         auto& entry = labels_[labelIdx];
         builder_.addFunction(entry.symbol);
+        // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED: the parallel slot, opened
+        // with the function so its index and the LIR function index are the
+        // same number by construction rather than by agreement.
+        perFuncCfi_.emplace_back();
+        funcInstCount_     = 0;
         openFunctionLabel_ = labelIdx;
         // ★ EVERY BLOCK OF THIS FUNCTION IS CREATED UP FRONT, IN LABEL ORDER.
         // A forward branch (`jmp .Lend` above `.Lend:`) needs the target's
@@ -1369,6 +1941,23 @@ private:
     void closeFunction() {
         if (openFunctionLabel_ == kNoLabel) return;
         auto const& entry = labels_[openFunctionLabel_];
+        // ★ AN UNCLOSED FRAME DESCRIPTION IS A REFUSAL, NOT A TRUNCATION
+        // (D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED). A description with no
+        // `frameEnd` states no extent: closing it here at the function boundary
+        // would silently invent one, and the invented FDE would cover exactly
+        // the bytes the source never claimed.
+        if (frame_.active) {
+            sink_.fail(frame_.at,
+                 std::format("assembly function '{}' opens a frame description "
+                             "that is never closed — {} states which bytes the "
+                             "unwind table covers, and ending it at the "
+                             "function boundary instead would emit an FDE over "
+                             "an extent the source never stated{}",
+                             entry.name,
+                             cfg_.spellingsForVerb(AsmDirectiveVerb::FrameEnd),
+                             sink_.pairSuffix()));
+            frame_.active = false;
+        }
         if (!openTerminated_) {
             // ★ A FUNCTION THAT FALLS OFF ITS END IS REFUSED, NOT PADDED. LIR
             // requires every block to be terminated, and the two ways to
@@ -1794,6 +2383,23 @@ private:
     std::size_t                                 openFunctionLabel_ = kNoLabel;
     std::size_t                                 openBlockLabel_    = kNoLabel;
     std::uint32_t                               blockInstCount_    = 0;
+    // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED. One slot per LIR function, in
+    // `openFunction` order — which IS `builder_.addFunction` order and
+    // therefore `AssembledModule::functions` order, the parallel-index
+    // discipline every other per-function vector here follows.
+    // ⚠ A SLOT EXISTS FOR EVERY FUNCTION, DESCRIBED OR NOT, precisely so the
+    // index stays the function index; a vector holding only described
+    // functions would make "slot k" mean something different from "function k".
+    // The slot is ENGAGED by the frame-start directive.
+    std::vector<std::optional<LirFuncCfi>>      perFuncCfi_;
+    OpenFrame                                   frame_{};
+    std::optional<CfiInitialState>              cfiInitial_;
+    // Instructions emitted into the CURRENT function. The anchor question a
+    // `.cfi_*` rule asks is "is there an instruction above me *in this
+    // function*?" — `blockInstCount_` resets at every label and would answer it
+    // wrongly for the first rule after a block boundary, and `lastInst()`
+    // ABORTS when nothing has been appended at all.
+    std::uint32_t                               funcInstCount_     = 0;
     bool                                        openTerminated_    = false;
     bool                                        branchProbed_      = false;
     std::optional<std::uint16_t>                branchOpcode_;

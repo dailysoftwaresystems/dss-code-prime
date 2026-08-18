@@ -162,3 +162,31 @@ tests/**/data/** binary
 # prevent, and the same category the note above says is the one most likely to
 # be forgotten. Placed LAST so last-match precedence beats every text rule.
 examples/**/*.so binary
+
+# The shipped RUNTIME's generated object cache (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF).
+# `src/dss-config/runtime/platform/dist/` holds COMPILED OUTPUT — object bytes for a
+# target, keyed by content — inside a directory tree that the `src/dss-config/** text
+# eol=lf` rule near the top of this file otherwise claims wholesale.
+#
+# ★ THIS IS NOT PRE-EMPTIVE TIDYING; THE TWO DECLARATIONS ACTIVELY DISAGREE TODAY.
+# ✔MEASURED 2026-08-17 on a probe object written into that tree:
+#     git check-ignore -v  -> .gitignore:87 (ignored, as intended)
+#     git check-attr       -> text: set, eol: lf      ← on a FILE OF OBJECT BYTES
+# So `.gitignore` says "generated, never tracked" while `.gitattributes` says "text,
+# normalise every CR". The contradiction is inert only for as long as nothing makes one
+# of those files tracked, and the two ways that happens are both ordinary: a `git add -f`
+# while debugging a cache miss, or the shipped `dist/release/` tree becoming COMMITTED so
+# a package can carry it — which is exactly what the operator ruling wants that tree for.
+# On the day either happens, checkout rewrites 0x0D bytes inside a relocatable object and
+# the corruption is silent: the file is present, the size is close, and the link fails (or
+# worse, does not) far from the cause.
+#
+# ⚠ THIS IS THE THIRD INSTANCE OF ONE DEFECT, so it is a pattern and not an accident —
+# `tests/**/data/**` and `examples/**/*.so` above are the first two, and both were written
+# only AFTER a broad `text eol=lf` rule had already claimed binary bytes it did not know
+# about. The lesson each time: a directory-wide text pin's blast radius is exactly what it
+# NAMES, and what it omits is invisible. Declared here in the same change that creates the
+# tree, rather than after the third corruption.
+#
+# Placed after `examples/**/*.so` so last-match precedence beats `src/dss-config/**`.
+src/dss-config/runtime/platform/dist/** binary

@@ -1,0 +1,15 @@
+{
+  "$comment": "★★★ THE WITNESS FOR direct.json's DECLARED SUPERSET DEVIATION (LANE-CFG edit 3/4). On `pe`, DSS makes <direct.h> re-export <dirent.h> — and through it <windows.h> — which NEITHER reference compiler does: ✔MEASURED, `DIR` from a bare `#include <direct.h>` is rc=2 under MSVC `cl` and rc=1 under x86_64-w64-mingw32-gcc, against a `&_mkdir` control on the same header that is rc=0 on both. A superset is compatible ONLY IF it never makes LESS available and never changes the MEANING of anything already visible; the second half cannot be assumed, so this example asserts it BY EXECUTION rather than by review. ★ THE TU DELIBERATELY NEVER INCLUDES <windows.h>: everything Win32 that reaches it arrives over the new edges, so a regression in the chain <direct.h>→<dirent.h>→<windows.h> stops this compiling instead of silently losing the deviation. ★★ THE THREE COLLISION PROBES ARE THE POINT, and each is deliberately INCOMPATIBLE with the platform spelling it shadows: `typedef int HANDLE;` (Win32's is an 8-byte void*, the user's is a 4-byte int and sizeof must prove it), a private `struct DIR` with the user's own fields (the shipped DIR is an OPAQUE empty tag, so member access on it would fail loud — reading `marker`/`tag` proves the user's definition is the one in scope), and a `free_slots` function whose root collides with <stdlib.h>'s `free` arriving over edit 1's windows.h→stdlib.h edge. All three compile and run identically WITH and WITHOUT the edges, because a user declaration outranks a shipped one — that is what makes the superset safe, and it is now asserted rather than measured once in a lane's scratch directory. ★ The elf/macho legs compile the SAME source down the `#else` arm (<direct.h> is a pe-only header, so the deviation is scoped to pe by construction) and re-assert that POSIX keeps its own meaning: there S_ISLNK is the real formula and S_ISLNK(40960) is TRUE, while on pe it is the constant `(0)` (edit 4/4). So the two arms disagree on S_ISLNK BY DESIGN and each pins its own platform's answer. RED-ON-DISABLE, each run: drop direct.json's `includes` ⇒ pe64 fails `error[S0006] DIR`; drop dirent.json's `includes` ⇒ pe64 fails on the Win32 surface behind it; drop windows.json's `includes` ⇒ `free`/`_wfullpath` go unresolved in the fileio.c consumer; drop sys/stat.json's S_ISLNK pe arm ⇒ pe64 fails `error[S0001] S_ISLNK` here.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

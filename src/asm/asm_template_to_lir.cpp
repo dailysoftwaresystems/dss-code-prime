@@ -2710,6 +2710,39 @@ parseAsmTemplateText(std::string                          templateText,
     auto src = SourceBuffer::fromString(std::move(templateText),
                                         std::move(bufferName));
 
+    // ★★★ THE FRAGMENT BUFFER IS REGISTERED WITH THE REPORTER **HERE**, BEFORE
+    // A SINGLE TOKEN IS READ — which is what makes a template diagnostic
+    // RENDERABLE, and what makes it renderable on the path that had lost it
+    // entirely.
+    //
+    // ⚠ ✔MEASURED 2026-08-17 through the CLI, before this line existed:
+    //     __asm__("movl $42, %0 @@@" : "=r"(r));
+    //     error[P0001]: expected 'LineEnd' — got '@'
+    //       --> <unknown-buffer:6>:offset 13
+    // Every diagnostic that names this buffer — the lex/parse diagnostics
+    // forwarded below AND every `A_AsmTextUnsupported` the LOWERING raises
+    // afterwards (`AsmDiagnosticSink::fail` stamps `tree_.source().id()`, the
+    // same buffer) — carried an id that resolved to nothing, because the
+    // driver builds its `BufferRegistry` from `cu.trees()` +
+    // `cu.auxiliaryBuffers()` and a buffer minted at the LIR tier is reachable
+    // from neither. A diagnostic that cannot be rendered is barely better than
+    // one that was never emitted.
+    //
+    // ★ WHY AT THE MINT AND NOT AT THE RETURN. On the FAILURE path there is no
+    // `Tree` to hand back and the buffer would die inside this function with
+    // the diagnostics still pointing at it — the exact path that most needs
+    // the source. Registering before the parse makes survival independent of
+    // the verdict. It is also why this is not an out-param: an optional the
+    // one production caller never reads would be a knob nobody turns, and the
+    // failure path could not use it even if the caller did.
+    //
+    // ★ AND IT IS NOT A KNOB THIS TIER INVENTED. `reporter` is the object that
+    // already spans the gap — the LIR tier's reporter is the driver's
+    // per-target scratch, which `mergeWithTargetContext` folds into the
+    // run-wide reporter that renders. The buffer now travels the same route
+    // its diagnostics do.
+    reporter.sourceBuffers().add(src);
+
     // ★★ THE PARSER CONFIG IS BUILT FROM THE DIALECT, NOT DEFAULT-CONSTRUCTED.
     // `ParserConfig{}`'s `maxExpressionDepth` is a C++ FALLBACK; a language
     // states its own in `parser.maxExpressionDepth`, and the `.s` path honours

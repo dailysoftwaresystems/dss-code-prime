@@ -1,0 +1,22 @@
+{
+  "$comment": "★★★ THE aarch64 CFI COUNTERPART THE ANCHOR SAID COULD NOT EXIST YET — D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED. That row recorded the asymmetry in its own text: x86_64 declared all eighteen `.cfi_*` spellings and DROPPED them (the defect), while `asm-arm64-gas` declared ZERO, so `.cfi_startproc` FAILED LOUD there — correct behaviour that simply could not read `aarch64-linux-gnu-gcc -S` output. The row also warned that declaring them as `ignoredAnnotation` first, to make the dialects 'consistent', would propagate the defect into a second dialect. They arrived as REAL verbs, and this file is the witness.\\n\\n★★★ IT IS NOT A COPY OF THE x86_64 FIXTURE, AND THE THREE DIFFERENCES ARE THE POINT. ✔MEASURED 2026-08-17 with `aarch64-linux-gnu-as` 2.42 + `readelf --debug-dump=frames`: the aarch64 CIE prints `Return address column: 30` and `DW_CFA_def_cfa: r31 (sp) ofs 0`, against x86_64's column 16 and `rsp+8`. (a) The CFA offset at entry is 0, not 8 — an aarch64 `bl` does not push. (b) The return address starts in a REGISTER (x30), so the entry state names a link register instead of a stack slot. (c) x30 is an ordinary register that ALSO serves as the RA column, where x86_64's 16 is synthetic and belongs to no register — so `.cfi_offset 30, -8` exercises the one path (resolve a DWARF number against the RA column BEFORE the register table) that is INVISIBLE on x86_64 and wrong if done the other way round here.\\n\\n★★ THE FRAME DESCRIPTION IS TRUE OF THE CODE. `x30` is genuinely spilled across the `bl` and `.cfi_offset 30, -8` says so, so an unwinder following this table finds the real return address. ⚠ A file that DESCRIBED saves it never performed would still assemble and still exit 42 — which is exactly why 'the example runs' is not by itself evidence about unwind data, and why the x86_64 sibling carries a gdb walk as its end-to-end witness.\\n\\n★★ `helper` CARRIES THE SPELLINGS A COMPILER NEVER EMITS — `.cfi_def_cfa`, `.cfi_def_cfa_register`, `.cfi_adjust_cfa_offset`, `.cfi_rel_offset`, `.cfi_val_offset`, `.cfi_register`, `.cfi_same_value`, `.cfi_undefined`, `.cfi_return_column` — so the per-ROW red-on-disable covers the whole honoured set and not just the nine `gcc -O1 -S` happens to write (✔MEASURED that set: `.cfi_startproc`, `.cfi_endproc`, `.cfi_def_cfa_offset`, `.cfi_offset`, `.cfi_restore`, `.cfi_remember_state`, `.cfi_restore_state`, `.cfi_def_cfa_register`, `.cfi_def_cfa`). Deleting any one row from `asm-arm64-gas.lang.json` turns this example red at `A0008` naming that spelling.\\n\\n⛔ THE TWO UNREPRESENTABLE SPELLINGS ARE DELIBERATELY ABSENT. `.cfi_signal_frame` changes the CIE augmentation to 'zRS' (✔MEASURED) and DSS emits one shared 'zR' CIE per module; `.cfi_escape` states raw DWARF bytes nothing can validate — ✔MEASURED 2026-08-17, a malformed escape makes GNU as itself silently EAT the following rules out of the unwind program at rc=0. Both are refused by name and the refusals are pinned in tests/asm/test_asm_cfi_producer.cpp.\\n\\n★ THE `release` ARM, SCOPED HONESTLY: at the `encode` tier there is no MIR module, so the optimizer never runs and this arm cannot witness it. It pins that `--config=release` still produces a working, unwindable binary.\n\n⚠⚠ THE HONEST LIMIT, same as the x86_64 sibling's: ✔MEASURED 2026-08-17, removing the producer from the emit walk leaves this example GREEN, because a dropped unwind table changes nothing at runtime. This file guards the CONFIG rows per-ROW (a deleted row reds at `A0008`); the PRODUCER is guarded by tests/asm/test_asm_cfi_producer.cpp.",
+  "language": "asm-arm64-gas",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

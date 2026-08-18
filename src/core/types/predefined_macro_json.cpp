@@ -5,8 +5,13 @@
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <format>
+#include <fstream>
+#include <map>
 #include <string>
+#include <system_error>
+#include <vector>
 
 namespace dss {
 
@@ -82,6 +87,99 @@ packVersionComponents(std::string_view           versionText,
     return packed;
 }
 
+// Ruling B' SS6 -- see the contract in `preprocess_config.hpp`.
+//
+// Deliberately LENIENT about everything that is not its own subject: a file that
+// is not JSON, is not an object, or carries no `predefinedMacros` array is
+// SKIPPED, because every one of those is somebody else's loud failure (the
+// schema loaders read these same files and refuse them by name). Reporting them
+// a second time here would make this sweep's output a duplicate of theirs, and a
+// sweep whose findings are mostly other checks' findings is a sweep nobody
+// reads.
+std::vector<std::string>
+predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
+    namespace fs = std::filesystem;
+    using json   = nlohmann::json;
+
+    struct Seen {
+        std::string where;   // the document that declared it FIRST
+        json        surface; // its `impliedSurface` node (absent -> null)
+    };
+    std::map<std::string, Seen> firstByName;
+    std::vector<std::string>    out;
+
+    std::error_code ec;
+    std::vector<fs::path> files;
+    for (fs::recursive_directory_iterator
+             it{fs::path{configRootDir},
+                fs::directory_options::skip_permission_denied, ec},
+         end;
+         it != end; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        if (it->path().extension() != ".json") continue;
+        files.push_back(it->path());
+    }
+    // Deterministic on every host: a directory iteration order is the
+    // filesystem's, and "which document is FIRST" decides which one the message
+    // names as the reference. A host-dependent reference makes the same defect
+    // read differently on two machines.
+    std::sort(files.begin(), files.end());
+
+    for (fs::path const& f : files) {
+        std::ifstream in(f, std::ios::binary);
+        if (!in) continue;
+        json doc;
+        try {
+            in >> doc;
+        } catch (...) {
+            continue;   // the schema loaders own malformed JSON
+        }
+        if (!doc.is_object()) continue;
+        json const* arr = nullptr;
+        if (auto const pp = doc.find("preprocess");
+            pp != doc.end() && pp->is_object()) {
+            if (auto const a = pp->find("predefinedMacros");
+                a != pp->end() && a->is_array()) {
+                arr = &*a;
+            }
+        }
+        if (arr == nullptr) {
+            if (auto const a = doc.find("predefinedMacros");
+                a != doc.end() && a->is_array()) {
+                arr = &*a;
+            }
+        }
+        if (arr == nullptr) continue;
+
+        std::string const where = f.generic_string();
+        for (json const& e : *arr) {
+            if (!e.is_object()) continue;
+            auto const n = e.find("name");
+            if (n == e.end() || !n->is_string()) continue;
+            std::string name = n->get<std::string>();
+            if (name.empty()) continue;
+            auto const isIt = e.find("impliedSurface");
+            json const surface = (isIt == e.end()) ? json{} : *isIt;
+
+            auto const [pos, inserted] =
+                firstByName.try_emplace(name, Seen{where, surface});
+            if (inserted) continue;
+            if (pos->second.surface == surface) continue;
+            out.push_back(std::format(
+                "predefined macro '{}' is declared by more than one config "
+                "document with DIFFERENT 'impliedSurface' declarations: '{}' "
+                "says {}, '{}' says {}. A macro's implied surface is one fact; "
+                "declared in N documents it must resolve identically in all N, "
+                "or a build picks whichever document its target happens to load "
+                "and the claim silently changes meaning per leg",
+                name, pos->second.where, pos->second.surface.dump(), where,
+                surface.dump()));
+        }
+    }
+    return out;
+}
+
 namespace detail {
 
 using json = nlohmann::json;
@@ -100,6 +198,10 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
             continue;
         }
         PredefinedMacroDef pm;
+        // PROVENANCE, set before any field is read so it is carried even by a
+        // row that fails later validation (a diagnostic about a broken row must
+        // still be able to say which row).
+        pm.declaredAt = mpath;
         // ── D-CONFIG-PREDEFINED-MACRO-ROW-KEYS-UNGATED ────────────────────
         //
         // The CLOSED key vocabulary of a `predefinedMacros` ENTRY. Every
@@ -153,9 +255,9 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
         // emitted diagnostic already fails the load, and continuing lets the
         // author see every problem with the row in one pass.
         {
-            static constexpr std::array<std::string_view, 6> kMacroEntryKeys{
+            static constexpr std::array<std::string_view, 7> kMacroEntryKeys{
                 "name", "kind", "value", "params", "componentWeights",
-                "availableObjectFormats"};
+                "availableObjectFormats", "impliedSurface"};
             DSS_CHECK_KEY_VOCABULARY(kMacroEntryKeys);
             for (auto it = e.begin(); it != e.end(); ++it) {
                 if (isDocumentationKey(it.key())) continue;
@@ -445,6 +547,318 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                 pm.availableObjectFormats.push_back(std::move(fmt));
             }
             if (!afOk) continue;
+        }
+        // -- D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE (ruling B') ----
+        //
+        // `impliedSurface` -- MANDATORY on EVERY entry, always an OBJECT tagged
+        // by `kind`. There is no `null` form and no default.
+        //
+        //   {"kind":"surface",         "headers":[{"header":h,"names":[...]}]}
+        //   {"kind":"claims-nothing",  "reason":<closed>, "note":<optional>}
+        //   {"kind":"not-expressible", "note":<REQUIRED, non-empty>}
+        //
+        // ** THE MISSING FIELD IS THE ERROR, AND SO IS AN UNTAGGED ONE. Every
+        // other optional key here defaults to "off" when omitted, which is right
+        // for a key that ADDS a behavior. This key REMOVES an assumption, so a
+        // default would re-create the exact state it exists to end. MEASURED on
+        // this field's own first cut: with a `null` form available, 80 of 84 rows
+        // took it and FIVE of those were surface-implying platform identities --
+        // written while populating the mechanism built to prevent that. The tag
+        // is what makes the low-content answer visible in a diff.
+        //
+        // ** AND A `surface` CLAIM IS SYMBOL-GRANULAR, NEVER HEADER-GRANULAR. A
+        // claim naming only a header is nearly VACUOUS once transitive re-export
+        // exists: the header resolves the moment an `includes` edge fires, even
+        // if the only name that arrives is one of the ones claimed. So `names` is
+        // REQUIRED and NON-EMPTY on every claim, and an empty `headers` array is
+        // refused -- a requirement that cannot fail is the nominal claim this key
+        // exists to make impossible.
+        //
+        // ** THE KEYS ARE GATED PER STATE. A `reason` under `surface`, or
+        // `headers` under `claims-nothing`, is REFUSED rather than ignored: an
+        // unreachable field sitting in config looks exactly like a field that
+        // does something, which is how the `paramss` class of defect works.
+        //
+        // ENFORCED IN THE SHARED PARSER, so all THREE families inherit it --
+        // language, target and format. The motivating macros are language-owned
+        // but nothing about the defect is: `_WIN32` is language-owned, `__LP64__`
+        // is FORMAT-owned, and both imply real surfaces.
+        //
+        // The SHAPE is validated here (core owns the predicate's grammar); the
+        // SATISFACTION of a `surface` claim is checked against the shipped
+        // descriptor corpus by `ffi::validateShippedSurfaceRequirements`, the
+        // only tier that can see the corpus. `not-expressible` is RECORDED and
+        // deliberately NOT evaluated -- a language-feature predicate is an
+        // operator-deferred build, and this enumerator is not a licence for one.
+        //
+        // WARNING: THE KEY WAS RENAMED FROM `requires` ON 2026-08-18 BY OPERATOR
+        // RULING -- see the long note in `preprocess_config.hpp`. Do not
+        // reintroduce that spelling.
+        if (!e.contains("impliedSurface")) {
+            coll.emit(DiagnosticCode::C_MissingField, mpath + "/impliedSurface",
+                      "a 'predefinedMacros' entry requires 'impliedSurface' - an "
+                      "object tagged by 'kind': {\"kind\":\"surface\",\"headers\""
+                      ":[{\"header\":\"unistd.h\",\"names\":[\"getpid\"]}]}, or "
+                      "{\"kind\":\"claims-nothing\",\"reason\":\"arch-property\"}"
+                      ", or {\"kind\":\"not-expressible\",\"note\":\"...\"}. It "
+                      "is MANDATORY in all three states: an omitted field cannot "
+                      "be told apart from a question nobody asked, and an unasked "
+                      "question is how an identity macro ships promising a "
+                      "platform surface that was never built");
+            continue;
+        }
+        {
+            json const& is = e.at("impliedSurface");
+            if (!is.is_object()) {
+                coll.emit(entryCode, mpath + "/impliedSurface",
+                          "'impliedSurface' must be an OBJECT tagged by 'kind' - "
+                          "there is no null form, because a bare null is exactly "
+                          "the low-content answer that cannot be reviewed");
+                continue;
+            }
+            if (!is.contains("kind") || !is.at("kind").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          mpath + "/impliedSurface/kind",
+                          "'impliedSurface' requires a string 'kind' "
+                          "(\"surface\" / \"claims-nothing\" / "
+                          "\"not-expressible\")");
+                continue;
+            }
+            const std::string kindText = is.at("kind").get<std::string>();
+            auto const        kindOpt  = impliedSurfaceKindFromName(kindText);
+            if (!kindOpt.has_value()) {
+                coll.emit(entryCode, mpath + "/impliedSurface/kind",
+                          std::format("unknown 'impliedSurface.kind' '{}' "
+                                      "(expected \"surface\" / \"claims-nothing\""
+                                      " / \"not-expressible\")",
+                                      kindText));
+                continue;
+            }
+            ImpliedSurface impl;
+            impl.kind = *kindOpt;
+
+            // The key vocabulary is PER STATE, so a field belonging to another
+            // state is refused rather than silently ignored.
+            bool keysOk = true;
+            auto checkKeys = [&](std::initializer_list<std::string_view> allowed) {
+                for (auto it = is.begin(); it != is.end(); ++it) {
+                    if (isDocumentationKey(it.key())) continue;
+                    if (std::ranges::find(allowed, it.key()) != allowed.end())
+                        continue;
+                    std::string list;
+                    for (auto const& a : allowed) {
+                        if (!list.empty()) list += ", ";
+                        list += '\'';
+                        list += a;
+                        list += '\'';
+                    }
+                    coll.emit(entryCode,
+                              std::format("{}/impliedSurface/{}", mpath, it.key()),
+                              std::format("key '{}' is not valid under "
+                                          "'impliedSurface.kind' = '{}' - allowed "
+                                          "keys are {}. An unreachable field is "
+                                          "REFUSED rather than ignored: in config "
+                                          "it looks exactly like a field that does "
+                                          "something",
+                                          it.key(), kindText, list));
+                    keysOk = false;
+                }
+            };
+
+            if (impl.kind == ImpliedSurfaceKind::Surface) {
+                checkKeys({"kind", "headers"});
+                if (!keysOk) continue;
+                if (!is.contains("headers")) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              mpath + "/impliedSurface/headers",
+                              "a 'surface' impliedSurface requires 'headers'");
+                    continue;
+                }
+                json const& hs = is.at("headers");
+                // NON-EMPTY. An empty array is a requirement that cannot fail,
+                // and a requirement that cannot fail is the nominal claim this
+                // key exists to make impossible. Say "implies nothing" with the
+                // `claims-nothing` tag and a reason, where it is reviewable.
+                if (!hs.is_array() || hs.empty()) {
+                    coll.emit(entryCode, mpath + "/impliedSurface/headers",
+                              "'headers' must be a NON-EMPTY array of "
+                              "{\"header\",\"names\"} claims - an empty array is "
+                              "a requirement that can never fail; say \"implies "
+                              "nothing\" with {\"kind\":\"claims-nothing\","
+                              "\"reason\":...}");
+                    continue;
+                }
+                bool reqOk = true;
+                for (std::size_t hi = 0; hi < hs.size() && reqOk; ++hi) {
+                    const auto  hpath =
+                        std::format("{}/impliedSurface/headers/{}", mpath, hi);
+                    json const& h = hs[hi];
+                    if (!h.is_object()) {
+                        coll.emit(entryCode, hpath,
+                                  "each 'headers' entry must be an object "
+                                  "{\"header\":\"h\",\"names\":[\"n\",...]}");
+                        reqOk = false;
+                        break;
+                    }
+                    {
+                        static constexpr std::array<std::string_view, 2> kClaimKeys{
+                            "header", "names"};
+                        DSS_CHECK_KEY_VOCABULARY(kClaimKeys);
+                        for (auto it = h.begin(); it != h.end(); ++it) {
+                            if (isDocumentationKey(it.key())) continue;
+                            if (std::ranges::find(kClaimKeys, it.key())
+                                != kClaimKeys.end()) continue;
+                            coll.emit(entryCode,
+                                      std::format("{}/{}", hpath, it.key()),
+                                      std::format("unknown key '{}' in a "
+                                                  "'headers' claim - allowed keys "
+                                                  "are 'header', 'names'",
+                                                  it.key()));
+                            reqOk = false;
+                        }
+                        if (!reqOk) break;
+                    }
+                    if (!h.contains("header") || !h.at("header").is_string()
+                        || h.at("header").get<std::string>().empty()) {
+                        coll.emit(entryCode, hpath + "/header",
+                                  "a 'headers' claim requires a non-empty string "
+                                  "'header' (the shipped header NAME, e.g. "
+                                  "\"dirent.h\")");
+                        reqOk = false;
+                        break;
+                    }
+                    ShippedSurfaceClaim claim;
+                    claim.header = h.at("header").get<std::string>();
+                    for (auto const& prior : impl.headers) {
+                        if (prior.header == claim.header) {
+                            coll.emit(entryCode, hpath + "/header",
+                                      std::format("duplicate 'header' claim '{}' "
+                                                  "- one header is claimed once, "
+                                                  "with all its names in a single "
+                                                  "'names' array",
+                                                  claim.header));
+                            reqOk = false;
+                            break;
+                        }
+                    }
+                    if (!reqOk) break;
+                    // `names` -- REQUIRED and NON-EMPTY. THE GRANULARITY RULE,
+                    // and this is the only place it can be enforced before the
+                    // claim is believed. A header-only claim is satisfied by the
+                    // descriptor merely EXISTING -- and with transitive re-export
+                    // that is nearly vacuous, since the header resolves the moment
+                    // an `includes` edge fires, whatever arrives through it.
+                    if (!h.contains("names") || !h.at("names").is_array()
+                        || h.at("names").empty()) {
+                        coll.emit(entryCode, hpath + "/names",
+                                  std::format("the 'headers' claim for '{}' "
+                                              "requires a NON-EMPTY 'names' "
+                                              "array. A header-only claim is "
+                                              "satisfied by the descriptor merely "
+                                              "EXISTING, and with transitive "
+                                              "re-export that is nearly vacuous - "
+                                              "the header resolves the moment an "
+                                              "'includes' edge fires, whatever "
+                                              "arrives through it. Name the "
+                                              "declarations the macro's consumers "
+                                              "actually use",
+                                              claim.header));
+                        reqOk = false;
+                        break;
+                    }
+                    for (std::size_t ni = 0; ni < h.at("names").size(); ++ni) {
+                        json const& nv = h.at("names")[ni];
+                        if (!nv.is_string() || nv.get<std::string>().empty()) {
+                            coll.emit(entryCode, hpath + "/names",
+                                      "each 'names' entry must be a non-empty "
+                                      "string");
+                            reqOk = false;
+                            break;
+                        }
+                        std::string nm = nv.get<std::string>();
+                        if (std::find(claim.names.begin(), claim.names.end(), nm)
+                            != claim.names.end()) {
+                            coll.emit(entryCode, hpath + "/names",
+                                      std::format("duplicate name '{}' in a "
+                                                  "'names' array",
+                                                  nm));
+                            reqOk = false;
+                            break;
+                        }
+                        claim.names.push_back(std::move(nm));
+                    }
+                    if (!reqOk) break;
+                    impl.headers.push_back(std::move(claim));
+                }
+                if (!reqOk) continue;
+            } else if (impl.kind == ImpliedSurfaceKind::ClaimsNothing) {
+                checkKeys({"kind", "reason", "note"});
+                if (!keysOk) continue;
+                if (!is.contains("reason") || !is.at("reason").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              mpath + "/impliedSurface/reason",
+                              "a 'claims-nothing' impliedSurface requires a "
+                              "string 'reason' from the closed set "
+                              "(\"erases-to-nothing\" / \"arch-property\" / "
+                              "\"standard-defined\")");
+                    continue;
+                }
+                const std::string reasonText = is.at("reason").get<std::string>();
+                auto const        reasonOpt =
+                    claimsNothingReasonFromName(reasonText);
+                // CLOSED, and an unknown value fails loud. A free-text reason
+                // could not be audited across dozens of rows, and a reason that
+                // cannot be audited is a null with extra keystrokes.
+                if (!reasonOpt.has_value()) {
+                    coll.emit(entryCode, mpath + "/impliedSurface/reason",
+                              std::format("unknown 'reason' '{}' (expected "
+                                          "\"erases-to-nothing\" / "
+                                          "\"arch-property\" / "
+                                          "\"standard-defined\")",
+                                          reasonText));
+                    continue;
+                }
+                impl.reason = *reasonOpt;
+                // `note` is OPTIONAL here ON PURPOSE: the honest low-content rows
+                // have to stay cheap, or dozens of them become dozens of essays
+                // and the field decays into ceremony. When present it must still
+                // be a non-empty string -- an empty note is a key that says
+                // nothing while looking like it says something.
+                if (is.contains("note")) {
+                    if (!is.at("note").is_string()
+                        || is.at("note").get<std::string>().empty()) {
+                        coll.emit(entryCode, mpath + "/impliedSurface/note",
+                                  "'note' must be a non-empty string when present"
+                                  " - omit it rather than declaring an empty one");
+                        continue;
+                    }
+                    impl.note = is.at("note").get<std::string>();
+                }
+            } else {
+                // NotExpressible
+                checkKeys({"kind", "note"});
+                if (!keysOk) continue;
+                // REQUIRED here, and that asymmetry with `claims-nothing` is the
+                // point: this state's entire content is the sentence saying WHAT
+                // the predicate cannot express. Without it the tag is
+                // indistinguishable from "claims nothing", which is the exact
+                // conflation the third state exists to prevent.
+                if (!is.contains("note") || !is.at("note").is_string()
+                    || is.at("note").get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              mpath + "/impliedSurface/note",
+                              "a 'not-expressible' impliedSurface requires a "
+                              "non-empty 'note' saying WHAT it implies that this "
+                              "predicate cannot state (e.g. \"GNU C language "
+                              "extensions: statement expressions, __asm__, "
+                              "__attribute__\"). Without it the tag cannot be "
+                              "told apart from 'claims-nothing', which is the "
+                              "conflation this state exists to prevent");
+                    continue;
+                }
+                impl.note = is.at("note").get<std::string>();
+            }
+            pm.impliedSurface = std::move(impl);
         }
         // TF-C74: a WITHIN-LIST duplicate name is a load error. Two entries
         // spelling one macro would make the effective definition depend on

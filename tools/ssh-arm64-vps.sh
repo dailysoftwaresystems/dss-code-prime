@@ -39,6 +39,34 @@ unset _envHost _envUser _envKey
 : "${DSS_VPS_HOST:=}" ; : "${DSS_VPS_USER:=}" ; : "${DSS_VPS_KEY:=}"
 DSS_VPS_KEY=$(eval printf '%s' "\"$DSS_VPS_KEY\"")   # allow $HOME in the config
 
+# ★★★ THE SCRIPT FINDS THE KEY. THE CALLER NEVER DOES ANYTHING MANUALLY.
+# Operator instruction 2026-08-17: "you must be able to get everything from the
+# tool scripts, which goes inside .secrets and find the key. never manually."
+#
+# ⚠ WHY A REPO-RELATIVE KEY IS THE ONLY FORM THAT WORKS EVERYWHERE, measured:
+# `$HOME` names a DIFFERENT directory in each shell this repo is driven from —
+# `/home/<user>` in WSL, `/c/Users/<user>` in Git Bash, `C:\Users\<user>` in
+# PowerShell. ✔MEASURED 2026-08-17: the key existed ONLY under WSL's $HOME, so a
+# `$HOME`-relative config made this carriage work from WSL and fail from the other
+# two with "no private key at …" — a host reachable or not depending on which
+# shell you happened to start in. `$REPO/.secrets/` is the SAME directory in all
+# three, so resolving here removes the shell from the answer.
+# `.secrets/` is gitignored, so key material never reaches a commit.
+#
+# Precedence, and the order is deliberate: an explicit DSS_VPS_KEY that EXISTS
+# always wins (a caller pointing at a specific key means it); otherwise the
+# repo-local key is used; only then do we fail. A non-existent explicit path does
+# NOT silently fall through to a different key — that would answer a question the
+# caller did not ask — but it DOES fall through to discovery, and says so.
+_repo_key=$REPO/.secrets/arm64-vps.key
+if [ -n "$DSS_VPS_KEY" ] && [ ! -f "$DSS_VPS_KEY" ] && [ -f "$_repo_key" ]; then
+    echo "ssh-arm64-vps: DSS_VPS_KEY='$DSS_VPS_KEY' does not exist; using the repo-local key $_repo_key" >&2
+    DSS_VPS_KEY=$_repo_key
+elif [ -z "$DSS_VPS_KEY" ] && [ -f "$_repo_key" ]; then
+    DSS_VPS_KEY=$_repo_key
+fi
+unset _repo_key
+
 if [ -z "$DSS_VPS_HOST" ] || [ -z "$DSS_VPS_USER" ] || [ -z "$DSS_VPS_KEY" ]; then
     {
       echo "ssh-arm64-vps: connection data missing."
@@ -51,6 +79,40 @@ if [ ! -f "$DSS_VPS_KEY" ]; then
     # Name the cause: "permission denied" would send the reader hunting server-side.
     echo "ssh-arm64-vps: no private key at '$DSS_VPS_KEY' (DSS_VPS_KEY)." >&2
     exit 3
+fi
+
+# ★★ A KEY ON A WINDOWS DRIVE IS WORLD-READABLE TO WSL, AND ssh REFUSES IT.
+# ✔MEASURED 2026-08-17: the repo lives on `/mnt/c`, whose DrvFs mount maps Windows
+# ACLs to mode **0444** regardless of `icacls`, so from WSL ssh says
+#   "WARNING: UNPROTECTED PRIVATE KEY FILE! … Permissions 0444 … are too open"
+# and then fails as "Permission denied (publickey)" — a message that blames the
+# SERVER for a LOCAL file-mode problem, which is exactly the wrong place to look.
+# `chmod` cannot fix it: DrvFs ignores mode changes without the `metadata` mount
+# option, so the fix has to be a private COPY rather than a permission change.
+# ⇒ The script does this itself. The operator's rule is that the tooling resolves
+# everything and the caller never does anything manually, so "chmod it yourself"
+# is not an acceptable answer here — nor is it even possible on this mount.
+if [ -r "$DSS_VPS_KEY" ]; then
+    _mode=$(stat -c '%a' "$DSS_VPS_KEY" 2>/dev/null || echo '')
+    case "$_mode" in
+        ''|*00) : ;;                       # unknown, or already owner-only
+        *)
+            # Group or other bits are set. Try chmod first (works on a native fs);
+            # only fall back to a private copy if the mode genuinely will not move.
+            chmod 600 "$DSS_VPS_KEY" 2>/dev/null || true
+            if [ "$(stat -c '%a' "$DSS_VPS_KEY" 2>/dev/null || echo 600)" != "600" ]; then
+                _priv=$(mktemp "${TMPDIR:-/tmp}/.dss-vps-key.XXXXXX") || {
+                    echo "ssh-arm64-vps: cannot create a private copy of the key." >&2; exit 3; }
+                # Restrict BEFORE writing: a world-readable window, however brief, is
+                # still a window.
+                chmod 600 "$_priv" && cat "$DSS_VPS_KEY" > "$_priv" || {
+                    rm -f "$_priv"; echo "ssh-arm64-vps: failed to stage a private key copy." >&2; exit 3; }
+                trap 'rm -f "$_priv"' EXIT HUP INT TERM
+                DSS_VPS_KEY=$_priv
+            fi
+            ;;
+    esac
+    unset _mode
 fi
 
 args=(-i "$DSS_VPS_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=25

@@ -11,6 +11,43 @@
 
 namespace dss::opt::passes {
 
+namespace {
+
+// ★★★ THE ONE PLACE THIS FILE COMPOSES A FATAL, and the pass attribution is a
+// MANDATORY PARAMETER rather than an optional decoration
+// (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS). Nine `fprintf` sites each
+// free to forget the name is how the row happened; one composer that cannot be
+// called without a name is how it stays closed — a fatal added here next year
+// gets the attribution because there is no other way to raise one.
+//
+// `[[noreturn]]` so callers need no trailing `std::abort()` (a site that
+// formatted the message and then FELL THROUGH would be a silent continuation
+// past a substrate-contract violation — the exact failure class this file's
+// aborts exist to prevent).
+//
+// `std::format`, not `fprintf("%s")`: every caller hands us a
+// `std::string_view`, which is not guaranteed NUL-terminated, so `%s` on
+// `.data()` is undefined behaviour — and this is the code path where the process
+// is already dying, i.e. the worst place to add a second fault. `%.*s` would
+// work but repeats a `static_cast<int>(sv.size()), sv.data()` pair at every
+// site, which is exactly the per-site detail this helper exists to delete.
+//
+// The explicit flush matters: `std::abort()` is not required to flush C streams,
+// and the whole value of this message is that it survives the process.
+[[noreturn]] void rebuildFatal(std::string_view subject,
+                               std::string_view passName,
+                               std::string_view detail) {
+    std::fputs(std::format("dss::opt::passes::{} fatal [pass={}]: {}\n",
+                           subject, passName, detail).c_str(), stderr);
+    std::fflush(stderr);
+    std::abort();
+}
+
+// The subject every `MirFunctionRebuilder` (and `MirRebuildPolicy` default-arm)
+// fatal reports under — one spelling, so the message is greppable.
+constexpr std::string_view kRebuilderSubject = "MirFunctionRebuilder";
+
+} // namespace
 
 GlobalClonePrelude
 cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
@@ -64,19 +101,19 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
 }
 
 void cloneGlobalsRemappingInitFunc(Mir const& mir, MirBuilder& builder,
-                                   std::span<std::uint32_t const> oldOrdinalToNew) {
+                                   std::span<std::uint32_t const> oldOrdinalToNew,
+                                   std::string_view passName) {
     // Same alias-analysis polarity propagation every clone path performs
     // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE).
     builder.setAliasingMode(mir.aliasingMode());
     builder.setCharTypesAliasAll(mir.charTypesAliasAll());
 
     if (oldOrdinalToNew.size() != mir.moduleFuncCount()) {
-        std::fprintf(stderr,
-            "dss::opt::passes::cloneGlobalsRemappingInitFunc fatal: remap has "
-            "%zu entries but the source module has %zu functions — the caller "
-            "built the table from a different module than it is cloning.\n",
-            oldOrdinalToNew.size(), mir.moduleFuncCount());
-        std::abort();
+        rebuildFatal("cloneGlobalsRemappingInitFunc", passName,
+            std::format("remap has {} entries but the source module has {} "
+                        "functions — the caller built the table from a "
+                        "different module than it is cloning.",
+                        oldOrdinalToNew.size(), mir.moduleFuncCount()));
     }
 
     std::uint32_t const newTag = builder.id().v;
@@ -93,15 +130,14 @@ void cloneGlobalsRemappingInitFunc(Mir const& mir, MirBuilder& builder,
         if (oldInitFunc.valid()) {
             std::uint32_t const mapped = oldOrdinalToNew[oldInitFunc.v];
             if (mapped == UINT32_MAX) {
-                std::fprintf(stderr,
-                    "dss::opt::passes::cloneGlobalsRemappingInitFunc fatal: "
-                    "global symbol %u is initialized by function ordinal %u, "
-                    "which the rebuild DROPPED. A module-init function is never "
-                    "a legitimate drop target; re-pointing the global at "
-                    "whichever function inherited the ordinal would be a silent "
-                    "wrong-body call.\n",
-                    mir.globalSymbol(g).v, oldInitFunc.v);
-                std::abort();
+                rebuildFatal("cloneGlobalsRemappingInitFunc", passName,
+                    std::format("global symbol {} is initialized by function "
+                                "ordinal {}, which the rebuild DROPPED. A "
+                                "module-init function is never a legitimate "
+                                "drop target; re-pointing the global at "
+                                "whichever function inherited the ordinal "
+                                "would be a silent wrong-body call.",
+                                mir.globalSymbol(g).v, oldInitFunc.v));
             }
             newInitFunc = MirFuncId{mapped, newTag};
         }
@@ -166,27 +202,31 @@ void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder) {
 }
 
 void MirRebuildPolicy::onZeroPhiIncomings(MirInstId oldPhi, MirBlockId oldBlock,
-                                         MirFuncId oldFn, MirInstId newPhi) {
-    std::fprintf(stderr,
-        "dss::opt::passes::MirFunctionRebuilder fatal: phi at OLD funcId "
-        "v=%u, OLD block v=%u, OLD phi v=%u (new id v=%u) ended phase 3 "
-        "with zero accepted incomings — every predecessor was rejected by "
-        "policy.acceptPhiIncoming(). Typical cause: a reachable block with "
-        "all-unreachable predecessors (a structural violation the verifier "
-        "should have rejected at the source MIR).\n",
-        oldFn.v, oldBlock.v, oldPhi.v, newPhi.v);
-    std::abort();
+                                         MirFuncId oldFn, MirInstId newPhi,
+                                         std::string_view drivingPassName) {
+    rebuildFatal(kRebuilderSubject, drivingPassName,
+        std::format("phi at OLD funcId v={}, OLD block v={}, OLD phi v={} "
+                    "(new id v={}) ended phase 3 with zero accepted incomings "
+                    "— every predecessor was rejected by "
+                    "policy.acceptPhiIncoming(). Typical cause: a reachable "
+                    "block with all-unreachable predecessors (a structural "
+                    "violation the verifier should have rejected at the source "
+                    "MIR).",
+                    oldFn.v, oldBlock.v, oldPhi.v, newPhi.v));
 }
 
 MirInstId MirFunctionRebuilder::rewriteOperand(MirInstId oldOp) const {
     auto const it = rewrite_.find(oldOp.v);
     if (it == rewrite_.end()) {
-        std::fprintf(stderr,
-            "dss::opt::passes::MirFunctionRebuilder fatal: rewriteOperand: "
-            "old MirInstId v=%u has no rewrite entry — scan-order violation "
-            "OR operand referenced a skipped instruction "
-            "(D-OPT2-REWRITE-MAP-COMPLETENESS).\n", oldOp.v);
-        std::abort();
+        // ★ THE FATAL THAT MOTIVATED THE ROW. This text is identical for all
+        // ~9 policies; `[pass=…]` is the only thing in it that says WHOSE
+        // rebuild died, and last cycle its absence cost a whole `DSS_OPT_TRACE`
+        // run to learn the one word `SimplifyCfg`.
+        rebuildFatal(kRebuilderSubject, policy_.passName(),
+            std::format("rewriteOperand: old MirInstId v={} has no rewrite "
+                        "entry — scan-order violation OR operand referenced a "
+                        "skipped instruction "
+                        "(D-OPT2-REWRITE-MAP-COMPLETENESS).", oldOp.v));
     }
     return it->second;
 }
@@ -342,12 +382,11 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
             if (!absorbed.has_value()) break;
             currentSource = *absorbed;
             if (++absorbDepth > absorbCap) {
-                std::fprintf(stderr,
-                    "dss::opt::passes::MirFunctionRebuilder fatal: "
-                    "absorbSuccessor chain exceeded block count "
-                    "walking from oldB v=%u — cycle in absorb chain "
-                    "(substrate-contract violation).\n", oldB.v);
-                std::abort();
+                rebuildFatal(kRebuilderSubject, policy_.passName(),
+                    std::format("absorbSuccessor chain exceeded block count "
+                                "walking from oldB v={} — cycle in absorb "
+                                "chain (substrate-contract violation).",
+                                oldB.v));
             }
         }
     }
@@ -374,15 +413,14 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
                 // fail-loud only fires when EVERY incoming is dropped;
                 // a single-edge silent drop turns the phi value-wrong
                 // without diagnostic).
-                std::fprintf(stderr,
-                    "dss::opt::passes::MirFunctionRebuilder fatal: phi "
-                    "incoming pred old v=%u (redirected to v=%u) not in "
-                    "blockMap_ after acceptPhiIncoming admitted it. "
-                    "OLD phi v=%u, OLD block v=%u, OLD fn v=%u. Policy "
-                    "must keep redirected preds in the surviving set.\n",
-                    inc.pred.v, redirectedPred.v, dp.oldPhi.v,
-                    dp.oldBlock.v, oldFn.v);
-                std::abort();
+                rebuildFatal(kRebuilderSubject, policy_.passName(),
+                    std::format("phi incoming pred old v={} (redirected to "
+                                "v={}) not in blockMap_ after "
+                                "acceptPhiIncoming admitted it. OLD phi v={}, "
+                                "OLD block v={}, OLD fn v={}. Policy must keep "
+                                "redirected preds in the surviving set.",
+                                inc.pred.v, redirectedPred.v, dp.oldPhi.v,
+                                dp.oldBlock.v, oldFn.v));
             }
             MirInstId const newVal = mapOperand(inc.value);
             dst_.addPhiIncoming(dp.newPhi,
@@ -390,7 +428,11 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
             ++kept;
         }
         if (kept == 0) {
-            active_->onZeroPhiIncomings(dp.oldPhi, dp.oldBlock, oldFn, dp.newPhi);
+            // `policy_`, NOT `active_`: under the TF-C85 neuter `active_` is the
+            // identity substitute, and the reader needs the PIPELINE pass to
+            // locate the abort (see `onZeroPhiIncomings`' `drivingPassName`).
+            active_->onZeroPhiIncomings(dp.oldPhi, dp.oldBlock, oldFn, dp.newPhi,
+                                        policy_.passName());
         }
     }
     // TF-C85: hand the pass its own policy back for the next function.
@@ -450,13 +492,12 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         MirBlockId const redirected = active_->redirectBlockTarget(oldTarget);
         auto const it = blockMap_.find(redirected.v);
         if (it == blockMap_.end()) {
-            std::fprintf(stderr,
-                "dss::opt::passes::MirFunctionRebuilder fatal: BlockAddress target "
-                "old v=%u (redirected v=%u) not in blockMap_ — an address-taken "
-                "block was elided/merged (MF-B guard missing in this pass). "
-                "Originating BlockAddress: old MirInstId v=%u.\n",
-                oldTarget.v, redirected.v, oldId.v);
-            std::abort();
+            rebuildFatal(kRebuilderSubject, policy_.passName(),
+                std::format("BlockAddress target old v={} (redirected v={}) not "
+                            "in blockMap_ — an address-taken block was "
+                            "elided/merged (MF-B guard missing in this pass). "
+                            "Originating BlockAddress: old MirInstId v={}.",
+                            oldTarget.v, redirected.v, oldId.v));
         }
         MirInstId const newId = dst_.addBlockAddress(it->second, src_.instType(oldId),
                                                      src_.instFlags(oldId));
@@ -520,9 +561,16 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
     auto const oldOps  = src_.instOperands(oldId);
     auto const oldBlk  = src_.instBlock(oldId);
     auto const oldSucc = src_.blockSuccessors(oldBlk);
-    bool const record  = active_->recordTerminatorInRewrite();
+    // ★★★ UNCONDITIONAL, AND THE `if` THAT USED TO GUARD IT WAS A PROCESS ABORT
+    // ON A LEGAL PROGRAM (D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER).
+    // A `ReturnPiece` ANCHORS to its producer through its one operand, and an
+    // `asm goto` with outputs makes that producer the block's TERMINATOR — so a
+    // policy answering "nothing reads a terminator as an operand" was answering
+    // a question about the MIR, wrongly, from a place that cannot see it. The
+    // full reasoning (and why neither `false` answer survived measurement) is in
+    // the header where the hook used to be declared.
     auto remember = [&](MirInstId newId) {
-        if (record) rewrite_.emplace(oldId.v, newId);
+        rewrite_.emplace(oldId.v, newId);
     };
     // Per-terminator full-replacement hook (branch-folding etc.).
     // Returning a value short-circuits the standard emit arms.
@@ -535,14 +583,13 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
         MirBlockId const redirected = active_->redirectBlockTarget(oldS);
         auto const it = blockMap_.find(redirected.v);
         if (it == blockMap_.end()) {
-            std::fprintf(stderr,
-                "dss::opt::passes::MirFunctionRebuilder fatal: emitTerminator "
-                "successor old v=%u (redirected to v=%u) not in blockMap_ — "
-                "either `selectBlocks` omitted a reachable block OR a policy's "
-                "`redirectBlockTarget` returned an elided block. Originating "
-                "terminator: old MirInstId v=%u.\n",
-                oldS.v, redirected.v, oldId.v);
-            std::abort();
+            rebuildFatal(kRebuilderSubject, policy_.passName(),
+                std::format("emitTerminator successor old v={} (redirected to "
+                            "v={}) not in blockMap_ — either `selectBlocks` "
+                            "omitted a reachable block OR a policy's "
+                            "`redirectBlockTarget` returned an elided block. "
+                            "Originating terminator: old MirInstId v={}.",
+                            oldS.v, redirected.v, oldId.v));
         }
         return it->second;
     };
@@ -642,12 +689,11 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             return;
         }
         default:
-            std::fprintf(stderr,
-                "dss::opt::passes::MirFunctionRebuilder fatal: emitTerminator: "
-                "MirOpcode %d marked isTerminator but no clone arm — add an "
-                "arm here when introducing a new terminator opcode.\n",
-                static_cast<int>(op));
-            std::abort();
+            rebuildFatal(kRebuilderSubject, policy_.passName(),
+                std::format("emitTerminator: MirOpcode {} marked isTerminator "
+                            "but no clone arm — add an arm here when "
+                            "introducing a new terminator opcode.",
+                            static_cast<int>(op)));
     }
 }
 

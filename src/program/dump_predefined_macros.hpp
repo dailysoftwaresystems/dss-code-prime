@@ -143,6 +143,14 @@ struct DSS_EXPORT PredefinedMacroDumpRequest {
     // pretend otherwise.
     std::optional<ObjectFormatKind> activeFormat;
 
+    // D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC: the language's mutual-exclusion
+    // groups, forwarded to the merge so this instrument REFUSES an impossible
+    // identity for exactly the triples a real compile refuses. A dump that
+    // cheerfully printed a set the compiler rejects would be the instrument
+    // disagreeing with the thing it exists to describe — and this dump is how
+    // the co-definition defect was found in the first place.
+    std::span<PredefinedMacroExclusionGroup const> exclusiveGroups;
+
     // `--define NAME[=VALUE]` entries, VERBATIM as the CLI captured them. Split
     // by `splitUserDefine` at render time — the same function the preprocessor's
     // `<command-line>` prologue uses.

@@ -77,3 +77,19 @@ target_include_directories(dss_analysis_semantic_test_declarator_engine
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_link_libraries(dss_analysis_semantic_test_declarator_engine
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER: the DETECTOR,
+# REPOINTED when the row CLOSED (P5c, 2026-08-17). It no longer compares two
+# owners — there is one: it proves every shipped dialect's template lexer mode is
+# DERIVED from the language's `semantics.inlineAsmTemplateLexemes`, by moving the
+# language declaration in a scratch config tree and requiring every dialect's
+# mode AND the semantic scan to move with it, plus the three load refusals
+# (R1/R2/R3). Reads and REWRITES shipped JSON in a scratch tree, so it needs
+# nlohmann and the tests/ include root for `test_support/repo_root.hpp` +
+# `test_support/scoped_env.hpp`.
+dss_add_test(NAME analysis/semantic/test_inline_asm_template_sigil_agreement
+             SOURCES test_inline_asm_template_sigil_agreement.cpp)
+target_include_directories(dss_analysis_semantic_test_inline_asm_template_sigil_agreement
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(dss_analysis_semantic_test_inline_asm_template_sigil_agreement
+                      PRIVATE nlohmann_json::nlohmann_json)

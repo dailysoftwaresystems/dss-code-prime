@@ -6,11 +6,19 @@
 // invariants prevents per-pass drift (D-OPT-MIR-REBUILDER-EXTRACT).
 //
 // **REWRITE-MAP COMPLETENESS CONTRACT** (D-OPT2-REWRITE-MAP-COMPLETENESS):
-// every value-producing OLD-module inst must be in the rewrite map
-// by the time a downstream consumer reads it. Phi back-edges are the
-// one delayed case — handled in phase 3 only. A missing entry at
-// emit time is a substrate-contract violation; `rewriteOperand`
-// fails loud rather than propagating an invalid `MirInstId{}`.
+// every EMITTED OLD-module inst must be in the rewrite map by the time
+// a downstream consumer reads it. Phi back-edges are the one delayed
+// case — handled in phase 3 only. A missing entry at emit time is a
+// substrate-contract violation; `rewriteOperand` fails loud rather
+// than propagating an invalid `MirInstId{}`.
+//   ⚠ "EMITTED", NOT "VALUE-PRODUCING" — the two are not the same set and
+//   reading this line as the narrower one cost a `std::abort` on a legal
+//   program (D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER). An
+//   operand can reference an instruction as an ANCHOR rather than as a
+//   value: `ReturnPiece`'s single operand names its PRODUCER, and for an
+//   `asm goto` with outputs that producer is the block's TERMINATOR. So
+//   terminators are recorded too, unconditionally — see the note where
+//   the `recordTerminatorInRewrite` hook used to be.
 //
 // **The 3-phase rebuild**:
 //   Phase 1 — pre-create every selected block so terminators can
@@ -84,6 +92,11 @@ DSS_EXPORT void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder);
 // `i`, or `UINT32_MAX` if that function was dropped. Its size MUST equal the old
 // module's `moduleFuncCount()`.
 //
+// `passName` names the REBUILD DRIVER for the two fatals below, on the same
+// terms (and with the same spelling) as `cloneGlobalsOrCarveOut`'s — it is not
+// optional, because a fatal is the one message a reader cannot follow up
+// interactively (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS).
+//
 // ★ WHY THIS EXISTS RATHER THAN A CARVE-OUT. `cloneGlobalsOrCarveOut` answers a
 // runtime-init module by SKIPPING the pass — correct for an optimization, and
 // catastrophic here: skipping the strip emits an inline definition's body as a
@@ -99,7 +112,8 @@ DSS_EXPORT void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder);
 // re-added to `builder`.
 DSS_EXPORT void
 cloneGlobalsRemappingInitFunc(Mir const& mir, MirBuilder& builder,
-                              std::span<std::uint32_t const> oldOrdinalToNew);
+                              std::span<std::uint32_t const> oldOrdinalToNew,
+                              std::string_view passName);
 
 // Per-pass policy driving the rebuild. Pass-specific state lives on
 // the concrete subclass; the rebuilder owns only the rewrite map +
@@ -109,6 +123,43 @@ cloneGlobalsRemappingInitFunc(Mir const& mir, MirBuilder& builder,
 class DSS_EXPORT MirRebuildPolicy {
 public:
     virtual ~MirRebuildPolicy() = default;
+
+    // ★★★ THE PASS THIS POLICY BELONGS TO, PRINTED BY EVERY FATAL THE REBUILD
+    // SUBSTRATE CAN RAISE (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS).
+    // ~9 policies drive one rebuilder, and its aborts used to name only the
+    // HELPER: `rewriteOperand: old MirInstId v=N has no rewrite entry` reads
+    // identically whichever policy produced it. ✔MEASURED as a cost, not a
+    // theory — isolating D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER
+    // took a `DSS_OPT_TRACE` run whose ONLY product was the word `SimplifyCfg`.
+    // A fatal is the one message a reader cannot follow up interactively (the
+    // process is gone), so it is the least able to afford a missing attribution.
+    //
+    // ★★ PURE VIRTUAL, AND THAT IS THE MECHANISM RATHER THAN AN OVERSIGHT. A
+    // defaulted `passName = "unknown"` parameter would re-create this exact row
+    // for the next pass added — silently, at whichever construction site forgot
+    // it. An abstract method cannot be forgotten: a policy that does not name
+    // itself does not INSTANTIATE, so the omission is a compile error at the
+    // construction site and never a diagnostic hole at runtime.
+    //
+    // ★ WHY THE NAME LIVES ON THE POLICY AND NOT ON `MirFunctionRebuilder`'s
+    // constructor. ✔MEASURED 2026-08-17: the rebuilder is constructed at 17
+    // PRODUCTION sites — 11 in `src/opt/passes` (twice each in `cse.cpp` and
+    // `licm.cpp`) and SIX outside it (five `src/mir/merge` synth clones plus the
+    // optimizer's own inline-definition strip) — against 15 policy CLASSES,
+    // because a pass has exactly one policy TYPE. Per-construction-site strings
+    // would let two sites of the SAME pass disagree (or copy-paste a
+    // neighbour's), and this is the "a fact with an owner does not get a second
+    // owner" rule the deleted `recordTerminatorInRewrite` hook below was removed
+    // for violating. The policy is the pass's identity; it owns the pass's name.
+    //
+    // SPELLING: the pipeline's own name for the pass — `kPassNameTable` in
+    // `opt/optimizer.hpp`, i.e. the string `DSS_OPT_TRACE` and a
+    // `*.pipeline.json` already use — so a fatal's `[pass=Cse]` is greppable
+    // against both. A driver that is NOT a pipeline pass (the `src/mir/merge`
+    // synth clones, the optimizer's inline-definition strip) names ITSELF, and
+    // that is informative rather than a mismatch: it tells the reader the abort
+    // did not come from the optimizer pipeline at all.
+    [[nodiscard]] virtual std::string_view passName() const noexcept = 0;
 
     // Phase 1: returns the block list to walk. Called once per function.
     // ConstFold: all blocks (full module preserve). DCE: RPO-reachable
@@ -233,8 +284,8 @@ public:
     // → standard `emitTerminator` arm. SimplifyCFG overrides for
     // branch-folding: `CondBr(Const(true|false), T, F)` → `Br(T|F)`.
     // The hook receives the SAME ids the standard path would consume;
-    // returning a new MirInstId records it in the rewrite map (per
-    // `recordTerminatorInRewrite`) and skips the standard emit arm.
+    // returning a new MirInstId records it in the rewrite map (old
+    // terminator id → the id it became) and skips the standard emit arm.
     [[nodiscard]] virtual std::optional<MirInstId>
     tryRewriteTerminator(MirOpcode /*op*/, MirInstId /*oldId*/,
                          MirBuilder& /*dst*/,
@@ -262,18 +313,64 @@ public:
     // Default: structural violation, std::abort with diagnostic
     // naming the OLD function/block/phi (so a maintainer can locate
     // the bad MIR), not just the new arena id.
+    //
+    // ★ `drivingPassName` IS NOT `this->passName()`, AND THE DIFFERENCE IS THE
+    // WHOLE REASON IT IS A PARAMETER. Every hook — this one included — is
+    // dispatched through the ACTIVE policy, and for a `MirFunc.noOptimize`
+    // function the active policy is `MirIdentityRebuildPolicy` (TF-C85's
+    // neuter). `this->passName()` would then report `Identity` for an abort the
+    // reader has to locate in a release pipeline, naming the substitute instead
+    // of the culprit. The rebuilder passes the name of the policy it was
+    // CONSTRUCTED with, which is the pipeline pass in either case. An override
+    // must print it (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS).
     virtual void onZeroPhiIncomings(MirInstId oldPhi, MirBlockId oldBlock,
-                                    MirFuncId oldFn, MirInstId newPhi);
+                                    MirFuncId oldFn, MirInstId newPhi,
+                                    std::string_view drivingPassName);
 
-    // Phase 2: whether terminator results should be recorded in the
-    // rewrite map. ConstFold: true (defensive — terminator results
-    // are never read but for consistency). DCE: false (saves a few
-    // hash inserts; terminator results are never used). New passes
-    // should default to true unless they explicitly verify nothing
-    // downstream reads terminator-as-operand.
-    [[nodiscard]] virtual bool recordTerminatorInRewrite() const noexcept {
-        return true;
-    }
+    // ★★★ THERE IS NO `recordTerminatorInRewrite` HOOK, AND ITS ABSENCE IS THE
+    // FIX FOR A PROCESS ABORT ON A LEGAL PROGRAM
+    // (D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER).
+    //
+    // The hook used to let a policy declare "nothing downstream reads a
+    // terminator as an operand", and two policies (Dce, SimplifyCfg) declared
+    // it. ✔MEASURED 2026-08-17 at the CLI: the declaration is FALSE. An
+    // `asm goto` WITH OUTPUTS is a `InlineAsmGoto` terminator whose result
+    // pieces are `ReturnPiece`s at the heads of its successor blocks, and a
+    // `ReturnPiece`'s sole operand ANCHORS IT TO ITS PRODUCER — so a terminator
+    // is referenced by another instruction's operand list. With the hook
+    // answering false the producer had no rewrite entry and `rewriteOperand`
+    // `std::abort`ed: `--config=release` exited **127** on a program that
+    // `--config=debug` REFUSES with a clean `L_UnsupportedLoweringForOpcode`
+    // (D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER). The trace named the pass:
+    // every earlier pass (Identity, ConstFold, Mem2Reg, CopyProp, Cse, Licm)
+    // took the `true` default and rebuilt it cleanly; `SimplifyCfg` was the
+    // first to answer false, and it died.
+    //
+    // ★ WHY THE HOOK IS DELETED RATHER THAN RE-ANSWERED. Whether an old id is
+    // referenced is a property of THE MIR BEING REBUILT — it is spelled out in
+    // the operand lists the rebuilder is already walking — not a property of the
+    // pass doing the rebuilding. A policy cannot know it, cannot re-derive it,
+    // and gets no signal when a new opcode makes its answer false; the substrate
+    // then converts that stale answer into an abort in shared code. This is the
+    // "a fact with an owner does not get a second owner" rule: the operand lists
+    // own the fact, so the map is simply always complete.
+    //
+    // ★ AND NEITHER STATED REASON SURVIVED THE MEASUREMENT. Dce's was cost
+    // ("saves a few hash inserts" — one per block). SimplifyCfg's was a
+    // hypothetical: a consumer looking up a FOLDED `CondBr` would retrieve the
+    // replacement `Br` "with wrong shape". But that entry is ACCURATE (the new
+    // Br is exactly what that old terminator became), it is unreachable today (a
+    // CondBr yields no value and nothing anchors to one), and omitting it does
+    // not turn a wrong-shape read into a diagnostic — it turns it into a
+    // guaranteed `std::abort`. Recording is the strictly safer of the two.
+    //
+    // ⚠ THE ONE REMAINING WAY A TERMINATOR LEAVES NO ENTRY is `absorbSuccessor`,
+    // which DROPS the absorbed-from block's terminator instead of emitting it.
+    // That is sound because the hook's precondition is structural there rather
+    // than declared: `absorbSuccessor` fires only for a `P` whose terminator is
+    // a plain `Br`, and `opcodeInfo(Br)` has `R::None` with no anchor form, so
+    // nothing can reference it. A future policy that absorbs across a
+    // value-producing or anchorable terminator must re-map, not drop.
 
     // ★★ TF-C85: "this function is `noOptimize`; your hooks will NOT be called
     // for it." Fired by `MirFunctionRebuilder::rebuildFunction` immediately
@@ -341,6 +438,20 @@ public:
 // symbol with no definition).
 class DSS_EXPORT MirIdentityRebuildPolicy final : public MirRebuildPolicy {
 public:
+    // The pipeline's spelling of the pass this policy IS when a caller uses it
+    // directly (`kPassNameTable`: `PassId::Identity` → "Identity"; the debug
+    // pipeline is literally `["Identity"]`).
+    //
+    // ⚠ NOT the name reported when this policy is the TF-C85 NEUTER substitute
+    // inside another pass's rebuilder — there the fatals print the pass the
+    // rebuilder was constructed with, so a `noOptimize` function aborting under
+    // `SimplifyCfg` still says `SimplifyCfg`. See `onZeroPhiIncomings`'
+    // `drivingPassName`. Do not "fix" this string to cover that case; it would
+    // mis-name the direct use instead.
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "Identity";
+    }
+
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override;
 };

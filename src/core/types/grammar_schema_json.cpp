@@ -2432,6 +2432,23 @@ struct DeclaredHoles {
 // degrading to "no holes" — a document that declares holes and has them
 // silently dropped would resolve its abstract names against nothing and
 // produce a pile of unknown-reference errors pointing at the wrong file.
+//
+// NOTE ON THE NAME, so nobody re-creates the collision that was almost shipped.
+// A predefined-macro entry ALSO once carried a key called `requires` (the
+// shipped-header surface an identity macro asserts is realized). It was renamed
+// to `impliedSurface` on 2026-08-18 by operator ruling, and the reasoning is
+// worth keeping HERE because this is the site that would tempt the next author
+// to reuse the word: "different scopes, no parse ambiguity" is a correct
+// statement about the PARSER and the wrong test for a config key -- the parser
+// was never the reader at risk. The two are not even the same RELATION. THIS
+// `requires` marks known INCOMPLETENESS: the document declares holes and expects
+// a host to fill them. The other was a hard load-time REFUSAL on the honesty of
+// a claim. A reader carrying this meaning into that one reads its empty form as
+// "no known holes" rather than "this macro claims no platform surface", which
+// defeats the one device that mechanism has against recurrence.
+//
+// So: `requires` here means grammar HOLES, and nothing else in this file family
+// may be called that. See `core/types/preprocess_config.hpp`.
 [[nodiscard]] DeclaredHoles parseRequires(json const& doc,
                                           std::string_view docLabel,
                                           Collector& coll) {
@@ -2653,12 +2670,62 @@ void substituteHoles(json& v,
     }
 }
 
+// ── the inline-asm TEMPLATE lexeme ROLE SET ──────────────────────────────
+//    D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER
+//
+// ★★★ THE CLOSED ROLE VOCABULARY, DECLARED ONCE AND READ BY THREE PLACES: the
+// `semantics` reader (which fills `SemanticConfig` for the analyzer's scan), the
+// row SYNTHESIS below (which fills the dialect's template lexer mode), and the
+// `spelledHoles` extension in the merge (which is what lets a dialect bind the
+// one role no shared SHAPE spells). One table, so a role cannot exist for one
+// consumer and not for another.
+//
+// ★★ THE KEY IS THE `bindTokens` HOLE NAME. That is the intersection seam: the
+// LANGUAGE says which bytes play the role, the DIALECT says which of its token
+// kinds does, and the loader joins them BY NAME. Four of the five holes were
+// already bound because the shared template shapes spell them; `templateEscape`
+// is the fifth and is spelled by nothing but this table (see the merge).
+//
+// ⚠ ORDER IS THE DECLARATION ORDER OF THE DIAGNOSTICS, NOT A PRECEDENCE. The
+// scan resolves competing forms by LEXEME LENGTH (maximal munch), exactly as
+// `longestMatchInMode` does — never by the order of this array.
+struct InlineAsmTemplateRole {
+    std::string_view key;                               // == the token hole name
+    std::string InlineAsmTemplateLexemes::*field;       // where it lands
+    char const* what;                                   // for diagnostics
+};
+constexpr std::array<InlineAsmTemplateRole, 5> kInlineAsmTemplateRoles{{
+    // ⚠ THE `what` STRINGS NAME THE ROLE'S JOB AND QUOTE NO BYTE. A diagnostic
+    // that illustrated the role with the GNU spelling would be a hard-coded
+    // sigil in the very mechanism that exists to remove them — and would print
+    // the wrong bytes at a language that spells them differently. The declared
+    // lexeme is interpolated by each message that needs one.
+    {"templatePlaceholder",      &InlineAsmTemplateLexemes::placeholder,
+     "introduces an operand reference"},
+    {"templateEscape",           &InlineAsmTemplateLexemes::escape,
+     "is the literal-percent escape, and is what stops an escaped sigil from "
+     "being re-read as an operand reference"},
+    {"templateLabelPlaceholder", &InlineAsmTemplateLexemes::labelPlaceholder,
+     "introduces an `asm goto` label reference"},
+    {"symbolicNameOpen",         &InlineAsmTemplateLexemes::symbolicNameOpen,
+     "opens a symbolic operand name"},
+    {"symbolicNameClose",        &InlineAsmTemplateLexemes::symbolicNameClose,
+     "closes a symbolic operand name"},
+}};
+constexpr std::string_view kInlineAsmTemplateLexemesKey =
+    "inlineAsmTemplateLexemes";
+
 // One validated cross-language reference, carried from the merge phase to the
 // late token-resolution check.
 struct LanguageReferenceBinding {
     std::string refName;   // the `languageReferences` key ("asm")
     std::string docLabel;  // the referenced document's diagnostic label
     std::vector<std::pair<std::string, std::string>> tokens;  // hole → host kind
+    // This reference's document is where `semantics.inlineAsmTemplateLexemes`
+    // came from. Recorded HERE because the merge folds the block into `doc` and
+    // provenance is not recoverable afterwards — and the refusals below have to
+    // name BOTH declaration sites to be actionable.
+    bool suppliesTemplateLexemes = false;
 };
 
 // ── the merge itself ─────────────────────────────────────────────────────
@@ -2710,6 +2777,14 @@ void mergeLanguageReferences(
     // half runs after every reference has contributed. Collected here.
     std::vector<std::pair<std::string, std::pair<std::string, std::string>>>
         pendingRuleBindings;   // (diag path, (hole, host rule name))
+
+    // Does THIS document declare that it can host an embedded assembly
+    // template? Read from the raw `assembly` block (the block itself is parsed
+    // thousands of lines below; only the key's PRESENCE is needed here). It
+    // gates the template-role clause of `spelledHoles` — see there.
+    const bool hostDeclaresTemplateLexerMode =
+        doc.contains("assembly") && doc.at("assembly").is_object()
+        && doc.at("assembly").contains("templateLexerMode");
 
     for (auto const& [refName, spec] : lrs.items()) {
         if (isDocumentationKey(refName)) continue;
@@ -3020,6 +3095,39 @@ void mergeLanguageReferences(
             };
             for (auto const& name : reachable) {
                 collectHoles(refShapes.at(name), collectHoles);
+            }
+            // ★★★ A SHAPE IS NOT THE ONLY THING THAT SPELLS A HOLE, AND
+            // ASSUMING IT WAS WOULD HAVE MADE THE TEMPLATE ROLE SET
+            // UNIMPLEMENTABLE. `semantics.inlineAsmTemplateLexemes` names a
+            // token hole PER ROLE, and the loader consumes those names to
+            // synthesize this document's template lexer mode — so a binding for
+            // one of them substitutes something very real. Four of the five
+            // roles are also spelled by the shared template SHAPES and were
+            // already reachable; `templateEscape` is spelled by NOTHING ELSE,
+            // because the escaped percent has no shared production (in AT&T it
+            // is consumed by the dialect-private `attRegister`, in arm64 gas by
+            // nothing at all — it is a munch guard). Without this clause
+            // Direction 1 below would refuse the binding as "a binding with no
+            // hole silently does nothing", which is exactly the wrong verdict:
+            // it does the one thing the whole facet exists for.
+            // ⚠ GATED ON THE CAPABILITY, not on the role set's mere presence. A
+            // host that embeds no dialect (it SCANS templates, it does not LEX
+            // them) declares no `assembly.templateLexerMode`, synthesizes
+            // nothing, and must still be told that binding a template role does
+            // nothing for it.
+            if (hostDeclaresTemplateLexerMode
+                && refDoc.contains("semantics")
+                && refDoc.at("semantics").is_object()
+                && refDoc.at("semantics").contains(kInlineAsmTemplateLexemesKey)
+                && refDoc.at("semantics")
+                         .at(kInlineAsmTemplateLexemesKey).is_object()) {
+                json const& roles =
+                    refDoc.at("semantics").at(kInlineAsmTemplateLexemesKey);
+                for (auto const& r : kInlineAsmTemplateRoles) {
+                    std::string const key{r.key};
+                    if (!roles.contains(key) || roles.at(key).is_null()) continue;
+                    if (tokenHoles.contains(key)) spelledHoles.insert(key);
+                }
             }
         }
 
@@ -3422,8 +3530,11 @@ void mergeLanguageReferences(
         mergeBlock("hirLowering",   "ruleMappings", DiagnosticCode::C_InvalidHirLowering);
         mergeBlock("pipelineEntry", "byRule",       DiagnosticCode::C_InvalidHirLowering);
 
-        outRefs.push_back(LanguageReferenceBinding{refName, docLabel,
-                                                   std::move(tokenBindings)});
+        outRefs.push_back(LanguageReferenceBinding{
+            refName, docLabel, std::move(tokenBindings),
+            refDoc.contains("semantics") && refDoc.at("semantics").is_object()
+                && refDoc.at("semantics").contains(
+                       kInlineAsmTemplateLexemesKey)});
     }
 
     // Rule bindings resolve against the FINAL merged shape map — a host may
@@ -3437,6 +3548,375 @@ void mergeLanguageReferences(
                               "shape in the grammar '{}' assembles (its own "
                               "shapes plus every referenced document's)",
                               binding.first, binding.second, hostLabel));
+    }
+}
+
+// ── the inline-asm TEMPLATE MODE, SYNTHESIZED ────────────────────────────
+//    D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER, closed.
+//
+// ★★★ WHAT THIS REPLACES. Until 2026-08-17 each assembly DIALECT declared the
+// GNU template sigils itself — `"%": [{"kind":"PlaceholderSigil"}]` and four
+// siblings in its `asm-template` lexer mode — while `scanInlineAsmTemplate`
+// compared against the same bytes as C++ literals. Two owners of one fact, with
+// nothing able to detect them disagreeing (the semantic tier has no dialect in
+// scope when it scans). Now the LANGUAGE owns the bytes
+// (`semantics.inlineAsmTemplateLexemes`), the DIALECT owns the capability
+// (`assembly.templateLexerMode` + `templateOperandRule`) and the KINDS (its
+// `bindTokens`), and this function INTERSECTS them into the rows the tokenizer
+// reads.
+//
+// ★★ IT RUNS AS A JSON REWRITE, IMMEDIATELY AFTER THE MERGE AND BEFORE ANY
+// OTHER BLOCK IS PARSED, AND THAT PLACEMENT IS THE WHOLE REASON THE REST OF THE
+// LOADER NEEDS NO CHANGE. A synthesized row is parsed by the SAME
+// `parseMeaningArray` a hand-written one is, so it joins `modeIntroducedKinds`
+// (the per-mode harvest in the shapes block, ~1500 lines below the lexer-mode
+// pass this injection feeds), `maxLexemeLength` and the schema-id stamping
+// automatically — three consumers, none of which needed a line of change. A
+// later injection — straight into `data.lexerModeTokens` from the `assembly`
+// block, say — would miss all three, and the first two failures are SILENT: a
+// mode-introduced kind absent from that set makes the tree builder's drift guard
+// `tbFatal` at the first template, and a stale `maxLexemeLength` truncates the
+// tokenizer's longest-match window so a two-byte sigil silently lexes as one.
+// ✔MEASURED that the tokenizer needs no per-dialect branch to accept these:
+// `longestMatchInMode` reads `lexerModeTokens` as opaque data and cannot tell a
+// synthesized row from a declared one.
+//
+// ★ THE THREE REFUSALS. Together they make the second owner IMPOSSIBLE rather
+// than merely absent — the distinction the row was opened over:
+//   R1  a dialect that declares template lexemes of its own ⇒ LOAD ERROR naming
+//       BOTH declaration sites. Checked in both directions (same BYTES, or the
+//       same role-bound KIND under different bytes), so "spell it `@` instead"
+//       is refused as firmly as re-declaring `%`.
+//   R2  a dialect declaring the capability with no host language supplying the
+//       role set — or supplying it with a role this document binds no token for
+//       ⇒ LOAD ERROR. The intersection fails loud in BOTH directions.
+//   R3  an unknown role key ⇒ LOAD ERROR naming it (in the `semantics` reader,
+//       where the object is read).
+void synthesizeInlineAsmTemplateLexemeRows(
+        json& doc, std::string_view hostLabel,
+        std::vector<LanguageReferenceBinding> const& refs, Collector& coll) {
+    // ── the CAPABILITY half ──
+    std::string modeName;
+    if (doc.contains("assembly") && doc.at("assembly").is_object()) {
+        json const& as = doc.at("assembly");
+        if (as.contains("templateLexerMode")
+            && as.at("templateLexerMode").is_string()) {
+            modeName = as.at("templateLexerMode").get<std::string>();
+        }
+    }
+    // No capability ⇒ nothing to synthesize, and that is the ORDINARY case for
+    // a host language: `c-subset.lang.json` carries the role set (its analyzer
+    // SCANS templates) and declares no `assembly` block at all (it never LEXES
+    // one — the dialect does, at MIR→LIR).
+    if (modeName.empty()) return;
+
+    // ── the VOCABULARY half ──
+    std::string origin{hostLabel};
+    for (auto const& r : refs) {
+        if (r.suppliesTemplateLexemes) { origin = r.docLabel; break; }
+    }
+    json const* roles = nullptr;
+    if (doc.contains("semantics") && doc.at("semantics").is_object()
+        && doc.at("semantics").contains(kInlineAsmTemplateLexemesKey)
+        && doc.at("semantics").at(kInlineAsmTemplateLexemesKey).is_object()) {
+        roles = &doc.at("semantics").at(kInlineAsmTemplateLexemesKey);
+    }
+    if (roles == nullptr) {
+        // R2, first direction.
+        coll.emit(DiagnosticCode::C_MissingField,
+                  "/assembly/templateLexerMode",
+                  std::format(
+                      "'{}' declares 'assembly.templateLexerMode' = '{}' — the "
+                      "capability to be EMBEDDED as an inline-asm template — but "
+                      "no language document in scope declares "
+                      "'semantics.{}'. The template sigils are HOST-LANGUAGE "
+                      "vocabulary — the embedding language substitutes them "
+                      "before the assembler ever sees the text — so this dialect "
+                      "has no bytes to lex a placeholder from and its whole "
+                      "template surface would be silently dead. Reference a "
+                      "document that declares the role set, or drop the "
+                      "capability",
+                      hostLabel, modeName, kInlineAsmTemplateLexemesKey));
+        return;
+    }
+
+    // ── the JOIN: role → (lexeme, this document's token kind) ──
+    // The kind comes from `bindTokens` and from nowhere else: a dialect already
+    // had to name its own token for four of these five roles (the shared
+    // template shapes spell them), so re-stating it here would be the very
+    // second-owner shape this function exists to remove.
+    // ⚠ SCOPED TO THE REFERENCE THAT SUPPLIED THE ROLE SET, when one did. A hole
+    // namespace belongs to the document that DECLARED it, so two references
+    // could each declare a hole spelled `templatePlaceholder` and a union would
+    // let the wrong document's binding answer — silently, and by map iteration
+    // order. When the role set is the HOST's own (a self-contained language with
+    // its own embedded-asm surface) there is no supplying reference, so the union
+    // is the only available answer and an ambiguity in it is REFUSED rather than
+    // resolved.
+    std::unordered_map<std::string, std::string> boundKind;   // hole → kind
+    bool haveSupplier = false;
+    for (auto const& r : refs) {
+        if (!r.suppliesTemplateLexemes) continue;
+        haveSupplier = true;
+        for (auto const& [hole, kind] : r.tokens) boundKind.emplace(hole, kind);
+        break;
+    }
+    if (!haveSupplier) {
+        std::unordered_map<std::string, std::string> owner;   // hole → refName
+        for (auto const& r : refs) {
+            for (auto const& [hole, kind] : r.tokens) {
+                auto const [slot, fresh] = boundKind.emplace(hole, kind);
+                if (fresh) { owner.emplace(hole, r.refName); continue; }
+                if (slot->second == kind) continue;
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          std::format("/languageReferences/{}/bindTokens/{}",
+                                      r.refName, hole),
+                          std::format(
+                              "references '{}' and '{}' bind the token role "
+                              "'{}' to DIFFERENT kinds ('{}' vs '{}'), and this "
+                              "document declares its own inline-asm template "
+                              "role set — so nothing can say which kind the "
+                              "synthesized template row should carry, and the "
+                              "answer would depend on table iteration order",
+                              owner.at(hole), r.refName, hole, slot->second,
+                              kind));
+            }
+        }
+    }
+
+    struct Row { std::string lexeme; std::string kind; json meaning; };
+    std::vector<Row> rows;
+    std::unordered_map<std::string, std::string> lexemeOwner;  // lexeme → role
+    for (auto const& role : kInlineAsmTemplateRoles) {
+        std::string const key{role.key};
+        // ★★★ AN EXPLICIT `null` ROLE THAT THIS DOCUMENT NEVERTHELESS BINDS A
+        // TOKEN FOR IS A CONTRADICTION, AND IT IS REFUSED HERE RATHER THAN LEFT
+        // TO WHATEVER THE INTERNER HAPPENS TO CONTAIN.
+        //
+        // ✔MEASURED 2026-08-17, and this is the defect the clause closes: with
+        // `symbolicNameClose` declared null, the two shipped dialects gave
+        // OPPOSITE answers to the identical declaration.
+        //   • `asm-x86_64-att` binds it to `PlaceholderNameClose`, a kind NO
+        //     global lexeme of that document declares — the synthesized template
+        //     row was its ONLY declaration. Nulling the role un-minted the kind,
+        //     so the binding dangled and `asmTemplateSymbolicName` could not
+        //     resolve: the load FAILED, two tiers away from the cause.
+        //   • `asm-arm64-gas` binds it to `BracketClose`, which its GLOBAL table
+        //     declares for the memory form (`[x0, #8]`). Nulling the role changed
+        //     NOTHING observable: the template went on accepting the symbolic
+        //     name through the mode's global fallback. The language declared the
+        //     form ABSENT and the dialect kept parsing it — accept-and-do-nothing,
+        //     which is exactly what this facet refuses everywhere else.
+        // ⇒ the outcome depended on whether some UNRELATED declaration happened
+        // to mint the same kind. A pin that loaded "the first shipped dialect"
+        // therefore returned a verdict decided by `directory_iterator` ORDER —
+        // green on NTFS (sorted: arm64 first, the silent-accept path) and red on
+        // ext4 (hash order: att first, the loud path). The platform split was the
+        // SYMPTOM; two meanings for one declaration was the defect.
+        //
+        // ★★ THE RULE IS DECIDABLE FROM THE TWO DOCUMENTS ALONE — no interning
+        // order, no filesystem order, no dependence on what else mints the kind.
+        // A binding exists exactly when the entry's closure SPELLS the hole (the
+        // merge REQUIRES it), so "the language has no such form" together with
+        // "my grammar still needs a token for it" cannot both be true.
+        // ⚠ GATED ON THE CAPABILITY, and that gate is load-bearing rather than
+        // cautious: `symbolicNameOpen`/`Close` are ALSO the roles a HOST binds
+        // for its own operand spelling (`[name] "constraint" (expr)`), which has
+        // nothing to do with the template. A host declaring no
+        // `templateLexerMode` therefore keeps its binding AND honours the null —
+        // which is the case the operator's "explicit null permitted" clause is
+        // actually about, and the one place the null has an observable effect
+        // (`scanInlineAsmTemplate` stops recognizing that form).
+        if (roles->contains(key) && roles->at(key).is_null()) {
+            auto const bound = boundKind.find(key);
+            if (bound == boundKind.end()) continue;   // coherent: nothing needs it
+            coll.emit(DiagnosticCode::C_ConflictingField,
+                      std::format("/semantics/{}/{}",
+                                  kInlineAsmTemplateLexemesKey, key),
+                      std::format(
+                          "'{}' declares the inline-asm template role '{}' as "
+                          "ABSENT (null), but '{}' declares "
+                          "'assembly.templateLexerMode' = '{}' and BINDS that "
+                          "role to its token '{}'. A binding exists only because "
+                          "the rules this document imports SPELL the role, so "
+                          "the language saying the form does not exist and this "
+                          "grammar still needing a token for it cannot both be "
+                          "true. ⚠ Left unrefused the outcome depends on whether "
+                          "some UNRELATED lexeme of this document happens to "
+                          "declare '{}' as well: where it does, the form goes on "
+                          "being accepted through the mode's global fallback "
+                          "although the language declared it absent; where it "
+                          "does not, the load fails two tiers away with an "
+                          "unresolvable shape reference. Declare the role with a "
+                          "lexeme, or drop the binding and the grammar that "
+                          "spells it "
+                          "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-"
+                          "CONFIG-OWNER)",
+                          origin, key, hostLabel, modeName, bound->second,
+                          bound->second));
+            continue;
+        }
+        if (!roles->contains(key)) continue;   // the reader reports the omission
+        json const& entry = roles->at(key);
+        if (!entry.is_object() || !entry.contains("lexeme")
+            || !entry.at("lexeme").is_string()
+            || entry.at("lexeme").get<std::string>().empty()) {
+            continue;      // the `semantics` reader reports the shape defect
+        }
+        auto const lexeme = entry.at("lexeme").get<std::string>();
+        auto const it = boundKind.find(key);
+        if (it == boundKind.end()) {
+            // R2, second direction — the capability is declared, the role is
+            // declared, and this document names no token to carry it.
+            coll.emit(DiagnosticCode::C_MissingField,
+                      std::format("/languageReferences/*/bindTokens/{}", key),
+                      std::format(
+                          "'{}' declares 'assembly.templateLexerMode' = '{}' and "
+                          "'{}' declares the inline-asm template role '{}' "
+                          "(lexeme '{}', {}) — but this document binds NO token "
+                          "kind for it. The loader synthesizes the template "
+                          "mode's rows from the LANGUAGE's bytes and THIS "
+                          "document's kinds; an unbound role means that sigil is "
+                          "unlexable in every template, with a clean build log. "
+                          "Bind '{}' in 'bindTokens', or declare the role null "
+                          "in '{}' if no language spells it",
+                          hostLabel, modeName, origin, key, lexeme, role.what,
+                          key, origin));
+            continue;
+        }
+        auto const [owner, fresh] = lexemeOwner.emplace(lexeme, key);
+        if (!fresh) {
+            coll.emit(DiagnosticCode::C_ConflictingField,
+                      std::format("/semantics/{}/{}",
+                                  kInlineAsmTemplateLexemesKey, key),
+                      std::format(
+                          "template roles '{}' and '{}' are BOTH declared with "
+                          "the lexeme '{}' — the tokenizer resolves competing "
+                          "lexemes by LENGTH, so two roles on one spelling means "
+                          "one of them can never be produced and which one is "
+                          "decided by table iteration order. Give them distinct "
+                          "spellings, or declare one null",
+                          owner->second, key, lexeme));
+            continue;
+        }
+        json meaning = json::object();
+        meaning["kind"] = it->second;
+        // The delimiter behaviour of the two symbolic-name roles travels with
+        // the lexeme, because it is a property of the BYTE's job in the
+        // template and not of the dialect's token: `[` opens a bracket scope
+        // whether the dialect calls the kind `PlaceholderNameOpen` (AT&T, which
+        // has no bracket of its own) or `BracketOpen` (arm64 gas, whose memory
+        // form already uses one).
+        if (entry.contains("opensScope")) meaning["opensScope"] = entry.at("opensScope");
+        if (entry.contains("closesScope")) meaning["closesScope"] = entry.at("closesScope");
+        rows.push_back(Row{lexeme, it->second, std::move(meaning)});
+    }
+
+    // ── R1: the dialect may not own any of this ──
+    // The mode must EXIST — if it does not, the `assembly` block below says so
+    // precisely ("unknown lexer mode '<name>'"), and inventing it here would
+    // both hide that and mint a lexer mode the document never declared.
+    if (!doc.contains("lexerModes") || !doc.at("lexerModes").is_object()
+        || !doc.at("lexerModes").contains(modeName)
+        || !doc.at("lexerModes").at(modeName).is_object()) {
+        return;
+    }
+    json& mode = doc.at("lexerModes").at(modeName);
+    // ★★★ R1's THIRD SHAPE: `"tokens": "default"` — a VERBATIM COPY of the
+    // global table under this mode's id. It is a second declaration of the
+    // sigils and the worst one, because it declares them with their `.s`
+    // MEANINGS (`%` is the AT&T register sigil, the arm64 type sigil), so a
+    // template read in such a mode is byte-for-byte the file surface. It is
+    // refused rather than overwritten: silently replacing a declared table with
+    // the synthesized rows would discard a statement the author made.
+    if (mode.contains("tokens") && !mode.at("tokens").is_object()) {
+        coll.emit(DiagnosticCode::C_ConflictingField,
+                  std::format("/lexerModes/{}/tokens", modeName),
+                  std::format(
+                      "'{}' names mode '{}' as its inline-asm TEMPLATE lexer "
+                      "mode, and that mode declares a 'tokens' table which is "
+                      "not an inline object — a verbatim copy of the global "
+                      "table is a SECOND declaration of the template sigils, "
+                      "with their `.s` meanings, so every template would be read "
+                      "exactly as a standalone file. The loader owns this mode's "
+                      "table: it synthesizes one row per template role from "
+                      "'{}'s 'semantics.{}'. Declare the mode with no 'tokens' "
+                      "of its own "
+                      "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-"
+                      "CONFIG-OWNER)",
+                      hostLabel, modeName, origin,
+                      kInlineAsmTemplateLexemesKey));
+        return;
+    }
+    if (mode.contains("tokens") && mode.at("tokens").is_object()) {
+        std::unordered_set<std::string> roleKinds;
+        for (auto const& r : rows) roleKinds.insert(r.kind);
+        for (auto const& [lexeme, meanings] : mode.at("tokens").items()) {
+            auto const owner = lexemeOwner.find(lexeme);
+            std::string clash;
+            std::string why;
+            if (owner != lexemeOwner.end()) {
+                clash = owner->second;
+                why   = std::format("its row for '{}' is the very LEXEME that "
+                                    "role is declared with", lexeme);
+            } else if (meanings.is_array()) {
+                for (auto const& m : meanings) {
+                    if (!m.is_object() || !m.contains("kind")
+                        || !m.at("kind").is_string()) continue;
+                    auto const k = m.at("kind").get<std::string>();
+                    if (!roleKinds.contains(k)) continue;
+                    for (auto const& r : rows) {
+                        if (r.kind != k) continue;
+                        clash = lexemeOwner.at(r.lexeme);
+                        why   = std::format(
+                            "its row for '{}' carries the KIND '{}', which is "
+                            "already the token this document binds to that role "
+                            "— spelling it '{}' instead of '{}' does not make it "
+                            "a different fact",
+                            lexeme, k, lexeme, r.lexeme);
+                        break;
+                    }
+                    if (!clash.empty()) break;
+                }
+            }
+            if (clash.empty()) continue;
+            coll.emit(DiagnosticCode::C_ConflictingField,
+                      std::format("/lexerModes/{}/tokens/{}", modeName, lexeme),
+                      std::format(
+                          "'{}' declares an inline-asm TEMPLATE lexeme of its "
+                          "own. Mode '{}' is this document's template lexer mode "
+                          "and {} for the template role '{}', which '{}' already "
+                          "owns in 'semantics.{}'. The template sigils have "
+                          "exactly ONE owner — the LANGUAGE — and this dialect's "
+                          "rows for them are SYNTHESIZED from it, so a second "
+                          "declaration here could only ever disagree, and "
+                          "nothing downstream could notice: the semantic tier "
+                          "scans templates with no dialect in scope. Delete the "
+                          "row; declare only the capability ('templateLexerMode' "
+                          "+ 'templateOperandRule') and the kind binding in "
+                          "'bindTokens' "
+                          "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-"
+                          "CONFIG-OWNER)",
+                          hostLabel, modeName, why, clash, origin,
+                          kInlineAsmTemplateLexemesKey));
+        }
+    }
+
+    // ── the injection ──
+    // `tokens` is created when the mode declares none, which is the shipped
+    // shape after this change: a dialect's template mode is a name, a rationale
+    // and nothing else. (A non-object `tokens` returned above, so this only ever
+    // creates or extends an object.)
+    // ⚠ NOT CREATED FOR AN EMPTY ROW SET. If every role is declared null there
+    // is nothing to write, and minting an empty `tokens` object would turn a
+    // mode that declares no table into one that declares an empty table — a
+    // different document, for no gain.
+    if (rows.empty()) return;
+    if (!mode.contains("tokens")) mode["tokens"] = json::object();
+    for (auto& r : rows) {
+        json arr = json::array();
+        arr.push_back(std::move(r.meaning));
+        mode.at("tokens")[r.lexeme] = std::move(arr);
     }
 }
 
@@ -3539,6 +4019,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     std::vector<LanguageReferenceBinding> languageRefs;
     mergeLanguageReferences(doc, hostLabel, coll, languageRefs,
                             data.shapeOriginDoc);
+
+    // D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER: fill this
+    // document's inline-asm TEMPLATE lexer mode from the language-declared role
+    // set. Immediately after the merge and before any block is parsed, for the
+    // reason spelled out at the function — a row injected later misses
+    // `modeIntroducedKinds` and `maxLexemeLength`, and both misses are silent.
+    synthesizeInlineAsmTemplateLexemeRows(doc, hostLabel, languageRefs, coll);
 
     // This document's OWN holes, if it declares any. In ROOT mode (this is
     // the top-level document, so nobody binds anything) they must be
@@ -6176,6 +6663,111 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC: the MUTUAL-EXCLUSION
+            // registry. Each row is `{macros: [>=2 unique non-empty names],
+            // reason: "<non-empty>"}` and asserts that at most one of `macros`
+            // may be EFFECTIVE for any one (language x target x format) triple.
+            // OPTIONAL: absent means the language declares no such rule.
+            //
+            // ★★ ONLY SHAPE IS VALIDATED HERE, AND A MEMBER IS NOT REQUIRED TO
+            // EXIST. Two independent reasons, the second of which is the whole
+            // point of the feature:
+            //   1. a member may legitimately be declared by an
+            //      `<arch>.target.json` or `<name>.format.json` this loader
+            //      cannot see, so a local-declaration check would reject a
+            //      legitimate rule spanning two families; and
+            //   2. a group is a PROHIBITION. Its most valuable use is to name a
+            //      spelling this compiler deliberately does NOT declare and must
+            //      never start declaring again — the case that motivated the
+            //      feature. Requiring every member to exist would make exactly
+            //      that rule unstatable, and the only way to satisfy the check
+            //      would be to re-declare the macro the rule exists to keep out.
+            // Non-vacuity (some member of each group IS real) is asserted by the
+            // test suite instead, where the whole shipped target x format matrix
+            // is visible. Shape at load, anchoring at test.
+            if (pp.contains("mutuallyExclusivePredefinedMacros")) {
+                json const& groups = pp.at("mutuallyExclusivePredefinedMacros");
+                constexpr char const* kPath =
+                    "/preprocess/mutuallyExclusivePredefinedMacros";
+                if (!groups.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess, kPath,
+                              "'preprocess.mutuallyExclusivePredefinedMacros' "
+                              "must be an array");
+                } else {
+                    std::size_t gi = 0;
+                    for (json const& g : groups) {
+                        auto const gpath = std::format("{}/{}", kPath, gi++);
+                        if (!g.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, gpath,
+                                      "each mutual-exclusion group must be an "
+                                      "object with 'macros' and 'reason'");
+                            continue;
+                        }
+                        PredefinedMacroExclusionGroup row;
+                        // `reason` — REQUIRED and non-empty: it is quoted into
+                        // the diagnostic, and a rule that refuses a build
+                        // without saying why is the silent-veto mirror of the
+                        // silent-accept this pin exists to end.
+                        if (!g.contains("reason") || !g.at("reason").is_string()
+                            || g.at("reason").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      gpath + "/reason",
+                                      "a mutual-exclusion group requires a "
+                                      "non-empty string 'reason' — it is quoted "
+                                      "verbatim when the group fires");
+                            continue;
+                        }
+                        row.reason = g.at("reason").get<std::string>();
+                        if (!g.contains("macros") || !g.at("macros").is_array()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      gpath + "/macros",
+                                      "a mutual-exclusion group requires a "
+                                      "'macros' array of macro names");
+                            continue;
+                        }
+                        bool bad = false;
+                        for (json const& n : g.at("macros")) {
+                            if (!n.is_string() || n.get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          gpath + "/macros",
+                                          "every entry of 'macros' must be a "
+                                          "non-empty macro-name string");
+                                bad = true;
+                                break;
+                            }
+                            auto name = n.get<std::string>();
+                            if (std::ranges::find(row.macros, name)
+                                != row.macros.end()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          gpath + "/macros",
+                                          std::format("macro '{}' is listed "
+                                                      "twice in one group — a "
+                                                      "name cannot exclude "
+                                                      "itself", name));
+                                bad = true;
+                                break;
+                            }
+                            row.macros.push_back(std::move(name));
+                        }
+                        if (bad) continue;
+                        // A group of 0 or 1 can NEVER fire. Accepting it would
+                        // leave config that reads as protection and asserts
+                        // nothing — the exact shape of a pin that was quietly
+                        // disarmed by an edit.
+                        if (row.macros.size() < 2) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      gpath + "/macros",
+                                      "a mutual-exclusion group needs at least "
+                                      "TWO names — a shorter group can never "
+                                      "fire and only looks like a rule");
+                            continue;
+                        }
+                        cfg.mutuallyExclusivePredefinedMacros.push_back(
+                            std::move(row));
+                    }
+                }
+            }
+
             // FC15c: an OPTIONAL non-empty directive/operator WORD (matched by
             // lexeme text -- no token kind, like the directive words). Absent ->
             // the feature is off. Present-but-empty / wrong-type ->
@@ -6562,7 +7154,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // purpose — a `.lang.json` still spelling `inlineAsmRule` is now
             // REFUSED at load rather than silently loading with every extended-asm
             // check disarmed, which is the whole point of the closed vocabulary.
-            static constexpr std::array<std::string_view, 56> kSemanticsKeys{
+            // ⓘ 57 after inline-asm P5c: `inlineAsmTemplateLexemes` IS a new
+            // facet — the one owner of the template sigils
+            // (D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER).
+            // It is a SIBLING of `inlineAsm` rather than a member because it
+            // must reach a DIALECT document too, and `inlineAsm` names twelve
+            // rules of the embedded surface a dialect never imports.
+            static constexpr std::array<std::string_view, 57> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
                 "scopes",
@@ -6579,7 +7177,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // attribute surface (FC17)
                 "attributeSemantics", "nodiscard",
                 // remaining expression / declaration facets
-                "variadic", "staticAssertRule", "inlineAsm", "generic",
+                "variadic", "staticAssertRule", "inlineAsm",
+                "inlineAsmTemplateLexemes", "generic",
                 "compoundLiterals", "builtinFunctions",
                 // statement surface
                 "returnRules", "loopRules", "loopControls",
@@ -12207,6 +12806,159 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── inlineAsmTemplateLexemes (inline-asm P5c) ──
+            //    D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER
+            //
+            // The ONE owner of the GNU template sigils. See
+            // `InlineAsmTemplateLexemes` (semantic_config.hpp) for why they are a
+            // LANGUAGE fact and not a dialect one, and
+            // `synthesizeInlineAsmTemplateLexemeRows` above for how the dialect's
+            // lexer mode is filled from these bytes.
+            //
+            // ★★ ALL-OR-NOTHING, WITH AN EXPLICIT NULL — modelled on
+            // `assembly.operandForms`, which is the shape this project already
+            // uses for "a fixed set of named roles". Every role is REQUIRED once
+            // the object exists; a role a language genuinely lacks is declared
+            // `null`, which is distinguishable from an omission and is why the
+            // key is still required. Omitting a role would make its form
+            // UNRECOGNIZED at the scan with a clean build log — the accept-and-
+            // do-nothing this config surface refuses everywhere else.
+            if (sem.contains(std::string{kInlineAsmTemplateLexemesKey})) {
+                std::string const kBlock{kInlineAsmTemplateLexemesKey};
+                json const& tl = sem.at(kBlock);
+                auto const blockPath = std::format("/semantics/{}", kBlock);
+                if (!tl.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, blockPath,
+                              std::format("'semantics.{}' must be an object "
+                                          "mapping every template role to "
+                                          "{{ lexeme, opensScope?, closesScope? }} "
+                                          "or to null", kBlock));
+                } else {
+                    // R3 — an unknown role key, named. A misspelled role would
+                    // otherwise load clean and leave that sigil undeclared.
+                    for (auto it = tl.begin(); it != tl.end(); ++it) {
+                        if (isDocumentationKey(it.key())) continue;
+                        bool known = false;
+                        for (auto const& r : kInlineAsmTemplateRoles) {
+                            if (r.key == it.key()) { known = true; break; }
+                        }
+                        if (known) continue;
+                        std::string closed;
+                        for (auto const& r : kInlineAsmTemplateRoles) {
+                            if (!closed.empty()) closed += ", ";
+                            closed += '\'';
+                            closed += r.key;
+                            closed += '\'';
+                        }
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  std::format("{}/{}", blockPath, it.key()),
+                                  std::format("unknown inline-asm template role "
+                                              "'{}' — the closed set is {}",
+                                              it.key(), closed));
+                    }
+                    auto& tlc = cfg.inlineAsmTemplateLexemes;
+                    tlc.declared = true;
+                    for (auto const& r : kInlineAsmTemplateRoles) {
+                        std::string const key{r.key};
+                        auto const path = std::format("{}/{}", blockPath, key);
+                        if (!tl.contains(key)) {
+                            coll.emit(DiagnosticCode::C_MissingField, path,
+                                      std::format(
+                                          "template role '{}' is UNMENTIONED — "
+                                          "every role must be either declared "
+                                          "with a lexeme or declared ABSENT "
+                                          "(null), because a role the scan cannot "
+                                          "recognize makes its form read as "
+                                          "ordinary text rather than announce "
+                                          "that it was never configured. This "
+                                          "role {}", key, r.what));
+                            continue;
+                        }
+                        // Explicit `null` = "this language has no such form".
+                        if (tl.at(key).is_null()) continue;
+                        json const& entry = tl.at(key);
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      std::format("template role '{}' must be an "
+                                                  "object {{ lexeme, opensScope?, "
+                                                  "closesScope? }} or null", key));
+                            continue;
+                        }
+                        static constexpr std::array<std::string_view, 3>
+                            kRoleKeys{"lexeme", "opensScope", "closesScope"};
+                        DSS_CHECK_KEY_VOCABULARY(kRoleKeys);
+                        for (auto rit = entry.begin(); rit != entry.end(); ++rit) {
+                            if (isDocumentationKey(rit.key())) continue;
+                            if (std::ranges::find(kRoleKeys, rit.key())
+                                != kRoleKeys.end()) continue;
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      std::format("{}/{}", path, rit.key()),
+                                      std::format("unknown key '{}' in template "
+                                                  "role '{}' — allowed keys are "
+                                                  "'lexeme', 'opensScope', "
+                                                  "'closesScope' (typo "
+                                                  "discriminator)",
+                                                  rit.key(), key));
+                        }
+                        if (!entry.contains("lexeme")
+                            || !entry.at("lexeme").is_string()
+                            || entry.at("lexeme").get<std::string>().empty()) {
+                            // EMPTY is refused separately from ABSENT, exactly as
+                            // `memoryClobber` is: `""` matches at every byte of
+                            // every template, so the scan would report a
+                            // placeholder on the first character of every line.
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      std::format("{}/lexeme", path),
+                                      std::format("template role '{}' must carry "
+                                                  "a non-empty 'lexeme' string, or "
+                                                  "be null — an empty spelling "
+                                                  "matches at EVERY byte", key));
+                            continue;
+                        }
+                        tlc.*(r.field) = entry.at("lexeme").get<std::string>();
+                    }
+                    // ★ MAXIMAL MUNCH MUST BE ABLE TO SEPARATE THE ESCAPE FROM
+                    // THE PLACEHOLDER, and it can only do that on LENGTH — which
+                    // is how the tokenizer decides too (`longestMatchInMode`
+                    // probes DOWN from the longest key; `nlohmann::json` sorts
+                    // object keys, so declaration order does not survive the
+                    // parse and cannot be the tie-break). An escape no longer
+                    // than its placeholder would make `%%0` read as placeholder +
+                    // `%0` and bind operand 0 to a LITERAL percent — ✔MEASURED on
+                    // gcc 13.3.0 and clang 18.1.3 that `"A%%0B"` emits `A%0B` and
+                    // the `%0` is NOT re-read, so that is a silent miscompile the
+                    // reference toolchain does not have.
+                    if (!tlc.escape.empty() && !tlc.placeholder.empty()
+                        && tlc.escape.size() <= tlc.placeholder.size()) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/templateEscape", blockPath),
+                                  std::format(
+                                      "the escape lexeme '{}' is not LONGER than "
+                                      "the placeholder lexeme '{}' — both the "
+                                      "tokenizer and the semantic scan separate "
+                                      "them by maximal munch, so a shorter-or-"
+                                      "equal escape can never win and an escaped "
+                                      "percent would bind an operand instead. "
+                                      "Declare an escape that extends the "
+                                      "placeholder", tlc.escape, tlc.placeholder));
+                    }
+                    if (!tlc.labelPlaceholder.empty() && !tlc.placeholder.empty()
+                        && tlc.labelPlaceholder.size()
+                               <= tlc.placeholder.size()) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/templateLabelPlaceholder",
+                                              blockPath),
+                                  std::format(
+                                      "the label lexeme '{}' is not LONGER than "
+                                      "the placeholder lexeme '{}' — maximal munch "
+                                      "would give every label reference to the "
+                                      "plain placeholder and `%l[done]` would read "
+                                      "as operand `l`", tlc.labelPlaceholder,
+                                      tlc.placeholder));
+                    }
+                }
+            }
+
             // ── generic (FC16 C11/C23 6.5.1.1, D-CSUBSET-GENERIC-SELECTION) ──
             // `{ rule, controlChild, assocRule, typedAssocRule, defaultAssocRule }`
             // — `_Generic` generic selection. Pass 2 resolves the controlling
@@ -15113,9 +15865,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             assemblyClean = false;
                             continue;
                         }
-                        static constexpr std::array<std::string_view, 6>
+                        static constexpr std::array<std::string_view, 8>
                             kDirRowKeys{"spelling", "verb", "marker",
-                                        "section", "unitBytes", "operandOnly"};
+                                        "section", "unitBytes", "operandOnly",
+                                        "rule", "offsetFromCfa"};
                         DSS_CHECK_KEY_VOCABULARY(kDirRowKeys);
                         for (auto it = row.begin(); it != row.end(); ++it) {
                             if (isDocumentationKey(it.key())) continue;
@@ -15356,6 +16109,117 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             dir.operandOnly =
                                 row.at("operandOnly").get<bool>();
                         }
+                        // ── rule ── `frameRule` ONLY, and REQUIRED there.
+                        // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED. Names one
+                        // `CfiOpKind` — the SHARED unwind vocabulary — and the
+                        // name is resolved against `cfiOpKindName()`, the one
+                        // owner of those spellings, rather than against a table
+                        // repeated here.
+                        // ⚠ NO DEFAULT AND NO FALLBACK. A `frameRule` row whose
+                        // rule did not resolve would be a directive the walker
+                        // accepts and drops — which is the DEFECT this whole
+                        // family exists to close, re-created one tier up.
+                        if (dir.verb == AsmDirectiveVerb::FrameRule) {
+                            if (!row.contains("rule")
+                                || !row.at("rule").is_string()
+                                || row.at("rule").get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/rule",
+                                          std::format(
+                                              "'rule' is required on a "
+                                              "'frameRule' directive — it names "
+                                              "which call-frame rule '{}' "
+                                              "states, and there is no default: "
+                                              "a directive whose rule this build "
+                                              "could not identify would be "
+                                              "accepted and dropped, which is "
+                                              "exactly the unwind information "
+                                              "loss this verb exists to end "
+                                              "(see "
+                                              "D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED)",
+                                              dir.spelling));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            auto const ruleName =
+                                row.at("rule").get<std::string>();
+                            auto const kind = asmFrameRuleFromName(ruleName);
+                            if (!kind.has_value()) {
+                                std::string known;
+                                for (std::size_t k = 0; k < kCfiOpKindCount;
+                                     ++k) {
+                                    if (!known.empty()) known += ", ";
+                                    known += '\'';
+                                    known += cfiOpKindName(
+                                        static_cast<CfiOpKind>(k));
+                                    known += '\'';
+                                }
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/rule",
+                                          std::format(
+                                              "unknown call-frame rule '{}' — "
+                                              "the closed set is {} (the "
+                                              "substrate's CfiOpKind vocabulary, "
+                                              "shared with every format's unwind "
+                                              "writer). A rule this build cannot "
+                                              "encode must stay UNDECLARED and "
+                                              "fail loud by name, never be "
+                                              "mapped onto a different one",
+                                              ruleName, known));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            dir.frameRule = *kind;
+                        } else if (row.contains("rule")) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/rule",
+                                      std::format("'rule' is only meaningful on "
+                                                  "a 'frameRule' directive; "
+                                                  "'{}' declares verb '{}', "
+                                                  "where the key would be "
+                                                  "silently ignored",
+                                                  dir.spelling, verbName));
+                            assemblyClean = false;
+                            continue;
+                        }
+                        // ── offsetFromCfa ── `frameRule` ONLY, OPTIONAL.
+                        // gas's `.cfi_rel_offset`: the same save rule stated
+                        // relative to the CURRENT CFA offset instead of to the
+                        // CFA. ⚠ REFUSED on a rule that carries no offset at
+                        // all — on `same_value` or `remember_state` the key
+                        // would describe a fold of a number that does not
+                        // exist, i.e. config that reads as behaviour and has
+                        // none.
+                        if (row.contains("offsetFromCfa")) {
+                            if (dir.verb != AsmDirectiveVerb::FrameRule
+                                || !dir.frameRule.has_value()
+                                || !cfiOpTouchesRegRule(*dir.frameRule)) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/offsetFromCfa",
+                                          std::format(
+                                              "'offsetFromCfa' is only "
+                                              "meaningful on a 'frameRule' "
+                                              "directive stating a per-register "
+                                              "save rule — it re-bases that "
+                                              "rule's OFFSET operand. '{}' "
+                                              "declares verb '{}', where the key "
+                                              "would be silently ignored",
+                                              dir.spelling, verbName));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            if (!row.at("offsetFromCfa").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/offsetFromCfa",
+                                          "'offsetFromCfa' must be a boolean "
+                                          "(omit the key entirely to mean 'the "
+                                          "offset is measured from the CFA')");
+                                assemblyClean = false;
+                                continue;
+                            }
+                            dir.frameOffsetFromCfa =
+                                row.at("offsetFromCfa").get<bool>();
+                        }
                         // ⚠ KEYED ON `spellingKey`, THE INSTRUCTION TABLE'S
                         // TWIN. `directiveBySpelling` matches under
                         // `spellingCase`, so in a folding dialect `.globl` and
@@ -15404,6 +16268,62 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     "config: it reads as support for a section "
                                     "and delivers none",
                                     r.spelling));
+                            assemblyClean = false;
+                        }
+                    }
+                    // ★★ CROSS-ROW, THE SAME SHAPE ONE FAMILY OVER: A FRAME
+                    // BODY NEEDS A FRAME TO SIT IN. `frameRule` /
+                    // `frameReturnColumn` are meaningful only between a
+                    // `frameStart` and its `frameEnd` — a dialect declaring
+                    // them with no `frameStart` row has written directives that
+                    // can only ever be refused as "outside a frame
+                    // description", which reads as unwind support and delivers
+                    // none. The mirror case is caught too: a `frameStart` with
+                    // no `frameEnd` could open a description nothing closes.
+                    // ⚠ CHECKED AFTER THE LOOP because the rows may appear in
+                    // any order.
+                    {
+                        bool hasStart = false;
+                        bool hasEnd   = false;
+                        for (auto const& r : cfg.directives) {
+                            if (r.verb == AsmDirectiveVerb::FrameStart) {
+                                hasStart = true;
+                            }
+                            if (r.verb == AsmDirectiveVerb::FrameEnd) {
+                                hasEnd = true;
+                            }
+                        }
+                        for (auto const& r : cfg.directives) {
+                            if (!asmVerbIsFrameBody(r.verb) || hasStart) {
+                                continue;
+                            }
+                            coll.emit(
+                                DiagnosticCode::C_InvalidHirLowering,
+                                "/assembly/directives",
+                                std::format(
+                                    "directive '{}' states a call-frame rule, "
+                                    "but this dialect declares no directive "
+                                    "with verb 'frameStart' — nothing can open "
+                                    "the frame description it would belong to, "
+                                    "so every use of it is refused. The row "
+                                    "reads as unwind support and delivers none",
+                                    r.spelling));
+                            assemblyClean = false;
+                        }
+                        if (hasStart != hasEnd) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidHirLowering,
+                                "/assembly/directives",
+                                std::format(
+                                    "this dialect declares a '{}' directive "
+                                    "with no '{}' counterpart. A frame "
+                                    "description that cannot be opened is "
+                                    "unreachable config; one that cannot be "
+                                    "closed has no extent, so every function "
+                                    "carrying it would be refused at end of "
+                                    "file. Declare both spellings or neither",
+                                    hasStart ? "frameStart" : "frameEnd",
+                                    hasStart ? "frameEnd" : "frameStart"));
                             assemblyClean = false;
                         }
                     }

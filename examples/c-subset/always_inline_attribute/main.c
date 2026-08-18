@@ -83,8 +83,21 @@ static int declared_first(int k) { return k * 1; }
 // ★ THE OVER-THRESHOLD CALLEE. Far larger than the shipped release
 // `inlineThreshold` (50 MIR instructions), so WITHOUT the attribute the cost
 // model refuses it and the call survives; WITH it the call is spliced away.
-// That difference was MEASURED on a real arm64 binary (`bl _sym_75` present
+// That difference was MEASURED on a real arm64 binary (`bl _wide` present
 // without, absent with).
+// ⚠ RE-MEASURED 2026-08-17 on real Apple Silicon (macho64-arm64-darwin-exec,
+// `--config=release`, Apple `otool -tV`): this annotation used to read
+// `bl _sym_<id>` while D-LINK-MACHO-IMAGE-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS
+// was open, because a Mach-O image spelled EVERY function `_sym_<id>` in its
+// symbol table and a disassembler symbolicates the branch target from exactly
+// that table. Closing that row did not move one instruction byte — only the
+// name the disassembler can print for the target it always had.
+// ★ THE OLD SPELLING WAS `_sym_75` AND IS NOT REPRODUCIBLE — say so rather
+// than leave a number that will not come back. A SymbolId is assigned per
+// build, so the id DRIFTS with unrelated front-end changes: the same
+// pre-fix probe on 2026-08-17 printed `_sym_110` for `main`, not the `_sym_75`
+// this comment carried. The NAME is stable; the id never was, which is a
+// second reason the image had no business printing it.
 static __attribute__((always_inline)) int wide(int k) {
     unsigned u = (unsigned)k;
     u = u * 3u + 1u; u = u ^ (u >> 2); u = u + 7u;

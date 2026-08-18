@@ -28,6 +28,11 @@ dss_add_test(NAME lir/test_lir_earlyclobber SOURCES test_lir_earlyclobber.cpp)
 # needs nlohmann_json.
 dss_add_test(NAME lir/test_lir_two_address_tie SOURCES test_lir_two_address_tie.cpp)
 target_link_libraries(dss_lir_test_lir_two_address_tie PRIVATE nlohmann_json::nlohmann_json)
+# D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE (the asm half): a `"+r"` operand's two
+# halves bind to ONE register. Drives the REAL c-subset → HIR → MIR → LIR
+# lowering for the positive claim and its untied control, and hand-builds the
+# two descriptor shapes that must still REFUSE.
+dss_add_test(NAME lir/test_lir_asm_tied_operand SOURCES test_lir_asm_tied_operand.cpp)
 dss_add_test(NAME lir/test_lir_text      SOURCES test_lir_text.cpp)
 dss_add_test(NAME lir/test_mir_to_lir    SOURCES test_mir_to_lir.cpp)
 # FC1 (V2-4.X): the role-contract red-on-disable levers strip

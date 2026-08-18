@@ -15,6 +15,7 @@
 #include <format>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>     // std::move
@@ -124,6 +125,18 @@ computeGuardedBodyBlocks(Mir const& mir, MirFuncId fn, MirBlockId tryBB,
 // SehParentPolicy specializes it, keeping the all-blocks `selectBlocks`.)
 class IdentityClonePolicy : public MirRebuildPolicy {
 public:
+    // The rebuild DRIVER this policy belongs to — printed by every
+    // `MirFunctionRebuilder` fatal.
+    // See D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS (one line: a wrapped
+    // anchor name mints a second, unregistered anchor).
+    // A MIR merge step, not a `kPassNameTable` pipeline pass. `virtual`
+    // by inheritance: `SehParentPolicy` re-answers it, because the two policies
+    // drive the rebuilder in the SAME loop (non-parent functions vs SEH parents)
+    // and an abort that named them alike would hide which arm died.
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "SynthSehFunclets";
+    }
+
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
         std::vector<MirBlockId> blocks;
@@ -145,6 +158,14 @@ public:
 // funclet. Every non-filter block is copied verbatim.
 class SehParentPolicy final : public IdentityClonePolicy {
 public:
+    // Distinct from the base's name ON PURPOSE — see the note there. Both
+    // policies drive the rebuilder inside one loop, so `[pass=SynthSehParent]`
+    // vs `[pass=SynthSehFunclets]` is the difference between "the SEH parent
+    // rewrite died" and "the verbatim clone of an unrelated function died".
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "SynthSehParent";
+    }
+
     SehParentPolicy(std::vector<Region> const& regions, MirFuncId parentFn,
                     TypeId i32Ty)
         : i32Ty_(i32Ty) {

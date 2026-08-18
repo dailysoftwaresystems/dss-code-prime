@@ -379,7 +379,8 @@ esac
 # resolver (its names are a contract — see `emit_sh` in harness_legs.py); the
 # second is filled by this driver as the run proceeds.
 declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
-           LEG_RUN_MODE=() LEG_RUN_VERDICT=() LEG_RUN_DETAIL=() \
+           LEG_RUN_MODE=() LEG_RUN_FIDELITY=() LEG_RUN_SAME_ISA=() \
+           LEG_RUN_VERDICT=() LEG_RUN_DETAIL=() \
            LEG_LAUNCH=() LEG_LAUNCH_ENV=() \
            LEG_PATH_TRANSLATION=() LEG_PATH_TRANSLATOR=() LEG_ENV_TRANSFER=() \
            LEG_RUN_FILESYSTEM=() LEG_CONFOUNDS=() LEG_ABORT_CONFOUNDS=() \
@@ -673,7 +674,56 @@ git_tree_divergence() {         # git_tree_divergence <dir> -> N | "" when uncom
   # collapsing them would report an unmeasurable tree as pristine.
   [[ -n "$out" ]] || { printf '0'; return 0; }
   local -a lines=(); mapfile -t lines <<< "$out"
-  printf '%d' "${#lines[@]}"
+  local raw="${#lines[@]}"
+  # D-HARNESS-DIVERGENCE-COUNT-INFLATED-BY-CRLF: the raw count OVERSTATED divergence
+  # by ~40x on a Windows→Linux synced tree (✔MEASURED on the VPS: "2420 file(s)
+  # differ" against a true modified set of ~60; of the first 60, 24 were CR-only).
+  # A Windows working tree carries CRLF and no autocrlf normalization applies on the
+  # Linux side, so `status --porcelain` reports every synced file as modified.
+  # ★ WHY IT IS NOT COSMETIC: this warning exists to stop someone attributing a
+  # result to a commit it was not built from. A figure wrong by 40x trains the reader
+  # to ignore it, which disables the warning exactly when it is telling the truth.
+  # ⛔ NOT fixed by lowering the severity — the severity is right, the arithmetic was
+  # wrong. TRACKED files are re-counted ignoring a CR at end-of-line; UNTRACKED files
+  # are counted as-is, because a source file a stale HEAD never knew about is real
+  # divergence and is precisely what the rsync gate leaves behind.
+  # ⚠ The porcelain listing stays the ENUMERATION. Only the TRACKED-modification
+  # lines are re-tested; untracked entries are passed through exactly as `status`
+  # reported them. Rebuilding the whole count from `diff` + `ls-files` was tried and
+  # REJECTED: `status` reports an untracked DIRECTORY as one entry while `ls-files`
+  # expands it to every file inside, so that version changed the figure on trees with
+  # no CRLF at all (✔MEASURED on this repo: 210 → 214). A fix for a Windows→Linux
+  # artefact must be INERT on every other tree, or it is a second defect.
+  local semantic_tracked=""
+  semantic_tracked="$(git -C "$1" --no-optional-locks diff --ignore-cr-at-eol --name-only HEAD 2>/dev/null)" \
+    || semantic_tracked="$(git -C "$1" diff --ignore-cr-at-eol --name-only HEAD 2>/dev/null)" \
+    || { printf '%d' "$raw"; return 0; }
+  local semantic=0 line="" path="" xy=""
+  for line in "${lines[@]}"; do
+    [[ -n "$line" ]] || continue
+    xy="${line:0:2}"
+    path="${line:3}"
+    if [[ "$xy" == '??' ]]; then
+      semantic=$(( semantic + 1 ))          # untracked: real divergence, always counted
+      continue
+    fi
+    # A rename reads `R  old -> new`; the destination is what a CR test can match.
+    [[ "$path" != *' -> '* ]] || path="${path##* -> }"
+    path="${path%\"}"; path="${path#\"}"
+    if printf '%s\n' "$semantic_tracked" | grep -qxF -- "$path"; then
+      semantic=$(( semantic + 1 ))
+    fi
+  done
+  # ⚠ The excluded count is written to a FILE, not to a global: every caller invokes
+  # this inside `$( )`, which is a SUBSHELL, so an assignment here would be discarded
+  # and the note would silently read zero — a fix that reports "0 excluded" while
+  # excluding 2360 is worse than the inflated count it replaced. The path is optional;
+  # a caller that does not set it simply gets no side-channel.
+  if [[ -n "${GIT_TREE_DIVERGENCE_CRONLY_FILE:-}" ]]; then
+    printf '%d' "$(( raw > semantic ? raw - semantic : 0 ))" \
+      > "$GIT_TREE_DIVERGENCE_CRONLY_FILE" 2>/dev/null || true
+  fi
+  printf '%d' "$semantic"
 }
 dir_has_entries() {             # dir_has_entries <dir> -> true if it holds ANY entry
   # Shape (c) of the anchor: a populated directory that is NOT a checkout — exactly
@@ -692,15 +742,29 @@ dir_has_entries() {             # dir_has_entries <dir> -> true if it holds ANY 
 # the `status` walk (which re-hashes every file whose mtime the rsync changed) is
 # paid once, up front, instead of at the end of a multi-hour run.
 SRC_HEAD=""; SRC_HEAD_LONG=""; SRC_BRANCH=""; SRC_DIVERGE=""; SRC_DIVERGE_NOTE=""
+GIT_TREE_DIVERGENCE_CRONLY=0
 read_src_provenance() {         # read_src_provenance <dir>
   SRC_HEAD="$(git_head_short "$1")"
   SRC_HEAD_LONG="$(git -C "$1" rev-parse HEAD 2>/dev/null)" || SRC_HEAD_LONG=""
   SRC_BRANCH="$(git_head_branch "$1")"
+  GIT_TREE_DIVERGENCE_CRONLY=0
+  GIT_TREE_DIVERGENCE_CRONLY_FILE="$(mktemp 2>/dev/null || printf '')"
   SRC_DIVERGE="$(git_tree_divergence "$1")"
+  if [[ -n "$GIT_TREE_DIVERGENCE_CRONLY_FILE" && -s "$GIT_TREE_DIVERGENCE_CRONLY_FILE" ]]; then
+    GIT_TREE_DIVERGENCE_CRONLY="$(cat "$GIT_TREE_DIVERGENCE_CRONLY_FILE" 2>/dev/null || printf '0')"
+  fi
+  [[ -z "$GIT_TREE_DIVERGENCE_CRONLY_FILE" ]] || rm -f "$GIT_TREE_DIVERGENCE_CRONLY_FILE"
+  GIT_TREE_DIVERGENCE_CRONLY_FILE=""
+  local cr_note=""
+  # Stated explicitly, per the row: a reader comparing this against a raw
+  # `git status` must be told why the two disagree, or the smaller number reads as
+  # a bug in the harness rather than as the more honest figure.
+  [[ "${GIT_TREE_DIVERGENCE_CRONLY:-0}" == "0" ]] \
+    || cr_note="; $GIT_TREE_DIVERGENCE_CRONLY CR-only difference(s) excluded as non-semantic"
   if [[ -z "$SRC_DIVERGE" ]]; then
     SRC_DIVERGE_NOTE=" (divergence from HEAD UNVERIFIED — git status failed in $1)"
   elif [[ "$SRC_DIVERGE" != "0" ]]; then
-    SRC_DIVERGE_NOTE=" (+$SRC_DIVERGE file(s) differ from HEAD — the sources built are NOT exactly this commit)"
+    SRC_DIVERGE_NOTE=" (+$SRC_DIVERGE file(s) differ from HEAD — the sources built are NOT exactly this commit$cr_note)"
   else
     SRC_DIVERGE_NOTE=""
   fi
@@ -1298,7 +1362,68 @@ if [[ -n "${DSS_LEGS:-}" ]]; then
     done
   fi
 fi
+
+# >>> dss:run-fidelity-select >>>
+# DSS_RUN_FIDELITY: restrict this run to legs whose artefact executes at a given
+# FIDELITY. [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+#
+# ★ WHY THIS IS NOT DSS_LEGS WITH EXTRA STEPS. `DSS_LEGS=elf64-arm64` names a
+# LEG; the operator then has to know, per host, whether that leg reaches real
+# hardware here — which is exactly the host-keyed reasoning this harness exists to
+# remove from operators' heads. `DSS_RUN_FIDELITY=native,foreign-kernel` names the
+# EVIDENCE wanted and lets the resolver work out which legs supply it on THIS box,
+# so the same command means the same thing on the Mac, the VPS and this desktop.
+#
+# ★★ IT SELECTS THE RUN, NEVER THE BUILD. "CAN THIS HOST BUILD TARGET T" is always
+# yes and is not a host question (this module's header); only execution is
+# host-limited. A deselected leg is therefore still BUILT and still reported — it
+# is ledgered `not-selected-by-runner`, the same class DSS_LEGS uses, with a detail
+# naming the fidelity it actually has. Silence about a leg is a harness bug.
+#
+# ⚠ VALIDATED HERE, AT THE DOOR, not at first use: a typo'd fidelity would
+# otherwise match nothing and silently run zero legs, which reads exactly like a
+# host that can execute nothing.
+if [[ -n "${DSS_RUN_FIDELITY:-}" ]]; then
+  _fid_known="$(python3 "$LEG_RESOLVER" --run-fidelities)" \
+    || die "could not read the run-fidelity vocabulary from $(basename "$LEG_RESOLVER")"
+  declare -a _fid_want=() _fid_keep=() _fid_drop=()
+  # Split on comma OR whitespace, exactly as DSS_LEGS-style filters are typed.
+  IFS=', ' read -r -a _fid_want <<< "${DSS_RUN_FIDELITY}"
+  for _f in "${_fid_want[@]}"; do
+    [[ -z "$_f" ]] && continue
+    grep -qx -- "$_f" <<< "$_fid_known" \
+      || die "DSS_RUN_FIDELITY names '$_f', which is not a run fidelity this harness declares.
+      Known: $(tr '\n' ' ' <<< "$_fid_known")
+      A value nothing matches would silently select ZERO legs, which reads exactly
+      like a host that can execute nothing [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]."
+  done
+  for _l in "${LEG_ORDER[@]}"; do
+    _lf="${LEG_RUN_FIDELITY[$_l]:-}"
+    if [[ -n "$_lf" ]] && grep -qx -- "$_lf" <<< "$(printf '%s\n' "${_fid_want[@]}")"; then
+      _fid_keep+=("$_l")
+    else
+      _fid_drop+=("$_l")
+    fi
+  done
+  [[ ${#_fid_keep[@]} -gt 0 ]] || \
+    die "DSS_RUN_FIDELITY='${DSS_RUN_FIDELITY}' selected NO leg on this host.
+      Per-leg fidelity here: $(for _l in "${LEG_ORDER[@]}"; do printf '%s=%s ' "$_l" "${LEG_RUN_FIDELITY[$_l]:-<never runs>}"; done)
+      A run that covers nothing must stop, not report a clean sweep of zero legs."
+  LEG_ORDER=("${_fid_keep[@]}")
+  if [[ ${#_fid_drop[@]} -gt 0 ]]; then
+    warn "DSS_RUN_FIDELITY='${DSS_RUN_FIDELITY}' DESELECTED ${#_fid_drop[@]} leg(s) — this run does NOT cover them:"
+    for _l in "${_fid_drop[@]}"; do
+      LEG_VERDICT["$_l"]="not-selected-by-runner"
+      LEG_VERDICT_DETAIL["$_l"]="deselected by DSS_RUN_FIDELITY='${DSS_RUN_FIDELITY}' — this leg's run fidelity on this host is '${LEG_RUN_FIDELITY[$_l]:-<never runs here>}', so ${LEG_SPEC[$_l]} was NOT built and NOT verified by this run"
+      warn "      $_l (${LEG_SPEC[$_l]}) — fidelity '${LEG_RUN_FIDELITY[$_l]:-<never runs here>}', not built, not verified"
+    done
+  fi
+fi
+# <<< dss:run-fidelity-select <<<
 info "legs selected: ${LEG_ORDER[*]}   tier: $DSS_TIER"
+for _l in "${LEG_ORDER[@]}"; do
+  info "   $_l: run mode '${LEG_RUN_MODE[$_l]:-<unset>}', fidelity '${LEG_RUN_FIDELITY[$_l]:-<never runs here>}'"
+done
 
 # ── strict mode, parsed and VALIDATED now (never at Step 9) ──────────────────
 # Mirrors `readStrictArmVerdicts` in tests/test_support/arm_verdict_ledger.hpp,
@@ -2635,9 +2760,27 @@ ensure_cmake() {
   info "cmake: $(cmake --version | sed -n '1p') (Kitware $ver)"
 }
 ensure_cmake
-( cd "$SRC_DIR" && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$JOBS" )
-DSS_BIN="$(find "$SRC_DIR/build" -type f -name dss-code-prime -perm -u+x -print -quit 2>/dev/null)"
-[[ -n "$DSS_BIN" && -x "$DSS_BIN" ]] || die "dss-code-prime binary not found under $SRC_DIR/build."
+# ⚠ BUILD INTO A NAMED SUBDIRECTORY, NEVER INTO `build/` ITSELF. Operator rule
+# 2026-08-17: `build/` is the single ROOT and every build tree is a subdirectory
+# of it. Configuring into the root would make the root simultaneously a container
+# and a build tree — the exact ambiguity the rule exists to remove.
+_dss_bdir="$SRC_DIR/build/rel"
+( cd "$SRC_DIR" && cmake -B "$_dss_bdir" -DCMAKE_BUILD_TYPE=Release && cmake --build "$_dss_bdir" -j"$JOBS" )
+# ★★ SEARCH THE TREE WE JUST BUILT, NOT THE WHOLE ROOT. This was
+# `find "$SRC_DIR/build" … -print -quit`, taking the FIRST match — unambiguous
+# only while `build/` held exactly one build tree. The one-root layout makes that
+# ambiguous BY CONSTRUCTION: ✔MEASURED 2026-08-17 on the Mac, `build/bin` and
+# `build/mac/bin` BOTH matched and `-print -quit` resolved it by filesystem
+# enumeration order. It happened to pick the tree this step rebuilds; nothing
+# guaranteed it. Same class as a pin sampling `front()` of a discovered set.
+DSS_BIN="$(find "$_dss_bdir" -type f -name dss-code-prime -perm -u+x -print -quit 2>/dev/null)"
+# Widen to the whole root ONLY if the tree we built has none, and SAY SO — a
+# silent widening is how the ambiguity creeps back.
+if [[ -z "$DSS_BIN" ]]; then
+  DSS_BIN="$(find "$SRC_DIR/build" -type f -name dss-code-prime -perm -u+x -print -quit 2>/dev/null)"
+  [[ -n "$DSS_BIN" ]] && warn "no dss-code-prime under $_dss_bdir; widened to a root-wide search and took $DSS_BIN"
+fi
+[[ -n "$DSS_BIN" && -x "$DSS_BIN" ]] || die "dss-code-prime binary not found under $_dss_bdir (nor anywhere under $SRC_DIR/build)."
 pass "dss-code-prime built: $DSS_BIN"
 
 # ── Step 6 — stage third-party headers + obtain per-leg libs ─────────────────
@@ -4178,6 +4321,16 @@ COMPILE_FAILS=0
 # ORACLE, in those terms, instead of inheriting a line about a binary it cannot
 # run. Empty means "none for this leg", which Step 9 prints as such.
 declare -A LEG_ORACLE=() LEG_ORACLE_CC=() LEG_ORACLE_TRIPLE=()
+# ★★ THE ORACLE'S *STATUS*, KEPT ON EVERY OUTCOME — the fact the old code threw
+# away. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] `build-failed` is not
+# the same event as `no-reference-compiler`: the first means THE CONTROL RAN AND
+# AGREED WITH US, the second means there is no control at all. Collapsing them to
+# an empty LEG_ORACLE made a leg whose reference rejects the same TUs dss rejects
+# print "NO ORACLE", which reads as *the control is missing*. Only `built` and
+# `build-failed` let `--attribute-build` grant anything, and it is handed this
+# value verbatim rather than re-deriving it from whether a log file exists — a
+# log left behind by a previous run must never buy an amnesty this run did not.
+declare -A LEG_ORACLE_STATUS=() LEG_ORACLE_LOG=() LEG_BUILD_ATTRIBUTION=()
 # python3 was already ensured at Step 0b (the leg plan needs it far earlier than
 # the manifest does). Re-asserted here because this is where the manifest is
 # actually generated, and `ensure_cmd` on a present command costs nothing.
@@ -4649,6 +4802,11 @@ for leg in "${LEG_ORDER[@]}"; do
       --build-reference-oracle "$leg" --manifest "$manifest" \
       --oracle-dir "$outd" --oracle-log "$outd/reference-oracle.log" \
       2>"$outd/reference-oracle.stderr")" || _orc=$?
+  # THE STATUS IS RECORDED ON EVERY ARM, from the resolver's own JSON — never
+  # inferred from the rc here, which would be this driver re-deriving a fact the
+  # resolver already stated. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]
+  LEG_ORACLE_STATUS["$leg"]="$(printf '%s' "$_oracle_json" | sed -n -e 's/.*"status": "\([^"]*\)".*/\1/p')"
+  LEG_ORACLE_LOG["$leg"]="$outd/reference-oracle.log"
   if [[ "$_orc" -eq 0 ]]; then
     LEG_ORACLE["$leg"]="$(printf '%s' "$_oracle_json"  | sed -n -e 's/.*"path": "\([^"]*\)".*/\1/p')"
     LEG_ORACLE_CC["$leg"]="$(printf '%s' "$_oracle_json" | sed -n -e 's/.*"cc": "\([^"]*\)".*/\1/p')"
@@ -4656,6 +4814,13 @@ for leg in "${LEG_ORDER[@]}"; do
     info "[$leg] same-platform ORACLE built by ${LEG_ORACLE_CC[$leg]} (${LEG_ORACLE_TRIPLE[$leg]}) → ${LEG_ORACLE[$leg]}"
   else
     LEG_ORACLE["$leg"]=""
+    # ★ AND THE TWO NON-ZERO ARMS ARE NOT ONE EVENT. rc 3 means the control RAN
+    # and could not build the very sources dss is about to be handed — which is
+    # EVIDENCE, and the whole input to the per-TU attribution below. rc 4 means
+    # this host owns no compiler for this leg, which is evidence about nothing.
+    if [[ "$_orc" -eq 3 ]]; then
+      info "[$leg] the same-platform ORACLE also FAILED to build these sources — its diagnostics are the CONTROL for this leg's build (${LEG_ORACLE_LOG[$leg]})"
+    fi
     # The resolver's own words, never this driver's paraphrase of them.
     while IFS= read -r _ol; do [[ -z "$_ol" ]] || warn "[$leg] oracle: $_ol"; done \
       < "$outd/reference-oracle.stderr"
@@ -4689,6 +4854,37 @@ for leg in "${LEG_ORDER[@]}"; do
     if [[ $_rc -eq 3 ]]; then
       warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — first diagnostics ($log):"
       { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
+      # >>> dss:build-attribution >>>
+      # ★★★ WHOSE FAILURE IS THIS? Asked ONLY on rc 3 — the diagnostics arm — because
+      # it is the only one where there is anything to compare: the other arms produced
+      # no diagnostics at all. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]
+      # The DECISION is the resolver's, once, for both drivers; this block only
+      # prints what it returned and records it. `|| _arc=$?` is load-bearing under
+      # errexit for the same reason it is on the build call above.
+      _arc=0
+      _attr="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+          --attribute-build "$leg" --compile-log "$log" \
+          --oracle-log "${LEG_ORACLE_LOG[$leg]:-}" \
+          --oracle-status "${LEG_ORACLE_STATUS[$leg]:-}" \
+          --manifest "$manifest" 2>"$outd/build-attribution.stderr")" || _arc=$?
+      if [[ $_arc -eq 0 || $_arc -eq 3 ]]; then
+        # ONE ACCOUNT, COMPOSED BY THE RESOLVER — the same transport the confound
+        # report uses, and the reason the two drivers cannot tell two stories about
+        # one build. Every TU is printed, upstream ones included: an upstream TU that
+        # vanished from the log would be indistinguishable from one that compiled.
+        while IFS= read -r _al; do [[ -z "$_al" ]] || info "$_al"; done \
+          <<< "$(printf '%s' "$_attr" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["report"]))' 2>/dev/null)"
+        LEG_BUILD_ATTRIBUTION["$leg"]="$(printf '%s' "$_attr" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%d of %d rejected TU(s) charged to DSS%s" % (len(d["chargedToDss"]), len(d["tus"]), "" if not d["chargedToDss"] else ": " + " ".join(t.rsplit("/",1)[-1] for t in d["chargedToDss"])))' 2>/dev/null)"
+        [[ -n "${LEG_BUILD_ATTRIBUTION[$leg]}" ]] \
+          && LEG_VERDICT_DETAIL["$leg"]="the fixture did not build for ${LEG_SPEC[$leg]} — ${LEG_BUILD_ATTRIBUTION[$leg]}.  See $log"
+      else
+        # A REFUSAL IS NOT AN ATTRIBUTION. The resolver could not decide, so nothing
+        # is excused and the leg keeps the un-attributed detail it already has.
+        while IFS= read -r _al; do [[ -z "$_al" ]] || warn "[$leg] attribution: $_al"; done \
+          < "$outd/build-attribution.stderr"
+        warn "[$leg] build attribution UNAVAILABLE (rc $_arc) — every diagnostic stays charged to dss, which is the safe direction"
+      fi
+      # <<< dss:build-attribution <<<
     elif [[ $_rc -eq 2 ]]; then
       warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — the build log reports MORE THAN ONE artefact for $spec; see the diagnostic above and $log"
     elif [[ $_rc -eq 1 ]]; then
@@ -6689,6 +6885,15 @@ for leg in "${LEG_DECLARED[@]}"; do
              --leg-oracle "${LEG_ORACLE[$leg]:-}" \
              --leg-oracle-cc "${LEG_ORACLE_CC[$leg]:-}" \
              --leg-oracle-triple "${LEG_ORACLE_TRIPLE[$leg]:-}" 2>&1)
+  # ★★ AND WHAT THE ORACLE WAS *FOR*, on the same shelf as the oracle line itself.
+  # [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] A build that failed and was
+  # ATTRIBUTED, whose attribution appears only in the per-leg build chatter 2,000
+  # lines up, is an attribution nobody reads — and the summary is the one part of
+  # this run that is always read. Printed only when there IS one: a leg that built
+  # has nothing to attribute and a blank line here would read as a missing answer.
+  if [[ -n "${LEG_BUILD_ATTRIBUTION[$leg]:-}" ]]; then
+    printf '   oracle   : %s build attribution: %s\n' "$leg" "${LEG_BUILD_ATTRIBUTION[$leg]}"
+  fi
 done
 printf '   tier     : %s.test   outputs: %s\n' "$DSS_TIER" "$OUT_DIR"
 if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then

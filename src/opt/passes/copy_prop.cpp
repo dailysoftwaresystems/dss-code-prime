@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -19,9 +20,19 @@ namespace dss::opt::passes {
 
 namespace {
 
+// ONE spelling of this pass's name for EVERY diagnostic it can emit — the
+// carve-out Info and every `MirFunctionRebuilder` fatal
+// (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS). Pipeline spelling
+// (`kPassNameTable`, opt/optimizer.hpp).
+constexpr std::string_view kPassName = "CopyProp";
+
 class CopyPropPolicy final : public MirRebuildPolicy {
 public:
     explicit CopyPropPolicy(Mir const& src) : src_(src) {}
+
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return kPassName;
+    }
 
     [[nodiscard]] std::size_t phisCollapsed() const noexcept {
         return phisCollapsed_;
@@ -131,7 +142,7 @@ CopyPropResult runCopyProp(Mir& mir, TypeInterner const& /*interner*/,
     CopyPropResult result{};
     MirBuilder builder;
 
-    if (cloneGlobalsOrCarveOut(mir, builder, reporter, "CopyProp")
+    if (cloneGlobalsOrCarveOut(mir, builder, reporter, kPassName)
         == GlobalClonePrelude::CarvedOut) {
         result.ok = true;
         return result;

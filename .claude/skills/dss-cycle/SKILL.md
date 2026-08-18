@@ -54,6 +54,34 @@ rationale in the owning plan this cycle so it is not re-litigated next invocatio
 
 The loop resumes only after the user answers. **While paused, do not start a different cycle.**
 
+### ★★★ A §B TRIGGER IS A PREDICATE, NOT A RITUAL (operator ruling 2026-08-17)
+
+A row pinned "§B — operator decision" is gated on a **stated reason**. If a lane MEASURES that
+reason to be FALSE, the §B **was never triggered** — discharging it is not closing a §B on the
+lane's own authority, it is discovering the gate does not apply.
+
+**The rule, and all three clauses are load-bearing:**
+- every §B row states its trigger as a **testable predicate**, not as a mood;
+- a lane MAY discharge a §B by **measuring the predicate false**, provided it records the
+  measurement **in the row** and **flags it in the cycle report** so the operator can veto;
+- an **INCONCLUSIVE** measurement escalates. **Silence is never a discharge.**
+
+✔The case that produced this ruling: `D-CSUBSET-INLINE-ASM-SPELLING` was pinned §B because bare
+`asm` "needs a new standard-mode axis". A lane measured that DSS already declares GNU mode in the
+reference compilers' own machine-readable spelling (defines `__GNUC__`/`__clang__`, does **not**
+define `__STRICT_ANSI__`) — so no axis exists or was added, and the predicate was false. It also
+measured that DSS was **accepting `int asm = 42;`**, which no reference compiler accepts in GNU
+mode: the pinned state was shipping an *invented extension*, not merely withholding a feature.
+Operator ruling: **keep it.** *"Reverting sound, measured, conformance-correcting work to
+re-present it as a brief would destroy value to satisfy a ritual."*
+
+⚠ **Without this rule the next lane's only options are an unauthorized close or a wrong revert** —
+which is why the procedural hole, not the keyword row, was the real deliverable of that cycle.
+⚠ Discharging a predicate does not discharge what the predicate did not cover. In that same case
+the references' acceptance genuinely IS conditional (under `__STRICT_ANSI__` they require
+`__asm__`), so a **trigger-gated** row was opened for the day a strict-conformance mode ships —
+the §B's original concern preserved and made testable, without holding the fix hostage to it.
+
 ## Workflow
 
 **Delegation is the default** — see the file map. The orchestrator judges; it should not be the one
@@ -97,6 +125,55 @@ hand-typing every edit or reading every subsystem.
     begins the next cycle with fresh context.
 
 ## Output contract
+
+★★★ **OPERATOR INSTRUCTION 2026-08-17 — SILENCE IS THE DEFAULT. EMIT NOTHING THE OPERATOR DOES NOT
+NEED IN ORDER TO PROCEED.** Verbatim: *"requires no output tokens unless what I need to know to
+proceed (failures, done/not done, final report, etc)"*.
+
+**The complete list of things worth emitting:**
+1. **A failure or a blocker** — something is red, refused, or cannot proceed. State it, with the
+   measurement, and what you are doing about it.
+2. **A pause gate** — a decision only the operator can make (§B, a pending definition, an unfired
+   trigger, a hard stop). This is the one case where length is justified: options, trade-offs,
+   recommendation.
+3. **Done / not done** — a step's terminal state, when the operator's next action depends on it.
+4. **The final report** — the output contract below.
+5. **A direct answer to a direct question.**
+
+⛔ **Everything else is noise, and the list of what NOT to emit is the useful half:** no progress
+narration ("lane X is running", "starting the build"), no interim summaries of work that is not
+finished, no restating a lane's report back, no explaining a finding that is already written into
+the registry row and the handoff — **the row IS the deliverable; a prose retelling is a second copy
+that will go stale**. Do not announce what you are about to do, then do it, then announce that you
+did it. Do not re-report a number the operator has already been given.
+⚠ **This does NOT license silent failure or thin measurement.** Rigor is unchanged: measure
+everything, anchor everything, write the registry rows and the handoff in full. The instruction is
+about the CHAT CHANNEL only — put the detail where it persists, not where it scrolls past.
+★ Test to apply before emitting: *does the operator have to do something differently because of
+this?* If no, it belongs in the row, not in the reply.
+
+★★★ **OPERATOR CORRECTION 2026-08-17, SECOND PASS — THE CATEGORY LIST WAS NOT ENOUGH, BECAUSE THE
+LEAK IS NOT *WHICH* ITEMS GET EMITTED, IT IS *HOW*.** Verbatim: *"silent mode is not working. You
+need to talk only things I need to know (forks, errors, final reports, etc.), not your own
+reasoning."* An emission can sit squarely in category 1 or 3 and still be almost entirely noise,
+because the fact arrives wrapped in the reasoning that produced it. **The fact is the payload; the
+reasoning is not.**
+
+**FORM, not just category — an allowed emission carries the fact and its measurement, and stops:**
+- ⛔ **No significance commentary.** Not *"that changes what delivered means"*, not *"this is worth
+  flagging"*, not *"the interesting part is…"*. State the fact; the operator ranks it.
+- ⛔ **No meta about the telling.** Not *"I'd rather say it now than at commit time"*, not *"stating
+  it plainly rather than burying it"*, not *"before I put it to you"*. Just say it.
+- ⛔ **No derivation.** The operator wants the conclusion and the number, not the path. *"886/886"*,
+  not the reasoning that made you re-run it.
+- ⛔ **No roads not taken.** What you considered and rejected belongs in the row, never in the reply.
+- ⛔ **No relaying a lane's report.** A lane's findings go into the registry and the handoff. Emit
+  only the part that changes the operator's next action, in your own one line.
+- ★ **Length is the tell.** A failure, a done/not-done, or an answer is **1–3 lines**. If it runs
+  longer and is not a §B pause gate, the excess is reasoning — cut it, do not compress it.
+
+⚠ **The one exception stays the §B pause gate**, which needs options, trade-offs and a
+recommendation. Everything else is a sentence or three.
 
 A one-line cycle summary — priority closed, anchors touched, test delta, commit hash — plus:
 
@@ -162,6 +239,10 @@ never lowers the bar.
 - Read `references/operator-discipline.md` when reporting or claiming anything — the bar applies to
   the operator, not only to the code.
 - Read `references/worktrees.md` before any byte-changing measurement or agent worktree operation.
+- Read `references/build-layout.md` before creating ANY build tree (step 5) and before reporting a
+  cycle complete (step 11) — **one root `build/`, subdirectories for distinct builds, and lane builds
+  cleared once the gate covering them is green.** Operator instruction 2026-08-17; a surviving
+  `build/lane-*` blocks the completion report the same way the anchor-balance gate does.
 
 ## Failure modes this skill exists to prevent
 

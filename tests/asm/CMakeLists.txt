@@ -86,6 +86,23 @@ dss_add_test(NAME asm/test_asm_shipped_dialects
 target_link_libraries(dss_asm_test_asm_shipped_dialects
     PRIVATE nlohmann_json::nlohmann_json)
 
+# D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED: the `.s` CALL-FRAME producer. Runs
+# BOTH shipped dialects UNMUTATED, because the defect this closes existed on
+# x86_64 (accepted-and-dropped) and did NOT exist on arm64 (the spellings were
+# absent, so `.cfi_startproc` failed loud) — a one-port test would cover half
+# the fix. Drives the whole chain lower -> assemble() -> attachAssemblyCfi ->
+# buildEhFrame, so the byte offsets are the encoder's MEASURED ones and the
+# DWARF opcodes are asserted on every leg, including hosts that can execute
+# neither corpus binary.
+# ⚠ ITS PINS ARE CONFIG-LEVEL (they read the shipped `.lang.json` and
+# `.target.json`), so it MUST run through ctest — `dss_add_test` sets
+# DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever tree
+# the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_cfi_producer
+             SOURCES test_asm_cfi_producer.cpp)
+target_link_libraries(dss_asm_test_asm_cfi_producer
+    PRIVATE nlohmann_json::nlohmann_json)
+
 # Tests under tests/asm/ share `asm_test_support.hpp` via this
 # include path. test_asm_substrate additionally reuses the LIR
 # lowering fixture (lowered_lir_fixture.hpp lives in tests/lir/).
@@ -95,7 +112,7 @@ foreach(t test_asm_substrate test_asm_x86_variable test_asm_x86_binaryops
           test_asm_pipeline test_asm_width_axis test_asm_x86_tls
           test_asm_arm64_tls test_asm_text_to_lir test_asm_shipped_dialects
           test_asm_arm64_bitwise_w test_asm_arm64_movz_w
-          test_asm_template_to_lir)
+          test_asm_template_to_lir test_asm_cfi_producer)
     target_include_directories(dss_asm_${t}
         PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
 endforeach()

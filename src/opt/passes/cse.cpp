@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -91,6 +92,14 @@ struct CseKeyHash {
     return true;
 }
 
+// ONE spelling of this pass's name for EVERY diagnostic it can emit — the
+// carve-out Info and every `MirFunctionRebuilder` fatal
+// (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS). ★ This pass constructs the
+// rebuilder at TWO sites (the timed and untimed arms of `runCse`), which is
+// precisely why the name is a property of the POLICY and not an argument at each
+// construction site: two sites cannot disagree about one constant.
+constexpr std::string_view kPassName = "Cse";
+
 class CsePolicy final : public MirRebuildPolicy {
 public:
     CsePolicy(Mir const& src, TypeInterner const& interner) noexcept
@@ -98,6 +107,10 @@ public:
           strictTbaa_(src.aliasingMode() == MirAliasingMode::StrictTBAA
                       ? StrictTbaa::Yes : StrictTbaa::No),
           charTypesAliasAll_(src.charTypesAliasAll()) {}
+
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return kPassName;
+    }
 
     [[nodiscard]] std::size_t instructionsCsed() const noexcept {
         return instructionsCsed_;
@@ -441,7 +454,7 @@ CseResult runCse(Mir& mir, TypeInterner const& interner,
     CseResult result{};
     MirBuilder builder;
 
-    if (cloneGlobalsOrCarveOut(mir, builder, reporter, "Cse")
+    if (cloneGlobalsOrCarveOut(mir, builder, reporter, kPassName)
         == GlobalClonePrelude::CarvedOut) {
         result.ok = true;
         return result;

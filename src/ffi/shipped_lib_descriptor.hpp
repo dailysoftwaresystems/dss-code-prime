@@ -5,6 +5,7 @@
 #include "core/types/include_path_resolve.hpp" // HeaderNameMatching + HeaderSearchResult (the `includes` closure walk's case policy)
 #include "core/types/named_type_binding.hpp" // NamedTypeBinding (c82 va_list alias thread-through)
 #include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
+#include "core/types/preprocess_config.hpp"  // PredefinedMacroDef / ShippedSurfaceClaim (the `impliedSurface` satisfaction half)
 #include "core/types/strong_ids.hpp"   // TypeId
 
 #include <cstdint>
@@ -260,6 +261,37 @@ struct DSS_EXPORT ShippedSymbol {
     // fails loud on read (the SAME `decodeLibraryMap` chokepoint the
     // descriptor-level map uses).
     std::unordered_map<std::string, std::string> library;
+    // ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF (operator ruling, 2026-08-17) —
+    // optional per-SYMBOL `realization` OVERRIDE: the per-object-format map
+    // ("pe"/"elf"/"macho" → the CONFIG-ROOT-RELATIVE PATH of a shipped source file) that answers
+    // WHETHER this symbol is imported at all, as opposed to `library` above,
+    // which answers which IMAGE it is imported FROM. EMPTY (the default, every
+    // symbol today) ⇒ IMPORT, i.e. byte-identical to the pre-ruling image.
+    //
+    // The two maps are SIBLINGS BY CONSTRUCTION — same closed object-format key
+    // vocabulary, same `decodeLibraryMap`-shaped chokepoint, and the SAME merge
+    // rule (a per-symbol map is merged OVER the descriptor's; symbol keys win, a
+    // format the symbol omits inherits the descriptor's entry). That is why this
+    // is an EXTENSION of the `library` axis rather than a parallel one: "where
+    // does this symbol's body come from, on this format" was already the
+    // descriptor's established shape, and this completes the answer set.
+    //
+    // ★ THE ENGINE NEVER BRANCHES ON FORMAT. It reads the declared realization
+    // and either emits an import or adds the named source unit to the build
+    // graph. There is no `if (format == "pe")` anywhere on this path — the
+    // decision is DATA, exactly as the realization invariant that deleted
+    // `externLibraryByFormat` requires (the declaration syntax has no authority
+    // over realization; the PLATFORM, per format, carries it).
+    //
+    // ★ AND IT REFUSES, BIDIRECTIONALLY. Three load errors, all format-
+    // independent so an inactive arm cannot rot (see `validateShippedSourceUnits`):
+    //   R1 — a format naming a source that is not there ⇒ the error names BOTH
+    //        the descriptor row and the missing path (LOAD time).
+    //   R2 — a shipped source file NO descriptor names ⇒ inert config (gate test;
+    //        see `validateShippedSourceTree` for why the placement differs).
+    //   R3 — one format carrying BOTH a `library` image AND a `source` ⇒ two
+    //        owners for one body is the defect, not a fallback resolved silently.
+    std::unordered_map<std::string, std::string> realization;
 };
 
 // True iff `id` is a member of the CLOSED synth-recipe vocabulary — 22 recipes spanning
@@ -486,7 +518,13 @@ struct DSS_EXPORT ShippedLibDescriptor {
     // pure back-compat). Fully generic: any descriptor may declare `includes`;
     // the engine walks a config-declared graph via `forEachDescriptorInClosure`
     // with NO `if (name==…)` and no source/target/format identity branch.
-    std::vector<std::string>     includes;    // transitive sibling header names
+    // D-FFI-DESCRIPTOR-INCLUDES-EDGE-GATE: an entry may instead be an object
+    // `{header, when}` — a CONDITIONAL edge, taken only on a format its `when`
+    // selects (see `readShippedLibIncludes` for the full entry grammar). This
+    // vector holds the ALREADY-SELECTED header names for the `activeFormat` the
+    // read was given: an inactive edge is not an edge on this target and never
+    // appears here, so a reader of this field can never re-decide the question.
+    std::vector<std::string>     includes;    // ACTIVE transitive sibling header names
     // The full neutral surface a header provides. A descriptor must declare AT
     // LEAST ONE of these non-empty (a descriptor that declares NOTHING is a
     // no-op artifact and fails loud); a header may legitimately carry only
@@ -501,7 +539,230 @@ struct DSS_EXPORT ShippedLibDescriptor {
     std::vector<ShippedMacro>    macros;      // preprocessor macros (injected at #include)
     std::vector<ShippedStruct>   structs;     // named-field structs (tag + field scope)
     std::vector<ShippedUnion>    unions;      // named-member unions (tag + field scope; all @0)
+    // ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — the descriptor-level per-object-
+    // format REALIZATION map (format → shipped source unit NAME), the sibling of
+    // `library` above and the DEFAULT each `symbols[i].realization` is merged
+    // over. EMPTY/absent (every descriptor but `dirent.json` today) ⇒ every
+    // symbol IMPORTS, byte-identical to the pre-ruling image. See the field of
+    // the same name on `ShippedSymbol` for the full contract.
+    std::unordered_map<std::string, std::string> realization;
 };
+
+// ═══ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — THE SHIPPED SOURCE TREE ═══
+//
+// DSS SHIPS THE SOURCE. The compiler synthesizes only STATELESS glue; anything
+// with state, allocation or nontrivial control flow lives in a RUNTIME LIBRARY
+// OF COMPILED SOURCE — libgcc / compiler-rt / libmingwex / newlib is the
+// universal shape, and `opendir` on Windows is literally the libmingwex case.
+//
+// A descriptor's `realization` map points AT THE FILE, config-root-relative:
+// `{"pe": {"source": "runtime/platform/pe/dirent.c"}}`. Nothing derives and
+// nothing composes — the string in the descriptor is the string you can paste
+// into `ls`, and it greps in BOTH directions (body→declaration and back). There
+// is NO manifest: a unit list would be a third copy of facts the descriptor and
+// the file tree already own, and `.c` already answers "which front end compiles
+// this" through `fileExtensions`, the same mechanism every ordinary compile uses.
+//
+// ★ THE `<format>` SEGMENT IS ORGANIZATIONAL, NEVER SEMANTIC, and the
+// distinction is worth keeping because it decides the next case. `pe/` organizes:
+// the realization KEY owns which format uses a body, the PATH owns which file,
+// and nothing is derived from the segment — a disagreement would be confusing,
+// not wrong. A LANGUAGE segment (`c-subset/`) would be semantic: it would compete
+// with the extension for HOW the file is compiled, and the moment it won, a
+// `foo.c` under `toy/` would compile as toy. It is therefore absent.
+// ⚠ The one case that would genuinely need a language axis is real and is NOT
+// this one: `.s`/`.S` is claimed by BOTH shipped asm dialects, so a hand-written
+// assembly runtime unit (soft-float helpers, setjmp/longjmp bodies — classic
+// contents of this tier) is genuinely ambiguous by extension. It would need the
+// ARCH, not the language, and the realization key is FORMAT-keyed, so it is a
+// different shape; building for it now is the speculative structure §A.2 rules
+// out.
+
+// The shipped-config ROOT (`…/src/dss-config`), by the SAME precedence every
+// other shipped thing uses. nullopt ⇒ discovery failed; the caller decides what
+// that means (it is a statement about the environment, never about the corpus).
+[[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path>
+findShippedConfigRootDir();
+
+// Resolve a descriptor's config-root-relative `realization.<fmt>.source` to an
+// absolute path. nullopt ⇒ discovery failed OR no readable file is there — the
+// two are one answer to the caller, which is R1's whole question.
+[[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path>
+resolveShippedSourcePath(std::string_view configRelativePath);
+
+// The interner-free FAST reader the DRIVER uses: every config-root-relative
+// shipped SOURCE path the descriptor at `path` realizes on `formatName`, from the
+// descriptor-level `realization` map with each symbol's override merged over it.
+// Deliberately parallel to `readShippedLibAvailability` — no interner, no type
+// decoding, no diagnostics — because the driver asks this once per resolved
+// descriptor per build and must not pay for a full read.
+[[nodiscard]] DSS_EXPORT std::vector<std::string>
+readShippedSourcesForFormat(std::filesystem::path const& path,
+                            std::string_view             formatName);
+
+// EVERY config-root-relative shipped SOURCE path that ANY descriptor under
+// `descriptorDir` realizes on `formatName`, deduplicated and in a deterministic
+// order (the corpus walk's order, which is the filesystem's sorted order).
+//
+// ★★★ THE RUNTIME IS COMPILED FOR EVERY BUILD OF A FORMAT THAT REALIZES IT,
+// NOT ONLY FOR BUILDS THAT HAPPEN TO INCLUDE THE HEADER — which is why this
+// reads the CORPUS rather than the CUs. On-demand compilation would make the
+// runtime object set depend on which headers somebody happened to `#include`,
+// and an object set that varies by that cannot be cached, packaged or shipped.
+// Always-compile makes it a PURE FUNCTION OF (target, config), which is the
+// property a shippable runtime needs.
+//
+// ⚠ COMPILE-ALWAYS IS NOT LINK-ALWAYS. This answers what to COMPILE; what
+// ends up in the image stays demand-driven, so a `hello.c` on pe64 carries no
+// directory-walking code it never calls.
+[[nodiscard]] DSS_EXPORT std::vector<std::string>
+allShippedSourcesForFormat(std::filesystem::path const& descriptorDir,
+                           std::string_view             formatName);
+
+// ★★★ THE CORPUS-WIDE REFUSALS, run over the WHOLE tree and INDEPENDENT OF THE
+// ACTIVE FORMAT — so an arm no current target selects cannot rot, which is the
+// bidirectional half of the bar.
+//
+//   R1  a realization naming a source that is not there ⇒ refusal naming BOTH the
+//       descriptor row and the missing path. ALSO enforced at DESCRIPTOR READ TIME
+//       (`readShippedLibDescriptor`), where it is one `is_regular_file` per
+//       declared entry and therefore free — that is its load-bearing home, because
+//       it is the refusal that can otherwise produce a build silently missing a
+//       body. It is repeated here so the sweep is a TOTAL statement about the tree.
+//   R2  a source file NO descriptor names ⇒ refusal (inert config: nothing can
+//       ever add it to a build graph). ⚠ GATE-TEST ONLY, and that is a deliberate
+//       departure from the ruling's "LOAD ERROR" wording, stated rather than left
+//       to look like verbatim compliance: without the deleted manifest this costs
+//       a directory walk PLUS a corpus scan on EVERY compile, and an inert `.c`
+//       can only waste disk while R1's failure can produce a wrong binary.
+//       Severity matched to the failure.
+//   R4  no HEADERS in the tree. Folded into R2 rather than given its own check,
+//       which is strictly stronger: a header is never a translation unit, so no
+//       `realization` can name one, so the unclaimed-file rule refuses it BY
+//       CONSTRUCTION with no extension vocabulary to enumerate or keep current.
+//
+// R3 (an image AND a source for one format — two owners for one body) is NOT here:
+// it is a WITHIN-DESCRIPTOR check and lives at descriptor read time, where it
+// costs nothing and fires on the descriptor actually being loaded.
+//
+// Returns false (diagnostics already reported) on any refusal.
+// ⚠ `runtimeRootDir` IS THE RUNTIME ROOT (`.../src/dss-config/runtime`), never a
+// tier and never a tier's `src/`. The function DERIVES `<root>/<tier>/src` and
+// walks only that — deliberately, because a tier also holds `dist/`, the
+// GENERATED object cache: handed a tier, an unfiltered walk would refuse every
+// cached object as unclaimed and red EVERY WARM BUILD, and the failure would read
+// as a config error rather than a wrong argument. Deriving the subtree makes the
+// wrong subject unrepresentable, and a root that HAS a `src/` child is refused
+// outright rather than scanned. (⚠⚠ Not closed by filtering to `.c`: that
+// would make this silently ignore a stray `.txt`/`.o` in the AUTHORED tree, which
+// is exactly the inert-config case R2 exists to catch. The subject was the bug.)
+[[nodiscard]] DSS_EXPORT bool
+validateShippedSourceTree(std::filesystem::path const& descriptorDir,
+                          std::filesystem::path const& runtimeRootDir,
+                          DiagnosticReporter&          reporter);
+
+// Every NAME the descriptor at `path` contributes on object format `fmt` — the
+// ONE surface-presence oracle, shared by the corpus invariants and by the
+// predefined-macro `requires` satisfaction check, so "is X visible here?" has a
+// single answer.
+//
+// A name is any declaration a `#include` of this header brings into scope: a
+// symbol, a constant, a float constant, a typedef, a struct or union tag, a
+// macro. Per-format selection is applied EXACTLY as the real reads apply it —
+// a symbol's own `availableObjectFormats` (falling back to the document's), and
+// the real `macros` decode with the real format, so a variants-only macro that
+// selects no arm on `fmt` contributes no name here for the same reason it
+// contributes no `#define` to a compile.
+//
+// ⚠ THE TYPED SURFACES ARE ANSWERED AT FORMAT REACHABILITY, NOT FULL SELECTION.
+// A `variants`-bearing typedef/constant/struct contributes its name on `fmt` if
+// ANY of its arms is format-compatible, because this scan has no arch and no
+// data model and does not need them: a variant set gives a name a different
+// TYPE or LAYOUT per arch, never existence. See `WhenAxes::FormatReachability`.
+//
+// std::nullopt (and `reporter` carries the reason) when the descriptor does not
+// decode far enough to answer — callers must report that, never treat it as an
+// empty surface. Callers that own their own wording pass a throwaway reporter.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
+shippedSurfaceNamesForFormat(std::filesystem::path const& path,
+                             ObjectFormatKind             fmt,
+                             DiagnosticReporter&          reporter);
+
+// ★★★ THE TWO CORPUS-WIDE INVARIANTS THAT SHIP WITH THE `includes` EDGE GATE
+// (D-FFI-DESCRIPTOR-INCLUDES-EDGE-GATE). Run over the WHOLE tree under
+// `descriptorDir` and INDEPENDENT OF ANY BUILD'S ACTIVE FORMAT — the
+// `validateShippedSourceTree` posture, for its reason: an arm no current target
+// selects must not be allowed to rot.
+//
+//   (i)  EDGE FIRES ⇒ CHILD AVAILABLE. For every descriptor D and every object
+//        format F in D's availability set, every `includes` edge of D ACTIVE on
+//        F must resolve to a child descriptor that is itself available on F.
+//        The config may not promise, on F, a surface it declares absent on F.
+//   (ii) NO EMPTY SURFACE ON A SERVED FORMAT. A descriptor available on F must
+//        contribute at least one name on F — its own surfaces or its active
+//        closure. A header whose `#include` compiles and declares nothing is a
+//        header that silently is not there.
+//
+// WHY THEY SHIP WITH THE GATE RATHER THAN LATER: a conditional edge lets an
+// author buy silence for free (write a `when` that never fires and get an empty
+// surface instead of a complaint). A mechanism that can convert a loud failure
+// into a quiet one must arrive with the checks that keep silence expensive.
+//
+// `servedFormats` is the set of object formats the corpus is expected to serve,
+// and it is a PARAMETER rather than an enumeration of `ObjectFormatKind`
+// deliberately: the enum carries reserved slots (`wasm`, `spirv`) that no
+// shipped object-format document declares, and sweeping them would refuse the
+// corpus for failing to serve a platform nobody targets. An EMPTY span is
+// refused outright — a sweep that cannot fail is not a sweep.
+//
+// ⚠ WHAT THEY DO NOT COVER (stated, not implied): PARTIAL OMISSION — (ii) is an
+// EXISTENCE claim, so a descriptor declaring one of a real header's forty names
+// passes exactly as a complete one does, and nothing here can measure
+// completeness (that is what a consumer's `requires` is for); SEMANTIC
+// correctness of any declaration (signatures, layouts — `ShippedTypeConsistency`
+// owns those); the ARCH and DATA-MODEL axes (both invariants are FORMAT-keyed —
+// see `shippedSurfaceNamesForFormat`); any format outside `servedFormats`; and
+// anything outside the shipped descriptor corpus.
+//
+// Returns false (diagnostics already reported) on any refusal.
+[[nodiscard]] DSS_EXPORT bool
+validateShippedIncludeClosure(std::filesystem::path const&      descriptorDir,
+                              std::span<ObjectFormatKind const> servedFormats,
+                              DiagnosticReporter&               reporter);
+
+// ★★★ D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE — the SATISFACTION half.
+//
+// The predicate's SHAPE lives in core (`ShippedSurfaceClaim`); this is the
+// half that can see the shipped corpus. For every macro in `macros` that
+// declares a non-null `impliedSurface`, every claimed header must resolve, must exist
+// on each format the claim covers, and must make every claimed NAME visible
+// through its ACTIVE include closure on that format.
+//
+// FORMAT SET, per macro: its own `availableObjectFormats` when non-empty (so a
+// pe-gated macro is checked on pe from EVERY leg — the arm nobody selects is the
+// arm that rots), else `activeFormat` when known. An ungated macro with no
+// active format has no platform in scope and therefore no claim to check; that
+// is a check whose SUBJECT does not exist, not a check that was skipped — and it
+// is unreachable from the driver, which builds a CU once per (target, format).
+//
+// It is an ASSERTION, never a suppression: a macro whose backing is missing
+// fails the build. Withdrawing it quietly would flip `#ifdef` branches under the
+// user with no diagnostic — the same quiet wrongness as the silently-PRESENT
+// macro this mechanism exists to end.
+//
+// `declaringDocument` is the config FILE FAMILY the rows came from (e.g.
+// "<lang>.lang.json /preprocess/predefinedMacros"); combined with each row's own
+// `declaredAt` JSON pointer it makes the diagnostic name the file and the row,
+// instead of naming a macro and leaving the author to grep three families.
+//
+// Returns false (diagnostics already reported) on any unsatisfied requirement.
+[[nodiscard]] DSS_EXPORT bool
+validateShippedSurfaceRequirements(
+    std::span<PredefinedMacroDef const>    macros,
+    std::string_view                       declaringDocument,
+    std::span<std::filesystem::path const> systemDirs,
+    std::optional<ObjectFormatKind>        activeFormat,
+    DiagnosticReporter&                    reporter);
 
 // Read + decode the neutral descriptor at `path`, interning each symbol's
 // `signature` type into `interner` (+ `typeReg` for `ext<>` kinds). PURE —
@@ -618,13 +879,35 @@ readShippedLibTypedefNames(std::filesystem::path const& path,
 // interner. Returns the declared header-name list (EMPTY when the descriptor
 // declares no `includes` — the common case, every existing descriptor);
 // std::nullopt + `F_ShippedLibDescriptorMalformed` on a malformed `includes` field
-// (not an array, or a non-string / empty entry). Validated through the SAME shared
-// decode as the full `readShippedLibDescriptor` read, so the interner-free and
-// interned reads never drift (the `readShippedLibMacros` lock-step precedent).
+// (not an array, or an entry that is neither a non-empty string nor a well-formed
+// `{header, when}` object). Validated through the SAME shared decode as the full
+// `readShippedLibDescriptor` read, so the interner-free and interned reads never
+// drift (the `readShippedLibMacros` lock-step precedent).
 // (D-FFI-DESCRIPTOR-INCLUDES)
+//
+// ── THE `includes` ENTRY GRAMMAR (D-FFI-DESCRIPTOR-INCLUDES-EDGE-GATE) ──
+// An entry is EITHER
+//   "stdio.h"                                  — an UNCONDITIONAL edge, and
+//                                                byte-identical to the pre-gate
+//                                                shape, OR
+//   {"header":"windows.h","when":{"format":"pe"}}
+//                                              — a CONDITIONAL edge, taken only
+//                                                on a format the `when` selects.
+// `when` is REQUIRED and NON-EMPTY in the object form (an absent or `{}` `when`
+// is a second spelling of the string form and FAILS LOUD), and is evaluated by
+// the ONE shared `when` evaluator in its FORMAT-ONLY mode — the SAME closed
+// vocabulary and the same unknown-key/unknown-format-name refusals the `macros`
+// surface gets. Every entry's SHAPE is validated EAGERLY regardless of whether
+// the edge is active, so a malformed INACTIVE edge fails the read on EVERY
+// target (the anti-lurking property the variant surfaces already have).
+//
+// `activeFormat` nullopt (LSP / direct-API / test callers, and any caller with no
+// target) ⇒ NO conditional edge is taken; unconditional edges are unaffected.
+// This is the same rule the `macros` surface applies to a variants-only macro.
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
-readShippedLibIncludes(std::filesystem::path const& path,
-                       DiagnosticReporter&          reporter);
+readShippedLibIncludes(std::filesystem::path const&    path,
+                       DiagnosticReporter&             reporter,
+                       std::optional<ObjectFormatKind> activeFormat = std::nullopt);
 
 // Walk the transitive shipped-descriptor closure rooted at `startPath`, invoking
 // `visit(path)` once for EACH DISTINCT descriptor in the closure, PARENT-FIRST (a
@@ -662,6 +945,51 @@ readShippedLibIncludes(std::filesystem::path const& path,
 //     `ambiguousCandidates` name every colliding file) so the caller can emit
 //     the right loud diagnostic; collapsing the two would report a typo for a
 //     tree that actually holds two case-colliding descriptors.
+//   * `activeFormat` makes the walk PER-FORMAT, and it is what lets every tier
+//     agree by construction:
+//       - a CONDITIONAL `includes` entry whose `when` does not select this format
+//         is NOT AN EDGE here. It is absent from the closure, so no tier forms an
+//         opinion about it and no two tiers can hold different ones.
+//       - a descriptor UNAVAILABLE on this format is still VISITED when it is the
+//         ROOT (the caller owns that verdict — it is the header the user named),
+//         but is never DESCENDED INTO: a header that does not exist on a format
+//         declares nothing on it, its `includes` closure included.
+//       - an ACTIVE edge whose child is UNAVAILABLE on this format is a config
+//         contradiction and fires `onUnavailableChild(headerName, childPath)`
+//         instead of being visited. `validateShippedIncludeClosure` invariant (i)
+//         refuses that statically over the whole corpus; this callback is the
+//         runtime belt to that sweep's braces.
+//     nullopt (LSP / direct-API / tests) ⇒ no conditional edge is taken and no
+//     availability test is applied — the pre-gate walk over unconditional edges.
+//   * `onUnavailableChild(headerName, childPath)` is MANDATORY, deliberately: a
+//     defaulted no-op is how one tier ends up silently dropping what another
+//     reports, which is the exact drift this parameter exists to end. A tier that
+//     genuinely must stay silent (the preprocessor macro-splice, whose loud twin
+//     is the import resolver) passes an empty lambda AND says why.
+DSS_EXPORT void forEachDescriptorInClosure(
+    std::filesystem::path const&                            startPath,
+    std::span<std::filesystem::path const>                  systemDirs,
+    HeaderNameMatching                                      matching,
+    std::optional<ObjectFormatKind>                         activeFormat,
+    std::unordered_set<std::string>&                        visited,
+    std::function<void(std::filesystem::path const&)> const& visit,
+    std::function<void(std::string const&,
+                       HeaderSearchResult const&)> const&    onUnresolvedInclude,
+    std::function<void(std::string const&,
+                       std::filesystem::path const&)> const& onUnavailableChild);
+
+// The FORMAT-BLIND walk, for callers that genuinely have no active object format
+// (the LSP, the direct API, unit tests over a synthetic corpus). Equivalent to
+// passing `activeFormat = std::nullopt` above.
+//
+// ★ IT OMITS `onUnavailableChild` BECAUSE THAT ARM IS UNREACHABLE HERE, NOT
+// BECAUSE IT IS OPTIONAL. "This child is unavailable on the active format" is
+// not a statement that exists without an active format, so there is nothing for
+// the callback to report and nothing being silently dropped. A caller that DOES
+// hold a format must use the full form and say what it does with the answer —
+// which is the property that keeps two tiers from disagreeing, and it is why
+// this is an overload with a stated precondition rather than a default argument
+// on the real one.
 DSS_EXPORT void forEachDescriptorInClosure(
     std::filesystem::path const&                            startPath,
     std::span<std::filesystem::path const>                  systemDirs,
@@ -814,6 +1142,15 @@ enum class ShippedRealizationStatus : std::uint8_t {
     // gated ["elf","macho"] with zero pe-gated symbol rows, which makes their
     // absent `pe` key CORRECT and puts them in `UnavailableForFormat` above).
     NoLibraryForFormat,
+    // ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF. Declared, available here, and the
+    // platform states that the BODY IS SHIPPED rather than imported: no image
+    // exports it on this format because no image HAS it (Windows has no POSIX
+    // directory API in ucrtbase or kernel32), so DSS supplies the source and the
+    // driver compiles it FOR THE TARGET as an ordinary extra translation unit.
+    // The reference binds like any sibling-CU definition — it is NOT an import,
+    // and emitting one would produce a binary the loader rejects at process
+    // start. Carries `shippedSourceUnit`.
+    ProvidedByShippedSource,
     // Fully realized: bind exactly as the `#include` path would have.
     Realized,
 };
@@ -831,6 +1168,11 @@ struct DSS_EXPORT ShippedSymbolRealization {
     std::string version;    // required ELF symbol version; EMPTY ⇒ unversioned
     std::string recipeId;   // `synthesize`; EMPTY ⇒ an ordinary library import
     std::string linkName;   // per-target link BASE name; EMPTY ⇒ the identifier
+    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the CONFIG-ROOT-RELATIVE path of
+    // the shipped source file whose compiled body provides this symbol on the
+    // active format (`runtime/platform/pe/dirent.c`). NON-EMPTY iff
+    // `status == ProvidedByShippedSource`; EMPTY for every other status.
+    std::string shippedSourcePath;
     // The row's DECLARED signature, interned in the CALLER's interner (the
     // `signatureByDataModel` override for the active model already applied).
     // InvalidType unless `status == Realized`.

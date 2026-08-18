@@ -31,6 +31,14 @@
 //   * codesign: the dylib CodeDirectory's execSegFlags is 0 (NOT
 //     CS_EXECSEG_MAIN_BINARY -- the exec keeps 1, pinned by
 //     test_macho_codesign.cpp).
+//   * D-LINK-MACHO-IMAGE-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS: a FINAL
+//     IMAGE's nlist carries every DECLARED function name, `static` included,
+//     across ALL THREE image arms (static exec / dynamic exec / dylib) and
+//     BOTH ports -- with the dylib cell doubling as the ABI control, since the
+//     `static` must gain its nlist name while staying OFF the export trie.
+//     That last pin lives HERE rather than beside the exec suites because this
+//     file owns the dyld trie walk, and separating the relaxation from its
+//     control would be the one place the two could drift.
 //   * policy: isImageFlavor() TRUE, allowsUndefinedImports() FALSE
 //     (two-level namespace -- every bind names a dylib ordinal),
 //     outputExtension ".dylib", tdata/tbss rejected by absence
@@ -56,6 +64,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -65,6 +74,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1325,4 +1335,599 @@ TEST(MachoDylibWriterX86_64, HeaderPinsDylibShape) {
         << "_dss_add must be exported via the LC_DYLD_INFO export trie";
     EXPECT_EQ(fn->address, 0x1000u) << "fn[0] at __text VA (base-0)";
     EXPECT_FALSE(trieWalk(trie, "_hidden_helper").has_value());
+}
+
+// ── D-LINK-MACHO-IMAGE-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS ───────────────
+//
+// THE red-on-disable pin: a FINAL Mach-O IMAGE's nlist must carry each
+// function's DECLARED name, and must keep `_sym_<id>` for exactly the symbols
+// that have no declared name.
+//
+// ✔MEASURED ON REAL APPLE SILICON (macOS 26.5.2, arm64), the defect this
+// closes. The macOS crash reporter -- Apple's own unwinder, symbolicating a
+// REAL faulting stack from the image's nlist -- printed
+//   #0 sym_83 + 52 / #1 sym_88 + 28 / #2 sym_92 + 44 / #3 sym_147 + 4
+// where the source says `static_helper` / `global_helper` / `main` (+ the
+// linker-injected trampoline). After the fix the SAME program at the SAME
+// offsets printed
+//   #0 static_helper + 52 / #1 global_helper + 28 / #2 main + 44 / #3 sym_147 + 4
+// -- every offset identical, so this is a NAME-only change, and the trampoline
+// correctly keeps its synthetic spelling. lldb agreed both times: `br set -n
+// main` reported "no locations (pending)" before, and resolves to
+// names_exec_dbg`main after.
+//
+// ★ WHY THIS LOOPS OVER THREE IMAGE ARMS AND NOT ONE. The Mach-O walker has
+// TWO image nlist builders and BOTH were wrong, in DIFFERENT ways:
+//   * `encodeExec` (the static, zero-extern arm) hardcoded `_sym_<id>`;
+//   * `encodeExecDynamic` carried an `isDylib ? definedName : "_sym_" + id`
+//     ternary -- so the EXEC branch hardcoded the synthetic id, AND the DYLIB
+//     branch used `definedName`, whose `isExternallyVisible` gate belongs to
+//     the RELOCATABLE tier and dropped a `static`'s name from a dylib's nlist
+//     too (✔MEASURED: `nm` on a DSS dylib showed `_sym_83` beside a correctly
+//     named `_dss_lib_entry`).
+// The LIVE arm is the dynamic one -- every Darwin exec schema declares
+// `processExit`, so `linker::link` injects a trampoline importing `_exit` and
+// every REAL executable carries at least one extern. A pin on the "minimal
+// static exec" alone would have tested the arm no shipped build reaches.
+//
+// ★ THE DYLIB CELL IS THE DECISIVE CONTROL, and it is why the image-tier
+// relaxation is safe: in ONE binary the `static` gains its name in the nlist
+// while staying ABSENT from the EXPORT TRIE, which is the surface dyld's
+// dlsym actually walks. The trie has its OWN `isExternallyVisible` gate over
+// the same `module.symbols`, so the two surfaces cannot drift.
+// ✔MEASURED BY EXECUTION on the Mac with a probe built by APPLE's clang (a
+// neutral third party, not DSS reading its own output): against the fixed
+// dylib, `dlsym(h, "lib_static_helper")` is still NULL while
+// `dlsym(h, "dss_lib_entry")` resolves AND calls correctly (returned 43).
+//
+// ★ EVERY CELL RUNS THROUGH A `void` CALLABLE so a failed ASSERT returns from
+// the BODY instead of aborting the whole matrix -- a safe arm masking a
+// dangerous one has been measured in this project twice.
+namespace {
+
+// Every nlist name in an emitted image, in emission order. Returned as a LIST
+// and asserted by MEMBERSHIP so the pin survives a legitimate reordering of the
+// symbol table (not what it exists to police) while still failing on a changed
+// SPELLING (which is). nlist_64 is 16 bytes: n_strx(4) n_type(1) n_sect(1)
+// n_desc(2) n_value(8).
+[[nodiscard]] std::vector<std::string>
+imageNlistNames(std::vector<std::uint8_t> const& bytes) {
+    std::vector<std::string> out;
+    auto const lc = findLoadCommand(bytes, /*LC_SYMTAB=*/0x02u);
+    if (!lc) return out;
+    std::uint32_t const symOff = readU32LE(bytes, *lc + 8);
+    std::uint32_t const nsyms  = readU32LE(bytes, *lc + 12);
+    std::uint32_t const strOff = readU32LE(bytes, *lc + 16);
+    for (std::uint32_t i = 0; i < nsyms; ++i) {
+        std::size_t const rec = static_cast<std::size_t>(symOff) + i * 16u;
+        if (rec + 16 > bytes.size()) break;
+        std::size_t p =
+            static_cast<std::size_t>(strOff) + readU32LE(bytes, rec);
+        std::string name;
+        while (p < bytes.size() && bytes[p] != 0)
+            name.push_back(static_cast<char>(bytes[p++]));
+        out.push_back(std::move(name));
+    }
+    return out;
+}
+
+// The three FINAL-IMAGE arms this pin must cover. Named by the walker each
+// selects, so a cell that lands in the wrong one says so by name.
+enum class ImageArm { StaticExec, DynamicExec, Dylib };
+
+struct MachoPortSpec {
+    char const*               label;
+    char const*               targetName;
+    char const*               execFormat;
+    char const*               dylibFormat;
+    std::vector<std::uint8_t> retBytes;
+};
+
+} // namespace
+
+TEST(MachoImageSymbolNames,
+     ImageNlistNamesEveryDeclaredFunctionOnBothPortsAndAllThreeImageArms) {
+    // The ONLY per-port data here is the return instruction. Every assertion
+    // below is identical for both ports, because the naming decision is made in
+    // format-neutral substrate (`ObjectSymbolNames::imageName`) that no target
+    // or format can reach into.
+    std::vector<MachoPortSpec> const ports{
+        {"arm64", "arm64",
+         "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib",
+         {0xC0, 0x03, 0x5F, 0xD6}},                     // RET
+        {"x86_64", "x86_64",
+         "macho64-x86_64-darwin-exec", "macho64-x86_64-darwin-dylib",
+         {0xC3}},                                       // ret
+    };
+
+    // ONE cell = one (port, image arm) pair. `void` on purpose -- see above.
+    auto runCell = [](MachoPortSpec const& port, ImageArm arm) -> void {
+        char const* const armLabel =
+            arm == ImageArm::StaticExec  ? " [static exec arm]"
+          : arm == ImageArm::DynamicExec ? " [dynamic exec arm]"
+                                         : " [dylib arm]";
+        std::string const label = std::string{port.label} + armLabel;
+        bool const isDylibCell = arm == ImageArm::Dylib;
+
+        auto target = TargetSchema::loadShipped(port.targetName);
+        ASSERT_TRUE(target.has_value()) << label;
+        auto fmt = ObjectFormatSchema::loadShipped(
+            isDylibCell ? port.dylibFormat : port.execFormat);
+        ASSERT_TRUE(fmt.has_value()) << label;
+
+        AssembledModule mod;
+        mod.expectedFuncCount = 3;
+
+        // fn #7 -- a `static` (Local binding) function WITH a declared name.
+        // THE discriminating case: a final image wants this name (it is the
+        // frame a debugger and a crash reporter print), while a relocatable
+        // `.o` must NOT expose it (a foreign linker keys by name, and two TUs'
+        // `helper`s would collide -- D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-
+        // FOREIGN-COLLISION). Pre-fix, every arm spelled it `_sym_7`.
+        AssembledFunction f7;
+        f7.symbol = SymbolId{7};
+        f7.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f7));
+
+        // fn #8 -- an externally-visible function with a declared name. Pre-fix
+        // the two EXEC arms lost this one too; only the dylib arm kept it.
+        AssembledFunction f8;
+        f8.symbol = SymbolId{8};
+        f8.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f8));
+
+        // fn #9 -- NO `ModuleSymbol` row at all: the shape of the linker-
+        // injected `_start` trampoline (minted SymbolId, no declared name).
+        // This one MUST keep `_sym_9`; the fallback is the deliberate answer
+        // for a symbol that genuinely has no name, not an oversight.
+        AssembledFunction f9;
+        f9.symbol = SymbolId{9};
+        f9.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f9));
+
+        mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "_img_static_fn",
+                                           SymbolBinding::Local,
+                                           SymbolVisibility::Default});
+        mod.symbols.push_back(ModuleSymbol{SymbolId{8}, "_img_global_fn",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+
+        // The EXTERN is what routes an exec to `encodeExecDynamic` -- exactly
+        // how every shipped build gets there (the injected trampoline imports
+        // `_exit`). Its ABSENCE is what keeps the static cell on `encodeExec`.
+        if (arm == ImageArm::DynamicExec) {
+            ExternImport imp;
+            imp.symbol      = SymbolId{99};
+            imp.mangledName = "_puts";
+            imp.libraryPath = "/usr/lib/libSystem.B.dylib";
+            mod.externImports.push_back(std::move(imp));
+        }
+        // A dylib is entry-less; only the exec arms need the D-LK10-ENTRY
+        // override that stands in for the trampoline `linker::link` would have
+        // injected.
+        if (!isDylibCell) mod.imageEntryOverride = std::size_t{0};
+
+        // ★ THE STATIC ARM IS NOT REACHABLE ON EVERY SHIPPED EXEC FORMAT, and
+        // this cell ASSERTS that boundary rather than skipping past it. The
+        // arm64 exec schema declares `image.buildVersion` (modern dyld rejects
+        // an Apple Silicon main executable without LC_BUILD_VERSION), and
+        // `encodeExec` REFUSES such a schema loud
+        // (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION) because only the dynamic
+        // arm emits that load command. The x86_64 exec schema deliberately
+        // OMITS the key for exactly this reason -- its own
+        // `$remainingDeliberateOmissionsComment` says so -- which is what
+        // keeps the static walker reachable from a test at all.
+        // So: on a format that declares it, this cell pins the LOUD REFUSAL
+        // (silently emitting an unloadable image is the failure that gate
+        // exists to prevent); on one that does not, it pins the NAMES. Either
+        // way the cell asserts something that can go red, and the naming fix
+        // is still witnessed on BOTH ports by the dynamic exec + dylib cells
+        // -- which is where every shipped build actually lands.
+        bool const staticArmRefusedByBuildVersion =
+            arm == ImageArm::StaticExec
+            && (*fmt)->machoImage().buildVersion.has_value();
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        std::string diags;
+        for (auto const& d : rep.all()) diags += d.actual + "\n";
+
+        if (staticArmRefusedByBuildVersion) {
+            EXPECT_TRUE(bytes.empty())
+                << label
+                << ": a schema declaring image.buildVersion must NOT encode "
+                   "down the static arm -- that arm emits no LC_BUILD_VERSION, "
+                   "so the image would be silently unloadable";
+            bool sawAnchor = false;
+            for (auto const& d : rep.all()) {
+                if (d.actual.find("D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION")
+                    != std::string::npos) {
+                    sawAnchor = true;
+                }
+            }
+            EXPECT_TRUE(sawAnchor)
+                << label
+                << ": the refusal must NAME its anchor so the boundary stays "
+                   "findable\n" << diags;
+            return;
+        }
+
+        ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
+        ASSERT_FALSE(bytes.empty()) << label << "\n" << diags;
+
+        // Each cell must really reach the arm it NAMES -- otherwise cells could
+        // silently share one builder and most of the matrix would assert
+        // nothing about the arm it claims to cover. filetype separates dylib
+        // from exec; __LINKEDIT separates the two exec walkers (the static arm
+        // emits none, which is also why it can carry no code signature).
+        std::uint32_t const filetype = readU32LE(bytes, 12);
+        EXPECT_EQ(filetype, isDylibCell ? 6u : 2u)
+            << label << ": wrong MH_ filetype for the arm this cell names";
+        if (!isDylibCell) {
+            EXPECT_EQ(findSegment(bytes, "__LINKEDIT").has_value(),
+                      arm == ImageArm::DynamicExec)
+                << label
+                << ": this cell did not reach the exec walker it names, so its "
+                   "result says nothing about that arm";
+        }
+
+        auto const names = imageNlistNames(bytes);
+        ASSERT_FALSE(names.empty()) << label << ": no nlist names read";
+        auto has = [&](std::string_view want) {
+            return std::find(names.begin(), names.end(), want) != names.end();
+        };
+
+        // THE FIX, both directions: the declared names are PRESENT...
+        EXPECT_TRUE(has("_img_static_fn"))
+            << label
+            << ": a `static` function must appear under its DECLARED name in a "
+               "final image -- this is the frame a debugger and the macOS crash "
+               "reporter print";
+        EXPECT_TRUE(has("_img_global_fn"))
+            << label << ": an externally-visible function must keep its name";
+        // ...and the pre-fix synthetic spellings are GONE. These are the
+        // red-on-disable discriminators: restore either hardcoded
+        // `"_sym_" + id`, or re-gate `imageName` on visibility, and they fail.
+        EXPECT_FALSE(has("_sym_7"))
+            << label
+            << ": `_sym_7` is the PRE-FIX spelling of `_img_static_fn`; "
+               "emitting it means the image threw the declared name away again";
+        EXPECT_FALSE(has("_sym_8"))
+            << label
+            << ": `_sym_8` is the PRE-FIX spelling of `_img_global_fn`";
+
+        // The deliberate fallback survives, and is asserted rather than
+        // assumed: if this ever fails, a nameless symbol has acquired a name
+        // from somewhere it should not have.
+        EXPECT_TRUE(has("_sym_9"))
+            << label
+            << ": a symbol with NO declared name (the injected entry "
+               "trampoline's shape) must keep the `_sym_<id>` fallback";
+
+        // ── THE ABI CONTROL, in the SAME binary as the relaxation ──
+        // Naming a `static` in the nlist must NOT put it on the export
+        // surface. The trie is what dlsym walks; the nlist is not.
+        if (isDylibCell) {
+            auto const di = readDyldInfo(bytes);
+            ASSERT_TRUE(di.found) << label;
+            ASSERT_GT(di.exportSize, 0u) << label;
+            ASSERT_LE(static_cast<std::size_t>(di.exportOff) + di.exportSize,
+                      bytes.size()) << label;
+            std::span<std::uint8_t const> const trie{
+                bytes.data() + di.exportOff, di.exportSize};
+            EXPECT_TRUE(trieWalk(trie, "_img_global_fn").has_value())
+                << label
+                << ": the externally-visible function must still be EXPORTED";
+            EXPECT_FALSE(trieWalk(trie, "_img_static_fn").has_value())
+                << label
+                << ": THE CONTROL -- a `static` gained its name in the nlist, "
+                   "but it must NOT have leaked onto the export trie, which is "
+                   "the ABI surface dlsym walks";
+            EXPECT_FALSE(trieWalk(trie, "_sym_9").has_value())
+                << label << ": a nameless symbol must never be exported";
+        }
+    };
+
+    for (auto const& port : ports) {
+        runCell(port, ImageArm::StaticExec);
+        runCell(port, ImageArm::DynamicExec);
+        runCell(port, ImageArm::Dylib);
+    }
+}
+
+// ── D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED ──────────────────────
+// A final image's __LINKEDIT is a chain of blobs whose file offsets the load
+// commands PUBLISH. Apple's image validator (dyld's
+// `Header::validStructureLinkedit`, which Apple's `ld` runs on every link
+// INPUT) requires each blob to START on a pointer-sized boundary -- 8 here --
+// and refuses the WHOLE image on the first one that fails:
+//     ld: mis-aligned LINKEDIT content 'symbol table' in '<image>'
+// ★★ WHY THIS PIN EXISTS, and why a green suite could not see the defect it
+// covers: the images LOADED and RAN perfectly while misaligned (dyld's own
+// mapping does not care, and `nm` / `otool` / the crash reporter read the
+// table fine), so every runtime witness this project owns stayed green while
+// a DSS-built dylib could not be handed to the Apple toolchain as a LINK
+// INPUT at all. ✔MEASURED on real Apple Silicon (macOS 26.5.2, ld-1267): the
+// same `ld` invocation goes rc=1 with that exact sentence before the fix and
+// rc=0 after, on the arm64 dylib, the arm64 exec (via `-bundle_loader`) and
+// the x86_64 dylib.
+// ★ THE ALIGNMENT USED TO LIVE IN THE PRODUCERS, which is why it held for
+// three blobs and not the fourth: the rebase, bind and export-trie builders
+// each pad their OWN tail "so the next payload starts aligned". The indirect
+// symbol table has no such producer step -- it is `count * 4` -- so an ODD
+// number of indirect symbols left the nlist table at (prev + 4). That is the
+// shape this test builds ON PURPOSE (see the odd-count assertion below);
+// without it every cell would pass pre-fix and assert nothing.
+namespace {
+
+// One __LINKEDIT blob exactly as the IMAGE publishes it, plus the alignment
+// Apple's validator requires of its START. Pointer-sized (8) for everything
+// except the indirect symbol table (4) and the string table (1) -- and the
+// two lax ones are emitted 8-aligned anyway, so `requiredAlign` carries the
+// SPEC's number and not ours (a test asserting our stricter rule would fail
+// the day the writer legitimately relaxed it).
+struct LinkeditBlobView {
+    char const*   name;
+    std::uint64_t requiredAlign;
+    std::uint32_t off;
+    std::uint32_t size;
+};
+
+[[nodiscard]] std::vector<LinkeditBlobView>
+readLinkeditBlobs(std::span<std::uint8_t const> b) {
+    std::vector<LinkeditBlobView> out;
+    if (auto lc = findLoadCommand(b, 0x80000022u)) {   // LC_DYLD_INFO_ONLY
+        out.push_back({"rebase opcodes", 8, readU32LE(b, *lc + 8),
+                       readU32LE(b, *lc + 12)});
+        out.push_back({"bind opcodes", 8, readU32LE(b, *lc + 16),
+                       readU32LE(b, *lc + 20)});
+        out.push_back({"weak bind opcodes", 8, readU32LE(b, *lc + 24),
+                       readU32LE(b, *lc + 28)});
+        out.push_back({"lazy bind opcodes", 8, readU32LE(b, *lc + 32),
+                       readU32LE(b, *lc + 36)});
+        out.push_back({"exports trie", 8, readU32LE(b, *lc + 40),
+                       readU32LE(b, *lc + 44)});
+    }
+    if (auto lc = findLoadCommand(b, 0x80000034u)) {   // LC_DYLD_CHAINED_FIXUPS
+        out.push_back({"chained fixups", 8, readU32LE(b, *lc + 8),
+                       readU32LE(b, *lc + 12)});
+    }
+    if (auto lc = findLoadCommand(b, 0x0Bu)) {         // LC_DYSYMTAB
+        out.push_back({"indirect symbol table", 4, readU32LE(b, *lc + 56),
+                       readU32LE(b, *lc + 60) * 4u});
+    }
+    if (auto lc = findLoadCommand(b, 0x02u)) {         // LC_SYMTAB
+        out.push_back({"symbol table", 8, readU32LE(b, *lc + 8),
+                       readU32LE(b, *lc + 12) * 16u});
+        out.push_back({"symbol table strings", 1, readU32LE(b, *lc + 16),
+                       readU32LE(b, *lc + 20)});
+    }
+    if (auto lc = findLoadCommand(b, 0x1Du)) {         // LC_CODE_SIGNATURE
+        out.push_back({"code signature", 8, readU32LE(b, *lc + 8),
+                       readU32LE(b, *lc + 12)});
+    }
+    return out;
+}
+
+// The indirect symbol COUNT the image published -- the DRIVER of the defect
+// (odd count => `count * 4` is 4 mod 8 => the packed nlist cursor lands
+// misaligned). Read back from the image rather than assumed from the module,
+// so a writer change that stopped emitting the data extern's __got slot makes
+// the cells fail loudly instead of going quietly vacuous.
+[[nodiscard]] std::uint32_t indirectSymbolCount(std::span<std::uint8_t const> b) {
+    auto lc = findLoadCommand(b, 0x0Bu);
+    return lc ? readU32LE(b, *lc + 60) : 0u;
+}
+
+}  // namespace
+
+TEST(MachoImageLinkeditAlignment,
+     EveryLinkeditBlobStartsOnApplesBoundaryOnBothPortsAndBothDynamicArms) {
+    struct PortSpec {
+        char const*               label;
+        char const*               targetName;
+        char const*               execFormat;
+        char const*               dylibFormat;
+        std::vector<std::uint8_t> retBytes;
+    };
+    std::vector<PortSpec> const ports{
+        {"arm64", "arm64",
+         "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib",
+         {0xC0, 0x03, 0x5F, 0xD6}},                     // RET
+        {"x86_64", "x86_64",
+         "macho64-x86_64-darwin-exec", "macho64-x86_64-darwin-dylib",
+         {0xC3}},                                       // ret
+    };
+
+    // ONE cell = one (port, arm) pair, run through a `void` callable so a
+    // failed ASSERT in one cell cannot cancel the other three.
+    auto runCell = [](PortSpec const& port, bool isDylibCell) -> void {
+        std::string const label =
+            std::string{port.label} + (isDylibCell ? " [dylib arm]"
+                                                   : " [dynamic exec arm]");
+
+        auto target = TargetSchema::loadShipped(port.targetName);
+        ASSERT_TRUE(target.has_value()) << label;
+        auto fmt = ObjectFormatSchema::loadShipped(
+            isDylibCell ? port.dylibFormat : port.execFormat);
+        ASSERT_TRUE(fmt.has_value()) << label;
+
+        AssembledModule mod;
+        mod.expectedFuncCount = 2;
+        for (std::uint32_t id : {1u, 2u}) {
+            AssembledFunction fn;
+            fn.symbol = SymbolId{id};
+            fn.bytes  = port.retBytes;
+            mod.functions.push_back(std::move(fn));
+        }
+        mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_dss_align_a",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+        mod.symbols.push_back(ModuleSymbol{SymbolId{2}, "_dss_align_b",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+
+        // ★ THE SHAPE THAT MAKES THIS CELL ABLE TO GO RED. Indirect symbols =
+        // one per STUB (function externs only) + one per __got slot (ALL
+        // externs). An all-function extern set is therefore always EVEN and
+        // leaves the nlist table 8-aligned by luck; ONE DATA extern makes it
+        // ODD, `count * 4` lands at 4 mod 8, and the packed cursor put the
+        // nlist table right there. This is exactly what a real `#include
+        // <stdio.h>` + `fprintf(stderr, ...)` translation unit produces --
+        // that CLI probe measured symoff = 50076 pre-fix.
+        ExternImport fnImp;
+        fnImp.symbol      = SymbolId{98};
+        fnImp.mangledName = "_puts";
+        fnImp.libraryPath = "/usr/lib/libSystem.B.dylib";
+        mod.externImports.push_back(std::move(fnImp));
+        ExternImport dataImp;
+        dataImp.symbol      = SymbolId{99};
+        dataImp.mangledName = "___stdoutp";
+        dataImp.libraryPath = "/usr/lib/libSystem.B.dylib";
+        dataImp.isData      = true;
+        mod.externImports.push_back(std::move(dataImp));
+
+        // A data slot whose abs64 reloc targets the DATA extern, so the __got
+        // slot is genuinely referenced rather than dead.
+        // ⚠ THE KIND TAG IS RESOLVED BY NAME, NOT TYPED AS A LITERAL. The
+        // vocabulary is per-TARGET and the two ports disagree: `abs64` is row
+        // 4 on arm64 and row 2 on x86_64, where 4 is `tls-tpoff32`. A literal
+        // `RelocationKind{4}` copied from an arm64-only test compiles fine and
+        // makes the x86_64 cells fail on a TLS width check instead of testing
+        // anything -- MEASURED, it happened while writing this test.
+        auto const* abs64 = (*target)->relocationByName("abs64");
+        ASSERT_NE(abs64, nullptr)
+            << label << ": this target declares no `abs64` relocation";
+        AssembledData slot;
+        slot.symbol    = SymbolId{5};
+        slot.section   = DataSectionKind::Data;
+        slot.bytes     = std::vector<std::uint8_t>(8, 0);
+        slot.alignment = Alignment::of<8>();
+        Relocation rel;
+        rel.offset = 0;
+        rel.target = SymbolId{99};
+        rel.kind   = abs64->kind;
+        rel.addend = 0;
+        slot.relocations.push_back(rel);
+        mod.dataItems.push_back(std::move(slot));
+        mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "_dss_align_slot",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+
+        // The exec arm needs the D-LK10-ENTRY override that stands in for the
+        // trampoline `linker::link` would have injected; a dylib is entryless.
+        if (!isDylibCell) mod.imageEntryOverride = std::size_t{0};
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        std::string diags;
+        for (auto const& d : rep.all()) diags += d.actual + "\n";
+        ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
+        ASSERT_FALSE(bytes.empty()) << label << "\n" << diags;
+
+        // Each cell must really reach the arm it NAMES.
+        EXPECT_EQ(readU32LE(bytes, 12), isDylibCell ? 6u : 2u)
+            << label << ": wrong MH_ filetype for the arm this cell names";
+        auto const linkeditSeg = findSegment(bytes, "__LINKEDIT");
+        ASSERT_TRUE(linkeditSeg.has_value())
+            << label
+            << ": this cell did not reach a DYNAMIC image walker -- only "
+               "those emit __LINKEDIT, so its result would say nothing about "
+               "the cursor chain it claims to cover";
+        std::uint64_t const leOff  = readU64LE(bytes, *linkeditSeg + 40);
+        std::uint64_t const leSize = readU64LE(bytes, *linkeditSeg + 48);
+
+        // ★ THE REACHABILITY WITNESS. If this count were EVEN, every
+        // alignment assertion below would hold PRE-FIX too and this test
+        // would assert nothing -- so the odd count is pinned, not assumed.
+        std::uint32_t const nIndirect = indirectSymbolCount(bytes);
+        ASSERT_NE(nIndirect, 0u)
+            << label << ": no indirect symbol table -- the cell lost the "
+                        "extern set that drives this defect";
+        ASSERT_EQ(nIndirect % 2u, 1u)
+            << label << ": the indirect symbol count is " << nIndirect
+            << ", which is EVEN. `count * 4` is then already 8-aligned and the "
+               "packed cursor would have landed the nlist table correctly by "
+               "luck -- this cell must carry an ODD count or it proves nothing";
+
+        auto const blobs = readLinkeditBlobs(bytes);
+        ASSERT_FALSE(blobs.empty()) << label;
+        bool sawSymtab = false;
+        for (auto const& blob : blobs) {
+            if (blob.off == 0 && blob.size == 0) continue;   // absent
+            EXPECT_EQ(blob.off % blob.requiredAlign, 0u)
+                << label << ": __LINKEDIT blob '" << blob.name << "' starts at "
+                << blob.off << " (" << (blob.off % 8u)
+                << " mod 8), but Apple's image validator requires a multiple "
+                   "of " << blob.requiredAlign
+                << " and refuses the WHOLE image with `ld: mis-aligned "
+                   "LINKEDIT content '" << blob.name
+                << "'` -- D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED";
+            EXPECT_GE(blob.off, leOff)
+                << label << ": blob '" << blob.name
+                << "' starts before __LINKEDIT";
+            EXPECT_LE(static_cast<std::uint64_t>(blob.off) + blob.size,
+                      leOff + leSize)
+                << label << ": blob '" << blob.name
+                << "' runs past the end of __LINKEDIT";
+            EXPECT_LE(static_cast<std::uint64_t>(blob.off) + blob.size,
+                      bytes.size())
+                << label << ": blob '" << blob.name
+                << "' runs past the end of the image";
+            if (std::string_view{blob.name} == "symbol table") {
+                sawSymtab = true;
+                // Named separately from the loop's generic assertion because
+                // this is the blob the row was opened on, and a future reader
+                // grepping the anchor must land on an assertion, not a list.
+                EXPECT_EQ(blob.off % 8u, 0u)
+                    << label
+                    << ": THE ANCHOR CASE -- an nlist_64 carries an 8-byte "
+                       "n_value and `symoff` is " << blob.off
+                    << ". Pre-fix this measured 50076 (4 mod 8) on a real "
+                       "build and Apple's `ld` refused the image outright";
+            }
+        }
+        EXPECT_TRUE(sawSymtab)
+            << label << ": no LC_SYMTAB -- the anchor's own blob is missing";
+
+        // ★ CONTENT, not just the published offset. The cursor arithmetic and
+        // the byte emission are two SEPARATE views of this chain (one says
+        // where a blob goes, the other appends it), and a fix that padded only
+        // the cursors would publish a correct `symoff` over the WRONG BYTES --
+        // a silent miscompile that every offset assertion above would pass.
+        // So the nlist table is read back THROUGH the published offsets and
+        // required to yield the names this module declared.
+        auto const names = imageNlistNames(bytes);
+        auto hasName = [&](std::string_view want) {
+            return std::find(names.begin(), names.end(), want) != names.end();
+        };
+        EXPECT_TRUE(hasName("_dss_align_a"))
+            << label
+            << ": the nlist table read THROUGH the published symoff/stroff "
+               "does not contain this module's own symbol -- the load "
+               "commands and the emitted bytes disagree about where the "
+               "symbol table is";
+        EXPECT_TRUE(hasName("_dss_align_b")) << label;
+
+        // The blobs must also be ASCENDING and non-overlapping: the fix works
+        // by padding each cursor FORWARD, and a padding bug that pushed one
+        // blob over its neighbour would still satisfy every alignment
+        // assertion above.
+        std::uint64_t prevEnd  = leOff;
+        char const*   prevName = "__LINKEDIT start";
+        for (auto const& blob : blobs) {
+            if (blob.off == 0 && blob.size == 0) continue;
+            EXPECT_GE(blob.off, prevEnd)
+                << label << ": blob '" << blob.name << "' starts at "
+                << blob.off << ", inside '" << prevName << "' which ends at "
+                << prevEnd;
+            prevEnd  = static_cast<std::uint64_t>(blob.off) + blob.size;
+            prevName = blob.name;
+        }
+    };
+
+    for (auto const& port : ports) {
+        runCell(port, /*isDylibCell=*/false);
+        runCell(port, /*isDylibCell=*/true);
+    }
 }

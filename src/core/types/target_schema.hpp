@@ -3177,6 +3177,30 @@ public:
     TargetSchema(TargetSchema&&) noexcept        = default;
     TargetSchema& operator=(TargetSchema&&) noexcept = default;
 
+    // Lowercase 64-hex SHA-256 of the EXACT document bytes this schema was
+    // loaded from — the cache key for the runtime-object cache, which keys on
+    // the config documents a build actually loaded.
+    //
+    // WHY RETAINED RATHER THAN RECOMPUTED. Re-walking `src/dss-config/` from
+    // disk to hash it costs ~165 ms per invocation (MEASURED 2026-08-17: 86
+    // files, 2,078,133 bytes; I/O-dominated — walk+read 152–160 ms, hash only
+    // 9–13 ms), and would be paid on EVERY build. The loaders already hold the
+    // bytes; they read them, parse them, and discard them. Digesting them
+    // where they already are costs zero extra I/O and happens once per load
+    // (loads are memoized in-process), and retaining 32 bytes of digest
+    // instead of up to 440 KB of document is what makes retention free.
+    //
+    // ⚠ EMPTY MEANS UNKNOWN, NEVER "no content". A schema built through a path
+    // that does NOT go via `loadFromText` — the public `TargetSchemaData`
+    // constructor above, which tests and in-memory mutators use — has no
+    // document bytes to digest and leaves this EMPTY. That is deliberate: an
+    // empty digest is a DETECTABLE unknown a cache can refuse to key on,
+    // whereas a fabricated or stale one is a silent wrong key. Every file
+    // route (`loadShipped` → `loadFromFile` → `loadFromText`) is digested.
+    [[nodiscard]] std::string_view  contentDigest() const noexcept {
+        return contentDigest_;
+    }
+
     [[nodiscard]] TargetSchemaId    id()       const noexcept { return d_.id; }
     [[nodiscard]] std::string_view  name()     const noexcept { return d_.name; }
     // Semantic version string declared by the target JSON. Round-trip
@@ -3528,6 +3552,11 @@ public:
         std::string_view jsonText, std::string_view sourceLabel = "<inline>");
 
 private:
+    // Lowercase 64-hex SHA-256 of the document bytes — see `contentDigest()`.
+    // Written ONLY by `loadFromText` (a static member, so no friend is
+    // needed); every other construction path leaves it empty on purpose.
+    std::string contentDigest_;
+
     detail::TargetSchemaData d_;
 };
 

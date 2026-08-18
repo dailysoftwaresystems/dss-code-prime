@@ -563,6 +563,21 @@ an `asm-template` lexer mode (`%`→placeholder, `%%`→escape) plus an `assembl
 so the template entry selects it without a hardcoded string. ⓘ The lane deliberately did **not** ship
 half of it, because its entry point is consumer-side and belongs with the template→LIR lane.
 
+> ⚠ **SUPERSEDED 2026-08-17 — the paragraph above is the HISTORICAL recommendation and its second
+> half is now WRONG. Do not implement it as written.** The `lexerModeTokens` mechanism and the
+> `assembly.templateLexerMode` key were both adopted, exactly as recommended. What changed is **who
+> declares the BYTES**: a dialect declaring `%`→placeholder / `%%`→escape in its own mode is precisely
+> the two-owner defect [[D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER]] recorded,
+> and it is now a **LOAD ERROR** naming both sites. The shipped split is: the **DIALECT** declares the
+> capability (`assembly.templateLexerMode`) and its own token **KINDS** (`bindTokens`); the
+> **LANGUAGE** (`asm.lang.json`) declares the **BYTES** (`semantics.inlineAsmTemplateLexemes`); the
+> **LOADER** intersects them and synthesizes the mode rows. Both dialects' `asm-template` modes are
+> now literally `{}`. ★ The reasoning that settles it: `%0`/`%%`/`%l[…]` are GNU **C-extension**
+> syntax that gcc substitutes *before* the assembler sees the text — gas never receives a `%0`, it
+> receives the substituted register name — so the sigils are a LANGUAGE fact and the dialect's job
+> begins after substitution. Kept rather than deleted because it records why the mechanism was chosen,
+> which is still correct and still the reason the mechanism is there.
+
 ### 4.7 ✅ OPERATOR RULING 2026-08-14 — **POSITIONAL OPERAND SELECTORS**, and why the sysreg-operand alternative is an AGNOSTICISM BREAK
 
 **The problem.** Two independent lanes hit the same wall and grepped the same empty result:
@@ -656,6 +671,49 @@ the sysreg must be carried as DATA into a real encoding slot."* ★ Record that 
 NOTHING**: if that trigger fires, a real sysreg operand kind coexists with selector rows — the
 selector row is a **SPECIALIZATION**, the same relation `nop` has to a generic form — *provided
 §4.7.1's ambiguity refusal is in place.* That is the second reason §4.7.1 is not optional.
+
+### 4.8 ✅ P5c 2026-08-17 — THE INPUT HALF WAS NEVER WIRED, AND THREE EXAMPLES COULD NOT SEE IT
+
+The arc's own retrospective, recorded here because it is a lesson about how this plan's phases were
+VERIFIED rather than about what they built.
+
+**What shipped broken.** `expandInlineAsm` materialised only *pinned* inputs into their bound
+register; the loop opened `if (!ins[j].pinned) continue;`. `bindAsmOperand` mints a fresh vreg for an
+unpinned operand, and for an INPUT nothing else ever writes it. ✔MEASURED: `__asm__("movl %1, %0" :
+"=r"(r) : "r"(a))` with `a == 42` compiled **rc=0** and returned **0**, on both `pe64-x86_64` and
+`elf64-x86_64`, at debug and release. The disassembly named it exactly — the input's load defined the
+register the OUTPUT had been allocated, and the template's `%1` read one nothing wrote.
+
+★★ **THE FALSE SYMMETRY.** The capture loop twelve lines below correctly skips unpinned OUTPUTS —
+*the template writes that vreg, so a copy would be dead* — and the input loop reads as its mirror
+image. It is not one: **an output is written by the TEMPLATE; an input must be written by the
+LOWERING.** Two loops that look like a matched pair, one of them inverted. It is also precisely the
+read-as-undefined outcome the `"+r"` refusal in the SAME FILE exists to prevent — the guard was
+written against one entrance and the plain `"r"` path walked in the other.
+
+★★★ **WHY THE CORPUS COULD NOT SEE IT, and this is the durable lesson for §4's remaining phases.**
+The three shipped inline-asm examples declared **ZERO input operands between them**: `c_inline_asm`
+is the empty template, `c_inline_asm_extended` is register-PINNED outputs (`rdtsc`) on x86_64 and a
+pure CLOBBER list on aarch64. ⇒ **A PHASE'S COVERAGE IS AS WIDE AS THE OPERAND SHAPES ITS EXAMPLES
+NAME, NEVER AS THE NUMBER OF EXAMPLES.** Counting examples said inline asm was well covered; counting
+SHAPES said inputs had never once run. §4.4's exit criteria should be read that way: enumerate the
+shapes, not the fixtures. ⚠ It also re-reads P5's headline honestly — `hwtime.h` compiling was a TRUE
+result, and true *because* `rdtsc` has outputs and no inputs, so the motivating construct could not
+have caught this.
+
+★★ **AND THE PIN NEARLY SHIPPED A FALSE CLAIM.** The replacement example first asserted it
+"discriminates at both arms, because a register nothing wrote is undefined at every optimization
+level" — airtight-sounding and wrong. ✔MEASURED with the mutant restored and the example reduced to
+its call-shaped two-input helper: **baseline exited 42 (GREEN — the mutant SURVIVED)** while release
+exited 1; the allocator had left the right value in the register the template read. The same defect
+lowered directly in `main` reddened the BASELINE arm. ⇒ a pin that survives because an undefined
+register happened to hold the right value is not a pin, and which shape gets that luck cannot be read
+off the source. `examples/c-subset/c_inline_asm_operands` therefore carries **both** shapes and must
+not be simplified to one.
+
+Rows: `D-LIR-ASM-UNPINNED-INPUT-NEVER-MATERIALISED`,
+`D-MIR-ASM-OUTPUT-STORE-BACK-BYPASSES-THE-SCALAR-FUNNEL`,
+`D-TEST-MIR-ASM-DESCRIPTOR-NEW-FIELDS-UNPINNED-THROUGH-REBUILD` (all born ✅ CLOSED).
 
 ### 4.1 Reuse to assess before P5 — the biggest unknown in the estimate
 

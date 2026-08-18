@@ -46,6 +46,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/header_name_matching.hpp"
 #include "core/types/source_buffer.hpp"
+#include "repo_root.hpp"  // the ONE repo-root resolver; see the note below
 #include "tokenizer/tokenizer.hpp"
 
 #include <gtest/gtest.h>
@@ -270,19 +271,22 @@ TEST(DiagnosticBudgetThreading, BudgetDoesNotCarryPolicyIntoATier) {
 // or bumps an allowlisted count (fails too).
 namespace {
 
-[[nodiscard]] fs::path repoRoot() {
-    // Walk up from cwd looking for the file this test is about. ctest runs
-    // tests from varying working directories; the shipped-schema loader does
-    // the same kind of upward search.
-    fs::path p = fs::current_path();
-    for (int i = 0; i < 12; ++i) {
-        if (fs::exists(p / "src" / "core" / "types" / "diagnostic_budget.hpp")) return p;
-        if (!p.has_parent_path() || p.parent_path() == p) break;
-        p = p.parent_path();
-    }
-    ADD_FAILURE() << "could not locate the repo root from " << fs::current_path();
-    return {};
-}
+// ⚠ THERE WAS A PRIVATE `repoRoot()` HERE AND IT WAS THE LAST ONE IN THE TREE.
+// D-TEST-BUDGET-THREADING-PRIVATE-REPO-ROOT-WALK-FAILS-OUT-OF-SOURCE. It walked
+// up from `fs::current_path()` ONLY — never consulting `DSS_CONFIG_ROOT` nor the
+// CMake-baked `DSS_TEST_REPO_ROOT` — so the SAME binary passed with a cwd inside
+// the repo and FAILED from an out-of-repo build directory, where the walk runs
+// out of parents and returns `{}`. ✔MEASURED both ways on one binary.
+// ★ It was the SOLE SURVIVOR of the `test_support/repo_root.hpp` consolidation:
+// the only file in `tests/` that still defined its own `repoRoot()` and included
+// none of the shared one — and it failed in bit-for-bit the way that header's own
+// docblock exists to prevent. ⇒ A consolidation is not finished when the shared
+// thing exists; it is finished when nothing private survives, and only a scan can
+// tell you which of those you have.
+// The shared resolver tries $DSS_CONFIG_ROOT, then the baked root, then the walk —
+// so it is correct from ANY working directory — and THROWS rather than returning
+// empty, which GoogleTest reports as a failure of this one test instead of
+// letting an empty path flow onward.
 
 [[nodiscard]] std::string trimmed(std::string s) {
     auto const b = s.find_first_not_of(" \t");
@@ -301,7 +305,7 @@ struct AllowedThrowaway {
 
 TEST(DiagnosticBudgetThreadingSourceEnumeration,
      EveryReporterInAThreadedFileIsBudgetDerived) {
-    fs::path const root = repoRoot();
+    fs::path const root = dss::test::repoRoot();
     ASSERT_FALSE(root.empty());
 
     // Every file that the operator's budget flows through. A `DiagnosticReporter`
@@ -467,7 +471,7 @@ TEST(DiagnosticBudgetThreadingSourceEnumeration,
 // `src/ffi/`, which have no operator budget to thread — they are not subjects.)
 TEST(DiagnosticBudgetThreadingSourceEnumeration,
      NoThreadedFileReachesTheLibraryDefaultBudget) {
-    fs::path const root = repoRoot();
+    fs::path const root = dss::test::repoRoot();
     ASSERT_FALSE(root.empty());
     for (std::string_view rel : {
              "src/analysis/compilation_unit/compilation_unit.cpp",

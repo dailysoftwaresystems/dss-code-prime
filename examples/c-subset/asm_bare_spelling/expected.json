@@ -1,0 +1,32 @@
+{
+  "$comment": "[[D-CSUBSET-INLINE-ASM-SPELLING]] closed 2026-08-17 — the runnable witness for the BARE `asm` spelling, the one form every other inline-asm fixture in this corpus cannot reach because they all write `__asm__`. ★★★ THE ROW'S BLOCKER WAS DISSOLVED BY A MEASUREMENT ABOUT DSS, NOT ABOUT gcc. It was pinned OPEN as an operator decision on the grounds that `asm` is keyword-or-identifier depending on ISO-vs-GNU STANDARD MODE while DSS has no `-std=` axis to hang a mode-conditional reserved word on. True, and irrelevant: DSS does not have two modes. It has one, it is GNU, and it already declares that exactly as gcc and clang do — ✔MEASURED `-dM -E` on gcc 13.3.0 / clang 18.1.3 / clang 19.1.1, `__STRICT_ANSI__` is defined by all three under `-std=c17` and by NONE of them under `-std=gnu17` or by default; ✔MEASURED against the shipped DSS CLI with a `#error` probe whose POSITIVE CONTROL fired (`P001E`), DSS defines `__GNUC__` and `__clang__` and does NOT define `__STRICT_ANSI__`. So the fix is ONE keyword row onto the EXISTING `AsmKeyword` kind — zero grammar, zero C++, no new configuration axis. ★★ AND THE OLD STATE WAS WRONG IN BOTH DIRECTIONS, which is the half the row never priced: ✔MEASURED across `c17`/`c23`/`gnu17`/`gnu23` with matched positive (`__asm__`) and negative (`__asm__zz`) controls, GNU mode ACCEPTS `asm(\"movl $42, %0\" : \"=r\"(x))` and REJECTS `int asm = 7;`, ISO mode swaps both — complementary, never both. DSS did the OPPOSITE of GNU mode on each half: it refused the statement (`P0002`) and accepted `int asm = 42;` and `static int asm(int)` at rc=0. Omitting the word was never neutral. ★ WHAT THE FILE PINS, WITH THE WEAKER HALF NAMED RATHER THAN IMPLIED: `AsmKeyword` has TWO grammar consumers and a spelling reaching only one would look correct from either side alone, so both are exercised — SHAPE 1, bare `asm` as a STATEMENT lowered directly in `main`, is fully runtime-observable (the exit code is a function of the template's output, and it is inline rather than behind a call because `c_inline_asm_operands` MEASURED a call-shaped asm letting a live mutant survive the baseline arm); SHAPE 2, bare `asm` as an ASM LABEL after a declarator, is NOT a rename oracle in a single TU and the file says so — it pins that the bare spelling REACHES the after-declarator rule, and its 22 is in the arithmetic so it is not decoration. ⚠ `dss_seed` is `volatile` so release cannot fold the template's input into a literal and silently change which mechanism each arm tests. ⛔ DELIBERATELY ABSENT: `asm goto` with `%l[label]` — ✔MEASURED to fail `L_UnsupportedLoweringForOpcode` IDENTICALLY under both `asm goto` and `__asm__ goto`, i.e. orthogonal to the spelling and already carried by [[D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER]]; including it would redden this example for another row's reason. ★ RED-ON-DISABLE: delete the `{\"word\": \"asm\", \"kind\": \"AsmKeyword\"}` row from c-subset.lang.json and this file does not compile at all — the statement degrades to a call to an undeclared function (`S0001`) and the label position to `P0002`. Run it through ctest, never a bare exe: config is read from the source tree via `DSS_CONFIG_ROOT`, which only `dss_add_test` sets.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

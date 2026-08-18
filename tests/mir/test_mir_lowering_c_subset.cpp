@@ -13578,3 +13578,137 @@ TEST(MirLoweringCSubset, InlineFunctionTypedParamKeepsItsArgSlot) {
     }
     EXPECT_TRUE(sawApply) << "`apply` must be lowered";
 }
+
+// ── D-CSUBSET-ASM-OUTPUT-ON-A-PARAMETER-NOT-ADDRESS-TAKEN ───────────────────
+//
+// An inline-asm OUTPUT is an assignment to the named object, and it reaches that
+// object through `lowerLvalueAddress` — so it needs STORAGE. A body local always
+// has some (its `VarDecl` allocates a slot); a PARAMETER does not, unless the
+// address-taken scan marks it. It did not, so this was valid C that DSS refused:
+//
+//   ✔MEASURED 2026-08-17 through the real CLI, before the fix:
+//     static int f(int v){ __asm__("movl $42,%0" : "=r"(v)); return v; }
+//   → rc=1 at BOTH configs, `error[H0009] symbol 86 has no storage slot
+//     (non-addressable param or unbound) — required by lvalue use`,
+//   while the SAME function with `&v` also taken compiled and exited 42, and
+//   gcc 13.3.0 compiles and runs both. A plain `"=r"` failed identically to a
+//   `"+r"`, which is what ruled out the constraint letter as the cause.
+//
+// ★★ WHY THIS TIER, ALONGSIDE THE RUNNABLE `asm_output_on_parameter` EXAMPLE.
+// The example proves the exit code; this proves the SHAPE that produces it. The
+// tempting wrong fix — copy the parameter into a fresh local and let the asm
+// write THAT — also compiles and also exits 42 for a single-output function, and
+// is a silent miscompile the moment the source reads the parameter again. What
+// distinguishes the two is structural: the correct lowering gives the PARAMETER
+// itself an `Alloca`, stores the incoming `Arg` into it, and stores the asm
+// result back through THE SAME slot. That is what is asserted here.
+TEST(MirLoweringCSubset, InlineAsmOutputOnAParameterGivesThatParameterStorage) {
+    auto L = lowerCSubset(
+        "int f(int v){ __asm__(\"movl $42,%0\" : \"=r\"(v)); return v; }");
+    ASSERT_TRUE(L.mir.ok)
+        << "an asm output bound to a non-address-taken PARAMETER must lower — "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+
+    // The asm block itself survived, with exactly one output.
+    auto const asms = collectOps(m, MirOpcode::InlineAsm);
+    ASSERT_EQ(asms.size(), 1u);
+    ASSERT_EQ(m.asmDescriptor(asms[0]).outputs.size(), 1u);
+
+    // ★ THE PARAMETER IS SLOT-BACKED. Exactly one `Alloca` (the parameter's) and
+    // exactly one `Arg` (the incoming value), and the Arg is STORED into that
+    // Alloca — that store is what makes the slot hold the caller's argument
+    // rather than garbage, and it is the half a "copy to a fresh local" fix
+    // would leave pointing at the wrong object.
+    auto const allocas = collectOps(m, MirOpcode::Alloca);
+    ASSERT_EQ(allocas.size(), 1u)
+        << "the parameter needs storage, and nothing else in this function does "
+           "— a second Alloca means a COPY was introduced beside the parameter, "
+           "which is the silent-miscompile fix this pin exists to reject";
+    auto const args = collectOps(m, MirOpcode::Arg);
+    ASSERT_EQ(args.size(), 1u);
+
+    auto const stores = collectOps(m, MirOpcode::Store);
+    // Two stores: the incoming Arg → slot reception, and the asm result → slot
+    // write-back. Both must target THE SAME slot.
+    ASSERT_EQ(stores.size(), 2u)
+        << "expected the Arg reception store and the asm write-back store";
+    bool sawArgReception = false;
+    bool sawAsmWriteBack = false;
+    // ★★ EACH STORE IS CHECKED THROUGH A **VOID CALLABLE**. A bare `ASSERT_*`
+    // expands to `return;` from the ENCLOSING function, so written inline in this
+    // loop the first store to fail would abort the whole TEST — the remaining
+    // stores would go unexamined and the two `EXPECT_TRUE`s below would never
+    // run. A safe arm masking a dangerous one is exactly that vacuity; routing
+    // the body through a `void` lambda makes the assert return from THE ARM, so
+    // every store is always visited.
+    auto checkStore = [&](MirInstId st) {
+        auto const ops = m.instOperands(st);
+        ASSERT_EQ(ops.size(), 2u);
+        EXPECT_EQ(ops[1], allocas[0])
+            << "every store must write THE PARAMETER's own slot — a write-back "
+               "aimed anywhere else is the read/write-different-object defect";
+        if (ops[0] == args[0])    sawArgReception = true;
+        if (ops[0] == asms[0])    sawAsmWriteBack = true;
+    };
+    for (MirInstId const st : stores) checkStore(st);
+    EXPECT_TRUE(sawArgReception)
+        << "the incoming Arg must be stored into the parameter's slot, else the "
+           "asm reads/returns an uninitialized object";
+    EXPECT_TRUE(sawAsmWriteBack)
+        << "output 0 IS the asm instruction's own value (Call's rule), and it "
+           "must be stored back through the parameter's slot";
+}
+
+// ★ THE OUTPUT **LOOP**, not just output 0. A fix that marked only the first
+// output operand addressable passes the test above and fails this one, and
+// nothing in the single-output shape can tell the two apart. (The runnable
+// example carries the same pair of shapes for the same reason.)
+TEST(MirLoweringCSubset, InlineAsmMarksEveryOutputParameterAddressable) {
+    auto L = lowerCSubset(
+        "int g(int a, int b){ __asm__(\"movl $40,%0\\n\\tmovl $2,%1\" "
+        ": \"=r\"(a), \"=r\"(b)); return a + b; }");
+    ASSERT_TRUE(L.mir.ok)
+        << "BOTH output-bound parameters must lower — "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+
+    auto const asms = collectOps(m, MirOpcode::InlineAsm);
+    ASSERT_EQ(asms.size(), 1u);
+    ASSERT_EQ(m.asmDescriptor(asms[0]).outputs.size(), 2u);
+
+    // TWO parameters, so TWO slots — one each, and distinct.
+    auto const allocas = collectOps(m, MirOpcode::Alloca);
+    ASSERT_EQ(allocas.size(), 2u)
+        << "both output-bound parameters need their own storage; ONE slot means "
+           "only output 0 was marked addressable";
+    EXPECT_NE(allocas[0], allocas[1]);
+
+    // Output 1 is a `ReturnPiece` anchored to the asm (output 0 is the asm's own
+    // value — Call's rule), and it is stored back through the SECOND slot.
+    auto const pieces = collectOps(m, MirOpcode::ReturnPiece);
+    ASSERT_EQ(pieces.size(), 1u)
+        << "outputs 1..N-1 are ReturnPiece reads anchored to the asm block";
+    EXPECT_EQ(m.instOperands(pieces[0])[0], asms[0]);
+
+    // Both asm results reach a slot: output 0 (the asm value) and output 1 (the
+    // piece) are each the VALUE operand of a Store, and the two targets differ.
+    MirInstId out0Target{};
+    MirInstId out1Target{};
+    // Void callable for the same reason as the sibling test above: a bare
+    // `ASSERT_*` inline here would abort the TEST at the first store and leave
+    // the two-outputs-write-different-objects assertion — the whole point of
+    // this test — unexecuted.
+    auto scanStore = [&](MirInstId st) {
+        auto const ops = m.instOperands(st);
+        ASSERT_EQ(ops.size(), 2u);
+        if (ops[0] == asms[0])   out0Target = ops[1];
+        if (ops[0] == pieces[0]) out1Target = ops[1];
+    };
+    for (MirInstId const st : collectOps(m, MirOpcode::Store)) scanStore(st);
+    ASSERT_TRUE(out0Target.valid()) << "output 0 was never stored back";
+    ASSERT_TRUE(out1Target.valid()) << "output 1 was never stored back";
+    EXPECT_NE(out0Target, out1Target)
+        << "the two outputs must write DIFFERENT objects — both landing in one "
+           "slot is a silent miscompile that still exits 42 for many templates";
+}

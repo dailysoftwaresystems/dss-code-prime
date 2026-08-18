@@ -15,6 +15,7 @@
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <cstdint>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -30,6 +31,17 @@ namespace {
 // transform is dropping unreachable BLOCKS.
 class PruneUnreachablePolicy final : public MirRebuildPolicy {
 public:
+    // ★ NOT a `kPassNameTable` entry, and that is correct rather than an
+    // omission: this is a MANDATORY NORMALIZE, not a pipeline pass — it has no
+    // `PassId`, appears in no `*.pipeline.json`, and `mandatoryNormalization()`
+    // below returns true. It names itself so a rebuilder fatal still says WHO,
+    // and a reader who greps `[pass=PruneUnreachable]` against the pipeline
+    // config and finds nothing has learned the right thing
+    // (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS).
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "PruneUnreachable";
+    }
+
     // Phase 1: the surviving block set = blocks forward-reachable from
     // the function entry, in RPO. IDENTICAL call to the one DCE uses
     // (mir/mir_cfg.hpp). The entry block is always element 0 of this

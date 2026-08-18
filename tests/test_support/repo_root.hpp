@@ -30,7 +30,13 @@
 //
 // ★ ENV FIRST, and the ordering is deliberate rather than incidental.
 // `src/core/types/config_path_walk.cpp` — the COMPILER side of exactly this
-// question — resolves env-then-walk. If the tests preferred the baked value
+// question — also resolves the environment FIRST. (It gained a third arm since
+// this note was written: env, then the INSTALLED layout relative to the running
+// executable, then the walk — [[D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE]].
+// The installed arm is inert here by construction: a test binary in
+// `build/bin/dss/` has no installed data directory beside it. What matters for
+// this header is unchanged and is the env-first half.) If the tests preferred
+// the baked value
 // while the compiler preferred the environment, then a developer pointing
 // `DSS_CONFIG_ROOT` at a second checkout would have the compiler reading tree A
 // while its own tests read tree B, with nothing anywhere reporting the split.

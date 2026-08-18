@@ -365,11 +365,12 @@ private:
     }
 
     // Re-emit one value-producing (non-Phi, non-terminator) instruction. Arg /
-    // Const / GlobalAddr use their dedicated builders (each owns a distinct
-    // payload encoding — argIndex / literalIndex / symbol — that a raw addInst
-    // would mis-stamp); every other opcode (Call, Load, Store, Add, Alloca,
-    // IntrinsicCall, ExtractValue, ...) re-emits generically with operands mapped
-    // through `local_` and `payload`/`flags` copied verbatim.
+    // Const / GlobalAddr / BlockAddress / InlineAsm use their dedicated builders
+    // (each owns a distinct payload encoding — argIndex / literalIndex / symbol /
+    // block id / asm-descriptor index — that a raw addInst would mis-stamp); every
+    // other opcode (Call, Load, Store, Add, Alloca, IntrinsicCall, ExtractValue,
+    // ...) re-emits generically with operands mapped through `local_` and
+    // `payload`/`flags` copied verbatim.
     void emitValue(MirOpcode op, MirInstId id) {
         if (op == MirOpcode::Arg) {
             // Thread the flat call-operand position (arg_payload.hpp) — the
@@ -409,6 +410,33 @@ private:
             local_.emplace(id.v, dst_.addBlockAddress(
                 mapBlock(src_.blockAddressTarget(id)), reType(src_.instType(id)),
                 src_.instFlags(id)));
+            return;
+        }
+        if (op == MirOpcode::InlineAsm) {
+            // Inline-asm P5. The payload indexes the SOURCE CU's asm-descriptor
+            // pool; the merged module is a DIFFERENT `Mir` whose pool starts
+            // empty, so forwarding the raw index below would name a descriptor
+            // that does not exist there — i.e. silently drop the template and the
+            // clobber list. Re-add the descriptor to the destination instead.
+            //
+            // ★ WHOLE, BY VALUE — never field-by-field, the same rule the rebuild
+            // substrate states at `opt/passes/mir_rebuild_helper.cpp`: a
+            // field-by-field copy that omits `isExtended` or an input's
+            // `tiedOutput` is exactly the silent-drop class `mir_asm_descriptor.hpp`
+            // guards.
+            //
+            // NOTE the one asymmetry with every other arm here: the descriptor
+            // needs NO `reType`. It carries template text, constraint strings,
+            // register names, clobbers and bools — no `TypeId` — so nothing in it
+            // is CU-scoped. Only the INSTRUCTION's result type crosses the lattice
+            // boundary, and that goes through `reType` below like all the others.
+            auto const asmOps = src_.instOperands(id);
+            std::vector<MirInstId> newAsmOps;
+            newAsmOps.reserve(asmOps.size());
+            for (MirInstId const o : asmOps) newAsmOps.push_back(mapValue(o, id));
+            local_.emplace(id.v, dst_.addInlineAsm(src_.asmDescriptor(id), newAsmOps,
+                                                   reType(src_.instType(id)),
+                                                   src_.instFlags(id)));
             return;
         }
         auto const ops = src_.instOperands(id);
@@ -485,6 +513,37 @@ private:
                 targets.reserve(succ.size());
                 for (MirBlockId const b : succ) targets.push_back(mapBlock(b));
                 dst_.addIndirectBr(mapValue(ops[0], id), targets);
+                return;
+            }
+            case MirOpcode::InlineAsmGoto: {
+                // Inline-asm P5, the TERMINATOR form — the sibling of `emitValue`'s
+                // `InlineAsm` arm and the same descriptor rule: the payload indexes
+                // the SOURCE CU's pool, so the descriptor is re-added to the merged
+                // module rather than forwarded as an index.
+                //
+                // `cloneInlineAsmGoto`, NEVER `addInlineAsmGoto`. The result pieces
+                // live at the heads of the successor blocks, which this merge already
+                // clones as ORDINARY blocks — the landing blocks came across through
+                // `mapBlock` with their pieces intact. `addInlineAsmGoto` owns the
+                // edge-PLACEMENT rule and re-running it here would interpose a SECOND
+                // landing block on every edge, on top of the one already cloned.
+                std::vector<MirInstId> newOps;
+                newOps.reserve(ops.size());
+                for (MirInstId const o : ops) newOps.push_back(mapValue(o, id));
+                std::vector<MirBlockId> targets;
+                targets.reserve(succ.size());
+                for (MirBlockId const b : succ) targets.push_back(mapBlock(b));
+                MirInstId const newId = dst_.cloneInlineAsmGoto(
+                    src_.asmDescriptor(id), newOps, targets, src_.instFlags(id));
+                // ★ THE ONE TERMINATOR ARM THAT MUST RECORD ITS CLONE. Every other
+                // terminator here produces nothing, so none of them touch `local_`.
+                // An `asm goto` WITH OUTPUTS is different: each result piece is a
+                // `ReturnPiece` at the head of a successor block that anchors to
+                // this terminator AS ITS OPERAND (`addReturnPiece(producer, ...)`,
+                // mir.cpp). Those successors are filled later in the same RPO walk,
+                // and without this mapping their `mapValue` would abort with the
+                // "no clone mapping" fatal instead of finding the terminator.
+                local_.emplace(id.v, newId);
                 return;
             }
             case MirOpcode::SehTryBegin:

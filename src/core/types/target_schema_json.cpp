@@ -1,5 +1,6 @@
 #include "core/types/target_schema.hpp"
 
+#include "core/crypto/sha256.hpp"                 // crypto::sha256Hex — the retained content digest
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table_json.hpp"
@@ -787,6 +788,18 @@ void parseEncodingVariants(json const& vs,
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     std::string_view jsonText, std::string_view sourceLabel) {
+    // ── Content digest ────────────────────────────────────────────────
+    // Digest the bytes AS RECEIVED, before the parser is allowed an opinion
+    // about them. This is the one chokepoint where the document bytes are
+    // already in memory (`loadFromFile` reads them, hands them here, and drops
+    // them), so the digest costs zero extra I/O — versus ~165 ms per
+    // invocation to re-walk and re-read `src/dss-config/` (MEASURED
+    // 2026-08-17, I/O-dominated). Computed BEFORE the parse so it is the
+    // digest of what was actually LOADED, independent of what the parse made
+    // of it. See `contentDigest()` for the full rationale and for why a
+    // non-`loadFromText` construction leaves it EMPTY.
+    std::string digest = crypto::sha256Hex(jsonText);
+
     Collector coll;
     json doc;
     try {
@@ -3539,7 +3552,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         return std::unexpected(std::move(coll).release());
     }
 
-    return std::make_shared<TargetSchema>(std::move(data));
+    auto schema = std::make_shared<TargetSchema>(std::move(data));
+    schema->contentDigest_ = std::move(digest);
+    return schema;
 }
 
 } // namespace dss

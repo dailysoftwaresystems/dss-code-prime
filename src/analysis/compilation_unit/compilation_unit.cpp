@@ -500,6 +500,82 @@ void UnitBuilder::setActiveFormat(ObjectFormatKind fmt) {
     activeFormat_ = fmt;
 }
 
+// ═══ THE UNCONDITIONAL PREDEFINED-MACRO IDENTITY VALIDATION ═══════════════════
+//
+// ★★★ WHY IT IS HERE AND NOT IN THE PREPROCESSOR. The predefined-macro rules —
+// the cross-family NAME collision, the mutual-exclusion groups, and (new) the
+// `requires` backing claim — are statements about a (language, target, object
+// format) TRIPLE. They are true or false before a single byte of source is read.
+// But the only place they were ever evaluated was inside the preprocess pass, so
+// they were silently conditional on the pass RUNNING, and MEASURED there are
+// three ways it does not:
+//
+//   1. a TU that includes NO shipped header — the pass runs, but nothing ever
+//      touched the shipped corpus, so a claim ABOUT that corpus had no site;
+//   2. a `.s` ASSEMBLY input — the assembly languages declare no `preprocess`
+//      block, so `preprocess().enabled` is false and the pass is a strict
+//      identity: NOTHING was validated, while the target and format families
+//      still contributed their macros to that build's identity;
+//   3. `#include`s inside `#if 0` — same shape as (1): the corpus is never
+//      reached, so a corpus claim is never tested.
+//
+// A rule that only fires when an unrelated thing happens is not a rule. Hoisting
+// it to `finish()` — which EVERY CompilationUnit passes through, in every
+// language, whether or not anything was preprocessed and whether or not any
+// header was included — makes it hold for the triple, which is what it was
+// always about.
+//
+// ⚠ HONEST NOTE ON DOUBLE REPORTING, stated rather than left to be discovered.
+// `preprocessRun` still performs its OWN merge and still reports a collision or
+// an exclusion-group violation itself, because it must REFUSE to preprocess
+// under an identity no real compiler can present, and its refusal is pinned by
+// its own suite. So for a preprocess-enabled language with a BROKEN config, the
+// collision message appears twice: once positioned in the TU by the pass, once
+// here as a driver diagnostic. That is deliberate. The alternative — making this
+// site conditional on "did the preprocessor run" — reintroduces exactly the
+// conditionality this hoist exists to remove, and it would buy a tidier failure
+// mode for a build that is already failing.
+void UnitBuilder::validatePredefinedMacroIdentity_() {
+    // The LANGUAGE family is per-schema: a multi-language CU has one predefine
+    // list per registered schema, and each is a separate claim about the same
+    // (target, format). `schemas_` holds every schema any tree was parsed with;
+    // a CU with no trees at all has none, and then only the target and format
+    // families are in scope — which is still a real pair to check.
+    auto const validateFamily = [&](std::span<PredefinedMacroDef const> rows,
+                                    std::string_view document) {
+        (void)ffi::validateShippedSurfaceRequirements(
+            rows, document, systemDirs_, activeFormat_, driverDiagnostics_);
+    };
+
+    std::unordered_set<std::uint32_t> seenSchemaIds;
+    for (auto const& schema : schemas_) {
+        if (!schema) continue;
+        if (!seenSchemaIds.insert(schema->schemaId().v).second) continue;
+        auto const& pp = schema->preprocess();
+        // The COLLISION + MUTUAL-EXCLUSION rules, evaluated for this language
+        // against the active target and format. `mergePredefinedMacros` is the
+        // ONE owner of both; this site only reports what it returns, so the two
+        // evaluation sites can never disagree about what a conflict IS.
+        MergedPredefinedMacros const merged = mergePredefinedMacros(
+            pp.predefinedMacros, targetPredefinedMacros_,
+            formatPredefinedMacros_, activeFormat_,
+            pp.mutuallyExclusivePredefinedMacros);
+        for (std::string const& msg : merged.conflicts) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::C_ConflictingPredefinedMacro;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = msg;
+            driverDiagnostics_.report(std::move(d));
+        }
+        validateFamily(pp.predefinedMacros, kPredefinedMacroFamilyPaths[0]);
+    }
+    // The TARGET and FORMAT families are per-CU, not per-schema, so they are
+    // checked ONCE outside the schema loop — otherwise a two-language CU would
+    // report the same target-row failure twice.
+    validateFamily(targetPredefinedMacros_, kPredefinedMacroFamilyPaths[1]);
+    validateFamily(formatPredefinedMacros_, kPredefinedMacroFamilyPaths[2]);
+}
+
 void UnitBuilder::setHeaderNameMatching(HeaderNameMatching matching) {
     if (finished_) {
         cuFatal("UnitBuilder::setHeaderNameMatching called after finish()");
@@ -685,6 +761,8 @@ CompilationUnit UnitBuilder::finish() && {
         cuFatal("UnitBuilder::finish() called twice");
     }
 
+    validatePredefinedMacroIdentity_();
+
     // Resolve imports BEFORE marking finished: a resolver may load additional
     // included files (include-following) via the loadFile callback, which routes
     // through addTree — and addTree aborts once finished_ is set.
@@ -704,6 +782,10 @@ CompilationUnit UnitBuilder::finish() && {
         includeDirs_,
         systemDirs_,
         headerNameMatching_,
+        // D-FFI-DESCRIPTOR-INCLUDES-EDGE-GATE: the same value the preprocessor
+        // tier already receives. Both tiers walk the shipped-descriptor closure;
+        // handing only one of them the format is how the two sets drift.
+        activeFormat_,
         [this](std::filesystem::path const& path, bool& ok,
                std::shared_ptr<GrammarSchema const> schema) {
             return loadAndAdd_(path, ok, std::move(schema));
@@ -895,6 +977,7 @@ CompilationUnit UnitBuilder::finish() && {
                     includeDirs_,
                     systemDirs_,
                     headerNameMatching_,
+                    activeFormat_,   // identical inputs to the first pass
                     [this](std::filesystem::path const& path, bool& ok,
                            std::shared_ptr<GrammarSchema const> schema) {
                         return loadAndAdd_(path, ok, std::move(schema));

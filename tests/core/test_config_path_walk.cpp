@@ -15,6 +15,7 @@
 // the caller never called it.
 
 #include "core/types/config_path_walk.hpp"
+#include "repo_root.hpp"     // the repo-root VERSION — the compiler's own identity
 #include "scoped_env.hpp"    // the ONE env override (this file used to carry a copy)
 #include "scratch_dir.hpp"
 
@@ -23,6 +24,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -103,6 +105,48 @@ private:
 // produced; canonicalise both sides before comparing, as the file-form tests do.
 void expectSameDir(fs::path const& got, fs::path const& want) {
     EXPECT_EQ(fs::weakly_canonical(got), fs::weakly_canonical(want));
+}
+
+// Write the repo-root `VERSION` file that declares a config tree's version —
+// the file the top-level CMakeLists already reads as the single source of truth.
+// It sits BESIDE `src/`, so `<root>/VERSION` describes `<root>/src/dss-config`.
+void plantVersion(fs::path const& root, std::string const& version) {
+    std::error_code ec;
+    fs::create_directories(root, ec);
+    std::ofstream(root / "VERSION") << version << "\n";
+}
+
+// The version THIS BINARY was built with, taken from the same file CMake reads
+// to define `DSS_PROJECT_VERSION`. Deliberately read from disk rather than
+// hard-coded: a literal here would go stale on the next version bump and turn a
+// real skew pin into a test that asserts a historical number.
+std::string compilerVersion() {
+    std::ifstream in(dss::test::repoRoot() / "VERSION", std::ios::binary);
+    std::string   text{std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>()};
+    auto const isSpace = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+    };
+    std::size_t b = 0, e = text.size();
+    while (b < e && isSpace(text[b])) ++b;
+    while (e > b && isSpace(text[e - 1])) --e;
+    return text.substr(b, e - b);
+}
+
+// Plant `<exeDir>/<installedConfigRelDir()>/<subdir>` — a SYNTHETIC installed
+// layout, composed through the resolver's own published relative path so the
+// test cannot drift from the layout CMake installs. Returns the config root.
+fs::path plantInstalledLayout(fs::path const& exeDir, std::string const& subdir) {
+    fs::path const root =
+        (exeDir / fs::path{std::string{dss::installedConfigRelDir()}}).lexically_normal();
+    std::error_code ec;
+    fs::create_directories(subdir.empty() ? root : root / subdir, ec);
+    EXPECT_FALSE(ec) << "plantInstalledLayout: " << ec.message();
+    return root;
+}
+
+bool contains(std::string const& haystack, std::string const& needle) {
+    return haystack.find(needle) != std::string::npos;
 }
 
 } // namespace
@@ -264,4 +308,237 @@ TEST(ConfigPathWalk, DirAcceptsNestedSubdir) {
     auto const got = findShippedConfigDir("shippedLibs/windows-x86_64");
     ASSERT_TRUE(got.has_value()) << "a nested shippedLibDirs value must resolve";
     expectSameDir(*got, planted);
+}
+
+// ── THE INSTALLED-LAYOUT ARM ────────────────────────────────────────────────
+//
+// [[D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE]]. Before this arm the
+// resolver knew only `$DSS_CONFIG_ROOT` and a cwd walk, so an installed `dsscp`
+// at `/usr/bin` invoked from a user's project walked THAT project's ancestors
+// and found nothing — a packaged compiler could not resolve `#include <stdio.h>`
+// even if the config tree HAD been in the package.
+//
+// ⚠ THESE PIN THE PURE HALF ONLY, AND THAT IS DELIBERATE. The end-to-end claim
+// ("an installed compiler compiles") is proven by the `install_scratch_prefix_smoke`
+// ctest entry, which installs to a scratch prefix outside the repository and
+// compiles a hello-world with the source tree provably out of reach. A unit test
+// CANNOT plant a real installed tree, because the only executable directory it
+// could plant beside is the one holding EVERY test binary — under `ctest -j` that
+// synthetic tree would silently outrank the cwd walk for every concurrent test in
+// the suite. Splitting `runningExecutableDir()` (host I/O) from
+// `installedConfigRootFrom()` (layout) is what makes the layout testable at all.
+
+// The relative hop must be RELATIVE, and it must name the config tree. Relative
+// is the relocatability property every packaging path here depends on — Homebrew's
+// cellar, Nix's store, Scoop's app dir, a user's `tar -xf` into ~/opt all place the
+// prefix somewhere unknown at build time. A baked absolute path would resolve on
+// the build machine and nowhere else.
+TEST(ConfigPathWalk, InstalledRelDirIsRelativeAndNamesTheConfigTree) {
+    fs::path const rel{std::string{dss::installedConfigRelDir()}};
+    ASSERT_FALSE(rel.empty()) << "cmake/DssInstall.cmake must compute the hop";
+    EXPECT_TRUE(rel.is_relative())
+        << "an absolute installed-config path makes the package non-relocatable: "
+        << rel.generic_string();
+    EXPECT_EQ(rel.filename().generic_string(), "dss-config")
+        << "the hop must land on the config tree itself: " << rel.generic_string();
+}
+
+// The layout ROUND-TRIPS: compose through the published relative hop, and the
+// resolver finds exactly that directory. Composing the expected path from
+// `installedConfigRelDir()` rather than from a literal is what keeps this pin
+// honest — a literal would keep passing after CMake changed the install layout,
+// which is the drift the single-owner arrangement exists to prevent.
+TEST(ConfigPathWalk, InstalledRootRoundTripsThroughTheComputedRelDir) {
+    ScratchDir scratch(Location::Temp, "config-walk-installed");
+    fs::path const exeDir = scratch.path() / "bin";
+    std::error_code ec;
+    fs::create_directories(exeDir, ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    fs::path const planted = plantInstalledLayout(exeDir, "sources");
+
+    auto const got = dss::installedConfigRootFrom(exeDir);
+    ASSERT_TRUE(got.has_value())
+        << "a planted installed layout must resolve from its executable dir";
+    expectSameDir(*got, planted);
+}
+
+// A DEVELOPMENT build has no installed layout around its binary, so the arm must
+// be inert rather than resolving something. This is what guarantees the change
+// reorders nothing for the repo's own workflow: `build/bin/dss/` has no sibling
+// data directory, so the cwd walk still answers exactly as it always did.
+TEST(ConfigPathWalk, InstalledRootIsNulloptWhenNothingIsInstalled) {
+    ScratchDir scratch(Location::Temp, "config-walk-installed");
+    EXPECT_FALSE(dss::installedConfigRootFrom(scratch.path()).has_value());
+}
+
+// Validated as a DIRECTORY, matching the directory form's discipline: a plain
+// FILE sitting where the tree should be must not be handed back as a config root
+// that callers will then try to iterate.
+TEST(ConfigPathWalk, InstalledRootRejectsAFileWhereTheTreeShouldBe) {
+    ScratchDir scratch(Location::Temp, "config-walk-installed");
+    fs::path const exeDir = scratch.path() / "bin";
+    std::error_code ec;
+    fs::create_directories(exeDir, ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    fs::path const root =
+        (exeDir / fs::path{std::string{dss::installedConfigRelDir()}}).lexically_normal();
+    fs::create_directories(root.parent_path(), ec);
+    ASSERT_FALSE(ec) << ec.message();
+    std::ofstream(root) << "not a directory\n";
+
+    EXPECT_FALSE(dss::installedConfigRootFrom(exeDir).has_value())
+        << "a FILE named dss-config is not an installed config tree";
+}
+
+// The host primitive answers about THIS process. Asserted by CONTENT, not by
+// "some directory came back": the answer must be the directory that actually
+// holds this test executable. An implementation that returned the cwd, or the
+// directory of argv[0], or an empty path would satisfy a mere has_value() check
+// and fail here.
+TEST(ConfigPathWalk, RunningExecutableDirHoldsThisTestBinary) {
+    auto const dir = dss::runningExecutableDir();
+    ASSERT_TRUE(dir.has_value())
+        << "this host must report the running executable's own path";
+    std::error_code ec;
+    ASSERT_TRUE(fs::is_directory(*dir, ec)) << dir->generic_string();
+
+    bool found = false;
+    for (fs::directory_iterator it{*dir, ec}, end; it != end; it.increment(ec)) {
+        if (ec) break;
+        if (it->path().filename().generic_string().rfind(
+                "dss_core_test_config_path_walk", 0) == 0) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found)
+        << "runningExecutableDir() returned '" << dir->generic_string()
+        << "', which does not contain this test's own binary — so it is not "
+           "reporting this process's image directory";
+}
+
+// ── BINARY / CONFIG VERSION SKEW ───────────────────────────────────────────
+//
+// A compiler paired with a config tree from another version does not fail; it
+// compiles something subtly different — the predefined-macro set, a target's
+// register file, a shipped header's struct layout and an object format's
+// relocation table all live in that tree. Same silent-wrong-answer class as a
+// stale cached object, and invisible from inside one image.
+
+// THE REFUSAL, and it must name BOTH halves: a message saying only "version
+// mismatch" leaves the user unable to tell which half to fix.
+TEST(ConfigPathWalk, VersionSkewedEnvRootIsRefusedNamingBothVersions) {
+    ScratchDir scratch(Location::Temp, "config-walk-skew");
+    plantTarget(scratch.path(), "synth_target");
+    plantVersion(scratch.path(), "0.0.0-a-different-release");
+
+    ScopedEnv env("DSS_CONFIG_ROOT", scratch.path().string());
+    auto const res = findShippedConfig(targetLocator("synth_target"));
+
+    ASSERT_FALSE(res.has_value())
+        << "a config tree from another version must be REFUSED, not used";
+    ASSERT_FALSE(res.error().empty());
+    std::string const msg = res.error().front().message;
+    EXPECT_TRUE(contains(msg, "0.0.0-a-different-release"))
+        << "the diagnostic must name the TREE's version: " << msg;
+    EXPECT_TRUE(contains(msg, compilerVersion()))
+        << "the diagnostic must name the COMPILER's version: " << msg;
+    EXPECT_TRUE(contains(msg, "dss-config"))
+        << "the diagnostic must name the tree it refused: " << msg;
+}
+
+// SAME TREE, MATCHING VERSION → resolves. The control that proves the pin above
+// reddens on the skew rather than on the presence of a VERSION file at all: both
+// tests plant the identical tree and differ only in the version string.
+TEST(ConfigPathWalk, VersionMatchedEnvRootResolves) {
+    ScratchDir scratch(Location::Temp, "config-walk-skew");
+    fs::path const file = plantTarget(scratch.path(), "synth_target");
+    plantVersion(scratch.path(), compilerVersion());
+
+    ScopedEnv env("DSS_CONFIG_ROOT", scratch.path().string());
+    auto const res = findShippedConfig(targetLocator("synth_target"));
+    ASSERT_TRUE(res.has_value())
+        << "a tree declaring THIS compiler's version must resolve";
+    EXPECT_EQ(fs::weakly_canonical(*res), fs::weakly_canonical(file));
+}
+
+// A tree that declares NO version is not a mismatch. Stated as a pin because it
+// is a deliberate semantic and not an accident: the guard makes a positive claim
+// only when it has BOTH facts, so an unversioned tree (a hand-assembled config
+// root, the pragma-census scratch tree) keeps working instead of turning one
+// missing file into a hard refusal.
+TEST(ConfigPathWalk, UnversionedTreeIsNotTreatedAsASkew) {
+    ScratchDir scratch(Location::Temp, "config-walk-skew");
+    fs::path const file = plantTarget(scratch.path(), "synth_target");   // no VERSION
+
+    ScopedEnv env("DSS_CONFIG_ROOT", scratch.path().string());
+    auto const res = findShippedConfig(targetLocator("synth_target"));
+    ASSERT_TRUE(res.has_value()) << "an unversioned tree declares no disagreement";
+    EXPECT_EQ(fs::weakly_canonical(*res), fs::weakly_canonical(file));
+}
+
+// THE CWD-WALK ARM SKEWS TOO. Pinned separately because the two arms reach the
+// check by different routes, and a fix applied to only one of them would leave a
+// build-tree binary standing in a different checkout compiling silently wrong.
+TEST(ConfigPathWalk, VersionSkewedWalkedTreeIsRefused) {
+    ScratchDir scratch(Location::Temp, "config-walk-skew");
+    plantTarget(scratch.path(), "synth_target");
+    plantVersion(scratch.path(), "0.0.0-a-different-release");
+
+    ScopedEnv env("DSS_CONFIG_ROOT");                  // construct-to-clear
+    ScopedCwd cwd(makeNestedStart(scratch.path()));    // 3 hops below the plant
+
+    auto const res = findShippedConfig(targetLocator("synth_target"));
+    ASSERT_FALSE(res.has_value())
+        << "the cwd walk must refuse a tree from another version too";
+    ASSERT_FALSE(res.error().empty());
+    EXPECT_TRUE(contains(res.error().front().message, "0.0.0-a-different-release"));
+}
+
+// THE TWO FORMS AGREE. They share one implementation precisely so a file can
+// never resolve out of one tree while a directory resolves out of another —
+// mixed trees would be a skew nothing could observe from either side.
+TEST(ConfigPathWalk, DirFormRefusesTheSameSkewedTree) {
+    ScratchDir scratch(Location::Temp, "config-walk-skew");
+    plantConfigDir(scratch.path(), "sources");
+    plantVersion(scratch.path(), "0.0.0-a-different-release");
+
+    ScopedEnv  env("DSS_CONFIG_ROOT", scratch.path().string());
+    ScratchDir bare(Location::Temp, "config-walk-skew");
+    ScopedCwd  cwd(makeNestedStart(bare.path()));      // nothing for the walk to find
+
+    EXPECT_FALSE(findShippedConfigDir("sources").has_value())
+        << "the directory form must not hand back a tree the file form refuses";
+}
+
+// ── THE NOT-FOUND DIAGNOSTIC NAMES WHERE IT LOOKED ─────────────────────────
+//
+// An installed binary that cannot find its config must SAY SO. Falling through
+// to a bare "not found" and letting a confusing downstream error surface (a
+// missing language, an unresolvable `<stdio.h>`) is the defect this arm closes,
+// not an acceptable way to report it.
+TEST(ConfigPathWalk, NotFoundDiagnosticListsEveryPathTried) {
+    ScratchDir scratch(Location::Temp, "config-walk-tried");   // nothing planted
+    ScratchDir bare(Location::Temp, "config-walk-tried");
+
+    ScopedEnv env("DSS_CONFIG_ROOT", scratch.path().string());
+    ScopedCwd cwd(makeNestedStart(bare.path()));
+
+    auto const res = findShippedConfig(targetLocator("no_such_target_at_all"));
+    ASSERT_FALSE(res.has_value());
+    ASSERT_FALSE(res.error().empty());
+    std::string const msg = res.error().front().message;
+
+    EXPECT_TRUE(contains(msg, "tried:")) << msg;
+    EXPECT_TRUE(contains(msg, "$DSS_CONFIG_ROOT"))
+        << "the override it consulted must appear among the tried paths: " << msg;
+    EXPECT_TRUE(contains(msg, "installed layout"))
+        << "the installed-layout probe must appear among the tried paths — that is "
+           "the arm a packaged user's report will be about: " << msg;
+    EXPECT_TRUE(contains(msg, "cwd walk"))
+        << "the walk must appear among the tried paths: " << msg;
+    EXPECT_TRUE(contains(msg, "no_such_target_at_all"))
+        << "the message must name what was being looked for: " << msg;
 }

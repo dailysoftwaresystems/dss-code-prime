@@ -2704,35 +2704,15 @@ struct Lowerer {
         out.spelling   = asmOperandSpelling(gnuIndex);
         out.widthBits  = asmWidthBitsForType(valueType);
         out.constraint = o.constraint;
-        // ⚠ `"+r"` — ONE operand that is read AND written, and the blocker is
-        // NO LONGER IN LIR. ✔MEASURED 2026-08-15: the LIR half is done — the
-        // two-address tie carries an operand INDEX rather than a bool fixed to
-        // *result == operand[0]* (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE), and a
-        // read-write asm operand does not even need it, because the template
-        // binds ONE spelling to ONE vreg that is both the instruction's result
-        // and its operand — the tie is then an identity, not a constraint.
-        // ★ WHAT IS ACTUALLY MISSING IS THE OPERAND'S INPUT VALUE. ✔MEASURED in
-        // `hir_to_mir.cpp`: a `+` operand is filed in `desc.outputs` (index <
-        // `outputCount`) and outputs contribute only an LVALUE ADDRESS for the
-        // store-back piece — the read half is never lowered, so no MIR operand
-        // carries the value the template is entitled to read. Accepting it here
-        // would bind the template to a vreg NOTHING wrote: the asm would read
-        // an undefined register with no diagnostic. Refused until the front end
-        // lowers a `+` operand's value as an input as well as an lvalue.
-        if (o.isReadWrite) {
-            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
-                DiagnosticSeverity::Error,
-                std::format(
-                    "inline asm (MIR inst {}): {} {} uses the read-write "
-                    "constraint \"{}\". The tie itself is expressible now, but "
-                    "the front end lowers a read-write operand's LVALUE only — "
-                    "no MIR operand carries the value the template must READ, "
-                    "so binding it would hand the template a register nothing "
-                    "wrote. Refused rather than read-as-undefined "
-                    "(D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE)",
-                    at.v, role, gnuIndex, o.constraint));
-            return false;
-        }
+        // ⚠ `"+r"` IS BOUND LIKE ANY OTHER OPERAND **HERE**, AND TIED IN
+        // `tieAsmReadWriteOperands` (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE). This
+        // function sees ONE operand and the tie is a relation between TWO, so a
+        // blanket refusal was the only thing it could honestly do while the read
+        // half did not exist. It does now: `hir_to_mir.cpp` appends a matching
+        // input entry per `+` output carrying `MirAsmOperand::tiedOutput`, and
+        // the whole-descriptor pass below is where that relation is checked and
+        // realised — before ANYTHING is emitted, so an unrepresentable shape
+        // still refuses rather than reaching a template.
         LirRegClass const cls = static_cast<LirRegClass>(o.regClass);
         if (cls == LirRegClass::None) {
             dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
@@ -2774,6 +2754,179 @@ struct Lowerer {
         out.pinned  = true;
         out.ordinal = ord;
         out.name    = std::move(name);
+        return true;
+    }
+
+    // ★★★ `"+r"` — THE TIE IS A **LOCATION IDENTITY**, AND THIS IS WHERE IT IS
+    // MADE ONE (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE).
+    //
+    // A `+` operand is ONE thing the source wrote and TWO things the machine
+    // needs: a value to READ and a location to WRITE. `hir_to_mir.cpp` splits it
+    // exactly as GNU does (6.47.2.4) — the write half stays in `outputs` (so it
+    // gets a `ReturnPiece` and a store-back) and a matching-constraint INPUT is
+    // appended carrying `MirAsmOperand::tiedOutput`, whose value LOADS from the
+    // very address the store-back writes. This pass is the first consumer of
+    // that field, and all it has to do is put both halves in ONE register:
+    // `bindAsmOperand` mints a FRESH vreg per operand, so left alone the read
+    // half would be materialised into a register the template never names while
+    // `%0` stayed undefined — the read-as-undefined outcome the blanket refusal
+    // used to prevent, arriving one tier later.
+    //
+    // ★ WHY THIS IS AN IDENTITY AND NOT `requires2Address`. The core's
+    // two-address tie is an ISA fact about a TARGET OPCODE (x86's `add` writes
+    // into one of its sources); it landed as an operand INDEX in the same arc and
+    // is consumed by `lir_2addr_legalize` / `lir_regalloc` for every target that
+    // declares it. A `+` asm operand is a different question — the SOURCE says
+    // two roles name one object — and the answer is that both roles bind to the
+    // same `LirReg`. The two mechanisms then compose for free: the template
+    // `addl $2, %0` elects x86's two-address `add` with result and operand[0]
+    // BOTH already equal to the tied register, so `needsLegalize`
+    // (`newOps[tied].reg != result_reg`) is false and the legalizer correctly
+    // inserts nothing. 📄 arm64's `add` declares NO `requires2Address` at all
+    // (read from `arm64.target.json`, where the reg-reg shape is natively
+    // three-address), and ✔MEASURED the same `"+r"` source compiles for
+    // `arm64:elf64-aarch64-linux-exec` and `arm64:macho64-arm64-darwin-exec` at
+    // both configs. ⇒ the identity is what makes `%0` name ONE register on a
+    // two-address target and a three-address one alike — no per-target arm here.
+    //
+    // ⚠ THE VREG GAINS A SECOND DEFINITION AND THAT IS DELIBERATE. The tied
+    // register is written by the materialisation `mov` AND by the template, so
+    // its live range spans both — which is exactly the range a read-write operand
+    // has. LIR is not SSA (the allocator is a linear scan over ranges, and
+    // `firstDef` takes the minimum), so this widens the range rather than
+    // confusing it, and it is what forces every OTHER input to a different
+    // register: they all overlap the template instruction.
+    //
+    // Refusals below, all of them shapes that would otherwise reach a template as
+    // an undefined register or a silently dropped write-back:
+    //   * a `+` in the INPUT section — no output entry, no `ReturnPiece`, no
+    //     lvalue address, so the write half cannot exist. ✔MEASURED on gcc
+    //     13.3.0: `error: input operand constraint contains '+'` — so refusing
+    //     is conformance, not a gap. ⚠ clang is NOT installed on this machine,
+    //     so it is deliberately not cited: the reference figure names the
+    //     compiler the probe was actually run against.
+    //   * a read-write OUTPUT that NO input entry claims — the front end owes one
+    //     per `+` output; without it the template would read a register only the
+    //     template itself writes. ★ This is the original refusal's protective
+    //     intent, kept and narrowed from "every `+`" to "a `+` whose read half is
+    //     actually missing".
+    //   * an OUTPUT carrying `tiedOutput`, an out-of-range index, a tie to a
+    //     write-only output, two inputs claiming one output, or two halves whose
+    //     widths disagree — each a descriptor defect that would otherwise be
+    //     absorbed silently.
+    [[nodiscard]] bool
+    tieAsmReadWriteOperands(MirAsmDescriptor const& desc, MirInstId at,
+                            std::vector<AsmBound> const& outs,
+                            std::vector<AsmBound>& ins) {
+        auto refuse = [&](std::string text) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format("inline asm (MIR inst {}): {} "
+                            "(D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE)",
+                            at.v, text));
+            return false;
+        };
+        // ⛔ AN OUTPUT NEVER CARRIES THE TIE — `mir_asm_descriptor.hpp` states it
+        // outright: the index is written on the INPUT because that is where GNU
+        // writes it and because outputs are bound FIRST, so the partner is
+        // already resolved when the input is reached. An output carrying one
+        // would be the same fact in two places, free to disagree.
+        for (std::size_t k = 0; k < desc.outputs.size(); ++k) {
+            if (desc.outputs[k].tiedOutput.has_value()) {
+                return refuse(std::format(
+                    "output {} carries a `tiedOutput` index ({}). The tie is "
+                    "recorded on the INPUT half of a read-write operand — an "
+                    "output carrying one is the same fact in two places",
+                    k, *desc.outputs[k].tiedOutput));
+            }
+        }
+        // Which output each input claims, so a double claim is caught rather
+        // than letting the second silently win.
+        std::vector<std::optional<std::size_t>> claimedBy(desc.outputs.size());
+        for (std::size_t j = 0; j < desc.inputs.size(); ++j) {
+            MirAsmOperand const& in = desc.inputs[j];
+            std::size_t const gnuIndex = desc.outputs.size() + j;
+            if (!in.tiedOutput.has_value()) {
+                if (in.isReadWrite) {
+                    return refuse(std::format(
+                        "input {} uses the read-write constraint \"{}\", but a "
+                        "`+` written in the INPUT section has no output entry, "
+                        "no result piece and no lvalue address, so the WRITE "
+                        "half of it cannot exist. gcc 13.3.0 rejects the "
+                        "same spelling: \"input operand constraint contains "
+                        "'+'\"",
+                        gnuIndex, in.constraint));
+                }
+                continue;
+            }
+            std::size_t const k = *in.tiedOutput;
+            if (k >= desc.outputs.size()) {
+                return refuse(std::format(
+                    "input {} is tied to output {}, and the block declares only "
+                    "{} output(s)", gnuIndex, k, desc.outputs.size()));
+            }
+            if (!desc.outputs[k].isReadWrite) {
+                return refuse(std::format(
+                    "input {} is tied to output {} (constraint \"{}\"), which is "
+                    "not read-write. A tie exists to carry a `+` operand's read "
+                    "half, so tying to a write-only output would feed the "
+                    "template a value the source never asked it to read",
+                    gnuIndex, k, desc.outputs[k].constraint));
+            }
+            if (claimedBy[k].has_value()) {
+                return refuse(std::format(
+                    "inputs {} and {} are both tied to output {} — a read-write "
+                    "operand has exactly one read half, and two would leave the "
+                    "register holding whichever was materialised last",
+                    desc.outputs.size() + *claimedBy[k], gnuIndex, k));
+            }
+            // ⚠ WIDTHS MUST AGREE, AND THE CHECK IS NOT CEREMONIAL. Both halves
+            // come from the same C lvalue, so today they cannot differ — but the
+            // two travel by DIFFERENT routes (the output's from the result piece
+            // type, the input's from the tied `Load`'s type), and a front end
+            // that ever narrowed one would silently hand the template a
+            // sub-register spelling for a value stored at another width.
+            if (ins[j].widthBits != outs[k].widthBits) {
+                return refuse(std::format(
+                    "input {} is tied to output {}, but the two halves of that "
+                    "one operand carry different widths ({} vs {} bits) — they "
+                    "name the same object and must select the same register "
+                    "spelling", gnuIndex, k, ins[j].widthBits,
+                    outs[k].widthBits));
+            }
+            claimedBy[k] = j;
+            // ★★ THE TIE ITSELF: the read half binds to the location the write
+            // half already got. Copying the LOCATION fields (never the whole
+            // bound operand) keeps this input's own `spelling`, `constraint` and
+            // width — the template names the halves by DIFFERENT `%N`, and the
+            // diagnostics quote each half's own index.
+            // ⓘ `earlyClobber` is deliberately NOT copied: `&` is the OUTPUT's
+            // promise about when it is written, and `stampEarlyClobberOutputs`
+            // only ever walks `outs`. The front end already clears it on the
+            // synthesized entry; leaving it out here means the two agree by
+            // construction rather than by both remembering.
+            ins[j].reg     = outs[k].reg;
+            ins[j].cls     = outs[k].cls;
+            ins[j].pinned  = outs[k].pinned;
+            ins[j].ordinal = outs[k].ordinal;
+            ins[j].name    = outs[k].name;
+        }
+        // ★★★ THE ONE THAT REPLACES THE OLD BLANKET REFUSAL. Every `+` output
+        // MUST have been claimed above. Reaching here unclaimed means the read
+        // half never arrived — the descriptor was built by a producer that does
+        // not synthesize it, or a rebuild dropped the entry — and binding it
+        // anyway would hand the template a register NOTHING wrote. That is a
+        // silent miscompile with a correct-looking rc=0, so it stays a refusal.
+        for (std::size_t k = 0; k < desc.outputs.size(); ++k) {
+            if (!desc.outputs[k].isReadWrite || claimedBy[k].has_value())
+                continue;
+            return refuse(std::format(
+                "output {} uses the read-write constraint \"{}\", but no input "
+                "entry carries its read half (a matching-constraint input naming "
+                "`tiedOutput` = {}). The template would read the bound register "
+                "before anything wrote it — refused rather than "
+                "read-as-undefined", k, desc.outputs[k].constraint, k));
+        }
         return true;
     }
 
@@ -2850,6 +3003,12 @@ struct Lowerer {
                 return false;
             }
         }
+        // ★ `"+r"` — collapse each read-write operand's two halves onto ONE
+        // register. Runs AFTER both bind loops (it reads the outputs' bound
+        // locations) and BEFORE the constraint list is built, so a tied PINNED
+        // operand contributes its register to `inputNames` as well as
+        // `outputNames` — it genuinely is both.
+        if (!tieAsmReadWriteOperands(desc, id, outs, ins)) return false;
 
         // ── 2. the ONE per-instruction constraint ──
         ImplicitRegisterConstraint c;
@@ -3182,15 +3341,28 @@ struct Lowerer {
     // `asm goto` — the TERMINATOR form. Returns true iff the block was sealed.
     //
     // ⚠⚠ REFUSED, AND THE REFUSAL IS THE CORRECT ANSWER RATHER THAN A DEFERRAL.
-    // ✔MEASURED 2026-08-15 on both shipped dialects: neither declares an operand
-    // placeholder at all (x86 AT&T's `attRegister` is `[RegisterSigil,
-    // Identifier]`, so `%0` lexes as sigil + IntLiteral and matches nothing;
-    // arm64 gas spells `%` as `TypeSigil`), and NEITHER declares the `%l[label]`
-    // form an `asm goto` template needs to NAME its labels. A template that
-    // cannot name its labels cannot branch to them — so sealing this block with
-    // an unconditional jump to any one successor would silently pick a branch
-    // the programmer did not write, and sealing it with a fall-through would
-    // discard the edges entirely. Both are miscompiles with no diagnostic.
+    //
+    // ★★ THE REASON CHANGED ON 2026-08-15 AND THIS DOCBLOCK DID NOT FOLLOW IT
+    // FOR TWO DAYS (D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-LONGER-
+    // EXISTS). It used to say — correctly at the time — that neither shipped
+    // dialect declared a `%l[label]` form. ✘ THAT IS NOW FALSE: both
+    // `asm-x86_64-att.lang.json` and `asm-arm64-gas.lang.json` bind
+    // `templateLabelPlaceholder` → `PlaceholderLabelSigil` with a two-byte `%l`
+    // lexeme, `asm.lang.json` declares the `asmTemplateLabelRef` shape, and a
+    // detector test proves `%l` survives `loadShipped` as a lexeme of the
+    // template mode. The stale claim was written the SAME DAY the placeholder
+    // surface landed, which is how a reason outlives its measurement.
+    //
+    // ✔THE REAL BLOCKER, MEASURED: a label target must resolve to a BLOCK of the
+    // function that embedded the template, and an `AsmOperandBinding` carries a
+    // `LirReg` and no block — so no caller can bind one. A template that cannot
+    // name its labels cannot branch to them, so sealing this block with an
+    // unconditional jump to any one successor would silently pick a branch the
+    // programmer did not write, and sealing it with a fall-through would discard
+    // the edges entirely. Both are miscompiles with no diagnostic.
+    // ⇒ this refusal retires when a binding can name a BLOCK, not when config
+    // changes. Sending a reader to edit a dialect file that is already correct
+    // is the cost a wrong reason carries.
     // (`asm goto` with NO labels never reaches here: HIR→MIR routes it to the
     // ordinary non-terminator form, which this build lowers.)
     [[nodiscard]] bool lowerInlineAsmGoto(MirInstId id,
@@ -3198,12 +3370,14 @@ struct Lowerer {
         dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
             DiagnosticSeverity::Error,
             std::format(
-                "`asm goto` (MIR inst {}) has {} label edge(s), and assembly "
-                "dialect '{}' declares no label-placeholder form for a template "
-                "to name them by — so the template cannot branch to its own "
-                "labels. Refused rather than sealed with a synthesized branch, "
-                "which would choose an edge the programmer did not write "
-                "(D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER)",
+                "`asm goto` (MIR inst {}) has {} label edge(s), and an assembly "
+                "operand binding carries a register and no BLOCK — so a label "
+                "target cannot be expressed, and the template cannot branch to "
+                "its own labels. Refused rather than sealed with a synthesized "
+                "branch, which would choose an edge the programmer did not "
+                "write. (The dialect is not at fault: '{}' does declare the "
+                "`%l` label placeholder, and the template parses.) "
+                "(D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-LONGER-EXISTS)",
                 id.v, succs.size(), target.defaultAssemblyLanguage()));
         return false;
     }

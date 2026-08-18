@@ -1108,9 +1108,27 @@ void expectDoublePercentIsNotAFileToken(ShippedDialect const& d) {
     ASSERT_FALSE(mutated["tokens"].contains("%%"))
         << d.language << ": the shipped document still declares `%%` in its "
            "GLOBAL token table — the arm above is asserting nothing";
-    ASSERT_TRUE(mutated["lexerModes"]["asm-template"]["tokens"].contains("%%"))
-        << d.language << ": the shipped document declares no `%%` row in its "
-           "TEMPLATE mode either — the escape is simply gone";
+    // ⚠ THE SECOND PRECONDITION MOVED WITH THE OWNER (P5c, 2026-08-17 —
+    // D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER). It used to
+    // read `lexerModes["asm-template"]["tokens"]["%%"]` out of this document; the
+    // dialect no longer declares that row — `asm.lang.json` owns the bytes and
+    // the loader synthesizes the row from them, joined to the KIND bound here.
+    // So the "the escape is not simply gone" check is now the CAPABILITY plus the
+    // role BINDING, which are this document's whole share of it.
+    ASSERT_TRUE(mutated["assembly"].contains("templateLexerMode"))
+        << d.language << ": the shipped document declares no template lexer mode "
+           "— there is no template surface for the escape to live in";
+    {
+        bool bound = false;
+        for (auto const& [_, ref] : mutated["languageReferences"].items()) {
+            if (!ref.is_object() || !ref.contains("bindTokens")) continue;
+            bound = bound || ref["bindTokens"].contains("templateEscape");
+        }
+        ASSERT_TRUE(bound)
+            << d.language << ": the shipped document binds no 'templateEscape' "
+               "role, so no escape row is synthesized anywhere — the escape IS "
+               "simply gone and the arm above is asserting nothing";
+    }
     mutated["tokens"]["%%"] = nlohmann::json::parse(
         R"([{"kind": "PercentEscape"}])");
     auto const leaked = lowerAsmText(mutated, source, d.target);

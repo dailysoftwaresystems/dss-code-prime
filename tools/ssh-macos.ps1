@@ -46,6 +46,26 @@ if (-not $HostName) { $HostName = if ($env:DSS_MACOS_HOST) { $env:DSS_MACOS_HOST
 if (-not $UserName) { $UserName = if ($env:DSS_MACOS_USER) { $env:DSS_MACOS_USER } else { $conf['DSS_MACOS_USER'] } }
 if (-not $KeyPath)  { $KeyPath  = if ($env:DSS_MACOS_KEY)  { $env:DSS_MACOS_KEY }  else { $conf['DSS_MACOS_KEY'] } }
 
+# ★★★ THE SCRIPT FINDS THE KEY. THE CALLER NEVER DOES ANYTHING MANUALLY.
+# Operator instruction 2026-08-17: "you must be able to get everything from the tool
+# scripts, which goes inside .secrets and find the key. never manually."
+# ⚠ `$HOME` names a DIFFERENT directory in WSL / Git Bash / PowerShell, so a
+# `$HOME`-relative key makes a host reachable or not depending on which shell you
+# started in — ✔MEASURED on the arm64 VPS twin, whose key existed only under WSL's
+# $HOME. `.secrets/` is the SAME directory in all three and is gitignored (as are
+# *.key and *.env repo-wide), so the key lives there and this script RESOLVES it.
+# ⚠ CAPABILITY-PAIRED with `ssh-macos.sh` and BOTH arm64-vps carriages — a change to
+# one lands in all four, which is a claim these headers make and nothing checks
+# (that is exactly how the `.ps1` twin ended up not expanding `$HOME` at all).
+$_repoKey = Join-Path $PSScriptRoot '..\.secrets\macos.key'
+if ($KeyPath) { $KeyPath = $KeyPath -replace '^\$HOME', $HOME -replace '^~', $HOME }
+if ($KeyPath -and -not (Test-Path $KeyPath) -and (Test-Path $_repoKey)) {
+    Write-Warning "ssh-macos: DSS_MACOS_KEY='$KeyPath' does not exist; using the repo-local key $_repoKey"
+    $KeyPath = $_repoKey
+} elseif (-not $KeyPath -and (Test-Path $_repoKey)) {
+    $KeyPath = $_repoKey
+}
+
 if (-not $HostName -or -not $UserName) {
     Write-Error "ssh-macos: connection data missing. Create .secrets\macos.env with DSS_MACOS_HOST, DSS_MACOS_USER, DSS_MACOS_KEY (a key PATH), or pass -HostName/-UserName."
     exit 3

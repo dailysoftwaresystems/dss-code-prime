@@ -1,8 +1,9 @@
 # Nix flake for the dsscp compiler (prebuilt-binary packaging). Rendered by
 # packaging/render.py on each release and pushed to the flake repo, so
 # `nix run github:@NIX_FLAKE_SLUG@` / `nix profile install github:@NIX_FLAKE_SLUG@`
-# fetch the matching release binary. Depends on the queued install-layout +
-# dsscp-rename prerequisites.
+# fetch the matching release binary. The tarball is a PREFIX TREE produced by
+# `cmake --install` (bin/, lib/, share/) — see cmake/DssInstall.cmake, the single
+# owner of what ships. Still depends on the queued dss-code-prime -> dsscp rename.
 {
   description = "@DESCRIPTION@";
 
@@ -29,10 +30,18 @@
           buildInputs = [ pkgs.stdenv.cc.cc.lib ];
           installPhase = ''
             runHook preInstall
-            install -Dm755 bin/dss/dsscp "$out/bin/dsscp"
-            for lib in bin/dss/*.so bin/dss/*.so.* bin/dss/*.dylib; do
-              [ -e "$lib" ] && install -Dm644 "$lib" "$out/lib/$(basename "$lib")"
-            done
+            # Copied WHOLE: `dsscp` resolves its config tree by a path relative to
+            # its own executable (../share/dss-code-prime/<version>/dss-config) and
+            # its shared library by $ORIGIN/../lib. Installing selected files would
+            # break both hops and leave a compiler that cannot resolve a single
+            # `#include <stdio.h>`. autoPatchelfHook still fixes the interpreter.
+            mkdir -p "$out"
+            cp -a bin lib share "$out/"
+            chmod 755 "$out/bin/dsscp"
+            test -d "$out/share/dss-code-prime" || {
+              echo "dsscp: release tarball carries no share/dss-code-prime config tree" >&2
+              exit 1
+            }
             runHook postInstall
           '';
         };

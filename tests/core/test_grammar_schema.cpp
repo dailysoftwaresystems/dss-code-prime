@@ -5,6 +5,9 @@
 // third copy of the loop (`core/types/config_key_vocabulary.hpp`, TF-C74).
 #include "core/types/artifact_profile.hpp"
 #include "core/types/config_key_vocabulary.hpp"
+// The repo's SHA-256 — the independent oracle the retained `contentDigest()`
+// is pinned against (the tests hex-render it themselves; see `hexOracle`).
+#include "core/crypto/sha256.hpp"
 #include "repo_root.hpp"
 
 #include <gtest/gtest.h>
@@ -12,11 +15,13 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -6542,4 +6547,135 @@ TEST(GrammarSchema, AttributeVocabularyCrossCheckStaysQuietOnWholesaleIgnoringSh
            "route an attribute identifier to its name lookup, so ignoring one "
            "more unrelated specifier by name must stay clean: "
         << errorDiags(result.error());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `contentDigest()` — the retained content digest
+// ─────────────────────────────────────────────────────────────────────────
+//
+// `GrammarSchema::loadFromText` retains the lowercase 64-hex SHA-256 of the
+// EXACT document bytes it was handed, computed at the one chokepoint where
+// those bytes are already in memory. It exists so the runtime-object cache can
+// key on the config a build actually LOADED without re-walking
+// `src/dss-config/` from disk — ~165 ms per invocation, MEASURED 2026-08-17
+// (86 files, 2,078,133 bytes; I/O-dominated: walk+read 152-160 ms, hash only
+// 9-13 ms), which would be paid on every build.
+//
+// ★★ THE ONE-BYTE ARM IS BUILT AT EQUAL LENGTH, AND THAT IS THE POINT OF IT.
+// A "digest" that had quietly become a size or length stamp would sail through
+// a mutation test whose two inputs differ in SIZE — and the mutation this cache
+// has to tell apart is exactly the equal-length kind (MEASURED: a real
+// descriptor mutation was 9149 bytes before AND after). So the fixture ASSERTS
+// equal length and EXACTLY ONE differing byte rather than merely being
+// constructed that way, and it perturbs a byte of STRUCTURAL JSON WHITESPACE so
+// the two documents PARSE IDENTICALLY — the digest cannot then be coming from
+// anything the parser produced.
+
+namespace {
+
+// Lowercase-hex render, written here rather than reached for from
+// `dss::crypto::toHexLower`: an oracle that shares code with the subject
+// cannot witness the subject.
+[[nodiscard]] std::string hexOracle(std::array<std::uint8_t, 32> const& digest) {
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (std::uint8_t const byte : digest) {
+        out.push_back(kHexDigits[byte >> 4]);
+        out.push_back(kHexDigits[byte & 0x0fu]);
+    }
+    return out;
+}
+
+// SHA-256 over `text`'s exact bytes — the INDEPENDENT expectation the retained
+// digest is pinned against, computed here and never read back off the schema.
+[[nodiscard]] std::string digestOracle(std::string_view text) {
+    return hexOracle(dss::crypto::sha256(std::span<std::uint8_t const>{
+        reinterpret_cast<std::uint8_t const*>(text.data()), text.size()}));
+}
+
+// Number of positions at which two strings differ; `npos` if their lengths do
+// (so a length change can never be mistaken for a one-byte change).
+[[nodiscard]] std::size_t differingBytes(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return std::string_view::npos;
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i] != b[i]) ++n;
+    }
+    return n;
+}
+
+// `text` with its first LF turned into a space: same length, one byte
+// different, and provably the same document to the parser — JSON forbids a raw
+// newline inside a string, so every LF in a valid document is structural
+// whitespace and a space is its equal in every position it can occupy.
+[[nodiscard]] std::string withOneWhitespaceByteChanged(std::string_view text) {
+    std::string out{text};
+    auto const pos = out.find('\n');
+    EXPECT_NE(pos, std::string::npos)
+        << "the fixture carries no LF to perturb — reach for another "
+           "same-length mutation rather than dropping this arm";
+    if (pos != std::string::npos) out[pos] = ' ';
+    return out;
+}
+
+} // namespace
+
+TEST(GrammarSchemaContentDigest, IsSixtyFourLowercaseHexDigits) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig);
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    auto const digest = (*result)->contentDigest();
+    EXPECT_EQ(digest.size(), 64u);
+    EXPECT_EQ(digest.find_first_not_of("0123456789abcdef"),
+              std::string_view::npos)
+        << "not lowercase hex: " << digest;
+}
+
+TEST(GrammarSchemaContentDigest, SameTextTwiceYieldsTheSameDigest) {
+    auto a = GrammarSchema::loadFromText(kHappyConfig);
+    auto b = GrammarSchema::loadFromText(kHappyConfig);
+    ASSERT_TRUE(a.has_value()) << errorDiags(a.error());
+    ASSERT_TRUE(b.has_value()) << errorDiags(b.error());
+    ASSERT_NE(a->get(), b->get())
+        << "the two loads returned the SAME object, so an equal digest would "
+           "be a tautology rather than a determinism claim";
+    EXPECT_EQ((*a)->contentDigest(), (*b)->contentDigest());
+}
+
+TEST(GrammarSchemaContentDigest, OneByteAtEqualLengthChangesTheDigest) {
+    std::string const original{kHappyConfig};
+    std::string const perturbed = withOneWhitespaceByteChanged(original);
+
+    ASSERT_EQ(original.size(), perturbed.size())
+        << "the two inputs must be the SAME LENGTH, or a size stamp would "
+           "pass this test";
+    ASSERT_EQ(differingBytes(original, perturbed), 1u);
+
+    auto a = GrammarSchema::loadFromText(original);
+    auto b = GrammarSchema::loadFromText(perturbed);
+    ASSERT_TRUE(a.has_value()) << errorDiags(a.error());
+    ASSERT_TRUE(b.has_value()) << errorDiags(b.error());
+
+    // Parse-identical — the perturbed byte was JSON whitespace …
+    EXPECT_EQ((*a)->name(), (*b)->name());
+    EXPECT_EQ((*a)->version(), (*b)->version());
+    // … and still byte-distinguishable, which is the whole contract.
+    EXPECT_NE((*a)->contentDigest(), (*b)->contentDigest());
+}
+
+TEST(GrammarSchemaContentDigest, EqualsAnIndependentSha256OfTheLoadedBytes) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig);
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->contentDigest(), digestOracle(kHappyConfig));
+}
+
+// ⚠ EMPTY MEANS UNKNOWN, NEVER WRONG. The public `GrammarSchemaData` ctor is
+// the documented bypass (tests build schemas without JSON), and it has no
+// document bytes to digest. An empty digest is a DETECTABLE unknown a cache can
+// refuse to key on; a fabricated or inherited one is a silent wrong key.
+TEST(GrammarSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItEmpty) {
+    GrammarSchema const schema{detail::GrammarSchemaData{}};
+    EXPECT_TRUE(schema.contentDigest().empty())
+        << "a schema with no document bytes reported a digest: "
+        << schema.contentDigest();
 }

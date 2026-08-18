@@ -4,6 +4,9 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "asm/asm.hpp"
+// The ONE call-frame join, shared by the calling-convention producer and the
+// assembly-text producer (D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED).
+#include "asm/asm_cfi.hpp"
 #include "asm/asm_text_to_lir.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
 #include "core/substrate/mint_monotonic_id.hpp"  // c165: fresh per-member CompilationUnitId (static pull)
@@ -64,6 +67,13 @@ namespace dss {
 
 void copyDiagnostics(DiagnosticReporter const& src,
                      DiagnosticReporter&       dst) {
+    // The retained source buffers move WITH the diagnostics — same rule, same
+    // reason, as `mergeWithTargetContext`: a diagnostic naming a buffer only
+    // `src` holds renders `--> <unknown-buffer:N>` at `dst`. Any tier that
+    // parses text the compilation units do not own (an embedded assembly
+    // template today) registers its fragment buffer on the reporter it was
+    // handed, so every reporter→reporter copy owes the pairing.
+    dst.sourceBuffers().addAll(src.sourceBuffers());
     for (auto const& d : src.all()) dst.report(d);
 }
 
@@ -1264,105 +1274,17 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         // with no return address to describe at all (an operand-stack VM). Its
         // functions get a CFA rule and no RA rule, which is the truth.
 
-        for (std::size_t fi = 0; fi < assembled.functions.size(); ++fi) {
-            AssembledFunction& outFn = assembled.functions[fi];
-            LirFuncCfi const&  src   = cc.perFuncCfi[fi];
-
-            // LirInstId -> the byte offset ONE PAST that instruction. The source
-            // map is stamped once per successfully encoded instruction, in
-            // emission order, so instruction k spans
-            // [sourceMap[k].byteOffset, sourceMap[k+1].byteOffset).
-            std::unordered_map<std::uint32_t, std::uint32_t> pcAfter;
-            pcAfter.reserve(outFn.sourceMap.size());
-            for (std::size_t k = 0; k < outFn.sourceMap.size(); ++k) {
-                std::uint32_t const endOff =
-                    (k + 1 < outFn.sourceMap.size())
-                        ? outFn.sourceMap[k + 1].byteOffset
-                        : static_cast<std::uint32_t>(outFn.bytes.size());
-                pcAfter[outFn.sourceMap[k].lirInst.v] = endOff;
-            }
-
-            CfiFunction fnCfi;
-            fnCfi.codeLength = static_cast<std::uint32_t>(outFn.bytes.size());
-            fnCfi.initial    = initial;
-            fnCfi.ops.reserve(src.ops.size());
-            // A frame that allocates nothing and saves nothing has an empty
-            // prologue, which is a MEASURED fact (offset 0), not an absent one.
-            std::optional<std::uint32_t> prologueEnd;
-            if (src.prologueOpCount == 0) prologueEnd = 0u;
-            for (std::size_t oi = 0; oi < src.ops.size(); ++oi) {
-                LirCfiOp const& op = src.ops[oi];
-                if (op.atBlockEnd) {
-                    // Resolve to the end of the named block -- the byte offset
-                    // of whatever block is laid out immediately after it, or
-                    // the function's extent when it is laid out last. Block
-                    // LAYOUT order is not creation order (the optimizer
-                    // reorders by RPO), so this is a scan for the smallest
-                    // strictly-greater offset -- the identical idiom the SEH
-                    // scope-end binding below uses, for the identical reason.
-                    auto const bIt = outFn.blockByteOffsets.find(op.block.v);
-                    if (bIt == outFn.blockByteOffsets.end()) {
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::K_UnwindRuleUnrepresentable;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.actual   = std::format(
-                            "function index {}: the frame rule '{}' is anchored "
-                            "to LIR block {}, which has no byte offset "
-                            "(plan 15 CFI)", fi, cfiOpKindName(op.kind),
-                            op.block.v);
-                        reporter.report(std::move(d));
-                        return std::nullopt;
-                    }
-                    std::uint32_t end =
-                        static_cast<std::uint32_t>(outFn.bytes.size());
-                    for (auto const& [blkV, off] : outFn.blockByteOffsets) {
-                        (void)blkV;
-                        if (off > bIt->second && off < end) end = off;
-                    }
-                    // A restore that lands at the function's very end re-arms
-                    // rules for code that does not exist. Dropping it keeps the
-                    // single-return case -- the overwhelming majority -- byte-
-                    // identical to a stream that never had the mechanism, and a
-                    // dangling remember_state is harmless (nothing pops it).
-                    if (end >= fnCfi.codeLength) continue;
-                    fnCfi.ops.push_back(CfiOp{end, op.kind, op.reg,
-                                              op.srcReg, op.offset});
-                    continue;
-                }
-                auto const it = pcAfter.find(op.inst.v);
-                if (it == pcAfter.end()) {
-                    // The materializer said an instruction establishes a frame
-                    // rule and the assembler never emitted it. That is a
-                    // substrate-invariant break, and the WRONG response is to
-                    // drop the op: the resulting table would describe a frame
-                    // that is only partly built. Refuse, naming the rule.
-                    ParseDiagnostic d;
-                    d.code     = DiagnosticCode::K_UnwindRuleUnrepresentable;
-                    d.severity = DiagnosticSeverity::Error;
-                    d.actual   = std::format(
-                        "function index {}: the frame rule '{}' is attached to LIR "
-                        "instruction {}, which produced no bytes -- the unwind "
-                        "description and the emitted code disagree (plan 15 CFI)",
-                        fi, cfiOpKindName(op.kind), op.inst.v);
-                    reporter.report(std::move(d));
-                    return std::nullopt;
-                }
-                fnCfi.ops.push_back(CfiOp{it->second, op.kind, op.reg,
-                                          op.srcReg, op.offset});
-                if (oi + 1 == src.prologueOpCount) prologueEnd = it->second;
-            }
-            fnCfi.prologueEndPc = prologueEnd;
-            if (auto const why = validateCfiFunction(fnCfi); !why.empty()) {
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::K_UnwindRuleUnrepresentable;
-                d.severity = DiagnosticSeverity::Error;
-                d.actual   = std::format(
-                    "function index {}: malformed call-frame information -- {} "
-                    "(plan 15 CFI)", fi, why);
-                reporter.report(std::move(d));
-                return std::nullopt;
-            }
-            outFn.cfi = std::move(fnCfi);
+        // ★★★ THE JOIN ITSELF LIVES IN `asm/asm_cfi.hpp`, AND IT IS SHARED WITH
+        // THE ASSEMBLY PRODUCER (D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED). It
+        // used to be written out here, and that was fine while there was ONE
+        // producer; a hand-written `.s`'s `.cfi_*` directives are a second one,
+        // keyed identically (`LirCfiOp::inst`), and `core/types/cfi.hpp` opens
+        // by naming the failure two descriptions of one frame produce. So the
+        // resolution moved to the tier that owns BOTH halves it joins --
+        // `AssembledFunction`'s byte offsets and `LirFuncCfi`'s anchors -- and
+        // both callers reach it through one function.
+        if (!attachCallconvCfi(assembled, cc.perFuncCfi, initial, reporter)) {
+            return std::nullopt;
         }
     }
 
@@ -2930,6 +2852,22 @@ assembleAsmUnit(CompilationUnit const&     cu,
         // item set for their unit, and an `insert` here would silently tolerate
         // an `assemble()` that had started emitting its own.
         assembled.dataItems       = std::move(lowered->dataItems);
+        // ★★★ D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED: attach the CALL FRAME
+        // INFORMATION this file's `.cfi_*` directives stated. Runs AFTER
+        // `assemble()` for the identical reason the C path's own attach does —
+        // the byte offsets a rule resolves against are what `assemble()`
+        // computes — and through the SAME `asm/asm_cfi.hpp` resolver, so a
+        // hand-written frame and a compiled frame become an `.eh_frame` FDE by
+        // one code path. Without this line the directives are parsed,
+        // validated, folded and DROPPED, which is the defect itself.
+        // ⚠ `cfiInitial` is engaged only when the file described a frame; a
+        // `.s` with no `.cfi_*` at all carries no entry state and needs no
+        // attach (its `perFuncCfi` slots are all `nullopt`).
+        if (lowered->cfiInitial.has_value()
+            && !attachAssemblyCfi(assembled, lowered->perFuncCfi,
+                                  *lowered->cfiInitial, reporter)) {
+            return std::nullopt;
+        }
         // D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET: bind the block
         // symbols that only a DATA slot names (a hand-written jump table). This
         // runs AFTER `assemble()` for the same reason the C jump-table arm does

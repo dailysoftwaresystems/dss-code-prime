@@ -298,12 +298,42 @@ TEST(EnvironDataObjectBinding, RealUnistdJsonEnvironElfOnlyDataObject) {
     EXPECT_FALSE(arm.contains("params"))
         << "object-like: `environ` is an LVALUE, not a call";
 
-    // Positive control: an ungated sibling really does read as "every format",
-    // so the assertions above are discriminating rather than trivially true.
-    json const* control = findNamed(doc, "symbols", "close");
-    ASSERT_NE(control, nullptr) << "positive control: close must be present";
-    EXPECT_FALSE(control->contains("availableObjectFormats"))
-        << "positive control: close ships with no per-symbol availability set";
+    // Positive control: an ungated symbol row really does read as "every
+    // format", so the assertions above are discriminating rather than trivially
+    // true.
+    //
+    // ⚠ THE CONTROL MOVED OUT OF `unistd.json`, AND WHY IT HAD TO IS THE POINT.
+    // It used to name `close`, whose row carried no per-symbol availability. As
+    // of the shipped-surface backing gate EVERY `unistd.json` symbol row is
+    // explicitly gated, and MUST be: an ungated POSIX row resolves on pe, which
+    // is precisely the "the platform promises what it cannot realize" hazard
+    // this corner of the tree exists to close. So the control now names a row
+    // that is ungated for a REASON rather than by omission — `stdio.json`'s
+    // `puts`, in a document that declares no `availableObjectFormats` either,
+    // because C's standard I/O genuinely does exist on every format DSS emits.
+    // The assertion is unchanged in strength and gains the document tier, which
+    // is what "reads as every format" actually requires: a row is only ungated
+    // in effect if BOTH tiers leave it open (the reader falls back from the
+    // symbol's set to the document's).
+    {
+        fs::path const controlPath = root / "stdio.json";
+        ASSERT_TRUE(fs::exists(controlPath))
+            << "positive control: stdio.json missing: "
+            << controlPath.generic_string();
+        json const  controlDoc = loadDescriptor(controlPath);
+        json const* control    = findNamed(controlDoc, "symbols", "puts");
+        ASSERT_NE(control, nullptr)
+            << "positive control: stdio.json must declare `puts`";
+        EXPECT_FALSE(control->contains("availableObjectFormats"))
+            << "positive control: `puts` ships with no per-symbol availability "
+               "set — if this ever gains one, the control is no longer a control "
+               "and must MOVE, never be relaxed";
+        EXPECT_FALSE(controlDoc.contains("availableObjectFormats"))
+            << "positive control: stdio.json itself declares no document-level "
+               "availability, so `puts` is ungated at BOTH tiers — which is what "
+               "makes it read as 'every format' rather than merely inheriting a "
+               "restriction from its document";
+    }
 }
 
 // Neither direction of the macro/symbol collision may exist anywhere in tree.

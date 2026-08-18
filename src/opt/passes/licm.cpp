@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -117,6 +118,13 @@ using dss::opt::analysis::MirMemoryClobbers;
     return true;
 }
 
+// ONE spelling of this pass's name for EVERY diagnostic it can emit — the
+// carve-out Info and every `MirFunctionRebuilder` fatal
+// (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS). ★ Like `Cse`, this pass
+// constructs the rebuilder at TWO sites (timed / untimed arms), so a
+// per-construction-site string could disagree with itself; one constant cannot.
+constexpr std::string_view kPassName = "Licm";
+
 class LicmPolicy final : public MirRebuildPolicy {
 public:
     LicmPolicy(Mir const& src, TypeInterner const& interner) noexcept
@@ -124,6 +132,10 @@ public:
           strictTbaa_(src.aliasingMode() == MirAliasingMode::StrictTBAA
                       ? StrictTbaa::Yes : StrictTbaa::No),
           charTypesAliasAll_(src.charTypesAliasAll()) {}
+
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return kPassName;
+    }
 
     [[nodiscard]] std::size_t instructionsHoisted() const noexcept {
         return instructionsHoisted_;
@@ -574,7 +586,7 @@ LicmResult runLicm(Mir& mir, TypeInterner const& interner,
     LicmResult result{};
     MirBuilder builder;
 
-    if (cloneGlobalsOrCarveOut(mir, builder, reporter, "Licm")
+    if (cloneGlobalsOrCarveOut(mir, builder, reporter, kPassName)
         == GlobalClonePrelude::CarvedOut) {
         result.ok = true;
         return result;

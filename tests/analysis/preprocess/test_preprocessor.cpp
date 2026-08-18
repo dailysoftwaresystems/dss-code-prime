@@ -167,6 +167,20 @@ static_assert(std::is_reference_v<decltype(cSubset())>,
     return false;
 }
 
+// The SEVERITY a code was reported at, or nullopt when it was not reported at
+// all. `hasPPCode` alone cannot tell an Error from a Warning, so a pin written
+// with it stays green across exactly the change that matters when a diagnostic's
+// severity is the SUBJECT of the fix (D-PP-INCOMPATIBLE-REDEFINITION-IS-FATAL:
+// the old pins here asserted the code's presence and would have survived the
+// severity flip untouched, proving nothing).
+[[nodiscard]] std::optional<DiagnosticSeverity> ppCodeSeverity(
+    PreprocessResult const& r, DiagnosticCode code) {
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code == code) return d.severity;
+    }
+    return std::nullopt;
+}
+
 // Read the shipped c-subset config TEXT so a test can REBIND a single config
 // field and reload, proving the engine reads that field from config rather than
 // hard-coding a lexeme. Returns "" if not found — the ~14 callers each already
@@ -300,13 +314,115 @@ TEST(Preprocessor, UndefRemovesBinding) {
     EXPECT_EQ(lexs[3], "X") << "after #undef, the name is no longer a macro";
 }
 
-TEST(Preprocessor, IncompatibleRedefinitionIsReported) {
+// D-PP-INCOMPATIBLE-REDEFINITION-IS-FATAL. C 6.10.3p2 makes this a constraint
+// violation, so a diagnostic is REQUIRED — but ✔MEASURED on the compilers this
+// language declares itself to be, one TU per shape: every divergence shape warns
+// at rc=0 and the NEW definition takes effect. This pin asserts all three facts
+// (reported / not fatal / new value), because any one of them alone is satisfied
+// by a wrong implementation: presence alone survived the very defect this closes.
+TEST(Preprocessor, IncompatibleRedefinitionWarnsAndTakesTheNewDefinition) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define X 1\n#define X 2\nint v = X;\n", r);
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroRedefinition))
-        << "a different #define of an existing macro must be reported";
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorMacroRedefinition),
+              DiagnosticSeverity::Warning)
+        << "reported, and as a WARNING — the references do not make this fatal";
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "translation CONTINUES: a warning must never bump the error count";
     ASSERT_EQ(lexs.size(), 5u);
-    EXPECT_EQ(lexs[3], "1") << "the first definition is kept";
+    EXPECT_EQ(lexs[3], "2")
+        << "the SECOND definition wins, as on every reference compiler; keeping "
+           "the first would agree about the diagnostic and disagree about the "
+           "PROGRAM, which is strictly worse than failing loud";
+}
+
+// The four other shapes `sameDefinition` can report. Measured INDIVIDUALLY: the
+// parameter-spelling case is the one that bit a real consumer (sqlite shell.c
+// defines S_ISLNK(mode) before including <sys/stat.h>), but generalizing from it
+// would have been a guess wearing a measurement's clothes.
+TEST(Preprocessor, EveryIncompatibleRedefinitionShapeWarnsAndTakesTheNew) {
+    struct Shape {
+        char const* name;
+        char const* src;
+        char const* expect;  // lexeme the expansion must produce
+    };
+    // Each program ends `int v = <use>;` so lexs[3] is the expanded value.
+    Shape const shapes[] = {
+        {"parameter spelling",
+         "#define M(mode) 1\n#define M(m) 2\nint v = M(0);\n", "2"},
+        {"arity",
+         "#define M(a) 1\n#define M(a,b) 2\nint v = M(0,0);\n", "2"},
+        {"object vs function-like",
+         "#define M 1\n#define M(a) 2\nint v = M(0);\n", "2"},
+        {"variadic vs not",
+         "#define M(a,...) 1\n#define M(a) 2\nint v = M(0);\n", "2"},
+    };
+    for (Shape const& s : shapes) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(s.src, r);
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorMacroRedefinition),
+                  DiagnosticSeverity::Warning)
+            << s.name << ": must be reported, and as a warning";
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << s.name << ": must not be fatal";
+        ASSERT_EQ(lexs.size(), 5u) << s.name;
+        EXPECT_EQ(lexs[3], s.expect) << s.name << ": the new definition must win";
+    }
+}
+
+// THE BOUNDARY THAT DOWNGRADING P0014 CREATED, pinned because nothing else
+// enforces it. Two redefinition guards now sit side by side at DIFFERENT
+// severities: an ORDINARY macro redefinition is a Warning (C 6.10.3p2, above),
+// while redefining a CONFIG PREDEFINED macro stays a hard Error (C 6.10.8.1).
+// The distinction is not stylistic — the tests around `--define` call the
+// predefined path the `_MSC_VER`/`_WIN32` SILENT-MISCOMPILE CHANNEL, since a
+// user who flips a profile macro changes which target the program is compiled
+// for. A later "tidy-up" unifying the two severities would take that guard down
+// with it and nothing would have failed, so this asserts BOTH halves in one
+// place: the pair is the invariant, not either one alone.
+TEST(Preprocessor, PredefinedMacroGuardStaysFatalWhileOrdinaryRedefinitionWarns) {
+    PreprocessResult ordinary;
+    (void)ppLexemes("#define X 1\n#define X 2\nint v = X;\n", ordinary);
+    EXPECT_EQ(ppCodeSeverity(ordinary, DiagnosticCode::P_PreprocessorMacroRedefinition),
+              DiagnosticSeverity::Warning);
+    EXPECT_FALSE(ordinary.diagnostics->hasErrors())
+        << "an ordinary redefinition must not stop translation";
+
+    PreprocessResult predefined;
+    (void)ppLexemes("#define __STDC__ 9\nint v = 0;\n", predefined);
+    EXPECT_EQ(ppCodeSeverity(predefined, DiagnosticCode::P_PreprocessorPredefinedMacro),
+              DiagnosticSeverity::Error)
+        << "C 6.10.8.1 is a DIFFERENT rule and keeps its own severity — the "
+           "6.10.3p2 downgrade must not leak across to it";
+    EXPECT_TRUE(predefined.diagnostics->hasErrors())
+        << "redefining a predefined macro must still be fatal";
+}
+
+// D-PP-REDEFINITION-IGNORES-WHITESPACE-PRESENCE — the OPPOSITE direction of the
+// same rule, and the reason the shapes above were swept rather than assumed.
+// C 6.10.3p2: white-space separation must agree in PRESENCE; the AMOUNT is
+// immaterial. `MacroDef::text` joins tokens with one space unconditionally, so
+// before `MacroDef::spacing` existed DSS reported these two lists as IDENTICAL
+// and accepted SILENTLY what both references diagnose.
+TEST(Preprocessor, RedefinitionWhitespacePresenceIsPartOfTheIdentity) {
+    PreprocessResult differs;
+    auto a = ppLexemes("#define M 40+2\n#define M 40 + 2\nint v = M;\n", differs);
+    EXPECT_EQ(ppCodeSeverity(differs, DiagnosticCode::P_PreprocessorMacroRedefinition),
+              DiagnosticSeverity::Warning)
+        << "`40+2` vs `40 + 2` differ in white-space PRESENCE (C 6.10.3p2)";
+    EXPECT_FALSE(differs.diagnostics->hasErrors());
+    ASSERT_EQ(a.size(), 7u) << "int v = 40 + 2 ;";
+
+    PreprocessResult amount;
+    (void)ppLexemes("#define M 4 + 38\n#define M 4  +  38\nint v = M;\n", amount);
+    EXPECT_FALSE(hasPPCode(amount, DiagnosticCode::P_PreprocessorMacroRedefinition))
+        << "the AMOUNT of white space is immaterial — this pair is IDENTICAL, and "
+           "a fix that reported it would have overshot into the other direction "
+           "of wrong";
+
+    PreprocessResult comment;
+    (void)ppLexemes("#define M 4 + 38\n#define M 4 /*c*/ + 38\nint v = M;\n", comment);
+    EXPECT_FALSE(hasPPCode(comment, DiagnosticCode::P_PreprocessorMacroRedefinition))
+        << "a comment IS white space for this purpose (C 6.10.3p2), so it neither "
+           "creates nor removes a separation";
 }
 
 TEST(Preprocessor, IdenticalRedefinitionIsBenign) {
@@ -2639,6 +2755,22 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // macho-gated (`__APPLE_CC__`). 11+5=16 un-gated, 11 pe-gated, 2+1=3
     // macho-gated = 30.
     //
+    // ★★★ D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC: −1 pe-gated row. `_MSC_VER`
+    // is DELETED. DSS predefined it for `pe` while `__GNUC__`/`__GNUC_MINOR__`/
+    // `__GNUC_PATCHLEVEL__`/`__clang__` sit UN-GATED above, so a pe64 TU saw
+    // `_MSC_VER` AND `__GNUC__` AND `_WIN32` at once — ✔MEASURED (clang 19.1.1,
+    // `-dM -E --target=<triple>`) to be an identity NO reference compiler
+    // presents: `x86_64-pc-windows-msvc` defines `_MSC_VER` and SUPPRESSES
+    // `__GNUC__`; `x86_64-w64-mingw32` defines `__GNUC__` and not `_MSC_VER`.
+    // Presenting the union is a BIDIRECTIONAL conformance defect, and it is what
+    // sent pe64 alone into sqlite `src/hwtime.h`'s `#if defined(_MSC_VER) &&
+    // defined(_WIN32)` arm -> `#include <profileapi.h>` -> error[F001A], while
+    // the other four legs reached the `__GNUC__` rdtsc / `mrs cntvct_el0` arms.
+    // The identity kept is GNU-on-Windows (the half DSS actually implements —
+    // GNU extended inline asm, `__attribute__`, `__declspec` AS A MACRO, which
+    // is the MinGW shape and not the MSVC one). 11 pe-gated - 1 = 10, so
+    // 19 un-gated + 10 pe-gated + 3 macho-gated = 32.
+    //
     // TF-C115 (D-PP-ENDIANNESS-PREDEFINES): +3 UN-GATED rows — the byte-order
     // NAMING VOCABULARY `__ORDER_LITTLE_ENDIAN__`/`__ORDER_BIG_ENDIAN__`/
     // `__ORDER_PDP_ENDIAN__` (1234/4321/3412). They are on the LANGUAGE, not the
@@ -2648,9 +2780,13 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // machine's answer, so they vary by nothing. The per-CPU ANSWER
     // (`__LITTLE_ENDIAN__`, `__BYTE_ORDER__`) is on the TARGET and is therefore
     // absent from this list, exactly like the TF-C74 identity spellings.
-    // 16+3=19 un-gated, 11 pe-gated, 3 macho-gated = 33.
-    EXPECT_EQ(pms.size(), 33u)
-        << "c-subset declares 19 un-gated + 11 pe-gated + 3 macho-gated predefined macros";
+    // 16+3=19 un-gated, 11 pe-gated, 3 macho-gated = 33 (was 32 after _MSC_VER
+    // was deleted; now 35 — the GNU-on-Windows identity was COMPLETED with
+    // __MINGW32__/__MINGW64__/__MSVCRT__, all pe-gated, in the same change that
+    // gave pe the <unistd.h>/<dirent.h> surface those three promise;
+    // D-LANG-PE64-HAS-NO-POSIX-DIRECTORY-API).
+    EXPECT_EQ(pms.size(), 35u)
+        << "c-subset declares 19 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -2698,11 +2834,19 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "are un-gated (every format); "
            "__STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
            "complete on all legs) are both REMOVED";
-    EXPECT_EQ(peGated, 11u)
+    EXPECT_EQ(peGated, 13u)
         << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "
-           "_MSC_VER/__int64/__forceinline/__declspec (c105) + _declspec (the legacy "
+           "__int64/__forceinline/__declspec (c105; _MSC_VER DELETED, "
+           "D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC) + _declspec (the legacy "
            "single-underscore MSVC alias; tcl.h's TCL_NORETURN under the pe profile, "
-           "D-SQLITE-PE64-TESTFIXTURE-FRONTEND B1) are pe-gated";
+           "D-SQLITE-PE64-TESTFIXTURE-FRONTEND B1) + __MINGW32__/__MINGW64__/__MSVCRT__ "
+           "(D-LANG-PE64-HAS-NO-POSIX-DIRECTORY-API: the GNU-on-Windows identity, "
+           "COMPLETED in the same change that made it backable -- pe gained <unistd.h> "
+           "as a re-export and <dirent.h> via a shipped-source realization, so all three "
+           "carry an `impliedSurface` claim naming the symbols they promise) are pe-gated. "
+           "MEASURED, x86_64-w64-mingw32-gcc -dM -E: the reference defines __MINGW32__, "
+           "__MINGW64__, __MSVCRT__, _WIN32, _WIN64, __GNUC__ and NOT _MSC_VER, so this "
+           "count going back to 10 means DSS is presenting an identity no toolchain has";
 }
 
 // LOADER fail-loud (c95): a `predefinedMacros.availableObjectFormats` naming an
@@ -2714,15 +2858,26 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
 TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
     std::string text = loadShippedCSubsetText();
     ASSERT_FALSE(text.empty());
-    const std::string from =
-        "{ \"name\": \"_WIN32\",              \"kind\": \"constant\", "
-        "\"value\": \"1\", \"availableObjectFormats\": [\"pe\"] }";
-    const std::string to   =
-        "{ \"name\": \"_WIN32\",              \"kind\": \"constant\", "
-        "\"value\": \"1\", \"availableObjectFormats\": [\"pee\"] }";
-    auto const pos = text.find(from);
+    // ANCHORED ON THE ROW, MUTATING ONLY THE FIELD UNDER TEST. The first cut
+    // matched the WHOLE `_WIN32` entry verbatim, which made this pin fail every
+    // time an UNRELATED field was added to that row -- it broke when
+    // `impliedSurface` landed (D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE),
+    // and it would break again on the next one. That is not a weakening: the
+    // verbatim match never asserted anything about the row's other fields, it
+    // only guaranteed the substitution actually happened, and locating the row by
+    // NAME and then its OWN `availableObjectFormats` guarantees exactly that while
+    // naming the field the test is about. It still fails loud if `_WIN32` stops
+    // being ["pe"]-gated, which is the property worth pinning here.
+    const std::string row = "\"name\": \"_WIN32\"";
+    auto const rowPos = text.find(row);
+    ASSERT_NE(rowPos, std::string::npos)
+        << "the _WIN32 predefinedMacros entry must be present";
+    const std::string from = "\"availableObjectFormats\": [\"pe\"]";
+    const std::string to   = "\"availableObjectFormats\": [\"pee\"]";
+    auto const pos = text.find(from, rowPos);
     ASSERT_NE(pos, std::string::npos)
-        << "the _WIN32 predefinedMacros entry must be present verbatim";
+        << "_WIN32 must still carry availableObjectFormats [\"pe\"] -- if it does "
+           "not, this test is mutating some LATER row and proves nothing about _WIN32";
     text.replace(pos, from.size(), to);
     auto loaded = GrammarSchema::loadFromText(text, "<bad-objfmt-c-subset>");
     EXPECT_FALSE(loaded.has_value())
@@ -3483,7 +3638,9 @@ TEST(Preprocessor, TfC85OptimizeRowAndItsStateWordsAreConfigDriven) {
 //
 // MEASURED: `availableObjectFormats` keys on format KIND, so the 24 shipped
 // format files collapse to exactly three predefine classes — `pe`
-// (_WIN32/_WIN64/_MSC_VER + more), `macho` (__APPLE__/__MACH__), and the
+// (_WIN32/_WIN64 + more; `_MSC_VER` was here until
+// D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC deleted it), `macho`
+// (__APPLE__/__MACH__), and the
 // NEITHER class (elf/spirv/wasm declare no identity predefines at all). Three
 // passes, not 24. `nullopt` is a FOURTH state (only universal entries survive)
 // and is included because the LSP / direct-API callers use it.
@@ -3531,14 +3688,23 @@ TEST(Preprocessor, TfC85NoUnclaimedPragmaUnderAnyPredefineClass) {
 }
 
 // ★ NON-VACUITY FOR THE CENSUS GUARD. A census that preprocesses nothing passes
-// trivially, and the pe-only pragmas live behind `#if defined(_MSC_VER)` — so the
+// trivially, and the pe-only pragmas live behind a pe-ONLY PREDEFINE — so the
 // fixture MUST actually reach them on the pe leg and MUST NOT on the others.
 // Without this, deleting the fixture's whole body would leave the guard green.
+//
+// ★★ THE FIXTURE'S GUARD IS `_WIN32`, NOT `_MSC_VER`, AND THAT IS NOT A
+// WEAKENING (D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC). `_MSC_VER` is gone
+// from every leg — DSS may not present an identity no reference compiler has —
+// so a guard spelled on it would now be dead EVERYWHERE and this non-vacuity
+// twin would be asserting over an arm nothing can reach. What the pin needs is
+// a predefine LIVE on pe and DEAD elsewhere; `_WIN32` is that, and is the
+// honest one (it names the OS, not a toolchain). Both halves below are
+// unchanged in strength: same two legs, same stamping witness.
 TEST(Preprocessor, TfC85ProfileCensusFixtureActuallyReachesTheProfileGatedRows) {
     auto const text = test_support::readFile(
         test_support::findCorpusRoot() / "c-subset" / "pragma_profile_census.c");
     ASSERT_FALSE(text.empty());
-    {   // pe: `_MSC_VER` is defined, so the MSVC arm is LIVE and its
+    {   // pe: `_WIN32` is defined, so the MSVC arm is LIVE and its
         // `#pragma optimize("", off)` region actually stamps a token.
         PreprocessResult r;
         ppUnderFormat(text, ObjectFormatKind::Pe, r);
@@ -3547,7 +3713,7 @@ TEST(Preprocessor, TfC85ProfileCensusFixtureActuallyReachesTheProfileGatedRows) 
                "REACHED — otherwise this whole census is vacuous";
         EXPECT_TRUE(tokenIsNoOptimize(r, "msvc_no_optimize_marker"));
     }
-    {   // macho: `_MSC_VER` undefined -> the MSVC arm is a DEAD branch -> C
+    {   // macho: `_WIN32` undefined -> the MSVC arm is a DEAD branch -> C
         // 6.10p1 silence, and nothing is stamped.
         PreprocessResult r;
         ppUnderFormat(text, ObjectFormatKind::MachO, r);
@@ -7603,8 +7769,18 @@ namespace {
     const std::string anchor = "\"predefinedMacros\": [";
     const auto        pos    = text.find(anchor);
     if (pos == std::string::npos) return {};
+    // `impliedSurface` is MANDATORY on every entry, in one of its three tagged
+    // states (D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE, ruling B'),
+    // so the probe entry must answer it. `claims-nothing`/`standard-defined` is
+    // the honest answer for a synthetic probe macro that implies no platform
+    // surface. Omitting it — or writing the older bare `null` — would make BOTH
+    // tests that use this fixture fail for the wrong reason: the unknown-key
+    // test would go green on an impliedSurface diagnostic instead of the key one
+    // it is pinning, and the `$`-prefix carve-out test could not load at all.
     std::string entry = "{\"name\":\"__DSS_KEY_GATE_PROBE__\","
-                        "\"kind\":\"constant\",\"value\":\"1\",";
+                        "\"kind\":\"constant\",\"value\":\"1\","
+                        "\"impliedSurface\":{\"kind\":\"claims-nothing\","
+                        "\"reason\":\"standard-defined\"},";
     entry += '"';
     entry += extraKey;
     entry += "\":\"1\"},";
@@ -7903,6 +8079,346 @@ TEST(Preprocessor, TFC74MergeConflictYieldsNoUsableList) {
     auto merged = mergePredefinedMacros(lang, tgt, {}, ObjectFormatKind::Elf);
     EXPECT_EQ(merged.conflicts.size(), 1u);
     EXPECT_TRUE(merged.effective.empty());
+}
+
+// ══ D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC — THE CO-DEFINITION PIN ══════
+//
+// DSS predefined `_MSC_VER=1943` for `pe` while `__GNUC__`/`__clang__` sat
+// un-gated on every format, so a pe64 TU saw `_MSC_VER` AND `__GNUC__` AND
+// `_WIN32` at once. ✔MEASURED (Ubuntu clang 19.1.1, `clang-19 -dM -E -x c
+// /dev/null --target=<triple>`): `x86_64-pc-windows-msvc` defines `_MSC_VER`/
+// `_MSC_FULL_VER`/`_MSC_EXTENSIONS`/`_WIN32`/`_WIN64`/`__clang__` and NOT
+// `__GNUC__` — clang SUPPRESSES `__GNUC__` in MS-compatibility mode on purpose;
+// `x86_64-w64-mingw32` defines `__GNUC__`/`_WIN32`/`_WIN64`/`__MINGW32__`/
+// `__MINGW64__` and NOT `_MSC_VER`. No reference compiler presents the union.
+//
+// ★ WHAT THE FALSE IDENTITY COST: sqlite `src/hwtime.h` opens `#if
+// defined(_MSC_VER) && defined(_WIN32)` -> `#include <profileapi.h>`, so pe64
+// ALONE took that arm and died `error[F001A]` while the four other legs reached
+// the `__GNUC__` rdtsc / `mrs cntvct_el0` arms. The identity kept is
+// GNU-on-Windows, which is the half DSS actually implements.
+
+namespace {
+// The shipped `<arch>.target.json` / `<name>.format.json` STEMS, discovered from
+// the config tree rather than listed here — a future target or format file is
+// then covered the day it lands, which is the entire point of a pin whose job is
+// to stop a REGRESSION nobody is looking for. A hard-coded list would pass
+// forever while a new arm quietly re-co-defined the pair.
+[[nodiscard]] std::vector<std::string> shippedStems(char const* subdir,
+                                                    char const* suffix) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    auto const dir = test::configRoot() / subdir;
+    for (auto const& e : std::filesystem::directory_iterator(dir, ec)) {
+        auto const name = e.path().filename().string();
+        if (name.size() > std::strlen(suffix)
+            && name.ends_with(suffix)) {
+            out.push_back(name.substr(0, name.size() - std::strlen(suffix)));
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+} // namespace
+
+// ★★★ THE PIN ITSELF, over the WHOLE shipped matrix: no target x format may
+// make two members of a mutual-exclusion group effective at once.
+//
+// TARGET-AGNOSTIC BY CONSTRUCTION — the loop enumerates the config tree, so this
+// is a statement about EVERY target DSS ships, present and future, not about
+// pe64. The pe64 instance is merely the one that was caught in the field.
+TEST(Preprocessor, PeIdentityNoShippedTargetFormatCoDefinesAnExclusiveGroup) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    auto const& groups = (*c)->preprocess().mutuallyExclusivePredefinedMacros;
+    ASSERT_FALSE(groups.empty())
+        << "c-subset must declare at least one mutual-exclusion group — with "
+           "none, every assertion below is vacuous and the pin is disarmed";
+
+    auto const targets = shippedStems("targets", ".target.json");
+    auto const formats = shippedStems("object-formats", ".format.json");
+    ASSERT_FALSE(targets.empty()) << "no shipped <arch>.target.json discovered";
+    ASSERT_FALSE(formats.empty()) << "no shipped <name>.format.json discovered";
+
+    // ★ EVERY arm runs. The body is a `void` callable precisely so a failing
+    // ASSERT_* returns from the BODY and not from the test: one bad
+    // target x format must not cancel the remaining ~48 and leave the operator
+    // believing a single arm is the whole story.
+    std::size_t checked = 0;
+    auto checkOne = [&](std::string const& tname,
+                        std::string const& fname) -> void {
+        auto t = TargetSchema::loadShipped(tname);
+        ASSERT_TRUE(t.has_value()) << "target " << tname << " must load";
+        auto f = ObjectFormatSchema::loadShipped(fname);
+        ASSERT_TRUE(f.has_value()) << "format " << fname << " must load";
+        auto const merged = mergePredefinedMacros(
+            (*c)->preprocess().predefinedMacros, (*t)->predefinedMacros(),
+            (*f)->predefinedMacros(), (*f)->kind(), groups);
+        std::string msgs;
+        for (auto const& m : merged.conflicts) msgs += "\n    " + m;
+        EXPECT_TRUE(merged.conflicts.empty())
+            << "target=" << tname << " format=" << fname
+            << " presents an identity no reference compiler can have:" << msgs;
+        ++checked;
+    };
+    for (auto const& tname : targets) {
+        for (auto const& fname : formats) checkOne(tname, fname);
+    }
+    EXPECT_EQ(checked, targets.size() * formats.size())
+        << "every target x format pair must have been visited";
+}
+
+// ★★ NON-VACUITY: every group must have at least ONE member that some config
+// actually declares, so the group is anchored to a real macro rather than being
+// dead config that reads as protection.
+//
+// ★★★ WHY THIS IS "AT LEAST ONE" AND NOT "ALL", WHICH IS WHAT I WROTE FIRST AND
+// WHICH THIS TEST ITSELF REFUTED. The obvious-looking invariant — every member
+// must be declared somewhere — is WRONG, and wrong in the direction that would
+// have forced the fix back out. A mutual-exclusion group is a PROHIBITION: its
+// whole purpose here is to name a spelling DSS deliberately does NOT declare and
+// must never start declaring again. Requiring every member to exist would make
+// the rule unstatable exactly when it matters, and the only way to satisfy it
+// would be to re-add the row this cycle removed. So the checkable property is
+// that the group is ANCHORED (some member is real), not that it is fully
+// populated.
+//
+// ⚠ WHAT THIS THEREFORE DOES NOT COVER, said plainly rather than left implied: a
+// typo in the ABSENT member's spelling. Nothing that reads only the configs can
+// catch it — an absent name and a misspelled absent name are the same bytes to
+// every check. It is covered instead by
+// `PeIdentityRedOnDisableRemovingTheGroupReadmitsTheCoDefinition`, which re-adds
+// that exact spelling to the shipped text and requires the group to FIRE. Misspell
+// it in the group and that test goes red, because arm 1 demands a conflict.
+TEST(Preprocessor, PeIdentityEveryExclusionGroupIsAnchoredToADeclaredMacro) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    auto const& groups = (*c)->preprocess().mutuallyExclusivePredefinedMacros;
+    ASSERT_FALSE(groups.empty());
+
+    // The UNION of every name any family declares, gates ignored — availability
+    // is what the sweep above tests; existence is what this one tests.
+    std::vector<std::string> declared;
+    for (auto const& pm : (*c)->preprocess().predefinedMacros) {
+        declared.push_back(pm.name);
+    }
+    for (auto const& tname : shippedStems("targets", ".target.json")) {
+        auto t = TargetSchema::loadShipped(tname);
+        ASSERT_TRUE(t.has_value());
+        for (auto const& pm : (*t)->predefinedMacros()) declared.push_back(pm.name);
+    }
+    for (auto const& fname : shippedStems("object-formats", ".format.json")) {
+        auto f = ObjectFormatSchema::loadShipped(fname);
+        ASSERT_TRUE(f.has_value());
+        for (auto const& pm : (*f)->predefinedMacros()) declared.push_back(pm.name);
+    }
+
+    for (auto const& g : groups) {
+        std::size_t anchored = 0;
+        std::string listed;
+        for (auto const& want : g.macros) {
+            listed += (listed.empty() ? "" : ", ") + want;
+            if (std::ranges::find(declared, want) != declared.end()) ++anchored;
+        }
+        EXPECT_GT(anchored, 0u)
+            << "mutual-exclusion group {" << listed << "} names NO macro that "
+               "any language/target/format config declares. A group in which "
+               "every member is absent can never fire under any target, so it "
+               "is dead config that only looks like a rule — most likely every "
+               "spelling is stale, or the group outlived the macros it governed";
+    }
+}
+
+// ★ THE PIN FIRES, AND THE MESSAGE NAMES THE OFFENDING FORMAT. Synthetic
+// config, because the shipped one must (and now does) be clean: a pin whose
+// firing path is never exercised is a guess, not a guard.
+TEST(Preprocessor, PeIdentityCoDefinitionIsRefusedAndNamesTheFormat) {
+    std::vector<PredefinedMacroDef> lang{
+        targetMacro("__GNUC__", "4"),               // un-gated, like the real one
+        targetMacro("_MSC_VER", "1943", {"pe"})};   // pe-gated, like the real one
+    std::vector<PredefinedMacroExclusionGroup> groups{
+        {{"_MSC_VER", "__GNUC__"}, "clang suppresses __GNUC__ under -fms-compatibility"}};
+
+    // On pe BOTH are effective -> refused, `effective` unusable.
+    auto pe = mergePredefinedMacros(lang, {}, {}, ObjectFormatKind::Pe, groups);
+    ASSERT_EQ(pe.conflicts.size(), 1u);
+    EXPECT_TRUE(pe.effective.empty())
+        << "a refused identity must leave NO partially-merged list a caller "
+           "could mistake for usable";
+    EXPECT_NE(pe.conflicts[0].find("_MSC_VER"), std::string::npos);
+    EXPECT_NE(pe.conflicts[0].find("__GNUC__"), std::string::npos);
+    EXPECT_NE(pe.conflicts[0].find(objectFormatKindName(ObjectFormatKind::Pe)),
+              std::string::npos)
+        << "the message must NAME the offending format — the whole defect class "
+           "is a pair that is legitimate everywhere else, so a message that "
+           "does not say WHICH leg leaves the reader to re-derive it: "
+        << pe.conflicts[0];
+    EXPECT_NE(pe.conflicts[0].find("-fms-compatibility"), std::string::npos)
+        << "the group's `reason` must be quoted verbatim: " << pe.conflicts[0];
+
+    // ★ THE OTHER HALF, which is what makes the check a pin and not a ban: on
+    // elf the pe-gated member is filtered out, ONE member remains, and the very
+    // same group is silent. Without this, gating the pair to disjoint formats
+    // (the actual fix a maintainer would reach for) would be refused too.
+    auto elf = mergePredefinedMacros(lang, {}, {}, ObjectFormatKind::Elf, groups);
+    EXPECT_TRUE(elf.conflicts.empty())
+        << "one effective member is not a co-definition — a group must forbid "
+           "the OVERLAP, never the names";
+    EXPECT_EQ(elf.effective.size(), 1u);
+}
+
+// ★★ RED-ON-DISABLE, at the CONFIG level and against the SHIPPED text. Re-add
+// the deleted `_MSC_VER` row to the real c-subset config: WITH the group the
+// pe leg is refused, and with the group ALSO removed the impossible identity is
+// silently accepted again — which is exactly the state this cycle found.
+TEST(Preprocessor, PeIdentityRedOnDisableRemovingTheGroupReadmitsTheCoDefinition) {
+    // The `_MSC_VER` row as it stood before this cycle, re-inserted ahead of the
+    // `_WIN32` row it used to follow.
+    //
+    // ANCHORED ON THE ROW'S OPENING, NOT ON THE WHOLE ROW. The first cut spelled
+    // `_WIN32`'s entry out in full and used that as the rebind anchor, so it
+    // broke the moment an UNRELATED field was added to the row — which
+    // `impliedSurface` did (D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE).
+    // The anchor's only job is to name a UNIQUE insertion point; reproducing the
+    // rest of the row pinned content this test says nothing about. It still
+    // fails loud if the `_WIN32` row disappears, which is the real precondition.
+    std::string const winRowOpen = "{ \"name\": \"_WIN32\",";
+    // The re-inserted row must satisfy the SAME mandatory-`impliedSurface` rule
+    // every other row does, or arm 1 would fail at the load for that reason
+    // instead of exercising the exclusion group. `not-expressible` is the
+    // honest tag for a historical spelling re-created by a pin: it is recorded,
+    // never evaluated, so it cannot itself pass or fail a surface check.
+    std::string const withMsc =
+        "{ \"name\": \"_MSC_VER\",            \"kind\": \"constant\", "
+        "\"value\": \"1943\", \"availableObjectFormats\": [\"pe\"], "
+        "\"impliedSurface\": { \"kind\": \"not-expressible\", \"note\": "
+        "\"the historical row, re-created by this red-on-disable pin only\" } },\n      "
+        + winRowOpen;
+
+    {   // ARM 1 — group PRESENT: the co-definition is REFUSED on pe.
+        auto schema = reboundCSubset(winRowOpen, withMsc, "<msc-ver-readded>");
+        ASSERT_NE(schema, nullptr);
+        auto const& groups = schema->preprocess().mutuallyExclusivePredefinedMacros;
+        ASSERT_FALSE(groups.empty()) << "arm 1 must still carry the group";
+        auto merged = mergePredefinedMacros(schema->preprocess().predefinedMacros,
+                                            {}, {}, ObjectFormatKind::Pe, groups);
+        EXPECT_EQ(merged.conflicts.size(), 1u)
+            << "with _MSC_VER back alongside the un-gated __GNUC__, pe must be "
+               "refused";
+        // ...and the OTHER legs stay green, proving the refusal is per-format.
+        EXPECT_TRUE(mergePredefinedMacros(schema->preprocess().predefinedMacros,
+                                          {}, {}, ObjectFormatKind::Elf, groups)
+                        .conflicts.empty());
+    }
+    {   // ARM 2 — group REMOVED: the SAME config is silently accepted. This is
+        // the disable arm; if it ever starts failing, the check has grown a
+        // second, un-configured source of truth and is no longer config-driven.
+        std::string text = loadShippedCSubsetText();
+        ASSERT_FALSE(text.empty());
+        auto const wpos = text.find(winRowOpen);
+        ASSERT_NE(wpos, std::string::npos);
+        text.replace(wpos, winRowOpen.size(), withMsc);
+        auto const gpos = text.find("\"mutuallyExclusivePredefinedMacros\"");
+        ASSERT_NE(gpos, std::string::npos)
+            << "the shipped config must carry the group for this arm to mean "
+               "anything";
+        auto const gend = text.find("],", gpos);
+        ASSERT_NE(gend, std::string::npos);
+        text.replace(gpos, gend + 2 - gpos, "\"$disabledGroups\": [],");
+        auto loaded = GrammarSchema::loadFromText(text, "<no-exclusion-groups>");
+        ASSERT_TRUE(loaded.has_value())
+            << "removing an OPTIONAL key must still load — that is what makes "
+               "this a real disable arm rather than a load error";
+        auto const& groups = (*loaded)->preprocess().mutuallyExclusivePredefinedMacros;
+        ASSERT_TRUE(groups.empty());
+        auto merged = mergePredefinedMacros((*loaded)->preprocess().predefinedMacros,
+                                            {}, {}, ObjectFormatKind::Pe, groups);
+        EXPECT_TRUE(merged.conflicts.empty())
+            << "WITHOUT the group the impossible identity must be accepted "
+               "again — this arm is the proof that the shipped group, and not "
+               "some engine-side hard-coding of the two names, is what refuses "
+               "it";
+        // And it really is co-defined in this arm — otherwise arm 1 proves
+        // nothing either.
+        auto has = [&](char const* n) {
+            return std::ranges::find(merged.effective, std::string{n},
+                                     &PredefinedMacroDef::name)
+                   != merged.effective.end();
+        };
+        EXPECT_TRUE(has("_MSC_VER"));
+        EXPECT_TRUE(has("__GNUC__"));
+    }
+}
+
+// ★ THE IDENTITY ITSELF, on the SHIPPED config: `_MSC_VER` effective NOWHERE,
+// `__GNUC__` effective EVERYWHERE. The sweep above proves the pair never
+// overlaps; this proves WHICH of the two survived, which is the decision the
+// cycle actually made and the thing a well-meaning "restore MSVC compatibility"
+// edit would undo.
+TEST(Preprocessor, PeIdentityShippedConfigIsGnuOnWindowsNotMsvc) {
+    auto c = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(c.has_value());
+    for (ObjectFormatKind k : {ObjectFormatKind::Pe, ObjectFormatKind::Elf,
+                               ObjectFormatKind::MachO}) {
+        auto const merged = mergePredefinedMacros(
+            (*c)->preprocess().predefinedMacros, {}, {}, k,
+            (*c)->preprocess().mutuallyExclusivePredefinedMacros);
+        ASSERT_TRUE(merged.conflicts.empty());
+        auto has = [&](char const* n) {
+            return std::ranges::find(merged.effective, std::string{n},
+                                     &PredefinedMacroDef::name)
+                   != merged.effective.end();
+        };
+        EXPECT_FALSE(has("_MSC_VER"))
+            << objectFormatKindName(k)
+            << ": `_MSC_VER` must be defined on NO leg — DSS implements GNU "
+               "extended inline asm, which MSVC x64 does not have at all, and "
+               "spells __declspec/__cdecl/__stdcall as MACROS, which is the "
+               "MinGW shape and not the MSVC one";
+        EXPECT_TRUE(has("__GNUC__"))
+            << objectFormatKindName(k)
+            << ": `__GNUC__` is the language's un-gated base identity and must "
+               "survive on every leg";
+    }
+    // `_WIN32` is the HONEST half and stays: it names the OS, not the toolchain,
+    // and it is what selects sqlite's os_win.c.
+    auto const pe = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
+                                          {}, {}, ObjectFormatKind::Pe, {});
+    EXPECT_NE(std::ranges::find(pe.effective, std::string{"_WIN32"},
+                                &PredefinedMacroDef::name),
+              pe.effective.end())
+        << "removing `_MSC_VER` must not have taken `_WIN32` with it";
+}
+
+// ── LOADER shape guards. Each rejected form is one that would sit in config
+//    looking like a rule while being incapable of ever firing. ──────────────
+TEST(Preprocessor, PeIdentityExclusionGroupShapeIsValidatedAtLoad) {
+    std::string const good = "\"mutuallyExclusivePredefinedMacros\": [";
+    struct Case {
+        char const* label;
+        char const* replacement;
+    };
+    // A one-name group can never fire; a missing `reason` makes the refusal
+    // unexplainable; a repeated name is a name excluding itself.
+    for (Case const& c : {Case{"one-name group",
+                               "\"mutuallyExclusivePredefinedMacros\": ["
+                               "{\"reason\":\"r\",\"macros\":[\"ONLY\"]}],\"$x\": ["},
+                          Case{"missing reason",
+                               "\"mutuallyExclusivePredefinedMacros\": ["
+                               "{\"macros\":[\"A\",\"B\"]}],\"$x\": ["},
+                          Case{"duplicate name",
+                               "\"mutuallyExclusivePredefinedMacros\": ["
+                               "{\"reason\":\"r\",\"macros\":[\"A\",\"A\"]}],\"$x\": ["}}) {
+        std::string text = loadShippedCSubsetText();
+        ASSERT_FALSE(text.empty());
+        auto const pos = text.find(good);
+        ASSERT_NE(pos, std::string::npos);
+        text.replace(pos, good.size(), c.replacement);
+        auto loaded = GrammarSchema::loadFromText(text, "<bad-exclusion-group>");
+        EXPECT_FALSE(loaded.has_value())
+            << c.label << " must be a LOAD error — a group that cannot fire is "
+                          "config that reads as protection and asserts nothing";
+    }
 }
 
 // ── shipped-config sibling pins: language ⊕ arm64 and language ⊕ x86_64 ───

@@ -43,12 +43,14 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/include_path_resolve.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
+#include "core/types/object_format_kind.hpp"  // ObjectFormatKind (D-FFI-DESCRIPTOR-INCLUDES-EDGE-GATE)
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree.hpp"
 
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -96,6 +98,25 @@ struct DSS_EXPORT ResolutionContext {
     // no active format (LSP, direct-API, tests, non-C languages); the driver
     // threads the real value through `UnitBuilder::setHeaderNameMatching`.
     HeaderNameMatching headerNameMatching = kDefaultHeaderNameMatching;
+
+    // D-FFI-DESCRIPTOR-INCLUDES-EDGE-GATE: the ACTIVE OBJECT FORMAT, threaded for
+    // exactly the reason `headerNameMatching` above is — this tier and the
+    // preprocessor tier walk the SAME shipped-descriptor closure, and a closure
+    // that is per-format on one tier and format-blind on the other is two
+    // different closures wearing one name.
+    //
+    // It decides two things inside `forEachDescriptorInClosure`: which
+    // CONDITIONAL `includes` edges are edges at all, and whether an active edge's
+    // child exists on this format (the loud `F_ShippedHeaderUnavailableForTarget`
+    // this tier alone can position on the `#include` line).
+    //
+    // UNSET (the default) ⇒ the format-blind walk: no conditional edge is taken
+    // and no availability test is applied — the state the LSP, the direct API,
+    // the FFI header parser and the unit tests deliberately stay in, matching
+    // `UnitBuilder::setActiveFormat`'s own unset semantics. The driver threads the
+    // real value through `UnitBuilder::setActiveFormat`, and because it can change
+    // the resolved descriptor set, the driver's CU cache key already carries it.
+    std::optional<ObjectFormatKind> activeFormat;
 
     // Load + tokenize + parse `path` UNDER `schema` (the including tree's
     // language — an `#include` in a c-subset file loads another c-subset file),
