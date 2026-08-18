@@ -333,6 +333,13 @@ struct OptimizedArm {
     // expected exit code, legal ONLY inside an example that declares
     // `optimizationObservable`. Absent ⇒ the arm must match the baseline.
     std::optional<std::int64_t> exitCode;
+    // The arm's OPT-IN to a hard red when its image comes out byte-identical to
+    // the baseline's. Mirrors the in-process sibling's field of the same name:
+    // an arm whose job is the optimizer x feature composition witnesses nothing
+    // if the pipeline transformed nothing, and only the MANIFEST knows which
+    // arms have that job -- 7 of the corpus's arms are `asm/` examples where a
+    // pipeline has nothing to transform BY CONSTRUCTION.
+    bool                        mustDifferFromBaseline = false;
 };
 
 // The example-level EXEMPTION that alone makes a per-arm `exitCode` legal. Its
@@ -829,13 +836,24 @@ struct ExampleManifest {
                 }
                 oa.exitCode = arm.at("exitCode").get<std::int64_t>();
             }
+            if (arm.contains("mustDifferFromBaseline")) {
+                if (!arm.at("mustDifferFromBaseline").is_boolean()) {
+                    std::cerr << "  optimizedPipelines arm '" << oa.label
+                              << "' key 'mustDifferFromBaseline' must be a"
+                                 " boolean in " << path.generic_string() << "\n";
+                    return false;
+                }
+                oa.mustDifferFromBaseline =
+                    arm.at("mustDifferFromBaseline").get<bool>();
+            }
             // The CLOSED per-arm key set, mirroring the sibling exactly. An
             // expectation the runner does not read is an assertion that never
             // fires, so an unknown key is a LOAD ERROR naming it.
             for (auto const& [k, unusedV] : arm.items()) {
                 (void)unusedV;
                 if (k == "label" || k == "passes" || k == "shippedPipeline"
-                    || k == "exitCode" || k.starts_with("$")) {
+                    || k == "exitCode" || k == "mustDifferFromBaseline"
+                    || k.starts_with("$")) {
                     continue;
                 }
                 std::cerr << "  optimizedPipelines arm '" << oa.label
@@ -1756,10 +1774,30 @@ void runSelectedTargetViaCli(std::string const& compiler,
         // COMPILER and needs no machine to execute the result. This is what a
         // dropped `--config` cannot survive: without the flag the arm IS the
         // baseline build and every image below is byte-identical.
-        if (auto const differs = filesDiffer(armOut.artifactPath,
-                                             baseline.artifactPath);
-            differs.ok) {
+        auto const differs = filesDiffer(armOut.artifactPath,
+                                         baseline.artifactPath);
+        if (differs.ok) {
             ++optimizedArmsArtifactDiffered;
+        }
+        // The arm's declared opt-in, read HERE rather than merely accepted at
+        // load time. `differs.why` carries "byte-identical" when the images
+        // matched and a REASON when the comparison could not run at all; both
+        // are failures for an arm that declares it must differ, because an
+        // uncomparable arm must never be read as a compared one.
+        if (arm.mustDifferFromBaseline) {
+            check(exampleName + " [arm=" + arm.label
+                      + "]: optimized image differs from the baseline"
+                        " (manifest declares mustDifferFromBaseline)",
+                  differs.ok,
+                  differs.ok
+                      ? ""
+                      : "the arm declares \"mustDifferFromBaseline\": true but"
+                        " the comparison did not witness a difference ("
+                            + differs.why
+                            + ") — either the source has nothing for the"
+                              " pipeline to transform (give it one: an inlinable"
+                              " helper, an accumulator, a loop) or the pipeline"
+                              " regressed");
         }
 
         if (baseline.verdict != ArmVerdict::Ran) continue;  // nothing to compare

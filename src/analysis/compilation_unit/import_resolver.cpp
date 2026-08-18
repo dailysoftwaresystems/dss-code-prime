@@ -1,5 +1,7 @@
 #include "analysis/compilation_unit/import_resolver.hpp"
 
+#include "core/substrate/path_identity.hpp"
+
 #include "core/types/header_case_diagnostic.hpp"   // reportHeaderCaseAmbiguity
 #include "core/types/include_path_resolve.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -232,7 +234,7 @@ private:
         // two parents — or also included directly — is recorded ONCE, and a
         // descriptor cycle terminates. Keyed on the weakly-canonical descriptor
         // path (the SAME key the semantic readDescriptors dedup uses).
-        std::unordered_set<std::string> systemVisited;
+        std::unordered_set<core::PathIdentity> systemVisited;
 
         // Index-based loop: include-following appends to context.trees, and we
         // re-derive context.trees[i] each iteration (stable across reallocation)

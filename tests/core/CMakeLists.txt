@@ -8,6 +8,10 @@ dss_add_test(NAME core/test_token               SOURCES test_token.cpp)
 dss_add_test(NAME core/test_rule_id             SOURCES test_rule_id.cpp)
 dss_add_test(NAME core/test_parse_diagnostic    SOURCES test_parse_diagnostic.cpp)
 dss_add_test(NAME core/test_config_path_walk    SOURCES test_config_path_walk.cpp)
+# The ONE path-identity chokepoint (D-PATH-IDENTITY-8DOT3-SPELLINGS-SPLIT-KEYS).
+# Its 8.3 arms CONSTRUCT the hazard and SKIP LOUDLY where the volume cannot
+# stage it -- a test that merely hopes to meet a short name is a false green.
+dss_add_test(NAME core/test_path_identity       SOURCES test_path_identity.cpp)
 dss_add_test(NAME core/test_char_decode         SOURCES test_char_decode.cpp)
 dss_add_test(NAME core/test_diagnostic_reporter SOURCES test_diagnostic_reporter.cpp)
 dss_add_test(NAME core/test_diagnostic_budget_threading SOURCES test_diagnostic_budget_threading.cpp)

@@ -1,5 +1,6 @@
 #include "program/dependency_resolver.hpp"
 
+#include "core/substrate/path_identity.hpp"
 #include "core/types/artifact_profile.hpp"
 #include "core/types/config_path_walk.hpp"   // findShippedConfigDir
 #include "core/types/grammar_schema.hpp"
@@ -61,9 +62,7 @@ void emitGuaranteed(DiagnosticReporter& rep, DiagnosticCode code,
 // costs is that two exotic spellings of one directory might read as two nodes
 // (which produces a duplicate build, never a wrong one).
 [[nodiscard]] fs::path canonicalize(fs::path const& p) {
-    std::error_code ec;
-    fs::path const c = fs::weakly_canonical(p, ec);
-    return ec ? p.lexically_normal() : c;
+    return core::PathIdentity::of(p).path();
 }
 
 // The de-dup key for a source path. Same rule `expandAndDedupProjectSources`
@@ -72,8 +71,8 @@ void emitGuaranteed(DiagnosticReporter& rep, DiagnosticCode code,
 // absolute-vs-relative spellings of ONE file are the NORMAL case here rather
 // than an exotic edge — and its consequence is a duplicate CU and a
 // duplicate-symbol link error no diagnostic can tie back to a manifest.
-[[nodiscard]] std::string sourceKey(std::string const& spelling) {
-    return canonicalize(fs::path{spelling}).generic_string();
+[[nodiscard]] core::PathIdentity sourceKey(std::string const& spelling) {
+    return core::PathIdentity::of(fs::path{spelling});
 }
 
 // A shipped object-format document, remembered under THE NAME IT WAS LOADED BY.
@@ -194,7 +193,7 @@ private:
     [[nodiscard]] DependencyCache* cache_();
     [[nodiscard]] std::span<ShippedFormat const> shippedFormats_();
     void collectMergeSources_(std::size_t index, std::vector<std::string>& out,
-                              std::set<std::string>& seen) const;
+                              std::set<core::PathIdentity>& seen) const;
     [[nodiscard]] std::vector<std::string> buildSourcesFor_(std::size_t index) const;
 
     DependencyResolveRequest const& req_;
@@ -769,7 +768,7 @@ Resolver::deriveFormat_(Node const& node, std::string const& consumerSpec,
 // stem names the artifact when the manifest states no `artifactName`.
 void Resolver::collectMergeSources_(std::size_t index,
                                     std::vector<std::string>& out,
-                                    std::set<std::string>&    seen) const {
+                                    std::set<core::PathIdentity>& seen) const {
     Node const& node = nodes_[index];
     for (auto const& s : node.ownSources) {
         if (seen.insert(sourceKey(s)).second) out.push_back(s);
@@ -783,8 +782,8 @@ void Resolver::collectMergeSources_(std::size_t index,
 }
 
 std::vector<std::string> Resolver::buildSourcesFor_(std::size_t index) const {
-    std::vector<std::string> out;
-    std::set<std::string>    seen;
+    std::vector<std::string>     out;
+    std::set<core::PathIdentity> seen;
     collectMergeSources_(index, out, seen);
     return out;
 }
@@ -903,10 +902,12 @@ Resolver::gather_(std::size_t index, std::string const& consumerSpec,
         return Gathered{hit->second};
     }
 
-    std::vector<BuiltArtifact> incoming;
-    std::set<std::string>      seen;
+    std::vector<BuiltArtifact>   incoming;
+    std::set<core::PathIdentity> seen;
     auto const add = [&](BuiltArtifact const& a) {
-        if (seen.insert(a.path.generic_string()).second) incoming.push_back(a);
+        if (seen.insert(core::PathIdentity::of(a.path)).second) {
+            incoming.push_back(a);
+        }
     };
 
     for (std::size_t const child : nodes_[index].children) {
@@ -1023,7 +1024,7 @@ std::optional<DependencyResolution> Resolver::run(ProjectConfig const& rootConfi
     // itself: the driver expands the root's own `sources[]` AFTER its own
     // pre-build hooks and puts them FIRST (M4b).
     {
-        std::set<std::string> seen;
+        std::set<core::PathIdentity> seen;
         for (std::size_t const child : nodes_.front().children) {
             if (nodes_[child].composition != DependencyComposition::SourceMerge) {
                 continue;

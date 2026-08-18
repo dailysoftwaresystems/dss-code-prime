@@ -1,5 +1,7 @@
 #include "program/program.hpp"
 
+#include "core/substrate/path_identity.hpp"
+
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
 #include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
@@ -2830,11 +2832,9 @@ int Program::compileProject(
     // FIRST occurrence wins, keeping its own spelling, exactly as within a
     // single manifest.
     if (!resolved->mergedSources.empty()) {
-        std::set<std::string> seen;
+        std::set<core::PathIdentity> seen;
         auto const key = [](std::string const& s) {
-            std::error_code ec;
-            fs::path const c = fs::weakly_canonical(fs::path{s}, ec);
-            return (ec ? fs::path{s}.lexically_normal() : c).generic_string();
+            return core::PathIdentity::of(fs::path{s});
         };
         for (auto const& s : expandedSources) seen.insert(key(s));
         expandedSources.reserve(expandedSources.size()

@@ -67,12 +67,13 @@ void emitMalformed(DiagnosticReporter& reporter, std::string what) {
 // the within-TU 4×→1× dedup is where the win is. Returns nullptr on an I/O / parse
 // / non-object failure (diagnostic emitted to `reporter`); failures are NOT cached,
 // so a malformed descriptor still fails loud on every reader exactly as before.
+[[nodiscard]] core::PathIdentity descriptorPathKey(
+    std::filesystem::path const& path);
+
 json const* cachedDescriptorJson(std::filesystem::path const& path,
                                  DiagnosticReporter& reporter) {
-    thread_local std::unordered_map<std::string, json> cache;
-    std::error_code ec;
-    auto const canon = std::filesystem::weakly_canonical(path, ec);
-    std::string key = (ec ? path.lexically_normal() : canon).string();
+    thread_local std::unordered_map<core::PathIdentity, json> cache;
+    auto const key = descriptorPathKey(path);
     if (auto const it = cache.find(key); it != cache.end()) return &it->second;
 
     std::ifstream in{path, std::ios::binary};
@@ -1194,10 +1195,9 @@ void decodeShippedIncludes(json const& doc, std::string const& pathStr,
 // three agree that "the same descriptor" is the same path. Falls back to
 // `lexically_normal` when the file can't be canonicalized (mirrors the two
 // existing call sites verbatim).
-[[nodiscard]] std::string descriptorPathKey(std::filesystem::path const& path) {
-    std::error_code ec;
-    auto const canon = std::filesystem::weakly_canonical(path, ec);
-    return (ec ? path.lexically_normal() : canon).string();
+[[nodiscard]] core::PathIdentity descriptorPathKey(
+    std::filesystem::path const& path) {
+    return core::PathIdentity::of(path);
 }
 
 // Decode a struct `fields` JSON array (non-empty, each `{name,type}`) into
@@ -2843,7 +2843,7 @@ void forEachDescriptorInClosure(
     std::span<std::filesystem::path const>                   systemDirs,
     HeaderNameMatching                                       matching,
     std::optional<ObjectFormatKind>                          activeFormat,
-    std::unordered_set<std::string>&                         visited,
+    std::unordered_set<core::PathIdentity>&                  visited,
     std::function<void(std::filesystem::path const&)> const& visit,
     std::function<void(std::string const&,
                        HeaderSearchResult const&)> const&    onUnresolvedInclude,
@@ -2855,7 +2855,7 @@ void forEachDescriptorInClosure(
     // A→B→A stops at the second A and a diamond's shared leaf is visited once. The
     // recursion is bounded by the finite shipped-descriptor count — no fixpoint
     // iteration, a single DFS is complete + terminating.
-    std::string const key = descriptorPathKey(startPath);
+    auto const key = descriptorPathKey(startPath);
     if (!visited.insert(key).second) return;   // already in the closure
 
     // PARENT FIRST — visit this descriptor before the siblings its `includes`
@@ -2935,7 +2935,7 @@ void forEachDescriptorInClosure(
     std::filesystem::path const&                             startPath,
     std::span<std::filesystem::path const>                   systemDirs,
     HeaderNameMatching                                       matching,
-    std::unordered_set<std::string>&                         visited,
+    std::unordered_set<core::PathIdentity>&                  visited,
     std::function<void(std::filesystem::path const&)> const& visit,
     std::function<void(std::string const&,
                        HeaderSearchResult const&)> const&    onUnresolvedInclude) {
@@ -3654,11 +3654,11 @@ bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
     // single `is_regular_file` per declared entry and therefore free. It is
     // repeated here so the corpus sweep is a TOTAL statement about the tree rather
     // than a partial one that assumes every descriptor has been read.
-    std::unordered_set<std::string> claimedPaths;
+    std::unordered_set<core::PathIdentity> claimedPaths;
     for (auto const& c : claims) {
         auto const resolved = resolveShippedSourcePath(c.source);
         if (resolved) {
-            claimedPaths.insert(resolved->generic_string());
+            claimedPaths.insert(core::PathIdentity::of(*resolved));
             continue;
         }
         emitMalformed(reporter,
@@ -3735,8 +3735,7 @@ bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
             if (ec) break;
             if (!it->is_regular_file(ec)) continue;
             std::filesystem::path const p = it->path();
-            if (claimedPaths.contains(p.lexically_normal().generic_string()))
-                continue;
+            if (claimedPaths.contains(core::PathIdentity::of(p))) continue;
             emitMalformed(reporter,
                 "shipped-source tree: '" + p.generic_string() + "' is named by NO "
                 "shipped-lib descriptor under '" + descriptorDir.generic_string()
@@ -3769,7 +3768,7 @@ closureSurfaceOnFormat(std::filesystem::path const&           startPath,
                        std::span<std::filesystem::path const> systemDirs,
                        ObjectFormatKind                       fmt) {
     ClosureSurfaceOnFormat outS;
-    std::unordered_set<std::string> visited;
+    std::unordered_set<core::PathIdentity> visited;
     // Case-SENSITIVE resolution, and the choice is load-bearing rather than
     // incidental: this sweep is FORMAT-INDEPENDENT by design (it evaluates arms
     // no current target selects), while `headerNameMatching` is a per-FORMAT

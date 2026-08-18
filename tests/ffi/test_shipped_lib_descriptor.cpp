@@ -1143,7 +1143,7 @@ TEST(ShippedLibDescriptor, ClosureCycleTerminates) {
         "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
     })JSON");
     std::vector<fs::path> const systemDirs{dir.path()};
-    std::unordered_set<std::string> visited;
+    std::unordered_set<dss::core::PathIdentity> visited;
     std::vector<std::string> order;
     std::vector<std::string> unresolved;
     forEachDescriptorInClosure(
@@ -1157,6 +1157,154 @@ TEST(ShippedLibDescriptor, ClosureCycleTerminates) {
     EXPECT_EQ(order[0], "a");   // parent FIRST (the start)
     EXPECT_EQ(order[1], "b");   // then its include
     EXPECT_TRUE(unresolved.empty());
+}
+
+// ── THE CORPUS SWEEP'S OWN INVARIANTS ──────────────────────────────────────
+//
+// ★★★ `validateShippedIncludeClosure` shipped in cycle P7 with NO test, and the
+// two diagnostic codes it owns were therefore pinned by nothing. That was not
+// caught for a cycle because `tools/check-diagnostic-codes.py` stops at its
+// FIRST failing category, and a cross-branch reservation collision was firing
+// above it — so the uncovered-code report never printed. A gate that reports one
+// category at a time hides everything behind it.
+
+// ★★ THE VACUOUS-SWEEP REFUSAL, AND IT IS THE MOST IMPORTANT ARM HERE. A sweep
+// handed an EMPTY served-format set would iterate zero formats per descriptor and
+// pass every invariant TRIVIALLY — reporting a clean corpus because it checked
+// nothing. That is the false-green family this repo keeps closing, so the sweep
+// refuses rather than succeeds.
+TEST(ShippedLibDescriptor, CorpusSweepRefusesAVacuousRun) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    (void)writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h",
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+
+    DiagnosticReporter rep;
+    std::vector<ObjectFormatKind> const none;
+    EXPECT_FALSE(validateShippedIncludeClosure(dir.path(), none, rep))
+        << "a sweep with no served formats checked nothing and said so was fine";
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedCorpusInvariantBroken), 0u);
+}
+
+// Invariant (i): an edge that is ACTIVE on a format whose child declares it does
+// not exist there. The config promises a surface it also declares absent.
+TEST(ShippedLibDescriptor, CorpusSweepCatchesAnActiveEdgeToAnAbsentChild) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // `a` is available everywhere and includes `b` UNCONDITIONALLY...
+    (void)writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h", "includes": ["b.h"],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+    // ...but `b` declares it exists on elf ONLY, so on pe the edge is active and
+    // the child is absent.
+    (void)writeTemp(dir, "b.json", R"JSON({
+        "header": "b.h", "availableObjectFormats": ["elf"],
+        "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
+    })JSON");
+
+    DiagnosticReporter rep;
+    std::vector<ObjectFormatKind> const served{ObjectFormatKind::Elf,
+                                               ObjectFormatKind::Pe};
+    EXPECT_FALSE(validateShippedIncludeClosure(dir.path(), served, rep))
+        << "an edge active on pe reaching a child declared elf-only passed";
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedCorpusInvariantBroken), 0u);
+}
+
+// ★ THE CONTROL, because a refusal that fires on everything asserts nothing: the
+// SAME shape with the edge GATED by a `when` must pass clean.
+TEST(ShippedLibDescriptor, CorpusSweepAcceptsAGatedEdgeToAFormatLimitedChild) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    (void)writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h",
+        "includes": [ { "header": "b.h", "when": { "format": "elf" } } ],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "b.json", R"JSON({
+        "header": "b.h", "availableObjectFormats": ["elf"],
+        "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
+    })JSON");
+
+    DiagnosticReporter rep;
+    std::vector<ObjectFormatKind> const served{ObjectFormatKind::Elf,
+                                               ObjectFormatKind::Pe};
+    EXPECT_TRUE(validateShippedIncludeClosure(dir.path(), served, rep))
+        << "a correctly gated edge was refused, so the invariant above would "
+           "fire on legitimate config and the corpus would be pressured to "
+           "weaken it";
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedCorpusInvariantBroken), 0u);
+}
+
+// ── THE `impliedSurface` SATISFACTION HALF ─────────────────────────────────
+//
+// D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE: a predefined macro that
+// claims a shipped surface must have one. It is an ASSERTION, never a
+// suppression — withdrawing the macro quietly would flip `#ifdef` branches under
+// the user with no diagnostic, which is the same quiet wrongness the mechanism
+// exists to end.
+TEST(ShippedLibDescriptor, PredefinedMacroClaimingAnAbsentHeaderIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    (void)writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h",
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+
+    PredefinedMacroDef m;
+    m.name       = "__PROBE_IDENTITY__";
+    m.value      = "1";
+    m.declaredAt = "/preprocess/predefinedMacros/0";
+    ShippedSurfaceClaim claim;
+    claim.header = "nowhere.h";
+    claim.names  = {"af"};
+    ImpliedSurface surface;
+    surface.kind    = ImpliedSurfaceKind::Surface;
+    surface.headers = {claim};
+    m.impliedSurface = surface;
+
+    DiagnosticReporter rep;
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::vector<PredefinedMacroDef> const macros{m};
+    EXPECT_FALSE(validateShippedSurfaceRequirements(
+        macros, "probe.lang.json /preprocess/predefinedMacros", systemDirs,
+        ObjectFormatKind::Elf, rep))
+        << "a macro claiming a header that resolves to nothing was accepted";
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::C_UnbackedPredefinedMacro), 0u);
+}
+
+// ★ ITS CONTROL: the same macro whose claim IS backed must pass, or the check
+// above is just "refuse every claim".
+TEST(ShippedLibDescriptor, PredefinedMacroWithABackedSurfaceIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    (void)writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h",
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+
+    PredefinedMacroDef m;
+    m.name       = "__PROBE_IDENTITY__";
+    m.value      = "1";
+    m.declaredAt = "/preprocess/predefinedMacros/0";
+    ShippedSurfaceClaim claim;
+    claim.header = "a.h";
+    claim.names  = {"af"};
+    ImpliedSurface surface;
+    surface.kind    = ImpliedSurfaceKind::Surface;
+    surface.headers = {claim};
+    m.impliedSurface = surface;
+
+    DiagnosticReporter rep;
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::vector<PredefinedMacroDef> const macros{m};
+    EXPECT_TRUE(validateShippedSurfaceRequirements(
+        macros, "probe.lang.json /preprocess/predefinedMacros", systemDirs,
+        ObjectFormatKind::Elf, rep))
+        << "a macro whose claimed header and name both exist was refused";
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::C_UnbackedPredefinedMacro), 0u);
 }
 
 // (b') DIAMOND (a→b, a→c, b→d, c→d): the shared leaf `d` is visited ONCE, and every
@@ -1179,7 +1327,7 @@ TEST(ShippedLibDescriptor, ClosureDiamondVisitsSharedLeafOnce) {
         "header": "dd.h", "symbols": [ { "name": "df", "signature": "fn() -> i32" } ]
     })JSON");
     std::vector<fs::path> const systemDirs{dir.path()};
-    std::unordered_set<std::string> visited;
+    std::unordered_set<dss::core::PathIdentity> visited;
     std::vector<std::string> order;
     forEachDescriptorInClosure(
         aPath, systemDirs, kDefaultHeaderNameMatching, visited,
@@ -1215,7 +1363,7 @@ TEST(ShippedLibDescriptor, ClosureUnresolvedIncludeIsReported) {
         "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
     })JSON");
     std::vector<fs::path> const systemDirs{dir.path()};
-    std::unordered_set<std::string> visited;
+    std::unordered_set<dss::core::PathIdentity> visited;
     std::vector<std::string> order;
     std::vector<std::string> unresolved;
     forEachDescriptorInClosure(

@@ -142,15 +142,22 @@ MIN_PLAUSIBLE_CODES = 300
 #   ⓘ This verification is a SNAPSHOT. If #54 gains codes before it merges the
 #   ranges can widen; re-run the command above rather than trusting this note.
 #
+# ★★★ RETIRED 2026-08-18 — THE TWO PR #54 ROWS ARE GONE, BY THIS TABLE'S OWN RULE.
+# ✔MEASURED: `feature/c23-conformance-burndown-3` (which IS PR #54) rebased onto
+# `origin/main`, so main's table arrived on the very branch it was reserving
+# against — and all ten codes (S_ 0xE065..0xE06B, L_ 0xB010..0xB012) are now IN
+# THIS TREE'S ENUM. The gate consequently reported this branch colliding with its
+# own reservation: precisely the "a stale reservation would start refusing
+# legitimate ordinals" failure the note above predicts, arriving by rebase rather
+# than by merge. The rule stated there applies unchanged — *"its codes are in the
+# enum and the ordinary duplicate check covers them properly ... Delete the row,
+# do not 'update' it."*
+# ⚠ THE RESERVATION IS NOT LOST FOR ANYONE ELSE: `origin/main` still carries these
+# rows, which is where a DIFFERENT branch would read them. Deleting them here
+# removes only the self-collision.
+#
 # Each entry: (low, high, why) — INCLUSIVE on both ends.
-RESERVED_ELSEWHERE = (
-    (0xE065, 0xE06B,
-     "PR #54 (feature/c23-conformance-burndown-3): S_InlineAsm* x7. "
-     "RETIRE THIS ROW WHEN #54 MERGES."),
-    (0xB010, 0xB012,
-     "PR #54 (feature/c23-conformance-burndown-3): L_SideStructure* x3. "
-     "RETIRE THIS ROW WHEN #54 MERGES."),
-)
+RESERVED_ELSEWHERE = ()
 
 
 def reserved_hit(value):
@@ -492,9 +499,18 @@ def self_test():
           next_free_by_band(rows), {"D": (0xD028, 0xD029)})
 
     # ── (c3) CROSS-BRANCH RESERVATIONS ──────────────────────────────────────
-    # ★ Uses the REAL RESERVED_ELSEWHERE table, so these cases go red the day
-    #   somebody empties it while another branch still owns those ordinals.
-    if RESERVED_ELSEWHERE:
+    # ★★ RUN ON A SYNTHETIC TABLE, UNCONDITIONALLY — changed 2026-08-18 with the
+    # retirement of the PR #54 rows. These cases used to read the LIVE table under
+    # `if RESERVED_ELSEWHERE:`, and the comment claimed that made them "go red the
+    # day somebody empties it". ✔They do not: they SKIP. So the mechanism stopped
+    # being pinned at exactly the moment the table went empty — which is the
+    # moment the next author reaches for it and needs it to work.
+    # ⚠ The live table is still exercised, by (c3-live) below, whenever it has
+    # rows; what changed is that an EMPTY table no longer silences the mechanism.
+    global RESERVED_ELSEWHERE
+    _live = RESERVED_ELSEWHERE
+    RESERVED_ELSEWHERE = ((0xE065, 0xE06B, "synthetic: pins the mechanism"),)
+    try:
         low, high, _why = RESERVED_ELSEWHERE[0]
         rows = parse_enumerators(extract_enum_body(
             _enum("S_Taken = 0x%04X," % low, "S_Fine = 0x%04X," % (low - 1))))
@@ -508,6 +524,14 @@ def self_test():
             _enum("S_Last = 0x%04X," % (low - 1))))
         check("next-free skips a claimed range entirely",
               next_free_by_band(rows), {"S": (low - 1, high + 1)})
+    finally:
+        RESERVED_ELSEWHERE = _live
+
+    # (c3-live) — the real table, when it has rows: every reserved range must be
+    # well formed. A row with low > high silently reserves NOTHING.
+    for _low, _high, _why in RESERVED_ELSEWHERE:
+        check("live reservation 0x%04X..0x%04X is well formed" % (_low, _high),
+              _low <= _high and bool(_why), True)
 
     check("an unclaimed ordinal is not reported as a conflict",
           find_reserved_conflicts(parse_enumerators(extract_enum_body(

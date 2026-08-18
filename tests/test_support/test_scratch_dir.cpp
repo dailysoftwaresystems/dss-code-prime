@@ -270,23 +270,22 @@ TEST(ScratchDirSubstrate, ShortPathSpellingIsDefeatedAtTheChokepoint) {
 
 namespace {
 
-// `canonicalizeLikeTheProduct` is a deliberate COPY of the product's resolver
-// (see the rationale on the function itself). A copy with no pin is how the two
-// drift apart silently, so this reads the product's own text and asserts the
-// two still agree on WHICH resolution is being performed.
-[[nodiscard]] std::string productCanonicalizerBody() {
-    fs::path const  src = dss::test::repoRoot() / "src" / "program"
-                       / "dependency_resolver.cpp";
+// `canonicalizeLikeTheProduct` CALLS the product's canonicalizer rather than
+// mirroring it, so "do the two agree" is now x == x. What can still go wrong is
+// the fixture growing a private copy again, which is what this reads for.
+[[nodiscard]] std::string fixtureCanonicalizerBody() {
+    fs::path const src = dss::test::repoRoot() / "tests" / "test_support"
+                       / "scratch_dir.hpp";
     std::ifstream in{src};
     if (!in) return {};
     std::string const text{std::istreambuf_iterator<char>{in},
                            std::istreambuf_iterator<char>{}};
 
-    // The body between `canonicalize(fs::path const& p) {` and its closing
-    // brace at column 0 — narrow enough that an unrelated `weakly_canonical`
-    // elsewhere in the file cannot satisfy this pin.
-    constexpr std::string_view kSig = "canonicalize(fs::path const& p) {";
-    auto const                 at   = text.find(kSig);
+    // The body between the signature and its closing brace at column 0 —
+    // narrow enough that the surrounding docblock cannot satisfy the pin.
+    constexpr std::string_view kSig =
+        "canonicalizeLikeTheProduct(std::filesystem::path const& p) {";
+    auto const at = text.find(kSig);
     if (at == std::string::npos) return {};
     auto const end = text.find("\n}", at);
     return text.substr(at, end == std::string::npos ? std::string::npos
@@ -295,39 +294,44 @@ namespace {
 
 }  // namespace
 
-TEST(ScratchDirSubstrate, MatchesTheProductsOwnCanonicalizer) {
-    std::string const body = productCanonicalizerBody();
+TEST(ScratchDirSubstrate, FixtureHasNotGrownItsOwnCanonicalizer) {
+    std::string const body = fixtureCanonicalizerBody();
     ASSERT_FALSE(body.empty())
-        << "could not locate `canonicalize` in src/program/dependency_resolver."
-           "cpp. If it was renamed or moved, re-point this pin AND re-check "
-           "that `canonicalizeLikeTheProduct` still mirrors it — do not delete "
-           "this test to make the build green.";
+        << "could not locate `canonicalizeLikeTheProduct` in "
+           "tests/test_support/scratch_dir.hpp. If it was renamed or moved, "
+           "re-point this pin — do not delete this test to make the build "
+           "green.";
 
-    EXPECT_NE(body.find("weakly_canonical"), std::string::npos)
-        << "the product no longer resolves with `weakly_canonical`, but the "
-           "test fixture still does. Every fixture path in the tree is now "
-           "spelled differently from what the product reports — the exact "
-           "2026-08-17 CI failure, in the other direction.";
-    EXPECT_NE(body.find("lexically_normal"), std::string::npos)
-        << "the product dropped its degraded-key fallback; "
-           "`canonicalizeLikeTheProduct` still has one.";
+    EXPECT_NE(body.find("canonicalIdentityKey"), std::string::npos)
+        << "the fixture no longer calls the product's canonicalizer. Every "
+           "fixture path in the tree can now be spelled differently from what "
+           "the product reports — the exact 2026-08-17 CI failure, which took "
+           "a green local gate and four green legs to reach CI.";
+    EXPECT_EQ(body.find("weakly_canonical"), std::string::npos)
+        << "the fixture has grown a PRIVATE canonicalizer again. There is one "
+           "canonicalizer (core/substrate/path_identity); a second one is a "
+           "second owner of one fact, and the two can disagree silently.";
 }
 
 // The scanner's own positive control — an all-clear from a reader that reads
 // nothing is worthless, and this repo has been burned by exactly that before.
 TEST(ScratchDirSubstrate, TheCanonicalizerScannerActuallyDetects) {
-    std::string const body = productCanonicalizerBody();
+    std::string const body = fixtureCanonicalizerBody();
     ASSERT_FALSE(body.empty());
-    std::string mutated = body;
-    for (auto at = mutated.find("weakly_canonical");
-         at != std::string::npos;
-         at      = mutated.find("weakly_canonical", at + 1)) {
-        mutated.replace(at, std::string_view{"weakly_canonical"}.size(),
-                        "absolute________");
+    // Mutate the token the pin above SEARCHES FOR. Re-pointed 2026-08-18 with
+    // the pin itself: the control used to blank `weakly_canonical`, which the
+    // fixture no longer contains at all — so the mutation would silently fail
+    // to land and this control would assert nothing, which is precisely the
+    // failure mode it exists to rule out.
+    constexpr std::string_view kToken = "canonicalIdentityKey";
+    std::string                mutated = body;
+    for (auto at = mutated.find(kToken); at != std::string::npos;
+         at      = mutated.find(kToken, at + 1)) {
+        mutated.replace(at, kToken.size(), "absolute____________");
     }
     ASSERT_NE(mutated, body) << "the mutation did not land, so this control "
                                 "proves nothing about the scanner";
-    EXPECT_EQ(mutated.find("weakly_canonical"), std::string::npos)
+    EXPECT_EQ(mutated.find(kToken), std::string::npos)
         << "the matcher used by the pin above still finds the token in a text "
            "that no longer contains it";
 }

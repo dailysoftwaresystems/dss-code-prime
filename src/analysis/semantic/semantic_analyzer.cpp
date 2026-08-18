@@ -1,5 +1,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 
+#include "core/substrate/path_identity.hpp"
+
 #include "analysis/compilation_unit/unit_attribute.hpp"
 #include "analysis/preprocess/preprocessor.hpp"   // TF-C82: kPragmaPackAmbiguous
 #include "analysis/semantic/scope_tree.hpp"
@@ -14080,7 +14082,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // twice in one tree, records the path twice) AND symbol names already
         // minted (two descriptors both declaring `puts` → first wins) so a name
         // is injected at most once.
-        std::unordered_set<std::string> readDescriptors;
+        std::unordered_set<core::PathIdentity> readDescriptors;
         // Struct/union/enum TAGS live in a SEPARATE namespace (C 6.2.3): a
         // descriptor `struct stat` does NOT collide with the ordinary `stat`
         // function, so tag first-wins dedup uses its own set.
@@ -14136,10 +14138,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         for (ShippedDescriptorRef const& ref :
              cu->shippedLibDescriptors()) {
             std::filesystem::path const& descPath = ref.path;  // (ref.span/buffer: the c8 gate)
-            std::error_code ec;
-            auto canonical = std::filesystem::weakly_canonical(descPath, ec);
-            std::string const key =
-                (ec ? descPath.lexically_normal() : canonical).string();
+            auto const key = core::PathIdentity::of(descPath);
             if (!readDescriptors.insert(key).second) continue;  // already read
 
             // Read + decode against THIS CU's interner/registry/reporter. The

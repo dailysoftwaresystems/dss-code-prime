@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/substrate/path_identity.hpp"
+
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
 #include "core/types/include_path_resolve.hpp" // HeaderNameMatching + HeaderSearchResult (the `includes` closure walk's case policy)
@@ -971,7 +973,7 @@ DSS_EXPORT void forEachDescriptorInClosure(
     std::span<std::filesystem::path const>                  systemDirs,
     HeaderNameMatching                                      matching,
     std::optional<ObjectFormatKind>                         activeFormat,
-    std::unordered_set<std::string>&                        visited,
+    std::unordered_set<core::PathIdentity>&                 visited,
     std::function<void(std::filesystem::path const&)> const& visit,
     std::function<void(std::string const&,
                        HeaderSearchResult const&)> const&    onUnresolvedInclude,
@@ -994,7 +996,7 @@ DSS_EXPORT void forEachDescriptorInClosure(
     std::filesystem::path const&                            startPath,
     std::span<std::filesystem::path const>                  systemDirs,
     HeaderNameMatching                                      matching,
-    std::unordered_set<std::string>&                        visited,
+    std::unordered_set<core::PathIdentity>&                 visited,
     std::function<void(std::filesystem::path const&)> const& visit,
     std::function<void(std::string const&,
                        HeaderSearchResult const&)> const&    onUnresolvedInclude);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/substrate/path_identity.hpp"
+
 // CompilationUnit (CU) — the bundle of trees + driver-resolved cross-tree
 // references + driver-level diagnostics that the semantic phase, IR, and
 // codegen all consume. Phase #7.5 substrate; bridges parser (per-file Tree)
@@ -468,10 +470,10 @@ private:
     // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE).
     DiagnosticBudget                     budget_;
     DiagnosticReporter                   driverDiagnostics_;
-    std::unordered_set<std::string>      seenPaths_;   // weakly-canonical, for addFile dedup
+    std::unordered_set<core::PathIdentity> seenPaths_;  // for addFile dedup
     // Weakly-canonical path → index into trees_, for include-following dedup
     // (resolve an #include to an already-loaded tree instead of re-parsing).
-    std::unordered_map<std::string, std::size_t> pathToTreeIndex_;
+    std::unordered_map<core::PathIdentity, std::size_t> pathToTreeIndex_;
     std::vector<std::filesystem::path>   includeDirs_;
     std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
     std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include

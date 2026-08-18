@@ -6671,7 +6671,15 @@ for leg in "${LEG_ORDER[@]}"; do
   # By INDEX, so each abort is classified against ITS OWN segment log. Walking
   # the names alone would hand every abort the same (or no) diagnostic, which is
   # the location-keyed excusal this conjunction exists to end.
-  for _ai in ${!ABORTS[@]+"${!ABORTS[@]}"}; do
+  # ⚠ PLAIN `"${!ABORTS[@]}"`, NOT the `${arr[@]+"${arr[@]}"}` set -u guard:
+  # `${!VAR+word}` is INDIRECT EXPANSION, so the guarded form takes the array's
+  # VALUE as a variable NAME and dies with "invalid variable name". ✔MEASURED
+  # 2026-08-18 on bash 5.2.21 — and it only ever executes when ABORTS is
+  # NON-EMPTY, so it was invisible on every clean run and fired on exactly the
+  # run whose summary was needed (WSL host, pe64 leg, 4 Wine aborts), killing
+  # step 9/9 after every corpus result had already been produced.
+  # The plain form is already set -u-safe on an empty array in bash ≥ 4.4.
+  for _ai in "${!ABORTS[@]}"; do
     a="${ABORTS[$_ai]}"
     _acrc=0
     if [[ -z "${LEG_ABORT_CONFOUNDS[$leg]:-}" ]]; then

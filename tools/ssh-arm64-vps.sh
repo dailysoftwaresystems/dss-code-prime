@@ -116,7 +116,46 @@ if [ -r "$DSS_VPS_KEY" ]; then
 fi
 
 args=(-i "$DSS_VPS_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=25
-      -o ServerAliveInterval=30 -o BatchMode=yes "$DSS_VPS_USER@$DSS_VPS_HOST")
+      -o ServerAliveInterval=30 -o BatchMode=yes)
+
+# ★★★ `--rsync <src...> <dest>` — A TRANSPORT THAT DOES NOT USE STDIN.
+#
+# ✔MEASURED 2026-08-18: pushing a tree with `tar czf - . | <carriage> 'tar xzf -'`
+# DIED on the macOS host with "Unrecognized archive format", because that host's
+# login profile CONSUMES STDIN before the remote tar ever reads it —
+# `printf 'X' | ssh-macos.sh cat` returns NOTHING. The arm64 VPS survived the
+# identical code path purely because its profile is quiet, which means the old
+# transport's correctness depended on a remote shell's chattiness: not a property
+# any caller can test, and not one worth depending on.
+#
+# ⚠ IT ALSO FIXES THE SILENT HALF. When the tar fallback failed, the caller could
+# not tell a successful push from one whose archive arrived truncated — the remote
+# tar reported the error, the local tar reported SIGPIPE, and the driver printed
+# "FAIL push" carrying neither. This `exec`s rsync directly, so the caller's `$?`
+# is rsync's own status and never a pipeline's last stage.
+#
+# `-a` preserves mtimes DELIBERATELY (ninja keys on them); a caller that needs a
+# rebuild touches what moved, which every leg driver here already does.
+if [ "${1:-}" = "--rsync" ]; then
+    shift
+    if [ $# -lt 2 ]; then
+        echo "ssh-arm64-vps: --rsync needs at least <src> and <dest>" >&2
+        exit 2
+    fi
+    # Build the rsh command with EACH option quoted: the key path can contain
+    # spaces (it does under a Windows user profile) and rsync word-splits the
+    # `-e` string, so joining the array with bare spaces would corrupt it.
+    _rsh=ssh
+    for _o in "${args[@]}"; do
+        _rsh="$_rsh '$_o'"
+    done
+    # The LAST argument is the remote destination; everything before it is local.
+    _dest=${!#}
+    set -- "${@:1:$#-1}"
+    exec rsync -a --delete -e "$_rsh" "$@" "$DSS_VPS_USER@$DSS_VPS_HOST:$_dest"
+fi
+
+args+=("$DSS_VPS_USER@$DSS_VPS_HOST")
 [ $# -gt 0 ] && args+=("$@")
 ssh "${args[@]}"
 exit $?

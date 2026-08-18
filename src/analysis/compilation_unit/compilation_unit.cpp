@@ -608,9 +608,7 @@ void UnitBuilder::setFormatPredefinedMacros(
 
 TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok,
                                std::shared_ptr<GrammarSchema const> schema) {
-    std::error_code ec;
-    auto canonical = std::filesystem::weakly_canonical(path, ec);
-    std::string const key = (ec ? path.lexically_normal() : canonical).string();
+    auto const key = core::PathIdentity::of(path);
 
     // Already loaded (by addFile or a previous include) → reuse, no re-parse.
     if (auto it = pathToTreeIndex_.find(key); it != pathToTreeIndex_.end()) {
@@ -655,10 +653,7 @@ void UnitBuilder::addInMemory(std::string source, std::string label,
     // sources against each other (labels may legitimately repeat) — we only
     // record the mapping for include-following to consult. A repeated label
     // overwrites the map entry (last wins) without skipping the second tree.
-    std::error_code ec;
-    auto canonical = std::filesystem::weakly_canonical(label, ec);
-    std::string const key =
-        (ec ? std::filesystem::path(label).lexically_normal() : canonical).string();
+    auto const key = core::PathIdentity::of(std::filesystem::path{label});
     seenPaths_.insert(key);  // also block a later addFile re-loading this path.
     parseAndAdd_(SourceBuffer::fromString(std::move(source), std::move(label)), std::move(schema));
     pathToTreeIndex_[key] = trees_.size() - 1;
@@ -672,10 +667,7 @@ void UnitBuilder::addFile(std::filesystem::path path) {
     // Dedup by weakly-canonical path (handles `.`/`..`/symlinks without
     // requiring the file to exist). On canonicalization failure fall back
     // to the lexically-normal form so a bad path is still keyed stably.
-    std::error_code ec;
-    auto canonical = std::filesystem::weakly_canonical(path, ec);
-    std::string const key =
-        (ec ? path.lexically_normal() : canonical).string();
+    auto const key = core::PathIdentity::of(path);
     if (!seenPaths_.insert(key).second) {
         reportDriver(driverDiagnostics_, DiagnosticCode::D_DuplicateFile,
                      DiagnosticSeverity::Warning, InvalidBuffer, path.string());

@@ -9,53 +9,169 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-18 — cycle **P7** complete (pe64 POSIX layer + `impliedSurface` + three bidirectional conformance fixes); P6 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** `b52784a6` ✔MEASURED (Cycle P5c),
-this cycle's work committed on top.
+**Last updated:** 2026-08-18 — cycle **P8** complete (ONE path-identity chokepoint; the rebase onto `origin/main` is DONE); P7 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** `41a320ad` ✔MEASURED (Cycle P7, post-rebase), this cycle's work on top and NOT PUSHED.
 
 ---
 
-## 0.00000 ★★★ READ THIS FIRST — THE NEXT ACTION IS A REBASE, AND THREE ANCHORS DO NOT EXIST HERE YET
+## 0.000000 ★★★ READ THIS FIRST — CYCLE P8: PATH IDENTITY IS NOW A TYPE, AND THE REBASE IS DONE
 
-★★★ **OPERATOR RULING 2026-08-18, IN THIS ORDER, NO STEP SKIPPED:** finish the lanes → commit + push
-→ **cut a SECOND backup branch AFTER the commit** → *then* rebase, carefully.
-⚠ **`backup/c23-burndown-3-pre-rebase-2026-08-17` at `b52784a6` PROTECTS ONLY THE THREE PRE-CYCLE
-COMMITS.** It was cut while 118 files were uncommitted, and a branch ref cannot hold a working tree —
-which is exactly why the post-commit branch is a separate, non-optional step rather than a duplicate.
+**✅ THE REBASE IS COMPLETE.** ✔MEASURED: HEAD `41a320ad` (Cycle P7) sits on `origin/main`'s
+`fe031376` (AP6 #53); `backup..HEAD` = **555 files**, exactly AP6's own count, and the ONLY file
+changed that AP6 never touched is `src/asm/asm_template_to_lir.cpp` (a deliberate port of AP6's
+`CfClass::Switch` refusal into our relocated dispatch). Backups: `backup/pre-rebase-p7-8ecb8e8d`,
+`backup/pre-rebase-main-0f47896f`, `backup/c23-burndown-3-pre-rebase-2026-08-17`.
+⛔ **NOT PUSHED — operator instruction, verbatim: *"when it's time to commit, do it, but don't
+push."*** That instruction is still live.
 
-★★★ **AND THE ANCHOR BALANCE IS RED BY OPERATOR DECISION, NOT BY OVERSIGHT.**
-`python tools/check-anchor-balance.py` FAILS at **+31** — ✔RE-MEASURED at the P7 tree: **39 rows
-opened, 8 closed**, OPEN 992 → 1023, via the gate's OWN `grep '^  + '` / `grep '^  - '` output. (P6
-committed at +22; the P7 delta is +9, and every one of those rows is named in §0.000001 or in the
-registry with its trigger and closing work.)
-Operator ruling, verbatim: *"we'll handle ALL anchors once
-rebased."* That is the §B escape the gate's own message names, exercised deliberately — the balance
-is DEFERRED to a post-rebase anchor pass, never waived. ⛔ Do not "fix" it by widening the gate.
-⚠ **INSTRUMENT WARNING, and it has now bitten three times:** an ad-hoc `grep -o 'D-[A-Z0-9-]*'` over
-that output returns **44** "ids" including truncated fragments (`D-MI`, `D-SEMANTIC-ASM-`). **Use the
-gate's own line output; never a hand-rolled regex over it.**
+### ⚖️ THE sqlite MATRIX — CANCELLED MID-FLIGHT BY OPERATOR INSTRUCTION. WHAT IS AND IS NOT MEASURED
 
-⚠⚠ **THREE ANCHORS THE POST-REBASE PASS MUST PICK UP DO NOT EXIST ON THIS BRANCH** — ✔MEASURED, they
-arrive with `origin/main`'s single squashed commit `fe031376` (AP6 #53, 555 files):
-`D-DEPS-DEPENDENCY-CANNOT-DECLINE-A-TARGET` (in `.plans/06-artifact-profile-plan - tbd.md`),
-`D-TEST-CLI-CORPUS-RUNNER-IGNORES-OPTIMIZED-PIPELINES-AND-STDOUT` and
-`D-DIAG-CODES-WITH-NO-COMPILED-TEST-REFERENCE` (both in main's registry). ⇒ **the backlog must be
-re-derived AFTER the rebase, not carried across it.**
-⚠ **REBASE CONFLICT SURFACE, ✔MEASURED:** `tools/check-anchor-registry.sh` (+112 lines upstream, and
-edited this cycle), `tools/check-anchor-balance.py` (+38), `CMakeLists.txt` (+62 upstream, and this
-cycle created `cmake/DssInstall.cmake` + `cmake/DssBuildStamp.cmake`), and
-`src/dss-config/targets/{arm64,x86_64}.target.json` (+2 each — main's new `target.isa`).
-★ **`isa` DOES NOT CLOSE `D-CONFIG-FORMAT-DECLARES-NO-UNIFORM-ARCHITECTURE`** — ✔MEASURED
-`kTargetArchMachineCodes` is UNCHANGED on `origin/main`. `isa` is a language↔target compatibility
-axis, not an arch→machine-code mapping. ⚠ And note the trap it creates: `target.name` is `"arm64"`
-while `target.isa` is `"aarch64"` — **two spellings of one architecture**, and the C++ table keys on
-the NAME.
-⚠ **TWO STALE WORKTREES hold 118 and 124 dirty files at OLD commits** (`dss-wt-bitwise` `75ca4034`,
-`dss-wt-movzw` `730e642a`). Detached, so they do not block a rebase; left in place because deleting
-two trees of uncommitted files is the operator's call. 🧠INFERRED they are stale leftovers — one
-lane found their `object_format_schema.*` edits already merged into HEAD.
+Operator, 2026-08-18: *"ok. let's cancel this, commit + push, we'll re run everything
+once our compile is fast enough"*. ⚠ **The BUILD half is a real result and the RUN
+half is mostly UNMEASURED. Do not read the build numbers as a matrix verdict.**
 
----
+✅ **BUILD — measured, and it is the strongest statement this run supports:**
+**three hosts each built ALL FIVE target legs** (`elf64-x86_64`, `elf64-arm64`,
+`pe64-x86_64`, `macho64-arm64`, `macho64-x86_64`) from the full upstream sqlite
+source set. Windows 5/5 · WSL 5/5 · arm64 VPS 5/5. ★ That is the
+build-ANY-target-on-ANY-host requirement holding on three hosts at once.
+⚠ **macOS never reached step 7** — it was at 6/9 (per-leg tcl/zlib resolution) when
+cancelled, so it built NOTHING this run and its 5/5 is **not** claimed.
+
+✅ **RUN — what actually executed, all of it from the WSL host:**
+- `elf64-x86_64` corpus **GREEN** — 4 errors / **394,693** tests, all 4 known
+  non-DSS confounds (`sessionnoact-4.3`, `walsetlk-2.1.6`, `walsetlk-2.2.14`,
+  `zipfile-25.0`).
+- `elf64-arm64` corpus **GREEN** — 7 errors / **394,697** tests, all known
+  confounds.
+- `pe64-x86_64` CLI smoke **14/14**; its corpus ran under Wine with 4 aborts and
+  4 resumes, and 1 failure excused ONLY because the leg is emulated.
+- arm64 VPS: `elf64-arm64` CLI smoke **14/14**; the other three legs' smokes were
+  CLASSIFIED skips naming the host OS and the absent launcher, never silent.
+
+⛔ **NOT MEASURED, and each is a hole, not a pass:**
+- **No host produced a step-9 VERDICT BLOCK.** WSL's was destroyed by
+  [[D-HARNESS-ABORT-SUMMARY-CRASHES-ON-THE-RUN-THAT-NEEDS-IT]]; the other three
+  were cancelled before reaching it.
+- **The Windows corpus never ran at all** — it was still in step 7b (per-leg CLI
+  builds, ~11 min each) after ~2 hours, having spent ~89 min on the testfixtures.
+- **The native arm64 corpus never ran.** ★★ THE REASON IS WORTH KEEPING: the VPS
+  driver runs legs in catalogue order, so it spent **59+ minutes emulating x86_64
+  under `qemu-x86_64`** — duplicating a leg WSL had already run NATIVELY green —
+  while the one result only that machine can give sat queued behind it. ⚠ On a
+  re-run, drive that host with `DSS_LEGS=elf64-arm64`.
+- **macOS: no build, no run, no CLI smoke** this cycle. Its UNITS are green
+  (898/898) and that is a separate, complete measurement.
+
+### ⛔ TWO RE-RUNS ARE OWED AND ARE **DEFERRED BY OPERATOR INSTRUCTION** — DO NOT RUN THEM
+
+Operator, 2026-08-18, verbatim: *"don't rerun qemu now please. we need to enhance
+compile time before it, we'll do it later"*. ⚠ **This is a deliberate sequencing
+decision, not an oversight, and a future reader must not discharge it as tidy-up.**
+
+The two owed items, stated precisely so nobody re-derives them wrongly:
+1. **arm64 VPS units re-run.** Its 897/898 was measured on a tree synced BEFORE the
+   last three fixes landed; the sole failure was `anchor_registry_guard`, the
+   registry cell-width violation now fixed. ⚠ On POSIX the only product-code
+   delta since that sync (`make_preferred()`) is a NO-OP, so the compiler
+   behaviour it measured is the shipped behaviour — but the trees are not
+   byte-identical and the claim is stated at that strength, not stronger.
+2. **WSL sqlite re-run.** Its run produced every corpus result and then died in
+   step 9/9 (see `D-HARNESS-ABORT-SUMMARY-CRASHES-ON-THE-RUN-THAT-NEEDS-IT`), so
+   there is **no verdict block** for it. The per-leg numbers below were read from
+   the lines that printed before the crash and are sound; the aggregate verdict
+   was never computed.
+
+★ THE BLOCKER TO CLEAR FIRST IS [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]]
+— the reason the operator wants compile time addressed before paying for another
+full matrix is in that row's numbers: ~18 min per leg on the Windows host against
+~2m20s on WSL and ~5 min on a small ARM VPS.
+
+### ★★★ THE FINDING: EVERY PATH-IDENTITY KEY IN THE COMPILER WAS 8.3-BLIND ON OUR OWN TOOLCHAIN
+
+✔**MEASURED** with a standalone probe against `c++.exe (MinGW-W64 x86_64-ucrt-posix-seh) 13.2.0` —
+the compiler `build/dbg` actually uses:
+
+```
+input            : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1
+exists           : yes
+weakly_canonical : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1   ec: <none>
+canonical        : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1   ec: <none>
+```
+
+libstdc++ resolves `.`/`..` and symlinks and has **no concept of an 8.3 alias**, so two spellings of
+ONE directory survived as TWO keys. ★★ **The MSVC STL happens to normalize them, which is why the
+2026-08-17 CI fix looked like it worked: the property was never HELD, only accidentally satisfied by
+one toolchain.** The consequences were live — the preprocessor's `#pragma once` re-entry guard was a
+`vector<fs::path>` searched with `std::find` (a LEXICAL compare), so a header reached through both
+spellings would be preprocessed TWICE into one TU; and the source-dedup keys would admit one file
+twice, producing a duplicate CU and a duplicate-symbol link error naming no manifest.
+
+★★★ **OPERATOR RULING 2026-08-18 — option (A) WITH TWO UPGRADES.** The test that decided it:
+*"the only one whose invariant a check script can hold."* Boundary normalization (option B) was
+rejected on its own analysis — an unbounded ingress set where a miss is silent *"is not an invariant,
+it is a habit"* — and §4 of the ruling **forbids doing both**: a second normalizer is a second owner
+of one fact, and the one that runs first wins silently.
+
+- **Upgrade 1 — PATH IDENTITY IS A TYPE, NOT A FUNCTION RESULT.** `core::PathIdentity`
+  (`src/core/substrate/path_identity.{hpp,cpp}`) has exactly one constructor, `of()`; the 14
+  containers are keyed on it, so a raw `fs::path` **does not compile** as a key. Converting OUT is
+  free; construction IN is the one gate.
+- **Upgrade 2 — THE LINT DEFINES A COMPLEMENT.** `tools/check-path-identity.py`: rule 1 refuses
+  `#include <filesystem>` in `src/` outside a 50-file allowlist (so a NEW file doing path work is a
+  decision on the record); rule 2 is the enumeration underneath. Comment/string-stripped so it fires
+  on CALLS not mentions, with a 4-control `--selftest`.
+
+★★ **THE UPGRADE PAID FOR ITSELF IMMEDIATELY, AND THIS IS THE DURABLE LESSON: the type found FOUR
+sites the originating grep was structurally incapable of seeing, because none of them called
+`weakly_canonical` at all** — `dependency_resolver.cpp`'s artifact `seen` (raw `generic_string()`),
+`shipped_lib_descriptor.cpp`'s `claimedPaths` (a THIRD normalizer), and the `visited` closure sets in
+`import_resolver.cpp` and `preprocessor.cpp` (×2). **13 sites became 14.**
+
+⚠ **ONE SITE WAS DELIBERATELY NOT CONVERTED** — `core/types/config_path_walk.cpp` resolves the
+running executable's symlink to derive a directory to WALK; its result is never compared, never a
+key, never printed as an identity. It carries an explicit, reasoned exemption in the lint.
+
+### ⚠⚠ TWO TRAPS INSIDE THE FIX — BOTH MEASURED, ONE BEFORE AND ONE AFTER
+
+1. ✔**BEFORE the code was written:** `GetLongPathNameW` **fails wholesale when any component is
+   absent** — `DSS-SC~1` expands, `DSS-SC~1\not\yet\built.o` comes back **UNCHANGED**. The obvious
+   one-call composition therefore no-ops on exactly the paths that do not exist yet (every output
+   artifact) while looking correct on every input path that happens to exist. The implementation
+   expands the longest EXISTING prefix and re-attaches the remainder verbatim.
+2. ✔**AFTER, caught by the suite:** unifying the identity key on `generic_string()` was right, but
+   leaving the conversion OUT generic too handed callers a forward-slashed Windows path. Three
+   native-probe tests died with `'""C:' is not recognized as an internal command` — the probe builds
+   a `.bat` path from a canonicalized base plus a natively-joined suffix, and **`cmd.exe` cannot run
+   a forward-slashed path while every Win32 API accepts one happily**. ⇒ `string()` is the identity
+   and stays generic; `path()` returns PREFERRED separators.
+
+### ★ THE TEST THAT WAS RIGHT WHEN I ASSUMED IT WAS MIS-AIMED
+
+`MatchesTheProductsOwnCanonicalizer` scanned `dependency_resolver.cpp`'s body for `weakly_canonical`.
+Routing the product through `PathIdentity` emptied that body, so the pin failed — saying exactly the
+true thing. **Its subject moved; it was not wrong.** It is replaced by
+`FixtureHasNotGrownItsOwnCanonicalizer` (the fixture now CALLS the product, so "the two agree" would
+be x==x — a test that passes both ways). ⚠ Its positive control was mutating `weakly_canonical`, a
+token the fixture no longer contains, so it would have silently asserted NOTHING; re-pointed to the
+token the pin now searches for.
+
+### ★★ TWO HARNESS DEFECTS FIXED IN PASSING, BOTH OF THE SAME SHAPE
+
+- **`mustDifferFromBaseline` was read by ONE of the two example runners.** ✔MEASURED **455 of 609**
+  manifests declare it across **548 arms**; `integrated_tests/runner.cpp` never learned the key, so
+  every one of those assertions was invisible on the CLI-subprocess side. Implemented (parse + allow
+  + **read**) — whitelisting alone would have re-created, inside the fix, the exact defect the closed
+  key set exists to prevent.
+- **The macOS leg could not be staged at all.** ✔MEASURED: `printf 'X' \| tools/ssh-macos.sh cat`
+  returns **nothing** — the Mac's login profile CONSUMES STDIN, so tar-over-ssh arrives truncated.
+  The VPS survived the identical path only because its profile is quiet. Both `.sh` carriages gained
+  a `--rsync` transport that never touches stdin; ✔verified by execution, not by exit code.
+
+⚠ **AND THE MISTAKE I KEPT REPEATING, RECORDED BECAUSE IT COST FOUR ROUND TRIPS:** a `\| tail` after
+a build or a gate replaces the status that matters with `tail`'s. It produced a "green" Windows leg
+over a red ctest, a "successful" build that had failed on a brace error, and two "completed" legs
+that had died on a path. **Take rc DIRECTLY; use `tools/run-gate.sh`, which exists for this.**
 
 ## 0.000001 ★★★ CYCLE P7 — pe64 GETS A POSIX LAYER, AND AN IDENTITY CLAIM BECOMES CHECKABLE
 
@@ -1405,16 +1521,28 @@ clobbers. It is an `if`, **not** a `switch` — the compiler forces nothing. Shi
 
 ## 5. PRIORITIES
 
-0. **`NEXT` — REBASE ONTO `origin/main`, THEN RE-DERIVE THE ANCHOR BACKLOG. Nothing else starts
-   first.** See §0.00000 for the full ruling, the conflict surface and the three anchors that do not
-   exist on this branch yet. The order is fixed by the operator: **commit + push → cut a SECOND
-   backup branch AFTER the commit → rebase → re-run all three legs.** ⚠ A green gate taken BEFORE a
-   rebase says nothing about after, and two of the four known conflicts are the gate tools themselves.
-   Then land the prioritized backlog in **plan-00 §0.1** (asm → ap → production errors → the rest) so
-   the stepper and the operator read one list rather than two that drift.
+0. **`NEXT` — MAKE THE WINDOWS COMPILE FAST, *THEN* RE-RUN THE FULL MATRIX.**
+   [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]]. Operator instruction 2026-08-18,
+   verbatim: *"we'll re run everything once our compile is fast enough"* — so the matrix re-run is
+   BLOCKED ON THIS, deliberately, and is not a separate item anyone should pick up first.
+   ✔THE NUMBERS THAT DECIDED IT, same source set, same release pipeline, same day: Windows host
+   **18m59s / 18m26s / 18m09s / 16m25s / 17m04s** per leg for the testfixture and a further
+   **~11 min per leg** for the CLI — against WSL's **~2m20s** on the SAME machine and a small
+   arm64 VPS's **~5 min**. ⚠ **The 3.6× loss to the VPS is the damning one**, because WSL shares
+   this hardware and the VPS does not.
+   ★ **STEP ONE IS AN EXPERIMENT, NOT AN EDIT** — the row lists four unseparated candidates
+   (Defender over a 9 GB working set · Windows heap/page-fault behaviour under one huge arena ·
+   NTFS vs ext4 on many small reads · a real codegen/IO cost in the MinGW build). Naming one
+   without measuring is the guess the registry exists to prevent.
+   ⚠ **DO NOT MEASURE A SYNTHETIC BENCHMARK.** The number that matters is the one the operator
+   waits for: a full-source `--project` build.
+   Then land the prioritized backlog in **plan-00 §0.1** (asm → ap → production errors → the rest)
+   so the stepper and the operator read one list rather than two that drift.
    ⚠ **RE-DERIVE IT FROM THE REGISTRY, NEVER FROM THE PREVIOUS LIST.** ✔The list handed to the
-   operator this cycle named `D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED` as the top asm priority; it had
-   been **CLOSED earlier in that same cycle**. Recalling a row is not measuring it.
+   operator in an earlier cycle named `D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED` as the top asm
+   priority; it had been **CLOSED earlier in that same cycle**. Recalling a row is not measuring it.
+   ✅ **THE REBASE THIS ITEM USED TO ORDER IS DONE** — HEAD `41a320ad` sits on `origin/main`'s
+   `fe031376`; see §0.000000.
 
 1. **FINISH THE P5 CYCLE.** Wave 2 is unstarted: the typed inline-asm view, the four
    semantic gates re-expressed, HIR/MIR carriage, the MIR→LIR expansion, `asm goto`'s CFG, the
@@ -1505,6 +1633,11 @@ stray build artifacts (`*.preMutant`, `*.orig`) left by tooling.
 
 | Date | Commit | What shipped | Gate |
 |---|---|---|---|
+| 2026-08-18 | *(this cycle, P8)* | **Path identity becomes a TYPE.** `core::PathIdentity` + 14 containers re-keyed + `tools/check-path-identity.py`; the 8.3 blindness of `weakly_canonical` under libstdc++ measured and closed. Plus `mustDifferFromBaseline` on the CLI runner (455 manifests / 548 arms armed) and a `--rsync` transport on both ssh carriages (the Mac's profile eats stdin) | Win **898/898** · WSL **898/898** · arm64 + macOS below |
+| 2026-08-16 | *(P7 predecessor)* | **`module` corpus example** — `project_module_standalone_build`, the first corpus proof that a `module` project builds standalone (B.13.3). Closed on the standalone half only; artifact-content and must-not-exist assertions are inexpressible in the corpus and stay in unit pins | Win **866/866** · ⚠ example not re-run on the 3 non-Windows legs |
+| 2026-08-16 | `f0695b7` | **AP5/AP6 close-out**, 509 files: `tools/check-diagnostic-codes.py` (the ordinal-allocation gate, built after two lanes both took `0xD029`) · `-Werror=switch` tree-wide at one chokepoint (closes G-711) · the ISA-mismatch diagnostic + its unsuppressable row · corpus arming | **All four legs 865/865**: Win · WSL gcc · qemu-aarch64 strict · macOS arm64 |
+| 2026-08-14 | `867fa81` | **AP6 in flight.** Resolver + driver wiring landed (the `D_PlanNotLanded` reject is gone); git acquisition; per-target library channel; wrong-format guard at both binders; 3 latent spawn defects fixed; recursive corpus staging. **Two reds found by the merged-tree baseline and fixed**, one of them a test its authoring lane never compiled | merged-tree build **rc=0, 0 warnings** · ctest **859/861** → both reds fixed · balance **982→982 OK** |
+| 2026-08-12 | `ca2c6721` | DSS Axis + DSS HIR plan rework | — |
 | 2026-08-14 | *(in flight, session 2)* | **Inline-asm P5 wave 2.** Operator rulings taken (§0.1): reuse `ReturnPiece`, ZERO new value-producing opcodes; producer-declared piece source; the `ResultPiece` rename; **`asm goto` WITH outputs BUILDS this cycle**; `%N` is structural. ★ The ruling's own §8 contingency **FIRED** — `ReturnPiece`'s payload carries two facts with one stored (§0.2). ✔MEASURED the four constraint forms vs the core (§0.3): `"=r"` already works, `"+r"` and `"=&r"` are core gaps. ★ Found by reading, not by report: **regalloc cannot see the per-instruction pool at all** — 3 hand-rolled per-opcode-only union sites. Lane V (7 diagnostics) DONE; Lanes 1/G/T killed mid-flight by a context exhaustion and resumed. | ⬜ **not run — UNCOMMITTED**; dirty-tree ctest was **862/863**, sole red `anchor_registry_guard` |
 | 2026-08-14 | *(in flight)* | **Inline-asm P5 — embedded `__asm__` in C.** Scope corrected (the `.temp` plan's "P3+P4" is retired numbering; the work is P5). Reference spec measured on gcc+clang (§2). Carrier + `asm goto` decided (§3). Three blockers refuted (§4). Wave 1: mutation-helper fail-open **fixed** + a vacuous shipped pin caught; LIR carrier and target vocabulary in flight. | ⬜ **not run — UNCOMMITTED** |
 | 2026-08-14 | — | Two in-passing fixes: a **stale red-on-disable recipe** pointing a mutator at `c-subset.lang.json` for a row that lives in `asm.lang.json`, and an unannotated `[[nodiscard]]` discard (live `-Wunused-result`). Plus the arm64 `.cfi_*` asymmetry folded into its owning row. | balance 982→982 |

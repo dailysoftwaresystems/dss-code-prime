@@ -1,5 +1,7 @@
 #include "program/project_sources.hpp"
 
+#include "core/substrate/path_identity.hpp"
+
 #include "core/types/glob_match.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -115,11 +117,11 @@ expandAndDedupProjectSources(std::vector<std::string> const& sources,
     // failure (an unreadable parent), never "not generated yet".
     std::vector<std::string> deduped;
     deduped.reserve(expanded.size());
-    std::unordered_set<std::string> seen;
+    std::unordered_set<core::PathIdentity> seen;
     seen.reserve(expanded.size());
     for (auto& s : expanded) {
         std::error_code kec;
-        auto const canon = fs::weakly_canonical(fs::path{s}, kec);
+        auto const id = core::PathIdentity::of(fs::path{s}, kec);
         if (kec) {
             emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                        "project sources: filesystem error resolving source path '"
@@ -127,7 +129,7 @@ expandAndDedupProjectSources(std::vector<std::string> const& sources,
                          "de-duplicating the source list: " + kec.message());
             return std::nullopt;
         }
-        if (seen.insert(canon.generic_string()).second) {
+        if (seen.insert(id).second) {
             deduped.push_back(std::move(s));
         }
     }

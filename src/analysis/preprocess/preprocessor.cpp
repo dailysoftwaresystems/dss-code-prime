@@ -1,5 +1,7 @@
 #include "analysis/preprocess/preprocessor.hpp"
 
+#include "core/substrate/path_identity.hpp"
+
 #include "analysis/preprocess/pp_if_eval.hpp"
 #include "core/types/header_case_diagnostic.hpp"   // reportHeaderCaseAmbiguity (the ONE fold-collision emit)
 #include "core/types/include_path_resolve.hpp"
@@ -702,7 +704,7 @@ struct SynthBuilder {
     HeaderNameMatching                   headerNameMatching;
     DiagnosticReporter&                  rep;
     int                                  depth;
-    std::vector<fs::path>&               includeStack;
+    std::vector<core::PathIdentity>&     includeStack;
     // Set TRUE when the include-nesting backstop fires (truncating the
     // splice). Shared by reference across the recursive child builders so
     // a deep-nest truncation at any level reaches `preprocess()`.
@@ -1032,7 +1034,7 @@ struct SynthBuilder {
         // exact cost a fail-loud diagnostic exists to remove. This carries the detail
         // out so the P0016 text can name the offending key.
         std::string parentMacrosDetail;
-        std::unordered_set<std::string> visited;   // per-call (a splice is one root)
+        std::unordered_set<core::PathIdentity> visited;  // per-call (a splice is one root)
         ffi::forEachDescriptorInClosure(
             *descPath, systemDirs, headerNameMatching, activeFormat, visited,
             [&](fs::path const& p) {
@@ -1999,9 +2001,7 @@ struct SynthBuilder {
                     // the output. Mirrors the quote arm below.
                     const ByteOffset dirEnd =
                         literalEndPastCloser(*schema, toks, aBody);
-                    std::error_code ec;
-                    fs::path canon = fs::weakly_canonical(angleRes.path, ec);
-                    if (ec) canon = angleRes.path;
+                    auto const canon = core::PathIdentity::of(angleRes.path);
                     // TF-C87: the buffer is loaded BEFORE the stack test now,
                     // because the re-entry decision reads the header's own text.
                     // Order-independent in practice: a header already ON the stack
@@ -2186,9 +2186,7 @@ struct SynthBuilder {
                 copiedUpTo = dirEnd;
                 continue;
             }
-            std::error_code ec;
-            fs::path canon = fs::weakly_canonical(*resolved, ec);
-            if (ec) canon = *resolved;
+            auto const canon = core::PathIdentity::of(*resolved);
             // TF-C87: loaded BEFORE the stack test (the re-entry decision reads
             // the header's own text) — see the angle arm's note.
             auto headerBuf = SourceBuffer::fromFile(*resolved);
@@ -6418,12 +6416,9 @@ PreprocessResult preprocessRun(
         }
     }
 
-    std::vector<fs::path> includeStack;
-    {
-        std::error_code ec;
-        fs::path canon = fs::weakly_canonical(fs::path{mainSource->name()}, ec);
-        includeStack.push_back(ec ? fs::path{mainSource->name()} : canon);
-    }
+    std::vector<core::PathIdentity> includeStack;
+    includeStack.push_back(
+        core::PathIdentity::of(fs::path{mainSource->name()}));
     // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE, Option 2): the `#define NAME
     // VALUE\n` VALUE prefix for the include-gating pre-scan. So a `#if
     // <cmdline/predefined>` VALUE guard (`#if SQLITE_TEST >= 1`,
@@ -6669,7 +6664,7 @@ PreprocessResult preprocessRun(
     //     the `#include`); silent here to avoid a double-report.
     // EMIT-ONLY -- populates a new output field, changes no preprocess behavior.
     {
-        std::unordered_set<std::string> visited;
+        std::unordered_set<core::PathIdentity> visited;
         for (auto const& [parent, off] : resolvedParents) {
             if (byteInDeadRegion(off)) continue;   // authoritatively-dead -> not seeded
             ffi::forEachDescriptorInClosure(
