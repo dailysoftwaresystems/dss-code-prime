@@ -9,8 +9,28 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-19 — cycle **P13 COMPLETE** (the cross-host build matrix, measured by execution + a miscompile found and pinned). P12/P11/P10 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P13); parent `d078b25c` (Cycle P12, PUSHED).
+**Last updated:** 2026-08-19 — cycle **P14 IN FLIGHT, paused by operator at the root cause's threshold** (the pe64 scanstatus2 miscompile: root cause pinned to the merge-path lowering, one instrument from the defect's exact MIR shape). P13/P12/P11 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P14 WIP); the P14 WIP chain `8f1b3963`→`96dcfa3d` is PUSHED.
+
+---
+
+## 0.0000000000000000 ★★★ READ THIS FIRST — CYCLE P14 PAUSED: THE pe64 MISCOMPILE, EVERY EXONERATION MEASURED, ONE INSTRUMENT FROM THE FIX
+
+**Mandate**: FIX `D-HARNESS-PE64-CORPUS-WINE-ABORT-SCANSTATUS2` (best long-term, no workarounds; the pin must be an examples entry running on ALL legs — operator instruction). The registry row carries the COMPLETE evidence chain; this block is the working state.
+
+**Exonerated by measurement (each took instruments, all recorded in the row)**: wine (native Windows crashes identically) · the optimizer (debug/Identity crashes identically) · the Tcl handle registry (string→entry→clientData all valid ON THE CRASHING CALL) · the caller's C source semantics (gcc reference, same 189 TUs + defines, passes 5.1 clean — `reference-testfixture`) · single-TU codegen (both `tss.c` AND the real `test1.c` .obj: all ten call sites load the slot correctly) · callee-side register/lowering (store+reload statically correct, three aligned verifications) · stack imbalance (rsp identical store→reload, measured live).
+
+**THE PINNED DEFECT SHAPE**: the crash is REAL only in the **full-project (merged, N>1 CU) compile**. In the probe build (merged, with fprintf probes) the first scanstatus_v2 argument statically receives a register last written by `mov $0x0,%r12d` — a STALE VALUE on the call-argument path — while a use of the same local BETWEEN the `a||b` merge and the call reloads it correctly (the probe prints it valid). The runtime callee got rcx=0 (r15=0 after its entry move) on the crashing call with the slot valid. Trigger path: the objc==5 (`-flags`) arm — every crashing call passes `-flags`, every passing call is objc==3.
+
+**INSTRUMENTS READY (all on disk)**:
+- `build/perf/p13/` — probe scripts (`probe*.sh`), watchpoint scripts, `tss.c` (the standalone shape reproducer), the MIR-dump diagnostic patch (`mir-dump-diagnostic.patch` — 34 lines, applied+compiled into the WSL gate tree at `~/src/dss-code-prime/build/gate`; ⚠ `emitMir` SEGFAULTS on the 189-TU merged module — the dump-before-optimize needs a per-function emit or a fix to emitMir).
+- **THE LIR DUMP EXISTS**: `~/p14/lir2.txt` on WSL (390 functions ≥800 insts, post-rewrite, via the standing `DSS_DUMP_LIR_MIN_INSTS` hook) — the merged LIR of the probe fixture. **NEXT SESSION'S FIRST MOVE**: locate `test_stmt_scanstatus` in it (the probe build's fprintf call sites are recognizable; calls print as `call _ pN...` without symbols — identify by structure: ~10 calls to one target in one function) and diff the arg1 vreg's def chain between the call sites — the stale def (a `mov $0` / constant) instead of a slot load IS the bug, visible pre-regalloc.
+- `~/sqlite-probe/` (WSL) — the patched sqlite tree + `proj.json`; builds the probe fixture in ~90 s.
+- The operator's two wine crash dumps (r15=0 at entry; the second with the full stack) — recorded in the row.
+
+**UNCOMMITTED on disk**: `examples/c-subset/outparam_shortcircuit_merge/` (cu_a.c + cu_b.c + expected.json) — the two-TU construct pin. ⚠ NOT YET WORKING: `--compile a.c b.c` emitted only `cu_a.exe` (multi-TU artifact naming needs the examples-runner/project path, not bare `--compile`) — next session: make it build through the runner's manifest path, confirm it exercises the merge, THEN verify whether it reds on the current build (if it passes, the merge trigger needs more ingredients — extract them from the LIR dump diff).
+
+**THEN**: fix in shared code (the stale-operand path is MIR→LIR call-arg materialization or the merge's value renumbering), red-on-disable pin, pe64 corpus leg green (`wine testfixture.exe test/scanstatus2.test` is the oracle; crashing fixture at `~/src/dss-code-prime/build/real-examples/c/sqlite/pe64-x86_64/`), 3-leg gate, close the row, remove the diagnostic patch. ⚠ The Windows `build/dbg` was rebuilt WITH the diagnostic (env-gated no-op; safe); `src/program/program.cpp` itself is REVERTED to HEAD.
 
 ---
 
