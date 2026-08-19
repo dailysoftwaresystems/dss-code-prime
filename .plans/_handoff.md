@@ -9,8 +9,8 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-19 — cycles **P14 + P15 + P16 + P17 + P18**. **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P18). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
+**Last updated:** 2026-08-19 — cycles **P14 + P15 + P16 + P17 + P18 + P19**. **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P19). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
 
@@ -44,12 +44,18 @@ commit that lands it, and never delete a ticked row.
       tell a deliberate POSIX-only script from a forgotten twin, so it would need an eleven-entry allowlist —
       the convention written twice, reddening honest work by default. Rule now lives in `dss-cycle/SKILL.md`
       and the `dss-code-prime` skill (conventions authority). Net −1.
-- [ ] **P19 — `D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` (label half).** Trigger FIRED. The operand half and
+- [x] **P19 — OPERATOR RULING: `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` WITHDRAWN + 3 false citations repaired. ✅ DONE 2026-08-19.**
+      Twin parity is a REVIEW obligation, not a detector: *"the parity must be checked in the review, before the
+      commit, when the script is being created or modified. Not after and not a script to it."* An independent
+      audit classified all **50** surviving citations of the two withdrawn rows and found **three that asserted
+      something false** — one claiming the sibling row *stays OPEN*, two instructing a future cycle to build the
+      forbidden guard. All three repaired. Net −1.
+- [ ] **P20 — `D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` (label half).** Trigger FIRED. The operand half and
       the `%%` half are DONE; this is the asm-goto BLOCK-binding design and the last piece of the feature.
       Expect a real design fork — bring it as a §B rather than guessing.
-- [ ] **P20 — `D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM`.** Trigger FIRED. AP5/AP6's `dependsOn` path has
+- [ ] **P21 — `D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM`.** Trigger FIRED. AP5/AP6's `dependsOn` path has
       never been touched by the release optimizer on ANY leg, so a release-only fault in it is invisible today.
-- [ ] **P21 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
+- [ ] **P22 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
       family, and it gates the pe64 sqlite CLI. ✔Measured to shrink to ONE library for the CLI case.
 - [x] **OPERATOR CALL — ✅ FILED 2026-08-19: <https://sqlite.org/bugs/forumpost/97cd29ca44624113c73b30f5d2504729e6ffc5c5ebcba137078ea1a868cd97c9>.**
       The `%p` half only, which is the half that warranted it. ✔The toolchain table is what makes it
@@ -83,6 +89,40 @@ SHIPPED design record, and `D-TEST-MACOS-LEG-EMSDK-PROFILE-REPLACES-PATH-HIDING-
 pre-existing environment fact.
 
 ---
+
+## 0.000000000000000000000 ★★★ CYCLE P19 — THE SECOND PAIRING ANCHOR WITHDRAWN, AND THREE CITATIONS THAT HAD QUIETLY GONE FALSE
+
+**One row closed, net −1. No code changed.**
+
+`D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` was the behavioural half, split out of the existence half in
+2026-07-31. **Operator ruling 2026-08-19:** *"the parity must be checked in the review, before the commit,
+when the script is being created or modified. Not after and not a script to it. After committed it must be
+already working. There is no easy way to script automate this because the scripts can do literally
+anything."*
+
+⭐⭐ **THE ROW'S DIAGNOSIS IS RIGHT AND ITS PRESCRIPTION IS NOT.** Its three instances stand — ✔the
+anchor-registry twins reported **777 vs 781** because each reimplemented the scan; ✔a `.ps1` launcher
+REJECTED an `--out` its `.sh` sibling accepted; ✔the `--rsync` transport exists in the `.sh` carriage and
+*cannot* exist in the `.ps1` one. **The third is the refutation of the second:** a legitimate permanent
+divergence sits in the same measurement as two real defects, so any detector needs a declared-exception
+list to avoid convicting correct work — and the row already conceded that, delegating the design to the
+row withdrawn one cycle earlier. Equivalence of two arbitrary programs is not decidable, and these are
+shells.
+
+**The obligation now lives in `dss-cycle/SKILL.md` step 6 (Review and fold) and the `dss-code-prime` skill.**
+ⓘ **What survives as a DESIGN and beats both a detector and vigilance:** the row's own item (a) — collapse
+the pair to ONE implementation with thin launchers, the shape `corpus-census` and `pragma-profile-census`
+already use. That removes the possibility of drift instead of detecting it.
+
+★★ **AND THE CITATION SWEEP WAS THE REAL FIND.** An independent audit classified all **50** surviving
+citations of the two withdrawn rows (the estimate of ~34 was low — several rows cite them twice): 8 mean
+EXISTENCE, 17 mean BEHAVIOURAL DRIFT, 19 are historical, 6 are the withdrawal narrative itself. **Three
+asserted something FALSE** and were repaired: one cell claimed the sibling row *"STAYS 🔴 OPEN under its
+own name"* (it is closed — a status claim about ANOTHER row that nothing re-checks), and two OPEN rows
+carried live closing-work instructions to build the forbidden guard. ⚠ **No instrument will ever surface
+the other 47**: the anchor guard's RETIRED-ID check matches a status cell opening `RETIRED-ID`, and these
+open `WITHDRAWN`. That is correct — the ids were closed, not renamed — so a reader arriving from any
+citation lands on a row that redirects them to the skills.
 
 ## 0.00000000000000000000 ★★★ CYCLE P18 — AN ANCHOR WITHDRAWN BECAUSE WHAT IT ASKED FOR WOULD HAVE BEEN WRONG
 

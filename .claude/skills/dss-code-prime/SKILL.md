@@ -82,8 +82,18 @@ execution is posix only."*
   `.py` runs on both hosts; a twin would be a second implementation of something never split), or its
   execution is POSIX-ONLY BY NATURE (`wsl-leg` runs inside a WSL distro where PowerShell is not the
   shell; `profile-compile` drives a POSIX toolchain over a carriage).
-- **Where a pair exists, the two must not drift.** A change to one lands in the other in the same
-  commit — pairing by EXISTENCE is not pairing by BEHAVIOUR.
+- **Where a pair exists, the two must not drift — and that is checked IN THE REVIEW, at the moment the
+  script is written or changed.** Operator ruling 2026-08-19: *"the parity must be checked in the
+  review, before the commit, when the script is being created or modified. Not after and not a script
+  to it. After committed it must be already working."*
+  ⚠ **Not automatable, and the reason is not laziness:** a script can do literally anything, so
+  equivalence of two arbitrary programs is not a property a detector can decide. What a gate CAN see is
+  existence and metadata — which is why `scripts_index_guard` refuses a sibling whose `PURPOSE:`
+  contradicts its primary, and stops exactly there.
+  **What the reviewer owes when a `.sh`/`.ps1` pair is touched:** the two scan the same inputs, check
+  the same properties, accept the same flags, and return the same exit codes for the same conditions —
+  and a change to one landed in the other in the SAME commit. Pairing by EXISTENCE is not pairing by
+  BEHAVIOUR.
 
 ⚠ **Deliberately not gated, and the reason is measured:** ✔11 of 21 script directories carry no `.ps1`
 and every one is correct. A guard cannot tell a deliberate POSIX-only script from a forgotten twin, so
