@@ -19,6 +19,7 @@
 #include "opt/passes/simplify_cfg.hpp"
 
 #include <format>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -192,6 +193,262 @@ stripInlineDefinitions(Mir& mir, std::span<ExternImport const> externImports) {
     return dropped;
 }
 
+// ── The schedule interpreter (P10 operator ruling, 2026-08-18) ────────
+//
+// The engine became the INTERPRETER of the normalized schedule tree:
+// depth-first, left-to-right over the tree, fixpoint iteration outer /
+// body inner. Every loaded or flat()-built schedule has a single
+// top-level Fixpoint root, so for those the walk is EXACTLY the
+// pre-tree (iteration × passes) loop nest — same invocation order, same
+// call-global counters, same `iter=` trace bytes (behavior-preserving
+// by construction; pinned by the byte/counter identity battery).
+//
+// The pinned interpreter contract, item by item:
+//   1. invocation order: depth-first, left-to-right; fixpoint
+//      iteration outer, body inner.
+//   2. `mutated` is a boolean PER INVOCATION accumulated into the ONE
+//      call-global OptResult (passesMutated + passMutationCount[p] —
+//      sum(passMutationCount) == passesMutated, always).
+//   3. early stop: per WHOLE traversal, checked AFTER the traversal
+//      completes (a converged traversal still runs every pass AND
+//      every per-pass verify). The delta scope for any fixpoint node
+//      is a per-traversal snapshot of the call-global counter — an
+//      inner fixpoint cannot see outer mutations (they all happened
+//      before this node's traversal began); the root's snapshot IS the
+//      pre-tree `mutatedAtIterStart`. `repeat` NEVER early-exits.
+//   4. max:1 keeps the convergence check ACTIVE (a fixpoint whose one
+//      traversal is mutation-free HAS converged); max:0 clamps to ONE
+//      traversal, never zero.
+//   5. fixedPointReached = every EXECUTED fixpoint node converged
+//      before its cap (AND over all of them; the root included).
+//   6. verifyEveryPass: after EVERY pass-leaf invocation, under
+//      PhaseTimers::Scope{CompilePhase::Verify}, exactly as before —
+//      the --time Optimize/Verify split survives inside the
+//      interpreter.
+//   7. trace: `iter=` is the INNERMOST enclosing fixpoint's iteration
+//      index, starting at 0 per optimize() call. Single-fixpoint
+//      schedules (every desugared flat doc + the two shipped docs)
+//      emit byte-identical lines; deeper schedules add
+//      ` path=<index-path>` ONLY when more than one fixpoint is open,
+//      so depth-1 logs are unchanged.
+//   8. a failure latches `stopped` and unwinds WITHOUT the epilogues —
+//      the pre-tree `return result` out of the pass loop, verbatim.
+struct ScheduleInterpreter {
+    Mir& mir;
+    TargetSchema const& target;
+    TypeInterner const& interner;
+    OptPipeline const& pipeline;
+    DiagnosticReporter& reporter;
+    OptResult& result;
+    std::size_t const entryErrorCount;
+    bool const optTrace;
+
+    // Failure latch — once a pass or a verify fails, unwind without
+    // running anything further (the pre-tree early `return result`).
+    bool stopped = false;
+
+    // Contract rule 5 accumulators, folded into result.fixedPointReached
+    // ONLY on the normal exit path (a failure return keeps the
+    // pessimistic `false` default).
+    std::size_t completedFixpoints = 0;
+    bool allFixpointsConverged = true;
+
+    // Trace state. `iter` is the innermost enclosing FIXPOINT's
+    // iteration index (a `repeat` contributes no counter — its leaves
+    // keep the enclosing fixpoint's). `nodePath` is the leaf's
+    // index-path from the root ("0.2" = root's child 0's child 2),
+    // printed only when more than one fixpoint is open.
+    unsigned iter = 0;
+    std::size_t fixpointDepth = 0;
+    std::string nodePath;
+
+    void run(OptPipelineNode const& n, std::string path) {
+        if (stopped) return;
+        nodePath = std::move(path);
+        switch (n.kind) {
+        case OptPipelineNode::Kind::Leaf:
+            runLeaf(n.passId);
+            return;
+        case OptPipelineNode::Kind::Repeat:
+            // Bounded unroll, NO convergence check — ever (rule 3).
+            // Repeat never clamps: count 0 unrolls zero times; the
+            // engine's zero-invocation entry guard refuses such a
+            // tree before the walk begins.
+            for (std::uint32_t k = 0; k < n.count && !stopped; ++k) {
+                runChildren(n);
+            }
+            return;
+        case OptPipelineNode::Kind::Fixpoint:
+            runFixpoint(n);
+            return;
+        }
+    }
+
+    void runChildren(OptPipelineNode const& n) {
+        for (std::size_t i = 0; i < n.children.size() && !stopped; ++i) {
+            std::string childPath = nodePath.empty()
+                ? std::to_string(i)
+                : nodePath + "." + std::to_string(i);
+            run(n.children[i], std::move(childPath));
+        }
+    }
+
+    void runFixpoint(OptPipelineNode const& n) {
+        // Today's maxIterations==0 defense, verbatim: clamp to ONE
+        // traversal, never zero (rule 4).
+        std::uint32_t const cap = n.count == 0 ? std::uint32_t{1} : n.count;
+        unsigned const savedIter = iter;
+        ++fixpointDepth;
+        bool converged = false;
+        for (std::uint32_t i = 0; i < cap; ++i) {
+            iter = i;  // the innermost enclosing fixpoint's counter
+            // The delta scope for THIS node (rule 3): a snapshot of the
+            // call-global counter at traversal start. Mutations by any
+            // outer sibling before this node entered are already in the
+            // snapshot; nothing outside this node runs during its
+            // traversal, so the delta is exactly this node's own.
+            std::size_t const mutatedAtTraversalStart = result.passesMutated;
+            runChildren(n);
+            if (stopped) break;
+            // Fixed-point check: a full traversal with zero new
+            // passes-mutated means no remaining transformation inside
+            // this scope enables another.
+            if (result.passesMutated == mutatedAtTraversalStart) {
+                converged = true;
+                break;
+            }
+        }
+        if (!stopped) {
+            ++completedFixpoints;
+            allFixpointsConverged = allFixpointsConverged && converged;
+        }
+        --fixpointDepth;
+        iter = savedIter;
+    }
+
+    void runLeaf(PassId p) {
+        std::chrono::steady_clock::time_point t0;
+        if (optTrace) {
+            // Env-gated per-pass trace (DSS_OPT_TRACE=1). Flushed
+            // start/done lines so a KILLED run still shows the pass it
+            // hung in — the direct diagnostic for a non-converging
+            // fixpoint or a pathological/looping pass on a huge
+            // function. Depth-1 lines are BYTE-IDENTICAL to the
+            // pre-tree engine's; deeper ones add ` path=` only.
+            auto const nm = optPassIdName(p);
+            if (fixpointDepth > 1) {
+                std::fprintf(stderr, "opt: iter=%u path=%.*s pass=%.*s start\n",
+                             iter,
+                             static_cast<int>(nodePath.size()),
+                             nodePath.data(),
+                             static_cast<int>(nm.size()), nm.data());
+            } else {
+                std::fprintf(stderr, "opt: iter=%u pass=%.*s start\n",
+                             iter,
+                             static_cast<int>(nm.size()), nm.data());
+            }
+            std::fflush(stderr);
+            t0 = std::chrono::steady_clock::now();
+        }
+        auto const passResult =
+            runPass(p, mir, target, interner, pipeline, reporter);
+        if (optTrace) {
+            auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            auto const nm = optPassIdName(p);
+            if (fixpointDepth > 1) {
+                std::fprintf(stderr,
+                             "opt: iter=%u path=%.*s pass=%.*s done %lldms "
+                             "mutated=%d\n",
+                             iter,
+                             static_cast<int>(nodePath.size()),
+                             nodePath.data(),
+                             static_cast<int>(nm.size()), nm.data(),
+                             static_cast<long long>(ms),
+                             passResult.mutated ? 1 : 0);
+            } else {
+                std::fprintf(stderr,
+                             "opt: iter=%u pass=%.*s done %lldms mutated=%d\n",
+                             iter,
+                             static_cast<int>(nm.size()), nm.data(),
+                             static_cast<long long>(ms),
+                             passResult.mutated ? 1 : 0);
+            }
+            std::fflush(stderr);
+        }
+        ++result.passesRun;
+        if (!passResult.ok) {
+            if (reporter.errorCount() <= entryErrorCount) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::X_OptReturnFalseWithoutDiagnostic;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = "opt::optimize: pass returned ok=false WITHOUT "
+                             "emitting a diagnostic — substrate contract "
+                             "violation (D-OPT1-RETURN-FALSE-DIAGNOSTIC-"
+                             "CONTRACT).";
+                reporter.report(std::move(d));
+            }
+            stopped = true;
+            return;
+        }
+        if (passResult.mutated) {
+            ++result.passesMutated;
+            // Per-pass effectiveness signal (D-OPT-PASS-METRICS):
+            // record each invocation where this PassId mutated.
+            // Consumed by effectiveness tests asserting that a
+            // pass fired enough times to prove the
+            // mutually-enabling cluster converged (e.g.
+            // `passMutationCount[ConstFold] >= 2` proves the
+            // re-fold post-Mem2Reg happened).
+            //
+            // The `kPassIdCount` static_assert at the enum
+            // declaration site keeps this index in range; an
+            // out-of-range `p` getting past `runPass` would also
+            // have already routed through the `X_UnknownPassId`
+            // fail-loud arm + early-returned. Reaching here with
+            // an OOR ordinal is a substrate-contract violation —
+            // fail loud rather than silently drop the count.
+            auto const idx = static_cast<std::size_t>(p);
+            if (idx >= kPassIdCount) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::X_UnknownPassId;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "opt::optimize: PassId ordinal {} bypassed the "
+                    "runPass enum-drift guard AND reached the "
+                    "passMutationCount increment with mutated=true "
+                    "— substrate-shape violation "
+                    "(D-OPT1-PASS-ID-STABILITY).",
+                    static_cast<int>(p));
+                reporter.report(std::move(d));
+                stopped = true;
+                return;
+            }
+            ++result.passMutationCount[idx];
+        }
+
+        // D-OPT1-VERIFY-AFTER-EVERY-PASS / D-OPT1-VERIFY-FREQUENCY-CONFIG —
+        // verify after EVERY pass only under the DEVELOPER posture
+        // (`verifyEveryPass`, the safe default: LLVM `-verify-each` / GCC
+        // `--enable-checking=yes` — pinpoints the pass that produced invalid
+        // MIR). The RELEASE posture (verifyEveryPass=false) verifies ONCE
+        // after the whole pipeline (below), trusting tested passes — the
+        // LLVM/GCC production split. Per-pass verify over a large module is
+        // ~passes × iterations full-module verifies (minutes on SQLite).
+        // (Sub-scoped as `Verify` so --time separates verify's share from
+        // the passes + per-pass rebuild inside the Optimize phase.)
+        if (pipeline.verifyEveryPass) {
+            substrate::PhaseTimers::Scope verifyScope{
+                substrate::CompilePhase::Verify};
+            MirVerifier verifier{mir, &interner};
+            if (!verifier.verify(reporter)) {
+                stopped = true;
+                return;
+            }
+        }
+    }
+};
+
 } // namespace
 
 OptResult optimize(Mir& mir,
@@ -207,158 +464,54 @@ OptResult optimize(Mir& mir,
 
     OptResult result{};
 
-    // Symmetric defense: the JSON loader rejects empty `passes` at
-    // load time, but a caller constructing OptPipeline{} directly in
-    // code (test fixtures, future programmatic builders, the
-    // CompileConfig→pipeline mapping when it lands) could bypass that
-    // check and silently produce an "optimizer ran nothing" result
-    // observationally indistinguishable from a successful run. Reject
-    // at the engine entrypoint too — use [Identity] for explicit no-op.
-    if (pipeline.passes.empty()) {
+    // Symmetric defense, generalized with the schedule tree: the JSON
+    // loader rejects empty `passes` at load time, but a caller
+    // constructing OptPipeline{} directly in code (test fixtures,
+    // future programmatic builders, the CompileConfig→pipeline mapping
+    // when it lands) could bypass that check and silently produce an
+    // "optimizer ran nothing" result observationally indistinguishable
+    // from a successful run. The tree generalization of "empty
+    // pipeline" is "computes ZERO invocations" — an empty body, a
+    // zero-unroll repeat, any shape that runs nothing. Reject at the
+    // engine entrypoint too (the shared static cost function is the
+    // ONE definition of what a schedule runs) — use [Identity] for an
+    // explicit no-op.
+    if (optPipelineCost(pipeline.schedule) == 0) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::X_PipelineMalformed;
         d.severity = DiagnosticSeverity::Error;
-        d.actual   = "opt::optimize: pipeline has zero passes — substrate "
-                     "contract violation. Use [Identity] for an explicit "
-                     "no-op pipeline.";
+        d.actual   = "opt::optimize: pipeline schedule computes zero pass "
+                     "invocations — substrate contract violation. Use "
+                     "[Identity] for an explicit no-op pipeline.";
         reporter.report(std::move(d));
         return result;
     }
 
-    // Pipeline-level fixed-point loop (D-OPT-FIXED-POINT-LOOP +
-    // D-OPT1-PASS-RUN-MAX-ITER). The whole `passes` sequence reruns
-    // up to `maxIterations` times, or stops early when a full
-    // iteration produces zero `passesMutated` (the fixed-point
-    // signal). Each pass remains internally idempotent; only the
-    // MUTUALLY-ENABLING cluster (ConstFold ↔ SimplifyCfg ↔ Dce)
-    // needs the outer loop. `maxIterations = 1` (the default)
-    // preserves single-pass semantics for every pipeline that
-    // doesn't opt in.
-    // Defense — loader rejects 0; clamp here too so a programmatic
-    // OptPipeline construction (test fixture, future builder API)
-    // bypassing the loader still gets at-least-one iteration.
-    std::uint8_t const maxIter = pipeline.maxIterations == 0
-        ? std::uint8_t{1}
-        : pipeline.maxIterations;
-    // Pessimistic default: stays `false` if we exit the loop without
-    // observing a mutation-free iteration. Set `true` on the first
-    // converged iteration.
-    result.fixedPointReached = false;
-    // Env-gated per-pass trace (DSS_OPT_TRACE=1). Flushed start/done lines so a
-    // KILLED run still shows the pass it hung in — the direct diagnostic for a
-    // non-converging fixpoint or a pathological/looping pass on a huge function.
-    bool const optTrace = std::getenv("DSS_OPT_TRACE") != nullptr;
-    for (std::uint8_t iter = 0; iter < maxIter; ++iter) {
-        std::size_t const mutatedAtIterStart = result.passesMutated;
-        for (PassId p : pipeline.passes) {
-            std::chrono::steady_clock::time_point t0;
-            if (optTrace) {
-                auto const nm = optPassIdName(p);
-                std::fprintf(stderr, "opt: iter=%u pass=%.*s start\n",
-                             static_cast<unsigned>(iter),
-                             static_cast<int>(nm.size()), nm.data());
-                std::fflush(stderr);
-                t0 = std::chrono::steady_clock::now();
-            }
-            auto const passResult =
-                runPass(p, mir, target, interner, pipeline, reporter);
-            if (optTrace) {
-                auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - t0).count();
-                auto const nm = optPassIdName(p);
-                std::fprintf(stderr,
-                             "opt: iter=%u pass=%.*s done %lldms mutated=%d\n",
-                             static_cast<unsigned>(iter),
-                             static_cast<int>(nm.size()), nm.data(),
-                             static_cast<long long>(ms),
-                             passResult.mutated ? 1 : 0);
-                std::fflush(stderr);
-            }
-            ++result.passesRun;
-            if (!passResult.ok) {
-                if (reporter.errorCount() <= entryErrorCount) {
-                    ParseDiagnostic d;
-                    d.code     = DiagnosticCode::X_OptReturnFalseWithoutDiagnostic;
-                    d.severity = DiagnosticSeverity::Error;
-                    d.actual   = "opt::optimize: pass returned ok=false WITHOUT "
-                                 "emitting a diagnostic — substrate contract "
-                                 "violation (D-OPT1-RETURN-FALSE-DIAGNOSTIC-"
-                                 "CONTRACT).";
-                    reporter.report(std::move(d));
-                }
-                return result;
-            }
-            if (passResult.mutated) {
-                ++result.passesMutated;
-                // Per-pass effectiveness signal (D-OPT-PASS-METRICS):
-                // record each iteration where this PassId mutated.
-                // Consumed by effectiveness tests asserting that a
-                // pass fired enough times to prove the
-                // mutually-enabling cluster converged (e.g.
-                // `passMutationCount[ConstFold] >= 2` proves the
-                // re-fold post-Mem2Reg happened).
-                //
-                // The `kPassIdCount` static_assert at the enum
-                // declaration site keeps this index in range; an
-                // out-of-range `p` getting past `runPass` would also
-                // have already routed through the `X_UnknownPassId`
-                // fail-loud arm + early-returned. Reaching here with
-                // an OOR ordinal is a substrate-contract violation —
-                // fail loud rather than silently drop the count.
-                auto const idx = static_cast<std::size_t>(p);
-                if (idx >= kPassIdCount) {
-                    ParseDiagnostic d;
-                    d.code     = DiagnosticCode::X_UnknownPassId;
-                    d.severity = DiagnosticSeverity::Error;
-                    d.actual   = std::format(
-                        "opt::optimize: PassId ordinal {} bypassed the "
-                        "runPass enum-drift guard AND reached the "
-                        "passMutationCount increment with mutated=true "
-                        "— substrate-shape violation "
-                        "(D-OPT1-PASS-ID-STABILITY).",
-                        static_cast<int>(p));
-                    reporter.report(std::move(d));
-                    return result;
-                }
-                ++result.passMutationCount[idx];
-            }
-
-            // D-OPT1-VERIFY-AFTER-EVERY-PASS / D-OPT1-VERIFY-FREQUENCY-CONFIG —
-            // verify after EVERY pass only under the DEVELOPER posture
-            // (`verifyEveryPass`, the safe default: LLVM `-verify-each` / GCC
-            // `--enable-checking=yes` — pinpoints the pass that produced invalid
-            // MIR). The RELEASE posture (verifyEveryPass=false) verifies ONCE
-            // after the whole pipeline (below), trusting tested passes — the
-            // LLVM/GCC production split. Per-pass verify over a large module is
-            // ~passes × iterations full-module verifies (minutes on SQLite).
-            // (Sub-scoped as `Verify` so --time separates verify's share from
-            // the passes + per-pass rebuild inside the Optimize phase.)
-            if (pipeline.verifyEveryPass) {
-                substrate::PhaseTimers::Scope verifyScope{
-                    substrate::CompilePhase::Verify};
-                MirVerifier verifier{mir, &interner};
-                if (!verifier.verify(reporter)) {
-                    return result;
-                }
-            }
-        }
-        // Fixed-point check: a full iteration with zero passes-mutated
-        // means no remaining transformation enables another.
-        if (result.passesMutated == mutatedAtIterStart) {
-            result.fixedPointReached = true;
-            break;
-        }
+    ScheduleInterpreter interp{mir, target, interner, pipeline, reporter,
+                               result, entryErrorCount,
+                               std::getenv("DSS_OPT_TRACE") != nullptr};
+    interp.run(pipeline.schedule, std::string{});
+    if (interp.stopped) {
+        // A failed pass / failed verify unwinds WITHOUT the epilogues —
+        // the pre-tree `return result` out of the pass loop, verbatim
+        // (fixedPointReached keeps its pessimistic `false` default).
+        return result;
     }
+    // Rule 5: converged iff EVERY executed fixpoint node converged
+    // before its cap. Single-root schedules (every loaded/flat doc)
+    // reduce this to the pre-tree rule exactly.
+    result.fixedPointReached =
+        interp.completedFixpoints > 0 && interp.allFixpointsConverged;
 
     // ★★★ THE INLINE-DEFINITION STRIP, unconditional and ahead of the final
     // verify (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED). Placed
-    // HERE, after the fixed-point loop, for two reasons that pull the same way:
-    // the inliner must have had every iteration to consume these bodies before
-    // they go, and the module that reaches codegen must be the module the final
-    // verify approved. `result.ok` is untouched — the strip cannot fail (it
-    // aborts loud on the one impossible input, a dropped module-init function),
-    // and reporting it as a pass would put a mandatory normalize into a
-    // configurable surface, which is exactly what it must not be.
+    // HERE, after the whole schedule tree, for two reasons that pull the same
+    // way: the inliner must have had every traversal to consume these bodies
+    // before they go, and the module that reaches codegen must be the module
+    // the final verify approved. `result.ok` is untouched — the strip cannot
+    // fail (it aborts loud on the one impossible input, a dropped module-init
+    // function), and reporting it as a pass would put a mandatory normalize
+    // into a configurable surface, which is exactly what it must not be.
     (void)stripInlineDefinitions(mir, externImports);
 
     // RELEASE posture (D-OPT1-VERIFY-FREQUENCY-CONFIG): a pipeline that did NOT
@@ -372,7 +525,8 @@ OptResult optimize(Mir& mir,
         // feed only the verifier — nothing reads them between passes). Re-stamp
         // every block ONCE from the FINAL CFG here, so the final verify (and
         // anything downstream) sees canonical markers. This one call replaces
-        // up to passes × iterations whole-module derivations (~2min on SQLite).
+        // up to the whole tree's unrolled per-pass derivations (~2min on
+        // SQLite).
         rederiveStructCfMarkers(mir);
         substrate::PhaseTimers::Scope verifyScope{substrate::CompilePhase::Verify};
         MirVerifier verifier{mir, &interner};

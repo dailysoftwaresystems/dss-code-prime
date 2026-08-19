@@ -11,6 +11,8 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -21,13 +23,30 @@
 // shipped config (`TargetSchema::loadFromText` / `GrammarSchema` / ...):
 // parse → version → required → optional → enum-resolve → validate → return.
 //
-// Schema (D-OPT1-PIPELINE-FROM-CONFIG):
+// Schema (D-OPT1-PIPELINE-FROM-CONFIG; schedule grammar = P10 operator
+// ruling, 2026-08-18):
 //   { "dssPipelineVersion": 1,
-//     "pipeline": { "name": "<str>", "passes": ["<PassId-name>", ...] } }
+//     "pipeline": {
+//       "name": "<str>",
+//       "passes": [ <element>, ... ]        — element =
+//           "<PassId-name>"                                 (leaf)
+//         | {"repeat":   {"count": N, "passes": [element,...]}}
+//         | {"fixpoint": {"max":  N, "passes": [element,...]}}
+//       "maxIterations": <1..32>,           — FLAT spelling only; refused
+//                                              beside structural nodes
+//       "inlineThreshold": <1..100000>, "verifyEveryPass": <bool> } }
 //
-// Unknown sub-keys under `pipeline` are rejected (D-CONFIG-LOADER-
-// UNKNOWN-KEYS-FAIL-LOUD). Unknown top-level keys are also rejected so
-// a typo in `dssPipelineVersion` doesn't silently load with the default.
+// FLAT documents stay valid (all-string `passes` + optional top-level
+// `maxIterations` desugar to one top-level fixpoint). Every document
+// NORMALIZES to a root Fixpoint (see parsePipelineDoc). Load-time
+// budgets, fail-loud: count/max ∈ [1,32]; nesting depth (combinator
+// levels, root counts as 1) ≤ 8; total worst-case unrolled invocations
+// ≤ 4096; empty bodies rejected before cost evaluation.
+//
+// Unknown sub-keys under `pipeline` (and under any node object) are
+// rejected (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD). Unknown top-level
+// keys are also rejected so a typo in `dssPipelineVersion` doesn't
+// silently load with the default.
 
 namespace dss::opt {
 
@@ -104,46 +123,175 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     }
     std::string const name = pipe.at("name").get<std::string>();
 
-    // `pipeline.passes` — array of pass-name strings.
+    // `pipeline.passes` — the SCHEDULE TREE's top sequence (P10
+    // operator ruling, 2026-08-18). An element is either a pass-name
+    // string (leaf, resolved against kPassNameTable) or a node object
+    // — exactly one of:
+    //   {"repeat":   {"count": N, "passes": [...]}}   bounded unroll
+    //   {"fixpoint": {"max":  N, "passes": [...]}}    rerun to
+    //                                                  convergence
+    // NO seq node (the array is the sequence), NO conditionals, NO
+    // per-step pass params, NO parallel node — unknown kinds/keys fail
+    // loud here.
     if (!pipe.contains("passes") || !pipe.at("passes").is_array()) {
         emitMalformed(coll, std::string{sourceLabel} + "/pipeline",
                       "missing or non-array 'passes'");
         return std::unexpected(std::move(coll).release());
     }
-    std::vector<PassId> passes;
-    passes.reserve(pipe.at("passes").size());
-    std::size_t idx = 0;
-    for (auto const& el : pipe.at("passes")) {
-        if (!el.is_string()) {
-            emitMalformed(coll,
-                          std::format("{}/pipeline/passes[{}]", sourceLabel, idx),
-                          "pass entry must be a string");
-            ++idx;
-            continue;
+
+    // Parse one `passes` element. `combDepth` = the number of
+    // combinator (repeat/fixpoint) nodes ENCLOSING this element's
+    // position, counting the normalized top-level Fixpoint root as 1 —
+    // a structural element therefore SITS at depth combDepth + 1, and
+    // the load-time depth budget (≤ kMaxPipelineDepth) is enforced
+    // here, at the node, before any recursion into its body.
+    std::function<std::optional<OptPipelineNode>(json const&, std::string,
+                                                 unsigned)>
+    parseElement = [&](json const& el, std::string path,
+                       unsigned combDepth) -> std::optional<OptPipelineNode> {
+        if (el.is_string()) {
+            auto const resolved = optPassIdFromName(el.get<std::string>());
+            if (!resolved.has_value()) {
+                coll.emit(DiagnosticCode::X_UnknownPassName, std::move(path),
+                          std::format("unknown PassId name '{}' "
+                                      "(not in optPassIdFromName)",
+                                      el.get<std::string>()));
+                return std::nullopt;
+            }
+            return OptPipelineNode::leaf(*resolved);
         }
-        std::string const s = el.get<std::string>();
-        auto const resolved = optPassIdFromName(s);
-        if (!resolved.has_value()) {
-            coll.emit(DiagnosticCode::X_UnknownPassName,
-                      std::format("{}/pipeline/passes[{}]", sourceLabel, idx),
-                      std::format("unknown PassId name '{}' "
-                                  "(not in optPassIdFromName)", s));
-            ++idx;
-            continue;
+        if (!el.is_object()) {
+            emitMalformed(coll, std::move(path),
+                          "pass entry must be a string pass name or a "
+                          "pipeline node object");
+            return std::nullopt;
         }
-        passes.push_back(*resolved);
-        ++idx;
+        bool const hasRepeat   = el.contains("repeat");
+        bool const hasFixpoint = el.contains("fixpoint");
+        if (hasRepeat == hasFixpoint) {
+            emitMalformed(coll, std::move(path),
+                          hasRepeat
+                              ? "a node object must declare exactly ONE of "
+                                "'repeat' / 'fixpoint', not both"
+                              : "unknown pipeline node kind — a node object "
+                                "must declare exactly one of 'repeat' / "
+                                "'fixpoint' (no seq/conditional/parallel "
+                                "node exists)");
+            return std::nullopt;
+        }
+        char const* const nodeKind = hasRepeat ? "repeat" : "fixpoint";
+        rejectUnknownKeys(coll, el, path, {nodeKind});
+        json const& inner = el.at(nodeKind);
+        if (!inner.is_object()) {
+            emitMalformed(coll, path + "/" + nodeKind,
+                          std::format("'{}' value must be an object", nodeKind));
+            return std::nullopt;
+        }
+        rejectUnknownKeys(coll, inner, path + "/" + nodeKind,
+                          {std::string_view{hasRepeat ? "count" : "max"},
+                           std::string_view{"passes"}});
+
+        // Depth budget (fail-loud at load). The node itself sits at
+        // combDepth + 1; anything past kMaxPipelineIterations-deep
+        // nesting is a pathological schedule, not a pipeline.
+        unsigned const nodeDepth = combDepth + 1;
+        if (nodeDepth > kMaxPipelineDepth) {
+            emitMalformed(coll, std::move(path),
+                          std::format("nesting depth {} exceeds the budget of "
+                                      "{} combinator levels (the normalized "
+                                      "top-level fixpoint counts as 1)",
+                                      nodeDepth,
+                                      static_cast<int>(kMaxPipelineDepth)));
+            return std::nullopt;
+        }
+
+        // count / max — same bounds discipline as the flat document's
+        // top-level maxIterations: [1, kMaxPipelineIterations]. 0 is a
+        // silent no-op trap; > 32 signals non-convergence or
+        // pathological input.
+        std::uint32_t bound = 0;
+        char const* const boundKey = hasRepeat ? "count" : "max";
+        if (!inner.contains(boundKey)
+         || !inner.at(boundKey).is_number_integer()) {
+            emitMalformed(coll, path + "/" + nodeKind,
+                          std::format("missing or non-integer '{}'", boundKey));
+        } else {
+            auto const v = inner.at(boundKey).get<std::int64_t>();
+            if (v < 1 || v > kMaxPipelineIterations) {
+                emitMalformed(coll, path + "/" + nodeKind + "/" + boundKey,
+                              std::format("must be in [1, {}] (got {})",
+                                          static_cast<int>(
+                                              kMaxPipelineIterations),
+                                          v));
+            } else {
+                bound = static_cast<std::uint32_t>(v);
+            }
+        }
+
+        // Body — rejected EMPTY before any cost evaluation (existing
+        // empty-pipeline discipline: an empty body would run nothing
+        // and read as "an optimizer ran").
+        if (!inner.contains("passes") || !inner.at("passes").is_array()) {
+            emitMalformed(coll, path + "/" + nodeKind,
+                          "missing or non-array 'passes' body");
+            return std::nullopt;
+        }
+        std::vector<OptPipelineNode> body;
+        bool bodyOk = true;
+        std::size_t cIdx = 0;
+        for (auto const& child : inner.at("passes")) {
+            auto parsed = parseElement(
+                child, std::format("{}/{}/passes[{}]", path, nodeKind, cIdx),
+                nodeDepth);
+            if (parsed.has_value()) {
+                body.push_back(std::move(*parsed));
+            } else {
+                bodyOk = false;
+            }
+            ++cIdx;
+        }
+        if (!bodyOk) return std::nullopt;
+        if (body.empty()) {
+            emitMalformed(coll, path + "/" + nodeKind + "/passes",
+                          "'passes' body must contain at least one entry; "
+                          "use [\"Identity\"] for an explicit no-op");
+            return std::nullopt;
+        }
+        return hasRepeat ? OptPipelineNode::repeat(bound, std::move(body))
+                         : OptPipelineNode::fixpoint(bound, std::move(body));
+    };
+
+    std::vector<OptPipelineNode> elements;
+    bool anyStructural = false;
+    {
+        std::size_t idx = 0;
+        bool ok = true;
+        for (auto const& el : pipe.at("passes")) {
+            auto parsed = parseElement(
+                el, std::format("{}/pipeline/passes[{}]", sourceLabel, idx), 1);
+            if (parsed.has_value()) {
+                anyStructural = anyStructural
+                             || parsed->kind != OptPipelineNode::Kind::Leaf;
+                elements.push_back(std::move(*parsed));
+            } else {
+                ok = false;
+            }
+            ++idx;
+        }
+        if (!ok) return std::unexpected(std::move(coll).release());
     }
 
-    // Pipeline-level fixed-point loop (D-OPT-FIXED-POINT-LOOP +
-    // D-OPT1-PASS-RUN-MAX-ITER). Optional. Default = 1 (single
-    // iteration — historical behavior). Rejected outside
+    // Whole-pipeline fixed-point loop (D-OPT-FIXED-POINT-LOOP +
+    // D-OPT1-PASS-RUN-MAX-ITER), the FLAT spelling. Optional. Default
+    // = 1 (single iteration — historical behavior). Rejected outside
     // [1, kMaxPipelineIterations]: 0 is a silent-no-op trap, and
     // values > 32 indicate non-convergence or pathological input
     // (every realistic mutually-enabling cluster converges in
     // < log(blockCount) iterations).
     std::uint8_t maxIterations = 1;
+    bool sawMaxIterations = false;
     if (pipe.contains("maxIterations")) {
+        sawMaxIterations = true;
         if (!pipe.at("maxIterations").is_number_integer()) {
             emitMalformed(coll, std::string{sourceLabel} + "/pipeline/maxIterations",
                           "must be an integer");
@@ -206,10 +354,25 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
                       {"name", "passes", "maxIterations", "inlineThreshold",
                        "verifyEveryPass"});
 
+    // ★ ONE SPELLING PER DOCUMENT (P10 ruling): a document using ANY
+    // structural node (repeat/fixpoint) REFUSES top-level
+    // `maxIterations` — the two spellings of "rerun this" would
+    // otherwise compose silently (fixpoint caps multiplying through
+    // the wrapper), and a reader could not tell which bound governs.
+    if (sawMaxIterations && anyStructural) {
+        emitMalformed(coll,
+                      std::string{sourceLabel} + "/pipeline/maxIterations",
+                      "'maxIterations' cannot be combined with structural "
+                      "nodes ('repeat'/'fixpoint') — one spelling per "
+                      "document: EITHER flat 'passes' + top-level "
+                      "'maxIterations' OR structural 'repeat'/'fixpoint' "
+                      "nodes carrying their own 'count'/'max', never both");
+    }
+
     // Empty pipeline = silent no-op at the optimizer engine. Reject
     // at load-time so a stray `"passes": []` doesn't ship a build
     // that thinks optimization happened but ran zero passes.
-    if (passes.empty()) {
+    if (elements.empty()) {
         emitMalformed(coll, std::string{sourceLabel} + "/pipeline/passes",
                       "'passes' array must contain at least one PassId; "
                       "use [\"Identity\"] for an explicit no-op pipeline");
@@ -217,8 +380,48 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     if (coll.hasErrors()) {
         return std::unexpected(std::move(coll).release());
     }
-    return OptPipeline{std::move(name), std::move(passes), maxIterations,
-                       inlineThreshold, verifyEveryPass};
+
+    // ★ NORMALIZATION: every document becomes a top-level
+    // Fixpoint{N ≥ 1, [...]} — uniform interpreter entry, uniform
+    // `iter=` numbering. Flat documents take the whole-pipeline bound;
+    // structural documents wrap in N=1 — EXCEPT the collapse: a
+    // document whose ENTIRE `passes` is one `fixpoint` node uses THAT
+    // node as the root, so the structural `fixpoint{max:4,[…]}` shape
+    // desugars to exactly its flat `maxIterations:4` twin's schedule
+    // (identical tree, identical counters, depth-1 trace).
+    OptPipelineNode root;
+    if (!anyStructural) {
+        root = OptPipelineNode::fixpoint(maxIterations, std::move(elements));
+    } else if (elements.size() == 1
+            && elements[0].kind == OptPipelineNode::Kind::Fixpoint) {
+        root = std::move(elements[0]);
+    } else {
+        root = OptPipelineNode::fixpoint(1, std::move(elements));
+    }
+
+    // ★ LOAD-TIME BUDGET (fail-loud): total worst-case unrolled
+    // invocations, from the ONE shared static cost function (leaf=1,
+    // sequence=Σ, Repeat{n,b}=n·cost(b), Fixpoint{m,b}=m·cost(b)).
+    // Nested repeat bounds multiply — a schedule that could unroll to
+    // more than kMaxPipelineInvocations pass runs is pathological, not
+    // a pipeline. (Depth was enforced per-node during the parse, and
+    // empty bodies were rejected BEFORE this evaluation.)
+    if (auto const total = optPipelineCost(root);
+        total > kMaxPipelineInvocations) {
+        emitMalformed(coll, std::string{sourceLabel} + "/pipeline/passes",
+                      std::format("total worst-case pass invocations exceed "
+                                  "the budget of {} (nested 'repeat'/"
+                                  "'fixpoint' bounds multiply)",
+                                  static_cast<int>(kMaxPipelineInvocations)));
+        return std::unexpected(std::move(coll).release());
+    }
+
+    OptPipeline out;
+    out.name             = std::move(name);
+    out.schedule         = std::move(root);
+    out.inlineThreshold  = inlineThreshold;
+    out.verifyEveryPass  = verifyEveryPass;
+    return out;
 }
 
 } // namespace

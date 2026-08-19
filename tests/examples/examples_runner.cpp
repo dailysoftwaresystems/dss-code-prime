@@ -988,10 +988,11 @@ buildPipeline(OptimizedArm const& arm, fs::path const& manifestPath) {
         return std::move(*loaded);
     }
 
-    // Inline-array form: resolve each PassId name.
-    ::dss::opt::OptPipeline p;
-    p.name = arm.label;
-    p.passes.reserve(arm.passes.size());
+    // Inline-array form: resolve each PassId name. (P10: the flat
+    // factory — the arm's pass list is one fixpoint iteration, exactly
+    // what the pre-tree aggregate construction expressed.)
+    std::vector<::dss::opt::PassId> ids;
+    ids.reserve(arm.passes.size());
     for (auto const& name : arm.passes) {
         auto resolved = ::dss::opt::optPassIdFromName(name);
         if (!resolved.has_value()) {
@@ -1000,9 +1001,9 @@ buildPipeline(OptimizedArm const& arm, fs::path const& manifestPath) {
                           << arm.label << "'";
             return std::nullopt;
         }
-        p.passes.push_back(*resolved);
+        ids.push_back(*resolved);
     }
-    return p;
+    return ::dss::opt::OptPipeline::flat(arm.label, std::move(ids), 1);
 }
 
 // Per-arm compile+spawn outcome. The states distinguish every reason the
