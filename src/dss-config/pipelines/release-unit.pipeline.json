@@ -1,0 +1,11 @@
+{
+  "dssPipelineVersion": 1,
+  "pipeline": {
+    "name": "release-unit",
+    "passes": [
+      {"fixpoint": {"max": 2, "passes": ["ConstFold", "Mem2Reg", "SimplifyCfg", "Dce", "Inlining"]}}
+    ],
+    "inlineThreshold": 50,
+    "verifyEveryPass": false
+  }
+}

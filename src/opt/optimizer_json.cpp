@@ -113,7 +113,26 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     json const& pipe = doc.at("pipeline");
 
     rejectUnknownKeys(coll, doc, std::string{sourceLabel},
-                      {"dssPipelineVersion", "pipeline"});
+                      {"dssPipelineVersion", "pipeline", "unitPipeline"});
+
+    // P10 stage topology: optional top-level `unitPipeline` — the NAME of
+    // the pipeline document that runs at the per-CU (Unit) stage instead
+    // of this one (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE). A name, never an
+    // embedded schedule; the stage routing + the unknown-name failure live
+    // in `optimizeModule` (it can actually resolve the name against the
+    // shipped set). Non-string or EMPTY are refused here — an empty name
+    // is a typo away from "run nothing at the unit stage" and would read
+    // as the absent-key default in every log.
+    if (doc.contains("unitPipeline")) {
+        if (!doc.at("unitPipeline").is_string()
+            || doc.at("unitPipeline").get<std::string>().empty()) {
+            emitMalformed(coll, std::string{sourceLabel},
+                          "'unitPipeline' must be a non-empty pipeline "
+                          "document NAME (the per-CU stage's schedule; the "
+                          "Program stage always runs this document)");
+            return std::unexpected(std::move(coll).release());
+        }
+    }
 
     // `pipeline.name`.
     if (!pipe.contains("name") || !pipe.at("name").is_string()) {
@@ -421,6 +440,9 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     out.schedule         = std::move(root);
     out.inlineThreshold  = inlineThreshold;
     out.verifyEveryPass  = verifyEveryPass;
+    if (doc.contains("unitPipeline")) {
+        out.unitPipelineName = doc.at("unitPipeline").get<std::string>();
+    }
     return out;
 }
 

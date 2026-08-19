@@ -386,6 +386,12 @@ def cmd_gcc_reference(args):
 # and the merged invocation is the final one to begin.
 DONE = re.compile(r'^opt: iter=(\d+) pass=(\w+) done (\d+)ms mutated=(\d)')
 START0 = re.compile(r'^opt: iter=0 pass=Identity start')
+# P10 stage attribution (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE): every
+# config-resolved optimize prints `opt: stage=<unit|program> pipeline=<name>`
+# at entry (a pipelineOverride emits none — it bypasses resolution). This is
+# the CONSUMER of that line: per-stage invocation + pipeline accounting, so a
+# schedule routed to the wrong stage is visible in every profile report.
+STAGE = re.compile(r'^opt: stage=(unit|program) pipeline=(\S+)$')
 REDERIVE = re.compile(r'^opt:\s+rederiveStructCfMarkers whole-module (\d+)ms')
 SUB = re.compile(r'^opt:\s+(\w+) sub: (.*)$')
 
@@ -441,6 +447,15 @@ def cmd_agg_trace(args):
             'was not made with DSS_OPT_TRACE=1, or it never reached the optimizer'
             % args.log)
     print('optimize invocations (iter=0 Identity start): %d' % len(starts))
+    by_stage = defaultdict(lambda: defaultdict(int))
+    for ln in lines:
+        m = STAGE.match(ln)
+        if m:
+            by_stage[m.group(1)][m.group(2)] += 1
+    if by_stage:
+        for stage in sorted(by_stage):
+            for pipe, n in sorted(by_stage[stage].items()):
+                print('stage=%s pipeline=%s invocations=%d' % (stage, pipe, n))
     boundary = starts[-1]
     print('merged-module optimize begins at line %d\n' % (boundary + 1))
     _tally(lines[:boundary],

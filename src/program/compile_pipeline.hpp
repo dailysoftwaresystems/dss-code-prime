@@ -244,6 +244,22 @@ resolvePipelineName(CompileConfig config) noexcept {
     return kPipelineNameTable[idx].second;
 }
 
+// The REVERSE lookup over the SAME table (P10: the examples runner's
+// `shippedPipeline: <name>` arm resolves a pipeline NAME back to the
+// CompileConfig that selects it, so that arm exercises the REAL production
+// channel — config → resolvePipelineName → loadShippedPipeline → stage
+// routing — instead of injecting a `pipelineOverride`). One table, both
+// directions: a second mapping would drift. Nullopt on an unknown name —
+// callers fail loud (an unknown name in a manifest is a config error, never
+// a silent debug fallback).
+[[nodiscard]] constexpr std::optional<CompileConfig>
+resolveCompileConfigFromPipelineName(std::string_view name) noexcept {
+    for (auto const& [cfg, pipeline] : kPipelineNameTable) {
+        if (pipeline == name) return cfg;
+    }
+    return std::nullopt;
+}
+
 // Assemble ONE standalone-assembly CompilationUnit at the `encode` pipeline
 // tier (plan 29 P4) — the `assembleUnit` sibling for a language whose root rule
 // declares `{"tier": "encode"}`.
@@ -472,11 +488,32 @@ buildCuMir(CompilationUnit const&         cu,
 // byte-identical (`buildCuMir` calls this with the same arguments it used inline).
 // `interner` is the type space the module's TypeIds index into — the per-CU lattice's
 // interner for `buildCuMir`, the merged host lattice's interner for the merged path.
+//
+// ── P10 stage topology (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE, operator ruling
+// 2026-08-18: "first class LTO implementation, 100% config driven") ──
+// The DRIVER owns the slots (which call sites exist is structural knowledge);
+// the DOCUMENT owns what runs in each. `Unit` runs wherever a CU is built
+// (buildCuMir); `Program` runs wherever a FINAL module is about to be lowered
+// — the N>1 merged module, the N==1 sole CU, and each static-archive member.
+// WHICH pipeline a stage runs: `opts.pipelineOverride` wins at every site
+// (unchanged semantics); else the config's document, and — at the Unit stage
+// only — if that document declares a top-level `"unitPipeline": "<name>"`,
+// THAT named pipeline runs instead. Absent key ⇒ same document at both
+// stages (the pre-P10 behavior, and what `debug` ships). N==1 needs no
+// special case: its buildCuMir call is a Unit site, its pre-lower call is a
+// Program site, and both fall out of the config — never a driver `if` on
+// stage content.
+enum class PipelineStage : std::uint8_t {
+    Unit = 0,     // per-CU build (buildCuMir)
+    Program = 1,  // final module pre-lower (merged / N==1 / archive member)
+};
+
 [[nodiscard]] DSS_EXPORT bool
 optimizeModule(Mir&                  mir,
                TargetSchema const&   target,
                TypeInterner const&   interner,
                CompileOptions const& opts,
+               PipelineStage         stage,
                DiagnosticReporter&   reporter,
                // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the
                // module's extern table. `opt::optimize`'s unconditional strip

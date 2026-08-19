@@ -654,3 +654,53 @@ TEST(PipelineLoader, NonStringPassEntryRejects) {
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
 }
+
+// ── P10 stage topology: the `unitPipeline` key (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE) ──
+
+// A non-empty string key is accepted and lands on the loaded pipeline — the
+// name the UNIT stage resolves instead of this document.
+TEST(PipelineLoader, UnitPipelineNameLandsOnThePipeline) {
+    auto r = opt::loadPipelineFromText(
+        R"({ "dssPipelineVersion": 1, "unitPipeline": "release-unit",
+             "pipeline": { "name": "release",
+                          "passes": [{"fixpoint": {"max": 4, "passes": ["Identity"]}}] } })",
+        "unit-name.json");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->unitPipelineName, "release-unit");
+}
+
+// The SHIPPED release document declares the two-stage topology; the shipped
+// debug document does NOT (Identity at both stages, the pre-P10 behavior).
+// A JSON edit that drops or renames the key silently reverts the unit stage
+// to the full schedule — this pin makes that a RED, not a silent revert.
+TEST(PipelineLoader, ShippedDocsDeclareTheirStageTopology) {
+    auto rel = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(rel.has_value());
+    EXPECT_EQ(rel->unitPipelineName, "release-unit")
+        << "release.pipeline.json must keep declaring its unit stage";
+    auto un = opt::loadShippedPipeline("release-unit");
+    ASSERT_TRUE(un.has_value());
+    EXPECT_TRUE(un->unitPipelineName.empty())
+        << "the unit document itself must not chain another unit stage";
+    auto dbg = opt::loadShippedPipeline("debug");
+    ASSERT_TRUE(dbg.has_value());
+    EXPECT_TRUE(dbg->unitPipelineName.empty())
+        << "debug ships ONE schedule for both stages by design";
+}
+
+// EMPTY and non-string names are refused at load — an empty name is a typo
+// away from "run nothing at the unit stage" and would read as the absent-key
+// default in every log.
+TEST(PipelineLoader, UnitPipelineEmptyOrNonStringRejects) {
+    for (std::string_view bad : {"\"\"", "7"}) {
+        auto r = opt::loadPipelineFromText(
+            std::string{R"({ "dssPipelineVersion": 1, "unitPipeline": )"}
+                + std::string{bad}
+                + std::string{R"(, "pipeline": { "name": "x",
+                                               "passes": ["Identity"] } })"},
+            "unit-bad.json");
+        ASSERT_FALSE(r.has_value()) << "unitPipeline=" << bad;
+        EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+        EXPECT_TRUE(msgHas(r.error(), "unitPipeline"));
+    }
+}

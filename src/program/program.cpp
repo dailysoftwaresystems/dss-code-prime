@@ -974,6 +974,18 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         members.reserve(cuMirs.size());
         memberNames.reserve(cuMirs.size());
         for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+            // P10: a static-archive member is the FINAL module of its own
+            // artifact (nothing downstream merges it — the foreign linker
+            // pulls members whole), so it gets the PROGRAM-stage schedule
+            // before lowering, exactly like the N==1 sole CU. Skipping this
+            // would silently ship release archives optimized at the unit
+            // schedule only — the archive twin of the old double-opt defect.
+            if (!optimizeModule(cuMirs[i].mir, **targetR,
+                                cuMirs[i].model.lattice().interner(), compileOpts,
+                                PipelineStage::Program, reporter,
+                                cuMirs[i].externImports)) {
+                return std::nullopt;  // optimize-stage failure already reported
+            }
             auto mod = lowerCuMirToAssembly(cuMirs[i], (*formatR)->processArgs(),
                                             (*formatR)->entryVerbs(),
                                             (*formatR)->sehPersonality(),
@@ -1020,10 +1032,21 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                                   reporter, imageRequest));
     }
     // N==1 (the CU5 multi-file-single-CU case): lower the sole CU + link it. UNCHANGED
-    // from cycle 24 — byte-identical single-CU output. Routing N==1 through the merge
-    // would re-intern CU0's types into a fresh host (a no-op for correctness, but extra
-    // work + a different code path); keep the proven single-CU lowering for byte-identity.
+    // from cycle 24 in its LOWERING — routing N==1 through the merge would re-intern
+    // CU0's types into a fresh host (a no-op for correctness, but extra work + a
+    // different code path). P10 adds the PROGRAM-stage optimize the topology requires:
+    // the sole CU's module IS a final module (nothing downstream merges it), so it gets
+    // the link-time schedule here exactly as the N>1 merged module does above — no
+    // driver `if` on stage content, the site exists and the config decides what runs.
     if (cuMirs.size() == 1) {
+        if (!optimizeModule(cuMirs[0].mir, **targetR,
+                            cuMirs[0].model.lattice().interner(), compileOpts,
+                            PipelineStage::Program, reporter,
+                            // this CU's extern table; lowerCuMirToAssembly moves
+                            // it into MIR→LIR only after this call returns.
+                            cuMirs[0].externImports)) {
+            return std::nullopt;  // optimize-stage failure already reported
+        }
         auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(),
                                         (*formatR)->entryVerbs(),
                                         (*formatR)->sehPersonality(),
@@ -1327,20 +1350,17 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // inliner's `symToFunc` now resolves the callee — a cross-CU call becomes inline-
     // eligible exactly like an intra-CU one. `merged->host.interner()` is the type space
     // the merged TypeIds index into (the same interner `lowerMergedToAssembly` uses). The
-    // optimizer runs MirVerifier after every pass (the merged-module safety net). DOUBLE-
-    // OPT is correct: a cross-CU call's per-CU inline was a no-op (extern, unresolvable
-    // per-CU); the merged inline does the work. Same pipeline resolution as the per-CU
-    // path (`optimizeModule`), so the examples-runner's `["Inlining"]` override flows here
-    // via `compileOpts.pipelineOverride`.
+    // optimizer runs MirVerifier after every pass (the merged-module safety net).
     //
-    // D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE (deferred, efficiency-only): the N>1 path
-    // currently optimizes each CU's MIR in `buildCuMir` AND optimizes the merged module
-    // here (DOUBLE-OPT). Correct but redundant work — a true LTO shape would skip the
-    // per-CU optimize for multi-CU builds and optimize the whole-program merged module
-    // ONCE. Not done now because `buildCuMir` is shared with the N==1 path (which must
-    // still optimize per-CU) and the redundant per-CU pass is correctness-neutral.
+    // P10 (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE, CLOSED): this is the PROGRAM stage — the
+    // link-time schedule of the two-stage topology. The per-CU UNIT stage already ran in
+    // `buildCuMir` (its schedule is the document's `unitPipeline`), so "double-opt" is
+    // now TWO DIFFERENT pipelines by design, exactly like a per-TU -O2 compile followed
+    // by a link-time pipeline — never the same 9×4 list twice. The examples-runner's
+    // `["Inlining"]` override still flows here via `compileOpts.pipelineOverride`
+    // (an override runs at every site).
     if (!optimizeModule(merged->mir, **targetR, merged->host.interner(),
-                        compileOpts, reporter,
+                        compileOpts, PipelineStage::Program, reporter,
                         // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED:
                         // the MERGED module's extern table.
                         //

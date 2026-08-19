@@ -1917,7 +1917,8 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         opts.pipelineOverride = &inlining;
         auto const before = rep.errorCount();
         ASSERT_TRUE(optimizeModule(merged->mir, **targetR,
-                                   merged->host.interner(), opts, rep))
+                                   merged->host.interner(), opts,
+                                   PipelineStage::Program, rep))
             << "optimizing the merged module with [Inlining] must succeed";
         EXPECT_EQ(rep.errorCount(), before)
             << "the merged-module optimize must not emit any error";
@@ -1937,11 +1938,151 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         CompileOptions opts{DiagnosticBudget::libraryDefault()};
         opts.pipelineOverride = &identity;
         ASSERT_TRUE(optimizeModule(merged->mir, **targetR,
-                                   merged->host.interner(), opts, rep));
+                                   merged->host.interner(), opts,
+                                   PipelineStage::Program, rep));
         EXPECT_EQ(countOpInModule(merged->mir, MirOpcode::Call), 1u)
             << "with an [Identity] pipeline (no Inlining) the cross-CU Call MUST survive "
                "— the inlining in arm 1 is what removes it (RED-on-disable witness)";
     }
+}
+
+// P10 (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE): the SHIPPED stage routing, end to
+// end through the real channel — NO override. Both directions of the shape
+// pin the anchor demands, each at the SITE that owns it:
+//   • UNIT stage: `buildCuMir` runs release-unit (its Inlining CANNOT inline
+//     main→add5 — the callee is extern per-CU, unresolvable), so the Call
+//     survives the build.
+//   • PROGRAM stage: the full release document over the merged module kills
+//     it (the merge made the call intra-module direct).
+TEST(Program_WholeProgramMerge, ShippedStageRoutingInlinesCrossCuAtProgramStage) {
+    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(grammarR.has_value());
+    auto grammar = *grammarR;
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto formatR = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(formatR.has_value());
+
+    DiagnosticReporter rep;
+    auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, rep);
+    ASSERT_TRUE(abi.has_value());
+    ASSERT_NE(abi->cc, nullptr);
+    auto const ccSpan = (*targetR)->callingConventions();
+    auto const ccIndex = static_cast<std::uint16_t>(
+        std::distance(ccSpan.data(), abi->cc));
+
+    // RELEASE options — the config whose document declares the two-stage
+    // topology (`unitPipeline: release-unit`). No pipelineOverride: the
+    // resolution must flow config → resolvePipelineName → stage routing.
+    CompileOptions relOpts{DiagnosticBudget::libraryDefault()};
+    relOpts.config = CompileConfig::Release;
+
+    auto buildCu = [&](std::string src, std::string label) {
+        UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
+        builder.addInMemory(std::move(src), std::move(label));
+        return std::move(builder).finish();
+    };
+    CompilationUnit cuMain = buildCu(
+        "extern int add5(int x);\nint main() { return add5(37); }\n", "main.c");
+    CompilationUnit cuHelper =
+        buildCu("int add5(int x) { return x + 5; }\n", "helper.c");
+
+    // ── UNIT direction: the extern Call SURVIVES the per-CU build. ──
+    auto mirMain = buildCuMir(cuMain, *grammar, **targetR, **formatR, ccIndex,
+                              rep, relOpts);
+    ASSERT_TRUE(mirMain.has_value()) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(countOpInModule(mirMain->mir, MirOpcode::Call), 1u)
+        << "the unit stage's Inlining cannot resolve an EXTERN callee — "
+           "main→add5 must survive buildCuMir under the shipped release-unit "
+           "schedule (the stage boundary is real: cross-CU inlining is the "
+           "PROGRAM stage's job)";
+
+    auto mirHelper = buildCuMir(cuHelper, *grammar, **targetR, **formatR,
+                                ccIndex, rep, relOpts);
+    ASSERT_TRUE(mirHelper.has_value());
+
+    std::vector<CuMirModule> cuMirs;
+    cuMirs.push_back(std::move(*mirMain));
+    cuMirs.push_back(std::move(*mirHelper));
+    std::vector<MergeCuInput> inputs;
+    for (auto& cm : cuMirs) {
+        MergeCuInput in;
+        in.mir      = &cm.mir;
+        in.interner = &cm.model.lattice().interner();
+        in.nameOf   = [cmP = &cm](SymbolId s) -> std::string {
+            if (SymbolRecord const* r = cmP->model.recordFor(s)) return r->name;
+            for (auto const& e : cmP->externImports) {
+                if (e.symbol.v == s.v) return e.mangledName;
+            }
+            return std::string{};
+        };
+        in.externImports = cm.externImports;
+        inputs.push_back(std::move(in));
+    }
+    TypeLattice host{cuMirs[0].cuId,
+                     std::string{cuMirs[0].model.lattice().registry().sourceLanguage()}};
+    std::vector<std::string> entryNames;
+    for (auto const& decl : grammar->semantics().declarations) {
+        for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+            entryNames.push_back(n);
+        }
+    }
+    auto merged = mergeCuMirs(
+        std::span<MergeCuInput const>{inputs.data(), inputs.size()},
+        std::move(host),
+        std::span<std::string const>{entryNames.data(), entryNames.size()}, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    // ── PROGRAM direction: the full document over the merged module. ──
+    auto const before = rep.errorCount();
+    ASSERT_TRUE(optimizeModule(merged->mir, **targetR, merged->host.interner(),
+                               relOpts, PipelineStage::Program, rep))
+        << "the program stage over the merged module must succeed through the "
+           "shipped release document";
+    EXPECT_EQ(rep.errorCount(), before);
+    EXPECT_EQ(countOpInModule(merged->mir, MirOpcode::Call), 0u)
+        << "the PROGRAM stage's Inlining resolves the now-intra-module call — "
+           "the cross-CU Call must be gone";
+}
+
+// P10: the UNIT STAGE runs the DOCUMENT the `unitPipeline` key names — a
+// strict red arm for the dispatch itself. `release-unit` contains NO Cse, so
+// a load pair CSE would fold (`*p + *p` → two Loads → one) SURVIVES the unit
+// stage; the config's own FULL document contains Cse and would fold it. If
+// the stage router is deleted (both stages run the config doc), this reads 1
+// and reds. This is the pin the routing audit demanded: every other witness
+// of the two-stage topology stays green over a deleted router.
+TEST(Program_WholeProgramMerge, UnitStageRunsTheUnitDocumentNotTheConfigDoc) {
+    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(grammarR.has_value());
+    auto grammar = *grammarR;
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto formatR = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(formatR.has_value());
+
+    DiagnosticReporter rep;
+    auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, rep);
+    ASSERT_TRUE(abi.has_value());
+    ASSERT_NE(abi->cc, nullptr);
+    auto const ccSpan = (*targetR)->callingConventions();
+    auto const ccIndex = static_cast<std::uint16_t>(
+        std::distance(ccSpan.data(), abi->cc));
+
+    CompileOptions relOpts{DiagnosticBudget::libraryDefault()};
+    relOpts.config = CompileConfig::Release;
+
+    UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
+    builder.addInMemory(
+        "int twice(int* p) { return *p + *p; }\n", "twice.c");
+    CompilationUnit cu = std::move(builder).finish();
+    auto mir = buildCuMir(cu, *grammar, **targetR, **formatR, ccIndex, rep,
+                          relOpts);
+    ASSERT_TRUE(mir.has_value()) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(countOpInModule(mir->mir, MirOpcode::Load), 2u)
+        << "the unit stage runs release-unit, which has NO Cse — the load "
+           "pair must survive buildCuMir. One load means the FULL config "
+           "document ran at the unit site: the stage router is gone";
 }
 
 // ── Model 3 per-OBJECT-FORMAT shipped-library resolution (2026-06-09) ─────────

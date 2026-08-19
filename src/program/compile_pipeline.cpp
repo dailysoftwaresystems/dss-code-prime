@@ -47,6 +47,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <format>
 #include <fstream>
 #include <functional>
@@ -141,6 +143,7 @@ bool optimizeModule(Mir&                  mir,
                     TargetSchema const&   target,
                     TypeInterner const&   interner,
                     CompileOptions const& opts,
+                    PipelineStage         stage,
                     DiagnosticReporter&   reporter,
                     // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED:
                     // the module's extern table, read by `opt::optimize`'s
@@ -190,7 +193,59 @@ bool optimizeModule(Mir&                  mir,
             return false;
         }
         loadedPipeline = std::move(loaded).value();
+        // P10 stage routing: at the UNIT stage, a document that declares a
+        // top-level "unitPipeline" name runs THAT pipeline instead (the
+        // per-TU schedule of a two-stage LTO topology). The Program stage
+        // always runs the config's own document — the link-time schedule.
+        // An override (above) already bypassed this whole block, so an
+        // explicit pipelineOverride runs at every site unchanged.
+        if (stage == PipelineStage::Unit
+            && !loadedPipeline.unitPipelineName.empty()) {
+            auto unitLoaded =
+                ::dss::opt::loadShippedPipeline(loadedPipeline.unitPipelineName);
+            if (!unitLoaded.has_value()) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::X_PipelineNameResolutionFailed;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "compile_pipeline: pipeline '{}' declares unitPipeline "
+                    "'{}' which failed to load — a two-stage topology must "
+                    "name a shipped pipeline document (D-OPT7-CROSSCU-LTO-"
+                    "SINGLE-OPTIMIZE).",
+                    *name, loadedPipeline.unitPipelineName);
+                reporter.report(std::move(d));
+                forwardConfigDiagnostics(unitLoaded.error(), reporter);
+                return false;
+            }
+            // The unit stage is ONE hop deep. A resolved unit document that
+            // itself declares `unitPipeline` would have the key silently
+            // ignored (nothing re-inspects it below) — refuse it loud: the
+            // topology is two stages, and a chain is a config error, not a
+            // third stage.
+            if (!unitLoaded->unitPipelineName.empty()) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::X_PipelineNameResolutionFailed;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "compile_pipeline: unit pipeline '{}' itself declares "
+                    "unitPipeline '{}' — the unit stage resolves exactly ONE "
+                    "hop; chaining is refused rather than silently ignored.",
+                    loadedPipeline.unitPipelineName,
+                    unitLoaded->unitPipelineName);
+                reporter.report(std::move(d));
+                return false;
+            }
+            loadedPipeline = std::move(unitLoaded).value();
+        }
         effectivePipeline = &loadedPipeline;
+        // Stage attribution under the SAME env gate as the per-pass trace
+        // (DSS_OPT_TRACE) — the A/B instrument keys on these lines.
+        if (std::getenv("DSS_OPT_TRACE") != nullptr) {
+            std::fprintf(stderr, "opt: stage=%s pipeline=%s\n",
+                         stage == PipelineStage::Unit ? "unit" : "program",
+                         loadedPipeline.name.c_str());
+            std::fflush(stderr);
+        }
     }
     auto const optResult = ::dss::opt::optimize(
         mir, target, interner, *effectivePipeline, reporter, externImports);
@@ -852,7 +907,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
     //      extracted to the shared `optimizeModule` (Cycle 26) so the N>1 whole-program
     //      path can run the SAME pipeline over the MERGED module. Pure code-motion —
     //      same arguments as the former inline block, so the per-CU output is identical.
-    if (!optimizeModule(mir.mir, target, model.lattice().interner(), opts, reporter,
+    if (!optimizeModule(mir.mir, target, model.lattice().interner(), opts,
+                        // P10: the per-CU build is the UNIT stage — the site
+                        // whose schedule the document's `unitPipeline` key
+                        // selects (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE).
+                        PipelineStage::Unit, reporter,
                         // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED:
                         // this CU's extern table, still owned by `mir` here (the
                         // LOWER half moves it into MIR→LIR later).

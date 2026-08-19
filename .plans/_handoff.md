@@ -9,8 +9,47 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-18 — cycle **P9 COMPLETE** (compile-time: four-leg profile, four measured causes fixed, output byte-identical). P8/P7 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P9); parent `d62405ba` (Cycle P8, PUSHED).
+**Last updated:** 2026-08-18 — cycle **P10 COMPLETE** (first-class config-driven LTO: schedule grammar + two-stage topology, shipped split decided by a runtime-measured rule). P9/P8/P7 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P10); parents `a0370fde` (P10 step 1) → `2557a717` (P10 pre-step) → `be0e883b` (Cycle P9, PUSHED).
+
+---
+
+## 0.00000000 ★★★ READ THIS FIRST — CYCLE P10 (COMPLETE): FIRST-CLASS CONFIG-DRIVEN LTO
+
+Operator mandate, verbatim: *"address it properly, long term solution, no workarounds, 100% config
+driven. first class LTO implementation"* (`D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE`, ✅ CLOSED — the row
+carries the full measurement table and the two §B rulings).
+
+**Landed in two operator-steered steps, one behavior change each:**
+1. **`2557a717` pre-step** — the P9 self-audit's hardening pins (production candidate-builder value
+   pin with a mutant-proven red arm; front-half concurrency witness; `.sh`/`.ps1` case parity).
+2. **`a0370fde` step 1 — the schedule GRAMMAR**: `passes` became a closed tree (leaf / `repeat` /
+   `fixpoint`), the engine its interpreter, flat docs desugar at load; budgets fail loud at load.
+   ✔Byte-identical to P9 (`1d117b1a…`), compile 41.7s.
+3. **This commit, step 2 — the TOPOLOGY**: `PipelineStage` slots in the driver (Unit at
+   `buildCuMir`; Program at every final-module site — merged, N==1, archive member), the document
+   owns what runs (`unitPipeline` key; absent = both stages same doc, what `debug` ships).
+   `resolveCompileConfigFromPipelineName` + the examples runner's real-channel switch.
+
+**The shipped split (B′, decided by the operator-amended rule — direct measures, no proxies):**
+`release-unit` = `[ConstFold, Mem2Reg, SimplifyCfg, Dce, Inlining]×2` per CU, full release at the
+program stage. Against the incumbent: **exe −5.6%** (6,904,848 vs 7,314,848), **compile time
+neutral** (38.4s median vs 38.7s), **runtime FASTER** (0.453s vs 0.470s median, 7 repeats —
+`tools/sqlite-runtime-bench.py`, the standing runtime-differential instrument). The control arm
+(unit key removed) measured **byte-identical to pre-P10**, proving the restructure behavior-neutral.
+⚠ The FIRST rule (inline counts + exe-vs-A′) picked A′ and its cheapness premise was refuted
+(+60% compile); the operator amended the rule toward direct measures BEFORE the runtime column was
+measured — recorded in the row as the pre-registration discipline working.
+
+**§B rulings this cycle:** (a) strip-order — unit stage CONTAINS `Inlining` (operator; per-TU -O2
+shape); (b) the A/B rule amendment itself. Both recorded in the D-OPT7 row.
+
+**⚠ OWED NEXT CYCLE (nothing blocks, all small):** the stage trace line (`opt: stage=…`) is
+parsed by agg-trace (verified: 103 unit / 1 program over the B′ log) but no TEST pins its format;
+the audit's nodePath label fix landed same-cycle. Debug-config column measured and clean: the kit
+compiles in **24.8s** at `--config=debug` (the new N==1/archive program-stage calls run
+Identity+prune+strip — no give-back).
+
 
 ---
 
@@ -1685,7 +1724,14 @@ clobbers. It is an `if`, **not** a `switch` — the compiler forces nothing. Shi
 
 ## 5. PRIORITIES
 
-0. **`NEXT` — FIRST-CLASS, CONFIG-DRIVEN LTO.** [[D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE]], promoted
+0. ✅ **DONE 2026-08-18 (Cycle P10): FIRST-CLASS, CONFIG-DRIVEN LTO** — [[D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE]] CLOSED (see §0.00000000). The grammar + two-stage topology shipped; the split decided by the runtime-measured rule; runtime-differential is a standing instrument.
+0. **`NEXT` — THE FULL sqlite MATRIX RE-RUN, now UNBLOCKED.** Operator sequencing 2026-08-18:
+   *"we'll re run everything once our compile is fast enough"* — it now is (Windows 38–41 s,
+   WSL 33.6 s, macOS 23.0 s on the CLI kit). The matrix (4 legs × build+run of both artifacts,
+   `dss-cross-leg-test` / the sqlite harness) re-runs against the P10 tree; per [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]]
+   the post-P9/P10 numbers are the honest baseline now. Then FC18
+   ([[D-DIAG-CORPUS-EVERY-CODE]], sole remaining C23 phase — read its BLOCKED note first).
+0. **(was) FIRST-CLASS, CONFIG-DRIVEN LTO.** [[D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE]], promoted
    by operator ruling during P9 (verbatim: *"address it properly, long term solution, no
    workarounds, 100% config driven. first class LTO implementation"*). The deliverable is the
    TOPOLOGY — a per-TU pipeline and a link-time pipeline that are DIFFERENT documents — not

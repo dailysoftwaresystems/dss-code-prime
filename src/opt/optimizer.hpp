@@ -278,6 +278,15 @@ optPipelineCost(OptPipelineNode const& n) {
 // source json::value without lifetime audit.
 struct OptPipeline {
     std::string       name;
+    // P10 stage topology (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE): optional
+    // NAME of the pipeline document that runs at the UNIT (per-CU) stage
+    // instead of this one — read by `optimizeModule`'s stage routing, at
+    // the Unit site only. EMPTY = this document runs at both stages (the
+    // pre-P10 behavior; what `debug` ships). A NAME, never an embedded
+    // schedule: the grammar owns schedules, this key owns only topology.
+    // The Program stage ignores it — the link-time schedule is always
+    // the config's own document.
+    std::string       unitPipelineName;
     // The schedule tree (see OptPipelineNode). After any load or
     // flat() construction the root is a Fixpoint — uniform interpreter
     // entry, uniform `iter=` numbering.

@@ -49,6 +49,7 @@
 #include "core/types/source_buffer.hpp"
 #include "opt/optimizer.hpp"
 #include "program/program.hpp"
+#include "program/compile_pipeline.hpp"  // resolveCompileConfigFromPipelineName (P10 real-channel arm)
 #include "repo_root.hpp"   // the single-definition-site lint reads BOTH runners
                            // and the shared header off disk
 #include "run_binary.hpp"
@@ -950,11 +951,21 @@ readProjectFacts(fs::path const& projectPath) {
     return !findOnPath(argv0).empty();
 }
 
-// Resolve a list of pass-name strings into an OptPipeline. Fails the
-// test loud (ADD_FAILURE) if any name is unrecognised — surfaces typos
-// in manifests at runtime + catches drift between the JSON vocab and
-// the PassId enum.
-[[nodiscard]] std::optional<::dss::opt::OptPipeline>
+// Resolve an optimizedPipelines arm into WHAT DRIVES THE COMPILE. P10
+// (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE): the `shippedPipeline` form returns
+// the CompileConfig that SELECTS that pipeline (the arm then runs through
+// the REAL production channel — config → resolvePipelineName → stage
+// routing → the document's `unitPipeline` — instead of an injected
+// override, which could never express a two-stage topology); the inline
+// `passes` form returns the explicit OptPipeline override, unchanged.
+// Exactly one of the two optionals is set; fails the test loud
+// (ADD_FAILURE) on any unrecognised name — surfaces manifest typos at
+// runtime + catches drift between the JSON vocab and the tables.
+struct ArmPipeline {
+    std::optional<::dss::opt::OptPipeline> overridePipeline;
+    std::optional<CompileConfig>          config;
+};
+[[nodiscard]] std::optional<ArmPipeline>
 buildPipeline(OptimizedArm const& arm, fs::path const& manifestPath) {
     // EXACTLY-ONE-OF `passes` / `shippedPipeline` — fail loud on both or
     // neither (a manifest typo must surface, never silently pick a
@@ -971,10 +982,22 @@ buildPipeline(OptimizedArm const& arm, fs::path const& manifestPath) {
         return std::nullopt;
     }
 
-    // Shipped-config form: load the pipeline ITSELF (name/maxIterations/
-    // inlineThreshold from the file — ZERO drift between the corpus arm
-    // and the shipped configuration it claims to exercise).
+    // Shipped-config form: resolve the pipeline NAME to the CompileConfig
+    // that selects it, and verify the document still LOADS (fail at
+    // manifest-attribution time, not deep inside the compile). The arm
+    // compiles through the real channel — see ArmPipeline above.
     if (hasShipped) {
+        auto const config =
+            resolveCompileConfigFromPipelineName(*arm.shippedPipeline);
+        if (!config.has_value()) {
+            ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                          << ": arm '" << arm.label << "' shippedPipeline '"
+                          << *arm.shippedPipeline
+                          << "' names no CompileConfig (kPipelineNameTable "
+                             "has no such pipeline — a manifest typo, never "
+                             "a silent debug fallback)";
+            return std::nullopt;
+        }
         auto loaded = ::dss::opt::loadShippedPipeline(*arm.shippedPipeline);
         if (!loaded.has_value()) {
             std::ostringstream diag;
@@ -985,7 +1008,7 @@ buildPipeline(OptimizedArm const& arm, fs::path const& manifestPath) {
                           << "' failed to load:" << diag.str();
             return std::nullopt;
         }
-        return std::move(*loaded);
+        return ArmPipeline{.overridePipeline = std::nullopt, .config = *config};
     }
 
     // Inline-array form: resolve each PassId name. (P10: the flat
@@ -1003,7 +1026,10 @@ buildPipeline(OptimizedArm const& arm, fs::path const& manifestPath) {
         }
         ids.push_back(*resolved);
     }
-    return ::dss::opt::OptPipeline::flat(arm.label, std::move(ids), 1);
+    return ArmPipeline{
+        .overridePipeline = ::dss::opt::OptPipeline::flat(arm.label,
+                                                          std::move(ids), 1),
+        .config           = std::nullopt};
 }
 
 // Per-arm compile+spawn outcome. The states distinguish every reason the
@@ -1331,7 +1357,15 @@ compileAndRunArm(fs::path const& exampleDir,
                  ExampleManifest const& m,
                  ExampleTarget const& t,
                  ::dss::opt::OptPipeline const* pipelineOverride,
-                 char const* armLabel) {
+                 char const* armLabel,
+                 // P10 real-channel switch (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE):
+                 // a `shippedPipeline` arm now drives the compile through the
+                 // CompileConfig that SELECTS that pipeline, instead of loading
+                 // the document and injecting it as an override — so the arm
+                 // exercises the production resolution incl. STAGE ROUTING and
+                 // the `unitPipeline` key. Exactly one of the two is set
+                 // (enforced by buildPipeline's either-or).
+                 CompileConfig const* configOverride = nullptr) {
     SCOPED_TRACE(std::string{"arm="} + armLabel);
     ArmResult armResult;
     ScratchDir scratch{Location::InsideRepo, "examples"};
@@ -1494,6 +1528,9 @@ compileAndRunArm(fs::path const& exampleDir,
     }
     if (pipelineOverride != nullptr) {
         prog.setOptimizerPipelineOverride(*pipelineOverride);
+    }
+    if (configOverride != nullptr) {
+        prog.setCompileConfig(*configOverride);
     }
     // PROJECT MODE → compileProject (the manifest supplies language, targets,
     // sources, flags AND the build-lifecycle hooks — this is the ONLY driver
@@ -1826,8 +1863,11 @@ void runOneTarget(fs::path const&        exampleDir,
                           "optimizedPipelines arm could not be resolved");
             continue;
         }
-        auto const optResult = compileAndRunArm(exampleDir, m, t, &*pipeline,
-                                                 arm.label.c_str());
+        auto const optResult = compileAndRunArm(
+            exampleDir, m, t,
+            pipeline->overridePipeline ? &*pipeline->overridePipeline : nullptr,
+            arm.label.c_str(),
+            pipeline->config ? &*pipeline->config : nullptr);
         ledger.record(exampleId, t.spec, arm.label, optResult.verdict,
                       optResult.detail);
         // The two arms must share the run outcome: both ran (compare) or both

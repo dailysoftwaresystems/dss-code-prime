@@ -1,5 +1,6 @@
 {
     "dssPipelineVersion": 1,
+    "unitPipeline": "release-unit",
     "pipeline": {
         "name": "release",
         "passes": [

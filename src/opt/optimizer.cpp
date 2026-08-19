@@ -285,10 +285,17 @@ struct ScheduleInterpreter {
     }
 
     void runChildren(OptPipelineNode const& n) {
+        // The base must be captured BEFORE the loop: every nested run()
+        // reassigns `nodePath`, so deriving child i's path from the live
+        // member after the first subtree completes would label siblings
+        // under the LAST-VISITED leaf's path (audit finding: labels only,
+        // but wrong labels under the exact deep-schedule conditions the
+        // path exists to disambiguate).
+        std::string const base = nodePath;
         for (std::size_t i = 0; i < n.children.size() && !stopped; ++i) {
-            std::string childPath = nodePath.empty()
+            std::string childPath = base.empty()
                 ? std::to_string(i)
-                : nodePath + "." + std::to_string(i);
+                : base + "." + std::to_string(i);
             run(n.children[i], std::move(childPath));
         }
     }

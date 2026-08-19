@@ -1647,6 +1647,14 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     }
 
     result.callsInlined = callsInlined;
+    // A/B instrument (P10 D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE): the per-stage
+    // inlining count the split decision pre-registers on. Same env gate as
+    // the engine's per-pass trace so the two compose in one log.
+    if (std::getenv("DSS_OPT_TRACE") != nullptr) {
+        std::fprintf(stderr, "opt: pass=Inlining callsInlined=%u\n",
+                     static_cast<unsigned>(callsInlined));
+        std::fflush(stderr);
+    }
     mir = std::move(builder).finish();
     // Canonical-marker stamping (D-OPT4-1): the splice changed the
     // caller's CFG (split blocks, cloned callee bodies). Markers are

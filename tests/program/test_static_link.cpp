@@ -41,6 +41,7 @@
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "program/compile_pipeline.hpp"
+#include "core/substrate/phase_timers.hpp"
 #include "program/program.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
@@ -1209,4 +1210,94 @@ TEST(StaticLink, MachoStaticLibDriverEmitsArchive) {
     };
     EXPECT_TRUE(refsSym("dss_add"));
     EXPECT_TRUE(refsSym("dss_sub"));
+}
+
+// P10 (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE): a static-archive MEMBER is a
+// FINAL module of its own artifact — the foreign linker pulls members whole,
+// nothing downstream merges them — so the member's lowering site carries the
+// PROGRAM stage. This pin witnesses that site through the REAL driver
+// channel: the same source, compiled at Debug and at Release into a
+// staticlib, must produce DIFFERENT member bytes (the release build ran the
+// two-stage schedule — release-unit per CU, then the program stage over the
+// member — and ConstFold/Inlining observably change `.text`), while the
+// debug build (Identity at both stages) leaves the foldable arithmetic live.
+// If the member's program-stage call is deleted, the release member is
+// optimized ONLY at the unit stage and this comparison narrows toward
+// equality — the archive twin of the routing pin in test_compile_pipeline.
+TEST(StaticArchive, ReleaseMemberIsProgramStageOptimized) {
+    ScratchDir scratch{Location::InsideRepo, "static_link"};
+    scratch.useAsCwd();
+    char const* const src =
+        "int fold(int a) { return (2 + 3) * a; }\n"
+        "int entry(int x) { return fold(x) + fold(x + 1); }\n";
+
+    auto build = [&](char const* label, CompileConfig cfg) {
+        fs::path const outDir = scratch.path() / label;
+        fs::path const srcPath = scratch.path() / (std::string{label} + ".c");
+        {
+            std::ofstream out{srcPath, std::ios::binary};
+            out << src;
+        }
+        std::vector<std::string> files;
+        files.push_back(srcPath.generic_string());
+        Program prog;
+        prog.setCompileConfig(cfg);
+        prog.setOutputDir(outDir);
+        DiagnosticReporter rep;
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux-staticlib"}, rep);
+        EXPECT_EQ(rc, 0) << label << " build must succeed";
+        if (rc != 0) return std::vector<std::uint8_t>{};
+        fs::path artifact = outDir / (std::string{label} + ".a");
+        std::error_code ec;
+        auto const size = fs::file_size(artifact, ec);
+        EXPECT_FALSE(ec) << "no staticlib artifact at " << artifact;
+        if (ec) return std::vector<std::uint8_t>{};
+        std::ifstream in{artifact, std::ios::binary};
+        return std::vector<std::uint8_t>{(std::istreambuf_iterator<char>(in)),
+                                         std::istreambuf_iterator<char>()};
+    };
+
+    auto const dbg = build("member_dbg", CompileConfig::Debug);
+    auto const rel = build("member_rel", CompileConfig::Release);
+    ASSERT_FALSE(dbg.empty()) << "the debug member archive must exist";
+    ASSERT_FALSE(rel.empty()) << "the release member archive must exist";
+    EXPECT_NE(dbg, rel)
+        << "Debug and Release members must differ byte-wise — the release "
+           "member carries the PROGRAM-stage schedule (unit stage + member "
+           "pre-lower optimize); identical bytes mean the member's "
+           "program-stage call is gone";
+
+    // ★ THE STRICT SITE WITNESS — the byte comparison above can pass on the
+    // UNIT stage's schedule difference ALONE (debug unit=Identity vs
+    // release-unit), so it cannot see the member's program-stage site
+    // specifically. This arm can: a single-CU archive build runs the Optimize
+    // phase EXACTLY TWICE (once per-CU at the unit site, once over the member
+    // at its lowering site). Delete the member's program-stage call and this
+    // reads 1 — a strict red that names the site, independent of which passes
+    // either schedule contains.
+    substrate::PhaseTimers::reset();
+    fs::path const outDir = scratch.path() / "member_count";
+    fs::path const srcPath = scratch.path() / "member_count.c";
+    {
+        std::ofstream out{srcPath, std::ios::binary};
+        out << src;
+    }
+    {
+        Program prog;
+        prog.setCompileConfig(CompileConfig::Release);
+        prog.setOutputDir(outDir);
+        DiagnosticReporter rep;
+        std::vector<std::string> files;
+        files.push_back(srcPath.generic_string());
+        ASSERT_EQ(prog.compileUnits(
+                      files, "c-subset",
+                      {"x86_64:elf64-x86_64-linux-staticlib"}, rep), 0);
+    }
+    EXPECT_EQ(substrate::PhaseTimers::read(substrate::CompilePhase::Optimize)
+                  .runs,
+              2u)
+        << "a 1-CU static-archive build must run Optimize TWICE — the unit "
+           "stage in buildCuMir and the program stage at the member's "
+           "lowering site (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE)";
 }
