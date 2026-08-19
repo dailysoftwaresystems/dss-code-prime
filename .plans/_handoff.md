@@ -9,8 +9,57 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-19 — cycle **P12 COMPLETE** (the Mac-awake window: four rows closed on real-Apple-Silicon measurements). P11/P10/P9 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P12); parent `b144e05e` (Cycle P11, PUSHED).
+**Last updated:** 2026-08-19 — cycle **P13 COMPLETE** (the cross-host build matrix, measured by execution + a miscompile found and pinned). P12/P11/P10 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P13); parent `d078b25c` (Cycle P12, PUSHED).
+
+---
+
+## 0.00000000000 ★★★ READ THIS FIRST — CYCLE P13: THE CROSS-HOST MATRIX RAN — AND FOUND A MISCOMPILE
+
+**The queue re-derivation paid for itself again**: the C7 "provider conversions" the handoff queued
+were ALREADY DONE — the pinned-archive-everywhere conversion landed 2026-08-10 in `3e86a187`
+(PR #48) and three rows sat stale-open for 9 days (`D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-
+GENERALISED-TO-PINNED-ARCHIVE`, `D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER` —
+both closed this cycle; the "PS1 dispatch arm" sub-row never existed under the name I queued).
+What remained was the ROW'S OWN STANDARD: *"the closing test is per-cell and by EXECUTION"*.
+
+**The matrix, run by execution on four hosts** (sqlite harness, full driver per host):
+- **Windows** × {elf64-arm64, elf64-x86_64}: built (after the discovery hazard below).
+- **WSL** × {elf64-x86_64, pe64-x86_64, macho64-arm64, macho64-x86_64}: all built; elf64-x86_64 +
+  pe64 corpus-VERIFIED (2 verified, 0 build-input-missing).
+- **arm64 VPS** × elf64-arm64: built + corpus VERIFIED natively.
+- **macOS** × {elf64-x86_64, pe64-x86_64}: built (runs structurally skipped by runOn, as designed).
+⇒ **`D-HARNESS-CROSS-HOST-ANY-TARGET`'s BUILD half: every declared leg built on every host, by
+execution.** (The row's close records the RUN matrix's documented restrictions.)
+
+**⚠ THE DISCOVERY HAZARD, measured:** the first Windows attempt "failed" with pre-P10 loader
+errors — the driver's compiler discovery (newest RELEASE tree, mtime-wins, build-type read from
+each tree's CMakeCache) picked `build/rel`, a 2026-08-18 21:01 pre-grammar binary; the repo's
+only current tree was Debug (excluded by design). **Not a harness defect** — the policy did
+exactly what it documents; the fix was building a current `build/rel`. A stale Release tree that
+SILENTLY answers discovery is now a standing trap: `cmake --build build/rel` after any
+harness-relevant change, or clear the stale trees.
+
+**★★★ THE FINDING — `D-HARNESS-PE64-CORPUS-WINE-ABORT-SCANSTATUS2` (OPEN, HIGH, silent-miscompile class), operator-directed root cause, three facts pinned:**
+1. **DETERMINISTIC**: standalone `scanstatus2.test` crashes at `scanstatus2-5.1`, same RIP, 30/30.
+2. **WINE EXONERATED**: the same WSL-built testfixture.exe on REAL Windows exits 0xC0000005 at
+   the same test — no wine in the path.
+3. **THE INSTRUCTION**: the callee (RVA [0x5E0B0F,0x5E1952)) homes SIX arguments — rcx/rdx/r8/r9,
+   stack arg5 — **and reads its SIXTH from `r15`, a callee-saved register no x86-64 ABI passes
+   arguments in**, then derefs `[r15+0x88]`. The caller (the 5,534-byte Tcl command dispatcher
+   [0x4D098E,0x4D1F2C)) passes five args and holds r15 as an int counter (=0). Shape: a
+   caller/callee ARGUMENT-CONVENTION disagreement (K&R prototype-vs-definition arg-count mismatch
+   is the classic source shape) or a >4-arg pe64 codegen bug.
+⚠ The pe64 corpus has passed on WINDOWS-built fixtures historically — the reproducer must decide
+whether the trigger keys on the WSL cross-build or a path the Windows build didn't take.
+
+**NEXT — P14, nothing above it:** root-cause and FIX
+`D-HARNESS-PE64-CORPUS-WINE-ABORT-SCANSTATUS2`. Start from the pinned RVAs: identify the TU
+(transpile the staged `tclsqlite.c`-family TUs, match the caller's `mov %esi,%eax` + 5-arg call
+shape), build the minimal reproducer (a 6-arg call through a mismatched prototype), fix in the
+shared calling-convention/prologue code — this is a FIX, no gate applies — then rerun the pe64
+corpus leg to green. Then the loop continues: the TLS-dylib corpus arm (P12's stated residual),
+asm remainder, C1 coordinates.
 
 ---
 
